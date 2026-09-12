@@ -135,6 +135,7 @@ class TestQwen4ExpPleCacheIntegration(unittest.TestCase):
                         "check_file_backend_supported",
                         return_value=True,
                     ),
+                    mock.patch.object(torch.cuda, "current_device", return_value=0),
                 ):
                     wrapped = Qwen4ExpPinnedHostEmbedding(
                         source.ngram_embedding,
