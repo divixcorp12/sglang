@@ -28,16 +28,20 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import hashlib
+import json
 import logging
 import os
 import re
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_loader.weight_utils import get_lock
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,82 @@ PLE_FILE_RSS_TRIM_CHUNK_BYTES = 1 << 30
 # Below this many rows a gather is decode-sized (16 rows per token): the page
 # faults are cheap and the host-side hint would cost more than it saves.
 PLE_FILE_PREFETCH_MIN_ROWS = 2048
+_PLE_FILE_CACHE_MANIFEST_VERSION = 1
+
+
+class PleFileCache:
+    """Lifecycle state for one verified file-backed PLE table."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        manifest_path: str,
+        manifest: dict[str, Any],
+        cache_hit: bool,
+        lock: Any,
+    ) -> None:
+        self.path = path
+        self.manifest_path = manifest_path
+        self.cache_hit = bool(cache_hit)
+        self._manifest = manifest
+        self._lock = lock
+        self._closed = False
+
+    def complete(self) -> None:
+        """Durably publish this table as complete and release its lock."""
+        if self._closed:
+            return
+        temporary_path: Optional[str] = None
+        try:
+            if not self.cache_hit:
+                data_fd = os.open(self.path, os.O_RDWR)
+                try:
+                    os.fsync(data_fd)
+                finally:
+                    os.close(data_fd)
+
+                manifest_dir = os.path.dirname(self.manifest_path)
+                temporary_fd, temporary_path = tempfile.mkstemp(
+                    prefix=f"{os.path.basename(self.manifest_path)}.tmp",
+                    dir=manifest_dir,
+                )
+                try:
+                    with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
+                        json.dump(self._manifest, stream, sort_keys=True)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary_path, self.manifest_path)
+                    temporary_path = None
+                    try:
+                        _fsync_directory(manifest_dir)
+                    except Exception:
+                        _discard_failed_manifest(self.manifest_path)
+                        raise
+                finally:
+                    if temporary_path is not None:
+                        try:
+                            os.unlink(temporary_path)
+                        except FileNotFoundError:
+                            pass
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Release the SGLang cache lock once."""
+        if self._closed:
+            return
+        self._closed = True
+        lock, self._lock = self._lock, None
+        if lock is not None:
+            lock.release()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class PleFilePrefetcher:
@@ -225,13 +305,14 @@ def allocate_ple_host_table(
     backend: str = "pinned",
     table_dir: Optional[str] = None,
     tag: Optional[str] = None,
+    cache_identity: Optional[str] = None,
 ) -> torch.Tensor:
     """Return a host tensor of ``shape``/``dtype`` for the PLE table.
 
     For the file backend, ``table_dir`` should be private to one checkpoint
     (the server defaults it to ``$SGLANG_CACHE_DIR/ple/<model path>``): the
-    file name only encodes shape, dtype and ``tag``, and every boot rewrites
-    the whole table through the weight loader.
+    legacy file name only encodes shape, dtype and ``tag``. Supplying
+    ``cache_identity`` enables verified reuse after durable completion.
     """
     if backend not in PLE_OFFLOAD_BACKENDS:
         raise ValueError(
@@ -246,19 +327,217 @@ def allocate_ple_host_table(
     nbytes = numel * torch.empty(0, dtype=dtype).element_size()
     table_dir = os.path.expanduser(table_dir or envs.SGLANG_QWEN4_PLE_FILE_DIR.get())
     os.makedirs(table_dir, exist_ok=True)
-    path = os.path.join(table_dir, ple_table_file_name(shape, dtype, tag))
-    if not os.path.exists(path) or os.path.getsize(path) != nbytes:
-        # Sparse: only pages that get written take disk space.
-        with open(path, "wb") as f:
-            f.truncate(nbytes)
+    path = os.path.join(
+        table_dir,
+        ple_table_file_name(shape, dtype, tag, cache_identity=cache_identity),
+    )
+    if cache_identity is None:
+        if not os.path.exists(path) or os.path.getsize(path) != nbytes:
+            with open(path, "wb") as f:
+                f.truncate(nbytes)
+        return _map_ple_file_table(path, shape, dtype, nbytes)
+
+    identity = str(cache_identity)
+    identity_digest = _ple_cache_identity_digest(identity)
+    manifest_path = f"{path}.manifest.json"
+    manifest = _ple_cache_manifest(
+        identity=identity,
+        identity_digest=identity_digest,
+        shape=shape,
+        dtype=dtype,
+        nbytes=nbytes,
+        tag=tag,
+    )
+    canonical_path = os.path.realpath(path)
+    lock_digest = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
+    lock = get_lock(f"ple-file-cache-{lock_digest}")
+    lock.acquire()
+    cache: Optional[PleFileCache] = None
+    try:
+        cache_hit = _ple_file_cache_is_valid(path, manifest_path, manifest, nbytes)
+        if not cache_hit:
+            _durably_invalidate_manifest(manifest_path)
+            _replace_ple_cache_data(path, nbytes)
+        table = _map_ple_file_table(path, shape, dtype, nbytes)
+        cache = PleFileCache(
+            path=path,
+            manifest_path=manifest_path,
+            manifest=manifest,
+            cache_hit=cache_hit,
+            lock=lock,
+        )
+        table._sglang_ple_file_cache = cache
+        logger.info(
+            "PLE table: persistent cache %s for %s",
+            "hit" if cache_hit else "miss",
+            path,
+        )
+        return table
+    except Exception:
+        if cache is None:
+            lock.release()
+        else:
+            cache.close()
+        raise
+
+
+def get_ple_file_cache(table: torch.Tensor) -> Optional[PleFileCache]:
+    """Return the persistent cache state attached to ``table``, if any.
+
+    Callers must retain the result before wrapping ``table`` in
+    ``torch.nn.Parameter`` because PyTorch does not copy arbitrary tensor
+    attributes onto the new parameter object.
+    """
+    return getattr(table, "_sglang_ple_file_cache", None)
+
+
+def complete_ple_file_cache(
+    table: torch.Tensor,
+    seen_shards: Iterable[int],
+    expected_shards: int,
+) -> None:
+    """Publish a cache miss only after every expected weight shard was seen."""
+    cache = get_ple_file_cache(table)
+    if cache is None:
+        return
+    if cache.cache_hit:
+        cache.close()
+        return
+    expected = set(range(int(expected_shards)))
+    actual = {int(shard) for shard in seen_shards}
+    if actual != expected:
+        cache.close()
+        raise RuntimeError(
+            "PLE table cache cannot be completed before exact weight-shard "
+            f"coverage: expected {sorted(expected)}, saw {sorted(actual)}"
+        )
+    cache.complete()
+
+
+def _map_ple_file_table(
+    path: str,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    nbytes: int,
+) -> torch.Tensor:
     logger.info(
         "PLE table: file-backed mmap %s (%.1f GiB, %s)", path, nbytes / 2**30, dtype
     )
     storage = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
     _madvise_random(storage, nbytes)
     table = storage.view(dtype).view(*[int(d) for d in shape])
-    table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
+    table._sglang_ple_file_path = path
     return table
+
+
+def _ple_cache_identity_digest(identity: str) -> str:
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _ple_cache_manifest(
+    *,
+    identity: str,
+    identity_digest: str,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    nbytes: int,
+    tag: Optional[str],
+) -> dict[str, Any]:
+    return {
+        "version": _PLE_FILE_CACHE_MANIFEST_VERSION,
+        "cache_identity": identity,
+        "identity_digest": identity_digest,
+        "shape": [int(dimension) for dimension in shape],
+        "dtype": str(dtype),
+        "nbytes": int(nbytes),
+        "tag": tag,
+    }
+
+
+def _ple_file_cache_is_valid(
+    path: str,
+    manifest_path: str,
+    expected_manifest: dict[str, Any],
+    nbytes: int,
+) -> bool:
+    try:
+        if os.path.getsize(path) != nbytes:
+            return False
+        with open(manifest_path, encoding="utf-8") as stream:
+            manifest = json.load(stream)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return False
+    return _exact_json_equal(manifest, expected_manifest)
+
+
+def _exact_json_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _exact_json_equal(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _exact_json_equal(actual_value, expected_value)
+            for actual_value, expected_value in zip(actual, expected)
+        )
+    return bool(actual == expected)
+
+
+def _durably_invalidate_manifest(manifest_path: str) -> None:
+    try:
+        os.unlink(manifest_path)
+    except FileNotFoundError:
+        return
+    _fsync_directory(os.path.dirname(manifest_path))
+
+
+def _discard_failed_manifest(manifest_path: str) -> None:
+    try:
+        os.unlink(manifest_path)
+    except OSError:
+        try:
+            with open(manifest_path, "wb") as stream:
+                stream.write(b"invalid")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            pass
+    try:
+        _fsync_directory(os.path.dirname(manifest_path))
+    except OSError:
+        pass
+
+
+def _replace_ple_cache_data(path: str, nbytes: int) -> None:
+    directory = os.path.dirname(path)
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix=f"{os.path.basename(path)}.data.tmp",
+        dir=directory,
+    )
+    try:
+        try:
+            os.ftruncate(temporary_fd, nbytes)
+        finally:
+            os.close(temporary_fd)
+        os.replace(temporary_path, path)
+        temporary_path = ""
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
+def _fsync_directory(directory: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(directory, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:
@@ -432,7 +711,10 @@ def default_ple_table_dir(model_path: str) -> str:
 
 
 def ple_table_file_name(
-    shape: Sequence[int], dtype: torch.dtype, tag: Optional[str] = None
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    tag: Optional[str] = None,
+    cache_identity: Optional[str] = None,
 ) -> str:
     """Deterministic file name so the sparse table is reused across restarts.
 
@@ -445,6 +727,8 @@ def ple_table_file_name(
     elem = torch.empty(0, dtype=dtype).element_size()
     dims = "x".join(str(int(d)) for d in shape)
     suffix = f"_{tag}" if tag else ""
+    if cache_identity is not None:
+        suffix += f"_{_ple_cache_identity_digest(str(cache_identity))}"
     return f"ple_table_{dims}_{str(dtype).replace('torch.', '')}_{numel * elem}B{suffix}.bin"
 
 

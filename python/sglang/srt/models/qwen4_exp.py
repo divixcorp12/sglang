@@ -67,6 +67,8 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     PleFileRowStager,
     allocate_ple_host_table,
     check_file_backend_supported,
+    complete_ple_file_cache,
+    get_ple_file_cache,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -808,6 +810,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         *,
         backend: str = "pinned",
         table_dir: Optional[str] = None,
+        cache_identity: Optional[str] = None,
+        cache_tag: Optional[str] = None,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -830,6 +834,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
+        table_cache_identity = (
+            f"{cache_identity}\0{cache_tag}" if cache_identity is not None else None
+        )
         host_table = allocate_ple_host_table(
             shape=source_weight.shape,
             dtype=source_weight.dtype,
@@ -840,7 +847,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"rows{self.shard_indices.org_vocab_start_index}"
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
+            cache_identity=table_cache_identity,
         )
+        self._ple_file_cache_table = host_table
+        self._ple_file_cache = get_ple_file_cache(host_table)
+        self._ple_file_cache_seen_shards: Set[int] = set()
+        if self._ple_file_cache is not None and self._ple_file_cache.cache_hit:
+            self._ple_file_cache.close()
         self._file_row_stager = None
         direct_file_access = True
         if backend == "file":
@@ -856,7 +869,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
-        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
+        self._file_rss_trimmer = None
+        if self._ple_file_cache is None or self._ple_file_cache.cache_hit:
+            self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
         cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
@@ -867,6 +882,28 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+
+    @property
+    def ple_file_cache_hit(self) -> bool:
+        return self._ple_file_cache is not None and self._ple_file_cache.cache_hit
+
+    def record_ple_file_cache_shard(self, shard_idx: int) -> None:
+        self._ple_file_cache_seen_shards.add(int(shard_idx))
+
+    def complete_ple_file_cache(self, expected_shards: int) -> None:
+        complete_ple_file_cache(
+            self._ple_file_cache_table,
+            self._ple_file_cache_seen_shards,
+            expected_shards,
+        )
+        if self._file_rss_trimmer is None:
+            self._file_rss_trimmer = make_ple_file_rss_trimmer(
+                self._ple_file_cache_table
+            )
+
+    def abort_ple_file_cache(self) -> None:
+        if self._ple_file_cache is not None:
+            self._ple_file_cache.close()
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -961,10 +998,19 @@ class Qwen4ExpPLELayer(nn.Module):
             prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
         if config.ple_offload_embedding:
+            ngram_prefix = (
+                f"{prefix}.ple_embedding.ngram_embedding"
+                if prefix
+                else "ple_embedding.ngram_embedding"
+            )
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 self.ple_embedding.ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+                cache_identity=getattr(
+                    config, "ple_offload_cache_identity", None
+                ),
+                cache_tag=ngram_prefix,
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
@@ -1992,7 +2038,20 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_start = shard_idx * shard_size
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
-            copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
+            if not (
+                isinstance(emb, Qwen4ExpPinnedHostEmbedding)
+                and emb.ple_file_cache_hit
+            ):
+                try:
+                    copy_ple_rows_to_tp_embedding(
+                        emb, loaded_weight, shard_start, shard_end
+                    )
+                except Exception:
+                    if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                        emb.abort_ple_file_cache()
+                    raise
+                if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                    emb.record_ple_file_cache_shard(shard_idx)
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
 
@@ -2175,6 +2234,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
+
+        try:
+            for ple_mod in ple_modules.values():
+                emb = ple_mod.ngram_embedding
+                if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                    emb.complete_ple_file_cache(ple_num_sync_shards)
+        except Exception:
+            for ple_mod in ple_modules.values():
+                emb = ple_mod.ngram_embedding
+                if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                    emb.abort_ple_file_cache()
+            raise
 
         if skipped_visual_count > 0:
             logger.info(
