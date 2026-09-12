@@ -767,6 +767,14 @@ class HotCacheConfigurationTests(unittest.TestCase):
             ):
                 memory_hook.handle_offload_compatibility(args)
 
+    def test_pinned_host_cache_allows_decode_breakable_cuda_graph(self):
+        self.enable()
+        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "0"
+        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "1"
+        allowed = self.args()
+        allowed.cuda_graph_config.decode.backend = "breakable"
+        memory_hook.handle_offload_compatibility(allowed)
+
     def test_early_graph_resolution_and_repeated_validation_are_safe(self):
         self.enable()
         args = self.args(cuda_graph_config=None)

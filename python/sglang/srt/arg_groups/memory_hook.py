@@ -114,11 +114,12 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "breakable, and prefill CUDA graph capture to be disabled"
         )
     if pinned_budget_mb and graph_config is not None and (
-        graph_config.decode.backend != Backend.DISABLED
+        graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
         or graph_config.prefill.backend != Backend.DISABLED
     ):
         raise ValueError(
-            "NVFP4 pinned host caching requires CUDA graph capture to be disabled"
+            "NVFP4 pinned host caching requires decode CUDA graph capture to be disabled "
+            "or breakable, and prefill CUDA graph capture to be disabled"
         )
 
 
