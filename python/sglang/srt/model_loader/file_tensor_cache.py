@@ -146,25 +146,24 @@ class FileTensorCacheGroup:
             return
         temporary_path: Optional[str] = None
         try:
-            if not self.cache_hit:
-                for path in self.paths.values():
-                    _fsync_file(path)
-                temporary_fd, temporary_path = tempfile.mkstemp(
-                    prefix=f"{os.path.basename(self.manifest_path)}.tmp",
-                    dir=self.directory,
-                )
-                try:
-                    with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
-                        json.dump(self._manifest, stream, sort_keys=True)
-                        stream.write("\n")
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary_path, self.manifest_path)
-                    temporary_path = None
-                    _fsync_directory(self.directory)
-                finally:
-                    if temporary_path is not None:
-                        _unlink_if_present(temporary_path)
+            for path in self.paths.values():
+                _fsync_file(path)
+            temporary_fd, temporary_path = tempfile.mkstemp(
+                prefix=f"{os.path.basename(self.manifest_path)}.tmp",
+                dir=self.directory,
+            )
+            try:
+                with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
+                    json.dump(self._manifest, stream, sort_keys=True)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, self.manifest_path)
+                temporary_path = None
+                _fsync_directory(self.directory)
+            finally:
+                if temporary_path is not None:
+                    _unlink_if_present(temporary_path)
         finally:
             self.close()
 
