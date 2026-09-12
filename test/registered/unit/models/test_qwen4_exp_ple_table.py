@@ -22,9 +22,11 @@ import torch
 
 from sglang.srt.models.qwen4_exp_ple_table import (
     PleFilePrefetcher,
+    PleFileRowStager,
     PleFileRssTrimmer,
     _mapping_rss_bytes,
     allocate_ple_host_table,
+    check_file_backend_supported,
     default_ple_table_dir,
     device_uses_host_page_tables,
     make_ple_file_prefetcher,
@@ -104,6 +106,46 @@ class TestPleFileTableAllocator(CustomTestCase):
         table = allocate_ple_host_table((4, 4), torch.bfloat16, "pinned", None)
         self.assertTrue(table.is_pinned())
         self.assertIsNone(make_ple_file_prefetcher(table))
+
+    def test_discrete_gpu_uses_staged_file_access(self):
+        with mock.patch(
+            "sglang.srt.models.qwen4_exp_ple_table.device_uses_host_page_tables",
+            return_value=False,
+        ):
+            with self.assertLogs(
+                "sglang.srt.models.qwen4_exp_ple_table", level="INFO"
+            ):
+                self.assertFalse(check_file_backend_supported())
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA pinned memory")
+class TestPleFileRowStager(CustomTestCase):
+    def test_stages_only_selected_rows_and_reuses_bounded_buffers(self):
+        with tempfile.TemporaryDirectory() as d:
+            table = allocate_ple_host_table((32, 7), torch.bfloat16, "file", d)
+            source = torch.arange(32 * 7, dtype=torch.float32).reshape(32, 7)
+            table.copy_(source.to(torch.bfloat16))
+            stager = PleFileRowStager(table)
+
+            ids = torch.tensor([[4, 11, 40], [7, -1, 4]], device="cuda")
+            staged = stager.stage(ids, vocab_start=4, vocab_end=36)
+            expected = torch.zeros((2, 3, 7), dtype=torch.bfloat16, device="cuda")
+            expected[0, 0] = table[0].to("cuda")
+            expected[0, 1] = table[7].to("cuda")
+            expected[1, 0] = table[3].to("cuda")
+            expected[1, 2] = table[0].to("cuda")
+            torch.testing.assert_close(staged, expected, rtol=0, atol=0)
+
+            capacity = stager.capacity
+            staged_small = stager.stage(ids[:1, :2], vocab_start=4, vocab_end=36)
+            self.assertEqual(stager.capacity, capacity)
+            self.assertLessEqual(stager.host_buffer_bytes, capacity * 7 * 2)
+            torch.testing.assert_close(
+                staged_small,
+                expected[:1, :2],
+                rtol=0,
+                atol=0,
+            )
 
 
 class TestPleFilePrefetcher(CustomTestCase):

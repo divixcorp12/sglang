@@ -64,7 +64,9 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
+    PleFileRowStager,
     allocate_ple_host_table,
+    check_file_backend_supported,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -839,8 +841,19 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
         )
-        # Only the file backend has anything to prefetch (rows live on storage).
-        self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        self._file_row_stager = None
+        direct_file_access = True
+        if backend == "file":
+            direct_file_access = check_file_backend_supported(
+                torch.cuda.current_device()
+            )
+            if not direct_file_access:
+                self._file_row_stager = PleFileRowStager(host_table)
+        # Direct file access can use page-cache hints. Staged access performs
+        # the host gather synchronously before its bounded H2D transfer.
+        self._file_prefetcher = (
+            make_ple_file_prefetcher(host_table) if direct_file_access else None
+        )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
         self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
@@ -887,22 +900,30 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            if self._file_prefetcher is not None:
-                self._file_prefetcher.enqueue(
-                    flat_ids,
+            if self._file_row_stager is not None:
+                staged = self._file_row_stager.stage(
+                    input_ids,
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
-                output,
-                embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                BLOCK_D=self._block_d,
-            )
+                output.copy_(staged.to(torch.bfloat16))
+            else:
+                if self._file_prefetcher is not None:
+                    self._file_prefetcher.enqueue(
+                        flat_ids,
+                        vocab_start=self.shard_indices.org_vocab_start_index,
+                        vocab_end=self.shard_indices.org_vocab_end_index,
+                    )
+                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    BLOCK_D=self._block_d,
+                )
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:

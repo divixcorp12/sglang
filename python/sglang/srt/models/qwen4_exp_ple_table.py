@@ -9,19 +9,16 @@ rows straight from a host pointer. Two backends provide that pointer:
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
-    ``--ple-offload-dir``. Meant for unified-memory parts (GB10 / DGX Spark and
-    similar), where pinned host memory comes out of the *same* pool as the
-    model weights and ``pinned`` therefore frees nothing: Qwen3.8-Flash-Next is
-    126.0 GiB of weights on a 121.63 GiB box and does not boot with ``pinned``.
-    The kernel dereferences the pageable pointer directly, which only works on
-    devices that report ``cudaDevAttrPageableMemoryAccessUsesHostPageTables``;
-    rows are paged in from storage on demand, the file is sparse, deterministic
-    in name and reused across restarts, and gathers of prefill size hint the
-    page cache (``posix_fadvise(WILLNEED)``) so page faults are served
-    concurrently instead of one at a time. A background trimmer keeps the
-    mapping's resident set under a budget, because faulting rows in maps whole
-    page-cache folios and the table would otherwise creep towards full
-    residency (see ``PleFileRssTrimmer``).
+    ``--ple-offload-dir``. Unified-memory devices that report
+    ``cudaDevAttrPageableMemoryAccessUsesHostPageTables`` read the mapping
+    directly. Discrete GPUs copy only the requested rows through bounded pinned
+    host and device buffers. Rows are paged in from storage on demand, the file
+    is sparse, deterministic in name and reused across restarts. Direct gathers
+    of prefill size hint the page cache (``posix_fadvise(WILLNEED)``) so page
+    faults are served concurrently instead of one at a time. A background
+    trimmer keeps the mapping's resident set under a budget, because faulting
+    rows in maps whole page-cache folios and the table would otherwise creep
+    towards full residency (see ``PleFileRssTrimmer``).
 
 This module has no Triton or CUDA-kernel imports so that its allocator and
 prefetcher can be unit-tested on CPU.
@@ -318,29 +315,114 @@ def make_ple_file_rss_trimmer(table: torch.Tensor) -> Optional[PleFileRssTrimmer
     return trimmer
 
 
-def check_file_backend_supported(device_index: int = 0) -> None:
-    """Fail fast at load time instead of silently reading garbage in the kernel."""
+class PleFileRowStager:
+    """Copy selected rows from a file mapping through bounded pinned buffers."""
+
+    def __init__(self, table: torch.Tensor) -> None:
+        if getattr(table, "_sglang_ple_file_path", None) is None:
+            raise ValueError("PLE row staging requires a file-backed table")
+        if table.dim() != 2:
+            raise ValueError(f"PLE row staging requires a 2D table, got {table.dim()}D")
+        self._table = table.detach()
+        self._dtype = table.dtype
+        self._embedding_dim = int(table.shape[1])
+        self._byte_rows = self._table.view(torch.uint8).reshape(table.shape[0], -1)
+        self._row_bytes = int(self._byte_rows.shape[1])
+        self._host_buffer: Optional[torch.Tensor] = None
+        self._device_buffer: Optional[torch.Tensor] = None
+        self._capacity = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def host_buffer_bytes(self) -> int:
+        if self._host_buffer is None:
+            return 0
+        return self._host_buffer.numel() * self._host_buffer.element_size()
+
+    def _ensure_capacity(self, row_count: int, device: torch.device) -> None:
+        if (
+            row_count <= self._capacity
+            and self._device_buffer is not None
+            and self._device_buffer.device == device
+        ):
+            return
+        self._capacity = max(row_count, self._capacity, 64)
+        self._host_buffer = torch.empty(
+            (self._capacity, self._row_bytes),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._device_buffer = torch.empty(
+            (self._capacity, self._row_bytes), dtype=torch.uint8, device=device
+        )
+
+    def stage(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        vocab_start: int,
+        vocab_end: int,
+    ) -> torch.Tensor:
+        """Return selected rows on the ID device in the table's storage dtype."""
+        if not input_ids.is_cuda:
+            raise ValueError("PLE file row staging requires CUDA input IDs")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "staged PLE file access is incompatible with CUDA graph capture; "
+                "disable CUDA graphs for prefill and decode"
+            )
+        flat_ids = input_ids.detach().reshape(-1).to(device="cpu", dtype=torch.int64)
+        row_count = flat_ids.numel()
+        if row_count == 0:
+            return torch.empty(
+                (*input_ids.shape, self._embedding_dim),
+                dtype=self._dtype,
+                device=input_ids.device,
+            )
+        inside = (flat_ids >= vocab_start) & (flat_ids < vocab_end)
+        local_ids = torch.where(inside, flat_ids - vocab_start, 0)
+        self._ensure_capacity(row_count, input_ids.device)
+        host_rows = self._host_buffer[:row_count]
+        torch.index_select(self._byte_rows, 0, local_ids, out=host_rows)
+        host_rows[~inside] = 0
+        device_rows = self._device_buffer[:row_count]
+        device_rows.copy_(host_rows, non_blocking=True)
+        return device_rows.view(self._dtype).reshape(
+            *input_ids.shape, self._embedding_dim
+        )
+
+
+def check_file_backend_supported(device_index: int = 0) -> bool:
+    """Return whether the file mapping is directly GPU-addressable.
+
+    Discrete GPUs use selected-row staging instead, so lack of direct pageable
+    access is no longer an error.
+    """
     if envs.SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK.get():
         logger.warning(
             "PLE table: file backend device check skipped by "
             "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"
         )
-        return
+        return True
     supported = device_uses_host_page_tables(device_index)
     if supported is None:
-        raise RuntimeError(
-            "--ple-offload-backend file: could not query "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. Set "
-            "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 only if you know the "
-            "device reads pageable host memory through the host page tables."
+        logger.info(
+            "PLE table: pageable host access is unknown; using selected-row "
+            "staging for the file backend"
         )
-    if not supported:
-        raise ValueError(
-            "--ple-offload-backend file needs a device whose pageable host "
-            "memory accesses go through the host page tables (unified-memory "
-            "parts such as GB10). This device reports it does not; use "
-            "--ple-offload-backend pinned."
-        )
+        return False
+    if supported:
+        logger.info("PLE table: using direct pageable host access")
+        return True
+    logger.info(
+        "PLE table: device lacks direct pageable host access; using bounded "
+        "selected-row staging for the file backend"
+    )
+    return False
 
 
 def default_ple_table_dir(model_path: str) -> str:
