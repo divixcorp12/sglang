@@ -1,5 +1,7 @@
+import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -183,6 +185,218 @@ class TestExpertHotCache(unittest.TestCase):
         self.assertEqual(compact.tolist(), [[1, 0, 1, 0]] * 17)
         self.assertIs(tensors, cache.tensors)
         self.assertEqual(self.streamer.last_gather_stats.requested_rows, 2)
+
+
+class TestExpertFrequencySeed(unittest.TestCase):
+    def test_stat_steps_are_summed_and_count_beats_mass(self):
+        from sglang.srt.layers.moe.expert_hot_cache import (
+            normalize_expert_frequency_seed,
+        )
+
+        for payload in (
+            {"logical_count": [[[1, 2], [3, 4]], [[4, 3], [2, 1]]]},
+            {"count": [[5, 5], [5, 5]], "mass": [[99, 0], [0, 99]], "tokens": 10},
+        ):
+            self.assertEqual(
+                normalize_expert_frequency_seed(payload).tolist(), [[5, 5], [5, 5]]
+            )
+        self.assertEqual(
+            normalize_expert_frequency_seed({"mass": [[1, 2]]}).tolist(), [[1, 2]]
+        )
+
+    def test_invalid_seed_is_rejected(self):
+        from sglang.srt.layers.moe.expert_hot_cache import (
+            normalize_expert_frequency_seed,
+        )
+
+        for payload in (
+            {},
+            {"count": [1, 2]},
+            {"count": [[-1, 2]]},
+            {"mass": [[float("nan")]]},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                normalize_expert_frequency_seed(payload)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestExpertHotCacheManager(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        self.manager_type = ExpertHotCacheManager
+        self.mode = ForwardMode
+        self.model = torch.nn.Module()
+        for layer_id, width in ((0, 3), (2, 6)):
+            layer = torch.nn.Module()
+            layer.layer_id = layer_id
+            layer._nvfp4_file_source_bytes_per_expert = 0
+            for name in NVFP4_STREAM_TENSORS[:4]:
+                setattr(
+                    layer,
+                    name,
+                    torch.arange(4 * width, dtype=torch.uint8).reshape(4, width),
+                )
+            layer.g1_alphas = torch.ones(4)
+            layer.g2_alphas = torch.ones(4)
+            layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+            self.model.add_module(str(layer_id), layer)
+
+    def manager(self, seed=None, **kwargs):
+        options = dict(
+            budget_bytes=52,
+            seed_path=None,
+            dynamic=True,
+            update_prefill_tokens=16,
+            min_residence_forwards=2,
+            benefit_ratio=2.0,
+        )
+        options.update(kwargs)
+        if seed is None:
+            return self.manager_type.from_model(self.model, **options)
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            torch.save(seed, f.name)
+            options["seed_path"] = f.name
+            return self.manager_type.from_model(self.model, **options)
+
+    def batch(self, mode=None, tokens=32):
+        return SimpleNamespace(
+            forward_mode=mode or self.mode.EXTEND, extend_num_tokens=tokens
+        )
+
+    def observe(self, manager, counts, **kwargs):
+        manager.on_expert_distribution(
+            self.batch(**kwargs), {"global_physical_count": torch.tensor(counts)}
+        )
+
+    def test_seed_allocates_complete_slots_by_global_expected_byte_savings(self):
+        manager = self.manager({"count": [[9, 0, 0, 0], [0] * 4, [0, 10, 0, 0]]})
+        self.assertEqual(
+            {k: c.capacity for k, c in manager.caches.items()}, {0: 1, 2: 1}
+        )
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+        self.assertEqual(manager.caches[2].slot_to_expert, [1])
+        self.assertEqual(manager.residency_bytes, 52)
+        self.assertEqual(self.manager(budget_bytes=19), None)
+        self.assertEqual(self.manager(budget_bytes=0), None)
+
+    def test_larger_layer_can_win_entire_budget_and_json_seed_loads(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as f:
+            json.dump({"count": [[0] * 4, [0] * 4, [9, 8, 7, 6]]}, f)
+            f.flush()
+            manager = self.manager(seed_path=f.name, budget_bytes=64)
+        self.assertEqual({k: c.capacity for k, c in manager.caches.items()}, {2: 2})
+        self.assertEqual(manager.caches[2].slot_to_expert, [0, 1])
+
+    def test_dynamic_update_requires_prefill_residence_and_strict_benefit(self):
+        manager = self.manager({"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]})
+        cold = [[0, 10, 0, 0], [0] * 4, [0, 10, 0, 0]]
+        for mode in (
+            self.mode.DECODE,
+            self.mode.TARGET_VERIFY,
+            self.mode.DRAFT_EXTEND_V2,
+            self.mode.IDLE,
+        ):
+            self.observe(manager, cold, mode=mode)
+        self.observe(manager, cold, tokens=15)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+        self.observe(manager, [[0, 2, 0, 0], [0] * 4, [0, 2, 0, 0]])
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+        pointers = manager.caches[0].data_ptrs()
+        self.observe(manager, cold)
+        self.assertEqual(manager.caches[0].slot_to_expert, [1])
+        self.observe(manager, [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]])
+        self.assertEqual(manager.caches[0].slot_to_expert, [1])
+        self.observe(manager, [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]])
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+        self.assertEqual(manager.caches[0].data_ptrs(), pointers)
+
+    def test_static_seed_never_changes_and_counts_actual_gathers_once(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]}, dynamic=False
+        )
+        streamer = self.model.get_submodule("0")._nvfp4_expert_streamer
+        streamer.gather(torch.tensor([[0, 1, 0]], device="cuda"))
+        cold = [[2, 1, 0, 0], [0] * 4, [0] * 4]
+        self.observe(manager, cold, mode=self.mode.DECODE)
+        self.observe(manager, cold, mode=self.mode.DECODE)
+        counters = manager.snapshot_counters()
+        self.assertEqual(counters["decode"]["0"]["hot_hits"], 2)
+        self.assertEqual(counters["decode"]["0"]["h2d_bytes"], 20)
+        self.assertEqual(counters["decode"]["0"]["d2d_bytes"], 60)
+        self.assertEqual(counters["decode"]["0"]["requested_unique_experts"], 2)
+        self.assertEqual(counters["decode"]["0"]["file_source_bytes"], 0)
+        self.assertEqual(counters["prefill"]["0"]["promotions"], 1)
+        self.assertEqual(counters["prefill"]["0"]["migration_bytes"], 20)
+        json.dumps(counters, allow_nan=False)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+
+    def test_initial_residence_and_delta_migration_keep_retained_expert(self):
+        manager = self.manager(
+            {"count": [[20, 10, 0, 0], [0] * 4, [0] * 4]}, budget_bytes=40
+        )
+        counts = [[8, 1, 4, 0], [0] * 4, [0] * 4]
+        self.observe(manager, counts)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0, 1])
+        self.observe(manager, counts)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0, 2])
+        counters = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(counters["promotions"], 3)
+        self.assertEqual(counters["evictions"], 1)
+        self.assertEqual(counters["migration_bytes"], 60)
+
+    def test_file_attribution_requires_explicit_metadata_and_logs_totals(self):
+        layer = self.model.get_submodule("0")
+        del layer._nvfp4_file_source_bytes_per_expert
+        manager = self.manager(dynamic=False)
+        streamer = layer._nvfp4_expert_streamer
+        streamer.gather(torch.tensor([[2, 3]], device="cuda"))
+        counts = [[0, 0, 1, 1], [0] * 4, [0] * 4]
+        self.observe(manager, counts)
+        counters = manager.snapshot_counters()["prefill"]["0"]
+        self.assertIsNone(counters["file_source_bytes"])
+        self.assertIsNone(counters["file_misses"])
+        self.assertEqual(counters["backing_source_bytes"], 40)
+        self.assertEqual(counters["h2d_bytes"], 40)
+        for _ in range(98):
+            self.observe(manager, counts)
+        with self.assertLogs(
+            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
+        ) as logs:
+            self.observe(manager, counts)
+        logged = json.loads(logs.records[0].getMessage().split("Expert hot cache ")[1])
+        self.assertEqual(logged["prefill"]["0"]["backing_source_bytes"], 40)
+
+    def test_known_file_bytes_do_not_include_other_host_sources(self):
+        self.model.get_submodule("0")._nvfp4_file_source_bytes_per_expert = 12
+        manager = self.manager(dynamic=False)
+        streamer = self.model.get_submodule("0")._nvfp4_expert_streamer
+        streamer.gather(torch.tensor([[2, 3]], device="cuda"))
+        self.observe(manager, [[0, 0, 1, 1], [0] * 4, [0] * 4])
+        counters = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(counters["file_source_bytes"], 24)
+        self.assertEqual(counters["file_misses"], 2)
+        self.assertEqual(counters["backing_source_bytes"], 40)
+
+    def test_invalid_config_and_seed_do_not_allocate_slots(self):
+        for options in (
+            {"budget_bytes": -1},
+            {"update_prefill_tokens": 0},
+            {"min_residence_forwards": -1},
+            {"benefit_ratio": float("nan")},
+            {"benefit_ratio": -1},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.manager(**options)
+        with self.assertRaises(ValueError):
+            self.manager({"count": [[1, 2, 3, 4]]})
+        self.assertTrue(
+            all(
+                module._nvfp4_expert_streamer.hot_cache is None
+                for module in self.model.children()
+            )
+        )
 
 
 if __name__ == "__main__":
