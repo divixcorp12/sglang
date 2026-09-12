@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -117,6 +118,12 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
+    def register_forward_observer(
+        self, callback: Callable[[ForwardBatch, Dict[str, Any]], None]
+    ) -> None:
+        """Observe shared forward statistics; no-op recorders ignore registration."""
+        pass
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -163,6 +170,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
+        self._forward_observers = []
         self._disable_all = False
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
@@ -194,7 +202,18 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             try:
                 yield outputs
             finally:
-                self._on_forward_pass_end(forward_pass_id, outputs)
+                self._on_forward_pass_end(forward_pass_id, outputs, forward_batch)
+
+    def register_forward_observer(
+        self, callback: Callable[[ForwardBatch, Dict[str, Any]], None]
+    ) -> None:
+        """Register a synchronous observer without changing user recording state.
+
+        Callbacks must treat the data as read-only and copy tensors they retain:
+        the gatherer reuses its count buffer on the next forward.
+        """
+        if callback not in self._forward_observers:
+            self._forward_observers.append(callback)
 
     @contextmanager
     def disable_this_region(self):
@@ -207,20 +226,25 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._disable_all = previous_disable_all
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
-        if not self._recording:
+        if not (self._recording or self._forward_observers):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
 
-    def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
-        if not self._recording:
+    def _on_forward_pass_end(
+        self, forward_pass_id: int, outputs: Dict[str, Any], forward_batch: ForwardBatch
+    ):
+        if not (self._recording or self._forward_observers):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            self._accumulator.append(
-                forward_pass_id, gatherer_key, single_pass_data, outputs
-            )
+            if self._recording:
+                self._accumulator.append(
+                    forward_pass_id, gatherer_key, single_pass_data, outputs
+                )
+            for callback in self._forward_observers:
+                callback(forward_batch, single_pass_data)
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -252,7 +276,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if self._disable_all:
             return
         if not (
-            self._recording or torch.get_device_module().is_current_stream_capturing()
+            self._recording
+            or self._forward_observers
+            or torch.get_device_module().is_current_stream_capturing()
         ):
             return
         gatherer = self._single_pass_gatherers[

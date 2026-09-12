@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import logging
+import math
+from dataclasses import asdict, dataclass
 from operator import index
-from typing import Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -124,3 +133,237 @@ class ExpertHotCache:
         return tuple(tensor.data_ptr() for tensor in self.tensors.values()) + (
             self.expert_to_slot.data_ptr(),
         )
+
+
+def normalize_expert_frequency_seed(data: Mapping[str, Any]) -> torch.Tensor:
+    """Normalize recorder steps or routing artifacts to CPU [layer, expert] counts."""
+    if not isinstance(data, Mapping):
+        raise ValueError("expert frequency seed must be a mapping")
+    key = next(
+        (name for name in ("logical_count", "count", "mass") if name in data), None
+    )
+    if key is None:
+        raise ValueError("expert frequency seed requires logical_count, count, or mass")
+    counts = torch.as_tensor(data[key], dtype=torch.float64, device="cpu")
+    expected_ndim = 3 if key == "logical_count" else 2
+    if counts.ndim != expected_ndim or counts.numel() == 0:
+        raise ValueError("expert frequency seed has invalid dimensions")
+    if not torch.isfinite(counts).all() or (counts < 0).any():
+        raise ValueError("expert frequency seed must contain finite nonnegative counts")
+    return counts.sum(dim=0) if key == "logical_count" else counts
+
+
+@dataclass
+class _OperationalCounters:
+    hot_hits: int = 0
+    file_misses: int | None = None
+    d2d_bytes: int = 0
+    h2d_bytes: int = 0
+    backing_source_bytes: int = 0
+    file_source_bytes: int | None = None
+    requested_unique_experts: int = 0
+    promotions: int = 0
+    evictions: int = 0
+    migration_bytes: int = 0
+    residency_bytes: int = 0
+
+
+class ExpertHotCacheManager:
+    """Allocate a global slot budget and observe the recorder after each forward.
+
+    Routing counts are borrowed synchronously, never retained or counted again.
+    Placement and gathers must share the streamer's serialized CUDA stream.
+    Startup may set each layer's `_nvfp4_file_source_bytes_per_expert` to enable
+    exact file attribution; absent metadata is reported as unknown, not guessed.
+    """
+
+    @classmethod
+    def from_model(
+        cls,
+        model: torch.nn.Module,
+        budget_bytes: int,
+        seed_path: str | None,
+        dynamic: bool,
+        update_prefill_tokens: int,
+        min_residence_forwards: int,
+        benefit_ratio: float,
+    ) -> ExpertHotCacheManager | None:
+        budget_bytes = index(budget_bytes)
+        update_prefill_tokens = index(update_prefill_tokens)
+        min_residence_forwards = index(min_residence_forwards)
+        if budget_bytes < 0 or update_prefill_tokens < 1 or min_residence_forwards < 0:
+            raise ValueError("invalid expert hot cache budget or update interval")
+        if not math.isfinite(benefit_ratio) or benefit_ratio < 0:
+            raise ValueError(
+                "expert hot cache benefit ratio must be finite and nonnegative"
+            )
+        if budget_bytes == 0:
+            return None
+        streamers = {}
+        for module in model.modules():
+            streamer = getattr(module, "_nvfp4_expert_streamer", None)
+            if streamer is None:
+                continue
+            layer_id = index(module.layer_id)
+            if layer_id < 0 or layer_id in streamers:
+                raise ValueError(
+                    "expert hot cache requires unique nonnegative layer IDs"
+                )
+            streamers[layer_id] = streamer
+        if not streamers:
+            return None
+        seed = None
+        if seed_path is not None:
+            path = Path(seed_path)
+            if path.suffix == ".json":
+                with path.open() as source:
+                    payload = json.load(source)
+            else:
+                payload = torch.load(path, map_location="cpu", weights_only=True)
+            seed = normalize_expert_frequency_seed(payload)
+            if any(
+                layer_id >= seed.shape[0] or seed.shape[1] != streamer.num_experts
+                for layer_id, streamer in streamers.items()
+            ):
+                raise ValueError(
+                    "expert frequency seed does not match model layers and experts"
+                )
+        candidates = sorted(
+            (
+                -(float(seed[layer_id, expert_id]) if seed is not None else 1.0)
+                * streamer.bytes_per_expert,
+                expert_id,
+                layer_id,
+            )
+            for layer_id, streamer in streamers.items()
+            for expert_id in range(streamer.num_experts)
+        )
+        selected = {layer_id: [] for layer_id in streamers}
+        remaining = budget_bytes
+        for _, expert_id, layer_id in candidates:
+            slot_bytes = streamers[layer_id].bytes_per_expert
+            if slot_bytes <= remaining:
+                selected[layer_id].append(expert_id)
+                remaining -= slot_bytes
+        if not any(selected.values()):
+            return None
+        manager = cls()
+        manager.streamers = streamers
+        manager.caches = {}
+        manager.dynamic = dynamic
+        manager.update_prefill_tokens = update_prefill_tokens
+        manager.min_residence_forwards = min_residence_forwards
+        manager.benefit_ratio = benefit_ratio
+        manager._forward_count = 0
+        manager._last_update = {layer_id: 0 for layer_id in streamers}
+        manager._last_gather = {
+            layer_id: streamer.last_gather_stats
+            for layer_id, streamer in streamers.items()
+        }
+        manager._counters = {
+            mode: {layer_id: _OperationalCounters() for layer_id in streamers}
+            for mode in ("prefill", "decode")
+        }
+        for layer_id, expert_ids in selected.items():
+            if expert_ids:
+                cache = ExpertHotCache(streamers[layer_id], len(expert_ids))
+                manager.caches[layer_id] = cache
+                manager._record_update(layer_id, cache.reassign(expert_ids))
+        return manager
+
+    @property
+    def residency_bytes(self) -> int:
+        return sum(cache.capacity_bytes for cache in self.caches.values())
+
+    def _record_update(self, layer_id: int, update: HotCacheUpdateStats) -> None:
+        counters = self._counters["prefill"][layer_id]
+        counters.promotions += update.promoted_experts
+        counters.evictions += update.evicted_experts
+        counters.migration_bytes += update.migration_bytes
+
+    def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | None]]]:
+        """Return JSON-compatible cumulative totals and current allocation gauges."""
+        result = {}
+        for mode, layers in self._counters.items():
+            result[mode] = {}
+            for layer_id, counters in layers.items():
+                row = asdict(counters)
+                cache = self.caches.get(layer_id)
+                row["residency_bytes"] = cache.capacity_bytes if cache else 0
+                result[mode][str(layer_id)] = row
+        return result
+
+    def on_expert_distribution(
+        self, forward_batch: ForwardBatch, single_pass_data: Mapping[str, Any]
+    ) -> None:
+        """Account for fresh gathers and change slots only on profitable prefills."""
+        counts = single_pass_data.get("global_physical_count")
+        if counts is None:
+            return
+        if counts.ndim != 2 or any(
+            layer_id >= counts.shape[0] or counts.shape[1] != streamer.num_experts
+            for layer_id, streamer in self.streamers.items()
+        ):
+            raise ValueError(
+                "recorder counts do not match expert cache layers and experts"
+            )
+        self._forward_count += 1
+        prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        mode = "prefill" if prefill else "decode"
+        qualifying = (
+            self.dynamic
+            and prefill
+            and (forward_batch.extend_num_tokens or 0) >= self.update_prefill_tokens
+        )
+        for layer_id, streamer in self.streamers.items():
+            row = counts[layer_id]
+            stats = streamer.last_gather_stats
+            if stats is not self._last_gather[layer_id]:
+                self._last_gather[layer_id] = stats
+                counters = self._counters[mode][layer_id]
+                counters.hot_hits += stats.hot_hit_rows
+                counters.d2d_bytes += stats.d2d_bytes
+                counters.h2d_bytes += stats.h2d_bytes
+                counters.backing_source_bytes += stats.source_bytes
+                counters.requested_unique_experts += int(
+                    torch.count_nonzero(row).item()
+                )
+                file_bytes = getattr(
+                    streamer.layer, "_nvfp4_file_source_bytes_per_expert", None
+                )
+                if file_bytes is not None:
+                    counters.file_source_bytes = (
+                        counters.file_source_bytes or 0
+                    ) + stats.miss_rows * file_bytes
+                    counters.file_misses = (counters.file_misses or 0) + (
+                        stats.miss_rows if file_bytes else 0
+                    )
+            cache = self.caches.get(layer_id)
+            if (
+                not qualifying
+                or cache is None
+                or self._forward_count - self._last_update[layer_id]
+                < self.min_residence_forwards
+            ):
+                continue
+            desired = torch.argsort(row, descending=True, stable=True)[
+                : cache.capacity
+            ].tolist()
+            existing = set(cache.slot_to_expert) - {-1}
+            promoted = set(desired) - existing
+            if not promoted:
+                continue
+            evicted = existing - set(desired)
+            saved = (
+                sum(float(row[expert]) for expert in promoted)
+                - sum(float(row[expert]) for expert in evicted)
+            ) * streamer.bytes_per_expert
+            migration = len(promoted) * streamer.bytes_per_expert
+            if saved > migration * self.benefit_ratio:
+                self._record_update(layer_id, cache.reassign(desired))
+                self._last_update[layer_id] = self._forward_count
+        if self._forward_count % 100 == 0:
+            logger.info(
+                "Expert hot cache %s",
+                json.dumps(self.snapshot_counters(), sort_keys=True),
+            )
