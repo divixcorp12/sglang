@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
 import torch
@@ -27,6 +28,22 @@ NVFP4_STREAM_TENSORS = (
     "g1_alphas",
     "g2_alphas",
 )
+
+
+@dataclass(frozen=True)
+class ExpertGatherStats:
+    """Actual source rows and transfer bytes after the gather's deduplication.
+
+    All-hot slot remapping has no transfer bytes. source_bytes counts misses
+    read from backing tensors, whether their source device is CPU or CUDA.
+    """
+
+    requested_rows: int = 0
+    hot_hit_rows: int = 0
+    miss_rows: int = 0
+    d2d_bytes: int = 0
+    h2d_bytes: int = 0
+    source_bytes: int = 0
 
 
 def expert_streaming_enabled() -> bool:
@@ -55,6 +72,28 @@ def _gather_host_rows_kernel(
 
 def _tensor_data(value: torch.Tensor) -> torch.Tensor:
     return value.data if isinstance(value, torch.nn.Parameter) else value
+
+
+@triton.jit
+def _scatter_hot_rows_kernel(
+    src_ptr,
+    source_ids,
+    destination_ids,
+    output_ptr,
+    row_bytes,
+    BLOCK: tl.constexpr,
+):
+    source_row = tl.load(source_ids + tl.program_id(0)).to(tl.int64)
+    destination_row = tl.load(destination_ids + tl.program_id(0)).to(tl.int64)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(
+        src_ptr + source_row * row_bytes + offsets, mask=offsets < row_bytes, other=0
+    )
+    tl.store(
+        output_ptr + destination_row * row_bytes + offsets,
+        values,
+        mask=offsets < row_bytes,
+    )
 
 
 def _cached_arange(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -140,6 +179,21 @@ class ExpertStreamer:
             raise ValueError("expert streamer requires at least one tensor")
 
         self.num_experts = self._validate_sources()
+        self.hot_cache = None
+        self.last_gather_stats = ExpertGatherStats()
+        self.bytes_per_expert = sum(
+            _tensor_data(getattr(layer, name)).numel()
+            * _tensor_data(getattr(layer, name)).element_size()
+            // self.num_experts
+            for name in self.tensor_names
+        )
+        self.host_bytes_per_expert = sum(
+            _tensor_data(getattr(layer, name)).numel()
+            * _tensor_data(getattr(layer, name)).element_size()
+            // self.num_experts
+            for name in self.tensor_names
+            if _tensor_data(getattr(layer, name)).device.type == "cpu"
+        )
         signature = tuple(
             (
                 name,
@@ -179,11 +233,120 @@ class ExpertStreamer:
                 expert_count = tensor.shape[0]
             elif tensor.shape[0] != expert_count:
                 raise ValueError(
-                    f"expert count mismatch for {name!r}: "
-                    f"{tensor.shape[0]} != {expert_count}"
+                    f"expert count mismatch for {name!r}: {tensor.shape[0]} != {expert_count}"
                 )
         assert expert_count is not None
         return expert_count
+
+    def _copy_source_rows(
+        self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
+    ) -> None:
+        """Fill supplied CUDA rows through the existing bounded host buffers."""
+        row_count = source_ids.numel()
+        capacity = max(row_count, _NO_DEDUP_LIMIT)
+        pageable_source = any(
+            _tensor_data(getattr(self.layer, name)).device.type == "cpu"
+            and not _tensor_data(getattr(self.layer, name)).is_pinned()
+            for name in self.tensor_names
+        )
+        cpu_ids = (
+            _copy_indices_to_cpu(source_ids, capacity) if pageable_source else None
+        )
+        for name, output in outputs.items():
+            source = _tensor_data(getattr(self.layer, name))
+            if source.device.type == "cuda":
+                torch.index_select(source, 0, source_ids, out=output)
+            elif source.is_pinned():
+                row_bytes = source.numel() * source.element_size() // self.num_experts
+                _gather_host_rows_kernel[(row_count, triton.cdiv(row_bytes, 1024))](
+                    source.view(torch.uint8),
+                    source_ids,
+                    output.view(torch.uint8),
+                    row_bytes,
+                    BLOCK=1024,
+                )
+            else:
+                assert cpu_ids is not None
+                host_output = _pinned_staging_buffer(
+                    name, row_count, capacity, tuple(source.shape[1:]), source.dtype
+                )
+                torch.index_select(source, 0, cpu_ids, out=host_output)
+                output.copy_(host_output, non_blocking=True)
+
+    def _gather_cached(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        cache = self.hot_cache
+        slots, hit_mask = cache.lookup(source_ids)
+        row_count = source_ids.numel()
+        hit_rows = int(hit_mask.sum().item())
+        miss_rows = row_count - hit_rows
+        if miss_rows == 0:
+            self.last_gather_stats = ExpertGatherStats(row_count, hit_rows)
+            return slots[compact_ids.long()].reshape(topk_ids.shape).to(
+                topk_ids.dtype
+            ), cache.tensors
+        capacity = max(row_count, _NO_DEDUP_LIMIT)
+        gathered = {
+            name: _staging_buffer(
+                name,
+                row_count,
+                capacity,
+                tuple(source.shape[1:]),
+                source.dtype,
+                topk_ids.device,
+            )
+            for name in self.tensor_names
+            for source in [_tensor_data(getattr(self.layer, name))]
+        }
+        if hit_rows == 0:
+            self._copy_source_rows(source_ids, gathered)
+            assembly_bytes = 0
+        else:
+            hit_positions = hit_mask.nonzero().flatten()
+            hot_slots = slots[hit_mask]
+            miss_positions = (~hit_mask).nonzero().flatten()
+            misses = {
+                name: _staging_buffer(
+                    ("hot_cache_misses", name),
+                    miss_rows,
+                    capacity,
+                    tuple(output.shape[1:]),
+                    output.dtype,
+                    output.device,
+                )
+                for name, output in gathered.items()
+            }
+            self._copy_source_rows(source_ids[~hit_mask], misses)
+            for name, output in gathered.items():
+                row_bytes = output.numel() * output.element_size() // row_count
+                _scatter_hot_rows_kernel[(hit_rows, triton.cdiv(row_bytes, 1024))](
+                    cache.tensors[name].view(torch.uint8),
+                    hot_slots,
+                    hit_positions,
+                    output.view(torch.uint8),
+                    row_bytes,
+                    BLOCK=1024,
+                )
+                output.view(torch.uint8).reshape(row_count, -1).index_copy_(
+                    0,
+                    miss_positions,
+                    misses[name].view(torch.uint8).reshape(miss_rows, -1),
+                )
+            assembly_bytes = row_count * self.bytes_per_expert
+        self.last_gather_stats = ExpertGatherStats(
+            row_count,
+            hit_rows,
+            miss_rows,
+            assembly_bytes
+            + miss_rows * (self.bytes_per_expert - self.host_bytes_per_expert),
+            miss_rows * self.host_bytes_per_expert,
+            miss_rows * self.bytes_per_expert,
+        )
+        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
 
     def gather(
         self, topk_ids: torch.Tensor
@@ -209,6 +372,16 @@ class ExpertStreamer:
             )
 
         row_count = source_ids.numel()
+        if self.hot_cache is not None and self.hot_cache.capacity:
+            return self._gather_cached(source_ids, compact_ids, topk_ids)
+        self.last_gather_stats = ExpertGatherStats(
+            row_count,
+            0,
+            row_count,
+            row_count * (self.bytes_per_expert - self.host_bytes_per_expert),
+            row_count * self.host_bytes_per_expert,
+            row_count * self.bytes_per_expert,
+        )
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         pageable_source = any(
             _tensor_data(getattr(self.layer, name)).device.type == "cpu"
