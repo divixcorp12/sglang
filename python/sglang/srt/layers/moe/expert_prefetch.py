@@ -33,10 +33,9 @@ class SparseNextLayerPolicy:
         for (source, target), value in affinity.items():
             if source in routed and target not in resident and value > 0:
                 scores[index(target)] += float(value)
-        if not scores:
-            for expert_id, value in popularity.items():
-                if expert_id not in resident and value > 0:
-                    scores[index(expert_id)] = float(value)
+        for expert_id, value in popularity.items():
+            if expert_id not in resident and expert_id not in scores and value > 0:
+                scores[index(expert_id)] = float(value)
         return tuple(
             expert_id
             for expert_id, _ in sorted(
@@ -56,6 +55,7 @@ class ExpertPrefetchStats:
     evictions: int = 0
     overlap_achieved: int = 0
     exposed_wait_ns: int = 0
+    event_wait_enqueues: int = 0
     synchronous_corrections: int = 0
 
 
@@ -128,25 +128,31 @@ class ExpertPrefetchCoordinator:
         self._stats.submitted_bytes += int(submitted_bytes or 0)
         return True
 
+    def prepare_for_lookup(self) -> None:
+        """Order lookup after every inflight mutation, then unlock its slots."""
+        if not self._inflight:
+            return
+        if self._ready_event is not None and self.device is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._ready_event)
+            self._stats.event_wait_enqueues += 1
+        self._inflight = ()
+        self._protected_slots.clear()
+
     def synchronous_correction(
         self,
         actual_experts: Sequence[int],
         correct: Callable[[tuple[int, ...]], None],
     ) -> None:
-        """Wait only for useful predictions, then delegate authoritative gather."""
+        """Order correction after speculative writes and retain authoritative gather."""
         actual = tuple(dict.fromkeys(index(expert_id) for expert_id in actual_experts))
-        overlap = set(actual).intersection(self._inflight)
-        if overlap and self._ready_event is not None and self.device is not None:
-            start = time.perf_counter_ns()
-            torch.cuda.current_stream(self.device).wait_event(self._ready_event)
-            self._stats.exposed_wait_ns += time.perf_counter_ns() - start
-            self._stats.overlap_achieved += 1
+        inflight = self._inflight
+        overlap = set(actual).intersection(inflight)
+        self.prepare_for_lookup()
         correct(actual)
         self._stats.actual_experts += len(actual)
         self._stats.useful_experts += len(overlap)
-        self._stats.wasted_experts += len(set(self._inflight) - set(actual))
+        self._stats.wasted_experts += len(set(inflight) - set(actual))
         self._stats.synchronous_corrections += 1
-        self._inflight = ()
 
     def record_placement(self, *, cache_pollution_bytes: int, evictions: int) -> None:
         self._stats.cache_pollution_bytes += index(cache_pollution_bytes)

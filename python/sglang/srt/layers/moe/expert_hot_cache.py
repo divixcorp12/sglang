@@ -15,6 +15,10 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
+from sglang.srt.layers.moe.expert_prefetch import (
+    ExpertPrefetchCoordinator,
+    SparseNextLayerPolicy,
+)
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
 
 if TYPE_CHECKING:
@@ -327,6 +331,60 @@ class ExpertHotCacheManager:
             ),
         )
         return manager
+
+    def enable_next_layer_prefetch(self, max_candidates: int) -> None:
+        """Attach default-off sparse prefetch callbacks between adjacent layers."""
+        max_candidates = index(max_candidates)
+        if max_candidates <= 0:
+            return
+        policy = SparseNextLayerPolicy(max_candidates)
+        self.prefetch_coordinators = {}
+        layer_ids = sorted(self.streamers)
+        for current_layer, next_layer in zip(layer_ids, layer_ids[1:]):
+            cache = self.caches.get(next_layer)
+            if cache is None:
+                continue
+            next_streamer = self.streamers[next_layer]
+            if next_streamer.pinned_host_cache is None:
+                continue
+            coordinator = ExpertPrefetchCoordinator(enabled=True, device=cache.device)
+            next_streamer.prefetch_coordinator = coordinator
+            self.prefetch_coordinators[next_layer] = coordinator
+
+            def schedule(
+                source_ids,
+                current_layer=current_layer,
+                next_layer=next_layer,
+                cache=cache,
+                coordinator=coordinator,
+            ):
+                popularity = self._route_popularity["decode"][next_layer]
+                affinity = self._route_affinity["decode"].get(
+                    (current_layer, next_layer), {}
+                )
+                resident = set(cache.slot_to_expert) - {-1}
+                candidates = policy.predict(
+                    source_ids.tolist(), popularity, affinity, resident
+                )
+                if not candidates:
+                    return
+
+                def submit(predicted):
+                    desired = list(predicted) + [
+                        expert
+                        for expert in cache.slot_to_expert
+                        if expert not in predicted and expert >= 0
+                    ]
+                    update = cache.reassign(desired[: cache.capacity])
+                    coordinator.record_placement(
+                        cache_pollution_bytes=update.migration_bytes,
+                        evictions=update.evicted_experts,
+                    )
+                    return update.migration_bytes
+
+                coordinator.launch(candidates, protected_slots=(), submit=submit)
+
+            self.streamers[current_layer].next_layer_prefetch = schedule
 
     @property
     def residency_bytes(self) -> int:

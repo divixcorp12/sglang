@@ -62,7 +62,7 @@ class TestExpertPrefetch(unittest.TestCase):
 
         self.assertEqual(submitted, [4, 2])
         self.assertEqual(event.recorded, 1)
-        self.assertEqual(coordinator.protected_slots, frozenset({1, 3}))
+        self.assertEqual(coordinator.protected_slots, frozenset())
         self.assertEqual(corrected, [2, 6])
         stats = coordinator.snapshot_stats()
         self.assertEqual((stats["useful_experts"], stats["wasted_experts"]), (1, 1))

@@ -672,6 +672,10 @@ class ModelRunner:
         )
         self.maybe_init_expert_hot_cache()
         self.maybe_init_expert_pinned_host_cache()
+        if self.expert_hot_cache_manager is not None:
+            self.expert_hot_cache_manager.enable_next_layer_prefetch(
+                envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
+            )
 
         self.maybe_init_dwdp()
 
