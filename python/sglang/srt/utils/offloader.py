@@ -338,7 +338,10 @@ class OffloaderV1(BaseOffloader):
                         f"Incomplete NVFP4 file-cache runtime layout for layer {layer_id}"
                     )
             for group in self._expert_file_groups.values():
-                group.complete()
+                if group.cache_hit:
+                    group.close()
+                else:
+                    group.complete()
         except Exception:
             self.abort()
             raise

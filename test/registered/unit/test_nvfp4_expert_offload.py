@@ -266,9 +266,7 @@ class FileExpertOffloadTests(unittest.TestCase):
         self.assertEqual(set(group.tensors), set(OFFLOAD_NAMES[:4]))
         self.assertFalse(Path(group.manifest_path).exists())
 
-    def test_cold_load_publishes_only_on_post_init_and_warm_load_skips_large_copies(
-        self,
-    ):
+    def test_cold_load_publishes_and_warm_hit_closes_without_republishing(self):
         offloader, layer = self._bind()
         self._load_all(layer)
         group = layer.w13_weight._sglang_file_cache_group
@@ -290,7 +288,14 @@ class FileExpertOffloadTests(unittest.TestCase):
             warm_layer.w13_weight_scale_2, torch.tensor(9.0), "weight_scale_2", "w3", 1
         )
         self.assertEqual(warm_layer.w13_weight_scale_2[1, 1].item(), 9)
-        warm.post_init()
+        warm_group = warm_layer.w13_weight._sglang_file_cache_group
+        with patch.object(
+            warm_group,
+            "complete",
+            side_effect=AssertionError("warm hit must not be republished"),
+        ):
+            warm.post_init()
+        self.assertIsNone(warm_group._lock)
 
     def test_each_missing_logical_shard_aborts_all_groups(self):
         for tag, expert_id, shard_id in (
