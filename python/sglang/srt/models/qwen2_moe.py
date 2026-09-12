@@ -767,6 +767,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and get_is_capture_mode()
             and not torch.compiler.is_compiling()
+            and not (
+                is_in_breakable_cuda_graph()
+                and getattr(self.experts, "_nvfp4_expert_streamer", None) is not None
+            )
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,
