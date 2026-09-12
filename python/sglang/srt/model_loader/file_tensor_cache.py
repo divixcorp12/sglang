@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -15,6 +16,7 @@ import torch
 from sglang.srt.model_loader.weight_utils import get_lock
 
 _FORMAT_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,7 @@ class FileTensorCacheGroup:
                 manifest_path, manifest, normalized_specs, paths
             )
             if not cache_hit:
+                _log_cache_event(manifest_path, manifest, "building_miss")
                 _invalidate_manifest(manifest_path)
                 for spec in normalized_specs:
                     _replace_sparse_file(paths[spec.tag], spec.nbytes)
@@ -126,7 +129,7 @@ class FileTensorCacheGroup:
                 spec.tag: _map_tensor(paths[spec.tag], spec)
                 for spec in normalized_specs
             }
-            return cls(
+            group = cls(
                 cache_hit=cache_hit,
                 directory=directory_path,
                 manifest_path=manifest_path,
@@ -136,8 +139,18 @@ class FileTensorCacheGroup:
                 tensors=tensors,
                 lock=lock,
             )
-        except Exception:
+            if cache_hit:
+                _log_cache_event(manifest_path, manifest, "verified_hit")
+            return group
+        except Exception as error:
             lock.release()
+            _log_cache_event(
+                manifest_path,
+                manifest,
+                "open_failed",
+                level=logging.WARNING,
+                reason=type(error).__name__,
+            )
             raise
 
     def complete(self) -> None:
@@ -164,6 +177,18 @@ class FileTensorCacheGroup:
             finally:
                 if temporary_path is not None:
                     _unlink_if_present(temporary_path)
+            _log_cache_event(
+                self.manifest_path, self._manifest, "published_completed_cache"
+            )
+        except Exception as error:
+            _log_cache_event(
+                self.manifest_path,
+                self._manifest,
+                "publication_failed",
+                level=logging.WARNING,
+                reason=type(error).__name__,
+            )
+            raise
         finally:
             self.close()
 
@@ -173,6 +198,16 @@ class FileTensorCacheGroup:
             return
         try:
             _invalidate_manifest(self.manifest_path)
+            _log_cache_event(self.manifest_path, self._manifest, "aborted_invalidated")
+        except Exception as error:
+            _log_cache_event(
+                self.manifest_path,
+                self._manifest,
+                "invalidation_failed",
+                level=logging.WARNING,
+                reason=type(error).__name__,
+            )
+            raise
         finally:
             self.close()
 
@@ -224,14 +259,68 @@ def _cache_is_valid(
     specs: tuple[FileTensorSpec, ...],
     paths: dict[str, str],
 ) -> bool:
+    reason = "manifest_unreadable"
     try:
         with open(manifest_path, encoding="utf-8") as stream:
             actual_manifest = json.load(stream)
         if not _exact_json_equal(actual_manifest, expected_manifest):
+            _log_cache_event(
+                manifest_path,
+                expected_manifest,
+                "validation_miss",
+                level=logging.DEBUG,
+                reason="manifest_mismatch",
+            )
             return False
-        return all(os.path.getsize(paths[spec.tag]) == spec.nbytes for spec in specs)
-    except (OSError, UnicodeError, ValueError, RecursionError):
+        reason = "member_unavailable"
+        for index, spec in enumerate(specs):
+            actual_bytes = os.path.getsize(paths[spec.tag])
+            if actual_bytes != spec.nbytes:
+                _log_cache_event(
+                    manifest_path,
+                    expected_manifest,
+                    "validation_miss",
+                    level=logging.DEBUG,
+                    reason=f"member_size_mismatch member={index} expected_bytes={spec.nbytes} actual_bytes={actual_bytes}",
+                )
+                return False
+        return True
+    except (OSError, UnicodeError, ValueError, RecursionError) as error:
+        if reason == "manifest_unreadable" and isinstance(error, FileNotFoundError):
+            reason = "manifest_missing"
+        _log_cache_event(
+            manifest_path,
+            expected_manifest,
+            "validation_miss",
+            level=logging.DEBUG,
+            reason=f"{reason} error={type(error).__name__}",
+        )
         return False
+
+
+def _log_cache_event(
+    manifest_path: str,
+    manifest: Mapping[str, Any],
+    outcome: str,
+    *,
+    level: int = logging.INFO,
+    reason: str | None = None,
+) -> None:
+    """Describe the group using its digest, without disclosing checkpoint paths."""
+    if not logger.isEnabledFor(level):
+        return
+    key = os.path.basename(manifest_path).rsplit("_", 1)[-1][:12]
+    members = manifest["tensors"]
+    logger.log(
+        level,
+        "File tensor cache namespace=%s key=%s members=%d bytes=%d outcome=%s%s",
+        _safe_component(manifest["namespace"]),
+        key,
+        len(members),
+        sum(member["nbytes"] for member in members),
+        outcome,
+        "" if reason is None else f" reason={reason}",
+    )
 
 
 def _exact_json_equal(actual: Any, expected: Any) -> bool:
