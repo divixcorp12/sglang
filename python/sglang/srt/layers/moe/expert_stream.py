@@ -17,6 +17,15 @@ _STAGING: Dict[Tuple, torch.Tensor] = {}
 _ARANGE_CACHE: Dict[Tuple, torch.Tensor] = {}
 _LOGGED_SOURCE_SIGNATURES: set[Tuple] = set()
 
+NVFP4_STREAM_TENSORS = (
+    "w13_weight",
+    "w2_weight",
+    "w13_blockscale_swizzled",
+    "w2_blockscale_swizzled",
+    "g1_alphas",
+    "g2_alphas",
+)
+
 
 def expert_streaming_enabled() -> bool:
     return os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
@@ -170,7 +179,7 @@ class ExpertStreamer:
             output = _staging_buffer(
                 name,
                 row_count,
-                self.num_experts,
+                max(self.num_experts, _NO_DEDUP_LIMIT),
                 tuple(source.shape[1:]),
                 source.dtype,
                 topk_ids.device,

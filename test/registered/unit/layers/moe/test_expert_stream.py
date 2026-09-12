@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 import torch
 
@@ -69,6 +70,26 @@ class TestExpertStreamer(unittest.TestCase):
             )
         )
         self.assertEqual(tensors["host_rows"].shape[0], 11)
+
+    def test_decode_buffer_covers_more_routes_than_experts(self):
+        layer = self._make_layer(experts=4)
+        streamer = ExpertStreamer(layer, ("gpu_rows",))
+        topk_ids = torch.tensor(
+            [[3, 1, 2], [1, 3, 0]], device="cuda", dtype=torch.int32
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compact_ids, tensors = streamer.gather(topk_ids)
+
+        self.assertEqual(compact_ids.tolist(), [[0, 1, 2], [3, 4, 5]])
+        self.assertEqual(tensors["gpu_rows"].shape[0], 6)
+        self.assertTrue(
+            torch.equal(
+                tensors["gpu_rows"].cpu(),
+                layer.gpu_rows[topk_ids.reshape(-1).to(torch.long)].cpu(),
+            )
+        )
 
     def test_rejects_pageable_cpu_sources(self):
         layer = _Layer()
