@@ -251,6 +251,8 @@ class TestExpertHotCacheManager(unittest.TestCase):
             update_prefill_tokens=16,
             min_residence_forwards=2,
             benefit_ratio=2.0,
+            metrics_path=None,
+            route_history_limit=2,
         )
         options.update(kwargs)
         if seed is None:
@@ -346,44 +348,69 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(counters["evictions"], 1)
         self.assertEqual(counters["migration_bytes"], 60)
 
-    def test_file_attribution_requires_explicit_metadata_and_logs_totals(self):
+    def test_file_attribution_requires_explicit_metadata_and_writes_totals(self):
         layer = self.model.get_submodule("0")
         del layer._nvfp4_file_source_bytes_per_expert
-        manager = self.manager(dynamic=False)
-        streamer = layer._nvfp4_expert_streamer
-        streamer.gather(torch.tensor([[2, 3]], device="cuda"))
-        counts = [[0, 0, 1, 1], [0] * 4, [0] * 4]
-        self.observe(manager, counts)
-        counters = manager.snapshot_counters()["prefill"]["0"]
-        self.assertIsNone(counters["file_source_bytes"])
-        self.assertIsNone(counters["file_misses"])
-        self.assertEqual(counters["backing_source_bytes"], 40)
-        self.assertEqual(counters["h2d_bytes"], 40)
-        for _ in range(98):
+        with tempfile.NamedTemporaryFile() as trace:
+            manager = self.manager(dynamic=False, metrics_path=trace.name)
+            streamer = layer._nvfp4_expert_streamer
+            streamer.gather(torch.tensor([[2, 3]], device="cuda"))
+            counts = [[0, 0, 1, 1], [0] * 4, [0] * 4]
             self.observe(manager, counts)
-        with self.assertLogs(
-            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
-        ) as logs:
-            self.observe(manager, counts)
-        logged = json.loads(logs.records[0].getMessage().split("Expert hot cache ")[1])
-        self.assertEqual(logged["prefill"]["0"]["backing_source_bytes"], 40)
+            counters = manager.snapshot_counters()["prefill"]["0"]
+            self.assertIsNone(counters["file_source_bytes"])
+            self.assertIsNone(counters["file_misses"])
+            self.assertEqual(counters["backing_source_bytes"], 40)
+            self.assertEqual(counters["h2d_bytes"], 40)
+            for _ in range(98):
+                self.observe(manager, counts)
+            with self.assertNoLogs("sglang.srt.layers.moe.expert_hot_cache", level="INFO"):
+                self.observe(manager, counts)
+            trace.seek(0)
+            logged = json.loads(trace.read().splitlines()[0])
+        self.assertEqual(logged["counters"]["prefill"]["0"]["backing_source_bytes"], 40)
 
-    def test_configured_log_interval_controls_observer_emission(self):
-        manager = self.manager(dynamic=False, log_interval=2)
+    def test_configured_log_interval_controls_metrics_file_emission(self):
+        with tempfile.NamedTemporaryFile() as trace:
+            manager = self.manager(
+                dynamic=False, log_interval=2, metrics_path=trace.name
+            )
+            counts = [[0] * 4 for _ in range(3)]
+            with self.assertNoLogs("sglang.srt.layers.moe.expert_hot_cache", level="INFO"):
+                self.observe(manager, counts)
+                self.observe(manager, counts)
+            trace.seek(0)
+            self.assertEqual(len(trace.read().splitlines()), 1)
+
+    def test_phase_aware_trace_persists_bounded_route_popularity_and_affinity(self):
+        with tempfile.NamedTemporaryFile() as trace:
+            manager = self.manager(
+                dynamic=False, log_interval=1, metrics_path=trace.name
+            )
+            counts = [[1, 4, 0, 0], [0] * 4, [3, 0, 2, 0]]
+            self.observe(manager, counts, mode=self.mode.TARGET_VERIFY)
+            self.observe(manager, counts, mode=self.mode.DRAFT_EXTEND_V2)
+            self.observe(manager, counts, mode=self.mode.DECODE)
+            trace.seek(0)
+            records = [json.loads(line) for line in trace.read().splitlines()]
+        self.assertEqual(
+            [record["phase"] for record in records], ["speculative"] * 2 + ["decode"]
+        )
+        speculative = records[1]["route_statistics"]["speculative"]
+        self.assertEqual(speculative["popularity"]["0"], [[1, 8.0], [0, 2.0]])
+        self.assertEqual(
+            speculative["affinity"]["0->2"], [[1, 0, 24.0], [1, 2, 16.0]]
+        )
+        counters = records[1]["counters"]["speculative"]["0"]
+        self.assertIn("pinned_hits", counters)
+        self.assertIn("file_fallbacks", counters)
+        self.assertIn("transfer_wait_ns", counters)
+
+    def test_no_metrics_file_never_uses_server_logger(self):
+        manager = self.manager(dynamic=False, log_interval=1)
         counts = [[0] * 4 for _ in range(3)]
         with self.assertNoLogs("sglang.srt.layers.moe.expert_hot_cache", level="INFO"):
             self.observe(manager, counts)
-        with self.assertLogs(
-            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
-        ) as logs:
-            self.observe(manager, counts)
-        self.assertEqual(len(logs.records), 1)
-        every_forward = self.manager(dynamic=False, log_interval=1)
-        with self.assertLogs(
-            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
-        ) as logs:
-            self.observe(every_forward, counts)
-        self.assertEqual(len(logs.records), 1)
 
     def test_startup_summary_reports_actual_slots_and_cuda_memory(self):
         with self.assertLogs(

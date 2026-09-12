@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from operator import index
 from pathlib import Path
@@ -168,6 +171,13 @@ class _OperationalCounters:
     evictions: int = 0
     migration_bytes: int = 0
     residency_bytes: int = 0
+    pinned_hits: int = 0
+    pinned_misses: int = 0
+    pinned_admissions: int = 0
+    pinned_evictions: int = 0
+    file_fallbacks: int | None = None
+    transfer_wait_ns: int = 0
+    gather_fallbacks: int = 0
 
 
 class ExpertHotCacheManager:
@@ -190,6 +200,8 @@ class ExpertHotCacheManager:
         min_residence_forwards: int,
         benefit_ratio: float,
         log_interval: int = 100,
+        metrics_path: str | os.PathLike[str] | None = None,
+        route_history_limit: int = 32,
     ) -> ExpertHotCacheManager | None:
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
@@ -197,11 +209,13 @@ class ExpertHotCacheManager:
         update_prefill_tokens = index(update_prefill_tokens)
         min_residence_forwards = index(min_residence_forwards)
         log_interval = index(log_interval)
+        route_history_limit = index(route_history_limit)
         if (
             budget_bytes < 0
             or update_prefill_tokens < 1
             or min_residence_forwards < 0
             or log_interval < 1
+            or route_history_limit < 1
         ):
             raise ValueError("invalid expert hot cache budget or update interval")
         if not math.isfinite(benefit_ratio) or benefit_ratio < 0:
@@ -264,16 +278,30 @@ class ExpertHotCacheManager:
         manager.min_residence_forwards = min_residence_forwards
         manager.benefit_ratio = benefit_ratio
         manager.log_interval = log_interval
+        manager.metrics_path = Path(metrics_path) if metrics_path else None
+        manager.route_history_limit = route_history_limit
         manager._forward_count = 0
         manager._last_update = {layer_id: 0 for layer_id in streamers}
         manager._last_gather = {
             layer_id: streamer.last_gather_stats
             for layer_id, streamer in streamers.items()
         }
+        manager._last_pinned_cache_stats = {
+            layer_id: manager._pinned_cache_stats(streamer)
+            for layer_id, streamer in streamers.items()
+        }
         manager._counters = {
             mode: {layer_id: _OperationalCounters() for layer_id in streamers}
             for mode in ("prefill", "decode")
         }
+        manager._counters["speculative"] = {
+            layer_id: _OperationalCounters() for layer_id in streamers
+        }
+        manager._route_popularity = {
+            mode: {layer_id: defaultdict(float) for layer_id in streamers}
+            for mode in manager._counters
+        }
+        manager._route_affinity = {mode: {} for mode in manager._counters}
         for layer_id, expert_ids in selected.items():
             if expert_ids:
                 cache = ExpertHotCache(streamers[layer_id], len(expert_ids))
@@ -310,6 +338,93 @@ class ExpertHotCacheManager:
         counters.evictions += update.evicted_experts
         counters.migration_bytes += update.migration_bytes
 
+    @staticmethod
+    def _pinned_cache_stats(streamer: ExpertStreamer) -> tuple[int, int]:
+        cache = streamer.pinned_host_cache
+        if cache is None:
+            return (0, 0)
+        return (cache.stats.populated_rows, cache.stats.evictions)
+
+    @staticmethod
+    def _phase(forward_batch: ForwardBatch) -> str:
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_draft_extend_v2():
+            return "speculative"
+        if mode.is_extend_without_speculative():
+            return "prefill"
+        return "decode"
+
+    @staticmethod
+    def _prune_counts(counts: defaultdict, limit: int) -> None:
+        if len(counts) <= limit:
+            return
+        retained = sorted(counts, key=lambda key: (-counts[key], key))[:limit]
+        for key in tuple(counts):
+            if key not in retained:
+                del counts[key]
+
+    def _record_route_statistics(self, phase: str, counts: torch.Tensor) -> None:
+        active = {}
+        for layer_id in self.streamers:
+            row = counts[layer_id].detach().to(device="cpu", dtype=torch.float64)
+            nonzero = torch.nonzero(row, as_tuple=False).flatten().tolist()
+            popularity = self._route_popularity[phase][layer_id]
+            for expert_id in nonzero:
+                popularity[int(expert_id)] += float(row[expert_id])
+            self._prune_counts(popularity, self.route_history_limit)
+            active[layer_id] = sorted(
+                nonzero, key=lambda expert_id: (-float(row[expert_id]), expert_id)
+            )[: self.route_history_limit]
+        layer_ids = sorted(active)
+        for previous, following in zip(layer_ids, layer_ids[1:]):
+            left = counts[previous].detach().to(device="cpu", dtype=torch.float64)
+            right = counts[following].detach().to(device="cpu", dtype=torch.float64)
+            affinity = self._route_affinity[phase].setdefault(
+                (previous, following), defaultdict(float)
+            )
+            for source_expert in active[previous]:
+                for target_expert in active[following]:
+                    affinity[(source_expert, target_expert)] += float(
+                        left[source_expert] * right[target_expert]
+                    )
+            self._prune_counts(affinity, self.route_history_limit)
+
+    def snapshot_route_statistics(self) -> dict[str, dict[str, dict[str, list]]]:
+        result = {}
+        for phase in self._counters:
+            popularity = {
+                str(layer_id): [
+                    [int(expert_id), float(value)]
+                    for expert_id, value in sorted(
+                        values.items(), key=lambda item: (-item[1], item[0])
+                    )
+                ]
+                for layer_id, values in self._route_popularity[phase].items()
+            }
+            affinity = {
+                f"{source}->{target}": [
+                    [int(left), int(right), float(value)]
+                    for (left, right), value in sorted(
+                        values.items(), key=lambda item: (-item[1], item[0])
+                    )
+                ]
+                for (source, target), values in self._route_affinity[phase].items()
+            }
+            result[phase] = {"popularity": popularity, "affinity": affinity}
+        return result
+
+    def _write_trace(self, phase: str) -> None:
+        if self.metrics_path is None:
+            return
+        trace = {
+            "timestamp_ns": time.time_ns(),
+            "phase": phase,
+            "counters": self.snapshot_counters(),
+            "route_statistics": self.snapshot_route_statistics(),
+        }
+        with self.metrics_path.open("a", encoding="utf-8") as destination:
+            destination.write(json.dumps(trace, sort_keys=True) + "\n")
+
     def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | None]]]:
         """Return JSON-compatible cumulative totals and current allocation gauges."""
         result = {}
@@ -337,8 +452,9 @@ class ExpertHotCacheManager:
                 "recorder counts do not match expert cache layers and experts"
             )
         self._forward_count += 1
-        prefill = forward_batch.forward_mode.is_extend_without_speculative()
-        mode = "prefill" if prefill else "decode"
+        mode = self._phase(forward_batch)
+        prefill = mode == "prefill"
+        self._record_route_statistics(mode, counts)
         qualifying = (
             self.dynamic
             and prefill
@@ -356,6 +472,12 @@ class ExpertHotCacheManager:
                 counters.d2d_bytes += stats.d2d_bytes
                 counters.h2d_bytes += stats.h2d_bytes
                 counters.backing_source_bytes += stats.source_bytes
+                counters.pinned_hits += stats.pinned_host_hit_rows
+                counters.pinned_misses += stats.pinned_host_miss_rows
+                counters.transfer_wait_ns += getattr(stats, "transfer_wait_ns", 0)
+                counters.gather_fallbacks += int(
+                    getattr(stats, "gather_fallback_used", False)
+                )
                 counters.requested_unique_experts += int(
                     torch.count_nonzero(row).item()
                 )
@@ -369,6 +491,18 @@ class ExpertHotCacheManager:
                     counters.file_misses = (counters.file_misses or 0) + (
                         stats.miss_rows if file_bytes else 0
                     )
+                    counters.file_fallbacks = (counters.file_fallbacks or 0) + (
+                        stats.pinned_host_miss_rows
+                        if streamer.pinned_host_cache is not None
+                        else stats.miss_rows
+                    )
+                previous_admissions, previous_evictions = self._last_pinned_cache_stats[
+                    layer_id
+                ]
+                admissions, evictions = self._pinned_cache_stats(streamer)
+                counters.pinned_admissions += admissions - previous_admissions
+                counters.pinned_evictions += evictions - previous_evictions
+                self._last_pinned_cache_stats[layer_id] = (admissions, evictions)
             cache = self.caches.get(layer_id)
             if (
                 not qualifying
@@ -394,7 +528,4 @@ class ExpertHotCacheManager:
                 self._record_update(layer_id, cache.reassign(desired))
                 self._last_update[layer_id] = self._forward_count
         if self._forward_count % self.log_interval == 0:
-            logger.info(
-                "Expert hot cache %s",
-                json.dumps(self.snapshot_counters(), sort_keys=True),
-            )
+            self._write_trace(mode)
