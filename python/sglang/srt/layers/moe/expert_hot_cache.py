@@ -155,6 +155,8 @@ def normalize_expert_frequency_seed(data: Mapping[str, Any]) -> torch.Tensor:
 
 @dataclass
 class _OperationalCounters:
+    requested_rows: int = 0
+    miss_rows: int = 0
     hot_hits: int = 0
     file_misses: int | None = None
     d2d_bytes: int = 0
@@ -187,24 +189,31 @@ class ExpertHotCacheManager:
         update_prefill_tokens: int,
         min_residence_forwards: int,
         benefit_ratio: float,
+        log_interval: int = 100,
     ) -> ExpertHotCacheManager | None:
         budget_bytes = index(budget_bytes)
+        if budget_bytes == 0:
+            return None
         update_prefill_tokens = index(update_prefill_tokens)
         min_residence_forwards = index(min_residence_forwards)
-        if budget_bytes < 0 or update_prefill_tokens < 1 or min_residence_forwards < 0:
+        log_interval = index(log_interval)
+        if (
+            budget_bytes < 0
+            or update_prefill_tokens < 1
+            or min_residence_forwards < 0
+            or log_interval < 1
+        ):
             raise ValueError("invalid expert hot cache budget or update interval")
         if not math.isfinite(benefit_ratio) or benefit_ratio < 0:
             raise ValueError(
                 "expert hot cache benefit ratio must be finite and nonnegative"
             )
-        if budget_bytes == 0:
-            return None
         streamers = {}
         for module in model.modules():
             streamer = getattr(module, "_nvfp4_expert_streamer", None)
             if streamer is None:
                 continue
-            layer_id = index(module.layer_id)
+            layer_id = index(streamer.layer_id)
             if layer_id < 0 or layer_id in streamers:
                 raise ValueError(
                     "expert hot cache requires unique nonnegative layer IDs"
@@ -254,6 +263,7 @@ class ExpertHotCacheManager:
         manager.update_prefill_tokens = update_prefill_tokens
         manager.min_residence_forwards = min_residence_forwards
         manager.benefit_ratio = benefit_ratio
+        manager.log_interval = log_interval
         manager._forward_count = 0
         manager._last_update = {layer_id: 0 for layer_id in streamers}
         manager._last_gather = {
@@ -269,6 +279,25 @@ class ExpertHotCacheManager:
                 cache = ExpertHotCache(streamers[layer_id], len(expert_ids))
                 manager.caches[layer_id] = cache
                 manager._record_update(layer_id, cache.reassign(expert_ids))
+        devices = {cache.device for cache in manager.caches.values()}
+        logger.info(
+            "Expert hot cache startup %s",
+            json.dumps(
+                {
+                    "requested_bytes": budget_bytes,
+                    "residency_bytes": manager.residency_bytes,
+                    "slots": sum(cache.capacity for cache in manager.caches.values()),
+                    "layers": len(manager.caches),
+                    "cuda_allocated_bytes": sum(
+                        torch.cuda.memory_allocated(device) for device in devices
+                    ),
+                    "cuda_reserved_bytes": sum(
+                        torch.cuda.memory_reserved(device) for device in devices
+                    ),
+                },
+                sort_keys=True,
+            ),
+        )
         return manager
 
     @property
@@ -321,6 +350,8 @@ class ExpertHotCacheManager:
             if stats is not self._last_gather[layer_id]:
                 self._last_gather[layer_id] = stats
                 counters = self._counters[mode][layer_id]
+                counters.requested_rows += stats.requested_rows
+                counters.miss_rows += stats.miss_rows
                 counters.hot_hits += stats.hot_hit_rows
                 counters.d2d_bytes += stats.d2d_bytes
                 counters.h2d_bytes += stats.h2d_bytes
@@ -362,7 +393,7 @@ class ExpertHotCacheManager:
             if saved > migration * self.benefit_ratio:
                 self._record_update(layer_id, cache.reassign(desired))
                 self._last_update[layer_id] = self._forward_count
-        if self._forward_count % 100 == 0:
+        if self._forward_count % self.log_interval == 0:
             logger.info(
                 "Expert hot cache %s",
                 json.dumps(self.snapshot_counters(), sort_keys=True),

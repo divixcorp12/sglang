@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +12,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.arg_groups import memory_hook
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     ModelOptNvFp4FusedMoEMethod as RealModelOptNvFp4FusedMoEMethod,
@@ -607,6 +609,279 @@ class OffloadCompatibilityTests(unittest.TestCase):
                 memory_hook.handle_offload_compatibility(
                     self._args(offload_group_size=1)
                 )
+
+
+class HotCacheConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        view = patch.object(memory_hook, "resolving_view", lambda args: args)
+        view.start()
+        self.addCleanup(view.stop)
+
+    def args(self, **changes):
+        values = dict(
+            ple_offload_embedding=False,
+            cpu_offload_gb=1,
+            offload_group_size=0,
+            ple_offload_backend=None,
+            moe_runner_backend="flashinfer_cutlass",
+            tp_size=1,
+            ep_size=1,
+            moe_a2a_backend="none",
+            disable_overlap_schedule=True,
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+            max_running_requests=1,
+            expert_distribution_recorder_mode="stat",
+            elastic_ep_backend=None,
+            elastic_ep_rejoin=False,
+            ep_join_mode=None,
+            enable_elastic_expert_backup=False,
+            enable_eplb=False,
+            elastic_ep_initial_size=None,
+            max_ep_size=None,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend="disabled"),
+                prefill=PhaseConfig(backend="disabled"),
+            ),
+        )
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def enable(self):
+        os.environ.update(SGLANG_MOE_EXPERT_STREAM="1", SGLANG_MOE_HOT_GPU_MB="1")
+
+    def test_hot_cache_defaults_are_disabled_with_bounded_update_policy(self):
+        expected = dict(
+            SGLANG_MOE_EXPERT_FILE_DIR="",
+            SGLANG_MOE_HOT_GPU_MB=0,
+            SGLANG_MOE_HOT_SEED="",
+            SGLANG_MOE_HOT_DYNAMIC=False,
+            SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS=1024,
+            SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS=8,
+            SGLANG_MOE_HOT_BENEFIT_RATIO=1.0,
+            SGLANG_MOE_HOT_LOG_INTERVAL=100,
+        )
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(envs, name).get(), value)
+
+    def test_hot_cache_requires_streaming(self):
+        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "1"
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM"):
+            memory_hook.handle_offload_compatibility(self.args())
+
+    def test_unsupported_runtime_combinations_fail_early(self):
+        self.enable()
+        cases = (
+            (dict(moe_runner_backend="auto"), "flashinfer_cutlass"),
+            (dict(tp_size=2), "TP size 1"),
+            (dict(ep_size=2), "EP size 1"),
+            (dict(moe_a2a_backend="deepep"), "moe-a2a-backend none"),
+            (dict(disable_overlap_schedule=False), "disable-overlap-schedule"),
+            (dict(enable_two_batch_overlap=True), "overlap"),
+            (dict(enable_single_batch_overlap=True), "overlap"),
+            (dict(max_running_requests=2), "max-running-requests 1"),
+            (dict(max_running_requests=None), "max-running-requests 1"),
+            (dict(elastic_ep_backend="mooncake"), "elastic"),
+            (dict(elastic_ep_rejoin=True), "elastic"),
+            (dict(ep_join_mode="scale"), "elastic"),
+            (dict(enable_elastic_expert_backup=True), "elastic"),
+            (dict(elastic_ep_initial_size=1), "elastic"),
+            (dict(max_ep_size=2), "elastic"),
+            (dict(enable_eplb=True), "EPLB"),
+        )
+        for changes, message in cases:
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                memory_hook.handle_offload_compatibility(self.args(**changes))
+
+    def test_every_routed_graph_phase_is_rejected(self):
+        self.enable()
+        for phase in ("decode", "prefill"):
+            for backend in ("full", "breakable", "tc_piecewise"):
+                args = self.args()
+                getattr(args.cuda_graph_config, phase).backend = backend
+                with self.subTest(phase=phase, backend=backend), self.assertRaisesRegex(
+                    ValueError, "CUDA graph"
+                ):
+                    memory_hook.handle_offload_compatibility(args)
+
+    def test_early_graph_resolution_and_repeated_validation_are_safe(self):
+        self.enable()
+        args = self.args(cuda_graph_config=None)
+        memory_hook.handle_offload_compatibility(args)
+        args.cuda_graph_config = self.args().cuda_graph_config
+        memory_hook.handle_offload_compatibility(args)
+        memory_hook.handle_offload_compatibility(args)
+
+    def test_dynamic_mode_requires_exact_stat_recorder(self):
+        self.enable()
+        os.environ["SGLANG_MOE_HOT_DYNAMIC"] = "1"
+        for recorder in (None, "per_pass", "stat_approx"):
+            with self.subTest(recorder=recorder), self.assertRaisesRegex(
+                ValueError, "stat"
+            ):
+                memory_hook.handle_offload_compatibility(
+                    self.args(expert_distribution_recorder_mode=recorder)
+                )
+        memory_hook.handle_offload_compatibility(self.args())
+
+    def test_real_server_args_reads_resolved_graphs_without_mutating_inputs(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.server_args import ServerArgs
+
+        self.enable()
+        args = ServerArgs(
+            model_path="/unused/model", **vars(self.args(cuda_graph_config=None))
+        )
+        with patch.object(memory_hook, "resolving_view", resolving_view):
+            memory_hook.handle_offload_compatibility(args)
+            graphs = self.args().cuda_graph_config
+            args._resolved_overrides = [("test", {"cuda_graph_config": graphs})]
+            memory_hook.handle_offload_compatibility(args)
+            graphs.decode.backend = "full"
+            with self.assertRaisesRegex(ValueError, "CUDA graph"):
+                memory_hook.handle_offload_compatibility(args)
+        self.assertIsNone(args.cuda_graph_config)
+
+    def test_zero_budget_ignores_unused_seed_dynamic_and_policy_settings(self):
+        os.environ.update(
+            SGLANG_MOE_HOT_GPU_MB="0",
+            SGLANG_MOE_HOT_SEED="/missing/seed",
+            SGLANG_MOE_HOT_DYNAMIC="1",
+            SGLANG_MOE_HOT_LOG_INTERVAL="0",
+        )
+        memory_hook.handle_offload_compatibility(
+            self.args(
+                moe_runner_backend="auto",
+                disable_overlap_schedule=False,
+                max_running_requests=None,
+                expert_distribution_recorder_mode=None,
+            )
+        )
+
+    def test_invalid_policy_is_rejected_before_loading(self):
+        self.enable()
+        for name, value in (
+            ("SGLANG_MOE_HOT_GPU_MB", "-1"),
+            ("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS", "0"),
+            ("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS", "-1"),
+            ("SGLANG_MOE_HOT_BENEFIT_RATIO", "nan"),
+            ("SGLANG_MOE_HOT_LOG_INTERVAL", "0"),
+        ):
+            with patch.dict(os.environ, {name: value}), self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    memory_hook.handle_offload_compatibility(self.args())
+
+
+class HotCacheStartupTests(unittest.TestCase):
+    def test_manager_allocation_follows_topk_and_precedes_remaining_initialization(
+        self,
+    ):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+        from sglang.srt.model_executor import model_runner
+
+        for dynamic in (False, True):
+            with self.subTest(dynamic=dynamic), ExitStack() as stack:
+                stack.enter_context(
+                    patch.dict(
+                        os.environ,
+                        {
+                            "SGLANG_MOE_HOT_GPU_MB": "2",
+                            "SGLANG_MOE_HOT_SEED": "seed.pt",
+                            "SGLANG_MOE_HOT_DYNAMIC": str(int(dynamic)),
+                            "SGLANG_MOE_HOT_LOG_INTERVAL": "7",
+                        },
+                    )
+                )
+                runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+                runner.model = torch.nn.Module()
+                runner.model_config = object()
+                runner.ps = SimpleNamespace(moe_ep_size=1, moe_ep_rank=0)
+                events = []
+                for name in (
+                    "init_memory_saver_adapter",
+                    "maybe_init_remote_instance_transfer_engine",
+                    "maybe_init_expert_location_metadata",
+                    "maybe_init_lplb_solvers",
+                    "maybe_init_eplb_manager",
+                    "maybe_init_elastic_ep",
+                    "init_token_oracle",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(patch.object(model_runner, "ExpertLocationUpdater"))
+                stack.enter_context(patch.object(model_runner, "create_sampler"))
+                stack.enter_context(
+                    patch.object(
+                        runner, "load_model", side_effect=lambda: events.append("load")
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        model_runner,
+                        "prepare_moe_topk",
+                        side_effect=lambda **kw: events.append("topk"),
+                    )
+                )
+                manager = SimpleNamespace(on_expert_distribution=lambda *args: None)
+
+                def allocate(model, **options):
+                    self.assertIs(model, runner.model)
+                    self.assertEqual(events, ["load", "topk"])
+                    self.assertEqual(options["budget_bytes"], 2 * 1024 * 1024)
+                    self.assertEqual(options["seed_path"], "seed.pt")
+                    self.assertEqual(options["dynamic"], dynamic)
+                    self.assertEqual(options["log_interval"], 7)
+                    events.append("allocate")
+                    return manager
+
+                stack.enter_context(
+                    patch.object(
+                        ExpertHotCacheManager, "from_model", side_effect=allocate
+                    )
+                )
+                observer = stack.enter_context(
+                    patch.object(
+                        model_runner, "get_global_expert_distribution_recorder"
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "maybe_init_dwdp",
+                        side_effect=RuntimeError("stop after allocation"),
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "stop after allocation"):
+                    runner.initialize()
+                self.assertIs(
+                    getattr(runner, "expert_hot_cache_manager", None), manager
+                )
+                observer.return_value.register_forward_observer.assert_called_once_with(
+                    manager.on_expert_distribution
+                )
+
+    def test_zero_budget_skips_manager_creation_and_recorder_registration(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+        from sglang.srt.model_executor import model_runner
+
+        runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_MOE_HOT_GPU_MB": "0",
+                "SGLANG_MOE_HOT_SEED": "/missing/seed",
+                "SGLANG_MOE_HOT_DYNAMIC": "1",
+                "SGLANG_MOE_HOT_LOG_INTERVAL": "invalid",
+            },
+        ), patch.object(ExpertHotCacheManager, "from_model") as factory:
+            runner.maybe_init_expert_hot_cache()
+        self.assertIsNone(runner.expert_hot_cache_manager)
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":

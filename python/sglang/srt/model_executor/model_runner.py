@@ -670,6 +670,7 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
+        self.maybe_init_expert_hot_cache()
 
         self.maybe_init_dwdp()
 
@@ -695,6 +696,30 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def maybe_init_expert_hot_cache(self):
+        """Allocate expert residency before remaining startup and pool sizing."""
+        self.expert_hot_cache_manager = None
+        budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
+        if budget_mb == 0:
+            return
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+
+        manager = ExpertHotCacheManager.from_model(
+            self.model,
+            budget_bytes=budget_mb * 1024 * 1024,
+            seed_path=envs.SGLANG_MOE_HOT_SEED.get() or None,
+            dynamic=envs.SGLANG_MOE_HOT_DYNAMIC.get(),
+            update_prefill_tokens=envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get(),
+            min_residence_forwards=envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get(),
+            benefit_ratio=envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get(),
+            log_interval=envs.SGLANG_MOE_HOT_LOG_INTERVAL.get(),
+        )
+        self.expert_hot_cache_manager = manager
+        if manager is not None:
+            get_global_expert_distribution_recorder().register_forward_observer(
+                manager.on_expert_distribution
+            )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
