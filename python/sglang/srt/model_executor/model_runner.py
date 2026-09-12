@@ -227,7 +227,7 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
-    create_offloader,
+    create_offloader_from_server_args,
     get_offloader,
     set_offloader,
 )
@@ -440,7 +440,13 @@ class ModelRunner:
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
+        set_offloader(
+            create_offloader_from_server_args(
+                server_args=self.server_args,
+                dp_rank=self.ps.dp_rank,
+                model_config=self.model_config,
+            )
+        )
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 

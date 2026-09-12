@@ -8,6 +8,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.arg_groups import memory_hook
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    _checkpoint_cache_identity,
+)
 from sglang.srt.utils import offloader as offloader_module
 
 OFFLOAD_NAMES = (
@@ -150,6 +153,78 @@ class Nvfp4ExpertOffloadTests(unittest.TestCase):
         self.assertIn("forward", layer.__dict__)
         output = layer(torch.ones(1, 2, device="cuda"))
         self.assertEqual(output.device.type, "cuda")
+
+
+class OffloaderIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _exec_config(cpu_offload_gb=1):
+        return SimpleNamespace(
+            offload=SimpleNamespace(
+                cpu_offload_gb=cpu_offload_gb,
+                offload_group_size=0,
+                offload_num_in_group=1,
+                offload_prefetch_step=1,
+                offload_mode="cpu",
+            )
+        )
+
+    def test_factory_passes_immutable_checkpoint_identity_to_v1(self):
+        model_config = SimpleNamespace(
+            model_path="~/models/checkpoint",
+            revision="requested-revision",
+            hf_config=SimpleNamespace(_commit_hash="resolved-commit"),
+            hf_text_config=SimpleNamespace(),
+        )
+        server_args = SimpleNamespace(
+            model_path="ignored-model", revision="ignored-revision"
+        )
+        expected = _checkpoint_cache_identity(
+            model_config=model_config, server_args=server_args
+        )
+
+        with patch.object(
+            offloader_module, "get_exec", return_value=self._exec_config()
+        ):
+            offloader = offloader_module.create_offloader_from_server_args(
+                server_args=server_args,
+                dp_rank=0,
+                model_config=model_config,
+            )
+
+        self.assertIsInstance(offloader, offloader_module.OffloaderV1)
+        self.assertEqual(offloader.checkpoint_cache_identity, expected)
+        self.assertIsNot(offloader.checkpoint_cache_identity, expected)
+        with self.assertRaises(TypeError):
+            offloader.checkpoint_cache_identity["revision"] = "changed"
+
+    def test_factory_keeps_model_config_optional(self):
+        with patch.object(
+            offloader_module, "get_exec", return_value=self._exec_config()
+        ):
+            offloader = offloader_module.create_offloader_from_server_args(
+                server_args=SimpleNamespace(), dp_rank=0
+            )
+
+        self.assertIsInstance(offloader, offloader_module.OffloaderV1)
+        self.assertEqual(offloader.checkpoint_cache_identity, {})
+
+    def test_v1_copies_checkpoint_identity_before_storing_it(self):
+        source_identity = {
+            "model_path": "/models/checkpoint",
+            "revision": "requested-revision",
+            "commit_hash": "resolved-commit",
+        }
+
+        offloader = offloader_module.OffloaderV1(
+            1024, checkpoint_cache_identity=source_identity
+        )
+        source_identity["revision"] = "changed"
+
+        self.assertEqual(
+            offloader.checkpoint_cache_identity["revision"], "requested-revision"
+        )
+        with self.assertRaises(TypeError):
+            offloader.checkpoint_cache_identity["revision"] = "changed"
 
 
 class OffloadCompatibilityTests(unittest.TestCase):

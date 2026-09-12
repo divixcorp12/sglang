@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Generator, List, Mapping, Optional
 
 import torch
 from torch.func import functional_call
@@ -25,6 +28,10 @@ from sglang.srt.utils.host_shared_memory import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
@@ -101,20 +108,36 @@ def set_offloader(instance: BaseOffloader):
     _instance = instance
 
 
-def create_offloader(dp_rank: int):
-    if get_exec().offload.cpu_offload_gb > 0:
-        return OffloaderV1(
-            cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
+def create_offloader_from_server_args(
+    server_args: ServerArgs,
+    dp_rank: int,
+    model_config: ModelConfig | None = None,
+) -> BaseOffloader:
+    checkpoint_cache_identity = None
+    if model_config is not None:
+        from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+            _checkpoint_cache_identity,
         )
-    if get_exec().offload.offload_group_size > 0:
-        assert get_exec().offload.cpu_offload_gb == 0, (
+
+        checkpoint_cache_identity = _checkpoint_cache_identity(
+            model_config=model_config, server_args=server_args
+        )
+
+    offload = get_exec().offload
+    if offload.cpu_offload_gb > 0:
+        return OffloaderV1(
+            cpu_offload_max_bytes=int(offload.cpu_offload_gb * 1024**3),
+            checkpoint_cache_identity=checkpoint_cache_identity,
+        )
+    if offload.offload_group_size > 0:
+        assert offload.cpu_offload_gb == 0, (
             "V2 offload does not support cpu_offload_gb yet"
         )
         return OffloaderV2(
-            group_size=get_exec().offload.offload_group_size,
-            num_in_group=get_exec().offload.offload_num_in_group,
-            prefetch_step=get_exec().offload.offload_prefetch_step,
-            mode=get_exec().offload.offload_mode,
+            group_size=offload.offload_group_size,
+            num_in_group=offload.offload_num_in_group,
+            prefetch_step=offload.offload_prefetch_step,
+            mode=offload.offload_mode,
             dp_rank=dp_rank,
             dp_size=get_parallel().dp_size,
         )
@@ -122,9 +145,16 @@ def create_offloader(dp_rank: int):
 
 
 class OffloaderV1(BaseOffloader):
-    def __init__(self, cpu_offload_max_bytes: int):
+    def __init__(
+        self,
+        cpu_offload_max_bytes: int,
+        checkpoint_cache_identity: Mapping[str, Any] | None = None,
+    ):
         self._cpu_offload_bytes = 0
         self._cpu_offload_max_bytes = cpu_offload_max_bytes
+        self.checkpoint_cache_identity = MappingProxyType(
+            dict(checkpoint_cache_identity or {})
+        )
 
     def wrap_modules(
         self,

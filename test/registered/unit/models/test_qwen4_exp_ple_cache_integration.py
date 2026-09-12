@@ -1,14 +1,13 @@
-import unittest
-import json
 import os
 import tempfile
+import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
-    _qwen4_exp_ple_cache_identity,
+    _checkpoint_cache_identity,
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
@@ -36,15 +35,59 @@ class TestQwen4ExpPleCacheIntegration(unittest.TestCase):
             )
             server_args = SimpleNamespace(model_path=alias, revision="server-revision")
 
-            identity = json.loads(
-                _qwen4_exp_ple_cache_identity(
-                    model_config=model_config, server_args=server_args
-                )
+            identity = _checkpoint_cache_identity(
+                model_config=model_config, server_args=server_args
             )
 
-            self.assertEqual(identity["model_path"], os.path.realpath(checkpoint))
-            self.assertEqual(identity["revision"], "model-revision")
-            self.assertEqual(identity["commit_hash"], "commit-hash")
+            self.assertEqual(
+                identity,
+                {
+                    "model_path": os.path.realpath(checkpoint),
+                    "revision": "model-revision",
+                    "commit_hash": "commit-hash",
+                },
+            )
+            with self.assertRaises(TypeError):
+                identity["revision"] = "changed"
+
+    def test_cache_identity_is_stable_and_distinguishes_checkpoint_inputs(self):
+        def identity(model_path, revision, commit_hash):
+            return _checkpoint_cache_identity(
+                model_config=SimpleNamespace(
+                    model_path=model_path,
+                    revision=revision,
+                    hf_config=SimpleNamespace(_commit_hash=commit_hash),
+                    hf_text_config=SimpleNamespace(),
+                ),
+                server_args=SimpleNamespace(
+                    model_path=model_path, revision="server-revision"
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = os.path.join(directory, "checkpoint")
+            other_checkpoint = os.path.join(directory, "other-checkpoint")
+            os.mkdir(checkpoint)
+            os.mkdir(other_checkpoint)
+
+            baseline = identity(checkpoint, "revision-a", "commit-a")
+
+            self.assertEqual(
+                baseline,
+                identity(checkpoint, "revision-a", "commit-a"),
+            )
+            self.assertNotEqual(
+                baseline,
+                identity(other_checkpoint, "revision-a", "commit-a"),
+            )
+            self.assertNotEqual(
+                baseline,
+                identity(checkpoint, "revision-b", "commit-a"),
+            )
+            self.assertNotEqual(
+                baseline,
+                identity(checkpoint, "revision-a", "commit-b"),
+            )
 
     def test_cold_cache_completion_starts_trimmer_after_exact_shards(self):
         with tempfile.TemporaryDirectory() as directory:
