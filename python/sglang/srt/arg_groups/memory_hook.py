@@ -46,9 +46,16 @@ def handle_offload_compatibility(server_args: Any) -> None:
         raise ValueError("--ple-offload-backend file requires --ple-offload-embedding")
     hot_budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
     pinned_budget_mb = envs.SGLANG_MOE_PINNED_HOST_MB.get()
+    prefetch_candidates = envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
+    if prefetch_candidates < 0:
+        raise ValueError("SGLANG_MOE_PREFETCH_MAX_CANDIDATES must be nonnegative")
+    if prefetch_candidates and (not hot_budget_mb or not pinned_budget_mb):
+        raise ValueError("NVFP4 expert prefetch requires nonzero hot GPU and pinned host caches")
+    if prefetch_candidates and cfg.expert_distribution_recorder_mode != "stat":
+        raise ValueError("NVFP4 expert prefetch requires --expert-distribution-recorder-mode stat")
     if pinned_budget_mb < 0:
         raise ValueError("SGLANG_MOE_PINNED_HOST_MB must be nonnegative")
-    if hot_budget_mb == 0 and pinned_budget_mb == 0:
+    if hot_budget_mb == 0 and pinned_budget_mb == 0 and prefetch_candidates == 0:
         return
     if hot_budget_mb < 0:
         raise ValueError("SGLANG_MOE_HOT_GPU_MB must be nonnegative")
