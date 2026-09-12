@@ -339,37 +339,44 @@ def load_model_with_memory_saver(
 
     remote_instance_weight_info = None
     startup_weight_load = None
-    with memory_saver_adapter.region(
-        GPU_MEMORY_TYPE_WEIGHTS,
-        enable_cpu_backup=enable_cpu_backup,
-    ):
-        loader = get_model_loader(
-            load_config=load_config,
-            model_config=model_config,
-        )
-        device_config = DeviceConfig(device, gpu_id)
-        if get_model().is_startup_weight_load_overlap:
-            from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
-                StartupWeightLoadManager,
-            )
-
-            startup_weight_load = StartupWeightLoadManager.create_from_published_config(
-                loader=loader,
-                model_config=model_config,
+    try:
+        with memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=enable_cpu_backup,
+        ):
+            loader = get_model_loader(
                 load_config=load_config,
-                device_config=device_config,
-                is_draft_worker=is_draft_worker,
-            )
-            model = startup_weight_load.prepare()
-        else:
-            model = loader.load_model(
                 model_config=model_config,
-                device_config=device_config,
             )
-        if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
-            remote_instance_weight_info = (
-                loader.remote_instance_transfer_engine_weight_info
-            )
+            device_config = DeviceConfig(device, gpu_id)
+            if get_model().is_startup_weight_load_overlap:
+                from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+                    StartupWeightLoadManager,
+                )
+
+                startup_weight_load = StartupWeightLoadManager.create_from_published_config(
+                    loader=loader,
+                    model_config=model_config,
+                    load_config=load_config,
+                    device_config=device_config,
+                    is_draft_worker=is_draft_worker,
+                )
+                model = startup_weight_load.prepare()
+            else:
+                model = loader.load_model(
+                    model_config=model_config,
+                    device_config=device_config,
+                )
+            if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
+                remote_instance_weight_info = (
+                    loader.remote_instance_transfer_engine_weight_info
+                )
+    except Exception:
+        from sglang.srt.utils.offloader import get_offloader
+
+        get_offloader().abort()
+        monkey_patch_vllm_parallel_state(reverse=True)
+        raise
     if (
         not is_draft_worker
         and get_exec().offload.ple_offload_embedding

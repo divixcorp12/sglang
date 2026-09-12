@@ -14,6 +14,7 @@ from sglang.srt.distributed.naive_distributed import (
     get_naive_distributed,
     set_naive_distributed,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.runtime_context import (
     get_exec,
@@ -44,6 +45,7 @@ NVFP4_OFFLOAD_PARAMETER_NAMES = (
     "w13_blockscale_swizzled",
     "w2_blockscale_swizzled",
 )
+NVFP4_FILE_PARAMETER_NAMES = NVFP4_OFFLOAD_PARAMETER_NAMES[:4]
 
 
 def _expert_streaming_enabled() -> bool:
@@ -52,7 +54,9 @@ def _expert_streaming_enabled() -> bool:
     return expert_streaming_enabled()
 
 
-def _iter_streamed_nvfp4_parameters(module: torch.nn.Module):
+def _iter_streamed_nvfp4_parameters(
+    module: torch.nn.Module, parameter_names=NVFP4_OFFLOAD_PARAMETER_NAMES
+):
     """Yield decoder ModelOpt NVFP4 expert tensors eligible for streaming."""
     for submodule in module.modules():
         quant_method = getattr(submodule, "quant_method", None)
@@ -60,17 +64,15 @@ def _iter_streamed_nvfp4_parameters(module: torch.nn.Module):
             continue
 
         missing = [
-            name
-            for name in NVFP4_OFFLOAD_PARAMETER_NAMES
-            if submodule._parameters.get(name) is None
+            name for name in parameter_names if submodule._parameters.get(name) is None
         ]
         if missing:
             raise RuntimeError(
                 "ModelOpt NVFP4 expert module is missing streamable parameters: "
                 + ", ".join(missing)
             )
-        for name in NVFP4_OFFLOAD_PARAMETER_NAMES:
-            yield submodule._parameters[name]
+        for name in parameter_names:
+            yield submodule, name, submodule._parameters[name]
 
 
 class BaseOffloader(ABC):
@@ -83,6 +85,10 @@ class BaseOffloader(ABC):
         return list(all_modules_generator)
 
     def post_init(self):
+        pass
+
+    def abort(self):
+        """Release resources held by an unsuccessful model load."""
         pass
 
     @property
@@ -155,6 +161,104 @@ class OffloaderV1(BaseOffloader):
         self.checkpoint_cache_identity = MappingProxyType(
             dict(checkpoint_cache_identity or {})
         )
+        self._expert_file_groups = {}
+        self._expert_file_coverage = {}
+
+    def _bind_expert_files(self, parameters, directory: str) -> None:
+        from sglang.srt.model_loader.file_tensor_cache import (
+            FileTensorCacheGroup,
+            FileTensorSpec,
+        )
+
+        modules = {}
+        for submodule, name, parameter in parameters:
+            modules.setdefault(submodule, []).append((name, parameter))
+        try:
+            for submodule, members in modules.items():
+                layer_id = submodule.quant_method.moe_runner_config.layer_id
+                if layer_id in self._expert_file_groups:
+                    raise RuntimeError(f"Duplicate NVFP4 file-cache layer {layer_id}")
+                specs = tuple(
+                    FileTensorSpec(
+                        name,
+                        tuple(parameter.shape),
+                        tuple(parameter.stride()),
+                        parameter.dtype,
+                    )
+                    for name, parameter in members
+                )
+                identity = dict(self.checkpoint_cache_identity)
+                identity.update(
+                    layer_id=layer_id,
+                    layout="modelopt_nvfp4_checkpoint_v1",
+                    moe_tp_rank=getattr(submodule, "moe_tp_rank", 0),
+                    moe_tp_size=getattr(submodule, "moe_tp_size", 1),
+                    moe_ep_rank=getattr(submodule, "moe_ep_rank", 0),
+                    moe_ep_size=getattr(submodule, "moe_ep_size", 1),
+                    use_flashinfer_trtllm_moe=getattr(
+                        submodule, "use_flashinfer_trtllm_moe", False
+                    ),
+                )
+                group = FileTensorCacheGroup.open(
+                    directory, "modelopt_nvfp4_experts", identity, specs
+                )
+                self._expert_file_groups[layer_id] = group
+                self._expert_file_coverage[group] = set()
+                for name, parameter in members:
+                    parameter.data = group.tensors[name]
+                    parameter._sglang_skip_device_loading = True
+                    parameter._sglang_file_cache_hit = group.cache_hit
+                    parameter._sglang_file_cache_group = group
+                    parameter._sglang_file_cache_tag = name
+                    parameter._sglang_file_cache_offloader = self
+        except Exception:
+            self.abort()
+            raise
+
+    def record_expert_shard(self, parameter, expert_id: int, shard_id: str) -> None:
+        """Record a successfully copied checkpoint shard in destination expert space."""
+        group = parameter._sglang_file_cache_group
+        tag = parameter._sglang_file_cache_tag
+        shards = ("w1", "w3") if tag.startswith("w13") else ("w2",)
+        if not 0 <= expert_id < group.tensors[tag].shape[0] or shard_id not in shards:
+            raise RuntimeError(
+                f"Invalid NVFP4 file-cache coverage: {tag}/{expert_id}/{shard_id}"
+            )
+        self._expert_file_coverage[group].add((tag, expert_id, shard_id))
+
+    def post_init(self):
+        """Publish only after all checkpoint copies and postprocessing succeeded."""
+        try:
+            for layer_id, group in self._expert_file_groups.items():
+                if group.cache_hit:
+                    continue
+                expected = {
+                    (spec.tag, expert_id, shard_id)
+                    for spec in group.specs
+                    for expert_id in range(spec.shape[0])
+                    for shard_id in (
+                        ("w1", "w3") if spec.tag.startswith("w13") else ("w2",)
+                    )
+                }
+                if self._expert_file_coverage[group] != expected:
+                    missing = expected - self._expert_file_coverage[group]
+                    raise RuntimeError(
+                        f"Incomplete NVFP4 file-cache coverage for layer {layer_id}: "
+                        f"{len(missing)} missing shards"
+                    )
+            for group in self._expert_file_groups.values():
+                group.complete()
+        except Exception:
+            self.abort()
+            raise
+
+    def abort(self):
+        """Invalidate unfinished groups and release every cache lock."""
+        for group in self._expert_file_groups.values():
+            try:
+                group.abort()
+            except Exception:
+                logger.exception("Could not abort NVFP4 expert file-cache group")
 
     def wrap_modules(
         self,
@@ -166,12 +270,19 @@ class OffloaderV1(BaseOffloader):
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
         if _expert_streaming_enabled():
-            parameters = list(_iter_streamed_nvfp4_parameters(module))
+            directory = envs.SGLANG_MOE_EXPERT_FILE_DIR.get()
+            names = (
+                NVFP4_FILE_PARAMETER_NAMES
+                if directory
+                else NVFP4_OFFLOAD_PARAMETER_NAMES
+            )
+            parameters = list(_iter_streamed_nvfp4_parameters(module, names))
             if not parameters:
                 return module
 
             required_bytes = sum(
-                parameter.numel() * parameter.element_size() for parameter in parameters
+                parameter.numel() * parameter.element_size()
+                for _, _, parameter in parameters
             )
             remaining_bytes = self._cpu_offload_max_bytes - self._cpu_offload_bytes
             if required_bytes > remaining_bytes:
@@ -180,7 +291,11 @@ class OffloaderV1(BaseOffloader):
                     f"module: requires {required_bytes} bytes with "
                     f"{max(remaining_bytes, 0)} bytes remaining"
                 )
-            for parameter in parameters:
+            if directory:
+                self._bind_expert_files(parameters, directory)
+                self._cpu_offload_bytes += required_bytes
+                return module
+            for _, _, parameter in parameters:
                 cpu_data = torch.empty_strided(
                     size=parameter.data.size(),
                     stride=parameter.data.stride(),

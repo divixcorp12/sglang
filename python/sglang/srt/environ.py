@@ -302,6 +302,7 @@ class Envs:
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)

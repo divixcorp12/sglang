@@ -1138,6 +1138,30 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        group = getattr(param, "_sglang_file_cache_group", None)
+        if group is not None and group.cache_hit:
+            return
+        try:
+            self._weight_loader_impl_uncached(
+                param, loaded_weight, weight_name, shard_id, expert_id
+            )
+            if group is not None:
+                param._sglang_file_cache_offloader.record_expert_shard(
+                    param, expert_id, shard_id
+                )
+        except Exception:
+            if group is not None:
+                param._sglang_file_cache_offloader.abort()
+            raise
+
+    def _weight_loader_impl_uncached(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
         tp_rank = self.moe_tp_rank
 
         # Special case for GGUF weights
@@ -1375,6 +1399,38 @@ class FusedMoE(torch.nn.Module):
             )
 
     def weight_loader_fused(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+    ) -> None:
+        group = getattr(param, "_sglang_file_cache_group", None)
+        if group is not None and group.cache_hit:
+            return
+        try:
+            if group is not None and (
+                loaded_weight.ndim != param.ndim
+                or loaded_weight.shape[0] != param.shape[0]
+            ):
+                raise ValueError("Fused file-cache load must cover every expert")
+            self._weight_loader_fused_uncached(
+                param, loaded_weight, weight_name, shard_id
+            )
+            if group is not None:
+                for expert_id in range(param.shape[0]):
+                    for logical_shard in (
+                        ("w1", "w3") if shard_id == "w13" else (shard_id,)
+                    ):
+                        param._sglang_file_cache_offloader.record_expert_shard(
+                            param, expert_id, logical_shard
+                        )
+        except Exception:
+            if group is not None:
+                param._sglang_file_cache_offloader.abort()
+            raise
+
+    def _weight_loader_fused_uncached(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
