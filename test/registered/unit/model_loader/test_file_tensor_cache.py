@@ -3,9 +3,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
+from sglang.srt.model_loader import file_tensor_cache as file_tensor_cache_module
 from sglang.srt.model_loader.file_tensor_cache import (
     FileTensorCacheGroup,
     FileTensorSpec,
@@ -48,6 +50,40 @@ class TestFileTensorCacheGroup(unittest.TestCase):
                 )
             finally:
                 warm.close()
+
+    def test_completed_hit_flushes_and_republishes_after_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cold = self._open(directory)
+            cold.tensors["weight"].fill_(17)
+            cold.complete()
+
+            warm = self._open(directory)
+            self.assertTrue(warm.cache_hit)
+            original_manifest_inode = os.stat(warm.manifest_path).st_ino
+            warm.tensors["weight"].fill_(29)
+            with mock.patch.object(
+                file_tensor_cache_module,
+                "_fsync_file",
+                wraps=file_tensor_cache_module._fsync_file,
+            ) as fsync_file:
+                warm.complete()
+            fsync_file.assert_called_once_with(warm.paths["weight"])
+            self.assertTrue(os.path.isfile(warm.manifest_path))
+            self.assertNotEqual(
+                os.stat(warm.manifest_path).st_ino, original_manifest_inode
+            )
+
+            reopened = self._open(directory)
+            try:
+                self.assertTrue(reopened.cache_hit)
+                self.assertTrue(
+                    torch.equal(
+                        reopened.tensors["weight"],
+                        torch.full((4, 8), 29, dtype=torch.uint8),
+                    )
+                )
+            finally:
+                reopened.close()
 
     def test_strided_tensor_reopens_with_shape_stride_and_values(self):
         with tempfile.TemporaryDirectory() as directory:
