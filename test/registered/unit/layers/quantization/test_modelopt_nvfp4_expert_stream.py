@@ -1,18 +1,26 @@
 """Integration tests for ModelOpt NVFP4 selected-expert streaming."""
 
+import json
 import os
+import tempfile
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerBackend
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardDispatchOutput,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.layers.quantization import modelopt_quant
+from sglang.srt.utils.offloader import NVFP4_FILE_PARAMETER_NAMES, OffloaderV1
 
 
 def _cpu_parameter(shape, dtype, start=0, pinned=True):
@@ -123,6 +131,228 @@ def _finalization_layer():
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
+    def _cache_layer(self):
+        layer = FusedMoE.__new__(FusedMoE)
+        layer.__dict__.update(_finalization_layer().__dict__)
+        method = _method()
+        method.moe_runner_config.layer_id = 7
+        layer.quant_method = method
+        layer.scheme = None
+        layer.quant_config = SimpleNamespace(get_name=lambda: "modelopt_fp4")
+        layer.use_triton_kernels = False
+        layer.use_flashinfer_trtllm_moe = False
+        layer.use_padded_loading = False
+        layer.use_presharded_weights = False
+        layer._maybe_load_fp8_shared_expert_as_fp4 = lambda **kwargs: False
+        shapes = ((4, 256, 64), (4, 128, 64), (4, 256, 8), (4, 128, 8))
+        for index, (tag, shape) in enumerate(zip(NVFP4_FILE_PARAMETER_NAMES, shapes)):
+            dtype = torch.uint8 if index < 2 else torch.float8_e4m3fn
+            values = torch.arange(torch.tensor(shape).prod().item()).reshape(shape)
+            values = ((values * 17 + values // 7 + 23 * index) % 113).to(torch.uint8)
+            setattr(
+                layer,
+                tag,
+                torch.nn.Parameter(values.view(dtype), requires_grad=False),
+            )
+        layer.w13_blockscale_swizzled = None
+        layer.w2_blockscale_swizzled = None
+        return layer
+
+    def _finalize(self, layer):
+        with (
+            patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}),
+            patch.object(modelopt_quant, "get_moe_runner_backend", _backend),
+            patch.object(
+                modelopt_quant,
+                "get_moe_a2a_backend",
+                return_value=MoeA2ABackend.NONE,
+            ),
+        ):
+            layer.quant_method.process_weights_after_loading(layer)
+
+    def _bind_cache(self, layer, directory):
+        offloader = OffloaderV1(1000000, {"model_path": "/models/deterministic"})
+        self.addCleanup(offloader.abort)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_MOE_EXPERT_STREAM": "1",
+                "SGLANG_MOE_EXPERT_FILE_DIR": directory,
+            },
+        ):
+            offloader.maybe_offload_to_cpu(layer)
+        return offloader
+
+    def _load_cache(self, layer, payload):
+        for tag, source in payload.items():
+            for expert_id in range(4):
+                shards = ("w1", "w3") if tag.startswith("w13") else ("w2",)
+                chunks = source[expert_id].chunk(len(shards), dim=0)
+                for shard, chunk in zip(shards, chunks):
+                    layer._weight_loader_impl(
+                        getattr(layer, tag), chunk, tag, shard, expert_id
+                    )
+
+    def test_file_runtime_layout_matches_anonymous_and_warm_gather(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cold = self._cache_layer()
+            payload = {
+                tag: getattr(cold, tag).detach().clone()
+                for tag in NVFP4_FILE_PARAMETER_NAMES
+            }
+            offloader = self._bind_cache(cold, directory)
+            self._load_cache(cold, payload)
+            anonymous = self._cache_layer()
+            self._load_cache(anonymous, payload)
+            raw_w13 = cold.w13_weight.detach().clone()
+            self._finalize(anonymous)
+            self._finalize(cold)
+            self.assertFalse(torch.equal(raw_w13, cold.w13_weight))
+            self.assertTrue(
+                torch.equal(
+                    cold.w13_weight,
+                    torch.cat((raw_w13[:, ::2], raw_w13[:, 1::2]), dim=1),
+                )
+            )
+            group = cold.w13_weight._sglang_file_cache_group
+            runtime_names = (
+                "w13_weight",
+                "w2_weight",
+                "w13_blockscale_swizzled",
+                "w2_blockscale_swizzled",
+            )
+            for tag, name in zip(NVFP4_FILE_PARAMETER_NAMES, runtime_names):
+                actual = getattr(cold, name)
+                self.assertEqual(actual.data_ptr(), group.tensors[tag].data_ptr())
+                self.assertTrue(
+                    torch.equal(
+                        actual.view(torch.uint8),
+                        getattr(anonymous, name).view(torch.uint8),
+                    ),
+                    name,
+                )
+                disk = torch.from_file(
+                    group.paths[tag],
+                    shared=True,
+                    size=actual.numel(),
+                    dtype=torch.uint8,
+                )
+                self.assertTrue(
+                    torch.equal(disk, actual.view(torch.uint8).reshape(-1)),
+                    name,
+                )
+            offloader.post_init()
+            manifest = json.loads(Path(group.manifest_path).read_text())
+            self.assertIn("runtime_layout", manifest["cache_identity"])
+            self.assertEqual(len(manifest["cache_identity"]["runtime_layout"]), 4)
+            for entry, tag in zip(
+                manifest["cache_identity"]["runtime_layout"], NVFP4_FILE_PARAMETER_NAMES
+            ):
+                tensor = getattr(cold, tag)
+                self.assertEqual(entry["shape"], list(tensor.shape))
+                self.assertEqual(entry["stride"], list(tensor.stride()))
+                self.assertEqual(
+                    entry["nbytes"], tensor.numel() * tensor.element_size()
+                )
+            ids = torch.tensor([[3, 1, 3]], device="cuda", dtype=torch.int32)
+
+            def gather(layer):
+                remapped, tensors = layer._nvfp4_expert_streamer.gather(ids)
+                return {
+                    name: value.cpu().clone().view(torch.uint8)
+                    for name, value in tensors.items()
+                }, remapped.cpu().clone()
+
+            cold_payload, cold_ids = gather(cold)
+            anonymous_payload, anonymous_ids = gather(anonymous)
+            warm = self._cache_layer()
+            warm_offloader = self._bind_cache(warm, directory)
+            self.assertTrue(warm.w13_weight._sglang_file_cache_hit)
+            with patch.object(
+                FusedMoE,
+                "_weight_loader_impl_uncached",
+                side_effect=AssertionError("large loader copy"),
+            ):
+                self._load_cache(warm, payload)
+            with ExitStack() as stack:
+                for name in ("deinterleave_w13", "swizzle_blockscale"):
+                    stack.enter_context(
+                        patch.object(
+                            modelopt_quant,
+                            name,
+                            side_effect=AssertionError("warm transform"),
+                        )
+                    )
+                self._finalize(warm)
+            self.assertTrue(warm._w13_deinterleaved)
+            self.assertIs(warm.w13_blockscale_swizzled, warm.w13_weight_scale)
+            self.assertIs(warm.w2_blockscale_swizzled, warm.w2_weight_scale)
+            warm_payload, warm_ids = gather(warm)
+            for name in cold_payload:
+                self.assertTrue(
+                    torch.equal(cold_payload[name], warm_payload[name]), name
+                )
+                self.assertTrue(
+                    torch.equal(cold_payload[name], anonymous_payload[name]),
+                    name,
+                )
+            self.assertTrue(torch.equal(cold_ids, warm_ids))
+            self.assertTrue(torch.equal(cold_ids, anonymous_ids))
+            warm_offloader.post_init()
+
+    def test_warm_start_loads_tiny_scales_and_recomputes_alphas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cold = self._cache_layer()
+            payload = {
+                tag: getattr(cold, tag).detach().clone()
+                for tag in NVFP4_FILE_PARAMETER_NAMES
+            }
+            offloader = self._bind_cache(cold, directory)
+            self._load_cache(cold, payload)
+            self._finalize(cold)
+            offloader.post_init()
+            warm = self._cache_layer()
+            warm_offloader = self._bind_cache(warm, directory)
+            for expert in range(4):
+                for name, value, shards in (
+                    ("w13_input_scale", 3.0, ("w1", "w3")),
+                    ("w2_input_scale", 5.0, ("w2",)),
+                    ("w13_weight_scale_2", 2.0 + expert, ("w1", "w3")),
+                    ("w2_weight_scale_2", 7.0 + expert, ("w2",)),
+                ):
+                    for shard in shards:
+                        warm._weight_loader_impl(
+                            getattr(warm, name),
+                            torch.tensor(value),
+                            name,
+                            shard,
+                            expert,
+                        )
+            with (
+                patch.object(
+                    modelopt_quant,
+                    "deinterleave_w13",
+                    side_effect=AssertionError("warm deinterleave"),
+                ),
+                patch.object(
+                    modelopt_quant,
+                    "swizzle_blockscale",
+                    side_effect=AssertionError("warm swizzle"),
+                ),
+            ):
+                self._finalize(warm)
+            self.assertEqual(warm.g1_alphas.tolist(), [6, 9, 12, 15])
+            self.assertEqual(warm.g2_alphas.tolist(), [35, 40, 45, 50])
+            warm_offloader.post_init()
+
+    def test_file_runtime_rejects_swizzle_padding_byte_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layer = self._cache_layer()
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data[:, :64].contiguous()
+            self._bind_cache(layer, directory)
+            with self.assertRaisesRegex(RuntimeError, "byte length"):
+                self._finalize(layer)
+
     def test_finalization_keeps_large_tensors_pageable_and_small_scales_on_cuda(self):
         method = _method()
         layer = _finalization_layer()
@@ -262,6 +492,28 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
 
 
 class TestStreamingCompatibilityGuards(unittest.TestCase):
+    def test_create_streaming_weights_does_not_allocate_derived_scales(self):
+        method = _method()
+        method.quant_config.is_checkpoint_nvfp4_serialized = True
+        method.quant_config.get_name = lambda: "modelopt_fp4"
+        layer = torch.nn.Module()
+        layer.num_local_experts = 4
+        layer.num_experts = 4
+        layer.moe_runner_config = method.moe_runner_config
+        with (
+            patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}),
+            patch.object(modelopt_quant, "get_moe_runner_backend", _backend),
+            patch.object(
+                modelopt_quant,
+                "swizzle_blockscale",
+                side_effect=AssertionError("derived scale allocation"),
+            ),
+        ):
+            method.create_weights(layer, 4, 128, 128, torch.bfloat16)
+        self.assertIsNone(layer.w13_blockscale_swizzled)
+        self.assertIsNone(layer.w2_blockscale_swizzled)
+        self.assertEqual(layer.w13_weight_scale.shape, (4, 256, 8))
+
     def test_backend_tp_ep_and_a2a_are_rejected_before_attaching(self):
         cases = (
             (False, 1, 1, True, "flashinfer_cutlass"),

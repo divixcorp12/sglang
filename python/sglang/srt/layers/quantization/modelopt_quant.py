@@ -2443,6 +2443,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
+            or expert_streaming_enabled()
         ):
             layer.w13_blockscale_swizzled = None
         else:
@@ -2466,6 +2467,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
+            or expert_streaming_enabled()
         ):
             layer.w2_blockscale_swizzled = None
         else:
@@ -2542,6 +2544,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         stream_experts = (
             expert_streaming_enabled() and layer.w13_weight.device.type == "cpu"
         )
+        file_group = getattr(layer.w13_weight, "_sglang_file_cache_group", None)
+        warm_file_cache = file_group is not None and file_group.cache_hit
+        if file_group is not None:
+            from sglang.srt.utils.offloader import copy_to_expert_file
+        if warm_file_cache:
+            layer._w13_deinterleaved = True
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -2550,7 +2558,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_weight_scale = deinterleave_w13(
                 layer.w13_weight_scale.data, up_first=up_first
             )
-            if stream_experts:
+            if file_group is not None:
+                copy_to_expert_file(layer.w13_weight, w13_weight)
+                copy_to_expert_file(layer.w13_weight_scale, w13_weight_scale)
+            elif stream_experts:
                 copy_or_rebind_param(layer, "w13_weight", w13_weight)
                 copy_or_rebind_param(layer, "w13_weight_scale", w13_weight_scale)
             else:
@@ -2780,6 +2791,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
 
+        elif warm_file_cache:
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+
         else:
             # CUTLASS processing - handle w13 and w2 separately
 
@@ -2812,12 +2827,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_blockscale_swizzled = swizzle_blockscale(
                 layer.w13_weight_scale, target_device=swizzle_device
             )
-            alias_or_bind_derived_param(
-                layer,
-                "w13_weight_scale",
-                "w13_blockscale_swizzled",
-                w13_blockscale_swizzled,
-            )
+            if file_group is not None:
+                copy_to_expert_file(layer.w13_weight_scale, w13_blockscale_swizzled)
+                layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            else:
+                alias_or_bind_derived_param(
+                    layer,
+                    "w13_weight_scale",
+                    "w13_blockscale_swizzled",
+                    w13_blockscale_swizzled,
+                )
 
             w13_weight = layer.w13_weight
             intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
@@ -2855,12 +2874,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale_swizzled = swizzle_blockscale(
                 layer.w2_weight_scale, target_device=swizzle_device
             )
-            alias_or_bind_derived_param(
-                layer,
-                "w2_weight_scale",
-                "w2_blockscale_swizzled",
-                w2_blockscale_swizzled,
-            )
+            if file_group is not None:
+                copy_to_expert_file(layer.w2_weight_scale, w2_blockscale_swizzled)
+                layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            else:
+                alias_or_bind_derived_param(
+                    layer,
+                    "w2_weight_scale",
+                    "w2_blockscale_swizzled",
+                    w2_blockscale_swizzled,
+                )
 
             if self._is_cutedsl_v2_standard:
                 # CuteDSL v2 only: convert blockscales to MMA layout for
@@ -2910,6 +2933,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if stream_experts:
             self._attach_expert_streamer(layer)
+            if file_group is not None:
+                layer.w13_weight._sglang_file_cache_offloader.finalize_expert_files(
+                    layer
+                )
 
     def _attach_expert_streamer(self, layer: torch.nn.Module) -> None:
         moe_runner_backend = getattr(

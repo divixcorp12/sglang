@@ -64,7 +64,10 @@ def _iter_streamed_nvfp4_parameters(
             continue
 
         missing = [
-            name for name in parameter_names if submodule._parameters.get(name) is None
+            name
+            for name in parameter_names
+            if name in NVFP4_FILE_PARAMETER_NAMES
+            and submodule._parameters.get(name) is None
         ]
         if missing:
             raise RuntimeError(
@@ -72,7 +75,35 @@ def _iter_streamed_nvfp4_parameters(
                 + ", ".join(missing)
             )
         for name in parameter_names:
-            yield submodule, name, submodule._parameters[name]
+            parameter = submodule._parameters.get(name)
+            if parameter is not None:
+                yield submodule, name, parameter
+
+
+def copy_to_expert_file(parameter: torch.nn.Parameter, value: torch.Tensor) -> None:
+    """Retain a checkpoint mapping while replacing its bytes and runtime view."""
+    from sglang.srt.model_loader.file_tensor_cache import FileTensorSpec
+
+    group = parameter._sglang_file_cache_group
+    tag = parameter._sglang_file_cache_tag
+    loader_spec = next(spec for spec in group.specs if spec.tag == tag)
+    runtime_spec = FileTensorSpec(
+        tag, tuple(value.shape), tuple(value.stride()), value.dtype
+    )
+    if (
+        runtime_spec.dtype != loader_spec.dtype
+        or runtime_spec.nbytes != loader_spec.nbytes
+    ):
+        raise RuntimeError(
+            f"NVFP4 file-cache runtime byte length or dtype mismatch for {tag}"
+        )
+    mapped = torch.as_strided(
+        group.tensors[tag], runtime_spec.shape, runtime_spec.stride
+    )
+    if value.data_ptr() != mapped.data_ptr() or value.stride() != mapped.stride():
+        mapped.copy_(value.detach())
+    parameter.data = mapped
+    group.tensors[tag] = mapped
 
 
 class BaseOffloader(ABC):
@@ -187,10 +218,41 @@ class OffloaderV1(BaseOffloader):
                     )
                     for name, parameter in members
                 )
+                runtime_specs = tuple(
+                    FileTensorSpec(
+                        spec.tag,
+                        spec.shape,
+                        torch.empty(
+                            spec.shape, device="meta", dtype=spec.dtype
+                        ).stride(),
+                        spec.dtype,
+                    )
+                    for spec in specs
+                )
+                if any(
+                    runtime.nbytes != loader.nbytes
+                    for runtime, loader in zip(runtime_specs, specs)
+                ):
+                    raise RuntimeError(
+                        "NVFP4 file-cache runtime byte length differs from loader layout"
+                    )
                 identity = dict(self.checkpoint_cache_identity)
                 identity.update(
                     layer_id=layer_id,
-                    layout="modelopt_nvfp4_checkpoint_v1",
+                    layout="modelopt_nvfp4_cutlass_runtime_v1",
+                    runtime_layout=[
+                        dict(
+                            tag=spec.tag,
+                            shape=list(spec.shape),
+                            stride=list(spec.stride),
+                            dtype=str(spec.dtype),
+                            nbytes=spec.nbytes,
+                        )
+                        for spec in runtime_specs
+                    ],
+                    inference_moe_w13_interleaved=getattr(
+                        submodule, "inference_moe_w13_interleaved", False
+                    ),
                     moe_tp_rank=getattr(submodule, "moe_tp_rank", 0),
                     moe_tp_size=getattr(submodule, "moe_tp_size", 1),
                     moe_ep_rank=getattr(submodule, "moe_ep_rank", 0),
@@ -204,6 +266,13 @@ class OffloaderV1(BaseOffloader):
                 )
                 self._expert_file_groups[layer_id] = group
                 self._expert_file_coverage[group] = set()
+                group._nvfp4_runtime_specs = runtime_specs
+                group._nvfp4_runtime_ready = group.cache_hit
+                if group.cache_hit:
+                    for spec in runtime_specs:
+                        group.tensors[spec.tag] = torch.as_strided(
+                            group.tensors[spec.tag], spec.shape, spec.stride
+                        )
                 for name, parameter in members:
                     parameter.data = group.tensors[name]
                     parameter._sglang_skip_device_loading = True
@@ -226,6 +295,24 @@ class OffloaderV1(BaseOffloader):
             )
         self._expert_file_coverage[group].add((tag, expert_id, shard_id))
 
+    def finalize_expert_files(self, layer: torch.nn.Module) -> None:
+        """Verify all final views still occupy their verified file mappings."""
+        group = layer.w13_weight._sglang_file_cache_group
+        for spec in group._nvfp4_runtime_specs:
+            parameter = getattr(layer, spec.tag)
+            mapped = group.tensors[spec.tag]
+            if (
+                tuple(parameter.shape) != spec.shape
+                or tuple(parameter.stride()) != spec.stride
+                or parameter.dtype != spec.dtype
+                or parameter.device.type != "cpu"
+                or parameter.data_ptr() != mapped.data_ptr()
+            ):
+                raise RuntimeError(
+                    f"NVFP4 file-cache runtime layout mismatch for {spec.tag}"
+                )
+        group._nvfp4_runtime_ready = True
+
     def post_init(self):
         """Publish only after all checkpoint copies and postprocessing succeeded."""
         try:
@@ -245,6 +332,10 @@ class OffloaderV1(BaseOffloader):
                     raise RuntimeError(
                         f"Incomplete NVFP4 file-cache coverage for layer {layer_id}: "
                         f"{len(missing)} missing shards"
+                    )
+                if not group._nvfp4_runtime_ready:
+                    raise RuntimeError(
+                        f"Incomplete NVFP4 file-cache runtime layout for layer {layer_id}"
                     )
             for group in self._expert_file_groups.values():
                 group.complete()

@@ -1,5 +1,6 @@
 """Tests for gated ModelOpt NVFP4 selected-expert CPU offload."""
 
+import json
 import os
 import tempfile
 import unittest
@@ -272,6 +273,7 @@ class FileExpertOffloadTests(unittest.TestCase):
         self.assertFalse(Path(group.manifest_path).exists())
         self.assertTrue(torch.equal(layer.w13_weight, torch.full((2, 4, 4), 3.0)))
         layer.w13_weight.data.add_(1)
+        offloader.finalize_expert_files(layer)
         offloader.post_init()
         self.assertTrue(Path(group.manifest_path).exists())
         warm, warm_layer = self._bind()
@@ -327,6 +329,7 @@ class FileExpertOffloadTests(unittest.TestCase):
                         "w2",
                         expert_id,
                     )
+        offloader.finalize_expert_files(layer)
         offloader.post_init()
         self.assertTrue(
             Path(layer.w13_weight._sglang_file_cache_group.manifest_path).exists()
@@ -362,6 +365,58 @@ class FileExpertOffloadTests(unittest.TestCase):
         layer.w2_blockscale_swizzled = None
         _, layer = self._bind(layer)
         self.assertFalse(layer.w13_weight._sglang_file_cache_hit)
+
+    def test_anonymous_streaming_accepts_absent_derived_placeholders(self):
+        layer = self._layer()
+        layer.w13_blockscale_swizzled = None
+        layer.w2_blockscale_swizzled = None
+        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_FILE_DIR": ""}):
+            _, layer = self._bind(layer)
+        self.assertTrue(layer.w13_weight._sglang_skip_device_loading)
+        self.assertIsNone(layer.w13_blockscale_swizzled)
+
+    def test_checkpoint_coverage_cannot_publish_before_runtime_finalization(
+        self,
+    ):
+        offloader, layer = self._bind()
+        self._load_all(layer)
+        with self.assertRaisesRegex(RuntimeError, "runtime layout"):
+            offloader.post_init()
+        self.assertFalse(
+            Path(layer.w13_weight._sglang_file_cache_group.manifest_path).exists()
+        )
+
+    def test_runtime_finalization_rejects_anonymous_replacement(self):
+        offloader, layer = self._bind()
+        self._load_all(layer)
+        layer.w13_weight.data = layer.w13_weight.data.clone()
+        with self.assertRaisesRegex(RuntimeError, "runtime layout"):
+            offloader.finalize_expert_files(layer)
+        with self.assertRaisesRegex(RuntimeError, "runtime layout"):
+            offloader.post_init()
+
+    def test_changed_runtime_manifest_is_a_cold_miss(self):
+        offloader, layer = self._bind()
+        self._load_all(layer)
+        offloader.finalize_expert_files(layer)
+        offloader.post_init()
+        path = Path(layer.w13_weight._sglang_file_cache_group.manifest_path)
+        manifest = json.loads(path.read_text())
+        manifest["cache_identity"]["runtime_layout"][0]["stride"] = [1, 2, 3]
+        path.write_text(json.dumps(manifest))
+        _, reloaded = self._bind()
+        self.assertFalse(reloaded.w13_weight._sglang_file_cache_hit)
+        self.assertEqual(reloaded.w13_weight.count_nonzero().item(), 0)
+
+    def test_interleaved_checkpoint_layout_uses_a_distinct_cache(self):
+        offloader, layer = self._bind()
+        self._load_all(layer)
+        offloader.finalize_expert_files(layer)
+        offloader.post_init()
+        interleaved = self._layer()
+        interleaved.inference_moe_w13_interleaved = True
+        _, interleaved = self._bind(interleaved)
+        self.assertFalse(interleaved.w13_weight._sglang_file_cache_hit)
 
     def test_invalid_logical_shard_does_not_publish_coverage(self):
         offloader, layer = self._bind()
