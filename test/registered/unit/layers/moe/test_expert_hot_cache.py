@@ -368,6 +368,65 @@ class TestExpertHotCacheManager(unittest.TestCase):
         logged = json.loads(logs.records[0].getMessage().split("Expert hot cache ")[1])
         self.assertEqual(logged["prefill"]["0"]["backing_source_bytes"], 40)
 
+    def test_configured_log_interval_controls_observer_emission(self):
+        manager = self.manager(dynamic=False, log_interval=2)
+        counts = [[0] * 4 for _ in range(3)]
+        with self.assertNoLogs("sglang.srt.layers.moe.expert_hot_cache", level="INFO"):
+            self.observe(manager, counts)
+        with self.assertLogs(
+            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
+        ) as logs:
+            self.observe(manager, counts)
+        self.assertEqual(len(logs.records), 1)
+        every_forward = self.manager(dynamic=False, log_interval=1)
+        with self.assertLogs(
+            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
+        ) as logs:
+            self.observe(every_forward, counts)
+        self.assertEqual(len(logs.records), 1)
+
+    def test_startup_summary_reports_actual_slots_and_cuda_memory(self):
+        with self.assertLogs(
+            "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
+        ) as logs:
+            manager = self.manager(dynamic=False)
+        summary = json.loads(
+            logs.records[-1].getMessage().split("Expert hot cache startup ")[1]
+        )
+        self.assertEqual(summary["requested_bytes"], 52)
+        self.assertEqual(summary["residency_bytes"], manager.residency_bytes)
+        self.assertEqual(summary["slots"], 2)
+        self.assertEqual(summary["layers"], 2)
+        self.assertGreater(summary["cuda_allocated_bytes"], 0)
+        self.assertGreaterEqual(
+            summary["cuda_reserved_bytes"], summary["cuda_allocated_bytes"]
+        )
+
+    def test_observer_counts_requested_and_missed_rows_once(self):
+        manager = self.manager(dynamic=False)
+        streamer = self.model.get_submodule("0")._nvfp4_expert_streamer
+        streamer.gather(torch.tensor([[0, 0, 3]], device="cuda"))
+        counts = [[2, 0, 0, 1], [0] * 4, [0] * 4]
+        self.observe(manager, counts)
+        self.observe(manager, counts)
+        counters = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(counters["requested_rows"], 3)
+        self.assertEqual(counters["miss_rows"], 1)
+        self.assertEqual(counters["requested_unique_experts"], 2)
+
+    def test_zero_budget_ignores_seed_and_inactive_policy(self):
+        self.assertIsNone(
+            self.manager(
+                budget_bytes=0,
+                seed_path="/missing/seed",
+                dynamic=True,
+                update_prefill_tokens=0,
+                min_residence_forwards=-1,
+                benefit_ratio=float("nan"),
+                log_interval=0,
+            )
+        )
+
     def test_known_file_bytes_do_not_include_other_host_sources(self):
         self.model.get_submodule("0")._nvfp4_file_source_bytes_per_expert = 12
         manager = self.manager(dynamic=False)

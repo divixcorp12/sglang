@@ -172,8 +172,17 @@ def _copy_indices_to_cpu(source_ids: torch.Tensor, capacity: int) -> torch.Tenso
 class ExpertStreamer:
     """Gather aligned expert rows into compact, reusable CUDA buffers."""
 
-    def __init__(self, layer: torch.nn.Module, tensor_names: Iterable[str]):
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        tensor_names: Iterable[str],
+        *,
+        layer_id: int | None = None,
+    ):
         self.layer = layer
+        self.layer_id = (
+            getattr(layer, "layer_id", None) if layer_id is None else layer_id
+        )
         self.tensor_names = tuple(tensor_names)
         if not self.tensor_names:
             raise ValueError("expert streamer requires at least one tensor")

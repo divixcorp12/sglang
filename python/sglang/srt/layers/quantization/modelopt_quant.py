@@ -2939,6 +2939,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
     def _attach_expert_streamer(self, layer: torch.nn.Module) -> None:
+        """Attach sources for the standard-dispatch CUTLASS gather in apply()."""
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
@@ -2957,7 +2958,35 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
         for name in NVFP4_STREAM_TENSORS[:4]:
             _validate_streamed_host_parameter(layer, name)
-        layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        layer.layer_id = getattr(layer, "layer_id", self.moe_runner_config.layer_id)
+        layer._nvfp4_expert_streamer = ExpertStreamer(
+            layer, NVFP4_STREAM_TENSORS, layer_id=layer.layer_id
+        )
+        layer.__dict__.pop("_nvfp4_file_source_bytes_per_expert", None)
+        group = getattr(layer.w13_weight, "_sglang_file_cache_group", None)
+        if group is None:
+            return
+        specs = {spec.tag: spec for spec in group._nvfp4_runtime_specs}
+        file_bytes = 0
+        for name, tag in zip(
+            NVFP4_STREAM_TENSORS[:4],
+            ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+        ):
+            tensor = getattr(layer, name)
+            spec = specs.get(tag)
+            mapped = group.tensors.get(tag)
+            if (
+                spec is None
+                or mapped is None
+                or tensor.device.type != "cpu"
+                or tuple(tensor.shape) != spec.shape
+                or tuple(tensor.stride()) != spec.stride
+                or tensor.dtype != spec.dtype
+                or tensor.data_ptr() != mapped.data_ptr()
+            ):
+                return
+            file_bytes += tensor.numel() * tensor.element_size() // tensor.shape[0]
+        layer._nvfp4_file_source_bytes_per_expert = file_bytes
 
     @property
     def load_up_proj_weight_first(self) -> bool:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 from typing import Any
 
@@ -43,6 +44,67 @@ def handle_offload_compatibility(server_args: Any) -> None:
         )
     if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
         raise ValueError("--ple-offload-backend file requires --ple-offload-embedding")
+    budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
+    if budget_mb == 0:
+        return
+    if budget_mb < 0:
+        raise ValueError("SGLANG_MOE_HOT_GPU_MB must be nonnegative")
+    if not streaming:
+        raise ValueError("NVFP4 hot caching requires SGLANG_MOE_EXPERT_STREAM=1")
+    if cfg.moe_runner_backend != "flashinfer_cutlass":
+        raise ValueError(
+            "NVFP4 hot caching requires --moe-runner-backend flashinfer_cutlass"
+        )
+    if cfg.tp_size != 1:
+        raise ValueError("NVFP4 hot caching requires TP size 1")
+    if cfg.ep_size != 1:
+        raise ValueError("NVFP4 hot caching requires EP size 1")
+    if cfg.moe_a2a_backend != "none":
+        raise ValueError("NVFP4 hot caching requires --moe-a2a-backend none")
+    if not cfg.disable_overlap_schedule:
+        raise ValueError("NVFP4 hot caching requires --disable-overlap-schedule")
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        raise ValueError("NVFP4 hot caching requires both batch overlap modes disabled")
+    if cfg.max_running_requests != 1:
+        raise ValueError("NVFP4 hot caching requires --max-running-requests 1")
+    if any(
+        getattr(cfg, name, None)
+        for name in (
+            "elastic_ep_backend",
+            "elastic_ep_rejoin",
+            "ep_join_mode",
+            "enable_elastic_expert_backup",
+            "elastic_ep_initial_size",
+            "max_ep_size",
+            "ep_join_rank_offset",
+        )
+    ):
+        raise ValueError("NVFP4 hot caching does not support elastic EP")
+    if cfg.enable_eplb:
+        raise ValueError("NVFP4 hot caching does not support EPLB")
+    if (
+        envs.SGLANG_MOE_HOT_DYNAMIC.get()
+        and cfg.expert_distribution_recorder_mode != "stat"
+    ):
+        raise ValueError(
+            "Dynamic NVFP4 hot caching requires --expert-distribution-recorder-mode stat"
+        )
+    graph_config = cfg.cuda_graph_config
+    if graph_config is not None and any(
+        getattr(graph_config, phase).backend != Backend.DISABLED for phase in Phase.ALL
+    ):
+        raise ValueError(
+            "NVFP4 hot caching requires CUDA graph capture disabled for decode and prefill"
+        )
+    if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
+        raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
+    if envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get() < 0:
+        raise ValueError("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS must be nonnegative")
+    ratio = envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get()
+    if not math.isfinite(ratio) or ratio < 0:
+        raise ValueError("SGLANG_MOE_HOT_BENEFIT_RATIO must be finite and nonnegative")
+    if envs.SGLANG_MOE_HOT_LOG_INTERVAL.get() < 1:
+        raise ValueError("SGLANG_MOE_HOT_LOG_INTERVAL must be positive")
 
 
 def handle_gpu_memory_settings(server_args: Any, gpu_mem):

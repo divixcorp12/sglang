@@ -61,6 +61,7 @@ def _method():
     method.enable_flashinfer_trtllm_moe = False
     method._moe_runner_backend = _backend()
     method.moe_runner_config = SimpleNamespace(
+        layer_id=7,
         activation="silu",
         apply_router_weight_on_input=False,
         is_gated=True,
@@ -80,6 +81,7 @@ def _finalization_layer():
     layer.moe_tp_size = 1
     layer.moe_tp_rank = 0
     layer.moe_runner_config = SimpleNamespace(
+        layer_id=7,
         is_gated=True,
         gemm1_clamp_limit=None,
         swiglu_limit=None,
@@ -207,6 +209,10 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
             raw_w13 = cold.w13_weight.detach().clone()
             self._finalize(anonymous)
             self._finalize(cold)
+            self.assertEqual(cold._nvfp4_expert_streamer.layer_id, 7)
+            self.assertEqual(cold.layer_id, 7)
+            self.assertEqual(cold._nvfp4_file_source_bytes_per_expert, 27648)
+            self.assertFalse(hasattr(anonymous, "_nvfp4_file_source_bytes_per_expert"))
             self.assertFalse(torch.equal(raw_w13, cold.w13_weight))
             self.assertTrue(
                 torch.equal(
@@ -492,6 +498,39 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
 
 
 class TestStreamingCompatibilityGuards(unittest.TestCase):
+    def test_attachment_attributes_only_verified_final_file_views(self):
+        from sglang.srt.layers.moe.expert_stream import NVFP4_STREAM_TENSORS
+
+        method = _method()
+        layer = torch.nn.Module()
+        layer.layer_id = 19
+        layer.moe_tp_size = layer.moe_ep_size = 1
+        tensors = {}
+        specs = []
+        for name, tag in zip(NVFP4_STREAM_TENSORS[:4], NVFP4_FILE_PARAMETER_NAMES):
+            tensor = torch.zeros((4, 8), dtype=torch.uint8)
+            setattr(layer, name, torch.nn.Parameter(tensor, requires_grad=False))
+            tensors[tag] = tensor
+            specs.append(
+                SimpleNamespace(tag=tag, shape=(4, 8), stride=(8, 1), dtype=torch.uint8)
+            )
+        layer.g1_alphas = layer.g2_alphas = torch.ones(4)
+        layer.w13_weight._sglang_file_cache_group = SimpleNamespace(
+            tensors=tensors,
+            _nvfp4_runtime_specs=specs,
+        )
+        with patch.object(
+            modelopt_quant, "get_moe_runner_backend", _backend
+        ), patch.object(
+            modelopt_quant, "get_moe_a2a_backend", return_value=MoeA2ABackend.NONE
+        ):
+            method._attach_expert_streamer(layer)
+            self.assertEqual(layer._nvfp4_expert_streamer.layer_id, 19)
+            self.assertEqual(layer._nvfp4_file_source_bytes_per_expert, 32)
+            layer.w2_blockscale_swizzled.data = layer.w2_blockscale_swizzled.clone()
+            method._attach_expert_streamer(layer)
+            self.assertFalse(hasattr(layer, "_nvfp4_file_source_bytes_per_expert"))
+
     def test_create_streaming_weights_does_not_allocate_derived_scales(self):
         method = _method()
         method.quant_config.is_checkpoint_nvfp4_serialized = True
