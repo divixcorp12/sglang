@@ -1,5 +1,6 @@
 import unittest
 import warnings
+from unittest.mock import patch
 
 import torch
 
@@ -184,6 +185,7 @@ class TestExpertStreamer(unittest.TestCase):
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
 
         layer = self._make_layer(experts=4, pin_host_rows=False)
+        layer._nvfp4_file_source_bytes_per_expert = 12
         streamer = ExpertStreamer(layer, ("host_rows",))
         cache = ExpertPinnedHostCache(streamer, capacity=2)
 
@@ -191,7 +193,8 @@ class TestExpertStreamer(unittest.TestCase):
         compact, tensors = streamer.gather(first_ids)
         self.assertTrue(
             torch.equal(
-                tensors["host_rows"][compact.long()].cpu(), layer.host_rows[first_ids.cpu()]
+                tensors["host_rows"][compact.long()].cpu(),
+                layer.host_rows[first_ids.cpu()],
             )
         )
         self.assertEqual(cache.slot_to_expert.count(-1), 0)
@@ -205,7 +208,8 @@ class TestExpertStreamer(unittest.TestCase):
         compact, tensors = streamer.gather(second_ids)
         self.assertTrue(
             torch.equal(
-                tensors["host_rows"][compact.long()].cpu(), layer.host_rows[second_ids.cpu()]
+                tensors["host_rows"][compact.long()].cpu(),
+                layer.host_rows[second_ids.cpu()],
             )
         )
         self.assertEqual(streamer.last_gather_stats.pinned_host_hit_rows, 2)
@@ -214,6 +218,51 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertEqual(cache.stats.evictions, 1)
         self.assertEqual(streamer.last_gather_stats.pinned_host_populated_bytes, 12)
         self.assertLessEqual(cache.residency_bytes, 2 * streamer.host_bytes_per_expert)
+
+    def test_hot_misses_resolve_through_pinned_then_file_rows(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        layer = self._make_layer(experts=4, pin_host_rows=False)
+        layer._nvfp4_file_source_bytes_per_expert = 12
+        streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
+        hot_cache = ExpertHotCache(streamer, capacity=1)
+        hot_cache.reassign([3])
+        pinned_cache = ExpertPinnedHostCache(streamer, capacity=2)
+        pinned_cache.ensure_rows(torch.tensor([1], device="cuda"))
+        ids = torch.tensor([[3, 1, 2]], device="cuda", dtype=torch.int32)
+        compact_ids, tensors = streamer.gather(ids)
+        self.assertTrue(
+            torch.equal(
+                tensors["host_rows"][compact_ids.long()].cpu(),
+                layer.host_rows[ids.cpu()],
+            )
+        )
+        stats = streamer.last_gather_stats
+        self.assertEqual((stats.hot_hit_rows, stats.pinned_host_hit_rows), (1, 1))
+
+        self.assertEqual(stats.pinned_host_miss_rows, 1)
+        self.assertEqual(stats.source_bytes, 52)
+        self.assertEqual(stats.h2d_bytes, 24)
+
+    def test_pinned_cache_hits_do_not_select_host_rows_on_cpu(self):
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        layer = self._make_layer(experts=4, pin_host_rows=False)
+        layer._nvfp4_file_source_bytes_per_expert = 12
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertPinnedHostCache(streamer, capacity=2)
+        cache.ensure_rows(torch.tensor([1, 3], device="cuda"))
+        ids = torch.tensor([[3, 1]], device="cuda", dtype=torch.int32)
+        with patch("torch.index_select", side_effect=AssertionError("CPU row select")):
+            compact_ids, tensors = streamer.gather(ids)
+        self.assertTrue(
+            torch.equal(
+                tensors["host_rows"][compact_ids.long()].cpu(),
+                layer.host_rows[ids.cpu()],
+            )
+        )
+        self.assertEqual(streamer.last_gather_stats.pinned_host_hit_rows, 2)
 
     def test_rejects_mismatched_expert_dimensions(self):
         layer = _Layer()

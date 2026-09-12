@@ -50,6 +50,9 @@ class ExpertGatherStats:
     pinned_host_miss_rows: int = 0
     pinned_host_populated_bytes: int = 0
 
+    transfer_wait_ns: int = 0
+    gather_fallback_used: bool = False
+
 
 @dataclass
 class PinnedHostCacheStats:
@@ -77,7 +80,9 @@ class ExpertPinnedHostCache:
             if _tensor_data(getattr(streamer.layer, name)).device.type == "cpu"
         )
         if capacity and not self.cached_names:
-            raise ValueError("pinned host cache requires at least one CPU source tensor")
+            raise ValueError(
+                "pinned host cache requires at least one CPU source tensor"
+            )
         self.bytes_per_expert = streamer.host_bytes_per_expert
         self.residency_bytes = capacity * self.bytes_per_expert
         devices = {
@@ -92,7 +97,8 @@ class ExpertPinnedHostCache:
         )
         self.tensors = {
             name: torch.empty(
-                (capacity,) + tuple(_tensor_data(getattr(streamer.layer, name)).shape[1:]),
+                (capacity,)
+                + tuple(_tensor_data(getattr(streamer.layer, name)).shape[1:]),
                 dtype=_tensor_data(getattr(streamer.layer, name)).dtype,
                 device="cpu",
                 pin_memory=True,
@@ -117,9 +123,7 @@ class ExpertPinnedHostCache:
             raise ValueError("pinned host cache byte budget cannot be negative")
         if streamer.host_bytes_per_expert == 0:
             return 0
-        return min(
-            streamer.num_experts, budget_bytes // streamer.host_bytes_per_expert
-        )
+        return min(streamer.num_experts, budget_bytes // streamer.host_bytes_per_expert)
 
     def _refresh_mapping(self) -> None:
         mapping = [-1] * self.streamer.num_experts
@@ -133,7 +137,9 @@ class ExpertPinnedHostCache:
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return slots and record row-level hit/miss counters."""
         if source_ids.device != self.device:
-            raise ValueError("selected expert IDs must use the pinned cache CUDA device")
+            raise ValueError(
+                "selected expert IDs must use the pinned cache CUDA device"
+            )
         slots = self.expert_to_slot[source_ids.long()]
         hit_mask = slots >= 0
         hit_ids = source_ids[hit_mask].tolist()
@@ -197,22 +203,39 @@ class ExpertPinnedHostCache:
 
     def copy_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
-    ) -> None:
-        """Copy resident pinned rows to CUDA outputs using the existing async H2D path."""
+    ) -> bool:
+        """Gather resident pinned rows directly into CUDA outputs."""
         if source_ids.numel() == 0:
-            return
+            return False
         slots = self.expert_to_slot[source_ids.long()]
-        slots_cpu = _copy_indices_to_cpu(slots, source_ids.numel())
+        fallback_used = False
         for name in self.cached_names:
-            host_output = _pinned_staging_buffer(
-                ("pinned_host_cache", name),
-                source_ids.numel(),
-                max(source_ids.numel(), _NO_DEDUP_LIMIT),
-                tuple(self.tensors[name].shape[1:]),
-                self.tensors[name].dtype,
-            )
-            torch.index_select(self.tensors[name], 0, slots_cpu, out=host_output)
-            outputs[name].copy_(host_output, non_blocking=True)
+            source = self.tensors[name]
+            output = outputs[name]
+            if source.is_contiguous() and output.is_contiguous():
+                row_bytes = source.numel() * source.element_size() // self.capacity
+                _gather_host_rows_kernel[
+                    (source_ids.numel(), triton.cdiv(row_bytes, 1024))
+                ](
+                    source.view(torch.uint8),
+                    slots,
+                    output.view(torch.uint8),
+                    row_bytes,
+                    BLOCK=1024,
+                )
+            else:
+                fallback_used = True
+                slots_cpu = _copy_indices_to_cpu(slots, source_ids.numel())
+                host_output = _pinned_staging_buffer(
+                    ("pinned_host_cache_fallback", name),
+                    source_ids.numel(),
+                    max(source_ids.numel(), _NO_DEDUP_LIMIT),
+                    tuple(source.shape[1:]),
+                    source.dtype,
+                )
+                torch.index_select(source, 0, slots_cpu, out=host_output)
+                output.copy_(host_output, non_blocking=True)
+        return fallback_used
 
 
 class ExpertPinnedHostCacheManager:
@@ -560,8 +583,9 @@ class ExpertStreamer:
             for name in self.tensor_names
             for source in [_tensor_data(getattr(self.layer, name))]
         }
+        miss_source_ids = source_ids[~hit_mask]
         if hit_rows == 0:
-            self._copy_source_rows(source_ids, gathered)
+            misses = gathered
             assembly_bytes = 0
         else:
             hit_positions = hit_mask.nonzero().flatten()
@@ -578,7 +602,49 @@ class ExpertStreamer:
                 )
                 for name, output in gathered.items()
             }
-            self._copy_source_rows(source_ids[~hit_mask], misses)
+            assembly_bytes = row_count * self.bytes_per_expert
+        pinned_hit_rows = 0
+        pinned_miss_rows = 0
+        pinned_populated_bytes = 0
+        gather_fallback_used = False
+        pinned_cache = self.pinned_host_cache
+        source_bytes = miss_rows * self.bytes_per_expert
+        if (
+            pinned_cache is not None
+            and pinned_cache.capacity
+            and getattr(self.layer, "_nvfp4_file_source_bytes_per_expert", None)
+            is not None
+        ):
+            _, pinned_hit_mask = pinned_cache.lookup(miss_source_ids)
+            pinned_hit_rows = int(pinned_hit_mask.sum().item())
+            pinned_miss_rows = miss_rows - pinned_hit_rows
+            populated_before = pinned_cache.stats.populated_bytes
+            if pinned_miss_rows:
+                pinned_cache.ensure_rows(miss_source_ids[~pinned_hit_mask])
+            pinned_populated_bytes = (
+                pinned_cache.stats.populated_bytes - populated_before
+            )
+            source_bytes = pinned_miss_rows * self.host_bytes_per_expert + miss_rows * (
+                self.bytes_per_expert - self.host_bytes_per_expert
+            )
+            pinned_outputs = {
+                name: output
+                for name, output in misses.items()
+                if name in pinned_cache.cached_names
+            }
+            gather_fallback_used = pinned_cache.copy_rows(
+                miss_source_ids, pinned_outputs
+            )
+            uncached_outputs = {
+                name: output
+                for name, output in misses.items()
+                if name not in pinned_cache.cached_names
+            }
+            if uncached_outputs:
+                self._copy_source_rows(miss_source_ids, uncached_outputs)
+        else:
+            self._copy_source_rows(miss_source_ids, misses)
+        if hit_rows:
             for name, output in gathered.items():
                 row_bytes = output.numel() * output.element_size() // row_count
                 _scatter_hot_rows_kernel[(hit_rows, triton.cdiv(row_bytes, 1024))](
@@ -594,7 +660,6 @@ class ExpertStreamer:
                     miss_positions,
                     misses[name].view(torch.uint8).reshape(miss_rows, -1),
                 )
-            assembly_bytes = row_count * self.bytes_per_expert
         self.last_gather_stats = ExpertGatherStats(
             row_count,
             hit_rows,
@@ -602,7 +667,12 @@ class ExpertStreamer:
             assembly_bytes
             + miss_rows * (self.bytes_per_expert - self.host_bytes_per_expert),
             miss_rows * self.host_bytes_per_expert,
-            miss_rows * self.bytes_per_expert,
+            source_bytes,
+            pinned_hit_rows,
+            pinned_miss_rows,
+            pinned_populated_bytes,
+            0,
+            gather_fallback_used,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
 
@@ -742,7 +812,12 @@ class ExpertStreamer:
         row_count = source_ids.numel()
         if self.hot_cache is not None and self.hot_cache.capacity:
             return self._gather_cached(source_ids, compact_ids, topk_ids)
-        if self.pinned_host_cache is not None and self.pinned_host_cache.capacity:
+        if (
+            self.pinned_host_cache is not None
+            and self.pinned_host_cache.capacity
+            and getattr(self.layer, "_nvfp4_file_source_bytes_per_expert", None)
+            is not None
+        ):
             return self._gather_pinned_host(source_ids, compact_ids, topk_ids)
         self.last_gather_stats = ExpertGatherStats(
             row_count,
