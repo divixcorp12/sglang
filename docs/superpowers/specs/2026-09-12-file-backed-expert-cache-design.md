@@ -120,10 +120,19 @@ File misses gather ascending expert rows into the existing pinned bounce buffers
 and then transfer asynchronously. The FlashInfer runner continues receiving
 compact expert IDs and compact tensors, so its numerical behavior is unchanged.
 
-Initial cache placement is static and frequency-based. Dynamic promotion and
-eviction are enabled only after the metrics demonstrate stable locality.
-Budgets are byte-based and global rather than a fixed expert count because
-expert tensor sizes and available GPU memory determine actual capacity.
+Initial cache placement is frequency-based. After a qualifying large prefill,
+the same recorder statistics may re-rank the resident set for decode and move
+the hottest experts into the fixed GPU slots. The first performance experiment
+compares this dynamic update against an otherwise identical static-frequency
+placement; the dynamic policy is retained only when bytes avoided on PCIe
+exceed bytes spent migrating experts.
+
+The initial GPU budget is 4-8 GiB, roughly 6-11% of the measured 72 GiB expert
+corpus. This should hold about 31-57 of 512 equal-sized experts per layer if
+distributed uniformly, while a global byte budget may allocate slots unevenly
+when the recorder shows stronger locality in particular layers. Budgets are
+byte-based and global rather than a fixed expert count because expert tensor
+sizes and available GPU memory determine actual capacity.
 
 ### Placement statistics
 
@@ -142,6 +151,14 @@ The expert cache adds only operational counters the recorder does not provide:
 
 Statistics are exportable as structured JSON and periodic server logs so cache
 budgets and policies can be selected from evidence.
+
+Dynamic updates consume these existing statistics after large prefill rather
+than creating a parallel routing profiler. Updates are performed between
+forwards, preserve a minimum residence interval, and are suppressed when the
+candidate set would save fewer source-to-GPU bytes than the migration itself.
+Prefill unique-expert count is not used as the placement score: the observed
+1,024-token prefill touched 464 experts, while frequency skew within that set is
+what can make a much smaller decode hot tier effective.
 
 ### Transfer overlap
 
@@ -187,6 +204,8 @@ Prototype controls remain opt-in and environment-driven alongside
 - `SGLANG_MOE_EXPERT_FILE_RSS_BUDGET_GB`
 - `SGLANG_MOE_HOT_GPU_MB`
 - `SGLANG_MOE_HOT_PINNED_MB`
+- `SGLANG_MOE_HOT_DYNAMIC=1`
+- `SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS`
 - `SGLANG_MOE_TRANSFER_OVERLAP=1`
 - `SGLANG_MOE_VMM=1`
 
@@ -217,18 +236,21 @@ replace environment controls after the prototype is validated.
 - Add verified cold-build completion and warm-start reuse.
 - Compare outputs with the anonymous-source streamer for fixed routed IDs.
 
-### Phase 2: statistics and static hot residency
+### Phase 2: statistics and hot residency
 
 - Connect SGLang's expert-distribution recorder.
 - Add tier and transfer metrics.
 - Add bounded GPU and pinned-host tiers.
 - Seed them from recorded per-layer expert frequency.
+- After qualifying large prefill, optionally re-rank the fixed GPU slots from
+  the newly observed distribution.
+- Benchmark static-frequency and dynamically updated placement with identical
+  budgets; account for migration bytes and latency, not hit rate alone.
 
-### Phase 3: transfer overlap and dynamic policy
+### Phase 3: transfer overlap
 
 - Add double-buffered prepare/wait staging.
 - Pipeline CPU/file gathers with H2D copies.
-- Enable dynamic promotion only when measured locality supports it.
 - Evaluate the separate `w2`-during-`w13` runner change.
 
 ### Phase 4: optional VMM
@@ -254,6 +276,8 @@ behavior:
   no prefill claim is made without both measurements.
 - No GPU OOM occurs at the current 8,192-token configuration.
 
-`O_DIRECT` and `io_uring` remain later experiments. They are justified only if
-profiles show page-cache faults or synchronous file reads dominate after the
-file-backed hierarchy and overlap phases are working.
+`O_DIRECT` and `io_uring` remain later experiments. KTransformers MESH provides
+a relevant open-source pattern: direct asynchronous reads into a bounded,
+NUMA-local expert-slot pool while retaining the existing compute kernel. We
+adopt that shape only if profiles show page-cache faults or synchronous file
+reads dominate after the file-backed hierarchy and overlap phases are working.
