@@ -594,7 +594,10 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     )
 
 
-def swizzle_blockscale(scale: torch.Tensor):
+def swizzle_blockscale(
+    scale: torch.Tensor,
+    target_device: Optional[Union[torch.device, str]] = "cuda",
+):
     """
     Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
     """
@@ -608,19 +611,22 @@ def swizzle_blockscale(scale: torch.Tensor):
     round_up_multiple = lambda x, m: (x + m - 1) // m * m
     M_padded = round_up_multiple(M, 128)
     K_padded = round_up_multiple(K, 4)
-    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+    padded_scale = torch.zeros(
+        (B, M_padded, K_padded), dtype=scale.dtype, device=scale.device
+    )
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
     assert rows % 128 == 0
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
-    return (
+    swizzled_scale = swizzled_scale.contiguous()
+    result = (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
         else swizzled_scale.reshape(B, M_padded, K_padded)
     )
+    return result.to(scale.device if target_device is None else target_device)
 
 
 def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
