@@ -38,7 +38,9 @@ class SparseNextLayerPolicy:
                 scores.items(), key=lambda item: (-item[1], item[0])
             )[: self.max_candidates]
         ]
-        for expert_id, value in popularity.items():
+        for expert_id, value in sorted(
+            popularity.items(), key=lambda item: (-item[1], item[0])
+        ):
             if len(selected) >= self.max_candidates:
                 break
             expert_id = index(expert_id)

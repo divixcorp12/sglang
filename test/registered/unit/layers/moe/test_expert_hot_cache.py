@@ -215,6 +215,16 @@ class TestExpertFrequencySeed(unittest.TestCase):
             normalize_expert_frequency_seed({"mass": [[1, 2]]}).tolist(), [[1, 2]]
         )
 
+    def test_enabled_prefetch_requires_at_least_one_installable_coordinator(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+
+        manager = ExpertHotCacheManager.__new__(ExpertHotCacheManager)
+        manager.streamers = {0: object()}
+        manager.caches = {}
+
+        with self.assertRaisesRegex(ValueError, "no eligible adjacent layers"):
+            manager.enable_next_layer_prefetch(1)
+
     def test_invalid_seed_is_rejected(self):
         from sglang.srt.layers.moe.expert_hot_cache import (
             normalize_expert_frequency_seed,

@@ -44,6 +44,18 @@ class TestExpertPrefetch(unittest.TestCase):
 
         self.assertEqual(candidates, (3, 4, 2))
 
+    def test_policy_ranks_unsorted_popularity_by_count_then_expert_id(self):
+        policy = SparseNextLayerPolicy(max_candidates=3)
+
+        candidates = policy.predict(
+            routed_experts=(),
+            popularity={9: 2.0, 3: 7.0, 1: 7.0, 4: 5.0},
+            affinity={},
+            resident_experts=set(),
+        )
+
+        self.assertEqual(candidates, (1, 3, 4))
+
     def test_disabled_coordinator_never_submits_speculative_transfer(self):
         coordinator = ExpertPrefetchCoordinator(enabled=False)
         submitted = []

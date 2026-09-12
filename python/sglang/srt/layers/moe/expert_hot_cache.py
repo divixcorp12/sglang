@@ -450,6 +450,8 @@ class ExpertHotCacheManager:
                 )
 
             self.streamers[current_layer].next_layer_prefetch = schedule
+        if not self.prefetch_coordinators:
+            raise ValueError("NVFP4 expert prefetch has no eligible adjacent layers")
 
     @property
     def residency_bytes(self) -> int:
