@@ -149,6 +149,7 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    """Temporarily stage CPU parameters needed for post-load processing."""
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
@@ -158,7 +159,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
-        if p.device.type == "cpu":
+        if p.device.type == "cpu" and not getattr(
+            p, "_sglang_skip_device_loading", False
+        ):
             original_data = p.data
             device_data = p.data.to(target_device)
             original_infos[name] = dict(

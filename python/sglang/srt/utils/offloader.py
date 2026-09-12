@@ -159,6 +159,7 @@ class OffloaderV1(BaseOffloader):
                 )
                 cpu_data.copy_(parameter.data)
                 parameter.data = cpu_data
+                parameter._sglang_skip_device_loading = True
             self._cpu_offload_bytes += required_bytes
             logger.info(
                 "[offloader] stored %.1f MiB of ModelOpt NVFP4 expert tensors "

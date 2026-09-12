@@ -96,10 +96,30 @@ class Nvfp4ExpertOffloadTests(unittest.TestCase):
             parameter = getattr(layer.decoder_experts, name)
             self.assertEqual(parameter.device.type, "cpu")
             self.assertFalse(parameter.is_pinned())
+            self.assertTrue(parameter._sglang_skip_device_loading)
         self.assertEqual(layer.dense_weight.device.type, "cuda")
         self.assertEqual(layer.ple.weight.device.type, "cuda")
         self.assertEqual(layer.mtp_experts.w13_weight.device.type, "cuda")
         self.assertEqual(layer.decoder_experts.w13_weight_scale_2.device.type, "cuda")
+
+    def test_streamed_experts_stay_on_cpu_during_post_load_processing(self):
+        from sglang.srt.model_loader.loader import device_loading_context
+
+        layer = FakeLayer()
+        target_bytes = sum(
+            getattr(layer.decoder_experts, name).numel()
+            * getattr(layer.decoder_experts, name).element_size()
+            for name in OFFLOAD_NAMES
+        )
+        with patch.dict(os.environ, {"SGLANG_MOE_EXPERT_STREAM": "1"}):
+            offloader_module.OffloaderV1(target_bytes).maybe_offload_to_cpu(layer)
+
+        with device_loading_context(layer.decoder_experts, torch.device("cuda")):
+            for name in OFFLOAD_NAMES:
+                self.assertEqual(
+                    getattr(layer.decoder_experts, name).device.type,
+                    "cpu",
+                )
 
     def test_streaming_budget_is_atomic_for_an_expert_module(self):
         layer = FakeLayer()
