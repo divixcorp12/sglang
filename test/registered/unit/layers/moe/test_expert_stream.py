@@ -4,6 +4,9 @@ import warnings
 import torch
 
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
 
 
 class _Layer(torch.nn.Module):
@@ -103,6 +106,29 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertTrue(
             torch.equal(tensors["host_rows"].cpu(), layer.host_rows[expected_ids])
         )
+
+    def test_hot_cache_handles_pinned_and_cuda_sources(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        layer = self._make_layer(experts=4)
+        streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
+        cache = ExpertHotCache(streamer, capacity=1)
+        cache.reassign([3])
+        ids = torch.tensor([[3, 1, 3]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(ids)
+        for name in ("host_rows", "gpu_rows"):
+            source = getattr(layer, name)
+            self.assertTrue(
+                torch.equal(
+                    tensors[name][compact.long()].cpu(),
+                    source[ids.long().to(source.device)].cpu(),
+                )
+            )
+        stats = streamer.last_gather_stats
+        self.assertEqual((stats.hot_hit_rows, stats.miss_rows), (2, 1))
+        self.assertEqual(stats.source_bytes, 32)
+        self.assertEqual(stats.h2d_bytes, 12)
+        self.assertEqual(stats.d2d_bytes, 116)
 
     def test_rejects_mismatched_expert_dimensions(self):
         layer = _Layer()
