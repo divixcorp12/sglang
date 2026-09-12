@@ -701,8 +701,9 @@ class HotCacheConfigurationTests(unittest.TestCase):
             (dict(enable_eplb=True), "EPLB"),
         )
         for changes, message in cases:
-            with self.subTest(changes=changes), self.assertRaisesRegex(
-                ValueError, message
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 memory_hook.handle_offload_compatibility(self.args(**changes))
 
@@ -722,14 +723,43 @@ class HotCacheConfigurationTests(unittest.TestCase):
 
     def test_every_routed_graph_phase_is_rejected(self):
         self.enable()
-        for phase in ("decode", "prefill"):
-            for backend in ("full", "breakable", "tc_piecewise"):
+        for phase, backends in (
+            ("decode", ("full", "tc_piecewise")),
+            ("prefill", ("full", "breakable", "tc_piecewise")),
+        ):
+            for backend in backends:
                 args = self.args()
                 getattr(args.cuda_graph_config, phase).backend = backend
-                with self.subTest(phase=phase, backend=backend), self.assertRaisesRegex(
-                    ValueError, "CUDA graph"
+                with (
+                    self.subTest(phase=phase, backend=backend),
+                    self.assertRaisesRegex(ValueError, "CUDA graph"),
                 ):
                     memory_hook.handle_offload_compatibility(args)
+
+    def test_decode_breakable_cuda_graph_is_allowed(self):
+        self.enable()
+        allowed = self.args()
+        allowed.cuda_graph_config.decode.backend = "breakable"
+        memory_hook.handle_offload_compatibility(allowed)
+
+        for backend in ("full", "tc_piecewise"):
+            args = self.args()
+            args.cuda_graph_config.decode.backend = backend
+            with (
+                self.subTest(phase="decode", backend=backend),
+                self.assertRaisesRegex(ValueError, "CUDA graph"),
+            ):
+                memory_hook.handle_offload_compatibility(args)
+
+        for backend in ("full", "breakable", "tc_piecewise"):
+            args = self.args()
+            args.cuda_graph_config.decode.backend = "breakable"
+            args.cuda_graph_config.prefill.backend = backend
+            with (
+                self.subTest(phase="prefill", backend=backend),
+                self.assertRaisesRegex(ValueError, "CUDA graph"),
+            ):
+                memory_hook.handle_offload_compatibility(args)
 
     def test_early_graph_resolution_and_repeated_validation_are_safe(self):
         self.enable()
@@ -743,8 +773,9 @@ class HotCacheConfigurationTests(unittest.TestCase):
         self.enable()
         os.environ["SGLANG_MOE_HOT_DYNAMIC"] = "1"
         for recorder in (None, "per_pass", "stat_approx"):
-            with self.subTest(recorder=recorder), self.assertRaisesRegex(
-                ValueError, "stat"
+            with (
+                self.subTest(recorder=recorder),
+                self.assertRaisesRegex(ValueError, "stat"),
             ):
                 memory_hook.handle_offload_compatibility(
                     self.args(expert_distribution_recorder_mode=recorder)
@@ -891,15 +922,18 @@ class HotCacheStartupTests(unittest.TestCase):
         from sglang.srt.model_executor import model_runner
 
         runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_MOE_HOT_GPU_MB": "0",
-                "SGLANG_MOE_HOT_SEED": "/missing/seed",
-                "SGLANG_MOE_HOT_DYNAMIC": "1",
-                "SGLANG_MOE_HOT_LOG_INTERVAL": "invalid",
-            },
-        ), patch.object(ExpertHotCacheManager, "from_model") as factory:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_MOE_HOT_GPU_MB": "0",
+                    "SGLANG_MOE_HOT_SEED": "/missing/seed",
+                    "SGLANG_MOE_HOT_DYNAMIC": "1",
+                    "SGLANG_MOE_HOT_LOG_INTERVAL": "invalid",
+                },
+            ),
+            patch.object(ExpertHotCacheManager, "from_model") as factory,
+        ):
             runner.maybe_init_expert_hot_cache()
         self.assertIsNone(runner.expert_hot_cache_manager)
         factory.assert_not_called()

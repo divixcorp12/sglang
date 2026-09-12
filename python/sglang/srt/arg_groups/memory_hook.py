@@ -92,11 +92,13 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "Dynamic NVFP4 hot caching requires --expert-distribution-recorder-mode stat"
         )
     graph_config = cfg.cuda_graph_config
-    if graph_config is not None and any(
-        getattr(graph_config, phase).backend != Backend.DISABLED for phase in Phase.ALL
+    if graph_config is not None and (
+        graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
+        or graph_config.prefill.backend != Backend.DISABLED
     ):
         raise ValueError(
-            "NVFP4 hot caching requires CUDA graph capture disabled for decode and prefill"
+            "NVFP4 hot caching requires decode CUDA graph capture to be disabled or "
+            "breakable, and prefill CUDA graph capture to be disabled"
         )
     if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
         raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
