@@ -95,7 +95,7 @@ class Nvfp4ExpertOffloadTests(unittest.TestCase):
         for name in OFFLOAD_NAMES:
             parameter = getattr(layer.decoder_experts, name)
             self.assertEqual(parameter.device.type, "cpu")
-            self.assertTrue(parameter.is_pinned())
+            self.assertFalse(parameter.is_pinned())
         self.assertEqual(layer.dense_weight.device.type, "cuda")
         self.assertEqual(layer.ple.weight.device.type, "cuda")
         self.assertEqual(layer.mtp_experts.w13_weight.device.type, "cuda")

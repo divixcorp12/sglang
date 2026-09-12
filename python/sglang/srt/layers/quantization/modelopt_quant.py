@@ -2001,22 +2001,12 @@ def deinterleave_w13(weight: torch.Tensor, *, up_first: bool = False) -> torch.T
     return grouped.transpose(-3, -2).reshape_as(weight).contiguous()
 
 
-def _keep_parameter_pinned(layer: torch.nn.Module, name: str) -> None:
+def _validate_streamed_host_parameter(layer: torch.nn.Module, name: str) -> None:
     parameter = getattr(layer, name)
     if parameter.device.type != "cpu":
         raise RuntimeError(f"streamed expert tensor {name!r} must remain on CPU")
-    if parameter.is_pinned():
-        return
-    pinned = torch.empty_strided(
-        size=parameter.data.size(),
-        stride=parameter.data.stride(),
-        dtype=parameter.data.dtype,
-        layout=parameter.data.layout,
-        device="cpu",
-        pin_memory=True,
-    )
-    pinned.copy_(parameter.data)
-    parameter.data = pinned
+    if not parameter.is_contiguous():
+        raise RuntimeError(f"streamed expert tensor {name!r} must remain contiguous")
 
 
 class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
@@ -2762,7 +2752,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "ModelOpt NVFP4 expert streaming requires --moe-a2a-backend none"
             )
         for name in NVFP4_STREAM_TENSORS[:4]:
-            _keep_parameter_pinned(layer, name)
+            _validate_streamed_host_parameter(layer, name)
         layer._nvfp4_expert_streamer = ExpertStreamer(
             layer, NVFP4_STREAM_TENSORS
         )

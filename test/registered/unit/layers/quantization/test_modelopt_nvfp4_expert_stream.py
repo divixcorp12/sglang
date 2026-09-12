@@ -15,13 +15,13 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.layers.quantization import modelopt_quant
 
 
-def _pinned_parameter(shape, dtype, start=0):
+def _cpu_parameter(shape, dtype, start=0, pinned=True):
     values = torch.arange(
         start,
         start + torch.tensor(shape).prod().item(),
         dtype=torch.float32,
     ).reshape(shape)
-    data = torch.empty(shape, dtype=dtype, pin_memory=True)
+    data = torch.empty(shape, dtype=dtype, pin_memory=pinned)
     data.copy_(values.to(dtype))
     return torch.nn.Parameter(data, requires_grad=False)
 
@@ -81,24 +81,26 @@ def _finalization_layer():
     layer.inference_moe_w13_interleaved = True
     layer._w13_deinterleaved = False
     layer.register_parameter(
-        "w13_weight", _pinned_parameter((4, 256, 32), torch.uint8)
+        "w13_weight", _cpu_parameter((4, 256, 32), torch.uint8, pinned=False)
     )
-    layer.register_parameter("w2_weight", _pinned_parameter((4, 64, 64), torch.uint8))
+    layer.register_parameter(
+        "w2_weight", _cpu_parameter((4, 64, 64), torch.uint8, pinned=False)
+    )
     layer.register_parameter(
         "w13_weight_scale",
-        _pinned_parameter((4, 256, 4), torch.float8_e4m3fn),
+        _cpu_parameter((4, 256, 4), torch.float8_e4m3fn, pinned=False),
     )
     layer.register_parameter(
         "w2_weight_scale",
-        _pinned_parameter((4, 64, 8), torch.float8_e4m3fn),
+        _cpu_parameter((4, 64, 8), torch.float8_e4m3fn, pinned=False),
     )
     layer.register_parameter(
         "w13_blockscale_swizzled",
-        _pinned_parameter((4, 256, 4), torch.float8_e4m3fn),
+        _cpu_parameter((4, 256, 4), torch.float8_e4m3fn, pinned=False),
     )
     layer.register_parameter(
         "w2_blockscale_swizzled",
-        _pinned_parameter((4, 128, 8), torch.float8_e4m3fn),
+        _cpu_parameter((4, 128, 8), torch.float8_e4m3fn, pinned=False),
     )
     layer.register_parameter(
         "w13_weight_scale_2",
@@ -121,7 +123,7 @@ def _finalization_layer():
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
-    def test_finalization_keeps_large_tensors_pinned_and_small_scales_on_cuda(self):
+    def test_finalization_keeps_large_tensors_pageable_and_small_scales_on_cuda(self):
         method = _method()
         layer = _finalization_layer()
 
@@ -150,7 +152,7 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
         ):
             tensor = getattr(layer, name)
             self.assertEqual(tensor.device.type, "cpu")
-            self.assertTrue(tensor.is_pinned(), name)
+            self.assertFalse(tensor.is_pinned(), name)
         for name in (
             "g1_alphas",
             "g2_alphas",
@@ -168,13 +170,13 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
         layer.moe_ep_rank = 0
         layer.moe_tp_size = 1
         layer.moe_tp_rank = 0
-        layer.w13_weight = _pinned_parameter((4, 2, 2), torch.uint8, 0)
-        layer.w2_weight = _pinned_parameter((4, 2, 2), torch.uint8, 32)
-        layer.w13_blockscale_swizzled = _pinned_parameter(
-            (4, 2, 2), torch.float8_e4m3fn, 1
+        layer.w13_weight = _cpu_parameter((4, 2, 2), torch.uint8, 0, pinned=False)
+        layer.w2_weight = _cpu_parameter((4, 2, 2), torch.uint8, 32, pinned=False)
+        layer.w13_blockscale_swizzled = _cpu_parameter(
+            (4, 2, 2), torch.float8_e4m3fn, 1, pinned=False
         )
-        layer.w2_blockscale_swizzled = _pinned_parameter(
-            (4, 2, 2), torch.float8_e4m3fn, 17
+        layer.w2_blockscale_swizzled = _cpu_parameter(
+            (4, 2, 2), torch.float8_e4m3fn, 17, pinned=False
         )
         layer.g1_alphas = torch.nn.Parameter(
             torch.tensor([10, 20, 30, 40], device="cuda", dtype=torch.float32),

@@ -148,11 +148,6 @@ class OffloaderV1(BaseOffloader):
                     f"module: requires {required_bytes} bytes with "
                     f"{max(remaining_bytes, 0)} bytes remaining"
                 )
-            if not is_pin_memory_available():
-                raise RuntimeError(
-                    "ModelOpt NVFP4 expert streaming requires pinned CPU memory"
-                )
-
             for parameter in parameters:
                 cpu_data = torch.empty_strided(
                     size=parameter.data.size(),
@@ -160,13 +155,13 @@ class OffloaderV1(BaseOffloader):
                     dtype=parameter.data.dtype,
                     layout=parameter.data.layout,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=False,
                 )
                 cpu_data.copy_(parameter.data)
                 parameter.data = cpu_data
             self._cpu_offload_bytes += required_bytes
             logger.info(
-                "[offloader] pinned %.1f MiB of ModelOpt NVFP4 expert tensors "
+                "[offloader] stored %.1f MiB of ModelOpt NVFP4 expert tensors "
                 "(total %.1f MiB)",
                 required_bytes / 1024**2,
                 self._cpu_offload_bytes / 1024**2,

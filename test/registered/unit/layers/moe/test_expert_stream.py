@@ -12,14 +12,14 @@ class _Layer(torch.nn.Module):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestExpertStreamer(unittest.TestCase):
-    def _make_layer(self, experts=16):
+    def _make_layer(self, experts=16, pin_host_rows=True):
         layer = _Layer()
         host_rows = torch.arange(experts * 12, dtype=torch.uint8).reshape(
             experts, 3, 4
         )
-        layer.host_rows = torch.nn.Parameter(
-            host_rows.pin_memory(), requires_grad=False
-        )
+        if pin_host_rows:
+            host_rows = host_rows.pin_memory()
+        layer.host_rows = torch.nn.Parameter(host_rows, requires_grad=False)
         layer.gpu_rows = torch.nn.Parameter(
             torch.arange(experts * 5, dtype=torch.float32, device="cuda").reshape(
                 experts, 5
@@ -91,14 +91,20 @@ class TestExpertStreamer(unittest.TestCase):
             )
         )
 
-    def test_rejects_pageable_cpu_sources(self):
-        layer = _Layer()
-        layer.rows = torch.nn.Parameter(
-            torch.zeros((4, 8), dtype=torch.uint8), requires_grad=False
+    def test_pageable_cpu_sources_use_bounded_staging(self):
+        layer = self._make_layer(experts=4, pin_host_rows=False)
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        topk_ids = torch.tensor(
+            [[3, 1, 2], [1, 3, 0]], device="cuda", dtype=torch.int32
         )
 
-        with self.assertRaisesRegex(RuntimeError, "pinned CPU"):
-            ExpertStreamer(layer, ("rows",))
+        compact_ids, tensors = streamer.gather(topk_ids)
+
+        expected_ids = topk_ids.reshape(-1).to(torch.long).cpu()
+        self.assertEqual(compact_ids.tolist(), [[0, 1, 2], [3, 4, 5]])
+        self.assertTrue(
+            torch.equal(tensors["host_rows"].cpu(), layer.host_rows[expected_ids])
+        )
 
     def test_rejects_mismatched_expert_dimensions(self):
         layer = _Layer()

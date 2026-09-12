@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 _NO_DEDUP_LIMIT = 64
 _STAGING: Dict[Tuple, torch.Tensor] = {}
+_PINNED_STAGING: Dict[Tuple, torch.Tensor] = {}
+_PINNED_INDEX: Dict[Tuple, torch.Tensor] = {}
 _ARANGE_CACHE: Dict[Tuple, torch.Tensor] = {}
 _LOGGED_SOURCE_SIGNATURES: set[Tuple] = set()
 
@@ -92,6 +94,44 @@ def _staging_buffer(
     return buffer[:rows]
 
 
+def _pinned_staging_buffer(
+    name: str,
+    rows: int,
+    capacity: int,
+    row_shape: Tuple[int, ...],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (name, dtype, row_shape)
+    buffer = _PINNED_STAGING.get(key)
+    if buffer is None or buffer.shape[0] < capacity:
+        buffer = torch.empty(
+            (capacity,) + row_shape,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        _PINNED_STAGING[key] = buffer
+        logger.info(
+            "MoE expert pinned transfer buffer %s: shape=%s size=%.1f MiB",
+            name,
+            tuple(buffer.shape),
+            buffer.numel() * buffer.element_size() / 1024**2,
+        )
+    return buffer[:rows]
+
+
+def _copy_indices_to_cpu(source_ids: torch.Tensor, capacity: int) -> torch.Tensor:
+    key = (str(source_ids.device),)
+    buffer = _PINNED_INDEX.get(key)
+    if buffer is None or buffer.numel() < capacity:
+        buffer = torch.empty(capacity, dtype=torch.long, pin_memory=True)
+        _PINNED_INDEX[key] = buffer
+    indices = buffer[: source_ids.numel()]
+    indices.copy_(source_ids, non_blocking=True)
+    torch.cuda.current_stream(source_ids.device).synchronize()
+    return indices
+
+
 class ExpertStreamer:
     """Gather aligned expert rows into compact, reusable CUDA buffers."""
 
@@ -131,10 +171,6 @@ class ExpertStreamer:
                 raise ValueError(f"expert source tensor {name!r} has no expert rows")
             if not tensor.is_contiguous():
                 raise ValueError(f"expert source tensor {name!r} must be contiguous")
-            if tensor.device.type == "cpu" and not tensor.is_pinned():
-                raise RuntimeError(
-                    f"expert source tensor {name!r} must use pinned CPU memory"
-                )
             if tensor.device.type not in ("cpu", "cuda"):
                 raise ValueError(
                     f"expert source tensor {name!r} uses unsupported device {tensor.device}"
@@ -173,20 +209,29 @@ class ExpertStreamer:
             )
 
         row_count = source_ids.numel()
+        capacity = max(row_count, _NO_DEDUP_LIMIT)
+        pageable_source = any(
+            _tensor_data(getattr(self.layer, name)).device.type == "cpu"
+            and not _tensor_data(getattr(self.layer, name)).is_pinned()
+            for name in self.tensor_names
+        )
+        cpu_ids = (
+            _copy_indices_to_cpu(source_ids, capacity) if pageable_source else None
+        )
         gathered: dict[str, torch.Tensor] = {}
         for name in self.tensor_names:
             source = _tensor_data(getattr(self.layer, name))
             output = _staging_buffer(
                 name,
                 row_count,
-                max(self.num_experts, _NO_DEDUP_LIMIT),
+                capacity,
                 tuple(source.shape[1:]),
                 source.dtype,
                 topk_ids.device,
             )
             if source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
-            else:
+            elif source.is_pinned():
                 source_bytes = source.view(torch.uint8)
                 output_bytes = output.view(torch.uint8)
                 row_bytes = source_bytes.numel() // self.num_experts
@@ -200,6 +245,17 @@ class ExpertStreamer:
                     row_bytes,
                     BLOCK=block,
                 )
+            else:
+                assert cpu_ids is not None
+                host_output = _pinned_staging_buffer(
+                    name,
+                    row_count,
+                    capacity,
+                    tuple(source.shape[1:]),
+                    source.dtype,
+                )
+                torch.index_select(source, 0, cpu_ids, out=host_output)
+                output.copy_(host_output, non_blocking=True)
             gathered[name] = output
 
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
