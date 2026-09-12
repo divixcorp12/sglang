@@ -793,8 +793,6 @@ class ExpertStreamer:
             raise ValueError("selected expert IDs must be on CUDA")
         flat_ids = topk_ids.reshape(-1)
         prefetch_coordinator = getattr(self, "prefetch_coordinator", None)
-        if prefetch_coordinator is not None:
-            prefetch_coordinator.prepare_for_lookup()
         if flat_ids.numel() == 0:
             raise ValueError("selected expert IDs cannot be empty")
         if bool(((flat_ids < 0) | (flat_ids >= self.num_experts)).any().item()):
@@ -812,6 +810,10 @@ class ExpertStreamer:
                 flat_ids, sorted=True, return_inverse=True
             )
 
+        if prefetch_coordinator is not None:
+            prefetch_coordinator.synchronous_correction(
+                source_ids.tolist(), lambda _: None
+            )
         next_layer_prefetch = getattr(self, "next_layer_prefetch", None)
         if next_layer_prefetch is not None:
             next_layer_prefetch(source_ids)
