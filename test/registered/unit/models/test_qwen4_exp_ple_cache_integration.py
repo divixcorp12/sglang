@@ -12,7 +12,10 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
-from sglang.srt.models.qwen4_exp_ple_table import allocate_ple_host_table
+from sglang.srt.models.qwen4_exp_ple_table import (
+    allocate_ple_host_table,
+    get_ple_file_cache,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -68,9 +71,17 @@ class TestQwen4ExpPleCacheIntegration(unittest.TestCase):
             ):
                 embedding.complete_ple_file_cache(2)
 
-            self.assertTrue(
-                os.path.exists(f"{embedding._ple_file_cache.path}.manifest.json")
+            reopened = allocate_ple_host_table(
+                (4, 2),
+                torch.bfloat16,
+                "file",
+                directory,
+                cache_identity="checkpoint\0module",
             )
+            reopened_cache = get_ple_file_cache(reopened)
+            self.assertIsNotNone(reopened_cache)
+            self.assertTrue(reopened_cache.cache_hit)
+            reopened_cache.close()
             self.assertIs(embedding._file_rss_trimmer, trimmer)
 
 

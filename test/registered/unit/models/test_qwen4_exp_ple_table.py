@@ -14,15 +14,14 @@ gather kernel reading from the file-backed table matches a torch gather.
 """
 
 import inspect
-import json
 import os
 import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import torch
 
+from sglang.srt.model_loader.file_tensor_cache import FileTensorCacheGroup
 from sglang.srt.models import qwen4_exp_ple_table as ple_table_module
 from sglang.srt.models.qwen4_exp_ple_table import (
     PleFilePrefetcher,
@@ -149,228 +148,34 @@ class TestPleFilePersistentCache(unittest.TestCase):
         self.assertIsNotNone(cache)
         return cache
 
-    def _completed_cache(self, table_dir, identity=None):
-        table = self._allocate(table_dir, identity)
-        table.fill_(3.0)
-        cache = self._cache(table)
-        self.assertFalse(cache.cache_hit)
-        cache.complete()
-        cache.close()
-        del table
-
-    def test_same_sized_file_without_completion_manifest_is_a_miss(self):
+    def test_public_api_uses_generic_cache_and_preserves_completed_bytes(self):
         with tempfile.TemporaryDirectory() as d:
-            table = self._allocate(d)
-            cache = self._cache(table)
-            self.assertFalse(cache.cache_hit)
-            self.assertEqual(os.path.getsize(cache.path), table.numel() * 2)
-            self.assertFalse(os.path.exists(cache.manifest_path))
-            cache.close()
-            del table
-
-            reopened = self._allocate(d)
-            reopened_cache = self._cache(reopened)
-            try:
-                self.assertFalse(reopened_cache.cache_hit)
-            finally:
-                reopened_cache.close()
-
-    def test_completed_matching_cache_is_a_hit_and_preserves_bytes(self):
-        with tempfile.TemporaryDirectory() as d:
-            table = self._allocate(d)
+            cold = self._allocate(d)
+            cold_cache = self._cache(cold)
+            self.assertIsInstance(cold_cache._group, FileTensorCacheGroup)
+            self.assertFalse(cold_cache.cache_hit)
             expected = (
-                torch.arange(table.numel(), dtype=torch.float32)
+                torch.arange(cold.numel(), dtype=torch.float32)
                 .reshape(self.SHAPE)
                 .to(self.DTYPE)
             )
-            table.copy_(expected)
-            cache = self._cache(table)
-            cache.complete()
-            cache.close()
-            del table
+            cold.copy_(expected)
+            complete_ple_file_cache(cold, {0, 1}, 2)
 
-            reopened = self._allocate(d)
-            reopened_cache = self._cache(reopened)
+            warm = self._allocate(d)
+            warm_cache = self._cache(warm)
             try:
-                self.assertTrue(reopened_cache.cache_hit)
-                torch.testing.assert_close(reopened, expected, rtol=0, atol=0)
+                self.assertTrue(warm_cache.cache_hit)
+                torch.testing.assert_close(warm, expected, rtol=0, atol=0)
             finally:
-                reopened_cache.close()
+                warm_cache.close()
 
-    def test_malformed_manifest_is_a_miss(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._completed_cache(d)
-            table = self._allocate(d)
-            cache = self._cache(table)
-            cache.close()
-            del table
-
-            Path(cache.manifest_path).write_text("{not-json", encoding="utf-8")
-            reopened = self._allocate(d)
-            reopened_cache = self._cache(reopened)
+            invalidated = self._allocate(d, "checkpoint-b")
+            invalidated_cache = self._cache(invalidated)
             try:
-                self.assertFalse(reopened_cache.cache_hit)
+                self.assertFalse(invalidated_cache.cache_hit)
             finally:
-                reopened_cache.close()
-
-    def test_manifest_for_a_different_checkpoint_is_a_miss(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._completed_cache(d, "checkpoint-a")
-            self._completed_cache(d, "checkpoint-b")
-
-            a = self._allocate(d, "checkpoint-a")
-            a_cache = self._cache(a)
-            a_cache.close()
-            del a
-            b = self._allocate(d, "checkpoint-b")
-            b_cache = self._cache(b)
-            b_cache.close()
-            del b
-
-            Path(a_cache.manifest_path).write_bytes(
-                Path(b_cache.manifest_path).read_bytes()
-            )
-            reopened = self._allocate(d, "checkpoint-a")
-            reopened_cache = self._cache(reopened)
-            try:
-                self.assertFalse(reopened_cache.cache_hit)
-            finally:
-                reopened_cache.close()
-
-    def test_manifest_with_wrong_table_size_is_a_miss(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._completed_cache(d)
-            table = self._allocate(d)
-            cache = self._cache(table)
-            cache.close()
-            del table
-
-            manifest_path = Path(cache.manifest_path)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["nbytes"] += 1
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            reopened = self._allocate(d)
-            reopened_cache = self._cache(reopened)
-            try:
-                self.assertFalse(reopened_cache.cache_hit)
-            finally:
-                reopened_cache.close()
-
-    def test_invalid_utf8_manifest_is_a_miss(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._completed_cache(d)
-            table = self._allocate(d)
-            cache = self._cache(table)
-            cache.close()
-            del table
-
-            Path(cache.manifest_path).write_bytes(b"\xff\xfe\x80")
-            reopened = self._allocate(d)
-            reopened_cache = self._cache(reopened)
-            try:
-                self.assertFalse(reopened_cache.cache_hit)
-                self.assertFalse(Path(reopened_cache.manifest_path).exists())
-            finally:
-                reopened_cache.close()
-
-    def test_manifest_schema_and_json_types_must_match_exactly(self):
-        mutations = (
-            lambda manifest: {**manifest, "extra": True},
-            lambda manifest: {
-                key: value for key, value in manifest.items() if key != "tag"
-            },
-            lambda manifest: {**manifest, "version": 2},
-            lambda manifest: {**manifest, "version": True},
-            lambda manifest: {**manifest, "version": 1.0},
-            lambda manifest: {**manifest, "nbytes": float(manifest["nbytes"])},
-            lambda manifest: {**manifest, "shape": [True, 8]},
-            lambda manifest: [],
-        )
-        for mutate in mutations:
-            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as d:
-                self._completed_cache(d)
-                table = self._allocate(d)
-                cache = self._cache(table)
-                cache.close()
-                del table
-                manifest_path = Path(cache.manifest_path)
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                manifest = mutate(manifest)
-                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-                reopened = self._allocate(d)
-                reopened_cache = self._cache(reopened)
-                try:
-                    self.assertFalse(reopened_cache.cache_hit)
-                finally:
-                    reopened_cache.close()
-
-    def test_wrong_data_size_rebuilds_with_a_new_inode(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._completed_cache(d)
-            table = self._allocate(d)
-            cache = self._cache(table)
-            cache.close()
-            del table
-            old_inode = os.stat(cache.path).st_ino
-            with open(cache.path, "r+b") as stream:
-                stream.truncate(17)
-
-            reopened = self._allocate(d)
-            reopened_cache = self._cache(reopened)
-            try:
-                self.assertFalse(reopened_cache.cache_hit)
-                self.assertEqual(os.path.getsize(reopened_cache.path), 256)
-                self.assertNotEqual(os.stat(reopened_cache.path).st_ino, old_inode)
-            finally:
-                reopened_cache.close()
-
-    def test_cache_miss_replaces_inode_without_damaging_live_mapping(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._completed_cache(d)
-            live = self._allocate(d)
-            live_cache = self._cache(live)
-            live_cache.close()
-            old_inode = os.stat(live_cache.path).st_ino
-            Path(live_cache.manifest_path).write_text("{bad", encoding="utf-8")
-
-            replacement = self._allocate(d)
-            replacement_cache = self._cache(replacement)
-            try:
-                self.assertFalse(replacement_cache.cache_hit)
-                self.assertNotEqual(os.stat(replacement_cache.path).st_ino, old_inode)
-                self.assertTrue(torch.all(live.float() == 3.0))
-            finally:
-                replacement_cache.close()
-
-    def test_realpath_aliases_use_the_same_cache_lock_identity(self):
-        with tempfile.TemporaryDirectory() as root:
-            real_dir = Path(root, "real")
-            real_dir.mkdir()
-            alias_dir = Path(root, "alias")
-            alias_dir.symlink_to(real_dir, target_is_directory=True)
-            lock = mock.Mock()
-            with mock.patch.object(
-                ple_table_module, "get_lock", return_value=lock
-            ) as get_lock:
-                first = self._allocate(str(real_dir))
-                self._cache(first).close()
-                first_identity = get_lock.call_args.args[0]
-                alias = self._allocate(str(alias_dir))
-                self._cache(alias).close()
-                alias_identity = get_lock.call_args.args[0]
-            self.assertEqual(first_identity, alias_identity)
-
-    def test_close_releases_the_cache_lock_exactly_once(self):
-        with tempfile.TemporaryDirectory() as d:
-            lock = mock.Mock()
-            with mock.patch.object(ple_table_module, "get_lock", return_value=lock):
-                table = self._allocate(d)
-                cache = self._cache(table)
-                cache.close()
-                cache.close()
-            lock.acquire.assert_called_once_with()
-            lock.release.assert_called_once_with()
+                invalidated_cache.close()
 
     def test_complete_requires_exact_shard_coverage_and_close_is_idempotent(self):
         for seen in ({0, 1}, {0, 1, 2, 3}):
@@ -380,7 +185,10 @@ class TestPleFilePersistentCache(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     complete_ple_file_cache(table, seen, 3)
                 cache.close()
-                self.assertFalse(Path(cache.manifest_path).exists())
+                reopened = self._allocate(d)
+                reopened_cache = self._cache(reopened)
+                self.assertFalse(reopened_cache.cache_hit)
+                reopened_cache.close()
 
         with tempfile.TemporaryDirectory() as d:
             table = self._allocate(d)
@@ -388,10 +196,10 @@ class TestPleFilePersistentCache(unittest.TestCase):
             complete_ple_file_cache(table, {0, 1, 2}, 3)
             cache.close()
             cache.close()
-            self.assertTrue(Path(cache.manifest_path).is_file())
 
             hit = self._allocate(d)
             hit_cache = self._cache(hit)
+            self.assertTrue(hit_cache.cache_hit)
             complete_ple_file_cache(hit, set(), 3)
             hit_cache.close()
 
@@ -407,46 +215,6 @@ class TestPleFilePersistentCache(unittest.TestCase):
             self.assertIsNone(ple_table_module.get_ple_file_cache(parameter))
             self.assertIs(self._cache(table), retained_cache)
             retained_cache.close()
-
-    def test_failed_final_directory_fsync_removes_published_manifest(self):
-        with tempfile.TemporaryDirectory() as d:
-            table = self._allocate(d)
-            cache = self._cache(table)
-            real_fsync = os.fsync
-            directory_fsync_calls = 0
-
-            def fail_first_directory_fsync(fd):
-                nonlocal directory_fsync_calls
-                if os.path.isdir(f"/proc/self/fd/{fd}"):
-                    directory_fsync_calls += 1
-                    if directory_fsync_calls == 1:
-                        raise OSError("injected directory fsync failure")
-                return real_fsync(fd)
-
-            with mock.patch.object(
-                ple_table_module.os, "fsync", side_effect=fail_first_directory_fsync
-            ):
-                with self.assertRaises(OSError):
-                    cache.complete()
-            self.assertFalse(Path(cache.manifest_path).exists())
-            cache.close()
-            retry = self._allocate(d)
-            self._cache(retry).close()
-
-    def test_completion_publishes_only_the_final_atomic_manifest(self):
-        with tempfile.TemporaryDirectory() as d:
-            table = self._allocate(d)
-            cache = self._cache(table)
-            manifest_path = Path(cache.manifest_path)
-            self.assertFalse(manifest_path.exists())
-            cache.complete()
-            cache.close()
-
-            self.assertTrue(manifest_path.is_file())
-            temporary_manifests = list(
-                manifest_path.parent.glob(f"{manifest_path.name}.tmp*")
-            )
-            self.assertEqual(temporary_manifests, [])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA pinned memory")
