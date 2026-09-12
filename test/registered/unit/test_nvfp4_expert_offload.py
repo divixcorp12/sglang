@@ -663,6 +663,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
     def test_hot_cache_defaults_are_disabled_with_bounded_update_policy(self):
         expected = dict(
             SGLANG_MOE_EXPERT_FILE_DIR="",
+            SGLANG_MOE_PINNED_HOST_MB=0,
             SGLANG_MOE_HOT_GPU_MB=0,
             SGLANG_MOE_HOT_SEED="",
             SGLANG_MOE_HOT_DYNAMIC=False,
@@ -677,6 +678,11 @@ class HotCacheConfigurationTests(unittest.TestCase):
 
     def test_hot_cache_requires_streaming(self):
         os.environ["SGLANG_MOE_HOT_GPU_MB"] = "1"
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM"):
+            memory_hook.handle_offload_compatibility(self.args())
+
+    def test_pinned_host_cache_requires_streaming(self):
+        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "1"
         with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM"):
             memory_hook.handle_offload_compatibility(self.args())
 

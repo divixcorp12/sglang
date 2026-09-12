@@ -303,6 +303,7 @@ class Envs:
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
     SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
+    SGLANG_MOE_PINNED_HOST_MB = EnvInt(0)
     SGLANG_MOE_HOT_GPU_MB = EnvInt(0)
     SGLANG_MOE_HOT_SEED = EnvStr("")
     SGLANG_MOE_HOT_DYNAMIC = EnvBool(False)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from operator import index
 from typing import Dict, Iterable, Tuple
 
 import torch
@@ -44,6 +46,252 @@ class ExpertGatherStats:
     d2d_bytes: int = 0
     h2d_bytes: int = 0
     source_bytes: int = 0
+    pinned_host_hit_rows: int = 0
+    pinned_host_miss_rows: int = 0
+    pinned_host_populated_bytes: int = 0
+
+
+@dataclass
+class PinnedHostCacheStats:
+    """Cumulative counters for the bounded pinned-host expert cache."""
+
+    lookup_hits: int = 0
+    lookup_misses: int = 0
+    populated_rows: int = 0
+    populated_bytes: int = 0
+    evictions: int = 0
+
+
+class ExpertPinnedHostCache:
+    """Bounded, on-demand pinned host rows shared by one expert layer."""
+
+    def __init__(self, streamer: "ExpertStreamer", capacity: int):
+        capacity = index(capacity)
+        if not 0 <= capacity <= streamer.num_experts:
+            raise ValueError("pinned host cache capacity must be within expert count")
+        self.streamer = streamer
+        self.capacity = capacity
+        self.cached_names = tuple(
+            name
+            for name in streamer.tensor_names
+            if _tensor_data(getattr(streamer.layer, name)).device.type == "cpu"
+        )
+        if capacity and not self.cached_names:
+            raise ValueError("pinned host cache requires at least one CPU source tensor")
+        self.bytes_per_expert = streamer.host_bytes_per_expert
+        self.residency_bytes = capacity * self.bytes_per_expert
+        devices = {
+            _tensor_data(getattr(streamer.layer, name)).device
+            for name in streamer.tensor_names
+            if _tensor_data(getattr(streamer.layer, name)).device.type == "cuda"
+        }
+        if len(devices) > 1:
+            raise ValueError("pinned host cache CUDA sources must share one device")
+        self.device = next(
+            iter(devices), torch.device("cuda", torch.cuda.current_device())
+        )
+        self.tensors = {
+            name: torch.empty(
+                (capacity,) + tuple(_tensor_data(getattr(streamer.layer, name)).shape[1:]),
+                dtype=_tensor_data(getattr(streamer.layer, name)).dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for name in self.cached_names
+        }
+        self.expert_to_slot = torch.full(
+            (streamer.num_experts,), -1, dtype=torch.long, device=self.device
+        )
+        self.slot_to_expert = [-1] * capacity
+        self._expert_to_slot: dict[int, int] = {}
+        self._last_used = [0] * capacity
+        self._clock = 0
+        self.stats = PinnedHostCacheStats()
+        streamer.pinned_host_cache = self
+
+    @staticmethod
+    def capacity_for_budget(streamer: "ExpertStreamer", budget_bytes: int) -> int:
+        """Round a pinned-host byte budget down to complete expert rows."""
+        budget_bytes = index(budget_bytes)
+        if budget_bytes < 0:
+            raise ValueError("pinned host cache byte budget cannot be negative")
+        if streamer.host_bytes_per_expert == 0:
+            return 0
+        return min(
+            streamer.num_experts, budget_bytes // streamer.host_bytes_per_expert
+        )
+
+    def _refresh_mapping(self) -> None:
+        mapping = [-1] * self.streamer.num_experts
+        for slot, expert_id in enumerate(self.slot_to_expert):
+            if expert_id >= 0:
+                mapping[expert_id] = slot
+        self.expert_to_slot.copy_(
+            torch.tensor(mapping, dtype=torch.long, device=self.device)
+        )
+
+    def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return slots and record row-level hit/miss counters."""
+        if source_ids.device != self.device:
+            raise ValueError("selected expert IDs must use the pinned cache CUDA device")
+        slots = self.expert_to_slot[source_ids.long()]
+        hit_mask = slots >= 0
+        hit_ids = source_ids[hit_mask].tolist()
+        for expert_id in hit_ids:
+            slot = self._expert_to_slot[int(expert_id)]
+            self._clock += 1
+            self._last_used[slot] = self._clock
+        self.stats.lookup_hits += len(hit_ids)
+        self.stats.lookup_misses += source_ids.numel() - len(hit_ids)
+        return slots, hit_mask
+
+    def ensure_rows(self, source_ids: torch.Tensor) -> None:
+        """Read missing source rows into pinned slots, evicting least-recently-used rows."""
+        if not self.cached_names or self.capacity == 0 or source_ids.numel() == 0:
+            return
+        requested = list(dict.fromkeys(int(value) for value in source_ids.tolist()))
+        missing = [
+            expert_id
+            for expert_id in requested
+            if int(expert_id) not in self._expert_to_slot
+        ]
+        assignments = []
+        for expert_id in missing:
+            free = next(
+                (
+                    slot
+                    for slot, resident in enumerate(self.slot_to_expert)
+                    if resident < 0
+                ),
+                None,
+            )
+            evicted = free is None
+            if free is None:
+                free = min(range(self.capacity), key=self._last_used.__getitem__)
+            if evicted:
+                self.stats.evictions += 1
+                self._expert_to_slot.pop(self.slot_to_expert[free], None)
+            assignments.append((expert_id, free))
+            self.slot_to_expert[free] = expert_id
+            self._expert_to_slot[expert_id] = free
+            self._clock += 1
+            self._last_used[free] = self._clock
+        if not assignments:
+            return
+        source_ids_cpu = torch.tensor(
+            [expert_id for expert_id, _ in assignments], dtype=torch.long
+        )
+        slots_cpu = torch.tensor([slot for _, slot in assignments], dtype=torch.long)
+        for name in self.cached_names:
+            source = _tensor_data(getattr(self.streamer.layer, name))
+            for source_id, slot in zip(source_ids_cpu, slots_cpu):
+                torch.index_select(
+                    source,
+                    0,
+                    source_id.reshape(1),
+                    out=self.tensors[name][int(slot) : int(slot) + 1],
+                )
+        self._refresh_mapping()
+        self.stats.populated_rows += len(assignments)
+        self.stats.populated_bytes += len(assignments) * self.bytes_per_expert
+
+    def copy_rows(
+        self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
+    ) -> None:
+        """Copy resident pinned rows to CUDA outputs using the existing async H2D path."""
+        if source_ids.numel() == 0:
+            return
+        slots = self.expert_to_slot[source_ids.long()]
+        slots_cpu = _copy_indices_to_cpu(slots, source_ids.numel())
+        for name in self.cached_names:
+            host_output = _pinned_staging_buffer(
+                ("pinned_host_cache", name),
+                source_ids.numel(),
+                max(source_ids.numel(), _NO_DEDUP_LIMIT),
+                tuple(self.tensors[name].shape[1:]),
+                self.tensors[name].dtype,
+            )
+            torch.index_select(self.tensors[name], 0, slots_cpu, out=host_output)
+            outputs[name].copy_(host_output, non_blocking=True)
+
+
+class ExpertPinnedHostCacheManager:
+    """Allocate a global complete-row budget across streamed expert layers."""
+
+    @classmethod
+    def from_model(
+        cls, model: torch.nn.Module, budget_bytes: int
+    ) -> "ExpertPinnedHostCacheManager | None":
+        budget_bytes = index(budget_bytes)
+        if budget_bytes == 0:
+            return None
+        if budget_bytes < 0:
+            raise ValueError("pinned host cache byte budget cannot be negative")
+        streamers = {}
+        for module in model.modules():
+            streamer = getattr(module, "_nvfp4_expert_streamer", None)
+            if streamer is None or streamer.host_bytes_per_expert == 0:
+                continue
+            layer_id = index(streamer.layer_id)
+            if layer_id < 0 or layer_id in streamers:
+                raise ValueError(
+                    "pinned host cache requires unique nonnegative layer IDs"
+                )
+            streamers[layer_id] = streamer
+        if not streamers:
+            return None
+        capacities = {layer_id: 0 for layer_id in streamers}
+        remaining = budget_bytes
+        progress = True
+        while progress:
+            progress = False
+            for layer_id in sorted(streamers):
+                streamer = streamers[layer_id]
+                if capacities[layer_id] >= streamer.num_experts:
+                    continue
+                if streamer.host_bytes_per_expert > remaining:
+                    continue
+                capacities[layer_id] += 1
+                remaining -= streamer.host_bytes_per_expert
+                progress = True
+        if not any(capacities.values()):
+            return None
+        manager = cls()
+        manager.caches = {
+            layer_id: ExpertPinnedHostCache(streamers[layer_id], capacity)
+            for layer_id, capacity in capacities.items()
+            if capacity
+        }
+        manager.streamers = streamers
+        manager.requested_bytes = budget_bytes
+        logger.info(
+            "Pinned host expert cache startup %s",
+            json.dumps(
+                {
+                    "requested_bytes": budget_bytes,
+                    "residency_bytes": manager.residency_bytes,
+                    "rows": sum(cache.capacity for cache in manager.caches.values()),
+                    "layers": len(manager.caches),
+                },
+                sort_keys=True,
+            ),
+        )
+        return manager
+
+    @property
+    def residency_bytes(self) -> int:
+        return sum(cache.residency_bytes for cache in self.caches.values())
+
+    def snapshot_stats(self) -> dict[str, dict[str, int]]:
+        """Return cumulative row and byte counters grouped by layer."""
+        return {
+            str(layer_id): {
+                "capacity_rows": cache.capacity,
+                "residency_bytes": cache.residency_bytes,
+                **asdict(cache.stats),
+            }
+            for layer_id, cache in self.caches.items()
+        }
 
 
 def expert_streaming_enabled() -> bool:
@@ -189,6 +437,7 @@ class ExpertStreamer:
 
         self.num_experts = self._validate_sources()
         self.hot_cache = None
+        self.pinned_host_cache = None
         self.last_gather_stats = ExpertGatherStats()
         self.bytes_per_expert = sum(
             _tensor_data(getattr(layer, name)).numel()
@@ -357,6 +606,116 @@ class ExpertStreamer:
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
 
+    def _gather_pinned_host(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        cache = self.pinned_host_cache
+        assert cache is not None
+        row_count = source_ids.numel()
+        capacity = max(row_count, _NO_DEDUP_LIMIT)
+        slots, hit_mask = cache.lookup(source_ids)
+        del slots
+        hit_rows = int(hit_mask.sum().item())
+        miss_rows = row_count - hit_rows
+        gathered = {
+            name: _staging_buffer(
+                name,
+                row_count,
+                capacity,
+                tuple(_tensor_data(getattr(self.layer, name)).shape[1:]),
+                _tensor_data(getattr(self.layer, name)).dtype,
+                topk_ids.device,
+            )
+            for name in self.tensor_names
+        }
+        hit_positions = hit_mask.nonzero().flatten()
+        miss_positions = (~hit_mask).nonzero().flatten()
+        if hit_rows:
+            hit_outputs = {
+                name: _staging_buffer(
+                    ("pinned_host_cache_hits", name),
+                    hit_rows,
+                    capacity,
+                    tuple(output.shape[1:]),
+                    output.dtype,
+                    output.device,
+                )
+                for name, output in gathered.items()
+                if name in cache.cached_names
+            }
+            cache.copy_rows(source_ids[hit_mask], hit_outputs)
+            for name, output in hit_outputs.items():
+                gathered[name].index_copy_(0, hit_positions, output)
+        if miss_rows:
+            populated_before = cache.stats.populated_bytes
+            cache.ensure_rows(source_ids[~hit_mask])
+            resident_mask = cache.expert_to_slot[source_ids[~hit_mask].long()] >= 0
+            resident_count = int(resident_mask.sum().item())
+            miss_outputs = {
+                name: _staging_buffer(
+                    ("pinned_host_cache_misses", name),
+                    resident_count,
+                    capacity,
+                    tuple(output.shape[1:]),
+                    output.dtype,
+                    output.device,
+                )
+                for name, output in gathered.items()
+                if name in cache.cached_names
+            }
+            if bool(resident_mask.any().item()):
+                cache.copy_rows(source_ids[~hit_mask][resident_mask], miss_outputs)
+                resident_positions = miss_positions[resident_mask]
+                resident_output_rows = resident_mask.nonzero().flatten()
+                for name, output in miss_outputs.items():
+                    gathered[name].index_copy_(
+                        0, resident_positions, output[resident_output_rows]
+                    )
+            cold_mask = ~resident_mask
+            if bool(cold_mask.any().item()):
+                cold_ids = source_ids[~hit_mask][cold_mask]
+                cold_positions = miss_positions[cold_mask]
+                cold_outputs = {
+                    name: _staging_buffer(
+                        ("pinned_host_cache_cold", name),
+                        cold_ids.numel(),
+                        capacity,
+                        tuple(output.shape[1:]),
+                        output.dtype,
+                        output.device,
+                    )
+                    for name, output in gathered.items()
+                    if name in cache.cached_names
+                }
+                self._copy_source_rows(cold_ids, cold_outputs)
+                for name, output in cold_outputs.items():
+                    gathered[name].index_copy_(0, cold_positions, output)
+            populated_bytes = cache.stats.populated_bytes - populated_before
+        else:
+            populated_bytes = 0
+        uncached = {
+            name: output
+            for name, output in gathered.items()
+            if name not in cache.cached_names
+        }
+        if uncached:
+            self._copy_source_rows(source_ids, uncached)
+        self.last_gather_stats = ExpertGatherStats(
+            row_count,
+            0,
+            row_count,
+            0,
+            row_count * self.host_bytes_per_expert,
+            miss_rows * self.bytes_per_expert,
+            hit_rows,
+            miss_rows,
+            populated_bytes,
+        )
+        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
+
     def gather(
         self, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -383,6 +742,8 @@ class ExpertStreamer:
         row_count = source_ids.numel()
         if self.hot_cache is not None and self.hot_cache.capacity:
             return self._gather_cached(source_ids, compact_ids, topk_ids)
+        if self.pinned_host_cache is not None and self.pinned_host_cache.capacity:
+            return self._gather_pinned_host(source_ids, compact_ids, topk_ids)
         self.last_gather_stats = ExpertGatherStats(
             row_count,
             0,

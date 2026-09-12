@@ -671,6 +671,7 @@ class ModelRunner:
             moe_ep_rank=self.ps.moe_ep_rank,
         )
         self.maybe_init_expert_hot_cache()
+        self.maybe_init_expert_pinned_host_cache()
 
         self.maybe_init_dwdp()
 
@@ -720,6 +721,19 @@ class ModelRunner:
             get_global_expert_distribution_recorder().register_forward_observer(
                 manager.on_expert_distribution
             )
+
+    def maybe_init_expert_pinned_host_cache(self):
+        """Allocate the bounded on-demand pinned-host expert row cache."""
+        self.expert_pinned_host_cache_manager = None
+        budget_mb = envs.SGLANG_MOE_PINNED_HOST_MB.get()
+        if budget_mb == 0:
+            return
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCacheManager
+
+        manager = ExpertPinnedHostCacheManager.from_model(
+            self.model, budget_bytes=budget_mb * 1024 * 1024
+        )
+        self.expert_pinned_host_cache_manager = manager
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

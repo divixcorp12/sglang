@@ -180,6 +180,41 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertEqual(stats.h2d_bytes, 12)
         self.assertEqual(stats.d2d_bytes, 116)
 
+    def test_pinned_host_cache_populates_on_demand_and_evicts_bounded_rows(self):
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        layer = self._make_layer(experts=4, pin_host_rows=False)
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertPinnedHostCache(streamer, capacity=2)
+
+        first_ids = torch.tensor([[1, 3, 1]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(first_ids)
+        self.assertTrue(
+            torch.equal(
+                tensors["host_rows"][compact.long()].cpu(), layer.host_rows[first_ids.cpu()]
+            )
+        )
+        self.assertEqual(cache.slot_to_expert.count(-1), 0)
+        self.assertEqual(cache.stats.populated_rows, 2)
+        self.assertEqual(cache.stats.evictions, 0)
+        self.assertEqual(streamer.last_gather_stats.pinned_host_hit_rows, 0)
+        self.assertEqual(streamer.last_gather_stats.pinned_host_miss_rows, 3)
+        self.assertEqual(streamer.last_gather_stats.pinned_host_populated_bytes, 24)
+
+        second_ids = torch.tensor([[1, 2, 1]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(second_ids)
+        self.assertTrue(
+            torch.equal(
+                tensors["host_rows"][compact.long()].cpu(), layer.host_rows[second_ids.cpu()]
+            )
+        )
+        self.assertEqual(streamer.last_gather_stats.pinned_host_hit_rows, 2)
+        self.assertEqual(streamer.last_gather_stats.pinned_host_miss_rows, 1)
+        self.assertEqual(cache.stats.populated_rows, 3)
+        self.assertEqual(cache.stats.evictions, 1)
+        self.assertEqual(streamer.last_gather_stats.pinned_host_populated_bytes, 12)
+        self.assertLessEqual(cache.residency_bytes, 2 * streamer.host_bytes_per_expert)
+
     def test_rejects_mismatched_expert_dimensions(self):
         layer = _Layer()
         layer.a = torch.nn.Parameter(
