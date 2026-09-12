@@ -3811,13 +3811,22 @@ class ServerArgs:
         self._handle_offload_compatibility()
 
     def _handle_offload_compatibility(self):
-        if self.ple_offload_embedding and (
-            self.cpu_offload_gb > 0 or self.offload_group_size > 0
+        selected_expert_streaming = os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
+        if self.ple_offload_embedding and self.offload_group_size > 0:
+            raise ValueError(
+                "--ple-offload-embedding cannot be combined with "
+                "--offload-group-size: grouped layer offload "
+                "would stage the pinned PLE embedding back to the device."
+            )
+        if (
+            self.ple_offload_embedding
+            and self.cpu_offload_gb > 0
+            and not selected_expert_streaming
         ):
             raise ValueError(
                 "--ple-offload-embedding cannot be combined with "
-                "--cpu-offload-gb or --offload-group-size: generic layer offload "
-                "would stage the pinned PLE embedding back to the device."
+                "--cpu-offload-gb unless SGLANG_MOE_EXPERT_STREAM=1 limits "
+                "offload to ModelOpt NVFP4 routed experts."
             )
         if self.ple_offload_backend == "file" and self.ple_offload_embedding is False:
             raise ValueError(

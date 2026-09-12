@@ -26,6 +26,42 @@ logger = logging.getLogger(__name__)
 _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
 
+NVFP4_OFFLOAD_PARAMETER_NAMES = (
+    "w13_weight",
+    "w2_weight",
+    "w13_weight_scale",
+    "w2_weight_scale",
+    "w13_blockscale_swizzled",
+    "w2_blockscale_swizzled",
+)
+
+
+def _expert_streaming_enabled() -> bool:
+    from sglang.srt.layers.moe.expert_stream import expert_streaming_enabled
+
+    return expert_streaming_enabled()
+
+
+def _iter_streamed_nvfp4_parameters(module: torch.nn.Module):
+    """Yield decoder ModelOpt NVFP4 expert tensors eligible for streaming."""
+    for submodule in module.modules():
+        quant_method = getattr(submodule, "quant_method", None)
+        if type(quant_method).__name__ != "ModelOptNvFp4FusedMoEMethod":
+            continue
+
+        missing = [
+            name
+            for name in NVFP4_OFFLOAD_PARAMETER_NAMES
+            if submodule._parameters.get(name) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "ModelOpt NVFP4 expert module is missing streamable parameters: "
+                + ", ".join(missing)
+            )
+        for name in NVFP4_OFFLOAD_PARAMETER_NAMES:
+            yield submodule._parameters[name]
+
 
 class BaseOffloader(ABC):
     def wrap_modules(
@@ -96,6 +132,47 @@ class OffloaderV1(BaseOffloader):
         return [self.maybe_offload_to_cpu(module) for module in all_modules_generator]
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
+        if _expert_streaming_enabled():
+            parameters = list(_iter_streamed_nvfp4_parameters(module))
+            if not parameters:
+                return module
+
+            required_bytes = sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in parameters
+            )
+            remaining_bytes = self._cpu_offload_max_bytes - self._cpu_offload_bytes
+            if required_bytes > remaining_bytes:
+                raise RuntimeError(
+                    "--cpu-offload-gb cannot fit a complete ModelOpt NVFP4 expert "
+                    f"module: requires {required_bytes} bytes with "
+                    f"{max(remaining_bytes, 0)} bytes remaining"
+                )
+            if not is_pin_memory_available():
+                raise RuntimeError(
+                    "ModelOpt NVFP4 expert streaming requires pinned CPU memory"
+                )
+
+            for parameter in parameters:
+                cpu_data = torch.empty_strided(
+                    size=parameter.data.size(),
+                    stride=parameter.data.stride(),
+                    dtype=parameter.data.dtype,
+                    layout=parameter.data.layout,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                cpu_data.copy_(parameter.data)
+                parameter.data = cpu_data
+            self._cpu_offload_bytes += required_bytes
+            logger.info(
+                "[offloader] pinned %.1f MiB of ModelOpt NVFP4 expert tensors "
+                "(total %.1f MiB)",
+                required_bytes / 1024**2,
+                self._cpu_offload_bytes / 1024**2,
+            )
+            return module
+
         if (params := next(module.parameters(), None)) is None:
             return module
 
