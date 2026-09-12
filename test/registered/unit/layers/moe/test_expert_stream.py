@@ -4,6 +4,13 @@ import warnings
 import torch
 
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    BreakableCUDAGraph,
+    BreakableCUDAGraphCapture,
+    enable_breakable_cuda_graph,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
@@ -11,6 +18,20 @@ register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
 
 class _Layer(torch.nn.Module):
     pass
+
+
+class _StreamedFusedMoEHarness(FusedMoE):
+    def __init__(self, streamer):
+        torch.nn.Module.__init__(self)
+        self._nvfp4_expert_streamer = streamer
+        self._use_ascend_fuseep = False
+
+    def forward_impl(self, hidden_states, topk_output, pre_quant_input=None):
+        compact_ids, streamed_tensors = self._nvfp4_expert_streamer.gather(
+            topk_output.topk_ids
+        )
+        selected_rows = streamed_tensors["host_rows"][compact_ids.long()]
+        return hidden_states + selected_rows.reshape_as(hidden_states)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -106,6 +127,35 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertTrue(
             torch.equal(tensors["host_rows"].cpu(), layer.host_rows[expected_ids])
         )
+
+    def test_breakable_graph_replays_streamed_host_rows_for_new_routes(self):
+        layer = _Layer()
+        layer.host_rows = torch.nn.Parameter(
+            torch.tensor([[1.0], [3.0], [5.0], [7.0]]), requires_grad=False
+        )
+        model = _StreamedFusedMoEHarness(ExpertStreamer(layer, ("host_rows",)))
+        hidden_states = torch.zeros((1, 2), device="cuda")
+        topk_ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        topk_output = StandardTopKOutput(
+            torch.ones((1, 2), device="cuda"),
+            topk_ids,
+            torch.empty((1, 4), device="cuda"),
+        )
+        output = torch.empty_like(hidden_states)
+        graph = BreakableCUDAGraph()
+        stream = torch.cuda.Stream()
+
+        with (
+            enable_breakable_cuda_graph(),
+            BreakableCUDAGraphCapture(graph, stream=stream),
+        ):
+            output.copy_(model(hidden_states, topk_output))
+
+        topk_ids.copy_(torch.tensor([[2, 3]], device="cuda", dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(output, torch.tensor([[5.0, 7.0]], device="cuda"))
 
     def test_hot_cache_handles_pinned_and_cuda_sources(self):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache

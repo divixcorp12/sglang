@@ -66,6 +66,10 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
@@ -1537,6 +1541,24 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
+    def _forward_streamed_experts_eager_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
+        return self.forward_impl(
+            hidden_states,
+            StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            pre_quant_input=pre_quant_input,
+        )
+
+    forward_streamed_experts_eager = eager_on_graph(True)(
+        _forward_streamed_experts_eager_impl
+    )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1547,6 +1569,19 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if (
+            is_in_breakable_cuda_graph()
+            and getattr(self, "_nvfp4_expert_streamer", None) is not None
+        ):
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            return self.forward_streamed_experts_eager(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                pre_quant_input=pre_quant_input,
+            )
+
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
