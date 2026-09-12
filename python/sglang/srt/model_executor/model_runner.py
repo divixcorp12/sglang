@@ -719,6 +719,7 @@ class ModelRunner:
             min_residence_forwards=envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get(),
             benefit_ratio=envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get(),
             log_interval=envs.SGLANG_MOE_HOT_LOG_INTERVAL.get(),
+            metrics_path=envs.SGLANG_MOE_HOT_METRICS_FILE.get() or None,
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:
