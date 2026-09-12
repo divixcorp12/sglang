@@ -571,7 +571,10 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     )
 
 
-def swizzle_blockscale(scale: torch.Tensor):
+def swizzle_blockscale(
+    scale: torch.Tensor,
+    target_device: Optional[Union[torch.device, str]] = None,
+):
     """
     Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
     """
@@ -595,7 +598,9 @@ def swizzle_blockscale(scale: torch.Tensor):
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().to(scale.device)
+    swizzled_scale = swizzled_scale.contiguous().to(
+        scale.device if target_device is None else target_device
+    )
     return (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2

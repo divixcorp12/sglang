@@ -19,6 +19,11 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.expert_stream import (
+    NVFP4_STREAM_TENSORS,
+    ExpertStreamer,
+    expert_streaming_enabled,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -864,6 +869,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules = quantization_section.get("exclude_modules")
             quantized_layers = quantization_section.get("quantized_layers", {})
 
+        exclude_modules = list(exclude_modules or [])
+
         if quant_algo != "MIXED_PRECISION":
             raise ValueError(
                 "ModelOptMixedPrecisionConfig only supports MIXED_PRECISION checkpoints."
@@ -986,8 +993,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+            candidates.append("model." + prefix[len("model.language_model.") :])
+        elif prefix.startswith("model."):
+            candidates.append("model.language_model." + prefix[len("model.") :])
 
         return tuple(dict.fromkeys(candidates))
+
+    def resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        return self._resolve_quant_algo(prefix)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -1008,7 +1021,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo == "FP8_PB_WO":
+            if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
                 return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
@@ -1034,9 +1047,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
         if isinstance(layer, FusedMoE):
             if self.is_layer_excluded(prefix):
+                # Falls back to default unquantized MoE
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo == "FP8_BLOCK_SCALES":
+                return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
@@ -1743,7 +1759,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         weight = ModelWeightParameter(
             data=torch.empty(
-                # 2 fp4 data is packed in one uint8 in the input dimension
                 output_size_per_partition,
                 input_size_per_partition // 2,
                 dtype=torch.uint8,
@@ -2092,6 +2107,14 @@ def deinterleave_w13(weight: torch.Tensor, *, up_first: bool = False) -> torch.T
         # Flip each [gate, up] pair to [up, gate] before the block transpose.
         grouped = grouped.flip(-2)
     return grouped.transpose(-3, -2).reshape_as(weight).contiguous()
+
+
+def _validate_streamed_host_parameter(layer: torch.nn.Module, name: str) -> None:
+    parameter = getattr(layer, name)
+    if parameter.device.type != "cpu":
+        raise RuntimeError(f"streamed expert tensor {name!r} must remain on CPU")
+    if not parameter.is_contiguous():
+        raise RuntimeError(f"streamed expert tensor {name!r} must remain contiguous")
 
 
 class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
@@ -2516,16 +2539,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        stream_experts = (
+            expert_streaming_enabled() and layer.w13_weight.device.type == "cpu"
+        )
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
             up_first = self.enable_flashinfer_trtllm_moe
-            layer.w13_weight.data = deinterleave_w13(
-                layer.w13_weight.data, up_first=up_first
-            )
-            layer.w13_weight_scale.data = deinterleave_w13(
+            w13_weight = deinterleave_w13(layer.w13_weight.data, up_first=up_first)
+            w13_weight_scale = deinterleave_w13(
                 layer.w13_weight_scale.data, up_first=up_first
             )
+            if stream_experts:
+                copy_or_rebind_param(layer, "w13_weight", w13_weight)
+                copy_or_rebind_param(layer, "w13_weight_scale", w13_weight_scale)
+            else:
+                layer.w13_weight.data = w13_weight
+                layer.w13_weight_scale.data = w13_weight_scale
             layer._w13_deinterleaved = True
 
         # GEMM1 scale processing is deferred until the input scale is known;
@@ -2778,7 +2808,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
             # Process w13 weights
-            w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
+            swizzle_device = "cpu" if stream_experts else None
+            w13_blockscale_swizzled = swizzle_blockscale(
+                layer.w13_weight_scale, target_device=swizzle_device
+            )
             alias_or_bind_derived_param(
                 layer,
                 "w13_weight_scale",
@@ -2819,7 +2852,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
             # Process w2 weights
-            w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
+            w2_blockscale_swizzled = swizzle_blockscale(
+                layer.w2_weight_scale, target_device=swizzle_device
+            )
             alias_or_bind_derived_param(
                 layer,
                 "w2_weight_scale",
@@ -2872,6 +2907,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
+
+        if stream_experts:
+            self._attach_expert_streamer(layer)
+
+    def _attach_expert_streamer(self, layer: torch.nn.Module) -> None:
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if not moe_runner_backend.is_flashinfer_cutlass():
+            raise RuntimeError(
+                "ModelOpt NVFP4 expert streaming requires "
+                "--moe-runner-backend flashinfer_cutlass"
+            )
+        if layer.moe_tp_size != 1:
+            raise RuntimeError("ModelOpt NVFP4 expert streaming requires TP size 1")
+        if layer.moe_ep_size != 1:
+            raise RuntimeError("ModelOpt NVFP4 expert streaming requires EP size 1")
+        if not get_moe_a2a_backend().is_none():
+            raise RuntimeError(
+                "ModelOpt NVFP4 expert streaming requires --moe-a2a-backend none"
+            )
+        for name in NVFP4_STREAM_TENSORS[:4]:
+            _validate_streamed_host_parameter(layer, name)
+        layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -3082,21 +3141,69 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            streamer = getattr(layer, "_nvfp4_expert_streamer", None)
+            streamed_tensors = None
+            if streamer is not None:
+                from sglang.srt.layers.moe.token_dispatcher.standard import (
+                    StandardDispatchOutput,
+                )
+                from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+                if not isinstance(
+                    dispatch_output, StandardDispatchOutput
+                ) or not isinstance(dispatch_output.topk_output, StandardTopKOutput):
+                    raise RuntimeError(
+                        "ModelOpt NVFP4 expert streaming requires standard top-k dispatch"
+                    )
+                compact_ids, streamed_tensors = streamer.gather(
+                    dispatch_output.topk_output.topk_ids
+                )
+                compact_topk_output = dispatch_output.topk_output._replace(
+                    topk_ids=compact_ids
+                )
+                dispatch_output = dispatch_output._replace(
+                    topk_output=compact_topk_output
+                )
+
             assert not moe_runner_config.apply_router_weight_on_input, (
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
+                w13_weight=(
+                    streamed_tensors["w13_weight"]
+                    if streamed_tensors is not None
+                    else layer.w13_weight
+                ),
+                w2_weight=(
+                    streamed_tensors["w2_weight"]
+                    if streamed_tensors is not None
+                    else layer.w2_weight
+                ),
                 output_dtype=torch.bfloat16,
                 quant_scales=[
                     layer.w13_input_scale_quant,
-                    layer.w13_blockscale_swizzled,
-                    layer.g1_alphas,
+                    (
+                        streamed_tensors["w13_blockscale_swizzled"]
+                        if streamed_tensors is not None
+                        else layer.w13_blockscale_swizzled
+                    ),
+                    (
+                        streamed_tensors["g1_alphas"]
+                        if streamed_tensors is not None
+                        else layer.g1_alphas
+                    ),
                     layer.w2_input_scale_quant,
-                    layer.w2_blockscale_swizzled,
-                    layer.g2_alphas,
+                    (
+                        streamed_tensors["w2_blockscale_swizzled"]
+                        if streamed_tensors is not None
+                        else layer.w2_blockscale_swizzled
+                    ),
+                    (
+                        streamed_tensors["g2_alphas"]
+                        if streamed_tensors is not None
+                        else layer.g2_alphas
+                    ),
                 ],
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,

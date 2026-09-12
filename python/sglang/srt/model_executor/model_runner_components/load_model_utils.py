@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import os
 import socket
@@ -49,6 +50,25 @@ _is_npu = is_npu()
 
 
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
+def _qwen4_exp_ple_cache_identity(
+    *, model_config: ModelConfig, server_args: Any
+) -> str:
+    """Return a stable identity for a file-backed PLE table."""
+    model_path = os.path.realpath(
+        os.path.expanduser(str(model_config.model_path or server_args.model_path))
+    )
+    hf_config = model_config.hf_config
+    text_config = model_config.hf_text_config
+    identity = {
+        "model_path": model_path,
+        "revision": getattr(model_config, "revision", None)
+        or getattr(server_args, "revision", None),
+        "commit_hash": getattr(hf_config, "_commit_hash", None)
+        or getattr(text_config, "_commit_hash", None),
+    }
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
@@ -275,6 +295,27 @@ def load_model_with_memory_saver(
             )
         if is_qwen4_exp:
             model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
+            offload = get_exec().offload
+            model_config.hf_text_config.ple_offload_backend = (
+                offload.ple_offload_backend
+            )
+            if offload.ple_offload_backend == "file":
+                from sglang.srt.models.qwen4_exp_ple_table import (
+                    check_file_backend_supported,
+                    default_ple_table_dir,
+                )
+
+                model_config.hf_text_config.ple_offload_dir = (
+                    offload.ple_offload_dir
+                    or default_ple_table_dir(model_config.model_path)
+                )
+                model_config.hf_text_config.ple_offload_cache_identity = (
+                    _qwen4_exp_ple_cache_identity(
+                        model_config=model_config, server_args=get_model()
+                    )
+                )
+                if ple_offload_embedding and device == "cuda":
+                    check_file_backend_supported(gpu_id)
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup

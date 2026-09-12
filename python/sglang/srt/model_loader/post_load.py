@@ -155,7 +155,9 @@ def stage_module_for_post_load(
 
     try:
         for state in tensor_states.values():
-            if state.origin != process_device:
+            if state.origin != process_device and not getattr(
+                state.tensor, "_sglang_skip_device_loading", False
+            ):
                 state.staged_data = state.tensor.data.to(process_device)
                 state.tensor.data = state.staged_data
         yield module

@@ -879,6 +879,22 @@ class ExecOffload(msgspec.Struct):
         ),
     ] = None
 
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE table. 'pinned' uses "
+            "CPU pinned memory. 'file' maps a persistent table under "
+            "--ple-offload-dir; discrete GPUs stage selected rows through "
+            "bounded pinned buffers.",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        "Directory for persistent file-backed Qwen4 PLE tables. Defaults to "
+        "a model-specific directory under SGLANG_QWEN4_PLE_FILE_DIR.",
+    ] = None
+
 
 class ExecDllm(msgspec.Struct):
     """Namespace ``exec.dllm``."""

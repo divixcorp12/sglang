@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -25,16 +26,23 @@ _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
 def handle_offload_compatibility(server_args: Any) -> None:
-    """Flag-only check; re-run after the model overrides fill in the PLE default."""
+    """Validate generic, selected-expert, and PLE offload combinations."""
     cfg = resolving_view(server_args)
-    if cfg.ple_offload_embedding and (
-        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
-    ):
+    streaming = os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
+    if cfg.ple_offload_embedding and cfg.offload_group_size > 0:
         raise ValueError(
             "--ple-offload-embedding cannot be combined with "
-            "--cpu-offload-gb or --offload-group-size: generic layer offload "
-            "would stage the pinned PLE embedding back to the device."
+            "--offload-group-size: grouped layer offload would stage the "
+            "PLE embedding back to the device."
         )
+    if cfg.ple_offload_embedding and cfg.cpu_offload_gb > 0 and not streaming:
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with --cpu-offload-gb "
+            "unless SGLANG_MOE_EXPERT_STREAM=1 limits offload to ModelOpt "
+            "NVFP4 routed experts."
+        )
+    if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
+        raise ValueError("--ple-offload-backend file requires --ple-offload-embedding")
 
 
 def handle_gpu_memory_settings(server_args: Any, gpu_mem):
