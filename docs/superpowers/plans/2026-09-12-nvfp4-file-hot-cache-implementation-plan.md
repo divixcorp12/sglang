@@ -21,7 +21,7 @@
 - Keep `ModelOptNvFp4FusedMoEMethod.apply()` and the FlashInfer CUTLASS quant-info contract unchanged.
 - Start with `SGLANG_MOE_HOT_GPU_MB=4096`. The 31.4-GiB GPU must retain headroom for approximately 1.22 GiB of transient compact expert staging and the configured KV/Mamba pools.
 - Use focused unit and restart-lifecycle tests. Do not run the production server during implementation tasks.
-- Defer transfer overlap, `O_DIRECT`/`io_uring`, and CUDA VMM to later measured phases.
+- Defer `O_DIRECT`/`io_uring` and CUDA VMM to later measured phases. Transfer overlap begins only after the synchronous pinned-host path and its phase-aware metrics are correct.
 
 ---
 
@@ -625,3 +625,56 @@ Populate the result document with commands, commit, hardware, cache identity, co
 git add docs/superpowers/results/2026-09-12-nvfp4-file-hot-cache-results.md
 git commit -m "docs: record NVFP4 expert cache results"
 ```
+
+---
+
+## Phase 2: Phase-Aware Pinned Residency and Prefetch
+
+These tasks incorporate the useful parts of DuoServe-MoE without adopting its vLLM runtime, Top-k-sized GPU cache, or dense predictor. The existing GPU hot tier remains authoritative, ModelOpt NVFP4 tensors stay in their FlashInfer CUTLASS runtime layout, and every speculative transfer must preserve a synchronous corrective path after the real router result is known.
+
+### Task 10: Route GPU hot-cache misses through the pinned-host expert cache
+
+- [ ] Make `ExpertStreamer.gather()` resolve sources in this order: GPU hot slot, `ExpertPinnedHostCache`, then verified file-backed mapping.
+- [ ] Populate/admit pinned entries only from file-backed misses; never reread the file for a pinned hit.
+- [ ] Keep cache-slot pinning and eviction safe for every tensor that forms one NVFP4 expert (`w13`, `w2`, block scales, and required global/input scales).
+- [ ] Preserve the anonymous host path when persistent expert files are disabled.
+- [ ] Add focused mixed-hit tests covering GPU+pinned+file sources in one routed set.
+
+### Task 11: Use SGLang's existing device-side host-row gather path
+
+- [ ] Reuse `_gather_host_rows_kernel` for pinned-cache hits so the decode hot path does not execute CPU `torch.index_select`.
+- [ ] Batch the required rows for each runtime tensor into the existing compact staging buffers.
+- [ ] Keep a correct fallback for unsupported tensor layouts and make fallback use visible in metrics.
+- [ ] Verify stream/event ownership and non-blocking H2D behavior without changing the FlashInfer CUTLASS quant-info contract.
+- [ ] Add focused tests proving pinned hits avoid the CPU row-selection path.
+
+### Task 12: Collect phase-aware placement and cache statistics
+
+- [ ] Reuse SGLang's existing expert-distribution recorder and `ForwardBatch` classification; do not introduce a second router histogram.
+- [ ] Split counters into prefill, decode, and speculative/verification traffic.
+- [ ] Record per-layer requested experts, GPU hits, pinned hits, pinned misses, file fallbacks, pinned admissions/evictions, bytes by source, transfer wait time, and gather-fallback use.
+- [ ] Write periodic expert-cache traces only to the configured metrics file, not normal server stdout.
+- [ ] Persist enough route popularity and adjacent-layer affinity data to seed the next task's sparse policy.
+
+### Task 13: Add conservative asynchronous next-layer expert prefetch
+
+- [ ] Start with a sparse policy based on measured per-layer popularity and adjacent-layer affinity; do not add DuoServe's dense seven-layer MLP.
+- [ ] Predict a bounded candidate set for layer `L+1` from layer `L`'s actual routed experts and historical counts.
+- [ ] Prefetch only candidates absent from the GPU hot tier, using a dedicated CUDA stream and explicit events while protecting currently locked hot slots.
+- [ ] Preserve synchronous correction after the actual next-layer router output; a bad prediction must affect performance only, never outputs.
+- [ ] Track prediction precision/recall, useful and wasted bytes, cache pollution/evictions, overlap achieved, and exposed transfer stall.
+- [ ] Default the feature off and reject it when the synchronous pinned path or supported single-request NVFP4 envelope is unavailable.
+
+### Task 14: Add a dedicated prefill ping-pong execution path
+
+- [ ] Treat prefill separately because its union of routed experts is much denser than decode.
+- [ ] Group tokens by actual routed expert, double-buffer compact NVFP4 expert slots, and overlap transfer of expert `N+1` with computation of expert `N` using explicit CUDA events.
+- [ ] Retain the larger persistent GPU hot tier rather than replacing it with DuoServe's Top-k-only cache.
+- [ ] Benchmark against synchronous grouped prefill and retain only when TTFT improves without changing outputs.
+
+### Task 15: Evaluate a learned sparse predictor only if measured stalls justify it
+
+- [ ] First prove that prediction misses and exposed H2D waits remain material after Tasks 10-14.
+- [ ] If justified, train a compact sparse/top-candidate predictor from recorded routes; never flatten a full 512-by-512 affinity matrix into a dense first layer.
+- [ ] Bound predictor VRAM, inference latency, candidate count, and wasted-transfer budget through configuration.
+- [ ] Compare against popularity-only and affinity-table baselines and keep the learned predictor only when end-to-end decode latency improves reproducibly.
