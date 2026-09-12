@@ -671,10 +671,21 @@ class HotCacheConfigurationTests(unittest.TestCase):
             SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS=8,
             SGLANG_MOE_HOT_BENEFIT_RATIO=1.0,
             SGLANG_MOE_HOT_LOG_INTERVAL=100,
+            SGLANG_MOE_PREFETCH_MAX_CANDIDATES=0,
         )
         for name, value in expected.items():
             with self.subTest(name=name):
                 self.assertEqual(getattr(envs, name).get(), value)
+
+    def test_prefetch_requires_the_complete_single_request_cache_envelope(self):
+        os.environ["SGLANG_MOE_PREFETCH_MAX_CANDIDATES"] = "1"
+        with self.assertRaisesRegex(ValueError, "hot GPU and pinned host"):
+            memory_hook.handle_offload_compatibility(self.args())
+        self.enable()
+        with self.assertRaisesRegex(ValueError, "hot GPU and pinned host"):
+            memory_hook.handle_offload_compatibility(self.args())
+        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "1"
+        memory_hook.handle_offload_compatibility(self.args())
 
     def test_hot_cache_requires_streaming(self):
         os.environ["SGLANG_MOE_HOT_GPU_MB"] = "1"
@@ -893,7 +904,12 @@ class HotCacheStartupTests(unittest.TestCase):
                         side_effect=lambda **kw: events.append("topk"),
                     )
                 )
-                manager = SimpleNamespace(on_expert_distribution=lambda *args: None)
+                manager = SimpleNamespace(
+                    on_expert_distribution=lambda *args: None,
+                    enable_next_layer_prefetch=lambda candidates: events.append(
+                        ("prefetch", candidates)
+                    ),
+                )
 
                 def allocate(model, **options):
                     self.assertIs(model, runner.model)
@@ -930,6 +946,8 @@ class HotCacheStartupTests(unittest.TestCase):
                 observer.return_value.register_forward_observer.assert_called_once_with(
                     manager.on_expert_distribution
                 )
+
+                self.assertIn(("prefetch", 0), events)
 
     def test_zero_budget_skips_manager_creation_and_recorder_registration(self):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager

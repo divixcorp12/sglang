@@ -128,6 +128,67 @@ class ExpertHotCache:
             len(promoted), len(evicted), len(promoted) * self.bytes_per_expert
         )
 
+    def prefetch_destinations(
+        self, candidates: Sequence[int], protected_slots: Sequence[int]
+    ) -> tuple[tuple[int, int], ...]:
+        """Select stable unprotected victim slots for speculative admissions."""
+        protected = {index(slot) for slot in protected_slots}
+        if any(slot < 0 or slot >= self.capacity for slot in protected):
+            raise ValueError("protected hot cache slot is outside capacity")
+        existing = set(self.slot_to_expert) - {-1}
+        pending = []
+        for expert_id in candidates:
+            expert_id = index(expert_id)
+            if expert_id in existing or expert_id in pending:
+                continue
+            if expert_id < 0 or expert_id >= self.streamer.num_experts:
+                raise ValueError("hot cache expert ID is outside the expert range")
+            pending.append(expert_id)
+        writable = [slot for slot in range(self.capacity) if slot not in protected]
+        writable.sort(key=lambda slot: (self.slot_to_expert[slot] >= 0, slot))
+        return tuple(zip(pending, writable))
+
+    def assign_prefetch(
+        self, placements: Sequence[tuple[int, int]]
+    ) -> HotCacheUpdateStats:
+        """Copy speculative rows into destinations selected before stream launch."""
+        assignments = tuple((index(expert), index(slot)) for expert, slot in placements)
+        if len({expert for expert, _ in assignments}) != len(assignments):
+            raise ValueError("hot cache expert IDs must be unique")
+        if len({slot for _, slot in assignments}) != len(assignments):
+            raise ValueError("hot cache destination slots must be unique")
+        if any(
+            expert < 0
+            or expert >= self.streamer.num_experts
+            or slot < 0
+            or slot >= self.capacity
+            for expert, slot in assignments
+        ):
+            raise ValueError("hot cache prefetch placement is outside capacity")
+        current = list(self.slot_to_expert)
+        existing = set(current) - {-1}
+        if any(expert in existing for expert, _ in assignments):
+            raise ValueError("hot cache prefetch must not replace a resident expert")
+        evictions = sum(current[slot] >= 0 for _, slot in assignments)
+        for expert, slot in assignments:
+            source_ids = torch.tensor([expert], dtype=torch.long, device=self.device)
+            outputs = {
+                name: tensor[slot : slot + 1] for name, tensor in self.tensors.items()
+            }
+            self.streamer._copy_source_rows(source_ids, outputs)
+            current[slot] = expert
+        mapping = [-1] * self.streamer.num_experts
+        for slot, expert in enumerate(current):
+            if expert >= 0:
+                mapping[expert] = slot
+        self.expert_to_slot.copy_(
+            torch.tensor(mapping, dtype=torch.long, device=self.device)
+        )
+        self.slot_to_expert[:] = current
+        return HotCacheUpdateStats(
+            len(assignments), evictions, len(assignments) * self.bytes_per_expert
+        )
+
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return slot IDs (-1 for misses) and a hit mask for valid expert IDs."""
         if source_ids.device != self.device:
@@ -366,23 +427,27 @@ class ExpertHotCacheManager:
                 candidates = policy.predict(
                     source_ids.tolist(), popularity, affinity, resident
                 )
-                if not candidates:
+                placements = cache.prefetch_destinations(
+                    candidates, coordinator.protected_slots
+                )
+                if not placements:
                     return
+                predicted = tuple(expert for expert, _ in placements)
+                destination_slots = tuple(slot for _, slot in placements)
 
-                def submit(predicted):
-                    desired = list(predicted) + [
-                        expert
-                        for expert in cache.slot_to_expert
-                        if expert not in predicted and expert >= 0
-                    ]
-                    update = cache.reassign(desired[: cache.capacity])
+                def submit(submitted):
+                    if submitted != predicted:
+                        raise ValueError("prefetch candidates changed after placement")
+                    update = cache.assign_prefetch(placements)
                     coordinator.record_placement(
                         cache_pollution_bytes=update.migration_bytes,
                         evictions=update.evicted_experts,
                     )
                     return update.migration_bytes
 
-                coordinator.launch(candidates, protected_slots=(), submit=submit)
+                coordinator.launch(
+                    predicted, protected_slots=destination_slots, submit=submit
+                )
 
             self.streamers[current_layer].next_layer_prefetch = schedule
 
@@ -493,6 +558,12 @@ class ExpertHotCacheManager:
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
                 result[mode][str(layer_id)] = row
+        coordinators = getattr(self, "prefetch_coordinators", {})
+        if coordinators:
+            result["prefetch"] = {
+                str(layer_id): coordinator.snapshot_stats()
+                for layer_id, coordinator in coordinators.items()
+            }
         return result
 
     def on_expert_distribution(

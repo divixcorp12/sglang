@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from operator import index
@@ -33,15 +32,19 @@ class SparseNextLayerPolicy:
         for (source, target), value in affinity.items():
             if source in routed and target not in resident and value > 0:
                 scores[index(target)] += float(value)
-        for expert_id, value in popularity.items():
-            if expert_id not in resident and expert_id not in scores and value > 0:
-                scores[index(expert_id)] = float(value)
-        return tuple(
+        selected = [
             expert_id
             for expert_id, _ in sorted(
                 scores.items(), key=lambda item: (-item[1], item[0])
             )[: self.max_candidates]
-        )
+        ]
+        for expert_id, value in popularity.items():
+            if len(selected) >= self.max_candidates:
+                break
+            expert_id = index(expert_id)
+            if expert_id not in resident and expert_id not in scores and value > 0:
+                selected.append(expert_id)
+        return tuple(selected)
 
 
 @dataclass
@@ -54,7 +57,6 @@ class ExpertPrefetchStats:
     cache_pollution_bytes: int = 0
     evictions: int = 0
     overlap_achieved: int = 0
-    exposed_wait_ns: int = 0
     event_wait_enqueues: int = 0
     synchronous_corrections: int = 0
 
@@ -115,14 +117,20 @@ class ExpertPrefetchCoordinator:
         predicted = tuple(dict.fromkeys(index(expert_id) for expert_id in candidates))
         if not predicted:
             return False
+        if self._inflight:
+            raise RuntimeError("cannot replace an unfinished expert prefetch")
         self.protect_slots(protected_slots)
-        if self._copy_stream is None:
-            submitted_bytes = submit(predicted)
-        else:
-            with torch.cuda.stream(self._copy_stream):
+        try:
+            if self._copy_stream is None:
                 submitted_bytes = submit(predicted)
-                assert self._ready_event is not None
-                self._ready_event.record(self._copy_stream)
+            else:
+                with torch.cuda.stream(self._copy_stream):
+                    submitted_bytes = submit(predicted)
+                    assert self._ready_event is not None
+                    self._ready_event.record(self._copy_stream)
+        except Exception:
+            self._protected_slots.clear()
+            raise
         self._inflight = predicted
         self._stats.predicted_experts += len(predicted)
         self._stats.submitted_bytes += int(submitted_bytes or 0)
@@ -132,11 +140,13 @@ class ExpertPrefetchCoordinator:
         """Order lookup after every inflight mutation, then unlock its slots."""
         if not self._inflight:
             return
-        if self._ready_event is not None and self.device is not None:
-            torch.cuda.current_stream(self.device).wait_event(self._ready_event)
-            self._stats.event_wait_enqueues += 1
-        self._inflight = ()
-        self._protected_slots.clear()
+        try:
+            if self._ready_event is not None and self.device is not None:
+                torch.cuda.current_stream(self.device).wait_event(self._ready_event)
+                self._stats.event_wait_enqueues += 1
+        finally:
+            self._inflight = ()
+            self._protected_slots.clear()
 
     def synchronous_correction(
         self,
@@ -152,6 +162,8 @@ class ExpertPrefetchCoordinator:
         self._stats.actual_experts += len(actual)
         self._stats.useful_experts += len(overlap)
         self._stats.wasted_experts += len(set(inflight) - set(actual))
+        if overlap:
+            self._stats.overlap_achieved += 1
         self._stats.synchronous_corrections += 1
 
     def record_placement(self, *, cache_pollution_bytes: int, evictions: int) -> None:

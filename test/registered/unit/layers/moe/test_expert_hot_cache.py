@@ -84,6 +84,17 @@ class TestExpertHotCache(unittest.TestCase):
         self.assertEqual(cache.data_ptrs(), pointers)
         self.assertEqual(cache.expert_to_slot.tolist(), [-1] * 8)
 
+    def test_prefetch_uses_only_unprotected_victims_and_clamps_to_capacity(self):
+        cache = self.cache_type(self.streamer, capacity=3)
+        cache.reassign([1, 2, 3])
+
+        placements = cache.prefetch_destinations([4, 5, 6], protected_slots={1, 2})
+
+        self.assertEqual(placements, ((4, 0),))
+        update = cache.assign_prefetch(placements)
+        self.assertEqual(cache.slot_to_expert, [4, 2, 3])
+        self.assertEqual((update.promoted_experts, update.evicted_experts), (1, 1))
+
     def test_all_hot_returns_fixed_slots_without_compact_assembly(self):
         cache = self.cache_type(self.streamer, capacity=2)
         cache.reassign([3, 7])
@@ -364,7 +375,9 @@ class TestExpertHotCacheManager(unittest.TestCase):
             self.assertEqual(counters["h2d_bytes"], 40)
             for _ in range(98):
                 self.observe(manager, counts)
-            with self.assertNoLogs("sglang.srt.layers.moe.expert_hot_cache", level="INFO"):
+            with self.assertNoLogs(
+                "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
+            ):
                 self.observe(manager, counts)
             trace.seek(0)
             logged = json.loads(trace.read().splitlines()[0])
@@ -376,7 +389,9 @@ class TestExpertHotCacheManager(unittest.TestCase):
                 dynamic=False, log_interval=2, metrics_path=trace.name
             )
             counts = [[0] * 4 for _ in range(3)]
-            with self.assertNoLogs("sglang.srt.layers.moe.expert_hot_cache", level="INFO"):
+            with self.assertNoLogs(
+                "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
+            ):
                 self.observe(manager, counts)
                 self.observe(manager, counts)
             trace.seek(0)
@@ -398,9 +413,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
         )
         speculative = records[1]["route_statistics"]["speculative"]
         self.assertEqual(speculative["popularity"]["0"], [[1, 8.0], [0, 2.0]])
-        self.assertEqual(
-            speculative["affinity"]["0->2"], [[1, 0, 24.0], [1, 2, 16.0]]
-        )
+        self.assertEqual(speculative["affinity"]["0->2"], [[1, 0, 24.0], [1, 2, 16.0]])
         counters = records[1]["counters"]["speculative"]["0"]
         self.assertIn("pinned_hits", counters)
         self.assertIn("file_fallbacks", counters)
