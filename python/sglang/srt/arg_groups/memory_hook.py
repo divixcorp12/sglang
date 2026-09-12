@@ -61,6 +61,8 @@ def handle_offload_compatibility(server_args: Any) -> None:
         raise ValueError("NVFP4 hot caching requires EP size 1")
     if cfg.moe_a2a_backend != "none":
         raise ValueError("NVFP4 hot caching requires --moe-a2a-backend none")
+    if cfg.enable_waterfill:
+        raise ValueError("NVFP4 hot caching does not support Waterfill")
     if not cfg.disable_overlap_schedule:
         raise ValueError("NVFP4 hot caching requires --disable-overlap-schedule")
     if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:

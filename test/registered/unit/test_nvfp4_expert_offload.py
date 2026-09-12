@@ -640,6 +640,8 @@ class HotCacheConfigurationTests(unittest.TestCase):
             ep_join_mode=None,
             enable_elastic_expert_backup=False,
             enable_eplb=False,
+            enable_waterfill=False,
+            ep_join_rank_offset=0,
             elastic_ep_initial_size=None,
             max_ep_size=None,
             cuda_graph_config=CudaGraphConfig(
@@ -698,6 +700,20 @@ class HotCacheConfigurationTests(unittest.TestCase):
                 ValueError, message
             ):
                 memory_hook.handle_offload_compatibility(self.args(**changes))
+
+    def test_waterfill_rejected_before_a2a_backend_resolution(self):
+        self.enable()
+        args = self.args(enable_waterfill=True, moe_a2a_backend="none")
+        with self.assertRaisesRegex(ValueError, "Waterfill"):
+            memory_hook.handle_offload_compatibility(args)
+        self.assertEqual(args.moe_a2a_backend, "none")
+        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "0"
+        memory_hook.handle_offload_compatibility(args)
+
+    def test_nonzero_ep_join_rank_offset_is_rejected(self):
+        self.enable()
+        with self.assertRaisesRegex(ValueError, "elastic EP"):
+            memory_hook.handle_offload_compatibility(self.args(ep_join_rank_offset=1))
 
     def test_every_routed_graph_phase_is_rejected(self):
         self.enable()
