@@ -8,6 +8,11 @@ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    BreakableCUDAGraph,
+    BreakableCUDAGraphCapture,
+    enable_breakable_cuda_graph,
+)
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPinnedHostEmbedding,
@@ -187,6 +192,138 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
     assert graph_five.data_ptr() != graph_three.data_ptr()
     assert set(layer._graph_prefetch_buffers) == {3, 5}
+
+
+def test_qwen4_ple_staged_prefetch_stays_on_primary_stream_during_bcg(monkeypatch):
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embed_dim = 7
+    layer._prefetch_state = None
+    layer._prefetch_stream = object()
+
+    lookup_ids = torch.tensor([[1], [3]], dtype=torch.int64, device="cuda")
+    prefetched = torch.empty(
+        (2, layer.ple_embed_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    gathered_on_stream = []
+    primary_stream = torch.cuda.current_stream().cuda_stream
+
+    def gather(input_ids, out):
+        gathered_on_stream.append(torch.cuda.current_stream().cuda_stream)
+        out.fill_(4)
+        return out
+
+    layer.ple_embedding = SimpleNamespace(
+        gather_dp_tokens=False,
+        ngram_heads=1,
+        compute_ngram_ids=lambda _: lookup_ids,
+        _prepare_embedding_lookup=lambda *_: (lookup_ids, "semantic_tokens"),
+        ngram_embedding=SimpleNamespace(
+            _file_row_stager=object(),
+            gather=gather,
+        ),
+    )
+    monkeypatch.setattr(layer, "_get_prefetch_buffer", lambda *_: prefetched)
+    monkeypatch.setattr(
+        qwen4_exp_module, "is_in_breakable_cuda_graph", lambda: True, raising=False
+    )
+
+    layer.start_prefetch(
+        SimpleNamespace(physical_tokens=2),
+        SimpleNamespace(input_ids=lookup_ids.reshape(-1)),
+    )
+
+    assert gathered_on_stream == [primary_stream]
+    assert layer._prefetch_state == (prefetched, "semantic_tokens", 2)
+    torch.testing.assert_close(prefetched, torch.full_like(prefetched, 4))
+
+
+def test_qwen4_ple_non_file_prefetch_keeps_side_stream_in_bcg(monkeypatch):
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embed_dim = 7
+    layer._prefetch_state = None
+    layer._prefetch_stream = torch.cuda.Stream()
+
+    lookup_ids = torch.tensor([[1], [3]], dtype=torch.int64, device="cuda")
+    prefetched = torch.empty(
+        (2, layer.ple_embed_dim), dtype=torch.bfloat16, device="cuda"
+    )
+
+    def gather(input_ids, out):
+        out.fill_(4)
+        return out
+
+    layer.ple_embedding = SimpleNamespace(
+        gather_dp_tokens=False,
+        ngram_heads=1,
+        compute_ngram_ids=lambda _: lookup_ids,
+        _prepare_embedding_lookup=lambda *_: (lookup_ids, "semantic_tokens"),
+        ngram_embedding=SimpleNamespace(gather=gather),
+    )
+    monkeypatch.setattr(layer, "_get_prefetch_buffer", lambda *_: prefetched)
+    monkeypatch.setattr(qwen4_exp_module, "is_in_breakable_cuda_graph", lambda: True)
+
+    layer.start_prefetch(
+        SimpleNamespace(physical_tokens=2),
+        SimpleNamespace(input_ids=lookup_ids.reshape(-1)),
+    )
+    torch.cuda.current_stream().wait_stream(layer._prefetch_stream)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(prefetched, torch.full_like(prefetched, 4))
+
+
+def test_qwen4_ple_staged_prefetch_replays_with_fresh_ids():
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embed_dim = 7
+    layer._prefetch_state = None
+    layer._prefetch_stream = object()
+    layer._graph_prefetch_buffers = {}
+    layer._eager_prefetch_buffer = None
+
+    source_ids = torch.tensor([1, 3], dtype=torch.int64, device="cuda")
+    prefetched = torch.empty(
+        (2, layer.ple_embed_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    output = torch.empty_like(prefetched)
+
+    def gather(input_ids, out):
+        out.copy_(input_ids.to(out.dtype).unsqueeze(-1).expand_as(out))
+        return out
+
+    layer.ple_embedding = SimpleNamespace(
+        gather_dp_tokens=False,
+        ngram_heads=1,
+        compute_ngram_ids=lambda _: source_ids.reshape(-1, 1) + 0,
+        _prepare_embedding_lookup=lambda ids, *_: (ids, "semantic_tokens"),
+        ngram_embedding=SimpleNamespace(
+            _file_row_stager=object(),
+            gather=gather,
+        ),
+    )
+    layer._get_prefetch_buffer = lambda *_: prefetched
+
+    graph = BreakableCUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with (
+        enable_breakable_cuda_graph(),
+        BreakableCUDAGraphCapture(graph, stream=capture_stream),
+    ):
+        layer.start_prefetch(
+            SimpleNamespace(physical_tokens=2),
+            SimpleNamespace(input_ids=source_ids),
+        )
+        output.copy_(prefetched)
+
+    source_ids.copy_(torch.tensor([5, 7], dtype=torch.int64, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert len(graph._break_fns) == 1
+    expected = torch.tensor([[5] * 7, [7] * 7], dtype=torch.bfloat16, device="cuda")
+    torch.testing.assert_close(output, expected)
 
 
 if __name__ == "__main__":

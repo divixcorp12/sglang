@@ -55,6 +55,10 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -1211,6 +1215,14 @@ class Qwen4ExpPLELayer(nn.Module):
             self._eager_prefetch_buffer = buffer
         return buffer[:lookup_tokens]
 
+    @eager_on_graph(True)
+    def _start_staged_file_prefetch(
+        self,
+        lookup_ids: torch.Tensor,
+        output_view: torch.Tensor,
+    ) -> None:
+        self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+
     def start_prefetch(
         self,
         batch: Optional[_PLEBatch],
@@ -1242,11 +1254,17 @@ class Qwen4ExpPLELayer(nn.Module):
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
-        stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
-        lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
+        if (
+            is_in_breakable_cuda_graph()
+            and getattr(offloaded_embedding, "_file_row_stager", None) is not None
+        ):
+            self._start_staged_file_prefetch(lookup_ids, output_view)
+        else:
+            stream = self._prefetch_stream
+            stream.wait_stream(torch.cuda.current_stream())
+            lookup_ids.record_stream(stream)
+            with torch.cuda.stream(stream):
+                offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
     def _consume_prefetched_embeddings(
