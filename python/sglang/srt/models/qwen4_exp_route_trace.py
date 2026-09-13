@@ -50,8 +50,17 @@ forwards, plus ``input_ids``, ``positions``, ``req_pool_indices``,
 manifest's ``forward_modes``), ``sequence``, ``accept_len`` (int32) and
 ``selected`` (int8). See :func:`_mtp_rows` for which rows are kept and how
 ``accept_len`` / ``selected`` are derived. The MTP trace closes when the target
-trace ends, or after ``4 * SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS`` rows; its manifest
-names the cause in ``closed_by``.
+trace ends, or after ``4 * SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS`` rows. Both
+speculative manifests name the cause in ``closed_by``: ``cap``, ``atexit`` or
+``abandoned`` for either writer, plus ``target_complete`` and
+``target_abandoned`` for the MTP writer; null after an explicit ``close()``.
+
+At interpreter exit one handler finalizes the speculative writers, target before
+draft. That is the only shutdown path: the unflushed target tail is written only
+if the process reaches ``atexit`` and the target close finishes before any
+SIGKILL (the launcher SIGKILLs the scheduler right after Ctrl-C). A SIGKILL first
+leaves the target manifest at ``complete: false``; ``complete: true`` means every
+recorded row was written.
 
 ``sequence`` is one process-wide counter shared by both traces and taken once
 per recorded forward, so sorting by it restores the interleaving of target and
@@ -479,11 +488,22 @@ class MoeRouteTraceWriter:
             self.close("cap")
 
     def flush(self) -> None:
-        """Write buffered tokens as one shard and refresh the manifest."""
+        """Write buffered tokens as one shard and refresh the manifest.
+
+        Rows beyond the committed token count are not written. :meth:`end_forward`
+        appends field by field, so its row-count ``RuntimeError`` (or a
+        ``KeyboardInterrupt``) partway through leaves the fields before it one
+        forward longer, and the exit close still flushes that buffer.
+        """
         if not self._buffered_tokens:
             return
         name = f"shard_{len(self._shards):05d}.pt"
-        shard = {field: torch.cat(parts) for field, parts in self._buffer.items()}
+        shard = {}
+        for field, parts in self._buffer.items():
+            tensor = torch.cat(parts)
+            if tensor.shape[0] > self._buffered_tokens:
+                tensor = tensor[: self._buffered_tokens].clone()
+            shard[field] = tensor
         path = os.path.join(self.directory, name)
         torch.save(shard, path + ".tmp")
         os.replace(path + ".tmp", path)
@@ -633,9 +653,10 @@ def install_moe_route_trace(
     """Attach the route trace to a Qwen4-Exp language model (``Qwen4ExpModel``).
 
     ``speculative`` traces target verify forwards with the reduced field set,
-    records ``speculative_settings`` (see :data:`SPECULATIVE_SETTINGS`) in the
-    manifest, and closes the sibling MTP trace (see
-    :func:`install_mtp_hidden_trace`) when done.
+    records ``speculative_settings`` (see :data:`SPECULATIVE_SETTINGS`) and
+    ``closed_by`` in the manifest, closes the sibling MTP trace (see
+    :func:`install_mtp_hidden_trace`) when done, and finalizes both at interpreter
+    exit, target first.
     """
     layers = _moe_layers(language_model)
     if not layers:
@@ -669,9 +690,13 @@ def install_moe_route_trace(
 
         def finish() -> None:
             trace.remove()
-            link.finish_target(
-                "target_abandoned" if writer.error is not None else "target_complete"
-            )
+            if writer.error is not None:
+                reason = "target_abandoned"
+            elif writer.closed_by == "atexit":
+                reason = "atexit"
+            else:
+                reason = "target_complete"
+            link.finish_target(reason)
 
         writer = MoeRouteTraceWriter(
             directory,
@@ -685,6 +710,7 @@ def install_moe_route_trace(
             token_fields=SPECULATIVE_TOKEN_FIELDS,
             records=_is_target_verify,
             shared_entries=(MTP_SUBDIR,),
+            record_closed_by=True,
         )
     else:
         writer = MoeRouteTraceWriter(
@@ -721,7 +747,7 @@ def install_moe_route_trace(
             None,
             lambda mixed: writer.record_forward("final_hidden", mixed),
         )
-        atexit.register(writer.close)
+        _register_exit_close(0, writer)
         logger.warning(
             "MoE route trace enabled for speculative verify: %d MoE layers, up to "
             "%d target tokens (~%.1f KiB each) under %s",
@@ -878,6 +904,33 @@ def _speculative_link(directory: str) -> _SpeculativeTraceLink:
     return _SPECULATIVE_LINKS[key]
 
 
+_EXIT_WRITERS: List[Tuple[int, MoeRouteTraceWriter]] = []
+
+
+def _close_speculative_writers(reason: str) -> None:
+    """Finalize every open speculative writer, target traces before MTP traces.
+
+    A writer whose close raises is logged and skipped so the others still close.
+    """
+    for _, writer in sorted(_EXIT_WRITERS, key=lambda entry: entry[0]):
+        try:
+            writer.close(reason)
+        except Exception:
+            logger.exception("Route trace under %s failed to close", writer.directory)
+
+
+def _register_exit_close(order: int, writer: MoeRouteTraceWriter) -> None:
+    """Finalize ``writer`` at exit in ``order`` (target 0, MTP 1).
+
+    A single exit handler closes all writers: separate ``atexit`` entries would
+    run last-registered first, i.e. the MTP trace before the target trace.
+    """
+    _EXIT_WRITERS[:] = [entry for entry in _EXIT_WRITERS if not entry[1].closed]
+    _EXIT_WRITERS.append((order, writer))
+    atexit.unregister(_close_speculative_writers)
+    atexit.register(_close_speculative_writers, "atexit")
+
+
 def install_mtp_hidden_trace(
     mtp_model: nn.Module,
     directory: str,
@@ -936,7 +989,7 @@ def install_mtp_hidden_trace(
             before_logits, with_kwargs=True
         )
     )
-    atexit.register(writer.close, "atexit")
+    _register_exit_close(1, writer)
     _speculative_link(directory).mtp_writers.append(writer)
     logger.warning(
         "MTP hidden trace enabled: up to %d draft rows under %s",

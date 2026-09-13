@@ -1,5 +1,6 @@
 """Tests for the debug-only Qwen4-Exp MoE route trace writer and hooks."""
 
+import atexit
 import enum
 import json
 import os
@@ -16,6 +17,17 @@ from sglang.srt.models import qwen4_exp_route_trace as route_trace
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def isolated_speculative_exit_state():
+    """Keep exit-close registrations and speculative links from leaking across tests."""
+    route_trace._EXIT_WRITERS.clear()
+    route_trace._SPECULATIVE_LINKS.clear()
+    yield
+    route_trace._EXIT_WRITERS.clear()
+    route_trace._SPECULATIVE_LINKS.clear()
+    atexit.unregister(route_trace._close_speculative_writers)
 
 HC = 2
 HIDDEN = 3
@@ -395,7 +407,7 @@ def test_speculative_trace_records_every_token_of_target_verify_forwards():
     assert manifest["complete"] and manifest["mode"] == "speculative"
     assert (manifest["tokens"], manifest["forwards"]) == (8, 2)
     assert {name: manifest[name] for name in SETTINGS} == SETTINGS
-    assert "closed_by" not in manifest
+    assert manifest["closed_by"] == "cap"
     assert manifest["layer_fields"] == {
         "topk_ids": "torch.int32",
         "topk_weights": "torch.float32",
@@ -780,6 +792,79 @@ def test_speculative_flag_installs_both_traces_from_the_environment():
     assert mtp_manifest["max_tokens"] == 8 and mtp_trace.writer.closed
     for manifest in (target_manifest, mtp_manifest):
         assert set(SETTINGS) <= set(manifest)
+
+
+def test_first_exit_handler_writes_the_target_tail_before_the_draft():
+    target, mtp = _LanguageModel(), _MtpModel()
+    registered = []
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(
+            route_trace.atexit,
+            "register",
+            side_effect=lambda func, *args: registered.append((func, args)),
+        ), patch.object(route_trace.atexit, "unregister"):
+            target_trace = route_trace.install_moe_route_trace(
+                target, directory, max_tokens=64, speculative=True
+            )
+            mtp_trace = route_trace.install_mtp_hidden_trace(
+                mtp, directory, max_tokens=64
+            )
+        _run(target, _verify_batch([1, 2, 3], [0, 1, 2], [0]))
+        _run_mtp(mtp, _spec_batch(_ForwardMode.DECODE, [4], [3], [0]))
+        first_at_exit, args = registered[-1]
+        first_at_exit(*args)
+        target_manifest, target_shards = _load(directory)
+        mtp_manifest, mtp_shards = _mtp_load(directory)
+
+    assert target_manifest["complete"] and target_manifest["closed_by"] == "atexit"
+    assert target_manifest["tokens"] == 3
+    assert target_shards[0]["input_ids"].tolist() == [1, 2, 3]
+    assert mtp_manifest["complete"] and mtp_manifest["closed_by"] == "atexit"
+    assert mtp_shards[0]["input_ids"].tolist() == [4]
+    assert target_trace.writer.closed and mtp_trace.writer.closed
+
+
+def test_exit_close_that_raises_still_closes_the_other_writers():
+    target, mtp = _LanguageModel(), _MtpModel()
+    with tempfile.TemporaryDirectory() as directory:
+        target_trace = route_trace.install_moe_route_trace(
+            target, directory, max_tokens=64, speculative=True
+        )
+        mtp_trace = route_trace.install_mtp_hidden_trace(mtp, directory, max_tokens=64)
+        _run(target, _verify_batch([1, 2], [0, 1], [0]))
+        _run_mtp(mtp, _spec_batch(_ForwardMode.DECODE, [3], [2], [0]))
+        with patch.object(
+            target_trace.writer, "flush", side_effect=RuntimeError("boom")
+        ), patch.object(route_trace.logger, "exception") as logged:
+            route_trace._close_speculative_writers("atexit")
+        mtp_manifest, mtp_shards = _mtp_load(directory)
+
+    assert logged.call_count == 1
+    assert not target_trace.writer.closed
+    assert mtp_trace.writer.closed and mtp_manifest["complete"]
+    assert mtp_manifest["closed_by"] == "atexit"
+    assert mtp_shards[0]["input_ids"].tolist() == [3]
+
+
+def test_a_forward_interrupted_mid_append_is_not_written():
+    with tempfile.TemporaryDirectory() as directory:
+        writer = route_trace.MoeRouteTraceWriter(
+            directory,
+            8,
+            [],
+            {},
+            layer_fields={},
+            forward_fields={},
+            token_fields=("input_ids",),
+            records=lambda forward_mode: True,
+        )
+        writer.begin_forward(_batch(token=1, position=0))
+        writer.end_forward()
+        writer._buffer["input_ids"].append(torch.tensor([9]))
+        writer.close()
+        _, (shard,) = _load(directory)
+
+    assert shard["input_ids"].tolist() == [1]
 
 
 def test_bytes_per_token_estimate_for_qwen38_flash():
