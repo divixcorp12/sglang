@@ -691,6 +691,69 @@ class RouteTraceConfigurationTests(unittest.TestCase):
             ):
                 memory_hook.handle_offload_compatibility(self.args(**changes))
 
+    def enable_speculative_trace(self):
+        self.enable_trace()
+        os.environ["SGLANG_MOE_ROUTE_TRACE_SPECULATIVE"] = "1"
+
+    def speculative_args(self, decode="disabled", **changes):
+        values = dict(
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+            disable_flashinfer_autotune=True,
+        )
+        values.update(changes)
+        return self.args(decode=decode, **values)
+
+    def test_speculative_trace_accepts_eager_nextn(self):
+        self.enable_speculative_trace()
+        for algorithm in ("NEXTN", "nextn"):
+            with self.subTest(algorithm=algorithm):
+                memory_hook.handle_offload_compatibility(
+                    self.speculative_args(speculative_algorithm=algorithm)
+                )
+
+    def test_speculative_nextn_requires_the_speculative_trace_flag(self):
+        self.assertFalse(envs.SGLANG_MOE_ROUTE_TRACE_SPECULATIVE.get())
+        self.enable_trace()
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE=1"):
+            memory_hook.handle_offload_compatibility(self.speculative_args())
+
+    def test_speculative_trace_rejects_other_draft_configurations(self):
+        self.enable_speculative_trace()
+        for changes, message in (
+            (dict(speculative_algorithm="EAGLE3"), "NEXTN"),
+            (dict(speculative_algorithm="EAGLE"), "NEXTN"),
+            (dict(speculative_algorithm=None), "NEXTN"),
+            (dict(speculative_eagle_topk=4), "speculative-eagle-topk 1"),
+            (dict(speculative_eagle_topk=None), "speculative-eagle-topk 1"),
+            (dict(disable_flashinfer_autotune=False), "disable-flashinfer-autotune"),
+            (dict(enable_torch_compile=True), "torch.compile"),
+            (dict(tp_size=2), "--tp 1"),
+        ):
+            with (
+                self.subTest(**changes),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                memory_hook.handle_offload_compatibility(
+                    self.speculative_args(**changes)
+                )
+
+    def test_speculative_trace_rejects_captured_draft_graphs(self):
+        self.enable_speculative_trace()
+        for backend in ("full", "breakable", "tc_piecewise"):
+            with self.subTest(decode=backend), self.assertRaisesRegex(
+                ValueError, "cuda-graph-backend-decode disabled"
+            ):
+                memory_hook.handle_offload_compatibility(
+                    self.speculative_args(decode=backend)
+                )
+            args = self.speculative_args()
+            args.cuda_graph_config.prefill.backend = backend
+            with self.subTest(prefill=backend), self.assertRaisesRegex(
+                ValueError, "cuda-graph-backend-prefill disabled"
+            ):
+                memory_hook.handle_offload_compatibility(args)
+
     def test_trace_rejects_nonpositive_token_budget(self):
         self.enable_trace()
         os.environ["SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS"] = "0"

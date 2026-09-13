@@ -65,9 +65,34 @@ def validate_moe_route_trace(cfg: Any) -> None:
             "SGLANG_MOE_ROUTE_TRACE_DIR requires --moe-runner-backend "
             "flashinfer_cutlass, whose TopK output carries topk_ids and topk_weights"
         )
-    if getattr(cfg, "speculative_algorithm", None) is not None:
+    speculative_algorithm = getattr(cfg, "speculative_algorithm", None)
+    if not envs.SGLANG_MOE_ROUTE_TRACE_SPECULATIVE.get():
+        if speculative_algorithm is not None:
+            raise ValueError(
+                "SGLANG_MOE_ROUTE_TRACE_DIR does not support speculative decoding "
+                "unless SGLANG_MOE_ROUTE_TRACE_SPECULATIVE=1 (NEXTN only)"
+            )
+        return
+    if speculative_algorithm is None or str(speculative_algorithm).upper() != "NEXTN":
         raise ValueError(
-            "SGLANG_MOE_ROUTE_TRACE_DIR does not support speculative decoding"
+            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE requires --speculative-algorithm NEXTN"
+        )
+    if getattr(cfg, "speculative_eagle_topk", None) != 1:
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE requires --speculative-eagle-topk 1: "
+            "verify rows must be one draft chain per request"
+        )
+    if not getattr(cfg, "disable_flashinfer_autotune", False):
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE requires --disable-flashinfer-autotune: "
+            "autotune warms the target up with a TARGET_VERIFY dummy forward the "
+            "trace would record"
+        )
+    if graph_config is not None and graph_config.prefill.backend != Backend.DISABLED:
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_SPECULATIVE needs an eager draft model; use "
+            "--cuda-graph-backend-prefill disabled (a breakable prefill backend "
+            "captures draft graphs)"
         )
 
 

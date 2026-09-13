@@ -343,6 +343,11 @@ class Envs:
     # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
     SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")
     SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS = EnvInt(2048)
+    # Ignored unless SGLANG_MOE_ROUTE_TRACE_DIR is set. Traces target verify forwards
+    # and MTP draft hidden states (<dir>/mtp) under eager NEXTN; startup requires
+    # --speculative-eagle-topk 1 passed explicitly, --cuda-graph-backend-prefill
+    # disabled and --disable-flashinfer-autotune.
+    SGLANG_MOE_ROUTE_TRACE_SPECULATIVE = EnvBool(False)
     # Model path recorded in expert/PLE file-cache identities instead of the
     # resolved --model-path; after moving a checkpoint, set it to the resolved
     # path the caches were built from.

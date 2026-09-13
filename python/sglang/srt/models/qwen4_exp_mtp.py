@@ -19,6 +19,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
+from sglang.srt.models.qwen4_exp_route_trace import maybe_install_mtp_hidden_trace
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -69,6 +70,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.mtp_hidden_trace = maybe_install_mtp_hidden_trace(self)
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
