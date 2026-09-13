@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import time
-from collections import defaultdict
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
@@ -663,12 +662,13 @@ class ExpertHotCacheManager:
         manager._counters["speculative"] = {
             layer_id: _OperationalCounters() for layer_id in streamers
         }
-        manager._route_popularity = {
-            mode: {layer_id: defaultdict(float) for layer_id in streamers}
-            for mode in manager._counters
+        manager._layer_ids = sorted(streamers)
+        manager._layer_positions = {
+            layer_id: position for position, layer_id in enumerate(manager._layer_ids)
         }
-        manager._route_affinity = {mode: {} for mode in manager._counters}
-        manager._last_graph_counters = {}
+        manager._layer_index = {}
+        manager._registers = {}
+        manager._graph_counters = None
         for layer_id, expert_ids in selected.items():
             if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -693,6 +693,7 @@ class ExpertHotCacheManager:
         for layer_id, rows in scratch_rows.items():
             if rows:
                 streamers[layer_id].enable_graph_gather(rows)
+        manager._share_graph_counters()
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -743,10 +744,7 @@ class ExpertHotCacheManager:
                 cache=cache,
                 coordinator=coordinator,
             ):
-                popularity = self._route_popularity["decode"][next_layer]
-                affinity = self._route_affinity["decode"].get(
-                    (current_layer, next_layer), {}
-                )
+                popularity, affinity = self._route_tables("decode", next_layer)
                 resident = cache.resident_experts()
                 candidates = policy.predict(
                     source_ids.tolist(), popularity, affinity, resident
@@ -800,57 +798,42 @@ class ExpertHotCacheManager:
         counters.copy_submissions += submission.submissions
         counters.copy_fallbacks += submission.fallbacks
 
-    def _graph_counter_deltas(
-        self, counts: torch.Tensor
-    ) -> dict[int, tuple[int, int, int]]:
-        """Requested rows, missed rows, and routed experts of graph gathers.
+    def _share_graph_counters(self) -> None:
+        """Point every graph gather's device counters into one manager buffer.
 
-        Replayed gathers run no Python, so they cannot update
-        ``last_gather_stats``; their device counters and each layer's distinct
-        routed-expert count are read here instead, in one transfer per forward.
+        Captured gathers add to these fixed rows during replay; the manager
+        moves them into phase registers each forward without reading them.
         """
-        layers = [
-            (layer_id, streamer.graph_counters)
-            for layer_id, streamer in self.streamers.items()
-            if streamer.graph_counters is not None
+        graph_streamers = [
+            (position, self.streamers[layer_id])
+            for position, layer_id in enumerate(self._layer_ids)
+            if self.streamers[layer_id].graph_counters is not None
         ]
-        if not layers:
-            return {}
-        device = layers[0][1].device
-        layer_ids = torch.tensor([layer_id for layer_id, _ in layers], device=counts.device)
-        unique_experts = (counts.index_select(0, layer_ids) != 0).sum(dim=1)
-        values = (
-            torch.cat(
-                [
-                    torch.stack([counters for _, counters in layers]),
-                    unique_experts.to(device=device, dtype=torch.int64).unsqueeze(1),
-                ],
-                dim=1,
-            )
-            .cpu()
-            .tolist()
+        if not graph_streamers:
+            return
+        device = graph_streamers[0][1].graph_counters.device
+        shared = torch.zeros(
+            (len(self._layer_ids), 2), dtype=torch.int64, device=device
         )
-        deltas = {}
-        for (layer_id, _), (requested, misses, unique) in zip(layers, values):
-            previous = self._last_graph_counters.get(layer_id, (0, 0))
-            self._last_graph_counters[layer_id] = (requested, misses)
-            deltas[layer_id] = (requested - previous[0], misses - previous[1], unique)
-        return deltas
+        for position, streamer in graph_streamers:
+            shared[position].copy_(streamer.graph_counters)
+            streamer.graph_counters = shared[position]
+        self._graph_counters = shared
 
     def discard_graph_capture_routes(self) -> None:
         """Drop routes and counters that CUDA-graph warmup and capture recorded.
 
         Captured gathers execute once while recording, so their dummy routes
-        land in the residency counts and graph counters like a real forward.
+        land in the residency counts, graph counters, and route registers like
+        a real forward.
         """
-        for layer_id, streamer in self.streamers.items():
-            if streamer.graph_counters is None:
-                continue
-            streamer.graph_counters.zero_()
-            self._last_graph_counters[layer_id] = (0, 0)
-            policy = self.residency_policies.get(layer_id)
-            if policy is not None:
-                policy.pending_counts.zero_()
+        if self._graph_counters is not None:
+            self._graph_counters.zero_()
+        for registers in self._registers.values():
+            for register in registers.values():
+                register.zero_()
+        for policy in self.residency_policies.values():
+            policy.pending_counts.zero_()
 
     @staticmethod
     def _pinned_cache_stats(streamer: ExpertStreamer) -> tuple[int, int]:
@@ -868,61 +851,122 @@ class ExpertHotCacheManager:
             return "prefill"
         return "decode"
 
-    @staticmethod
-    def _prune_counts(counts: defaultdict, limit: int) -> None:
-        if len(counts) <= limit:
-            return
-        retained = sorted(counts, key=lambda key: (-counts[key], key))[:limit]
-        for key in tuple(counts):
-            if key not in retained:
-                del counts[key]
+    def _registers_for(
+        self, phase: str, device: torch.device, experts: int
+    ) -> dict[str, torch.Tensor]:
+        registers = self._registers.get(phase)
+        if registers is None:
+            layers = len(self._layer_ids)
+            registers = {
+                "popularity": torch.zeros(
+                    (layers, experts), dtype=torch.float64, device=device
+                ),
+                "affinity": torch.zeros(
+                    (max(layers - 1, 0), experts, experts),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "unique_experts": torch.zeros(layers, dtype=torch.int64, device=device),
+                "graph_rows": torch.zeros((layers, 2), dtype=torch.int64, device=device),
+            }
+            self._registers[phase] = registers
+        return registers
 
-    def _record_route_statistics(self, phase: str, counts: torch.Tensor) -> None:
-        active = {}
-        for layer_id in self.streamers:
-            row = counts[layer_id].detach().to(device="cpu", dtype=torch.float64)
-            nonzero = torch.nonzero(row, as_tuple=False).flatten().tolist()
-            popularity = self._route_popularity[phase][layer_id]
-            for expert_id in nonzero:
-                popularity[int(expert_id)] += float(row[expert_id])
-            self._prune_counts(popularity, self.route_history_limit)
-            active[layer_id] = sorted(
-                nonzero, key=lambda expert_id: (-float(row[expert_id]), expert_id)
-            )[: self.route_history_limit]
-        layer_ids = sorted(active)
-        for previous, following in zip(layer_ids, layer_ids[1:]):
-            left = counts[previous].detach().to(device="cpu", dtype=torch.float64)
-            right = counts[following].detach().to(device="cpu", dtype=torch.float64)
-            affinity = self._route_affinity[phase].setdefault(
-                (previous, following), defaultdict(float)
+    def _accumulate_registers(
+        self, phase: str, counts: torch.Tensor, eager_gathered: list[bool]
+    ) -> None:
+        """Add this forward's routes and graph gather counts to device registers.
+
+        Nothing here reads a device value on the host, so decode forwards pay no
+        synchronization for metrics; registers are read only by snapshots.
+        """
+        device = (
+            self._graph_counters.device
+            if self._graph_counters is not None
+            else counts.device
+        )
+        registers = self._registers_for(phase, device, counts.shape[1])
+        index = self._layer_index.get(device)
+        if index is None:
+            index = torch.tensor(self._layer_ids, dtype=torch.long, device=device)
+            self._layer_index[device] = index
+        rows = counts.detach().to(device=device, non_blocking=True).index_select(0, index)
+        registers["popularity"].add_(rows)
+        if registers["affinity"].shape[0]:
+            routed = rows.to(torch.float32)
+            registers["affinity"].baddbmm_(
+                routed[:-1].unsqueeze(2), routed[1:].unsqueeze(1)
             )
-            for source_expert in active[previous]:
-                for target_expert in active[following]:
-                    affinity[(source_expert, target_expert)] += float(
-                        left[source_expert] * right[target_expert]
-                    )
-            self._prune_counts(affinity, self.route_history_limit)
+        gathered = torch.tensor(eager_gathered, dtype=torch.bool)
+        if device.type == "cuda":
+            gathered = gathered.pin_memory().to(device, non_blocking=True)
+        if self._graph_counters is not None:
+            gathered = gathered | (self._graph_counters[:, 0] > 0)
+            registers["graph_rows"].add_(self._graph_counters)
+            self._graph_counters.zero_()
+        registers["unique_experts"].add_(rows.ne(0).sum(dim=1) * gathered)
+
+    def _top_entries(self, matrix: torch.Tensor) -> list[list[tuple[int, float]]]:
+        """Nonzero top ``route_history_limit`` (index, value) pairs of each row."""
+        if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+            return [[] for _ in range(matrix.shape[0])]
+        values, indices = matrix.topk(min(self.route_history_limit, matrix.shape[1]))
+        entries = []
+        for row_values, row_indices in zip(values.cpu().tolist(), indices.cpu().tolist()):
+            row = [
+                (index, value)
+                for index, value in zip(row_indices, row_values)
+                if value > 0
+            ]
+            row.sort(key=lambda item: (-item[1], item[0]))
+            entries.append(row)
+        return entries
+
+    def _route_tables(
+        self, phase: str, next_layer: int
+    ) -> tuple[dict[int, float], dict[tuple[int, int], float]]:
+        """Popularity of ``next_layer`` and affinity from the layer before it."""
+        registers = self._registers.get(phase)
+        position = self._layer_positions[next_layer]
+        if registers is None or position == 0:
+            return {}, {}
+        experts = registers["popularity"].shape[1]
+        (popularity,) = self._top_entries(
+            registers["popularity"][position : position + 1]
+        )
+        (affinity,) = self._top_entries(
+            registers["affinity"][position - 1 : position].flatten(1)
+        )
+        return dict(popularity), {
+            (flat // experts, flat % experts): value for flat, value in affinity
+        }
 
     def snapshot_route_statistics(self) -> dict[str, dict[str, dict[str, list]]]:
+        """Top ``route_history_limit`` popularity and affinity entries per phase."""
         result = {}
+        pairs = list(zip(self._layer_ids, self._layer_ids[1:]))
         for phase in self._counters:
+            registers = self._registers.get(phase)
+            if registers is None:
+                result[phase] = {
+                    "popularity": {str(layer_id): [] for layer_id in self._layer_ids},
+                    "affinity": {},
+                }
+                continue
+            experts = registers["popularity"].shape[1]
             popularity = {
-                str(layer_id): [
-                    [int(expert_id), float(value)]
-                    for expert_id, value in sorted(
-                        values.items(), key=lambda item: (-item[1], item[0])
-                    )
-                ]
-                for layer_id, values in self._route_popularity[phase].items()
+                str(layer_id): [[index, value] for index, value in entries]
+                for layer_id, entries in zip(
+                    self._layer_ids, self._top_entries(registers["popularity"])
+                )
             }
             affinity = {
                 f"{source}->{target}": [
-                    [int(left), int(right), float(value)]
-                    for (left, right), value in sorted(
-                        values.items(), key=lambda item: (-item[1], item[0])
-                    )
+                    [flat // experts, flat % experts, value] for flat, value in entries
                 ]
-                for (source, target), values in self._route_affinity[phase].items()
+                for (source, target), entries in zip(
+                    pairs, self._top_entries(registers["affinity"].flatten(1))
+                )
             }
             result[phase] = {"popularity": popularity, "affinity": affinity}
         return result
@@ -942,10 +986,32 @@ class ExpertHotCacheManager:
     def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | None]]]:
         """Return JSON-compatible cumulative totals and current allocation gauges."""
         result = {}
+        register_totals = {
+            phase: torch.cat(
+                [registers["graph_rows"], registers["unique_experts"].unsqueeze(1)],
+                dim=1,
+            )
+            .cpu()
+            .tolist()
+            for phase, registers in self._registers.items()
+        }
         for mode, layers in self._counters.items():
             result[mode] = {}
+            totals = register_totals.get(mode)
             for layer_id, counters in layers.items():
                 row = asdict(counters)
+                if totals is not None:
+                    requested, missed, unique = totals[self._layer_positions[layer_id]]
+                    streamer = self.streamers[layer_id]
+                    row["requested_rows"] += requested
+                    row["miss_rows"] += missed
+                    row["hot_hits"] += requested - missed
+                    row["d2d_bytes"] += requested * (
+                        streamer.bytes_per_expert - streamer.host_bytes_per_expert
+                    )
+                    row["h2d_bytes"] += missed * streamer.host_bytes_per_expert
+                    row["backing_source_bytes"] += missed * streamer.bytes_per_expert
+                    row["requested_unique_experts"] += unique
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
                 result[mode][str(layer_id)] = row
@@ -980,74 +1046,60 @@ class ExpertHotCacheManager:
         self._forward_count += 1
         mode = self._phase(forward_batch)
         prefill = mode == "prefill"
-        self._record_route_statistics(mode, counts)
-        graph_deltas = self._graph_counter_deltas(counts)
         qualifying = (
             self.dynamic
             and prefill
             and (forward_batch.extend_num_tokens or 0) >= self.update_prefill_tokens
         )
-        for layer_id, streamer in self.streamers.items():
-            row = counts[layer_id]
+        eager_gathered = []
+        for layer_id in self._layer_ids:
+            streamer = self.streamers[layer_id]
             stats = streamer.last_gather_stats
-            if stats is not self._last_gather[layer_id]:
-                self._last_gather[layer_id] = stats
-                counters = self._counters[mode][layer_id]
-                counters.requested_rows += stats.requested_rows
-                counters.miss_rows += stats.miss_rows
-                counters.hot_hits += stats.hot_hit_rows
-                counters.d2d_bytes += stats.d2d_bytes
-                counters.h2d_bytes += stats.h2d_bytes
-                counters.backing_source_bytes += stats.source_bytes
-                counters.pinned_hits += stats.pinned_host_hit_rows
-                counters.pinned_misses += stats.pinned_host_miss_rows
-                counters.transfer_wait_ns += getattr(stats, "transfer_wait_ns", 0)
-                counters.gather_fallbacks += int(
-                    getattr(stats, "gather_fallback_used", False)
-                )
-                counters.requested_unique_experts += int(
-                    torch.count_nonzero(row).item()
-                )
-                file_bytes = getattr(
-                    streamer.layer, "_nvfp4_file_source_bytes_per_expert", None
-                )
-                if file_bytes is not None:
-                    counters.file_source_bytes = (
-                        counters.file_source_bytes or 0
-                    ) + stats.miss_rows * file_bytes
-                    counters.file_misses = (counters.file_misses or 0) + (
-                        stats.miss_rows if file_bytes else 0
-                    )
-                    counters.file_fallbacks = (counters.file_fallbacks or 0) + (
-                        stats.pinned_host_miss_rows
-                        if streamer.pinned_host_cache is not None
-                        else stats.miss_rows
-                    )
-                previous_admissions, previous_evictions = self._last_pinned_cache_stats[
-                    layer_id
-                ]
-                admissions, evictions = self._pinned_cache_stats(streamer)
-                counters.pinned_admissions += admissions - previous_admissions
-                counters.pinned_evictions += evictions - previous_evictions
-                self._last_pinned_cache_stats[layer_id] = (admissions, evictions)
-            graph_requested, graph_misses, graph_unique = graph_deltas.get(
-                layer_id, (0, 0, 0)
+            gathered = stats is not self._last_gather[layer_id]
+            eager_gathered.append(gathered)
+            if not gathered:
+                continue
+            self._last_gather[layer_id] = stats
+            counters = self._counters[mode][layer_id]
+            counters.requested_rows += stats.requested_rows
+            counters.miss_rows += stats.miss_rows
+            counters.hot_hits += stats.hot_hit_rows
+            counters.d2d_bytes += stats.d2d_bytes
+            counters.h2d_bytes += stats.h2d_bytes
+            counters.backing_source_bytes += stats.source_bytes
+            counters.pinned_hits += stats.pinned_host_hit_rows
+            counters.pinned_misses += stats.pinned_host_miss_rows
+            counters.transfer_wait_ns += getattr(stats, "transfer_wait_ns", 0)
+            counters.gather_fallbacks += int(
+                getattr(stats, "gather_fallback_used", False)
             )
-            if graph_requested:
-                counters = self._counters[mode][layer_id]
-                counters.requested_rows += graph_requested
-                counters.miss_rows += graph_misses
-                counters.hot_hits += graph_requested - graph_misses
-                counters.d2d_bytes += graph_requested * (
-                    streamer.bytes_per_expert - streamer.host_bytes_per_expert
+            file_bytes = getattr(
+                streamer.layer, "_nvfp4_file_source_bytes_per_expert", None
+            )
+            if file_bytes is not None:
+                counters.file_source_bytes = (
+                    counters.file_source_bytes or 0
+                ) + stats.miss_rows * file_bytes
+                counters.file_misses = (counters.file_misses or 0) + (
+                    stats.miss_rows if file_bytes else 0
                 )
-                counters.h2d_bytes += graph_misses * streamer.host_bytes_per_expert
-                counters.backing_source_bytes += graph_misses * streamer.bytes_per_expert
-                counters.requested_unique_experts += graph_unique
+                counters.file_fallbacks = (counters.file_fallbacks or 0) + (
+                    stats.pinned_host_miss_rows
+                    if streamer.pinned_host_cache is not None
+                    else stats.miss_rows
+                )
+            previous_admissions, previous_evictions = self._last_pinned_cache_stats[
+                layer_id
+            ]
+            admissions, evictions = self._pinned_cache_stats(streamer)
+            counters.pinned_admissions += admissions - previous_admissions
+            counters.pinned_evictions += evictions - previous_evictions
+            self._last_pinned_cache_stats[layer_id] = (admissions, evictions)
+        self._accumulate_registers(mode, counts, eager_gathered)
+        for layer_id in self._layer_ids if qualifying else ():
             cache = self.caches.get(layer_id)
             if (
-                not qualifying
-                or cache is None
+                cache is None
                 or self._forward_count - self._last_update[layer_id]
                 < self.min_residence_forwards
             ):

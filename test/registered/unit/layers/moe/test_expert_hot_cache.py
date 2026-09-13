@@ -600,6 +600,23 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(counters["miss_rows"], 1)
         self.assertEqual(counters["requested_unique_experts"], 2)
 
+    def test_observer_accumulates_metrics_without_host_synchronization(self):
+        manager = self.manager(dynamic=False, log_interval=1000)
+        counts = torch.tensor([[2, 0, 0, 1], [0] * 4, [0, 3, 1, 0]], device="cuda")
+        batch = self.batch(mode=self.mode.DECODE)
+        manager.on_expert_distribution(batch, {"global_physical_count": counts})
+        torch.cuda.synchronize()
+
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            manager.on_expert_distribution(batch, {"global_physical_count": counts})
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+        statistics = manager.snapshot_route_statistics()["decode"]
+        self.assertEqual(statistics["popularity"]["2"], [[1, 6.0], [2, 2.0]])
+        self.assertEqual(statistics["affinity"]["0->2"], [[0, 1, 12.0], [3, 1, 6.0]])
+
     def test_zero_budget_ignores_seed_and_inactive_policy(self):
         self.assertIsNone(
             self.manager(

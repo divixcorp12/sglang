@@ -43,6 +43,38 @@ def test_copy_expert_rows_gpu_moves_selected_pinned_rows():
     assert torch.equal(destination[1], torch.full_like(destination[1], 255))
 
 
+@pytest.mark.parametrize(
+    "rows,row_bytes",
+    [(1, 1 << 20), (3, 4099), (7, 8195), (2048, 8), (2100, 12)],
+)
+def test_copy_expert_rows_gpu_copies_every_byte_for_any_row_count(rows, row_bytes):
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
+
+    generator = torch.Generator().manual_seed(rows)
+    source_count, slot_count = rows + 5, rows + 3
+    source = torch.randint(
+        0, 256, (source_count, row_bytes), dtype=torch.uint8, generator=generator
+    ).pin_memory()
+    destination = torch.zeros((slot_count, row_bytes), dtype=torch.uint8, device="cuda")
+    picked_rows = torch.randperm(source_count, generator=generator)[:rows]
+    picked_slots = torch.randperm(slot_count, generator=generator)[:rows]
+    untouched = torch.ones(slot_count, dtype=torch.bool)
+    untouched[picked_slots] = False
+
+    copy_expert_rows_gpu(
+        source,
+        destination,
+        picked_rows.to(device="cuda", dtype=torch.int64),
+        picked_slots.to(device="cuda", dtype=torch.int32),
+        torch.tensor([rows], dtype=torch.int32, device="cuda"),
+    )
+    torch.cuda.synchronize()
+
+    copied = destination.cpu()
+    assert torch.equal(copied[picked_slots], source[picked_rows])
+    assert not copied[untouched].any()
+
+
 def test_copy_expert_rows_gpu_rejects_invalid_launch_inputs():
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
 

@@ -32,6 +32,31 @@ __device__ __forceinline__ void store_expert_device_word_cached(uint32_t* addres
 #endif
 }
 
+__device__ __forceinline__ void copy_expert_row_lane(
+    const uint8_t* src_row, uint8_t* dst_row, int64_t row_bytes, int64_t lane, int64_t lanes) {
+  const bool word_aligned =
+      ((reinterpret_cast<uintptr_t>(src_row) | reinterpret_cast<uintptr_t>(dst_row)) & 3) == 0;
+  const int64_t word_bytes = word_aligned ? (row_bytes / sizeof(uint32_t)) * sizeof(uint32_t) : 0;
+
+  if (word_aligned) {
+    const auto src_words = reinterpret_cast<const uint32_t*>(src_row);
+    auto dst_words = reinterpret_cast<uint32_t*>(dst_row);
+    const int64_t word_count = word_bytes / sizeof(uint32_t);
+    for (int64_t word = lane; word < word_count; word += lanes) {
+      store_expert_device_word_cached(dst_words + word, load_expert_host_word_noncoherent(src_words + word));
+    }
+  }
+
+  for (int64_t byte = word_bytes + lane; byte < row_bytes; byte += lanes) {
+    dst_row[byte] = src_row[byte];
+  }
+}
+
+// Every launched thread works on the rows the device-side count selects. With
+// fewer rows than threads, each row owns a contiguous range of threads, one lane
+// per thread, so a handful of misses reads host memory with hundreds of
+// concurrent lanes; contiguity keeps each launch block on one row's host pages.
+// With more rows than threads, each thread walks one row in every `threads`.
 __global__ __launch_bounds__(kExpertTransferBlockSize, 1) void copy_expert_rows_gpu_kernel(
     const uint8_t* __restrict__ source,
     uint8_t* __restrict__ destination,
@@ -39,32 +64,35 @@ __global__ __launch_bounds__(kExpertTransferBlockSize, 1) void copy_expert_rows_
     const int32_t* __restrict__ destination_slots,
     const int32_t* __restrict__ count,
     int64_t row_bytes) {
-  constexpr int kWarpsPerBlock = kExpertTransferBlockSize / kExpertTransferWarpSize;
-  const int lane = threadIdx.x % kExpertTransferWarpSize;
-  const int warp = blockIdx.x * kWarpsPerBlock + threadIdx.x / kExpertTransferWarpSize;
-  const int total_warps = gridDim.x * kWarpsPerBlock;
-  const int active_count = count[0];
+  const int64_t total_threads = static_cast<int64_t>(gridDim.x) * kExpertTransferBlockSize;
+  const int64_t thread = static_cast<int64_t>(blockIdx.x) * kExpertTransferBlockSize + threadIdx.x;
+  const int64_t active_count = count[0];
+  if (active_count <= 0) {
+    return;
+  }
 
-  for (int plan_index = warp; plan_index < active_count; plan_index += total_warps) {
-    const auto src_row = source + source_rows[plan_index] * row_bytes;
-    auto dst_row = destination + static_cast<int64_t>(destination_slots[plan_index]) * row_bytes;
-    const bool word_aligned =
-        ((reinterpret_cast<uintptr_t>(src_row) | reinterpret_cast<uintptr_t>(dst_row)) & 3) == 0;
-    const int64_t word_bytes = word_aligned ? (row_bytes / sizeof(uint32_t)) * sizeof(uint32_t) : 0;
+  if (active_count <= total_threads) {
+    const int64_t row = thread * active_count / total_threads;
+    const int64_t first_thread = (row * total_threads + active_count - 1) / active_count;
+    const int64_t next_thread = ((row + 1) * total_threads + active_count - 1) / active_count;
+    const int64_t lane = thread - first_thread;
+    const int64_t lanes = next_thread - first_thread;
+    copy_expert_row_lane(
+        source + source_rows[row] * row_bytes,
+        destination + static_cast<int64_t>(destination_slots[row]) * row_bytes,
+        row_bytes,
+        lane,
+        lanes);
+    return;
+  }
 
-    if (word_aligned) {
-      const auto src_words = reinterpret_cast<const uint32_t*>(src_row);
-      auto dst_words = reinterpret_cast<uint32_t*>(dst_row);
-      const int64_t word_count = word_bytes / sizeof(uint32_t);
-      for (int64_t word = lane; word < word_count; word += kExpertTransferWarpSize) {
-        store_expert_device_word_cached(
-            dst_words + word, load_expert_host_word_noncoherent(src_words + word));
-      }
-    }
-
-    for (int64_t byte = word_bytes + lane; byte < row_bytes; byte += kExpertTransferWarpSize) {
-      dst_row[byte] = src_row[byte];
-    }
+  for (int64_t row = thread; row < active_count; row += total_threads) {
+    copy_expert_row_lane(
+        source + source_rows[row] * row_bytes,
+        destination + static_cast<int64_t>(destination_slots[row]) * row_bytes,
+        row_bytes,
+        0,
+        1);
   }
 }
 
