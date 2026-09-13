@@ -87,6 +87,24 @@ backend). `--ple-offload-embedding` moves only the PLE n-gram tables; `embed_tok
 The difference between summed weight bytes and `mem usage` after load. Check with
 `torch.cuda.memory_snapshot()` right after `Load weight end` before choosing an option.
 
+### 6. Allocate the NEXTN draft's `embed_tokens` and `lm_head` on `meta` — lossless, speculative runs only
+
+- Observed 2026-09-13: `Qwen4ExpForCausalLMMTP` loads at 4.86 GB, i.e. its FP8 experts (2.34), other MTP
+  weights (0.17) plus its own `embed_tokens` (1.18) and `lm_head` (1.18). The checkpoint's `mtp.*`
+  tensors contain neither of the last two.
+- Why they cost memory: `Scheduler.init_model_worker` sizes the target KV pool (`init_target_memory_pool`)
+  while those copies are still allocated; only afterwards does `EAGLEWorkerV2.alloc_memory_pool` call
+  `init_lm_head`, which replaces them with the target's tensors via `set_embed_and_head`. With the full
+  10 GiB hot cache this made startup fail with "Loaded weights leave no GPU memory for the KV cache".
+- Change: build the two modules under `torch.device("meta")` when the draft will share them (as the PLE
+  n-gram tables already do), or share them before the target pool is sized.
+- Saves: 2.36 GB at startup for speculative runs; likely enough to keep the 10 GiB hot cache with NEXTN.
+- Done when: `Load weight end ... type=Qwen4ExpForCausalLMMTP` reports about 2.5 GB, and a NEXTN run with
+  `SGLANG_MOE_HOT_GPU_MB=10240` starts and matches the 8 GiB run's accept length.
+- Status: implemented in `0f311510ce` (Phase 2 of the NEXTN graph-capture plan), not yet checked on GPU.
+  The draft binds the target's tensors at construction (`speculative/draft_shared_weights.py`) instead of
+  staying on `meta`, because post-load staging raises on any `meta` tensor (`post_load.py:139-142`).
+
 ## Not worth doing
 
 - KV-cache quantization: the whole KV cache is 0.18 GiB, so FP8 KV saves 0.09 GiB.
