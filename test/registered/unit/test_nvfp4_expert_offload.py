@@ -881,18 +881,22 @@ class HotCacheConfigurationTests(unittest.TestCase):
         memory_hook.handle_offload_compatibility(args)
         memory_hook.handle_offload_compatibility(args)
 
-    def test_dynamic_mode_requires_exact_stat_recorder(self):
+    def test_dynamic_mode_requires_a_recorder_reporting_physical_counts(self):
         self.enable()
         os.environ["SGLANG_MOE_HOT_DYNAMIC"] = "1"
-        for recorder in (None, "per_pass", "stat_approx"):
+        for recorder in (None, "stat_approx", "per_token"):
             with (
                 self.subTest(recorder=recorder),
-                self.assertRaisesRegex(ValueError, "stat"),
+                self.assertRaisesRegex(ValueError, "stat or per_pass"),
             ):
                 memory_hook.handle_offload_compatibility(
                     self.args(expert_distribution_recorder_mode=recorder)
                 )
-        memory_hook.handle_offload_compatibility(self.args())
+        for recorder in ("stat", "per_pass"):
+            with self.subTest(recorder=recorder):
+                memory_hook.handle_offload_compatibility(
+                    self.args(expert_distribution_recorder_mode=recorder)
+                )
 
     def test_real_server_args_reads_resolved_graphs_without_mutating_inputs(self):
         from sglang.srt.arg_groups.model_override_base import resolving_view

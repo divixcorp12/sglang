@@ -162,12 +162,11 @@ def handle_offload_compatibility(server_args: Any) -> None:
     if cfg.enable_eplb:
         raise ValueError("NVFP4 hot caching does not support EPLB")
     if hot_budget_mb:
-        if (
-            envs.SGLANG_MOE_HOT_DYNAMIC.get()
-            and cfg.expert_distribution_recorder_mode != "stat"
-        ):
+        recorder = cfg.expert_distribution_recorder_mode
+        if envs.SGLANG_MOE_HOT_DYNAMIC.get() and recorder not in ("stat", "per_pass"):
             raise ValueError(
-                "Dynamic NVFP4 hot caching requires --expert-distribution-recorder-mode stat"
+                "Dynamic NVFP4 hot caching requires --expert-distribution-recorder-mode "
+                "stat or per_pass"
             )
         if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
             raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
