@@ -25,6 +25,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
 )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -56,10 +57,21 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 def _checkpoint_cache_identity(
     *, model_config: ModelConfig, server_args: Any
 ) -> Mapping[str, Any]:
-    """Return an immutable identity for file-backed checkpoint tensors."""
-    model_path = os.path.realpath(
-        os.path.expanduser(str(model_config.model_path or server_args.model_path))
-    )
+    """Return an immutable identity for file-backed checkpoint tensors.
+
+    The model path is symlink-resolved, so repointing a symlink at another
+    checkpoint cannot reuse the caches built from the first one. After moving
+    a checkpoint, ``SGLANG_FILE_CACHE_MODEL_PATH`` names the resolved path its
+    caches were built from; it is made absolute but not symlink-resolved,
+    because that path may no longer exist.
+    """
+    override = envs.SGLANG_FILE_CACHE_MODEL_PATH.get()
+    if override:
+        model_path = os.path.abspath(os.path.expanduser(override))
+    else:
+        model_path = os.path.realpath(
+            os.path.expanduser(str(model_config.model_path or server_args.model_path))
+        )
     hf_config = model_config.hf_config
     text_config = model_config.hf_text_config
     return MappingProxyType(

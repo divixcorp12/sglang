@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 import warnings
 from unittest.mock import patch
@@ -218,6 +220,72 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertEqual(cache.stats.evictions, 1)
         self.assertEqual(streamer.last_gather_stats.pinned_host_populated_bytes, 12)
         self.assertLessEqual(cache.residency_bytes, 2 * streamer.host_bytes_per_expert)
+
+    @unittest.skipUnless(
+        os.path.exists("/usr/include/liburing.h"), "io_uring reads need liburing"
+    )
+    def test_io_uring_reader_fills_pinned_slots_and_pageable_gathers(self):
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+        from sglang.srt.model_loader.file_tensor_cache import (
+            FileTensorCacheGroup,
+            FileTensorSpec,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            spec = FileTensorSpec("host_rows", (6, 4096), (4096, 1), torch.uint8)
+            group = FileTensorCacheGroup.open(
+                directory, "stream_uring", {"k": 1}, (spec,)
+            )
+            try:
+                rows = group.tensors["host_rows"]
+                rows.copy_(
+                    torch.randint(
+                        0,
+                        256,
+                        rows.shape,
+                        dtype=torch.uint8,
+                        generator=torch.Generator().manual_seed(5),
+                    )
+                )
+                layer = _Layer()
+                layer.host_rows = torch.nn.Parameter(rows, requires_grad=False)
+                layer.host_rows._sglang_file_cache_group = group
+                layer.host_rows._sglang_file_cache_tag = "host_rows"
+                layer._nvfp4_file_source_bytes_per_expert = 4096
+                ids = torch.tensor([[5, 0, 5, 3]], device="cuda", dtype=torch.int32)
+                expected = rows[ids.cpu().long()]
+
+                for mode, capacity in (
+                    ("uring_direct", 3),
+                    ("uring_direct", 2),
+                    ("uring", None),
+                ):
+                    with (
+                        self.subTest(mode=mode, capacity=capacity),
+                        patch.dict(os.environ, {"SGLANG_MOE_EXPERT_FILE_READER": mode}),
+                    ):
+                        streamer = ExpertStreamer(layer, ("host_rows",))
+                        reader = streamer.file_row_reader
+                        self.assertIsNotNone(reader)
+                        cache = None
+                        if capacity is not None:
+                            cache = ExpertPinnedHostCache(streamer, capacity=capacity)
+                        with patch.object(reader, "read", wraps=reader.read) as read:
+                            compact, tensors = streamer.gather(ids)
+                        self.assertGreater(read.call_count, 0)
+                        if capacity == 2:
+                            self.assertGreater(cache.stats.evictions, 0)
+                        for call in read.call_args_list:
+                            if len(call.args) == 3:
+                                slots = call.args[2].tolist()
+                                self.assertEqual(len(slots), len(set(slots)))
+                        self.assertTrue(
+                            torch.equal(
+                                tensors["host_rows"][compact.long()].cpu(), expected
+                            )
+                        )
+            finally:
+                group.close()
 
     def test_hot_misses_resolve_through_pinned_then_file_rows(self):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache

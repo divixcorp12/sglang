@@ -318,6 +318,14 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # mmap | uring | uring_direct; see sglang.srt.model_loader.file_row_reader.
+    SGLANG_QWEN4_PLE_FILE_READER = EnvStr("mmap")
+    SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
+    SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
+    # Model path recorded in expert/PLE file-cache identities instead of the
+    # resolved --model-path; after moving a checkpoint, set it to the resolved
+    # path the caches were built from.
+    SGLANG_FILE_CACHE_MODEL_PATH = EnvStr("")
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)

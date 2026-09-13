@@ -105,6 +105,9 @@ class ExpertPinnedHostCache:
             )
             for name in self.cached_names
         }
+        file_row_reader = getattr(streamer, "file_row_reader", None)
+        if file_row_reader is not None:
+            file_row_reader.register_destinations(self.tensors.values())
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
@@ -184,22 +187,43 @@ class ExpertPinnedHostCache:
             self._last_used[free] = self._clock
         if not assignments:
             return
-        source_ids_cpu = torch.tensor(
-            [expert_id for expert_id, _ in assignments], dtype=torch.long
-        )
-        slots_cpu = torch.tensor([slot for _, slot in assignments], dtype=torch.long)
-        for name in self.cached_names:
-            source = _tensor_data(getattr(self.streamer.layer, name))
-            for source_id, slot in zip(source_ids_cpu, slots_cpu):
-                torch.index_select(
-                    source,
-                    0,
-                    source_id.reshape(1),
-                    out=self.tensors[name][int(slot) : int(slot) + 1],
+        # More misses than slots reassign a slot within this call. Read only the
+        # slot's final expert: batched file reads complete in any order.
+        final_slots = {slot: expert_id for expert_id, slot in assignments}
+        source_ids_cpu = torch.tensor(list(final_slots.values()), dtype=torch.long)
+        slots_cpu = torch.tensor(list(final_slots), dtype=torch.long)
+        file_row_reader = getattr(self.streamer, "file_row_reader", None)
+        try:
+            for name in self.cached_names:
+                if file_row_reader is not None and file_row_reader.covers(name):
+                    continue
+                source = _tensor_data(getattr(self.streamer.layer, name))
+                for source_id, slot in zip(source_ids_cpu, slots_cpu):
+                    torch.index_select(
+                        source,
+                        0,
+                        source_id.reshape(1),
+                        out=self.tensors[name][int(slot) : int(slot) + 1],
+                    )
+            if file_row_reader is not None:
+                file_row_reader.read(
+                    source_ids_cpu,
+                    {
+                        name: self.tensors[name]
+                        for name in self.cached_names
+                        if file_row_reader.covers(name)
+                    },
+                    slots_cpu,
                 )
+        except BaseException:
+            for slot, expert_id in final_slots.items():
+                self.slot_to_expert[slot] = -1
+                self._expert_to_slot.pop(expert_id, None)
+            self._refresh_mapping()
+            raise
         self._refresh_mapping()
-        self.stats.populated_rows += len(assignments)
-        self.stats.populated_bytes += len(assignments) * self.bytes_per_expert
+        self.stats.populated_rows += len(final_slots)
+        self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
 
     def copy_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
@@ -463,6 +487,11 @@ class ExpertStreamer:
             raise ValueError("expert streamer requires at least one tensor")
 
         self.num_experts = self._validate_sources()
+        # Imported here: the reader pulls in sglang.srt.model_loader, whose
+        # package import reaches modelopt_quant, which imports this module.
+        from sglang.srt.layers.moe.expert_file_reader import ExpertFileRowReader
+
+        self.file_row_reader = ExpertFileRowReader.from_layer(layer, self.tensor_names)
         self.hot_cache = None
         self.pinned_host_cache = None
         self.residency_policy = None
@@ -496,6 +525,18 @@ class ExpertStreamer:
                 self.num_experts,
                 ",".join(self.tensor_names),
             )
+
+    def _read_host_rows(
+        self,
+        name: str,
+        source: torch.Tensor,
+        cpu_ids: torch.Tensor,
+        host_output: torch.Tensor,
+    ) -> None:
+        if self.file_row_reader is not None and self.file_row_reader.covers(name):
+            self.file_row_reader.read(cpu_ids, {name: host_output})
+        else:
+            torch.index_select(source, 0, cpu_ids, out=host_output)
 
     def _validate_sources(self) -> int:
         expert_count = None
@@ -556,7 +597,7 @@ class ExpertStreamer:
                 host_output = _pinned_staging_buffer(
                     name, row_count, capacity, tuple(source.shape[1:]), source.dtype
                 )
-                torch.index_select(source, 0, cpu_ids, out=host_output)
+                self._read_host_rows(name, source, cpu_ids, host_output)
                 output.copy_(host_output, non_blocking=True)
 
     def _gather_cached(
@@ -744,11 +785,8 @@ class ExpertStreamer:
             if bool(resident_mask.any().item()):
                 cache.copy_rows(source_ids[~hit_mask][resident_mask], miss_outputs)
                 resident_positions = miss_positions[resident_mask]
-                resident_output_rows = resident_mask.nonzero().flatten()
                 for name, output in miss_outputs.items():
-                    gathered[name].index_copy_(
-                        0, resident_positions, output[resident_output_rows]
-                    )
+                    gathered[name].index_copy_(0, resident_positions, output)
             cold_mask = ~resident_mask
             if bool(cold_mask.any().item()):
                 cold_ids = source_ids[~hit_mask][cold_mask]
@@ -889,7 +927,7 @@ class ExpertStreamer:
                     tuple(source.shape[1:]),
                     source.dtype,
                 )
-                torch.index_select(source, 0, cpu_ids, out=host_output)
+                self._read_host_rows(name, source, cpu_ids, host_output)
                 output.copy_(host_output, non_blocking=True)
             gathered[name] = output
 

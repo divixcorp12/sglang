@@ -1,0 +1,135 @@
+"""Row reads of file-backed tensors through io_uring, checked against the file bytes."""
+
+import os
+import tempfile
+
+import pytest
+import torch
+
+from sglang.srt.model_loader.file_row_reader import (
+    AlignedRowSource,
+    PagedRowSource,
+    read_plans,
+    validate_file_reader_mode,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+pytestmark = pytest.mark.skipif(
+    not os.path.exists("/usr/include/liburing.h"),
+    reason="io_uring row reader tests require liburing headers.",
+)
+
+PAGE = 4096
+
+
+def _reader():
+    from sglang.kernels.ops.io.uring_file_reader import UringFileReader
+
+    return UringFileReader(queue_depth=16)
+
+
+def _write_rows(directory, name, row_count, row_bytes, seed):
+    generator = torch.Generator().manual_seed(seed)
+    rows = torch.randint(
+        0, 256, (row_count, row_bytes), dtype=torch.uint8, generator=generator
+    )
+    path = os.path.join(directory, name)
+    with open(path, "wb") as stream:
+        stream.write(rows.numpy().tobytes())
+    return path, rows
+
+
+def _aligned_rows(row_count, row_bytes):
+    storage = torch.empty(row_count * row_bytes + PAGE, dtype=torch.uint8)
+    start = (-storage.data_ptr()) % PAGE
+    return storage, storage[start : start + row_count * row_bytes].view(
+        row_count, row_bytes
+    )
+
+
+def test_mode_names_are_validated():
+    assert validate_file_reader_mode("uring_direct") == "uring_direct"
+    with pytest.raises(ValueError, match="unknown file reader mode"):
+        validate_file_reader_mode("uring-direct")
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_paged_rows_match_file_across_page_boundaries_and_partial_last_page(direct):
+    with tempfile.TemporaryDirectory() as directory:
+        path, table = _write_rows(directory, "ple.bin", 1000, 160, seed=1)
+        assert os.path.getsize(path) % PAGE != 0
+        source = PagedRowSource(_reader(), path, 160, 1000, direct=direct)
+        rows = torch.tensor([25, 999, 0, 25, 26, 700, 998, 1, 25])
+        assert (25 * 160) // PAGE != (26 * 160 - 1) // PAGE
+        destination = torch.zeros(rows.numel() + 3, 160, dtype=torch.uint8)
+
+        source.read_rows(rows, destination)
+
+        assert torch.equal(destination[: rows.numel()], table[rows])
+        assert torch.equal(
+            destination[rows.numel() :], torch.zeros(3, 160, dtype=torch.uint8)
+        )
+        first_bounce = source.bounce_bytes
+        source.read_rows(rows[:2], destination)
+        assert source.bounce_bytes == first_bounce
+        assert torch.equal(destination[:2], table[rows[:2]])
+
+
+def test_paged_rows_reject_out_of_range_ids_and_small_destinations():
+    with tempfile.TemporaryDirectory() as directory:
+        path, _ = _write_rows(directory, "ple.bin", 10, 7, seed=2)
+        source = PagedRowSource(_reader(), path, 7, 10, direct=False)
+        with pytest.raises(IndexError):
+            source.read_rows(torch.tensor([10]), torch.zeros(1, 7, dtype=torch.uint8))
+        with pytest.raises(ValueError, match="must hold"):
+            source.read_rows(torch.tensor([1, 2]), torch.zeros(1, 7, dtype=torch.uint8))
+        with pytest.raises(ValueError, match="fewer than"):
+            PagedRowSource(_reader(), path, 7, 11, direct=False)
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("aligned", [False, True])
+def test_aligned_rows_scatter_into_destination_rows(direct, aligned):
+    with tempfile.TemporaryDirectory() as directory:
+        reader = _reader()
+        wide_path, wide = _write_rows(directory, "wide.bin", 6, 2 * PAGE, seed=3)
+        narrow_path, narrow = _write_rows(directory, "narrow.bin", 6, PAGE, seed=4)
+        wide_source = AlignedRowSource(reader, wide_path, 2 * PAGE, 6, direct=direct)
+        narrow_source = AlignedRowSource(reader, narrow_path, PAGE, 6, direct=direct)
+        if aligned:
+            _, wide_destination = _aligned_rows(4, 2 * PAGE)
+            _, narrow_destination = _aligned_rows(4, PAGE)
+        else:
+            wide_destination = torch.zeros(4, 2 * PAGE + 1, dtype=torch.uint8)[:, 1:]
+            wide_destination = wide_destination.contiguous()
+            narrow_storage = torch.zeros(4 * PAGE + 1, dtype=torch.uint8)
+            narrow_destination = narrow_storage[1:].view(4, PAGE)
+        rows = torch.tensor([5, 0, 3])
+        slots = torch.tensor([2, 0, 3])
+
+        read_plans(
+            reader,
+            [
+                wide_source.plan(rows, wide_destination, slots),
+                narrow_source.plan(rows, narrow_destination, slots),
+            ],
+        )
+
+        assert torch.equal(wide_destination[slots], wide[rows])
+        assert torch.equal(narrow_destination[slots], narrow[rows])
+
+
+def test_aligned_rows_reject_wrong_width_and_mismatched_slots():
+    with tempfile.TemporaryDirectory() as directory:
+        path, _ = _write_rows(directory, "rows.bin", 3, PAGE, seed=5)
+        source = AlignedRowSource(_reader(), path, PAGE, 3, direct=False)
+        with pytest.raises(ValueError, match="expected 4096"):
+            source.plan(torch.tensor([0]), torch.zeros(1, 8, dtype=torch.uint8))
+        with pytest.raises(ValueError, match="must match in length"):
+            source.plan(
+                torch.tensor([0, 1]),
+                torch.zeros(2, PAGE, dtype=torch.uint8),
+                torch.tensor([0]),
+            )

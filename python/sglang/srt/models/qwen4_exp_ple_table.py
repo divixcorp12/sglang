@@ -39,6 +39,11 @@ from typing import Iterable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_loader.file_row_reader import (
+    PagedRowSource,
+    shared_uring_file_reader,
+    validate_file_reader_mode,
+)
 from sglang.srt.model_loader.file_tensor_cache import (
     FileTensorCacheGroup,
     FileTensorSpec,
@@ -417,10 +422,17 @@ def make_ple_file_rss_trimmer(table: torch.Tensor) -> Optional[PleFileRssTrimmer
 
 
 class PleFileRowStager:
-    """Copy selected rows from a file mapping through bounded pinned buffers."""
+    """Copy selected rows from a PLE table file through bounded pinned buffers.
 
-    def __init__(self, table: torch.Tensor) -> None:
-        if getattr(table, "_sglang_ple_file_path", None) is None:
+    ``reader_mode`` (default ``SGLANG_QWEN4_PLE_FILE_READER``) chooses how the
+    host rows are read: ``mmap`` gathers through the shared mapping, ``uring``
+    and ``uring_direct`` read the containing pages with io_uring and never
+    touch the mapping, so its resident set stays empty.
+    """
+
+    def __init__(self, table: torch.Tensor, reader_mode: Optional[str] = None) -> None:
+        path = getattr(table, "_sglang_ple_file_path", None)
+        if path is None:
             raise ValueError("PLE row staging requires a file-backed table")
         if table.dim() != 2:
             raise ValueError(f"PLE row staging requires a 2D table, got {table.dim()}D")
@@ -432,6 +444,25 @@ class PleFileRowStager:
         self._host_buffer: Optional[torch.Tensor] = None
         self._device_buffer: Optional[torch.Tensor] = None
         self._capacity = 0
+        self.reader_mode = validate_file_reader_mode(
+            envs.SGLANG_QWEN4_PLE_FILE_READER.get()
+            if reader_mode is None
+            else reader_mode
+        )
+        self._row_source: Optional[PagedRowSource] = None
+        if self.reader_mode != "mmap":
+            if table.storage_offset() != 0 or not table.is_contiguous():
+                raise ValueError(
+                    "io_uring PLE reads require a contiguous table at file offset zero"
+                )
+            self._row_source = PagedRowSource(
+                shared_uring_file_reader(),
+                path,
+                self._row_bytes,
+                int(table.shape[0]),
+                direct=self.reader_mode == "uring_direct",
+            )
+            logger.info("PLE table: %s row reads from %s", self.reader_mode, path)
 
     @property
     def capacity(self) -> int:
@@ -488,7 +519,10 @@ class PleFileRowStager:
         local_ids = torch.where(inside, flat_ids - vocab_start, 0)
         self._ensure_capacity(row_count, input_ids.device)
         host_rows = self._host_buffer[:row_count]
-        torch.index_select(self._byte_rows, 0, local_ids, out=host_rows)
+        if self._row_source is not None:
+            self._row_source.read_rows(local_ids, host_rows)
+        else:
+            torch.index_select(self._byte_rows, 0, local_ids, out=host_rows)
         host_rows[~inside] = 0
         device_rows = self._device_buffer[:row_count]
         device_rows.copy_(host_rows, non_blocking=True)

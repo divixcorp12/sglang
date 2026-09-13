@@ -18,7 +18,54 @@ NVFP4 server with dynamic expert residency.
 | Logs | `/data/models/slang/nvfp4-stream-logs/` |
 
 The launch script uses a 10 GiB GPU expert hot tier, a 35 GiB pinned-host tier,
-seeded dynamic residency, and disabled expert prefetch.
+seeded dynamic residency, and disabled expert prefetch. Its source of record is
+`/home/dimitri/data/divix/crypto/prototypes/sglang-nvfp4/run-nvfp4-expert-dynamic-hot10g.sh`;
+copy it over the host-local script whenever it changes.
+
+## Storage layout on divix01
+
+The model, the PLE table, and the expert files live on `/mnt/nvme2`. The expert
+and PLE cache manifests hash the resolved model path, and they were built from
+`/data/models/huggingface_hub/...`. The launch script therefore sets
+`SGLANG_FILE_CACHE_MODEL_PATH` to that old path; without it, the move rebuilds
+115 GB of caches. Change that variable together with `model`, never alone,
+because a stale value makes a different checkpoint reuse these caches. The
+launch script refuses to start when either cache directory has no manifests,
+instead of silently rebuilding.
+
+File reads are selected by environment in the launch script:
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `SGLANG_MOE_EXPERT_FILE_READER` | `uring_direct` | Expert rows are page multiples read straight into pinned slots with `O_DIRECT`, so the 64 GB file does not also fill the page cache. |
+| `SGLANG_QWEN4_PLE_FILE_READER` | `uring` | PLE rows are 160 B; buffered page reads let repeated tokens hit the page cache. |
+
+Either variable set to `mmap` restores the previous shared-mapping reads.
+
+One-time cut-over, with the server stopped (see
+[Stop the server](#8-stop-the-server)). The SATA copies stay in place:
+
+```bash
+ssh divix01 'mkdir -p /mnt/nvme2/nvfp4-work && rsync -aH --info=progress2 /data/models/slang/nvfp4-work/qwen38-nvfp4-expert-cache-v1 /mnt/nvme2/nvfp4-work/'
+scp /home/dimitri/data/divix/crypto/prototypes/sglang-nvfp4/run-nvfp4-expert-dynamic-hot10g.sh divix01:/data/models/slang/nvfp4-work/run-nvfp4-expert-dynamic-hot10g.sh
+```
+
+Done when the first startup log reports `outcome=verified_hit` for every
+`File tensor cache` line and contains no `building_miss`:
+
+```bash
+ssh divix01 'log=/data/models/slang/nvfp4-stream-logs/nvfp4-expert-dynamic-hot10g.latest.log; grep -o "outcome=[a-z_]*" "$log" | sort | uniq -c'
+```
+
+## Testing on divix01 without touching the served checkout
+
+Tests run from a copy of the local tree, with pytest installed outside the
+server's venv:
+
+```bash
+rsync -a --delete --exclude __pycache__ python test divix01:/data/models/slang/nvfp4-work/uring-test-tree/
+ssh divix01 'cd /data/models/slang/nvfp4-work/uring-test-tree && source /data/models/slang/.venv/bin/activate && PYTHONPATH=/data/models/slang/nvfp4-work/flashinfer-0.6.18-cu130-overlay:$PWD/python:/data/models/slang/nvfp4-work/uring-test-deps python -m pytest -q -p no:cacheprovider <test paths>'
+```
 
 ## 1. Publish the local branch
 

@@ -246,6 +246,35 @@ class TestPleFileRowStager(unittest.TestCase):
                 atol=0,
             )
 
+    @unittest.skipUnless(
+        os.path.exists("/usr/include/liburing.h"), "io_uring reads need liburing"
+    )
+    def test_io_uring_modes_stage_the_same_rows_without_touching_the_mapping(self):
+        with tempfile.TemporaryDirectory() as d:
+            rows, width = 5000, 160
+            table = allocate_ple_host_table((rows, width), torch.uint8, "file", d)
+            generator = torch.Generator().manual_seed(3)
+            table.copy_(
+                torch.randint(
+                    0, 256, (rows, width), dtype=torch.uint8, generator=generator
+                )
+            )
+            ids = torch.tensor(
+                [[4, 29, 30, 4999 + 4], [5003, -1, 1000, 30]], device="cuda"
+            )
+            expected = PleFileRowStager(table, reader_mode="mmap").stage(
+                ids, vocab_start=4, vocab_end=4 + rows
+            )
+
+            for mode in ("uring", "uring_direct"):
+                with self.subTest(mode=mode):
+                    stager = PleFileRowStager(table, reader_mode=mode)
+                    staged = stager.stage(ids, vocab_start=4, vocab_end=4 + rows)
+                    torch.testing.assert_close(staged, expected, rtol=0, atol=0)
+
+            with self.assertRaisesRegex(ValueError, "unknown file reader mode"):
+                PleFileRowStager(table, reader_mode="io_uring")
+
 
 class TestPleFilePrefetcher(unittest.TestCase):
     def test_page_set_covers_row_start_and_end(self):

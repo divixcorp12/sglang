@@ -148,6 +148,31 @@ class TestQwen4ExpPleCacheIntegration(unittest.TestCase):
                 )
                 self.assertEqual(allocate.call_args.kwargs["shape"], (18, 4))
 
+    def test_cache_identity_override_records_moved_checkpoint_path_verbatim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identities = []
+            for name in ("old", "new"):
+                checkpoint = os.path.join(directory, name)
+                os.mkdir(checkpoint)
+                with mock.patch.dict(
+                    os.environ,
+                    {"SGLANG_FILE_CACHE_MODEL_PATH": "/data/models/old-checkpoint"},
+                ):
+                    identities.append(
+                        _checkpoint_cache_identity(
+                            model_config=SimpleNamespace(
+                                model_path=checkpoint,
+                                revision=None,
+                                hf_config=SimpleNamespace(_commit_hash="commit"),
+                                hf_text_config=SimpleNamespace(),
+                            ),
+                            server_args=SimpleNamespace(model_path=checkpoint),
+                        )
+                    )
+
+            self.assertEqual(identities[0], identities[1])
+            self.assertEqual(identities[0]["model_path"], "/data/models/old-checkpoint")
+
     def test_cache_identity_canonicalizes_checkpoint_and_records_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = os.path.join(directory, "checkpoint")
