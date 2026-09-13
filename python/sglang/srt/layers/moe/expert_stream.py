@@ -546,9 +546,10 @@ class ExpertStreamer:
         rows by a kernel that reads its row count on the device, and routes are
         remapped with ``torch.where``. Nothing reads a CUDA value on the host, so
         a CUDA graph can capture the gather and replay it for any routes.
-        All host-backed tensors of the layer are pulled in one kernel launch
-        whose plan holds their addresses, so neither the host rows nor the
-        cache tensors may be reallocated afterwards.
+        All host-backed tensors of the layer are pulled in one kernel launch.
+        Its plan holds the tensors it addresses. Capture and eager gathers
+        raise if a layer tensor was rebound after this call; replays cannot
+        check, and keep reading the tensors frozen here.
         """
         from sglang.kernels.ops.moe.expert_cache_transfer import (
             copy_expert_row_segments_gpu,
@@ -577,10 +578,17 @@ class ExpertStreamer:
                     f"graph gather needs registered host rows; {name!r} is pageable"
                 )
         device = cache.device
+        self._graph_sources = {
+            name: _tensor_data(getattr(self.layer, name)) for name in self.tensor_names
+        }
+        self._graph_device_pairs = tuple(
+            (source, cache.tensors[name])
+            for name, source in self._graph_sources.items()
+            if source.device.type == "cuda"
+        )
         host_pairs = [
             (source, cache.tensors[name])
-            for name in self.tensor_names
-            for source in [_tensor_data(getattr(self.layer, name))]
+            for name, source in self._graph_sources.items()
             if source.device.type == "cpu"
         ]
         self._copy_row_segments_gpu = copy_expert_row_segments_gpu
@@ -604,6 +612,7 @@ class ExpertStreamer:
     def _gather_graph(
         self, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self._check_graph_sources()
         cache = self.hot_cache
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
@@ -617,11 +626,7 @@ class ExpertStreamer:
         self._graph_source_rows[:count].copy_(flat.index_select(0, order))
         self._graph_destination_slots[:count].copy_(scratch.index_select(0, order))
         self._graph_miss_count.copy_(miss_count.reshape(1))
-        for name in self.tensor_names:
-            source = _tensor_data(getattr(self.layer, name))
-            if source.device.type != "cuda":
-                continue
-            destination = cache.tensors[name]
+        for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,
                 scratch,
@@ -644,6 +649,15 @@ class ExpertStreamer:
             )
         remapped = torch.where(hit, slots, scratch)
         return remapped.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
+
+    def _check_graph_sources(self) -> None:
+        """Raise if a layer tensor was rebound after its graph gather plan froze it."""
+        for name, source in self._graph_sources.items():
+            current = _tensor_data(getattr(self.layer, name))
+            if current.data_ptr() != source.data_ptr() or current.device != source.device:
+                raise RuntimeError(
+                    f"expert tensor {name!r} moved after graph gather was enabled"
+                )
 
     def _read_host_rows(
         self,

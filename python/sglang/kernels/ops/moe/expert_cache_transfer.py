@@ -101,55 +101,60 @@ def copy_expert_rows_gpu(
     )
 
 
+class ExpertRowSegments:
+    """A CUDA table of ``{source address, destination address, row bytes}``.
+
+    The table stores raw data pointers, so the object holds every source and
+    destination tensor it addresses: that memory cannot be freed while the
+    table can still be launched.
+    """
+
+    def __init__(self, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        if not pairs:
+            raise ValueError("expert row segments need at least one tensor pair.")
+        for source, destination in pairs:
+            _validate_row_pair(source, destination)
+            if source.shape[0] == 0:
+                raise ValueError("expert row segment sources must have rows.")
+        devices = {destination.device for _, destination in pairs}
+        if len(devices) != 1:
+            raise ValueError(
+                "expert row segment destinations must share one CUDA device."
+            )
+        self.pairs = tuple(pairs)
+        self.table = torch.tensor(
+            [
+                [
+                    source.data_ptr(),
+                    destination.data_ptr(),
+                    source.numel() // source.shape[0] * source.element_size(),
+                ]
+                for source, destination in self.pairs
+            ],
+            dtype=torch.int64,
+            device=devices.pop(),
+        )
+
+
 def expert_row_segments(
     pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
-) -> torch.Tensor:
-    """Pack ``(source, destination)`` addresses and row widths into a CUDA plan.
-
-    The returned ``[pairs, 3]`` int64 tensor stores raw data pointers, so every
-    source and destination must stay allocated at its current address for as
-    long as the plan is used.
-    """
-    if not pairs:
-        raise ValueError("expert row segments need at least one tensor pair.")
-    for source, destination in pairs:
-        _validate_row_pair(source, destination)
-    devices = {destination.device for _, destination in pairs}
-    if len(devices) != 1:
-        raise ValueError("expert row segment destinations must share one CUDA device.")
-    return torch.tensor(
-        [
-            [
-                source.data_ptr(),
-                destination.data_ptr(),
-                source.stride(0) * source.element_size(),
-            ]
-            for source, destination in pairs
-        ],
-        dtype=torch.int64,
-        device=devices.pop(),
-    )
+) -> ExpertRowSegments:
+    """Build the copy segments for ``(source, destination)`` tensor pairs."""
+    return ExpertRowSegments(pairs)
 
 
 def copy_expert_row_segments_gpu(
-    segments: torch.Tensor,
+    segments: ExpertRowSegments,
     source_rows: torch.Tensor,
     destination_slots: torch.Tensor,
     count: torch.Tensor,
 ) -> None:
     """Copy the planned rows of every tensor pair in ``segments`` in one launch.
 
-    ``segments`` comes from :func:`expert_row_segments`. Each launched thread
-    copies its lane of the selected row in every segment, so a layer's tensors
-    cost one kernel launch instead of one per tensor.
+    Each launched thread copies its lane of the selected row in every segment,
+    so a layer's tensors cost one kernel launch instead of one per tensor.
     """
-    if segments.device.type != "cuda" or segments.dtype != torch.int64:
-        raise ValueError("segments must be a CUDA int64 tensor.")
-    if segments.ndim != 2 or segments.shape[0] < 1 or segments.shape[1] != 3:
-        raise ValueError("segments must have shape [pairs, 3].")
-    if not segments.is_contiguous():
-        raise ValueError("segments must be contiguous.")
-    _validate_plan(segments.device, source_rows, destination_slots, count)
+    _validate_plan(segments.table.device, source_rows, destination_slots, count)
     _jit_expert_cache_transfer_module().copy_expert_row_segments_gpu(
-        segments, source_rows, destination_slots, count
+        segments.table, source_rows, destination_slots, count
     )

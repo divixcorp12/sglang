@@ -137,18 +137,33 @@ def test_expert_row_segments_reject_invalid_pairs_and_plans():
     with pytest.raises(ValueError, match="pinned or CUDA-registered"):
         expert_row_segments([(torch.zeros((4, 6), dtype=torch.uint8), destination)])
     segments = expert_row_segments([(source, destination)])
-    with pytest.raises(ValueError, match="CUDA int64"):
-        copy_expert_row_segments_gpu(
-            segments.to(torch.int32), source_rows, destination_slots, count
-        )
-    with pytest.raises(ValueError, match=r"\[pairs, 3\]"):
-        copy_expert_row_segments_gpu(
-            segments[:, :2].contiguous(), source_rows, destination_slots, count
-        )
     with pytest.raises(ValueError, match="CUDA"):
         copy_expert_row_segments_gpu(
             segments, source_rows.cpu(), destination_slots, count
         )
+
+
+def test_expert_row_segments_keep_the_tensors_they_address_alive():
+    import gc
+    import weakref
+
+    from sglang.kernels.ops.moe.expert_cache_transfer import (
+        copy_expert_row_segments_gpu,
+        expert_row_segments,
+    )
+
+    source = torch.arange(6 * 5, dtype=torch.uint8).reshape(6, 5).pin_memory()
+    destination = torch.zeros((4, 5), dtype=torch.uint8, device="cuda")
+    expected = source[3].clone()
+    source_alive = weakref.ref(source)
+    segments = expert_row_segments([(source, destination)])
+    del source
+    gc.collect()
+
+    assert source_alive() is not None
+    copy_expert_row_segments_gpu(segments, *_make_plan([3], [2]))
+    torch.cuda.synchronize()
+    assert torch.equal(destination[2].cpu(), expected)
 
 
 def test_copy_expert_rows_gpu_rejects_invalid_launch_inputs():
