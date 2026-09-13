@@ -40,6 +40,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.draft_shared_weights import (
+    build_with_target_weight,
+    shared_target_head,
+)
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -137,11 +141,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
+                self.lm_head = build_with_target_weight(
+                    lambda: ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    ),
+                    shared_target_head(),
+                    "lm_head",
                 )
 
         self.logits_processor = LogitsProcessor(config)
@@ -337,11 +345,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             ):
                 param_name = "model.embed_tokens.weight"
                 if param_name in params_dict:
-                    param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                    if not getattr(
+                        self.model.embed_tokens, "shares_target_weight", False
+                    ):
+                        param = params_dict[param_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
                     loaded_params.add(param_name)
                 continue
 

@@ -122,6 +122,22 @@ def handle_offload_compatibility(server_args: Any) -> None:
     if copy_backend not in ("gpu", "dma"):
         raise ValueError("SGLANG_MOE_EXPERT_COPY_BACKEND must be gpu or dma")
     graph_gather = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
+    graph_gather_scratch_rows = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get()
+    if graph_gather_scratch_rows < 0:
+        raise ValueError(
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS must be nonnegative"
+        )
+    if graph_gather_scratch_rows and not graph_gather:
+        raise ValueError(
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS requires "
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER=1"
+        )
+    if graph_gather_scratch_rows and getattr(cfg, "speculative_algorithm", None) is None:
+        raise ValueError(
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS caps speculative verify "
+            "scratch and requires speculative decoding; non-speculative decode "
+            "reserves decode max_bs x top_k rows"
+        )
     if envs.SGLANG_MOE_EXPERT_HOST_ARENA.get() and pinned_budget_mb:
         raise ValueError(
             "SGLANG_MOE_EXPERT_HOST_ARENA replaces the pinned expert cache; "

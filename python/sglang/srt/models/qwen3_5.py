@@ -108,6 +108,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
+from sglang.srt.speculative.draft_shared_weights import (
+    build_with_target_weight,
+    shared_target_embed,
+)
 
 # Utils
 from sglang.srt.utils import (
@@ -1633,7 +1637,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
-        self.embed_tokens = self._build_embed_tokens(config)
+        self.embed_tokens = build_with_target_weight(
+            lambda: self._build_embed_tokens(config),
+            shared_target_embed() if is_nextn else None,
+            "embed_tokens",
+        )
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):

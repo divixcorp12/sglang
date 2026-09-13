@@ -21,6 +21,10 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_conf
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.models.qwen4_exp_route_trace import maybe_install_mtp_hidden_trace
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.speculative.draft_shared_weights import (
+    build_with_target_weight,
+    shared_target_head,
+)
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -62,12 +66,16 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        self.lm_head = build_with_target_weight(
+            lambda: ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            ),
+            None if config.tie_word_embeddings else shared_target_head(),
+            "lm_head",
         )
         self.logits_processor = LogitsProcessor(config)
         self.mtp_hidden_trace = maybe_install_mtp_hidden_trace(self)

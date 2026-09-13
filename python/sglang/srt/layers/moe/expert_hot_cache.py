@@ -39,6 +39,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def graph_gather_scratch_rows(tokens: int, top_k: int, max_rows: int = 0) -> int:
+    """Scratch rows one layer's graph gather reserves.
+
+    One row per route of a ``tokens``-token forward (decode batch size, times
+    verify tokens per request under speculation), capped at ``max_rows`` when
+    positive. The graph gather then serves only forwards with at most that
+    many routes.
+    """
+    tokens, top_k, max_rows = index(tokens), index(top_k), index(max_rows)
+    if tokens < 0 or top_k < 0 or max_rows < 0:
+        raise ValueError("graph gather scratch sizes cannot be negative")
+    rows = tokens * top_k
+    return min(rows, max_rows) if max_rows else rows
+
+
 @dataclass(frozen=True)
 class HotCacheUpdateStats:
     promoted_experts: int
@@ -561,12 +576,15 @@ class ExpertHotCacheManager:
         update_decode_forwards: int = 0,
         decay_tokens: int = 0,
         promotion_sigmas: float = 0.0,
+        graph_gather_max_rows: int = 0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
-        ``graph_gather_batch_size`` > 0 reserves ``batch_size * top_k`` scratch
-        rows per layer from the budget and enables each streamer's sync-free
-        graph gather for routes of at most that many rows.
+        ``graph_gather_batch_size`` > 0 is the tokens of the largest graph
+        forward; it reserves ``graph_gather_scratch_rows(tokens, top_k,
+        graph_gather_max_rows)`` scratch rows per layer from the budget and
+        enables each streamer's sync-free graph gather for routes of at most
+        that many rows.
         ``update_decode_forwards`` > 0 also updates dynamic residency after every
         that many decode or speculative verify forwards, so a long decode is not
         served by the set the last long prefill chose.
@@ -652,7 +670,11 @@ class ExpertHotCacheManager:
             if graph_gather_batch_size and top_k is None:
                 raise ValueError("graph gather needs each streamed layer's top_k")
             scratch_rows[layer_id] = (
-                graph_gather_batch_size * index(top_k) if graph_gather_batch_size else 0
+                graph_gather_scratch_rows(
+                    graph_gather_batch_size, top_k, graph_gather_max_rows
+                )
+                if graph_gather_batch_size
+                else 0
             )
         selected = {layer_id: [] for layer_id in streamers}
         remaining = budget_bytes - sum(

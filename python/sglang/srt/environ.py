@@ -339,6 +339,10 @@ class Envs:
     # Serve decode-sized expert gathers without host syncs so CUDA graphs capture
     # them; requires SGLANG_MOE_EXPERT_HOST_ARENA and SGLANG_MOE_HOT_GPU_MB.
     SGLANG_MOE_EXPERT_GRAPH_GATHER = EnvBool(False)
+    # Speculative decoding only: cap each layer's graph-gather scratch rows below
+    # one per verify route (decode max_bs x draft tokens x top_k); 0 keeps that bound.
+    # Startup rejects a cap below one request's routes: that needs phase 3's overflow path.
+    SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
     # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
     # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
     SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")

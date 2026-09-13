@@ -734,6 +734,25 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_GRAPH_GATHER requires decode CUDA graphs"
                 )
+            if self.spec_algorithm.is_speculative():
+                verify_tokens = self.decode_num_tokens_per_req(
+                    num_draft_tokens=max_speculative_num_draft_tokens()
+                )
+                graph_gather_batch_size *= verify_tokens
+                scratch_cap = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get()
+                request_routes = verify_tokens * max(
+                    getattr(module._nvfp4_expert_streamer.layer, "top_k", 0) or 0
+                    for module in self.model.modules()
+                    if getattr(module, "_nvfp4_expert_streamer", None) is not None
+                )
+                if 0 < scratch_cap < request_routes:
+                    raise ValueError(
+                        "SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS="
+                        f"{scratch_cap} is below one verify request's "
+                        f"{request_routes} routes, so no verify would use the graph "
+                        "gather; capped scratch (option B) needs the overflow "
+                        "re-verify path of NEXTN offload plan phase 3"
+                    )
         if budget_mb == 0:
             return
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
@@ -753,6 +772,7 @@ class ModelRunner:
             metrics_path=envs.SGLANG_MOE_HOT_METRICS_FILE.get() or None,
             copy_backend=envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get(),
             graph_gather_batch_size=graph_gather_batch_size,
+            graph_gather_max_rows=envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:

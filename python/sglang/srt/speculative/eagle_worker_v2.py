@@ -73,6 +73,10 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 )
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.draft_shared_weights import (
+    draft_shares_target_embed_and_head,
+    require_vocab_weights_materialized,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -193,12 +197,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             ctx = empty_context()
+        shared_embed, shared_head = (
+            (None, None)
+            if self.speculative_algorithm.is_eagle3()
+            else target_worker.model_runner.model.get_embed_and_head()
+        )
         with (
             ctx,
             draft_pp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             draft_model_build_scope(),
+            draft_shares_target_embed_and_head(shared_embed, shared_head),
         ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -359,6 +369,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+        require_vocab_weights_materialized(self.draft_runner.model)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
