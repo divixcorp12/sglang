@@ -26,9 +26,55 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
+def validate_moe_route_trace(cfg: Any) -> None:
+    """Reject configurations the debug MoE route trace cannot observe.
+
+    The trace reads routing tensors on the host from module hooks, so decode must
+    run eagerly: a captured graph replays without calling the hooks, and the
+    sync-free graph gather exists only to serve captured decode.
+    """
+    if not envs.SGLANG_MOE_ROUTE_TRACE_DIR.get():
+        return
+    if envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get() < 1:
+        raise ValueError("SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS must be positive")
+    if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_DIR is incompatible with "
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER; set SGLANG_MOE_EXPERT_GRAPH_GATHER=0"
+        )
+    graph_config = cfg.cuda_graph_config
+    if graph_config is not None and graph_config.decode.backend != Backend.DISABLED:
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_DIR traces eager decode only; use "
+            "--cuda-graph-backend-decode disabled"
+        )
+    if getattr(cfg, "enable_torch_compile", False):
+        raise ValueError("SGLANG_MOE_ROUTE_TRACE_DIR does not support torch.compile")
+    if any(getattr(cfg, name, 1) != 1 for name in ("tp_size", "pp_size", "dp_size")):
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_DIR requires --tp 1, --pp-size 1 and --dp 1: "
+            "one scheduler writes the trace directory"
+        )
+    if getattr(cfg, "enable_mixed_chunk", False):
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_DIR does not support --enable-mixed-chunk: "
+            "decode tokens inside mixed batches would be skipped"
+        )
+    if getattr(cfg, "moe_runner_backend", None) != "flashinfer_cutlass":
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_DIR requires --moe-runner-backend "
+            "flashinfer_cutlass, whose TopK output carries topk_ids and topk_weights"
+        )
+    if getattr(cfg, "speculative_algorithm", None) is not None:
+        raise ValueError(
+            "SGLANG_MOE_ROUTE_TRACE_DIR does not support speculative decoding"
+        )
+
+
 def handle_offload_compatibility(server_args: Any) -> None:
     """Validate generic, selected-expert, and PLE offload combinations."""
     cfg = resolving_view(server_args)
+    validate_moe_route_trace(cfg)
     streaming = os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
     if cfg.ple_offload_embedding and cfg.offload_group_size > 0:
         raise ValueError(

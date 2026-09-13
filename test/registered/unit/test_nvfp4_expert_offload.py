@@ -616,6 +616,127 @@ class OffloadCompatibilityTests(unittest.TestCase):
                 )
 
 
+class RouteTraceConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        view = patch.object(memory_hook, "resolving_view", lambda args: args)
+        view.start()
+        self.addCleanup(view.stop)
+
+    def args(self, decode="disabled", **changes):
+        values = dict(
+            ple_offload_embedding=False,
+            cpu_offload_gb=0,
+            offload_group_size=0,
+            ple_offload_backend=None,
+            tp_size=1,
+            pp_size=1,
+            speculative_algorithm=None,
+            enable_torch_compile=False,
+            moe_runner_backend="flashinfer_cutlass",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend="disabled"),
+                prefill=PhaseConfig(backend="disabled"),
+            ),
+        )
+        values.update(changes)
+        args = SimpleNamespace(**values)
+        args.cuda_graph_config.decode.backend = decode
+        return args
+
+    def enable_trace(self):
+        os.environ["SGLANG_MOE_ROUTE_TRACE_DIR"] = "/tmp/route-trace"
+
+    def test_trace_is_disabled_by_default(self):
+        self.assertEqual(envs.SGLANG_MOE_ROUTE_TRACE_DIR.get(), "")
+        self.assertEqual(envs.SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS.get(), 2048)
+        memory_hook.handle_offload_compatibility(self.args(decode="breakable"))
+
+    def test_trace_accepts_eager_decode(self):
+        self.enable_trace()
+        memory_hook.handle_offload_compatibility(self.args())
+
+    def test_trace_rejects_every_decode_cuda_graph_backend(self):
+        self.enable_trace()
+        for backend in ("full", "breakable", "tc_piecewise"):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, "cuda-graph-backend-decode disabled"),
+            ):
+                memory_hook.handle_offload_compatibility(self.args(decode=backend))
+
+    def test_trace_rejects_graph_gather(self):
+        self.enable_trace()
+        os.environ["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = "1"
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_GRAPH_GATHER=0"):
+            memory_hook.handle_offload_compatibility(self.args())
+
+    def test_trace_rejects_unobservable_runtimes(self):
+        self.enable_trace()
+        for changes, message in (
+            (dict(tp_size=2), "--tp 1"),
+            (dict(pp_size=2), "--tp 1"),
+            (dict(dp_size=2), "--dp 1"),
+            (dict(enable_mixed_chunk=True), "mixed-chunk"),
+            (dict(moe_runner_backend="flashinfer_trtllm"), "flashinfer_cutlass"),
+            (dict(moe_runner_backend="triton_kernel"), "flashinfer_cutlass"),
+            (dict(speculative_algorithm="EAGLE"), "speculative"),
+            (dict(enable_torch_compile=True), "torch.compile"),
+        ):
+            with (
+                self.subTest(**changes),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                memory_hook.handle_offload_compatibility(self.args(**changes))
+
+    def test_trace_rejects_nonpositive_token_budget(self):
+        self.enable_trace()
+        os.environ["SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS"] = "0"
+        with self.assertRaisesRegex(ValueError, "MAX_TOKENS must be positive"):
+            memory_hook.handle_offload_compatibility(self.args())
+
+    def test_trace_launch_envelope_with_file_ple_and_dynamic_hot_cache(self):
+        self.enable_trace()
+        os.environ.update(
+            SGLANG_MOE_EXPERT_STREAM="1",
+            SGLANG_MOE_HOT_GPU_MB="10240",
+            SGLANG_MOE_PINNED_HOST_MB="0",
+            SGLANG_MOE_EXPERT_HOST_ARENA="1",
+            SGLANG_MOE_EXPERT_GRAPH_GATHER="0",
+            SGLANG_MOE_HOT_DYNAMIC="1",
+            SGLANG_MOE_EXPERT_COPY_BACKEND="dma",
+        )
+        args = self.args(
+            ple_offload_embedding=True,
+            cpu_offload_gb=80,
+            ple_offload_backend="file",
+            moe_runner_backend="flashinfer_cutlass",
+            ep_size=1,
+            moe_a2a_backend="none",
+            disable_overlap_schedule=True,
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+            max_running_requests=1,
+            expert_distribution_recorder_mode="per_pass",
+            elastic_ep_backend=None,
+            elastic_ep_rejoin=False,
+            ep_join_mode=None,
+            enable_elastic_expert_backup=False,
+            enable_eplb=False,
+            enable_waterfill=False,
+            ep_join_rank_offset=0,
+            elastic_ep_initial_size=None,
+            max_ep_size=None,
+            dllm_algorithm=None,
+        )
+        for stage_before_replay in ("0", "1"):
+            with self.subTest(stage_before_replay=stage_before_replay):
+                os.environ["SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY"] = stage_before_replay
+                memory_hook.handle_offload_compatibility(args)
+
+
 class HotCacheConfigurationTests(unittest.TestCase):
     def setUp(self):
         environment = patch.dict(os.environ, {}, clear=True)

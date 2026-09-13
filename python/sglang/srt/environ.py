@@ -339,6 +339,10 @@ class Envs:
     # Serve decode-sized expert gathers without host syncs so CUDA graphs capture
     # them; requires SGLANG_MOE_EXPERT_HOST_ARENA and SGLANG_MOE_HOT_GPU_MB.
     SGLANG_MOE_EXPERT_GRAPH_GATHER = EnvBool(False)
+    # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
+    # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
+    SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")
+    SGLANG_MOE_ROUTE_TRACE_MAX_TOKENS = EnvInt(2048)
     # Model path recorded in expert/PLE file-cache identities instead of the
     # resolved --model-path; after moving a checkpoint, set it to the resolved
     # path the caches were built from.

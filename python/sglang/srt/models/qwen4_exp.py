@@ -77,6 +77,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
+from sglang.srt.models.qwen4_exp_route_trace import maybe_install_moe_route_trace
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -1995,6 +1996,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
+        self.moe_route_trace = maybe_install_moe_route_trace(self.model)
 
     @torch.no_grad()
     def forward(self, *args, **kwargs):
