@@ -514,6 +514,7 @@ class _OperationalCounters:
     file_fallbacks: int | None = None
     transfer_wait_ns: int = 0
     gather_fallbacks: int = 0
+    gather_copy_engine_bytes: int = 0
 
 
 class ExpertHotCacheManager:
@@ -1114,6 +1115,7 @@ class ExpertHotCacheManager:
             counters.gather_fallbacks += int(
                 getattr(stats, "gather_fallback_used", False)
             )
+            counters.gather_copy_engine_bytes += getattr(stats, "copy_engine_bytes", 0)
             file_bytes = getattr(
                 streamer.layer, "_nvfp4_file_source_bytes_per_expert", None
             )

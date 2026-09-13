@@ -2,7 +2,11 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from sglang.srt.layers.moe.expert_dma import ExpertDMABackend
+from sglang.srt.layers.moe.expert_dma import (
+    ExpertDMABackend,
+    _aot_transfer_available,
+    _coalesce_ranges,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
@@ -28,6 +32,52 @@ class TestExpertDMABackend(unittest.TestCase):
         self.assertTrue(torch.all(self.destination[0] == -1))
         self.assertEqual(actual_backend, backend.actual_backend)
         self.assertIn(actual_backend, {"dma", "fallback"})
+
+    def test_merges_rows_that_advance_together_into_ranges(self):
+        backend = ExpertDMABackend()
+        calls = []
+
+        def record(source, destination, source_starts, destination_starts, lengths):
+            calls.append((source_starts, destination_starts, lengths))
+
+        with patch(
+            "sglang.srt.layers.moe.expert_dma.transfer_embedding_ranges_direct",
+            record,
+        ), patch(
+            "sglang.srt.layers.moe.expert_dma._aot_transfer_available",
+            return_value=True,
+        ):
+            backend.copy_rows(
+                self.source,
+                self.destination,
+                source_rows=[1, 2, 3, 5, 0, 1],
+                destination_slots=[0, 1, 2, 3, 5, 4],
+            )
+
+        self.assertEqual(calls, [([1, 5, 0, 1], [0, 3, 5, 4], [3, 1, 1, 1])])
+
+    def test_runs_stop_at_the_bound_of_their_first_row(self):
+        self.assertEqual(
+            _coalesce_ranges(
+                [0, 1, 2, 3, 4, 7], [0, 1, 2, 3, 4, 5], lambda row: (row // 2 + 1) * 2
+            ),
+            ([0, 2, 4, 7], [0, 2, 4, 5], [2, 2, 1, 1]),
+        )
+
+    def test_copies_a_run_of_consecutive_rows(self):
+        backend = ExpertDMABackend()
+
+        actual_backend = backend.copy_rows(
+            self.source, self.destination, source_rows=[2, 3, 4], destination_slots=[1, 2, 3]
+        )
+        torch.cuda.synchronize()
+
+        if _aot_transfer_available():
+            self.assertEqual(actual_backend, "dma")
+
+        torch.testing.assert_close(self.destination[1:4], self.source[2:5].cuda())
+        self.assertTrue(torch.all(self.destination[0] == -1))
+        self.assertTrue(torch.all(self.destination[4:] == -1))
 
     def test_uses_row_copy_fallback_when_aot_primitive_is_unavailable(self):
         backend = ExpertDMABackend()

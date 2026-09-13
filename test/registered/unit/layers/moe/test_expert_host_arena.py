@@ -162,6 +162,29 @@ class TestExpertHostArena(unittest.TestCase):
         self.assertFalse(is_cuda_host_registered(tensor))
         self.assertFalse(is_cuda_host_registered(tensor[PAGE:]))
 
+    def test_copy_ranges_stop_at_registration_ends(self):
+        from sglang.srt.layers.moe.expert_dma import _registration_run_end
+        from sglang.srt.utils.cuda_host_registry import (
+            cuda_host_registration_end,
+            forget_cuda_host_registration,
+            record_cuda_host_registration,
+        )
+
+        tensor = torch.empty(2 * PAGE, dtype=torch.uint8)
+        base = tensor.data_ptr()
+        for offset in (0, PAGE):
+            record_cuda_host_registration(base + offset, PAGE)
+            self.addCleanup(forget_cuda_host_registration, base + offset)
+
+        self.assertIsNone(cuda_host_registration_end(base - 1))
+        self.assertEqual(cuda_host_registration_end(base), base + PAGE)
+        self.assertEqual(cuda_host_registration_end(base + PAGE - 1), base + PAGE)
+        self.assertEqual(cuda_host_registration_end(base + PAGE), base + 2 * PAGE)
+        self.assertIsNone(cuda_host_registration_end(base + 2 * PAGE))
+
+        run_end = _registration_run_end(tensor.view(8, PAGE // 4))
+        self.assertEqual([run_end(row) for row in (0, 3, 4, 7)], [4, 4, 8, 8])
+
     def test_model_without_streamers_has_no_arena(self):
         from sglang.srt.layers.moe.expert_host_arena import ExpertHostArena
 

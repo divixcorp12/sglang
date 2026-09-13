@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import sys
+from collections.abc import Callable, Sequence
 from operator import index
 
 import torch
+
+from sglang.srt.utils.cuda_host_registry import (
+    cuda_host_registration_end,
+    is_gpu_readable_host_tensor,
+)
 
 try:
     from sgl_kernel.kvcacheio import transfer_embedding_ranges_direct
@@ -14,7 +20,11 @@ except ImportError:
 
 
 class ExpertDMABackend:
-    """Copy selected pinned host expert rows into fixed CUDA cache slots."""
+    """Copy selected pinned or CUDA-registered host expert rows into CUDA rows.
+
+    Row pairs that advance together are merged into one range, so a run of
+    consecutive experts is one copy-engine transfer rather than one per row.
+    """
 
     requested_backend = "dma"
 
@@ -47,9 +57,11 @@ class ExpertDMABackend:
             transfer_embedding_ranges_direct(
                 source_matrix,
                 destination_matrix,
-                source_indices,
-                destination_indices,
-                [1] * len(source_indices),
+                *_coalesce_ranges(
+                    source_indices,
+                    destination_indices,
+                    _registration_run_end(source_matrix),
+                ),
             )
             self.actual_backend = "dma"
         else:
@@ -68,8 +80,8 @@ class ExpertDMABackend:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if source.device.type != "cpu":
             raise ValueError("expert DMA source must be a CPU tensor")
-        if not source.is_pinned():
-            raise ValueError("expert DMA source must be pinned")
+        if not is_gpu_readable_host_tensor(source):
+            raise ValueError("expert DMA source must be pinned or CUDA-registered")
         if destination.device.type != "cuda":
             raise ValueError("expert DMA destination must be a CUDA tensor")
         if source.dtype != destination.dtype:
@@ -90,6 +102,55 @@ class ExpertDMABackend:
         if any(row < 0 or row >= limit for row in indices):
             raise ValueError(f"expert DMA {name} are outside tensor rows")
         return indices
+
+
+def _coalesce_ranges(
+    source_rows: Sequence[int],
+    destination_slots: Sequence[int],
+    run_end: Callable[[int], int] | None = None,
+) -> tuple[list[int], list[int], list[int]]:
+    """Merge row pairs that advance together into start and length lists.
+
+    ``run_end(row)`` is the first source row a run starting at ``row`` may not
+    reach; without it runs are unbounded.
+    """
+    source_starts: list[int] = []
+    destination_starts: list[int] = []
+    lengths: list[int] = []
+    limit = 0
+    for source_row, destination_slot in zip(source_rows, destination_slots):
+        if (
+            lengths
+            and source_row == source_starts[-1] + lengths[-1]
+            and destination_slot == destination_starts[-1] + lengths[-1]
+            and source_row < limit
+        ):
+            lengths[-1] += 1
+        else:
+            source_starts.append(source_row)
+            destination_starts.append(destination_slot)
+            lengths.append(1)
+            limit = run_end(source_row) if run_end is not None else sys.maxsize
+    return source_starts, destination_starts, lengths
+
+
+def _registration_run_end(matrix: torch.Tensor) -> Callable[[int], int] | None:
+    """Bound runs of a registered host matrix to the registration of their first row.
+
+    The arena registers large tensors in row-aligned chunks, and one copy-engine
+    range spanning two registrations is not guaranteed to be read in place.
+    PyTorch pinned allocations are one block and need no bound.
+    """
+    row_bytes = matrix.shape[1] * matrix.element_size()
+    if matrix.is_pinned() or row_bytes == 0:
+        return None
+    base = matrix.data_ptr()
+
+    def run_end(row: int) -> int:
+        end = cuda_host_registration_end(base + row * row_bytes)
+        return row + 1 if end is None else (end - base) // row_bytes
+
+    return run_end
 
 
 def _aot_transfer_available() -> bool:

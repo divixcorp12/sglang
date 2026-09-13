@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class ExpertGatherStats:
 
     transfer_wait_ns: int = 0
     gather_fallback_used: bool = False
+    copy_engine_bytes: int = 0
 
 
 @dataclass
@@ -495,6 +497,8 @@ class ExpertStreamer:
 
         self.file_row_reader = ExpertFileRowReader.from_layer(layer, self.tensor_names)
         self.hot_cache = None
+        self.expert_copy_backend = "gpu"
+        self._dma_backend = ExpertDMABackend()
         self.pinned_host_cache = None
         self.residency_policy = None
         self.graph_gather_rows = 0
@@ -700,15 +704,34 @@ class ExpertStreamer:
 
     def _copy_source_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
-    ) -> None:
-        """Fill supplied CUDA rows through the existing bounded host buffers."""
+    ) -> int:
+        """Fill supplied CUDA rows through the existing bounded host buffers.
+
+        With the ``dma`` copy backend, rows of registered or pinned host tensors
+        go through the CUDA copy engine, merged into runs of consecutive rows.
+        Graph capture keeps the pull kernel. Returns the bytes the copy engine
+        moved, so a build without it shows up as zero.
+        """
         row_count = source_ids.numel()
-        capacity = max(row_count, _NO_DEDUP_LIMIT)
-        pageable_source = any(
-            _tensor_data(getattr(self.layer, name)).device.type == "cpu"
-            and not is_gpu_readable_host_tensor(_tensor_data(getattr(self.layer, name)))
-            for name in self.tensor_names
+        use_dma = (
+            self.expert_copy_backend == "dma"
+            and _aot_transfer_available()
+            and not torch.cuda.is_current_stream_capturing()
         )
+        dma_rows = None
+        copy_engine_bytes = 0
+        capacity = max(row_count, _NO_DEDUP_LIMIT)
+        host_sources = {
+            name: source
+            for name in self.tensor_names
+            for source in [_tensor_data(getattr(self.layer, name))]
+            if source.device.type == "cpu"
+        }
+        readable = {
+            name: is_gpu_readable_host_tensor(source)
+            for name, source in host_sources.items()
+        }
+        pageable_source = not all(readable.values())
         cpu_ids = (
             _copy_indices_to_cpu(source_ids, capacity) if pageable_source else None
         )
@@ -716,7 +739,14 @@ class ExpertStreamer:
             source = _tensor_data(getattr(self.layer, name))
             if source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
-            elif is_gpu_readable_host_tensor(source):
+            elif readable[name] and use_dma and source.ndim >= 2:
+                if dma_rows is None:
+                    dma_rows = source_ids.tolist()
+                self._dma_backend.copy_rows(source, output, dma_rows, range(row_count))
+                copy_engine_bytes += (
+                    row_count * source.numel() * source.element_size() // self.num_experts
+                )
+            elif readable[name]:
                 row_bytes = source.numel() * source.element_size() // self.num_experts
                 _gather_host_rows_kernel[(row_count, triton.cdiv(row_bytes, 1024))](
                     source.view(torch.uint8),
@@ -732,6 +762,7 @@ class ExpertStreamer:
                 )
                 self._read_host_rows(name, source, cpu_ids, host_output)
                 output.copy_(host_output, non_blocking=True)
+        return copy_engine_bytes
 
     def _gather_cached(
         self,
@@ -786,6 +817,7 @@ class ExpertStreamer:
         pinned_miss_rows = 0
         pinned_populated_bytes = 0
         gather_fallback_used = False
+        copy_engine_bytes = 0
         pinned_cache = self.pinned_host_cache
         source_bytes = miss_rows * self.bytes_per_expert
         if (
@@ -820,9 +852,11 @@ class ExpertStreamer:
                 if name not in pinned_cache.cached_names
             }
             if uncached_outputs:
-                self._copy_source_rows(miss_source_ids, uncached_outputs)
+                copy_engine_bytes = self._copy_source_rows(
+                    miss_source_ids, uncached_outputs
+                )
         else:
-            self._copy_source_rows(miss_source_ids, misses)
+            copy_engine_bytes = self._copy_source_rows(miss_source_ids, misses)
         if hit_rows:
             for name, output in gathered.items():
                 row_bytes = output.numel() * output.element_size() // row_count
@@ -852,6 +886,7 @@ class ExpertStreamer:
             pinned_populated_bytes,
             0,
             gather_fallback_used,
+            copy_engine_bytes=copy_engine_bytes,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
 
@@ -869,6 +904,7 @@ class ExpertStreamer:
         del slots
         hit_rows = int(hit_mask.sum().item())
         miss_rows = row_count - hit_rows
+        copy_engine_bytes = 0
         gathered = {
             name: _staging_buffer(
                 name,
@@ -936,7 +972,7 @@ class ExpertStreamer:
                     for name, output in gathered.items()
                     if name in cache.cached_names
                 }
-                self._copy_source_rows(cold_ids, cold_outputs)
+                copy_engine_bytes += self._copy_source_rows(cold_ids, cold_outputs)
                 for name, output in cold_outputs.items():
                     gathered[name].index_copy_(0, cold_positions, output)
             populated_bytes = cache.stats.populated_bytes - populated_before
@@ -948,7 +984,7 @@ class ExpertStreamer:
             if name not in cache.cached_names
         }
         if uncached:
-            self._copy_source_rows(source_ids, uncached)
+            copy_engine_bytes += self._copy_source_rows(source_ids, uncached)
         self.last_gather_stats = ExpertGatherStats(
             row_count,
             0,
@@ -959,6 +995,7 @@ class ExpertStreamer:
             hit_rows,
             miss_rows,
             populated_bytes,
+            copy_engine_bytes=copy_engine_bytes,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
 

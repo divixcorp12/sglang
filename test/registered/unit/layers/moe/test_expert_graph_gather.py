@@ -193,6 +193,85 @@ class TestExpertGraphGather(unittest.TestCase):
         finally:
             arena.close()
 
+    def test_eager_misses_use_the_copy_engine_for_registered_rows(self):
+        from sglang.srt.layers.moe.expert_dma import (
+            ExpertDMABackend,
+            _aot_transfer_available,
+        )
+        from sglang.srt.layers.moe.expert_host_arena import ExpertHostArena
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        if not _aot_transfer_available():
+            self.skipTest("the copy-engine range transfer is not built")
+        layer = _layer(pinned=False)
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        arena = ExpertHostArena()
+        arena.bind(streamer)
+        try:
+            cache = ExpertHotCache(streamer, 2, scratch_rows=TOP_K)
+            cache.reassign([1, 4])
+            streamer.enable_graph_gather(TOP_K)
+            streamer.expert_copy_backend = "dma"
+            ids = torch.tensor(
+                [[2, 3, 5, 1], [6, 0, 7, 4]], dtype=torch.int32, device="cuda"
+            )
+            original = ExpertDMABackend.copy_rows
+
+            with patch.object(
+                ExpertDMABackend, "copy_rows", autospec=True, side_effect=original
+            ) as copy_rows:
+                compact, tensors = streamer.gather(ids)
+
+            self._assert_rows(layer, ids, compact, tensors)
+            self.assertEqual(copy_rows.call_count, len(_HOST_SHAPES))
+            self.assertEqual(streamer._dma_backend.actual_backend, "dma")
+            self.assertEqual(
+                streamer.last_gather_stats.copy_engine_bytes,
+                6 * streamer.host_bytes_per_expert,
+            )
+        finally:
+            arena.close()
+
+    def test_eager_misses_keep_the_pull_kernel_without_the_copy_engine(self):
+        from sglang.srt.layers.moe.expert_dma import ExpertDMABackend
+        from sglang.srt.layers.moe.expert_host_arena import ExpertHostArena
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        conditions = {
+            "not built": patch(
+                "sglang.srt.layers.moe.expert_stream._aot_transfer_available",
+                return_value=False,
+            ),
+            "capturing": patch(
+                "torch.cuda.is_current_stream_capturing", return_value=True
+            ),
+        }
+        for condition, unavailable in conditions.items():
+            with self.subTest(condition):
+                layer = _layer(pinned=False)
+                streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+                arena = ExpertHostArena()
+                arena.bind(streamer)
+                try:
+                    cache = ExpertHotCache(streamer, 2, scratch_rows=TOP_K)
+                    cache.reassign([1, 4])
+                    streamer.expert_copy_backend = "dma"
+                    ids = torch.tensor(
+                        [[2, 3, 5, 1], [6, 0, 7, 4]], dtype=torch.int32, device="cuda"
+                    )
+
+                    with unavailable, patch.object(
+                        ExpertDMABackend, "copy_rows"
+                    ) as copy_rows:
+                        compact, tensors = streamer.gather(ids)
+                    torch.cuda.synchronize()
+
+                    self._assert_rows(layer, ids, compact, tensors)
+                    copy_rows.assert_not_called()
+                    self.assertEqual(streamer.last_gather_stats.copy_engine_bytes, 0)
+                finally:
+                    arena.close()
+
     def test_enable_rejects_pageable_sources_and_missing_scratch_rows(self):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
 

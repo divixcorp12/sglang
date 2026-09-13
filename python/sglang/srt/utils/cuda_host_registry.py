@@ -52,6 +52,16 @@ def is_cuda_host_registered(tensor: torch.Tensor) -> bool:
         return True
 
 
+def cuda_host_registration_end(address: int) -> int | None:
+    """End address of the recorded registration holding ``address``, or None."""
+    with _LOCK:
+        position = bisect.bisect_right(_BASES, address) - 1
+        if position < 0:
+            return None
+        end = _BASES[position] + _SIZES[_BASES[position]]
+        return end if address < end else None
+
+
 def is_gpu_readable_host_tensor(tensor: torch.Tensor) -> bool:
     """Whether CUDA kernels and non-blocking copies can read ``tensor`` in place.
 
