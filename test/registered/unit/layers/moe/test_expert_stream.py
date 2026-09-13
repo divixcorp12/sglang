@@ -100,14 +100,14 @@ class TestExpertStreamer(unittest.TestCase):
         layer = self._make_layer(experts=4)
         streamer = ExpertStreamer(layer, ("gpu_rows",))
         topk_ids = torch.tensor(
-            [[3, 1, 2], [1, 3, 0]], device="cuda", dtype=torch.int32
+            [[3, 1, 2, 1, 3, 0]], device="cuda", dtype=torch.int32
         )
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             compact_ids, tensors = streamer.gather(topk_ids)
 
-        self.assertEqual(compact_ids.tolist(), [[0, 1, 2], [3, 4, 5]])
+        self.assertEqual(compact_ids.tolist(), [[0, 1, 2, 3, 4, 5]])
         self.assertEqual(tensors["gpu_rows"].shape[0], 6)
         self.assertTrue(
             torch.equal(
@@ -125,10 +125,17 @@ class TestExpertStreamer(unittest.TestCase):
 
         compact_ids, tensors = streamer.gather(topk_ids)
 
-        expected_ids = topk_ids.reshape(-1).to(torch.long).cpu()
-        self.assertEqual(compact_ids.tolist(), [[0, 1, 2], [3, 4, 5]])
+        self.assertEqual(compact_ids.tolist(), [[3, 1, 2], [1, 3, 0]])
         self.assertTrue(
-            torch.equal(tensors["host_rows"].cpu(), layer.host_rows[expected_ids])
+            torch.equal(
+                tensors["host_rows"].cpu(), layer.host_rows[torch.arange(4)]
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                tensors["host_rows"][compact_ids.long()].cpu(),
+                layer.host_rows[topk_ids.long().cpu()],
+            )
         )
 
     def test_breakable_graph_replays_streamed_host_rows_for_new_routes(self):

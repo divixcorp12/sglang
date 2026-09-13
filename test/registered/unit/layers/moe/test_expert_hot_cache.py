@@ -238,6 +238,21 @@ class TestExpertHotCache(unittest.TestCase):
         )
         self.assertEqual((stats.h2d_bytes, stats.source_bytes), (56, 56))
 
+    def test_two_token_decode_deduplicates_and_counts_routed_and_unique_misses(self):
+        cache = self.cache_type(self.streamer, capacity=2)
+        cache.reassign([3, 7])
+        compact, tensors = self.assert_routes([[7, 1, 3], [1, 7, 2]])
+        self.assertEqual(tensors["w13_weight"].shape[0], 4)
+        stats = self.streamer.last_gather_stats
+        self.assertEqual(
+            (stats.requested_rows, stats.hot_hit_rows, stats.miss_rows), (4, 2, 2)
+        )
+        self.assertEqual(
+            (stats.routed_rows, stats.routed_miss_rows, stats.unique_miss_rows),
+            (6, 3, 2),
+        )
+        self.assertEqual((stats.h2d_bytes, stats.source_bytes), (112, 112))
+
     def test_all_cold_and_zero_budget_preserve_uncached_results(self):
         cache = self.cache_type(self.streamer, capacity=2)
         cache.reassign([3, 7])
@@ -614,12 +629,17 @@ class TestExpertHotCacheManager(unittest.TestCase):
             trace.seek(0)
             records = [json.loads(line) for line in trace.read().splitlines()]
         self.assertEqual(
-            [record["phase"] for record in records], ["speculative"] * 2 + ["decode"]
+            [record["phase"] for record in records], ["speculative", "decode"]
         )
-        speculative = records[1]["route_statistics"]["speculative"]
-        self.assertEqual(speculative["popularity"]["0"], [[1, 8.0], [0, 2.0]])
-        self.assertEqual(speculative["affinity"]["0->2"], [[1, 0, 24.0], [1, 2, 16.0]])
-        counters = records[1]["counters"]["speculative"]["0"]
+        speculative = records[-1]["route_statistics"]["speculative"]
+        self.assertEqual(
+            speculative, records[0]["route_statistics"]["speculative"]
+        )
+        self.assertEqual(speculative["popularity"]["0"], [[1, 4.0], [0, 1.0]])
+        self.assertEqual(speculative["affinity"]["0->2"], [[1, 0, 12.0], [1, 2, 8.0]])
+        decode = records[-1]["route_statistics"]["decode"]
+        self.assertEqual(decode["popularity"]["0"], [[1, 4.0], [0, 1.0]])
+        counters = records[-1]["counters"]["speculative"]["0"]
         self.assertIn("pinned_hits", counters)
         self.assertIn("file_fallbacks", counters)
         self.assertIn("transfer_wait_ns", counters)

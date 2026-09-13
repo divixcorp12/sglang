@@ -20,6 +20,11 @@ from sglang.srt.layers.moe.expert_prefetch import (
     SparseNextLayerPolicy,
 )
 from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
+from sglang.srt.layers.moe.expert_residency_clock import (
+    ForwardKind,
+    ResidencyBoundaryClock,
+    classify_forward,
+)
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
 
 from sglang.srt.layers.moe.expert_transfer import (
@@ -515,6 +520,18 @@ class _OperationalCounters:
     transfer_wait_ns: int = 0
     gather_fallbacks: int = 0
     gather_copy_engine_bytes: int = 0
+    routed_rows: int = 0
+    routed_miss_rows: int = 0
+    unique_miss_rows: int = 0
+    gathers: int = 0
+
+
+_PHASES = {
+    ForwardKind.PREFILL: "prefill",
+    ForwardKind.DECODE: "decode",
+    ForwardKind.IDLE: "decode",
+    ForwardKind.VERIFY: "speculative",
+}
 
 
 class ExpertHotCacheManager:
@@ -551,8 +568,8 @@ class ExpertHotCacheManager:
         rows per layer from the budget and enables each streamer's sync-free
         graph gather for routes of at most that many rows.
         ``update_decode_forwards`` > 0 also updates dynamic residency after every
-        that many decode forwards, so a long decode is not served by the set the
-        last long prefill chose.
+        that many decode or speculative verify forwards, so a long decode is not
+        served by the set the last long prefill chose.
         ``decay_tokens`` > 0 decays scores once per that many routed tokens
         instead of once per boundary, and ``promotion_sigmas`` adds that many
         standard deviations of count noise to the lead a promotion needs; see
@@ -660,14 +677,14 @@ class ExpertHotCacheManager:
         manager.dynamic = dynamic
         manager.update_prefill_tokens = update_prefill_tokens
         manager.update_decode_forwards = update_decode_forwards
-        manager._decode_forwards_since_boundary = 0
-        manager._tokens_since_boundary = 0
+        manager._boundary_clock = ResidencyBoundaryClock(
+            update_prefill_tokens, update_decode_forwards, enabled=dynamic
+        )
         manager.min_residence_forwards = min_residence_forwards
         manager.benefit_ratio = benefit_ratio
         manager.log_interval = log_interval
         manager.metrics_path = Path(metrics_path) if metrics_path else None
         manager.route_history_limit = route_history_limit
-        manager._forward_count = 0
         manager._last_update = {layer_id: 0 for layer_id in streamers}
         manager._last_gather = {
             layer_id: streamer.last_gather_stats
@@ -691,6 +708,7 @@ class ExpertHotCacheManager:
         manager._layer_index = {}
         manager._registers = {}
         manager._graph_counters = None
+        manager._graph_unique_counters = None
         for layer_id, expert_ids in selected.items():
             if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -841,10 +859,14 @@ class ExpertHotCacheManager:
         shared = torch.zeros(
             (len(self._layer_ids), 2), dtype=torch.int64, device=device
         )
+        unique_counters = torch.zeros_like(shared)
         for position, streamer in graph_streamers:
             shared[position].copy_(streamer.graph_counters)
             streamer.graph_counters = shared[position]
+            unique_counters[position].copy_(streamer.graph_unique_counters)
+            streamer.graph_unique_counters = unique_counters[position]
         self._graph_counters = shared
+        self._graph_unique_counters = unique_counters
 
     def discard_graph_capture_routes(self) -> None:
         """Drop routes and counters that CUDA-graph warmup and capture recorded.
@@ -855,6 +877,7 @@ class ExpertHotCacheManager:
         """
         if self._graph_counters is not None:
             self._graph_counters.zero_()
+            self._graph_unique_counters.zero_()
         for registers in self._registers.values():
             for register in registers.values():
                 register.zero_()
@@ -867,15 +890,6 @@ class ExpertHotCacheManager:
         if cache is None:
             return (0, 0)
         return (cache.stats.populated_rows, cache.stats.evictions)
-
-    @staticmethod
-    def _phase(forward_batch: ForwardBatch) -> str:
-        mode = forward_batch.forward_mode
-        if mode.is_target_verify() or mode.is_draft_extend_v2():
-            return "speculative"
-        if mode.is_extend_without_speculative():
-            return "prefill"
-        return "decode"
 
     def _registers_for(
         self, phase: str, device: torch.device, experts: int
@@ -894,6 +908,10 @@ class ExpertHotCacheManager:
                 ),
                 "unique_experts": torch.zeros(layers, dtype=torch.int64, device=device),
                 "graph_rows": torch.zeros((layers, 2), dtype=torch.int64, device=device),
+                "graph_unique_rows": torch.zeros(
+                    (layers, 2), dtype=torch.int64, device=device
+                ),
+                "gathers": torch.zeros(layers, dtype=torch.int64, device=device),
             }
             self._registers[phase] = registers
         return registers
@@ -929,8 +947,11 @@ class ExpertHotCacheManager:
         if self._graph_counters is not None:
             gathered = gathered | (self._graph_counters[:, 0] > 0)
             registers["graph_rows"].add_(self._graph_counters)
+            registers["graph_unique_rows"].add_(self._graph_unique_counters)
             self._graph_counters.zero_()
+            self._graph_unique_counters.zero_()
         registers["unique_experts"].add_(rows.ne(0).sum(dim=1) * gathered)
+        registers["gathers"].add_(gathered)
 
     def _top_entries(self, matrix: torch.Tensor) -> list[list[tuple[int, float]]]:
         """Nonzero top ``route_history_limit`` (index, value) pairs of each row."""
@@ -1014,7 +1035,12 @@ class ExpertHotCacheManager:
         result = {}
         register_totals = {
             phase: torch.cat(
-                [registers["graph_rows"], registers["unique_experts"].unsqueeze(1)],
+                [
+                    registers["graph_rows"],
+                    registers["unique_experts"].unsqueeze(1),
+                    registers["graph_unique_rows"],
+                    registers["gathers"].unsqueeze(1),
+                ],
                 dim=1,
             )
             .cpu()
@@ -1027,16 +1053,29 @@ class ExpertHotCacheManager:
             for layer_id, counters in layers.items():
                 row = asdict(counters)
                 if totals is not None:
-                    requested, missed, unique = totals[self._layer_positions[layer_id]]
+                    (
+                        routed,
+                        routed_missed,
+                        unique,
+                        unique_hit,
+                        unique_missed,
+                        gathers,
+                    ) = totals[self._layer_positions[layer_id]]
                     streamer = self.streamers[layer_id]
-                    row["requested_rows"] += requested
-                    row["miss_rows"] += missed
-                    row["hot_hits"] += requested - missed
-                    row["d2d_bytes"] += requested * (
+                    row["requested_rows"] += unique_hit + unique_missed
+                    row["routed_rows"] += routed
+                    row["miss_rows"] += unique_missed
+                    row["routed_miss_rows"] += routed_missed
+                    row["unique_miss_rows"] += unique_missed
+                    row["gathers"] += gathers
+                    row["hot_hits"] += unique_hit
+                    row["d2d_bytes"] += routed * (
                         streamer.bytes_per_expert - streamer.host_bytes_per_expert
                     )
-                    row["h2d_bytes"] += missed * streamer.host_bytes_per_expert
-                    row["backing_source_bytes"] += missed * streamer.bytes_per_expert
+                    row["h2d_bytes"] += unique_missed * streamer.host_bytes_per_expert
+                    row["backing_source_bytes"] += (
+                        unique_missed * streamer.bytes_per_expert
+                    )
                     row["requested_unique_experts"] += unique
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
@@ -1060,11 +1099,17 @@ class ExpertHotCacheManager:
     ) -> None:
         """Account for fresh gathers and change slots at residency boundaries.
 
-        A boundary is a prefill of at least ``update_prefill_tokens`` tokens or,
-        when ``update_decode_forwards`` is set, that many decode forwards after
-        the previous boundary. Every layer's scores advance at each boundary;
-        ``min_residence_forwards`` only holds back that layer's slot changes.
+        Draft-worker forwards are ignored before any counter is touched. A
+        boundary is a prefill of at least ``update_prefill_tokens`` tokens or,
+        when ``update_decode_forwards`` is set, that many decode or verify
+        forwards after the previous boundary; see
+        :class:`ResidencyBoundaryClock`. Every layer's scores advance at each
+        boundary; ``min_residence_forwards`` only holds back that layer's slot
+        changes.
         """
+        kind, tokens = classify_forward(forward_batch)
+        if kind is ForwardKind.DRAFT:
+            return
         counts = single_pass_data.get("global_physical_count")
         if counts is None:
             return
@@ -1075,24 +1120,10 @@ class ExpertHotCacheManager:
             raise ValueError(
                 "recorder counts do not match expert cache layers and experts"
             )
-        self._forward_count += 1
-        mode = self._phase(forward_batch)
-        extend_tokens = forward_batch.extend_num_tokens or 0
-        self._tokens_since_boundary += (
-            extend_tokens
-            if mode == "prefill"
-            else getattr(forward_batch, "batch_size", 1)
-        )
-        if mode == "decode" and not forward_batch.forward_mode.is_idle():
-            self._decode_forwards_since_boundary += 1
-        qualifying = self.dynamic and (
-            (mode == "prefill" and extend_tokens >= self.update_prefill_tokens)
-            or (
-                mode == "decode"
-                and self.update_decode_forwards > 0
-                and self._decode_forwards_since_boundary >= self.update_decode_forwards
-            )
-        )
+        mode = _PHASES[kind]
+        clock = self._boundary_clock
+        boundary_tokens = clock.observe(kind, tokens)
+        qualifying = boundary_tokens is not None
         eager_gathered = []
         for layer_id in self._layer_ids:
             streamer = self.streamers[layer_id]
@@ -1105,6 +1136,9 @@ class ExpertHotCacheManager:
             counters = self._counters[mode][layer_id]
             counters.requested_rows += stats.requested_rows
             counters.miss_rows += stats.miss_rows
+            counters.routed_rows += stats.routed_rows
+            counters.routed_miss_rows += stats.routed_miss_rows
+            counters.unique_miss_rows += stats.unique_miss_rows
             counters.hot_hits += stats.hot_hit_rows
             counters.d2d_bytes += stats.d2d_bytes
             counters.h2d_bytes += stats.h2d_bytes
@@ -1144,11 +1178,8 @@ class ExpertHotCacheManager:
             policy = self.residency_policies.get(layer_id)
             if cache is None or policy is None:
                 continue
-            policy.advance(self._tokens_since_boundary)
-            if (
-                self._forward_count - self._last_update[layer_id]
-                < self.min_residence_forwards
-            ):
+            policy.advance(boundary_tokens)
+            if clock.forwards - self._last_update[layer_id] < self.min_residence_forwards:
                 continue
             decision = policy.decide(cache.resident_experts())
             if not decision.promotions and not decision.evictions:
@@ -1157,9 +1188,14 @@ class ExpertHotCacheManager:
             self._record_update(
                 layer_id, cache.reassign(decision.desired_experts), mode
             )
-            self._last_update[layer_id] = self._forward_count
-        if qualifying:
-            self._tokens_since_boundary = 0
-            self._decode_forwards_since_boundary = 0
-        if self._forward_count % self.log_interval == 0:
+            self._last_update[layer_id] = clock.forwards
+        if clock.forwards % self.log_interval == 0:
             self._write_trace(mode)
+
+    def on_speculative_commit(self, accepted_tokens: int) -> None:
+        """Correct the oldest outstanding verify's drafted tokens to those it committed.
+
+        The speculative worker calls this once accept lengths are on the host;
+        the next boundary advances scores by the corrected token count.
+        """
+        self._boundary_clock.commit(accepted_tokens)

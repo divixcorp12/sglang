@@ -1460,6 +1460,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size
             )
+        hot_cache_manager = getattr(
+            self._target_worker.model_runner, "expert_hot_cache_manager", None
+        )
+        if hot_cache_manager is not None:
+            hot_cache_manager.on_speculative_commit(
+                sum(num_correct_drafts_per_req)
+                + len(num_correct_drafts_per_req)
+                * GenerationBatchResult.num_non_draft_tokens_per_req
+            )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is not None:

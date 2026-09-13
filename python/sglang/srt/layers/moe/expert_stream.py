@@ -14,11 +14,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
+from sglang.srt.layers.moe.expert_route_plan import NO_DEDUP_LIMIT as _NO_DEDUP_LIMIT
+from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes, should_dedup
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 logger = logging.getLogger(__name__)
 
-_NO_DEDUP_LIMIT = 64
 _STAGING: Dict[Tuple, torch.Tensor] = {}
 _PINNED_STAGING: Dict[Tuple, torch.Tensor] = {}
 _PINNED_INDEX: Dict[Tuple, torch.Tensor] = {}
@@ -41,6 +42,8 @@ class ExpertGatherStats:
 
     All-hot slot remapping has no transfer bytes. source_bytes counts misses
     read from backing tensors, whether their source device is CPU or CUDA.
+    routed_rows and routed_miss_rows count routes with multiplicity;
+    unique_miss_rows counts the distinct missed experts actually gathered.
     """
 
     requested_rows: int = 0
@@ -56,6 +59,9 @@ class ExpertGatherStats:
     transfer_wait_ns: int = 0
     gather_fallback_used: bool = False
     copy_engine_bytes: int = 0
+    routed_rows: int = 0
+    routed_miss_rows: int = 0
+    unique_miss_rows: int = 0
 
 
 @dataclass
@@ -605,12 +611,11 @@ class ExpertStreamer:
         self._graph_source_rows = torch.zeros(
             max_rows, dtype=torch.int64, device=device
         )
-        self._graph_destination_slots = torch.zeros(
-            max_rows, dtype=torch.int32, device=device
-        )
+        self._graph_destination_slots = self._graph_scratch_slots.to(torch.int32)
         self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
         self._graph_ones = torch.ones(max_rows, dtype=torch.float32, device=device)
         self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
+        self.graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_gather_rows = max_rows
 
     def _gather_graph(
@@ -620,23 +625,20 @@ class ExpertStreamer:
         cache = self.hot_cache
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
-        slots = cache.expert_to_slot.index_select(0, flat)
-        hit = slots >= 0
-        scratch = self._graph_scratch_slots[:count]
-        # Misses sort first, so the pull kernel's first ``miss_count`` plan rows
-        # are exactly the misses, whatever the routes are at replay time.
-        order = torch.argsort(hit.to(torch.uint8), stable=True)
-        miss_count = count - hit.sum(dtype=torch.int32)
-        self._graph_source_rows[:count].copy_(flat.index_select(0, order))
-        self._graph_destination_slots[:count].copy_(scratch.index_select(0, order))
-        self._graph_miss_count.copy_(miss_count.reshape(1))
+        plan = plan_graph_routes(
+            flat, cache.expert_to_slot, self.graph_gather_rows, cache.capacity
+        )
+        plan_rows = plan.source_rows.numel()
+        scratch = self._graph_scratch_slots[:plan_rows]
+        self._graph_source_rows[:plan_rows].copy_(plan.source_rows)
+        self._graph_miss_count.copy_(plan.miss_plan_rows.reshape(1))
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,
                 scratch,
                 source.view(torch.uint8)
                 .reshape(source.shape[0], -1)
-                .index_select(0, flat),
+                .index_select(0, plan.source_rows),
             )
         if self._graph_row_segments is not None:
             self._copy_row_segments_gpu(
@@ -646,13 +648,14 @@ class ExpertStreamer:
                 self._graph_miss_count,
             )
         self.graph_counters[0].add_(count)
-        self.graph_counters[1].add_(miss_count)
+        self.graph_counters[1].add_(plan.routed_miss_rows)
+        self.graph_unique_counters[0].add_(plan.unique_hit_rows)
+        self.graph_unique_counters[1].add_(plan.unique_miss_rows)
         if self.residency_policy is not None:
             self.residency_policy.pending_counts.index_add_(
                 0, flat, self._graph_ones[:count]
             )
-        remapped = torch.where(hit, slots, scratch)
-        return remapped.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
+        return plan.remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
 
     def _check_graph_sources(self) -> None:
         """Raise if a layer tensor was rebound after its graph gather plan froze it."""
@@ -773,10 +776,18 @@ class ExpertStreamer:
         cache = self.hot_cache
         slots, hit_mask = cache.lookup(source_ids)
         row_count = source_ids.numel()
-        hit_rows = int(hit_mask.sum().item())
+        routed_rows = compact_ids.numel()
+        if routed_rows == row_count:
+            hit_rows = routed_hit_rows = int(hit_mask.sum().item())
+        else:
+            hit_rows, routed_hit_rows = torch.stack(
+                (hit_mask.sum(), hit_mask[compact_ids.long()].sum())
+            ).tolist()
         miss_rows = row_count - hit_rows
         if miss_rows == 0:
-            self.last_gather_stats = ExpertGatherStats(row_count, hit_rows)
+            self.last_gather_stats = ExpertGatherStats(
+                row_count, hit_rows, routed_rows=routed_rows
+            )
             return slots[compact_ids.long()].reshape(topk_ids.shape).to(
                 topk_ids.dtype
             ), cache.tensors
@@ -887,6 +898,9 @@ class ExpertStreamer:
             0,
             gather_fallback_used,
             copy_engine_bytes=copy_engine_bytes,
+            routed_rows=routed_rows,
+            routed_miss_rows=routed_rows - routed_hit_rows,
+            unique_miss_rows=miss_rows,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
 
@@ -996,8 +1010,36 @@ class ExpertStreamer:
             miss_rows,
             populated_bytes,
             copy_engine_bytes=copy_engine_bytes,
+            routed_rows=compact_ids.numel(),
+            routed_miss_rows=compact_ids.numel(),
+            unique_miss_rows=row_count,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
+
+    def _plan_eager_routes(
+        self, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the source IDs to gather and each route's index into them.
+
+        Multi-token forwards gather one row per distinct expert; the residency
+        policy still records every route, keeping routed multiplicity.
+        """
+        flat_ids = topk_ids.reshape(-1)
+        if should_dedup(topk_ids):
+            source_ids, compact_ids = torch.unique(
+                flat_ids, sorted=True, return_inverse=True
+            )
+        else:
+            source_ids = flat_ids
+            compact_ids = _cached_arange(
+                flat_ids.numel(), flat_ids.device, topk_ids.dtype
+            )
+        residency_policy = self.residency_policy
+        if residency_policy is not None and not (
+            flat_ids.is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
+            residency_policy.record_routes(flat_ids)
+        return source_ids, compact_ids
 
     def gather(
         self, topk_ids: torch.Tensor
@@ -1015,22 +1057,7 @@ class ExpertStreamer:
                 f"selected expert ID is outside [0, {self.num_experts - 1}]"
             )
 
-        if flat_ids.numel() <= _NO_DEDUP_LIMIT:
-            source_ids = flat_ids
-            compact_ids = _cached_arange(
-                flat_ids.numel(), flat_ids.device, topk_ids.dtype
-            )
-        else:
-            source_ids, compact_ids = torch.unique(
-                flat_ids, sorted=True, return_inverse=True
-            )
-
-        residency_policy = self.residency_policy
-        if (
-            residency_policy is not None
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            residency_policy.record_routes(source_ids)
+        source_ids, compact_ids = self._plan_eager_routes(topk_ids)
         if prefetch_coordinator is not None:
             prefetch_coordinator.synchronous_correction(
                 source_ids.tolist(), lambda _: None
@@ -1055,6 +1082,9 @@ class ExpertStreamer:
             row_count * (self.bytes_per_expert - self.host_bytes_per_expert),
             row_count * self.host_bytes_per_expert,
             row_count * self.bytes_per_expert,
+            routed_rows=compact_ids.numel(),
+            routed_miss_rows=compact_ids.numel(),
+            unique_miss_rows=row_count,
         )
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         pageable_source = any(

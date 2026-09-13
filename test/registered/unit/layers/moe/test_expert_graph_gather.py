@@ -83,6 +83,29 @@ class TestExpertGraphGather(unittest.TestCase):
         self.assertEqual(streamer.graph_counters.tolist(), [4, 2])
         self.assertEqual(cache.resident_experts(), frozenset({1, 4, 6}))
 
+    def test_verify_shaped_routes_share_scratch_rows_between_duplicate_misses(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        layer = _layer()
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        routes = 4 * TOP_K
+        cache = ExpertHotCache(streamer, 3, scratch_rows=routes)
+        cache.reassign([1, 4, 6])
+        streamer.enable_graph_gather(routes)
+        ids = torch.tensor(
+            [[0, 1, 2, 3], [2, 3, 4, 5], [5, 0, 6, 7], [7, 2, 1, 3]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        compact, tensors = streamer.gather(ids)
+
+        self._assert_rows(layer, ids, compact, tensors)
+        self.assertEqual(streamer.graph_counters.tolist(), [routes, 12])
+        self.assertEqual(streamer.graph_unique_counters.tolist(), [3, 5])
+        scratch = compact[compact >= cache.capacity]
+        self.assertEqual(scratch.unique().numel(), 5)
+
     def test_graph_gather_performs_no_host_synchronization(self):
         streamer, _ = self._graph_streamer(_layer())
         ids = torch.tensor([[0, 4, 7, 0]], dtype=torch.int32, device="cuda")
@@ -384,8 +407,10 @@ class TestExpertGraphGather(unittest.TestCase):
         decode_step([2, 0, 5, 7])
 
         decode = manager.snapshot_counters()["decode"]["0"]
-        self.assertEqual(decode["requested_rows"], 20)
-        self.assertEqual(decode["miss_rows"], 15)
+        self.assertEqual(decode["requested_rows"], 10)
+        self.assertEqual(decode["routed_rows"], 20)
+        self.assertEqual(decode["miss_rows"], 6)
+        self.assertEqual(decode["routed_miss_rows"], 15)
         self.assertEqual(decode["promotions"], 2)
         self.assertEqual(decode["evictions"], 2)
 
@@ -439,8 +464,10 @@ class TestExpertGraphGather(unittest.TestCase):
         manager.on_expert_distribution(batch, {"global_physical_count": counts})
 
         decode = manager.snapshot_counters()["decode"]["0"]
-        self.assertEqual(decode["requested_rows"], 4)
-        self.assertEqual(decode["miss_rows"], 2)
+        self.assertEqual(decode["requested_rows"], 3)
+        self.assertEqual(decode["routed_rows"], 4)
+        self.assertEqual(decode["miss_rows"], 1)
+        self.assertEqual(decode["routed_miss_rows"], 2)
         self.assertEqual(decode["hot_hits"], 2)
         self.assertEqual(decode["requested_unique_experts"], 3)
-        self.assertEqual(decode["h2d_bytes"], 2 * streamer.host_bytes_per_expert)
+        self.assertEqual(decode["h2d_bytes"], streamer.host_bytes_per_expert)
