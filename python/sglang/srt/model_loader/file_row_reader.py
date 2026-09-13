@@ -137,7 +137,7 @@ class AlignedRowSource:
         """Extents reading ``rows`` into ``destination[destination_rows]``."""
         rows = _cpu_row_ids(rows, self.row_count)
         if rows.numel() == 0:
-            empty = torch.empty(0, dtype=torch.int64)
+            empty = torch.empty(0, dtype=torch.int64, device="cpu")
             return FileRowPlan(empty, empty, empty, empty)
         if _row_bytes_of(destination) != self.row_bytes:
             raise ValueError(
@@ -147,7 +147,9 @@ class AlignedRowSource:
         if destination_rows is None:
             if rows.numel() > destination.shape[0]:
                 raise ValueError("file row destination has fewer rows than requested")
-            destination_rows = torch.arange(rows.numel(), dtype=torch.int64)
+            destination_rows = torch.arange(
+                rows.numel(), dtype=torch.int64, device="cpu"
+            )
         else:
             destination_rows = _cpu_row_ids(destination_rows, destination.shape[0])
             if destination_rows.numel() != rows.numel():
@@ -157,10 +159,10 @@ class AlignedRowSource:
         file_id = self._direct_file if use_direct else self._buffered_file
         count = rows.numel()
         return FileRowPlan(
-            torch.full((count,), file_id, dtype=torch.int64),
+            torch.full((count,), file_id, dtype=torch.int64, device="cpu"),
             rows * self.row_bytes,
             destination_rows * self.row_bytes + base,
-            torch.full((count,), self.row_bytes, dtype=torch.int64),
+            torch.full((count,), self.row_bytes, dtype=torch.int64, device="cpu"),
         )
 
 
@@ -193,9 +195,9 @@ class PagedRowSource:
         self._file = (
             reader.open(self.path, direct=True) if direct else self._buffered_file
         )
-        self._row_offsets = torch.arange(self.row_bytes, dtype=torch.int64)
+        self._row_offsets = torch.arange(self.row_bytes, dtype=torch.int64, device="cpu")
         self._bounce_storage: Optional[torch.Tensor] = None
-        self._bounce = torch.empty(0, dtype=torch.uint8)
+        self._bounce = torch.empty(0, dtype=torch.uint8, device="cpu")
 
     @property
     def bounce_bytes(self) -> int:
@@ -205,7 +207,7 @@ class PagedRowSource:
         needed = page_count * PAGE_BYTES
         if self._bounce.numel() < needed:
             capacity = max(needed, 2 * self._bounce.numel())
-            storage = torch.empty(capacity + PAGE_BYTES, dtype=torch.uint8)
+            storage = torch.empty(capacity + PAGE_BYTES, dtype=torch.uint8, device="cpu")
             start = (-storage.data_ptr()) % PAGE_BYTES
             self._bounce_storage = storage
             self._bounce = storage[start : start + capacity]
@@ -225,7 +227,7 @@ class PagedRowSource:
         first_pages = starts >> _PAGE_SHIFT
         last_pages = (starts + (self.row_bytes - 1)) >> _PAGE_SHIFT
         pages = torch.unique(torch.cat([first_pages, last_pages]), sorted=True)
-        run_starts = torch.ones(pages.numel(), dtype=torch.bool)
+        run_starts = torch.ones(pages.numel(), dtype=torch.bool, device="cpu")
         run_starts[1:] = pages[1:] != pages[:-1] + 1
         run_ids = torch.cumsum(run_starts, 0) - 1
         run_first_pages = pages[run_starts]
@@ -244,7 +246,7 @@ class PagedRowSource:
             torch.clamp(torch.minimum(lengths, self._file_bytes - offsets), min=0).sum()
         )
         actual = self._reader.read(
-            torch.full((offsets.numel(),), self._file, dtype=torch.int64),
+            torch.full((offsets.numel(),), self._file, dtype=torch.int64, device="cpu"),
             offsets,
             run_bounce_pages * PAGE_BYTES + bounce.data_ptr(),
             lengths,

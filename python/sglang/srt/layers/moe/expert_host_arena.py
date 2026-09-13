@@ -21,7 +21,7 @@ PAGE_BYTES = 4096
 
 def _page_aligned_like(source: torch.Tensor) -> torch.Tensor:
     nbytes = source.numel() * source.element_size()
-    storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8)
+    storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
     start = (-storage.data_ptr()) % PAGE_BYTES
     return storage[start : start + nbytes].view(source.dtype).view(source.shape)
 
@@ -110,7 +110,7 @@ class ExpertHostArena:
             if reader is not None and reader.covers(name)
         }
         if from_files:
-            reader.read(torch.arange(streamer.num_experts), from_files)
+            reader.read(torch.arange(streamer.num_experts, device="cpu"), from_files)
         for name, (arena_tensor, source) in sources.items():
             if name not in from_files:
                 arena_tensor.copy_(source)

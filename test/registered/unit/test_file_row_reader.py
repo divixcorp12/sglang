@@ -121,6 +121,35 @@ def test_aligned_rows_scatter_into_destination_rows(direct, aligned):
         assert torch.equal(narrow_destination[slots], narrow[rows])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("direct", [False, True])
+def test_row_sources_stay_on_cpu_under_a_cuda_default_device(direct):
+    """Model construction and forwards run under ``with torch.device("cuda")``."""
+    with tempfile.TemporaryDirectory() as directory:
+        reader = _reader()
+        ple_path, ple = _write_rows(directory, "ple.bin", 1000, 160, seed=6)
+        wide_path, wide = _write_rows(directory, "wide.bin", 4, PAGE, seed=7)
+        rows = torch.tensor([999, 25, 26])
+        paged_destination = torch.zeros(3, 160, dtype=torch.uint8)
+        _, aligned_destination = _aligned_rows(3, PAGE)
+
+        with torch.device("cuda"):
+            paged = PagedRowSource(reader, ple_path, 160, 1000, direct=direct)
+            aligned = AlignedRowSource(reader, wide_path, PAGE, 4, direct=direct)
+            paged.read_rows(rows, paged_destination)
+            read_plans(
+                reader,
+                [
+                    aligned.plan(
+                        torch.tensor([3, 0, 1], device="cpu"), aligned_destination
+                    )
+                ],
+            )
+
+        assert torch.equal(paged_destination, ple[rows])
+        assert torch.equal(aligned_destination, wide[[3, 0, 1]])
+
+
 def test_aligned_rows_reject_wrong_width_and_mismatched_slots():
     with tempfile.TemporaryDirectory() as directory:
         path, _ = _write_rows(directory, "rows.bin", 3, PAGE, seed=5)
