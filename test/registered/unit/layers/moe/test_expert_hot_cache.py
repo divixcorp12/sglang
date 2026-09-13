@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import torch
@@ -95,6 +96,46 @@ class TestExpertHotCache(unittest.TestCase):
         self.assertEqual(cache.slot_to_expert, [4, 2, 3])
         self.assertEqual((update.promoted_experts, update.evicted_experts), (1, 1))
 
+    def test_reservation_hides_victim_until_matching_generation_is_ready(self):
+        cache = self.cache_type(self.streamer, capacity=1)
+        cache.reassign([1])
+
+        first = cache.reserve(((2, 0),), consumer_complete=True)[0]
+        self.assertEqual(cache.slot_states[0].name, "RESERVED")
+        self.assertEqual(cache.resident_experts(), frozenset())
+        self.assertEqual(
+            cache.lookup(torch.tensor([1, 2], device="cuda"))[0].tolist(), [-1, -1]
+        )
+        self.assertFalse(cache.publish_ready(first))
+        self.assertTrue(cache.begin_loading(first))
+        self.assertEqual(cache.slot_states[0].name, "LOADING")
+
+        self.assertTrue(cache.cancel(first))
+        replacement = cache.reserve(((3, 0),))[0]
+        self.assertNotEqual(first.generation, replacement.generation)
+        self.assertTrue(cache.begin_loading(replacement))
+        self.assertFalse(cache.publish_ready(first))
+        self.assertTrue(cache.publish_ready(replacement))
+        self.assertEqual(cache.slot_states[0].name, "READY")
+        self.assertEqual(cache.resident_experts(), frozenset({3}))
+        self.assertEqual(
+            cache.lookup(torch.tensor([2, 3], device="cuda"))[0].tolist(), [-1, 0]
+        )
+
+    def test_ready_slot_waits_for_consumer_before_reuse(self):
+        cache = self.cache_type(self.streamer, capacity=1)
+        reservation = cache.reserve(((2, 0),))[0]
+        self.assertTrue(cache.begin_loading(reservation))
+        self.assertTrue(cache.publish_ready(reservation))
+
+        self.assertFalse(cache.retire(reservation, consumer_complete=False))
+        self.assertEqual(cache.slot_states[0].name, "READY")
+        with self.assertRaisesRegex(RuntimeError, "active consumer"):
+            cache.reserve(((3, 0),))
+        self.assertTrue(cache.retire(reservation, consumer_complete=True))
+        self.assertEqual(cache.slot_states[0].name, "FREE")
+        self.assertEqual(cache.prefetch_destinations((3,), ()), ((3, 0),))
+
     def test_all_hot_returns_fixed_slots_without_compact_assembly(self):
         cache = self.cache_type(self.streamer, capacity=2)
         cache.reassign([3, 7])
@@ -128,6 +169,61 @@ class TestExpertHotCache(unittest.TestCase):
             self.assertEqual(stats.h2d_bytes, 112)
             self.assertEqual(stats.source_bytes, 112)
             self.assertEqual(stats.d2d_bytes, 224)
+
+    def test_mixed_file_rows_and_cuda_alphas_use_their_own_row_spaces(self):
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        layer = torch.nn.Module()
+        with ExitStack() as files:
+            for name, dtype in zip(
+                NVFP4_STREAM_TENSORS[:4],
+                (
+                    torch.uint8,
+                    torch.uint8,
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fn,
+                ),
+            ):
+                backing = files.enter_context(tempfile.NamedTemporaryFile())
+                backing.truncate(8 * 12)
+                bytes_view = torch.from_file(
+                    backing.name, shared=True, size=8 * 12, dtype=torch.uint8
+                ).reshape(8, 3, 4)
+                bytes_view.copy_(
+                    torch.arange(8 * 12, dtype=torch.uint8).reshape(8, 3, 4)
+                )
+                setattr(
+                    layer,
+                    name,
+                    bytes_view if dtype is torch.uint8 else bytes_view.view(dtype),
+                )
+            layer.g1_alphas = torch.arange(8, device="cuda", dtype=torch.float32)
+            layer.g2_alphas = layer.g1_alphas + 100
+            streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+            pinned = ExpertPinnedHostCache(streamer, capacity=2)
+            pinned.ensure_rows(torch.tensor([5, 3], device="cuda"))
+
+            self.assertEqual(pinned.slot_to_expert, [5, 3])
+            for backend in ("gpu", "dma"):
+                with self.subTest(backend=backend):
+                    cache = self.cache_type(streamer, capacity=2)
+                    cache.copy_backend = backend
+                    cache.reassign([3, 5])
+                    self.assertEqual(cache.last_copy_submission.requested_backend, backend)
+                    if backend == "gpu":
+                        self.assertEqual(cache.last_copy_submission.actual_backend, "mixed")
+                    else:
+                        self.assertIn(
+                            cache.last_copy_submission.actual_backend,
+                            ("mixed", "fallback"),
+                        )
+                    for name in NVFP4_STREAM_TENSORS:
+                        actual = cache.tensors[name][0:2].cpu()
+                        expected = getattr(layer, name)[torch.tensor([3, 5])].cpu()
+                        if actual.dtype is torch.float8_e4m3fn:
+                            actual = actual.view(torch.uint8)
+                            expected = expected.view(torch.uint8)
+                        self.assertTrue(torch.equal(actual, expected), name)
 
     def test_prefill_deduplicates_hot_and_cold_source_rows(self):
         cache = self.cache_type(self.streamer, capacity=2)
@@ -225,6 +321,12 @@ class TestExpertFrequencySeed(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no eligible adjacent layers"):
             manager.enable_next_layer_prefetch(1)
 
+    def test_disabled_prefetch_is_a_noop(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+
+        manager = ExpertHotCacheManager.__new__(ExpertHotCacheManager)
+        manager.enable_next_layer_prefetch(0)
+
     def test_invalid_seed_is_rejected(self):
         from sglang.srt.layers.moe.expert_hot_cache import (
             normalize_expert_frequency_seed,
@@ -288,7 +390,19 @@ class TestExpertHotCacheManager(unittest.TestCase):
             forward_mode=mode or self.mode.EXTEND, extend_num_tokens=tokens
         )
 
-    def observe(self, manager, counts, **kwargs):
+    def record_routes(self, manager, counts):
+        for layer_id, streamer in manager.streamers.items():
+            route_ids = [
+                expert_id
+                for expert_id, count in enumerate(counts[layer_id])
+                for _ in range(int(count))
+            ]
+            if route_ids:
+                streamer.gather(torch.tensor([route_ids], device="cuda"))
+
+    def observe(self, manager, counts, *, record_routes=False, **kwargs):
+        if record_routes:
+            self.record_routes(manager, counts)
         manager.on_expert_distribution(
             self.batch(**kwargs), {"global_physical_count": torch.tensor(counts)}
         )
@@ -304,6 +418,14 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(self.manager(budget_bytes=19), None)
         self.assertEqual(self.manager(budget_bytes=0), None)
 
+    def test_copy_backend_reaches_each_cache_before_initial_population(self):
+        manager = self.manager(copy_backend="dma")
+
+        self.assertTrue(manager.caches)
+        self.assertTrue(
+            all(cache.copy_backend == "dma" for cache in manager.caches.values())
+        )
+
     def test_larger_layer_can_win_entire_budget_and_json_seed_loads(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as f:
             json.dump({"count": [[0] * 4, [0] * 4, [9, 8, 7, 6]]}, f)
@@ -312,28 +434,39 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual({k: c.capacity for k, c in manager.caches.items()}, {2: 2})
         self.assertEqual(manager.caches[2].slot_to_expert, [0, 1])
 
-    def test_dynamic_update_requires_prefill_residence_and_strict_benefit(self):
+    def test_dynamic_update_uses_recorded_routes_at_prefill_boundary(self):
         manager = self.manager({"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]})
+        self.assertIn(0, manager.residency_policies)
         cold = [[0, 10, 0, 0], [0] * 4, [0, 10, 0, 0]]
-        for mode in (
-            self.mode.DECODE,
-            self.mode.TARGET_VERIFY,
-            self.mode.DRAFT_EXTEND_V2,
-            self.mode.IDLE,
-        ):
-            self.observe(manager, cold, mode=mode)
-        self.observe(manager, cold, tokens=15)
+        for mode in (self.mode.DECODE, self.mode.TARGET_VERIFY):
+            self.observe(manager, cold, mode=mode, record_routes=True)
+        self.observe(manager, cold, tokens=15, record_routes=True)
         self.assertEqual(manager.caches[0].slot_to_expert, [0])
-        self.observe(manager, [[0, 2, 0, 0], [0] * 4, [0, 2, 0, 0]])
-        self.assertEqual(manager.caches[0].slot_to_expert, [0])
-        pointers = manager.caches[0].data_ptrs()
-        self.observe(manager, cold)
+        self.observe(manager, cold, record_routes=True)
         self.assertEqual(manager.caches[0].slot_to_expert, [1])
-        self.observe(manager, [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]])
-        self.assertEqual(manager.caches[0].slot_to_expert, [1])
-        self.observe(manager, [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]])
+        metrics = manager.snapshot_counters()["residency_policy"]["0"]
+        self.assertGreater(metrics["recorded_routes"], 0)
+        self.assertEqual(metrics["boundary_updates"], 1)
+        self.assertEqual(metrics["background_promotion_experts"], 1)
+
+    def test_dynamic_scores_start_from_frequency_seed(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            min_residence_forwards=0,
+            benefit_ratio=0.0,
+        )
+        challenger = [[0, 3, 0, 0], [0] * 4, [0, 3, 0, 0]]
+
+        self.observe(manager, challenger, record_routes=True)
+
         self.assertEqual(manager.caches[0].slot_to_expert, [0])
-        self.assertEqual(manager.caches[0].data_ptrs(), pointers)
+        self.assertEqual(manager.caches[2].slot_to_expert, [0])
+
+        for _ in range(3):
+            self.observe(manager, challenger, record_routes=True)
+
+        self.assertEqual(manager.caches[0].slot_to_expert, [1])
+        self.assertEqual(manager.caches[2].slot_to_expert, [1])
 
     def test_static_seed_never_changes_and_counts_actual_gathers_once(self):
         manager = self.manager(
@@ -360,9 +493,12 @@ class TestExpertHotCacheManager(unittest.TestCase):
             {"count": [[20, 10, 0, 0], [0] * 4, [0] * 4]}, budget_bytes=40
         )
         counts = [[8, 1, 4, 0], [0] * 4, [0] * 4]
-        self.observe(manager, counts)
+        self.observe(manager, counts, record_routes=True)
         self.assertEqual(manager.caches[0].slot_to_expert, [0, 1])
-        self.observe(manager, counts)
+        self.observe(manager, counts, record_routes=True)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0, 1])
+        self.observe(manager, counts, record_routes=True)
+        self.observe(manager, counts, record_routes=True)
         self.assertEqual(manager.caches[0].slot_to_expert, [0, 2])
         counters = manager.snapshot_counters()["prefill"]["0"]
         self.assertEqual(counters["promotions"], 3)

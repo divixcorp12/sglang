@@ -9,6 +9,7 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from enum import IntEnum
 from operator import index
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -19,8 +20,15 @@ from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
     SparseNextLayerPolicy,
 )
+from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
 
+from sglang.srt.layers.moe.expert_transfer import (
+    AsyncExpertTransferExecutor,
+    ExpertCopySubmission,
+    FixedRowTransferPlan,
+    submit_expert_row_copies,
+)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -32,6 +40,24 @@ class HotCacheUpdateStats:
     promoted_experts: int
     evicted_experts: int
     migration_bytes: int
+
+
+class HotCacheSlotState(IntEnum):
+    """Lifecycle states for a fixed expert-cache destination slot."""
+
+    FREE = 0
+    RESERVED = 1
+    LOADING = 2
+    READY = 3
+
+
+@dataclass(frozen=True)
+class HotCacheSlotTicket:
+    """Generation-qualified authority to load or retire one cache slot."""
+
+    slot: int
+    expert_id: int
+    generation: int
 
 
 class ExpertHotCache:
@@ -74,7 +100,28 @@ class ExpertHotCache:
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
         self.slot_to_expert = [-1] * capacity
+        self.slot_states = [HotCacheSlotState.FREE] * capacity
+        self.slot_state = torch.full(
+            (capacity,),
+            int(HotCacheSlotState.FREE),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        self.slot_generations = torch.zeros(
+            (capacity,), dtype=torch.long, device=self.device
+        )
+        self._slot_generations = [0] * capacity
         streamer.hot_cache = self
+        self.copy_backend = getattr(streamer, "expert_copy_backend", "gpu")
+        self._transfer_executor = (
+            AsyncExpertTransferExecutor.for_device(self.device) if capacity else None
+        )
+        self._transfer_plan = (
+            FixedRowTransferPlan(max_rows=capacity, device=self.device)
+            if capacity
+            else None
+        )
+        self.last_copy_submission: ExpertCopySubmission | None = None
 
     @staticmethod
     def capacity_for_budget(streamer: ExpertStreamer, budget_bytes: int) -> int:
@@ -84,74 +131,50 @@ class ExpertHotCache:
             raise ValueError("hot cache byte budget cannot be negative")
         return min(streamer.num_experts, budget_bytes // streamer.bytes_per_expert)
 
-    def reassign(self, expert_ids: Sequence[int]) -> HotCacheUpdateStats:
-        """Retain matching slots and copy only newly admitted experts."""
-        desired = [index(expert_id) for expert_id in expert_ids]
-        if len(desired) > self.capacity:
-            raise ValueError("expert selection exceeds hot cache capacity")
-        if len(set(desired)) != len(desired):
-            raise ValueError("hot cache expert IDs must be unique")
-        if any(
-            expert_id < 0 or expert_id >= self.streamer.num_experts
-            for expert_id in desired
-        ):
-            raise ValueError("hot cache expert ID is outside the expert range")
-        wanted = set(desired)
-        existing = set(self.slot_to_expert) - {-1}
-        promoted = [expert_id for expert_id in desired if expert_id not in existing]
-        evicted = existing - wanted
-        if not promoted and not evicted:
-            return HotCacheUpdateStats(0, 0, 0)
-        next_slots = [
-            expert_id if expert_id in wanted else -1
-            for expert_id in self.slot_to_expert
-        ]
-        free_slots = [
-            slot for slot, expert_id in enumerate(next_slots) if expert_id == -1
-        ]
-        for slot, expert_id in zip(free_slots, promoted):
-            source_ids = torch.tensor([expert_id], dtype=torch.long, device=self.device)
-            outputs = {
-                name: tensor[slot : slot + 1] for name, tensor in self.tensors.items()
-            }
-            self.streamer._copy_source_rows(source_ids, outputs)
-            next_slots[slot] = expert_id
+    def _publish_mapping(self) -> None:
         mapping = [-1] * self.streamer.num_experts
-        for slot, expert_id in enumerate(next_slots):
-            if expert_id != -1:
+        for slot, expert_id in enumerate(self.slot_to_expert):
+            if self.slot_states[slot] is HotCacheSlotState.READY:
                 mapping[expert_id] = slot
         self.expert_to_slot.copy_(
             torch.tensor(mapping, dtype=torch.long, device=self.device)
         )
-        self.slot_to_expert[:] = next_slots
-        return HotCacheUpdateStats(
-            len(promoted), len(evicted), len(promoted) * self.bytes_per_expert
+
+    def _set_slot_state(self, slot: int, state: HotCacheSlotState) -> None:
+        self.slot_states[slot] = state
+        self.slot_state[slot] = int(state)
+
+    def resident_experts(self) -> frozenset[int]:
+        """Return only mappings that are ready for a gather consumer."""
+        return frozenset(
+            expert
+            for expert, state in zip(self.slot_to_expert, self.slot_states)
+            if state is HotCacheSlotState.READY
         )
 
-    def prefetch_destinations(
-        self, candidates: Sequence[int], protected_slots: Sequence[int]
-    ) -> tuple[tuple[int, int], ...]:
-        """Select stable unprotected victim slots for speculative admissions."""
-        protected = {index(slot) for slot in protected_slots}
-        if any(slot < 0 or slot >= self.capacity for slot in protected):
-            raise ValueError("protected hot cache slot is outside capacity")
-        existing = set(self.slot_to_expert) - {-1}
-        pending = []
-        for expert_id in candidates:
-            expert_id = index(expert_id)
-            if expert_id in existing or expert_id in pending:
-                continue
-            if expert_id < 0 or expert_id >= self.streamer.num_experts:
-                raise ValueError("hot cache expert ID is outside the expert range")
-            pending.append(expert_id)
-        writable = [slot for slot in range(self.capacity) if slot not in protected]
-        writable.sort(key=lambda slot: (self.slot_to_expert[slot] >= 0, slot))
-        return tuple(zip(pending, writable))
+    def _ticket_matches(
+        self, ticket: HotCacheSlotTicket, *states: HotCacheSlotState
+    ) -> bool:
+        return (
+            0 <= ticket.slot < self.capacity
+            and self._slot_generations[ticket.slot] == ticket.generation
+            and self.slot_to_expert[ticket.slot] == ticket.expert_id
+            and self.slot_states[ticket.slot] in states
+        )
 
-    def assign_prefetch(
-        self, placements: Sequence[tuple[int, int]]
-    ) -> HotCacheUpdateStats:
-        """Copy speculative rows into destinations selected before stream launch."""
+    def reserve(
+        self,
+        placements: Sequence[tuple[int, int]],
+        *,
+        consumer_complete: bool = False,
+    ) -> tuple[HotCacheSlotTicket, ...]:
+        """Reserve slots without making their destinations visible to gathers.
+
+        A transfer executor may call this before issuing its six row copies, then
+        use ``begin_loading`` and ``publish_ready`` after its completion event.
+        A READY victim can only be reused when the caller confirms its last
+        consumer has completed.
+        """
         assignments = tuple((index(expert), index(slot)) for expert, slot in placements)
         if len({expert for expert, _ in assignments}) != len(assignments):
             raise ValueError("hot cache expert IDs must be unique")
@@ -165,26 +188,261 @@ class ExpertHotCache:
             for expert, slot in assignments
         ):
             raise ValueError("hot cache prefetch placement is outside capacity")
-        current = list(self.slot_to_expert)
-        existing = set(current) - {-1}
+        active_experts = {
+            expert
+            for expert, state in zip(self.slot_to_expert, self.slot_states)
+            if state is not HotCacheSlotState.FREE
+        }
+        if any(expert in active_experts for expert, _ in assignments):
+            raise ValueError("hot cache reservation requires a nonresident expert")
+        ready_victims = [
+            slot
+            for _, slot in assignments
+            if self.slot_states[slot] is HotCacheSlotState.READY
+        ]
+        if ready_victims and not consumer_complete:
+            raise RuntimeError("hot cache victim still has an active consumer")
+        for slot in ready_victims:
+            if not self.retire(self.ticket_for_slot(slot), consumer_complete=True):
+                raise RuntimeError("hot cache victim could not be retired")
+        if any(
+            self.slot_states[slot] is not HotCacheSlotState.FREE
+            for _, slot in assignments
+        ):
+            raise RuntimeError("hot cache slot is not available for reservation")
+        tickets = []
+        for expert, slot in assignments:
+            generation = self._slot_generations[slot] + 1
+            self._slot_generations[slot] = generation
+            self.slot_generations[slot] = generation
+            self.slot_to_expert[slot] = expert
+            self._set_slot_state(slot, HotCacheSlotState.RESERVED)
+            tickets.append(HotCacheSlotTicket(slot, expert, generation))
+        return tuple(tickets)
+
+    def begin_loading(self, ticket: HotCacheSlotTicket) -> bool:
+        """Mark a valid reservation as loading; reject stale tickets."""
+        if not self._ticket_matches(ticket, HotCacheSlotState.RESERVED):
+            return False
+        self._set_slot_state(ticket.slot, HotCacheSlotState.LOADING)
+        return True
+
+    def publish_ready(self, ticket: HotCacheSlotTicket) -> bool:
+        """Publish a fully copied six-tensor slot after its ticket completes."""
+        if not self._ticket_matches(ticket, HotCacheSlotState.LOADING):
+            return False
+        self._set_slot_state(ticket.slot, HotCacheSlotState.READY)
+        self._publish_mapping()
+        return True
+
+    def cancel(self, ticket: HotCacheSlotTicket) -> bool:
+        """Release an unconsumed reservation; stale tickets cannot alter slots."""
+        if not self._ticket_matches(
+            ticket, HotCacheSlotState.RESERVED, HotCacheSlotState.LOADING
+        ):
+            return False
+        self.slot_to_expert[ticket.slot] = -1
+        self._set_slot_state(ticket.slot, HotCacheSlotState.FREE)
+        return True
+
+    def ticket_for_slot(self, slot: int) -> HotCacheSlotTicket:
+        """Return the current generation-qualified ticket for a nonfree slot."""
+        slot = index(slot)
+        if not 0 <= slot < self.capacity:
+            raise ValueError("hot cache slot is outside capacity")
+        if self.slot_states[slot] is HotCacheSlotState.FREE:
+            raise ValueError("hot cache free slots have no active ticket")
+        return HotCacheSlotTicket(
+            slot, self.slot_to_expert[slot], self._slot_generations[slot]
+        )
+
+    def retire(self, ticket: HotCacheSlotTicket, *, consumer_complete: bool) -> bool:
+        """Unpublish a READY slot only after its final consumer has completed."""
+        if not consumer_complete or not self._ticket_matches(
+            ticket, HotCacheSlotState.READY
+        ):
+            return False
+        self.slot_to_expert[ticket.slot] = -1
+        self._set_slot_state(ticket.slot, HotCacheSlotState.FREE)
+        self._publish_mapping()
+        return True
+
+    def _load_reserved(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
+        """Copy one reserved placement bundle before publishing any slot mapping."""
+        if not tickets:
+            return
+        assert self._transfer_executor is not None
+        if len(self.streamer.tensor_names) != 6:
+            for ticket in tickets:
+                if not self.begin_loading(ticket):
+                    raise RuntimeError("hot cache reservation became stale")
+                source_ids = torch.tensor(
+                    [ticket.expert_id], dtype=torch.long, device=self.device
+                )
+                outputs = {
+                    name: tensor[ticket.slot : ticket.slot + 1]
+                    for name, tensor in self.tensors.items()
+                }
+                self.streamer._copy_source_rows(source_ids, outputs)
+                if not self.publish_ready(ticket):
+                    raise RuntimeError("hot cache completion ticket became stale")
+            return
+        assert self._transfer_plan is not None
+        expert_rows = [ticket.expert_id for ticket in tickets]
+        destination_slots = [ticket.slot for ticket in tickets]
+        sources = {
+            name: _tensor_data(getattr(self.streamer.layer, name))
+            for name in self.streamer.tensor_names
+        }
+        source_rows = expert_rows
+        secondary_source_rows = None
+        use_secondary_source_rows = [False] * len(self.streamer.tensor_names)
+        pinned_cache = self.streamer.pinned_host_cache
+        if pinned_cache is not None and pinned_cache.cached_names:
+            pinned_cache.ensure_rows(torch.tensor(expert_rows, device=self.device))
+            cached_rows = [
+                pinned_cache._expert_to_slot.get(expert_id, -1)
+                for expert_id in expert_rows
+            ]
+            if all(slot >= 0 for slot in cached_rows):
+                secondary_source_rows = cached_rows
+                for position, name in enumerate(self.streamer.tensor_names):
+                    if name in pinned_cache.tensors:
+                        sources[name] = pinned_cache.tensors[name]
+                        use_secondary_source_rows[position] = True
+        self._transfer_plan.set_rows(
+            source_rows,
+            destination_slots,
+            [ticket.generation for ticket in tickets],
+        )
+        if secondary_source_rows is not None:
+            self._transfer_plan.secondary_source_rows.zero_()
+            self._transfer_plan.secondary_source_rows[: len(secondary_source_rows)].copy_(
+                torch.as_tensor(
+                    secondary_source_rows,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            )
+        try:
+            if not all(self.begin_loading(ticket) for ticket in tickets):
+                raise RuntimeError("hot cache reservation became stale")
+            submission = submit_expert_row_copies(
+                self._transfer_executor,
+                self._transfer_plan,
+                [(sources[name], self.tensors[name]) for name in self.streamer.tensor_names],
+                backend=self.copy_backend,
+                source_rows_cpu=source_rows,
+                destination_slots_cpu=destination_slots,
+                secondary_source_rows_cpu=secondary_source_rows,
+                use_secondary_source_rows=use_secondary_source_rows,
+                producer_stream=torch.cuda.current_stream(self.device),
+            )
+            self._transfer_executor.wait(
+                submission.ticket, torch.cuda.current_stream(self.device)
+            )
+            if not all(self.publish_ready(ticket) for ticket in tickets):
+                raise RuntimeError("hot cache completion ticket became stale")
+            self.last_copy_submission = submission
+        except Exception:
+            for ticket in tickets:
+                self.cancel(ticket)
+            raise
+
+    def reassign(self, expert_ids: Sequence[int]) -> HotCacheUpdateStats:
+        """Synchronously replace slots through the generation-safe lifecycle."""
+        desired = [index(expert_id) for expert_id in expert_ids]
+        if len(desired) > self.capacity:
+            raise ValueError("expert selection exceeds hot cache capacity")
+        if len(set(desired)) != len(desired):
+            raise ValueError("hot cache expert IDs must be unique")
+        if any(
+            expert_id < 0 or expert_id >= self.streamer.num_experts
+            for expert_id in desired
+        ):
+            raise ValueError("hot cache expert ID is outside the expert range")
+        wanted = set(desired)
+        existing = {
+            expert
+            for expert, state in zip(self.slot_to_expert, self.slot_states)
+            if state is HotCacheSlotState.READY
+        }
+        promoted = [expert_id for expert_id in desired if expert_id not in existing]
+        evicted = existing - wanted
+        if not promoted and not evicted:
+            return HotCacheUpdateStats(0, 0, 0)
+        for slot, expert_id in enumerate(self.slot_to_expert):
+            if expert_id in evicted:
+                self.retire(self.ticket_for_slot(slot), consumer_complete=True)
+        free_slots = [
+            slot
+            for slot, state in enumerate(self.slot_states)
+            if state is HotCacheSlotState.FREE
+        ]
+        if len(free_slots) < len(promoted):
+            raise RuntimeError("hot cache has no free slots for reassignment")
+        tickets = self.reserve(tuple(zip(promoted, free_slots)), consumer_complete=True)
+        self._load_reserved(tickets)
+        return HotCacheUpdateStats(
+            len(promoted), len(evicted), len(promoted) * self.bytes_per_expert
+        )
+
+    def prefetch_destinations(
+        self, candidates: Sequence[int], protected_slots: Sequence[int]
+    ) -> tuple[tuple[int, int], ...]:
+        """Select stable unprotected victim slots for speculative admissions."""
+        protected = {index(slot) for slot in protected_slots}
+        if any(slot < 0 or slot >= self.capacity for slot in protected):
+            raise ValueError("protected hot cache slot is outside capacity")
+        existing = {
+            expert
+            for expert, state in zip(self.slot_to_expert, self.slot_states)
+            if state is not HotCacheSlotState.FREE
+        }
+        pending = []
+        for expert_id in candidates:
+            expert_id = index(expert_id)
+            if expert_id in existing or expert_id in pending:
+                continue
+            if expert_id < 0 or expert_id >= self.streamer.num_experts:
+                raise ValueError("hot cache expert ID is outside the expert range")
+            pending.append(expert_id)
+        writable = [
+            slot
+            for slot, state in enumerate(self.slot_states)
+            if slot not in protected
+            and state in (HotCacheSlotState.FREE, HotCacheSlotState.READY)
+        ]
+        writable.sort(
+            key=lambda slot: (self.slot_states[slot] is HotCacheSlotState.READY, slot)
+        )
+        return tuple(zip(pending, writable))
+
+    def assign_prefetch(
+        self, placements: Sequence[tuple[int, int]]
+    ) -> HotCacheUpdateStats:
+        """Copy speculative rows into destinations selected before stream launch."""
+        assignments = tuple((index(expert), index(slot)) for expert, slot in placements)
+        if any(
+            expert < 0
+            or expert >= self.streamer.num_experts
+            or slot < 0
+            or slot >= self.capacity
+            for expert, slot in assignments
+        ):
+            raise ValueError("hot cache prefetch placement is outside capacity")
+        existing = {
+            expert
+            for expert, state in zip(self.slot_to_expert, self.slot_states)
+            if state is not HotCacheSlotState.FREE
+        }
         if any(expert in existing for expert, _ in assignments):
             raise ValueError("hot cache prefetch must not replace a resident expert")
-        evictions = sum(current[slot] >= 0 for _, slot in assignments)
-        for expert, slot in assignments:
-            source_ids = torch.tensor([expert], dtype=torch.long, device=self.device)
-            outputs = {
-                name: tensor[slot : slot + 1] for name, tensor in self.tensors.items()
-            }
-            self.streamer._copy_source_rows(source_ids, outputs)
-            current[slot] = expert
-        mapping = [-1] * self.streamer.num_experts
-        for slot, expert in enumerate(current):
-            if expert >= 0:
-                mapping[expert] = slot
-        self.expert_to_slot.copy_(
-            torch.tensor(mapping, dtype=torch.long, device=self.device)
+        evictions = sum(
+            self.slot_states[slot] is HotCacheSlotState.READY for _, slot in assignments
         )
-        self.slot_to_expert[:] = current
+        tickets = self.reserve(assignments, consumer_complete=True)
+        self._load_reserved(tickets)
         return HotCacheUpdateStats(
             len(assignments), evictions, len(assignments) * self.bytes_per_expert
         )
@@ -200,6 +458,8 @@ class ExpertHotCache:
         """Expose slot and mapping pointers for stable-allocation verification."""
         return tuple(tensor.data_ptr() for tensor in self.tensors.values()) + (
             self.expert_to_slot.data_ptr(),
+            self.slot_state.data_ptr(),
+            self.slot_generations.data_ptr(),
         )
 
 
@@ -230,6 +490,12 @@ class _OperationalCounters:
     d2d_bytes: int = 0
     h2d_bytes: int = 0
     backing_source_bytes: int = 0
+    requested_copy_backend: str | None = None
+    actual_copy_backend: str | None = None
+    copy_rows: int = 0
+    copy_bytes: int = 0
+    copy_submissions: int = 0
+    copy_fallbacks: int = 0
     file_source_bytes: int | None = None
     requested_unique_experts: int = 0
     promotions: int = 0
@@ -267,6 +533,7 @@ class ExpertHotCacheManager:
         log_interval: int = 100,
         metrics_path: str | os.PathLike[str] | None = None,
         route_history_limit: int = 32,
+        copy_backend: str = "gpu",
     ) -> ExpertHotCacheManager | None:
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
@@ -288,6 +555,8 @@ class ExpertHotCacheManager:
                 "expert hot cache benefit ratio must be finite and nonnegative"
             )
         streamers = {}
+        if copy_backend not in ("gpu", "dma"):
+            raise ValueError("expert copy backend must be gpu or dma")
         for module in model.modules():
             streamer = getattr(module, "_nvfp4_expert_streamer", None)
             if streamer is None:
@@ -338,6 +607,7 @@ class ExpertHotCacheManager:
         manager = cls()
         manager.streamers = streamers
         manager.caches = {}
+        manager.residency_policies = {}
         manager.dynamic = dynamic
         manager.update_prefill_tokens = update_prefill_tokens
         manager.min_residence_forwards = min_residence_forwards
@@ -369,9 +639,23 @@ class ExpertHotCacheManager:
         manager._route_affinity = {mode: {} for mode in manager._counters}
         for layer_id, expert_ids in selected.items():
             if expert_ids:
-                cache = ExpertHotCache(streamers[layer_id], len(expert_ids))
+                layer_streamer = streamers[layer_id]
+                layer_streamer.expert_copy_backend = copy_backend
+                cache = ExpertHotCache(layer_streamer, len(expert_ids))
                 manager.caches[layer_id] = cache
                 manager._record_update(layer_id, cache.reassign(expert_ids))
+                if dynamic:
+                    policy = ExpertResidencyPolicy(
+                        layer_streamer.num_experts,
+                        cache.capacity,
+                        device=cache.device,
+                        promotion_margin=benefit_ratio,
+                        initial_scores=(
+                            seed[layer_id] if seed is not None else None
+                        ),
+                    )
+                    layer_streamer.residency_policy = policy
+                    manager.residency_policies[layer_id] = policy
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -423,7 +707,7 @@ class ExpertHotCacheManager:
                 affinity = self._route_affinity["decode"].get(
                     (current_layer, next_layer), {}
                 )
-                resident = set(cache.slot_to_expert) - {-1}
+                resident = cache.resident_experts()
                 candidates = policy.predict(
                     source_ids.tolist(), popularity, affinity, resident
                 )
@@ -439,6 +723,7 @@ class ExpertHotCacheManager:
                     if submitted != predicted:
                         raise ValueError("prefetch candidates changed after placement")
                     update = cache.assign_prefetch(placements)
+                    self._record_update(next_layer, update)
                     coordinator.record_placement(
                         cache_pollution_bytes=update.migration_bytes,
                         evictions=update.evicted_experts,
@@ -462,6 +747,18 @@ class ExpertHotCacheManager:
         counters.promotions += update.promoted_experts
         counters.evictions += update.evicted_experts
         counters.migration_bytes += update.migration_bytes
+        submission = self.caches[layer_id].last_copy_submission
+        if submission is None or update.promoted_experts == 0:
+            return
+        counters.requested_copy_backend = submission.requested_backend
+        if counters.actual_copy_backend in (None, submission.actual_backend):
+            counters.actual_copy_backend = submission.actual_backend
+        else:
+            counters.actual_copy_backend = "mixed"
+        counters.copy_rows += submission.rows
+        counters.copy_bytes += submission.bytes
+        counters.copy_submissions += submission.submissions
+        counters.copy_fallbacks += submission.fallbacks
 
     @staticmethod
     def _pinned_cache_stats(streamer: ExpertStreamer) -> tuple[int, int]:
@@ -566,6 +863,12 @@ class ExpertHotCacheManager:
                 str(layer_id): coordinator.snapshot_stats()
                 for layer_id, coordinator in coordinators.items()
             }
+        policies = getattr(self, "residency_policies", {})
+        if policies:
+            result["residency_policy"] = {
+                str(layer_id): policy.snapshot_metrics()
+                for layer_id, policy in policies.items()
+            }
         return result
 
     def on_expert_distribution(
@@ -642,21 +945,14 @@ class ExpertHotCacheManager:
                 < self.min_residence_forwards
             ):
                 continue
-            desired = torch.argsort(row, descending=True, stable=True)[
-                : cache.capacity
-            ].tolist()
-            existing = set(cache.slot_to_expert) - {-1}
-            promoted = set(desired) - existing
-            if not promoted:
+            policy = self.residency_policies.get(layer_id)
+            if policy is None:
                 continue
-            evicted = existing - set(desired)
-            saved = (
-                sum(float(row[expert]) for expert in promoted)
-                - sum(float(row[expert]) for expert in evicted)
-            ) * streamer.bytes_per_expert
-            migration = len(promoted) * streamer.bytes_per_expert
-            if saved > migration * self.benefit_ratio:
-                self._record_update(layer_id, cache.reassign(desired))
-                self._last_update[layer_id] = self._forward_count
+            decision = policy.materialize_boundary(cache.resident_experts())
+            if not decision.promotions and not decision.evictions:
+                continue
+            policy.schedule_transfers(exact_demand=(), decision=decision)
+            self._record_update(layer_id, cache.reassign(decision.desired_experts))
+            self._last_update[layer_id] = self._forward_count
         if self._forward_count % self.log_interval == 0:
             self._write_trace(mode)

@@ -9,6 +9,12 @@ from typing import Callable, Mapping, Sequence
 
 import torch
 
+from sglang.srt.layers.moe.expert_transfer import (
+    AsyncExpertTransferExecutor,
+    ExpertTransferTicket,
+    FixedRowTransferPlan,
+)
+
 
 class SparseNextLayerPolicy:
     """Rank a bounded next-layer candidate set from sparse route history."""
@@ -64,11 +70,12 @@ class ExpertPrefetchStats:
 
 
 class ExpertPrefetchCoordinator:
-    """Own one prefetch stream while callers retain placement and correctness.
+    """Coordinate prefetch tickets while callers retain placement and correctness.
 
     The caller supplies a transfer operation that respects ``protected_slots`` and
     must invoke ``synchronous_correction`` after the real next-layer route is
-    known. This module never changes ModelOpt tensor layout or hot-cache slots.
+    known. The callback executes on the device-shared expert transfer stream;
+    this module never changes ModelOpt tensor layout or hot-cache slots.
     """
 
     def __init__(
@@ -78,22 +85,45 @@ class ExpertPrefetchCoordinator:
         device: torch.device | None = None,
         copy_stream: torch.cuda.Stream | None = None,
         ready_event: torch.cuda.Event | None = None,
+        executor: AsyncExpertTransferExecutor | None = None,
+        transfer_plan: FixedRowTransferPlan | None = None,
+        max_transfer_rows: int = 256,
     ) -> None:
         self.enabled = bool(enabled)
         self.device = device
-        self._copy_stream = copy_stream
-        self._ready_event = ready_event
-        if self.enabled and self._copy_stream is None:
+        self._executor = executor
+        self._transfer_plan = transfer_plan
+        if self.enabled and self.device is None and executor is not None:
+            self.device = executor.device
+        if self.enabled and self.device is None:
             if not torch.cuda.is_available():
                 raise RuntimeError("expert prefetch requires CUDA")
             self.device = self.device or torch.device(
                 "cuda", torch.cuda.current_device()
             )
-            self._copy_stream = torch.cuda.Stream(device=self.device)
-        if self.enabled and self._ready_event is None:
-            self._ready_event = torch.cuda.Event()
+        if self.enabled and self._executor is None:
+            if copy_stream is None and ready_event is None:
+                assert self.device is not None
+                self._executor = AsyncExpertTransferExecutor.for_device(self.device)
+            else:
+                assert self.device is not None
+                self._executor = AsyncExpertTransferExecutor(
+                    self.device,
+                    max_inflight=1,
+                    stream=copy_stream,
+                    event_factory=(lambda: ready_event)
+                    if ready_event is not None
+                    else None,
+                    stream_context=torch.cuda.stream,
+                )
+        if self.enabled and self._transfer_plan is None:
+            assert self.device is not None
+            self._transfer_plan = FixedRowTransferPlan(
+                max_rows=index(max_transfer_rows), device=self.device
+            )
         self._protected_slots: set[int] = set()
-        self._inflight: tuple[int, ...] = ()
+        self._inflight_ticket: ExpertTransferTicket | None = None
+        self._active_prediction: tuple[int, ...] = ()
         self._stats = ExpertPrefetchStats()
 
     @property
@@ -119,35 +149,55 @@ class ExpertPrefetchCoordinator:
         predicted = tuple(dict.fromkeys(index(expert_id) for expert_id in candidates))
         if not predicted:
             return False
-        if self._inflight:
+        if self._inflight_ticket is not None:
             raise RuntimeError("cannot replace an unfinished expert prefetch")
         self.protect_slots(protected_slots)
         try:
-            if self._copy_stream is None:
-                submitted_bytes = submit(predicted)
-            else:
-                with torch.cuda.stream(self._copy_stream):
-                    submitted_bytes = submit(predicted)
-                    assert self._ready_event is not None
-                    self._ready_event.record(self._copy_stream)
+            assert self._executor is not None
+            assert self._transfer_plan is not None
+            self._transfer_plan.set_rows(
+                predicted,
+                tuple(index(slot) for slot in protected_slots),
+                (0,) * len(predicted),
+            )
+            submitted_bytes = 0
+
+            def callback() -> None:
+                nonlocal submitted_bytes
+                submitted_bytes = int(submit(predicted) or 0)
+
+            producer_stream = (
+                torch.cuda.current_stream(self.device)
+                if self.device is not None and self.device.type == "cuda"
+                else None
+            )
+            self._inflight_ticket = self._executor.submit_callback(
+                self._transfer_plan, callback, producer_stream=producer_stream
+            )
         except Exception:
             self._protected_slots.clear()
             raise
-        self._inflight = predicted
+        self._active_prediction = predicted
         self._stats.predicted_experts += len(predicted)
-        self._stats.submitted_bytes += int(submitted_bytes or 0)
+        self._stats.submitted_bytes += submitted_bytes
         return True
 
     def prepare_for_lookup(self) -> None:
         """Order lookup after every inflight mutation, then unlock its slots."""
-        if not self._inflight:
+        if self._inflight_ticket is None:
             return
         try:
-            if self._ready_event is not None and self.device is not None:
-                torch.cuda.current_stream(self.device).wait_event(self._ready_event)
-                self._stats.event_wait_enqueues += 1
+            assert self._executor is not None
+            consumer_stream = (
+                torch.cuda.current_stream(self.device)
+                if self.device is not None and self.device.type == "cuda"
+                else None
+            )
+            self._executor.wait(self._inflight_ticket, consumer_stream)
+            self._stats.event_wait_enqueues += 1
         finally:
-            self._inflight = ()
+            self._inflight_ticket = None
+            self._active_prediction = ()
             self._protected_slots.clear()
 
     def synchronous_correction(
@@ -157,7 +207,7 @@ class ExpertPrefetchCoordinator:
     ) -> None:
         """Order correction after speculative writes and retain authoritative gather."""
         actual = tuple(dict.fromkeys(index(expert_id) for expert_id in actual_experts))
-        inflight = self._inflight
+        inflight = self._active_prediction
         overlap = set(actual).intersection(inflight)
         self.prepare_for_lookup()
         correct(actual)

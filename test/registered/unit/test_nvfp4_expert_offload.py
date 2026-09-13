@@ -899,6 +899,13 @@ class HotCacheStartupTests(unittest.TestCase):
                 )
                 stack.enter_context(
                     patch.object(
+                        runner,
+                        "maybe_init_expert_pinned_host_cache",
+                        side_effect=lambda: events.append("pinned"),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
                         model_runner,
                         "prepare_moe_topk",
                         side_effect=lambda **kw: events.append("topk"),
@@ -913,7 +920,7 @@ class HotCacheStartupTests(unittest.TestCase):
 
                 def allocate(model, **options):
                     self.assertIs(model, runner.model)
-                    self.assertEqual(events, ["load", "topk"])
+                    self.assertEqual(events, ["load", "topk", "pinned"])
                     self.assertEqual(options["budget_bytes"], 2 * 1024 * 1024)
                     self.assertEqual(options["seed_path"], "seed.pt")
                     self.assertEqual(options["dynamic"], dynamic)

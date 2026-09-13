@@ -670,8 +670,8 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
-        self.maybe_init_expert_hot_cache()
         self.maybe_init_expert_pinned_host_cache()
+        self.maybe_init_expert_hot_cache()
         if self.expert_hot_cache_manager is not None:
             self.expert_hot_cache_manager.enable_next_layer_prefetch(
                 envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
@@ -720,6 +720,7 @@ class ModelRunner:
             benefit_ratio=envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get(),
             log_interval=envs.SGLANG_MOE_HOT_LOG_INTERVAL.get(),
             metrics_path=envs.SGLANG_MOE_HOT_METRICS_FILE.get() or None,
+            copy_backend=envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:

@@ -47,6 +47,9 @@ def handle_offload_compatibility(server_args: Any) -> None:
     hot_budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
     pinned_budget_mb = envs.SGLANG_MOE_PINNED_HOST_MB.get()
     prefetch_candidates = envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
+    copy_backend = envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get()
+    if copy_backend not in ("gpu", "dma"):
+        raise ValueError("SGLANG_MOE_EXPERT_COPY_BACKEND must be gpu or dma")
     if prefetch_candidates < 0:
         raise ValueError("SGLANG_MOE_PREFETCH_MAX_CANDIDATES must be nonnegative")
     if prefetch_candidates and (not hot_budget_mb or not pinned_budget_mb):

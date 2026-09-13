@@ -441,7 +441,11 @@ def _copy_indices_to_cpu(source_ids: torch.Tensor, capacity: int) -> torch.Tenso
 
 
 class ExpertStreamer:
-    """Gather aligned expert rows into compact, reusable CUDA buffers."""
+    """Gather aligned expert rows into compact, reusable CUDA buffers.
+
+    Residency-policy recording is skipped during CUDA stream capture in phase one.
+
+    """
 
     def __init__(
         self,
@@ -461,6 +465,7 @@ class ExpertStreamer:
         self.num_experts = self._validate_sources()
         self.hot_cache = None
         self.pinned_host_cache = None
+        self.residency_policy = None
         self.last_gather_stats = ExpertGatherStats()
         self.bytes_per_expert = sum(
             _tensor_data(getattr(layer, name)).numel()
@@ -810,6 +815,12 @@ class ExpertStreamer:
                 flat_ids, sorted=True, return_inverse=True
             )
 
+        residency_policy = self.residency_policy
+        if (
+            residency_policy is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            residency_policy.record_routes(source_ids)
         if prefetch_coordinator is not None:
             prefetch_coordinator.synchronous_correction(
                 source_ids.tolist(), lambda _: None

@@ -1,22 +1,27 @@
 import unittest
-from contextlib import nullcontext
-from unittest.mock import patch
+
+import torch
 
 from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
     SparseNextLayerPolicy,
 )
+from sglang.srt.layers.moe.expert_transfer import FixedRowTransferPlan
 
 
-class _Event:
+class _Executor:
     def __init__(self):
-        self.recorded = 0
+        self.submissions = []
+        self.waits = []
 
-    def record(self, stream):
-        self.recorded += 1
+    def submit_callback(self, plan, callback, *, producer_stream=None):
+        callback()
+        ticket = object()
+        self.submissions.append((plan, producer_stream, ticket))
+        return ticket
 
-    def wait(self, stream):
-        return None
+    def wait(self, ticket, consumer_stream=None):
+        self.waits.append((ticket, consumer_stream))
 
 
 class TestExpertPrefetch(unittest.TestCase):
@@ -69,14 +74,15 @@ class TestExpertPrefetch(unittest.TestCase):
         self.assertEqual(coordinator.snapshot_stats()["predicted_experts"], 0)
 
     def test_failed_submission_releases_protected_slots(self):
+        executor = _Executor()
         coordinator = ExpertPrefetchCoordinator(
-            enabled=True, copy_stream=object(), ready_event=_Event()
+            enabled=True,
+            device=torch.device("cpu"),
+            executor=executor,
+            transfer_plan=FixedRowTransferPlan(max_rows=2, device="cpu"),
         )
 
-        with (
-            patch("torch.cuda.stream", return_value=nullcontext()),
-            self.assertRaisesRegex(RuntimeError, "copy failed"),
-        ):
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
             coordinator.launch(
                 (4,),
                 protected_slots={1},
@@ -86,23 +92,32 @@ class TestExpertPrefetch(unittest.TestCase):
         self.assertEqual(coordinator.protected_slots, frozenset())
 
     def test_coordinator_records_event_protects_slots_and_corrects_sync(self):
-        event = _Event()
-        coordinator = ExpertPrefetchCoordinator(enabled=True, ready_event=event)
+        executor = _Executor()
+        plan = FixedRowTransferPlan(max_rows=2, device="cpu")
+        coordinator = ExpertPrefetchCoordinator(
+            enabled=True,
+            device=torch.device("cpu"),
+            executor=executor,
+            transfer_plan=plan,
+        )
         submitted = []
         corrected = []
 
-        with patch("torch.cuda.stream", return_value=nullcontext()):
-            self.assertTrue(
-                coordinator.launch(
-                    (4, 2),
-                    protected_slots={1, 3},
-                    submit=lambda experts: submitted.extend(experts),
-                )
+        self.assertTrue(
+            coordinator.launch(
+                (4, 2),
+                protected_slots={1, 3},
+                submit=lambda experts: submitted.extend(experts),
             )
+        )
         coordinator.synchronous_correction((2, 6), corrected.extend)
 
         self.assertEqual(submitted, [4, 2])
-        self.assertEqual(event.recorded, 1)
+        self.assertEqual(plan.source_rows.tolist(), [4, 2])
+        self.assertEqual(plan.destination_slots.tolist(), [1, 3])
+        self.assertEqual(plan.generations.tolist(), [0, 0])
+        self.assertEqual(len(executor.submissions), 1)
+        self.assertEqual(len(executor.waits), 1)
         self.assertEqual(coordinator.protected_slots, frozenset())
         self.assertEqual(corrected, [2, 6])
         stats = coordinator.snapshot_stats()
