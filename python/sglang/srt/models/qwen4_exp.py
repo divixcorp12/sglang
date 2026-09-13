@@ -2,7 +2,7 @@
 
 import math
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple
+from typing import Any, Iterable, Optional, Sequence, Set, Tuple
 
 import msgspec
 import sympy
@@ -68,6 +68,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
+    PleFileRowBatchStager,
     PleFileRowStager,
     allocate_ple_host_table,
     check_file_backend_supported,
@@ -1250,6 +1251,21 @@ class Qwen4ExpPLELayer(nn.Module):
         """
         if batch is None:
             return
+        lookup_ids, output_view = self.replay_lookup(batch, forward_batch, graph_tokens)
+        if lookup_ids.shape[0] == 0:
+            return
+        self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+
+    def replay_lookup(
+        self,
+        batch: _PLEBatch,
+        forward_batch: ForwardBatch,
+        graph_tokens: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return this forward's lookup ids and the captured buffer rows they fill.
+
+        Rows of the captured buffer past the lookup are zeroed here.
+        """
         buffer = self._graph_prefetch_buffers.get(graph_tokens)
         if buffer is None:
             raise RuntimeError(
@@ -1266,12 +1282,11 @@ class Qwen4ExpPLELayer(nn.Module):
                 f"{graph_tokens}"
             )
         buffer[lookup_tokens:].zero_()
-        if lookup_tokens == 0:
-            return
+        heads = self.ple_embedding.ngram_heads
         output_view = buffer[:lookup_tokens].view(
-            lookup_tokens, self.ple_embedding.ngram_heads, -1
+            lookup_tokens, heads, buffer.shape[-1] // heads
         )
-        self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+        return lookup_ids, output_view
 
     def start_prefetch(
         self,
@@ -1756,6 +1771,28 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
+def _make_ple_replay_row_batch(
+    staged: Sequence[Qwen4ExpPLELayer],
+) -> Optional[PleFileRowBatchStager]:
+    """One batched stager over every staged layer's table, or None when any
+    layer's table is not staged from a file through io_uring."""
+    stagers = []
+    vocab_ranges = []
+    for ple in staged:
+        embedding = getattr(getattr(ple, "ple_embedding", None), "ngram_embedding", None)
+        stager = getattr(embedding, "_file_row_stager", None)
+        if not isinstance(stager, PleFileRowStager) or stager.reader_mode == "mmap":
+            return None
+        stagers.append(stager)
+        vocab_ranges.append(
+            (
+                embedding.shard_indices.org_vocab_start_index,
+                embedding.shard_indices.org_vocab_end_index,
+            )
+        )
+    return PleFileRowBatchStager(stagers, vocab_ranges)
+
+
 class Qwen4ExpModel(Qwen3_5ForCausalLM):
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
@@ -1818,8 +1855,23 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             ngram_size=self.ple_ngram_size,
             ngram_eos_token_id=self.ple_ngram_eos_token_id,
         )
-        for ple in staged:
-            ple.stage_rows_for_replay(ple_batch, forward_batch, graph_tokens)
+        row_batch = getattr(self, "_ple_replay_row_batch", None)
+        if row_batch is None:
+            row_batch = self._ple_replay_row_batch = (
+                _make_ple_replay_row_batch(staged),
+            )
+        if row_batch[0] is None:
+            for ple in staged:
+                ple.stage_rows_for_replay(ple_batch, forward_batch, graph_tokens)
+            return
+        if ple_batch is None:
+            return
+        lookups = [
+            ple.replay_lookup(ple_batch, forward_batch, graph_tokens) for ple in staged
+        ]
+        rows = row_batch[0].stage([lookup_ids for lookup_ids, _ in lookups])
+        for (_, output_view), staged_rows in zip(lookups, rows):
+            output_view.copy_(staged_rows)
 
     def forward(
         self,

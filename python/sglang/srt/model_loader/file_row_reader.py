@@ -267,3 +267,81 @@ class PagedRowSource:
             gather_index,
             out=destination[:count].view(torch.uint8).reshape(-1),
         )
+
+
+class PagedRowBatch:
+    """Rows of several ``PagedRowSource`` files read with one native call.
+
+    The native reader plans the pages under every source's rows, coalesces
+    them into runs, reads all runs in one io_uring batch and scatters the rows,
+    so a step that touches many tables pays one Python call and one batch.
+    Source ``i`` treats ids inside ``row_windows[i] = (start, end)`` as file row
+    ``id - start`` and writes zeros for every other id.
+    """
+
+    def __init__(
+        self,
+        sources: Sequence[PagedRowSource],
+        row_windows: Sequence[tuple[int, int]],
+    ) -> None:
+        if not sources:
+            raise ValueError("a paged row batch needs at least one source")
+        if len(row_windows) != len(sources):
+            raise ValueError("paged row batch needs one row window per source")
+        self._reader = sources[0]._reader
+        if any(source._reader is not self._reader for source in sources):
+            raise ValueError("paged row batch sources must share one reader")
+        self.row_bytes = tuple(source.row_bytes for source in sources)
+        self._segments = torch.tensor(
+            [
+                [source._file, source.row_bytes, source.row_count, int(start), int(end), 0, 0]
+                for source, (start, end) in zip(sources, row_windows)
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._layout: Optional[tuple] = None
+        self._id_total = 0
+
+    def read_rows(
+        self,
+        ids: torch.Tensor,
+        id_counts: Sequence[int],
+        destination: torch.Tensor,
+    ) -> None:
+        """Fill ``destination`` with every source's rows, back to back in source order.
+
+        Source ``i`` reads the next ``id_counts[i]`` entries of ``ids`` into the
+        next ``id_counts[i] * row_bytes[i]`` bytes of the flat ``destination``.
+        """
+        layout = (tuple(id_counts), destination.data_ptr(), destination.numel())
+        if layout != self._layout:
+            self._set_layout(id_counts, destination)
+            self._layout = layout
+        if ids.numel() != self._id_total:
+            raise ValueError(
+                f"paged row batch expected {self._id_total} ids, got {ids.numel()}"
+            )
+        if ids.device.type != "cpu":
+            raise ValueError("file row ids must be a CPU tensor")
+        self._reader.read_paged_rows(self._segments, ids)
+
+    def _set_layout(self, id_counts: Sequence[int], destination: torch.Tensor) -> None:
+        if len(id_counts) != len(self.row_bytes):
+            raise ValueError("paged row batch needs one id count per source")
+        if destination.device.type != "cpu" or not destination.is_contiguous():
+            raise ValueError("file row destination must be a contiguous CPU tensor")
+        counts = torch.tensor([int(count) for count in id_counts], dtype=torch.int64)
+        if bool((counts < 0).any()):
+            raise ValueError("paged row id counts must be non-negative")
+        byte_counts = counts * self._segments[:, 1]
+        total_bytes = int(byte_counts.sum())
+        if total_bytes > destination.numel() * destination.element_size():
+            raise ValueError(
+                f"paged row destination must hold {total_bytes} bytes"
+            )
+        self._segments[:, 5] = counts
+        self._segments[:, 6] = (
+            destination.data_ptr() + torch.cumsum(byte_counts, 0) - byte_counts
+        )
+        self._id_total = int(counts.sum())

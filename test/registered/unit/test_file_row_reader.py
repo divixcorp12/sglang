@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.model_loader.file_row_reader import (
     AlignedRowSource,
+    PagedRowBatch,
     PagedRowSource,
     read_plans,
     validate_file_reader_mode,
@@ -148,6 +149,73 @@ def test_row_sources_stay_on_cpu_under_a_cuda_default_device(direct):
 
         assert torch.equal(paged_destination, ple[rows])
         assert torch.equal(aligned_destination, wide[[3, 0, 1]])
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_paged_row_batch_matches_per_source_reads_across_files_and_windows(direct):
+    with tempfile.TemporaryDirectory() as directory:
+        reader = _reader()
+        wide_path, wide = _write_rows(directory, "wide.bin", 1000, 160, seed=8)
+        narrow_path, narrow = _write_rows(directory, "narrow.bin", 700, 7, seed=9)
+        sources = [
+            PagedRowSource(reader, wide_path, 160, 1000, direct=direct),
+            PagedRowSource(reader, narrow_path, 7, 700, direct=direct),
+            PagedRowSource(reader, wide_path, 160, 1000, direct=direct),
+        ]
+        tables = [wide, narrow, wide]
+        windows = [(0, 1000), (50, 750), (1000, 1600)]
+        batch = PagedRowBatch(sources, windows)
+        generator = torch.Generator().manual_seed(10)
+
+        def expected(table, ids, window):
+            start, end = window
+            inside = (ids >= start) & (ids < end)
+            rows = table[torch.where(inside, ids - start, 0)].clone()
+            rows[~inside] = 0
+            return rows
+
+        destinations = {}
+        for counts in ([9, 12, 7], [9, 12, 7], [0, 3, 1], [2, 0, 0]):
+            per_source = []
+            for count, (start, end) in zip(counts, windows):
+                ids = torch.randint(start - 40, end + 40, (count,), generator=generator)
+                if count >= 4:
+                    ids[:4] = torch.tensor([start + 25, start + 26, start + 25, end - 1])
+                    ids[-1] = -1
+                per_source.append(ids)
+            ids = torch.cat(per_source)
+            total = sum(c * rb for c, rb in zip(counts, batch.row_bytes))
+            destination = destinations.setdefault(
+                total, torch.full((total + 5,), 0xAB, dtype=torch.uint8)
+            )
+
+            batch.read_rows(ids, counts, destination)
+
+            offset = 0
+            for source_ids, source, table, window, row_bytes in zip(
+                per_source, sources, tables, windows, batch.row_bytes
+            ):
+                end = offset + source_ids.numel() * row_bytes
+                reference = expected(table, source_ids, window)
+                assert torch.equal(destination[offset:end].view(-1, row_bytes), reference)
+                inside = (source_ids >= window[0]) & (source_ids < window[1])
+                paged = torch.zeros(source_ids.numel(), row_bytes, dtype=torch.uint8)
+                source.read_rows(
+                    torch.where(inside, source_ids - window[0], 0), paged
+                )
+                paged[~inside] = 0
+                assert torch.equal(destination[offset:end].view(-1, row_bytes), paged)
+                offset = end
+            assert torch.equal(destination[total:], torch.full((5,), 0xAB, dtype=torch.uint8))
+
+        with pytest.raises(Exception, match="file row id outside"):
+            PagedRowBatch([sources[1]], [(0, 701)]).read_rows(
+                torch.tensor([700]), [1], torch.zeros(7, dtype=torch.uint8)
+            )
+        with pytest.raises(ValueError, match="expected 3 ids"):
+            batch.read_rows(torch.tensor([1, 2]), [1, 1, 1], torch.zeros(400, dtype=torch.uint8))
+        with pytest.raises(ValueError, match="must hold"):
+            batch.read_rows(torch.tensor([1]), [1, 0, 0], torch.zeros(100, dtype=torch.uint8))
 
 
 def test_aligned_rows_reject_wrong_width_and_mismatched_slots():

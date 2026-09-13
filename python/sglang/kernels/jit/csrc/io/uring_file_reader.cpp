@@ -9,8 +9,10 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <liburing.h>
 #include <stdexcept>
 #include <string>
@@ -24,6 +26,9 @@ namespace {
 constexpr unsigned kRegisteredBufferSlots = 1024;
 constexpr uint64_t kMaxRegisteredBufferBytes = 1ULL << 30;
 constexpr uint64_t kMaxReadBytes = 1ULL << 30;
+constexpr uint64_t kPageBytes = 4096;
+constexpr unsigned kPageShift = 12;
+constexpr int64_t kPagedRowColumns = 7;
 
 std::string errno_message(const std::string& what, int error) {
   return what + ": " + std::strerror(error);
@@ -96,6 +101,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
 
   ~UringFileReaderObj() {
     shutdown_();
+    std::free(bounce_);
     UnregisterRequest* request = unregister_requests_.exchange(nullptr);
     while (request != nullptr) {
       UnregisterRequest* next = request->next;
@@ -209,14 +215,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     const auto* length_values = static_cast<const int64_t*>(lengths.data_ptr());
 
     const size_t capacity = static_cast<size_t>(count);
-    if (requests_.size() < capacity) {
-      requests_.resize(capacity);
-      pending_.resize(capacity);
-    }
-    // Each extent is pending or in flight at most once, so ``capacity`` slots
-    // hold the whole FIFO without growing.
-    size_t pending_head = 0;
-    size_t pending_size = 0;
+    reserve_requests_(capacity);
     for (int64_t index = 0; index < count; ++index) {
       if (offset_values[index] < 0 || length_values[index] < 0) {
         throw std::invalid_argument("io_uring read offsets and lengths must be non-negative");
@@ -230,7 +229,131 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       request.length = static_cast<uint64_t>(length_values[index]);
       request.done = 0;
       request.buffer_index = find_buffer_(request.destination, request.length);
-      if (request.length > 0) {
+    }
+    return static_cast<int64_t>(run_requests_(capacity));
+  }
+
+  /// Read fixed-width sub-page rows of many files through one batch of
+  /// coalesced page reads.
+  ///
+  /// ``segments`` is an ``(S, 7)`` int64 table whose row ``s`` is
+  /// ``(file id, row bytes, row count, window start, window end, id count,
+  /// destination address)``. Segment ``s`` consumes the next ``id count``
+  /// entries of ``ids`` and writes them to consecutive rows of ``row bytes``
+  /// at ``destination address``: an id inside ``[window start, window end)``
+  /// becomes file row ``id - window start``, which must be below ``row count``,
+  /// and any other id becomes a row of zeros.
+  ///
+  /// The distinct pages under every requested row, across all segments, are
+  /// coalesced into runs of consecutive pages per file and read as whole
+  /// pages into a page-aligned bounce buffer the reader owns, so files opened
+  /// with ``O_DIRECT`` are served too; only the bytes before a file's end are
+  /// owed for its final page. Returns the bytes read from the files.
+  int64_t read_paged_rows(const tvm::ffi::TensorView segments, const tvm::ffi::TensorView ids) {
+    enter_();
+    if (segments.dim() != 2 || segments.size(1) != kPagedRowColumns) {
+      throw std::invalid_argument("paged row segments must be an (S, 7) table");
+    }
+    if (ids.dim() != 1) {
+      throw std::invalid_argument("paged row ids must be one-dimensional");
+    }
+    const int64_t segment_count = segments.size(0);
+    const int64_t id_count = ids.size(0);
+    const auto* columns = static_cast<const int64_t*>(segments.data_ptr());
+    const auto* id_values = static_cast<const int64_t*>(ids.data_ptr());
+
+    page_keys_.clear();
+    int64_t consumed = 0;
+    for (int64_t segment = 0; segment < segment_count; ++segment) {
+      const PagedSegment s = paged_segment_(columns + segment * kPagedRowColumns);
+      if (s.id_count > id_count - consumed) {
+        throw std::invalid_argument("paged row segments request more ids than were given");
+      }
+      for (int64_t index = consumed; index < consumed + s.id_count; ++index) {
+        uint64_t start = 0;
+        if (paged_row_start_(s, id_values[index], &start)) {
+          page_keys_.push_back(PageKey{s.file_id, start >> kPageShift});
+          page_keys_.push_back(PageKey{s.file_id, (start + s.row_bytes - 1) >> kPageShift});
+        }
+      }
+      consumed += s.id_count;
+    }
+    if (consumed != id_count) {
+      throw std::invalid_argument("paged row segments must consume every id");
+    }
+    std::sort(page_keys_.begin(), page_keys_.end());
+    page_keys_.erase(std::unique(page_keys_.begin(), page_keys_.end()), page_keys_.end());
+
+    const size_t page_count = page_keys_.size();
+    const uint8_t* bounce = bounce_for_(page_count);
+    size_t run_count = 0;
+    uint64_t expected = 0;
+    reserve_requests_(page_count);
+    for (size_t page = 0; page < page_count; ++page) {
+      const PageKey& key = page_keys_[page];
+      if (page > 0 && key.file_id == page_keys_[page - 1].file_id && key.page == page_keys_[page - 1].page + 1) {
+        requests_[run_count - 1].length += kPageBytes;
+        continue;
+      }
+      const File& file = file_(key.file_id);
+      Request& request = requests_[run_count++];
+      request.fd = file.fd;
+      request.file_bytes = file.size;
+      request.offset = key.page * kPageBytes;
+      request.destination = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bounce)) + page * kPageBytes;
+      request.length = kPageBytes;
+      request.done = 0;
+      request.buffer_index = -1;
+    }
+    for (size_t run = 0; run < run_count; ++run) {
+      const Request& request = requests_[run];
+      if (request.offset < request.file_bytes) {
+        expected += std::min(request.length, request.file_bytes - request.offset);
+      }
+    }
+    const uint64_t actual = run_requests_(run_count);
+    if (actual != expected) {
+      throw std::runtime_error(
+          "io_uring page read ended early: read " + std::to_string(actual) + " of " + std::to_string(expected) +
+          " bytes");
+    }
+
+    consumed = 0;
+    for (int64_t segment = 0; segment < segment_count; ++segment) {
+      const PagedSegment s = paged_segment_(columns + segment * kPagedRowColumns);
+      auto* row = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(s.destination));
+      for (int64_t index = consumed; index < consumed + s.id_count; ++index, row += s.row_bytes) {
+        uint64_t start = 0;
+        if (!paged_row_start_(s, id_values[index], &start)) {
+          std::memset(row, 0, s.row_bytes);
+          continue;
+        }
+        const PageKey key{s.file_id, start >> kPageShift};
+        const size_t page =
+            static_cast<size_t>(std::lower_bound(page_keys_.begin(), page_keys_.end(), key) - page_keys_.begin());
+        std::memcpy(row, bounce + page * kPageBytes + (start & (kPageBytes - 1)), s.row_bytes);
+      }
+      consumed += s.id_count;
+    }
+    return static_cast<int64_t>(actual);
+  }
+
+  void close() {
+    check_owner_();
+    shutdown_();
+  }
+
+ private:
+  /// Submit ``requests_[0, count)``, resubmitting short reads for their
+  /// remainder, and return the bytes read once every completion is reaped.
+  uint64_t run_requests_(size_t count) {
+    const size_t capacity = count;
+    // Each extent is pending or in flight at most once, so ``capacity`` slots
+    // hold the whole FIFO without growing.
+    size_t pending_head = 0;
+    size_t pending_size = 0;
+    for (size_t index = 0; index < count; ++index) {
+      if (requests_[index].length > 0) {
         pending_[pending_size++] = static_cast<uint32_t>(index);
       }
     }
@@ -316,15 +439,74 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     for (size_t index = 0; index < capacity; ++index) {
       total += requests_[index].done;
     }
-    return static_cast<int64_t>(total);
+    return total;
   }
 
-  void close() {
-    check_owner_();
-    shutdown_();
+  void reserve_requests_(size_t count) {
+    if (requests_.size() < count) {
+      requests_.resize(count);
+      pending_.resize(count);
+    }
   }
 
- private:
+  const uint8_t* bounce_for_(size_t page_count) {
+    const size_t needed = page_count * kPageBytes;
+    if (bounce_bytes_ < needed) {
+      const size_t capacity = std::max(needed, 2 * bounce_bytes_);
+      auto* storage = static_cast<uint8_t*>(std::aligned_alloc(kPageBytes, capacity));
+      if (storage == nullptr) {
+        throw std::bad_alloc();
+      }
+      std::free(bounce_);
+      bounce_ = storage;
+      bounce_bytes_ = capacity;
+    }
+    return bounce_;
+  }
+
+  struct PagedSegment {
+    int64_t file_id;
+    uint64_t row_bytes;
+    int64_t row_count;
+    int64_t window_start;
+    int64_t window_end;
+    int64_t id_count;
+    int64_t destination;
+  };
+
+  PagedSegment paged_segment_(const int64_t* columns) const {
+    PagedSegment s{
+        columns[0],
+        static_cast<uint64_t>(columns[1]),
+        columns[2],
+        columns[3],
+        columns[4],
+        columns[5],
+        columns[6]};
+    file_(s.file_id);
+    if (columns[1] <= 0 || columns[1] > static_cast<int64_t>(kPageBytes)) {
+      throw std::invalid_argument("paged rows must be between 1 byte and one page");
+    }
+    if (s.row_count < 0 || s.id_count < 0) {
+      throw std::invalid_argument("paged row counts must be non-negative");
+    }
+    return s;
+  }
+
+  /// Whether ``id`` falls inside the segment's window; if so, set ``*start``
+  /// to its row's file offset.
+  static bool paged_row_start_(const PagedSegment& s, int64_t id, uint64_t* start) {
+    if (id < s.window_start || id >= s.window_end) {
+      return false;
+    }
+    const int64_t row = id - s.window_start;
+    if (row >= s.row_count) {
+      throw std::out_of_range("file row id outside [0, " + std::to_string(s.row_count) + ")");
+    }
+    *start = static_cast<uint64_t>(row) * s.row_bytes;
+    return true;
+  }
+
   /// A failed submit may leave reads running in the kernel and unsubmitted
   /// SQEs in the ring. Wait out every read the kernel took, then tear the ring
   /// down so the unsubmitted SQEs can never run, and only then throw: no read
@@ -387,6 +569,18 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     uint64_t low;
     uint64_t high;
     UnregisterRequest* next;
+  };
+
+  struct PageKey {
+    int64_t file_id;
+    uint64_t page;
+
+    bool operator<(const PageKey& other) const {
+      return file_id < other.file_id || (file_id == other.file_id && page < other.page);
+    }
+    bool operator==(const PageKey& other) const {
+      return file_id == other.file_id && page == other.page;
+    }
   };
 
   void check_owner_() const {
@@ -484,6 +678,9 @@ struct UringFileReaderObj : public tvm::ffi::Object {
   std::vector<Buffer> buffers_;
   std::vector<Request> requests_;
   std::vector<uint32_t> pending_;
+  std::vector<PageKey> page_keys_;
+  uint8_t* bounce_ = nullptr;
+  size_t bounce_bytes_ = 0;
   std::atomic<UnregisterRequest*> unregister_requests_{nullptr};
 };
 
@@ -498,6 +695,7 @@ void register_uring_file_reader() {
       .def("unregister_buffer", &UringFileReaderObj::unregister_buffer)
       .def("request_unregister", &UringFileReaderObj::request_unregister)
       .def("read", &UringFileReaderObj::read)
+      .def("read_paged_rows", &UringFileReaderObj::read_paged_rows)
       .def("close", &UringFileReaderObj::close);
 }
 

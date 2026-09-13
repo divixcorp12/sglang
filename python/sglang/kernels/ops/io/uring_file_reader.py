@@ -139,6 +139,27 @@ class UringFileReader:
             return 0
         return int(self._native.read(*extents))
 
+    def read_paged_rows(self, segments: torch.Tensor, ids: torch.Tensor) -> int:
+        """Read sub-page rows of many files with one batch of coalesced page reads.
+
+        ``segments`` is an ``(S, 7)`` CPU int64 table whose row ``s`` is
+        ``(file id, row bytes, row count, window start, window end, id count,
+        destination address)``. Segment ``s`` takes the next ``id count``
+        entries of ``ids`` and fills consecutive rows at ``destination
+        address``: an id inside ``[window start, window end)`` gets file row
+        ``id - window start`` and any other id gets zeros. Callers keep every
+        destination alive for the call. Returns the bytes read from the files.
+        """
+        if (
+            segments.device.type != "cpu"
+            or segments.dtype != torch.int64
+            or segments.ndim != 2
+            or segments.shape[1] != 7
+            or not segments.is_contiguous()
+        ):
+            raise ValueError("paged row segments must be a contiguous CPU int64 (S, 7) table")
+        return int(self._native.read_paged_rows(segments, _extent_tensor("ids", ids)))
+
     def close(self) -> None:
         self._native.close()
         self._files.clear()

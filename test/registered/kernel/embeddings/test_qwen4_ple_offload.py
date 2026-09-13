@@ -440,6 +440,145 @@ def test_qwen4_model_stages_only_prefetched_ple_layers_before_replay(monkeypatch
     assert staged == [(2, "ple_batch", forward_batch, 4)]
 
 
+def _uring_file_layer(monkeypatch, tmp_path, name, dtype, dim, vocab, heads, graph):
+    from sglang.srt.models.qwen4_exp_ple_table import PleFileRowStager
+
+    monkeypatch.setattr(
+        qwen4_exp_module, "check_file_backend_supported", lambda *_: False
+    )
+    start, end = vocab
+    offloaded = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(
+            dtype=dtype,
+            embedding_dim=dim,
+            vocab_start=start,
+            vocab_end=end,
+            org_vocab_size=end,
+            tp_size=2 if start else 1,
+        ),
+        backend="file",
+        table_dir=str(tmp_path / name),
+    )
+    table = offloaded._ple_file_cache_table
+    generator = torch.Generator().manual_seed(len(name) * 31 + dim)
+    table.view(torch.uint8).view(-1).copy_(
+        torch.randint(0, 256, (table.numel() * table.element_size(),), generator=generator, dtype=torch.uint8)
+    )
+    offloaded._file_row_stager = PleFileRowStager(table, reader_mode="uring")
+
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embed_dim = heads * dim
+    layer.stage_before_replay = True
+    layer._graph_prefetch_buffers = {
+        graph: torch.full((graph, heads * dim), 9, dtype=torch.bfloat16, device="cuda")
+    }
+    ids = torch.zeros((0, heads), dtype=torch.int64, device="cuda")
+    layer.lookup = ids
+    layer.ple_embedding = SimpleNamespace(
+        gather_dp_tokens=False,
+        ngram_heads=heads,
+        compute_ngram_ids=lambda _: layer.lookup,
+        _prepare_embedding_lookup=lambda ids, *_: (ids, ids.shape[0]),
+        ngram_embedding=offloaded,
+    )
+    return layer, table
+
+
+def test_qwen4_model_stages_every_ple_layer_with_one_native_read(monkeypatch, tmp_path):
+    from sglang.kernels.ops.io.uring_file_reader import UringFileReader
+
+    heads, graph = 2, 5
+    specs = [
+        ("bf16", torch.bfloat16, 80, (0, 5000)),
+        ("fp8", torch.float8_e4m3fn, 160, (0, 5000)),
+        ("shard", torch.bfloat16, 80, (4, 3004)),
+    ]
+    layers = [
+        _uring_file_layer(monkeypatch, tmp_path, *spec, heads=heads, graph=graph)
+        for spec in specs
+    ]
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.layers = [SimpleNamespace(ple=None)] + [
+        SimpleNamespace(ple=layer) for layer, _ in layers
+    ]
+    model._start_layer, model._end_layer = 0, len(model.layers)
+    model.has_ple = True
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 9
+    forward_batch = SimpleNamespace(input_ids="ids")
+
+    calls = {"read": 0, "read_paged_rows": 0}
+    for method in calls:
+        original = getattr(UringFileReader, method)
+
+        def counted(self, *args, _original=original, _method=method):
+            calls[_method] += 1
+            return _original(self, *args)
+
+        monkeypatch.setattr(UringFileReader, method, counted)
+
+    def expected_rows(table, ids, vocab):
+        start, end = vocab
+        flat = ids.reshape(-1).cpu()
+        inside = (flat >= start) & (flat < end)
+        byte_rows = table.view(torch.uint8).view(table.shape[0], -1)
+        rows = byte_rows[torch.where(inside, flat - start, 0)].clone()
+        rows[~inside] = 0
+        return (
+            rows.to("cuda")
+            .view(table.dtype)
+            .to(torch.bfloat16)
+            .reshape(ids.shape[0], -1)
+        )
+
+    def captured(layer):
+        return layer._graph_prefetch_buffers[graph].clone()
+
+    generator = torch.Generator().manual_seed(11)
+    for tokens in (3, 3, 1, 3):
+        monkeypatch.setattr(
+            qwen4_exp_module,
+            "_prepare_ple_batch",
+            lambda *_a, _tokens=tokens, **_k: SimpleNamespace(physical_tokens=_tokens),
+        )
+        for (layer, _), (_, _, _, (start, end)) in zip(layers, specs):
+            local = torch.randint(0, end - start, (tokens * heads,), generator=generator)
+            local[0] = 25
+            local[-1] = end - start - 1
+            ids = local + start
+            ids[1] = -1
+            if tokens * heads > 2:
+                ids[2] = start + 25
+                ids[3] = start + 26
+                ids[4] = end
+            layer.lookup = ids.reshape(tokens, heads).to("cuda")
+            layer._graph_prefetch_buffers[graph].fill_(9)
+
+        calls.update(read=0, read_paged_rows=0)
+        model.prepare_decode_graph_replay(forward_batch, graph_tokens=graph)
+        torch.cuda.synchronize()
+        assert calls == {"read": 0, "read_paged_rows": 1}
+        batched = [captured(layer) for layer, _ in layers]
+
+        for (layer, table), (_, _, _, vocab), rows in zip(layers, specs, batched):
+            expected = torch.zeros_like(rows)
+            expected[:tokens] = expected_rows(table, layer.lookup, vocab)
+            assert torch.equal(rows.view(torch.uint8), expected.view(torch.uint8))
+
+        calls.update(read=0, read_paged_rows=0)
+        for layer, _ in layers:
+            layer._graph_prefetch_buffers[graph].fill_(9)
+            layer.stage_rows_for_replay(
+                SimpleNamespace(physical_tokens=tokens), forward_batch, graph
+            )
+        torch.cuda.synchronize()
+        assert calls == {"read": len(layers), "read_paged_rows": 0}
+        for (layer, _), rows in zip(layers, batched):
+            assert torch.equal(captured(layer).view(torch.uint8), rows.view(torch.uint8))
+
+
 if __name__ == "__main__":
     import sys
 

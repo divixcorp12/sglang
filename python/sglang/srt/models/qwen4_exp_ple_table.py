@@ -40,6 +40,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.file_row_reader import (
+    PagedRowBatch,
     PagedRowSource,
     shared_uring_file_reader,
     validate_file_reader_mode,
@@ -529,6 +530,92 @@ class PleFileRowStager:
         return device_rows.view(self._dtype).reshape(
             *input_ids.shape, self._embedding_dim
         )
+
+
+class PleFileRowBatchStager:
+    """Stage one step's rows from several io_uring-read PLE tables at once.
+
+    ``stage`` returns, per table, the rows ``PleFileRowStager.stage`` would
+    return for the same ids and vocabulary range, but copies all tables' ids
+    to the host once, plans and reads every table's pages in one native call,
+    and copies all rows to the device once. Its pinned and device buffers are
+    its own, so eager per-table staging never moves them.
+    """
+
+    def __init__(
+        self,
+        stagers: Sequence[PleFileRowStager],
+        vocab_ranges: Sequence[tuple[int, int]],
+    ) -> None:
+        sources = [stager._row_source for stager in stagers]
+        if any(source is None for source in sources):
+            raise ValueError("batched PLE staging requires an io_uring reader mode")
+        self._rows = PagedRowBatch(sources, vocab_ranges)
+        self._dtypes = [stager._dtype for stager in stagers]
+        self._embedding_dims = [stager._embedding_dim for stager in stagers]
+        self._row_bytes = self._rows.row_bytes
+        self._host_ids: Optional[torch.Tensor] = None
+        self._host_rows: Optional[torch.Tensor] = None
+        self._device_rows: Optional[torch.Tensor] = None
+
+    def _ensure_capacity(
+        self, id_count: int, byte_count: int, device: torch.device
+    ) -> None:
+        if self._host_ids is None or self._host_ids.numel() < id_count:
+            self._host_ids = torch.empty(
+                max(id_count, 1024), dtype=torch.int64, device="cpu", pin_memory=True
+            )
+        if (
+            self._host_rows is None
+            or self._host_rows.numel() < byte_count
+            or self._device_rows.device != device
+        ):
+            capacity = max(byte_count, 1 << 16)
+            self._host_rows = torch.empty(
+                capacity, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+            self._device_rows = torch.empty(capacity, dtype=torch.uint8, device=device)
+
+    def stage(self, input_ids: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+        """Return each table's rows for ``input_ids[i]`` on the ID device.
+
+        The pinned row buffer is reused every step while the previous step's
+        non-blocking upload may still be queued. The blocking device-to-host
+        id copy synchronizes the stream before the rows are overwritten, so it
+        must stay blocking.
+        """
+        if len(input_ids) != len(self._row_bytes):
+            raise ValueError("batched PLE staging needs one id tensor per table")
+        if not all(ids.is_cuda for ids in input_ids):
+            raise ValueError("PLE file row staging requires CUDA input IDs")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "staged PLE file access is incompatible with CUDA graph capture; "
+                "disable CUDA graphs for prefill and decode"
+            )
+        counts = [ids.numel() for ids in input_ids]
+        id_count = sum(counts)
+        byte_count = sum(
+            count * row_bytes for count, row_bytes in zip(counts, self._row_bytes)
+        )
+        device = input_ids[0].device
+        self._ensure_capacity(id_count, byte_count, device)
+        host_ids = self._host_ids[:id_count]
+        host_rows = self._host_rows[:byte_count]
+        device_rows = self._device_rows[:byte_count]
+        if id_count:
+            host_ids.copy_(torch.cat([ids.detach().reshape(-1) for ids in input_ids]))
+            self._rows.read_rows(host_ids, counts, host_rows)
+            device_rows.copy_(host_rows, non_blocking=True)
+        staged = []
+        offset = 0
+        for ids, count, row_bytes, dtype, dim in zip(
+            input_ids, counts, self._row_bytes, self._dtypes, self._embedding_dims
+        ):
+            end = offset + count * row_bytes
+            staged.append(device_rows[offset:end].view(dtype).view(*ids.shape, dim))
+            offset = end
+        return staged
 
 
 def check_file_backend_supported(device_index: int = 0) -> bool:
