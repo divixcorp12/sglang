@@ -167,7 +167,11 @@ def _run(args: argparse.Namespace) -> list[dict[str, object]]:
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
 
-    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
+    from sglang.kernels.ops.moe.expert_cache_transfer import (
+        copy_expert_row_segments_gpu,
+        copy_expert_rows_gpu,
+        expert_row_segments,
+    )
     from sglang.srt.layers.moe.expert_dma import ExpertDMABackend
     from sglang.srt.layers.moe.expert_transfer import FixedRowTransferPlan
 
@@ -209,6 +213,16 @@ def _run(args: argparse.Namespace) -> list[dict[str, object]]:
                 gpu_plan.count,
             )
 
+    segments = expert_row_segments(list(zip(sources, destinations)))
+
+    def submit_gpu_segments() -> None:
+        copy_expert_row_segments_gpu(
+            segments,
+            gpu_plan.source_rows,
+            gpu_plan.destination_slots,
+            gpu_plan.count,
+        )
+
     dma_backend = ExpertDMABackend()
 
     def submit_dma() -> None:
@@ -219,26 +233,27 @@ def _run(args: argparse.Namespace) -> list[dict[str, object]]:
 
     results: list[dict[str, object]] = []
     if args.backend in ("all", "gpu"):
-        gpu_latency_us = _time_submissions(
-            submit_gpu,
-            stream=stream,
-            warmup=args.warmup,
-            iterations=args.iterations,
-        )
-        results.append(
-            _result(
-                requested_backend="gpu",
-                actual_backend="gpu",
-                mode="eager",
-                median_latency_us=gpu_latency_us,
-                rows=args.rows,
-                bytes_per_submission=bytes_per_submission,
+        for mode, submit in (("eager", submit_gpu), ("eager_segments", submit_gpu_segments)):
+            gpu_latency_us = _time_submissions(
+                submit,
+                stream=stream,
                 warmup=args.warmup,
                 iterations=args.iterations,
-                tensor_count=args.tensor_count,
-                device=device,
             )
-        )
+            results.append(
+                _result(
+                    requested_backend="gpu",
+                    actual_backend="gpu",
+                    mode=mode,
+                    median_latency_us=gpu_latency_us,
+                    rows=args.rows,
+                    bytes_per_submission=bytes_per_submission,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                    tensor_count=args.tensor_count,
+                    device=device,
+                )
+            )
 
         if args.cuda_graph:
             stream.synchronize()

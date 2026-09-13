@@ -546,8 +546,14 @@ class ExpertStreamer:
         rows by a kernel that reads its row count on the device, and routes are
         remapped with ``torch.where``. Nothing reads a CUDA value on the host, so
         a CUDA graph can capture the gather and replay it for any routes.
+        All host-backed tensors of the layer are pulled in one kernel launch
+        whose plan holds their addresses, so neither the host rows nor the
+        cache tensors may be reallocated afterwards.
         """
-        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
+        from sglang.kernels.ops.moe.expert_cache_transfer import (
+            copy_expert_row_segments_gpu,
+            expert_row_segments,
+        )
 
         max_rows = index(max_rows)
         cache = self.hot_cache
@@ -571,7 +577,16 @@ class ExpertStreamer:
                     f"graph gather needs registered host rows; {name!r} is pageable"
                 )
         device = cache.device
-        self._copy_rows_gpu = copy_expert_rows_gpu
+        host_pairs = [
+            (source, cache.tensors[name])
+            for name in self.tensor_names
+            for source in [_tensor_data(getattr(self.layer, name))]
+            if source.device.type == "cpu"
+        ]
+        self._copy_row_segments_gpu = copy_expert_row_segments_gpu
+        self._graph_row_segments = (
+            expert_row_segments(host_pairs) if host_pairs else None
+        )
         self._graph_scratch_slots = torch.arange(
             cache.capacity, cache.capacity + max_rows, dtype=torch.long, device=device
         )
@@ -604,25 +619,23 @@ class ExpertStreamer:
         self._graph_miss_count.copy_(miss_count.reshape(1))
         for name in self.tensor_names:
             source = _tensor_data(getattr(self.layer, name))
+            if source.device.type != "cuda":
+                continue
             destination = cache.tensors[name]
-            if source.device.type == "cuda":
-                destination.view(torch.uint8).reshape(
-                    destination.shape[0], -1
-                ).index_copy_(
-                    0,
-                    scratch,
-                    source.view(torch.uint8)
-                    .reshape(source.shape[0], -1)
-                    .index_select(0, flat),
-                )
-            else:
-                self._copy_rows_gpu(
-                    source,
-                    destination,
-                    self._graph_source_rows,
-                    self._graph_destination_slots,
-                    self._graph_miss_count,
-                )
+            destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
+                0,
+                scratch,
+                source.view(torch.uint8)
+                .reshape(source.shape[0], -1)
+                .index_select(0, flat),
+            )
+        if self._graph_row_segments is not None:
+            self._copy_row_segments_gpu(
+                self._graph_row_segments,
+                self._graph_source_rows,
+                self._graph_destination_slots,
+                self._graph_miss_count,
+            )
         self.graph_counters[0].add_(count)
         self.graph_counters[1].add_(miss_count)
         if self.residency_policy is not None:

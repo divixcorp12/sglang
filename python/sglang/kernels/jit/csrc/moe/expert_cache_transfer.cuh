@@ -52,21 +52,39 @@ __device__ __forceinline__ void copy_expert_row_lane(
   }
 }
 
+// A segment is {source address, destination address, row bytes}.
+__device__ __forceinline__ void copy_expert_row_segments_lane(
+    const int64_t* segments,
+    int64_t segment_count,
+    int64_t source_row,
+    int64_t destination_slot,
+    int64_t lane,
+    int64_t lanes) {
+  for (int64_t segment = 0; segment < segment_count; ++segment) {
+    const int64_t* entry = segments + 3 * segment;
+    const int64_t row_bytes = entry[2];
+    copy_expert_row_lane(
+        reinterpret_cast<const uint8_t*>(static_cast<intptr_t>(entry[0])) + source_row * row_bytes,
+        reinterpret_cast<uint8_t*>(static_cast<intptr_t>(entry[1])) + destination_slot * row_bytes,
+        row_bytes,
+        lane,
+        lanes);
+  }
+}
+
 // Every launched thread works on the rows the device-side count selects. With
 // fewer rows than threads, each row owns a contiguous range of threads, one lane
 // per thread, so a handful of misses reads host memory with hundreds of
 // concurrent lanes; contiguity keeps each launch block on one row's host pages.
 // With more rows than threads, each thread walks one row in every `threads`.
-__global__ __launch_bounds__(kExpertTransferBlockSize, 1) void copy_expert_rows_gpu_kernel(
-    const uint8_t* __restrict__ source,
-    uint8_t* __restrict__ destination,
-    const int64_t* __restrict__ source_rows,
-    const int32_t* __restrict__ destination_slots,
-    const int32_t* __restrict__ count,
-    int64_t row_bytes) {
-  const int64_t total_threads = static_cast<int64_t>(gridDim.x) * kExpertTransferBlockSize;
-  const int64_t thread = static_cast<int64_t>(blockIdx.x) * kExpertTransferBlockSize + threadIdx.x;
-  const int64_t active_count = count[0];
+__device__ __forceinline__ void copy_expert_rows_for_thread(
+    const int64_t* segments,
+    int64_t segment_count,
+    const int64_t* source_rows,
+    const int32_t* destination_slots,
+    int64_t active_count,
+    int64_t thread,
+    int64_t total_threads) {
   if (active_count <= 0) {
     return;
   }
@@ -75,25 +93,57 @@ __global__ __launch_bounds__(kExpertTransferBlockSize, 1) void copy_expert_rows_
     const int64_t row = thread * active_count / total_threads;
     const int64_t first_thread = (row * total_threads + active_count - 1) / active_count;
     const int64_t next_thread = ((row + 1) * total_threads + active_count - 1) / active_count;
-    const int64_t lane = thread - first_thread;
-    const int64_t lanes = next_thread - first_thread;
-    copy_expert_row_lane(
-        source + source_rows[row] * row_bytes,
-        destination + static_cast<int64_t>(destination_slots[row]) * row_bytes,
-        row_bytes,
-        lane,
-        lanes);
+    copy_expert_row_segments_lane(
+        segments,
+        segment_count,
+        source_rows[row],
+        static_cast<int64_t>(destination_slots[row]),
+        thread - first_thread,
+        next_thread - first_thread);
     return;
   }
 
   for (int64_t row = thread; row < active_count; row += total_threads) {
-    copy_expert_row_lane(
-        source + source_rows[row] * row_bytes,
-        destination + static_cast<int64_t>(destination_slots[row]) * row_bytes,
-        row_bytes,
-        0,
-        1);
+    copy_expert_row_segments_lane(
+        segments, segment_count, source_rows[row], static_cast<int64_t>(destination_slots[row]), 0, 1);
   }
+}
+
+__global__ __launch_bounds__(kExpertTransferBlockSize, 1) void copy_expert_rows_gpu_kernel(
+    const uint8_t* __restrict__ source,
+    uint8_t* __restrict__ destination,
+    const int64_t* __restrict__ source_rows,
+    const int32_t* __restrict__ destination_slots,
+    const int32_t* __restrict__ count,
+    int64_t row_bytes) {
+  const int64_t segment[3] = {
+      static_cast<int64_t>(reinterpret_cast<intptr_t>(source)),
+      static_cast<int64_t>(reinterpret_cast<intptr_t>(destination)),
+      row_bytes};
+  copy_expert_rows_for_thread(
+      segment,
+      1,
+      source_rows,
+      destination_slots,
+      count[0],
+      static_cast<int64_t>(blockIdx.x) * kExpertTransferBlockSize + threadIdx.x,
+      static_cast<int64_t>(gridDim.x) * kExpertTransferBlockSize);
+}
+
+__global__ __launch_bounds__(kExpertTransferBlockSize, 1) void copy_expert_row_segments_gpu_kernel(
+    const int64_t* __restrict__ segments,
+    int64_t segment_count,
+    const int64_t* __restrict__ source_rows,
+    const int32_t* __restrict__ destination_slots,
+    const int32_t* __restrict__ count) {
+  copy_expert_rows_for_thread(
+      segments,
+      segment_count,
+      source_rows,
+      destination_slots,
+      count[0],
+      static_cast<int64_t>(blockIdx.x) * kExpertTransferBlockSize + threadIdx.x,
+      static_cast<int64_t>(gridDim.x) * kExpertTransferBlockSize);
 }
 
 void copy_expert_rows_gpu(
@@ -113,6 +163,21 @@ void copy_expert_rows_gpu(
       static_cast<const int32_t*>(destination_slots.data_ptr()),
       static_cast<const int32_t*>(count.data_ptr()),
       row_bytes);
+}
+
+void copy_expert_row_segments_gpu(
+    tvm::ffi::TensorView segments,
+    tvm::ffi::TensorView source_rows,
+    tvm::ffi::TensorView destination_slots,
+    tvm::ffi::TensorView count) {
+  const auto device = host::LaunchKernel::resolve_device(segments.device());
+  host::LaunchKernel(kExpertTransferGridSize, kExpertTransferBlockSize, device)(
+      copy_expert_row_segments_gpu_kernel,
+      static_cast<const int64_t*>(segments.data_ptr()),
+      static_cast<int64_t>(segments.size(0)),
+      static_cast<const int64_t*>(source_rows.data_ptr()),
+      static_cast<const int32_t*>(destination_slots.data_ptr()),
+      static_cast<const int32_t*>(count.data_ptr()));
 }
 
 }  // namespace sglang
