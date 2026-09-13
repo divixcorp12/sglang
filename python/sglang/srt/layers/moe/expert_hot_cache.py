@@ -69,14 +69,20 @@ class ExpertHotCache:
     unchanged while their rows are resident in the cache.
     """
 
-    def __init__(self, streamer: ExpertStreamer, capacity: int):
+    def __init__(self, streamer: ExpertStreamer, capacity: int, scratch_rows: int = 0):
+        """``scratch_rows`` extra rows after the slots receive graph-gather misses."""
         capacity = index(capacity)
+        scratch_rows = index(scratch_rows)
         if not 0 <= capacity <= streamer.num_experts:
             raise ValueError("hot cache capacity must be within the expert count")
+        if scratch_rows < 0:
+            raise ValueError("hot cache scratch rows cannot be negative")
         self.streamer = streamer
         self.capacity = capacity
+        self.scratch_rows = scratch_rows
         self.bytes_per_expert = streamer.bytes_per_expert
         self.capacity_bytes = capacity * self.bytes_per_expert
+        self.scratch_bytes = scratch_rows * self.bytes_per_expert
         devices = {
             _tensor_data(getattr(streamer.layer, name)).device
             for name in streamer.tensor_names
@@ -89,7 +95,7 @@ class ExpertHotCache:
         )
         self.tensors = {
             name: torch.empty(
-                (capacity,) + tuple(source.shape[1:]),
+                (capacity + scratch_rows,) + tuple(source.shape[1:]),
                 dtype=source.dtype,
                 device=self.device,
             )
@@ -534,7 +540,14 @@ class ExpertHotCacheManager:
         metrics_path: str | os.PathLike[str] | None = None,
         route_history_limit: int = 32,
         copy_backend: str = "gpu",
+        graph_gather_batch_size: int = 0,
     ) -> ExpertHotCacheManager | None:
+        """Build the per-layer hot caches.
+
+        ``graph_gather_batch_size`` > 0 reserves ``batch_size * top_k`` scratch
+        rows per layer from the budget and enables each streamer's sync-free
+        graph gather for routes of at most that many rows.
+        """
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
@@ -595,14 +608,32 @@ class ExpertHotCacheManager:
             for layer_id, streamer in streamers.items()
             for expert_id in range(streamer.num_experts)
         )
+        graph_gather_batch_size = index(graph_gather_batch_size)
+        if graph_gather_batch_size < 0:
+            raise ValueError("graph gather batch size cannot be negative")
+        scratch_rows = {}
+        for layer_id, streamer in streamers.items():
+            top_k = getattr(streamer.layer, "top_k", None)
+            if graph_gather_batch_size and top_k is None:
+                raise ValueError("graph gather needs each streamed layer's top_k")
+            scratch_rows[layer_id] = (
+                graph_gather_batch_size * index(top_k) if graph_gather_batch_size else 0
+            )
         selected = {layer_id: [] for layer_id in streamers}
-        remaining = budget_bytes
+        remaining = budget_bytes - sum(
+            rows * streamers[layer_id].bytes_per_expert
+            for layer_id, rows in scratch_rows.items()
+        )
+        if remaining < 0:
+            raise ValueError(
+                "expert hot cache budget cannot hold the graph-gather scratch rows"
+            )
         for _, expert_id, layer_id in candidates:
             slot_bytes = streamers[layer_id].bytes_per_expert
             if slot_bytes <= remaining:
                 selected[layer_id].append(expert_id)
                 remaining -= slot_bytes
-        if not any(selected.values()):
+        if not any(selected.values()) and not any(scratch_rows.values()):
             return None
         manager = cls()
         manager.streamers = streamers
@@ -637,11 +668,14 @@ class ExpertHotCacheManager:
             for mode in manager._counters
         }
         manager._route_affinity = {mode: {} for mode in manager._counters}
+        manager._last_graph_counters = {}
         for layer_id, expert_ids in selected.items():
-            if expert_ids:
+            if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
                 layer_streamer.expert_copy_backend = copy_backend
-                cache = ExpertHotCache(layer_streamer, len(expert_ids))
+                cache = ExpertHotCache(
+                    layer_streamer, len(expert_ids), scratch_rows[layer_id]
+                )
                 manager.caches[layer_id] = cache
                 manager._record_update(layer_id, cache.reassign(expert_ids))
                 if dynamic:
@@ -656,6 +690,9 @@ class ExpertHotCacheManager:
                     )
                     layer_streamer.residency_policy = policy
                     manager.residency_policies[layer_id] = policy
+        for layer_id, rows in scratch_rows.items():
+            if rows:
+                streamers[layer_id].enable_graph_gather(rows)
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -664,6 +701,9 @@ class ExpertHotCacheManager:
                     "requested_bytes": budget_bytes,
                     "residency_bytes": manager.residency_bytes,
                     "slots": sum(cache.capacity for cache in manager.caches.values()),
+                    "scratch_bytes": sum(
+                        cache.scratch_bytes for cache in manager.caches.values()
+                    ),
                     "layers": len(manager.caches),
                     "cuda_allocated_bytes": sum(
                         torch.cuda.memory_allocated(device) for device in devices
@@ -759,6 +799,58 @@ class ExpertHotCacheManager:
         counters.copy_bytes += submission.bytes
         counters.copy_submissions += submission.submissions
         counters.copy_fallbacks += submission.fallbacks
+
+    def _graph_counter_deltas(
+        self, counts: torch.Tensor
+    ) -> dict[int, tuple[int, int, int]]:
+        """Requested rows, missed rows, and routed experts of graph gathers.
+
+        Replayed gathers run no Python, so they cannot update
+        ``last_gather_stats``; their device counters and each layer's distinct
+        routed-expert count are read here instead, in one transfer per forward.
+        """
+        layers = [
+            (layer_id, streamer.graph_counters)
+            for layer_id, streamer in self.streamers.items()
+            if streamer.graph_counters is not None
+        ]
+        if not layers:
+            return {}
+        device = layers[0][1].device
+        layer_ids = torch.tensor([layer_id for layer_id, _ in layers], device=counts.device)
+        unique_experts = (counts.index_select(0, layer_ids) != 0).sum(dim=1)
+        values = (
+            torch.cat(
+                [
+                    torch.stack([counters for _, counters in layers]),
+                    unique_experts.to(device=device, dtype=torch.int64).unsqueeze(1),
+                ],
+                dim=1,
+            )
+            .cpu()
+            .tolist()
+        )
+        deltas = {}
+        for (layer_id, _), (requested, misses, unique) in zip(layers, values):
+            previous = self._last_graph_counters.get(layer_id, (0, 0))
+            self._last_graph_counters[layer_id] = (requested, misses)
+            deltas[layer_id] = (requested - previous[0], misses - previous[1], unique)
+        return deltas
+
+    def discard_graph_capture_routes(self) -> None:
+        """Drop routes and counters that CUDA-graph warmup and capture recorded.
+
+        Captured gathers execute once while recording, so their dummy routes
+        land in the residency counts and graph counters like a real forward.
+        """
+        for layer_id, streamer in self.streamers.items():
+            if streamer.graph_counters is None:
+                continue
+            streamer.graph_counters.zero_()
+            self._last_graph_counters[layer_id] = (0, 0)
+            policy = self.residency_policies.get(layer_id)
+            if policy is not None:
+                policy.pending_counts.zero_()
 
     @staticmethod
     def _pinned_cache_stats(streamer: ExpertStreamer) -> tuple[int, int]:
@@ -889,6 +981,7 @@ class ExpertHotCacheManager:
         mode = self._phase(forward_batch)
         prefill = mode == "prefill"
         self._record_route_statistics(mode, counts)
+        graph_deltas = self._graph_counter_deltas(counts)
         qualifying = (
             self.dynamic
             and prefill
@@ -937,6 +1030,20 @@ class ExpertHotCacheManager:
                 counters.pinned_admissions += admissions - previous_admissions
                 counters.pinned_evictions += evictions - previous_evictions
                 self._last_pinned_cache_stats[layer_id] = (admissions, evictions)
+            graph_requested, graph_misses, graph_unique = graph_deltas.get(
+                layer_id, (0, 0, 0)
+            )
+            if graph_requested:
+                counters = self._counters[mode][layer_id]
+                counters.requested_rows += graph_requested
+                counters.miss_rows += graph_misses
+                counters.hot_hits += graph_requested - graph_misses
+                counters.d2d_bytes += graph_requested * (
+                    streamer.bytes_per_expert - streamer.host_bytes_per_expert
+                )
+                counters.h2d_bytes += graph_misses * streamer.host_bytes_per_expert
+                counters.backing_source_bytes += graph_misses * streamer.bytes_per_expert
+                counters.requested_unique_experts += graph_unique
             cache = self.caches.get(layer_id)
             if (
                 not qualifying

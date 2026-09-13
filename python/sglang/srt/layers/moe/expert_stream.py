@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
+
 logger = logging.getLogger(__name__)
 
 _NO_DEDUP_LIMIT = 64
@@ -495,6 +497,8 @@ class ExpertStreamer:
         self.hot_cache = None
         self.pinned_host_cache = None
         self.residency_policy = None
+        self.graph_gather_rows = 0
+        self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
         self.bytes_per_expert = sum(
             _tensor_data(getattr(layer, name)).numel()
@@ -525,6 +529,108 @@ class ExpertStreamer:
                 self.num_experts,
                 ",".join(self.tensor_names),
             )
+
+    def serves_graph_gather(self, topk_output) -> bool:
+        """Whether ``topk_output`` fits the sync-free gather enabled at startup."""
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        return (
+            self.graph_gather_rows > 0
+            and isinstance(topk_ids, torch.Tensor)
+            and 0 < topk_ids.numel() <= self.graph_gather_rows
+        )
+
+    def enable_graph_gather(self, max_rows: int) -> None:
+        """Serve gathers of at most ``max_rows`` routes with device-only operations.
+
+        Misses are pulled from registered host rows into the hot cache's scratch
+        rows by a kernel that reads its row count on the device, and routes are
+        remapped with ``torch.where``. Nothing reads a CUDA value on the host, so
+        a CUDA graph can capture the gather and replay it for any routes.
+        """
+        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
+
+        max_rows = index(max_rows)
+        cache = self.hot_cache
+        if max_rows < 1:
+            raise ValueError("graph gather needs at least one route row")
+        if cache is None or cache.scratch_rows < max_rows:
+            raise ValueError("graph gather needs a hot cache scratch row per route")
+        if self.pinned_host_cache is not None:
+            raise ValueError(
+                "graph gather cannot admit rows through the pinned host cache"
+            )
+        if (
+            getattr(self, "prefetch_coordinator", None) is not None
+            or getattr(self, "next_layer_prefetch", None) is not None
+        ):
+            raise ValueError("graph gather cannot run with expert prefetch")
+        for name in self.tensor_names:
+            source = _tensor_data(getattr(self.layer, name))
+            if source.device.type == "cpu" and not is_gpu_readable_host_tensor(source):
+                raise ValueError(
+                    f"graph gather needs registered host rows; {name!r} is pageable"
+                )
+        device = cache.device
+        self._copy_rows_gpu = copy_expert_rows_gpu
+        self._graph_scratch_slots = torch.arange(
+            cache.capacity, cache.capacity + max_rows, dtype=torch.long, device=device
+        )
+        self._graph_source_rows = torch.zeros(
+            max_rows, dtype=torch.int64, device=device
+        )
+        self._graph_destination_slots = torch.zeros(
+            max_rows, dtype=torch.int32, device=device
+        )
+        self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
+        self._graph_ones = torch.ones(max_rows, dtype=torch.float32, device=device)
+        self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
+        self.graph_gather_rows = max_rows
+
+    def _gather_graph(
+        self, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        cache = self.hot_cache
+        flat = topk_ids.reshape(-1).long()
+        count = flat.numel()
+        slots = cache.expert_to_slot.index_select(0, flat)
+        hit = slots >= 0
+        scratch = self._graph_scratch_slots[:count]
+        # Misses sort first, so the pull kernel's first ``miss_count`` plan rows
+        # are exactly the misses, whatever the routes are at replay time.
+        order = torch.argsort(hit.to(torch.uint8), stable=True)
+        miss_count = count - hit.sum(dtype=torch.int32)
+        self._graph_source_rows[:count].copy_(flat.index_select(0, order))
+        self._graph_destination_slots[:count].copy_(scratch.index_select(0, order))
+        self._graph_miss_count.copy_(miss_count.reshape(1))
+        for name in self.tensor_names:
+            source = _tensor_data(getattr(self.layer, name))
+            destination = cache.tensors[name]
+            if source.device.type == "cuda":
+                destination.view(torch.uint8).reshape(
+                    destination.shape[0], -1
+                ).index_copy_(
+                    0,
+                    scratch,
+                    source.view(torch.uint8)
+                    .reshape(source.shape[0], -1)
+                    .index_select(0, flat),
+                )
+            else:
+                self._copy_rows_gpu(
+                    source,
+                    destination,
+                    self._graph_source_rows,
+                    self._graph_destination_slots,
+                    self._graph_miss_count,
+                )
+        self.graph_counters[0].add_(count)
+        self.graph_counters[1].add_(miss_count)
+        if self.residency_policy is not None:
+            self.residency_policy.pending_counts.index_add_(
+                0, flat, self._graph_ones[:count]
+            )
+        remapped = torch.where(hit, slots, scratch)
+        return remapped.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
 
     def _read_host_rows(
         self,
@@ -573,7 +679,7 @@ class ExpertStreamer:
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         pageable_source = any(
             _tensor_data(getattr(self.layer, name)).device.type == "cpu"
-            and not _tensor_data(getattr(self.layer, name)).is_pinned()
+            and not is_gpu_readable_host_tensor(_tensor_data(getattr(self.layer, name)))
             for name in self.tensor_names
         )
         cpu_ids = (
@@ -583,7 +689,7 @@ class ExpertStreamer:
             source = _tensor_data(getattr(self.layer, name))
             if source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
-            elif source.is_pinned():
+            elif is_gpu_readable_host_tensor(source):
                 row_bytes = source.numel() * source.element_size() // self.num_experts
                 _gather_host_rows_kernel[(row_count, triton.cdiv(row_bytes, 1024))](
                     source.view(torch.uint8),
@@ -834,6 +940,8 @@ class ExpertStreamer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if topk_ids.device.type != "cuda":
             raise ValueError("selected expert IDs must be on CUDA")
+        if 0 < topk_ids.numel() <= self.graph_gather_rows:
+            return self._gather_graph(topk_ids)
         flat_ids = topk_ids.reshape(-1)
         prefetch_coordinator = getattr(self, "prefetch_coordinator", None)
         if flat_ids.numel() == 0:
@@ -887,7 +995,7 @@ class ExpertStreamer:
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         pageable_source = any(
             _tensor_data(getattr(self.layer, name)).device.type == "cpu"
-            and not _tensor_data(getattr(self.layer, name)).is_pinned()
+            and not is_gpu_readable_host_tensor(_tensor_data(getattr(self.layer, name)))
             for name in self.tensor_names
         )
         cpu_ids = (
@@ -906,7 +1014,7 @@ class ExpertStreamer:
             )
             if source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
-            elif source.is_pinned():
+            elif is_gpu_readable_host_tensor(source):
                 source_bytes = source.view(torch.uint8)
                 output_bytes = output.view(torch.uint8)
                 row_bytes = source_bytes.numel() // self.num_experts

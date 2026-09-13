@@ -16,6 +16,7 @@ from typing import Callable, Sequence
 import torch
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend
+from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 
 NVFP4_TRANSFER_TENSOR_COUNT = 6
@@ -589,11 +590,7 @@ def _normalize_copy_backend(backend: str) -> str:
 
 
 def _can_copy_with_gpu(source: torch.Tensor, destination: torch.Tensor) -> bool:
-    return (
-        source.device.type == "cpu"
-        and source.is_pinned()
-        and destination.device.type == "cuda"
-    )
+    return is_gpu_readable_host_tensor(source) and destination.device.type == "cuda"
 
 
 def _can_copy_with_dma(source: torch.Tensor, destination: torch.Tensor) -> bool:
@@ -614,7 +611,7 @@ def _copy_rows_fallback(
     )
     if (
         source.device.type == "cpu"
-        and not source.is_pinned()
+        and not is_gpu_readable_host_tensor(source)
         and destination.device.type == "cuda"
     ):
         source_bytes = source.reshape(source.shape[0], -1).view(torch.uint8)
@@ -650,7 +647,9 @@ def _copy_rows_by_bytes(
         .index_select(0, source_rows[:row_count])
     )
     if rows.device != destination.device:
-        rows = rows.to(destination.device, non_blocking=source.is_pinned())
+        rows = rows.to(
+            destination.device, non_blocking=is_gpu_readable_host_tensor(source)
+        )
     destination.reshape(destination.shape[0], -1).view(torch.uint8).index_copy_(
         0, destination_slots[:row_count], rows
     )

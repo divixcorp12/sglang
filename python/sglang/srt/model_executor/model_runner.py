@@ -670,6 +670,7 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
+        self.maybe_init_expert_host_arena()
         self.maybe_init_expert_pinned_host_cache()
         self.maybe_init_expert_hot_cache()
         if self.expert_hot_cache_manager is not None:
@@ -706,6 +707,33 @@ class ModelRunner:
         """Allocate expert residency before remaining startup and pool sizing."""
         self.expert_hot_cache_manager = None
         budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
+        graph_gather_batch_size = 0
+        if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+            if budget_mb == 0:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
+                )
+            streamed = any(
+                getattr(module, "_nvfp4_expert_streamer", None) is not None
+                for module in self.model.modules()
+            )
+            if not streamed:
+                return
+            if getattr(self, "expert_host_arena", None) is None:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
+                )
+            if envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get() > 0:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_GRAPH_GATHER cannot run with expert prefetch"
+                )
+            graph_gather_batch_size = (
+                get_exec().graph.cuda_graph_config.decode.max_bs or 0
+            )
+            if graph_gather_batch_size < 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires decode CUDA graphs"
+                )
         if budget_mb == 0:
             return
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
@@ -721,12 +749,27 @@ class ModelRunner:
             log_interval=envs.SGLANG_MOE_HOT_LOG_INTERVAL.get(),
             metrics_path=envs.SGLANG_MOE_HOT_METRICS_FILE.get() or None,
             copy_backend=envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get(),
+            graph_gather_batch_size=graph_gather_batch_size,
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:
             get_global_expert_distribution_recorder().register_forward_observer(
                 manager.on_expert_distribution
             )
+
+    def maybe_init_expert_host_arena(self):
+        """Move host expert rows into registered memory before the expert caches."""
+        self.expert_host_arena = None
+        if not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
+            return
+        if envs.SGLANG_MOE_PINNED_HOST_MB.get():
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_HOST_ARENA replaces the pinned expert cache; "
+                "set SGLANG_MOE_PINNED_HOST_MB=0"
+            )
+        from sglang.srt.layers.moe.expert_host_arena import ExpertHostArena
+
+        self.expert_host_arena = ExpertHostArena.from_model(self.model)
 
     def maybe_init_expert_pinned_host_cache(self):
         """Allocate the bounded on-demand pinned-host expert row cache."""
@@ -1148,6 +1191,8 @@ class ModelRunner:
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
+        if getattr(self, "expert_hot_cache_manager", None) is not None:
+            self.expert_hot_cache_manager.discard_graph_capture_routes()
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner

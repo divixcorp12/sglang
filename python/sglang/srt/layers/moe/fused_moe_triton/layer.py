@@ -1569,9 +1569,11 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        streamer = getattr(self, "_nvfp4_expert_streamer", None)
         if (
             is_in_breakable_cuda_graph()
-            and getattr(self, "_nvfp4_expert_streamer", None) is not None
+            and streamer is not None
+            and not streamer.serves_graph_gather(topk_output)
         ):
             assert TopKOutputChecker.format_is_standard(topk_output)
             return self.forward_streamed_experts_eager(

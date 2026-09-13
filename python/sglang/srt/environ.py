@@ -322,6 +322,11 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_READER = EnvStr("mmap")
     SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
+    # Copy all host expert rows into registered memory (replaces the pinned LRU).
+    SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
+    # Serve decode-sized expert gathers without host syncs so CUDA graphs capture
+    # them; requires SGLANG_MOE_EXPERT_HOST_ARENA and SGLANG_MOE_HOT_GPU_MB.
+    SGLANG_MOE_EXPERT_GRAPH_GATHER = EnvBool(False)
     # Model path recorded in expert/PLE file-cache identities instead of the
     # resolved --model-path; after moving a checkpoint, set it to the resolved
     # path the caches were built from.

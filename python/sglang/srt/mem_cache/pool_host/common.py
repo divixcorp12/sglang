@@ -10,6 +10,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils.cuda_host_registry import (
+    forget_cuda_host_registration,
+    record_cuda_host_registration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +169,7 @@ def _cuda_host_register(
                     f"pinned and device transfers may silently return stale data."
                 )
             registered_ranges.append((ptr, size))
+            record_cuda_host_registration(ptr, size)
             offset += size
 
         # Keep the exact registration bases alive with the tensor. CUDA requires
@@ -186,6 +191,8 @@ def _cuda_host_unregister_ranges(
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
         rc = int(cudart.cudaHostUnregister(ptr))
+        if rc == 0:
+            forget_cuda_host_registration(ptr)
         if rc != 0:
             failed_ranges.append((ptr, size))
             logger.warning(

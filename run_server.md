@@ -42,6 +42,23 @@ File reads are selected by environment in the launch script:
 
 Either variable set to `mmap` restores the previous shared-mapping reads.
 
+Decode CUDA graphs replay the MoE layers without breaking when two more
+variables are set:
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `SGLANG_MOE_EXPERT_HOST_ARENA` | `1` | Startup copies all 63.3 GiB of host expert rows into page-aligned memory registered with CUDA, so a captured kernel can pull any expert. Requires `SGLANG_MOE_PINNED_HOST_MB=0` and about 64 GiB of free RAM. |
+| `SGLANG_MOE_EXPERT_GRAPH_GATHER` | `1` | Decode gathers of up to `--cuda-graph-max-bs-decode` × top-k routes run without host syncs. Each layer reserves that many scratch rows from `SGLANG_MOE_HOT_GPU_MB` (about 1.2 GiB at max batch size 1). |
+
+Unset both, and restore `SGLANG_MOE_PINNED_HOST_MB`, to return to the pinned
+LRU tier with one graph break per MoE layer. Done when startup logs
+`Expert host arena startup`, and the `Breakable CUDA graph captured` lines
+report fewer breaks than the 48 streamed MoE layers:
+
+```bash
+ssh divix01 'log=/data/models/slang/nvfp4-stream-logs/nvfp4-expert-dynamic-hot10g.latest.log; grep -E "Expert host arena startup|Breakable CUDA graph captured" "$log"'
+```
+
 One-time cut-over, with the server stopped (see
 [Stop the server](#8-stop-the-server)). The SATA copies stay in place:
 

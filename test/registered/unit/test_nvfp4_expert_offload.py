@@ -786,6 +786,65 @@ class HotCacheConfigurationTests(unittest.TestCase):
         allowed.cuda_graph_config.decode.backend = "breakable"
         memory_hook.handle_offload_compatibility(allowed)
 
+    def enable_graph_gather(self):
+        self.enable()
+        os.environ.update(
+            SGLANG_MOE_EXPERT_GRAPH_GATHER="1", SGLANG_MOE_EXPERT_HOST_ARENA="1"
+        )
+
+    def decode_args(self, backend, **changes):
+        args = self.args(**changes)
+        args.cuda_graph_config.decode.backend = backend
+        return args
+
+    def test_graph_gather_allows_full_decode_graphs_without_file_ple(self):
+        self.enable_graph_gather()
+        for backend in ("breakable", "full"):
+            with self.subTest(backend=backend):
+                memory_hook.handle_offload_compatibility(self.decode_args(backend))
+
+        file_ple = dict(ple_offload_embedding=True, ple_offload_backend="file")
+        with self.assertRaisesRegex(ValueError, "file-backed PLE"):
+            memory_hook.handle_offload_compatibility(
+                self.decode_args("full", **file_ple)
+            )
+        memory_hook.handle_offload_compatibility(
+            self.decode_args("breakable", **file_ple)
+        )
+        with self.assertRaisesRegex(ValueError, "CUDA graph"):
+            memory_hook.handle_offload_compatibility(self.decode_args("tc_piecewise"))
+        args = self.decode_args("full")
+        args.cuda_graph_config.prefill.backend = "breakable"
+        with self.assertRaisesRegex(ValueError, "CUDA graph"):
+            memory_hook.handle_offload_compatibility(args)
+
+    def test_graph_gather_requires_its_cache_envelope(self):
+        self.enable_graph_gather()
+        cases = (
+            (dict(SGLANG_MOE_HOT_GPU_MB="0"), "requires SGLANG_MOE_HOT_GPU_MB"),
+            (dict(SGLANG_MOE_EXPERT_HOST_ARENA="0"), "SGLANG_MOE_EXPERT_HOST_ARENA=1"),
+            (dict(SGLANG_MOE_PINNED_HOST_MB="1"), "SGLANG_MOE_PINNED_HOST_MB=0"),
+            (dict(SGLANG_MOE_PREFETCH_MAX_CANDIDATES="1"), "expert prefetch"),
+        )
+        for environment, message in cases:
+            with (
+                self.subTest(environment=environment),
+                patch.dict(os.environ, environment),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                memory_hook.handle_offload_compatibility(self.decode_args("breakable"))
+        with self.assertRaisesRegex(ValueError, "requires decode CUDA graphs"):
+            memory_hook.handle_offload_compatibility(self.decode_args("disabled"))
+
+    def test_host_arena_rejects_the_pinned_host_cache(self):
+        os.environ.update(
+            SGLANG_MOE_EXPERT_STREAM="1",
+            SGLANG_MOE_EXPERT_HOST_ARENA="1",
+            SGLANG_MOE_PINNED_HOST_MB="1",
+        )
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_PINNED_HOST_MB=0"):
+            memory_hook.handle_offload_compatibility(self.args())
+
     def test_early_graph_resolution_and_repeated_validation_are_safe(self):
         self.enable()
         args = self.args(cuda_graph_config=None)

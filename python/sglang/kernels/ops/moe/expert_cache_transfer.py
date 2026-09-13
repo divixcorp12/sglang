@@ -29,9 +29,11 @@ def _validate_copy_expert_rows_gpu_inputs(
     destination_slots: torch.Tensor,
     count: torch.Tensor,
 ) -> None:
+    from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
+
     if source.device.type not in ("cpu", "cuda"):
         raise ValueError("source must be a pinned CPU or CUDA tensor.")
-    if source.device.type == "cpu" and not source.is_pinned():
+    if source.device.type == "cpu" and not is_gpu_readable_host_tensor(source):
         raise ValueError("source must use pinned or CUDA-registered CPU storage.")
     if destination.device.type != "cuda":
         raise ValueError("destination must be a CUDA tensor.")

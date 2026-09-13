@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -49,6 +50,8 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+logger = logging.getLogger(__name__)
 
 _LOGITS_PROCESSOR_OUTPUT_TENSOR_FIELDS = (
     "next_token_logits",
@@ -157,6 +160,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
+        logger.info(
+            "Breakable CUDA graph captured: shape=%s segments=%d breaks=%d",
+            shape_key,
+            len(graph._segments),
+            len(graph._break_fns),
+        )
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.

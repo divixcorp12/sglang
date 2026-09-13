@@ -50,6 +50,39 @@ def handle_offload_compatibility(server_args: Any) -> None:
     copy_backend = envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get()
     if copy_backend not in ("gpu", "dma"):
         raise ValueError("SGLANG_MOE_EXPERT_COPY_BACKEND must be gpu or dma")
+    graph_gather = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
+    if envs.SGLANG_MOE_EXPERT_HOST_ARENA.get() and pinned_budget_mb:
+        raise ValueError(
+            "SGLANG_MOE_EXPERT_HOST_ARENA replaces the pinned expert cache; "
+            "set SGLANG_MOE_PINNED_HOST_MB=0"
+        )
+    if graph_gather:
+        if not hot_budget_mb:
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
+            )
+        if not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
+            )
+        if prefetch_candidates:
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER cannot run with expert prefetch"
+            )
+        graph_config = cfg.cuda_graph_config
+        if graph_config is not None:
+            if graph_config.decode.backend == Backend.DISABLED:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_GRAPH_GATHER requires decode CUDA graphs"
+                )
+            if (
+                graph_config.decode.backend == Backend.FULL
+                and cfg.ple_offload_backend == "file"
+            ):
+                raise ValueError(
+                    "Full decode CUDA graphs cannot stage file-backed PLE rows; "
+                    "use the breakable decode backend"
+                )
     if prefetch_candidates < 0:
         raise ValueError("SGLANG_MOE_PREFETCH_MAX_CANDIDATES must be nonnegative")
     if prefetch_candidates and (not hot_budget_mb or not pinned_budget_mb):
@@ -115,13 +148,19 @@ def handle_offload_compatibility(server_args: Any) -> None:
         if envs.SGLANG_MOE_HOT_LOG_INTERVAL.get() < 1:
             raise ValueError("SGLANG_MOE_HOT_LOG_INTERVAL must be positive")
     graph_config = cfg.cuda_graph_config
+    decode_backends = (
+        (Backend.BREAKABLE, Backend.FULL)
+        if graph_gather
+        else (Backend.DISABLED, Backend.BREAKABLE)
+    )
     if graph_config is not None and (
-        graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
+        graph_config.decode.backend not in decode_backends
         or graph_config.prefill.backend != Backend.DISABLED
     ):
         raise ValueError(
-            "NVFP4 hot caching requires decode CUDA graph capture to be disabled or "
-            "breakable, and prefill CUDA graph capture to be disabled"
+            "NVFP4 hot caching requires decode CUDA graph capture to be "
+            f"{' or '.join(decode_backends)}, and prefill CUDA graph capture to be "
+            "disabled"
         )
     if pinned_budget_mb and graph_config is not None and (
         graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
