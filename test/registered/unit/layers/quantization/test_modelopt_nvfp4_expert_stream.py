@@ -265,7 +265,7 @@ class ModelOptNvfp4ExpertStreamTests(unittest.TestCase):
             def gather(layer):
                 remapped, tensors = layer._nvfp4_expert_streamer.gather(ids)
                 return {
-                    name: value.cpu().clone().view(torch.uint8)
+                    name: value[remapped.long()].cpu().view(torch.uint8)
                     for name, value in tensors.items()
                 }, remapped.cpu().clone()
 

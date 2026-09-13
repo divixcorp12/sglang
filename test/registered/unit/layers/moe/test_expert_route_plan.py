@@ -2,6 +2,7 @@
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -106,6 +107,43 @@ class TestEagerRouteDedup(unittest.TestCase):
             policy.pending_counts, expected.to(policy.pending_counts.dtype)
         )
         self.assertEqual(policy.snapshot_metrics()["recorded_routes"], ids.numel())
+
+    def test_cached_gather_holds_the_kernel_expert_count_at_the_dedup_limit(self):
+        """Deduplicated gathers must hand the fused-MoE kernel one expert count,
+        not one that varies with distinct misses (4x slower decode, E10);
+        single-token gathers keep their top-k rows unpadded."""
+        experts = 80
+        layer = torch.nn.Module()
+        layer.rows = torch.arange(experts * 4, dtype=torch.int32).reshape(experts, 4)
+        streamer = ExpertStreamer(layer, ("rows",))
+
+        def all_miss(ids):
+            return torch.full_like(ids, -1), torch.zeros_like(ids, dtype=torch.bool)
+
+        streamer.hot_cache = SimpleNamespace(lookup=all_miss, capacity=1)
+
+        def copy_rows(source_ids, outputs):
+            for name, output in outputs.items():
+                torch.index_select(getattr(layer, name), 0, source_ids, out=output)
+            return 0
+
+        streamer._copy_source_rows = copy_rows
+        for tokens, distinct, expected_rows in (
+            (2, 3, 64),
+            (2, 17, 64),
+            (2, 40, 64),
+            (2, 70, 70),
+            (1, 10, 10),
+        ):
+            ids = torch.arange(distinct).repeat(tokens).reshape(tokens, distinct)
+            source_ids, compact_ids = streamer._plan_eager_routes(ids)
+            with self.subTest(tokens=tokens, distinct=distinct):
+                compact, tensors = streamer._gather_cached(source_ids, compact_ids, ids)
+                self.assertEqual(tensors["rows"].shape[0], expected_rows)
+                self.assertEqual(streamer.last_gather_stats.requested_rows, distinct)
+                self.assertTrue(
+                    torch.equal(tensors["rows"][compact.long()], layer.rows[ids])
+                )
 
 
 class TestGraphRoutePlan(unittest.TestCase):

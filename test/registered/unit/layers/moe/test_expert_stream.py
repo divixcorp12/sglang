@@ -94,7 +94,7 @@ class TestExpertStreamer(unittest.TestCase):
                 layer.gpu_rows[topk_ids.to(torch.long)].cpu(),
             )
         )
-        self.assertEqual(tensors["host_rows"].shape[0], 11)
+        self.assertEqual(tensors["host_rows"].shape[0], 64)
 
     def test_decode_buffer_covers_more_routes_than_experts(self):
         layer = self._make_layer(experts=4)
@@ -128,7 +128,7 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertEqual(compact_ids.tolist(), [[3, 1, 2], [1, 3, 0]])
         self.assertTrue(
             torch.equal(
-                tensors["host_rows"].cpu(), layer.host_rows[torch.arange(4)]
+                tensors["host_rows"][:4].cpu(), layer.host_rows[torch.arange(4)]
             )
         )
         self.assertTrue(

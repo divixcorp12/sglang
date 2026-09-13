@@ -231,7 +231,7 @@ class TestExpertHotCache(unittest.TestCase):
         routes = [[7, 1, 7, 3]] * 17
         compact, tensors = self.assert_routes(routes)
         self.assertEqual(compact.tolist(), [[2, 0, 2, 1]] * 17)
-        self.assertEqual(tensors["w13_weight"].shape[0], 3)
+        self.assertEqual(tensors["w13_weight"].shape[0], 64)
         stats = self.streamer.last_gather_stats
         self.assertEqual(
             (stats.requested_rows, stats.hot_hit_rows, stats.miss_rows), (3, 2, 1)
@@ -242,7 +242,7 @@ class TestExpertHotCache(unittest.TestCase):
         cache = self.cache_type(self.streamer, capacity=2)
         cache.reassign([3, 7])
         compact, tensors = self.assert_routes([[7, 1, 3], [1, 7, 2]])
-        self.assertEqual(tensors["w13_weight"].shape[0], 4)
+        self.assertEqual(tensors["w13_weight"].shape[0], 64)
         stats = self.streamer.last_gather_stats
         self.assertEqual(
             (stats.requested_rows, stats.hot_hit_rows, stats.miss_rows), (4, 2, 2)

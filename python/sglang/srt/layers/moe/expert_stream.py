@@ -418,10 +418,17 @@ def _staging_buffer(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
+    """Return the first ``rows`` rows of a reused buffer of at least ``max_rows``.
+
+    Allocated zeroed: deduplicated eager gathers hand the fused-MoE kernel rows
+    past the gathered ones, which no route selects and the CUTLASS kernel skips
+    as token-less experts (flashinfer 0.6.18 ``cutlass_fused_moe_kernels.cuh:1452-1457``);
+    zeros only keep it from reading uninitialised memory on first use.
+    """
     key = (name, dtype, str(device), row_shape)
     buffer = _STAGING.get(key)
     if buffer is None or buffer.shape[0] < max_rows:
-        buffer = torch.empty(
+        buffer = torch.zeros(
             (max_rows,) + row_shape,
             dtype=dtype,
             device=device,
@@ -773,6 +780,16 @@ class ExpertStreamer:
         compact_ids: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Gather routed rows through the hot cache for the fused-MoE kernel.
+
+        When ``should_dedup`` applies, returned tensors keep a leading dimension
+        of ``max(row_count, NO_DEDUP_LIMIT)``: rows are assembled into the first
+        ``row_count`` rows of each staging buffer and the padded view is
+        returned. Deduplicated gathers give a different expert count on almost
+        every call, which made the fused-MoE kernel 4x slower (experiment E10).
+        A forward without dedup already has a constant count and returns
+        ``row_count`` rows.
+        """
         cache = self.hot_cache
         slots, hit_mask = cache.lookup(source_ids)
         row_count = source_ids.numel()
@@ -792,10 +809,11 @@ class ExpertStreamer:
                 topk_ids.dtype
             ), cache.tensors
         capacity = max(row_count, _NO_DEDUP_LIMIT)
-        gathered = {
+        kernel_rows = capacity if should_dedup(topk_ids) else row_count
+        padded = {
             name: _staging_buffer(
                 name,
-                row_count,
+                kernel_rows,
                 capacity,
                 tuple(source.shape[1:]),
                 source.dtype,
@@ -804,6 +822,7 @@ class ExpertStreamer:
             for name in self.tensor_names
             for source in [_tensor_data(getattr(self.layer, name))]
         }
+        gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
         miss_source_ids = source_ids[~hit_mask]
         if hit_rows == 0:
             misses = gathered
@@ -902,7 +921,7 @@ class ExpertStreamer:
             routed_miss_rows=routed_rows - routed_hit_rows,
             unique_miss_rows=miss_rows,
         )
-        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
+        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
 
     def _gather_pinned_host(
         self,
@@ -910,19 +929,24 @@ class ExpertStreamer:
         compact_ids: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Gather routed rows through the pinned host cache.
+
+        Returned tensors follow the leading-dimension rule of ``_gather_cached``.
+        """
         cache = self.pinned_host_cache
         assert cache is not None
         row_count = source_ids.numel()
         capacity = max(row_count, _NO_DEDUP_LIMIT)
+        kernel_rows = capacity if should_dedup(topk_ids) else row_count
         slots, hit_mask = cache.lookup(source_ids)
         del slots
         hit_rows = int(hit_mask.sum().item())
         miss_rows = row_count - hit_rows
         copy_engine_bytes = 0
-        gathered = {
+        padded = {
             name: _staging_buffer(
                 name,
-                row_count,
+                kernel_rows,
                 capacity,
                 tuple(_tensor_data(getattr(self.layer, name)).shape[1:]),
                 _tensor_data(getattr(self.layer, name)).dtype,
@@ -930,6 +954,7 @@ class ExpertStreamer:
             )
             for name in self.tensor_names
         }
+        gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
         hit_positions = hit_mask.nonzero().flatten()
         miss_positions = (~hit_mask).nonzero().flatten()
         if hit_rows:
@@ -1014,7 +1039,7 @@ class ExpertStreamer:
             routed_miss_rows=compact_ids.numel(),
             unique_miss_rows=row_count,
         )
-        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
+        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
 
     def _plan_eager_routes(
         self, topk_ids: torch.Tensor
@@ -1044,6 +1069,11 @@ class ExpertStreamer:
     def gather(
         self, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return compact route IDs and the expert rows they index.
+
+        Eager results follow the leading-dimension rule of ``_gather_cached``;
+        graph gathers return the fixed hot-cache tensors.
+        """
         if topk_ids.device.type != "cuda":
             raise ValueError("selected expert IDs must be on CUDA")
         if 0 < topk_ids.numel() <= self.graph_gather_rows:
@@ -1095,17 +1125,19 @@ class ExpertStreamer:
         cpu_ids = (
             _copy_indices_to_cpu(source_ids, capacity) if pageable_source else None
         )
-        gathered: dict[str, torch.Tensor] = {}
+        kernel_rows = capacity if should_dedup(topk_ids) else row_count
+        padded: dict[str, torch.Tensor] = {}
         for name in self.tensor_names:
             source = _tensor_data(getattr(self.layer, name))
-            output = _staging_buffer(
+            padded[name] = _staging_buffer(
                 name,
-                row_count,
+                kernel_rows,
                 capacity,
                 tuple(source.shape[1:]),
                 source.dtype,
                 topk_ids.device,
             )
+            output = padded[name][:row_count]
             if source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
             elif is_gpu_readable_host_tensor(source):
@@ -1131,6 +1163,5 @@ class ExpertStreamer:
                 )
                 self._read_host_rows(name, source, cpu_ids, host_output)
                 output.copy_(host_output, non_blocking=True)
-            gathered[name] = output
 
-        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), gathered
+        return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
