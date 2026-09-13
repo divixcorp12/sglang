@@ -320,6 +320,9 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     # mmap | uring | uring_direct; see sglang.srt.model_loader.file_row_reader.
     SGLANG_QWEN4_PLE_FILE_READER = EnvStr("mmap")
+    # Stage file-backed PLE rows before decode CUDA-graph replay instead of
+    # breaking the graph for the host read.
+    SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY = EnvBool(False)
     SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
     # Copy all host expert rows into registered memory (replaces the pinned LRU).

@@ -15,6 +15,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpModel,
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
@@ -324,6 +325,119 @@ def test_qwen4_ple_staged_prefetch_replays_with_fresh_ids():
     assert len(graph._break_fns) == 1
     expected = torch.tensor([[5] * 7, [7] * 7], dtype=torch.bfloat16, device="cuda")
     torch.testing.assert_close(output, expected)
+
+
+def _staged_before_replay_layer(source_ids, gathered):
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embed_dim = 7
+    layer._prefetch_state = None
+    layer._prefetch_stream = object()
+    layer._graph_prefetch_buffers = {}
+    layer._eager_prefetch_buffer = None
+    layer.stage_before_replay = True
+
+    def gather(input_ids, out):
+        gathered.append(input_ids.clone())
+        out.copy_(input_ids.to(out.dtype).unsqueeze(-1).expand_as(out))
+        return out
+
+    layer.ple_embedding = SimpleNamespace(
+        gather_dp_tokens=False,
+        ngram_heads=1,
+        compute_ngram_ids=lambda _: source_ids.reshape(-1, 1) + 0,
+        _prepare_embedding_lookup=lambda ids, *_: (ids, "semantic_tokens"),
+        ngram_embedding=SimpleNamespace(
+            _file_row_stager=object(),
+            gather=gather,
+            allocate_output=lambda shape, device: torch.empty(
+                shape, dtype=torch.bfloat16, device=device
+            ),
+        ),
+    )
+    return layer
+
+
+def test_qwen4_ple_rows_staged_before_replay_leave_no_graph_break(monkeypatch):
+    source_ids = torch.tensor([1, 3], dtype=torch.int64, device="cuda")
+    gathered = []
+    layer = _staged_before_replay_layer(source_ids, gathered)
+    output = torch.empty((2, layer.ple_embed_dim), dtype=torch.bfloat16, device="cuda")
+    batch = SimpleNamespace(physical_tokens=2)
+    forward_batch = SimpleNamespace(input_ids=source_ids)
+
+    monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: True)
+    graph = BreakableCUDAGraph()
+    with (
+        enable_breakable_cuda_graph(),
+        BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()),
+    ):
+        layer.start_prefetch(batch, forward_batch)
+        output.copy_(layer._prefetch_state[0])
+        layer._prefetch_state = None
+    monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: False)
+
+    assert gathered == []
+    assert len(graph._break_fns) == 0
+
+    for routes in ([5, 7], [2, 2]):
+        source_ids.copy_(torch.tensor(routes, dtype=torch.int64, device="cuda"))
+        layer.stage_rows_for_replay(batch, forward_batch, graph_tokens=2)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.tensor(
+            [[routes[0]] * 7, [routes[1]] * 7], dtype=torch.bfloat16, device="cuda"
+        )
+        torch.testing.assert_close(output, expected)
+    assert layer._prefetch_state is None
+
+    padded = torch.full((3, layer.ple_embed_dim), 9, dtype=torch.bfloat16, device="cuda")
+    layer._graph_prefetch_buffers[3] = padded
+    layer.stage_rows_for_replay(batch, forward_batch, graph_tokens=3)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(padded[:2], expected)
+    torch.testing.assert_close(padded[2], torch.zeros_like(padded[2]))
+
+    with pytest.raises(RuntimeError, match="no captured PLE buffer"):
+        layer.stage_rows_for_replay(batch, forward_batch, graph_tokens=4)
+
+
+def test_qwen4_model_stages_only_prefetched_ple_layers_before_replay(monkeypatch):
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    staged = []
+
+    def ple(layer_id, stages):
+        return SimpleNamespace(
+            stage_before_replay=stages,
+            stage_rows_for_replay=lambda batch, forward_batch, graph_tokens: (
+                staged.append((layer_id, batch, forward_batch, graph_tokens))
+            ),
+        )
+
+    model.layers = [
+        SimpleNamespace(ple=ple(0, True)),
+        SimpleNamespace(ple=None),
+        SimpleNamespace(ple=ple(2, True)),
+        SimpleNamespace(ple=ple(3, False)),
+    ]
+    model._start_layer, model._end_layer = 0, 4
+    model.has_ple = True
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 9
+    forward_batch = SimpleNamespace(input_ids="ids")
+    prepared = []
+
+    def prepare(input_ids, batch, *, ngram_size, ngram_eos_token_id):
+        prepared.append((input_ids, batch, ngram_size, ngram_eos_token_id))
+        return "ple_batch"
+
+    monkeypatch.setattr(qwen4_exp_module, "_prepare_ple_batch", prepare)
+
+    model.prepare_decode_graph_replay(forward_batch, graph_tokens=4)
+
+    assert prepared == [("ids", forward_batch, 3, 9)]
+    assert staged == [(2, "ple_batch", forward_batch, 4)]
 
 
 if __name__ == "__main__":

@@ -1434,6 +1434,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            prepare_replay = getattr(
+                self.model_runner.model, "prepare_decode_graph_replay", None
+            )
+            if prepare_replay is not None:
+                prepare_replay(forward_batch, self._replay_graph_key.size)
+
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

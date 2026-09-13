@@ -818,6 +818,31 @@ class HotCacheConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CUDA graph"):
             memory_hook.handle_offload_compatibility(args)
 
+    def test_ple_staging_before_replay_allows_full_decode_graphs(self):
+        self.enable_graph_gather()
+        os.environ["SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY"] = "1"
+        file_ple = dict(ple_offload_embedding=True, ple_offload_backend="file")
+        memory_hook.handle_offload_compatibility(self.decode_args("full", **file_ple))
+
+        cases = (
+            (dict(speculative_algorithm="EAGLE", **file_ple), "speculative"),
+            (dict(dllm_algorithm="LowConfidence", **file_ple), "DLLM"),
+            (dict(disable_overlap_schedule=False, **file_ple), "overlap"),
+            (dict(), "file-backed PLE"),
+        )
+        for changes, message in cases:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                memory_hook.handle_offload_compatibility(
+                    self.decode_args("breakable", **changes)
+                )
+        args = self.decode_args("breakable", **file_ple)
+        args.cuda_graph_config.prefill.backend = "breakable"
+        with self.assertRaisesRegex(ValueError, "disable prefill CUDA graph"):
+            memory_hook.handle_offload_compatibility(args)
+
     def test_graph_gather_requires_its_cache_envelope(self):
         self.enable_graph_gather()
         cases = (

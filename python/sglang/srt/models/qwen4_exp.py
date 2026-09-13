@@ -974,6 +974,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
 
 class Qwen4ExpPLELayer(nn.Module):
+    stage_before_replay = False
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -1061,6 +1063,17 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
+        self.stage_before_replay = bool(
+            config.ple_offload_embedding
+            and envs.SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY.get()
+        )
+        if self.stage_before_replay and getattr(
+            self.ple_embedding, "gather_dp_tokens", False
+        ):
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY does not support DP-gathered "
+                "PLE lookups"
+            )
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         y = norm(x.flatten(-2, -1))
@@ -1223,6 +1236,43 @@ class Qwen4ExpPLELayer(nn.Module):
     ) -> None:
         self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
 
+    def stage_rows_for_replay(
+        self,
+        batch: Optional[_PLEBatch],
+        forward_batch: ForwardBatch,
+        graph_tokens: int,
+    ) -> None:
+        """Read this forward's PLE rows into the buffer a captured prefetch consumes.
+
+        Runs before replay and outside the graph, on the inputs the captured
+        forward hashes, and the N-gram history is only committed after the
+        forward, so the staged rows are exactly the rows the graph would look up.
+        """
+        if batch is None:
+            return
+        buffer = self._graph_prefetch_buffers.get(graph_tokens)
+        if buffer is None:
+            raise RuntimeError(
+                f"no captured PLE buffer for {graph_tokens} lookup tokens"
+            )
+        ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+        lookup_ids, _ = self.ple_embedding._prepare_embedding_lookup(
+            ngram_ids, forward_batch, batch.physical_tokens
+        )
+        lookup_tokens = lookup_ids.shape[0]
+        if lookup_tokens > graph_tokens:
+            raise RuntimeError(
+                f"PLE replay needs {lookup_tokens} rows but the graph captured "
+                f"{graph_tokens}"
+            )
+        buffer[lookup_tokens:].zero_()
+        if lookup_tokens == 0:
+            return
+        output_view = buffer[:lookup_tokens].view(
+            lookup_tokens, self.ple_embedding.ngram_heads, -1
+        )
+        self.ple_embedding.ngram_embedding.gather(lookup_ids, out=output_view)
+
     def start_prefetch(
         self,
         batch: Optional[_PLEBatch],
@@ -1253,11 +1303,12 @@ class Qwen4ExpPLELayer(nn.Module):
         prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
         offloaded_embedding = self.ple_embedding.ngram_embedding
+        staged_file = getattr(offloaded_embedding, "_file_row_stager", None) is not None
 
-        if (
-            is_in_breakable_cuda_graph()
-            and getattr(offloaded_embedding, "_file_row_stager", None) is not None
-        ):
+        if staged_file and self.stage_before_replay and get_is_capture_mode():
+            self._prefetch_state = prefetched, semantic_tokens, physical_tokens
+            return
+        if staged_file and is_in_breakable_cuda_graph():
             self._start_staged_file_prefetch(lookup_ids, output_view)
         else:
             stream = self._prefetch_stream
@@ -1743,6 +1794,33 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
 
+    def prepare_decode_graph_replay(
+        self, forward_batch: ForwardBatch, graph_tokens: int
+    ) -> None:
+        """Stage file-backed PLE rows that captured decode graphs read without a break.
+
+        Only layers after the first run a prefetch in ``forward``, so only they
+        hold a captured prefetch buffer.
+        """
+        if not self.has_ple:
+            return
+        staged = [
+            ple
+            for layer in self.layers[self.start_layer + 1 : self.end_layer]
+            if (ple := getattr(layer, "ple", None)) is not None
+            and ple.stage_before_replay
+        ]
+        if not staged:
+            return
+        ple_batch = _prepare_ple_batch(
+            forward_batch.input_ids,
+            forward_batch,
+            ngram_size=self.ple_ngram_size,
+            ngram_eos_token_id=self.ple_ngram_eos_token_id,
+        )
+        for ple in staged:
+            ple.stage_rows_for_replay(ple_batch, forward_batch, graph_tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1873,6 +1951,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
         return output
+
+    def prepare_decode_graph_replay(
+        self, forward_batch: ForwardBatch, graph_tokens: int
+    ) -> None:
+        self.model.prepare_decode_graph_replay(forward_batch, graph_tokens)
 
     def _load_qwen4_exp_ple_buffer(
         self,

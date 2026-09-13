@@ -78,11 +78,42 @@ def handle_offload_compatibility(server_args: Any) -> None:
             if (
                 graph_config.decode.backend == Backend.FULL
                 and cfg.ple_offload_backend == "file"
+                and not envs.SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY.get()
             ):
                 raise ValueError(
                     "Full decode CUDA graphs cannot stage file-backed PLE rows; "
                     "use the breakable decode backend"
                 )
+    if envs.SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY.get():
+        if cfg.ple_offload_backend != "file":
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY requires file-backed PLE "
+                "offload (--ple-offload-backend file)"
+            )
+        if getattr(cfg, "speculative_algorithm", None) is not None:
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY does not support speculative "
+                "decoding"
+            )
+        if getattr(cfg, "dllm_algorithm", None) is not None:
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY does not support DLLM decoding"
+            )
+        staged_graph_config = cfg.cuda_graph_config
+        if (
+            staged_graph_config is not None
+            and staged_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY stages rows only before decode "
+                "replays; disable prefill CUDA graph capture"
+            )
+        if not cfg.disable_overlap_schedule:
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY requires "
+                "--disable-overlap-schedule: decode token ids must be final "
+                "before replay"
+            )
     if prefetch_candidates < 0:
         raise ValueError("SGLANG_MOE_PREFETCH_MAX_CANDIDATES must be nonnegative")
     if prefetch_candidates and (not hot_budget_mb or not pinned_budget_mb):

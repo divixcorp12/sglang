@@ -49,9 +49,11 @@ variables are set:
 | --- | --- | --- |
 | `SGLANG_MOE_EXPERT_HOST_ARENA` | `1` | Startup copies all 63.3 GiB of host expert rows into page-aligned memory registered with CUDA, so a captured kernel can pull any expert. Requires `SGLANG_MOE_PINNED_HOST_MB=0` and about 64 GiB of free RAM. |
 | `SGLANG_MOE_EXPERT_GRAPH_GATHER` | `1` | Decode gathers of up to `--cuda-graph-max-bs-decode` × top-k routes run without host syncs. Each layer reserves that many scratch rows from `SGLANG_MOE_HOT_GPU_MB` (about 1.2 GiB at max batch size 1). |
+| `SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY` | `1` | The file-backed PLE rows are read before each decode replay instead of inside a graph break. Requires `--disable-overlap-schedule` and no speculative decoding. |
 
-Unset both, and restore `SGLANG_MOE_PINNED_HOST_MB`, to return to the pinned
-LRU tier with one graph break per MoE layer. Done when startup logs
+Unset the expert variables, and restore `SGLANG_MOE_PINNED_HOST_MB`, to return
+to the pinned LRU tier with one graph break per MoE layer; unset the PLE
+variable to put the PLE read back inside a break. Done when startup logs
 `Expert host arena startup`, and the `Breakable CUDA graph captured` lines
 report fewer breaks than the 48 streamed MoE layers:
 
