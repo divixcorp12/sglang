@@ -541,6 +541,8 @@ class ExpertHotCacheManager:
         copy_backend: str = "gpu",
         graph_gather_batch_size: int = 0,
         update_decode_forwards: int = 0,
+        decay_tokens: int = 0,
+        promotion_sigmas: float = 0.0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -550,12 +552,17 @@ class ExpertHotCacheManager:
         ``update_decode_forwards`` > 0 also updates dynamic residency after every
         that many decode forwards, so a long decode is not served by the set the
         last long prefill chose.
+        ``decay_tokens`` > 0 decays scores once per that many routed tokens
+        instead of once per boundary, and ``promotion_sigmas`` adds that many
+        standard deviations of count noise to the lead a promotion needs; see
+        :class:`ExpertResidencyPolicy`.
         """
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
         update_prefill_tokens = index(update_prefill_tokens)
         update_decode_forwards = index(update_decode_forwards)
+        decay_tokens = index(decay_tokens)
         min_residence_forwards = index(min_residence_forwards)
         log_interval = index(log_interval)
         route_history_limit = index(route_history_limit)
@@ -563,6 +570,7 @@ class ExpertHotCacheManager:
             budget_bytes < 0
             or update_prefill_tokens < 1
             or update_decode_forwards < 0
+            or decay_tokens < 0
             or min_residence_forwards < 0
             or log_interval < 1
             or route_history_limit < 1
@@ -571,6 +579,10 @@ class ExpertHotCacheManager:
         if not math.isfinite(benefit_ratio) or benefit_ratio < 0:
             raise ValueError(
                 "expert hot cache benefit ratio must be finite and nonnegative"
+            )
+        if not math.isfinite(promotion_sigmas) or promotion_sigmas < 0:
+            raise ValueError(
+                "expert hot cache promotion sigmas must be finite and nonnegative"
             )
         streamers = {}
         if copy_backend not in ("gpu", "dma"):
@@ -647,7 +659,8 @@ class ExpertHotCacheManager:
         manager.dynamic = dynamic
         manager.update_prefill_tokens = update_prefill_tokens
         manager.update_decode_forwards = update_decode_forwards
-        manager._decode_forward_count = 0
+        manager._decode_forwards_since_boundary = 0
+        manager._tokens_since_boundary = 0
         manager.min_residence_forwards = min_residence_forwards
         manager.benefit_ratio = benefit_ratio
         manager.log_interval = log_interval
@@ -692,6 +705,8 @@ class ExpertHotCacheManager:
                         cache.capacity,
                         device=cache.device,
                         promotion_margin=benefit_ratio,
+                        decay_tokens=decay_tokens or None,
+                        promotion_sigmas=promotion_sigmas,
                         initial_scores=(
                             seed[layer_id] if seed is not None else None
                         ),
@@ -1045,7 +1060,9 @@ class ExpertHotCacheManager:
         """Account for fresh gathers and change slots at residency boundaries.
 
         A boundary is a prefill of at least ``update_prefill_tokens`` tokens or,
-        when ``update_decode_forwards`` is set, every that many decode forwards.
+        when ``update_decode_forwards`` is set, that many decode forwards after
+        the previous boundary. Every layer's scores advance at each boundary;
+        ``min_residence_forwards`` only holds back that layer's slot changes.
         """
         counts = single_pass_data.get("global_physical_count")
         if counts is None:
@@ -1059,18 +1076,20 @@ class ExpertHotCacheManager:
             )
         self._forward_count += 1
         mode = self._phase(forward_batch)
-        if mode == "decode":
-            self._decode_forward_count += 1
+        extend_tokens = forward_batch.extend_num_tokens or 0
+        self._tokens_since_boundary += (
+            extend_tokens
+            if mode == "prefill"
+            else getattr(forward_batch, "batch_size", 1)
+        )
+        if mode == "decode" and not forward_batch.forward_mode.is_idle():
+            self._decode_forwards_since_boundary += 1
         qualifying = self.dynamic and (
-            (
-                mode == "prefill"
-                and (forward_batch.extend_num_tokens or 0)
-                >= self.update_prefill_tokens
-            )
+            (mode == "prefill" and extend_tokens >= self.update_prefill_tokens)
             or (
                 mode == "decode"
                 and self.update_decode_forwards > 0
-                and self._decode_forward_count % self.update_decode_forwards == 0
+                and self._decode_forwards_since_boundary >= self.update_decode_forwards
             )
         )
         eager_gathered = []
@@ -1120,16 +1139,16 @@ class ExpertHotCacheManager:
         self._accumulate_registers(mode, counts, eager_gathered)
         for layer_id in self._layer_ids if qualifying else ():
             cache = self.caches.get(layer_id)
+            policy = self.residency_policies.get(layer_id)
+            if cache is None or policy is None:
+                continue
+            policy.advance(self._tokens_since_boundary)
             if (
-                cache is None
-                or self._forward_count - self._last_update[layer_id]
+                self._forward_count - self._last_update[layer_id]
                 < self.min_residence_forwards
             ):
                 continue
-            policy = self.residency_policies.get(layer_id)
-            if policy is None:
-                continue
-            decision = policy.materialize_boundary(cache.resident_experts())
+            decision = policy.decide(cache.resident_experts())
             if not decision.promotions and not decision.evictions:
                 continue
             policy.schedule_transfers(exact_demand=(), decision=decision)
@@ -1137,5 +1156,8 @@ class ExpertHotCacheManager:
                 layer_id, cache.reassign(decision.desired_experts), mode
             )
             self._last_update[layer_id] = self._forward_count
+        if qualifying:
+            self._tokens_since_boundary = 0
+            self._decode_forwards_since_boundary = 0
         if self._forward_count % self.log_interval == 0:
             self._write_trace(mode)

@@ -221,6 +221,95 @@ class TestExpertGraphGather(unittest.TestCase):
         self.assertFalse(streamer.serves_graph_gather(SimpleNamespace(topk_ids=ids)))
         self.assertTrue(streamer.serves_graph_gather(SimpleNamespace(topk_ids=ids[:1])))
 
+    def test_gather_refuses_layer_tensors_rebound_after_enable(self):
+        layer = _layer()
+        streamer, _ = self._graph_streamer(layer)
+        layer.w13_weight.data = torch.zeros_like(layer.w13_weight.data).pin_memory()
+        ids = torch.tensor([[0, 4, 7, 0]], dtype=torch.int32, device="cuda")
+
+        with self.assertRaisesRegex(RuntimeError, "moved"):
+            streamer.gather(ids)
+
+    def test_decode_updates_between_replays_serve_promoted_experts(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        layer = _layer()
+        layer.layer_id = 0
+        layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        model = torch.nn.Module()
+        model.add_module("0", layer)
+        streamer = layer._nvfp4_expert_streamer
+        manager = ExpertHotCacheManager.from_model(
+            model,
+            budget_bytes=streamer.bytes_per_expert * (TOP_K + 2),
+            seed_path=None,
+            dynamic=True,
+            update_prefill_tokens=16,
+            min_residence_forwards=0,
+            benefit_ratio=0.0,
+            graph_gather_batch_size=1,
+            update_decode_forwards=2,
+        )
+        cache = manager.caches[0]
+        self.assertEqual(cache.resident_experts(), frozenset({0, 1}))
+        ids = torch.tensor([[5, 5, 5, 5]], dtype=torch.int32, device="cuda")
+        outputs = {
+            name: torch.empty(
+                (TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda"
+            )
+            for name, tensor in cache.tensors.items()
+        }
+
+        def gather_into_outputs():
+            compact, tensors = streamer.gather(ids)
+            for name, output in outputs.items():
+                output.copy_(tensors[name][compact.reshape(-1).long()])
+
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.stream(side_stream):
+            gather_into_outputs()
+        torch.cuda.current_stream().wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gather_into_outputs()
+        manager.discard_graph_capture_routes()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, extend_num_tokens=0, batch_size=1
+        )
+
+        def decode_step(routes):
+            ids.copy_(torch.tensor([routes], dtype=torch.int32, device="cuda"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for name, output in outputs.items():
+                self.assertTrue(
+                    torch.equal(
+                        output.view(torch.uint8).cpu(),
+                        _source_bytes(layer, name, ids.reshape(-1)),
+                    ),
+                    f"{name} routes={routes}",
+                )
+            counts = torch.zeros((1, EXPERTS), dtype=torch.int64)
+            for expert in routes:
+                counts[0, expert] += 1
+            manager.on_expert_distribution(batch, {"global_physical_count": counts})
+
+        decode_step([5, 5, 5, 5])
+        self.assertEqual(cache.resident_experts(), frozenset({0, 1}))
+        decode_step([5, 5, 5, 5])
+        self.assertEqual(cache.resident_experts(), frozenset({0, 5}))
+        decode_step([5, 1, 0, 5])
+        decode_step([2, 2, 2, 2])
+        self.assertEqual(cache.resident_experts(), frozenset({2, 5}))
+        decode_step([2, 0, 5, 7])
+
+        decode = manager.snapshot_counters()["decode"]["0"]
+        self.assertEqual(decode["requested_rows"], 20)
+        self.assertEqual(decode["miss_rows"], 15)
+        self.assertEqual(decode["promotions"], 2)
+        self.assertEqual(decode["evictions"], 2)
+
     def test_manager_reserves_scratch_rows_and_counts_replayed_gathers(self):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
         from sglang.srt.model_executor.forward_batch_info import ForwardMode

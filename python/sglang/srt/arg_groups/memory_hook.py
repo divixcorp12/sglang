@@ -175,6 +175,13 @@ def handle_offload_compatibility(server_args: Any) -> None:
             raise ValueError("SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS must be nonnegative")
         if envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get() < 0:
             raise ValueError("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS must be nonnegative")
+        if envs.SGLANG_MOE_HOT_DECAY_TOKENS.get() < 0:
+            raise ValueError("SGLANG_MOE_HOT_DECAY_TOKENS must be nonnegative")
+        sigmas = envs.SGLANG_MOE_HOT_PROMOTION_SIGMAS.get()
+        if not math.isfinite(sigmas) or sigmas < 0:
+            raise ValueError(
+                "SGLANG_MOE_HOT_PROMOTION_SIGMAS must be finite and nonnegative"
+            )
         ratio = envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get()
         if not math.isfinite(ratio) or ratio < 0:
             raise ValueError("SGLANG_MOE_HOT_BENEFIT_RATIO must be finite and nonnegative")

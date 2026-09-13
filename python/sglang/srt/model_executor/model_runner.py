@@ -745,6 +745,8 @@ class ModelRunner:
             dynamic=envs.SGLANG_MOE_HOT_DYNAMIC.get(),
             update_prefill_tokens=envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get(),
             update_decode_forwards=envs.SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS.get(),
+            decay_tokens=envs.SGLANG_MOE_HOT_DECAY_TOKENS.get(),
+            promotion_sigmas=envs.SGLANG_MOE_HOT_PROMOTION_SIGMAS.get(),
             min_residence_forwards=envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get(),
             benefit_ratio=envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get(),
             log_interval=envs.SGLANG_MOE_HOT_LOG_INTERVAL.get(),

@@ -314,6 +314,12 @@ class Envs:
     SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS = EnvInt(0)
     SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS = EnvInt(8)
     SGLANG_MOE_HOT_BENEFIT_RATIO = EnvFloat(1.0)
+    # Decay residency scores by 0.95 once per this many routed tokens instead
+    # of once per boundary; 0 keeps per-boundary decay.
+    SGLANG_MOE_HOT_DECAY_TOKENS = EnvInt(0)
+    # Standard deviations of routing-count noise a candidate expert must lead
+    # the expert it replaces by, on top of SGLANG_MOE_HOT_BENEFIT_RATIO.
+    SGLANG_MOE_HOT_PROMOTION_SIGMAS = EnvFloat(0.0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)

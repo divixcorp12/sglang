@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
@@ -52,9 +53,15 @@ class ExpertResidencyPolicy:
     """Select a bounded hot-expert set from exponentially decayed route counts.
 
     ``record_counts`` is safe on the route hot path: it only performs an
-    in-place device operation and never reads a CUDA value in Python. Calling
-    ``materialize_boundary`` intentionally transfers the fixed-size scores to
-    the CPU, so callers must use it only at a request or prefill boundary.
+    in-place device operation and never reads a CUDA value in Python.
+    ``advance`` folds pending counts into the scores on the device; ``decide``
+    and ``materialize_boundary`` intentionally transfer the fixed-size scores
+    to the CPU, so callers must use them only at a residency boundary.
+
+    Scores decay by ``decay`` once per boundary, or once per ``decay_tokens``
+    routed tokens when both it and the boundary's token count are given. A
+    candidate replaces its victim only when it leads by ``promotion_margin``
+    plus ``promotion_sigmas`` standard deviations of count noise.
     """
 
     def __init__(
@@ -66,11 +73,15 @@ class ExpertResidencyPolicy:
         promotion_margin: float = 0.0,
         device: torch.device | str | None = None,
         initial_scores: torch.Tensor | Sequence[float] | None = None,
+        decay_tokens: int | None = None,
+        promotion_sigmas: float = 0.0,
     ) -> None:
         self.num_experts = index(num_experts)
         self.capacity = index(capacity)
         self.decay = float(decay)
         self.promotion_margin = float(promotion_margin)
+        self.decay_tokens = None if decay_tokens is None else index(decay_tokens)
+        self.promotion_sigmas = float(promotion_sigmas)
         if self.num_experts < 1:
             raise ValueError("num_experts must be positive")
         if not 0 <= self.capacity <= self.num_experts:
@@ -79,6 +90,10 @@ class ExpertResidencyPolicy:
             raise ValueError("decay must be between zero and one")
         if self.promotion_margin < 0.0:
             raise ValueError("promotion_margin must be nonnegative")
+        if self.decay_tokens is not None and self.decay_tokens < 1:
+            raise ValueError("decay_tokens must be positive")
+        if not math.isfinite(self.promotion_sigmas) or self.promotion_sigmas < 0.0:
+            raise ValueError("promotion_sigmas must be finite and nonnegative")
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
@@ -125,12 +140,23 @@ class ExpertResidencyPolicy:
         self.record_counts(route_counts)
         self._metrics.recorded_routes += expert_ids.numel()
 
+    def advance(self, tokens: int | None = None) -> None:
+        """Decay the scores and fold in pending counts without a host readback."""
+        decay = self.decay
+        if self.decay_tokens is not None and tokens is not None:
+            decay = self.decay ** (index(tokens) / self.decay_tokens)
+        self._scores.mul_(decay).add_(self._pending_counts)
+        self._pending_counts.zero_()
+
     def materialize_boundary(
-        self, resident_experts: Iterable[int]
+        self, resident_experts: Iterable[int], tokens: int | None = None
     ) -> ResidencyDecision:
         """Apply decay and return a deterministic desired set at an explicit boundary."""
-        self._scores.mul_(self.decay).add_(self._pending_counts)
-        self._pending_counts.zero_()
+        self.advance(tokens)
+        return self.decide(resident_experts)
+
+    def decide(self, resident_experts: Iterable[int]) -> ResidencyDecision:
+        """Return the deterministic desired set for the current scores."""
         score_values = self._scores.detach().cpu().tolist()
         observed_resident = self._deduplicate_and_validate(resident_experts)
         resident = self._limited_resident(observed_resident, score_values)
@@ -211,7 +237,9 @@ class ExpertResidencyPolicy:
             victim = min(
                 desired, key=lambda expert_id: (score_values[expert_id], -expert_id)
             )
-            if score_values[candidate] <= score_values[victim] + self.promotion_margin:
+            if score_values[candidate] <= score_values[victim] + self._promotion_threshold(
+                score_values[candidate], score_values[victim]
+            ):
                 break
             desired.remove(victim)
             resident_set.remove(victim)
@@ -219,6 +247,20 @@ class ExpertResidencyPolicy:
             resident_set.add(candidate)
         return tuple(
             sorted(desired, key=lambda expert_id: (-score_values[expert_id], expert_id))
+        )
+
+    def _promotion_threshold(self, candidate: float, victim: float) -> float:
+        """Score lead a candidate needs over its victim before it is promoted.
+
+        For independent routes a score's variance is at most its mean: raw
+        counts from a seed or a long prefill are Poisson-like, and decayed sums
+        settle near half their mean. Two scores therefore differ by noise of at
+        most about ``sqrt(candidate + victim)``, and requiring
+        ``promotion_sigmas`` of it stops swaps between experts with
+        indistinguishable rates, each of which costs a row copy and saves none.
+        """
+        return self.promotion_margin + self.promotion_sigmas * math.sqrt(
+            max(candidate + victim, 0.0)
         )
 
     def _limited_resident(

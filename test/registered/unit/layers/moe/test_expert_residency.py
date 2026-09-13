@@ -44,6 +44,45 @@ class TestExpertResidencyPolicy(unittest.TestCase):
         self.assertEqual(promoted.promotions, (2,))
         self.assertEqual(promoted.evictions, (1,))
 
+    def test_decay_follows_routed_tokens_when_decay_tokens_is_set(self):
+        for tokens, expected in ((10, (0,)), (20, (1,))):
+            policy = ExpertResidencyPolicy(
+                num_experts=2, capacity=1, decay=0.5, decay_tokens=10
+            )
+            policy.record_counts(torch.tensor([8.0, 0.0]))
+            first = policy.materialize_boundary(resident_experts=(), tokens=tokens)
+            self.assertEqual(first.desired_experts, (0,))
+            policy.record_counts(torch.tensor([0.0, 3.0]))
+
+            second = policy.materialize_boundary(
+                resident_experts=first.desired_experts, tokens=tokens
+            )
+
+            with self.subTest(tokens=tokens):
+                self.assertEqual(second.desired_experts, expected)
+
+    def test_noise_scaled_margin_ignores_indistinguishable_leads(self):
+        policies = {
+            sigmas: ExpertResidencyPolicy(
+                num_experts=2, capacity=1, decay=1.0, promotion_sigmas=sigmas
+            )
+            for sigmas in (0.0, 2.0)
+        }
+        for sigmas, policy in policies.items():
+            policy.record_counts(torch.tensor([16.0, 0.0]))
+            resident = policy.materialize_boundary(resident_experts=()).desired_experts
+            policy.record_counts(torch.tensor([0.0, 22.0]))
+
+            close = policy.materialize_boundary(resident_experts=resident)
+
+            with self.subTest(sigmas=sigmas):
+                self.assertEqual(close.desired_experts, (1,) if sigmas == 0.0 else (0,))
+
+        noisy = policies[2.0]
+        noisy.record_counts(torch.tensor([0.0, 8.0]))
+        clear = noisy.materialize_boundary(resident_experts=(0,))
+        self.assertEqual(clear.desired_experts, (1,))
+
     def test_exact_demand_transfers_precede_background_promotions(self):
         policy = ExpertResidencyPolicy(num_experts=5, capacity=2)
         policy.record_counts(torch.tensor([0, 2, 3, 0, 0]))

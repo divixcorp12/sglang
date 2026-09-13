@@ -494,6 +494,39 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(counters["prefill"]["0"]["evictions"], 0)
         self.assertEqual(counters["residency_policy"]["0"]["boundary_updates"], 2)
 
+    def test_boundaries_decay_by_routed_tokens_and_restart_the_decode_count(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            decay_tokens=16,
+            update_decode_forwards=4,
+            min_residence_forwards=100,
+        )
+        scores = manager.residency_policies[0]._scores
+        one = [[0, 1, 0, 0], [0] * 4, [0, 1, 0, 0]]
+        decode = self.mode.DECODE
+
+        self.observe(manager, one, record_routes=True, tokens=8)
+        for _ in range(4):
+            self.observe(manager, one, record_routes=True, mode=decode)
+        expected = [10 * 0.95 ** (12 / 16), 5.0, 0.0, 0.0]
+        torch.testing.assert_close(scores.cpu(), torch.tensor(expected))
+
+        for _ in range(2):
+            self.observe(manager, one, record_routes=True, mode=decode)
+        self.observe(manager, one, record_routes=True, tokens=16)
+        decay = 0.95 ** (18 / 16)
+        expected = [expected[0] * decay, expected[1] * decay + 3.0, 0.0, 0.0]
+        torch.testing.assert_close(scores.cpu(), torch.tensor(expected))
+
+        for _ in range(3):
+            self.observe(manager, one, record_routes=True, mode=decode)
+        torch.testing.assert_close(scores.cpu(), torch.tensor(expected))
+        self.observe(manager, one, record_routes=True, mode=decode)
+        decay = 0.95 ** (4 / 16)
+        expected = [expected[0] * decay, expected[1] * decay + 4.0, 0.0, 0.0]
+        torch.testing.assert_close(scores.cpu(), torch.tensor(expected))
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+
     def test_static_seed_never_changes_and_counts_actual_gathers_once(self):
         manager = self.manager(
             {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]}, dynamic=False
@@ -672,6 +705,8 @@ class TestExpertHotCacheManager(unittest.TestCase):
             {"budget_bytes": -1},
             {"update_prefill_tokens": 0},
             {"update_decode_forwards": -1},
+            {"decay_tokens": -1},
+            {"promotion_sigmas": float("nan")},
             {"min_residence_forwards": -1},
             {"benefit_ratio": float("nan")},
             {"benefit_ratio": -1},
