@@ -39,13 +39,6 @@ def _uring_file_reader_type():
     return UringFileReaderFFI
 
 
-def _unregister_quietly(native, address: int, nbytes: int) -> None:
-    try:
-        native.unregister_buffer(address, nbytes)
-    except Exception:
-        pass
-
-
 def _extent_tensor(name: str, value: torch.Tensor) -> torch.Tensor:
     if value.device.type != "cpu":
         raise ValueError(f"io_uring read {name} must be a CPU tensor")
@@ -62,23 +55,26 @@ class UringFileReader:
     when its tensor object is garbage collected, before its memory can be
     reused: the ring holds its own page references, so a stale registration
     over a reused address range would send reads to the old pages.
+
+    The reader belongs to the thread that constructs it: calls from any other
+    thread raise instead of waiting, so the native reader holds no lock. A
+    registration whose tensor is collected on another thread is queued and
+    dropped at the owner's next call.
     """
 
     def __init__(self, queue_depth: int = 128) -> None:
         self._native = _uring_file_reader_type()(int(queue_depth))
         self._files: dict[tuple[str, bool], int] = {}
         self._finalizers: dict[tuple[int, int], tuple[object, weakref.finalize]] = {}
-        self._lock = threading.Lock()
 
     def open(self, path: str | os.PathLike[str], *, direct: bool) -> int:
         """Return a file id for ``path``, opening it once per ``direct`` flavour."""
         key = (os.path.realpath(os.fspath(path)), bool(direct))
-        with self._lock:
-            file_id = self._files.get(key)
-            if file_id is None:
-                file_id = int(self._native.open_file(key[0], int(key[1])))
-                self._files[key] = file_id
-            return file_id
+        file_id = self._files.get(key)
+        if file_id is None:
+            file_id = int(self._native.open_file(key[0], int(key[1])))
+            self._files[key] = file_id
+        return file_id
 
     def file_size(self, file_id: int) -> int:
         return int(self._native.file_size(int(file_id)))
@@ -117,7 +113,7 @@ class UringFileReader:
         entry = self._finalizers.get(key)
         if entry is not None and entry[0] is token:
             del self._finalizers[key]
-        _unregister_quietly(self._native, *key)
+        self._native.request_unregister(*key)
 
     def read(
         self,
@@ -144,9 +140,8 @@ class UringFileReader:
         return int(self._native.read(*extents))
 
     def close(self) -> None:
-        with self._lock:
-            self._files.clear()
-            self._native.close()
+        self._native.close()
+        self._files.clear()
 
 
 def get_shared_uring_file_reader(queue_depth: int = 128) -> UringFileReader:

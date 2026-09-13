@@ -173,6 +173,92 @@ def test_registration_is_dropped_when_its_tensor_is_freed():
     assert reader.unregister_buffer(replacement) >= 1
 
 
+def test_one_reader_resets_state_between_reads_of_different_sizes(data_file):
+    path, payload = data_file
+    reader = _reader(queue_depth=4)
+    file_id = reader.open(path, direct=False)
+
+    for count in (37, 3, 50, 1):
+        pages = [(index * 7) % 10 for index in range(count)]
+        destination = torch.zeros(count * PAGE, dtype=torch.uint8)
+        read = reader.read(
+            *_extents(
+                file_id,
+                [page * PAGE for page in pages],
+                [index * PAGE for index in range(count)],
+                [PAGE] * count,
+                destination.data_ptr(),
+            )
+        )
+
+        assert read == count * PAGE
+        expected = torch.cat(
+            [payload[page * PAGE : (page + 1) * PAGE] for page in pages]
+        )
+        assert torch.equal(destination, expected)
+
+
+def test_calls_from_another_thread_raise_without_touching_the_reader(data_file):
+    import threading
+
+    path, payload = data_file
+    reader = _reader()
+    file_id = reader.open(path, direct=False)
+    destination = torch.zeros(PAGE, dtype=torch.uint8)
+    errors = []
+
+    def use_from_another_thread():
+        for call in (
+            lambda: reader.open(path, direct=True),
+            lambda: reader.read(
+                *_extents(file_id, [0], [0], [PAGE], destination.data_ptr())
+            ),
+        ):
+            try:
+                call()
+            except Exception as error:
+                errors.append(str(error))
+
+    thread = threading.Thread(target=use_from_another_thread)
+    thread.start()
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    assert len(errors) == 2
+    assert all("belongs to thread" in error for error in errors)
+    assert not destination.any()
+    read = reader.read(*_extents(file_id, [0], [0], [PAGE], destination.data_ptr()))
+    assert read == PAGE
+    assert torch.equal(destination, payload[:PAGE])
+
+
+def test_registration_collected_on_another_thread_is_dropped_by_the_owner():
+    import gc
+    import threading
+
+    reader = _reader()
+    if not reader.registered_buffers_supported:
+        pytest.skip("kernel does not support sparse registered buffers")
+    storage, destination = _aligned(2 * PAGE)
+    start = destination.data_ptr() - storage.data_ptr()
+    assert reader.register_buffer(destination)
+    holder = [destination]
+    del destination
+
+    def collect_on_another_thread():
+        holder.clear()
+        gc.collect()
+
+    thread = threading.Thread(target=collect_on_another_thread)
+    thread.start()
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    replacement = storage[start : start + 2 * PAGE]
+    assert reader.register_buffer(replacement)
+    assert reader.unregister_buffer(replacement) >= 1
+
+
 def test_failed_read_raises_and_reader_stays_usable(data_file):
     path, payload = data_file
     reader = _reader()

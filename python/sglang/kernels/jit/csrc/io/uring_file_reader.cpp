@@ -6,13 +6,12 @@
 #include <tvm/ffi/reflection/registry.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <fcntl.h>
 #include <liburing.h>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -30,6 +29,29 @@ std::string errno_message(const std::string& what, int error) {
   return what + ": " + std::strerror(error);
 }
 
+pid_t current_thread_id() {
+  thread_local const pid_t id = ::gettid();
+  return id;
+}
+
+/// Prefer a ring only its creating thread may drive: the kernel then rejects
+/// submissions and registrations from other threads, and runs completion work
+/// inside that thread's own wait instead of interrupting it.
+void init_ring(unsigned queue_depth, io_uring* ring) {
+  int rc = -EINVAL;
+#if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
+  io_uring_params params{};
+  params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+  rc = io_uring_queue_init_params(queue_depth, ring, &params);
+#endif
+  if (rc == -EINVAL) {
+    rc = io_uring_queue_init(queue_depth, ring, 0);
+  }
+  if (rc < 0) {
+    throw std::runtime_error(errno_message("io_uring_queue_init", -rc));
+  }
+}
+
 }  // namespace
 
 /// Batched positional reads from a few files through one io_uring instance.
@@ -45,20 +67,26 @@ std::string errno_message(const std::string& what, int error) {
 /// every read. A registered buffer must stay allocated until it is unregistered
 /// or the reader is closed: the ring holds its own page references, so reads
 /// into a freed-then-reused address range would land in the old pages.
+///
+/// A reader belongs to the thread that constructs it, so the ring and its
+/// tables need no lock: only that thread may open files, register buffers,
+/// read, or close, and any other thread gets an error instead of waiting. The
+/// one call allowed from any thread is ``request_unregister``, for garbage
+/// collectors: it pushes the range onto a lock-free list that the owner applies
+/// at the start of its next call. Memory freed before that call began cannot
+/// still be named by a stale registration during it, and memory freed while
+/// it runs cannot be one of its destinations.
 struct UringFileReaderObj : public tvm::ffi::Object {
  public:
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.UringFileReader", UringFileReaderObj, tvm::ffi::Object);
   static constexpr bool _type_mutable = true;
 
-  explicit UringFileReaderObj(int64_t queue_depth) {
+  explicit UringFileReaderObj(int64_t queue_depth) : owner_(current_thread_id()) {
     if (queue_depth < 1 || queue_depth > 32768) {
       throw std::invalid_argument("io_uring queue depth must be in [1, 32768]");
     }
     queue_depth_ = static_cast<unsigned>(queue_depth);
-    int rc = io_uring_queue_init(queue_depth_, &ring_, 0);
-    if (rc < 0) {
-      throw std::runtime_error(errno_message("io_uring_queue_init", -rc));
-    }
+    init_ring(queue_depth_, &ring_);
     open_ = true;
     buffers_supported_ = io_uring_register_buffers_sparse(&ring_, kRegisteredBufferSlots) == 0;
     if (buffers_supported_) {
@@ -67,12 +95,17 @@ struct UringFileReaderObj : public tvm::ffi::Object {
   }
 
   ~UringFileReaderObj() {
-    close();
+    shutdown_();
+    UnregisterRequest* request = unregister_requests_.exchange(nullptr);
+    while (request != nullptr) {
+      UnregisterRequest* next = request->next;
+      delete request;
+      request = next;
+    }
   }
 
   int64_t open_file(const std::string& path, int64_t direct) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ensure_open_();
+    enter_();
     int flags = O_RDONLY | O_CLOEXEC | (direct ? O_DIRECT : 0);
     int fd = ::open(path.c_str(), flags);
     if (fd < 0) {
@@ -89,8 +122,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
   }
 
   int64_t file_size(int64_t file_id) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ensure_open_();
+    enter_();
     return static_cast<int64_t>(file_(file_id).size);
   }
 
@@ -102,8 +134,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
   /// Returns the number of chunks registered, or zero when the ring does not
   /// support registration or rejects the memory; reads then pin per request.
   int64_t register_buffer(int64_t address, int64_t nbytes) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ensure_open_();
+    enter_();
     if (!buffers_supported_ || nbytes <= 0) {
       return 0;
     }
@@ -141,18 +172,20 @@ struct UringFileReaderObj : public tvm::ffi::Object {
 
   /// Unregister every chunk lying inside ``[address, address + nbytes)``.
   int64_t unregister_buffer(int64_t address, int64_t nbytes) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ensure_open_();
+    enter_();
     uint64_t low = static_cast<uint64_t>(address);
-    uint64_t high = low + static_cast<uint64_t>(std::max<int64_t>(nbytes, 0));
-    std::vector<unsigned> removed;
-    for (const Buffer& buffer : buffers_) {
-      if (buffer.base >= low && buffer.base + buffer.length <= high) {
-        removed.push_back(buffer.slot);
-      }
+    return unregister_range_(low, low + static_cast<uint64_t>(std::max<int64_t>(nbytes, 0)));
+  }
+
+  /// Queue ``[address, address + nbytes)`` for unregistration; any thread may
+  /// call this, and the owner applies it at the start of its next call.
+  void request_unregister(int64_t address, int64_t nbytes) {
+    uint64_t low = static_cast<uint64_t>(address);
+    auto* request =
+        new UnregisterRequest{low, low + static_cast<uint64_t>(std::max<int64_t>(nbytes, 0)), nullptr};
+    request->next = unregister_requests_.load();
+    while (!unregister_requests_.compare_exchange_weak(request->next, request)) {
     }
-    rollback_(removed);
-    return static_cast<int64_t>(removed.size());
   }
 
   /// Read every extent completely. Returns the bytes read, which is less than
@@ -162,48 +195,59 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       const tvm::ffi::TensorView offsets,
       const tvm::ffi::TensorView destinations,
       const tvm::ffi::TensorView lengths) {
+    enter_();
     const int64_t count = file_ids.size(0);
     if (offsets.size(0) != count || destinations.size(0) != count || lengths.size(0) != count) {
       throw std::invalid_argument("io_uring read extents must have matching lengths");
+    }
+    if (count == 0) {
+      return 0;
     }
     const auto* file_id_values = static_cast<const int64_t*>(file_ids.data_ptr());
     const auto* offset_values = static_cast<const int64_t*>(offsets.data_ptr());
     const auto* destination_values = static_cast<const int64_t*>(destinations.data_ptr());
     const auto* length_values = static_cast<const int64_t*>(lengths.data_ptr());
 
-    std::lock_guard<std::mutex> guard(mutex_);
-    ensure_open_();
-    std::vector<Request> requests(static_cast<size_t>(count));
-    std::deque<uint32_t> pending;
+    const size_t capacity = static_cast<size_t>(count);
+    if (requests_.size() < capacity) {
+      requests_.resize(capacity);
+      pending_.resize(capacity);
+    }
+    // Each extent is pending or in flight at most once, so ``capacity`` slots
+    // hold the whole FIFO without growing.
+    size_t pending_head = 0;
+    size_t pending_size = 0;
     for (int64_t index = 0; index < count; ++index) {
       if (offset_values[index] < 0 || length_values[index] < 0) {
         throw std::invalid_argument("io_uring read offsets and lengths must be non-negative");
       }
       const File& file = file_(file_id_values[index]);
-      Request& request = requests[static_cast<size_t>(index)];
+      Request& request = requests_[static_cast<size_t>(index)];
       request.fd = file.fd;
       request.file_bytes = file.size;
       request.offset = static_cast<uint64_t>(offset_values[index]);
       request.destination = static_cast<uint64_t>(destination_values[index]);
       request.length = static_cast<uint64_t>(length_values[index]);
+      request.done = 0;
       request.buffer_index = find_buffer_(request.destination, request.length);
       if (request.length > 0) {
-        pending.push_back(static_cast<uint32_t>(index));
+        pending_[pending_size++] = static_cast<uint32_t>(index);
       }
     }
 
     unsigned inflight = 0;
     int first_error = 0;
     std::string error_context;
-    while (!pending.empty() || inflight > 0) {
-      while (first_error == 0 && !pending.empty() && inflight < queue_depth_) {
+    while (pending_size > 0 || inflight > 0) {
+      while (first_error == 0 && pending_size > 0 && inflight < queue_depth_) {
         io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (sqe == nullptr) {
           break;
         }
-        uint32_t index = pending.front();
-        pending.pop_front();
-        Request& request = requests[index];
+        uint32_t index = pending_[pending_head];
+        pending_head = (pending_head + 1) % capacity;
+        --pending_size;
+        Request& request = requests_[index];
         uint64_t remaining = request.length - request.done;
         unsigned chunk = static_cast<unsigned>(std::min(remaining, kMaxReadBytes));
         auto* buffer = reinterpret_cast<void*>(request.destination + request.done);
@@ -229,16 +273,17 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       io_uring_for_each_cqe(&ring_, head, cqe) {
         ++seen;
         uint32_t index = static_cast<uint32_t>(cqe->user_data);
-        if (inflight == 0 || index >= requests.size()) {
+        if (inflight == 0 || index >= capacity) {
           // A completion from outside this call would write through a
           // destination address that is no longer guaranteed to be alive.
           std::terminate();
         }
         --inflight;
-        Request& request = requests[index];
+        Request& request = requests_[index];
         int result = cqe->res;
+        bool resubmit = false;
         if (result == -EINTR || result == -EAGAIN) {
-          pending.push_back(index);
+          resubmit = true;
         } else if (result < 0) {
           if (first_error == 0) {
             first_error = -result;
@@ -255,9 +300,11 @@ struct UringFileReaderObj : public tvm::ffi::Object {
           }
         } else {
           request.done += static_cast<uint64_t>(result);
-          if (request.done < request.length) {
-            pending.push_back(index);
-          }
+          resubmit = request.done < request.length;
+        }
+        if (resubmit) {
+          pending_[(pending_head + pending_size) % capacity] = index;
+          ++pending_size;
         }
       }
       io_uring_cq_advance(&ring_, seen);
@@ -266,14 +313,14 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       throw std::runtime_error(errno_message(error_context, first_error));
     }
     uint64_t total = 0;
-    for (const Request& request : requests) {
-      total += request.done;
+    for (size_t index = 0; index < capacity; ++index) {
+      total += requests_[index].done;
     }
     return static_cast<int64_t>(total);
   }
 
   void close() {
-    std::lock_guard<std::mutex> guard(mutex_);
+    check_owner_();
     shutdown_();
   }
 
@@ -336,6 +383,37 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     int buffer_index = -1;
   };
 
+  struct UnregisterRequest {
+    uint64_t low;
+    uint64_t high;
+    UnregisterRequest* next;
+  };
+
+  void check_owner_() const {
+    const pid_t caller = current_thread_id();
+    if (caller != owner_) {
+      throw std::runtime_error(
+          "io_uring file reader belongs to thread " + std::to_string(owner_) + " but was called from thread " +
+          std::to_string(caller));
+    }
+  }
+
+  /// Start an owner call: reject other threads and closed readers, then apply
+  /// unregistrations queued since the previous call.
+  void enter_() {
+    check_owner_();
+    ensure_open_();
+    if (unregister_requests_.load() != nullptr) {
+      UnregisterRequest* request = unregister_requests_.exchange(nullptr);
+      while (request != nullptr) {
+        UnregisterRequest* next = request->next;
+        unregister_range_(request->low, request->high);
+        delete request;
+        request = next;
+      }
+    }
+  }
+
   void ensure_open_() const {
     if (!open_) {
       throw std::runtime_error("io_uring file reader is closed");
@@ -364,6 +442,17 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     return -1;
   }
 
+  int64_t unregister_range_(uint64_t low, uint64_t high) {
+    std::vector<unsigned> removed;
+    for (const Buffer& buffer : buffers_) {
+      if (buffer.base >= low && buffer.base + buffer.length <= high) {
+        removed.push_back(buffer.slot);
+      }
+    }
+    rollback_(removed);
+    return static_cast<int64_t>(removed.size());
+  }
+
   void rollback_(const std::vector<unsigned>& slots) {
     for (unsigned slot : slots) {
       struct iovec empty{nullptr, 0};
@@ -385,6 +474,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     });
   }
 
+  const pid_t owner_;
   io_uring ring_{};
   unsigned queue_depth_ = 0;
   bool open_ = false;
@@ -392,7 +482,9 @@ struct UringFileReaderObj : public tvm::ffi::Object {
   std::vector<bool> slot_used_;
   std::vector<File> files_;
   std::vector<Buffer> buffers_;
-  std::mutex mutex_;
+  std::vector<Request> requests_;
+  std::vector<uint32_t> pending_;
+  std::atomic<UnregisterRequest*> unregister_requests_{nullptr};
 };
 
 void register_uring_file_reader() {
@@ -404,6 +496,7 @@ void register_uring_file_reader() {
       .def("registered_buffers_supported", &UringFileReaderObj::registered_buffers_supported)
       .def("register_buffer", &UringFileReaderObj::register_buffer)
       .def("unregister_buffer", &UringFileReaderObj::unregister_buffer)
+      .def("request_unregister", &UringFileReaderObj::request_unregister)
       .def("read", &UringFileReaderObj::read)
       .def("close", &UringFileReaderObj::close);
 }
