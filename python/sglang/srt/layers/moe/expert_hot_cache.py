@@ -540,23 +540,29 @@ class ExpertHotCacheManager:
         route_history_limit: int = 32,
         copy_backend: str = "gpu",
         graph_gather_batch_size: int = 0,
+        update_decode_forwards: int = 0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
         ``graph_gather_batch_size`` > 0 reserves ``batch_size * top_k`` scratch
         rows per layer from the budget and enables each streamer's sync-free
         graph gather for routes of at most that many rows.
+        ``update_decode_forwards`` > 0 also updates dynamic residency after every
+        that many decode forwards, so a long decode is not served by the set the
+        last long prefill chose.
         """
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
         update_prefill_tokens = index(update_prefill_tokens)
+        update_decode_forwards = index(update_decode_forwards)
         min_residence_forwards = index(min_residence_forwards)
         log_interval = index(log_interval)
         route_history_limit = index(route_history_limit)
         if (
             budget_bytes < 0
             or update_prefill_tokens < 1
+            or update_decode_forwards < 0
             or min_residence_forwards < 0
             or log_interval < 1
             or route_history_limit < 1
@@ -640,6 +646,8 @@ class ExpertHotCacheManager:
         manager.residency_policies = {}
         manager.dynamic = dynamic
         manager.update_prefill_tokens = update_prefill_tokens
+        manager.update_decode_forwards = update_decode_forwards
+        manager._decode_forward_count = 0
         manager.min_residence_forwards = min_residence_forwards
         manager.benefit_ratio = benefit_ratio
         manager.log_interval = log_interval
@@ -780,8 +788,10 @@ class ExpertHotCacheManager:
     def residency_bytes(self) -> int:
         return sum(cache.capacity_bytes for cache in self.caches.values())
 
-    def _record_update(self, layer_id: int, update: HotCacheUpdateStats) -> None:
-        counters = self._counters["prefill"][layer_id]
+    def _record_update(
+        self, layer_id: int, update: HotCacheUpdateStats, phase: str = "prefill"
+    ) -> None:
+        counters = self._counters[phase][layer_id]
         counters.promotions += update.promoted_experts
         counters.evictions += update.evicted_experts
         counters.migration_bytes += update.migration_bytes
@@ -1032,7 +1042,11 @@ class ExpertHotCacheManager:
     def on_expert_distribution(
         self, forward_batch: ForwardBatch, single_pass_data: Mapping[str, Any]
     ) -> None:
-        """Account for fresh gathers and change slots only on profitable prefills."""
+        """Account for fresh gathers and change slots at residency boundaries.
+
+        A boundary is a prefill of at least ``update_prefill_tokens`` tokens or,
+        when ``update_decode_forwards`` is set, every that many decode forwards.
+        """
         counts = single_pass_data.get("global_physical_count")
         if counts is None:
             return
@@ -1045,11 +1059,19 @@ class ExpertHotCacheManager:
             )
         self._forward_count += 1
         mode = self._phase(forward_batch)
-        prefill = mode == "prefill"
-        qualifying = (
-            self.dynamic
-            and prefill
-            and (forward_batch.extend_num_tokens or 0) >= self.update_prefill_tokens
+        if mode == "decode":
+            self._decode_forward_count += 1
+        qualifying = self.dynamic and (
+            (
+                mode == "prefill"
+                and (forward_batch.extend_num_tokens or 0)
+                >= self.update_prefill_tokens
+            )
+            or (
+                mode == "decode"
+                and self.update_decode_forwards > 0
+                and self._decode_forward_count % self.update_decode_forwards == 0
+            )
         )
         eager_gathered = []
         for layer_id in self._layer_ids:
@@ -1111,7 +1133,9 @@ class ExpertHotCacheManager:
             if not decision.promotions and not decision.evictions:
                 continue
             policy.schedule_transfers(exact_demand=(), decision=decision)
-            self._record_update(layer_id, cache.reassign(decision.desired_experts))
+            self._record_update(
+                layer_id, cache.reassign(decision.desired_experts), mode
+            )
             self._last_update[layer_id] = self._forward_count
         if self._forward_count % self.log_interval == 0:
             self._write_trace(mode)

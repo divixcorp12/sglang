@@ -171,6 +171,8 @@ def handle_offload_compatibility(server_args: Any) -> None:
             )
         if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
             raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
+        if envs.SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS.get() < 0:
+            raise ValueError("SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS must be nonnegative")
         if envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get() < 0:
             raise ValueError("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS must be nonnegative")
         ratio = envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get()

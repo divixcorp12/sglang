@@ -668,6 +668,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
             SGLANG_MOE_HOT_SEED="",
             SGLANG_MOE_HOT_DYNAMIC=False,
             SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS=1024,
+            SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=0,
             SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS=8,
             SGLANG_MOE_HOT_BENEFIT_RATIO=1.0,
             SGLANG_MOE_HOT_LOG_INTERVAL=100,
@@ -930,6 +931,7 @@ class HotCacheConfigurationTests(unittest.TestCase):
         for name, value in (
             ("SGLANG_MOE_HOT_GPU_MB", "-1"),
             ("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS", "0"),
+            ("SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS", "-1"),
             ("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS", "-1"),
             ("SGLANG_MOE_HOT_BENEFIT_RATIO", "nan"),
             ("SGLANG_MOE_HOT_LOG_INTERVAL", "0"),

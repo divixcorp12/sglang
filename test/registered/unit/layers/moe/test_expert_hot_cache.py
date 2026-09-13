@@ -468,6 +468,32 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(manager.caches[0].slot_to_expert, [1])
         self.assertEqual(manager.caches[2].slot_to_expert, [1])
 
+    def test_decode_forwards_update_residency_only_when_configured(self):
+        seed = {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]}
+        challenger = [[0, 3, 0, 0], [0] * 4, [0, 3, 0, 0]]
+        options = dict(min_residence_forwards=0, benefit_ratio=0.0)
+
+        never = self.manager(seed, **options)
+        for _ in range(8):
+            self.observe(never, challenger, mode=self.mode.DECODE, record_routes=True)
+        self.assertEqual(never.caches[0].slot_to_expert, [0])
+
+        manager = self.manager(seed, update_decode_forwards=2, **options)
+        for _ in range(3):
+            self.observe(
+                manager, challenger, mode=self.mode.DECODE, record_routes=True
+            )
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+        self.observe(manager, challenger, mode=self.mode.DECODE, record_routes=True)
+
+        self.assertEqual(manager.caches[0].slot_to_expert, [1])
+        self.assertEqual(manager.caches[2].slot_to_expert, [1])
+        counters = manager.snapshot_counters()
+        self.assertEqual(counters["decode"]["0"]["promotions"], 1)
+        self.assertEqual(counters["decode"]["0"]["evictions"], 1)
+        self.assertEqual(counters["prefill"]["0"]["evictions"], 0)
+        self.assertEqual(counters["residency_policy"]["0"]["boundary_updates"], 2)
+
     def test_static_seed_never_changes_and_counts_actual_gathers_once(self):
         manager = self.manager(
             {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]}, dynamic=False
@@ -645,6 +671,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
         for options in (
             {"budget_bytes": -1},
             {"update_prefill_tokens": 0},
+            {"update_decode_forwards": -1},
             {"min_residence_forwards": -1},
             {"benefit_ratio": float("nan")},
             {"benefit_ratio": -1},

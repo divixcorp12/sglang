@@ -309,6 +309,9 @@ class Envs:
     SGLANG_MOE_HOT_SEED = EnvStr("")
     SGLANG_MOE_HOT_DYNAMIC = EnvBool(False)
     SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS = EnvInt(1024)
+    # Also update dynamic residency every this many decode forwards; 0 leaves
+    # updates to qualifying prefills only.
+    SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS = EnvInt(0)
     SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS = EnvInt(8)
     SGLANG_MOE_HOT_BENEFIT_RATIO = EnvFloat(1.0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)

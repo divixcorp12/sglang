@@ -49,6 +49,7 @@ variables are set:
 | --- | --- | --- |
 | `SGLANG_MOE_EXPERT_HOST_ARENA` | `1` | Startup copies all 63.3 GiB of host expert rows into page-aligned memory registered with CUDA, so a captured kernel can pull any expert. Requires `SGLANG_MOE_PINNED_HOST_MB=0` and about 64 GiB of free RAM. |
 | `SGLANG_MOE_EXPERT_GRAPH_GATHER` | `1` | Decode gathers of up to `--cuda-graph-max-bs-decode` × top-k routes run without host syncs. Each layer reserves that many scratch rows from `SGLANG_MOE_HOT_GPU_MB` (about 1.2 GiB at max batch size 1). |
+| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `16` | With `SGLANG_MOE_HOT_DYNAMIC=1`, re-ranks each layer's hot experts every 16 decode forwards and copies the promoted rows in. Without it only a prefill of `SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS` tokens re-ranks, so a long decode keeps missing the experts it keeps using. `0` disables it. |
 | `SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY` | `1` | The file-backed PLE rows are read before each decode replay instead of inside a graph break. Requires `--disable-overlap-schedule` and no speculative decoding. |
 
 Unset the expert variables, and restore `SGLANG_MOE_PINNED_HOST_MB`, to return
