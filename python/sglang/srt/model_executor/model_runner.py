@@ -799,6 +799,7 @@ class ModelRunner:
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
             attn_dp_size=self.ps.attn_dp_size,
+            pp_size=self.ps.pp_size,
             expert_hot_cache_manager=self.expert_hot_cache_manager,
         )
 

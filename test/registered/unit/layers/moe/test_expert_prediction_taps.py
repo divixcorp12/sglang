@@ -39,11 +39,12 @@ class TupleTopK(FakeTopK):
 
 
 class FakeMoE(nn.Module):
-    def __init__(self, layer_id, num_experts, hidden_size):
+    def __init__(self, layer_id, num_experts, hidden_size, num_fused_shared_experts=0):
         super().__init__()
         self.layer_id = layer_id
         self.num_experts = num_experts
         self.hidden_size = hidden_size
+        self.num_fused_shared_experts = num_fused_shared_experts
 
     def forward(self, hidden_states, topk_output):
         return hidden_states
@@ -56,7 +57,12 @@ class FakeBlock(nn.Module):
         super().__init__()
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
         self.topk = FakeTopK(top_k + num_fused_shared_experts, num_fused_shared_experts)
-        self.experts = FakeMoE(layer_id, num_experts + num_fused_shared_experts, hidden_size)
+        self.experts = FakeMoE(
+            layer_id,
+            num_experts + num_fused_shared_experts,
+            hidden_size,
+            num_fused_shared_experts,
+        )
 
     def forward(self, hidden_states):
         return self.experts(hidden_states, self.topk(hidden_states, self.gate(hidden_states)))
@@ -177,6 +183,24 @@ class TestDiscovery(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "2 TopK and 1 FusedMoE"):
             _discover(model)
 
+    def test_shared_expert_count_comes_from_each_owner_qwen2_shape(self):
+        # Qwen2MoeSparseMoeBlock: TopK has no fused shared experts, FusedMoE counts
+        # the shared slots in num_experts and appends shared ids after TopK returns.
+        class QwenBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate = nn.Linear(6, 8, bias=False)
+                self.topk = FakeTopK(2, num_fused_shared_experts=0)
+                self.experts = FakeMoE(0, 9, 6, num_fused_shared_experts=1)
+
+            def forward(self, hidden_states):
+                return self.experts(hidden_states, self.topk(hidden_states, self.gate(hidden_states)))
+
+        model = nn.Sequential(QwenBlock())
+        (layer,) = _discover(model)
+        self.assertEqual(layer.spec.num_experts, 8)
+        self.assertEqual(layer.spec.top_k, 2)
+
     def test_duplicate_layer_ids_raise(self):
         with self.assertRaisesRegex(ValueError, "layer_id 0"):
             _discover(FakeModel(layer_ids=(0, 0)))
@@ -236,6 +260,24 @@ class TestRouteTaps(unittest.TestCase):
             "sglang.srt.layers.moe.expert_prediction.taps", level="WARNING"
         ):
             model(torch.randn(2, 6))
+        self.assertEqual(taps.unsupported_layers, {0})
+
+    def test_width_mismatch_marks_layer_unsupported_without_raising(self):
+        model = FakeModel(layer_ids=(0,), hidden_size=8)
+        layers = _discover(model)
+        store = FeatureStore(
+            specs=[MoeLayerSpec(layer_id=0, num_experts=8, top_k=2, hidden_size=12)],
+            features=[RouteFeature.ROUTER_INPUT],
+            max_rows=4,
+            device=torch.device("cpu"),
+            hidden_dtype=torch.float32,
+        )
+        taps = RouteTaps(store)
+        taps.install(layers)
+        with torch.no_grad(), self.assertLogs(
+            "sglang.srt.layers.moe.expert_prediction.taps", level="WARNING"
+        ):
+            model(torch.randn(2, 8))
         self.assertEqual(taps.unsupported_layers, {0})
 
 

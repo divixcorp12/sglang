@@ -57,11 +57,12 @@ def discover_moe_layers(
 
 
 def _layer_spec(*, topk: nn.Module, moe: nn.Module) -> MoeLayerSpec:
-    shared = topk.topk_config.num_fused_shared_experts
+    # Qwen2MoeSparseMoeBlock builds TopK without fused shared experts while its
+    # FusedMoE counts the shared slots and appends shared ids after TopK returns.
     return MoeLayerSpec(
         layer_id=moe.layer_id,
-        num_experts=moe.num_experts - shared,
-        top_k=topk.topk_config.top_k - shared,
+        num_experts=moe.num_experts - moe.num_fused_shared_experts,
+        top_k=topk.topk_config.top_k - topk.topk_config.num_fused_shared_experts,
         hidden_size=moe.hidden_size,
     )
 
@@ -105,10 +106,17 @@ class RouteTaps:
                     )
                 return
             hidden_states = args[0] if args else kwargs["hidden_states"]
-            store.write(layer_id, RouteFeature.ROUTER_INPUT, hidden_states)
-            if output.router_logits is not None:
-                store.write(layer_id, RouteFeature.ROUTER_LOGITS, output.router_logits)
-            store.write(layer_id, RouteFeature.TOPK_IDS, output.topk_ids)
-            store.write(layer_id, RouteFeature.TOPK_WEIGHTS, output.topk_weights)
+            try:
+                store.write(layer_id, RouteFeature.ROUTER_INPUT, hidden_states)
+                if output.router_logits is not None:
+                    store.write(layer_id, RouteFeature.ROUTER_LOGITS, output.router_logits)
+                store.write(layer_id, RouteFeature.TOPK_IDS, output.topk_ids)
+                store.write(layer_id, RouteFeature.TOPK_WEIGHTS, output.topk_weights)
+            except ValueError as error:
+                if layer_id not in self.unsupported_layers:
+                    self.unsupported_layers.add(layer_id)
+                    logger.warning(
+                        "MoE expert prediction cannot tap layer %d: %s", layer_id, error
+                    )
 
         return hook

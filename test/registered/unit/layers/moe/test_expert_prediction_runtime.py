@@ -34,11 +34,12 @@ class TupleTopK(FakeTopK):
 
 
 class FakeMoE(nn.Module):
-    def __init__(self, layer_id, num_experts, hidden_size):
+    def __init__(self, layer_id, num_experts, hidden_size, num_fused_shared_experts=0):
         super().__init__()
         self.layer_id = layer_id
         self.num_experts = num_experts
         self.hidden_size = hidden_size
+        self.num_fused_shared_experts = num_fused_shared_experts
 
     def forward(self, hidden_states, topk_output):
         return hidden_states
@@ -76,7 +77,15 @@ def _batch(mode, rows):
     )
 
 
-def _runtime(*, model=None, metrics_path=None, hot_caches=None, max_rows=4, log_interval=2):
+def _runtime(
+    *,
+    model=None,
+    metrics_path=None,
+    hot_caches=None,
+    max_rows=4,
+    log_interval=2,
+    score_interval=1,
+):
     model = model or FakeModel()
     runtime = ExpertPredictionRuntime.build(
         model=model,
@@ -88,6 +97,7 @@ def _runtime(*, model=None, metrics_path=None, hot_caches=None, max_rows=4, log_
         hot_caches=hot_caches or {},
         log_interval=log_interval,
         metrics_path=metrics_path,
+        score_interval=score_interval,
         topk_type=FakeTopK,
         experts_type=FakeMoE,
     )
@@ -168,6 +178,7 @@ class TestExpertPredictionRuntime(unittest.TestCase):
             tokens_per_request=1,
             moe_ep_size=1,
             attn_dp_size=None,
+            pp_size=1,
             expert_hot_cache_manager=None,
         )
         with envs.SGLANG_MOE_EXPERT_PREDICTOR.override("popularity"):
@@ -175,6 +186,31 @@ class TestExpertPredictionRuntime(unittest.TestCase):
                 ExpertPredictionRuntime.from_env(decode_max_bs=1, tp_size=2, **common)
             with self.assertRaisesRegex(ValueError, "MAX_ROWS"):
                 ExpertPredictionRuntime.from_env(decode_max_bs=0, tp_size=1, **common)
+            with self.assertRaisesRegex(ValueError, "single GPU"):
+                ExpertPredictionRuntime.from_env(
+                    decode_max_bs=1, tp_size=1, **{**common, "pp_size": 2}
+                )
+
+    def test_score_interval_scores_every_nth_eligible_forward(self):
+        model, runtime = _runtime(score_interval=3)
+        for _ in range(6):
+            _decode(model, runtime)
+        self.assertEqual(runtime.forwards, 2)
+        self.assertEqual(runtime.eligible_forwards, 6)
+
+    def test_build_rejects_non_positive_score_interval(self):
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL must be positive"
+        ):
+            _runtime(score_interval=0)
+
+    def test_metrics_write_failure_disables_further_writes_without_raising(self):
+        path = Path(tempfile.mkdtemp()) / "missing" / "m.jsonl"
+        model, runtime = _runtime(metrics_path=path, log_interval=2)
+        with self.assertLogs("sglang.srt.layers.moe.expert_prediction", "WARNING"):
+            for _ in range(2):
+                _decode(model, runtime)
+        self.assertEqual(runtime.forwards, 2)
 
 
 if __name__ == "__main__":

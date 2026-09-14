@@ -52,12 +52,16 @@ class ExpertPredictionRuntime:
         hot_caches: Mapping[int, Any],
         log_interval: int,
         metrics_path: Path | None,
+        score_interval: int,
     ) -> None:
         if log_interval < 1:
             raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL must be positive")
+        if score_interval < 1:
+            raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL must be positive")
         self.store = store
         self.metrics = metrics
         self.forwards = 0
+        self.eligible_forwards = 0
         self._specs = {layer.spec.layer_id: layer.spec for layer in layers}
         self._layer_ids = tuple(sorted(self._specs))
         self._taps = taps
@@ -66,6 +70,7 @@ class ExpertPredictionRuntime:
         self._hot_caches = dict(hot_caches)
         self._log_interval = log_interval
         self._metrics_path = metrics_path
+        self._score_interval = score_interval
         self._reported_unsupported = False
 
     @classmethod
@@ -80,12 +85,13 @@ class ExpertPredictionRuntime:
         tp_size: int,
         moe_ep_size: int,
         attn_dp_size: int | None,
+        pp_size: int,
         expert_hot_cache_manager: Any | None,
     ) -> "ExpertPredictionRuntime":
-        if tp_size > 1 or moe_ep_size > 1 or (attn_dp_size or 1) > 1:
+        if tp_size > 1 or moe_ep_size > 1 or (attn_dp_size or 1) > 1 or pp_size > 1:
             raise ValueError(
                 "SGLANG_MOE_EXPERT_PREDICTOR supports a single GPU; got "
-                f"tp={tp_size} moe_ep={moe_ep_size} attn_dp={attn_dp_size}"
+                f"tp={tp_size} moe_ep={moe_ep_size} attn_dp={attn_dp_size} pp={pp_size}"
             )
         max_rows = (
             envs.SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS.get()
@@ -109,6 +115,7 @@ class ExpertPredictionRuntime:
             ),
             log_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL.get(),
             metrics_path=Path(metrics_file) if metrics_file else None,
+            score_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL.get(),
         )
 
     @classmethod
@@ -124,6 +131,7 @@ class ExpertPredictionRuntime:
         hot_caches: Mapping[int, Any],
         log_interval: int,
         metrics_path: Path | None,
+        score_interval: int,
         topk_type: type | None = None,
         experts_type: type | None = None,
     ) -> "ExpertPredictionRuntime":
@@ -172,18 +180,38 @@ class ExpertPredictionRuntime:
             hot_caches=hot_caches,
             log_interval=log_interval,
             metrics_path=metrics_path,
+            score_interval=score_interval,
         )
 
     def on_forward_end(self, forward_batch: Any) -> None:
         rows = self._scored_rows(forward_batch)
         if rows == 0:
             return
+        self.eligible_forwards += 1
+        if (self.eligible_forwards - 1) % self._score_interval != 0:
+            return
         for index, predictor in enumerate(self._predictors):
             self._score(predictor_index=index, predictor=predictor, rows=rows)
             predictor.observe(store=self.store, rows=rows)
         self.forwards += 1
         if self._metrics_path is not None and self.forwards % self._log_interval == 0:
-            self.metrics.append_jsonl(self._metrics_path, forwards=self.forwards)
+            self._append_metrics()
+
+    def _append_metrics(self) -> None:
+        try:
+            self.metrics.append_jsonl(
+                self._metrics_path,
+                forwards=self.forwards,
+                eligible_forwards=self.eligible_forwards,
+            )
+        except OSError as error:
+            logger.warning(
+                "MoE expert prediction metrics write failed, disabling further writes: "
+                "path=%s error=%s",
+                self._metrics_path,
+                error,
+            )
+            self._metrics_path = None
 
     def close(self) -> None:
         self._taps.remove()

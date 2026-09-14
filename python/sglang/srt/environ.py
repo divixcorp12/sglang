@@ -327,6 +327,9 @@ class Envs:
     # (comma list, e.g. "affinity,popularity"); empty installs no hooks or buffers.
     SGLANG_MOE_EXPERT_PREDICTOR = EnvTuple(tuple())
     SGLANG_MOE_EXPERT_PREDICTOR_CANDIDATES = EnvInt(16)
+    # Score and update predictors on every Nth eligible forward; raise it to
+    # cut the per-step host overhead of shadow scoring.
+    SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL = EnvInt(1)
     # Rows per tap buffer; 0 uses decode CUDA-graph max_bs x tokens per request.
     SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS = EnvInt(0)
     SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL = EnvInt(100)

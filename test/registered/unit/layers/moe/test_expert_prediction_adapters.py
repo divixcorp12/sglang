@@ -22,11 +22,12 @@ class FakeTopK(nn.Module):
 
 
 class FakeMoE(nn.Module):
-    def __init__(self, layer_id, num_experts, hidden_size):
+    def __init__(self, layer_id, num_experts, hidden_size, num_fused_shared_experts=0):
         super().__init__()
         self.layer_id = layer_id
         self.num_experts = num_experts
         self.hidden_size = hidden_size
+        self.num_fused_shared_experts = num_fused_shared_experts
 
     def forward(self, hidden_states, topk_output):
         return hidden_states

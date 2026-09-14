@@ -111,10 +111,11 @@ class ShadowMetrics:
             result[name] = {"layers": layers, "total": total}
         return result
 
-    def append_jsonl(self, path: Path, *, forwards: int) -> None:
+    def append_jsonl(self, path: Path, *, forwards: int, eligible_forwards: int) -> None:
         record = {
             "timestamp_ns": time.time_ns(),
             "forwards": forwards,
+            "eligible_forwards": eligible_forwards,
             "predictors": self.snapshot(),
         }
         with path.open("a", encoding="utf-8") as destination:

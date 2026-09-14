@@ -107,10 +107,11 @@ class TestShadowMetrics(unittest.TestCase):
         self.assertEqual(snapshot["b"]["total"]["recall_at_m"], 0.0)
 
         path = Path(tempfile.mkdtemp()) / "metrics.jsonl"
-        metrics.append_jsonl(path, forwards=7)
-        metrics.append_jsonl(path, forwards=9)
+        metrics.append_jsonl(path, forwards=7, eligible_forwards=7)
+        metrics.append_jsonl(path, forwards=9, eligible_forwards=9)
         records = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual([record["forwards"] for record in records], [7, 9])
+        self.assertEqual([record["eligible_forwards"] for record in records], [7, 9])
         self.assertEqual(records[0]["predictors"], snapshot)
         self.assertIsInstance(records[0]["timestamp_ns"], int)
 

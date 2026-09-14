@@ -245,6 +245,7 @@ class MlxModelRunnerStub(ModelRunner):
 
         # Load model (sets metadata only)
         self.sampler = None
+        self.expert_prediction_runtime = None
         self.load_model()
 
         # Layer metadata

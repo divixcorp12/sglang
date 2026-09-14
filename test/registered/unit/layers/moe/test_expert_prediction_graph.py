@@ -31,11 +31,12 @@ class FakeTopK(nn.Module):
 
 
 class FakeMoE(nn.Module):
-    def __init__(self, layer_id):
+    def __init__(self, layer_id, num_fused_shared_experts=0):
         super().__init__()
         self.layer_id = layer_id
         self.num_experts = EXPERTS
         self.hidden_size = HIDDEN
+        self.num_fused_shared_experts = num_fused_shared_experts
 
     def forward(self, hidden_states, topk_output):
         return hidden_states
@@ -78,6 +79,7 @@ class TestExpertPredictionGraph(unittest.TestCase):
             hot_caches={1: SimpleNamespace(expert_to_slot=torch.full((EXPERTS,), -1, device=device))},
             log_interval=10**9,
             metrics_path=None,
+            score_interval=1,
             topk_type=FakeTopK,
             experts_type=FakeMoE,
         )
