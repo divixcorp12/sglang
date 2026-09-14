@@ -677,6 +677,7 @@ class ModelRunner:
             self.expert_hot_cache_manager.enable_next_layer_prefetch(
                 envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
             )
+        self.maybe_init_expert_prediction()
 
         self.maybe_init_dwdp()
 
@@ -779,6 +780,27 @@ class ModelRunner:
             get_global_expert_distribution_recorder().register_forward_observer(
                 manager.on_expert_distribution
             )
+
+    def maybe_init_expert_prediction(self):
+        """Attach shadow MoE expert predictors before CUDA graph capture."""
+        self.expert_prediction_runtime = None
+        if self.is_draft_worker or not envs.SGLANG_MOE_EXPERT_PREDICTOR.get():
+            return
+        from sglang.srt.layers.moe.expert_prediction.runtime import (
+            ExpertPredictionRuntime,
+        )
+
+        self.expert_prediction_runtime = ExpertPredictionRuntime.from_env(
+            model=self.model,
+            gpu_id=self.gpu_id,
+            hidden_dtype=self.dtype,
+            decode_max_bs=get_exec().graph.cuda_graph_config.decode.max_bs or 0,
+            tokens_per_request=self.decode_num_tokens_per_req(),
+            tp_size=self.ps.tp_size,
+            moe_ep_size=self.ps.moe_ep_size,
+            attn_dp_size=self.ps.attn_dp_size,
+            expert_hot_cache_manager=self.expert_hot_cache_manager,
+        )
 
     def maybe_init_expert_host_arena(self):
         """Move host expert rows into registered memory before the expert caches."""
@@ -1800,6 +1822,8 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+            if self.expert_prediction_runtime is not None:
+                self.expert_prediction_runtime.on_forward_end(forward_batch)
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
