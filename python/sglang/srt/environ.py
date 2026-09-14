@@ -323,6 +323,14 @@ class Envs:
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)
+    # Shadow-score these registered MoE expert predictors against native routes
+    # (comma list, e.g. "affinity,popularity"); empty installs no hooks or buffers.
+    SGLANG_MOE_EXPERT_PREDICTOR = EnvTuple(tuple())
+    SGLANG_MOE_EXPERT_PREDICTOR_CANDIDATES = EnvInt(16)
+    # Rows per tap buffer; 0 uses decode CUDA-graph max_bs x tokens per request.
+    SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS = EnvInt(0)
+    SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL = EnvInt(100)
+    SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE = EnvStr("")
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
