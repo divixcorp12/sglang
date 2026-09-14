@@ -25,11 +25,12 @@ batches, cuda graph: True throughout for both)
 | shadow-off | 13.76 |
 | shadow-on (affinity,popularity) | 6.85 |
 
-Shadow scoring roughly halves decode throughput in this single-request, single-GPU
-smoke config (48 tapped MoE layers, `--max-running-requests 1`). No host sync was
-observed or expected to cause this; the added kernel-launch and scoring work itself
-accounts for the slowdown. Not investigated further per the task scope (only "record",
-not "fix" tok/s here).
+**Label: shadow scoring overhead, not a prefetch latency result.** Shadow scoring
+currently launches thousands of small eager kernels after every decode step (across
+all 48 tapped layers x both predictors); the off-vs-on gap above mostly reflects that
+per-step host launch overhead, not predictor or framework decode latency. No host sync
+was observed or expected to cause it. Not optimized here — a follow-up fix will address
+the eager-kernel-launch overhead after this smoke test.
 
 ## Output equality (off vs on, second request)
 
@@ -70,5 +71,5 @@ controller's instruction this is recorded as a concern and not investigated/fixe
 - GPU was confirmed free (`nvidia-smi --query-compute-apps`) before each server launch
   and confirmed clear again after each `SIGTERM`.
 - Nothing crashed, no missing log lines, no framework bug surfaced beyond the two
-  findings above (throughput regression under shadow scoring, and the greedy-output
-  divergence), both recorded as concerns rather than fixed.
+  findings above (shadow-scoring kernel-launch overhead lowering decode tok/s, and the
+  greedy-output divergence), both recorded as concerns rather than fixed.
