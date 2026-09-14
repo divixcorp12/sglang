@@ -30,6 +30,12 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
+from sglang.srt.speculative.verify_trace import (
+    record_verify_trace,
+    sampling_flags,
+    verify_logit_summary,
+    verify_trace_path,
+)
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -585,6 +591,14 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+    trace_path = verify_trace_path()
+    trace_summary = (
+        verify_logit_summary(
+            logits_output.next_token_logits, verify_input.draft_token_num
+        )
+        if trace_path and not batch.forward_mode.is_idle()
+        else None
+    )
     (
         predict,
         accept_lens,
@@ -596,6 +610,17 @@ def run_eagle_verify(
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
     )
+    if trace_summary is not None:
+        record_verify_trace(
+            trace_path,
+            batch.reqs,
+            verify_input.draft_token,
+            trace_summary,
+            accept_lens,
+            predict,
+            accept_index,
+            sampling_flags(batch.sampling_info, grammar_mask is not None),
+        )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

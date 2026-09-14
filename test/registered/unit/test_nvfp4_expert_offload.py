@@ -1010,9 +1010,33 @@ class HotCacheConfigurationTests(unittest.TestCase):
         os.environ["SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY"] = "1"
         file_ple = dict(ple_offload_embedding=True, ple_offload_backend="file")
         memory_hook.handle_offload_compatibility(self.decode_args("full", **file_ple))
+        for algorithm in ("NEXTN", "EAGLE"):
+            memory_hook.handle_offload_compatibility(
+                self.decode_args(
+                    "breakable",
+                    speculative_algorithm=algorithm,
+                    speculative_eagle_topk=1,
+                    **file_ple,
+                )
+            )
 
         cases = (
-            (dict(speculative_algorithm="EAGLE", **file_ple), "speculative"),
+            (
+                dict(speculative_algorithm="EAGLE", speculative_eagle_topk=2, **file_ple),
+                "topk 1",
+            ),
+            (dict(speculative_algorithm="EAGLE", **file_ple), "topk 1"),
+            *(
+                (
+                    dict(
+                        speculative_algorithm=algorithm,
+                        speculative_eagle_topk=1,
+                        **file_ple,
+                    ),
+                    "NEXTN or EAGLE",
+                )
+                for algorithm in ("NGRAM", "EAGLE3", "STANDALONE")
+            ),
             (dict(dllm_algorithm="LowConfidence", **file_ple), "DLLM"),
             (dict(disable_overlap_schedule=False, **file_ple), "overlap"),
             (dict(), "file-backed PLE"),

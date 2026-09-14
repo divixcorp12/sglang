@@ -177,10 +177,14 @@ def handle_offload_compatibility(server_args: Any) -> None:
                 "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY requires file-backed PLE "
                 "offload (--ple-offload-backend file)"
             )
-        if getattr(cfg, "speculative_algorithm", None) is not None:
+        if getattr(cfg, "speculative_algorithm", None) is not None and (
+            str(cfg.speculative_algorithm).upper() not in ("NEXTN", "EAGLE")
+            or getattr(cfg, "speculative_eagle_topk", None) != 1
+        ):
             raise ValueError(
-                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY does not support speculative "
-                "decoding"
+                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY with speculative decoding requires "
+                "--speculative-algorithm NEXTN or EAGLE and --speculative-eagle-topk 1 "
+                "passed explicitly"
             )
         if getattr(cfg, "dllm_algorithm", None) is not None:
             raise ValueError(

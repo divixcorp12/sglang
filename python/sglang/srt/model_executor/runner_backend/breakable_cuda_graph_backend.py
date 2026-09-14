@@ -82,6 +82,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
@@ -92,6 +93,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
+        self._shared_output_rows = 0
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -112,6 +114,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self._shared_output_rows = 0
         self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
@@ -142,9 +145,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
-        size = shape_key.size
-        if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+        size = self._capture_output_rows(shape_key)
+        output_buffer = self._reserve_shared_output_buffer(warmup_out, size)
         with (
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
@@ -157,9 +159,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             self._precarve.mint()
             out = captured_fn()
             out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            self._copy_output_to_buffer(out, output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        stored = self._slice_output(output_buffer, out_rows)
         logger.info(
             "Breakable CUDA graph captured: shape=%s segments=%d breaks=%d",
             shape_key,
@@ -170,6 +172,28 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+
+    def _capture_output_rows(self, shape_key: ShapeKey) -> int:
+        """Output rows a capture of ``shape_key`` stores.
+
+        A runner whose graph key counts requests rather than output rows (a
+        TARGET_VERIFY decode runner) reports the rows via ``capture_output_rows``.
+        """
+        rows_for = getattr(
+            getattr(self, "_cuda_graph_runner", None), "capture_output_rows", None
+        )
+        return shape_key.size if rows_for is None else rows_for(shape_key.size)
+
+    def _reserve_shared_output_buffer(self, warmup_out: Any, rows: int) -> Any:
+        """Return the shared output buffer, reallocating it when ``rows`` exceed it.
+
+        Graphs captured before a reallocation keep the slices of the buffer they
+        copied into, so their stored outputs stay valid.
+        """
+        if self._shared_output_buffer is None or self._shared_output_rows < rows:
+            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, rows)
+            self._shared_output_rows = rows
+        return self._shared_output_buffer
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
@@ -245,6 +269,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 f"{type(output)} vs {type(output_buffer)}"
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
+            if output.shape[0] < num_tokens:
+                raise ValueError(
+                    f"BCG output has {output.shape[0]} rows but the capture stores "
+                    f"{num_tokens}; a field would broadcast one row into many"
+                )
             output_buffer[:num_tokens].copy_(output[:num_tokens])
             return
         if isinstance(output, LogitsProcessorOutput) and isinstance(

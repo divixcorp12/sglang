@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.layers.quantization.online_fp8 import hc_mix_online_fp8_scheme
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -1455,15 +1456,18 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
+        hc_fp8_scheme = hc_mix_online_fp8_scheme(prefix)
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            online_fp8_scheme=hc_fp8_scheme,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            online_fp8_scheme=hc_fp8_scheme,
         )
 
     def _prepare_qwen4_exp_attn(
@@ -1830,7 +1834,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        self.hyper_connection_mixer = GatedResidual(
+            hc_config,
+            use_combine=False,
+            online_fp8_scheme=hc_mix_online_fp8_scheme(prefix),
+        )
 
     def prepare_decode_graph_replay(
         self, forward_batch: ForwardBatch, graph_tokens: int

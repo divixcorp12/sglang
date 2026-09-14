@@ -59,6 +59,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.online_fp8 import online_fp8_or_unquantized
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -1018,7 +1019,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return online_fp8_or_unquantized(prefix)
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
@@ -1029,7 +1030,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
-            return UnquantizedLinearMethod()
+            return online_fp8_or_unquantized(prefix)
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
         # VocabParallelEmbedding, and a tied lm_head IS the embedding module.

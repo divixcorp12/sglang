@@ -22,11 +22,14 @@ lightweight stand-in (with the real precedence helper bound) so no model or
 server is constructed.
 """
 
+import contextlib
 import os
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -291,6 +294,81 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class TestCaptureOutputRows(CustomTestCase):
+    """Stored and PLE-staged rows of a graph follow its tokens, not its key."""
+
+    def _runner(self, mode, width, ragged=False):
+        return SimpleNamespace(
+            capture_forward_mode=mode,
+            captured_req_width=width,
+            ragged_verify_mode=ragged,
+        )
+
+    def test_target_verify_rows_are_requests_times_width(self):
+        runner = self._runner(mod.ForwardMode.TARGET_VERIFY, 4)
+        self.assertEqual(DecodeCudaGraphRunner.capture_output_rows(runner, 1), 4)
+        self.assertEqual(DecodeCudaGraphRunner.capture_output_rows(runner, 3), 12)
+
+    def test_ragged_verify_keys_already_count_tokens(self):
+        runner = self._runner(mod.ForwardMode.TARGET_VERIFY, 4, ragged=True)
+        self.assertEqual(DecodeCudaGraphRunner.capture_output_rows(runner, 8), 8)
+
+    def test_decode_and_draft_modes_keep_one_row_per_key_unit(self):
+        for mode, width in (
+            (mod.ForwardMode.DECODE, 1),
+            (mod.ForwardMode.DECODE, 4),
+            (mod.ForwardMode.DRAFT_EXTEND_V2, 4),
+        ):
+            with self.subTest(mode=mode, width=width):
+                runner = self._runner(mode, width)
+                self.assertEqual(
+                    DecodeCudaGraphRunner.capture_output_rows(runner, 2), 2
+                )
+
+
+class TestExecuteStagesTargetVerifyPleRows(CustomTestCase):
+    """``execute`` hands PLE staging the verify token count of the replayed graph."""
+
+    def test_prepare_replay_receives_verify_tokens_not_request_count(self):
+        staged = []
+        replayed = mod.LogitsProcessorOutput(
+            next_token_logits=torch.arange(8.0).reshape(4, 2)
+        )
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            device_timer=None,
+            is_draft_worker=False,
+            model=SimpleNamespace(
+                prepare_decode_graph_replay=lambda forward_batch, graph_tokens: (
+                    staged.append(graph_tokens)
+                )
+            ),
+        )
+        runner.backend = SimpleNamespace(
+            replay_session=contextlib.nullcontext,
+            replay=lambda shape_key, forward_batch: replayed,
+        )
+        runner._resolve_shared_read_ends = lambda attn_backend, forward_mode: None
+        runner._replay_attn_backend = lambda: None
+        runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
+        runner.captured_req_width = 4
+        runner.ragged_verify_mode = False
+        runner.is_dllm = False
+        runner.raw_num_token = 4
+
+        def load_batch(forward_batch, pp_proxy_tensors):
+            runner._replay_graph_key = SimpleNamespace(size=1)
+
+        runner.load_batch = load_batch
+
+        output = runner.execute(
+            SimpleNamespace(forward_mode=mod.ForwardMode.TARGET_VERIFY, batch_size=1)
+        )
+
+        self.assertEqual(staged, [4])
+        self.assertEqual(output.next_token_logits.shape, (4, 2))
 
 
 if __name__ == "__main__":

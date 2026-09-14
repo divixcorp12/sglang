@@ -1404,6 +1404,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
+    def capture_output_rows(self, size: int) -> int:
+        """Output rows of the graph keyed by ``size``.
+
+        A non-ragged TARGET_VERIFY graph is keyed by request count and emits
+        ``captured_req_width`` rows per request; ragged verify keys already count
+        tokens, and every other mode emits one row per key unit.
+        """
+        if (
+            self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not getattr(self, "ragged_verify_mode", False)
+        ):
+            return size * self.captured_req_width
+        return size
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1438,7 +1452,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model, "prepare_decode_graph_replay", None
             )
             if prepare_replay is not None:
-                prepare_replay(forward_batch, self._replay_graph_key.size)
+                graph_tokens = self.capture_output_rows(self._replay_graph_key.size)
+                if self.capture_forward_mode == ForwardMode.TARGET_VERIFY and not getattr(
+                    self, "_logged_verify_replay_graph_tokens", False
+                ):
+                    self._logged_verify_replay_graph_tokens = True
+                    logger.info(
+                        "Target verify graph replay stages PLE rows for graph_tokens=%d "
+                        "(graph key size %d)",
+                        graph_tokens,
+                        self._replay_graph_key.size,
+                    )
+                prepare_replay(forward_batch, graph_tokens)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 

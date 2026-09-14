@@ -352,6 +352,10 @@ class Envs:
     # --speculative-eagle-topk 1 passed explicitly, --cuda-graph-backend-prefill
     # disabled and --disable-flashinfer-autotune.
     SGLANG_MOE_ROUTE_TRACE_SPECULATIVE = EnvBool(False)
+    # Debug only: append per-request speculative verify rows (draft, argmax, accept
+    # length, committed tokens, top-2 logit gap, sampling flags) to this JSONL file,
+    # suffixed .rank<N> when several ranks run; empty disables and adds no work.
+    SGLANG_SPEC_VERIFY_TRACE = EnvStr("")
     # Model path recorded in expert/PLE file-cache identities instead of the
     # resolved --model-path; after moving a checkpoint, set it to the resolved
     # path the caches were built from.

@@ -440,6 +440,62 @@ def test_qwen4_model_stages_only_prefetched_ple_layers_before_replay(monkeypatch
     assert staged == [(2, "ple_batch", forward_batch, 4)]
 
 
+def test_qwen4_target_verify_replay_stages_under_the_captured_token_key(
+    monkeypatch, tmp_path
+):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+
+    heads, draft_tokens, requests = 2, 4, 1
+    layer, table = _uring_file_layer(
+        monkeypatch,
+        tmp_path,
+        "verify",
+        torch.bfloat16,
+        80,
+        (0, 5000),
+        heads=heads,
+        graph=requests * draft_tokens,
+    )
+    ids = torch.arange(requests * draft_tokens * heads, device="cuda") * 7 + 3
+    layer.lookup = ids.reshape(requests * draft_tokens, heads)
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.layers = [SimpleNamespace(ple=None), SimpleNamespace(ple=layer)]
+    model._start_layer, model._end_layer = 0, 2
+    model.has_ple = True
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 9
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "_prepare_ple_batch",
+        lambda *_a, **_k: SimpleNamespace(physical_tokens=requests * draft_tokens),
+    )
+    runner = SimpleNamespace(
+        capture_forward_mode=ForwardMode.TARGET_VERIFY,
+        captured_req_width=draft_tokens,
+        ragged_verify_mode=False,
+    )
+
+    graph_tokens = DecodeCudaGraphRunner.capture_output_rows(runner, requests)
+    assert graph_tokens == requests * draft_tokens
+    with pytest.raises(RuntimeError, match="no captured PLE buffer"):
+        model.prepare_decode_graph_replay(SimpleNamespace(input_ids="ids"), requests)
+
+    layer._graph_prefetch_buffers[graph_tokens].fill_(9)
+    model.prepare_decode_graph_replay(SimpleNamespace(input_ids="ids"), graph_tokens)
+    torch.cuda.synchronize()
+
+    byte_rows = table.view(torch.uint8).view(table.shape[0], -1)
+    expected = (
+        byte_rows[ids.cpu()].to("cuda").view(table.dtype).reshape(graph_tokens, -1)
+    )
+    staged = layer._graph_prefetch_buffers[graph_tokens]
+    assert torch.equal(staged.view(torch.uint8), expected.view(torch.uint8))
+
+
 def _uring_file_layer(monkeypatch, tmp_path, name, dtype, dim, vocab, heads, graph):
     from sglang.srt.models.qwen4_exp_ple_table import PleFileRowStager
 

@@ -119,8 +119,12 @@ class GatedResidual(HyperConnectionBase):
         use_mix: bool = True,
         use_combine: bool = True,
         role: Optional[str] = None,
+        online_fp8_scheme: Optional[str] = None,
     ):
+        """``online_fp8_scheme`` converts the two mix projections to FP8 after loading
+        (see ``sglang.srt.layers.quantization.online_fp8``); ``None`` keeps them BF16."""
         super().__init__(config, use_mix, use_combine, role)
+        self._online_fp8_mix = False
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -160,6 +164,18 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            if online_fp8_scheme is not None:
+                from sglang.srt.layers.quantization.online_fp8 import (
+                    OnlineFp8LinearMethod,
+                )
+
+                self.input_mix_weight_down.quant_method = OnlineFp8LinearMethod(
+                    online_fp8_scheme
+                )
+                self.input_mix_weight_up.quant_method = OnlineFp8LinearMethod(
+                    online_fp8_scheme
+                )
+                self._online_fp8_mix = True
 
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -219,6 +235,14 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _mix_online_fp8(self, hyper_input_normed: torch.Tensor) -> torch.Tensor:
+        """``_mix_compute`` with both projections run through their FP8 quant methods."""
+        hc, hs = self.hc_count, self.hidden_size
+        down, up = self.input_mix_weight_down, self.input_mix_weight_up
+        gate = F.silu(down.quant_method.apply(down, hyper_input_normed) / hc)
+        gate = torch.sigmoid(up.quant_method.apply(up, gate)).unflatten(-1, (hc, hs))
+        return (gate * hyper_input_normed.unflatten(-1, (hc, hs))).mean(dim=-2)
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -233,7 +257,11 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
+        if self._online_fp8_mix:
+            mixed_input = self._mix_online_fp8(hyper_input_normed).to(
+                self.params_dtype
+            )
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
