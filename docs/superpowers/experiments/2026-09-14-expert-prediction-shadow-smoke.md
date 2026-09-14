@@ -104,9 +104,17 @@ before each launch and confirmed clear after each stop.
   layers=48 max_rows=1 tap_bytes=3840 predictor_state_bytes=49479680`, no `cannot tap layer`
   warning. No `expert-prediction.metrics.jsonl` was written (log-interval gate never fires
   again after the single scored forward), consistent with scoring running exactly once.
-- **D**: not run. Controller condition for D was "A == B through at least 300 chars and C
-  differs from A"; A and B already diverged at char 129 (< 300), so D was skipped per the
-  brief.
+- **D** `div-on`: `affinity,popularity` with `SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL=1`
+  (scoring every eligible forward, fresh launch). Initially skipped (controller condition "A
+  == B through >= 300 chars and C differs from A" wasn't met, A/B diverged at 129), then run
+  on controller follow-up because A/B/C/shadow-off-1 all agreed through >= 73 chars while
+  shadow-on-1 (the earlier smoke's only scoring-every-step run) uniquely diverged from
+  everything at char 22 — an unexplained outlier worth checking against a fresh scoring
+  launch. Run dir
+  `/data/models/slang/nvfp4-work/cc-expert-prediction/servers/div-on/run-20260914-163435`.
+  Median decode `gen throughput (token/s)` over 14 decode-batch log lines: **6.955** (close to
+  Task 7's shadow-on median of 6.85, consistent with the known scoring-kernel-launch
+  overhead).
 
 All completions used the full `max_tokens=600` budget (`completion_tokens=600` in every
 run's `usage`).
@@ -125,33 +133,53 @@ run's `usage`).
 | B (off) vs shadow-on-1 | 22 | 1801 / 1772 |
 | C (taps-only) vs shadow-on-1 | 22 | 1885 / 1772 |
 | shadow-off-1 vs shadow-on-1 (Task 7's original comparison) | 22 | 1717 / 1772 |
+| A (off) vs D (on, scoring every forward) | 129 | 1845 / 1762 |
+| B (off) vs D | 232 | 1801 / 1762 |
+| C (taps-only) vs D | 73 | 1885 / 1762 |
+| shadow-off-1 vs D | 73 | 1717 / 1762 |
+| D vs shadow-on-1 | 22 | 1762 / 1772 |
 
-No pair matched past ~130 characters; every pair, including two fresh off-vs-off launches
+No pair matched past ~230 characters; every pair, including two fresh off-vs-off launches
 (A vs B), diverged well before the 300-char bar the brief set for "taps are inert."
 
-### Verdict: H0
+### Verdict: H0 (shadow-on-1 was a launch outlier)
 
 Two off/off fresh launches (A vs B) diverge at char 129 — the same order of magnitude as
-off-vs-taps-only (73) and the original off-vs-on Task 7 comparison (22). Divergence does not
-grow monotonically with how much predictor machinery is active: A-vs-C (73, taps installed,
-scored once) is *smaller* than A-vs-B (129, both predictor off), and C is closer to
-shadow-off-1 in divergence point (133) than to shadow-on-1 (22). If taps/buffers (H1) or
-per-forward scoring (H2) were perturbing numerics, divergence onset should track predictor
-activity; instead it is roughly constant (character range 22-133) regardless of whether the
-predictor is off, taps-only, or fully scoring. This matches H0: separate server launches are
-not repeatable at greedy decoding (consistent with experiment log E7's prior finding that
-`explain`-class replies are non-reproducible across runs), and the original Task 7 off-vs-on
-divergence cannot be attributed to expert prediction with this evidence. The exact
-divergence character varies run to run (22-133) rather than clustering tightly, so this is
-circumstantial, not a proof of exact bitwise cause, but it is sufficient to reject H1/H2 as
-the primary explanation for Task 7's observation.
+off-vs-taps-only (73) and off-vs-D (129/232). A/B/C/shadow-off-1 all agree with each other
+through **>= 73 chars** pairwise. D (`affinity,popularity`, scoring every forward, fresh
+launch) also agrees with A, B, C, and shadow-off-1 in that same 73-232 char range — it does
+**not** reproduce shadow-on-1's early (char-22) divergence from everything else. D vs
+shadow-on-1 itself diverges at char 22, i.e. D behaves like an ordinary off/taps-only run
+relative to every other run, and only shadow-on-1 stands apart, diverging from all five other
+runs (A, B, C, D, shadow-off-1) at exactly char 22.
+
+Per the controller's decision rule: D agreed with A/B/C through >= 73 chars, so
+**shadow-on-1 was a launch outlier, and H0 (launch-to-launch nondeterminism) holds** — not
+H2 (per-step scoring). If scoring-every-forward reliably perturbed output, D should have
+diverged early like shadow-on-1 did; instead D's divergence points (73-232 chars against the
+other five runs) fall squarely inside the same noise band as pairs where the predictor was
+off or taps-only throughout. Divergence character does not track predictor activity in
+either direction: off-vs-off (A-B) can diverge as early as taps-vs-off (C vs A/B, 73) or as
+late as 232 (B vs D), and the one run that diverged earliest overall (shadow-on-1, char 22)
+is matched no more closely by other scoring runs (D) than by pure off runs. This is
+consistent with experiment log E7's prior finding that `explain`-class replies are
+non-reproducible across runs, and confirms the original Task 7 off-vs-on divergence (char 22)
+cannot be attributed to expert prediction — it was launch noise, and shadow-on-1's early
+divergence in that run did not repeat when scoring-every-forward was relaunched fresh (D).
+
+Caveat: n=1 per configuration (except off, n=2, and shadow-on-1-like runs, n=2: shadow-on-1
+and D), so this remains circumstantial rather than a bitwise proof; but it directly
+contradicts H2 (D was the exact repeat of shadow-on-1's config and did not reproduce its
+divergence pattern), and no evidence in either run set supports H1.
 
 Per the brief, no code fix was attempted for H1/H2 (none is warranted under H0 anyway).
 
 ### Commits
 
-- `docs(nvfp4): record expert prediction output divergence check` — this entry
-  (`docs/superpowers/experiments/2026-09-14-expert-prediction-shadow-smoke.md`, staged by
-  name only).
-- No launcher change was needed: `SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL` reached the
-  shadow server correctly on the first try (verified via `/proc/<pid>/environ`).
+- `docs(nvfp4): record expert prediction output divergence check` — the original A/B/C
+  section above (`docs/superpowers/experiments/2026-09-14-expert-prediction-shadow-smoke.md`,
+  staged by name only).
+- `docs(nvfp4): add scoring-launch divergence run` — added run D, its table rows, and the
+  corrected verdict (same file, staged by name only).
+- No launcher change was needed in either pass: `SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL`
+  reached the shadow server correctly on the first try (verified via `/proc/<pid>/environ`).
