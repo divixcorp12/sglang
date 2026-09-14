@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # Launches one expert-prediction shadow server with production's E16c settings from the
 # cc-expert-prediction worktree on 127.0.0.1:<port>. <predictors> is a comma list or "off".
-# Usage: run-shadow-server.sh <name> <port> <predictors>
+# Usage: run-shadow-server.sh <name> <port> <predictors|off> [radix]
 # Refuses to start while any process holds the GPU. Runs in the foreground; the session backgrounds it.
 set -euo pipefail
 
 name=${1:?name}
 port=${2:?port}
 predictors=${3:?predictors or off}
+radix=${4:-}
 [ "$predictors" = off ] && predictors=""
+
+if [ "$radix" = radix ]; then
+    radix_flags=(--mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 8)
+else
+    radix_flags=(--disable-radix-cache --mamba-radix-cache-strategy extra_buffer_lazy --max-mamba-cache-size 1)
+fi
 
 work=/data/models/slang/nvfp4-work
 worktree=$work/cc-expert-prediction/worktree
@@ -30,7 +37,7 @@ mkdir -p "$run_dir/profiles" "$work/runtime-tmp"
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off}: $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off): $(date --iso-8601=seconds)"
     git status --short --branch
     git log -1 --oneline
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
@@ -87,13 +94,11 @@ exec env \
         --max-prefill-tokens 4096 \
         --context-length 65536 \
         --max-total-tokens 65536 \
-        --mamba-radix-cache-strategy extra_buffer_lazy \
         --max-running-requests 1 \
-        --max-mamba-cache-size 1 \
         --mamba-ssm-dtype bfloat16 \
         --mem-fraction-static 0.95 \
         --disable-overlap-schedule \
-        --disable-radix-cache \
+        "${radix_flags[@]}" \
         --language-model-only \
         --cuda-graph-backend-decode breakable \
         --cuda-graph-bs-decode 1 \
