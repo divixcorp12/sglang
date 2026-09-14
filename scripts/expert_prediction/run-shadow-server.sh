@@ -10,6 +10,7 @@ port=${2:?port}
 predictors=${3:?predictors or off}
 radix=${4:-}
 [ "$predictors" = off ] && predictors=""
+hot_gpu_mb=${HOT_GPU_MB:-14336}
 
 if [ "$radix" = radix ]; then
     radix_flags=(--mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 8)
@@ -37,7 +38,7 @@ mkdir -p "$run_dir/profiles" "$work/runtime-tmp"
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off): $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb: $(date --iso-8601=seconds)"
     git status --short --branch
     git log -1 --oneline
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
@@ -55,7 +56,7 @@ exec env \
     SGLANG_QWEN4_PLE_FILE_READER=uring \
     SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY=1 \
     SGLANG_FILE_CACHE_MODEL_PATH="$cache_model_path" \
-    SGLANG_MOE_HOT_GPU_MB=14336 \
+    SGLANG_MOE_HOT_GPU_MB="$hot_gpu_mb" \
     SGLANG_MOE_PINNED_HOST_MB=0 \
     SGLANG_MOE_EXPERT_HOST_ARENA=1 \
     SGLANG_MOE_EXPERT_GRAPH_GATHER=1 \
