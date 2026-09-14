@@ -73,3 +73,85 @@ controller's instruction this is recorded as a concern and not investigated/fixe
 - Nothing crashed, no missing log lines, no framework bug surfaced beyond the two
   findings above (shadow-scoring kernel-launch overhead lowering decode tok/s, and the
   greedy-output divergence), both recorded as concerns rather than fixed.
+
+## Follow-up: does shadow prediction cause the greedy-output divergence? (2026-09-14)
+
+Commit tested: `d6a67beac3` (fix wave; adds `SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL`).
+Question: does installing taps/buffers or running scoring change greedy output, or is the
+divergence ordinary launch-to-launch nondeterminism (H0 vs H1 vs H2, see
+`.superpowers/sdd/2026-09-14-moe-expert-prediction-framework/divergence-brief.md`)?
+
+Same request each run (one request, first after health): `POST /v1/chat/completions`,
+prompt "Explain how a B-tree handles node splits, with a worked example.", `max_tokens=600`,
+`temperature=0`, `chat_template_kwargs.enable_thinking=false`, model = the served NVFP4
+Qwen3.8-Flash-Next model path. Port 7871, 127.0.0.1, production down, GPU confirmed free
+before each launch and confirmed clear after each stop.
+
+### Runs
+
+- **A** `div-off-a`: predictor off. Run dir
+  `/data/models/slang/nvfp4-work/cc-expert-prediction/servers/div-off-a/run-20260914-161824`.
+- **B** `div-off-b`: predictor off (repeat, fresh launch). Run dir
+  `/data/models/slang/nvfp4-work/cc-expert-prediction/servers/div-off-b/run-20260914-162252`.
+- **C** `div-taps-only`: `affinity,popularity` with
+  `SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL=1000000000` (taps/buffers installed, but with
+  the fix wave's `(eligible-1) % interval == 0` rule the first eligible forward is still
+  scored once, then never again). Confirmed via `/proc/<pid>/environ` on divix01 that the env
+  var reached the server process (launcher passes it through correctly; no launcher change
+  was needed). Run dir
+  `/data/models/slang/nvfp4-work/cc-expert-prediction/servers/div-taps-only/run-20260914-162726`.
+  `server.log` shows `MoE expert prediction shadow mode: predictors=affinity,popularity
+  layers=48 max_rows=1 tap_bytes=3840 predictor_state_bytes=49479680`, no `cannot tap layer`
+  warning. No `expert-prediction.metrics.jsonl` was written (log-interval gate never fires
+  again after the single scored forward), consistent with scoring running exactly once.
+- **D**: not run. Controller condition for D was "A == B through at least 300 chars and C
+  differs from A"; A and B already diverged at char 129 (< 300), so D was skipped per the
+  brief.
+
+All completions used the full `max_tokens=600` budget (`completion_tokens=600` in every
+run's `usage`).
+
+### First-difference table (character index into `choices[0].message.content`)
+
+| Pair | First diff index | Lengths (chars) |
+|---|---|---|
+| A (off) vs B (off) | 129 | 1845 / 1801 |
+| A (off) vs C (taps-only) | 73 | 1845 / 1885 |
+| B (off) vs C (taps-only) | 73 | 1801 / 1885 |
+| A (off) vs shadow-off-1 (earlier smoke, off) | 73 | 1845 / 1717 |
+| B (off) vs shadow-off-1 | 73 | 1801 / 1717 |
+| C (taps-only) vs shadow-off-1 | 133 | 1885 / 1717 |
+| A (off) vs shadow-on-1 (earlier smoke, `affinity,popularity` scoring every forward) | 22 | 1845 / 1772 |
+| B (off) vs shadow-on-1 | 22 | 1801 / 1772 |
+| C (taps-only) vs shadow-on-1 | 22 | 1885 / 1772 |
+| shadow-off-1 vs shadow-on-1 (Task 7's original comparison) | 22 | 1717 / 1772 |
+
+No pair matched past ~130 characters; every pair, including two fresh off-vs-off launches
+(A vs B), diverged well before the 300-char bar the brief set for "taps are inert."
+
+### Verdict: H0
+
+Two off/off fresh launches (A vs B) diverge at char 129 — the same order of magnitude as
+off-vs-taps-only (73) and the original off-vs-on Task 7 comparison (22). Divergence does not
+grow monotonically with how much predictor machinery is active: A-vs-C (73, taps installed,
+scored once) is *smaller* than A-vs-B (129, both predictor off), and C is closer to
+shadow-off-1 in divergence point (133) than to shadow-on-1 (22). If taps/buffers (H1) or
+per-forward scoring (H2) were perturbing numerics, divergence onset should track predictor
+activity; instead it is roughly constant (character range 22-133) regardless of whether the
+predictor is off, taps-only, or fully scoring. This matches H0: separate server launches are
+not repeatable at greedy decoding (consistent with experiment log E7's prior finding that
+`explain`-class replies are non-reproducible across runs), and the original Task 7 off-vs-on
+divergence cannot be attributed to expert prediction with this evidence. The exact
+divergence character varies run to run (22-133) rather than clustering tightly, so this is
+circumstantial, not a proof of exact bitwise cause, but it is sufficient to reject H1/H2 as
+the primary explanation for Task 7's observation.
+
+Per the brief, no code fix was attempted for H1/H2 (none is warranted under H0 anyway).
+
+### Commits
+
+- `docs(nvfp4): record expert prediction output divergence check` — this entry
+  (`docs/superpowers/experiments/2026-09-14-expert-prediction-shadow-smoke.md`, staged by
+  name only).
+- No launcher change was needed: `SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL` reached the
+  shadow server correctly on the first try (verified via `/proc/<pid>/environ`).
