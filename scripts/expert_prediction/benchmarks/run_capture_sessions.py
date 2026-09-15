@@ -97,7 +97,11 @@ def _score(content, expected):
     return False
 
 
-def _stream_chat(port, messages, rid, timeout=1800):
+def _echo(text):
+    print(text, end="", flush=True)
+
+
+def _stream_chat(port, messages, rid, timeout=1800, echo=False):
     body = json.dumps(
         {
             "model": "default",
@@ -117,6 +121,7 @@ def _stream_chat(port, messages, rid, timeout=1800):
 
     start = time.monotonic()
     ttft = None
+    last_token = None
     reasoning_parts = []
     content_parts = []
     finish_reason = None
@@ -141,17 +146,27 @@ def _stream_chat(port, messages, rid, timeout=1800):
             finish_reason = choices[0].get("finish_reason") or finish_reason
             reasoning_delta = delta.get("reasoning_content") or ""
             content_delta = delta.get("content") or ""
-            if (reasoning_delta or content_delta) and ttft is None:
-                ttft = time.monotonic() - start
+            if reasoning_delta or content_delta:
+                now = time.monotonic()
+                if ttft is None:
+                    ttft = now - start
+                last_token = now
             if reasoning_delta:
                 reasoning_parts.append(reasoning_delta)
+                if echo:
+                    _echo(reasoning_delta)
             if content_delta:
+                if echo and not content_parts:
+                    _echo("\n--- answer ---\n")
                 content_parts.append(content_delta)
+                if echo:
+                    _echo(content_delta)
 
     total = time.monotonic() - start
     return {
         "ttft": ttft,
         "total": total,
+        "decode_seconds": None if ttft is None else last_token - start - ttft,
         "reasoning": "".join(reasoning_parts),
         "content": "".join(content_parts),
         "finish_reason": finish_reason,
@@ -165,6 +180,11 @@ def main():
     parser.add_argument("--sessions", required=True)
     parser.add_argument("--results", required=True)
     parser.add_argument("--max-sessions", type=int, default=None)
+    parser.add_argument(
+        "--print-stream",
+        action="store_true",
+        help="Echo reasoning and answers to stdout as they stream.",
+    )
     args = parser.parse_args()
 
     sessions = _load_sessions(args.sessions)
@@ -199,7 +219,12 @@ def main():
                 )
 
                 try:
-                    result = _stream_chat(args.port, history, rid)
+                    if args.print_stream:
+                        print(
+                            f"\n===== {rid} ({session['domain']}, {session['split']}) =====",
+                            flush=True,
+                        )
+                    result = _stream_chat(args.port, history, rid, echo=args.print_stream)
                 except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
                     record = {
                         "session_id": session["session_id"],
@@ -218,8 +243,8 @@ def main():
                 prompt_tokens = usage.get("prompt_tokens")
                 completion_tokens = usage.get("completion_tokens")
                 decode_tps = None
-                if completion_tokens and result["total"] and result["total"] > 0:
-                    decode_tps = completion_tokens / result["total"]
+                if completion_tokens and completion_tokens > 1 and result["decode_seconds"]:
+                    decode_tps = (completion_tokens - 1) / result["decode_seconds"]
 
                 correct = (
                     _score(content, expected) if session["domain"] == "convfinqa" else None
@@ -245,6 +270,12 @@ def main():
                 }
                 results_f.write(json.dumps(record) + "\n")
                 results_f.flush()
+                if args.print_stream:
+                    print(
+                        f"\n----- {rid}: {completion_tokens} tokens, "
+                        f"finish={result['finish_reason']}, correct={correct} -----",
+                        flush=True,
+                    )
 
                 history.append({"role": "assistant", "content": content})
 
