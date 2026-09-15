@@ -14,6 +14,7 @@ synchronizes the host or breaks the graph.
 from __future__ import annotations
 
 import functools
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,6 +34,7 @@ _TAG_BASE = 8
 _PUBLISH_RING = 1024
 _TRACE_ROWS = 4096
 _POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
+_HEAD_STORES = {"release": 0, "volatile": 1}
 _STATE_WORDS = {
     "posted": 0,
     "fallback_count": 1,
@@ -106,10 +108,9 @@ class ExpertDoorbellCopier:
     Each ``tag`` names one outstanding request, e.g. the MoE layer the rows are
     for; ``wait(tag)`` waits for the latest ``post`` with that tag.
 
-    Measured limit (RTX 5090, driver 610.57, torch 2.13): copies the thread
-    queues while a CUDA graph launch runs do not execute until that launch's
-    GPU work ends, so inside a graph the thread cannot overlap the graph's
-    compute and a wait for a request posted in a graph falls back.
+    ``head_store`` selects how the poster publishes the sequence to the host:
+    ``"release"`` (a system-scope release store) or ``"volatile"`` (a volatile
+    global store).
 
     Invariants the caller must uphold:
 
@@ -141,6 +142,7 @@ class ExpertDoorbellCopier:
         degraded_polls: int = 4_096,
         prefer_overlap: bool = True,
         poll_mode: str = "acquire",
+        head_store: str = "release",
     ) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive.")
@@ -152,6 +154,8 @@ class ExpertDoorbellCopier:
             raise ValueError("poll limits must not be negative.")
         if poll_mode not in _POLL_MODES:
             raise ValueError(f"poll_mode must be one of {sorted(_POLL_MODES)}.")
+        if head_store not in _HEAD_STORES:
+            raise ValueError(f"head_store must be one of {sorted(_HEAD_STORES)}.")
         device = segments.table.device
         self.segments = segments
         self.capacity = capacity
@@ -160,6 +164,7 @@ class ExpertDoorbellCopier:
         self.timeout_polls = timeout_polls
         self.degraded_polls = degraded_polls
         self.poll_mode = _POLL_MODES[poll_mode]
+        self.head_store = _HEAD_STORES[head_store]
         self.device = device
         self.page = torch.zeros(
             _PAGE_HEADER_BYTES + ring * _record_bytes(capacity),
@@ -229,6 +234,7 @@ class ExpertDoorbellCopier:
             tag,
             self.capacity,
             self.ring,
+            self.head_store,
         )
 
     def wait(self, tag: int = 0) -> None:
@@ -255,6 +261,28 @@ class ExpertDoorbellCopier:
 
     def resume(self) -> None:
         self._module.expert_doorbell_pause(self._handle, 0)
+
+    def quiesce(self, timeout_s: float = 10.0) -> None:
+        """Pause the thread once every request posted so far is serviced and its copies completed.
+
+        Synchronizes the device. Use it before capturing a CUDA graph so the
+        thread issues no copies while the capture runs, and ``resume`` after.
+        """
+        torch.cuda.synchronize(self.device)
+        posted = int(self.state[_STATE_WORDS["posted"]].item())
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            trace = self.trace()
+            last = trace[-1] if trace else None
+            caught_up = posted == 0 or (
+                last is not None
+                and last["seq"] == posted
+                and (last["status"] != "serviced" or last["complete_ns"] != 0)
+            )
+            if caught_up:
+                self.pause()
+                return
+        raise RuntimeError("expert doorbell thread did not catch up before the quiesce timeout.")
 
     def stop(self) -> None:
         """Drain every request posted so far, then join the thread."""

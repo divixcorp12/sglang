@@ -189,6 +189,49 @@ def test_poll_modes_match_reference(poll_mode):
     _assert_matches_reference(sources, destinations, picked_rows, picked_slots)
 
 
+@pytest.mark.parametrize("head_store", ["release", "volatile"])
+def test_head_stores_match_reference(head_store):
+    generator = torch.Generator().manual_seed(59)
+    sources = _sources(90, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 80)
+    picked_rows, picked_slots = _pick(generator, 90, 80, 37)
+    with _copier(sources, destinations, capacity=64, head_store=head_store) as copier:
+        copier.post(*_plan(64, picked_rows, picked_slots))
+        copier.wait()
+        torch.cuda.synchronize()
+        assert copier.stats()["timeouts"] == 0
+    _assert_matches_reference(sources, destinations, picked_rows, picked_slots)
+
+
+def test_quiesce_drains_posted_requests_then_holds_new_ones():
+    """``quiesce`` returns only after every posted request's copy completed, and the thread then
+    services nothing until ``resume``."""
+    generator = torch.Generator().manual_seed(61)
+    sources = _sources(60, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 60)
+    rows, slots = _pick(generator, 60, 60, 40)
+    with _copier(sources, destinations, capacity=10) as copier:
+        for tag in range(3):
+            copier.post(*_plan(10, rows[10 * tag : 10 * (tag + 1)], slots[10 * tag : 10 * (tag + 1)]), tag=tag)
+        copier.quiesce()
+        _assert_matches_reference(sources, destinations, rows[:30], slots[:30])
+        assert copier.stats()["serviced"] == 3
+
+        copier.post(*_plan(10, rows[30:], slots[30:]), tag=3)
+        torch.cuda.synchronize()
+        time.sleep(0.05)
+        assert copier.stats()["serviced"] == 3
+        _assert_matches_reference(sources, destinations, rows[:30], slots[:30])
+
+        copier.resume()
+        copier.wait(tag=3)
+        torch.cuda.synchronize()
+        stats = copier.stats()
+    _assert_matches_reference(sources, destinations, rows, slots)
+    assert stats["serviced"] == 4
+    assert stats["timeouts"] == 0
+
+
 @pytest.mark.parametrize("prefer_overlap", [True, False])
 def test_overlap_preference_matches_reference(prefer_overlap):
     generator = torch.Generator().manual_seed(17)

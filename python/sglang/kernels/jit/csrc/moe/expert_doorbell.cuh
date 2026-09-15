@@ -78,8 +78,23 @@ __device__ __host__ __forceinline__ int64_t record_offset(uint32_t seq, int64_t 
   return kPageHeaderBytes + static_cast<int64_t>((seq - 1u) % static_cast<uint32_t>(ring)) * record_bytes(capacity);
 }
 
+constexpr int64_t kHeadStoreRelease = 0;
+constexpr int64_t kHeadStoreVolatile = 1;
+
 __device__ __forceinline__ void store_release_system(uint32_t* address, uint32_t value) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
+}
+
+__device__ __forceinline__ void store_volatile_global(uint32_t* address, uint32_t value) {
+  asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
+}
+
+__device__ __forceinline__ void store_head(uint32_t* address, uint32_t value, int64_t head_store) {
+  if (head_store == kHeadStoreVolatile) {
+    store_volatile_global(address, value);
+  } else {
+    store_release_system(address, value);
+  }
 }
 
 __device__ __forceinline__ uint32_t load_acquire_device(const uint32_t* address) {
@@ -124,7 +139,8 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
     const int32_t* __restrict__ count,
     int64_t tag,
     int64_t capacity,
-    int64_t ring) {
+    int64_t ring,
+    int64_t head_store) {
   using namespace expert_doorbell;
   __shared__ uint32_t shared_seq;
   __shared__ int64_t shared_count;
@@ -154,7 +170,7 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    store_release_system(reinterpret_cast<uint32_t*>(page + kHeadOffset), shared_seq);
+    store_head(reinterpret_cast<uint32_t*>(page + kHeadOffset), shared_seq, head_store);
   }
 }
 
@@ -248,7 +264,8 @@ void expert_doorbell_post(
     tvm::ffi::TensorView count,
     int64_t tag,
     int64_t capacity,
-    int64_t ring) {
+    int64_t ring,
+    int64_t head_store) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
   host::LaunchKernel(1, expert_doorbell::kBlockSize, stream)(
       expert_doorbell_post_kernel,
@@ -259,7 +276,8 @@ void expert_doorbell_post(
       static_cast<const int32_t*>(count.data_ptr()),
       tag,
       capacity,
-      ring);
+      ring,
+      head_store);
 }
 
 void expert_doorbell_wait(
