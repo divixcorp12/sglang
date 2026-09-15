@@ -116,10 +116,14 @@ has a `DONE` marker, so a killed run resumes by re-invoking the same command.
 2 LLaPor pairs (layers 0, 10) and 1 APEX layer (layer 0) at 2 epochs each:
 ~8s/pair including data load, PCA/ranker fit, dev eval, and manifest write.
 Already showed LLaPor beating both baselines by a wide margin
-(recall@10 0.65 vs. same_expert 0.03 / popularity 0.12) and APEX at
-dev_kl=0.014 after only 2 epochs -- confirmed the pipeline end-to-end before
-the full run. Extrapolating smoke throughput projected the full run at
-roughly 30-45 minutes; actual wall time matched that (below).
+(recall@10 0.65 vs. same_expert 0.03 / popularity 0.12) and confirmed the
+pipeline end-to-end before the full run. (The APEX smoke's dev_kl=0.014 at
+this stage was itself computed with the teacher-input bug described below;
+a second 1-layer APEX smoke after the fix gave dev_kl=0.083 at 5 epochs --
+materially higher, as expected once the teacher is the real router
+distribution rather than the ranker's own input.) Extrapolating smoke
+throughput projected the full run at roughly 30-45 minutes; actual wall
+time matched that (below).
 
 ## Full run
 
@@ -129,16 +133,33 @@ peak combined GPU memory was ~24 GB with GPU utilization pinned near
 100%, host RAM stayed under 45 GB used / free of the 188 GB total.
 
 - **Wall time:** LLaPor 47/47 pairs in ~31 min (30 epochs/pair, ~35-45s
-  each once past the first few PCA fits); APEX 48/48 layers in ~16 min
-  (ranker + CDF fit + calibration per layer, ~12-25s each). Neither hit
+  each once past the first few PCA fits); APEX 48/48 layers in ~15-16 min
+  (ranker + CDF fit + calibration per layer, ~15-26s each). Neither hit
   early stopping in the observed runs (all pairs/layers used their full
   epoch budget); patience=5 never triggered at 30/20 max epochs here.
-- **No crashes** in the full run. Four bugs were caught and fixed during
-  the smoke run before it (see commits below): a device mismatch in the
-  frequency-weight scatter_add, a bf16/float32 dtype mismatch in the APEX
-  ranker's first linear layer, one non-benchmark rid
-  (`HEALTH_CHECK_*`) crashing the split join, and a harmless autograd
-  warning from converting a still-attached loss tensor to a scalar.
+- **No crashes** in either full run. Four bugs were caught and fixed
+  during smoke-testing before the first full run (see commits below): a
+  device mismatch in the frequency-weight scatter_add, a bf16/float32
+  dtype mismatch in the APEX ranker's first linear layer, one
+  non-benchmark rid (`HEALTH_CHECK_*`) crashing the split join, and a
+  harmless autograd warning from converting a still-attached loss tensor
+  to a scalar.
+- **APEX teacher bug (caught after the first full run, by a reviewer).**
+  `train_apex.py` originally loaded only `PRE_MIXER`+`TOPK_IDS` and aliased
+  `pre_mixer` as the variable passed for `router_input`, so the KL teacher
+  was computed as `softmax(pre_mixer @ gate.T)` instead of the real
+  `softmax(router_input @ gate.T)` -- distilling the ranker against a gate
+  applied to its own input feature rather than the actual router
+  distribution. Caught by a suspiciously near-zero mean dev KL (4e-5) in
+  the first full run's results. Fixed by loading `ROUTER_INPUT` alongside
+  `PRE_MIXER`, threading both through with distinct names (ranker reads
+  `pre_mixer`, teacher reads `router_input`), and adding
+  `apex.compute_teacher_probabilities`, which raises if ever handed the
+  same tensor for both roles (regression-tested). The first full run's
+  `apex/` checkpoints were deleted and APEX was retrained from scratch; the
+  numbers below are from that corrected run. **LLaPor's code path never
+  touched `pre_mixer`/the teacher and is unaffected** -- its checkpoints
+  and numbers are from the original run.
 - Checkpoints: `/mnt/nvme2/nvfp4-work/expert-prediction-models/20260915-121630/{llapor,apex}/`,
   one directory per pair/layer with `model.pt`/`pca.pt` (LLaPor) or
   `ranker.pt`/`cdf.pt` (APEX), `manifest.json` (architecture, PCA stats,
@@ -171,39 +192,42 @@ Full budgets 10/12/16/24/32 are in `evaluate_report.json`.
 
 ### APEX: same-layer top-10 coverage, mean across all 48 layers
 
+(Corrected run, after the teacher-input fix above.)
+
 | split / phase | cov@10 | cov@16 | cov@24 | cov@32 |
 |---|---|---|---|---|
-| dev / decode | 0.521 | 0.650 | 0.743 | 0.798 |
-| dev / prefill | 0.516 | 0.647 | 0.741 | 0.796 |
-| shifted_test / decode | 0.549 | 0.682 | 0.771 | 0.820 |
-| shifted_test / prefill | 0.482 | 0.606 | 0.700 | 0.758 |
+| dev / decode | 0.833 | 0.943 | 0.974 | 0.984 |
+| dev / prefill | 0.819 | 0.934 | 0.969 | 0.980 |
+| shifted_test / decode | 0.781 | 0.902 | 0.948 | 0.965 |
+| shifted_test / prefill | 0.748 | 0.871 | 0.925 | 0.948 |
 
-Mean dev KL (ranker vs. teacher): **4e-5** across all 48 layers -- the
-linear-softmax ranker distills the teacher distribution almost exactly.
+Mean dev KL (ranker vs. teacher): **0.0177** across all 48 layers (range
+0.0059-0.0834) -- a real, well-fit distillation, not the near-zero 4e-5
+the buggy teacher produced. `pre_mixer` (an earlier, pre-attention/mixer
+representation) turns out to be a strong same-layer predictor of the real
+router distribution: cov@10 alone already covers ~78-83% of native
+top-10 selections.
 
 ### APEX: ordinal CDF calibration (calibration subset, mean across 48 layers)
 
 | tau | mean requested depth (of 502 = E-K) | empirical full-set coverage |
 |---|---|---|
-| 0.90 | 90.5 | 0.668 |
-| 0.95 | 92.5 | 0.684 |
-| 0.99 | 97.1 | 0.719 |
+| 0.90 | 17.8 | 0.814 |
+| 0.95 | 19.9 | 0.852 |
+| 0.99 | 24.7 | 0.903 |
 
-**None of the three tau settings reaches its nominal coverage target**
-(the spec's target is empirical coverage ~= tau, e.g. ~99% at tau=0.99).
-Reporting the shortfall rather than a calibrated result, per the spec's
-explicit instruction for this case: the CDF is well-fit in KL/BCE terms
-(ranker KL is ~4e-5) but its calibration curve saturates well under 1.0
-long before requesting most of the 502 non-native experts -- i.e. a
-non-trivial share of rows have their true `delta_star` past where the
-learned sigmoid threshold ever crosses tau, so `select_depth` falls back to
-the max depth (E-K) for those rows and calibration still under-covers.
-This is a genuine finding, not a training bug: dev KL is excellent while
-tail-coverage calibration is poor, meaning the ranking is accurate but the
-*worst-case* rank of a native expert has a heavier tail than the ordinal
-CDF's single global threshold per depth captures well. Worth revisiting
-(e.g. per-layer/per-phase tau, or a heavier-tailed ordinal link) before any
-serving use of the calibrated depths.
+Requested depths are tiny relative to the 502-expert non-native space
+(17.8-24.7 extra candidates, not hundreds) -- consistent with the strong
+ranker above. **None of the three tau settings quite reaches its nominal
+coverage target** (empirical coverage should equal tau, e.g. ~99% at
+tau=0.99; observed is ~81-90%), so this is still reported as a shortfall
+per the spec's explicit instruction for that case, but the gap is now
+~8-15 points instead of the buggy run's ~20-30 points, and the practical
+picture is materially different: with the real teacher, a depth budget of
+~25 extra candidates already covers ~90% of the full native set on
+held-out data. Revisit calibration (e.g. per-layer/per-phase tau) before
+any serving use, but this is a much more promising result than the
+pre-fix numbers suggested.
 
 ## Environment
 
@@ -226,3 +250,5 @@ serving use of the calibrated depths.
 - `7beeaadf07` fix(expert-prediction): keep frequency-count scatter_add on the input device
 - `e4abd61cff` fix(expert-prediction): detach the running loss before float() conversion
 - `d4d2b38f7c` fix(expert-prediction): cast the ranker's bf16 pre_mixer input to float32
+- `f316f5a83a` docs(expert-prediction): write up the offline LLaPor/APEX training run (superseded by this revision's APEX numbers)
+- `4d6c95899a` fix(expert-prediction): compute the APEX teacher from router_input, not pre_mixer
