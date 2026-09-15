@@ -64,6 +64,26 @@ class TestLLaPorFocalLoss(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits.grad).all())
 
 
+class TestApexTeacherInput(unittest.TestCase):
+    def test_teacher_rejects_the_rankers_own_input_tensor(self):
+        # Bug regression: train_apex.py once aliased pre_mixer as the
+        # variable it passed for router_input, so the KL teacher was
+        # accidentally computed from the ranker's own input feature instead
+        # of the real post-mixer router_input (caught by a suspiciously
+        # near-zero dev KL in the 2026-09-15 full run).
+        pre_mixer = torch.randn(4, 8)
+        gate_weight = torch.randn(3, 8)
+        with self.assertRaises(ValueError):
+            apex.compute_teacher_probabilities(pre_mixer, gate_weight, pre_mixer=pre_mixer)
+
+    def test_teacher_accepts_a_distinct_router_input_tensor(self):
+        pre_mixer = torch.randn(4, 8)
+        router_input = torch.randn(4, 8)
+        gate_weight = torch.randn(3, 8)
+        probs = apex.compute_teacher_probabilities(router_input, gate_weight, pre_mixer=pre_mixer)
+        self.assertEqual(probs.shape, (4, 3))
+
+
 class TestApexOracleDelta(unittest.TestCase):
     def test_oracle_depth_uses_one_based_rank(self):
         logits = torch.tensor([[9.0, 8.0, 7.0, 6.0, 5.0]])

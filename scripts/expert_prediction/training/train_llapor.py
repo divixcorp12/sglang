@@ -81,6 +81,7 @@ def train_pair(
     group = llapor.layer_group(source_layer)
     rank = llapor.pca_rank_for_group(group)
 
+    t_load = time.time()
     rows = load_layer_rows(
         capture_dir,
         splits,
@@ -97,7 +98,9 @@ def train_pair(
     topk_ids = rows.features["topk_ids"].to(device)
     topk_weights = rows.features["topk_weights"].to(device)
     next_topk_ids = rows.features["next_topk_ids"].to(device)
+    load_seconds = time.time() - t_load
 
+    t_train = time.time()
     pca = fit_pca(router_input[train_mask.to(device)], rank=rank)
     q = llapor.expert_frequency_weights(next_topk_ids[train_mask.to(device)], num_experts).to(device)
 
@@ -108,6 +111,7 @@ def train_pair(
     best_metric, best_state, epochs_without_improve = -1.0, None, 0
     history = []
     for epoch in range(max_epochs):
+        t_epoch = time.time()
         lr = _lr_at_epoch(epoch, _LR[group], max_epochs)
         for group_param in optimizer.param_groups:
             group_param["lr"] = lr
@@ -135,6 +139,11 @@ def train_pair(
         dev_metrics = _evaluate(model, u_dev, next_topk_ids[dev_idx], num_experts, topk_ids[dev_idx])
         dev_metrics["train_loss"] = epoch_loss
         history.append({"epoch": epoch, **dev_metrics})
+        print(
+            f"layer {source_layer} ({group}): epoch {epoch} loss={epoch_loss:.4f} "
+            f"dev_recall@16={dev_metrics['llapor_recall@16']:.4f} in {time.time() - t_epoch:.1f}s",
+            flush=True,
+        )
         selection_metric = dev_metrics["llapor_recall@16"]
         if selection_metric > best_metric:
             best_metric = selection_metric
@@ -146,8 +155,17 @@ def train_pair(
                 break
 
     model.load_state_dict(best_state)
+    train_seconds = time.time() - t_train
 
-    report = {"group": group, "pca_rank": rank, "epochs_trained": len(history), "history": history}
+    t_eval = time.time()
+    report = {
+        "group": group,
+        "pca_rank": rank,
+        "epochs_trained": len(history),
+        "history": history,
+        "load_seconds": load_seconds,
+        "train_seconds": train_seconds,
+    }
     for name, mask in (("dev", dev_mask), ("shifted_test", test_mask)):
         mask_dev = mask.to(device)
         for phase_name, phase_mask in (
@@ -163,6 +181,7 @@ def train_pair(
             report[f"{name}_{phase_name}"] = _evaluate(
                 model, u, next_topk_ids[idx], num_experts, topk_ids[idx]
             )
+    report["eval_seconds"] = time.time() - t_eval
 
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(best_state, out_dir / "model.pt")
@@ -227,7 +246,12 @@ def main() -> None:
             seed=args.seed,
         )
         elapsed = time.time() - t0
-        print(f"layer {source_layer}: {report['epochs_trained']} epochs in {elapsed:.1f}s")
+        print(
+            f"layer {source_layer}: {report['epochs_trained']} epochs, "
+            f"load={report['load_seconds']:.1f}s train={report['train_seconds']:.1f}s "
+            f"eval={report['eval_seconds']:.1f}s total={elapsed:.1f}s",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

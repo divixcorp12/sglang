@@ -32,6 +32,19 @@ def teacher_probabilities(router_input: torch.Tensor, gate_weight: torch.Tensor)
     return F.softmax(logits, dim=-1)
 
 
+def compute_teacher_probabilities(
+    router_input: torch.Tensor, gate_weight: torch.Tensor, *, pre_mixer: torch.Tensor
+) -> torch.Tensor:
+    """teacher_probabilities, but rejects being fed the ranker's own pre_mixer
+    input tensor as router_input. The teacher must be the real post-mixer
+    router distribution the ranker is trying to distill, not a gate applied
+    to the ranker's own feature -- that would make the KL target a linear
+    function of the ranker's input instead of the real router."""
+    if router_input is pre_mixer:
+        raise ValueError("teacher must be computed from router_input, not the ranker's pre_mixer input")
+    return teacher_probabilities(router_input, gate_weight)
+
+
 def ranker_kl_loss(rank_logits: torch.Tensor, teacher_probs: torch.Tensor) -> torch.Tensor:
     return F.kl_div(
         F.log_softmax(rank_logits.float(), dim=-1), teacher_probs.float(), reduction="batchmean"

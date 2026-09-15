@@ -6,6 +6,8 @@ section 4 and the offline-training write-up for the exact contract.
 Teacher distribution: softmax(router_input @ gate.weight.T), matching this
 model's TopK scoring_func="softmax" (no grouped-topk/correction bias); see
 scripts/expert_prediction/check-capture-gate-topk.py for the same gate lookup.
+The ranker itself reads pre_mixer (the earlier, causally-available feature);
+router_input is only ever used to build the teacher it distills against.
 """
 
 from __future__ import annotations
@@ -66,28 +68,50 @@ def _lr_at_epoch(epoch: int, base_lr: float, max_epochs: int, warmup_epochs: int
 
 
 def _train_ranker(
-    *, router_input, gate_weight, train_idx, dev_idx, num_experts, device, max_epochs, patience, batch_size, seed
+    *,
+    pre_mixer,
+    router_input,
+    gate_weight,
+    train_idx,
+    dev_idx,
+    num_experts,
+    device,
+    max_epochs,
+    patience,
+    batch_size,
+    seed,
+    layer_id,
 ):
     torch.manual_seed(seed)
-    model = apex.Ranker(hidden_size=router_input.shape[1], num_experts=num_experts).to(device)
+    model = apex.Ranker(hidden_size=pre_mixer.shape[1], num_experts=num_experts).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=_WD)
     best_loss, best_state, stale = float("inf"), None, 0
     for epoch in range(max_epochs):
+        t0 = time.time()
         lr = _lr_at_epoch(epoch, _LR, max_epochs)
         for group in optimizer.param_groups:
             group["lr"] = lr
         perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
         for start in range(0, perm.numel(), batch_size):
             idx = perm[start : start + batch_size]
-            teacher = apex.teacher_probabilities(router_input[idx], gate_weight)
-            loss = apex.ranker_kl_loss(model(router_input[idx]), teacher)
+            teacher = apex.compute_teacher_probabilities(
+                router_input[idx], gate_weight, pre_mixer=pre_mixer[idx]
+            )
+            loss = apex.ranker_kl_loss(model(pre_mixer[idx]), teacher)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
         with torch.no_grad():
-            teacher_dev = apex.teacher_probabilities(router_input[dev_idx], gate_weight)
-            dev_loss = float(apex.ranker_kl_loss(model(router_input[dev_idx]), teacher_dev))
+            teacher_dev = apex.compute_teacher_probabilities(
+                router_input[dev_idx], gate_weight, pre_mixer=pre_mixer[dev_idx]
+            )
+            dev_loss = float(apex.ranker_kl_loss(model(pre_mixer[dev_idx]), teacher_dev))
+        print(
+            f"layer {layer_id} ranker: epoch {epoch} dev_kl={dev_loss:.6f} "
+            f"in {time.time() - t0:.1f}s",
+            flush=True,
+        )
         if dev_loss < best_loss:
             best_loss, best_state, stale = dev_loss, {k: v.clone() for k, v in model.state_dict().items()}, 0
         else:
@@ -98,15 +122,15 @@ def _train_ranker(
     return model, best_loss
 
 
-def _fit_cdf(*, model, router_input, topk_ids, cdf_idx, num_experts, top_k, device, max_epochs, batch_size, seed):
+def _fit_cdf(*, model, pre_mixer, topk_ids, cdf_idx, num_experts, top_k, device, max_epochs, batch_size, seed):
     torch.manual_seed(seed)
     with torch.no_grad():
-        logits = model(router_input[cdf_idx])
+        logits = model(pre_mixer[cdf_idx])
         delta_star = apex.oracle_delta(logits, topk_ids[cdf_idx])
     num_depths = num_experts - top_k + 1
-    cdf = apex.OrdinalCDF(hidden_size=router_input.shape[1], num_depths=num_depths).to(device)
+    cdf = apex.OrdinalCDF(hidden_size=pre_mixer.shape[1], num_depths=num_depths).to(device)
     optimizer = torch.optim.AdamW(cdf.parameters(), lr=1e-3, weight_decay=0.0)
-    x = router_input[cdf_idx]
+    x = pre_mixer[cdf_idx]
     for _epoch in range(max_epochs):
         perm = torch.randperm(x.shape[0], device=device)
         for start in range(0, perm.numel(), batch_size):
@@ -118,11 +142,11 @@ def _fit_cdf(*, model, router_input, topk_ids, cdf_idx, num_experts, top_k, devi
     return cdf, num_depths
 
 
-def _calibrate(*, model, cdf, router_input, topk_ids, calib_idx, num_depths):
+def _calibrate(*, model, cdf, pre_mixer, topk_ids, calib_idx, num_depths):
     with torch.no_grad():
-        rank_logits = model(router_input[calib_idx])
+        rank_logits = model(pre_mixer[calib_idx])
         delta_star = apex.oracle_delta(rank_logits, topk_ids[calib_idx])
-        cdf_logits = cdf(router_input[calib_idx])
+        cdf_logits = cdf(pre_mixer[calib_idx])
     result = {}
     for tau in _TAUS:
         chosen_depth = apex.select_depth(cdf_logits, tau, num_depths - 1)
@@ -148,16 +172,19 @@ def train_layer(
     batch_size: int,
     seed: int,
 ) -> dict:
+    t_load = time.time()
     rows = load_layer_rows(
         capture_dir,
         splits,
         layer_id=layer_id,
-        features=(RouteFeature.PRE_MIXER, RouteFeature.TOPK_IDS),
+        features=(RouteFeature.PRE_MIXER, RouteFeature.ROUTER_INPUT, RouteFeature.TOPK_IDS),
     )
     subset_of_session = carve_apex_train_subsets(splits, seed=seed)
     is_decode = rows.is_decode
-    router_input = rows.features["pre_mixer"].to(device)
+    pre_mixer = rows.features["pre_mixer"].to(device)
+    router_input = rows.features["router_input"].to(device)
     topk_ids = rows.features["topk_ids"].to(device)
+    load_seconds = time.time() - t_load
 
     dev_mask = split_mask(rows, splits, "dev")
     test_mask = split_mask(rows, splits, "shifted_test")
@@ -169,7 +196,9 @@ def train_layer(
 
     train_idx = train_subset.nonzero(as_tuple=True)[0].to(device)
     dev_idx = dev_mask.nonzero(as_tuple=True)[0].to(device)
+    t_train = time.time()
     model, dev_kl = _train_ranker(
+        pre_mixer=pre_mixer,
         router_input=router_input,
         gate_weight=gate_weight,
         train_idx=train_idx,
@@ -180,12 +209,14 @@ def train_layer(
         patience=patience,
         batch_size=batch_size,
         seed=seed,
+        layer_id=layer_id,
     )
+    train_seconds = time.time() - t_train
 
     cdf_idx = cdf_subset.nonzero(as_tuple=True)[0].to(device)
     cdf, num_depths = _fit_cdf(
         model=model,
-        router_input=router_input,
+        pre_mixer=pre_mixer,
         topk_ids=topk_ids,
         cdf_idx=cdf_idx,
         num_experts=num_experts,
@@ -198,11 +229,18 @@ def train_layer(
 
     calib_idx = calib_subset.nonzero(as_tuple=True)[0].to(device)
     calibration = _calibrate(
-        model=model, cdf=cdf, router_input=router_input, topk_ids=topk_ids,
+        model=model, cdf=cdf, pre_mixer=pre_mixer, topk_ids=topk_ids,
         calib_idx=calib_idx, num_depths=num_depths,
     )
 
-    report = {"dev_kl": dev_kl, "calibration": calibration, "coverage": {}}
+    t_eval = time.time()
+    report = {
+        "dev_kl": dev_kl,
+        "calibration": calibration,
+        "coverage": {},
+        "load_seconds": load_seconds,
+        "train_seconds": train_seconds,
+    }
     for name, mask in (("dev", dev_mask), ("shifted_test", test_mask)):
         for phase_name, phase_mask in (
             ("decode", mask & is_decode), ("prefill", mask & ~is_decode),
@@ -211,20 +249,21 @@ def train_layer(
             if idx.numel() == 0:
                 continue
             with torch.no_grad():
-                rank_logits = model(router_input[idx])
+                rank_logits = model(pre_mixer[idx])
             report["coverage"][f"{name}_{phase_name}"] = {
                 f"top10_coverage@{depth}": metrics.recall_at_budget(
                     metrics.topk_candidates(rank_logits, depth), topk_ids[idx]
                 )
                 for depth in (10, 16, 24, 32)
             }
+    report["eval_seconds"] = time.time() - t_eval
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ranker_state = model.state_dict()
     torch.save(ranker_state, out_dir / "ranker.pt")
     torch.save(cdf.state_dict(), out_dir / "cdf.pt")
     manifest = {
-        "architecture": {"hidden_size": router_input.shape[1], "num_experts": num_experts, "top_k": top_k},
+        "architecture": {"hidden_size": pre_mixer.shape[1], "num_experts": num_experts, "top_k": top_k},
         "layer_id": layer_id,
         "gate_transform": "softmax(router_input @ gate.weight.T)",
         "split_session_hashes": {
@@ -288,7 +327,12 @@ def main() -> None:
             seed=args.seed,
         )
         elapsed = time.time() - t0
-        print(f"layer {layer_id}: dev_kl={report['dev_kl']:.4f} in {elapsed:.1f}s")
+        print(
+            f"layer {layer_id}: dev_kl={report['dev_kl']:.4f} load={report['load_seconds']:.1f}s "
+            f"train={report['train_seconds']:.1f}s eval={report['eval_seconds']:.1f}s "
+            f"total={elapsed:.1f}s",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
