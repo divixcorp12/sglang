@@ -825,6 +825,7 @@ class ExpertHotCacheManager:
         doorbell_degraded_polls: int = 0,
         doorbell_drain_polls: int = 0,
         doorbell_plan_capacity: int = 0,
+        doorbell_fatal_wait_s: float = 30.0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1030,6 +1031,7 @@ class ExpertHotCacheManager:
                 doorbell_degraded_polls,
                 doorbell_drain_polls,
                 doorbell_plan_capacity,
+                doorbell_fatal_wait_s,
             )
             if expert_doorbell
             else None
@@ -1192,6 +1194,7 @@ class ExpertHotCacheManager:
         degraded_polls: int,
         drain_polls: int,
         plan_capacity: int = 0,
+        fatal_wait_s: float = 30.0,
     ) -> "ExpertDoorbellCopier":
         """Serve every graph-gather layer's host miss plans through one doorbell thread.
 
@@ -1208,7 +1211,9 @@ class ExpertHotCacheManager:
         as 250 ns. A zero drain budget is about 2 s: that long after a timed-out
         resolve of a request the thread had committed to, the copier is disabled
         for the rest of the process and the resolve keeps waiting for that
-        request's copies, so none lands on a later forward's scratch rows.
+        request's copies, so none lands on a later forward's scratch rows. If
+        they have not landed ``fatal_wait_s`` later, the copier's watchdog
+        aborts the process with an ERROR on stderr.
         """
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
         from sglang.srt.layers.moe.expert_row_plan import (
@@ -1253,6 +1258,7 @@ class ExpertHotCacheManager:
             timeout_polls=timeout_polls,
             degraded_polls=degraded_polls,
             drain_polls=drain_polls,
+            fatal_wait_s=fatal_wait_s,
             copy_api="batch",
             src_access_order="stream",
             stream=torch.cuda.Stream(device),
@@ -1291,6 +1297,7 @@ class ExpertHotCacheManager:
                     "timeout_polls": timeout_polls,
                     "degraded_polls": degraded_polls,
                     "drain_polls": drain_polls,
+                    "fatal_wait_s": fatal_wait_s,
                     "largest_copy_bytes": int(largest_copy_s * link_bytes_per_s),
                     "spin_cpu": spin_cpu,
                 },
@@ -1315,6 +1322,15 @@ class ExpertHotCacheManager:
         if doorbell is None:
             return
         stats = doorbell.stats()
+        if stats.get("fatal_timeouts"):
+            logger.error(
+                "Expert doorbell: a disabled drain ran past its fatal bound without the watchdog "
+                "aborting (%d times); rows may be corrupt, stopping the scheduler",
+                stats["fatal_timeouts"],
+            )
+            raise RuntimeError(
+                "expert doorbell fatal wait exhausted: a committed copy never completed"
+            )
         if stats.get("disabled") and not getattr(self, "_doorbell_disabled_logged", False):
             self._doorbell_disabled_logged = True
             logger.warning(
@@ -1332,6 +1348,7 @@ class ExpertHotCacheManager:
                         "disabled",
                         "disabled_posts",
                         "discarded_disabled",
+                        "fatal_timeouts",
                         "posted",
                         "waits",
                         "timeouts",

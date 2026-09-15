@@ -9,7 +9,9 @@
 //                      before its final abandoned/disabled check and before
 //                      it queues any copy
 //   [8]  u32 disabled  release-stored 1 by the first drain that runs out
-//   [12] u32 reserved
+//   [12] u32 fatal     sequence a disabled drain is still waiting for (0 when
+//                      none); the thread's watchdog aborts the process if it
+//                      stays set longer than the fatal wait
 //   [16] u32 abandoned[max_tags]  last sequence a resolve of that tag gave up on
 //   [header_bytes] ring records, record k holds sequence (k + 1) mod ring:
 //        {u32 seq, u32 count, u32 tag, u32 unserviced,
@@ -19,9 +21,10 @@
 //
 // Device state (int32 words): posted, disabled, degraded, timeouts, waits,
 // last polls, record mismatches, resolved, drain timeouts, drains, drain
-// pending, disabled posts, then one sequence per tag (0 = nothing posted).
+// pending, disabled posts, fatal timeouts, then one sequence per tag (0 =
+// nothing posted).
 // A separate int32 word per tag holds the delivered flag of its latest post.
-// Completion lives in two device words {seq, unserviced} written only by the
+// Completion lives in two device words {seq, seq if copied else 0} written only by the
 // thread's eight-byte host-to-device copy, queued behind that request's row
 // copies on the thread's stream, so the words reach a sequence only after
 // the rows it covers have landed. Sequence 0 is never posted; it means
@@ -45,6 +48,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -60,6 +65,7 @@ constexpr int kBlockSize = 32;
 constexpr int64_t kHeadOffset = 0;
 constexpr int64_t kClaimedOffset = 4;
 constexpr int64_t kDisabledOffset = 8;
+constexpr int64_t kFatalOffset = 12;
 constexpr int64_t kAbandonedBase = 16;
 constexpr int64_t kRecordHeaderBytes = 16;
 constexpr int64_t kRecordUnservicedOffset = 12;
@@ -76,7 +82,8 @@ constexpr int64_t kDrainTimeouts = 8;
 constexpr int64_t kDrains = 9;
 constexpr int64_t kDrainPending = 10;
 constexpr int64_t kDisabledPosts = 11;
-constexpr int64_t kTagBase = 12;
+constexpr int64_t kFatalTimeouts = 12;
+constexpr int64_t kTagBase = 13;
 
 constexpr int64_t kFirstChunkPolls = 256;
 constexpr int64_t kChunkGrowth = 4;
@@ -183,19 +190,15 @@ __device__ __forceinline__ uint32_t poll_completion(
   return observed;
 }
 
-// Whether the thread copied the published `seq`. While the completion words
-// still hold `seq`, their unserviced word answers with device loads, checked
-// again after the load so a later publish cannot pair another request's flag
-// with this sequence. Once a later request was published, the record's
-// unserviced mark answers; an overwritten record counts as a mismatch and as
-// not delivered.
+// Whether the thread copied the published `seq`. The second completion word
+// holds a sequence only when the thread copied that very request, so reading
+// `seq` there proves delivery; no other publish can write it, whatever the
+// byte order of a concurrent write. Otherwise the record's unserviced mark
+// answers; an overwritten record counts as a mismatch and as not delivered.
 __device__ __forceinline__ int32_t delivered_flag(
     const uint8_t* page, int32_t* state, const uint32_t* done, int64_t record, uint32_t seq) {
-  if (load_acquire_device(done) == seq) {
-    const uint32_t unserviced = load_acquire_device(done + 1);
-    if (load_acquire_device(done) == seq) {
-      return unserviced == 0 ? 1 : 0;
-    }
+  if (load_acquire_device(done + 1) == seq) {
+    return 1;
   }
   const auto header = reinterpret_cast<const uint32_t*>(page + record);
   if (header[0] != seq) {
@@ -340,10 +343,14 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
 // queues behind that request's copies, so they land before the resolve
 // returns instead of after a later write to the same slots. If the final
 // chunk runs out, the copier is disabled for good (the thread discards every
-// request it has not committed to, and later posts post nothing) and the
-// chunk keeps waiting without a bound for this committed request's copies:
-// once queued on a live stream they complete, and returning earlier would
-// let them land on rows a later forward writes.
+// request it has not committed to, and later posts post nothing), the chunk
+// release-stores the sequence into the page's fatal word and keeps waiting
+// for this committed request's copies, since returning earlier would let
+// them land on rows a later forward writes. The thread's watchdog aborts the
+// process if that word stays set past the fatal wait, so a stuck copy is a
+// crash rather than a hang. `fatal_polls` bounds the wait only as a backstop
+// for a watchdog that could not act: that exhaustion is counted and resolves
+// undelivered.
 __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbell_drain_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
@@ -355,6 +362,7 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
     int64_t header_bytes,
     int64_t chunk_polls,
     int64_t final_chunk,
+    int64_t fatal_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   if (threadIdx.x != 0) {
@@ -375,7 +383,15 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
       state[kDisabled] = 1;
       store_release_system(reinterpret_cast<uint32_t*>(page + kDisabledOffset), 1u);
     }
-    observed = poll_completion(done, seq, -1, poll_mode, state);
+    store_release_system(reinterpret_cast<uint32_t*>(page + kFatalOffset), seq);
+    observed = poll_completion(done, seq, fatal_polls, poll_mode, state);
+    if (!reached(observed, seq)) {
+      state[kFatalTimeouts] += 1;
+      state[kDrainPending] = 0;
+      state[kResolved] = static_cast<int32_t>(seq);
+      return;
+    }
+    store_release_system(reinterpret_cast<uint32_t*>(page + kFatalOffset), 0u);
   }
   state[kDrainPending] = 0;
   state[kResolved] = static_cast<int32_t>(seq);
@@ -423,6 +439,7 @@ void expert_doorbell_resolve(
     int64_t timeout_polls,
     int64_t degraded_polls,
     int64_t drain_polls,
+    int64_t fatal_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   const auto stream = host::LaunchKernel::resolve_device(state.device());
@@ -477,6 +494,7 @@ void expert_doorbell_resolve(
         header_bytes,
         chunk_polls,
         static_cast<int64_t>(final_chunk),
+        fatal_polls,
         poll_mode);
     if (final_chunk) {
       break;
@@ -599,7 +617,8 @@ class DoorbellThread {
       bool prefer_overlap,
       int64_t copy_api,
       int64_t src_access_order,
-      ::cudaStream_t external_stream)
+      ::cudaStream_t external_stream,
+      int64_t fatal_wait_ns)
       : page_(page),
         capacity_(capacity),
         ring_(ring),
@@ -627,6 +646,7 @@ class DoorbellThread {
         publish_serviced_(publish_ring, 0),
         publish_tags_(publish_ring, 0),
         stream_(external_stream),
+        fatal_wait_ns_(fatal_wait_ns),
         trace_(kTraceCapacity) {
     for (auto& counter : counters_) {
       counter.store(0);
@@ -645,6 +665,7 @@ class DoorbellThread {
       thread_.join();
       return false;
     }
+    watchdog_ = std::thread([this] { watch(); });
     return true;
   }
 
@@ -652,6 +673,9 @@ class DoorbellThread {
     stop_.store(true);
     if (thread_.joinable()) {
       thread_.join();
+    }
+    if (watchdog_.joinable()) {
+      watchdog_.join();
     }
   }
 
@@ -695,6 +719,40 @@ class DoorbellThread {
   }
 
  private:
+  /// Fail-stop watchdog, on its own thread so a spin thread stuck inside a CUDA
+  /// call cannot silence it. A disabled drain release-stores the sequence it
+  /// still waits for into the page's fatal word and clears it once that
+  /// request's copies landed; if the same sequence stays there longer than the
+  /// fatal wait, the watchdog reports it on stderr and aborts the process, since
+  /// the resolve can neither return safely nor wait forever.
+  void watch() {
+    uint32_t watched = 0;
+    int64_t since_ns = 0;
+    while (!stop_.load(std::memory_order_relaxed)) {
+      const uint32_t waiting = read_host_word(page_ + kFatalOffset);
+      const int64_t now_ns = monotonic_ns();
+      if (waiting == 0) {
+        watched = 0;
+      } else if (waiting != watched) {
+        watched = waiting;
+        since_ns = now_ns;
+      } else if (now_ns - since_ns > fatal_wait_ns_) {
+        std::fprintf(
+            stderr,
+            "ERROR expert doorbell: request %u was committed to copy but did not complete %.1f s after "
+            "the copier was disabled (last seen %lld, serviced %lld); aborting the process instead of "
+            "hanging decode or letting the copy land on rows a later forward writes\n",
+            waiting,
+            static_cast<double>(fatal_wait_ns_) / 1e9,
+            static_cast<long long>(counters_[kLastSeen].load()),
+            static_cast<long long>(counters_[kServiced].load()));
+        std::fflush(stderr);
+        std::abort();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+
   void run() {
     if (::cudaSetDevice(device_) != ::cudaSuccess || (owns_stream_ && ::cudaStreamCreate(&stream_) != ::cudaSuccess)) {
       failed_.store(true);
@@ -864,7 +922,7 @@ class DoorbellThread {
     publish(seq, tag, entry, false);
   }
 
-  /// Queue the eight-byte publish of `{seq, unserviced}` into the completion
+  /// Queue the eight-byte publish of `{seq, serviced ? seq : 0}` into the completion
   /// words behind everything already queued on the stream.
   void publish(uint32_t seq, uint32_t tag, TraceEntry& entry, bool serviced) {
     const int64_t slot = publish_cursor_++ % publish_ring_;
@@ -873,10 +931,15 @@ class DoorbellThread {
       poll_completions();
     }
     publish_words_[2 * slot] = static_cast<int32_t>(seq);
-    publish_words_[2 * slot + 1] = serviced ? 0 : 1;
+    publish_words_[2 * slot + 1] = serviced ? static_cast<int32_t>(seq) : 0;
     publish_serviced_[slot] = serviced ? 1 : 0;
     publish_tags_[slot] = static_cast<int64_t>(tag) < max_tags_ ? tag : 0;
-    ::cudaMemcpyAsync(done_, publish_words_ + 2 * slot, 2 * sizeof(uint32_t), ::cudaMemcpyHostToDevice, stream_);
+    const ::cudaError_t publish_status =
+        ::cudaMemcpyAsync(done_, publish_words_ + 2 * slot, 2 * sizeof(uint32_t), ::cudaMemcpyHostToDevice, stream_);
+    if (publish_status != ::cudaSuccess) {
+      counters_[kCopyErrors].fetch_add(1);
+      counters_[kLastCopyError].store(static_cast<int64_t>(publish_status));
+    }
     ::cudaEventRecord(publish_events_[slot], stream_);
     entry.enqueued_ns = monotonic_ns();
     entry.publish_slot = slot;
@@ -978,7 +1041,9 @@ class DoorbellThread {
   size_t pending_head_ = 0;
   int64_t publish_cursor_ = 0;
   ::cudaStream_t stream_ = nullptr;
+  int64_t fatal_wait_ns_;
   std::thread thread_;
+  std::thread watchdog_;
   std::atomic<bool> started_{false};
   std::atomic<bool> failed_{false};
   std::atomic<bool> stop_{false};
@@ -1023,7 +1088,8 @@ int64_t expert_doorbell_start(
     int64_t prefer_overlap,
     int64_t copy_api,
     int64_t src_access_order,
-    int64_t external_stream) {
+    int64_t external_stream,
+    int64_t fatal_wait_ns) {
   using namespace expert_doorbell;
   const auto table = static_cast<const int64_t*>(segment_table.data_ptr());
   std::vector<Segment> segments(segment_table.size(0));
@@ -1051,7 +1117,8 @@ int64_t expert_doorbell_start(
       prefer_overlap != 0,
       copy_api,
       src_access_order,
-      reinterpret_cast<::cudaStream_t>(static_cast<intptr_t>(external_stream)));
+      reinterpret_cast<::cudaStream_t>(static_cast<intptr_t>(external_stream)),
+      fatal_wait_ns);
   if (!thread->start()) {
     return -1;
   }

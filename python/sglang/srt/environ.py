@@ -344,6 +344,9 @@ class Envs:
     # Which layer a doorbell plan targets: "current" posts and resolves layer
     # L's misses inside layer L; "next_layer" is reserved for prediction.
     SGLANG_MOE_EXPERT_DOORBELL_MODE = EnvStr("current")
+    # Seconds a disabled drain may wait for a committed copy before the
+    # doorbell watchdog aborts the process (a crash instead of a hang).
+    SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S = EnvFloat(30.0)
     # Static plan capacity per target layer; 0 uses the layer's scratch rows.
     SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY = EnvInt(0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)

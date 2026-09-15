@@ -4,7 +4,8 @@ Inside a CUDA graph, ``ExpertDoorbellCopier.post`` launches a kernel that
 writes a copy plan into a pinned request page and bumps its sequence last. A
 C++ thread spinning on that sequence copies the planned pinned rows to their
 device slots with one batched copy on a CUDA stream, then queues an eight-byte
-publish of ``{sequence, unserviced}`` into device completion words.
+publish of ``{sequence, sequence if copied else 0}`` into device completion
+words.
 ``ExpertDoorbellCopier.resolve`` launches a chain of short kernels that block
 until those words reach the tag's request and set the tag's device delivered
 flag, or give up after ``timeout_polls`` and report nothing delivered; when
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
 
 _ABANDONED_BASE = 16
 _RECORD_HEADER_BYTES = 16
-_TAG_BASE = 12
+_TAG_BASE = 13
+_POLL_SECONDS = 250e-9
+_FATAL_BACKSTOP = 4
 _PUBLISH_RING = 1024
 _TRACE_ROWS = 4096
 _POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
@@ -54,6 +57,7 @@ _STATE_WORDS = {
     "drains": 9,
     "drain_pending": 10,
     "disabled_posts": 11,
+    "fatal_timeouts": 12,
 }
 _COUNTERS = (
     "serviced",
@@ -182,7 +186,11 @@ class ExpertDoorbellCopier:
       for that committed request's copies, so no copy ever lands after its
       resolve returned; once disabled every later ``post`` posts nothing
       (``disabled_posts``) and the thread discards what it had not committed
-      to (``discarded_disabled``).
+      to (``discarded_disabled``). That wait is fail-stop: if the copies have
+      not landed ``fatal_wait_s`` later, a watchdog thread reports an ERROR on
+      stderr and aborts the process. A kernel-side bound of four times that
+      wait backstops a watchdog that could not act; reaching it is counted
+      (``fatal_timeouts``) and resolves undelivered.
     * Source rows must stay allocated, registered and unchanged while any
       request naming them is outstanding.
     * At most ``ring - 1`` requests may be posted between a ``post`` and its
@@ -201,6 +209,7 @@ class ExpertDoorbellCopier:
         timeout_polls: int = 2_000_000,
         degraded_polls: int = 4_096,
         drain_polls: int = 8_000_000,
+        fatal_wait_s: float = 30.0,
         prefer_overlap: bool = True,
         poll_mode: str = "acquire",
         head_store: str = "release",
@@ -216,6 +225,8 @@ class ExpertDoorbellCopier:
             raise ValueError("max_tags must be positive.")
         if timeout_polls < 0 or degraded_polls < 0 or drain_polls < 0:
             raise ValueError("poll limits must not be negative.")
+        if not fatal_wait_s > 0:
+            raise ValueError("fatal_wait_s must be positive.")
         if poll_mode not in _POLL_MODES:
             raise ValueError(f"poll_mode must be one of {sorted(_POLL_MODES)}.")
         if head_store not in _HEAD_STORES:
@@ -249,6 +260,8 @@ class ExpertDoorbellCopier:
         self.timeout_polls = timeout_polls
         self.degraded_polls = degraded_polls
         self.drain_polls = drain_polls
+        self.fatal_wait_s = fatal_wait_s
+        self.fatal_polls = int(_FATAL_BACKSTOP * fatal_wait_s / _POLL_SECONDS) + 1
         self.poll_mode = _POLL_MODES[poll_mode]
         self.head_store = _HEAD_STORES[head_store]
         self.device = device
@@ -303,6 +316,7 @@ class ExpertDoorbellCopier:
             _COPY_APIS[copy_api],
             _SRC_ACCESS_ORDERS[src_access_order],
             stream.cuda_stream if stream is not None else 0,
+            int(fatal_wait_s * 1e9),
         )
         if self._handle < 0:
             raise RuntimeError("expert doorbell thread failed to start.")
@@ -370,6 +384,7 @@ class ExpertDoorbellCopier:
             self.timeout_polls,
             self.degraded_polls,
             self.drain_polls,
+            self.fatal_polls,
             self.poll_mode,
         )
         return self.delivered[tag : tag + 1]

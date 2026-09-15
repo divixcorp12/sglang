@@ -457,7 +457,7 @@ def test_graph_launch_lets_torch_stream_copies_overlap_compute():
 
         def post_and_compute():
             copier.post(*plan)
-            for _ in range(16):
+            for _ in range(128):
                 torch.matmul(compute_in, compute_in, out=compute_out)
 
         graph = _capture(lambda: post_and_compute())
@@ -766,6 +766,59 @@ def test_resolving_an_earlier_tag_does_not_wait_for_a_later_tags_request():
     assert stats["serviced"] == 2 and stats["timeouts"] == 0
     assert first_s < 0.8, first_s
     assert both_s >= 0.9, both_s
+
+
+_FAIL_STOP_CHILD = """
+import sys
+import torch
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+core = int(sys.argv[1])
+source = torch.randint(0, 256, (8, 64), dtype=torch.uint8).pin_memory()
+destination = torch.zeros((8, 64), dtype=torch.uint8, device="cuda")
+copier = ExpertDoorbellCopier(
+    expert_row_segments([(source, destination)]),
+    4,
+    cpu_core=core,
+    stream=torch.cuda.Stream(),
+    timeout_polls=20_000,
+    drain_polls=70_000,
+    fatal_wait_s=0.5,
+)
+copier.inject_fault(service_delay_s=6.0)
+rows = torch.tensor([1, 2, 0, 0], dtype=torch.int64, device="cuda")
+slots = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda")
+count = torch.tensor([2], dtype=torch.int32, device="cuda")
+copier.post(rows, slots, count)
+print("POSTED", flush=True)
+copier.resolve()
+torch.cuda.synchronize()
+print("RETURNED", copier.stats(), flush=True)
+"""
+
+
+def test_a_disabled_drain_that_outlives_the_fatal_wait_aborts_the_process():
+    """Fail-stop: a committed copy stuck past the drain budget disables the copier, and if it
+    still has not landed after the fatal wait the watchdog aborts the process with an ERROR
+    instead of hanging the resolve or returning before the copy lands."""
+    import signal
+    import subprocess
+    import sys
+
+    started = time.perf_counter()
+    child = subprocess.run(
+        [sys.executable, "-c", _FAIL_STOP_CHILD, str(SPIN_CORE)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    elapsed = time.perf_counter() - started
+    assert "POSTED" in child.stdout, child.stderr[-2000:]
+    assert "RETURNED" not in child.stdout, child.stdout
+    assert child.returncode == -signal.SIGABRT, (child.returncode, child.stderr[-2000:])
+    assert "ERROR expert doorbell" in child.stderr, child.stderr[-2000:]
+    assert elapsed < 60.0
 
 
 def test_stop_drains_posted_requests_and_is_idempotent():

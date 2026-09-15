@@ -714,6 +714,132 @@ class TestExpertGraphGather(unittest.TestCase):
         finally:
             copier.stop()
 
+    def test_flag_off_gather_matches_the_pre_doorbell_path(self):
+        """Flag off, ``_gather_graph`` issues the same torch ops and the same copy-kernel call
+        (same plan tensors, rows, slots and count) and writes the same routes and cache bytes as
+        7de955329a's ``_gather_graph``, reproduced verbatim below as the reference."""
+        from sglang.srt.layers.moe import expert_row_plan
+        from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes
+
+        def reference_gather(self, topk_ids):
+            self._check_graph_sources()
+            if self.residency_update is not None:
+                self.residency_update.on_graph_forward(topk_ids.shape[0])
+            cache = self.hot_cache
+            flat = topk_ids.reshape(-1).long()
+            count = flat.numel()
+            plan = plan_graph_routes(
+                flat, cache.expert_to_slot, self.graph_gather_rows, cache.capacity
+            )
+            plan_rows = plan.source_rows.numel()
+            scratch = self._graph_scratch_slots[:plan_rows]
+            self._graph_source_rows[:plan_rows].copy_(plan.source_rows)
+            self._graph_miss_count.copy_(plan.miss_plan_rows.reshape(1))
+            for source, destination in self._graph_device_pairs:
+                destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
+                    0,
+                    scratch,
+                    source.view(torch.uint8)
+                    .reshape(source.shape[0], -1)
+                    .index_select(0, plan.source_rows),
+                )
+            if self._graph_row_segments is not None:
+                self._copy_row_segments_gpu(
+                    self._graph_row_segments,
+                    self._graph_source_rows,
+                    self._graph_destination_slots,
+                    self._graph_miss_count,
+                )
+            self.graph_counters[0].add_(count)
+            self.graph_counters[1].add_(plan.routed_miss_rows)
+            self.graph_unique_counters[0].add_(plan.unique_hit_rows)
+            self.graph_unique_counters[1].add_(plan.unique_miss_rows)
+            if self.residency_policy is not None:
+                self.residency_policy.pending_counts.index_add_(
+                    0, flat, self._graph_ones[:count]
+                )
+            return plan.remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
+
+        layers = (_layer(seed=77), _layer(seed=77))
+        current, current_cache = self._graph_streamer(layers[0])
+        reference, reference_cache = self._graph_streamer(layers[1])
+        for cache in (current_cache, reference_cache):
+            for tensor in cache.tensors.values():
+                tensor[cache.capacity :].view(torch.uint8).zero_()
+        self.assertEqual(current.row_backend.name, "in_graph")
+        real_copy = expert_row_plan.copy_expert_row_segments_gpu
+
+        def recorder(streamer, calls):
+            def record(segments, rows, slots, count):
+                calls.append(
+                    (
+                        segments is streamer._graph_row_segments,
+                        rows.data_ptr() == streamer._graph_source_rows.data_ptr(),
+                        slots.data_ptr() == streamer._graph_destination_slots.data_ptr(),
+                        count.data_ptr() == streamer._graph_miss_count.data_ptr(),
+                    )
+                )
+                real_copy(segments, rows, slots, count)
+
+            return record
+
+        def op_names(run):
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            ) as profile:
+                result = run()
+            events = sorted(profile.events(), key=lambda event: event.time_range.start)
+            return result, [event.name for event in events if event.name.startswith("aten::")]
+
+        current_calls, reference_calls = [], []
+        reference._copy_row_segments_gpu = recorder(reference, reference_calls)
+        routes = (
+            [1, 4, 6, 1],
+            [0, 2, 3, 5],
+            [7, 7, 7, 7],
+            [6, 0, 1, 2],
+            [5, 3, 5, 3],
+            [2, 7, 0, 4],
+        )
+        with patch.object(
+            expert_row_plan,
+            "copy_expert_row_segments_gpu",
+            recorder(current, current_calls),
+        ):
+            for index, route in enumerate(routes):
+                if index == len(routes) // 2:
+                    for cache in (current_cache, reference_cache):
+                        cache.expert_to_slot = torch.full_like(cache.expert_to_slot, -1)
+                ids = torch.tensor([route], dtype=torch.int32, device="cuda")
+                (current_remap, current_tensors), current_ops = op_names(
+                    lambda: current._gather_graph(ids)
+                )
+                (reference_remap, reference_tensors), reference_ops = op_names(
+                    lambda: reference_gather(reference, ids)
+                )
+                torch.cuda.synchronize()
+                self.assertEqual(current_ops, reference_ops, route)
+                self.assertEqual(current_remap.tolist(), reference_remap.tolist(), route)
+                self.assertEqual(
+                    current._graph_source_rows.tolist(),
+                    reference._graph_source_rows.tolist(),
+                )
+                self.assertEqual(
+                    current._graph_miss_count.tolist(), reference._graph_miss_count.tolist()
+                )
+                for name in NVFP4_STREAM_TENSORS:
+                    self.assertTrue(
+                        torch.equal(
+                            current_tensors[name].view(torch.uint8).cpu(),
+                            reference_tensors[name].view(torch.uint8).cpu(),
+                        ),
+                        f"{name} route={route}",
+                    )
+        self.assertEqual(len(current_calls), len(routes))
+        self.assertEqual(current_calls, reference_calls)
+        self.assertEqual(current_calls, [(True, True, True, True)] * len(routes))
+        self.assertEqual(current.graph_counters.tolist(), reference.graph_counters.tolist())
+
     def _host_scratch_rows(self, cache):
         return {
             name: cache.tensors[name][cache.capacity :].view(torch.uint8).cpu()

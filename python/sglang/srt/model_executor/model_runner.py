@@ -839,6 +839,7 @@ class ModelRunner:
             doorbell_degraded_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS.get(),
             doorbell_drain_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS.get(),
             doorbell_plan_capacity=envs.SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY.get(),
+            doorbell_fatal_wait_s=envs.SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:

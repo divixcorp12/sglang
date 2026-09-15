@@ -15,8 +15,9 @@ next-layer (L+1) prediction mode:
   priority=None)`` takes int64 expert ids ``[N]`` (``-1`` pads) or a bool mask
   ``[num_experts]``, with an optional float priority aligned to them; it drops
   experts already resident in the hot cache, dedupes, and clamps to
-  ``min(C, scratch_rows)`` in priority order (ties: earlier id position, or
-  lower expert id for a mask). Both run fixed-shape device ops only, so a CUDA
+  ``min(C, scratch_rows)`` in priority order (eligible experts always rank
+  above ineligible ones; without a priority earlier id positions come first,
+  and equal priorities break by lower expert id). Both run fixed-shape device ops only, so a CUDA
   graph can capture them.
 * **Destinations**: a planner addresses its own target layer's scratch rows,
   ``scratch_base + r`` for plan row ``r``. Scratch holds ``bs x top_k`` rows
@@ -112,26 +113,45 @@ class ExpertRowPlan:
 class ExpertRowPlanner:
     """Turns routes or candidate experts into one target layer's scratch plan."""
 
-    def __init__(
-        self, expert_to_slot: torch.Tensor, scratch_base: int, scratch_rows: int
-    ) -> None:
-        self.expert_to_slot = expert_to_slot
+    def __init__(self, slot_map, scratch_base: int, scratch_rows: int) -> None:
+        """``slot_map`` is the int64 ``[num_experts]`` expert-to-slot tensor, or an object
+        whose ``expert_to_slot`` attribute is read on every call: a hot cache, whose mapping
+        the GPU residency update rebinds to its own device table."""
+        self._slot_map = slot_map
         self.scratch_base = scratch_base
         self.scratch_rows = scratch_rows
-        self.num_experts = expert_to_slot.numel()
 
-    def plan_routes(self, flat: torch.Tensor, plan: ExpertRowPlan) -> GraphRoutePlan:
-        """Plan the distinct misses of int64 routes ``flat`` into ``plan``.
+    @property
+    def expert_to_slot(self) -> torch.Tensor:
+        if isinstance(self._slot_map, torch.Tensor):
+            return self._slot_map
+        return self._slot_map.expert_to_slot
 
-        The misses take plan rows in first-appearance order, matching the
-        returned route plan's ``remap``. ``flat.numel()`` must not exceed the
-        scratch rows or the plan capacity.
+    @property
+    def num_experts(self) -> int:
+        return self.expert_to_slot.numel()
+
+    def route_plan(self, flat: torch.Tensor) -> GraphRoutePlan:
+        """Plan int64 routes ``flat`` against the live expert-to-slot mapping.
+
+        Distinct misses take scratch rows in first-appearance order, matching
+        the returned ``remap``. ``flat.numel()`` must not exceed the scratch
+        rows or the plan capacity.
         """
-        route = plan_graph_routes(
+        return plan_graph_routes(
             flat, self.expert_to_slot, self.scratch_rows, self.scratch_base
         )
+
+    @staticmethod
+    def fill_routes(route: GraphRoutePlan, plan: ExpertRowPlan) -> None:
+        """Write a route plan's distinct misses and their count into ``plan``."""
         plan.expert_ids[: route.source_rows.numel()].copy_(route.source_rows)
         plan.count.copy_(route.miss_plan_rows.reshape(1))
+
+    def plan_routes(self, flat: torch.Tensor, plan: ExpertRowPlan) -> GraphRoutePlan:
+        """``route_plan`` followed by ``fill_routes``: the router-miss producer."""
+        route = self.route_plan(flat)
+        self.fill_routes(route, plan)
         return route
 
     def plan_candidates(
@@ -146,7 +166,9 @@ class ExpertRowPlanner:
         duplicates keep their highest priority) or a bool mask
         ``[num_experts]``. ``priority`` is an optional float tensor of the same
         shape; without it earlier ids (or lower expert ids for a mask) come
-        first. At most ``min(plan.capacity, scratch_rows)`` rows are counted.
+        first, and equal priorities break by lower expert id. Eligible experts
+        always rank above ineligible ones, whatever their priority. At most
+        ``min(plan.capacity, scratch_rows)`` rows are counted.
         """
         experts = self.num_experts
         device = self.expert_to_slot.device
@@ -182,8 +204,11 @@ class ExpertRowPlanner:
         if priority is not None and priority.shape != candidates.shape:
             raise ValueError("priority must align with candidates.")
         eligible = present & (self.expert_to_slot < 0)
+        lowest = torch.finfo(torch.float32).min
         ranked = torch.argsort(
-            torch.where(eligible, score, float("-inf")), descending=True, stable=True
+            torch.where(eligible, score.nan_to_num(nan=lowest).clamp(min=lowest), float("-inf")),
+            descending=True,
+            stable=True,
         )
         rows = min(plan.capacity, experts)
         plan.expert_ids[:rows].copy_(ranked[:rows])
@@ -273,6 +298,8 @@ def plan_residual_routes(
     nonresident routes must fit ``residual.capacity`` scratch rows.
     """
     plan = delivery.plan
+    if residual is plan or residual.slots.data_ptr() == plan.slots.data_ptr():
+        raise ValueError("the residual plan must not share tensors with the delivered plan.")
     experts = expert_to_slot.numel()
     device = flat.device
     scratch_rows = residual.capacity

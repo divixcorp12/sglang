@@ -631,7 +631,7 @@ class ExpertStreamer:
         )
         self._graph_destination_slots = self._graph_scratch_slots.to(torch.int32)
         self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
-        self.row_planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, max_rows)
+        self.row_planner = ExpertRowPlanner(cache, cache.capacity, max_rows)
         self.row_plan = ExpertRowPlan(
             expert_ids=self._graph_source_rows,
             slots=self._graph_destination_slots,
@@ -656,8 +656,9 @@ class ExpertStreamer:
         cache = self.hot_cache
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
-        plan = self.row_planner.plan_routes(flat, self.row_plan)
+        plan = self.row_planner.route_plan(flat)
         scratch = self._graph_scratch_slots[: plan.source_rows.numel()]
+        self.row_planner.fill_routes(plan, self.row_plan)
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,
