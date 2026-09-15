@@ -340,7 +340,7 @@ class TestAsyncHotCachePromotions(unittest.TestCase):
     def test_promoted_slot_is_not_a_hit_until_its_copy_completes(self):
         manager = self.manager(async_promotions=True, held_events=True)
         self.assertEqual(self.lookup(manager, 0, [0, 1]), [0, -1])
-        for _ in range(2):
+        for _ in range(4):
             self.observe(manager, self.challenger(1))
         cache = manager.caches[0]
         self.assertIsNotNone(cache.promotion_in_flight)
@@ -361,7 +361,7 @@ class TestAsyncHotCachePromotions(unittest.TestCase):
 
     def test_in_flight_slot_is_neither_evicted_nor_published_twice(self):
         manager = self.manager(async_promotions=True, held_events=True)
-        for _ in range(2):
+        for _ in range(4):
             self.observe(manager, self.challenger(1))
         cache = manager.caches[0]
         promotion = cache.promotion_in_flight
@@ -387,7 +387,7 @@ class TestAsyncHotCachePromotions(unittest.TestCase):
 
     def test_finish_promotions_publishes_real_copies_behind_the_current_stream(self):
         manager = self.manager(async_promotions=True, held_events=False)
-        for _ in range(2):
+        for _ in range(4):
             self.observe(manager, self.challenger(1))
         manager.finish_promotions()
         self.assertEqual(manager._inflight_promotions, [])
@@ -400,7 +400,7 @@ class TestAsyncHotCachePromotions(unittest.TestCase):
 
     def test_flag_off_publishes_promotions_at_the_boundary(self):
         manager = self.manager(async_promotions=False, held_events=True)
-        for _ in range(2):
+        for _ in range(4):
             self.observe(manager, self.challenger(1))
         self.assertEqual(manager._inflight_promotions, [])
         for layer_id in (0, 2):
