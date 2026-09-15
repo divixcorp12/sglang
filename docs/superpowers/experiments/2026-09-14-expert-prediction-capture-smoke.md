@@ -26,12 +26,13 @@
 
 ## Measured values
 
-- **Bytes per row:** 534,214 (vs. the ~494,000 estimate in the plan; ~8% higher, likely rounding in the estimate's per-layer overhead term).
+- **Bytes per row:** 534,214, vs the ~494,400 plan estimate. The difference is the per-forward `forward.expert_to_slot` snapshot: 513 forwards x 48 layers x 512 experts x 2 B = 25.2 MB, or 39.7 KB per row when most forwards are 1-row decodes. 494.4 + 39.7 = 534.1 KB. Long prefills amortize it; decode-heavy traffic pays it per token.
 - **Disk on shard:** 324 MiB for 635 rows across 48 layers.
 - **Gate top-k agreement per layer** (`check-capture-gate-topk.py` against the NVFP4 model's `mlp.gate.weight`):
-  - Layer 0: **not computed** — the gate-key regex matches both `model.language_model.layers.0.mlp.gate.weight` and `mtp.layers.0.mlp.gate.weight`, so the script reports "gate key not unique" for layer 0 and skips it. Open item below.
-  - Layers 1-47: min **0.9**, most layers at **1.0**. Layers below 0.99: 11, 16, 17, 20, 25, 27, 29, 32, 39, 43, 45, 46 (all at 0.9).
-  - Mean over the 47 computed layers: ~0.98.
+  - The first run of the script read only `manifest[0]`. That shard was the idle flush of a single warmup row, so agreement could only be 0.9 or 1.0. It also skipped layer 0, because `mtp.layers.0.mlp.gate.weight` matched the key regex. The script now reads every shard and excludes `mtp.` keys.
+  - Over all 635 rows, layers 0-47: agreement **0.982-0.992** (min layer 45, max layer 24).
+  - Mismatches sit only at predicted ranks 9-10 (rank 8 at most 3%, ranks 1-7 about 0). At mismatched rows, the median logit gap between the 10th and 11th expert is 0.005-0.010, vs a 0.03-0.055 median over all rows. These are near-ties: the router's bf16/fused top-k and a float32 recompute from bf16 router input order the last slot differently.
+  - Conclusion: capture is consistent with the router. Router logits need not be stored, because gate weight x router input reproduces them to near-tie precision. That is adequate for soft targets such as APEX's KL ranker. Captured `topk_ids` remain the label ground truth, since a recompute can swap ranks 9-10.
 - **Decode tok/s with capture on:** mean 12.40 tok/s over 12 `Decode batch` log lines (13.39 tok/s excluding the first, cold-start line), vs. **13.76 tok/s** with capture off (`2026-09-14-expert-prediction-shadow-smoke.md`). About a 3-10% slowdown depending on whether the cold-start sample is included; within the noise of a 12-sample log window from a single short smoke run.
 
 ## Disk projection
@@ -44,5 +45,5 @@
 - **Radix cache decision for the capture server:** decided in `2026-09-14-radix-cache-ab.md` (enable, `extra_buffer`, 8 mamba slots, 12 GB hot cache); this smoke used the same flags. Production's launcher still needs the change.
 - **Speculative decoding support:** out of scope for capture; VERIFY rows would need a branch tag and an acceptance join (see plan's "Open items after this plan").
 - **Per-session tagging from the traffic driver:** the traffic driver should log `rid -> session, domain, split` so shards can be split by session without parsing prompts.
-- **New:** `check-capture-gate-topk.py`'s gate-key regex is ambiguous for layer 0 when an `mtp.layers.0...` key exists alongside `model.language_model.layers.0...`; it should anchor on the full prefix (e.g. require `model.language_model.` or exclude `mtp.`) rather than a bare `(^|\.)` boundary. Left unfixed here since the plan's script is the spec and this affects only the offline gate-check tool, not capture correctness.
-- **New:** several layers (11, 16, 17, 20, 25, 27, 29, 32, 39, 43, 45, 46) show gate top-k agreement of only 0.9, below the plan's 0.99 threshold. Per the plan, this means router logits should not be dropped from capture for those layers pending further investigation into why the gate-weight-only reconstruction diverges (possibly NVFP4 quantization effects on the gate weights, or shared-expert/bias terms not captured by `router_input @ gate.weight.T`).
+- **Resolved:** the gate check read one shard and matched the MTP gate key. It is fixed. All-row agreement is 0.982-0.992, with only near-tie swaps at ranks 9-10. The plan's 0.99 bar was too strict for a float32 recompute of bf16 routing.
+- **Residency snapshot cost:** about 50 KB per forward. If decode-heavy capture volume matters, store `expert_to_slot` only when it changes (the hot cache updates every 4 decode forwards) or as deltas.

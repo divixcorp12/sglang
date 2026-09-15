@@ -155,7 +155,7 @@
   - `PrefixHasher(*, max_requests).hash_rows(*, rid, positions, token_ids) -> list[int]`.
   - `SeenPrefixes().keep_mask(*, hashes, is_prefill) -> list[bool]`.
 
-- [ ] **Step 1: Write `capture_schema.py`**
+- [x] **Step 1: Write `capture_schema.py`**
 
 ```python
 """Row identity and tensor names for captured expert-prediction training data."""
@@ -224,7 +224,7 @@ def rows_per_request(
     return (1,) * batch_size
 ```
 
-- [ ] **Step 2: Write `prefix_hash.py`**
+- [x] **Step 2: Write `prefix_hash.py`**
 
 ```python
 """Chain token hashes per request so identical prefixes share keys across requests."""
@@ -291,7 +291,7 @@ class SeenPrefixes:
         return keep
 ```
 
-- [ ] **Step 3: Write the tests**
+- [x] **Step 3: Write the tests**
 
 ```python
 import unittest
@@ -362,7 +362,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 4: Commit, push, sync the experiment worktree, run the tests on divix01**
+- [x] **Step 4: Commit, push, sync the experiment worktree, run the tests on divix01**
 
 ```bash
 git add python/sglang/srt/layers/moe/expert_prediction/capture_schema.py \
@@ -401,7 +401,7 @@ Expected: `8 passed`, `EXIT=0`. (Commit messages end with the two trailer lines 
   - **Writer:** `PendingForward(record, frame)`; `ShardWriter(*, directory, specs, hidden_dtype, pool, shard_rows, max_bytes, idle_flush_s=5.0)` with `.submit(pending)`, `.stop(reason)`, `.close()`, `.stopped` (a `threading.Event`), `.written_bytes`; constants `MANIFEST_NAME`, `HEADER_NAME`, `STOPPED_NAME`.
   - **Reader:** `CaptureShard(name, request_ids, tensors)`, `CaptureReport`, `read_manifest(directory)`, `load_shard(directory, name)`, `check_capture(directory) -> CaptureReport`.
 
-- [ ] **Step 1: Write `capture_frames.py`**
+- [x] **Step 1: Write `capture_frames.py`**
 
 ```python
 """Pinned host frames that receive one forward's captured rows without blocking the GPU."""
@@ -494,7 +494,7 @@ class FramePool:
         self._free.put(frame)
 ```
 
-- [ ] **Step 2: Add the spill sink to `FeatureStore`**
+- [x] **Step 2: Add the spill sink to `FeatureStore`**
 
 In `__init__`, after the `self._buffers = ...` assignment, add:
 
@@ -530,7 +530,7 @@ Change `from typing import Iterable` to `from typing import Callable, Iterable`.
                 buffer[:rows].copy_(flat[:, :width])
 ```
 
-- [ ] **Step 3: Write `capture_writer.py`**
+- [x] **Step 3: Write `capture_writer.py`**
 
 ```python
 """Background thread that turns captured frames into safetensors shards on disk."""
@@ -788,7 +788,7 @@ class ShardWriter:
         self._reset_shard()
 ```
 
-- [ ] **Step 4: Write `capture_reader.py`**
+- [x] **Step 4: Write `capture_reader.py`**
 
 ```python
 """Load expert capture shards and check that no forward or row went missing."""
@@ -917,7 +917,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 5: Write the tests**
+- [x] **Step 5: Write the tests**
 
 ```python
 import tempfile
@@ -1101,7 +1101,7 @@ if __name__ == "__main__":
 
 Test `test_shard_with_every_row_deduplicated_still_records_its_forward` is the zero-row-tensor safetensors case: its second shard holds one forward and no rows. If `save_file` rejects zero-sized tensors, the test fails with a safetensors error. In that case, skip writing empty row tensors, store `row.*`/`layer.*` keys only when the shard has at least one kept row, and make `check_capture` treat missing row keys as zero rows.
 
-- [ ] **Step 6: Commit, push, sync the worktree, run the new tests plus the existing feature store tests on divix01**
+- [x] **Step 6: Commit, push, sync the worktree, run the new tests plus the existing feature store tests on divix01**
 
 ```bash
 git add python/sglang/srt/layers/moe/expert_prediction/capture_frames.py \
@@ -1154,7 +1154,7 @@ Expected: the 7 new tests pass, the existing taps/runtime tests still pass, `EXI
   - `ExpertPredictionRuntime.build(..., capture: CaptureSettings | None = None)` and `.capture`.
   - `ExpertPredictionRuntime.from_env(..., max_prefill_rows: int = 0)`.
 
-- [ ] **Step 1: Write `capture.py`**
+- [x] **Step 1: Write `capture.py`**
 
 ```python
 """Stage each prefill and decode forward's taps, identity, and residency for the writer."""
@@ -1389,7 +1389,7 @@ def _unrecordable_reason(
     return None
 ```
 
-- [ ] **Step 2: Wire capture into `runtime.py`**
+- [x] **Step 2: Wire capture into `runtime.py`**
 
 - **Imports:**
 
@@ -1467,7 +1467,7 @@ from sglang.srt.layers.moe.expert_prediction.capture_schema import CAPTURE_FEATU
 - **`close`:** add `if self.capture is not None: self.capture.close()` as its first statement.
 - **If `build_predictors(())` or `ShadowMetrics(predictor_names=(), ...)` raises**, make it accept an empty predictor list (zero predictors, empty counters). Capture-only runs build no predictors.
 
-- [ ] **Step 3: Env vars in `python/sglang/srt/environ.py`**
+- [x] **Step 3: Env vars in `python/sglang/srt/environ.py`**
 
 After `SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE = EnvStr("")`:
 
@@ -1478,7 +1478,7 @@ After `SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE = EnvStr("")`:
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES = EnvInt(2)
 ```
 
-- [ ] **Step 4: ModelRunner orchestration edit**
+- [x] **Step 4: ModelRunner orchestration edit**
 
 In `maybe_init_expert_prediction` (`python/sglang/srt/model_executor/model_runner.py:784`), replace the gate:
 
@@ -1492,7 +1492,7 @@ In `maybe_init_expert_prediction` (`python/sglang/srt/model_executor/model_runne
 
 Then add `max_prefill_rows=get_schedule().chunked_prefill_size or 0,` right after the `tokens_per_request=...` argument. `get_schedule` is already imported at line 184. Update the docstring to `"""Attach MoE expert prediction shadow scoring and capture before CUDA graph capture."""`.
 
-- [ ] **Step 5: Server script capture argument**
+- [x] **Step 5: Server script capture argument**
 
 In `scripts/expert_prediction/run-shadow-server.sh`:
 The 4th positional argument is already `radix` (commit `92e9217851`), and `HOT_GPU_MB` is already an env knob (`c19b41a4d0`). Capture follows the env-knob pattern:
@@ -1509,7 +1509,7 @@ fi
 - Add `capture_dir=${capture_dir:-none}` to the `echo "cc-expert-prediction server ..."` line.
 - Add `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR="$capture_dir" \` after the `SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE=...` line.
 
-- [ ] **Step 6: Write the CPU integration tests `test_expert_prediction_capture.py`**
+- [x] **Step 6: Write the CPU integration tests `test_expert_prediction_capture.py`**
 
 ```python
 import tempfile
@@ -1699,7 +1699,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 7: Write the CUDA test `test_expert_prediction_capture_graph.py`**
+- [x] **Step 7: Write the CUDA test `test_expert_prediction_capture_graph.py`**
 
 ```python
 import tempfile
@@ -1859,7 +1859,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 8: Commit, push, sync the worktree, run the tests on divix01**
+- [x] **Step 8: Commit, push, sync the worktree, run the tests on divix01**
 
 The GPU is free (production can stay down). If a server holds the GPU, stop it first.
 
@@ -1911,7 +1911,7 @@ Expected: all pass (the 21 new capture tests plus the existing framework tests),
 - Consumes: `HOT_GPU_MB=12288 CAPTURE=1 run-shadow-server.sh <name> <port> off radix` (Task 3; radix on and a 12 GB hot cache match the settings `docs/superpowers/experiments/2026-09-14-radix-cache-ab.md` recommends for production); `python -m sglang.srt.layers.moe.expert_prediction.capture_reader <dir>` (Task 2); shard tensor keys (Task 1).
 - Produces: measured bytes per row, dedupe effect, decode tok/s with capture on, and gate top-k agreement. These are recorded in the experiment doc.
 
-- [ ] **Step 1: Write `capture-two-turn-smoke.py`**
+- [x] **Step 1: Write `capture-two-turn-smoke.py`**
 
 ```python
 """Send a two-turn chat (turn 2 repeats turn 1 as history) and print token usage as JSON."""
@@ -1959,7 +1959,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 2: Write `check-capture-gate-topk.py`**
+- [x] **Step 2: Write `check-capture-gate-topk.py`**
 
 ```python
 """Check that gate weights times captured router input reproduce the captured top-k ids."""
@@ -2008,11 +2008,11 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 3: Commit, push, sync the worktree**
+- [x] **Step 3: Commit, push, sync the worktree**
 
 Commit both scripts (`-- <paths>`), push, and sync the experiment worktree with the same three commands as Task 3 Step 8.
 
-- [ ] **Step 4: Launch the capture server**
+- [x] **Step 4: Launch the capture server**
 
 The shadow script refuses to start while the GPU is in use. Production may stay down.
 
@@ -2024,7 +2024,7 @@ ssh -n divix01 'grep -E "MoE expert capture|shadow mode" /data/models/slang/nvfp
 
 Expected: `HEALTH_EXIT=0`, and a `MoE expert capture: directory=/mnt/nvme2/nvfp4-work/expert-prediction-capture/capture-smoke/... capacity_rows=4096 frames=2` log line.
 
-- [ ] **Step 5: Drive two turns, wait for the idle flush, check the capture**
+- [x] **Step 5: Drive two turns, wait for the idle flush, check the capture**
 
 ```bash
 ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && /data/models/slang/.venv/bin/python scripts/expert_prediction/capture-two-turn-smoke.py --port 31010'
@@ -2039,7 +2039,7 @@ Expected:
 
 If `decode_rows` or `prefill_rows` differ, record the numbers and explain them from the forward kinds before continuing.
 
-- [ ] **Step 6: Gate top-k agreement and decode speed**
+- [x] **Step 6: Gate top-k agreement and decode speed**
 
 ```bash
 ssh -n divix01 'd=$(ls -d /mnt/nvme2/nvfp4-work/expert-prediction-capture/capture-smoke/*/ | tail -1); cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && PYTHONPATH=$PWD/python /data/models/slang/.venv/bin/python scripts/expert_prediction/check-capture-gate-topk.py "$d" /mnt/nvme2/huggingface_hub/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47'
@@ -2050,7 +2050,7 @@ Expected:
 - **Top-k agreement:** at least 0.99 on every layer. Lower agreement, or a non-float or missing gate key, means router logits cannot be dropped from capture. Record it as an open item.
 - **Decode tok/s:** compare with capture off, 13.76 tok/s from `docs/superpowers/experiments/2026-09-14-expert-prediction-shadow-smoke.md`.
 
-- [ ] **Step 7: Stop the server, write the experiment doc, commit**
+- [x] **Step 7: Stop the server, write the experiment doc, commit**
 
 ```bash
 ssh -n divix01 'pkill -f "[s]glang serve.*--port 31010"; sleep 20; nvidia-smi --query-compute-apps=pid --format=csv,noheader'
