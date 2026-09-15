@@ -51,6 +51,12 @@ class SessionSplits(msgspec.Struct, frozen=True):
     def split_of_rid(self, rid: str) -> str:
         return self.split_of_session[self.session_id_of_rid(rid)]
 
+    def known_session_id_of_rid(self, rid: str) -> str | None:
+        """Like session_id_of_rid, but None for a non-benchmark rid (e.g. a
+        server HEALTH_CHECK_* probe) instead of raising."""
+        match = _RID_PATTERN.match(rid)
+        return match.group(1) if match is not None else None
+
 
 def load_session_splits(sessions_path: Path) -> SessionSplits:
     split_of_session: dict[str, str] = {}
@@ -150,8 +156,17 @@ def load_layer_rows(
     )
 
 
+def _known_split_of_rid(splits: SessionSplits, rid: str) -> str | None:
+    """None for rows outside the benchmark (e.g. server HEALTH_CHECK_* probes),
+    which never belong to any split."""
+    session_id = splits.known_session_id_of_rid(rid)
+    return None if session_id is None else splits.split_of_session.get(session_id)
+
+
 def split_mask(rows: LayerRows, splits: SessionSplits, split: str) -> torch.Tensor:
-    return torch.tensor([splits.split_of_rid(rid) == split for rid in rows.rids], dtype=torch.bool)
+    return torch.tensor(
+        [_known_split_of_rid(splits, rid) == split for rid in rows.rids], dtype=torch.bool
+    )
 
 
 def apex_subset_mask(
@@ -159,6 +174,9 @@ def apex_subset_mask(
 ) -> torch.Tensor:
     """Mask over train-split rows whose session fell into `subset` (see carve_apex_train_subsets)."""
     return torch.tensor(
-        [subset_of_session.get(splits.session_id_of_rid(rid)) == subset for rid in rows.rids],
+        [
+            subset_of_session.get(splits.known_session_id_of_rid(rid)) == subset
+            for rid in rows.rids
+        ],
         dtype=torch.bool,
     )
