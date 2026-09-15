@@ -28,6 +28,7 @@ from safetensors import safe_open
 from sglang.srt.layers.moe.expert_prediction.capture_reader import read_manifest
 from sglang.srt.layers.moe.expert_prediction.capture_schema import (
     FORWARD_KIND,
+    FORWARD_RESIDENCY,
     ROW_FORWARD,
     ROW_REQUEST,
     CaptureKind,
@@ -104,6 +105,7 @@ class LayerRows(msgspec.Struct, frozen=True):
     features: dict[str, torch.Tensor]
     is_decode: torch.Tensor  # [N] bool
     rids: list[str]  # [N]; resolve to a split/subset via SessionSplits
+    resident: torch.Tensor | None = None  # [N, experts] bool
 
 
 def load_layer_rows(
@@ -113,6 +115,7 @@ def load_layer_rows(
     layer_id: int,
     features: Sequence[RouteFeature],
     next_layer_topk: int | None = None,
+    residency_layer: int | None = None,
 ) -> LayerRows:
     """Stream `features` for `layer_id`, plus `next_layer_topk`'s topk_ids if set."""
     entries = _manifest_entries(capture_dir)
@@ -125,6 +128,7 @@ def load_layer_rows(
     parts: dict[str, list[torch.Tensor]] = {name: [] for name in wanted_keys.values()}
     is_decode_parts: list[torch.Tensor] = []
     rid_parts: list[str] = []
+    resident_parts: list[torch.Tensor] = []
 
     for entry in entries:
         path = capture_dir / entry.name
@@ -144,6 +148,9 @@ def load_layer_rows(
             rid_parts += [request_ids[i] for i in row_request.tolist()]
             for disk_key, name in wanted_keys.items():
                 parts[name].append(handle.get_tensor(disk_key))
+            if residency_layer is not None:
+                table = handle.get_slice(FORWARD_RESIDENCY)[:, residency_layer : residency_layer + 1, :]
+                resident_parts.append(table[local_forward.long(), 0, :] >= 0)
 
     features_out = {name: torch.cat(tensors) for name, tensors in parts.items()}
     for name in ("topk_ids", "next_topk_ids"):
@@ -153,6 +160,7 @@ def load_layer_rows(
         features=features_out,
         is_decode=torch.cat(is_decode_parts) if is_decode_parts else torch.empty(0, dtype=torch.bool),
         rids=rid_parts,
+        resident=torch.cat(resident_parts) if residency_layer is not None and resident_parts else None,
     )
 
 
