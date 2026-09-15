@@ -1994,9 +1994,24 @@ git commit -m "docs(moe): measure prefetch scoring cost and concurrent expert co
 
 Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/nvfp4-expert-stream-main` and synced to divix01. Do not write code against the unmerged branch.
 
+**Scheduling (user decision):** Task 6's live shadow run waits for this merge. It then shares one GPU window with B2, booked through crypto-c9.
+
 ### Task B1: Adapt prefetch candidates to crypto-c9's plan interface
 
 **Assumed interface (exact names TBD at merge):** per target layer, int64 row ids `[C]`, slots `[C]`, and a count.
+
+**Pre-merge draft from crypto-c9 (unmerged, may shift with their deadlock fix; confirm in Step 1):**
+- **Module:** `python/sglang/srt/layers/moe/expert_row_plan.py`.
+  - `ExpertRowPlan(expert_ids int64 [C], slots int32 [C], count int32 [1])`, one per target layer.
+  - `ExpertRowPlanner(<hot cache or live-lookup callable>, scratch_base, scratch_rows)`. A bare map tensor raises TypeError.
+  - `plan_candidates(candidates int64 [N] or bool [E], plan, priority=None)` filters residents, dedupes, orders by priority, and clamps to `min(C, scratch_rows)`, which is 10 today.
+- **Backends:** `InGraphRowBackend` (default) and `DoorbellRowBackend`, with `post(tag, plan)`, `resolve(tag, plan) -> delivery.mask()` and `copy_residual(tag, delivery)`. Residual goes through `plan_residual_routes`. Tag = target layer.
+- **Delivery today is all-or-nothing per tag.**
+  - Prefix delivery (resolve waits only through the deepest actual miss) is feasible in the design but not built.
+  - It needs per-segment copies in priority order and a monotonic delivered count. Per-segment copy cost is unmeasured, and resolve may have to run in bounded chunks.
+  - The ask waits on measured scorer cost (Task 3: prefix clears at budget 3, all-or-nothing doesn't).
+- **APEX same-layer:** its pre-mixer `post(tag=L)` *replaces* layer L's router-miss post; there is one outstanding post per tag and no second tag space. At routing: `resolve(L)`, then `plan_residual_routes`, then `copy_residual` in-graph.
+- **LLaPor:** `plan_candidates` plus `post(L+1)` inside layer L, then `resolve(L+1)` plus residual at layer L+1. `SGLANG_MOE_EXPERT_DOORBELL_MODE=next_layer` is reserved until this task implements it.
 
 - [ ] **Step 1: Read the merged layer.** Record the answers in this plan file, and commit that edit before writing code:
   - the plan type and its field names and dtypes;
