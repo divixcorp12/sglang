@@ -23,7 +23,7 @@ class Ranker(nn.Module):
         self.linear = nn.Linear(hidden_size, num_experts, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        return self.linear(x.float())
 
 
 def teacher_probabilities(router_input: torch.Tensor, gate_weight: torch.Tensor) -> torch.Tensor:
