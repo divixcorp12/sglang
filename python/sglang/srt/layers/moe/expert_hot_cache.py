@@ -813,6 +813,8 @@ class ExpertHotCacheManager:
         promotion_sigmas: float = 0.0,
         graph_gather_max_rows: int = 0,
         async_promotions: bool = False,
+        gpu_residency_update: bool = False,
+        gpu_residency_max_promotions: int = 64,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1002,6 +1004,15 @@ class ExpertHotCacheManager:
             if rows:
                 streamers[layer_id].enable_graph_gather(rows)
         manager._share_graph_counters()
+        manager.gpu_residency = None
+        if gpu_residency_update:
+            if not dynamic:
+                raise ValueError("GPU residency update requires dynamic residency")
+            from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+            manager.gpu_residency = GpuResidencyUpdater(
+                manager, max_promotions=gpu_residency_max_promotions
+            )
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -1150,6 +1161,8 @@ class ExpertHotCacheManager:
         for policy in self.residency_policies.values():
             policy.pending_counts.zero_()
         self.finish_promotions()
+        if getattr(self, "gpu_residency", None) is not None:
+            self.gpu_residency.reset_after_capture(self._boundary_clock)
 
     def finish_promotions(self) -> None:
         """Publish every in-flight promotion, ordering the current stream behind its copies.
@@ -1448,6 +1461,22 @@ class ExpertHotCacheManager:
                 "deferred_updates": self.deferred_residency_updates,
                 "inflight_submissions": len(self._inflight_promotions),
             }
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            device = updater.snapshot()
+            result["residency_gpu"] = device
+            for row, layer_id in enumerate(updater.layer_ids):
+                bytes_per_expert = self.caches[layer_id].bytes_per_expert
+                for phase, mode in enumerate(("decode", "prefill")):
+                    entry = result[mode][str(layer_id)]
+                    entry["promotions"] += device["promotions"][phase][row]
+                    entry["evictions"] += device["evictions"][phase][row]
+                    entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                metrics = result.get("residency_policy", {}).get(str(layer_id))
+                if metrics is not None:
+                    metrics["boundary_updates"] += device["boundary_updates"][row]
+                    metrics["promotions"] += device["promotions"][0][row] + device["promotions"][1][row]
+                    metrics["evictions"] += device["evictions"][0][row] + device["evictions"][1][row]
         return result
 
     def on_expert_distribution(
@@ -1531,7 +1560,16 @@ class ExpertHotCacheManager:
             counters.pinned_evictions += evictions - previous_evictions
             self._last_pinned_cache_stats[layer_id] = (admissions, evictions)
         self._accumulate_registers(mode, counts, eager_gathered)
-        if qualifying:
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            first = self._layer_positions[updater.layer_ids[0]]
+            updater.observe_forward(
+                kind,
+                tokens,
+                qualifying,
+                graph_served=kind is not ForwardKind.IDLE and not eager_gathered[first],
+            )
+        elif qualifying:
             self._update_residency(boundary_tokens, mode)
         if clock.forwards % self.log_interval == 0:
             self._write_trace(mode)

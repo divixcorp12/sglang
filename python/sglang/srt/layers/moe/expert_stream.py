@@ -514,6 +514,8 @@ class ExpertStreamer:
         self._dma_backend = ExpertDMABackend()
         self.pinned_host_cache = None
         self.residency_policy = None
+        self.residency_update = None
+        self.before_eager_gather = None
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
@@ -629,6 +631,8 @@ class ExpertStreamer:
         self, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         self._check_graph_sources()
+        if self.residency_update is not None:
+            self.residency_update.on_graph_forward(topk_ids.shape[0])
         cache = self.hot_cache
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
@@ -1078,6 +1082,8 @@ class ExpertStreamer:
             raise ValueError("selected expert IDs must be on CUDA")
         if 0 < topk_ids.numel() <= self.graph_gather_rows:
             return self._gather_graph(topk_ids)
+        if self.before_eager_gather is not None:
+            self.before_eager_gather()
         flat_ids = topk_ids.reshape(-1)
         prefetch_coordinator = getattr(self, "prefetch_coordinator", None)
         if flat_ids.numel() == 0:

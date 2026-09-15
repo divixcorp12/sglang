@@ -6,7 +6,7 @@ import math
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -313,6 +313,115 @@ class ExpertResidencyPolicy:
                 result.append(expert_id)
                 seen.add(expert_id)
         return tuple(result)
+
+
+class DeviceResidencyDecision(NamedTuple):
+    """Fixed-shape per-layer residency changes; entries past each count are unused.
+
+    ``promotions`` lists promoted experts in rank order, ``evictions`` the
+    evicted residents worst first, both ``[layers, max_promotions]``.
+    ``needed_promotions`` is at least ``max_promotions`` exactly when the
+    uncapped decision promotes that many or more.
+    """
+
+    promotions: torch.Tensor
+    promotion_counts: torch.Tensor
+    evictions: torch.Tensor
+    eviction_counts: torch.Tensor
+    needed_promotions: torch.Tensor
+
+
+def residency_rank_keys(scores: torch.Tensor) -> torch.Tensor:
+    """Unique int64 keys ordering experts by ``(-score, expert)`` when sorted descending.
+
+    Nonnegative float32 scores order like their IEEE bit patterns; adding
+    ``0.0`` folds ``-0.0`` into ``0.0`` so the bits compare as the values do.
+    The low 16 bits break ties toward the lower expert ID.
+    """
+    num_experts = scores.shape[-1]
+    if num_experts > 1 << 16:
+        raise ValueError("residency rank keys support at most 65536 experts")
+    bits = (scores.to(torch.float32) + 0.0).view(torch.int32).to(torch.int64)
+    ids = torch.arange(num_experts, dtype=torch.int64, device=scores.device)
+    return bits * (1 << 16) + (num_experts - 1 - ids)
+
+
+def decide_residency_on_device(
+    scores: torch.Tensor,
+    resident: torch.Tensor,
+    capacity: torch.Tensor,
+    *,
+    promotion_margin: float,
+    promotion_sigmas: float,
+    max_promotions: int,
+    active: torch.Tensor | None = None,
+) -> DeviceResidencyDecision:
+    """Decide every layer's promotions and evictions with fixed-shape device ops.
+
+    Equivalent to :meth:`ExpertResidencyPolicy.decide` on each row when the
+    residents fit the capacity, truncated to the first ``max_promotions``
+    promotions in rank order. Candidates are nonresidents with a positive
+    score in ``(-score, expert)`` order. Free capacity admits the leading
+    candidates; candidate ``i`` after them then replaces the ``i``-th worst
+    member, ``(score, -expert)`` ascending, for as long as its lead clears
+    ``promotion_margin + promotion_sigmas * sqrt(candidate + victim)``. The
+    swaps form a prefix: a member admitted by a swap that becomes the weakest
+    can only be challenged by a later, weaker candidate, which fails the same
+    test the next worst original member would. Nothing is read on the host,
+    so a CUDA graph can capture the decision.
+    """
+    num_layers, num_experts = scores.shape
+    width = min(index(max_promotions), num_experts)
+    if width < 1:
+        raise ValueError("max_promotions must be positive")
+    device = scores.device
+    positions = torch.arange(num_experts, dtype=torch.int64, device=device)
+    window = positions[:width]
+    keys = residency_rank_keys(scores)
+    resident = resident.to(torch.bool)
+    capacity = capacity.to(torch.int64)
+    candidates = ~resident & (scores > 0)
+    resident_count = resident.sum(dim=1)
+    candidate_count = candidates.sum(dim=1)
+    candidate_order = torch.sort(
+        torch.where(candidates, keys, torch.full_like(keys, -1)), dim=1, descending=True
+    ).indices
+    fill = torch.minimum((capacity - resident_count).clamp(min=0), candidate_count)
+    admitted = torch.zeros_like(resident).scatter_(
+        1, candidate_order, positions.unsqueeze(0) < fill.unsqueeze(1)
+    )
+    members = resident | admitted
+    member_count = resident_count + fill
+    victims = torch.sort(
+        torch.where(members, keys, torch.full_like(keys, torch.iinfo(torch.int64).max)),
+        dim=1,
+    ).indices[:, :width]
+    swap_positions = fill.unsqueeze(1) + window.unsqueeze(0)
+    swap_candidates = candidate_order.gather(1, swap_positions.clamp(max=num_experts - 1))
+    exact = scores.to(torch.float64)
+    candidate_scores = exact.gather(1, swap_candidates)
+    victim_scores = exact.gather(1, victims)
+    lead = torch.sqrt(torch.clamp(candidate_scores + victim_scores, min=0.0))
+    threshold = lead * float(promotion_sigmas) + float(promotion_margin)
+    swaps = (
+        (swap_positions < candidate_count.unsqueeze(1))
+        & (window.unsqueeze(0) < member_count.unsqueeze(1))
+        & (capacity > 0).unsqueeze(1)
+        & (candidate_scores > victim_scores + threshold)
+    )
+    swap_count = torch.cumprod(swaps.to(torch.int64), dim=1).sum(dim=1)
+    needed = torch.where(capacity > 0, fill + swap_count, torch.zeros_like(fill))
+    if active is not None:
+        needed = torch.where(active.to(torch.bool), needed, torch.zeros_like(needed))
+    promotion_counts = torch.clamp(needed, max=width)
+    eviction_counts = torch.clamp(promotion_counts - fill, min=0)
+    return DeviceResidencyDecision(
+        promotions=candidate_order[:, :width],
+        promotion_counts=promotion_counts,
+        evictions=victims,
+        eviction_counts=eviction_counts,
+        needed_promotions=needed,
+    )
 
 
 def advance_residency_policies(
