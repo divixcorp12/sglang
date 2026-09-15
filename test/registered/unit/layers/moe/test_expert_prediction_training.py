@@ -15,13 +15,15 @@ from sglang.srt.layers.moe.expert_prediction.training.pca import encode, fit_pca
 
 class TestLLaPorLossWeights(unittest.TestCase):
     def test_rarer_expert_gets_more_weight(self):
-        # expert 0 selected in 0.5% of rows, expert 1 in 2%: rarer expert must
+        # expert 0 selected in 10% of rows, expert 1 in 90%: rarer expert must
         # receive strictly larger q under the relative inverse-frequency formula.
+        # (Frequencies stay far enough from the tails that neither q clips,
+        # isolating the frequency-weighting behavior from the clip in
+        # test_clipped_experts_keep_equal_weight_after_renormalization.)
         topk_ids = torch.zeros((1000, 1), dtype=torch.int64)
-        topk_ids[:5] = 0  # 0.5%
-        topk_ids[5:25] = 1  # 2.0%
-        topk_ids[25:] = 2
-        q = llapor.expert_frequency_weights(topk_ids, num_experts=3)
+        topk_ids[:100] = 0  # 10%
+        topk_ids[100:] = 1  # 90%
+        q = llapor.expert_frequency_weights(topk_ids, num_experts=2)
         self.assertGreater(float(q[0]), float(q[1]))
 
     def test_clipped_experts_keep_equal_weight_after_renormalization(self):
