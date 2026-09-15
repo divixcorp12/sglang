@@ -31,9 +31,11 @@ def popularity_baseline_candidates(
     topk_ids: torch.Tensor, num_experts: int, budget: int
 ) -> torch.Tensor:
     """Global top-`budget` most frequently selected experts, identical for every row."""
-    counts = torch.zeros(num_experts, dtype=torch.float64)
+    counts = torch.zeros(num_experts, dtype=torch.float64, device=topk_ids.device)
     counts.scatter_add_(
-        0, topk_ids.reshape(-1).long(), torch.ones(topk_ids.numel(), dtype=torch.float64)
+        0,
+        topk_ids.reshape(-1).long(),
+        torch.ones(topk_ids.numel(), dtype=torch.float64, device=topk_ids.device),
     )
     top = torch.topk(counts, budget).indices
     return top.unsqueeze(0).expand(topk_ids.shape[0], -1)

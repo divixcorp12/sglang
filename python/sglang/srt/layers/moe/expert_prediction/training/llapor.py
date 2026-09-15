@@ -92,9 +92,11 @@ def build_predictor(group: str, *, pca_rank: int, num_experts: int) -> nn.Module
 
 def expert_frequency_weights(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     """q_e = clip(mean(f) / max(f_e, 1e-4), 0.1, 10), renormalized to mean 1."""
-    counts = torch.zeros(num_experts, dtype=torch.float64)
+    counts = torch.zeros(num_experts, dtype=torch.float64, device=topk_ids.device)
     counts.scatter_add_(
-        0, topk_ids.reshape(-1).long(), torch.ones(topk_ids.numel(), dtype=torch.float64)
+        0,
+        topk_ids.reshape(-1).long(),
+        torch.ones(topk_ids.numel(), dtype=torch.float64, device=topk_ids.device),
     )
     freq = counts / topk_ids.shape[0]
     q = freq.mean() / freq.clamp_min(1e-4)
