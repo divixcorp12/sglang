@@ -861,7 +861,7 @@ class TestExpertGraphGather(unittest.TestCase):
 
         layer = _layer()
         streamer, cache = self._graph_streamer(layer)
-        planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+        planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
         plan = ExpertRowPlan.for_scratch(6, cache.capacity, TOP_K, cache.device)
         cases = (
             (torch.tensor([0, 2, 3, 5, 7], dtype=torch.int64), None, [0, 2, 3, 5]),
@@ -886,6 +886,45 @@ class TestExpertGraphGather(unittest.TestCase):
             plan.slots[:TOP_K].tolist(),
             [cache.capacity + row for row in range(TOP_K)],
         )
+
+    def test_planner_and_residual_routes_refuse_a_bare_map_tensor(self):
+        """A held expert_to_slot tensor goes stale when the GPU residency update rebinds the
+        cache's map, so the planner and the residual planner accept only the cache or a
+        live-lookup callable, and the callable is read on every call."""
+        from sglang.srt.layers.moe.expert_row_plan import (
+            ExpertRowDelivery,
+            ExpertRowPlan,
+            ExpertRowPlanner,
+            plan_residual_routes,
+        )
+
+        layer = _layer(seed=61)
+        streamer, cache = self._graph_streamer(layer)
+        plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+        residual = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+        flat = torch.tensor([0, 2, 3, 5], dtype=torch.int64, device="cuda")
+        with self.assertRaisesRegex(TypeError, "not an expert_to_slot tensor"):
+            ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+        with self.assertRaisesRegex(TypeError, "not an expert_to_slot tensor"):
+            plan_residual_routes(
+                flat, cache.expert_to_slot, cache.capacity, ExpertRowDelivery(plan, None), residual
+            )
+        with self.assertRaises(TypeError):
+            ExpertRowPlanner(object(), cache.capacity, TOP_K)
+
+        maps = [cache.expert_to_slot]
+        planner = ExpertRowPlanner(lambda: maps[0], cache.capacity, TOP_K)
+        self.assertEqual(planner.route_plan(flat).miss_plan_rows.item(), 4)
+        maps[0] = torch.full_like(cache.expert_to_slot, 0)
+        self.assertEqual(planner.route_plan(flat).miss_plan_rows.item(), 0)
+        cache_planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
+        original = cache.expert_to_slot
+        cache.expert_to_slot = torch.full_like(original, 0)
+        try:
+            self.assertEqual(cache_planner.route_plan(flat).miss_plan_rows.item(), 0)
+        finally:
+            cache.expert_to_slot = original
+        self.assertEqual(cache_planner.route_plan(flat).miss_plan_rows.item(), 4)
 
     def test_same_plan_through_both_backends_writes_identical_rows_and_masks(self):
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
@@ -912,7 +951,7 @@ class TestExpertGraphGather(unittest.TestCase):
             DoorbellRowBackend(copier, {0: built[1][0]._graph_row_segments}),
         )
         planners = [
-            ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+            ExpertRowPlanner(cache, cache.capacity, TOP_K)
             for _, cache in built
         ]
         plans = [
@@ -980,7 +1019,7 @@ class TestExpertGraphGather(unittest.TestCase):
                 backend = DoorbellRowBackend(copier, {0: segments})
             else:
                 backend = InGraphRowBackend({0: segments})
-            planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+            planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
             plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
             residual = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
             try:
@@ -999,7 +1038,7 @@ class TestExpertGraphGather(unittest.TestCase):
                     ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
                     remap = plan_residual_routes(
                         ids.reshape(-1).long(),
-                        cache.expert_to_slot,
+                        cache,
                         cache.capacity,
                         delivery,
                         residual,
@@ -1028,7 +1067,7 @@ class TestExpertGraphGather(unittest.TestCase):
 
         layer = _layer(seed=55)
         streamer, cache = self._graph_streamer(layer)
-        planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+        planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
         plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
         backend = InGraphRowBackend({0: streamer._graph_row_segments})
         candidates = torch.full((6,), -1, dtype=torch.int64, device="cuda")

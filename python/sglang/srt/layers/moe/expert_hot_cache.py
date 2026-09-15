@@ -1317,6 +1317,17 @@ class ExpertHotCacheManager:
             self.doorbell.reset_wait_state()
             self.doorbell.resume()
 
+    def stop_doorbell(self) -> None:
+        """Drain and join the doorbell threads; idempotent.
+
+        Called from the scheduler's graceful shutdown before host resources are
+        released, so the process never reaches interpreter teardown with a running
+        copier thread (that ended in std::terminate and a scheduler stuck in the
+        driver). The copier module's atexit hook covers other exit paths.
+        """
+        if getattr(self, "doorbell", None) is not None:
+            self.doorbell.stop()
+
     def _log_doorbell(self) -> None:
         doorbell = getattr(self, "doorbell", None)
         if doorbell is None:

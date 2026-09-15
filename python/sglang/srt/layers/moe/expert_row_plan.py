@@ -50,7 +50,7 @@ next-layer (L+1) prediction mode:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -110,22 +110,42 @@ class ExpertRowPlan:
         )
 
 
+def live_slot_map(slot_source) -> Callable[[], torch.Tensor]:
+    """A zero-argument lookup of a target layer's live int64 expert-to-slot map.
+
+    ``slot_source`` is a hot cache (any object with an ``expert_to_slot``
+    attribute, read on every lookup) or a callable returning the map. A bare
+    map tensor is refused: the cache's owner may rebind the attribute to a
+    different tensor (the GPU residency update does), and a held tensor would
+    silently route against the stale map.
+    """
+    if isinstance(slot_source, torch.Tensor):
+        raise TypeError(
+            "pass the hot cache (or a callable returning its expert_to_slot), not an "
+            "expert_to_slot tensor: the GPU residency update rebinds the cache's map"
+        )
+    if hasattr(slot_source, "expert_to_slot"):
+        return lambda: slot_source.expert_to_slot
+    if callable(slot_source):
+        return slot_source
+    raise TypeError(
+        "slot_source must be a hot cache or a callable returning expert_to_slot."
+    )
+
+
 class ExpertRowPlanner:
     """Turns routes or candidate experts into one target layer's scratch plan."""
 
-    def __init__(self, slot_map, scratch_base: int, scratch_rows: int) -> None:
-        """``slot_map`` is the int64 ``[num_experts]`` expert-to-slot tensor, or an object
-        whose ``expert_to_slot`` attribute is read on every call: a hot cache, whose mapping
-        the GPU residency update rebinds to its own device table."""
-        self._slot_map = slot_map
+    def __init__(self, slot_source, scratch_base: int, scratch_rows: int) -> None:
+        """``slot_source`` is the target layer's hot cache, or a callable returning its live
+        expert-to-slot map; the map is looked up on every call (see ``live_slot_map``)."""
+        self._lookup = live_slot_map(slot_source)
         self.scratch_base = scratch_base
         self.scratch_rows = scratch_rows
 
     @property
     def expert_to_slot(self) -> torch.Tensor:
-        if isinstance(self._slot_map, torch.Tensor):
-            return self._slot_map
-        return self._slot_map.expert_to_slot
+        return self._lookup()
 
     @property
     def num_experts(self) -> int:
@@ -282,14 +302,16 @@ class DoorbellRowBackend:
 
 def plan_residual_routes(
     flat: torch.Tensor,
-    expert_to_slot: torch.Tensor,
+    slot_source,
     scratch_base: int,
     delivery: ExpertRowDelivery,
     residual: ExpertRowPlan,
 ) -> torch.Tensor:
     """Plan actual routes against a delivered scratch plan; return the route remap.
 
-    ``flat`` holds int64 expert ids of the routes. A route whose expert is
+    ``slot_source`` is the target layer's hot cache or a callable returning its
+    live expert-to-slot map (never the map tensor itself, see
+    ``live_slot_map``). ``flat`` holds int64 expert ids of the routes. A route whose expert is
     resident maps to its hot slot, one whose expert the plan delivered maps to
     that plan row's scratch row, and every other distinct expert (the residual)
     takes a scratch row no needed delivered expert occupies, in first-appearance
@@ -307,6 +329,7 @@ def plan_residual_routes(
         )
     ):
         raise ValueError("the residual plan must not share tensors with the delivered plan.")
+    expert_to_slot = live_slot_map(slot_source)()
     experts = expert_to_slot.numel()
     device = flat.device
     scratch_rows = residual.capacity

@@ -864,6 +864,111 @@ def test_a_process_exiting_with_a_live_copier_exits_cleanly():
     assert elapsed < 60.0
 
 
+_SCHEDULER_LIKE_LAUNCHER = """
+import multiprocessing as mp
+import os
+import sys
+import time
+
+SERVING_STATE = []
+
+
+def child(mode, core, err_path, ready):
+    fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(fd, 2)
+    from sglang.srt.utils.common import kill_itself_when_parent_died
+
+    kill_itself_when_parent_died()
+    import torch
+    from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+    from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+    source = torch.randint(0, 256, (8, 64), dtype=torch.uint8).pin_memory()
+    destination = torch.zeros((8, 64), dtype=torch.uint8, device="cuda")
+    options = dict(cpu_core=core, stream=torch.cuda.Stream())
+    if mode == "sigterm_fatal_wait":
+        options.update(timeout_polls=20_000, drain_polls=70_000, fatal_wait_s=30.0)
+    copier = ExpertDoorbellCopier(expert_row_segments([(source, destination)]), 4, **options)
+    # The scheduler holds its copier through the hot-cache manager, streamers and model runner
+    # until interpreter teardown, not as a local freed when the event loop returns.
+    SERVING_STATE.append(copier)
+    rows = torch.tensor([1, 2, 0, 0], dtype=torch.int64, device="cuda")
+    slots = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda")
+    count = torch.tensor([2], dtype=torch.int32, device="cuda")
+    if mode == "sigterm_fatal_wait":
+        copier.inject_fault(service_delay_s=120.0)
+        copier.post(rows, slots, count)
+        ready.set()
+        copier.resolve()
+        torch.cuda.synchronize()
+        return
+    copier.post(rows, slots, count)
+    copier.wait()
+    torch.cuda.synchronize()
+    assert torch.equal(destination[3:5].cpu(), source[1:3])
+    ready.set()
+    if mode == "graceful":
+        return
+    time.sleep(600)
+
+
+if __name__ == "__main__":
+    mode, core, err_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    mp.set_start_method("spawn", force=True)
+    ready = mp.Event()
+    process = mp.Process(target=child, args=(mode, core, err_path, ready))
+    process.start()
+    if not ready.wait(300):
+        print("NOT_READY", flush=True)
+        process.kill()
+        sys.exit(2)
+    if mode == "sigterm_fatal_wait":
+        time.sleep(3.0)
+    started = time.perf_counter()
+    if mode != "graceful":
+        process.terminate()
+    process.join(30)
+    elapsed = time.perf_counter() - started
+    alive = process.is_alive()
+    if alive:
+        process.kill()
+        process.join(30)
+    print(f"RESULT exitcode={process.exitcode} alive_after={int(alive)} elapsed={elapsed:.2f}", flush=True)
+"""
+
+
+@pytest.mark.parametrize("mode", ["graceful", "sigterm_idle", "sigterm_fatal_wait"])
+def test_a_scheduler_like_process_with_a_live_copier_exits_cleanly(mode, tmp_path):
+    """Mirror the sglang scheduler process: a spawned child that set PDEATHSIG and installs no
+    SIGTERM handler runs a live copier, then either returns from its target (the ShutdownReq
+    path), or is sent SIGTERM while idle or while a disabled drain is in its fatal wait. It must
+    exit within 10 s with no "terminate called" (a joinable thread destroyed at teardown, which
+    left production's scheduler stuck in the driver)."""
+    import re
+    import signal
+    import subprocess
+    import sys
+
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(_SCHEDULER_LIKE_LAUNCHER)
+    child_stderr = tmp_path / "child.stderr"
+    run = subprocess.run(
+        [sys.executable, str(launcher), mode, str(SPIN_CORE), str(child_stderr)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    stderr = child_stderr.read_text() if child_stderr.exists() else ""
+    result = re.search(r"RESULT exitcode=(-?\d+) alive_after=(\d) elapsed=([0-9.]+)", run.stdout)
+    assert result, (run.stdout, run.stderr[-2000:], stderr[-2000:])
+    exitcode, alive_after, elapsed = int(result.group(1)), int(result.group(2)), float(result.group(3))
+    assert "terminate called" not in stderr, stderr[-2000:]
+    assert alive_after == 0, (mode, elapsed, stderr[-2000:])
+    assert elapsed < 10.0, (mode, elapsed)
+    expected = 0 if mode == "graceful" else -signal.SIGTERM
+    assert exitcode == expected, (mode, exitcode, stderr[-2000:])
+
+
 def test_stop_drains_posted_requests_and_is_idempotent():
     generator = torch.Generator().manual_seed(41)
     sources = _sources(30, EXPERT_LIKE_SHAPES, generator)
