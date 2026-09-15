@@ -337,6 +337,9 @@ class Envs:
     # per-layer miss copy.
     SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS = EnvInt(0)
     SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS = EnvInt(0)
+    # Polls a timed-out wait keeps waiting for the thread's queued copies
+    # before returning; 0 uses about 2 s.
+    SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS = EnvInt(0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)

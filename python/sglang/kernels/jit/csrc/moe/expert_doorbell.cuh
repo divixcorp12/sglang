@@ -57,7 +57,8 @@ constexpr int64_t kWaits = 4;
 constexpr int64_t kLastPolls = 5;
 constexpr int64_t kRecordMismatches = 6;
 constexpr int64_t kResolved = 7;
-constexpr int64_t kTagBase = 8;
+constexpr int64_t kDrainTimeouts = 8;
+constexpr int64_t kTagBase = 9;
 
 constexpr int64_t kFirstChunkPolls = 256;
 constexpr int64_t kChunkGrowth = 4;
@@ -184,7 +185,11 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
 // chunk also runs out, it marks the sequence abandoned and the copier
 // degraded, and loads the request's plan back from its record so the
 // fallback launch that follows copies it; otherwise the fallback count stays
-// zero.
+// zero. It then polls for up to `drain_polls` more until the thread publishes
+// the sequence: the thread publishes an abandoned sequence it skips, and
+// publishes a serviced one only behind its row copies, so a copy the thread
+// had already queued lands before the wait returns instead of after a later
+// write to the same slots. A drain that runs out is counted.
 __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbell_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
@@ -198,6 +203,7 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
     int64_t chunk_degraded_polls,
     int64_t chunk_index,
     int64_t final_chunk,
+    int64_t drain_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   __shared__ int64_t shared_fallback;
@@ -244,6 +250,20 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
           state[kRecordMismatches] += 1;
         }
         state[kFallbackCount] = static_cast<int32_t>(shared_fallback);
+        int64_t drained = 0;
+        for (;;) {
+          observed = load_acquire_device(done);
+          if (static_cast<int32_t>(observed - seq) >= 0 || drained >= drain_polls) {
+            break;
+          }
+#if __CUDA_ARCH__ >= 700
+          __nanosleep(64);
+#endif
+          ++drained;
+        }
+        if (static_cast<int32_t>(observed - seq) < 0) {
+          state[kDrainTimeouts] += 1;
+        }
       }
     }
   }
@@ -292,6 +312,7 @@ void expert_doorbell_wait(
     int64_t ring,
     int64_t timeout_polls,
     int64_t degraded_polls,
+    int64_t drain_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   const auto stream = host::LaunchKernel::resolve_device(state.device());
@@ -318,6 +339,7 @@ void expert_doorbell_wait(
         chunk_degraded,
         chunk,
         static_cast<int64_t>(final_chunk),
+        drain_polls,
         poll_mode);
     if (final_chunk) {
       break;
@@ -462,6 +484,7 @@ class DoorbellThread {
         sizes_(capacity * widest_set_),
         publish_events_(publish_ring),
         publish_trace_(publish_ring, -1),
+        publish_serviced_(publish_ring, 0),
         stream_(external_stream),
         trace_(kTraceCapacity) {
     for (auto& counter : counters_) {
@@ -586,7 +609,7 @@ class DoorbellThread {
     if (abandoned != 0 && static_cast<int32_t>(seq - abandoned) <= 0) {
       entry.status = static_cast<int64_t>(RequestStatus::kSkippedAbandoned);
       counters_[kSkippedAbandonedCount].fetch_add(1);
-      push_trace(entry);
+      publish(seq, entry, false);
       return;
     }
     if (static_cast<int64_t>(head - seq) >= ring_ - 1) {
@@ -653,20 +676,27 @@ class DoorbellThread {
       return;
     }
 
+    entry.status = static_cast<int64_t>(RequestStatus::kServiced);
+    counters_[kRowsCopied].fetch_add(rows_copied);
+    counters_[kBytesCopied].fetch_add(entry.bytes);
+    counters_[kServiced].fetch_add(1);
+    publish(seq, entry, true);
+  }
+
+  /// Queue the four-byte publish of `seq` into the completion word behind
+  /// everything already queued on the stream.
+  void publish(uint32_t seq, TraceEntry& entry, bool serviced) {
     const int64_t slot = publish_cursor_++ % publish_ring_;
     if (publish_trace_[slot] >= 0) {
       ::cudaEventSynchronize(publish_events_[slot]);
       poll_completions();
     }
     publish_words_[slot] = static_cast<int32_t>(seq);
+    publish_serviced_[slot] = serviced ? 1 : 0;
     ::cudaMemcpyAsync(done_, publish_words_ + slot, sizeof(uint32_t), ::cudaMemcpyHostToDevice, stream_);
     ::cudaEventRecord(publish_events_[slot], stream_);
     entry.enqueued_ns = monotonic_ns();
-    entry.status = static_cast<int64_t>(RequestStatus::kServiced);
     entry.publish_slot = slot;
-    counters_[kRowsCopied].fetch_add(rows_copied);
-    counters_[kBytesCopied].fetch_add(entry.bytes);
-    counters_[kServiced].fetch_add(1);
     publish_trace_[slot] = push_trace(entry);
     pending_.push_back(slot);
   }
@@ -707,7 +737,7 @@ class DoorbellThread {
       const int64_t complete_ns = monotonic_ns();
       const uint32_t abandoned = read_host_word(page_ + kAbandonedOffset);
       const uint32_t seq = static_cast<uint32_t>(publish_words_[slot]);
-      if (abandoned != 0 && static_cast<int32_t>(seq - abandoned) <= 0) {
+      if (publish_serviced_[slot] != 0 && abandoned != 0 && static_cast<int32_t>(seq - abandoned) <= 0) {
         counters_[kLateCompletions].fetch_add(1);
       }
       {
@@ -756,6 +786,7 @@ class DoorbellThread {
   std::vector<size_t> sizes_;
   std::vector<::cudaEvent_t> publish_events_;
   std::vector<int64_t> publish_trace_;
+  std::vector<char> publish_serviced_;
   std::vector<int64_t> pending_;
   size_t pending_head_ = 0;
   int64_t publish_cursor_ = 0;

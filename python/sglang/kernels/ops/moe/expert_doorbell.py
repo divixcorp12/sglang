@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 _PAGE_HEADER_BYTES = 16
 _RECORD_HEADER_BYTES = 16
-_TAG_BASE = 8
+_TAG_BASE = 9
 _PUBLISH_RING = 1024
 _TRACE_ROWS = 4096
 _POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
@@ -47,6 +47,7 @@ _STATE_WORDS = {
     "last_polls": 5,
     "record_mismatches": 6,
     "resolved": 7,
+    "drain_timeouts": 8,
 }
 _COUNTERS = (
     "serviced",
@@ -141,6 +142,10 @@ class ExpertDoorbellCopier:
       kernel launched before that request's ``wait`` returns, and must not be
       written by anyone else until then. The thread writes slots on its own
       stream at any time between ``post`` and completion.
+    * A timed-out ``wait`` drains for up to ``drain_polls`` until the thread
+      has either skipped the request or finished the copies it had queued, so
+      those copies cannot land after the wait returns; ``drain_timeouts``
+      counts drains that ran out, after which the next invariant is at risk.
     * After a timeout the thread may still be finishing copies it already
       queued for that request. They write the same source rows into the same
       slots the fallback wrote, so a slot of a timed-out request must not be
@@ -163,6 +168,7 @@ class ExpertDoorbellCopier:
         cpu_core: int = 71,
         timeout_polls: int = 2_000_000,
         degraded_polls: int = 4_096,
+        drain_polls: int = 4_000_000,
         prefer_overlap: bool = True,
         poll_mode: str = "acquire",
         head_store: str = "release",
@@ -176,7 +182,7 @@ class ExpertDoorbellCopier:
             raise ValueError("ring must hold at least two requests.")
         if max_tags <= 0:
             raise ValueError("max_tags must be positive.")
-        if timeout_polls < 0 or degraded_polls < 0:
+        if timeout_polls < 0 or degraded_polls < 0 or drain_polls < 0:
             raise ValueError("poll limits must not be negative.")
         if poll_mode not in _POLL_MODES:
             raise ValueError(f"poll_mode must be one of {sorted(_POLL_MODES)}.")
@@ -210,6 +216,7 @@ class ExpertDoorbellCopier:
         self.max_tags = max_tags
         self.timeout_polls = timeout_polls
         self.degraded_polls = degraded_polls
+        self.drain_polls = drain_polls
         self.poll_mode = _POLL_MODES[poll_mode]
         self.head_store = _HEAD_STORES[head_store]
         self.device = device
@@ -309,6 +316,7 @@ class ExpertDoorbellCopier:
             self.ring,
             self.timeout_polls,
             self.degraded_polls,
+            self.drain_polls,
             self.poll_mode,
         )
 
@@ -337,7 +345,7 @@ class ExpertDoorbellCopier:
         thread issues no copies while the capture runs, and ``resume`` after.
         """
         torch.cuda.synchronize(self.device)
-        posted = int(self.state[_STATE_WORDS["posted"]].item())
+        posted = int(self.state[_STATE_WORDS["posted"]].item()) & 0xFFFFFFFF
         deadline = time.perf_counter() + timeout_s
         while time.perf_counter() < deadline:
             trace = self.trace()

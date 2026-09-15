@@ -823,6 +823,7 @@ class ExpertHotCacheManager:
         doorbell_cpu_core: int = 71,
         doorbell_timeout_polls: int = 0,
         doorbell_degraded_polls: int = 0,
+        doorbell_drain_polls: int = 0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1023,7 +1024,10 @@ class ExpertHotCacheManager:
             )
         manager.doorbell = (
             manager._start_doorbell(
-                doorbell_cpu_core, doorbell_timeout_polls, doorbell_degraded_polls
+                doorbell_cpu_core,
+                doorbell_timeout_polls,
+                doorbell_degraded_polls,
+                doorbell_drain_polls,
             )
             if expert_doorbell
             else None
@@ -1180,7 +1184,7 @@ class ExpertHotCacheManager:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
 
     def _start_doorbell(
-        self, cpu_core: int, timeout_polls: int, degraded_polls: int
+        self, cpu_core: int, timeout_polls: int, degraded_polls: int, drain_polls: int
     ) -> "ExpertDoorbellCopier":
         """Serve every graph-gather layer's host miss copies through one doorbell thread.
 
@@ -1190,7 +1194,9 @@ class ExpertHotCacheManager:
         thread and the fallback use that layer's segments. A zero wait budget
         is sized to four times the largest per-layer miss copy at 8 GiB/s, at
         least 20 ms, and a zero degraded budget to twice that copy, at least
-        4096 polls, taking a poll as 250 ns.
+        4096 polls, taking a poll as 250 ns. A zero drain budget is about 2 s:
+        a timed-out wait keeps waiting that long for copies the thread had
+        already queued, so they cannot land on a later forward's scratch rows.
         """
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
 
@@ -1217,6 +1223,7 @@ class ExpertHotCacheManager:
         )
         timeout_polls = timeout_polls or int(max(0.02, 4 * largest_copy_s) / poll_s) + 1
         degraded_polls = degraded_polls or max(4096, int(2 * largest_copy_s / poll_s) + 1)
+        drain_polls = drain_polls or int(2.0 / poll_s)
         device = served[0].hot_cache.device
         copier = ExpertDoorbellCopier(
             [streamer._graph_row_segments for streamer in served],
@@ -1226,6 +1233,7 @@ class ExpertHotCacheManager:
             cpu_core=cpu_core,
             timeout_polls=timeout_polls,
             degraded_polls=degraded_polls,
+            drain_polls=drain_polls,
             copy_api="batch",
             src_access_order="stream",
             stream=torch.cuda.Stream(device),
@@ -1233,6 +1241,14 @@ class ExpertHotCacheManager:
         for tag, streamer in enumerate(served):
             streamer.doorbell = copier
             streamer.doorbell_tag = tag
+        spin_cpu = copier.stats()["spin_cpu"]
+        if cpu_core >= 0 and spin_cpu != cpu_core:
+            logger.warning(
+                "Expert doorbell thread asked for CPU %d but runs on CPU %d; "
+                "check the process CPU affinity",
+                cpu_core,
+                spin_cpu,
+            )
         logger.info(
             "Expert doorbell startup %s",
             json.dumps(
@@ -1242,8 +1258,9 @@ class ExpertHotCacheManager:
                     "cpu_core": cpu_core,
                     "timeout_polls": timeout_polls,
                     "degraded_polls": degraded_polls,
+                    "drain_polls": drain_polls,
                     "largest_copy_bytes": int(largest_copy_s * link_bytes_per_s),
-                    "spin_cpu": copier.stats()["spin_cpu"],
+                    "spin_cpu": spin_cpu,
                 },
                 sort_keys=True,
             ),
@@ -1270,11 +1287,13 @@ class ExpertHotCacheManager:
             "Expert doorbell %s",
             json.dumps(
                 {
-                    key: stats[key]
+                    key: stats.get(key)
                     for key in (
+                        "running",
                         "posted",
                         "waits",
                         "timeouts",
+                        "drain_timeouts",
                         "degraded",
                         "record_mismatches",
                         "serviced",

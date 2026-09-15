@@ -1,6 +1,7 @@
 """Sync-free expert gather: CUDA-graph replays match source rows for any routes."""
 
 import os
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -63,7 +64,7 @@ def _streamed_model(seeds):
     return model
 
 
-def _manager(model, doorbell):
+def _manager(model, doorbell, **doorbell_budgets):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 
     layers = list(model.children())
@@ -80,6 +81,7 @@ def _manager(model, doorbell):
         graph_gather_batch_size=1,
         expert_doorbell=doorbell,
         doorbell_cpu_core=DOORBELL_SPIN_CORE,
+        **doorbell_budgets,
     )
 
 
@@ -523,6 +525,10 @@ class TestExpertGraphGather(unittest.TestCase):
         """
         plain_model, doorbell_model = _streamed_model((21, 33)), _streamed_model((21, 33))
         plain, doorbell = _manager(plain_model, False), _manager(doorbell_model, True)
+        for manager in (plain, doorbell):
+            for cache in manager.caches.values():
+                for tensor in cache.tensors.values():
+                    tensor[cache.capacity :].view(torch.uint8).zero_()
         try:
             self.assertIsNone(plain.doorbell)
             for layer in plain_model.children():
@@ -563,9 +569,11 @@ class TestExpertGraphGather(unittest.TestCase):
 
     def test_doorbell_gather_replays_after_a_quiesced_capture(self):
         """A capture taken with the thread quiesced replays thread-served copies for changing
-        routes, and resuming clears the timeouts the paused capture recorded."""
+        routes. Capture only records the doorbell launches, so a gather run while the thread is
+        still quiesced stands in for any wait that timed out around a capture: it leaves the
+        copier degraded, and resuming must clear that before serving."""
         model = _streamed_model((21,))
-        manager = _manager(model, True)
+        manager = _manager(model, True, doorbell_drain_polls=40_000)
         layer = model.get_submodule("0")
         streamer = layer._nvfp4_expert_streamer
         cache = manager.caches[0]
@@ -593,7 +601,11 @@ class TestExpertGraphGather(unittest.TestCase):
                 with torch.cuda.graph(graph):
                     gather_into_outputs()
                 torch.cuda.synchronize()
-                self.assertEqual(manager.doorbell.stats()["timeouts"], 1)
+                streamer.gather(torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device="cuda"))
+                torch.cuda.synchronize()
+                paused = manager.doorbell.stats()
+                self.assertEqual(paused["timeouts"], 1)
+                self.assertEqual(paused["degraded"], 1)
             finally:
                 manager.resume_doorbell()
             manager.discard_graph_capture_routes()
@@ -619,9 +631,49 @@ class TestExpertGraphGather(unittest.TestCase):
         finally:
             manager.doorbell.stop()
 
+    def test_doorbell_timeout_waits_for_the_copy_the_thread_already_queued(self):
+        """A copy the thread queued before its wait timed out lands before the gather returns.
+
+        The copier's stream is kept busy so the thread's copy is queued behind that work and the
+        wait times out. Returning at the timeout would let the queued copy land after a later
+        forward's fallback wrote the same scratch rows; the drain makes the completion word reach
+        the request before the gather returns.
+        """
+        model = _streamed_model((21,))
+        manager = _manager(
+            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=80_000_000
+        )
+        layer = model.get_submodule("0")
+        streamer = layer._nvfp4_expert_streamer
+        copier = manager.doorbell
+        resident = sorted(manager.caches[0].resident_experts())
+        missing = [e for e in range(EXPERTS) if e not in resident]
+        stall_in = torch.randn((2048, 2048), device="cuda")
+        stall_out = torch.empty_like(stall_in)
+        try:
+            torch.cuda.synchronize()
+            with torch.cuda.stream(copier.stream):
+                for _ in range(40):
+                    torch.matmul(stall_in, stall_in, out=stall_out)
+            ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
+            compact, tensors = streamer.gather(ids)
+            torch.cuda.current_stream().synchronize()
+            returned = copier.stats()
+            self.assertEqual(returned["timeouts"], 1)
+            self.assertEqual(returned["drain_timeouts"], 0)
+            self.assertGreaterEqual(returned["done"], returned["posted"])
+            torch.cuda.synchronize()
+            self._assert_rows(layer, ids, compact, tensors)
+            deadline = time.perf_counter() + 5.0
+            while copier.stats()["late_completions"] == 0 and time.perf_counter() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(copier.stats()["late_completions"], 1)
+        finally:
+            copier.stop()
+
     def test_doorbell_gather_falls_back_to_correct_rows_when_the_thread_stalls(self):
         model = _streamed_model((21,))
-        manager = _manager(model, True)
+        manager = _manager(model, True, doorbell_drain_polls=40_000)
         layer = model.get_submodule("0")
         streamer = layer._nvfp4_expert_streamer
         copier = manager.doorbell

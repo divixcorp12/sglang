@@ -774,6 +774,11 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_DOORBELL needs a decode CUDA graph batch size of 1"
                 )
+            if self.ps.tp_size > 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL runs one spin thread on one CPU core "
+                    "and cannot run with tensor parallelism"
+                )
         if budget_mb == 0:
             return
         if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():
@@ -817,6 +822,7 @@ class ModelRunner:
             doorbell_cpu_core=envs.SGLANG_MOE_EXPERT_DOORBELL_CPU.get(),
             doorbell_timeout_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS.get(),
             doorbell_degraded_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS.get(),
+            doorbell_drain_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:
