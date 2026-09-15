@@ -16,8 +16,10 @@ not delivered. None of these calls synchronizes the host or breaks the graph.
 
 from __future__ import annotations
 
+import atexit
 import functools
 import time
+import weakref
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -138,6 +140,20 @@ def _header_bytes(max_tags: int) -> int:
 
 def _capturing() -> bool:
     return torch.cuda.graphs.is_current_stream_capturing()
+
+
+_LIVE_COPIERS: weakref.WeakSet = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_live_copiers() -> None:
+    """Stop every copier still running at interpreter exit, while CUDA is still up.
+
+    Otherwise the process-wide thread registry is destroyed during static
+    teardown with its threads still running.
+    """
+    for copier in list(_LIVE_COPIERS):
+        copier.stop()
 
 
 class ExpertDoorbellCopier:
@@ -321,6 +337,7 @@ class ExpertDoorbellCopier:
         if self._handle < 0:
             raise RuntimeError("expert doorbell thread failed to start.")
         self._stopped = False
+        _LIVE_COPIERS.add(self)
 
     def _check_tag(self, tag: int) -> None:
         if not 0 <= tag < self.max_tags:

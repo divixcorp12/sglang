@@ -43,6 +43,7 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <time.h>
 
 #include <atomic>
@@ -186,7 +187,7 @@ __device__ __forceinline__ uint32_t poll_completion(
   if (poll_mode != kPollAcquire && reached(observed, seq)) {
     observed = load_acquire_device(done);
   }
-  state[kLastPolls] += static_cast<int32_t>(polls);
+  state[kLastPolls] += static_cast<int32_t>(polls < 0x7fffffffLL ? polls : 0x7fffffffLL);
   return observed;
 }
 
@@ -656,6 +657,15 @@ class DoorbellThread {
     counters_[kExternalStream].store(owns_stream_ ? 0 : 1);
   }
 
+  /// Joins both threads. A process that exits with a copier still registered
+  /// destroys it from the static registry; destroying a joinable std::thread
+  /// would call std::terminate during CUDA teardown and leave the process
+  /// stuck in the driver. The Python side stops live copiers at exit first;
+  /// this is the last resort.
+  ~DoorbellThread() {
+    stop();
+  }
+
   bool start() {
     thread_ = std::thread([this] { run(); });
     while (!started_.load() && !failed_.load()) {
@@ -724,11 +734,14 @@ class DoorbellThread {
   /// still waits for into the page's fatal word and clears it once that
   /// request's copies landed; if the same sequence stays there longer than the
   /// fatal wait, the watchdog reports it on stderr and aborts the process, since
-  /// the resolve can neither return safely nor wait forever.
+  /// the resolve can neither return safely nor wait forever. It keeps watching
+  /// past `stop()` while a fatal wait is in progress, and marks the process
+  /// non-dumpable before aborting so a scheduler holding tens of GB of pinned
+  /// rows does not write a core file before it can be restarted.
   void watch() {
     uint32_t watched = 0;
     int64_t since_ns = 0;
-    while (!stop_.load(std::memory_order_relaxed)) {
+    while (!stop_.load(std::memory_order_relaxed) || read_host_word(page_ + kFatalOffset) != 0) {
       const uint32_t waiting = read_host_word(page_ + kFatalOffset);
       const int64_t now_ns = monotonic_ns();
       if (waiting == 0) {
@@ -747,6 +760,7 @@ class DoorbellThread {
             static_cast<long long>(counters_[kLastSeen].load()),
             static_cast<long long>(counters_[kServiced].load()));
         std::fflush(stderr);
+        prctl(PR_SET_DUMPABLE, 0);
         std::abort();
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));

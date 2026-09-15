@@ -821,6 +821,49 @@ def test_a_disabled_drain_that_outlives_the_fatal_wait_aborts_the_process():
     assert elapsed < 60.0
 
 
+_EXIT_WITH_LIVE_COPIER_CHILD = """
+import sys
+import torch
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+core = int(sys.argv[1])
+source = torch.randint(0, 256, (8, 64), dtype=torch.uint8).pin_memory()
+destination = torch.zeros((8, 64), dtype=torch.uint8, device="cuda")
+copier = ExpertDoorbellCopier(
+    expert_row_segments([(source, destination)]), 4, cpu_core=core, stream=torch.cuda.Stream()
+)
+rows = torch.tensor([1, 2, 0, 0], dtype=torch.int64, device="cuda")
+slots = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda")
+count = torch.tensor([2], dtype=torch.int32, device="cuda")
+copier.post(rows, slots, count)
+copier.wait()
+torch.cuda.synchronize()
+assert torch.equal(destination[3:5].cpu(), source[1:3])
+print("RESOLVED", copier.stats()["serviced"], flush=True)
+"""
+
+
+def test_a_process_exiting_with_a_live_copier_exits_cleanly():
+    """A server process that exits without stopping its copier must not destroy a running thread
+    during static teardown (std::terminate, then a scheduler stuck in the driver holding the GPU)."""
+    import subprocess
+    import sys
+
+    started = time.perf_counter()
+    child = subprocess.run(
+        [sys.executable, "-c", _EXIT_WITH_LIVE_COPIER_CHILD, str(SPIN_CORE)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    elapsed = time.perf_counter() - started
+    assert "RESOLVED 1" in child.stdout, (child.stdout, child.stderr[-2000:])
+    assert "terminate called" not in child.stderr, child.stderr[-2000:]
+    assert child.returncode == 0, (child.returncode, child.stderr[-2000:])
+    assert elapsed < 60.0
+
+
 def test_stop_drains_posted_requests_and_is_idempotent():
     generator = torch.Generator().manual_seed(41)
     sources = _sources(30, EXPERT_LIKE_SHAPES, generator)

@@ -298,7 +298,14 @@ def plan_residual_routes(
     nonresident routes must fit ``residual.capacity`` scratch rows.
     """
     plan = delivery.plan
-    if residual is plan or residual.slots.data_ptr() == plan.slots.data_ptr():
+    if residual is plan or any(
+        mine.data_ptr() == theirs.data_ptr()
+        for mine, theirs in (
+            (residual.expert_ids, plan.expert_ids),
+            (residual.slots, plan.slots),
+            (residual.count, plan.count),
+        )
+    ):
         raise ValueError("the residual plan must not share tensors with the delivered plan.")
     experts = expert_to_slot.numel()
     device = flat.device
