@@ -48,6 +48,8 @@ class FeatureStore:
         }
         # Receives batches above max_rows (eager prefill) when capture is on.
         self.spill: Callable[[int, RouteFeature, torch.Tensor], None] | None = None
+        # Called after an in-buffer write with (layer_id, feature, rows); runs at graph capture, not replay.
+        self.after_write: Callable[[int, RouteFeature, int], None] | None = None
 
     @property
     def nbytes(self) -> int:
@@ -80,6 +82,8 @@ class FeatureStore:
                 self.spill(layer_id, feature, flat[:, :width])
             else:
                 buffer[:rows].copy_(flat[:, :width])
+                if self.after_write is not None:
+                    self.after_write(layer_id, feature, rows)
 
     def view(self, layer_id: int, feature: RouteFeature, rows: int) -> torch.Tensor:
         return self._buffers[(layer_id, feature)][:rows]

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import msgspec
 import torch
 from torch import nn
 
@@ -18,6 +20,7 @@ from sglang.srt.layers.moe.expert_prediction.contracts import RouteFeature
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
 from sglang.srt.layers.moe.expert_prediction.metrics import ShadowMetrics, score_candidates
 from sglang.srt.layers.moe.expert_prediction.registry import build_predictors
+from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchScoring
 from sglang.srt.layers.moe.expert_prediction.taps import (
     RouteTaps,
     TappedMoeLayer,
@@ -33,6 +36,14 @@ _SCORED_KINDS = frozenset({ForwardKind.DECODE, ForwardKind.VERIFY})
 def layer_pairs(layer_ids: Sequence[int], offset: int) -> tuple[tuple[int, int], ...]:
     """``(source, target)`` pairs where target is ``offset`` tapped MoE layers after source."""
     return tuple(zip(layer_ids, layer_ids[offset:]))
+
+
+class PrefetchSettings(msgspec.Struct, frozen=True):
+    predictor: str
+    model_dir: Path
+    width: int
+    budget: int
+    tau: float
 
 
 class ExpertPredictionRuntime:
@@ -56,6 +67,7 @@ class ExpertPredictionRuntime:
         metrics_path: Path | None,
         score_interval: int,
         capture: RouteCapture | None = None,
+        prefetch: PrefetchScoring | None = None,
     ) -> None:
         if log_interval < 1:
             raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL must be positive")
@@ -76,6 +88,7 @@ class ExpertPredictionRuntime:
         self._score_interval = score_interval
         self._reported_unsupported = False
         self.capture = capture
+        self.prefetch = prefetch
 
     @classmethod
     def from_env(
@@ -126,6 +139,41 @@ class ExpertPredictionRuntime:
                 shard_rows=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS.get(),
                 max_bytes=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB.get() * 2**30,
             )
+        prefetch_predictor = envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
+        prefetch = None
+        if prefetch_predictor:
+            if tokens_per_request != 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR does not support speculative decoding"
+                )
+            if decode_max_bs < 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR needs decode CUDA graphs"
+                )
+            if expert_hot_cache_manager is None:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR needs SGLANG_MOE_HOT_GPU_MB"
+                )
+            model_dir = envs.SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR.get()
+            if not model_dir:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR needs SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR"
+                )
+            if capture_dir:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR cannot run with SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR"
+                )
+            if envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get() != 0:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR cannot run with SGLANG_MOE_PREFETCH_MAX_CANDIDATES"
+                )
+            prefetch = PrefetchSettings(
+                predictor=prefetch_predictor,
+                model_dir=Path(model_dir),
+                width=envs.SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES.get(),
+                budget=envs.SGLANG_MOE_EXPERT_PREFETCH_BUDGET.get(),
+                tau=envs.SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU.get(),
+            )
         return cls.build(
             model=model,
             predictor_names=envs.SGLANG_MOE_EXPERT_PREDICTOR.get(),
@@ -140,6 +188,7 @@ class ExpertPredictionRuntime:
             metrics_path=Path(metrics_file) if metrics_file else None,
             score_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL.get(),
             capture=capture,
+            prefetch=prefetch,
         )
 
     @classmethod
@@ -159,6 +208,7 @@ class ExpertPredictionRuntime:
         topk_type: type | None = None,
         experts_type: type | None = None,
         capture: CaptureSettings | None = None,
+        prefetch: PrefetchSettings | None = None,
     ) -> "ExpertPredictionRuntime":
         layers = discover_moe_layers(model, topk_type=topk_type, experts_type=experts_type)
         specs = [layer.spec for layer in layers]
@@ -170,6 +220,8 @@ class ExpertPredictionRuntime:
         )
         if capture is not None:
             features.update(CAPTURE_FEATURES)
+        if prefetch is not None:
+            features.update(PrefetchScoring.features_for(prefetch.predictor))
         store = FeatureStore(
             specs=specs,
             features=features,
@@ -194,6 +246,22 @@ class ExpertPredictionRuntime:
                 hidden_dtype=hidden_dtype,
                 settings=capture,
                 hot_caches=hot_caches,
+            )
+        )
+        prefetch_scoring = (
+            None
+            if prefetch is None
+            else PrefetchScoring.build(
+                predictor=prefetch.predictor,
+                model_dir=prefetch.model_dir,
+                specs=specs,
+                store=store,
+                hot_caches=hot_caches,
+                width=prefetch.width,
+                budget=prefetch.budget,
+                tau=prefetch.tau,
+                dtype=hidden_dtype,
+                device=device,
             )
         )
         logger.info(
@@ -221,6 +289,7 @@ class ExpertPredictionRuntime:
             metrics_path=metrics_path,
             score_interval=score_interval,
             capture=route_capture,
+            prefetch=prefetch_scoring,
         )
 
     def on_forward_end(self, forward_batch: Any) -> None:
@@ -248,6 +317,12 @@ class ExpertPredictionRuntime:
                 forwards=self.forwards,
                 eligible_forwards=self.eligible_forwards,
             )
+            if self.prefetch is not None:
+                with self._metrics_path.open("a", encoding="utf-8") as destination:
+                    destination.write(
+                        json.dumps({"prefetch": self.prefetch.metrics_record(), "forwards": self.forwards})
+                        + "\n"
+                    )
         except OSError as error:
             logger.warning(
                 "MoE expert prediction metrics write failed, disabling further writes: "
@@ -260,6 +335,8 @@ class ExpertPredictionRuntime:
     def close(self) -> None:
         if self.capture is not None:
             self.capture.close()
+        if self.prefetch is not None:
+            self.store.after_write = None
         self._taps.remove()
         for remove in self._pre_mixer_removers:
             remove()

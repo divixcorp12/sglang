@@ -106,3 +106,30 @@ def install_pre_mixer_taps(
         type(model).__name__, install_decoder_input_pre_mixer
     )
     return installer(model=model, layers=layers, store=store)
+
+
+MixerKindClassifier = Callable[[nn.Module], str]
+
+
+def _qwen4exp_mixer_kind(decoder: nn.Module) -> str:
+    name = type(decoder).__name__
+    return "full_attention" if "Attention" in name else "linear_attention" if "Linear" in name else "unknown"
+
+
+_MIXER_KIND_ADAPTERS: dict[str, MixerKindClassifier] = {
+    "Qwen4ExpForConditionalGeneration": _qwen4exp_mixer_kind,
+}
+
+
+def register_mixer_kind_adapter(*, architecture: str, classify: MixerKindClassifier) -> None:
+    if architecture in _MIXER_KIND_ADAPTERS:
+        raise ValueError(f"mixer-kind adapter already registered for {architecture}")
+    _MIXER_KIND_ADAPTERS[architecture] = classify
+
+
+def mixer_kinds(*, model: nn.Module, layers: Sequence[TappedMoeLayer]) -> dict[int, str]:
+    """An unregistered architecture reports ``unknown`` for every layer."""
+    classify = _MIXER_KIND_ADAPTERS.get(type(model).__name__)
+    if classify is None:
+        return {layer.spec.layer_id: "unknown" for layer in layers}
+    return {layer_id: classify(decoder) for layer_id, decoder in decoder_layers_by_moe_layer(model=model, layers=layers).items()}

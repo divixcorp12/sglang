@@ -806,6 +806,7 @@ class ModelRunner:
         if self.is_draft_worker or not (
             envs.SGLANG_MOE_EXPERT_PREDICTOR.get()
             or envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.get()
+            or envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
         ):
             return
         from sglang.srt.layers.moe.expert_prediction.runtime import (

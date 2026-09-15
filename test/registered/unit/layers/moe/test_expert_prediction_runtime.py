@@ -212,6 +212,49 @@ class TestExpertPredictionRuntime(unittest.TestCase):
                 _decode(model, runtime)
         self.assertEqual(runtime.forwards, 2)
 
+    def test_from_env_rejects_misconfigured_prefetch(self):
+        common = dict(
+            model=FakeModel(),
+            gpu_id=0,
+            hidden_dtype=torch.float32,
+            decode_max_bs=1,
+            tp_size=1,
+            moe_ep_size=1,
+            attn_dp_size=None,
+            pp_size=1,
+        )
+        # envs.override()'s restore-on-exit runs only after the `with` body exits
+        # normally, so assertRaisesRegex (which swallows the raise) must be the
+        # inner context and override the outer one -- otherwise the env var leaks
+        # into the next block.
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.override("llapor"):
+            with envs.SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR.override("/tmp/does-not-matter"):
+                with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"):
+                    ExpertPredictionRuntime.from_env(
+                        tokens_per_request=1, expert_hot_cache_manager=None, **common
+                    )
+                with envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.override("/tmp/capture"):
+                    with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR"):
+                        ExpertPredictionRuntime.from_env(
+                            tokens_per_request=1,
+                            expert_hot_cache_manager=SimpleNamespace(caches={}),
+                            max_prefill_rows=1,
+                            **common,
+                        )
+                with envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.override(4):
+                    with self.assertRaisesRegex(ValueError, "SGLANG_MOE_PREFETCH_MAX_CANDIDATES"):
+                        ExpertPredictionRuntime.from_env(
+                            tokens_per_request=1,
+                            expert_hot_cache_manager=SimpleNamespace(caches={}),
+                            **common,
+                        )
+            with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR"):
+                ExpertPredictionRuntime.from_env(
+                    tokens_per_request=1,
+                    expert_hot_cache_manager=SimpleNamespace(caches={}),
+                    **common,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

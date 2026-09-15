@@ -346,6 +346,14 @@ class Envs:
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB = EnvInt(500)
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS = EnvInt(4096)
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES = EnvInt(2)
+    # In-graph expert prefetch candidate scoring (shadow until the shared copy layer consumes it): "", "llapor" or "apex".
+    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR = EnvStr("")
+    SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR = EnvStr("")
+    # Candidates per target layer kept in the device bank.
+    SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES = EnvInt(16)
+    # Rows per layer the shadow budget-recall metric credits.
+    SGLANG_MOE_EXPERT_PREFETCH_BUDGET = EnvInt(3)
+    SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU = EnvFloat(0.95)
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)

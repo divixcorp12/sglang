@@ -161,6 +161,21 @@ class TestPreMixerAdapters(unittest.TestCase):
         for layer in model.model.layers:
             self.assertNotIn("mix", layer.attn_hyper_connection.__dict__)
 
+    def test_mixer_kinds_unregistered_architecture_reports_unknown(self):
+        model = PlainModel()
+        layers, _ = _setup(model)
+        self.assertEqual(adapters.mixer_kinds(model=model, layers=layers), {0: "unknown", 1: "unknown"})
+
+    def test_mixer_kinds_registered_architecture_classifies_by_decoder_type(self):
+        model = Qwen4ExpForConditionalGeneration()
+        layers, _ = _setup(model)
+        model.model.layers[0].__class__ = type("AttentionDecoderLayer", (HyperDecoderLayer,), {})
+        model.model.layers[1].__class__ = type("LinearDecoderLayer", (HyperDecoderLayer,), {})
+        self.assertEqual(
+            adapters.mixer_kinds(model=model, layers=layers),
+            {0: "full_attention", 1: "linear_attention"},
+        )
+
     def test_registered_adapter_overrides_default(self):
         calls = []
 
