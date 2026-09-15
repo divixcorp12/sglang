@@ -104,10 +104,12 @@ These findings go to crypto-c9 with the Task 3 and Task 7 reports. Phase B picks
   - **Gap window** (a copy that starts after L's own miss copy): E28's 0.267/0.290 ms. That fits `floor(0.267 / 0.2299) = 1` in-graph row. The doorbell (29–75 µs reaction + 0.209 ms/row) also lands about 1 row without a wait.
   - **Overlap window** (a copy that starts before L's miss copy): gap + L's copy time ≈ 0.267 + 0.006 + 2.72 × 0.2239 ≈ 0.88 ms, about 3 rows. It is valid only if two concurrent copy launches don't slow each other. E27 measured copy vs compute only; Task 7 measures copy vs copy.
 - **APEX (target L, source L's pre-mixer).**
-  - The copy must land before L's own gather, so the window is layer L's norm + mixer + shared expert + router + planning, ≈ 0.267 − 0.06 ≈ 0.21 ms (linear) and 0.23 ms (full).
-  - That fits **0** in-graph rows (one row takes 0.2299 ms). It is also shorter than the doorbell's reaction plus one row (0.03–0.075 + 0.216 ms).
-  - APEX would need a same-layer post/resolve, and every hit row would pay `reaction + n·0.209 − 0.21` ms of wait.
-  - **Decision:** APEX is priced offline (Task 3) and deferred from live prefetch. The exception is Task 3 showing ≥3 ms/token *and* crypto-c9's layer supporting same-layer tags. Its scorer is still built (Task 2) and can run in shadow (Task 6) to measure cost and recall.
+  - **Metric:** the success metric is demand-loading wait saved, not whether a whole row lands before the router. A copy that starts at the pre-mixer hook and finishes after routing still saves its head start, provided the demand path joins it instead of restarting it.
+  - **Window:** launch-order time from L's pre-mixer hook to L's own miss copy, i.e. norm + mixer + shared expert + router + planning. It is ≈ 0.267 − 0.06 ≈ 0.21 ms (linear) and 0.23 ms (full): E28's gap minus ~0.06 ms of L−1's MoE kernels. The DMA head start is shorter: minus the doorbell reaction (29–75 µs) and minus the scorer's own GPU time (unmeasured until Task 7).
+  - **Join semantics (checked in `cc/doorbell-serving` 19c3ac656e, `expert_doorbell.py`):** once the thread commits a request, `resolve` drains it until its copies land, so progress is kept. Delivery is **all-or-nothing** per tag: resolve waits for every posted row, including mispredicted ones.
+  - **Consequence:** wait after routing = `max(0, reaction + n_posted·0.209 + 0.007 − window)`. At 30 µs reaction the wait is ≈0.06 ms at B=1, ≈0.27 ms at B=2 and ≈0.48 ms at B=3, so break-even is ≈0.26, 1.2 and 2.1 hits. Ideal per-layer bound at B=1 with a perfect hit is ≈0.16 ms, ≈8 ms/token over 48 layers.
+  - **Compared with LLaPor:** APEX's window is only ≈0.06 ms shorter than LLaPor's gap window. LLaPor is clearly ahead only if the overlap window (≈0.88 ms) holds, which needs Task 7.
+  - **Decision:** APEX is not ruled out on timing. Task 3 prices it with an oracle bound, scorer cost and both delivery variants (see the Task 3 amendment). It goes live only if it clears the gate and crypto-c9's layer supports a same-layer post at the pre-mixer hook. Its scorer is built (Task 2) and runs in shadow (Task 6).
 
 ### Phase A output contract (what Phase B consumes)
 
@@ -162,7 +164,7 @@ Owned by crypto-c9's copy layer. Task 3 still reports budget recall at 1–10 *a
 - **No LLaPor online adaptation, no rollback, no slot leases in Phase A.** Slot safety belongs to crypto-c9's copy layer.
 - **Candidates come from summed batch scores**, the specs' batch extension. At batch 1 this equals per-token ranking.
 - **Splits are train/dev/shifted_test** (training write-up), not the specs' 70/10/10/10.
-- **APEX is deferred from live prefetch** unless Task 3 says otherwise.
+- **APEX live prefetch is gated on Task 3's saved-wait pricing**, not ruled out by its window. The specs' "finish useful transfers inside the window" is replaced by "reduce exposed demand-loading latency".
 
 ## File Structure
 
@@ -1093,6 +1095,17 @@ Run on divix01: `CUDA_VISIBLE_DEVICES="" /data/models/slang/.venv/bin/python scr
 
 - [ ] **Step 6: Pricing script** (`scripts/expert_prediction/prefetch/price_prefetch.py`)
 
+**Amendment (APEX feasibility review).** It applies on top of the code below, and it still runs on CPU only.
+- **Keep** `doorbell_saving_ms`'s partial-progress accounting, which charges only the wait past the window.
+- **Scorer cost:** `--scorer-ms` (default `0,0.02,0.05`), for both predictors. The effective window is `window_ms − scorer_ms`, and net saving also subtracts `scorer_ms` per target layer.
+- **Oracle arm:** `--predictor oracle` offers the row's native non-resident experts and posts `min(misses, budget)` rows. Landing time takes a per-row posted count; real predictors post `budget`. Price it under both the APEX (same-layer) and LLaPor (gap) windows; it is the upper bound.
+- **Delivery variants:**
+  - `all_or_nothing` (today's copier) waits for every posted row.
+  - `prefix` (hypothetical copier change) lands rows in priority order and waits only through the deepest offered rank that is an actual miss: `max(0, reaction + (deepest_hit_rank+1)·0.209 + 0.007 − window)`. A row with no hits waits only `DOORBELL_COMPLETED_WAIT_MS`.
+  - Price both.
+- **Splits:** by mixer kind (linear vs full attention) and by `forward.kind` (prefill vs decode).
+- **Tests:** CPU unit tests for the oracle posted-count path and the prefix wait.
+
 ```python
 """Offline prefetch gate: recall of non-resident native experts within a budget, and doorbell ms/token (CPU)."""
 
@@ -1244,7 +1257,10 @@ Write `docs/superpowers/experiments/2026-09-15-expert-prefetch-offline-gate.md` 
   - **GO:** `side_saving_ms_per_token_gap` ≥ 3.0 or `saving_ms_per_token_r0.075` ≥ 3.0 for some budget. Record each argmax budget.
   - **Conditional GO:** only `side_saving_ms_per_token_overlap` reaches 3.0. Phase B then depends on Task 7 showing that concurrent copies do not slow each other.
   - **NO-GO:** none of the above. Report to the user before Task 4. Tasks 4–7 still run only if the user says so; the shadow run still measures scoring cost.
-  - **APEX live prefetch:** needs the doorbell rule *and* same-layer post/resolve support in crypto-c9's layer. Otherwise it is deferred, and the doc states the shortfall.
+  - **Gate metric:** saved demand wait in ms/token *after* scorer cost, not whether rows land inside the window. Don't write "doesn't fit" as a verdict. For each GO, state which arm (predictor or oracle), delivery variant, scorer cost and budget clears 3.0.
+  - **Oracle bound:** if even the oracle under `all_or_nothing` stays below 3.0 ms/token for a window, that predictor/window pair is NO-GO on timing, whatever its recall.
+  - **APEX live prefetch:** needs the gate *and* same-layer post support at the pre-mixer hook in crypto-c9's layer. Otherwise the doc states the shortfall.
+  - **Copier ask:** if `prefix` clears the gate and `all_or_nothing` doesn't, send crypto-c9 the numbers and ask for per-row (prefix) delivery.
   - **Evictable-slot follow-up** (for crypto-c9): flag it if budget recall at 32 exceeds budget 10 by more than 0.15.
 
 Send the decision to the user; do not start Task 4 on NO-GO without their answer.
@@ -2030,9 +2046,10 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
    - The gap window fits 1 row per layer, in-graph or doorbell.
    - Only an overlapped copy (≈0.88 ms, ~3 rows) approaches E28's ~10 ms/token ceiling, and that needs concurrent copies not to contend (unmeasured; Task 7).
    - A NO-GO at Task 3 or a negative Phase B is a legitimate outcome.
-2. **APEX does not fit its same-layer window.**
-   - 0.21–0.23 ms fits 0 in-graph rows and is shorter than the doorbell's reaction plus one row.
-   - It needs a same-layer post/resolve plus a wait. It is deferred from live prefetch and runs only in shadow (optional S2).
+2. **APEX's head start is short, and the copier waits for whole requests.**
+   - The head start is ≈0.21–0.23 ms minus reaction and scorer time. A late copy still saves time because the doorbell joins committed copies, but all-or-nothing delivery makes every mispredicted row add ≈0.209 ms of wait, so budgets above 1 need high precision.
+   - Task 3 prices the oracle bound, scorer cost and a prefix-delivery variant. It runs in shadow (S2) regardless.
+   - **Scratch capacity:** posted rows occupy the layer's 10 scratch rows, and uncovered misses need the rest (p90 6 misses per layer). Phase B must cap `budget + residual ≤ scratch rows` with crypto-c9.
 3. **In-graph scoring cost is on the main stream.**
    - LLaPor is ≈10 kernels × 47 layers at bs 1, estimated at ~5–9 ms/token, which could eat the whole gain.
    - Task 7 measures it in isolation and Task 6 end to end (S1 − S0). The follow-ups are fused PCA and a fused kernel.
@@ -2057,7 +2074,7 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
 - **Output:** a residency-agnostic bank of int64 ids `[C]` plus float32 priorities. A mask, filtering or a clamp is built in the adapter.
 - **Shadow metric:** in-graph `BudgetRecall` at budget B, identical in definition to Task 3's offline `budget_hits`.
 - **Env names:** `SGLANG_MOE_EXPERT_PREFETCH_*`, checked for no collision with the doorbell branch.
-- **APEX:** deferred from live prefetch, shadow only.
+- **APEX:** runs in shadow. Whether it prefetches live is gated on Task 3's saved-wait pricing (oracle bound, scorer cost, delivery variant), not on whether a row fits the window.
 - **Off-path proof:** exact logprobs against `7de955329a`. Scoring-on proof: exact logprobs against scoring off.
 
 **Need the user (asked at the named step):**
