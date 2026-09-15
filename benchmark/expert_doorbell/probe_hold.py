@@ -18,6 +18,9 @@ or a doorbell request's completion, was first observed by a spin loop.
     waits     "graph": graph j > 0 starts with wait(tag j); "eager": every wait is launched after the token
     gated     host waits for the thread to enqueue request j+1 before launching replay j+1
     head_store / poll_mode / prefer_overlap as in ExpertDoorbellCopier
+    The thread's copy arm comes from --copy-api, --src-access-order and --torch-stream. Every plan maps a source
+    row to the same destination slot, so the bytes after a token do not depend on which copy (thread or
+    fallback) landed last; after each token the whole destination is compared with that image.
 """
 
 import argparse
@@ -30,6 +33,7 @@ import torch
 DEV = torch.device("cuda:0")
 ROW_BYTES = 2_764_808
 SOURCE_ROWS = 32
+DOORBELL_SLOTS = 64
 
 DOORBELL_CASES = (
     {"name": "doorbell_layers", "post": "graph", "waits": "graph"},
@@ -87,6 +91,19 @@ def main_event():
     event = torch.cuda.Event()
     event.record()
     return event
+
+
+def drain(copier, timeout_s=30.0):
+    """Wait until the thread has handled every posted request and its copies completed."""
+    torch.cuda.synchronize(DEV)
+    posted = copier.stats()["posted"]
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        trace = copier.trace()
+        last = trace[-1] if trace else None
+        if posted == 0 or (last and last["seq"] == posted and (last["status"] != "serviced" or last["complete_ns"])):
+            return True
+    return False
 
 
 class Probe:
@@ -239,18 +256,32 @@ class Probe:
             "poll_mode": case.get("poll_mode", "acquire"),
             "prefer_overlap": case.get("prefer_overlap", True),
         }
+        arm = {
+            "copy_api": self.args.copy_api,
+            "src_access_order": self.args.src_access_order,
+            "torch_stream": self.args.torch_stream,
+        }
         rows, layers = self.args.rows, self.args.layers
         source = self.source.view(SOURCE_ROWS, ROW_BYTES)
-        destination = self.destination.view(SOURCE_ROWS, ROW_BYTES)
+        destination = torch.zeros((DOORBELL_SLOTS, ROW_BYTES), dtype=torch.uint8, device=DEV)
         segments = expert_row_segments([(source, destination)])
+        stream = torch.cuda.Stream(DEV) if self.args.torch_stream else None
         with ExpertDoorbellCopier(segments, rows, max_tags=layers + 1, cpu_core=self.args.spin_core,
-                                  timeout_polls=self.args.timeout_polls, **settings) as copier:
+                                  timeout_polls=self.args.timeout_polls, copy_api=arm["copy_api"],
+                                  src_access_order=arm["src_access_order"], stream=stream, **settings) as copier:
             plans = []
             generator = torch.Generator().manual_seed(7)
+            slot_of = torch.randperm(DOORBELL_SLOTS, generator=generator)[:SOURCE_ROWS]
+            written = set()
             for _ in range(layers + 1):
-                source_rows = torch.randperm(SOURCE_ROWS, generator=generator)[:rows].to(DEV)
-                destination_slots = torch.randperm(SOURCE_ROWS, generator=generator)[:rows].to(DEV, torch.int32)
-                plans.append((source_rows, destination_slots, torch.tensor([rows], dtype=torch.int32, device=DEV)))
+                picked = torch.randperm(SOURCE_ROWS, generator=generator)[:rows]
+                plans.append((picked.to(DEV), slot_of[picked].to(DEV, torch.int32),
+                              torch.tensor([rows], dtype=torch.int32, device=DEV)))
+            for plan_rows, _, _ in plans[1:]:
+                written.update(plan_rows.tolist())
+            expected = torch.zeros_like(destination)
+            written_rows = torch.tensor(sorted(written))
+            expected[slot_of[written_rows].to(DEV)] = source[written_rows].to(DEV)
 
             def post(index):
                 copier.post(*plans[index + 1], tag=index + 1)
@@ -268,13 +299,19 @@ class Probe:
                     for index in range(layers)
                 ]
             except Exception as error:
-                emit({"probe": name, "rows": rows, "layers": layers, "capture_error": repr(error)[:300]}, self.out)
+                emit({"probe": name, "rows": rows, "layers": layers, **arm, "capture_error": repr(error)[:300],
+                      "stats": copier.stats()}, self.out)
                 return
             for tag in range(1, layers + 1):
                 copier.wait(tag=tag)
             torch.cuda.synchronize(DEV)
             timeouts, elapsed, holds = [], [], []
+            exact, drained = True, True
+            start_stats = copier.stats()
             for _ in range(self.args.iters):
+                drained = drain(copier) and drained
+                destination.zero_()
+                torch.cuda.synchronize(DEV)
                 before = copier.stats()
                 launched = now_ns()
                 ends = []
@@ -306,10 +343,21 @@ class Probe:
                         holds.append((request["complete_ns"] - end_times[index]) / 1e6)
                 timeouts.append(after["timeouts"] - before["timeouts"])
                 elapsed.append((finished - launched) / 1e6)
+                drained = drain(copier) and drained
+                exact = exact and torch.equal(destination, expected)
+            destination[0, 0] ^= 0xFF
+            flip_detected = not torch.equal(destination, expected)
+            end_stats = copier.stats()
             emit({"probe": name, "rows": rows, "layers": layers, "post": case["post"], "waits": case["waits"],
-                  "gated": gated, **settings, "timeouts_per_token": summary(timeouts), "waits_per_token": layers,
-                  "token_ms": summary(elapsed),
-                  "request_complete_minus_posting_layer_end_ms": summary(holds) if holds else None}, self.out)
+                  "gated": gated, **settings, **arm, "timeouts_per_token": summary(timeouts),
+                  "waits_per_token": layers, "token_ms": summary(elapsed),
+                  "request_complete_minus_posting_layer_end_ms": summary(holds) if holds else None,
+                  "exact": exact, "exact_check_detects_flip": flip_detected, "drained": drained,
+                  "serviced": end_stats["serviced"] - start_stats["serviced"],
+                  "copy_errors": end_stats["copy_errors"] - start_stats["copy_errors"],
+                  "last_copy_error": end_stats["last_copy_error"],
+                  "configured": {key: end_stats[key] for key in ("copy_api", "src_access_order", "external_stream")}},
+                 self.out)
 
     def run(self):
         idle = self.idle_copy_ms()
@@ -341,6 +389,9 @@ def main():
     parser.add_argument("--skip-doorbell", action="store_true")
     parser.add_argument("--doorbell-only", action="store_true")
     parser.add_argument("--cases", nargs="*", default=[])
+    parser.add_argument("--copy-api", choices=["batch", "per_segment"], default="batch")
+    parser.add_argument("--src-access-order", choices=["stream", "during_call", "any"], default="stream")
+    parser.add_argument("--torch-stream", action="store_true")
     parser.add_argument("--out", default="probe_hold.jsonl")
     Probe(parser.parse_args()).run()
 

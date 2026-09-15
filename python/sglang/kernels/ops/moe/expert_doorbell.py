@@ -35,6 +35,8 @@ _PUBLISH_RING = 1024
 _TRACE_ROWS = 4096
 _POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
 _HEAD_STORES = {"release": 0, "volatile": 1}
+_COPY_APIS = {"batch": 0, "per_segment": 1}
+_SRC_ACCESS_ORDERS = {"stream": 1, "during_call": 2, "any": 3}
 _STATE_WORDS = {
     "posted": 0,
     "fallback_count": 1,
@@ -57,6 +59,10 @@ _COUNTERS = (
     "running",
     "spin_cpu",
     "last_seen",
+    "last_copy_error",
+    "copy_api",
+    "src_access_order",
+    "external_stream",
 )
 _STATUSES = (
     "pending",
@@ -112,6 +118,15 @@ class ExpertDoorbellCopier:
     ``"release"`` (a system-scope release store) or ``"volatile"`` (a volatile
     global store).
 
+    ``copy_api`` selects how the thread issues row copies: ``"batch"`` (one
+    ``cudaMemcpyBatchAsync`` per request, every copy with ``src_access_order``
+    ``"stream"``, ``"during_call"`` or ``"any"``) or ``"per_segment"`` (one
+    ``cudaMemcpyAsync`` per segment row, stream order only). ``stream`` is a
+    ``torch.cuda.Stream`` the thread copies on instead of a stream it creates
+    itself; the copier keeps a reference to it. ``stats()`` reports the
+    configured values and ``last_copy_error``, the CUDA status of the latest
+    failed copy call.
+
     Invariants the caller must uphold:
 
     * A destination slot named by a posted request must not be read by any
@@ -143,6 +158,9 @@ class ExpertDoorbellCopier:
         prefer_overlap: bool = True,
         poll_mode: str = "acquire",
         head_store: str = "release",
+        copy_api: str = "batch",
+        src_access_order: str = "stream",
+        stream: torch.cuda.Stream | None = None,
     ) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive.")
@@ -156,7 +174,18 @@ class ExpertDoorbellCopier:
             raise ValueError(f"poll_mode must be one of {sorted(_POLL_MODES)}.")
         if head_store not in _HEAD_STORES:
             raise ValueError(f"head_store must be one of {sorted(_HEAD_STORES)}.")
+        if copy_api not in _COPY_APIS:
+            raise ValueError(f"copy_api must be one of {sorted(_COPY_APIS)}.")
+        if src_access_order not in _SRC_ACCESS_ORDERS:
+            raise ValueError(
+                f"src_access_order must be one of {sorted(_SRC_ACCESS_ORDERS)}."
+            )
+        if copy_api == "per_segment" and src_access_order != "stream":
+            raise ValueError("src_access_order applies only to copy_api='batch'.")
         device = segments.table.device
+        if stream is not None and stream.device != device:
+            raise ValueError("stream must be on the copier's device.")
+        self.stream = stream
         self.segments = segments
         self.capacity = capacity
         self.ring = ring
@@ -202,6 +231,9 @@ class ExpertDoorbellCopier:
             device.index if device.index is not None else torch.cuda.current_device(),
             cpu_core,
             int(prefer_overlap),
+            _COPY_APIS[copy_api],
+            _SRC_ACCESS_ORDERS[src_access_order],
+            stream.cuda_stream if stream is not None else 0,
         )
         if self._handle < 0:
             raise RuntimeError("expert doorbell thread failed to start.")

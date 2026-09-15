@@ -356,7 +356,16 @@ enum Counter : int64_t {
   kRunning,
   kSpinCpu,
   kLastSeen,
+  kLastCopyError,
+  kCopyApi,
+  kSrcAccessOrder,
+  kExternalStream,
   kCounterCount,
+};
+
+enum CopyApi : int64_t {
+  kBatchCopy = 0,
+  kPerSegmentCopy = 1,
 };
 
 struct TraceEntry {
@@ -390,8 +399,10 @@ inline uint32_t read_host_word(const uint8_t* address) {
 
 /// A CPU spin thread that services requests posted to one request page.
 ///
-/// It copies each request's rows with one batched copy on its own CUDA stream
-/// and then queues a four-byte host-to-device copy of the request's sequence
+/// It copies each request's rows on a CUDA stream, either one it creates or one
+/// the caller passes in, with one batched copy (``copy_api`` kBatchCopy, using
+/// ``src_access_order`` for every copy) or one copy per segment row
+/// (kPerSegmentCopy), and then queues a four-byte host-to-device copy of the request's sequence
 /// into the device completion word, so completion becomes visible to the GPU
 /// no earlier than the row copies it covers. Every publish reads its own
 /// pinned word, which is never rewritten while an earlier publish from it is
@@ -408,7 +419,10 @@ class DoorbellThread {
       int64_t publish_ring,
       int device,
       int cpu_core,
-      bool prefer_overlap)
+      bool prefer_overlap,
+      int64_t copy_api,
+      int64_t src_access_order,
+      ::cudaStream_t external_stream)
       : page_(page),
         capacity_(capacity),
         ring_(ring),
@@ -419,6 +433,9 @@ class DoorbellThread {
         device_(device),
         cpu_core_(cpu_core),
         prefer_overlap_(prefer_overlap),
+        copy_api_(copy_api),
+        src_access_order_(src_access_order),
+        owns_stream_(external_stream == nullptr),
         rows_(capacity),
         slots_(capacity),
         sources_(capacity * segments_.size()),
@@ -426,10 +443,14 @@ class DoorbellThread {
         sizes_(capacity * segments_.size()),
         publish_events_(publish_ring),
         publish_trace_(publish_ring, -1),
+        stream_(external_stream),
         trace_(kTraceCapacity) {
     for (auto& counter : counters_) {
       counter.store(0);
     }
+    counters_[kCopyApi].store(copy_api);
+    counters_[kSrcAccessOrder].store(src_access_order);
+    counters_[kExternalStream].store(owns_stream_ ? 0 : 1);
   }
 
   bool start() {
@@ -484,7 +505,7 @@ class DoorbellThread {
 
  private:
   void run() {
-    if (::cudaSetDevice(device_) != ::cudaSuccess || ::cudaStreamCreate(&stream_) != ::cudaSuccess) {
+    if (::cudaSetDevice(device_) != ::cudaSuccess || (owns_stream_ && ::cudaStreamCreate(&stream_) != ::cudaSuccess)) {
       failed_.store(true);
       return;
     }
@@ -532,7 +553,9 @@ class DoorbellThread {
     for (auto event : publish_events_) {
       ::cudaEventDestroy(event);
     }
-    ::cudaStreamDestroy(stream_);
+    if (owns_stream_) {
+      ::cudaStreamDestroy(stream_);
+    }
     counters_[kRunning].store(0);
   }
 
@@ -595,9 +618,13 @@ class DoorbellThread {
       ++rows_copied;
     }
 
-    if (copies > 0 && !copy_batch(copies)) {
+    const ::cudaError_t copy_status = copies == 0 ? ::cudaSuccess
+                                     : copy_api_ == kPerSegmentCopy ? copy_per_segment(copies)
+                                                                    : copy_batch(copies);
+    if (copy_status != ::cudaSuccess) {
       entry.status = static_cast<int64_t>(RequestStatus::kCopyFailed);
       counters_[kCopyErrors].fetch_add(1);
+      counters_[kLastCopyError].store(static_cast<int64_t>(copy_status));
       push_trace(entry);
       return;
     }
@@ -620,20 +647,31 @@ class DoorbellThread {
     pending_.push_back(slot);
   }
 
-  bool copy_batch(size_t copies) {
+  ::cudaError_t copy_batch(size_t copies) {
     ::cudaMemcpyAttributes attributes{};
-    attributes.srcAccessOrder = ::cudaMemcpySrcAccessOrderStream;
+    attributes.srcAccessOrder = static_cast<decltype(attributes.srcAccessOrder)>(src_access_order_);
     attributes.flags = prefer_overlap_ ? ::cudaMemcpyFlagPreferOverlapWithCompute : ::cudaMemcpyFlagDefault;
     size_t attribute_index = 0;
     return ::cudaMemcpyBatchAsync(
-               destinations_.data(),
-               const_cast<const void* const*>(sources_.data()),
-               sizes_.data(),
-               copies,
-               &attributes,
-               &attribute_index,
-               1,
-               stream_) == ::cudaSuccess;
+        destinations_.data(),
+        const_cast<const void* const*>(sources_.data()),
+        sizes_.data(),
+        copies,
+        &attributes,
+        &attribute_index,
+        1,
+        stream_);
+  }
+
+  ::cudaError_t copy_per_segment(size_t copies) {
+    for (size_t index = 0; index < copies; ++index) {
+      const ::cudaError_t status = ::cudaMemcpyAsync(
+          destinations_[index], sources_[index], sizes_[index], ::cudaMemcpyHostToDevice, stream_);
+      if (status != ::cudaSuccess) {
+        return status;
+      }
+    }
+    return ::cudaSuccess;
   }
 
   void poll_completions() {
@@ -677,6 +715,9 @@ class DoorbellThread {
   int device_;
   int cpu_core_;
   bool prefer_overlap_;
+  int64_t copy_api_;
+  int64_t src_access_order_;
+  bool owns_stream_;
   std::vector<int64_t> rows_;
   std::vector<int32_t> slots_;
   std::vector<void*> sources_;
@@ -725,7 +766,10 @@ int64_t expert_doorbell_start(
     int64_t ring,
     int64_t device,
     int64_t cpu_core,
-    int64_t prefer_overlap) {
+    int64_t prefer_overlap,
+    int64_t copy_api,
+    int64_t src_access_order,
+    int64_t external_stream) {
   using namespace expert_doorbell;
   const auto table = static_cast<const int64_t*>(segment_table.data_ptr());
   std::vector<Segment> segments(segment_table.size(0));
@@ -745,7 +789,10 @@ int64_t expert_doorbell_start(
       publish_words.size(0),
       static_cast<int>(device),
       static_cast<int>(cpu_core),
-      prefer_overlap != 0);
+      prefer_overlap != 0,
+      copy_api,
+      src_access_order,
+      reinterpret_cast<::cudaStream_t>(static_cast<intptr_t>(external_stream)));
   if (!thread->start()) {
     return -1;
   }

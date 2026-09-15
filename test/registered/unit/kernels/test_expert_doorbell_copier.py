@@ -139,6 +139,63 @@ def _copy_and_compute_end_ns(copier, event, seq):
     return complete, compute_end
 
 
+def _completed_request(copier, seq, timeout_s=10.0):
+    """Spin until the thread reports request ``seq`` handled and, if serviced, its copies complete."""
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        trace = copier.trace()
+        if trace and trace[-1]["seq"] == seq and (trace[-1]["status"] != "serviced" or trace[-1]["complete_ns"]):
+            return trace[-1]
+    return None
+
+
+COPY_ARMS = (
+    ("batch", "stream", False),
+    ("batch", "any", False),
+    ("batch", "during_call", False),
+    ("batch", "stream", True),
+    ("batch", "any", True),
+    ("per_segment", "stream", False),
+    ("per_segment", "stream", True),
+)
+
+
+@pytest.mark.parametrize("copy_api,src_access_order,torch_stream", COPY_ARMS)
+def test_copy_arm_thread_copies_match_reference_before_wait(copy_api, src_access_order, torch_stream):
+    """Each copy arm's thread copies alone produce the reference bytes.
+
+    Bytes are checked once the thread reports the request complete and before
+    ``wait`` launches, so an in-graph fallback copy cannot hide a wrong thread
+    copy. The configured arm is read back from the thread, so an option that
+    never reaches it fails here. Access order values are the CUDA
+    ``cudaMemcpySrcAccessOrder`` enumerators.
+    """
+    generator = torch.Generator().manual_seed(67)
+    sources = _sources(90, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 80)
+    stream = torch.cuda.Stream() if torch_stream else None
+    with _copier(sources, destinations, capacity=64, copy_api=copy_api, src_access_order=src_access_order,
+                 stream=stream) as copier:
+        requests = []
+        for rows in (37, 1, 64):
+            picked_rows, picked_slots = _pick(generator, 90, 80, rows)
+            _zero(destinations)
+            copier.post(*_plan(64, picked_rows, picked_slots))
+            torch.cuda.synchronize()
+            request = _completed_request(copier, copier.stats()["posted"])
+            requests.append(request)
+            _assert_matches_reference(sources, destinations, picked_rows, picked_slots)
+            copier.wait()
+            torch.cuda.synchronize()
+        stats = copier.stats()
+    assert [request and request["status"] for request in requests] == ["serviced"] * 3, requests
+    assert stats["copy_errors"] == 0, stats["last_copy_error"]
+    assert stats["timeouts"] == 0
+    assert stats["copy_api"] == {"batch": 0, "per_segment": 1}[copy_api]
+    assert stats["src_access_order"] == {"stream": 1, "during_call": 2, "any": 3}[src_access_order]
+    assert stats["external_stream"] == int(torch_stream)
+
+
 def test_reference_check_fails_on_flipped_byte_and_stray_write():
     generator = torch.Generator().manual_seed(1)
     sources = _sources(8, EXPERT_LIKE_SHAPES, generator)
@@ -549,6 +606,12 @@ def test_rejects_invalid_construction_and_plans():
         _copier(sources, destinations, capacity=0)
     with pytest.raises(ValueError, match="poll_mode"):
         _copier(sources, destinations, capacity=4, poll_mode="bogus")
+    with pytest.raises(ValueError, match="copy_api"):
+        _copier(sources, destinations, capacity=4, copy_api="bogus")
+    with pytest.raises(ValueError, match="src_access_order"):
+        _copier(sources, destinations, capacity=4, src_access_order="bogus")
+    with pytest.raises(ValueError, match="only to copy_api='batch'"):
+        _copier(sources, destinations, capacity=4, copy_api="per_segment", src_access_order="any")
     with _copier(sources, destinations, capacity=4, max_tags=2) as copier:
         source_rows, destination_slots, count = _plan(4, [1], [1])
         with pytest.raises(ValueError, match="capacity"):

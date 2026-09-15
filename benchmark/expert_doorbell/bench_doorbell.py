@@ -123,11 +123,14 @@ class Bench:
                    "gib_s_p50": nbytes / GIB / (statistics.median(samples) / 1e3)})
 
     def run_doorbell(self, count, prefer_overlap):
-        label = {"prefer_overlap": prefer_overlap}
+        label = {"prefer_overlap": prefer_overlap, "copy_api": self.args.copy_api,
+                 "src_access_order": self.args.src_access_order, "torch_stream": self.args.torch_stream}
         plan = self.plan_tensors(count)
+        stream = torch.cuda.Stream(DEV) if self.args.torch_stream else None
         with ExpertDoorbellCopier(self.setup.segments, count, cpu_core=self.args.spin_core,
                                   prefer_overlap=prefer_overlap,
-                                  timeout_polls=self.args.timeout_polls) as copier:
+                                  timeout_polls=self.args.timeout_polls, copy_api=self.args.copy_api,
+                                  src_access_order=self.args.src_access_order, stream=stream) as copier:
             def body():
                 copier.post(*plan, tag=0)
                 copier.wait(tag=0)
@@ -143,7 +146,8 @@ class Bench:
                        "thread_seen_to_copy_complete_ms": summary(copy_ms),
                        "copy_gib_s_p50": nbytes / GIB / (statistics.median(copy_ms) / 1e3),
                        "timeouts": stats["timeouts"] - base["timeouts"], "serviced": stats["serviced"] - base["serviced"],
-                       "spin_cpu": stats["spin_cpu"]})
+                       "spin_cpu": stats["spin_cpu"], "copy_errors": stats["copy_errors"],
+                       "last_copy_error": stats["last_copy_error"]})
 
             post_done, reaction, launch_seen, exact_eager = [], [], [], True
             for index in range(self.args.warmup + self.args.iters):
@@ -197,6 +201,9 @@ def main():
     parser.add_argument("--spin-core", type=int, default=71)
     parser.add_argument("--timeout-polls", type=int, default=20_000)
     parser.add_argument("--prefer-overlap", nargs="+", type=int, default=[1, 0])
+    parser.add_argument("--copy-api", choices=["batch", "per_segment"], default="batch")
+    parser.add_argument("--src-access-order", choices=["stream", "during_call", "any"], default="stream")
+    parser.add_argument("--torch-stream", action="store_true")
     parser.add_argument("--tag", default="main")
     parser.add_argument("--out", default="/data/models/slang/nvfp4-work/cc-doorbell/results/results.jsonl")
     args = parser.parse_args()
