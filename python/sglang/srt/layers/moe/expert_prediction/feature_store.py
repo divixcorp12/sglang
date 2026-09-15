@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 
@@ -46,6 +46,8 @@ class FeatureStore:
             for spec in specs
             for feature in wanted
         }
+        # Receives batches above max_rows (eager prefill) when capture is on.
+        self.spill: Callable[[int, RouteFeature, torch.Tensor], None] | None = None
 
     @property
     def nbytes(self) -> int:
@@ -57,10 +59,13 @@ class FeatureStore:
         return (layer_id, feature) in self._buffers
 
     def write(self, layer_id: int, feature: RouteFeature, source: torch.Tensor) -> None:
-        """Copy ``source`` rows in; unstored features and batches above ``max_rows`` are skipped."""
+        """Copy ``source`` rows in; batches above ``max_rows`` go to ``spill`` or are skipped."""
         buffer = self._buffers.get((layer_id, feature))
         rows = source.shape[0]
-        if buffer is None or rows == 0 or rows > self.max_rows:
+        if buffer is None or rows == 0:
+            return
+        oversized = rows > self.max_rows
+        if oversized and self.spill is None:
             return
         width = buffer.shape[1]
         flat = source.reshape(rows, -1)
@@ -71,7 +76,10 @@ class FeatureStore:
                 f"expected {width}"
             )
         with torch.no_grad():
-            buffer[:rows].copy_(flat[:, :width])
+            if oversized:
+                self.spill(layer_id, feature, flat[:, :width])
+            else:
+                buffer[:rows].copy_(flat[:, :width])
 
     def view(self, layer_id: int, feature: RouteFeature, rows: int) -> torch.Tensor:
         return self._buffers[(layer_id, feature)][:rows]
