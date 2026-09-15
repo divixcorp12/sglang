@@ -1,37 +1,56 @@
-# MoE Expert Prefetch (LLaPor → Prefetch Plan → In-Graph Copy / Doorbell) Live Test Implementation Plan
+# MoE Expert Prefetch Candidates (LLaPor/APEX): Phase A In-Graph Shadow Scoring, Phase B Doorbell Wiring — Implementation Plan
 
-> **Dependency, stated first:** only the doorbell backend (Task 10) and the two doorbell-on matrix cells wait on crypto-c9's `cc/doorbell-serving` landing on `codex/nvfp4-expert-stream-main`. It is not on `shared` yet. Tasks 1–9, including the default `in_graph_copy` backend and the prefetch-on/doorbell-off live cell, need nothing from it.
+> **Dependency, stated first:** Phase B (Tasks B1–B2) is **BLOCKED** until crypto-c9's `cc/doorbell-serving` merges into `codex/nvfp4-expert-stream-main`.
+> - That branch owns the whole shared copy layer: the plan interface, the planner, delivered/residual accounting, and both the in-graph and doorbell copy backends.
+> - It merges as one piece after review, divix01 tests and a serving A/B. It is in a rework round for a late-copy race, so there is no ETA.
+> - Phase A (Tasks 1–7) starts now and touches no copy path.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Score next-layer experts with the trained LLaPor predictor (and APEX if feasible) inside the decode CUDA graph. Turn the scores into a backend-independent per-layer prefetch plan. Serve the plan with the existing in-graph copy kernel by default, or with the doorbell copier when it is enabled. Then measure logprob parity and live decode tok/s across every prefetch × doorbell combination.
+**Goal:**
+- **Phase A:** load the trained LLaPor (and APEX) checkpoints in serving from a model-agnostic place.
+  - Score each target layer's experts inside the decode CUDA graph with no host syncs.
+  - Publish per-target-layer candidate ids (int64 `[C]`) and float32 priorities as stable device tensors.
+  - Validate offline (recall of non-resident native experts within a budget) and live in shadow mode: the same metric, no prefetch, logprobs exactly unchanged, scoring cost measured.
+- **Phase B:** once the shared copy layer merges, adapt those candidates to its plan interface, then run the 4-cell prefetch × doorbell matrix with live tok/s.
 
 **Architecture:**
 - **Model-independent package.** A new `layers/moe/expert_prediction/serving/` package loads the trained checkpoints, validates them against the live `MoeLayerSpec`s, and builds static-shape bf16 scorers.
-- **In-graph scoring through generic hooks.** Scorers attach through one new generic hook, `FeatureStore.after_write`. It fires from the existing TopK taps and pre-mixer adapters. On a decode forward it writes each target layer's top-C expert ids and scores into a stable device bank, with no host sync.
-- **One plan interface, two backends.** An in-graph planner turns candidates into a `PrefetchPlan` per target layer: int64 row ids `[B]`, destination slots `[B]`, a device count, and a delivered mask `[B]`. The planner drops resident experts and clamps to budget B by score.
-  - `in_graph_copy` (default, doorbell off) copies plan rows into B dedicated prefetch rows per layer with `copy_expert_row_segments_gpu`.
-  - `doorbell` (optional, `SGLANG_MOE_EXPERT_DOORBELL=1`) posts the same plan to the doorbell copier.
-  - The graph gather treats delivered plan rows as hits. The residual (actual misses minus delivered) goes through the existing in-graph miss copy.
-- **Ordering.** The in-graph copy backend ships first. Only the doorbell-backend cells wait on `cc/doorbell-serving`.
-- **Gate before live.** An offline replay of the full capture measures recall of non-resident native experts within the budget. It also prices both backends' timelines, and decides go/defer before any live GPU time.
+- **In-graph scoring through generic hooks.** Scorers attach through one new generic hook, `FeatureStore.after_write`, which fires from the existing TopK taps and pre-mixer adapters. On a decode forward, scoring rewrites each target layer's top-C candidate ids and priorities in a stable device bank, with no host sync.
+- **Candidate output contract.** `PrefetchCandidateBank` holds, per target layer, `ids` int64 `[C]` (best first) and `scores` float32 `[C]` (priorities).
+  - The bank is residency-agnostic.
+  - A `[num_experts]` mask, resident filtering or a budget clamp is one `scatter_`/`index_select` in the Phase B adapter, whichever crypto-c9's interface wants.
+- **Shadow metric.** `BudgetRecall` counts, in-graph, the non-resident native routes covered by the first B non-resident candidates. It is read only at log intervals.
+- **No copy path in Phase A.** Phase A reads `expert_to_slot` and nothing else from the hot cache.
+- **Gates.** The offline gate (Task 3) and the live shadow run (Task 6) decide whether Phase B is worth running.
 
-**Tech Stack:** Python 3.13, torch 2.13 (CUDA graphs, `torch.cuda.set_sync_debug_mode`), msgspec, safetensors, SGLang `envs`, the JIT copy kernel `copy_expert_row_segments_gpu`, the breakable decode CUDA graph (`eager_on_graph`), and optionally the doorbell copier (`ExpertDoorbellCopier`, `cc/doorbell-serving`, Task 10 only).
+**Tech Stack:** Python 3.13, torch 2.13 (CUDA graphs, `torch.cuda.set_sync_debug_mode`), msgspec, safetensors, SGLang `envs`. Phase B adds crypto-c9's shared copy layer (`cc/doorbell-serving`).
 
 **Spec and research inputs (read before any task):**
 - LLaPor serving: `/home/dimitri/data/divix/crypto/trading-framework/mechanism_hunter/docs/superpowers/plans/2026-09-14-llapor-gpu-only.md` §6–8 (read-only).
 - APEX serving: `.../2026-09-14-apex-gpu-only.md` §5, Tasks 5–8 (read-only).
-- Doorbell: `/home/dimitri/data/divix/crypto/NVFP4_DOORBELL_COPIER.md` §3, §6 (read-only). Prototype API is `shared/cc/doorbell-prototype:python/sglang/kernels/ops/moe/expert_doorbell.py`.
+- Shared copy layer: `/home/dimitri/data/divix/crypto/NVFP4_DOORBELL_COPIER.md` §3, §6, and the branch `shared/cc/doorbell-serving` (both read-only; Phase B waits for the merge).
 - Trained models: `docs/superpowers/experiments/2026-09-15-expert-predictor-offline-training.md`. Checkpoints are at `/mnt/nvme2/nvfp4-work/expert-prediction-models/20260915-121630/{llapor/pair-NN,apex/layer-NN}`.
 - Capture: `/mnt/nvme2/nvfp4-work/expert-prediction-capture/capture-full/20260915-054438`. Sessions are in `/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl`.
 - Timing evidence: `docs/superpowers/experiments/nvfp4-expert-offload-experiment-log.md` E26–E32 (E27 overlap, E28 window, E29/E32 doorbell).
 
 ## Global Constraints
 
-- **Doorbell dependency (D-on cells only):** Task 10 and the matrix cells with `SGLANG_MOE_EXPERT_DOORBELL=1` need the doorbell serving integration from `cc/doorbell-serving` (owner: the crypto-c9 production session) on `codex/nvfp4-expert-stream-main`. Every other task, and the in-graph copy backend, must build, test and run with `SGLANG_MOE_EXPERT_DOORBELL` unset. If the landed doorbell API differs from the one assumed in Design, only `serving/doorbell_backend.py` (Task 10) changes.
-- **One plan interface, backends behind it.** The planner (Task 4) owns candidate filtering, the budget clamp and destination rows. A backend only moves bytes and sets `PrefetchPlan.delivered`. No backend reads scores, and the gather reads nothing but the delivered ids.
-- **Prefetch never writes hot slots.** Plans target B dedicated rows per layer after the graph-gather scratch rows. The in-graph residency updater (E31) stays the only writer of `expert_to_slot`, slot states and hot rows.
-- **Prefetch off must be production.** With `SGLANG_MOE_EXPERT_PREFETCH` unset, the hot-cache layout, the recorded graph kernels, and the logprobs must equal the pre-change build. Every code change is guarded so the off path launches exactly the kernels it launches today.
+- **Phase split (hard). Phase A must not modify the copy path.**
+  - Off limits: `python/sglang/srt/layers/moe/expert_stream.py`, `expert_route_plan.py`, `expert_hot_cache.py`, `expert_residency_gpu.py`, `expert_transfer.py`, `expert_prefetch.py`, and `python/sglang/kernels/ops/moe/*`.
+  - Also off limits: any file `cc/doorbell-serving` adds.
+  - Before each Phase A task, run `git fetch -q shared cc/doorbell-serving && git diff --stat codex/nvfp4-expert-stream-main...shared/cc/doorbell-serving`.
+  - **Two overlaps are known and allowed** (checked 2026-09-15 at `56a5920489`):
+    - `environ.py`: the branch's hunk is at lines 328–333. Phase A adds lines only after `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES` (line 348).
+    - `model_runner.py`: the branch's hunks are at 754–798, 1257 and 1631–1700. Phase A changes one condition in `maybe_init_expert_prediction` (line ~803).
+  - If any other Phase A file appears in that diff, stop and coordinate with crypto-c9 through the team lead.
+- **Phase B interface is TBD.** It is described only as: per target layer, int64 row ids `[C]`, slots `[C]`, and a count.
+  - These come from crypto-c9 at merge: exact names, slot and count dtypes, who filters residents and clamps to a budget, delivered/residual accounting, backend selection, and env flags.
+  - Do not code against the unmerged branch.
+- **Shadow scoring must not change outputs.**
+  - Scoring off must be production: exact logprobs against the pre-change commit `7de955329a`.
+  - Scoring on only appends kernels that read tap buffers and write the bank and counters, so logprobs must stay exactly equal to scoring off.
+- **Env names do not collide** with the doorbell branch. That branch defines `SGLANG_MOE_EXPERT_DOORBELL*` and keeps `SGLANG_MOE_PREFETCH_MAX_CANDIDATES`. Phase A uses `SGLANG_MOE_EXPERT_PREFETCH_*`.
 - **Model-agnostic placement:**
   - Nothing goes in `python/sglang/srt/models/*` and nothing hardcodes Qwen3.8-Next dimensions.
   - Dimensions come from checkpoint manifests, validated against live `MoeLayerSpec` (`layer_id`, `num_experts`, `top_k`, `hidden_size`).
@@ -74,110 +93,80 @@
 | Per-row expert bytes | 2,764,808 | server log |
 | Graph scratch per layer | 10 rows (1.33 GiB total) | server log |
 | Copy under compute | No measurable contention either way (±0.01 ms compute, ~0.1 GiB/s copy); a copy graph captured on a side stream replays on whichever stream is current | E27 |
-| Two copies at once (side copy for L+1 during L's own miss copy) | **Unmeasured** — E27 measured copy vs compute only | Task 8 |
+| Two copies at once (side copy for L+1 during L's own miss copy) | **Unmeasured** — E27 measured copy vs compute only | Task 7 |
 
-### Where each predictor's output can be used
+### Where each predictor's output can be used (input to Phase B)
+
+These findings go to crypto-c9 with the Task 3 and Task 7 reports. Phase B picks its budget from them.
 
 - **LLaPor (target L+1, source L's router features).**
-  - Scores and the L+1 plan are ready inside layer L's gather, after the residency update and before L's own route plan and miss copy.
-  - **Gap window** (side copy starts after L's miss copy): E28's 0.267/0.290 ms. That fits `floor(0.267 / 0.2299) = 1` row.
-  - **Overlap window** (side copy starts before L's miss copy): gap + L's copy time, ≈ 0.267 + 0.006 + 2.72 × 0.2239 ≈ 0.88 ms, about 3 rows. It is valid only if two concurrent copy launches don't slow each other, which Task 8 measures.
+  - Candidates for L+1 are ready after TopK(L), inside layer L, before L's gather in launch order.
+  - **Gap window** (a copy that starts after L's own miss copy): E28's 0.267/0.290 ms. That fits `floor(0.267 / 0.2299) = 1` in-graph row. The doorbell (29–75 µs reaction + 0.209 ms/row) also lands about 1 row without a wait.
+  - **Overlap window** (a copy that starts before L's miss copy): gap + L's copy time ≈ 0.267 + 0.006 + 2.72 × 0.2239 ≈ 0.88 ms, about 3 rows. It is valid only if two concurrent copy launches don't slow each other. E27 measured copy vs compute only; Task 7 measures copy vs copy.
 - **APEX (target L, source L's pre-mixer).**
-  - Scores are ready at layer L's input. The copy must land before L's own gather, so the window is layer L's norm + mixer + shared expert + router + planning, about 0.267 − 0.06 ≈ 0.21 ms (linear) and 0.23 ms (full).
-  - In-graph side stream: 0 rows fit (one row is 0.2299 ms). Worse, the scores exist only after the pre-mixer tap, and a break there splits the mixer segment. **Not feasible.**
-  - Doorbell: reaction plus one row is 0.03–0.075 + 0.216 ms, also longer than the window. It needs a same-layer post/resolve, and every hit row pays `reaction + n·0.209 − 0.21` ms of wait.
-  - `at_target` (copy at L's gather): correct but no faster than baseline.
-  - **Decision: APEX is priced offline (Task 3) and deferred from the live test**, unless Task 3 shows ≥3 ms/token *and* the doorbell supports same-layer tags. The scorer is still built and tested (Task 2).
+  - The copy must land before L's own gather, so the window is layer L's norm + mixer + shared expert + router + planning, ≈ 0.267 − 0.06 ≈ 0.21 ms (linear) and 0.23 ms (full).
+  - That fits **0** in-graph rows (one row takes 0.2299 ms). It is also shorter than the doorbell's reaction plus one row (0.03–0.075 + 0.216 ms).
+  - APEX would need a same-layer post/resolve, and every hit row would pay `reaction + n·0.209 − 0.21` ms of wait.
+  - **Decision:** APEX is priced offline (Task 3) and deferred from live prefetch. The exception is Task 3 showing ≥3 ms/token *and* crypto-c9's layer supporting same-layer tags. Its scorer is still built (Task 2) and can run in shadow (Task 6) to measure cost and recall.
 
-### Prefetch plan interface (backend-independent)
+### Phase A output contract (what Phase B consumes)
 
-```python
-class PrefetchPlan(msgspec.Struct, frozen=True):
-    """One target layer's prefetch request. Every tensor is a stable device buffer rewritten in place."""
-    target_layer: int
-    expert_ids: torch.Tensor         # int64 [B]: row ids to fetch, best score first
-    destination_slots: torch.Tensor  # int32 [B]: the target layer's dedicated prefetch rows
-    destination_rows: torch.Tensor   # int64 [B]: the same rows, for index_copy_ on device-resident tensors
-    count: torch.Tensor              # int32 [1]: min(B, non-resident candidates); rows >= count are padding
-    delivered: torch.Tensor          # bool [B]: set by the backend; True only once that row's bytes are safe to read
-```
+- **Handle.** `ExpertPredictionRuntime.prefetch: PrefetchScoring | None`.
+- **Structure.**
+  - `PrefetchScoring.targets: list[int]`.
+  - `PrefetchScoring.next_target: dict[int, int]`: source layer → target layer for LLaPor, `{}` for APEX.
+  - `PrefetchScoring.bank.ids_for(T)`: int64 `[C]`, best first.
+  - `PrefetchScoring.bank.scores_for(T)`: float32 `[C]`, non-negative priorities. LLaPor gives sigmoid probabilities summed over batch rows; APEX gives softmax zeroed past `top_k + depth(tau)`, summed.
+- **When the bank is written.**
+  - The bank rows are rewritten in place from `FeatureStore.after_write`: at the source layer's TOPK_WEIGHTS write (LLaPor) or the target's PRE_MIXER write (APEX).
+  - For LLaPor, a Phase B reader at layer L's gather or later sees this forward's candidates for L+1.
+  - Addresses survive graph capture. Rows never written hold distinct valid ids with score 0.
+- **Residents stay in.** The bank does not filter residents. `BudgetRecall` quantifies what filtering plus a B clamp would deliver.
 
-- **Planner** (`serving/plan.py`, in-graph, main stream):
-  1. Read the bank's top-C candidates for the target.
-  2. Mask residents (`expert_to_slot >= 0`).
-  3. Take the top-B non-resident candidates by score; residents sort last.
-  4. Write `expert_ids` and `count`, and clear `delivered`.
-- **Residual:** actual misses − delivered. The graph gather calls `plan_graph_routes(..., prefetch_ids=where(delivered, expert_ids, -1), prefetch_base)`.
-  - Routes to delivered experts remap to their prefetch row.
-  - Every other non-resident route takes the existing scratch-row miss copy. `routed_miss_rows` becomes the residual.
-  - An undelivered, late, or garbage plan therefore only costs time, never bytes.
-- **Dedicated prefetch rows:** `ExpertHotCacheManager.from_model(prefetch_rows=B)`.
-  - Scratch per layer becomes graph rows + B, and `enable_graph_gather(graph rows)` is unchanged.
-  - Prefetch rows start at `capacity + graph_gather_rows`. The residency updater's dump row (`capacity`, the first graph scratch row) is untouched.
-  - The budget deduction is automatic: B × 48 × 2.64 MiB (B = 3 → 380 MiB, B = 10 → 1.27 GiB, taken from hot slots). Live arms keep `HOT_GPU_MB` equal, so prefetch pays for its rows in hot slots; the report counts the lost slots.
-- **Streamer hook:** `ExpertStreamer.prefetch: LayerPrefetch | None` (default `None`). In `_gather_graph`, after `residency_update.on_graph_forward` and before `plan_graph_routes`:
-  - `prefetch_ids = self.prefetch.resolve()` resolves this layer's plan;
-  - `self.prefetch.launch_next()` plans the next layer and starts its copy.
-  - With `prefetch is None` the recorded kernels are exactly today's.
+### Phase B interface (TBD, owned by crypto-c9)
 
-### Backends
-
-| Backend | Selected by | Launch (source layer L's gather) | Resolve (target gather) | Status |
-|---|---|---|---|---|
-| `in_graph_copy` / `at_target` | `SGLANG_MOE_EXPERT_PREFETCH_SCHEDULE=at_target` | nothing | plan the target, copy its `count` rows on the main stream, `delivered = arange < count` | Task 4. A correctness and plumbing mode with zero overlap, so never faster than baseline |
-| `in_graph_copy` / `side_stream` (default) | `...SCHEDULE=side_stream` | plan L+1; `main_seq += 1` at the first source; record a main-stream event; **graph break**: `side.wait_event(event)`, replay L+1's captured side graph (per row j: copy 1 row, then `ready[j] = side_seq`) | `delivered = (ready == main_seq) & (arange < count)`, read before the route plan | Task 5 |
-| `doorbell` | `SGLANG_MOE_EXPERT_DOORBELL=1` | plan L+1, `copier.post(expert_ids, destination_slots, count, tag=L+1)` | `copier.wait(tag)`, then `delivered = arange < count` | Task 10, **blocked on `cc/doorbell-serving`** |
-
-- **Why `side_stream` is the default schedule rather than copying at L+1 before MoE:** only a copy that runs while the main stream computes can save time.
-  - E27: overlap saving equals min(copy, window)/copy, with no contention against compute.
-  - `at_target` does the prefetch copy exactly where the miss copy would have run, plus wasted rows, so it can only lose. It stays as a correctness mode and a backend-plumbing check.
-  - Task 8 measures both on real modules, and the live matrix runs `at_target` as a probe-only correctness cell.
-- **Why a graph break per source layer:** E27 found that a copy graph captured on a side stream replays on whichever stream is current. One captured decode graph therefore cannot hold side-stream kernels.
-  - The break is a host launch per layer: record the event, `wait_event`, and a side-graph replay. It is the one per-token Python step this plan adds.
-  - It is sync-free. `set_sync_debug_mode("error")` tests enforce that.
-  - Task 8 prices its host cost and spikes a multi-stream capture that would remove it.
-- **Why the seq protocol is safe:**
-  - `main_seq` (main stream, first source gather) and `side_seq` (side stream, first side graph) each advance once per graph-gather decode forward, starting equal.
-  - A row counts as delivered only when its ready stamp equals this forward's `main_seq`. The stamp is written on the side stream *after* the row's copy, so a delivered row's bytes are complete.
-  - Nothing rewrites a target's prefetch rows until the next forward's side copy. That copy launches only after this forward's sampled token is read back, because the overlap schedule is off, `--cuda-graph-max-bs-decode 1`, and there is no speculative decoding (validated in Task 6).
-  - Every race therefore degrades to "not delivered", never to wrong bytes.
-  - A non-breakable decode graph backend would never replay the break. Rows would never be delivered, which is safe but useless, so Task 6 refuses `side_stream` unless the decode backend is `breakable`.
-- **Doorbell API assumed** from `shared/cc/doorbell-prototype:python/sglang/kernels/ops/moe/expert_doorbell.py`: `ExpertDoorbellCopier(segments, capacity, ...)`, `.post(source_rows int64[cap], destination_slots int32[cap], count int32[1], tag)`, `.wait(tag)`, `.quiesce()` around capture, slots unreadable before `wait`.
-  - Whether `post`/`wait` are capturable or need a break is decided by `cc/doorbell-serving`; Task 10 adapts.
-  - The handle is assumed to be `expert_hot_cache_manager.doorbell` (`None` when off).
+- **Assumed, nothing more:** per target layer, int64 row ids `[C]`, slots `[C]`, and a count.
+- **Adapter:** Phase B's adapter (Task B1) maps bank → that interface, and nothing else.
+- **Decided by crypto-c9 at merge:**
+  - where plans are read;
+  - resident filtering and the budget clamp;
+  - destination rows and slot safety;
+  - delivered/residual accounting;
+  - backend selection (in-graph vs doorbell);
+  - the prefetch-on flag.
+- **Candidate format:** if the interface prefers a `[num_experts]` mask, the adapter builds it with one `scatter_` from the same ids and priorities.
 
 ### Scratch versus evictable hot slots
 
-Prefetching into evictable hot slots is **out of scope**:
-- The in-graph residency update (E31) owns the mapping, slot states and generations. A second slot writer would need a generation/lease protocol inside the graph.
-- Dedicated rows cap B at a few rows per layer (≤ 10 here). Task 3 reports budget recall at 1–10 rows *and* at 16/32. If recall keeps rising well past 10, slot targeting is a follow-up plan, not this one.
+Owned by crypto-c9's copy layer. Task 3 still reports budget recall at 1–10 *and* 16/32 rows, so that decision has data.
 
 ### What stays outside the decode graph, and why
 
-1. Checkpoint load, checksum and spec validation, dtype casting, buffer allocation, and side-graph capture: one-time setup.
+1. Checkpoint load, checksum and spec validation, dtype casting, and buffer allocation: one-time setup.
 2. Hook installation, and the Python bodies of hooks during graph capture. Replay re-executes the recorded kernels without Python, as for the existing `RouteTaps`.
-3. The `rows <= max_rows` shape check in `FeatureStore.write`. It reads a Python int shape, not device data, and it never runs during replay.
-4. Eager prefill forwards larger than the tap buffers. `FeatureStore.write` skips them (no `spill` when capture is off), and the eager gather path ignores `prefetch`. Prefill prefetch is out of scope.
+3. The `rows <= max_rows` shape check in `FeatureStore.write`. It reads a Python int shape, not device data, and never runs during replay.
+4. Eager prefill forwards larger than the tap buffers. `FeatureStore.write` skips them (no `spill` when capture is off), so they are never scored. Prefill prefetch is out of scope.
 5. Metric readback, once per `SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL` forwards, only when a metrics file is set.
-6. **`side_stream` only:** one `eager_on_graph` break per source layer (47 per token). It is a host launch with no device read (see Backends).
-7. **`doorbell` only:** the doorbell's C++ copy thread, and whatever host calls its serving API needs.
+6. Phase B's copy-path host steps, owned by crypto-c9's layer.
 
 ### Existing Python-side logic this supersedes
 
 - **Host-side next-layer policy:** `expert_prefetch.SparseNextLayerPolicy`, `ExpertPrefetchCoordinator.launch`, and `ExpertHotCacheManager.enable_next_layer_prefetch`.
   - They use `.tolist()` on routes and require the pinned host cache.
-  - `ModelRunner.maybe_init_expert_hot_cache` refuses them with graph gather (`SGLANG_MOE_PREFETCH_MAX_CANDIDATES` stays 0).
-  - They are not deleted, but live prefetch on graph-gather builds goes through this plan only. `SGLANG_MOE_EXPERT_PREFETCH` and `SGLANG_MOE_PREFETCH_MAX_CANDIDATES > 0` are mutually exclusive (Task 6).
-- **Post-forward shadow scoring:** `ExpertPredictionRuntime._score` calls `ExpertPredictor.predict` after the forward. That is too late to feed the same forward's copy, so the live LLaPor/APEX path does not register as an `ExpertPredictor`. Shadow predictors (`affinity`, `popularity`) keep working unchanged.
+  - `ModelRunner.maybe_init_expert_hot_cache` refuses them with graph gather.
+  - They are not deleted. `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR` and `SGLANG_MOE_PREFETCH_MAX_CANDIDATES > 0` are mutually exclusive (Task 4).
+- **Post-forward shadow scoring:** `ExpertPredictionRuntime._score` calls `ExpertPredictor.predict` after the forward. That is too late to feed the same forward's copy, so LLaPor/APEX do not register as `ExpertPredictor`s. Shadow predictors (`affinity`, `popularity`) keep working unchanged.
 
 ### Deviations from the research specs (recorded for the write-up)
 
-- **No LLaPor online adaptation, no rollback, no slot leases.** Prefetch writes only dedicated rows, so it needs no slot safety.
-- **Candidates come from summed batch scores** (LLaPor sigmoid, APEX softmax masked beyond `top_k + depth(tau)`), the specs' batch extension. At batch 1 this equals per-token ranking.
+- **No LLaPor online adaptation, no rollback, no slot leases in Phase A.** Slot safety belongs to crypto-c9's copy layer.
+- **Candidates come from summed batch scores**, the specs' batch extension. At batch 1 this equals per-token ranking.
 - **Splits are train/dev/shifted_test** (training write-up), not the specs' 70/10/10/10.
-- **APEX is deferred from live** unless Task 3 says otherwise.
+- **APEX is deferred from live prefetch** unless Task 3 says otherwise.
 
 ## File Structure
+
+**Phase A (now):**
 
 | File | Responsibility | Task |
 |---|---|---|
@@ -186,37 +175,37 @@ Prefetching into evictable hot slots is **out of scope**:
 | `.../serving/scorers.py` | static-shape bf16 `LlaporScorer`, `ApexScorer` | 2 |
 | `.../serving/candidates.py` | `PrefetchCandidateBank`, `BudgetRecall` device counters | 2 |
 | `.../expert_prediction/training/dataset.py` | add `residency_layer` to `load_layer_rows` | 3 |
-| `.../expert_prediction/prefetch_pricing.py` | budget recall, doorbell and side-stream timing models (pure torch) | 3 |
+| `.../expert_prediction/prefetch_pricing.py` | budget recall, doorbell and in-graph copy timing models (pure torch) | 3 |
 | `scripts/expert_prediction/prefetch/check_serving_parity.py` | real checkpoints: serving bf16 vs training fp32 | 3 |
 | `scripts/expert_prediction/prefetch/price_prefetch.py` | offline gate report from the capture | 3 |
-| `python/sglang/srt/layers/moe/expert_route_plan.py` | `plan_graph_routes(prefetch_ids=, prefetch_base=)`, `GraphRoutePlan.prefetch_hit_routes` | 4 |
-| `python/sglang/srt/layers/moe/expert_hot_cache.py` | `from_model(prefetch_rows=)` | 4 |
-| `python/sglang/srt/layers/moe/expert_stream.py` | `ExpertStreamer.prefetch` hook, `copy_rows_into_cache`, prefetch counters | 4 |
-| `.../serving/plan.py` | `PrefetchPlan`, `PrefetchPlanner`, `LayerPrefetch` protocol | 4 |
-| `.../serving/in_graph_copy.py` | `in_graph_copy` backend: `at_target` (4), `side_stream` (5) | 4, 5 |
-| `.../expert_prediction/feature_store.py` | `after_write` generic hook | 6 |
-| `.../expert_prediction/adapters.py` | `register_mixer_kind_adapter`, `mixer_kinds` | 6 |
-| `.../serving/runtime.py` | `PrefetchScoring`: scorers, bank, planner, backend, metrics | 6 |
-| `.../expert_prediction/runtime.py` | build `PrefetchScoring` from env; log its metrics | 6 |
-| `python/sglang/srt/environ.py` | `SGLANG_MOE_EXPERT_PREFETCH*` | 6 |
-| `python/sglang/srt/model_executor/model_runner.py` | prediction gate condition + one `prefetch_rows=` kwarg (orchestration) | 6 |
-| `scripts/expert_prediction/run-shadow-server.sh` | doorbell/prefetch/budget/schedule knobs, production-current flags, lock | 7 |
-| `scripts/expert_prediction/benchmarks/run_capture_sessions.py` | `--max-tokens`, `--session-ids` | 7 |
-| `scripts/expert_prediction/prefetch/select_ab_sessions.py` | fixed A/B subset | 7 |
-| `scripts/expert_prediction/prefetch/logprob_probe.py` | greedy top-2 logprob capture per arm | 7 |
-| `scripts/expert_prediction/prefetch/compare_logprobs.py` | correctness gate between arms | 7 |
-| `scripts/expert_prediction/prefetch/summarize_ab.py` | tok/s, TTFT, budget recall, delivered rows per arm | 7 |
-| `scripts/expert_prediction/prefetch/bench_prefetch_schedule.py` | schedule microbench on real layer tensors | 8 |
-| `.../serving/doorbell_backend.py` | `doorbell` backend adapter (blocked) | 10 |
+| `.../expert_prediction/feature_store.py` | `after_write` generic hook | 4 |
+| `.../expert_prediction/adapters.py` | `register_mixer_kind_adapter`, `mixer_kinds` | 4 |
+| `.../serving/runtime.py` | `PrefetchScoring`: scorers, bank, shadow recall, metrics | 4 |
+| `.../expert_prediction/runtime.py` | build `PrefetchScoring` from env; log its metrics | 4 |
+| `python/sglang/srt/environ.py` | `SGLANG_MOE_EXPERT_PREFETCH_*` | 4 |
+| `python/sglang/srt/model_executor/model_runner.py` | one gate condition (orchestration) | 4 |
+| `scripts/expert_prediction/run-shadow-server.sh` | predictor knobs, production-current flags, lock | 5 |
+| `scripts/expert_prediction/benchmarks/run_capture_sessions.py` | `--max-tokens`, `--session-ids` | 5 |
+| `scripts/expert_prediction/prefetch/select_ab_sessions.py` | fixed A/B subset | 5 |
+| `scripts/expert_prediction/prefetch/logprob_probe.py` | greedy top-2 logprob capture per arm | 5 |
+| `scripts/expert_prediction/prefetch/compare_logprobs.py` | exact and near-tie correctness gates | 5 |
+| `scripts/expert_prediction/prefetch/summarize_ab.py` | tok/s, TTFT, shadow budget recall per arm | 5 |
+| `scripts/expert_prediction/prefetch/bench_scoring_cost.py` | 47-layer scorer graph cost at bs 1 | 7 |
+| `scripts/expert_prediction/prefetch/bench_concurrent_copies.py` | two concurrent existing-kernel copies on real rows | 7 |
 | `test/registered/unit/layers/moe/test_expert_prefetch_checkpoints.py` | Task 1 tests (CPU) | 1 |
 | `test/registered/unit/layers/moe/test_expert_prefetch_scoring.py` | Task 2 tests (CPU + CUDA) | 2 |
 | `test/registered/unit/layers/moe/test_expert_prefetch_pricing.py` | Task 3 tests (CPU) | 3 |
-| `test/registered/unit/layers/moe/test_expert_prefetch_plan.py` | Task 4 tests (CPU + CUDA) | 4 |
-| `test/registered/unit/layers/moe/test_expert_prefetch_side_stream.py` | Task 5 tests (CUDA) | 5 |
-| `test/registered/unit/layers/moe/test_expert_prefetch_runtime.py` | Task 6 tests (CUDA, small) | 6 |
+| `test/registered/unit/layers/moe/test_expert_prefetch_runtime.py` | Task 4 tests (CUDA, small) | 4 |
 | `docs/superpowers/experiments/2026-09-15-expert-prefetch-offline-gate.md` | Task 3 report | 3 |
-| `docs/superpowers/experiments/2026-09-1X-expert-prefetch-schedule-bench.md` | Task 8 report | 8 |
-| `docs/superpowers/experiments/2026-09-1X-expert-prefetch-live-ab.md` | Task 9 (and 10) report | 9, 10 |
+| `docs/superpowers/experiments/2026-09-1X-expert-prefetch-shadow-live.md` | Task 6 report (+ Task 7 section) | 6, 7 |
+
+**Phase B (blocked on the doorbell merge):**
+
+| File | Responsibility | Task |
+|---|---|---|
+| `.../serving/<adapter>.py` (name TBD) | bank → crypto-c9's per-target-layer ids/slots/count | B1 |
+| its test file (name TBD) | adapter tests on the merged layer | B1 |
+| `docs/superpowers/experiments/2026-09-1X-expert-prefetch-live-ab.md` | 4-cell matrix and live tok/s | B2 |
 
 ---
 
@@ -878,9 +867,9 @@ git commit -m "feat(moe): add graph-capturable prefetch scorers, candidate bank 
   - `load_layer_rows(..., residency_layer: int | None = None)`, whose `LayerRows.resident` is bool `[rows, experts]` or None;
   - `prefetch_pricing.budget_hits(scores, topk_ids, resident, budget) -> (missed [rows], hits [rows])`;
   - `prefetch_pricing.doorbell_saving_ms(*, hits, budget, window_ms, reaction_ms) -> Tensor[rows] float64`;
-  - `prefetch_pricing.side_stream_ready_rows(*, budget, window_ms) -> int`: how many of the plan's rows the side-stream copy lands before the target gather reads readiness (Task 5 copies rows one launch at a time, best score first);
+  - `prefetch_pricing.side_stream_ready_rows(*, budget, window_ms) -> int`: how many of the plan's rows the side-stream copy lands before the target gather reads readiness (an in-graph copy launched one row at a time, best score first; how crypto-c9's in-graph backend schedules rows is TBD);
   - the constants `IN_GRAPH_ROW_MS`, `IN_GRAPH_FIXED_MS`, `DOORBELL_ROW_MS`, `DOORBELL_FIXED_MS`, `DOORBELL_COMPLETED_WAIT_MS`.
-- Side-stream saving is `budget_hits(..., side_stream_ready_rows(...)).hits × IN_GRAPH_ROW_MS`. Rows that land late are simply not delivered, so they cost no wait. Whether their copy slows the target's residual copy is unmeasured (Task 8).
+- Side-stream saving is `budget_hits(..., side_stream_ready_rows(...)).hits × IN_GRAPH_ROW_MS`. Rows that land late are simply not delivered, so they cost no wait. Whether their copy slows the target's residual copy is unmeasured (Task 7).
 
 - [ ] **Step 1: Write the failing pricing tests**
 
@@ -1197,7 +1186,7 @@ def main():
                 if args.predictor == "llapor":
                     # "gap": the side copy starts after the source layer's own miss copy (E28 window only).
                     # "overlap": it starts before that copy, so the window also spans the source layer's
-                    # baseline copy time. Valid only if concurrent copies do not slow each other (Task 8).
+                    # baseline copy time. Valid only if concurrent copies do not slow each other (Task 7).
                     source_entry = per_layer.get(checkpoint.source_layer, {}).get(f"{split}_b{budgets[0]}", {})
                     source_copy_ms = IN_GRAPH_FIXED_MS + source_entry.get("missed_per_token", 0.0) * IN_GRAPH_ROW_MS
                     for label, side_window in (("gap", window), ("overlap", window + source_copy_ms)):
@@ -1251,13 +1240,12 @@ Write `docs/superpowers/experiments/2026-09-15-expert-prefetch-offline-gate.md` 
 - **Totals:** a table of budget recall and ms/token by budget, split, and reaction.
 - **Per-mixer-kind means.**
 - **Parity output** from Step 5.
-- **A decision under these rules** (all on `shifted_test`, budget ≤ 10):
-  - **In-graph copy GO:** `side_saving_ms_per_token_gap` ≥ 3.0 for some budget. The live budget B is its argmax.
-  - **Conditional GO:** only `side_saving_ms_per_token_overlap` reaches 3.0. The live test then waits for Task 8 to show that concurrent copies do not slow each other, and B is the overlap argmax.
-  - **Doorbell GO:** `saving_ms_per_token_r0.075` ≥ 3.0. It is recorded for Task 10 and does not block Tasks 4–9.
-  - **NO-GO:** none of the above. Report to the user before Task 4. Tasks 4–7 may still proceed as plumbing if the user says so, but Task 9 does not run.
-  - **APEX live:** needs the doorbell rule *and* a doorbell same-layer post/resolve. Otherwise it is deferred, and the doc states the shortfall. The in-graph side stream cannot serve APEX, because APEX's scores and its own gather sit in the same layer.
-  - **Evictable-slot follow-up:** flag it if budget recall at 32 exceeds budget 10 by more than 0.15.
+- **A decision under these rules** (all on `shifted_test`, budget ≤ 10). The decision is whether Phase B is worth running, and which budget to give crypto-c9:
+  - **GO:** `side_saving_ms_per_token_gap` ≥ 3.0 or `saving_ms_per_token_r0.075` ≥ 3.0 for some budget. Record each argmax budget.
+  - **Conditional GO:** only `side_saving_ms_per_token_overlap` reaches 3.0. Phase B then depends on Task 7 showing that concurrent copies do not slow each other.
+  - **NO-GO:** none of the above. Report to the user before Task 4. Tasks 4–7 still run only if the user says so; the shadow run still measures scoring cost.
+  - **APEX live prefetch:** needs the doorbell rule *and* same-layer post/resolve support in crypto-c9's layer. Otherwise it is deferred, and the doc states the shortfall.
+  - **Evictable-slot follow-up** (for crypto-c9): flag it if budget recall at 32 exceeds budget 10 by more than 0.15.
 
 Send the decision to the user; do not start Task 4 on NO-GO without their answer.
 
@@ -1275,510 +1263,9 @@ git commit -m "feat(moe): price live expert prefetch offline from the capture's 
 
 ---
 
-### Task 4: Prefetch plan, in-graph planner, dedicated prefetch rows and gather integration (`in_graph_copy` / `at_target`)
+### Task 4: Live in-graph shadow scoring runtime — generic tap hook, env vars, runner gate (Phase A)
 
-MVP backbone. It needs nothing from the doorbell, and it runs with `SGLANG_MOE_EXPERT_DOORBELL` unset.
-
-**Files:**
-- Create: `python/sglang/srt/layers/moe/expert_prediction/serving/plan.py`
-- Create: `python/sglang/srt/layers/moe/expert_prediction/serving/in_graph_copy.py`
-- Modify: `python/sglang/srt/layers/moe/expert_route_plan.py` (`GraphRoutePlan`, `plan_graph_routes`)
-- Modify: `python/sglang/srt/layers/moe/expert_stream.py` (`ExpertStreamer.__init__`, `_gather_graph`, new `install_prefetch` and `copy_rows_into_cache`)
-- Modify: `python/sglang/srt/layers/moe/expert_hot_cache.py` (`ExpertHotCacheManager.from_model`)
-- Test: `test/registered/unit/layers/moe/test_expert_prefetch_plan.py`
-
-**Interfaces:**
-- Consumes: Task 2 `PrefetchCandidateBank`; the existing `ExpertStreamer`, `ExpertHotCache`, `plan_graph_routes`, and `copy_expert_row_segments_gpu`.
-- Produces:
-  - `PrefetchPlan` (see Design);
-  - `PrefetchPlanner(*, bank, expert_to_slot: Mapping[int, Tensor], prefetch_base: Mapping[int, int], budget, device)` with `.plans`, `.plan(target_layer)`, `.valid_rows(plan)`, `.delivered_ids(plan)`;
-  - the `LayerPrefetch` protocol: `base: int`, `resolve() -> Tensor | None`, `launch_next() -> None`;
-  - `InGraphCopyBackend.install(*, planner, streamers, next_target: Mapping[int, int], schedule, device)`. Task 4 implements `schedule="at_target"` only and raises `NotImplementedError` for `side_stream`, which Task 5 replaces;
-  - `ExpertStreamer.install_prefetch(hook)`, `ExpertStreamer.prefetch_base` (= `hot_cache.capacity + graph_gather_rows`), `ExpertStreamer.copy_rows_into_cache(source_rows, destination_rows, destination_slots, count)`, and `ExpertStreamer.graph_prefetch_counters` int64 `[2]` (routes served from prefetch rows, delivered rows);
-  - `plan_graph_routes(flat, expert_to_slot, scratch_rows, scratch_base, prefetch_ids=None, prefetch_base=0)`, whose `GraphRoutePlan.prefetch_hit_routes` is `None` when `prefetch_ids is None`;
-  - `ExpertHotCacheManager.from_model(..., prefetch_rows: int = 0)`.
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-"""Prefetch plans only move bytes into dedicated rows: routes stay byte-exact whatever the plan says."""
-
-import unittest
-
-import torch
-
-from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes
-
-EXPERTS, TOP_K = 8, 4
-
-
-class TestPrefetchRoutePlanCpu(unittest.TestCase):
-    def test_delivered_experts_leave_the_residual_miss_copy(self):
-        expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.long)
-        expert_to_slot[1] = 0
-        flat = torch.tensor([1, 5, 3, 5])
-        plan = plan_graph_routes(flat, expert_to_slot, 4, 10, prefetch_ids=torch.tensor([7, 5, -1]), prefetch_base=14)
-        self.assertEqual(plan.remap.tolist(), [0, 15, 10, 15])
-        self.assertEqual((int(plan.miss_plan_rows), int(plan.routed_miss_rows), int(plan.prefetch_hit_routes)), (1, 1, 2))
-        self.assertEqual(plan.source_rows[:1].tolist(), [3])
-
-    def test_resident_expert_wins_over_a_stale_plan_row(self):
-        expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.long)
-        expert_to_slot[5] = 2
-        plan = plan_graph_routes(torch.tensor([5, 6]), expert_to_slot, 2, 10, prefetch_ids=torch.tensor([5]), prefetch_base=12)
-        self.assertEqual(plan.remap.tolist(), [2, 10])
-        self.assertEqual(int(plan.prefetch_hit_routes), 0)
-
-    def test_no_prefetch_keeps_the_existing_plan(self):
-        expert_to_slot = torch.tensor([0, -1, -1, 1, -1, -1, -1, -1])
-        flat = torch.tensor([2, 0, 2, 7])
-        plan = plan_graph_routes(flat, expert_to_slot, 4, 2)
-        self.assertIsNone(plan.prefetch_hit_routes)
-        self.assertEqual(plan.remap.tolist(), [2, 0, 2, 3])
-
-    def test_planner_takes_best_nonresident_candidates_and_counts_them(self):
-        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
-        from sglang.srt.layers.moe.expert_prediction.serving.plan import PrefetchPlanner
-
-        bank = PrefetchCandidateBank(layer_ids=[1], width=4, device=torch.device("cpu"))
-        bank.ids[0] = torch.tensor([3, 4, 6, 2])
-        bank.scores[0] = torch.tensor([0.9, 0.8, 0.7, 0.1])
-        expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.long)
-        expert_to_slot[[3, 6]] = torch.tensor([0, 1])
-        planner = PrefetchPlanner(bank=bank, expert_to_slot={1: expert_to_slot}, prefetch_base={1: 20},
-                                  budget=3, device=torch.device("cpu"))
-        plan = planner.plan(1)
-        self.assertEqual(plan.expert_ids[:2].tolist(), [4, 2])
-        self.assertEqual(plan.count.tolist(), [2])
-        self.assertEqual(plan.destination_slots.tolist(), [20, 21, 22])
-        plan.delivered.copy_(planner.valid_rows(plan))
-        self.assertEqual(planner.delivered_ids(plan).tolist(), [4, 2, -1])
-```
-
-For the CUDA class, import `_layer`, `_source_bytes`, `EXPERTS`, `TOP_K` and `NVFP4_STREAM_TENSORS` exactly as `test_expert_graph_gather.py` does. Copy its `_graph_streamer` and `_assert_rows` helpers, building the cache with `scratch_rows=TOP_K + BUDGET` (`BUDGET = 3`). Then add:
-
-```python
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestAtTargetPrefetchCuda(unittest.TestCase):
-    def _install(self, layer, bank_ids, bank_scores, resident=(1, 4, 6)):
-        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
-        from sglang.srt.layers.moe.expert_prediction.serving.in_graph_copy import InGraphCopyBackend
-        from sglang.srt.layers.moe.expert_prediction.serving.plan import PrefetchPlanner
-
-        streamer, cache = self._graph_streamer(layer, resident)
-        device = torch.device("cuda")
-        bank = PrefetchCandidateBank(layer_ids=[0], width=len(bank_ids), device=device)
-        bank.ids[0].copy_(torch.tensor(bank_ids))
-        bank.scores[0].copy_(torch.tensor(bank_scores))
-        planner = PrefetchPlanner(bank=bank, expert_to_slot={0: cache.expert_to_slot},
-                                  prefetch_base={0: streamer.prefetch_base}, budget=BUDGET, device=device)
-        InGraphCopyBackend.install(planner=planner, streamers={0: streamer}, next_target={},
-                                   schedule="at_target", device=device)
-        return streamer, cache, bank
-
-    def test_predicted_misses_are_served_from_prefetch_rows_byte_exact(self):
-        layer = _layer()
-        streamer, cache, _ = self._install(layer, [2, 7, 0, 5], [0.9, 0.8, 0.7, 0.6])
-        ids = torch.tensor([[2, 7, 4, 3]], dtype=torch.int32, device="cuda")
-        compact, tensors = streamer.gather(ids)
-        self._assert_rows(layer, ids, compact, tensors)
-        base = streamer.prefetch_base
-        self.assertEqual(compact.tolist(), [[base, base + 1, cache.expert_to_slot[4].item(), cache.capacity]])
-        self.assertEqual(streamer.graph_prefetch_counters.tolist(), [2, 3])
-        self.assertEqual(streamer.graph_counters.tolist(), [4, 1])
-
-    def test_garbage_plan_is_byte_exact_under_replay(self):
-        layer = _layer()
-        streamer, cache, bank = self._install(layer, [0, 1, 2, 3], [0.0, 0.0, 0.0, 0.0])
-        ids = torch.tensor([[1, 4, 6, 1]], dtype=torch.int32, device="cuda")
-        outputs = {name: torch.empty((TOP_K,) + tuple(t.shape[1:]), dtype=t.dtype, device="cuda")
-                   for name, t in cache.tensors.items()}
-
-        def step():
-            compact, tensors = streamer.gather(ids)
-            for name, output in outputs.items():
-                output.copy_(tensors[name][compact.reshape(-1).long()])
-
-        side = torch.cuda.Stream()
-        with torch.cuda.stream(side):
-            step()
-        torch.cuda.current_stream().wait_stream(side)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            step()
-        generator = torch.Generator().manual_seed(7)
-        for _ in range(12):
-            ids.copy_(torch.randint(0, EXPERTS, (1, TOP_K), generator=generator).to("cuda", torch.int32))
-            bank.ids[0].copy_(torch.randperm(EXPERTS, generator=generator)[:4].cuda())
-            bank.scores[0].copy_(torch.rand(4, generator=generator).cuda())
-            graph.replay()
-            torch.cuda.synchronize()
-            for name, output in outputs.items():
-                self.assertTrue(torch.equal(output.view(torch.uint8).cpu(), _source_bytes(layer, name, ids.reshape(-1))))
-
-    def test_prefetch_gather_never_synchronizes(self):
-        streamer, _, _ = self._install(_layer(), [2, 7, 0, 5], [0.9, 0.8, 0.7, 0.6])
-        ids = torch.tensor([[2, 7, 4, 3]], dtype=torch.int32, device="cuda")
-        streamer.gather(ids)
-        torch.cuda.synchronize()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            streamer.gather(ids)
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
-
-    def test_manager_adds_prefetch_rows_after_graph_scratch_and_none_when_off(self):
-        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
-
-        def build(prefetch_rows):
-            layer = _layer()
-            layer.layer_id = 0
-            layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
-            model = torch.nn.Module()
-            model.add_module("0", layer)
-            streamer = layer._nvfp4_expert_streamer
-            manager = ExpertHotCacheManager.from_model(
-                model, budget_bytes=streamer.bytes_per_expert * (TOP_K + BUDGET + 2), seed_path=None, dynamic=True,
-                update_prefill_tokens=16, min_residence_forwards=0, benefit_ratio=1.0, graph_gather_batch_size=1,
-                prefetch_rows=prefetch_rows,
-            )
-            return manager.caches[0], streamer
-
-        cache, streamer = build(BUDGET)
-        self.assertEqual((cache.capacity, cache.scratch_rows, streamer.graph_gather_rows), (2, TOP_K + BUDGET, TOP_K))
-        self.assertEqual(streamer.prefetch_base, 2 + TOP_K)
-        cache, streamer = build(0)
-        self.assertEqual((cache.capacity, cache.scratch_rows, streamer.prefetch), (2 + BUDGET, TOP_K, None))
-```
-
-In the first test:
-- Residents are 1, 4 and 6. The candidates are [2, 7, 0, 5], all non-resident, and B = 3 plans [2, 7, 0].
-- Routes 2 and 7 hit prefetch rows. Route 4 is resident. Route 3 is the only residual miss, so it lands in the first graph scratch row.
-- The counters therefore read 2 prefetch-hit routes out of 3 delivered rows, and graph misses [4 routes, 1 routed miss].
-
-The last test guards the off path: with `prefetch_rows=0` the slot/scratch split is today's. Register the file with `register_cuda_ci(est_time=15, stage="base-a", runner_config="1-gpu-small")`.
-
-- [ ] **Step 2: Run to verify failure**
-
-CPU first: `CUDA_VISIBLE_DEVICES="" <test command> test/registered/unit/layers/moe/test_expert_prefetch_plan.py`. Expected: FAIL (`TypeError: plan_graph_routes() got an unexpected keyword argument 'prefetch_ids'`).
-
-- [ ] **Step 3: `plan_graph_routes` and `GraphRoutePlan`**
-
-Add `prefetch_hit_routes: torch.Tensor | None = None` as the last `GraphRoutePlan` field. Leave the dataclass as it is; it is existing code. Change the signature to `..., scratch_base: int, prefetch_ids: torch.Tensor | None = None, prefetch_base: int = 0`. Directly after `hit = slots >= 0`, add:
-
-```python
-    prefetch_hit_routes = None
-    if prefetch_ids is not None:
-        # prefetch_ids holds -1 for undelivered rows, which never equals an expert id.
-        match = flat.unsqueeze(1) == prefetch_ids.unsqueeze(0)
-        prefetched = match.any(dim=1) & ~hit
-        slots = torch.where(prefetched, match.to(torch.uint8).argmax(dim=1) + prefetch_base, slots)
-        prefetch_hit_routes = prefetched.sum()
-        hit = hit | prefetched
-```
-
-Pass `prefetch_hit_routes=prefetch_hit_routes` into the returned plan. Everything below already treats `hit` routes as served. With `prefetch_ids is None` no new kernel is recorded, so the production graph is unchanged. Extend the docstring by one sentence on delivered rows.
-
-- [ ] **Step 4: `ExpertStreamer` hook and row copy**
-
-- **`__init__`:** next to `self.graph_gather_rows = 0` (`expert_stream.py:519`), add `self.prefetch = None` and `self.graph_prefetch_counters = None`.
-- **New methods**, after `enable_graph_gather`:
-
-```python
-    @property
-    def prefetch_base(self) -> int:
-        """First hot-cache row after the graph-gather scratch rows."""
-        return self.hot_cache.capacity + self.graph_gather_rows
-
-    def install_prefetch(self, hook) -> None:
-        """Serve delivered prefetch rows from the graph gather; ``hook`` follows ``serving.plan.LayerPrefetch``."""
-        if self.graph_gather_rows < 1:
-            raise ValueError("expert prefetch needs the graph gather")
-        if self.hot_cache.scratch_rows < self.graph_gather_rows + hook.rows:
-            raise ValueError("expert prefetch needs hot cache rows after the graph scratch")
-        self.prefetch = hook
-        self.graph_prefetch_counters = torch.zeros(2, dtype=torch.int64, device=self.hot_cache.device)
-
-    def copy_rows_into_cache(
-        self,
-        source_rows: torch.Tensor,
-        destination_rows: torch.Tensor,
-        destination_slots: torch.Tensor,
-        count: torch.Tensor,
-    ) -> None:
-        """Graph-capturable copy of expert rows into hot-cache rows on the current stream.
-
-        Device-resident tensors copy every row; host rows copy the first ``count``.
-        """
-        for source, destination in self._graph_device_pairs:
-            destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
-                0,
-                destination_rows,
-                source.view(torch.uint8).reshape(source.shape[0], -1).index_select(0, source_rows),
-            )
-        if self._graph_row_segments is not None:
-            self._copy_row_segments_gpu(self._graph_row_segments, source_rows, destination_slots, count)
-```
-
-`LayerPrefetch` therefore also carries `rows: int` (B); add it to the protocol.
-
-- **`_gather_graph`:** replace the `plan = plan_graph_routes(...)` call with:
-
-```python
-        prefetch_ids = None
-        if self.prefetch is not None:
-            prefetch_ids = self.prefetch.resolve()
-            self.prefetch.launch_next()
-        if prefetch_ids is None:
-            plan = plan_graph_routes(flat, cache.expert_to_slot, self.graph_gather_rows, cache.capacity)
-        else:
-            plan = plan_graph_routes(
-                flat, cache.expert_to_slot, self.graph_gather_rows, cache.capacity,
-                prefetch_ids=prefetch_ids, prefetch_base=self.prefetch_base,
-            )
-            self.graph_prefetch_counters[0].add_(plan.prefetch_hit_routes)
-            self.graph_prefetch_counters[1].add_((prefetch_ids >= 0).sum())
-```
-
-The call must come after `residency_update.on_graph_forward`: the planner reads post-update residency. It must also come before the route plan: the side stream (Task 5) starts the next layer's copy ahead of this layer's miss copy.
-
-- [ ] **Step 5: `from_model(prefetch_rows=)`**
-
-- **Signature:** add `prefetch_rows: int = 0` after `gpu_residency_max_promotions`, and reject negatives.
-- **Split the dict:** rename the existing `scratch_rows` dict to `graph_rows`, then build `scratch_rows = {layer_id: rows + prefetch_rows if rows else 0 for layer_id, rows in graph_rows.items()}`.
-  - `scratch_rows` keeps driving the budget deduction and `ExpertHotCache(...)`.
-  - The `enable_graph_gather` loop iterates `graph_rows`.
-- **Guard:** if `prefetch_rows` is set, `graph_gather_batch_size` must be > 0, otherwise raise `ValueError`.
-- **Off path:** with `prefetch_rows=0`, every number is today's.
-
-- [ ] **Step 6: `serving/plan.py`**
-
-```python
-"""Backend-independent expert prefetch plans, built inside the decode graph from the candidate bank."""
-
-from __future__ import annotations
-
-from typing import Mapping, Protocol
-
-import msgspec
-import torch
-
-from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
-
-
-class PrefetchPlan(msgspec.Struct, frozen=True):
-    target_layer: int
-    expert_ids: torch.Tensor  # int64 [B], best score first
-    destination_slots: torch.Tensor  # int32 [B], dedicated prefetch rows of the target layer
-    destination_rows: torch.Tensor  # int64 [B], the same rows
-    count: torch.Tensor  # int32 [1], rows < count are non-resident candidates
-    delivered: torch.Tensor  # bool [B], set by the backend once a row's bytes are safe to read
-
-
-class LayerPrefetch(Protocol):
-    """What one streamed layer's graph gather calls; a backend installs one per streamed layer."""
-
-    rows: int
-
-    def resolve(self) -> torch.Tensor | None: ...
-
-    def launch_next(self) -> None: ...
-
-
-class PrefetchPlanner:
-    """Turns candidate scores into per-target plans; every op is fixed-shape and sync-free."""
-
-    def __init__(
-        self,
-        *,
-        bank: PrefetchCandidateBank,
-        expert_to_slot: Mapping[int, torch.Tensor],
-        prefetch_base: Mapping[int, int],
-        budget: int,
-        device: torch.device,
-    ) -> None:
-        if not 1 <= budget <= bank.width:
-            raise ValueError("prefetch budget must be between 1 and the candidate width")
-        self.budget = budget
-        self._bank = bank
-        self._expert_to_slot = dict(expert_to_slot)
-        self._positions = torch.arange(budget, device=device)
-        self.plans: dict[int, PrefetchPlan] = {}
-        for layer_id, base in prefetch_base.items():
-            rows = torch.arange(base, base + budget, dtype=torch.int64, device=device)
-            self.plans[layer_id] = PrefetchPlan(
-                target_layer=layer_id,
-                expert_ids=torch.zeros(budget, dtype=torch.int64, device=device),
-                destination_slots=rows.to(torch.int32),
-                destination_rows=rows,
-                count=torch.zeros(1, dtype=torch.int32, device=device),
-                delivered=torch.zeros(budget, dtype=torch.bool, device=device),
-            )
-
-    def plan(self, target_layer: int) -> PrefetchPlan:
-        plan = self.plans[target_layer]
-        ids = self._bank.ids_for(target_layer)
-        scores = self._bank.scores_for(target_layer)
-        nonresident = self._expert_to_slot[target_layer].index_select(0, ids) < 0
-        order = torch.topk(torch.where(nonresident, scores, torch.full_like(scores, float("-inf"))), self.budget).indices
-        plan.expert_ids.copy_(ids.index_select(0, order))
-        plan.count.copy_(nonresident.sum().clamp(max=self.budget).to(torch.int32).reshape(1))
-        plan.delivered.zero_()
-        return plan
-
-    def valid_rows(self, plan: PrefetchPlan) -> torch.Tensor:
-        return self._positions < plan.count
-
-    def delivered_ids(self, plan: PrefetchPlan) -> torch.Tensor:
-        return torch.where(plan.delivered, plan.expert_ids, torch.full_like(plan.expert_ids, -1))
-```
-
-Scores are non-negative (sigmoid, or masked softmax), so every non-resident candidate outranks the `-inf` residents, and `count` rows are exactly the non-resident prefix.
-
-- [ ] **Step 7: `serving/in_graph_copy.py` (`at_target`)**
-
-```python
-"""In-graph copy prefetch backend: plan rows are copied by the JIT row-copy kernel inside the decode graph."""
-
-from __future__ import annotations
-
-from typing import Mapping
-
-import torch
-
-from sglang.srt.layers.moe.expert_prediction.serving.plan import PrefetchPlanner
-
-IN_GRAPH_SCHEDULES = ("side_stream", "at_target")
-
-
-class _AtTargetLayer:
-    """Plans and copies this layer's own rows right before its route plan (no overlap)."""
-
-    def __init__(self, *, planner: PrefetchPlanner, streamer, layer_id: int) -> None:
-        self.rows = planner.budget
-        self._planner = planner
-        self._streamer = streamer
-        self._layer_id = layer_id
-
-    def resolve(self) -> torch.Tensor:
-        plan = self._planner.plan(self._layer_id)
-        self._streamer.copy_rows_into_cache(plan.expert_ids, plan.destination_rows, plan.destination_slots, plan.count)
-        plan.delivered.copy_(self._planner.valid_rows(plan))
-        return self._planner.delivered_ids(plan)
-
-    def launch_next(self) -> None:
-        return None
-
-
-class InGraphCopyBackend:
-    @classmethod
-    def install(
-        cls,
-        *,
-        planner: PrefetchPlanner,
-        streamers: Mapping[int, object],
-        next_target: Mapping[int, int],
-        schedule: str,
-        device: torch.device,
-    ) -> "InGraphCopyBackend":
-        if schedule not in IN_GRAPH_SCHEDULES:
-            raise ValueError(f"unknown in-graph prefetch schedule {schedule!r}; expected one of {IN_GRAPH_SCHEDULES}")
-        if schedule == "side_stream":
-            raise NotImplementedError("side_stream prefetch lands in Task 5")
-        for layer_id in planner.plans:
-            streamers[layer_id].install_prefetch(_AtTargetLayer(planner=planner, streamer=streamers[layer_id], layer_id=layer_id))
-        return cls()
-```
-
-`next_target` maps source layer → target layer; `at_target` ignores it. It is part of the signature so Task 5 does not change callers.
-
-- [ ] **Step 8: Run the tests**
-
-- CPU: expected `4 passed`, CUDA skipped.
-- GPU (< 100 MiB, lock, etiquette): `flock -n /data/models/slang/nvfp4-work/cc-gpu.lock <test command> test/registered/unit/layers/moe/test_expert_prefetch_plan.py test/registered/unit/layers/moe/test_expert_graph_gather.py test/registered/unit/layers/moe/test_expert_graph_gather_scratch.py test/registered/unit/layers/moe/test_expert_residency_gpu.py`. Expected: all pass, and the three existing files are unchanged in count.
-- If the GPU is unavailable, record "CUDA cases pending" in the commit body.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git commit -m "feat(moe): add backend-independent expert prefetch plans served from dedicated hot-cache rows" -- \
-  python/sglang/srt/layers/moe/expert_route_plan.py python/sglang/srt/layers/moe/expert_stream.py \
-  python/sglang/srt/layers/moe/expert_hot_cache.py \
-  python/sglang/srt/layers/moe/expert_prediction/serving/plan.py \
-  python/sglang/srt/layers/moe/expert_prediction/serving/in_graph_copy.py \
-  test/registered/unit/layers/moe/test_expert_prefetch_plan.py
-```
-
----
-
-### Task 5: `side_stream` schedule — overlap the next layer's copy through one graph break per layer
-
-**Files:**
-- Modify: `python/sglang/srt/layers/moe/expert_prediction/serving/in_graph_copy.py`
-- Test: `test/registered/unit/layers/moe/test_expert_prefetch_side_stream.py`
-
-**Interfaces:**
-- Consumes: Task 4; `eager_on_graph` from `model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py`.
-- Produces:
-  - `InGraphCopyBackend.install(schedule="side_stream")`;
-  - `InGraphCopyBackend.side_stream: torch.cuda.Stream`;
-  - `InGraphCopyBackend.capture_side_graphs()`, called once after install and before decode graph capture.
-
-**Mechanism (see Design → Backends):**
-- **Shared state:** `main_seq` and `side_seq` (int64 `[1]`, both 0), plus per target T `ready[T]` (int64 `[B]`, -1) and `row_count[T]` (int32 `[B]`).
-- **Source layer L's gather, `launch_next()`, for T = next_target[L]:**
-  1. `plan = planner.plan(T)`.
-  2. `row_count[T].copy_(planner.valid_rows(plan).to(torch.int32))`.
-  3. If L is the first source layer: `main_seq.add_(1)`.
-  4. Call the break `_launch(T)`, decorated `eager_on_graph(True)`:
-     - `event = torch.cuda.Event()`; `event.record()`;
-     - `side.wait_event(event)`;
-     - `with torch.cuda.stream(side): side_graphs[T].replay()`.
-- **Side graph for T** (captured with `torch.cuda.graph(g, stream=side)` in `capture_side_graphs`):
-  - if T is the first target: `side_seq.add_(1)`;
-  - for j in range(B): `streamer_T.copy_rows_into_cache(plan.expert_ids[j:j+1], plan.destination_rows[j:j+1], plan.destination_slots[j:j+1], row_count[T][j:j+1])`, then `ready[T][j:j+1].copy_(side_seq)`.
-  - Rows copy one launch at a time, best score first, so whole rows become deliverable as they land. `_validate_plan` accepts 1-row contiguous views.
-- **Target T's gather, `resolve()`:**
-  - `plan.delivered.copy_((ready[T] == main_seq) & planner.valid_rows(plan))`;
-  - return `planner.delivered_ids(plan)`.
-- A layer that is both a target and a source (every middle layer) resolves first, then launches.
-
-- [ ] **Step 1: Write the failing tests** (CUDA; copy Task 4's fixtures; two layers 0 → 1, each with its own `_layer(seed)` and streamer)
-
-  - **`test_side_stream_delivers_rows_byte_exact_under_breakable_replay`**
-    - Build a two-layer forward function: `gather(layer 0 ids)`, then `gather(layer 1 ids)`, copying the outputs.
-    - Capture it with the breakable graph harness in `test/registered/unit/model_executor/runner_backend/test_breakable_cuda_graph_backend.py`. Read that file and reuse its capture helper; do not invent one.
-    - Replay 12 times with random routes and random bank rows for target 1.
-    - After each replay, synchronize and assert both layers' outputs byte-exact against `_source_bytes`, and `graph_prefetch_counters[1]` of layer 1 increasing by `count` when the bank's top candidates are non-resident.
-  - **`test_delayed_side_stream_degrades_to_undelivered`**
-    - Before one replay, enqueue `torch.cuda._sleep(50_000_000)` on `backend.side_stream`.
-    - Assert that replay's layer 1 outputs are byte-exact and `plan.delivered.sum() == 0` for that forward.
-    - Assert the next replay (no delay, synchronized) delivers again.
-    - This is the derived property the seq protocol exists for.
-  - **`test_side_stream_forward_never_synchronizes`:** run the eager two-layer forward once, synchronize, then run it under `set_sync_debug_mode("error")`.
-  - **`test_side_stream_refuses_same_layer_targets`:** `next_target={1: 1}` raises `ValueError` ("side_stream needs a later target layer"). Guards against APEX being wired to it.
-
-- [ ] **Step 2: Run to verify failure** (GPU, lock): expect `NotImplementedError: side_stream prefetch lands in Task 5`.
-
-- [ ] **Step 3: Implement** `_SideStreamState`, `_SideStreamLayer(resolve, launch_next)` and `capture_side_graphs` in `in_graph_copy.py`, following the mechanism above.
-  - **Validation:** every `next_target[L] > L`; every target's streamer shares one device.
-  - **Capture order:** `capture_side_graphs` warms each side step three times on the side stream (as the existing replay tests do) before capturing.
-  - **Break wrapper:** decorate a module-level function taking only `(state, target)`, so the break's captured args are plain objects, not tensors that `_weak_ref_if_tensor` would weak-ref.
-  - **Logging:** `logger.info("MoE expert prefetch side stream: targets=%d rows=%d breaks_per_forward=%d", ...)`.
-
-- [ ] **Step 4: Run** Task 4's and Task 5's test files under the lock. Expected: all pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git commit -m "feat(moe): overlap next-layer expert prefetch copies on a side stream from one graph break per layer" -- \
-  python/sglang/srt/layers/moe/expert_prediction/serving/in_graph_copy.py \
-  test/registered/unit/layers/moe/test_expert_prefetch_side_stream.py
-```
-
----
-
-### Task 6: Live runtime wiring — generic tap hook, scoring runtime, env vars, runner
+Touches no copy path. It reads `ExpertHotCacheManager.caches[layer].expert_to_slot` only.
 
 **Files:**
 - Modify: `python/sglang/srt/layers/moe/expert_prediction/feature_store.py` (`after_write`)
@@ -1786,24 +1273,24 @@ git commit -m "feat(moe): overlap next-layer expert prefetch copies on a side st
 - Create: `python/sglang/srt/layers/moe/expert_prediction/serving/runtime.py`
 - Modify: `python/sglang/srt/layers/moe/expert_prediction/runtime.py` (`from_env`, `build`, `on_forward_end`, `close`)
 - Modify: `python/sglang/srt/environ.py`
-- Modify: `python/sglang/srt/model_executor/model_runner.py` (orchestration only: one gate condition, one kwarg)
+- Modify: `python/sglang/srt/model_executor/model_runner.py` (`maybe_init_expert_prediction` gate only)
 - Test: `test/registered/unit/layers/moe/test_expert_prefetch_runtime.py`; additions to `test_expert_prediction_runtime.py` and `test_expert_prediction_adapters.py`
 
 **Interfaces:**
-- Consumes: Tasks 1, 2, 4 and 5. Also the existing `FeatureStore`, `TappedMoeLayer`, `install_pre_mixer_taps`, and `ExpertHotCacheManager.{caches, streamers}`.
+- Consumes: Tasks 1–2. Also the existing `FeatureStore`, `TappedMoeLayer`, `install_pre_mixer_taps`, and `ExpertHotCacheManager.caches[layer].expert_to_slot`.
 - Produces:
   - `FeatureStore.after_write: Callable[[int, RouteFeature, int], None] | None`;
   - `register_mixer_kind_adapter(*, architecture, classify)` and `mixer_kinds(*, model, layers)`;
-  - `PrefetchScoring.build(...)`, `.from_checkpoints(...)`, `.features_for(predictor)`, `.required_features`, `.metrics_record()`, `.next_target`;
-  - `attach_prefetch_backend(*, scoring, manager, budget, schedule, device) -> InGraphCopyBackend`;
-  - `expert_prefetch_rows() -> int`;
+  - `PrefetchScoring.build(...)`, `.from_checkpoints(...)`, `.features_for(predictor)`, `.required_features`, `.targets`, `.next_target`, `.bank`, `.metrics_record()`;
+  - `ExpertPredictionRuntime.prefetch` (the Phase A output contract);
   - the env vars:
-    - `SGLANG_MOE_EXPERT_PREFETCH` (`""|llapor|apex`);
+    - `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR` (`""|llapor|apex`);
     - `SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR`;
     - `SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES` (16);
-    - `SGLANG_MOE_EXPERT_PREFETCH_BUDGET` (3);
-    - `SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU` (0.95);
-    - `SGLANG_MOE_EXPERT_PREFETCH_SCHEDULE` (`side_stream`).
+    - `SGLANG_MOE_EXPERT_PREFETCH_BUDGET` (3; the shadow metric's budget);
+    - `SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU` (0.95).
+
+- [ ] **Step 0: Overlap check.** Run the Global Constraints `git diff --stat` against `shared/cc/doorbell-serving`. Proceed only if its overlap with this task's files is still the two known hunks.
 
 - [ ] **Step 1: Write the failing tests** (`test_expert_prefetch_runtime.py`)
 
@@ -1919,18 +1406,16 @@ if __name__ == "__main__":
 
 Register with `register_cuda_ci(est_time=15, stage="base-a", runner_config="1-gpu-small")`.
 
-- **The first test** guards the direction of the LLaPor wiring: a source-layer write lands in the *next* layer's row. Swapping source and target would pass the other tests.
+- **The first test** guards the direction of the LLaPor wiring: a source-layer write lands in the *next* layer's row.
 - **The replay test:** layer 2's native ids are experts 8..11 and the residents are 0..5, so 4 replays × 4 routes are all misses.
-- **Runtime tests** (`test_expert_prediction_runtime.py`): `from_env` raises `ValueError` naming the env var for each of:
-  - `SGLANG_MOE_EXPERT_PREFETCH="llapor"` with `expert_hot_cache_manager=None`;
-  - `SCHEDULE="side_stream"` with `PREFETCH="apex"`;
-  - `side_stream` with `decode_graph_backend="full"`;
-  - `PREFETCH` together with `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR`.
-
-  Use `envs.X.override(...)`.
+- **Runtime tests** (`test_expert_prediction_runtime.py`, using `envs.X.override(...)`): `from_env` raises `ValueError` naming the env var for:
+  - `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR="llapor"` with `expert_hot_cache_manager=None`;
+  - the predictor set without `..._MODEL_DIR`;
+  - the predictor together with `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR`;
+  - the predictor together with `SGLANG_MOE_PREFETCH_MAX_CANDIDATES=4`.
 - **Adapter tests** (`test_expert_prediction_adapters.py`): registered and unregistered mixer-kind paths, on that file's fake models.
 
-- [ ] **Step 2: Run to verify failure** (GPU < 200 MiB, lock): `ModuleNotFoundError: ...serving.runtime`.
+- [ ] **Step 2: Run to verify failure** (GPU < 200 MiB, lock, etiquette): `flock -n /data/models/slang/nvfp4-work/cc-gpu.lock <test command> test/registered/unit/layers/moe/test_expert_prefetch_runtime.py`. Expected: `ModuleNotFoundError: ...serving.runtime`.
 
 - [ ] **Step 3: `FeatureStore.after_write`.** In `__init__`, after `self.spill = None`:
 
@@ -1983,10 +1468,11 @@ The key matches `_PRE_MIXER_ADAPTERS`. The decoder classes (`models/qwen4_exp.py
 - [ ] **Step 5: Write `serving/runtime.py`**
 
 ```python
-"""Live expert prefetch: score target-layer experts from tap writes inside the decode graph, then plan and copy.
+"""Live expert prefetch scoring: per-target-layer candidates written inside the decode graph from tap writes.
 
-Every per-token op runs from ``FeatureStore.after_write`` and the graph gather's prefetch
-hook during eager forwards and graph capture, so replay executes recorded kernels only.
+Every per-token op runs from ``FeatureStore.after_write`` during eager forwards and graph
+capture, so replay executes recorded kernels only. Phase B hands ``bank`` rows to the
+shared copy layer; this module never touches the copy path.
 """
 
 from __future__ import annotations
@@ -1997,13 +1483,10 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prediction.contracts import MoeLayerSpec, RouteFeature
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
 from sglang.srt.layers.moe.expert_prediction.serving.candidates import BudgetRecall, PrefetchCandidateBank
 from sglang.srt.layers.moe.expert_prediction.serving.checkpoints import load_prefetch_checkpoints
-from sglang.srt.layers.moe.expert_prediction.serving.in_graph_copy import InGraphCopyBackend
-from sglang.srt.layers.moe.expert_prediction.serving.plan import PrefetchPlanner
 from sglang.srt.layers.moe.expert_prediction.serving.scorers import ApexScorer, LlaporScorer
 
 logger = logging.getLogger(__name__)
@@ -2016,13 +1499,8 @@ _FEATURES = {
 _SCORE_TRIGGER = {"llapor": RouteFeature.TOPK_WEIGHTS, "apex": RouteFeature.PRE_MIXER}
 
 
-def expert_prefetch_rows() -> int:
-    """Dedicated hot-cache rows per layer that ``ExpertHotCacheManager.from_model`` reserves for prefetch."""
-    return envs.SGLANG_MOE_EXPERT_PREFETCH_BUDGET.get() if envs.SGLANG_MOE_EXPERT_PREFETCH.get() else 0
-
-
 class PrefetchScoring:
-    """Owns scorers, the candidate bank the planner reads, and budget-recall counters."""
+    """Owns scorers, the candidate bank Phase B reads, and shadow budget-recall counters."""
 
     @staticmethod
     def features_for(predictor: str) -> frozenset[RouteFeature]:
@@ -2053,7 +1531,7 @@ class PrefetchScoring:
             raise ValueError("SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES exceeds the expert count")
         missing_caches = sorted(set(checkpoints) - set(hot_caches))
         if missing_caches:
-            raise ValueError(f"expert prefetch needs hot caches for layers {missing_caches}")
+            raise ValueError(f"expert prefetch scoring needs hot caches for layers {missing_caches}")
         if predictor == "llapor":
             scorers = {target: LlaporScorer(c, num_experts=by_layer[target].num_experts, dtype=dtype, device=device)
                        for target, c in checkpoints.items()}
@@ -2116,98 +1594,71 @@ class PrefetchScoring:
                 scores = self._scorers[target](self._store.view(layer_id, RouteFeature.PRE_MIXER, rows))
         self.bank.write(target, scores)
 
-    def metrics_record(self, streamers: Mapping[int, Any] | None = None) -> dict:
+    def metrics_record(self) -> dict:
         """Host read of the device counters; call only at metric log intervals."""
         layers = {str(layer): {"missed_routes": missed, "covered_routes": covered}
                   for layer, (missed, covered) in self.recall.snapshot().items()}
-        if streamers is not None:
-            served = torch.stack([streamers[layer].graph_prefetch_counters for layer in self.targets]).cpu().tolist()
-            for layer, (routes, rows) in zip(self.targets, served):
-                layers[str(layer)].update(served_routes=routes, delivered_rows=rows)
         missed = sum(v["missed_routes"] for v in layers.values())
         covered = sum(v["covered_routes"] for v in layers.values())
         return {"predictor": self.predictor, "budget": self.recall.budget,
                 "budget_recall": covered / missed if missed else 0.0, "layers": layers}
-
-
-def attach_prefetch_backend(
-    *, scoring: PrefetchScoring, manager: Any, budget: int, schedule: str, device: torch.device
-) -> InGraphCopyBackend:
-    """Build the planner over the hot caches and install the in-graph copy backend on every target's streamer."""
-    planner = PrefetchPlanner(
-        bank=scoring.bank,
-        expert_to_slot={layer: manager.caches[layer].expert_to_slot for layer in scoring.targets},
-        prefetch_base={layer: manager.streamers[layer].prefetch_base for layer in scoring.targets},
-        budget=budget,
-        device=device,
-    )
-    backend = InGraphCopyBackend.install(
-        planner=planner, streamers=manager.streamers, next_target=scoring.next_target, schedule=schedule, device=device,
-    )
-    if schedule == "side_stream":
-        backend.capture_side_graphs()
-    return backend
 ```
 
-- **Recall vs gather residency:** `recall.observe(L)` reads the live `expert_to_slot` view. The in-graph residency update rewrites it at the first streamed layer's gather, which comes after layer 0's TopK tap. So layer 0's recall uses pre-update residency, while the planner (at gather) sees post-update residency. The difference is one layer out of 47 and only affects the metric.
-- **Doorbell:** Task 10 adds its branch in `attach_prefetch_backend`, and only there.
-
-**Launch order within one forward (LLaPor, side_stream):**
+**Launch order within one forward (LLaPor):**
 1. TopK(L) tap writes ROUTER_INPUT, IDS and WEIGHTS.
 2. `_on_write(L, TOPK_IDS)` runs `recall.observe(L)` against the bank row written at L−1.
 3. `_on_write(L, TOPK_WEIGHTS)` runs `bank.write(L+1)`.
-4. `gather(L)` runs `resolve()` for L's own plan (ready check), then `launch_next()` (plan L+1, break, side copy), then the route plan and residual copy for L.
+4. L's gather runs, unchanged.
 
-For APEX with `at_target`: pre-mixer(L) runs `bank.write(L)`, TopK(L) runs `recall.observe(L)`, and `gather(L)` plans and copies L.
+**APEX:** pre-mixer(L) runs `bank.write(L)`, then TopK(L) runs `recall.observe(L)`.
+
+**Why this is the shadow metric:** `observe` reads the live `expert_to_slot` view, and the in-graph residency update rewrites it at the first streamed layer's gather. So the metric counts non-resident native routes at the moment a Phase B planner would filter them, and how many of those the first B non-resident candidates cover. That is the live counterpart of Task 3's `budget_hits`.
 
 - [ ] **Step 6: Env vars, runtime, runner.**
-  - **`environ.py`**, directly after `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES` (same section):
+  - **`environ.py`**, directly after `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES` (clear of the doorbell branch's hunk):
 
 ```python
-    # Live expert prefetch: "" (off), "llapor" or "apex".
-    SGLANG_MOE_EXPERT_PREFETCH = EnvStr("")
+    # In-graph expert prefetch candidate scoring (shadow until the shared copy layer consumes it): "", "llapor" or "apex".
+    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR = EnvStr("")
     SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR = EnvStr("")
-    # Candidates per target layer the prefetch planner reads.
+    # Candidates per target layer kept in the device bank.
     SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES = EnvInt(16)
-    # Dedicated hot-cache rows per layer; also the planner's per-layer row budget.
+    # Rows per layer the shadow budget-recall metric credits.
     SGLANG_MOE_EXPERT_PREFETCH_BUDGET = EnvInt(3)
     SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU = EnvFloat(0.95)
-    # "side_stream" (overlapped copy, breakable decode graph) or "at_target" (correctness mode).
-    SGLANG_MOE_EXPERT_PREFETCH_SCHEDULE = EnvStr("side_stream")
 ```
 
   - **`expert_prediction/runtime.py`:**
-    - **`from_env`.** Read the six vars. When `PREFETCH` is set, raise `ValueError` naming the env var unless all of these hold:
+    - **`from_env`.** Read the five vars. When the predictor is set, raise `ValueError` naming the env var unless all of these hold:
       - `tokens_per_request == 1`;
-      - `decode_max_bs == 1`;
+      - `decode_max_bs >= 1`;
       - `expert_hot_cache_manager is not None`;
       - the model dir is set;
-      - `SCHEDULE` is in `IN_GRAPH_SCHEDULES`;
-      - `SCHEDULE != "side_stream"` or `PREFETCH == "llapor"`;
-      - `SGLANG_MOE_PREFETCH_MAX_CANDIDATES == 0`;
-      - `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR` is empty.
+      - `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR` is empty, because `spill` and `after_write` would both be live;
+      - `SGLANG_MOE_PREFETCH_MAX_CANDIDATES == 0`.
 
-      Also pass a `decode_graph_backend: str` argument from the runner. With `side_stream`, raise unless it is `breakable`. Pass `prefetch=PrefetchSettings(predictor, model_dir, width, budget, tau, schedule)` into `build`, where `PrefetchSettings` is a `msgspec.Struct(frozen=True)` in this file.
-    - **`build`.** Union `PrefetchScoring.features_for(...)` into the features. After the store and taps are installed:
-      - `self.prefetch = PrefetchScoring.build(...)`;
-      - `self.prefetch_backend = attach_prefetch_backend(scoring=self.prefetch, manager=manager, budget=..., schedule=..., device=device)`.
+      Pass `prefetch=PrefetchSettings(predictor, model_dir, width, budget, tau)` into `build`, where `PrefetchSettings` is a `msgspec.Struct(frozen=True)` in this file.
+    - **`build`.** Add `prefetch: PrefetchSettings | None = None`. Union `PrefetchScoring.features_for(...)` into the features. After the store and taps (and pre-mixer taps) are installed, set `self.prefetch = PrefetchScoring.build(predictor=..., model_dir=..., specs=specs, store=store, hot_caches=manager.caches, width=..., budget=..., tau=..., dtype=hidden_dtype, device=device)`. The attribute defaults to `None`.
+    - **`on_forward_end`.** In the existing metrics block, append `{"prefetch": self.prefetch.metrics_record(), "forwards": self.forwards}` as its own JSONL line when `self.prefetch is not None`. For scoring-only runs (`SGLANG_MOE_EXPERT_PREDICTOR` empty), count `forwards` on decode forwards with `rows > 0`.
+    - **`close`.** `self.store.after_write = None` when prefetch scoring is on.
+  - **`model_runner.py`** (`maybe_init_expert_prediction`), the only runner edit:
 
-      Both default to `None`.
-    - **`on_forward_end`.** In the existing metrics block, append `{"prefetch": self.prefetch.metrics_record(manager.streamers), "forwards": self.forwards}` when prefetch is on. For prefetch-only runs, count `forwards` on decode forwards with `rows > 0`.
-    - **`close`.** `self.store.after_write = None` when prefetch is on.
-  - **`model_runner.py`**, orchestration only (`large-class-style` §1.3):
-    - **`maybe_init_expert_prediction` gate:** add `or envs.SGLANG_MOE_EXPERT_PREFETCH.get()`.
-    - **`maybe_init_expert_hot_cache`:** add the kwarg `prefetch_rows=expert_prefetch_rows(),`, with a local import next to the existing `ExpertHotCacheManager` import.
-    - **`from_env` call:** add `decode_graph_backend=get_exec().graph.cuda_graph_config.decode.backend`. Verify this field name against `cuda_graph_config.py:61-64` (`PhaseConfig.backend`) and the runner's existing `get_exec().graph.cuda_graph_config.decode.max_bs` read.
+```python
+        if self.is_draft_worker or not (
+            envs.SGLANG_MOE_EXPERT_PREDICTOR.get()
+            or envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.get()
+            or envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
+        ):
+```
 
-    No logic enters the runner.
+It is a coordinate/select condition, allowed by `large-class-style` §1.3.
 
-- [ ] **Step 7: Run all prefetch and prediction tests** under the lock: Task 1, 2, 4, 5 and 6 files, plus `test_expert_prediction_runtime.py`, `test_expert_prediction_adapters.py`, `test_expert_prediction_graph.py`, `test_expert_prediction_capture_graph.py`, `test_expert_graph_gather.py`, and `test_expert_residency_gpu.py`. Expected: all pass, and no previously passing test drops.
+- [ ] **Step 7: Run all prediction tests** under the lock (GPU etiquette): Task 1, 2 and 4 files, plus `test_expert_prediction_runtime.py`, `test_expert_prediction_adapters.py`, `test_expert_prediction_graph.py` and `test_expert_prediction_capture_graph.py`. Expected: all pass, and no previously passing test drops.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git commit -m "feat(moe): wire live expert prefetch scoring, planning and in-graph copy into serving" -- \
+git commit -m "feat(moe): score expert prefetch candidates in the decode graph with shadow budget recall" -- \
   python/sglang/srt/layers/moe/expert_prediction/feature_store.py \
   python/sglang/srt/layers/moe/expert_prediction/adapters.py \
   python/sglang/srt/layers/moe/expert_prediction/serving/runtime.py \
@@ -2220,7 +1671,7 @@ git commit -m "feat(moe): wire live expert prefetch scoring, planning and in-gra
 
 ---
 
-### Task 7: Launcher, A/B subset, driver flags, correctness probe and summary scripts
+### Task 5: Launcher knobs, A/B subset, driver flags, logprob gates and summary scripts (Phase A)
 
 **Files:**
 - Modify: `scripts/expert_prediction/run-shadow-server.sh`
@@ -2228,26 +1679,27 @@ git commit -m "feat(moe): wire live expert prefetch scoring, planning and in-gra
 - Create: `scripts/expert_prediction/prefetch/select_ab_sessions.py`, `logprob_probe.py`, `compare_logprobs.py`, `summarize_ab.py`
 
 **Launcher env:**
-- `PREFETCH=off|llapor|apex` sets `SGLANG_MOE_EXPERT_PREFETCH`.
-- `PREFETCH_SCHEDULE` (default `side_stream`), `PREFETCH_BUDGET` (default 3), `PREFETCH_CANDIDATES` (16), `PREFETCH_MODEL_DIR`.
+- `PREFETCH_PREDICTOR=off|llapor|apex` sets `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR`.
+- `PREFETCH_BUDGET` (default 3), `PREFETCH_CANDIDATES` (16), `PREFETCH_MODEL_DIR`.
 - `HOT_GPU_MB` (default 12288).
-- `DOORBELL=0|1` sets `SGLANG_MOE_EXPERT_DOORBELL` **only when `DOORBELL=1`**. When unset, the variable is not exported, so D-off cells equal production's environment.
-- `DOORBELL_ENV` is a space-separated `NAME=VALUE` pass-through for doorbell knobs (Task 10).
+- No doorbell knobs: Phase B adds whatever the merged layer needs.
 
 - [ ] **Step 1: Launcher changes**
-  - **Env:** `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`, `SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS=64`, and the prefetch vars. Build `doorbell_env=()` and append `SGLANG_MOE_EXPERT_DOORBELL=1` only when `DOORBELL=1`. Expand `"${doorbell_env[@]}"` and `${DOORBELL_ENV:-}`.
-  - **Prefetch variable:** `prefetch=${PREFETCH:-off}`; `[ "$prefetch" = off ] && prefetch=""`.
-  - **Server flags:** `--context-length 40000 --max-total-tokens 40000`. Keep `--cuda-graph-backend-decode breakable --cuda-graph-max-bs-decode 1` (already at lines 110–112).
+  - **Env block:** add `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`, `SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS=64` (production since E31), `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR="${predictor}"`, `SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR="${PREFETCH_MODEL_DIR:-/mnt/nvme2/nvfp4-work/expert-prediction-models/20260915-121630}"`, `SGLANG_MOE_EXPERT_PREFETCH_BUDGET="${PREFETCH_BUDGET:-3}"` and `SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES="${PREFETCH_CANDIDATES:-16}"`.
+  - **Predictor variable:** `predictor=${PREFETCH_PREDICTOR:-off}`; `[ "$predictor" = off ] && predictor=""`.
+  - **Server flags:** `--context-length 40000 --max-total-tokens 40000`. Keep `--cuda-graph-backend-decode breakable`, `--cuda-graph-max-bs-decode 1` and `--disable-overlap-schedule`.
+  - **Hot cache default:** `hot_gpu_mb=${HOT_GPU_MB:-12288}`.
   - **Refusal:** before the empty-GPU check, `ss -ltn 'sport = :7867' | grep -q LISTEN && { echo "REFUSING_TO_START: production on 7867 is up or relaunching" >&2; exit 1; }`.
   - **Lock:** `exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \`.
-  - **Header echo:** `doorbell=`, `prefetch=`, `schedule=`, `budget=`.
-  - **Check:** `bash -n` returns 0.
+  - **Header echo:** add `predictor=`, `candidates=`, `budget=`.
+  - **Check:** `bash -n scripts/expert_prediction/run-shadow-server.sh` returns 0.
 
-- [ ] **Step 2: Driver flags.**
-  - **`run_capture_sessions.py`:** `--max-tokens` (default 4096) replaces the literal. `--session-ids` is a comma list that filters sessions in file order.
-  - **Test** against the fake SSE server.
+- [ ] **Step 2: Driver flags** (`run_capture_sessions.py`)
+  - `--max-tokens` (int, default 4096) replaces the literal `4096` in `_stream_chat`.
+  - `--session-ids` (comma list, default empty) runs only the listed sessions, in file order.
+  - Test against the fake SSE server: `--max-tokens 7` appears in the request body, and `--session-ids` filters.
 
-- [ ] **Step 3: `select_ab_sessions.py`, `logprob_probe.py`, `compare_logprobs.py`.** `compare_logprobs.py --exact` fails on any token difference; it is used for the P0D0-vs-REF identity check.
+- [ ] **Step 3: `select_ab_sessions.py`**
 
 ```python
 """Fixed live A/B subset: the first FinanceBench holdout and ConvFinQA val sessions that fit the time budget."""
@@ -2283,8 +1735,10 @@ if __name__ == "__main__":
     main()
 ```
 
+- [ ] **Step 4: `logprob_probe.py` and `compare_logprobs.py`**
+
 ```python
-"""Greedy first-turn completions with top-2 logprobs, for the prefetch correctness gate."""
+"""Greedy first-turn completions with top-2 logprobs, for the prefetch correctness gates."""
 
 import argparse
 import json
@@ -2324,7 +1778,7 @@ if __name__ == "__main__":
 ```
 
 ```python
-"""Pass if every divergence between two arms starts at a near-tie (E31 rule: some side's top-2 margin <= 0.375 nats)."""
+"""Compare two arms' greedy tokens: --exact fails on any flip; otherwise flips must start at a near-tie (E31: top-2 margin <= 0.375 nats)."""
 
 import argparse
 import json
@@ -2341,7 +1795,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base")
     parser.add_argument("other")
-    parser.add_argument("--exact", action="store_true", help="fail on any token difference (identical-build check)")
+    parser.add_argument("--exact", action="store_true")
     args = parser.parse_args()
     base, other = json.load(open(args.base)), json.load(open(args.other))
     failures = []
@@ -2360,12 +1814,10 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: `summarize_ab.py`.**
-  - **Metrics:** each `prefetch` record carries `served_routes` and `delivered_rows` summed over layers. Report `delivered_rows_per_token` and `served_routes_per_token` next to `budget_recall`.
-  - **Arm keys:** use the cell names below, e.g. `P0D0`, `P1D0`, `P1D0-at_target`.
+- [ ] **Step 5: `summarize_ab.py`**
 
 ```python
-"""Per arm: median decode tok/s and TTFT over turns with >= 64 completion tokens, plus live prefetch counters."""
+"""Per arm: median decode tok/s and TTFT over turns with >= 64 completion tokens, plus shadow budget recall."""
 
 import argparse
 import json
@@ -2375,7 +1827,7 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("runs", nargs="+", help="arm=results.jsonl[:prefetch-metrics.jsonl]")
+    parser.add_argument("runs", nargs="+", help="arm=results.jsonl[:prediction-metrics.jsonl]")
     args = parser.parse_args()
     table = {}
     for spec in args.runs:
@@ -2383,7 +1835,7 @@ def main():
         results, _, metrics = paths.partition(":")
         turns = [json.loads(line) for line in open(results) if line.strip()]
         good = [t for t in turns if "error" not in t and (t.get("completion_tokens") or 0) >= 64]
-        entry = table.setdefault(arm, {"tok_s": [], "ttft": [], "turns": 0, "errors": 0, "prefetch": None})
+        entry = table.setdefault(arm, {"tok_s": [], "ttft": [], "turns": 0, "errors": 0, "budget_recall": None})
         entry["tok_s"] += [t["decode_tokens_per_sec"] for t in good if t["decode_tokens_per_sec"]]
         entry["ttft"] += [t["ttft"] for t in good if t["ttft"] is not None]
         entry["turns"] += len(good)
@@ -2391,16 +1843,10 @@ def main():
         if metrics and Path(metrics).exists():
             records = [json.loads(line) for line in open(metrics) if '"prefetch"' in line]
             if records:
-                last = records[-1]
-                layers = last["prefetch"]["layers"].values()
-                entry["prefetch"] = {
-                    "budget_recall": last["prefetch"]["budget_recall"],
-                    "delivered_rows_per_token": sum(v["delivered_rows"] for v in layers) / max(last["forwards"], 1),
-                    "served_routes_per_token": sum(v["served_routes"] for v in layers) / max(last["forwards"], 1),
-                }
+                entry["budget_recall"] = records[-1]["prefetch"]["budget_recall"]
     summary = {arm: {"median_decode_tok_s": statistics.median(e["tok_s"]) if e["tok_s"] else None,
                      "median_ttft_s": statistics.median(e["ttft"]) if e["ttft"] else None,
-                     "turns": e["turns"], "errors": e["errors"], "prefetch": e["prefetch"]}
+                     "turns": e["turns"], "errors": e["errors"], "budget_recall": e["budget_recall"]}
                for arm, e in table.items()}
     print(json.dumps(summary, indent=2))
 
@@ -2409,10 +1855,10 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 5: Check and commit.** Run `bash -n`, each script's `--help` on divix01 (CPU), and the fake-SSE driver test. Then:
+- [ ] **Step 6: Check and commit.** Run `bash -n` on the launcher, each script's `--help` on divix01 (CPU), and the driver against the fake SSE server. Then:
 
 ```bash
-git commit -m "feat(nvfp4): add live prefetch matrix launcher knobs, subset, logprob gate and summary" -- \
+git commit -m "feat(nvfp4): add prefetch scoring launcher knobs, A/B subset, logprob gates and summary" -- \
   scripts/expert_prediction/run-shadow-server.sh scripts/expert_prediction/benchmarks/run_capture_sessions.py \
   scripts/expert_prediction/prefetch/select_ab_sessions.py scripts/expert_prediction/prefetch/logprob_probe.py \
   scripts/expert_prediction/prefetch/compare_logprobs.py scripts/expert_prediction/prefetch/summarize_ab.py
@@ -2420,211 +1866,229 @@ git commit -m "feat(nvfp4): add live prefetch matrix launcher knobs, subset, log
 
 ---
 
-### Task 8: Schedule microbench — `side_stream` vs `at_target` on real layer tensors, concurrent copies, break cost
+### Task 6: Live shadow validation — exact outputs, scoring cost, live budget recall (Phase A; ask the user first)
 
-GPU needed, < 4 GiB. It fits beside production only if 7867 is healthy and the lock is free; otherwise it runs in Task 9's approved window, before the matrix.
+**Cells** (all on the same launcher flags, 2 FinanceBench + 6 ConvFinQA val, `--max-tokens 768`):
 
-**Files:**
-- Create: `scripts/expert_prediction/prefetch/bench_prefetch_schedule.py`
-- Report: `docs/superpowers/experiments/2026-09-1X-expert-prefetch-schedule-bench.md`
+| Cell | Build and env | Checks |
+|---|---|---|
+| `REF` | detached worktree at `7de955329a`, predictor unset | reference |
+| `S0` | this branch, predictor unset | `compare_logprobs.py --exact` vs REF, and tok/s within REF's pass-to-pass spread: the off path is production |
+| `S1` | this branch, `PREFETCH_PREDICTOR=llapor`, same `HOT_GPU_MB` | `--exact` vs S0: scoring changes nothing. Tok/s S1 − S0 is the in-graph scoring cost. Live `budget_recall` vs Task 3's `shifted_test`/`dev` budget recall at B = `PREFETCH_BUDGET` |
+| `S2` (optional) | `PREFETCH_PREDICTOR=apex` | same as S1, for APEX's cost and recall |
 
-- [ ] **Step 1: Write the bench.**
-  - **Setup:** reuse E27's harness shape (`work/cc-overlap/bench_overlap.py` on divix01; read it first) with real NVFP4 layer tensors registered in the host arena.
-  - **Two streamed layers:** L (source) and L+1 (target), each with the graph gather and B prefetch rows, fed by a fixed candidate plan.
-  - **Arms**, each captured with the breakable graph backend:
-    1. baseline: no prefetch, misses copied in-graph at each gather;
-    2. `at_target`;
-    3. `side_stream`, launched before L's miss copy (the Task 5 order);
-    4. `side_stream`, launched after L's miss copy (event recorded after L's copy; a bench-only variant).
-    5. Compute stand-in between gathers: replay a captured 0.267 ms (linear) / 0.290 ms (full) E28 layer-compute graph.
-  - **Sweep:** B ∈ {1, 2, 3, 4, 6}, residual misses ∈ {0, 1, 3}, and plan hit fraction ∈ {0, 0.5, 1}.
-  - **Measure:**
-    - wall ms per two-layer step (CUDA events on the main stream);
-    - delivered rows per target (`graph_prefetch_counters[1]`);
-    - L's miss copy GiB/s with and without a concurrent side copy, the unmeasured E27 gap;
-    - host time per break (`time.perf_counter_ns` around `BreakableCUDAGraph.replay`, minus the 0-break arm).
-  - **Correctness:** assert byte-exact rows in every arm.
-
-- [ ] **Step 2: Multi-stream capture spike (≤ 2 h, report only).**
-  - Try recording the side copy inside the main decode graph: capture with `torch.cuda.graph(..., stream=main)`, then switch `torch.cuda.stream(side)` inside the capture region.
-  - Check whether replay keeps the side kernels on the side stream: side stream busy with `torch.cuda._sleep` while main-stream timestamps advance.
-  - Expected from E27: no. If yes, record it as a follow-up that removes the per-layer breaks.
-
-- [ ] **Step 3: Report and decide.**
-  - **Contents:** tables per arm; the concurrent-copy slowdown; break host cost per forward (× 47); and the projected ms/token = Σ layers (baseline − arm), using Task 3's per-layer hit rates.
-  - **Decision rules:**
-    - `side_stream` stays the live default if its projected saving is ≥ 3 ms/token *after* break cost.
-    - If concurrent copies slow L's copy by > 10%, the live budget uses Task 3's gap window (`side_ready_rows_gap`).
-    - If break cost alone exceeds the saving, Task 9 runs only the correctness cells and reports NO-GO for tok/s.
-
-```bash
-git commit -m "docs(moe): benchmark in-graph prefetch schedules on real layer tensors" -- \
-  scripts/expert_prediction/prefetch/bench_prefetch_schedule.py \
-  docs/superpowers/experiments/2026-09-1X-expert-prefetch-schedule-bench.md
-```
-
----
-
-### Task 9: Live 4-cell matrix — doorbell-off cells now, doorbell-on cells after Task 10 (ask the user first)
-
-**Cells** (`P` = `SGLANG_MOE_EXPERT_PREFETCH`, `D` = `SGLANG_MOE_EXPERT_DOORBELL`):
-
-| Cell | Env | Checks | Runs in |
-|---|---|---|---|
-| `REF` | server from the pre-change commit `7de955329a`, P/D unset, same launcher flags | reference for "identical to production" | this task |
-| `P0D0` | current branch, P unset, D unset | **logprobs exactly equal to REF** (`compare_logprobs.py --exact`) and tok/s within REF's run-to-run noise | this task |
-| `P1D0` | `PREFETCH=llapor PREFETCH_SCHEDULE=side_stream PREFETCH_BUDGET=<B> HOT_GPU_MB=11776` | near-tie rule vs P0D0; tok/s delta; delivered/served counters | this task |
-| `P1D0-at_target` | as P1D0 with `PREFETCH_SCHEDULE=at_target` | near-tie rule only (probe, no tok/s run) | this task |
-| `P0D1` | `DOORBELL=1`, P unset | near-tie rule vs P0D0; tok/s | Task 10 |
-| `P1D1` | `DOORBELL=1 PREFETCH=llapor` | near-tie rule vs P0D1; tok/s | Task 10 |
-
-`HOT_GPU_MB=11776` (−512 MiB) holds total VRAM roughly equal for the scorer state (~100 MB) plus bank buffers. Prefetch rows come out of the same budget automatically. Record hot-slot counts per arm from the startup log.
-
-**Preconditions:**
-- Task 3 is GO (or conditional GO with Task 8 passing).
-- Tasks 4–7 are merged, and all their tests pass on the synced divix01 worktree.
-- Task 8's report exists (if Task 8 needs the window, it runs first inside it).
+**Preconditions:** Tasks 1–5 merged, and their tests pass on the synced divix01 worktree. Task 3's report exists; a NO-GO there needs the user's explicit go-ahead for this task.
 
 - [ ] **Step 1: Ask the user** (AskUserQuestion) for an approved production-down window.
-  - **Estimate:** REF + P0D0 + P1D0 + at_target probe ≈ 4 launches per pass × ~23 min × 2 passes ≈ 3–3.5 h, plus ~1 h if Task 8 runs in the window.
-  - **Confirm** that the crypto-c9 production session has released the GPU and will not relaunch 7867 during the window.
-  - **Confirm** the live budget B (Task 3/8 argmax) and whether to add a second budget arm (+~50 min).
-  - **Worktree:** `REF` needs a detached worktree at `7de955329a` under `/data/models/slang/nvfp4-work/cc-expert-prediction/ref-7de955` (create it with `git worktree add --detach`). Never use the serving worktree.
+  - **Estimate:** REF, S0, S1 × 2 passes × ~23 min ≈ 2.3 h. S2 adds ≈0.8 h. Task 7's GPU benches add ≈0.75 h if run in the same window.
+  - **Confirm** the crypto-c9 production session has released the GPU and will not relaunch 7867 during the window.
+  - **Ask** whether to include S2 and Task 7.
   - Do nothing further without a yes.
 
-- [ ] **Step 2: Build the subset** (CPU): `select_ab_sessions.py --sessions /mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl --out /mnt/nvme2/nvfp4-work/benchmarks/prefetch-ab/sessions.jsonl`. It yields 2 FinanceBench + 6 ConvFinQA val sessions, ≈29 turns, ≈17 min per run at `--max-tokens 768`.
+- [ ] **Step 2: Prepare** (CPU).
+  - **REF worktree:** `git -C /data/models/slang/nvfp4-work/cc-expert-prediction/worktree worktree add --detach /data/models/slang/nvfp4-work/cc-expert-prediction/ref-7de955 7de955329a`. Its launcher copy gets only Task 5 Step 1's flag and lock edits applied by `git show <task5-commit>:scripts/expert_prediction/run-shadow-server.sh > <ref>/scripts/expert_prediction/run-shadow-server.sh`, so REF and S0 share flags. Never touch the serving worktree.
+  - **Subset:** `select_ab_sessions.py --sessions /mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl --out /mnt/nvme2/nvfp4-work/benchmarks/prefetch-shadow/sessions.jsonl`.
 
-- [ ] **Step 3: Arm order and procedure.**
-  - **Order:** pass 1 runs REF → P0D0 → P1D0 → at_target-probe; pass 2 runs P1D0 → P0D0 → REF. The at_target probe runs once, so the order is ABC/CBA.
+- [ ] **Step 3: Run the cells.**
+  - **Order:** pass 1 runs REF → S0 → S1 (→ S2); pass 2 runs (S2 →) S1 → S0 → REF.
   - **Each launch:**
-    1. `ssh -n divix01 'nohup env PREFETCH=... <launcher> prefetch-<cell>-p<pass> 31040 off radix > /dev/null 2>&1 &'`. REF uses the ref worktree's launcher copy.
+    1. `ssh -n divix01 'nohup env PREFETCH_PREDICTOR=... <launcher> prefetch-shadow-<cell>-p<pass> 31040 off radix > /dev/null 2>&1 &'`.
     2. Wait for `/health` 200 with a Monitor until-loop.
     3. Warm up with one turn outside the subset.
-    4. Run `logprob_probe.py`.
-    5. Run `run_capture_sessions.py --max-tokens 768` (skipped for the probe cell).
-    6. Copy `expert-prediction.metrics.jsonl`.
+    4. `logprob_probe.py --port 31040 --sessions <subset> --out .../<cell>-p<pass>-logprobs.json`.
+    5. `run_capture_sessions.py --port 31040 --sessions <subset> --results .../<cell>-p<pass>.jsonl --max-tokens 768`.
+    6. Copy the run dir's `expert-prediction.metrics.jsonl`.
     7. `pkill -f '[s]glang serve.*--port 31040'` and wait for an empty GPU.
   - **Required log lines:**
-    - P1D0: `MoE expert prefetch scoring: predictor=llapor targets=47` and `MoE expert prefetch side stream: targets=47`;
-    - P0D0: neither line.
-    - Any capture error stops the run with the log excerpt.
+    - S1 must log `MoE expert prefetch scoring: predictor=llapor targets=47` and capture the decode graph without errors.
+    - S0 must not log it.
+    - Otherwise stop and report the log excerpt.
 
-- [ ] **Step 4: Correctness gate.**
-  - **`--exact`:** `compare_logprobs.py --exact REF-p1 P0D0-p1`. It must pass; a failure means the off path is not production, and the run stops.
-  - **Near-tie rule:** `compare_logprobs.py P0D0-p1 P1D0-p1` and `P0D0-p1 at_target`, with `REF-p1` vs `REF-p2` as the noise bound. A large-margin flip beyond REF-vs-REF fails the arm.
+- [ ] **Step 4: Gates.**
+  - **Exact checks:** `compare_logprobs.py --exact REF-p1 S0-p1` and `--exact S0-p1 S1-p1` (and S2) must pass.
+    - An S1 flip means scoring perturbed the model forward: allocator-driven kernel choice, a stream bug, or a write into a live buffer.
+    - Root-cause it before Phase B; do not relax the gate.
+  - **Throughput:** S0's median tok/s must lie within REF's two-pass spread.
+  - **Recall:** live `budget_recall` within ±0.05 (absolute) of Task 3's `dev` value at the same budget means the offline gate is trusted for Phase B. Outside that band, the report explains it (residency drift, prompt mix).
 
-- [ ] **Step 5: Summarize** with `summarize_ab.py`, per cell and per pass.
-  - **Report:** median decode tok/s, TTFT, errors, budget recall, delivered rows/token, served routes/token, hot slots, and scorer state bytes.
-  - **Compare** against Task 3's projection and Task 8's projection.
-  - **Target:** ≥ 5% median decode improvement for P1D0 over P0D0 with no correctness failure. With 2 runs per cell, label the result preliminary.
-
-- [ ] **Step 6: Write-up and commit.** Write `docs/superpowers/experiments/2026-09-1X-expert-prefetch-live-ab.md` with setup (commits, flags, B), the cell table, the gate outputs, deviations, the APEX status, and next steps. Commit, push, sync. **Do not relaunch production;** tell the user the GPU is free.
+- [ ] **Step 5: Write-up.**
+  - **File:** `docs/superpowers/experiments/2026-09-1X-expert-prefetch-shadow-live.md`.
+  - **Contents:** setup (commits, flags), the cell table (median tok/s, TTFT, errors, budget recall, per pass), the gate outputs, scoring state bytes from the startup log, and scoring cost in ms/token (from S1 − S0 median decode time per token).
+  - **Phase B projection:** Task 3's saving minus the measured scoring cost.
+  - Commit, push and sync. **Do not relaunch production;** tell the user the GPU is free.
 
 ```bash
-git commit -m "docs(moe): live LLaPor prefetch matrix, doorbell-off cells" -- docs/superpowers/experiments/2026-09-1X-expert-prefetch-live-ab.md
+git commit -m "docs(moe): live shadow validation of in-graph expert prefetch scoring" -- docs/superpowers/experiments/2026-09-1X-expert-prefetch-shadow-live.md
 ```
 
 ---
 
-### Task 10: `doorbell` backend and doorbell-on cells (BLOCKED on `cc/doorbell-serving`)
+### Task 7: Phase B timing inputs that need no copy-path code of ours — scorer cost and concurrent copies (Phase A)
 
-**Blocked until:**
-- crypto-c9's doorbell serving integration is on `codex/nvfp4-expert-stream-main`;
-- `SGLANG_MOE_EXPERT_DOORBELL=1` starts a server whose production-flag logprobs pass the near-tie rule.
-
-Do not start earlier, and do not copy code from the unlanded branch.
+**Where it runs:**
+- Only scripts that import existing modules read-only. Nothing is added to the copy path.
+- GPU work runs under the lock, and only when etiquette allows:
+  - production healthy and the job fits beside it (production peaks at 30.2 of 32 GiB, so realistically inside Task 6's window);
+  - or with the GPU free.
 
 **Files:**
-- Create: `python/sglang/srt/layers/moe/expert_prediction/serving/doorbell_backend.py`
-- Modify: `serving/runtime.py` (`attach_prefetch_backend` branch)
-- Modify: `expert_prediction/runtime.py` (`from_env` validation)
-- Test: `test/registered/unit/layers/moe/test_expert_prefetch_doorbell.py`
+- Create: `scripts/expert_prediction/prefetch/bench_scoring_cost.py`
+- Create: `scripts/expert_prediction/prefetch/bench_concurrent_copies.py`
+- Report: a "Phase B timing inputs" section of the Task 6 write-up
 
-- [ ] **Step 1: Read the landed API.** Find the handle on `ExpertHotCacheManager` (assumed `doorbell`), `post`, `wait`, `quiesce`, and whether `post`/`wait` are capturable or host calls. Update this task's steps in the plan file if they differ, then commit the plan edit.
-- [ ] **Step 2: Tests** (CUDA, lock), mirroring Task 5:
-  - byte-exact rows under replay with a real copier on two layers;
-  - an undelivered plan (copier stalled, per the doorbell's own test hooks) is byte-exact;
-  - `set_sync_debug_mode("error")` passes, or the test documents the doorbell's own host step;
-  - the four env combinations select the right backend: P0D0 installs nothing, P0D1 installs the doorbell's own path only, P1D0 installs `in_graph_copy`, and P1D1 installs `doorbell`.
-- [ ] **Step 3: Implement `_DoorbellLayer`.**
-  - **`launch_next()`:** `plan = planner.plan(T)`, then `copier.post(plan.expert_ids, plan.destination_slots, plan.count, tag=T)`.
-  - **`resolve()`:** `copier.wait(tag=L)`, then `plan.delivered.copy_(planner.valid_rows(plan))`, and return the delivered ids.
-  - **Selection:** `attach_prefetch_backend` picks it when `manager.doorbell is not None`. `from_env` needs no new env var: the doorbell's own flag selects the backend.
-  - **Destination rows:** they are Task 4's dedicated prefetch rows. If the doorbell insists on its own scratch rows, pass those as `prefetch_base` instead and drop the `prefetch_rows` reservation for this backend.
-- [ ] **Step 4: Live cells P0D1 and P1D1.** Follow Task 9's procedure, with a new user approval and a ≈1–1.5 h window: 2 cells × 2 passes, plus a P0D0 anchor launch. Append the rows to the Task 9 write-up.
-- [ ] **Step 5: Commit** the three code files, the test, and the write-up update.
+- [ ] **Step 1: `bench_scoring_cost.py`** (< 2 GiB)
+  - **Build:** load all 47 LLaPor checkpoints with `load_prefetch_checkpoints` (the capture's `capture.json` gives the specs). Create a `FeatureStore` with `max_rows=1` plus `PrefetchScoring.from_checkpoints`.
+  - **Capture:** one CUDA graph that runs the 48 layers' tap writes in order with random bf16 inputs.
+  - **Measure:** median replay ms over 2,000 replays, compared with a graph of the same tap writes without scoring. The difference is scoring ms/token.
+  - **Variants:** `middle`/`outer` groups separately; `width` 16 vs 64; and PCA folded into the first linear (`fc_in.weight @ projection`, bias adjusted), reported as the fused-PCA follow-up's ceiling.
+  - **Cross-check:** against Task 6's S1 − S0.
+
+- [ ] **Step 2: `bench_concurrent_copies.py`** (< 4 GiB)
+  - **Setup:**
+    - Load two real NVFP4 MoE layers' expert rows into the registered host arena, the way `test_expert_graph_gather.py` registers pinned rows (read it and E27's `work/cc-overlap/bench_overlap.py` on divix01 first).
+    - Build two `ExpertHotCache`s with 10 scratch rows each.
+    - Build `expert_row_segments` per layer.
+  - **Copy launches:** `copy_expert_row_segments_gpu` into scratch rows, used exactly as `expert_stream._gather_graph` uses it, from new tensors in the script.
+  - **Arms:**
+    - layer A's copy alone on the main stream;
+    - layer B's copy alone on a side stream;
+    - both launched together (side-stream launch first);
+    - both together with the side copy launched 0.1/0.2 ms (`torch.cuda._sleep` calibrated) after the main one.
+  - **Sweep:** rows ∈ {1, 2, 3, 6, 10} per copy.
+  - **Report:** GiB/s of each copy alone and under the other, and the realized overlap saving `(T_seq − T_both) / T_seq`. This is the unmeasured E27 gap that decides between Phase B's gap-window (1 row) and overlap-window (~3 rows) budgets.
+  - **Correctness:** assert byte-exact rows in every arm.
+
+- [ ] **Step 3: Multi-stream capture spike (≤ 2 h, report only).**
+  - Capture one CUDA graph that switches to a side stream mid-capture for a copy.
+  - Check whether replay keeps that copy on the side stream: side stream busy with `torch.cuda._sleep` while main-stream timestamps advance.
+  - E27 predicts no. A yes would let crypto-c9's in-graph backend overlap copies without graph breaks.
+
+- [ ] **Step 4: Report and hand off.** Add the "Phase B timing inputs" section (tables, then projected ms/token per budget for gap vs overlap, net of scoring cost). Send its path to the team lead for crypto-c9. Commit the two scripts and the doc update:
+
+```bash
+git commit -m "docs(moe): measure prefetch scoring cost and concurrent expert copies for the shared copy layer" -- \
+  scripts/expert_prediction/prefetch/bench_scoring_cost.py scripts/expert_prediction/prefetch/bench_concurrent_copies.py \
+  docs/superpowers/experiments/2026-09-1X-expert-prefetch-shadow-live.md
+```
+
+---
+
+## Phase B — BLOCKED on the `cc/doorbell-serving` merge
+
+Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/nvfp4-expert-stream-main` and synced to divix01. Do not write code against the unmerged branch.
+
+### Task B1: Adapt prefetch candidates to crypto-c9's plan interface
+
+**Assumed interface (exact names TBD at merge):** per target layer, int64 row ids `[C]`, slots `[C]`, and a count.
+
+- [ ] **Step 1: Read the merged layer.** Record the answers in this plan file, and commit that edit before writing code:
+  - the plan type and its field names and dtypes;
+  - where a plan for target L+1 must be written relative to layer L's gather;
+  - whether the layer filters residents and clamps to a budget itself, or expects the producer to;
+  - how destination slots are chosen;
+  - which flag turns prefetch on;
+  - how the in-graph and doorbell backends are selected;
+  - whether a same-layer (APEX) target is supported.
+- [ ] **Step 2: Write the adapter** (`serving/<adapter>.py`, name TBD). At the point the merged layer designates, map `PrefetchScoring.bank.ids_for(T)` and `.scores_for(T)` into its plan:
+  - with resident filtering (`expert_to_slot.index_select(ids) < 0`) and a top-B by priority, only if the interface leaves that to the producer;
+  - or into a `[num_experts]` priority mask via one `scatter_`, if that is what it takes.
+  - **In-graph rules:** fixed shapes, no host reads. The only runner/runtime change is the wiring call the merged layer's docs name.
+- [ ] **Step 3: Tests** (CUDA, lock), mirroring the merged layer's own test style:
+  - `set_sync_debug_mode("error")` over a decode step with scoring and the adapter on;
+  - byte-exact expert rows under graph replay with random candidates, including all-resident and garbage ids;
+  - prefetch-flag off gives a recorded graph identical to Phase A's (no adapter kernels).
+- [ ] **Step 4: Commit** the adapter, its test and the wiring change.
+
+### Task B2: 4-cell prefetch × doorbell matrix and live tok/s (ask the user first)
+
+**Cells** (`P` = the merged prefetch flag, `D` = `SGLANG_MOE_EXPERT_DOORBELL`; names confirmed in B1):
+
+| Cell | Env | Checks |
+|---|---|---|
+| `P0D0` | both off | `--exact` vs Task 6's REF: identical to production |
+| `P0D1` | doorbell on, prefetch off | near-tie rule vs P0D0; tok/s |
+| `P1D0` | prefetch on through the merged in-graph backend, LLaPor, budget B | near-tie rule vs P0D0; tok/s; delivered/served counters from the merged layer |
+| `P1D1` | prefetch on through the doorbell backend | near-tie rule vs P0D1; tok/s |
+
+**Budget and memory:**
+- B comes from Task 3's argmax. Use the gap window unless Task 7 showed concurrent copies cost < 10%; then use the overlap window.
+- `HOT_GPU_MB` is equal across cells. Prefetch rows and scorer state come out of hot slots; report slot counts per cell.
+
+- [ ] **Step 1: Ask the user** (AskUserQuestion) for a production-down window: ≈4 cells × 2 passes × ~23 min ≈ 3–3.5 h. Confirm B, and whether to add an APEX cell. APEX is only valid if B1 found same-layer support and Task 3 cleared 3 ms/token.
+- [ ] **Step 2: Run** with Task 6's procedure. Pass 1 runs P0D0 → P0D1 → P1D0 → P1D1; pass 2 runs the reverse.
+- [ ] **Step 3: Gates and summary.**
+  - **Correctness:** exact P0D0; near-tie rule for the others, with P0D0-p1 vs P0D0-p2 bounding noise.
+  - **Throughput:** median decode tok/s, TTFT, shadow budget recall, the merged layer's delivered/served counters, and hot slots per cell, set against the Task 3/6/7 projections.
+  - **Target:** ≥ 5% median decode improvement for a P1 cell over its P0 counterpart with no correctness failure. With 2 runs per cell, label it preliminary.
+- [ ] **Step 4: Write-up and commit** `docs/superpowers/experiments/2026-09-1X-expert-prefetch-live-ab.md`. **Do not relaunch production;** tell the user the GPU is free.
 
 ---
 
 ## Risks
 
 1. **The window may be too short to pay.**
-   - The gap window fits 1 row per layer. Only an overlapped side copy (≈0.88 ms, ~3 rows) approaches E28's ~10 ms/token ceiling.
-   - Overlap depends on concurrent copy launches not slowing each other, which E27 never measured. Task 8 measures it.
-   - A NO-GO at Task 3 or Task 8 is a likely, legitimate outcome.
-2. **APEX's same-layer window (~0.21–0.23 ms) fits 0 rows in-graph, and less than reaction + one row on the doorbell.**
-   - It is deferred from live. The in-graph side stream cannot serve it structurally, and `at_target` is never faster.
-   - It needs a doorbell same-layer post/resolve plus a wait, priced in Task 3.
-3. **47 graph breaks per token** (`side_stream`).
-   - Each break is a host launch (event, wait_event, side replay), so the decode step becomes 48 segments.
-   - If host launch falls behind GPU compute, the GPU idles and the saving evaporates.
-   - Task 8 prices it, and the multi-stream capture spike is the escape hatch.
-4. **In-graph scoring cost is on the main stream.**
-   - The LLaPor middle scorer runs PCA plus three GEMMs plus scatter/cat/sigmoid/topk, ≈10 kernels × 47 layers, which could cost ~5–9 ms/token.
-   - P1D0 vs P0D0 measures it end to end. The follow-ups are fusing PCA into the first linear and a fused kernel.
-5. **Prefetch rows cost hot slots.** B × 48 × 2.64 MiB comes out of the hot budget (B = 3 → 380 MiB ≈ 144 slots), which adds baseline misses. The planner's value must exceed that; Task 9 reports slot counts.
-6. **Off-path drift.** Any recorded-kernel change with prefetch off breaks "identical to production". Task 4 keeps `prefetch_ids is None` on the old code path, and Task 9 gates it with `--exact` against `7de955329a`.
-7. **Seq-protocol assumptions.**
-   - Safety needs one graph-gather decode forward at a time, with the next launch after readback: no overlap schedule, bs = 1, no speculation.
-   - Task 6 validates bs and speculation. If the overlap scheduler is ever enabled with this path, rows could be read while the next forward's side copy rewrites them.
-   - Production and the shadow launcher both pass `--disable-overlap-schedule`. Task 6 makes it a hard check: the runner passes the server-args overlap flag into `from_env` (read the exact field name from `server_args`), and `side_stream` is refused when the overlap schedule is on.
-8. **Doorbell dependency and contract drift.** Only Task 10's backend file and the launcher pass-through change. Tasks 1–9 are unaffected.
-9. **Timing assumptions.**
+   - The gap window fits 1 row per layer, in-graph or doorbell.
+   - Only an overlapped copy (≈0.88 ms, ~3 rows) approaches E28's ~10 ms/token ceiling, and that needs concurrent copies not to contend (unmeasured; Task 7).
+   - A NO-GO at Task 3 or a negative Phase B is a legitimate outcome.
+2. **APEX does not fit its same-layer window.**
+   - 0.21–0.23 ms fits 0 in-graph rows and is shorter than the doorbell's reaction plus one row.
+   - It needs a same-layer post/resolve plus a wait. It is deferred from live prefetch and runs only in shadow (optional S2).
+3. **In-graph scoring cost is on the main stream.**
+   - LLaPor is ≈10 kernels × 47 layers at bs 1, estimated at ~5–9 ms/token, which could eat the whole gain.
+   - Task 7 measures it in isolation and Task 6 end to end (S1 − S0). The follow-ups are fused PCA and a fused kernel.
+4. **Hot-cache budget.**
+   - Phase B's prefetch rows (≈2.64 MiB × B × 48; B = 3 ≈ 380 MiB ≈ 144 slots) and ~100 MB of scorer state come out of `HOT_GPU_MB`, which adds baseline misses.
+   - Task 6 keeps the budget equal (scorer state only). Phase B reports slot counts per cell.
+5. **Merge overlap with the doorbell branch.**
+   - Both edit `environ.py` and `model_runner.py`. The hunks are disjoint as of `56a5920489`: environ 328–333 vs after 348, runner 754–798 vs ~803.
+   - The runner edit sits a few lines from their hunk, so a textual conflict is possible after their rework. Task 4 Step 0 re-checks, and a conflict is resolved by re-applying the one-line condition.
+6. **Interface drift.** Phase B's interface is TBD. The bank is residency-agnostic ids plus priorities, so B1's adapter absorbs any ids/slots/count or mask shape without touching Phase A.
+7. **Shadow must be exact.** An S1 ≠ S0 flip blocks Phase B until it is root-caused.
+8. **Timing assumptions.**
    - The pricing uses E27/E28/E32 medians at 4,957 slots; production has 4,180.
    - Recall uses the capture's own residency, so it is faithful. The ms model is approximate (±4 ms/token per E26).
-10. **Two runs per cell is preliminary**, against spec §8's five matched runs.
-11. **GPU etiquette vs live tests.** The live cells need production down. This plan treats only an approved, coordinated window (no 7867 listener, empty GPU) as the exception, confirmed in Task 9 Step 1.
+9. **Two runs per cell is preliminary**, against spec §8's five matched runs.
+10. **GPU etiquette vs live runs.** Tasks 6 and B2 need production down. Only an approved, coordinated window (no 7867 listener, empty GPU) is the exception.
 
 ## Decisions
 
 **Made in this plan:**
-- **Scoring:** in-graph via `FeatureStore.after_write`. LLaPor fires on TOPK_WEIGHTS(L) and APEX on PRE_MIXER(L).
-- **Planner:** backend-independent. It clamps to B by score over non-resident candidates, and the delivered mask is set by the backend.
-- **Destination:** dedicated prefetch rows after the graph scratch, not evictable hot slots.
-- **Default backend `in_graph_copy`, schedule `side_stream`:**
-  - one break per source layer;
-  - per-row copy launches best-first, so partial delivery counts;
-  - the side copy launches before the source layer's own miss copy;
-  - `at_target` is kept as a correctness mode.
-- **APEX:** deferred from live, and in-graph side stream refused for it.
-- **P0D0 reference:** a server at `7de955329a`, with exact logprob equality.
-- **Pricing:** gap and overlap windows both reported; GO at ≥ 3 ms/token on `shifted_test`.
+- **Phase split:** Phase A touches no copy path. Phase B is an adapter only, with names TBD.
+- **Output:** a residency-agnostic bank of int64 ids `[C]` plus float32 priorities. A mask, filtering or a clamp is built in the adapter.
+- **Shadow metric:** in-graph `BudgetRecall` at budget B, identical in definition to Task 3's offline `budget_hits`.
+- **Env names:** `SGLANG_MOE_EXPERT_PREFETCH_*`, checked for no collision with the doorbell branch.
+- **APEX:** deferred from live prefetch, shadow only.
+- **Off-path proof:** exact logprobs against `7de955329a`. Scoring-on proof: exact logprobs against scoring off.
 
-**Need the user (asked at the named step, via AskUserQuestion):**
-1. The production-down window for Task 9 (≈3–3.5 h, +1 h if Task 8 needs the GPU), and again for Task 10 (≈1–1.5 h).
-2. The live budget B, if Task 3 and Task 8 disagree (gap vs overlap argmax), and whether to add a second budget arm.
-3. On Task 3 NO-GO: whether to build Tasks 4–7 anyway as plumbing for the doorbell.
-4. Whether a Task 3 result showing recall still rising past B = 10 justifies a follow-up evictable-slot plan.
+**Need the user (asked at the named step):**
+1. The production-down window for Task 6 (≈2.3 h; +0.8 h APEX S2; +0.75 h Task 7 benches), and later for B2 (≈3–3.5 h).
+2. On a Task 3 NO-GO: whether to still run Task 6 (it measures scoring cost and validates the bank) or stop Phase A after Task 5.
+3. Whether to include the APEX shadow arm S2.
+4. The live budget B for B2, if Task 3's gap and overlap argmaxes differ and Task 7 is inconclusive.
 
 ## Self-review notes
 
 - **Requirement coverage:**
-  - model-agnostic placement → `serving/` package, generic `after_write`, adapters only;
-  - in-graph with no host syncs → Tasks 2, 4, 5 and 6 sync tests, plus Design "outside the graph" (breaks listed);
-  - plan interface (ids `[B]`, slots `[B]`, device count, delivered mask, residual = misses − delivered) → Design and Task 4;
-  - `in_graph_copy` default, doorbell unset → Tasks 4–6;
-  - `doorbell` optional and blocked → Task 10;
-  - schedule choice justified and measured → Design and Task 8;
-  - 4-cell matrix → Task 9 (D-off) and Task 10 (D-on);
-  - offline recall of non-resident natives within budget → Task 3;
-  - APEX feasibility → Design, Task 3 and Risk 2.
-- **Project rules:** `msgspec.Struct` for new containers (`PrefetchPlan`, `PrefetchSettings`, checkpoints). The existing `GraphRoutePlan` dataclass is extended, not converted. No `getattr`/`hasattr` in new code. Envs are in `environ.py` next to the predictor block. Runner edits are one gate condition and two kwargs.
+  - model-agnostic checkpoint loading → Task 1;
+  - in-graph forward with no host syncs → Tasks 2 and 4, with sync-debug and replay tests;
+  - candidate ids/priorities as device tensors → Task 2 bank and the Phase A output contract;
+  - shadow and offline recall → Task 3 (offline), Tasks 4 and 6 (live shadow);
+  - no copy path in Phase A → Global Constraints plus Task 4 Step 0;
+  - Phase B interface TBD → Design and B1;
+  - 4-cell matrix and live tok/s → B2;
+  - window findings kept → Design, Task 3 pricing, Task 7.
+- **Project rules:**
+  - `msgspec.Struct` for new containers (`LlaporCheckpoint`, `ApexCheckpoint`, `PrefetchSettings`);
+  - no `getattr`/`hasattr` in new code;
+  - envs in `environ.py` next to the predictor block;
+  - one runner condition;
+  - commits stage named paths only.
 - **Names are consistent across tasks:**
-  - `PrefetchPlan`, `PrefetchPlanner.plan`/`valid_rows`/`delivered_ids`;
-  - `LayerPrefetch.rows`/`resolve`/`launch_next`;
-  - `ExpertStreamer.install_prefetch`/`prefetch_base`/`copy_rows_into_cache`/`graph_prefetch_counters`;
-  - `InGraphCopyBackend.install`/`capture_side_graphs`/`side_stream`;
-  - `PrefetchScoring.build`/`from_checkpoints`/`features_for`/`metrics_record`/`next_target`/`targets`;
-  - `attach_prefetch_backend`, `expert_prefetch_rows`;
-  - `budget_hits`, `doorbell_saving_ms`, `side_stream_ready_rows`.
-- **Specified by contract, not code:** Task 5's side-stream implementation and tests, Task 8's bench, and Task 10. Each depends on an API to be read at implementation time: the breakable capture helper, E27's harness, and the landed doorbell. The mechanism, the assertions, and the failure each test guards are fixed here.
+  - `load_prefetch_checkpoints`;
+  - `LlaporScorer`/`ApexScorer`;
+  - `PrefetchCandidateBank.ids_for`/`scores_for`;
+  - `BudgetRecall.observe`/`snapshot`;
+  - `PrefetchScoring.build`/`from_checkpoints`/`features_for`/`targets`/`next_target`/`bank`/`metrics_record`;
+  - `budget_hits`, `doorbell_saving_ms`, `side_stream_ready_rows`;
+  - `SGLANG_MOE_EXPERT_PREFETCH_{PREDICTOR,MODEL_DIR,CANDIDATES,BUDGET,APEX_TAU}`.
+- **Specified by contract, not code:** Task 7's benches (they reuse E27's harness, read at implementation time) and Phase B (its interface is TBD by design).
