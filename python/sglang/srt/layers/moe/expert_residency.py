@@ -320,8 +320,9 @@ class DeviceResidencyDecision(NamedTuple):
 
     ``promotions`` lists promoted experts in rank order, ``evictions`` the
     evicted residents worst first, both ``[layers, max_promotions]``.
-    ``needed_promotions`` is at least ``max_promotions`` exactly when the
-    uncapped decision promotes that many or more.
+    ``needed_promotions`` equals the uncapped promotion count up to
+    ``max_promotions + 1``, so it exceeds ``max_promotions`` exactly when the
+    cap truncated the decision.
     """
 
     promotions: torch.Tensor
@@ -376,7 +377,7 @@ def decide_residency_on_device(
         raise ValueError("max_promotions must be positive")
     device = scores.device
     positions = torch.arange(num_experts, dtype=torch.int64, device=device)
-    window = positions[:width]
+    window = positions[: min(width + 1, num_experts)]
     keys = residency_rank_keys(scores)
     resident = resident.to(torch.bool)
     capacity = capacity.to(torch.int64)
@@ -395,7 +396,7 @@ def decide_residency_on_device(
     victims = torch.sort(
         torch.where(members, keys, torch.full_like(keys, torch.iinfo(torch.int64).max)),
         dim=1,
-    ).indices[:, :width]
+    ).indices[:, : window.numel()]
     swap_positions = fill.unsqueeze(1) + window.unsqueeze(0)
     swap_candidates = candidate_order.gather(1, swap_positions.clamp(max=num_experts - 1))
     exact = scores.to(torch.float64)
@@ -418,7 +419,7 @@ def decide_residency_on_device(
     return DeviceResidencyDecision(
         promotions=candidate_order[:, :width],
         promotion_counts=promotion_counts,
-        evictions=victims,
+        evictions=victims[:, :width],
         eviction_counts=eviction_counts,
         needed_promotions=needed,
     )

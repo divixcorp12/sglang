@@ -120,11 +120,13 @@ class TestDeviceResidencyDecisions(unittest.TestCase):
                 self.assertLessEqual(int(output.promotion_counts.max()), max_promotions)
                 self.assertEqual(mismatches(scores, residents, capacities, output, 0.0, 0.0, max_promotions)[:2], [])
                 needed = output.needed_promotions.cpu().tolist()
+                truncated = 0
                 for row, (score, resident, capacity) in enumerate(zip(scores, residents, capacities)):
-                    self.assertEqual(
-                        needed[row] >= max_promotions,
-                        len(_reference(score, resident, capacity, 0.0, 0.0).promotions) >= max_promotions,
-                    )
+                    uncapped = len(_reference(score, resident, capacity, 0.0, 0.0).promotions)
+                    self.assertEqual(min(needed[row], max_promotions + 1), min(uncapped, max_promotions + 1), f"row {row}")
+                    self.assertEqual(needed[row] > max_promotions, uncapped > max_promotions, f"row {row}")
+                    truncated += uncapped > max_promotions
+                self.assertGreater(truncated, 0, f"no truncated rows at cap {max_promotions}")
 
     def test_inactive_layers_decide_nothing(self):
         scores = [[0.0, 5.0, 4.0, 1.0], [3.0, 0.0, 9.0, 0.0]]
