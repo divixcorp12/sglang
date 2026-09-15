@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -63,7 +64,9 @@ _COUNTERS = (
     "copy_api",
     "src_access_order",
     "external_stream",
+    "late_completions",
 )
+_RESET_AFTER_CAPTURE = ("fallback_count", "degraded", "timeouts", "waits", "last_polls", "record_mismatches")
 _STATUSES = (
     "pending",
     "serviced",
@@ -127,6 +130,11 @@ class ExpertDoorbellCopier:
     configured values and ``last_copy_error``, the CUDA status of the latest
     failed copy call.
 
+    ``segments`` is one ``ExpertRowSegments`` copied by every request, or a
+    sequence of them, one per tag: a request copies its tag's set and ``wait``
+    falls back through that set, so one thread serves layers whose rows live in
+    different tensors.
+
     Invariants the caller must uphold:
 
     * A destination slot named by a posted request must not be read by any
@@ -147,7 +155,7 @@ class ExpertDoorbellCopier:
 
     def __init__(
         self,
-        segments: ExpertRowSegments,
+        segments: ExpertRowSegments | Sequence[ExpertRowSegments],
         capacity: int,
         *,
         ring: int = 64,
@@ -182,11 +190,21 @@ class ExpertDoorbellCopier:
             )
         if copy_api == "per_segment" and src_access_order != "stream":
             raise ValueError("src_access_order applies only to copy_api='batch'.")
-        device = segments.table.device
+        segment_sets = (
+            (segments,) if isinstance(segments, ExpertRowSegments) else tuple(segments)
+        )
+        if not segment_sets:
+            raise ValueError("segments must hold at least one segment set.")
+        if len(segment_sets) > 1 and max_tags < len(segment_sets):
+            raise ValueError("max_tags must cover every segment set.")
+        device = segment_sets[0].table.device
+        if any(segment_set.table.device != device for segment_set in segment_sets):
+            raise ValueError("every segment set must share one CUDA device.")
         if stream is not None and stream.device != device:
             raise ValueError("stream must be on the copier's device.")
         self.stream = stream
-        self.segments = segments
+        self.segment_sets = segment_sets
+        self.segments = segment_sets[0]
         self.capacity = capacity
         self.ring = ring
         self.max_tags = max_tags
@@ -216,14 +234,21 @@ class ExpertDoorbellCopier:
                     source.shape[0],
                     destination.shape[0],
                 ]
-                for source, destination in segments.pairs
+                for segment_set in segment_sets
+                for source, destination in segment_set.pairs
             ],
+            dtype=torch.int64,
+        )
+        set_sizes = [len(segment_set.pairs) for segment_set in segment_sets]
+        self.set_offsets = torch.tensor(
+            [sum(set_sizes[:index]) for index in range(len(set_sizes) + 1)],
             dtype=torch.int64,
         )
         self._module = _jit_expert_doorbell_module()
         self._handle = self._module.expert_doorbell_start(
             self.page,
             self.segment_table,
+            self.set_offsets,
             self.done,
             self.publish_words,
             capacity,
@@ -278,7 +303,7 @@ class ExpertDoorbellCopier:
             self.done,
             self.fallback_rows,
             self.fallback_slots,
-            self.segments.table,
+            self.segment_sets[tag if len(self.segment_sets) > 1 else 0].table,
             tag,
             self.capacity,
             self.ring,
@@ -293,6 +318,17 @@ class ExpertDoorbellCopier:
 
     def resume(self) -> None:
         self._module.expert_doorbell_pause(self._handle, 0)
+
+    def reset_wait_state(self) -> None:
+        """Zero the wait counters and the degraded flag, keeping sequences.
+
+        Waits captured while the thread is quiesced time out and leave the
+        copier degraded; call this before resuming so serving starts with full
+        wait budgets and counters that only count serving waits.
+        """
+        torch.cuda.synchronize(self.device)
+        for name in _RESET_AFTER_CAPTURE:
+            self.state[_STATE_WORDS[name]] = 0
 
     def quiesce(self, timeout_s: float = 10.0) -> None:
         """Pause the thread once every request posted so far is serviced and its copies completed.

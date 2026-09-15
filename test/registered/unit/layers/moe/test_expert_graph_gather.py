@@ -1,5 +1,6 @@
 """Sync-free expert gather: CUDA-graph replays match source rows for any routes."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -47,6 +48,47 @@ def _layer(seed=21, pinned=True):
 def _source_bytes(layer, name, ids):
     source = getattr(layer, name).data
     return source[ids.long().to(source.device)].view(torch.uint8).cpu()
+
+
+DOORBELL_SPIN_CORE = int(os.environ.get("DOORBELL_SPIN_CORE", "71"))
+
+
+def _streamed_model(seeds):
+    model = torch.nn.Module()
+    for layer_id, seed in enumerate(seeds):
+        layer = _layer(seed=seed)
+        layer.layer_id = layer_id
+        layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        model.add_module(str(layer_id), layer)
+    return model
+
+
+def _manager(model, doorbell):
+    from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+
+    layers = list(model.children())
+    return ExpertHotCacheManager.from_model(
+        model,
+        budget_bytes=len(layers)
+        * layers[0]._nvfp4_expert_streamer.bytes_per_expert
+        * (TOP_K + 2),
+        seed_path=None,
+        dynamic=False,
+        update_prefill_tokens=16,
+        min_residence_forwards=0,
+        benefit_ratio=1.0,
+        graph_gather_batch_size=1,
+        expert_doorbell=doorbell,
+        doorbell_cpu_core=DOORBELL_SPIN_CORE,
+    )
+
+
+def _cache_rows(manager):
+    return {
+        (layer_id, name): tensor.view(torch.uint8).cpu()
+        for layer_id, cache in manager.caches.items()
+        for name, tensor in cache.tensors.items()
+    }
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -471,3 +513,137 @@ class TestExpertGraphGather(unittest.TestCase):
         self.assertEqual(decode["hot_hits"], 2)
         self.assertEqual(decode["requested_unique_experts"], 3)
         self.assertEqual(decode["h2d_bytes"], streamer.host_bytes_per_expert)
+
+    def test_doorbell_gather_writes_the_same_cache_rows_as_the_in_graph_copy(self):
+        """Flag on, the thread (not the fallback) writes every layer's hot and scratch rows
+        byte-for-byte as the in-graph kernel does, for 0 misses, all-miss plans and random plans.
+
+        Two layers with different rows post under different tags, so a request copied through
+        the wrong layer's segments differs from the in-graph copy.
+        """
+        plain_model, doorbell_model = _streamed_model((21, 33)), _streamed_model((21, 33))
+        plain, doorbell = _manager(plain_model, False), _manager(doorbell_model, True)
+        try:
+            self.assertIsNone(plain.doorbell)
+            for layer in plain_model.children():
+                self.assertIsNone(layer._nvfp4_expert_streamer.doorbell)
+            generator = torch.Generator().manual_seed(5)
+            no_miss_steps = 0
+            steps = 0
+            for step in range(12):
+                for layer_id in sorted(plain.caches):
+                    resident = sorted(plain.caches[layer_id].resident_experts())
+                    missing = [e for e in range(EXPERTS) if e not in resident]
+                    if step == 0 and resident:
+                        routes = [resident[0]] * TOP_K
+                        no_miss_steps += 1
+                    elif step == 1:
+                        routes = missing[:TOP_K]
+                    else:
+                        routes = torch.randint(0, EXPERTS, (TOP_K,), generator=generator).tolist()
+                    ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
+                    for model in (plain_model, doorbell_model):
+                        layer = model.get_submodule(str(layer_id))
+                        compact, tensors = layer._nvfp4_expert_streamer.gather(ids)
+                        self._assert_rows(layer, ids, compact, tensors)
+                    steps += 1
+                    torch.cuda.synchronize()
+                    plain_rows, doorbell_rows = _cache_rows(plain), _cache_rows(doorbell)
+                    for key, rows in plain_rows.items():
+                        self.assertTrue(torch.equal(rows, doorbell_rows[key]), f"{key} step={step}")
+            stats = doorbell.doorbell.stats()
+            self.assertGreater(no_miss_steps, 0)
+            self.assertEqual(stats["timeouts"], 0)
+            self.assertEqual(stats["serviced"], steps)
+            self.assertEqual(stats["copy_errors"], 0)
+            self.assertEqual(stats["invalid_records"], 0)
+            self.assertEqual(stats["late_completions"], 0)
+        finally:
+            doorbell.doorbell.stop()
+
+    def test_doorbell_gather_replays_after_a_quiesced_capture(self):
+        """A capture taken with the thread quiesced replays thread-served copies for changing
+        routes, and resuming clears the timeouts the paused capture recorded."""
+        model = _streamed_model((21,))
+        manager = _manager(model, True)
+        layer = model.get_submodule("0")
+        streamer = layer._nvfp4_expert_streamer
+        cache = manager.caches[0]
+        ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device="cuda")
+        outputs = {
+            name: torch.empty(
+                (TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda"
+            )
+            for name, tensor in cache.tensors.items()
+        }
+
+        def gather_into_outputs():
+            compact, tensors = streamer.gather(ids)
+            for name, output in outputs.items():
+                output.copy_(tensors[name][compact.reshape(-1).long()])
+
+        try:
+            side_stream = torch.cuda.Stream()
+            with torch.cuda.stream(side_stream):
+                gather_into_outputs()
+            torch.cuda.current_stream().wait_stream(side_stream)
+            graph = torch.cuda.CUDAGraph()
+            manager.quiesce_doorbell()
+            try:
+                with torch.cuda.graph(graph):
+                    gather_into_outputs()
+                torch.cuda.synchronize()
+                self.assertEqual(manager.doorbell.stats()["timeouts"], 1)
+            finally:
+                manager.resume_doorbell()
+            manager.discard_graph_capture_routes()
+            self.assertEqual(manager.doorbell.stats()["timeouts"], 0)
+            self.assertEqual(manager.doorbell.stats()["degraded"], 0)
+            before = manager.doorbell.stats()["serviced"]
+            replays = ([5, 6, 7, 5], [0, 7, 3, 2], [4, 4, 4, 4], [1, 2, 3, 4], [7, 6, 5, 4])
+            for routes in replays:
+                ids.copy_(torch.tensor([routes], dtype=torch.int32, device="cuda"))
+                graph.replay()
+                torch.cuda.synchronize()
+                for name, output in outputs.items():
+                    self.assertTrue(
+                        torch.equal(
+                            output.view(torch.uint8).cpu(),
+                            _source_bytes(layer, name, ids.reshape(-1)),
+                        ),
+                        f"{name} routes={routes}",
+                    )
+            stats = manager.doorbell.stats()
+            self.assertEqual(stats["timeouts"], 0)
+            self.assertEqual(stats["serviced"] - before, len(replays))
+        finally:
+            manager.doorbell.stop()
+
+    def test_doorbell_gather_falls_back_to_correct_rows_when_the_thread_stalls(self):
+        model = _streamed_model((21,))
+        manager = _manager(model, True)
+        layer = model.get_submodule("0")
+        streamer = layer._nvfp4_expert_streamer
+        copier = manager.doorbell
+        resident = sorted(manager.caches[0].resident_experts())
+        missing = [e for e in range(EXPERTS) if e not in resident]
+        try:
+            copier.pause()
+            ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
+            compact, tensors = streamer.gather(ids)
+            torch.cuda.synchronize()
+            self._assert_rows(layer, ids, compact, tensors)
+            stalled = copier.stats()
+            self.assertEqual(stalled["timeouts"], 1)
+            self.assertEqual(stalled["serviced"], 0)
+
+            copier.resume()
+            ids = torch.tensor([missing[::-1][:TOP_K]], dtype=torch.int32, device="cuda")
+            compact, tensors = streamer.gather(ids)
+            torch.cuda.synchronize()
+            self._assert_rows(layer, ids, compact, tensors)
+            recovered = copier.stats()
+            self.assertEqual(recovered["skipped_abandoned"], 1)
+            self.assertEqual(recovered["late_completions"], 0)
+        finally:
+            copier.stop()

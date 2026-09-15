@@ -328,6 +328,15 @@ class Envs:
     SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
     # Most experts one layer promotes at a decode boundary on the GPU path.
     SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
+    # Serve graph-gather miss copies through the doorbell copier thread: the
+    # gather posts its miss plan and waits in-graph, falling back to the
+    # in-graph copy on timeout. Requires SGLANG_MOE_EXPERT_GRAPH_GATHER.
+    SGLANG_MOE_EXPERT_DOORBELL = EnvBool(False)
+    SGLANG_MOE_EXPERT_DOORBELL_CPU = EnvInt(71)
+    # Wait budgets in polls (about 250 ns each); 0 sizes them from the largest
+    # per-layer miss copy.
+    SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS = EnvInt(0)
+    SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS = EnvInt(0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)

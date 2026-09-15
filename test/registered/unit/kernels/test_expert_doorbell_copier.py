@@ -196,6 +196,44 @@ def test_copy_arm_thread_copies_match_reference_before_wait(copy_api, src_access
     assert stats["external_stream"] == int(torch_stream)
 
 
+def test_segment_sets_copy_each_tags_rows_into_its_own_destinations():
+    """With one segment set per tag, each request copies through its tag's set, and a tag
+    without a set is refused as an invalid record instead of copying another set's rows."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+    from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+    generator = torch.Generator().manual_seed(71)
+    sources_a = _sources(30, EXPERT_LIKE_SHAPES, generator)
+    destinations_a = _destinations(sources_a, 20)
+    sources_b = _sources(25, (((17, 3), torch.uint8), ((5,), torch.uint8)), generator)
+    destinations_b = _destinations(sources_b, 12)
+    rows_a, slots_a = _pick(generator, 30, 20, 9)
+    rows_b, slots_b = _pick(generator, 25, 12, 9)
+    sets = [
+        expert_row_segments(list(zip(sources_a, destinations_a))),
+        expert_row_segments(list(zip(sources_b, destinations_b))),
+    ]
+    with ExpertDoorbellCopier(sets, 9, max_tags=3, cpu_core=SPIN_CORE) as copier:
+        copier.post(*_plan(9, rows_a, slots_a), tag=0)
+        copier.post(*_plan(9, rows_b, slots_b), tag=1)
+        torch.cuda.synchronize()
+        serviced = _completed_request(copier, copier.stats()["posted"])
+        _assert_matches_reference(sources_a, destinations_a, rows_a, slots_a)
+        _assert_matches_reference(sources_b, destinations_b, rows_b, slots_b)
+        copier.wait(tag=0)
+        copier.wait(tag=1)
+        copier.post(*_plan(9, rows_a, slots_a), tag=2)
+        torch.cuda.synchronize()
+        invalid = _completed_request(copier, copier.stats()["posted"])
+        stats = copier.stats()
+    _assert_matches_reference(sources_b, destinations_b, rows_b, slots_b)
+    assert serviced and serviced["status"] == "serviced"
+    assert invalid and invalid["status"] == "invalid_record"
+    assert stats["invalid_records"] == 1
+    assert stats["timeouts"] == 0
+    assert stats["late_completions"] == 0
+
+
 def test_reference_check_fails_on_flipped_byte_and_stray_write():
     generator = torch.Generator().manual_seed(1)
     sources = _sources(8, EXPERT_LIKE_SHAPES, generator)

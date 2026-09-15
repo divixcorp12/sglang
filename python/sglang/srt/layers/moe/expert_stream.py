@@ -515,6 +515,8 @@ class ExpertStreamer:
         self.pinned_host_cache = None
         self.residency_policy = None
         self.residency_update = None
+        self.doorbell = None
+        self.doorbell_tag = 0
         self.before_eager_gather = None
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
@@ -651,7 +653,15 @@ class ExpertStreamer:
                 .reshape(source.shape[0], -1)
                 .index_select(0, plan.source_rows),
             )
-        if self._graph_row_segments is not None:
+        if self._graph_row_segments is not None and self.doorbell is not None:
+            self.doorbell.post(
+                self._graph_source_rows,
+                self._graph_destination_slots,
+                self._graph_miss_count,
+                tag=self.doorbell_tag,
+            )
+            self.doorbell.wait(tag=self.doorbell_tag)
+        elif self._graph_row_segments is not None:
             self._copy_row_segments_gpu(
                 self._graph_row_segments,
                 self._graph_source_rows,

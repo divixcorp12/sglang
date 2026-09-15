@@ -360,6 +360,7 @@ enum Counter : int64_t {
   kCopyApi,
   kSrcAccessOrder,
   kExternalStream,
+  kLateCompletions,
   kCounterCount,
 };
 
@@ -397,12 +398,27 @@ inline uint32_t read_host_word(const uint8_t* address) {
   return *reinterpret_cast<const volatile uint32_t*>(address);
 }
 
+inline size_t widest_segment_set(const std::vector<int64_t>& set_offsets) {
+  size_t widest = 0;
+  for (size_t index = 1; index < set_offsets.size(); ++index) {
+    const size_t span = static_cast<size_t>(set_offsets[index] - set_offsets[index - 1]);
+    widest = span > widest ? span : widest;
+  }
+  return widest;
+}
+
 /// A CPU spin thread that services requests posted to one request page.
 ///
 /// It copies each request's rows on a CUDA stream, either one it creates or one
 /// the caller passes in, with one batched copy (``copy_api`` kBatchCopy, using
 /// ``src_access_order`` for every copy) or one copy per segment row
 /// (kPerSegmentCopy), and then queues a four-byte host-to-device copy of the request's sequence
+/// into the device completion word. Segments are grouped into sets by
+/// ``set_offsets``: with one set every request copies it, otherwise a request
+/// copies the set its tag names and a tag without a set is an invalid record.
+/// ``late_completions`` counts requests whose copies completed at or before
+/// the latest abandoned sequence, an upper bound on copies that landed after
+/// their waiter fell back. Completion is published
 /// into the device completion word, so completion becomes visible to the GPU
 /// no earlier than the row copies it covers. Every publish reads its own
 /// pinned word, which is never rewritten while an earlier publish from it is
@@ -414,6 +430,7 @@ class DoorbellThread {
       int64_t capacity,
       int64_t ring,
       std::vector<Segment> segments,
+      std::vector<int64_t> set_offsets,
       uint32_t* done,
       int32_t* publish_words,
       int64_t publish_ring,
@@ -427,6 +444,8 @@ class DoorbellThread {
         capacity_(capacity),
         ring_(ring),
         segments_(std::move(segments)),
+        set_offsets_(std::move(set_offsets)),
+        widest_set_(widest_segment_set(set_offsets_)),
         done_(done),
         publish_words_(publish_words),
         publish_ring_(publish_ring),
@@ -438,9 +457,9 @@ class DoorbellThread {
         owns_stream_(external_stream == nullptr),
         rows_(capacity),
         slots_(capacity),
-        sources_(capacity * segments_.size()),
-        destinations_(capacity * segments_.size()),
-        sizes_(capacity * segments_.size()),
+        sources_(capacity * widest_set_),
+        destinations_(capacity * widest_set_),
+        sizes_(capacity * widest_set_),
         publish_events_(publish_ring),
         publish_trace_(publish_ring, -1),
         stream_(external_stream),
@@ -578,7 +597,9 @@ class DoorbellThread {
     }
     const uint8_t* record = page_ + record_offset(seq, capacity_, ring_);
     const uint32_t count = read_host_word(record + 4);
-    if (read_host_word(record) != seq || count > static_cast<uint32_t>(capacity_)) {
+    const size_t sets = set_offsets_.size() - 1;
+    const size_t set = sets == 1 ? 0 : static_cast<size_t>(read_host_word(record + 8));
+    if (read_host_word(record) != seq || count > static_cast<uint32_t>(capacity_) || set >= sets) {
       entry.status = static_cast<int64_t>(RequestStatus::kInvalidRecord);
       counters_[kInvalidRecords].fetch_add(1);
       push_trace(entry);
@@ -596,18 +617,21 @@ class DoorbellThread {
 
     size_t copies = 0;
     int64_t rows_copied = 0;
+    const auto first = segments_.begin() + set_offsets_[set];
+    const auto last = segments_.begin() + set_offsets_[set + 1];
     for (uint32_t index = 0; index < count; ++index) {
       const int64_t row = rows_[index];
       const int64_t slot = slots_[index];
       bool valid = true;
-      for (const Segment& segment : segments_) {
-        valid = valid && row >= 0 && row < segment.source_rows && slot >= 0 && slot < segment.destination_rows;
+      for (auto segment = first; segment != last; ++segment) {
+        valid = valid && row >= 0 && row < segment->source_rows && slot >= 0 && slot < segment->destination_rows;
       }
       if (!valid) {
         counters_[kCopyErrors].fetch_add(1);
         continue;
       }
-      for (const Segment& segment : segments_) {
+      for (auto it = first; it != last; ++it) {
+        const Segment& segment = *it;
         sources_[copies] = reinterpret_cast<void*>(segment.source + static_cast<uint64_t>(row) * segment.row_bytes);
         destinations_[copies] =
             reinterpret_cast<void*>(segment.destination + static_cast<uint64_t>(slot) * segment.row_bytes);
@@ -681,6 +705,11 @@ class DoorbellThread {
         break;
       }
       const int64_t complete_ns = monotonic_ns();
+      const uint32_t abandoned = read_host_word(page_ + kAbandonedOffset);
+      const uint32_t seq = static_cast<uint32_t>(publish_words_[slot]);
+      if (abandoned != 0 && static_cast<int32_t>(seq - abandoned) <= 0) {
+        counters_[kLateCompletions].fetch_add(1);
+      }
       {
         std::lock_guard<std::mutex> guard(trace_mutex_);
         const int64_t trace_index = publish_trace_[slot];
@@ -709,6 +738,8 @@ class DoorbellThread {
   int64_t capacity_;
   int64_t ring_;
   std::vector<Segment> segments_;
+  std::vector<int64_t> set_offsets_;
+  size_t widest_set_;
   uint32_t* done_;
   int32_t* publish_words_;
   int64_t publish_ring_;
@@ -760,6 +791,7 @@ inline DoorbellThread* find_thread(int64_t handle) {
 int64_t expert_doorbell_start(
     tvm::ffi::TensorView page,
     tvm::ffi::TensorView segment_table,
+    tvm::ffi::TensorView set_offsets,
     tvm::ffi::TensorView done,
     tvm::ffi::TensorView publish_words,
     int64_t capacity,
@@ -779,11 +811,14 @@ int64_t expert_doorbell_start(
         static_cast<uint64_t>(entry[0]), static_cast<uint64_t>(entry[1]), static_cast<uint64_t>(entry[2]), entry[3],
         entry[4]};
   }
+  const auto offsets = static_cast<const int64_t*>(set_offsets.data_ptr());
+  std::vector<int64_t> set_bounds(offsets, offsets + set_offsets.size(0));
   auto thread = std::make_unique<DoorbellThread>(
       static_cast<uint8_t*>(page.data_ptr()),
       capacity,
       ring,
       std::move(segments),
+      std::move(set_bounds),
       static_cast<uint32_t*>(done.data_ptr()),
       static_cast<int32_t*>(publish_words.data_ptr()),
       publish_words.size(0),
