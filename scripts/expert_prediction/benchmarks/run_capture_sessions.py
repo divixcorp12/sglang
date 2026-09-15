@@ -13,7 +13,9 @@ import time
 import urllib.error
 import urllib.request
 
-ANSWER_RE = re.compile(r"ANSWER:\s*([-+]?[\d,\.]+)\s*%?\s*$", re.IGNORECASE | re.MULTILINE)
+ANSWER_RE = re.compile(
+    r"ANSWER:\s*\$?\s*([-+]?[\d,\.]+)\s*%?\s*$", re.IGNORECASE | re.MULTILINE
+)
 
 
 def _load_sessions(path):
