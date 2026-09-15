@@ -39,6 +39,13 @@ is `work/latest.log`. Plan these experiments serve:
 | E23 | 09-14 18:34 | CUDA 13 driver graph nodes for expert copies: BatchMemOp semantics, MEMCPY nodes captured in torch's CUDA graph, host retarget and GPU-predicate IF fan-out | Viable only with a host sync per layer: BatchMemOp nodes can't copy; captured MEMCPY nodes run 11.8 GiB/s byte-exact inside torch's graph, but targets are host-only; IF fan-out ≈ 1.7 s/token at 512 experts. Nets ~15–20 ms/token only with a thin C++ break (estimate) |
 | E24 | 09-14 18:44 | Warp-aligned in-graph copy kernel: 23-variant screen (grid, block, load width, layout) and final W1–W4 eager + graph replay on an exclusive GPU | Positive: 11.2–11.5 GiB/s (89% of link) vs the original 5.0–6.6, byte-exact, no graph break; closes ~80% of the gap to the link; estimated 22–37 ms/token saved; integration is a kernel-only change in `expert_cache_transfer.cuh` |
 | E25 | 09-14 20:33 | Serving A/B of E24's 16 B kernel: base/proto/base at production settings, logprob margins, in-graph shadow copy under real decode, dynamic-residency-off pair | Positive, cleared: 0 differing bytes over 452,088 real miss rows; saves 17.1–17.3 ms/token (13.4 → 17.4 tok/s, +29%) at production settings and 54.5 ms/token (+63%) with residency off; greedy parity unusable because the stock server is itself nondeterministic |
+| E26 | 09-15 | Offline re-rank of the post-kernel ideas: cost model refit from E25's on/off pairs (c_miss 0.1426 → 0.0681 s/GiB), applied to E20's replay | Copy-saving ideas lose about a third of their value; CPU experts at 4 threads now lose (−7%). Order: FP8 slots (+7–9%, implemented), overlapping next-layer copies (ceiling +27–48%, needs a contention microbenchmark), skipping low-weight misses (+8–12% at 20–30%). Gen4/Gen5 host: +27% / +47% |
+| E27 | 09-15 01:02 | Copy kernel under decode load: side-stream next-layer copy overlapped with 48 captured NVFP4-MoE layer graphs, eager and graph, 1/3/10/30 rows/layer | ALIVE but window-bound: no measurable contention either way; saving = min(copy, window)/copy, 97.6–97.8% at 3 rows with a 0.76 ms/layer window, 35% with the real kernels' 0.25 ms; byte- and hidden-state-exact. The real serving per-layer GPU time decides the size |
+| E28 | 09-15 02:00 | Serving decode profile (nsys, CUDA-graph node trace, no-profiler arm): per-layer window, miss distribution, step composition | Window 0.268 ms, not 0.76; one graph, no breaks; misses/layer mean 2.72 (p90 6). Idea 2 re-priced to ~10 ms/token ceiling (+15–17%). **Every 4th step (residency update) stalls the host ~60–80 ms extra, 38–47% of decode wall time without the profiler, ~70 ms unattributed host CPU**: the largest lever found |
+| E29 | 09-15 02:12 | Doorbell copier prototype: in-graph poster → pinned ring → C++ spin thread (`cudaMemcpyBatchAsync`) → chunked GPU waiter with in-graph fallback | Negative for serving: bytes always correct, eager copies 12.7 GiB/s, 54/54 tests (branch `cc/doorbell-prototype` `d57db3e1a1`). The doorbell thread's own `cudaMemcpyBatchAsync` copies land only after the replays launched after them, so every ungated in-graph wait times out. A plain torch side-stream copy is **not** held by graph replay (round 1's claim corrected). The host-gated form works but costs 74 vs 40 ms/token |
+| E30 | 09-15 02:39 | Residency-update host stall attribution (instrumented spans, py-spy, no-profiler arm; 233 update steps) | Attributed: the update costs 76 ms p50 / 109 ms p90 on the decode thread, ≈85% Python bookkeeping and synchronous tiny transfers (rank sort, 137 mapping publishes, 274 scalar slot writes, plan uploads), 15% promotion-copy wait; 35.7 ms + 0.616 ms × promotions. Fixes #1–#6 estimated to remove ≈50 ms per update ≈ +20% tok/s |
+| E31 | 09-15 04:31 | Residency update inside the decode CUDA graph (`cc/residency-update-fast` `252a888559`, flag `SGLANG_MOE_GPU_RESIDENCY_UPDATE`) vs E30's Python fixes vs base; 175 tests, lockstep replay, 2-run interleaved serving A/B | Positive: gpu +22.3% tok/s (14.87 → 18.18), mean ITL −18.1%, update-step p50 118 → 65 ms (the rest is the in-graph promotion copy); Python fixes alone +15.8%; hit rate unchanged; replay identical uncapped (1 truncated layer at K=64); 0 large-margin flips. Open: normal-step +1.7 ms unresolved. Merged `d43c59b58a` and deployed 09-15 05:12 |
+| E32 | 09-15 12:10 | Doorbell hold isolation: thread copy API (batch / per-segment), batch `srcAccessOrder` (stream / during_call / any), thread-created vs torch-created stream; `cc/doorbell-prototype` `696b8cc96b` | **Cause found: the thread's own `cudaStreamCreate` stream.** On a torch-created stream the hold is gone at 3 rows: 0 timeouts per token, requests land 0.64 ms after their layer, token 68 ms in graph / 40.5 ms eager-post, byte-exact, with either copy API. Access order does nothing (`any` = baseline; `during_call` blocks the thread, 40/960 serviced). 30 rows also succeeds once the wait budget covers the 6 ms copy: 0 timeouts, done 6.3 ms after the layer, 339 ms/token. The torch-stream thread keeps 12.3–12.4 GiB/s and beats the in-graph kernel by 4–7% at 1–10 rows. Step-2 estimate ≈2.4 ms/token, below the 3 ms go threshold |
 
 ## Standard NEXTN workload
 
@@ -1022,4 +1029,574 @@ A single 3-row launch (18 nodes) took 0.659 ms, so launch overhead is negligible
 - **Cost-model reconciliation (E22):** the implied in-serving cost of the original kernel is about 0.147–0.158 s/GiB (estimate, assuming proto runs at its microbenchmark rate), close to the cost model's 0.1347 s/GiB. E22's microbenchmark overstated the original kernel's small-launch cost.
 - **Hand-off:** `kernel.patch` holds only the kernel change and tests, with no Python caller changes, and passes `git apply --check` on the fork at `4b083ae749` (not applied). `shadow_debug.patch` is debug-only.
 - **Not run:** repeated runs per arm (no confidence intervals); base self-consistency with dynamic residency off; chat-template or concurrent traffic; per-op copy timing in serving; root cause of the stock server's 6.5-nat flip.
-- **End state:** at 20:33:29 no GPU compute process, nothing listening on 31207 or 7867, tmux session gone; nothing committed or pushed.
+- **End state:** at 20:33:29 no GPU compute process, nothing listening on 31207 or 7867, tmux session gone. The kernel was later committed as `8473a28c88` (101/101 kernel tests at `4b083ae749` + patch) and the serving worktree fast-forwarded to `d0a3e55b16` with :7867 still down.
+
+## E26 — Re-rank the enhancement ideas at the post-E25 copy cost (offline model)
+
+- **Question:** every estimate before E25 priced a miss at the original kernel's cost. At the new cost, which remaining idea is worth building? (Step 1 of `docs/superpowers/plans/2026-09-14-nvfp4-post-copy-kernel-enhancements.md`.)
+- **Run:** 09-15 laptop, CPU only, `rerank.py` EXIT=0. Artifacts: divix01 `nvfp4-work/cc-rerank/` (`rerank.py`, `rerank.out`).
+- **Model:** per decode token, s = c_miss·D + c_promo·G + F, bytes calibrated ×0.976 (E20). D = in-graph miss GiB, G = DMA promotion GiB.
+  - **c_promo = 0.0794 s/GiB:** E22's production DMA rate, 12.6 GiB/s.
+  - **c_miss from E25's dynamic-on and dynamic-off runs per kernel** (two equations, c and F unknown): c = (Δs − c_promo·ΔG)/ΔD.
+    - Original kernel: (142.22 − 74.88 ms + 0.0794·0.0439 GiB)/(0.7847 − 0.2881 GiB) = **0.1426 s/GiB**.
+    - Warp-aligned kernel: (87.74 − 57.77 ms + 0.0794·0.0446 GiB)/(0.7794 − 0.2874 GiB) = **0.0681 s/GiB** (0.48×).
+  - **Fit quality:** the two kernels' intercepts on the E25 workload differ by 4.3 ms (30.3 vs 34.7 ms) although only the kernel changed, so treat the model as ±4 ms/token. Each point is one run.
+  - **F on the E1 workload:** solving E20's 4,957-slot baseline (11.42 tok/s) with the original kernel's c gives F = 36.4 ms, close to the E16 fit's independent intercept of 35.9 ms.
+- **Post-E25 baseline (E1 workload, 4,957 slots, predicted):** 15.83 tok/s = 63.2 ms/token = 22.3 ms miss copies + 4.4 ms promotions + 36.4 ms rest. Each avoided miss saves 0.171 ms (0.358 ms before E25). E25 measured 17.4 tok/s on its own, lighter workload.
+
+### Results (predicted gain vs each era's baseline)
+
+| Idea | Variant | Before E25 (vs 11.42) | After E25 (vs 15.83) | tok/s after |
+|---|---|---:|---:|---:|
+| 3 FP8 slots | 6,236 slots | +10.6% | +7.3% | 16.99 |
+| 3 FP8 slots | 6,466 slots | +12.5% | +8.6% | 17.19 |
+| 4 skip low-weight misses | −10% / −20% / −30% / −50% misses | +5.3 / +11.2 / +17.8 / +33.7% | +3.7 / +7.6 / +11.9 / +21.4% | 16.41 / 17.04 / 17.71 / 19.23 |
+| 5 CPU experts, in-graph | 4 threads (E21 measured 25.8 ms) | +23.9% | **−7.2%** | 14.69 |
+| 5 CPU experts, in-graph | 8 / 18 threads (linear scaling, unmeasured) | +51.5 / +73.0% | +14.4 / +31.5% | 18.12 / 20.82 |
+| 2 overlap next-layer copy | recall 0.594 / 0.775 / 0.92 (ceiling) | +42.7 / +64.1 / +86.4% | +26.6 / +37.7 / +48.1% | 20.04 / 21.80 / 23.45 |
+| 7 faster host link | Gen4 / Gen5 (copy and promotion time ÷2 / ÷4) | +41.8 / +79.4% | +26.9 / +46.6% | 20.09 / 23.20 |
+| 6 last 11% to link | c_miss × 0.89 | n/a | +4.0% | 16.47 |
+| 6 promotions | half the promotion time | +4.5% | +3.6% | 16.41 |
+
+- **Recall sources for idea 2:** 0.775 and 0.92 are E2's one-layer lookahead at 10 and 20 candidates; 0.594 is the affinity predictor's recall at M from the expert-prediction shadow smoke (`docs/superpowers/experiments/2026-09-14-expert-prediction-shadow-smoke.md`).
+- **The idea 2 rows are a ceiling, not a prediction.** They credit recall × all miss-copy time and assume the copy overlaps compute for free. They ignore: copies of false-positive candidates, the per-layer window (36.4 ms / 48 ≈ 0.76 ms of other work to overlap with), and GPU-thread contention between the copy kernel and compute. E2's earlier 1.10–1.17× cap included such limits.
+
+### Verdict
+
+- **Every copy-saving idea lost about a third of its value**, and CPU experts at 4 threads now lose (−7%). Idea 5 needs ≥8 threads, which the divix01 CPU policy doesn't allow today.
+- **Re-ranked software order:**
+  1. **Idea 3, FP8 slots (+7–9%):** already implemented (`SGLANG_ONLINE_FP8_GROUPS`); blocked only on the parked GPU accuracy session. Cheapest to ship.
+  2. **Idea 2, overlapping copies (ceiling +27–48%):** the largest software lever, but unproven. A copy-kernel-under-decode-load microbenchmark decides whether it's real before any build.
+  3. **Idea 4, skipping low-weight misses (+8–12% at 20–30% fewer misses):** needs the gate-weight distribution of misses (the new expert-prediction capture mode records routing) and a quality gate.
+  4. **Idea 6, small items (~+4% each).**
+  5. **Idea 5, CPU experts:** only with more cores.
+- **Hardware (idea 7):** a Gen4 host is worth about +27% and Gen5 about +47%, more than any software idea except the idea 2 ceiling.
+- **Caveats:** one run per E25 point; the ±4 ms intercept gap; the E1 workload only; CPU thread scaling beyond 4 is unmeasured; skip fractions are assumptions, not measured.
+
+## E27 — Copy kernel under decode load: does an overlapped next-layer copy contend with compute?
+
+- **Question:** step 2 of the enhancements plan. If layer L+1's miss rows are copied on a side stream while layer L computes, how much of the sequential copy time is actually saved?
+- **Pre-registered verdict** on the realized saving (T_seq − T_ovl)/T_copy at 3 rows/layer:
+  - ≥50% ALIVE (≈7.7 ms/token at recall 0.7, ≈+13%);
+  - 20–50% MARGINAL;
+  - <20% DROP.
+- **Run:** 09-15 00:18–01:02 CDT, divix01 RTX 5090, exclusive GPU under `cc-gpu.lock`, 7867 down.
+  - Artifacts: `work/cc-overlap/` (`REPORT.md`, `bench_overlap.py`, `results.jsonl`, `summary.md`, `cal.jsonl`, `probe_wait.jsonl`, `run.log`).
+  - All final runs EXIT=0. A first run was killed for two harness defects (graph `seq` was secretly overlapped; stateful layers made the hidden-state check non-discriminating) and kept as `results_invalid_run1.jsonl`.
+- **Copy:** production `copy_expert_row_segments_gpu` from the serving worktree at `d0a3e55b16` (includes `8473a28c88`). Sources are arena-registered rows in the real 6-segment layout, repeated with plain pinned rows.
+- **Compute (load level 2, not the real decoder layer):** 48 per-layer CUDA graphs, each containing:
+  - the overlay's CUTLASS NVFP4 fused MoE, top-10, bs 1, reading the slots the copy writes;
+  - bf16 router, shared expert, hyper-connection, linear-attention and every-4th full-attention ops at checkpoint shapes, with random weights.
+  - Real kernels alone take 0.25 ms/layer; 50 dense pads calibrate to 0.764 ms/layer (E26's 36.4 ms ÷ 48).
+- **Schedules:**
+  - `seq` = copy then compute on the main stream.
+  - `ovl` = launch copy(L+1) on the side stream, replay compute(L), then a device-side `wait_stream`.
+  - 4 chained tokens × 30 samples, wall time bracketed by synchronize.
+
+### Results (p50, per token; eager / CUDA graph)
+
+| Compute per layer | Rows/layer | Copy GiB/s alone / under compute | Compute ms alone / under copy | seq ms | ovl ms | Realized saving |
+|---|---:|---|---|---:|---:|---:|
+| 0.76 ms (calibrated) | 1 | 11.20 / 10.89 | 0.765 / 0.765 | 47.9 / 48.2 | 37.1 / 37.3 | 98.0 / 98.2% |
+| 0.76 ms (calibrated) | **3** | 11.37 / 11.20 | 0.786 / 0.786 | 69.6 / 70.0 | 37.8 / 38.0 | **97.6 / 97.8%** |
+| 0.76 ms (calibrated) | 10 | 11.46 / 11.44 | 0.790 / 0.790 | 144.6 / 145.0 | 108.2 / 108.4 | 33.8 / 34.0% |
+| 0.76 ms (calibrated) | 30 | 11.48 / 11.48 | 0.793 / 0.794 | 360.0 / 360.3 | 323.4 / 323.5 | 11.3 / 11.4% |
+| 0.25 ms (real kernels only) | 1 | 11.20 / 10.07 | 0.253 / 0.253 | 22.7 / 23.0 | 12.1 / 12.3 | 95.7 / 96.1% |
+| 0.25 ms (real kernels only) | 3 | 11.37 / 11.30 | 0.256 / 0.254 | 44.3 / 44.7 | 32.9 / 33.0 | 35.0 / 35.6% |
+| 0.25 ms (real kernels only) | 10 | 11.46 / 11.44 | 0.257 / 0.256 | 119.6 / 119.9 | 108.1 / 108.3 | 10.6 / 10.8% |
+| 0.25 ms (real kernels only) | 30 | 11.48 / 11.47 | 0.260 / 0.260 | 334.9 / 335.3 | 323.3 / 323.4 | 3.6 / 3.7% |
+
+- **No measurable contention either way.** Compute under a running copy is within ±0.01 ms of compute alone, paired or saturated. Copy speed under compute is within ~0.1 GiB/s of copy alone at 3–30 rows.
+- **The saving equals the no-contention ideal, min(copy, window)/copy, within ~2 points.** The per-layer window is the whole answer.
+- **Eager and graph are identical.** A copy graph captured on the side stream replays on whichever stream is current at replay.
+- **Arena rows and pinned rows are identical.**
+- **Correctness, all 20 records:**
+  - every copied row in all 48 layers is byte-exact;
+  - the overlapped hidden state is bitwise equal to sequential;
+  - sequential is deterministic;
+  - count 0 changes the hidden state, which proves the equality check can fail.
+  - The wait probe's negative control (no wait) sees 3.4–4.8% of the bytes.
+- **Not run:** the launch-width sweep (256–2,048 threads) and the host-thread DMA arm were requested after this batch had started.
+
+### Verdict
+
+- **ALIVE on the pre-registered metric** (97.6% eager / 97.8% graph at 3 rows/layer with a 0.76 ms window). It is **conditional on the window**: with only the real batch-1 kernels (0.25 ms/layer) the same point is 35%, MARGINAL.
+- **Contention is not the risk.** The in-graph kernel on a side stream costs compute nothing, so moving the copy off the compute cores (a CPU doorbell thread on the copy engine) buys no contention relief. Its only GPU-side edge is link rate: DMA at 12.6 vs 11.4 GiB/s (E22/E24).
+- **What decides the size in serving:**
+  - How much GPU time a real decode layer takes. The decode graph is one captured graph, so host time between layers is not in the window. E26's 0.76 ms/layer includes LM head, sampling and host work.
+  - Burstiness: each layer saves only min(copy, window), so skew lowers the saving below the 3-row point.
+  - Lookahead depth: launching copies two or more layers ahead widens the window, at lower recall.
+- **Next:** measure the real per-layer GPU timeline in serving (profile a decode step of the production graph), then re-price idea 2 with the measured window, recall and the E1 per-layer miss distribution.
+- **Caveats:** proxy non-MoE kernels, random weights; plans are exact rows (no recall, no false-positive copies); promotions and multi-request traffic not modeled.
+
+### Addendum: dedicated copy paths (arms W and H, 09-15 01:15–01:45)
+
+- **Run:** same harness, calibrated 0.76 ms/layer compute, arena rows, 3 and 10 rows/layer. `bench_arms.py`, `results_arms.jsonl`, `summary_arms.md`, report addendum in `REPORT.md`. `arms_full` EXIT=0; 28/28 records pass all four correctness checks.
+  - Width variants live in `work/cc-overlap/worktree` (detached `d0a3e55b16` plus an untracked `expert_cache_transfer_width.cuh`).
+  - The in-run production-kernel control saved 97.5% eager / 97.6% graph at 3 rows.
+- **Arm W (narrower in-graph launch, 256/512/1,024/2,048 threads):** no contention to remove at any width (compute within ±0.01 ms). Narrower launches are slower, not link-limited.
+
+  | Width | GiB/s 3 rows | ovl ms/token 3 rows | Saving 3 rows | GiB/s 10 rows | ovl ms/token 10 rows | Saving 10 rows |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 256 | 3.2 | 116.3 | 31.0% | 8.0 | 156.8 | 22.5% |
+  | 512 | 7.7 | 49.3 | 74.3% | 5.3 | 236.0 | 15.1% |
+  | 1,024 | 11.0 | 37.65 | 98.1% | 11.3 | 110.6 | 32.7% |
+  | 2,048 | 11.3 | 37.77 | 97.6% | 11.45 | 108.4 | 33.6% |
+
+  Keep 2,048. Speed follows 32-thread warps per row, which is why 256 beats 512 at 10 rows.
+- **Arm H (Python host thread on its own stream, eager copy, compute still 48 captured per-layer graphs):**
+
+  | Path | GiB/s 3 / 10 rows | ovl ms/token 3 / 10 rows | Request→landed 3 / 10 rows |
+  |---|---|---|---|
+  | Host thread, production DMA op | 12.6 / 12.75 | 38.5 / 97.2 | 0.62 / 2.03 ms |
+  | Host thread, per-row `non_blocking` copies | 12.0 / 12.1 | 37.9–38.1 / 102.9–103.2 | – |
+  | In-graph kernel (control) | 11.3 / 11.45 | 37.75 / 108.4 | 0.70 / 2.26 ms |
+
+  - **Readings:**
+    - The DMA host path is 0.75 ms/token slower than the kernel at 3 rows, because ~0.3 ms of host launch time per copy eats the window. It is 11 ms/token faster at 10 rows, because the link is faster.
+    - Under back-to-back compute the host copy drops to 9.9–10.2 GiB/s at 3 rows, and compute is 1–2% slower whenever the thread exists.
+    - A Python busy-spin was slightly worse (GIL). A native thread was not measured.
+  - **Ordering matters:** main blocked until the host copy was launched, and only then replayed layer L's graph, so every copy was queued *before* its replay launched. The doorbell prototype found the opposite case fails: host copies queued *after* a replay launched were held until that replay ended (18/18 in-graph waits timed out). In serving, the predicted rows are only known inside the replay, so arm H is a best case that also ignores the GPU→host readback.
+- **Verdict unchanged:** ALIVE, window-bound. The in-graph 2,048-thread kernel is the practical overlap path. A host-driven path gains link rate only at ≥10 rows/layer, and only if its copies can be queued before the replay that must overlap them.
+
+## E28 — Serving decode profile: the real per-layer window and where decode time goes
+
+- **Question:** E27 showed idea 2's saving is min(copy, window)/copy per layer. How long is the real window in serving, how are misses spread across layers, and where does the rest of a decode step go?
+- **Run:** 09-15 01:45–02:00 CDT, divix01, `work/cc-decode-profile/` (`REPORT.md`, `overhead.md`, `analyze.py`, `gaps.py`, `livemiss.py`, `miss_replay.py`, `runs/nsys-20260915-014557/`, `runs/plain-20260915-015447/`, `miss/miss-14g.json`). `session.log` EXIT=0, GPU released after each arm. 7867 stayed down.
+- **Config:** a copy of `run-nvfp4-e16c-public.sh` at `d0a3e55b16`, differing only in:
+  - port 7897 on 127.0.0.1;
+  - own run and log dirs;
+  - taskset to NUMA node 0;
+  - an nsys wrapper in the profiled arm.
+- **Workload:** greedy, 330 decode tokens, prompts of 126 and 5,501 tokens.
+- **Profiler:** Nsight Systems 2026.3.2 with `--cuda-graph-trace=node`, 200-step captures via `/start_profile`. A second arm ran with no profiler.
+- **Segmentation check:**
+  - every step has exactly 48 copy / 48 expand / 48 finalize kernels in launch order, and 12 `kernel_mha` at layers 3, 7, …, 47;
+  - capture step periods agree with client inter-token latency within 1.5%.
+- **Profiler overhead is large and host-side:** +18% to +52% mean ITL on the same token window, −1.7% on one request. Routing also diverged between arms (94–98 vs 136–150 misses/token), so the profiled host-side times are upper bounds. GPU kernel times in the graph are unaffected.
+
+### Results
+
+- **Decode is one captured graph with no breaks** (`segments=1 breaks=0`), so no host time sits inside any layer.
+  - Order within a layer: norm, attention, shared expert, router, route planning (0.21 ms) → the layer's miss copy → MoE kernels (0.05 ms, 10 µs after the copy).
+- **The overlap window, copy(L) end → copy(L+1) start, is 0.268 ms p50** (p10 0.265, p90 0.291):
+  - 0.267 ms before a linear-attention layer, 0.290 before a full-attention layer;
+  - no material change from 126 to 5,501 tokens of context.
+  - Whole-token non-copy GPU time is 13.2 ms, plus 0.83 ms after layer 47 (LM head 0.80).
+- **Per-layer miss copies:**
+  - the kernel costs 0.2239 ms/row + 0.006 ms (11.5 GiB/s), fitted on live kernel durations;
+  - a layer's copy is 0.68 ms p50 (linear) and 0.45 ms p50 (full), about 33 ms/token mean in the profiled arm.
+- **Misses per layer per token** (E1 trace replayed at 4,957 slots, policy 4/1/2/0; reproduces E20's 130.2/token):
+
+  | Stat | Value |
+  |---|---|
+  | Mean | 2.72 |
+  | p50 / p90 / p99 / max | 2 / 6 / 9 / 10 |
+  | Share of cells: 0 misses | 16.8% |
+  | Share of cells: 1–3 misses | 51.8% |
+  | Share of cells: 4–10 misses | 31.4% |
+  | Full-attention layers | 2.11 |
+  | Linear-attention layers | 2.93 |
+  | Live profile mean | 3.04 |
+
+- **Step pattern:** every 4th decode step is a residency update (exactly spacing 4 in 49/49 and 48/48 captured steps).
+  - Normal steps take ~54 ms: 3.5 ms graph launch call, ~44 ms graph, ~4 ms scheduling and input prep.
+  - Update steps have a host gap of 106 / 101 ms p50 (short / long), 33–34% of all decode time in the profiled arm.
+  - About 30 ms of that gap is visible CUDA work: 160–180 promotion rows on a side stream, stream synchronizes, memcpy waits.
+  - The other ~70 ms is unattributed host CPU (no Python sampling).
+- **The stall is not a profiler artifact.** Client ITL in the no-profiler arm, tokens 21–330:
+  - one slow token every 4 (spacing 4 dominates);
+  - slow tokens 105–130 ms p50 against 42–50 ms for normal tokens;
+  - slow tokens hold 38–47% of decode wall time.
+  - The excess over a normal token is roughly 60–80 ms every 4 tokens, about 15–20 ms/token on average (estimate from ITL, not from a profile).
+
+### Re-pricing idea 2 with the measured window (offline, laptop)
+
+- **Per layer, saving = min(recall·copy(n), 0.268 ms)**, with copy(n) = 0.2239·n + 0.006 ms, over the replay histogram, for 47 layers (layer 0's routes are only known inside the graph).
+
+  | Recall | Saving per token |
+  |---|---|
+  | 1.0 | 10.1 ms |
+  | 0.775 | 9.6 ms |
+  | 0.594 | 9.3 ms |
+
+  - The copy total is 29.5 ms/token, so overlap recovers about a third of it.
+  - Recall barely matters because the window covers only ~1.2 rows.
+  - The hard cap is the 13.2 ms of non-copy GPU time per token.
+  - False-positive copies are not charged: they eat the same window and can delay the next layer, so these are ceilings.
+- **At the no-profiler arm's ~60–70 ms/token, ~10 ms is +15–17%** (estimate). That is below E26's +27–48% ceiling and roughly level with FP8 slots.
+
+### Verdict
+
+- **Idea 2 is MARGINAL-to-modest in real serving:** window 0.268 ms, not 0.76 ms; a ~10 ms/token ceiling; it needs a layer-ahead predictor, new in-graph code, and handling of false-positive copies.
+- **The residency-update step is the largest single cost found so far.** Every 4th step stalls the host ~60–80 ms beyond a normal step, of which ~70 ms (profiled) is unattributed host CPU. Removing most of that stall is worth roughly 15–20 ms/token (estimate, +25–40%), more than any idea on the E26 list.
+- **Next:** profile the update step's host CPU (py-spy or Python sampling on the no-profiler config) to attribute the ~70 ms, then decide between cheaper, asynchronous or less frequent updates.
+- **Caveats:** one capture per context; profiler overhead on host times; server pinned to node 0 (production unpinned); long context 5,501, not ~4,000 tokens; the E26 cost model's "36.4 ms rest" is now known to hide the update stall and the 13.2 ms of non-copy GPU time.
+
+## E29 — Doorbell copier prototype: GPU posts expert-row requests to pinned memory, a native CPU thread copies them
+
+- **Question:** can the GPU request miss rows through a pinned page, with a C++ spin thread issuing the copies on the copy engine, and a GPU waiter holding the layer until they land? The goal is no host sync, no graph break, and overlap with compute inside the decode CUDA graph.
+- **Run:** 09-15, divix01 RTX 5090, under `cc-gpu.lock`. Artifacts in `work/cc-doorbell/`: `REPORT.md`, `doorbell.patch`, `bench_doorbell.py`, `results/bench1.jsonl`, `probe_*.py`, `logs/`, `run.log`.
+  - Code lives in `work/cc-doorbell/worktree`, detached at `d0a3e55b16`, as uncommitted new files: `kernels/jit/csrc/moe/expert_doorbell.cuh`, `kernels/ops/moe/expert_doorbell.py`, `test/registered/unit/kernels/test_expert_doorbell_copier.py`.
+  - The first round (the numbers below) was authored in that divix01 worktree. A second round followed the requested flow: a local worktree `sglang-nvfp4-worktrees/doorbell` on branch `cc/doorbell-prototype`, pushed to `shared` at `9a95819eac` ("doorbell head-store mode, quiesce, and hold isolation probe"), and tested on divix01 (`br2_*` in `run.log`, `br2_pytest` EXIT=0). Final results are in Round 2 below.
+- **Design:**
+  - **Request page:** a pinned page holding `head` and `abandoned` words plus a ring of `{seq, count, tag, rows int64[cap], slots int32[cap]}` records.
+  - **Poster:** a 1×32 in-graph poster kernel writes the record and publishes `head` last.
+  - **Copy thread:** a C++ thread busy-spins on core 71 with no GIL. It issues one `cudaMemcpyBatchAsync` per request on its own stream, then a 4-byte `done` copy queued behind the rows.
+  - **Waiter:** a chain of short GPU poll launches (the krasis `__nanosleep(64)` pattern).
+    - Chunked because one long waiter launch held any copy queued after it.
+    - `cuStreamWaitValue32` was rejected: 801 NOT_SUPPORTED on the 5090, 900 inside torch graph capture, no timeout.
+  - **Timeout:** about 512 ms, then about 1 ms in degraded mode. On timeout the waiter marks the request abandoned and falls back to `copy_expert_row_segments_gpu_kernel` from the record.
+- **Tests:** 51 collected, 50 passed, 1 failed, EXIT=1 (green5).
+  - The failure is `test_posted_rows_match_reference[0]` on `timeouts == 0`, with correct bytes. The first doorbell request in a process can miss its whole wait chain; the cause is unresolved.
+  - The negative check can fail: the byte-reference helper flags a flipped byte and a stray write.
+  - The RED run failed 46/47 on the missing module.
+- **Latency:** 40 iterations, every one byte-exact.
+
+  | Rows | In-graph kernel p50 ms (GiB/s) | Doorbell, eager post and compute, p50 ms | Post → thread sees request, p50 µs | Doorbell inside a graph, p50 ms (all fallback) |
+  |---:|---|---:|---:|---:|
+  | 1 | 0.243 (10.6) | 0.247 | 28.7 | 1.300 |
+  | 3 | 0.697 (11.1) | 0.660 | 30.4 | 1.750 |
+  | 10 | 2.274 (11.3) | 2.133 | 60.3 | 3.332 |
+  | 30 | 6.761 (11.4) | 6.278 | 71.1 | 7.818 |
+
+  - Batch memcpy after the thread sees the request runs at about 12.7 GiB/s at 30 rows (1.08× the kernel).
+  - Waiting on an already-finished request costs 15–25 µs.
+  - `PreferOverlapWithCompute` copies ~5.5× faster under main-stream compute, but defers main-stream events behind the thread's copy.
+  - The batch memcpy call blocks the thread for the copy's duration from the second request onward.
+
+### Verdict
+
+- **Negative for serving on this machine.** While a CUDA-graph replay runs, the thread's host-issued copies do not run until that replay's GPU work ends.
+  - Post plus ~4 ms of in-graph compute: the copy finished at 3.99 ms and compute at 4.00 ms (6/6).
+  - The same work run eagerly: the copy finished at 0.36 ms.
+  - Every in-graph wait timed out (45/45 per variant) and paid waiter chain plus fallback. Inside a graph the doorbell is slower than the kernel alone.
+  - The hold is independent of poll mode and of whether post and wait share a replay. `test_graph_launch_holds_thread_copies_until_launch_ends` asserts it.
+- **Consistent with E27 arm H:** host copies overlap a replay only when queued before it launches. Production decode is one unbroken graph (E28), so a doorbell copy can never be queued ahead of the compute it should overlap.
+- **Moot anyway:** E27 found no contention for the in-graph kernel, and E28 measured a 0.268 ms window. The in-graph kernel is the overlap path if idea 2 proceeds.
+- **Open:** the first-request timeout; slot reservation across timeouts; the single `abandoned` word across tags.
+
+### Round 2 (final): hold isolated to the doorbell thread's copy path
+
+- **Code:** built in the local worktree `sglang-nvfp4-worktrees/doorbell`. Branch `cc/doorbell-prototype` on `shared`, three commits: `867da96dfc`, `9a95819eac` (head-store mode, `quiesce()`, isolation cases), `d57db3e1a1` (probe-only). Tested detached on divix01 in `work/cc-doorbell/worktree`. Report: `work/cc-doorbell/REPORT.md` (copy at `sglang-nvfp4-worktrees/REPORT.md`).
+- **Tests:**
+  - divix01 `br2_pytest` at `9a95819eac`: 54 collected, 54 passed, EXIT=0. The first-request timeout no longer fails.
+  - Negative check: flipped byte → `segment 0`, stray write → `segment 4`.
+  - Laptop 3060 is a compile gate only: 51 collected, 42 passed, 9 failed. That is 7 wait timeouts, 1 overlap-timing assertion, and 1 arena test that can't import without a local `common_ops`.
+- **Correction to round 1:** a compute-only CUDA graph does **not** hold a host-issued torch side-stream copy queued after its launch.
+  - One 4.4 ms replay: extra time beyond an idle copy ≈0.01 ms p50, at both 3 and 30 rows.
+  - 48 short replays: a copy queued after replay 0 lands its own duration after layer 0 ends (0.6 ms at 3 rows, 4.9 ms at 30).
+  - This matches E27 arm H.
+- **What does hold: the doorbell thread's own copies**, issued with `cudaMemcpyBatchAsync` on a stream the C++ thread created itself. Measured over 48 layers × 3 rows × 20 tokens, with compute-only layers at 40 ms/token:
+
+  | Case | Timeouts per token (of 48) | Request done after its layer ended, p50 | Token p50 |
+  |---|---:|---:|---:|
+  | Post and wait in graph | 48 | 90 ms | 181 ms |
+  | Post in graph, eager waits after the token | 46 | 147 ms | 181 ms |
+  | Volatile head store | 48 | 90 ms | 181 ms |
+  | Noncoherent poll | 48 | 79 ms | 156 ms |
+  | `PreferOverlapWithCompute` off | 46 | 147 ms | 180 ms |
+  | Compute-only graphs, post launched eagerly between replays | 45 | 144 ms | 179 ms |
+  | Host-gated (thread enqueues request j+1 before replay j+1) | 0 | before its layer ended | 74 ms |
+
+  - Requests land near the end of **all** replays launched after them, not only the current replay.
+  - Ruled out: graph contents, head store, poll kind, the overlap flag.
+  - Not yet tried: the thread issuing `cudaMemcpyAsync` on a torch-created stream.
+- **Capture caveat:** one capture failed with `cudaErrorStreamCaptureInvalidated` while the thread was busy. `quiesce()` around every capture fixed it.
+- **Latency at `d57db3e1a1` (`br3_bench`):** same shape as round 1.
+  - Eager doorbell vs in-graph kernel: 0.663 vs 0.693 ms at 3 rows, 6.273 vs 6.758 ms at 30 rows (≈12.7 vs 11.4 GiB/s).
+  - Reaction time 29–75 µs.
+  - Inside a graph, always the fallback path.
+
+### Final verdict
+
+- **Negative for serving as built.** Only the host-gated form overlaps, and its per-layer host step makes tokens 74 ms against 40 ms of compute. The hold lies in the thread's own stream and copy path, not in graph replay.
+- **Overlap is still possible from a host thread in principle,** with plain torch side-stream copies (arm H). That still needs the plan on the host, which means a readback from inside an unbroken decode graph. The in-graph kernel (E27) needs neither.
+- **Not pursued further:** E28's 0.268 ms window caps any overlap at ~10 ms/token, and the residency-update stall (E30) is the larger target.
+
+## E30 — Residency-update host stall attribution
+
+- **Question:** E28 found every 4th decode step stalls the host ~60–80 ms beyond a normal step. Where does that time go, and what removes it?
+- **Run:** 09-15 02:15–02:39 CDT, divix01, `work/cc-update-stall/` (`REPORT.md`, `probe.py`, `itl.py`, `pyspy_steps.py`, `microbench.py`, `runs/{plain,instr,pyspy}-*`). Session EXIT=0 and GPU released; 7867 stayed down.
+- **Setup:**
+  - E28's `serve.sh` unchanged: E16c policy 4/1/2/0, 14 GiB hot cache, graph gather, DMA, port 7897.
+  - Three arms: plain; instrumented (`perf_counter_ns` spans in `work/cc-update-stall/worktree`, detached `d0a3e55b16` with probe edits in `expert_hot_cache.py`, `expert_residency.py`, `expert_transfer.py`); and py-spy 0.4.2.
+  - Greedy, 330 decode tokens, prompts of 126 and 5,501 tokens.
+- **Measured process:** the `sglang::scheduler` main thread, which runs the forward, the expert-distribution hook that performs the update, and sampling.
+- **Overhead:**
+  - Instrumented vs plain mean ITL: +9.7 / −9.4 / +14.8%.
+  - Excess per update step: 71–81 ms instrumented vs 65–76 ms plain.
+  - Absolute instrumented times may run up to ~10 ms high; shares are reliable.
+  - py-spy native sampling at 500 Hz overloaded, so py-spy is used for ranking only.
+  - No GC inside analyzed steps.
+
+### Results (instrumented, 233 update steps vs 688 normal; promotions per update p10/p50/p90 = 29/61/117)
+
+| Component (ms per update step) | p50 | p90 | mean |
+|---|---:|---:|---:|
+| **Update total** (normal step: 0.51) | **76.0** | **109.3** | **77.9** |
+| `advance` + `resident_experts`, 48 layers | 3.0 | 3.2 | 3.0 |
+| `decide`, 48 layers | 19.7 | 21.2 | 20.1 |
+| … rank sort over 512 experts (`expert_residency.py:163–168`) | 9.2 | 9.8 | 9.5 |
+| … `_select_desired` | 3.0 | 3.7 | 3.1 |
+| … score readback (GPU wait / `.cpu()` / `.tolist()`) | 0.8 / 1.2 / 0.7 | | |
+| … O(C²) eviction membership (`:174–176`) and other | ~3.8 | | |
+| `reassign`, 32.6 changed layers | 50.4 | 82.8 | 53.1 |
+| … retire loop (incl. mapping publishes) | 8.7 | 15.2 | 9.3 |
+| … reserve | 2.7 | 4.6 | 2.9 |
+| … `set_rows` plan upload (`expert_transfer.py:85–120`) | 6.3 | 8.1 | 6.1 |
+| … copy submission, host side of 6 copy ops | 7.8 | 10.4 | 7.7 |
+| … copy submission, GPU wait for the promotion copy | 7.3 | 16.1 | 8.5 |
+| … copy submission, other plumbing | ~4.8 | | |
+| … `publish_ready` (incl. mapping publishes) | 8.1 | 14.4 | 8.6 |
+| Across the above: `_publish_mapping`, 137 calls (`expert_hot_cache.py:159–166`) | 12.5 | 22.6 | 13.5 |
+| Across the above: `_set_slot_state` scalar GPU writes, 274 calls (`:168–170`) | 4.8 | 8.6 | 5.2 |
+
+- **Split of the 77.9 ms mean:**
+  - GPU waits ≈11.5 ms (15%), of which 8.5 ms is the promotion copy.
+  - Synchronous tiny H2D/D2H transfers from Python ≈17–23 ms (22–30%): 137 mapping uploads, 274 scalar slot writes, 48 score readbacks, plan uploads.
+  - Pure host CPU (Python, torch dispatch, launches) ≈42–48 ms (55–60%).
+  - The py-spy captures rank the same hotspots.
+- **Scaling:** update total = 35.7 ms + 0.616 ms × promotions (r = 0.96). Per layer: 0.455 ms p50 with no promotions, fit 0.73 + 0.617 × promotions. At p50 the fixed and per-promotion parts are about half each; at p90 the per-promotion part is 72 of 108 ms.
+- **Inherent:** only ~170 MB of promotion bytes per update (≈14 ms of PCIe, 8.5 ms of which blocks the host today), one score readback, and deciding the desired set. The rest is per-row and per-layer Python plumbing.
+
+### Fix candidates (all savings are estimates)
+
+| # | Change | Location (`d0a3e55b16`) | Est. saving per update |
+|---|---|---|---|
+| 1 | Vectorize `decide`/`advance` across 48 layers: one `[48, 512]` score tensor, one top-k plus one readback, set-based evictions | `expert_hot_cache.py:1198–1206`; `expert_residency.py:143–149`, `:158–185`, `:214–250` | ~18–20 ms |
+| 2 | Publish expert→slot mapping once per changed layer (device `index_copy_`), not per ticket | `expert_hot_cache.py:159–166`, via `:260`, `:292`, `:369`, `:399–401` | ~10–12 ms |
+| 3 | Batch slot state and generation writes, one pinned copy per layer | `expert_hot_cache.py:168–170`, `:241–244`, `:252`, `:259`, `:270`, `:291` | ~5–6 ms |
+| 4 | Persistent pinned plan buffers with a `non_blocking` copy; drop full-capacity `zero_`; ideally one plan for all layers | `expert_transfer.py:85–129`; `expert_hot_cache.py:338–342` | ~5 ms |
+| 5 | Cache copy-path validation per (layer, tensor); call the DMA op directly with precomputed ranges | `expert_transfer.py:330–523`, `:592–597`; `expert_dma.py:34–75`, `:107–` | ~6–9 ms |
+| 6 | Asynchronous promotions: publish slots on a later forward once the ticket completes (RESERVED→LOADING→READY already exists) | `expert_hot_cache.py:366–370`; `expert_transfer.py:258–274` | ≤8.5 ms; PCIe contention with miss copies unmeasured |
+| 7 | Bulk `swap(layer, evict_slots, promote_experts)` replacing retire/reserve/begin/publish bookkeeping | `expert_hot_cache.py:190–293`, `:377–413` | ~4–6 ms after #2–#3 |
+| 8 | Rotate 12 layers per forward instead of 48 every 4th forward | `expert_hot_cache.py:1198`; `expert_residency_clock.py:84–111` | 0 mean; cuts the ITL spike to ~¼ |
+| 9 | Move the update off the decode thread | same | limited by the GIL until #1–#5 land |
+
+### Verdict
+
+- **Attributed.** The stall is the residency update on the scheduler's decode thread: 76 ms p50 / 109 ms p90 per update. It is mostly per-layer and per-row Python bookkeeping and synchronous tiny transfers (≈85%); waiting on the promotion copy is only 15%.
+- **Fixes #1–#6 are estimated to remove ≈50 of ≈78 ms per update:** ≈12 ms/token of mean ITL, or ≈+20% decode tok/s at the plain arm's ~64 ms. That estimate is below E28's rough +25–40%, which assumed most of the stall could go.
+- **All are code-local to the hot-cache/residency/transfer modules.** None changes routing or model output, apart from #6's one-forward-later slot publication, which changes which slots are hits.
+- **Caveats:** instrumented absolute times may be up to ~10 ms high; routing and promotions diverged between arms; savings are estimated from the breakdown and CPU microbenchmarks, not implemented.
+
+## E31 — Residency update inside the decode CUDA graph (plus the Python-path fixes), serving A/B
+
+- **Question:** E30 attributed the every-4th-step stall to Python bookkeeping in the residency update. How much is gained by:
+  - (a) E30's Python fixes #1–#6 (`fix`);
+  - (b) moving the whole update onto the GPU, inside the decode graph (`gpu`)?
+- **Code:** branch `cc/residency-update-fast` on `shared`, head `252a888559`, based on `d0a3e55b16`.
+  - `e493c6a9cc`, `0ef30a6931`: fixes #1–#6. With the flag off this is the live path.
+  - `afb18e82ac`: `decide_residency_on_device`, `GpuResidencyUpdater` in `expert_residency_gpu.py`, hooks, flags, tests.
+  - `b7f96b5d4f`: test helper.
+  - `8839a08ac0`: K+1 swap window so the truncation counter can fire.
+  - `252a888559`: review follow-ups: idle flush, count-only when updates are off, exact decay table, ownership guards, and runner guards refusing DP attention, speculative decoding and decode graph bs > 1.
+  - Report: `work/cc-update-fix/REPORT.md`. Laptop worktree: `sglang-nvfp4-worktrees/residency-update`.
+- **Design (flag `SGLANG_MOE_GPU_RESIDENCY_UPDATE`, default off):**
+  - Scores, route counts, the expert→slot mapping, slot state and generations live in `[48, …]` device banks. Caches and policies are rebound to row views, so captured pointers stay stable.
+  - Decide is a sorted prefix with composite int64 keys (score bits, then 65535 − id): the old swap loop's exact tie order with no readback.
+  - At most K = `SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS` promotions per layer (default 64).
+  - A decode update applies decay from a token-indexed table, runs a masked decide, scatters mapping and state, bumps generations, then copies the promotions into hot slots with the in-graph `copy_expert_row_segments_gpu`.
+  - It runs inside the first streamed layer's graph gather of the forward after a boundary, before any gather reads the mapping. A device pending flag and counters drive the trigger.
+  - Prefill flushes a pending boundary before its first gather and applies qualifying prefill boundaries with the same device update, eager and uncapped.
+  - With the flag on, the host lists are not authoritative, so the Python path runs only at startup to populate the seed.
+- **Tests (divix01).** Collected counts never dropped (145 → 172 → 175).
+  - Existing suite on base: 145 passed, EXIT=0.
+  - RED on base: device-decide file import error (EXIT=2), GPU file 5/5 failed (EXIT=1).
+  - `gpu6_all` at `252a888559`: 175 passed, EXIT=0. This includes a captured 3-layer decode graph replayed over 17 forwards plus prefills against the Python manager, with byte-exact slot rows.
+  - Negative checks: slot-row helpers raise on a flipped byte, a wrong mapping entry and a wrong alpha, at three SHAs. The strict truncation test fails on the old decide. The review tests fail 2/8 on `8839a08ac0`.
+  - Prefix equivalence was checked exhaustively on a 5-expert layer (every score vector on 4 tied levels × resident set × capacity × 4 margin/sigma pairs) and on random 48×512 layers.
+  - An independent code review found 0 critical, 2 major, 1 medium and 4 minor issues. All were fixed or guarded except metrics folding.
+- **Replay at `252a888559`** (E1 trace, CPU, real `GpuResidencyUpdater` in lockstep with base):
+  - Uncapped: identical before all 2,148 forwards (resident mask, scores), 47,691 promotions, counters and clock.
+  - K = 64: 47,690 promotions, 1 truncated layer, 72.8816% vs 72.8817% hit rate, 130.168 misses/step.
+  - K sizing: decode per-layer promotions p99 9, p99.9 54, max 68.
+- **Serving A/B (`ab2`):**
+  - E28/E30 workload: greedy, 330 decode tokens, prompts of 126 and 5,501 tokens, first 20 tokens dropped, plus a top-2 logprob pass.
+  - Order base, fix, gpu, gpu, fix, base, port 7897, under the lock.
+  - All drives EXIT=0 and session EXIT=0. `SERVER_EXIT=137` is the harness's stop; the GPU was released to 62 MiB after each arm.
+  - Artifacts: `work/cc-update-fix/ab/ab2/{ab_summary.md, margins.md, runs.txt}`, `runs/<arm>-<stamp>/`.
+
+| Metric (mean of 2 runs) | base `d0a3e55b16` | fix (flag off) | gpu (flag on, K=64) |
+|---|---:|---:|---:|
+| Mean ITL (ms) | 67.27 | 58.09 (−13.6%) | **55.08 (−18.1%)** |
+| Update-step ITL p50 / p90 (ms) | 117.9 / 158.3 | 80.8 / 109.0 | **65.3 / 88.7** |
+| Normal-step ITL p50 (ms) | 47.31 | 48.27 | 49.00 |
+| Decode tok/s | 14.87 | 17.22 (+15.8%) | **18.18 (+22.3%)** |
+| Hit rate | 0.688 | 0.689 | 0.685 |
+| Misses per token | 149.5 | 149.5 | 151.0 |
+| Promotions per update | 89.8 | 90.4 | 88.4 |
+| Update excess p50 (update − normal) | 70.5 | 32.5 | 16.3 |
+| … promotion copy estimate (rows × 0.2239 ms) | 20.1 | 20.3 | 19.8 |
+| … other | 50.4 | 12.3 | −3.5 |
+
+- **Per run:**
+  - base 14.58 / 15.16 tok/s, fix 16.98 / 17.45, gpu 18.91 / 17.46;
+  - hit rate: base 0.685 / 0.692, gpu 0.693 / 0.678;
+  - 1 truncated layer (layer 2) per gpu run, over 425 boundaries per layer.
+- **Logprob margins:** 30 pair×request comparisons, 0 large-margin flips. Every first divergence has at least one side ≤ 0.375 nats, and base diverges from base too. The largest gpu-vs-gpu gap (0.81 nats at a near-tie) is inside the spread seen between arms at identical prefixes.
+
+### Verdict
+
+- **Positive.**
+  - The in-graph update gives +22.3% decode tok/s (14.87 → 18.18) and −18.1% mean ITL.
+  - The update-step spike falls from 118 to 65 ms p50, and all measurable remaining excess is the in-graph promotion copy itself (≈0.185 ms/row).
+  - Hit rate, misses and promotions are unchanged within run spread.
+  - The Python-path fixes alone give +15.8%.
+- **Open:**
+  1. Normal-step p50 is +1.7 ms vs base. The masked update runs in every graph forward, and 2 runs can't resolve it (the gpu runs are 4.1 ms apart). Needs a longer A/B or a no-op-step microbenchmark.
+  2. Promotion copies run inline, so a large burst stalls that token (the replay's largest decode boundary copied 2,409 rows).
+  3. With the flag on, DP attention, speculative decoding and decode bs > 1 are refused.
+  4. `copy_rows` / `copy_bytes` / backend metrics are not reproduced.
+  5. Two runs per arm on one workload.
+- **Not merged or deployed at A/B time.** The serving branch was untouched and 7867 stayed down.
+
+### Deployment (2026-09-15 05:12 CDT, at the user's request)
+
+- **Merge:** `cc/residency-update-fast` merged into `codex/nvfp4-expert-stream-main` as `d43c59b58a` (no conflicts; the branch's only other new commits since `d0a3e55b16` were two benchmark scripts), pushed to `shared`.
+- **Serving worktree:** `main-port-probe-7bc4eb` fast-forwarded to `d43c59b58a`; `git status --short -- python` was empty beforehand.
+- **Tests in the serving worktree** under `cc-gpu.lock`: 188 passed, 12,042 subtests, EXIT=0, over the copy-kernel, DMA, hot-cache, residency (host, batched, clock, device, GPU) and transfer test files (`work/cc-deploy-gpu-residency/tests.log`).
+- **Launch script:** `run-nvfp4-e16c-public.sh` gains `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` and `SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS=64`. Nothing else changed (diff verified, `bash -n` OK). Rollback copy: `run-nvfp4-e16c-public.sh.bak-pre-gpu-residency-20260915`.
+- **Relaunch:** tmux `cc-nvfp4-dynamic`, run dir `work/cc-e16c-public/run-20260915-051223/`.
+  - Healthy after 180 s on 127.0.0.1 and 10.0.0.15; the log shows `d43c59b58a`.
+  - The only tracebacks are the known startup `freeze_gc` connection-refused noise.
+  - GPU memory at idle is 28,337 MiB.
+- **Post-deploy checks:**
+  - Hot-cache metrics show evictions (39) with 0 host promotion copy submissions, so the GPU update path is live.
+  - A greedy 400-token decode (thinking off) ran at 20.48 tok/s, mean ITL 48.8 ms, p50 46.7 ms.
+  - A 116-token reply was coherent, at 15.8 tok/s over a short window.
+  - These are single requests, not an A/B.
+- **Crash at 05:21:18: CUDA OOM in eager prefill.**
+  - The scheduler died in `expert_stream._gather_cached` → `_staging_buffer`: `torch.zeros` of 790 MiB for `hot_cache_misses` with 799.69 MiB free (30.42 GiB in use, 28.74 GiB allocated by PyTorch).
+  - Server log: `SIGQUIT received ... one child failed`.
+  - This is the eager (non-graph) miss path on a prefill, not the in-graph residency update. The setup doc already recorded a 32,055 MiB peak with one recoverable allocator OOM on a 20k-token prompt at the 14 GiB cache.
+  - Idle memory rose to 28,337 MiB after deployment (27,609 MiB before), which plausibly removed the remaining headroom. The cause of the +728 MiB is not isolated (device residency banks, 14 GiB cache, 65,536-token KV).
+- **Config change at the user's request (05:22):** `SGLANG_MOE_HOT_GPU_MB` 14336 → 12288 and `--context-length` / `--max-total-tokens` 65536 → 40000. Backup of the pre-change script: `run-nvfp4-e16c-public.sh.bak-ctx65536-hot14g-20260915`.
+- **Relaunch at 05:23:24:** run `work/cc-e16c-public/run-20260915-052324/`, healthy at 05:27:01 on 127.0.0.1 and 10.0.0.15, still at `d43c59b58a`.
+  - Hot cache startup: 4,180 slots (from 4,957), 11.56 GiB residency plus 1.33 GiB scratch.
+  - Idle GPU memory: 24,891 MiB (from 28,337).
+  - The only traceback is the known `freeze_gc` startup noise; 0 OOM.
+- **Long-prompt check (05:27:27):** a 32,423-token prompt with 40 completion tokens returned 200 OK and a coherent summary in 322.5 s end to end.
+  - Peak GPU memory 30,177 MiB (sampled every 0.5 s), with 0 OOM and 0 SIGQUIT in the log afterwards.
+  - One `/health` probe right after timed out (HTTP 000) while the server was serving a queued Hermes request. The next three returned 200. With `--max-running-requests 1`, health can stall behind active work.
+  - Not measured: whether decode tok/s drops with 4,180 slots vs 4,957. E20's replay predicts more misses per token at fewer slots.
+- **Unrelated client errors in the same window:** Hermes requests with `reasoning_effort: "max"` (Hermes config `reasoning_effort: ultra`) got HTTP 400 "Unexpected reasoning effort max. Supported types are xhigh (default), medium, and low." The same pattern appears in the 2026-09-13 run log. It is not caused by this merge.
+
+## E32 — Doorbell hold isolation: copy API, source access order, stream origin
+
+- **Question:** E29 found the doorbell thread's `cudaMemcpyBatchAsync` copies held until near the end of every CUDA-graph replay launched after them. Plain torch side-stream copies were not held. Is the cause:
+  - the batch copy's `srcAccessOrder = Stream` (the source is an immutable pinned arena, so `Any` / `DuringApiCall` are valid),
+  - the batch API itself, or
+  - the stream the C++ thread created with `cudaStreamCreate`?
+- **Code:** `cc/doorbell-prototype` `696b8cc96b`, based on `d57db3e1a1`.
+  - The thread takes runtime `copy_api` (`batch` | `per_segment`), `src_access_order` (`stream` | `during_call` | `any`, the CUDA enumerator values 1/2/3) and an optional caller-owned `torch.cuda.Stream`.
+  - `stats()` reports the configured arm and the CUDA status of the last failed copy.
+  - `probe_hold.py` and `bench_doorbell.py` take `--copy-api`, `--src-access-order` and `--torch-stream`.
+  - The probe's doorbell cases now compare the whole destination byte-exact after every token. Every plan maps a source row to one fixed slot, so the result doesn't depend on whether the thread or the fallback landed last. Each case ends by flipping a byte and confirming the check catches it.
+- **Tests:**
+  - divix01 `e32_pytest`: 61 collected, 61 passed, EXIT=0. That is the 54 existing tests plus 7 copy-arm cases. The arm cases check bytes *before* `wait` launches, so a fallback copy can't hide a wrong thread copy, and they read the configured arm back from the thread.
+  - Negative check on the laptop: planted a short per-segment copy and a stream that never reached the thread. 4 of the 7 arm cases went red; reverted, 8 of 8 green.
+  - Laptop 3060 compile gate (needs `CUDA_HOME` pointed at the venv's `nvidia/cu13`; system nvcc 12.4 has no batch API): 61 collected, 56 passed, 5 failed (known laptop wait timeouts, overlap timing, arena import).
+- **Run:** divix01 RTX 5090, `cc-doorbell/run.sh` under `cc-gpu.lock`, thread on core 71, driver `cc-doorbell/e32.sh` (tmux `cc-doorbell-e32`), results `cc-doorbell/results/e32_*.jsonl`, logs `cc-doorbell/logs/e32_*.log`.
+  - `probe_hold.py --iters 20`, 48 layers of 3 × 2048² matmuls (≈40 ms/token of compute), `--timeout-polls 20000`.
+  - Cases: `doorbell_layers` (post and wait in graph) and `compute_graphs_eager_post` (compute-only graphs, post launched eagerly). The baseline run also includes `doorbell_layers_gated` and the host torch side-stream controls.
+  - Production was already down: SIGTERM at 05:36:02 from session `sglang-nvfp4-ef`, which stopped it for the expert-routing capture, not from this experiment.
+
+### Results, 3 rows (all byte-exact, flip detected, no copy errors)
+
+| Arm | Case | Timeouts / token (of 48) | Request done after its layer ended, p50 | Token p50 | Serviced |
+|---|---|---:|---:|---:|---:|
+| Baseline: batch, own stream, `stream` | doorbell_layers | 48 | 90.4 ms | 185.1 ms | 960 |
+| | compute_graphs_eager_post | 46 | 148.8 ms | 183.9 ms | 960 |
+| | doorbell_layers_gated (control) | 0 | −38.0 ms | 75.3 ms | 960 |
+| Batch, own stream, `any` | doorbell_layers | 48 | 90.9 ms | 185.6 ms | 960 |
+| | compute_graphs_eager_post | 45 | 147.8 ms | 182.0 ms | 960 |
+| Batch, own stream, `during_call` | doorbell_layers | 48 | 125.6 ms | 155.5 ms | 40 |
+| | compute_graphs_eager_post | 48 | 153.8 ms | 158.5 ms | 41 |
+| **(a) per-segment, torch stream** | doorbell_layers | **0** | **0.64 ms** | **68.1 ms** | 960 |
+| | compute_graphs_eager_post | **0** | 0.65 ms | **40.5 ms** | 960 |
+| **(b) batch, torch stream, `stream`** | doorbell_layers | **0** | **0.64 ms** | **68.0 ms** | 960 |
+| | compute_graphs_eager_post | **0** | 0.65 ms | **40.6 ms** | 960 |
+| (c) per-segment, own stream | doorbell_layers | 48 | 91.5 ms | 186.4 ms | 960 |
+| | compute_graphs_eager_post | 45 | 147.9 ms | 182.5 ms | 960 |
+| Batch, torch stream, `any` | doorbell_layers | **0** | 0.64 ms | 67.8 ms | 960 |
+| | compute_graphs_eager_post | **0** | 0.64 ms | 40.7 ms | 960 |
+
+Host controls, same run: an idle 3-row copy takes 0.627 ms. A torch side-stream copy queued after replay 0 finishes −0.001 ms after layer 0 ends; queued after all 48 replays, 0.60 ms after layer 0.
+
+### Results, 30 rows
+
+| Arm | Case | Timeouts / token | Done after layer, p50 | Token p50 | Serviced |
+|---|---|---:|---:|---:|---:|
+| Baseline | doorbell_layers | 48 | 521.0 ms | 1048.7 ms | 960 |
+| | compute_graphs_eager_post | 45 | 856.1 ms | 1027.8 ms | 960 |
+| | doorbell_layers_gated | 0 | −161.5 ms | 340.6 ms | 960 |
+| Batch, own, `any` | doorbell_layers | 48 | 577.4 ms | 1150.3 ms | 960 |
+| | compute_graphs_eager_post | 45 | 853.5 ms | 1023.3 ms | 960 |
+| Batch, own, `during_call` | doorbell_layers | 48 | 650.1 ms | 760.9 ms | 40 |
+| | compute_graphs_eager_post | 48 | 774.1 ms | 777.6 ms | 40 |
+| (a) per-segment, torch stream | doorbell_layers | 48 | 8.3 ms | 969.1 ms | 960 |
+| | compute_graphs_eager_post | 4 (0–4) | 150.4 ms | 353.1 ms | 960 |
+| (b) batch, torch stream | doorbell_layers | 48 | 7.7 ms | 955.3 ms | 960 |
+| | compute_graphs_eager_post | 3 | 146.1 ms | 327.6 ms | 960 |
+| (c) per-segment, own stream (`e32b`) | doorbell_layers | 48 | 583.9 ms | 968.5 ms | 720 |
+| | compute_graphs_eager_post | 45 (42–45) | 834.0 ms | 964.8 ms | 803 |
+| Batch, torch stream, `any` (`e32b`) | doorbell_layers | 48 | 7.7 ms | 955.2 ms | 960 |
+| | compute_graphs_eager_post | 3 | 145.7 ms | 327.8 ms | 960 |
+| **(a) per-segment, torch stream, `--timeout-polls 200000`** | doorbell_layers | **0** | **6.42 ms** | **345.3 ms** | 960 |
+| | compute_graphs_eager_post | **0** | 138.2 ms | 310.6 ms | 960 |
+| **(b) batch, torch stream, 200000 polls** | doorbell_layers | **0** | **6.34 ms** | **339.4 ms** | 960 |
+| | compute_graphs_eager_post | **0** | 133.9 ms | 302.4 ms | 960 |
+| Batch, torch stream, `any`, 200000 polls | doorbell_layers | **0** | 6.34 ms | 339.4 ms | 960 |
+| | compute_graphs_eager_post | 0 | 134.1 ms | 302.6 ms | 960 |
+| (b) at 3 rows, 200000 polls (budget control) | doorbell_layers | 0 | 0.64 ms | 68.0 ms | 960 |
+
+- An idle 30-row copy takes 6.05 ms, and a torch side-stream copy queued after replay 0 lands 4.8 ms after layer 0.
+- With a budget that covers the copy, the 30-row torch-stream arms land one copy duration after their layer.
+  - Token time is 339 ms = 40 ms of compute + 48 × ~6.2 ms of waits: "compute plus copy time".
+- (c) serviced fewer requests than posted (720 and 803 of 960): requests abandoned before the thread reached them are skipped by design. Bytes were exact and the thread drained.
+- `e32b` ran 12:48–12:53 after the other session's GPU jobs ended at 12:47:53. Driver `cc-doorbell/e32b.sh`.
+
+### Link rate on a torch stream (`bench_doorbell.py`, 1,024 production-sized arena rows, 40 iterations, all byte-exact, `prefer_overlap` on)
+
+| Rows | In-graph kernel p50 (GiB/s) | Doorbell in graph, torch stream, p50 | Thread copy (GiB/s) | Timeouts (of 45) | Doorbell in graph, own stream (E29 path), p50 | Own-stream timeouts |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | 0.243 ms (10.6) | **0.233 ms** | 0.216 ms (11.9) | 0 | 1.299 ms | 45 |
+| 3 | 0.693 ms (11.2) | **0.646 ms** | 0.628 ms (12.3) | 0 | 1.749 ms | 45 |
+| 10 | 2.274 ms (11.3) | **2.104 ms** | 2.072 ms (12.4) | 0 | 3.330 ms | 45 |
+| 30 | 6.759 ms (11.4) | 12.928 ms | 7.503 ms (10.3) | 45 | 7.841 ms | 45 |
+
+- On a torch stream the in-graph doorbell now beats the in-graph kernel end to end at 1–10 rows, by 4–7%.
+- At 30 rows the bench's own `--timeout-polls 20000` budget (≈5 ms) is shorter than the 6.3 ms copy, so it paid the fallback, the same artifact as the probe.
+- Eager post → copy complete matches E29 (0.667 / 2.139 / 6.276 ms).
+- The bench's "reaction" column is negative here: the Python event spin observes the GPU post after the thread already has. It isn't meaningful and isn't reported.
+
+### Production during E32
+
+- The trainers of session `sglang-nvfp4-ef` held the GPU 12:16–12:47:53, outside `cc-gpu.lock`.
+- Relaunch at 12:53:57 (run `run-20260915-125357`) died at 12:58:06 with a CUDA OOM allocating the expert hot cache: `train_apex.py` restarted at 12:54:06 and took 10.3 GiB, leaving 20.24 GB at load instead of 30.53. The script's empty-GPU check runs only at start.
+- Relaunch at 13:08:48 (tmux `cc-nvfp4-prod-e32b`, run `run-20260915-130848`): health 200 at 13:13:15, 4,180 slots, 0 OOM, 24.7 GiB at idle. The other session has since agreed to take `cc-gpu.lock` and wait for 7867 health before GPU work.
+
+### Verdict
+
+- **Cause of the E29 hold: the stream the C++ thread creates for itself** (`cudaStreamCreate` on the non-torch thread).
+  - With a torch-created stream (`torch.cuda.Stream().cuda_stream` handed to the thread), requests at 3 rows land 0.64 ms after the posting layer. That equals the idle copy time. Every in-graph wait succeeds (0/48 timeouts).
+  - Token time is 68 ms in-graph, which is 40 ms of compute plus 48 × ~0.6 ms of waits: the success criterion "40 ms plus copy time". It is 40.5 ms when the post is eager and the waits come after the token.
+  - Copy API is irrelevant: (a) ≡ (b), and (c) is held like the baseline.
+- **Access order is not the cause** (hypothesis refuted).
+  - `any` on the thread's own stream is identical to `stream`, and `any` on a torch stream is identical to `stream` on a torch stream.
+  - `during_call` returns no error on driver 610.57. The call itself waits behind the hold, so the thread is stuck in it and serviced only 40 of 960 requests. Unusable.
+- **30 rows succeeds too, once the wait budget covers the copy.**
+  - With `--timeout-polls 20000` (≈5 ms) the 6.05 ms copy timed out every wait.
+  - With 200000 polls: 0/48 timeouts, requests land 6.3–6.4 ms after their layer, token 339–345 ms, byte-exact.
+  - (c) stays held at 30 rows (584 ms). The success criterion of NVFP4_DOORBELL_COPIER.md §6 step 1 is met at both 3 and 30 rows.
+- **Link rate is kept.** On a torch stream the thread copies at 11.9–12.4 GiB/s, and the in-graph doorbell beats the in-graph kernel by 4–7% at 1–10 rows.
+- **Not run (lead's call: keep production up):**
+  - (i) Baseline at 30 rows with `--timeout-polls 200000`. The 20000-poll baseline lands 521 ms after the layer, far past either budget, so it is held regardless, but that control is informal.
+  - (ii) `bench_doorbell.py` at 30 rows with a 200000-poll budget. At the default budget the 30-row doorbell falls back.
+- **Serving caveat:** `timeout_polls` must cover the largest expected copy. The default in `ExpertDoorbellCopier` is 2,000,000 polls; the probe and bench used 20000.
+- **Next (§6 step 2):** re-price against the in-graph kernel for overlap. The go threshold is ≥3 ms/token.
+  - Rough E28-based estimate: 2.72 misses/layer × 0.224 ms/row ≈ 0.61 ms of copy per layer. The doorbell's link-rate edge (12.4 vs 11.4 GiB/s, ≈8%) saves ≈0.05 ms/layer, ≈2.4 ms/token over 48 layers.
+  - Overlap itself is available to the in-graph kernel too (E27), so the doorbell's edge over it is only that link rate, plus any gain from not holding a GPU kernel thread.
+  - This is below the threshold, and is an estimate to confirm with the serving miss distribution, not a measurement.
