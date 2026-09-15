@@ -104,7 +104,7 @@ def assert_slot_rows(test, manager, model, context=""):
                 actual = cache.tensors[name][slot].cpu()
                 expected = getattr(layer, name)[expert].cpu()
                 test.assertTrue(
-                    torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)),
+                    torch.equal(actual.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)),
                     f"{context} layer {layer_id} expert {expert} slot {slot} {name}",
                 )
 
