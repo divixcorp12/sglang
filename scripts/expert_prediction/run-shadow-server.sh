@@ -3,6 +3,7 @@
 # cc-expert-prediction worktree on 127.0.0.1:<port>. <predictors> is a comma list or "off".
 # Usage: run-shadow-server.sh <name> <port> <predictors|off> [radix]
 # Refuses to start while any process holds the GPU. Runs in the foreground; the session backgrounds it.
+# Env: HOT_GPU_MB (default 14336), CAPTURE=1 to record expert prediction training data.
 set -euo pipefail
 
 name=${1:?name}
@@ -11,6 +12,10 @@ predictors=${3:?predictors or off}
 radix=${4:-}
 [ "$predictors" = off ] && predictors=""
 hot_gpu_mb=${HOT_GPU_MB:-14336}
+capture_dir=""
+if [ "${CAPTURE:-}" = 1 ]; then
+    capture_dir=/mnt/nvme2/nvfp4-work/expert-prediction-capture/$name/$(date +%Y%m%d-%H%M%S)
+fi
 
 if [ "$radix" = radix ]; then
     radix_flags=(--mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 8)
@@ -38,7 +43,7 @@ mkdir -p "$run_dir/profiles" "$work/runtime-tmp"
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb: $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none}: $(date --iso-8601=seconds)"
     git status --short --branch
     git log -1 --oneline
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
@@ -74,6 +79,7 @@ exec env \
     SGLANG_MOE_EXPERT_PREDICTOR="$predictors" \
     SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL=100 \
     SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE="$run_dir/expert-prediction.metrics.jsonl" \
+    SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR="$capture_dir" \
     SGLANG_TORCH_PROFILER_DIR="$run_dir/profiles" \
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$run_dir/profiles/expert-distribution" \
     SGLANG_VLM_CACHE_SIZE_MB=0 \

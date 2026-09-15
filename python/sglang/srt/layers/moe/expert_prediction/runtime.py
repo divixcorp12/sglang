@@ -12,6 +12,8 @@ from torch import nn
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prediction.adapters import install_pre_mixer_taps
 from sglang.srt.layers.moe.expert_prediction.base import ExpertPredictor
+from sglang.srt.layers.moe.expert_prediction.capture import CaptureSettings, RouteCapture
+from sglang.srt.layers.moe.expert_prediction.capture_schema import CAPTURE_FEATURES
 from sglang.srt.layers.moe.expert_prediction.contracts import RouteFeature
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
 from sglang.srt.layers.moe.expert_prediction.metrics import ShadowMetrics, score_candidates
@@ -53,6 +55,7 @@ class ExpertPredictionRuntime:
         log_interval: int,
         metrics_path: Path | None,
         score_interval: int,
+        capture: RouteCapture | None = None,
     ) -> None:
         if log_interval < 1:
             raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL must be positive")
@@ -72,6 +75,7 @@ class ExpertPredictionRuntime:
         self._metrics_path = metrics_path
         self._score_interval = score_interval
         self._reported_unsupported = False
+        self.capture = capture
 
     @classmethod
     def from_env(
@@ -82,6 +86,7 @@ class ExpertPredictionRuntime:
         hidden_dtype: torch.dtype,
         decode_max_bs: int,
         tokens_per_request: int,
+        max_prefill_rows: int = 0,
         tp_size: int,
         moe_ep_size: int,
         attn_dp_size: int | None,
@@ -103,6 +108,24 @@ class ExpertPredictionRuntime:
                 "SGLANG_MOE_EXPERT_PREDICTOR_MAX_ROWS to size its tap buffers"
             )
         metrics_file = envs.SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE.get()
+        capture_dir = envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.get()
+        capture = None
+        if capture_dir:
+            if tokens_per_request != 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR does not support speculative decoding"
+                )
+            if max_prefill_rows < 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR needs --chunked-prefill-size"
+                )
+            capture = CaptureSettings(
+                directory=Path(capture_dir),
+                capacity=max(max_rows, max_prefill_rows),
+                frames=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES.get(),
+                shard_rows=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS.get(),
+                max_bytes=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB.get() * 2**30,
+            )
         return cls.build(
             model=model,
             predictor_names=envs.SGLANG_MOE_EXPERT_PREDICTOR.get(),
@@ -116,6 +139,7 @@ class ExpertPredictionRuntime:
             log_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL.get(),
             metrics_path=Path(metrics_file) if metrics_file else None,
             score_interval=envs.SGLANG_MOE_EXPERT_PREDICTOR_SCORE_INTERVAL.get(),
+            capture=capture,
         )
 
     @classmethod
@@ -134,6 +158,7 @@ class ExpertPredictionRuntime:
         score_interval: int,
         topk_type: type | None = None,
         experts_type: type | None = None,
+        capture: CaptureSettings | None = None,
     ) -> "ExpertPredictionRuntime":
         layers = discover_moe_layers(model, topk_type=topk_type, experts_type=experts_type)
         specs = [layer.spec for layer in layers]
@@ -143,6 +168,8 @@ class ExpertPredictionRuntime:
         features = {RouteFeature.TOPK_IDS}.union(
             *(predictor.required_features for predictor in predictors)
         )
+        if capture is not None:
+            features.update(CAPTURE_FEATURES)
         store = FeatureStore(
             specs=specs,
             features=features,
@@ -156,6 +183,18 @@ class ExpertPredictionRuntime:
             install_pre_mixer_taps(model=model, layers=layers, store=store)
             if RouteFeature.PRE_MIXER in features
             else []
+        )
+        route_capture = (
+            None
+            if capture is None
+            else RouteCapture.build(
+                specs=specs,
+                store=store,
+                device=device,
+                hidden_dtype=hidden_dtype,
+                settings=capture,
+                hot_caches=hot_caches,
+            )
         )
         logger.info(
             "MoE expert prediction shadow mode: predictors=%s layers=%d max_rows=%d "
@@ -181,9 +220,14 @@ class ExpertPredictionRuntime:
             log_interval=log_interval,
             metrics_path=metrics_path,
             score_interval=score_interval,
+            capture=route_capture,
         )
 
     def on_forward_end(self, forward_batch: Any) -> None:
+        if self.capture is not None:
+            self.capture.on_forward_end(
+                forward_batch, taps_supported=not self._taps.unsupported_layers
+            )
         rows = self._scored_rows(forward_batch)
         if rows == 0:
             return
@@ -214,6 +258,8 @@ class ExpertPredictionRuntime:
             self._metrics_path = None
 
     def close(self) -> None:
+        if self.capture is not None:
+            self.capture.close()
         self._taps.remove()
         for remove in self._pre_mixer_removers:
             remove()

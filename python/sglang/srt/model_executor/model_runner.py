@@ -782,9 +782,12 @@ class ModelRunner:
             )
 
     def maybe_init_expert_prediction(self):
-        """Attach shadow MoE expert predictors before CUDA graph capture."""
+        """Attach MoE expert prediction shadow scoring and capture before CUDA graph capture."""
         self.expert_prediction_runtime = None
-        if self.is_draft_worker or not envs.SGLANG_MOE_EXPERT_PREDICTOR.get():
+        if self.is_draft_worker or not (
+            envs.SGLANG_MOE_EXPERT_PREDICTOR.get()
+            or envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR.get()
+        ):
             return
         from sglang.srt.layers.moe.expert_prediction.runtime import (
             ExpertPredictionRuntime,
@@ -796,6 +799,7 @@ class ModelRunner:
             hidden_dtype=self.dtype,
             decode_max_bs=get_exec().graph.cuda_graph_config.decode.max_bs or 0,
             tokens_per_request=self.decode_num_tokens_per_req(),
+            max_prefill_rows=get_schedule().chunked_prefill_size or 0,
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
             attn_dp_size=self.ps.attn_dp_size,
