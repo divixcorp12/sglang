@@ -11,7 +11,12 @@ port=${2:?port}
 predictors=${3:?predictors or off}
 radix=${4:-}
 [ "$predictors" = off ] && predictors=""
-hot_gpu_mb=${HOT_GPU_MB:-14336}
+hot_gpu_mb=${HOT_GPU_MB:-12288}
+predictor=${PREFETCH_PREDICTOR:-off}
+[ "$predictor" = off ] && predictor=""
+prefetch_model_dir=${PREFETCH_MODEL_DIR:-/mnt/nvme2/nvfp4-work/expert-prediction-models/20260915-121630}
+prefetch_budget=${PREFETCH_BUDGET:-3}
+prefetch_candidates=${PREFETCH_CANDIDATES:-16}
 capture_dir=""
 if [ "${CAPTURE:-}" = 1 ]; then
     capture_dir=/mnt/nvme2/nvfp4-work/expert-prediction-capture/$name/$(date +%Y%m%d-%H%M%S)
@@ -34,6 +39,10 @@ expert_seed=/data/models/slang/slang-dev-2bit/qwen3.8-flash-next-24gb-sglang/ass
 run_dir=$work/cc-expert-prediction/servers/$name/run-$(date +%Y%m%d-%H%M%S)
 log=$run_dir/server.log
 
+if ss -ltn 'sport = :7867' | grep -q LISTEN; then
+    echo "REFUSING_TO_START: production on 7867 is up or relaunching" >&2
+    exit 1
+fi
 if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
     echo "REFUSING_TO_START: the GPU is in use" >&2
     exit 1
@@ -43,13 +52,13 @@ mkdir -p "$run_dir/profiles" "$work/runtime-tmp"
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none}: $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} candidates=$prefetch_candidates budget=$prefetch_budget: $(date --iso-8601=seconds)"
     git status --short --branch
     git log -1 --oneline
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
 } 2>&1 | tee -a "$log"
 
-exec env \
+exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \
     PYTHONUNBUFFERED=1 \
     TMPDIR="$work/runtime-tmp" \
@@ -74,12 +83,18 @@ exec env \
     SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS=0 \
     SGLANG_MOE_HOT_LOG_INTERVAL=100 \
     SGLANG_MOE_HOT_METRICS_FILE="$run_dir/hot-cache.metrics.jsonl" \
+    SGLANG_MOE_GPU_RESIDENCY_UPDATE=1 \
+    SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS=64 \
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES=0 \
     SGLANG_MOE_EXPERT_COPY_BACKEND=dma \
     SGLANG_MOE_EXPERT_PREDICTOR="$predictors" \
     SGLANG_MOE_EXPERT_PREDICTOR_LOG_INTERVAL=100 \
     SGLANG_MOE_EXPERT_PREDICTOR_METRICS_FILE="$run_dir/expert-prediction.metrics.jsonl" \
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR="$capture_dir" \
+    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR="$predictor" \
+    SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR="$prefetch_model_dir" \
+    SGLANG_MOE_EXPERT_PREFETCH_BUDGET="$prefetch_budget" \
+    SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES="$prefetch_candidates" \
     SGLANG_TORCH_PROFILER_DIR="$run_dir/profiles" \
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$run_dir/profiles/expert-distribution" \
     SGLANG_VLM_CACHE_SIZE_MB=0 \
@@ -99,8 +114,8 @@ exec env \
         --mamba-track-interval 64 \
         --chunked-prefill-size 4096 \
         --max-prefill-tokens 4096 \
-        --context-length 65536 \
-        --max-total-tokens 65536 \
+        --context-length 40000 \
+        --max-total-tokens 40000 \
         --max-running-requests 1 \
         --mamba-ssm-dtype bfloat16 \
         --mem-fraction-static 0.95 \

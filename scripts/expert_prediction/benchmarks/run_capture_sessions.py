@@ -101,13 +101,13 @@ def _echo(text):
     print(text, end="", flush=True)
 
 
-def _stream_chat(port, messages, rid, timeout=1800, echo=False):
+def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
     body = json.dumps(
         {
             "model": "default",
             "messages": messages,
             "temperature": 0,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
             "rid": rid,
@@ -180,6 +180,12 @@ def main():
     parser.add_argument("--sessions", required=True)
     parser.add_argument("--results", required=True)
     parser.add_argument("--max-sessions", type=int, default=None)
+    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--session-ids",
+        default="",
+        help="Comma list of session_ids to run, in this file's order; empty runs all.",
+    )
     parser.add_argument(
         "--print-stream",
         action="store_true",
@@ -194,6 +200,9 @@ def main():
     args = parser.parse_args()
 
     sessions = _load_sessions(args.sessions)
+    if args.session_ids:
+        wanted = set(args.session_ids.split(","))
+        sessions = [session for session in sessions if session["session_id"] in wanted]
     done_turns, done_contents = _load_done_turns(args.results)
     stop_marker = (
         os.path.join(args.stop_when_capture_stopped, "capture-stopped.json")
@@ -238,7 +247,9 @@ def main():
                             f"\n===== {rid} ({session['domain']}, {session['split']}) =====",
                             flush=True,
                         )
-                    result = _stream_chat(args.port, history, rid, echo=args.print_stream)
+                    result = _stream_chat(
+                        args.port, history, rid, args.max_tokens, echo=args.print_stream
+                    )
                 except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
                     record = {
                         "session_id": session["session_id"],
