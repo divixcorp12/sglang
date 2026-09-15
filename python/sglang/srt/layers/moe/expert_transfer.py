@@ -13,9 +13,10 @@ from operator import index
 from threading import Lock
 from typing import Callable, Sequence
 
+import numpy as np
 import torch
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_rows_gpu
-from sglang.srt.layers.moe.expert_dma import ExpertDMABackend
+from sglang.srt.layers.moe.expert_dma import ExpertDMARowRoute
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 
@@ -37,22 +38,29 @@ class FixedRowTransferPlan:
         if self.max_rows < 1:
             raise ValueError("transfer plan max_rows must be positive")
         self.device = _canonical_device(device)
-        self.source_rows = torch.zeros(
-            self.max_rows, dtype=torch.int64, device=self.device
+        self._rows64 = torch.zeros(
+            (4, self.max_rows), dtype=torch.int64, device=self.device
         )
-        self.secondary_source_rows = torch.zeros(
-            self.max_rows, dtype=torch.int64, device=self.device
+        self._rows32 = torch.zeros(
+            self.max_rows + 1, dtype=torch.int32, device=self.device
         )
-        self.destination_slots = torch.zeros(
-            self.max_rows, dtype=torch.int32, device=self.device
-        )
-        self.destination_slots_long = torch.zeros(
-            self.max_rows, dtype=torch.int64, device=self.device
-        )
-        self.generations = torch.zeros(
-            self.max_rows, dtype=torch.int64, device=self.device
-        )
-        self.count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.source_rows = self._rows64[0]
+        self.secondary_source_rows = self._rows64[1]
+        self.destination_slots_long = self._rows64[2]
+        self.generations = self._rows64[3]
+        self.destination_slots = self._rows32[: self.max_rows]
+        self.count = self._rows32[self.max_rows :]
+        if self.device.type == "cuda":
+            self._host_rows64 = torch.zeros_like(self._rows64, device="cpu").pin_memory()
+            self._host_rows32 = torch.zeros_like(self._rows32, device="cpu").pin_memory()
+            self._upload_event = torch.cuda.Event()
+        else:
+            self._host_rows64 = self._rows64
+            self._host_rows32 = self._rows32
+            self._upload_event = None
+        self._host_rows64_view = self._host_rows64.numpy()
+        self._host_rows32_view = self._host_rows32.numpy()
+        self._uploaded = False
         self._row_count = 0
         self._active_sequence: int | None = None
 
@@ -87,46 +95,65 @@ class FixedRowTransferPlan:
         source_rows: torch.Tensor | Sequence[int],
         destination_slots: torch.Tensor | Sequence[int],
         generations: torch.Tensor | Sequence[int],
+        secondary_source_rows: torch.Tensor | Sequence[int] | None = None,
     ) -> None:
-        """Replace the active prefix while preserving all plan allocations."""
+        """Replace the active prefix while preserving all plan allocations.
+
+        Rows are staged in persistent pinned host buffers and reach the device
+        through two non-blocking copies of the packed int64 and int32 plans.
+        Entries past the prefix are zero. ``secondary_source_rows``, when
+        given, replaces the secondary prefix; otherwise it is left unchanged.
+        """
         if self._active_sequence is not None:
             raise RuntimeError("cannot rewrite a transfer plan while it is in flight")
         source = self._as_vector(source_rows, "source_rows")
         destination = self._as_vector(destination_slots, "destination_slots")
         generation = self._as_vector(generations, "generations")
-        row_count = source.numel()
-        if destination.numel() != row_count or generation.numel() != row_count:
+        secondary = (
+            None
+            if secondary_source_rows is None
+            else self._as_vector(secondary_source_rows, "secondary_source_rows")
+        )
+        row_count = source.shape[0]
+        if destination.shape[0] != row_count or generation.shape[0] != row_count:
+            raise ValueError("transfer plan rows must have the same number of entries")
+        if secondary is not None and secondary.shape[0] != row_count:
             raise ValueError("transfer plan rows must have the same number of entries")
         if row_count > self.max_rows:
             raise ValueError("transfer plan row count exceeds fixed capacity")
-        self.source_rows.zero_()
-        self.destination_slots.zero_()
-        self.generations.zero_()
-        self.destination_slots_long.zero_()
-        if row_count:
-            self.source_rows[:row_count].copy_(
-                source.to(device=self.device, dtype=torch.int64)
-            )
-            self.destination_slots[:row_count].copy_(
-                destination.to(device=self.device, dtype=torch.int32)
-            )
-            self.destination_slots_long[:row_count].copy_(
-                destination.to(device=self.device, dtype=torch.int64)
-            )
-            self.generations[:row_count].copy_(
-                generation.to(device=self.device, dtype=torch.int64)
-            )
-        self.count.fill_(row_count)
+        if self._upload_event is not None and self._uploaded:
+            self._upload_event.synchronize()
+        rows64 = self._host_rows64_view
+        rows32 = self._host_rows32_view
+        rows64[0, :row_count] = source
+        rows64[2, :row_count] = destination
+        rows64[3, :row_count] = generation
+        rows64[(0, 2, 3), row_count:] = 0
+        if secondary is not None:
+            rows64[1, :row_count] = secondary
+            rows64[1, row_count:] = 0
+        rows32[:row_count] = destination
+        rows32[row_count : self.max_rows] = 0
+        rows32[self.max_rows] = row_count
+        if self._upload_event is not None:
+            self._rows64.copy_(self._host_rows64, non_blocking=True)
+            self._rows32.copy_(self._host_rows32, non_blocking=True)
+            self._upload_event.record()
+            self._uploaded = True
         self._row_count = row_count
 
     @staticmethod
-    def _as_vector(values: torch.Tensor | Sequence[int], name: str) -> torch.Tensor:
-        tensor = values if isinstance(values, torch.Tensor) else torch.as_tensor(values)
-        if tensor.ndim != 1:
+    def _as_vector(values: torch.Tensor | Sequence[int], name: str) -> np.ndarray:
+        if isinstance(values, torch.Tensor):
+            if values.is_floating_point() or values.is_complex():
+                raise ValueError(f"transfer plan {name} must contain integer values")
+            values = values.detach().cpu().numpy()
+        array = np.asarray(values)
+        if array.ndim != 1:
             raise ValueError(f"transfer plan {name} must be one-dimensional")
-        if tensor.is_floating_point() or tensor.is_complex():
+        if array.dtype.kind not in "iub":
             raise ValueError(f"transfer plan {name} must contain integer values")
-        return tensor
+        return array
 
     def _claim(self, sequence: int) -> None:
         if self._active_sequence is not None:
@@ -146,6 +173,13 @@ class ExpertTransferTicket:
     slot: int
     sequence: int
     plan: FixedRowTransferPlan
+    extra_plans: tuple[FixedRowTransferPlan, ...] = ()
+
+    def release_plans(self) -> None:
+        """Permit every plan this ticket claimed to be rewritten."""
+        self.plan._release(self.sequence)
+        for plan in self.extra_plans:
+            plan._release(self.sequence)
 
 
 @dataclass(frozen=True)
@@ -232,7 +266,7 @@ class AsyncExpertTransferExecutor:
         if not all(callable(operation) for operation in operations):
             raise TypeError("expert transfer copy operations must be callable")
         return self._submit_operations(
-            plan, operations, producer_stream=producer_stream
+            (plan,), operations, producer_stream=producer_stream
         )
 
     def submit_callback(
@@ -252,7 +286,27 @@ class AsyncExpertTransferExecutor:
         if not callable(callback):
             raise TypeError("expert transfer callback must be callable")
         return self._submit_operations(
-            plan, (callback,), producer_stream=producer_stream
+            (plan,), (callback,), producer_stream=producer_stream
+        )
+
+    def submit_batch(
+        self,
+        plans: Sequence[FixedRowTransferPlan],
+        callback: Callable[[], None],
+        *,
+        producer_stream=None,
+    ) -> ExpertTransferTicket:
+        """Run one callback issuing several plans' copies behind one completion event.
+
+        Every plan is claimed until the shared ticket completes, so a whole
+        residency update occupies one ring slot however many layers it changes.
+        """
+        if not plans:
+            raise ValueError("an expert transfer batch requires at least one plan")
+        if not callable(callback):
+            raise TypeError("expert transfer callback must be callable")
+        return self._submit_operations(
+            tuple(plans), (callback,), producer_stream=producer_stream
         )
 
     def is_complete(self, ticket: ExpertTransferTicket) -> bool:
@@ -260,8 +314,21 @@ class AsyncExpertTransferExecutor:
         event = self._event_for(ticket)
         complete = bool(event.query())
         if complete:
-            ticket.plan._release(ticket.sequence)
+            ticket.release_plans()
         return complete
+
+    def has_completed(self, ticket: ExpertTransferTicket) -> bool:
+        """Like :meth:`is_complete`, but a ticket whose ring slot was reused is complete.
+
+        A ring slot is reused only after its event completed, so a caller that
+        polls late still learns its copies landed instead of seeing a stale ticket.
+        """
+        if ticket.device != self.device:
+            raise ValueError("expert transfer ticket belongs to a different device")
+        current = self._tickets[ticket.slot]
+        if current is None or current.sequence != ticket.sequence:
+            return True
+        return self.is_complete(ticket)
 
     def wait(self, ticket: ExpertTransferTicket, consumer_stream=None) -> None:
         """Order a consumer stream and permit plan reuse on that stream."""
@@ -271,29 +338,39 @@ class AsyncExpertTransferExecutor:
                 self.device
             )
         event.wait(consumer_stream)
-        ticket.plan._release(ticket.sequence)
+        ticket.release_plans()
 
     def _submit_operations(
         self,
-        plan: FixedRowTransferPlan,
+        plans: Sequence[FixedRowTransferPlan],
         operations: Sequence[Callable[[], None]],
         *,
         producer_stream,
     ) -> ExpertTransferTicket:
-        if plan.row_count < 1:
-            raise ValueError("cannot submit an empty expert transfer plan")
-        if (
-            plan.device != self.device
-            and self.device.type == "cuda"
-            and torch.cuda.is_available()
-        ):
-            raise ValueError("transfer plan and executor must use the same CUDA device")
+        for plan in plans:
+            if plan.row_count < 1:
+                raise ValueError("cannot submit an empty expert transfer plan")
+            if (
+                plan.device != self.device
+                and self.device.type == "cuda"
+                and torch.cuda.is_available()
+            ):
+                raise ValueError(
+                    "transfer plan and executor must use the same CUDA device"
+                )
+        if len({id(plan) for plan in plans}) != len(plans):
+            raise ValueError("an expert transfer batch cannot repeat a plan")
         slot = self._acquire_slot()
         sequence = self._next_sequence
         self._next_sequence += 1
-        plan._claim(sequence)
-        ticket = ExpertTransferTicket(self.device, slot, sequence, plan)
+        ticket = ExpertTransferTicket(
+            self.device, slot, sequence, plans[0], tuple(plans[1:])
+        )
+        claimed = []
         try:
+            for plan in plans:
+                plan._claim(sequence)
+                claimed.append(plan)
             with self._stream_context(self.stream):
                 if producer_stream is not None:
                     self.stream.wait_stream(producer_stream)
@@ -301,7 +378,8 @@ class AsyncExpertTransferExecutor:
                     operation()
                 self._events[slot].record(self.stream)
         except Exception:
-            plan._release(sequence)
+            for plan in claimed:
+                plan._release(sequence)
             raise
         self._tickets[slot] = ticket
         self._next_slot = (slot + 1) % self.max_inflight
@@ -314,7 +392,7 @@ class AsyncExpertTransferExecutor:
             if previous is None:
                 return slot
             if self._events[slot].query():
-                previous.plan._release(previous.sequence)
+                previous.release_plans()
                 return slot
         raise RuntimeError("expert transfer ticket ring is full")
 
@@ -340,212 +418,206 @@ def submit_expert_row_copies(
     producer_stream=None,
 ) -> ExpertCopySubmission:
     """Submit six row copies, retaining a device-plan GPU path and CPU DMA path."""
-    requested_backend = _normalize_copy_backend(backend)
-    pairs = tuple(tensor_pairs)
-    if len(pairs) != NVFP4_TRANSFER_TENSOR_COUNT:
-        raise ValueError("an expert transfer requires six tensor pairs")
-    if (
-        len(source_rows_cpu) != plan.row_count
-        or len(destination_slots_cpu) != plan.row_count
-    ):
-        raise ValueError("CPU transfer rows must match the fixed plan prefix")
-    row_bytes = sum(source[0].numel() * source.element_size() for source, _ in pairs)
-    submitted_bytes = plan.row_count * row_bytes
-    secondary_rows_cpu = (
-        source_rows_cpu
-        if secondary_source_rows_cpu is None
-        else secondary_source_rows_cpu
+    routes = ExpertRowCopyRoutes(
+        tensor_pairs,
+        backend=backend,
+        use_secondary_source_rows=use_secondary_source_rows,
     )
-    use_secondary_rows = (
-        tuple(False for _ in pairs)
-        if use_secondary_source_rows is None
-        else tuple(use_secondary_source_rows)
-    )
-    if len(use_secondary_rows) != len(pairs):
-        raise ValueError("secondary source row selectors must match tensor pairs")
-    if any(use_secondary_rows) and secondary_source_rows_cpu is None:
-        raise ValueError("secondary source rows are required by a selected tensor")
-    if len(secondary_rows_cpu) != plan.row_count:
-        raise ValueError("secondary source rows must match the fixed plan prefix")
-    if any(use_secondary_rows) or any(
-        source.device.type == "cuda" for source, _ in pairs
-    ):
-        return _submit_mixed_expert_row_copies(
-            executor,
-            plan,
-            pairs,
-            requested_backend,
-            source_rows_cpu,
-            secondary_rows_cpu,
-            use_secondary_rows,
-            destination_slots_cpu,
-            producer_stream,
-            submitted_bytes,
-        )
-
-    if requested_backend == "gpu" and all(
-        _can_copy_with_gpu(source, destination) for source, destination in pairs
-    ):
-        ticket = executor.submit(
-            plan,
-            [
-                lambda source=source, destination=destination: copy_expert_rows_gpu(
-                    source,
-                    destination,
-                    plan.source_rows,
-                    plan.destination_slots,
-                    plan.count,
-                )
-                for source, destination in pairs
-            ],
-            producer_stream=producer_stream,
-        )
-        return ExpertCopySubmission(
-            ticket, requested_backend, "gpu", plan.row_count, submitted_bytes, 1, 0
-        )
-
-    if requested_backend == "dma" and all(
-        _can_copy_with_dma(source, destination) for source, destination in pairs
-    ):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("expert DMA transfers are not CUDA-graph-capturable")
-        paths: list[str] = []
-        dma = ExpertDMABackend()
-
-        def copy_dma(source: torch.Tensor, destination: torch.Tensor) -> None:
-            paths.append(
-                dma.copy_rows(
-                    source, destination, source_rows_cpu, destination_slots_cpu
-                )
-            )
-
-        ticket = executor.submit(
-            plan,
-            [
-                lambda source=source, destination=destination: copy_dma(
-                    source, destination
-                )
-                for source, destination in pairs
-            ],
-            producer_stream=producer_stream,
-        )
-        actual_backend = "dma" if all(path == "dma" for path in paths) else "fallback"
-        return ExpertCopySubmission(
-            ticket,
-            requested_backend,
-            actual_backend,
-            plan.row_count,
-            submitted_bytes,
-            1,
-            int(actual_backend == "fallback"),
-        )
-
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("expert copy fallback is not CUDA-graph-capturable")
-    ticket = executor.submit(
-        plan,
+    (submission,) = submit_expert_row_copy_batch(
+        executor,
         [
-            lambda source=source, destination=destination: _copy_rows_fallback(
-                source, destination, source_rows_cpu, destination_slots_cpu
+            ExpertRowCopyRequest(
+                routes,
+                plan,
+                source_rows_cpu,
+                destination_slots_cpu,
+                secondary_source_rows_cpu,
             )
-            for source, destination in pairs
         ],
         producer_stream=producer_stream,
     )
-    return ExpertCopySubmission(
-        ticket, requested_backend, "fallback", plan.row_count, submitted_bytes, 1, 1
-    )
+    return submission
 
 
-def _submit_mixed_expert_row_copies(
-    executor: AsyncExpertTransferExecutor,
-    plan: FixedRowTransferPlan,
-    pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
-    requested_backend: str,
-    source_rows_cpu: Sequence[int],
-    secondary_rows_cpu: Sequence[int],
-    use_secondary_rows: Sequence[bool],
-    destination_slots_cpu: Sequence[int],
-    producer_stream,
-    submitted_bytes: int,
-) -> ExpertCopySubmission:
-    paths: list[str] = []
-    dma = ExpertDMABackend() if requested_backend == "dma" else None
-    copy_operations: list[Callable[[], None]] = []
-    for (source, destination), use_secondary in zip(pairs, use_secondary_rows):
-        source_rows = plan.secondary_source_rows if use_secondary else plan.source_rows
-        source_rows_cpu_for_tensor = (
-            secondary_rows_cpu if use_secondary else source_rows_cpu
+_ROUTE_GPU = "gpu"
+_ROUTE_DMA = "dma"
+_ROUTE_D2D = "d2d"
+_ROUTE_FALLBACK = "fallback"
+
+
+class ExpertRowCopyRoutes:
+    """The copy path of each of one layer's six source and destination pairs.
+
+    Paths follow the selection rules of :func:`submit_expert_row_copies`: a
+    pair set with CUDA sources or secondary rows picks a path per pair, and
+    otherwise all six use the requested backend when every source is GPU
+    readable, or the fallback. Readability, DMA tensor validation and
+    registration bounds are resolved once here, so a caller holding routes for
+    stable tensors pays none of them per submission.
+    """
+
+    def __init__(
+        self,
+        tensor_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        backend: str,
+        use_secondary_source_rows: Sequence[bool] | None = None,
+    ) -> None:
+        self.requested_backend = _normalize_copy_backend(backend)
+        self.pairs = tuple(tensor_pairs)
+        if len(self.pairs) != NVFP4_TRANSFER_TENSOR_COUNT:
+            raise ValueError("an expert transfer requires six tensor pairs")
+        self.use_secondary_rows = (
+            tuple(False for _ in self.pairs)
+            if use_secondary_source_rows is None
+            else tuple(bool(flag) for flag in use_secondary_source_rows)
         )
-        if requested_backend == "gpu" and _can_copy_with_gpu(source, destination):
-            copy_operations.append(
-                lambda source=source, destination=destination, source_rows=source_rows: (
-                    _copy_gpu_rows(source, destination, source_rows, plan, paths)
-                )
+        if len(self.use_secondary_rows) != len(self.pairs):
+            raise ValueError("secondary source row selectors must match tensor pairs")
+        self.row_bytes = sum(
+            source[0].numel() * source.element_size() for source, _ in self.pairs
+        )
+        mixed = any(self.use_secondary_rows) or any(
+            source.device.type == "cuda" for source, _ in self.pairs
+        )
+        if mixed:
+            kinds = tuple(
+                self._mixed_kind(source, destination) for source, destination in self.pairs
             )
-        elif requested_backend == "dma" and _can_copy_with_dma(source, destination):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("expert DMA transfers are not CUDA-graph-capturable")
-            assert dma is not None
-            copy_operations.append(
-                lambda source=source, destination=destination, rows=source_rows_cpu_for_tensor: (
-                    _copy_dma_rows(
-                        dma, source, destination, rows, destination_slots_cpu, paths
-                    )
-                )
-            )
-        elif source.device.type == "cuda" and destination.device.type == "cuda":
-            copy_operations.append(
-                lambda source=source, destination=destination, source_rows=source_rows: (
-                    _copy_d2d_rows(source, destination, source_rows, plan, paths)
-                )
-            )
+        elif self.requested_backend == _ROUTE_GPU and all(
+            _can_copy_with_gpu(source, destination) for source, destination in self.pairs
+        ):
+            kinds = (_ROUTE_GPU,) * len(self.pairs)
+        elif self.requested_backend == _ROUTE_DMA and all(
+            _can_copy_with_dma(source, destination) for source, destination in self.pairs
+        ):
+            kinds = (_ROUTE_DMA,) * len(self.pairs)
         else:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("expert copy fallback is not CUDA-graph-capturable")
-            copy_operations.append(
-                lambda source=source, destination=destination, rows=source_rows_cpu_for_tensor: (
-                    _copy_fallback_rows(
-                        source, destination, rows, destination_slots_cpu, paths
-                    )
+            kinds = (_ROUTE_FALLBACK,) * len(self.pairs)
+        self.kinds = kinds
+        self._dma_routes = tuple(
+            ExpertDMARowRoute(source, destination) if kind == _ROUTE_DMA else None
+            for (source, destination), kind in zip(self.pairs, kinds)
+        )
+        paths = [
+            ("dma" if dma_route.aot_available else "fallback")
+            if dma_route is not None
+            else kind
+            for kind, dma_route in zip(kinds, self._dma_routes)
+        ]
+        self.actual_backend = (
+            _actual_backend(self.requested_backend, paths)
+            if mixed
+            else ("fallback" if "fallback" in paths else kinds[0])
+        )
+        self.fallbacks = int(self.actual_backend == "fallback")
+        self.host_issued = any(kind in (_ROUTE_DMA, _ROUTE_FALLBACK) for kind in kinds)
+
+    def _mixed_kind(self, source: torch.Tensor, destination: torch.Tensor) -> str:
+        if self.requested_backend == _ROUTE_GPU and _can_copy_with_gpu(source, destination):
+            return _ROUTE_GPU
+        if self.requested_backend == _ROUTE_DMA and _can_copy_with_dma(source, destination):
+            return _ROUTE_DMA
+        if source.device.type == "cuda" and destination.device.type == "cuda":
+            return _ROUTE_D2D
+        return _ROUTE_FALLBACK
+
+    def copy_rows(
+        self,
+        plan: FixedRowTransferPlan,
+        source_rows_cpu: Sequence[int],
+        secondary_rows_cpu: Sequence[int],
+        destination_slots_cpu: Sequence[int],
+        coalesced: dict,
+    ) -> None:
+        """Issue the six row copies of one plan on the current stream."""
+        for (source, destination), kind, use_secondary, dma_route in zip(
+            self.pairs, self.kinds, self.use_secondary_rows, self._dma_routes
+        ):
+            rows_cpu = secondary_rows_cpu if use_secondary else source_rows_cpu
+            if dma_route is not None:
+                dma_route.copy_rows(rows_cpu, destination_slots_cpu, coalesced)
+            elif kind == _ROUTE_FALLBACK:
+                _copy_rows_fallback(source, destination, rows_cpu, destination_slots_cpu)
+            else:
+                copy_expert_rows_gpu(
+                    source,
+                    destination,
+                    plan.secondary_source_rows if use_secondary else plan.source_rows,
+                    plan.destination_slots,
+                    plan.count,
                 )
+
+
+@dataclass(frozen=True)
+class ExpertRowCopyRequest:
+    """One plan's rows and the routes that copy them."""
+
+    routes: ExpertRowCopyRoutes
+    plan: FixedRowTransferPlan
+    source_rows_cpu: Sequence[int]
+    destination_slots_cpu: Sequence[int]
+    secondary_source_rows_cpu: Sequence[int] | None = None
+
+
+def submit_expert_row_copy_batch(
+    executor: AsyncExpertTransferExecutor,
+    requests: Sequence[ExpertRowCopyRequest],
+    *,
+    producer_stream=None,
+) -> tuple[ExpertCopySubmission, ...]:
+    """Submit several plans' six-tensor copies behind one executor ticket.
+
+    Each request is validated as :func:`submit_expert_row_copies` validates
+    its arguments and reports its own :class:`ExpertCopySubmission`; all of
+    them share the returned ticket.
+    """
+    requests = tuple(requests)
+    if not requests:
+        raise ValueError("an expert transfer batch requires at least one request")
+    for request in requests:
+        rows = request.plan.row_count
+        if (
+            len(request.source_rows_cpu) != rows
+            or len(request.destination_slots_cpu) != rows
+        ):
+            raise ValueError("CPU transfer rows must match the fixed plan prefix")
+        secondary = request.secondary_source_rows_cpu
+        if any(request.routes.use_secondary_rows) and secondary is None:
+            raise ValueError("secondary source rows are required by a selected tensor")
+        if secondary is not None and len(secondary) != rows:
+            raise ValueError("secondary source rows must match the fixed plan prefix")
+    if any(request.routes.host_issued for request in requests):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("expert host-issued copies are not CUDA-graph-capturable")
+
+    def copy_all() -> None:
+        coalesced: dict = {}
+        for request in requests:
+            request.routes.copy_rows(
+                request.plan,
+                request.source_rows_cpu,
+                request.source_rows_cpu
+                if request.secondary_source_rows_cpu is None
+                else request.secondary_source_rows_cpu,
+                request.destination_slots_cpu,
+                coalesced,
             )
-    ticket = executor.submit(plan, copy_operations, producer_stream=producer_stream)
-    actual_backend = _actual_backend(requested_backend, paths)
-    return ExpertCopySubmission(
-        ticket,
-        requested_backend,
-        actual_backend,
-        plan.row_count,
-        submitted_bytes,
-        1,
-        int(actual_backend == "fallback"),
+
+    ticket = executor.submit_batch(
+        [request.plan for request in requests], copy_all, producer_stream=producer_stream
     )
-
-
-def _copy_gpu_rows(
-    source: torch.Tensor,
-    destination: torch.Tensor,
-    source_rows: torch.Tensor,
-    plan: FixedRowTransferPlan,
-    paths: list[str],
-) -> None:
-    copy_expert_rows_gpu(
-        source, destination, source_rows, plan.destination_slots, plan.count
-    )
-    paths.append("gpu")
-
-
-def _copy_dma_rows(
-    dma: ExpertDMABackend,
-    source: torch.Tensor,
-    destination: torch.Tensor,
-    source_rows_cpu: Sequence[int],
-    destination_slots_cpu: Sequence[int],
-    paths: list[str],
-) -> None:
-    paths.append(
-        dma.copy_rows(source, destination, source_rows_cpu, destination_slots_cpu)
+    return tuple(
+        ExpertCopySubmission(
+            ticket,
+            request.routes.requested_backend,
+            request.routes.actual_backend,
+            request.plan.row_count,
+            request.plan.row_count * request.routes.row_bytes,
+            1,
+            request.routes.fallbacks,
+        )
+        for request in requests
     )
 
 
@@ -560,17 +632,6 @@ def _copy_d2d_rows(
         source, destination, source_rows, plan.destination_slots, plan.count
     )
     paths.append("d2d")
-
-
-def _copy_fallback_rows(
-    source: torch.Tensor,
-    destination: torch.Tensor,
-    source_rows_cpu: Sequence[int],
-    destination_slots_cpu: Sequence[int],
-    paths: list[str],
-) -> None:
-    _copy_rows_fallback(source, destination, source_rows_cpu, destination_slots_cpu)
-    paths.append("fallback")
 
 
 def _actual_backend(requested_backend: str, paths: Sequence[str]) -> str:

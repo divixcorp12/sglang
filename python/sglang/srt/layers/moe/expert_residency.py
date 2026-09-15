@@ -8,6 +8,7 @@ from enum import IntEnum
 from operator import index
 from typing import Iterable, Sequence
 
+import numpy as np
 import torch
 
 
@@ -140,12 +141,15 @@ class ExpertResidencyPolicy:
         self.record_counts(route_counts)
         self._metrics.recorded_routes += expert_ids.numel()
 
+    def boundary_decay(self, tokens: int | None = None) -> float:
+        """Multiplier ``advance`` applies to the scores at a boundary of ``tokens``."""
+        if self.decay_tokens is not None and tokens is not None:
+            return self.decay ** (index(tokens) / self.decay_tokens)
+        return self.decay
+
     def advance(self, tokens: int | None = None) -> None:
         """Decay the scores and fold in pending counts without a host readback."""
-        decay = self.decay
-        if self.decay_tokens is not None and tokens is not None:
-            decay = self.decay ** (index(tokens) / self.decay_tokens)
-        self._scores.mul_(decay).add_(self._pending_counts)
+        self._scores.mul_(self.boundary_decay(tokens)).add_(self._pending_counts)
         self._pending_counts.zero_()
 
     def materialize_boundary(
@@ -157,22 +161,31 @@ class ExpertResidencyPolicy:
 
     def decide(self, resident_experts: Iterable[int]) -> ResidencyDecision:
         """Return the deterministic desired set for the current scores."""
-        score_values = self._scores.detach().cpu().tolist()
+        return decide_residency_policies([self], [resident_experts])[0]
+
+    def _decide_from_host(
+        self,
+        score_values: list[float],
+        ranked: list[int],
+        rank: list[int],
+        resident_experts: Iterable[int],
+    ) -> ResidencyDecision:
+        """Decide from host scores, their ``(-score, expert)`` order and its inverse.
+
+        ``rank[expert]`` is the expert's position in ``ranked``, so ordering by
+        rank is ordering by ``(-score, expert)`` and the smallest ``(score,
+        -expert)`` victim is the member with the largest rank.
+        """
         observed_resident = self._deduplicate_and_validate(resident_experts)
-        resident = self._limited_resident(observed_resident, score_values)
-        ranked = tuple(
-            expert_id
-            for expert_id, _ in sorted(
-                enumerate(score_values), key=lambda item: (-item[1], item[0])
-            )
-        )
-        desired = self._select_desired(ranked, score_values, resident)
+        resident = self._limited_resident(observed_resident, rank)
+        desired = self._select_desired(ranked, score_values, rank, resident)
         observed_resident_set = set(observed_resident)
+        desired_set = set(desired)
         promotions = tuple(
             expert_id for expert_id in desired if expert_id not in observed_resident_set
         )
         evictions = tuple(
-            expert_id for expert_id in observed_resident if expert_id not in desired
+            expert_id for expert_id in observed_resident if expert_id not in desired_set
         )
         self._metrics.boundary_updates += 1
         self._metrics.promotions += len(promotions)
@@ -181,7 +194,7 @@ class ExpertResidencyPolicy:
             desired_experts=desired,
             promotions=promotions,
             evictions=evictions,
-            ranked_experts=ranked,
+            ranked_experts=tuple(ranked),
         )
 
     def schedule_transfers(
@@ -213,41 +226,60 @@ class ExpertResidencyPolicy:
 
     def _select_desired(
         self,
-        ranked: tuple[int, ...],
+        ranked: list[int],
         score_values: list[float],
+        rank: list[int],
         resident: tuple[int, ...],
     ) -> tuple[int, ...]:
+        """Fill free capacity in rank order, then swap in leaders over the weakest members.
+
+        Members admitted in rank order only get weaker, so the weakest member is
+        either the weakest remaining resident or the last admitted expert: a
+        queue of residents and a stack of admissions replace a linear victim
+        search per candidate.
+        """
         if self.capacity == 0:
             return ()
-        desired = list(resident[: self.capacity])
-        resident_set = set(desired)
-        for expert_id in ranked:
-            if len(desired) >= self.capacity:
-                break
+        residents = list(resident[: self.capacity])
+        members = set(residents)
+        admitted: list[int] = []
+        position = 0
+        expert_count = len(ranked)
+        while position < expert_count and len(members) < self.capacity:
+            expert_id = ranked[position]
             if score_values[expert_id] <= 0.0:
                 break
-            if expert_id not in resident_set:
-                desired.append(expert_id)
-                resident_set.add(expert_id)
-        for candidate in ranked:
-            if candidate in resident_set:
+            if expert_id not in members:
+                admitted.append(expert_id)
+                members.add(expert_id)
+            position += 1
+        victims: list[int] | None = None
+        victim_position = 0
+        while position < expert_count:
+            candidate = ranked[position]
+            position += 1
+            if candidate in members:
                 continue
-            if score_values[candidate] <= 0.0 or not desired:
+            if score_values[candidate] <= 0.0 or not members:
                 break
-            victim = min(
-                desired, key=lambda expert_id: (score_values[expert_id], -expert_id)
+            if victims is None:
+                victims = sorted(residents, key=rank.__getitem__, reverse=True)
+            from_residents = victim_position < len(victims) and (
+                not admitted or rank[victims[victim_position]] > rank[admitted[-1]]
             )
+            victim = victims[victim_position] if from_residents else admitted[-1]
             if score_values[candidate] <= score_values[victim] + self._promotion_threshold(
                 score_values[candidate], score_values[victim]
             ):
                 break
-            desired.remove(victim)
-            resident_set.remove(victim)
-            desired.append(candidate)
-            resident_set.add(candidate)
-        return tuple(
-            sorted(desired, key=lambda expert_id: (-score_values[expert_id], expert_id))
-        )
+            if from_residents:
+                victim_position += 1
+            else:
+                admitted.pop()
+            members.remove(victim)
+            members.add(candidate)
+            admitted.append(candidate)
+        return tuple(sorted(members, key=rank.__getitem__))
 
     def _promotion_threshold(self, candidate: float, victim: float) -> float:
         """Score lead a candidate needs over its victim before it is promoted.
@@ -264,15 +296,11 @@ class ExpertResidencyPolicy:
         )
 
     def _limited_resident(
-        self, resident: tuple[int, ...], score_values: list[float]
+        self, resident: tuple[int, ...], rank: list[int]
     ) -> tuple[int, ...]:
         if len(resident) <= self.capacity:
             return resident
-        return tuple(
-            sorted(resident, key=lambda expert_id: (-score_values[expert_id], expert_id))[
-                : self.capacity
-            ]
-        )
+        return tuple(sorted(resident, key=rank.__getitem__)[: self.capacity])
 
     def _deduplicate_and_validate(self, expert_ids: Iterable[int]) -> tuple[int, ...]:
         result = []
@@ -285,3 +313,63 @@ class ExpertResidencyPolicy:
                 result.append(expert_id)
                 seen.add(expert_id)
         return tuple(result)
+
+
+def advance_residency_policies(
+    policies: Sequence[ExpertResidencyPolicy], tokens: int | None = None
+) -> None:
+    """Advance every policy at one boundary with three fused launches per group.
+
+    Policies sharing a device and boundary decay are decayed, folded and
+    cleared by one ``torch._foreach_*`` call each, which is bit-identical to
+    :meth:`ExpertResidencyPolicy.advance` on every policy.
+    """
+    groups: dict[tuple[torch.device, float], list[ExpertResidencyPolicy]] = {}
+    for policy in policies:
+        groups.setdefault((policy.device, policy.boundary_decay(tokens)), []).append(
+            policy
+        )
+    for (_, decay), members in groups.items():
+        scores = [policy._scores for policy in members]
+        pending = [policy._pending_counts for policy in members]
+        torch._foreach_mul_(scores, decay)
+        torch._foreach_add_(scores, pending)
+        torch._foreach_zero_(pending)
+
+
+def decide_residency_policies(
+    policies: Sequence[ExpertResidencyPolicy],
+    resident_experts: Sequence[Iterable[int]],
+) -> list[ResidencyDecision]:
+    """Decide every policy from one score readback per device and expert count.
+
+    The stacked scores are ranked by one stable host argsort of the negated
+    scores, which orders ties by expert ID exactly as the per-layer
+    ``(-score, expert)`` sort did; decisions equal per-policy :meth:`decide`.
+    """
+    policies = list(policies)
+    residents = list(resident_experts)
+    if len(policies) != len(residents):
+        raise ValueError("each residency policy needs one resident expert set")
+    groups: dict[tuple[torch.device, int], list[int]] = {}
+    for position, policy in enumerate(policies):
+        groups.setdefault((policy.device, policy.num_experts), []).append(position)
+    decisions: list[ResidencyDecision | None] = [None] * len(policies)
+    for positions in groups.values():
+        scores = (
+            torch.stack([policies[position]._scores.detach() for position in positions])
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        order = np.argsort(-scores, axis=1, kind="stable")
+        rank = np.empty_like(order)
+        np.put_along_axis(rank, order, np.arange(order.shape[1]), axis=1)
+        for row, (score_values, ranked, ranks) in enumerate(
+            zip(scores.tolist(), order.tolist(), rank.tolist())
+        ):
+            position = positions[row]
+            decisions[position] = policies[position]._decide_from_host(
+                score_values, ranked, ranks, residents[position]
+            )
+    return decisions
