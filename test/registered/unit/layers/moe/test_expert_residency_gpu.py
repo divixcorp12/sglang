@@ -45,10 +45,13 @@ def _model():
     return model
 
 
-def _manager(model, gpu, max_promotions=EXPERTS, **overrides):
+def _manager(model, gpu, max_promotions=EXPERTS, seed_scale=(1, 1, 1), **overrides):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 
-    seed = [[float((expert * 7 + layer) % 5) for expert in range(EXPERTS)] for layer in range(LAYERS)]
+    seed = [
+        [float((expert * 7 + layer) % 5) * seed_scale[layer] for expert in range(EXPERTS)]
+        for layer in range(LAYERS)
+    ]
     options = dict(
         budget_bytes=56 * (12 + LAYERS * TOP_K),
         dynamic=True,
@@ -115,6 +118,12 @@ def _decode_batch():
     return SimpleNamespace(forward_mode=ForwardMode.DECODE, extend_num_tokens=1, batch_size=1)
 
 
+def _idle_batch():
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    return SimpleNamespace(forward_mode=ForwardMode.IDLE, extend_num_tokens=0, batch_size=1)
+
+
 def _prefill_batch(tokens):
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -137,6 +146,23 @@ def _decode_routes(generator, step):
         second = generator.choice([expert for expert in range(EXPERTS) if expert != first])
         routes.append([[first, second]])
     return routes
+
+
+def _burst_routes(window):
+    """Every token of a boundary window routes to one fresh expert pair per layer.
+
+    Both experts gain the whole window's routes at once, so a boundary can
+    promote two experts into the same layer.
+    """
+    return [
+        [[(window * 4 + 5 + layer) % EXPERTS, (window * 4 + 9 + layer) % EXPERTS]]
+        for layer in range(LAYERS)
+    ]
+
+
+def _decode_promotions(manager):
+    counters = manager.snapshot_counters()["decode"]
+    return [counters[str(layer)]["promotions"] for layer in range(LAYERS)]
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -227,6 +253,53 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         self.assertFalse(gpu.gpu_residency.host_pending)
         self.run_decode(host, gpu, graph, static, generator, steps=9, start=20)
 
+    def test_residence_margins_and_uneven_capacities_match_host_path(self):
+        options = dict(min_residence_forwards=6, benefit_ratio=0.25, promotion_sigmas=0.5, seed_scale=(1, 3, 9))
+        host = _manager(self.host_model, gpu=False, **options)
+        gpu = _manager(self.gpu_model, gpu=True, **options)
+        capacities = [cache.capacity for _, cache in sorted(gpu.caches.items())]
+        self.assertGreater(len(set(capacities)), 1, capacities)
+        graph, static = self.capture(gpu)
+        generator = random.Random(6)
+        self.run_decode(host, gpu, graph, static, generator, steps=25)
+        self.assertGreater(sum(_decode_promotions(gpu)), 0)
+        self.assertEqual(_decode_promotions(gpu), _decode_promotions(host))
+
+    def test_idle_and_graph_served_prefill_keep_the_clocks_aligned(self):
+        host = _manager(self.host_model, gpu=False, min_residence_forwards=3)
+        gpu = _manager(self.gpu_model, gpu=True, min_residence_forwards=3)
+        graph, static = self.capture(gpu)
+        generator = random.Random(7)
+        self.run_decode(host, gpu, graph, static, generator, steps=4)
+        self.assertTrue(gpu.gpu_residency.host_pending)
+        idle_counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64)}
+        host.on_expert_distribution(_idle_batch(), idle_counts)
+        gpu.on_expert_distribution(_idle_batch(), idle_counts)
+        self.assertFalse(gpu.gpu_residency.host_pending)
+        assert_states_equal(self, device_state(gpu), device_state(host), "after idle")
+        routes = [[[layer, (layer + 3) % EXPERTS]] for layer in range(LAYERS)]
+        self.host_forward(host, routes, _prefill_batch(1))
+        self.host_forward(gpu, routes, _prefill_batch(1))
+        counts = {"global_physical_count": _counts(routes)}
+        host.on_expert_distribution(_prefill_batch(1), counts)
+        gpu.on_expert_distribution(_prefill_batch(1), counts)
+        assert_states_equal(self, device_state(gpu), device_state(host), "after graph-served prefill")
+        self.run_decode(host, gpu, graph, static, generator, steps=11, start=40)
+        clock = host._boundary_clock
+        updater = gpu.gpu_residency
+        self.assertEqual(
+            (int(updater.forwards), int(updater.tokens), int(updater.decode_forwards)),
+            (clock.forwards, clock.tokens_since_boundary, clock.decode_forwards_since_boundary),
+        )
+
+    def test_gpu_owned_slots_refuse_host_publication(self):
+        gpu = _manager(self.gpu_model, gpu=True)
+        cache = next(cache for _, cache in sorted(gpu.caches.items()) if cache.capacity)
+        with self.assertRaisesRegex(RuntimeError, "owned by the GPU residency update"):
+            cache.reassign([])
+        with self.assertRaisesRegex(RuntimeError, "owned by the GPU residency update"):
+            cache.resident_experts()
+
     def test_decode_forward_hook_is_sync_free(self):
         gpu = _manager(self.gpu_model, gpu=True)
         graph, static = self.capture(gpu)
@@ -243,14 +316,22 @@ class TestGpuResidencyUpdate(unittest.TestCase):
             torch.cuda.set_sync_debug_mode("default")
 
     def test_capped_update_truncates_and_keeps_slots_consistent(self):
+        host = _manager(self.host_model, gpu=False)
         gpu = _manager(self.gpu_model, gpu=True, max_promotions=1)
         graph, static = self.capture(gpu)
-        generator = random.Random(3)
+        host_most_promotions = 0
+        before = _decode_promotions(host)
         for step in range(24):
-            routes = _decode_routes(generator, step * 5)
+            routes = _burst_routes(step // 4)
+            self.host_forward(host, routes, _decode_batch())
             static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
             graph.replay()
-            gpu.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+            counts = {"global_physical_count": _counts(routes)}
+            host.on_expert_distribution(_decode_batch(), counts)
+            gpu.on_expert_distribution(_decode_batch(), counts)
+            after = _decode_promotions(host)
+            host_most_promotions = max(host_most_promotions, *(a - b for a, b in zip(after, before)))
+            before = after
             assert_slot_rows(self, gpu, self.gpu_model, f"capped step {step}")
             updater = gpu.gpu_residency
             for row, cache in enumerate(updater.caches):
@@ -260,6 +341,9 @@ class TestGpuResidencyUpdate(unittest.TestCase):
                     if slot >= 0:
                         self.assertEqual(slots[slot], expert)
                 self.assertEqual(sum(slot >= 0 for slot in mapping), sum(expert >= 0 for expert in slots))
+        self.assertGreaterEqual(
+            host_most_promotions, 2, "the uncapped host path never promoted two experts into one layer"
+        )
         self.assertGreater(sum(gpu.gpu_residency.snapshot()["truncated_layers"]), 0)
 
     def test_state_helpers_fail_on_perturbed_state(self):

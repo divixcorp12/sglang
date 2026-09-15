@@ -133,12 +133,9 @@ class GpuResidencyUpdater:
         self.enabled = torch.zeros(1, dtype=torch.bool, device=device)
         self.last_update = torch.zeros(layers, dtype=torch.long, device=device)
         self.host_pending = False
-        self.decay_table_tokens = index(decay_table_tokens)
-        self.decay_table = torch.tensor(
-            [policies[0].boundary_decay(tokens) for tokens in range(self.decay_table_tokens + 1)],
-            dtype=torch.float32,
-            device=device,
-        )
+        decay_values = self._decay_values(policies[0], index(decay_table_tokens))
+        self.decay_table_tokens = len(decay_values) - 1
+        self.decay_table = torch.tensor(decay_values, dtype=torch.float32, device=device)
 
         self.promotions = torch.zeros((2, layers), dtype=torch.long, device=device)
         self.evictions = torch.zeros((2, layers), dtype=torch.long, device=device)
@@ -148,9 +145,34 @@ class GpuResidencyUpdater:
         streamers[0].residency_update = self
         streamers[0].before_eager_gather = self.flush
 
+    @staticmethod
+    def _decay_values(policy, limit: int) -> list[float]:
+        """Boundary decays by token count until they reach float32 zero, which every longer window keeps.
+
+        Clamping the token index to the last entry is then exact. A decay that
+        stays nonzero through ``limit`` tokens would be approximated past it, so
+        it is refused.
+        """
+        if policy.decay_tokens is None or policy.decay >= 1.0:
+            return [policy.boundary_decay(None)] * 2
+        values = []
+        for tokens in range(limit + 1):
+            value = policy.boundary_decay(tokens)
+            values.append(value)
+            if float(torch.tensor(value, dtype=torch.float32)) == 0.0:
+                return values
+        raise ValueError(
+            "GPU residency update cannot tabulate this decay exactly; "
+            "lower SGLANG_MOE_HOT_DECAY_TOKENS"
+        )
+
     def on_graph_forward(self, tokens: int) -> None:
-        """At the first streamed layer's graph gather: apply a pending boundary, then count this forward."""
-        self._apply(self.boundary_pending & self.enabled, self.max_promotions, _DECODE_PHASE)
+        """At the first streamed layer's graph gather: apply a pending boundary, then count this forward.
+
+        Without decode boundaries the forward is only counted.
+        """
+        if self.update_decode_forwards > 0:
+            self._apply(self.boundary_pending & self.enabled, self.max_promotions, _DECODE_PHASE)
         self._count(tokens, decode=True)
 
     def flush(self) -> None:
@@ -166,8 +188,11 @@ class GpuResidencyUpdater:
 
         A forward whose first gather ran on the graph path already counted
         itself as a decode forward, and a prefill that did so is corrected.
-        An eager forward is counted here. A qualifying prefill applies its
-        boundary now; a decode boundary stays pending for the next forward.
+        Any other forward first applies a boundary still pending, as its
+        first eager gather would have, so a forward without gathers never
+        lands in the window it closes, and is then counted here. A qualifying
+        prefill applies its boundary now; a decode boundary stays pending for
+        the next forward.
         """
         if kind is ForwardKind.DRAFT:
             return
@@ -177,6 +202,7 @@ class GpuResidencyUpdater:
                 self.decode_forwards.sub_(1)
                 self.boundary_pending.copy_(self._decode_boundary_reached())
         else:
+            self.flush()
             self._count(tokens, decode=kind in (ForwardKind.DECODE, ForwardKind.VERIFY))
         if not boundary:
             return

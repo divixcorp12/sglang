@@ -203,6 +203,8 @@ class ExpertHotCache:
         buffer is rewritten only after its previous upload has run.
         """
         self._slots_dirty = False
+        if getattr(self, "device_residency", None) is not None:
+            raise RuntimeError("hot cache slots are owned by the GPU residency update")
         if not self.capacity:
             return
         if self._slot_upload_recorded:
@@ -250,6 +252,8 @@ class ExpertHotCache:
 
     def resident_experts(self) -> frozenset[int]:
         """Return only mappings that are ready for a gather consumer."""
+        if getattr(self, "device_residency", None) is not None:
+            raise RuntimeError("hot cache slots are owned by the GPU residency update")
         return frozenset(
             expert
             for expert, state in zip(self.slot_to_expert, self.slot_states)
