@@ -7,8 +7,9 @@ device slots with one batched copy on its own CUDA stream, then queues a
 four-byte publish of the sequence into a device completion word.
 ``ExpertDoorbellCopier.wait`` launches a chain of short kernels that block
 until that word reaches the request's sequence, or after ``timeout_polls``
-polls in total fall back to the in-graph copy of the same plan. Neither call
-synchronizes the host or breaks the graph.
+polls in total fall back to the in-graph copy of the same plan, or, when the
+thread had already claimed the request, drain until its copies land. Neither
+call synchronizes the host or breaks the graph.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
 
 _PAGE_HEADER_BYTES = 16
 _RECORD_HEADER_BYTES = 16
-_TAG_BASE = 9
+_TAG_BASE = 11
 _PUBLISH_RING = 1024
 _TRACE_ROWS = 4096
 _POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
@@ -48,6 +49,8 @@ _STATE_WORDS = {
     "record_mismatches": 6,
     "resolved": 7,
     "drain_timeouts": 8,
+    "drains": 9,
+    "drain_pending": 10,
 }
 _COUNTERS = (
     "serviced",
@@ -67,7 +70,17 @@ _COUNTERS = (
     "external_stream",
     "late_completions",
 )
-_RESET_AFTER_CAPTURE = ("fallback_count", "degraded", "timeouts", "waits", "last_polls", "record_mismatches")
+_RESET_AFTER_CAPTURE = (
+    "fallback_count",
+    "degraded",
+    "timeouts",
+    "waits",
+    "last_polls",
+    "record_mismatches",
+    "drain_timeouts",
+    "drains",
+    "drain_pending",
+)
 _STATUSES = (
     "pending",
     "serviced",
@@ -96,6 +109,7 @@ def _jit_expert_doorbell_module() -> Module:
         "expert_doorbell_start",
         "expert_doorbell_stop",
         "expert_doorbell_pause",
+        "expert_doorbell_inject",
         "expert_doorbell_counters",
         "expert_doorbell_trace",
     )
@@ -142,15 +156,19 @@ class ExpertDoorbellCopier:
       kernel launched before that request's ``wait`` returns, and must not be
       written by anyone else until then. The thread writes slots on its own
       stream at any time between ``post`` and completion.
-    * A timed-out ``wait`` drains for up to ``drain_polls`` until the thread
-      has either skipped the request or finished the copies it had queued, so
-      those copies cannot land after the wait returns; ``drain_timeouts``
-      counts drains that ran out, after which the next invariant is at risk.
-    * After a timeout the thread may still be finishing copies it already
-      queued for that request. They write the same source rows into the same
-      slots the fallback wrote, so a slot of a timed-out request must not be
-      reassigned to a different row until the thread has caught up
-      (``stats()["last_seen"]`` at or past that request and nothing pending).
+    * A timed-out ``wait`` whose request the thread had not claimed falls
+      back at once: the thread claims a request before it checks whether the
+      waiter abandoned it, so an unclaimed request is never copied. A claimed
+      request is drained for up to ``drain_polls`` until the thread publishes
+      it, behind any copies it queued, so those copies land before the wait
+      returns (``drains`` counts these). A request the thread did not copy is
+      published marked unserviced, and its wait falls back.
+    * ``drain_timeouts`` counts drains that ran out and fell back. The
+      thread may still be finishing that request's queued copies; they write
+      the same source rows into the same slots the fallback wrote, so such a
+      slot must not be reassigned to a different row until the thread has
+      caught up (``stats()["last_seen"]`` at or past that request and nothing
+      pending).
     * Source rows must stay allocated, registered and unchanged while any
       request naming them is outstanding.
     * At most ``ring - 1`` requests may be posted between a ``post`` and its
@@ -168,7 +186,7 @@ class ExpertDoorbellCopier:
         cpu_core: int = 71,
         timeout_polls: int = 2_000_000,
         degraded_polls: int = 4_096,
-        drain_polls: int = 4_000_000,
+        drain_polls: int = 8_000_000,
         prefer_overlap: bool = True,
         poll_mode: str = "acquire",
         head_store: str = "release",
@@ -327,6 +345,13 @@ class ExpertDoorbellCopier:
     def resume(self) -> None:
         self._module.expert_doorbell_pause(self._handle, 0)
 
+    def inject_fault(self, service_delay_s: float = 0.0, fail_copies: bool = False) -> None:
+        """Make the thread sleep ``service_delay_s`` before queuing each request's copies,
+        or report every copy as failed without issuing it; the defaults clear both."""
+        self._module.expert_doorbell_inject(
+            self._handle, int(service_delay_s * 1e9), int(fail_copies)
+        )
+
     def reset_wait_state(self) -> None:
         """Zero the wait counters and the degraded flag, keeping sequences.
 
@@ -351,9 +376,7 @@ class ExpertDoorbellCopier:
             trace = self.trace()
             last = trace[-1] if trace else None
             caught_up = posted == 0 or (
-                last is not None
-                and last["seq"] == posted
-                and (last["status"] != "serviced" or last["complete_ns"] != 0)
+                last is not None and last["seq"] == posted and last["complete_ns"] != 0
             )
             if caught_up:
                 self.pause()

@@ -567,6 +567,97 @@ def test_stalled_thread_times_out_and_falls_back_with_correct_bytes():
     assert recovered["degraded"] == 0
 
 
+def test_timed_out_wait_drains_a_claimed_request_until_its_copies_land():
+    """A request the thread claimed before its wait timed out is drained, not copied again: the
+    wait returns only after the thread's delayed copies landed, so nothing lands after it.
+
+    The thread copies on a torch-created stream, as serving does: copies queued on a stream the
+    thread created are held back until the running drain chunk ends."""
+    generator = torch.Generator().manual_seed(37)
+    sources = _sources(20, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 20)
+    rows, slots = _pick(generator, 20, 20, 7)
+    with _copier(
+        sources,
+        destinations,
+        capacity=8,
+        timeout_polls=STALL_TIMEOUT_POLLS,
+        drain_polls=400_000_000,
+        stream=torch.cuda.Stream(),
+    ) as copier:
+        copier.inject_fault(service_delay_s=1.0)
+        copier.post(*_plan(8, rows, slots))
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        copier.wait()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        stats = copier.stats()
+        _assert_matches_reference(sources, destinations, rows, slots)
+        _zero(destinations)
+        time.sleep(1.5)
+        torch.cuda.synchronize()
+        landed_after = [int(destination.view(torch.uint8).count_nonzero()) for destination in destinations]
+    assert stats["timeouts"] == 1
+    assert stats["drains"] == 1
+    assert stats["drain_timeouts"] == 0
+    assert stats["fallback_count"] == 0
+    assert stats["done"] >= stats["posted"]
+    assert elapsed >= 0.8
+    assert landed_after == [0] * len(destinations)
+
+
+def test_timed_out_wait_on_an_unclaimed_request_falls_back_without_draining():
+    """A paused thread never claims the request, so the wait falls back after its timeout
+    instead of spending the drain budget."""
+    generator = torch.Generator().manual_seed(41)
+    sources = _sources(8, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 8)
+    with _copier(
+        sources, destinations, capacity=4, timeout_polls=STALL_TIMEOUT_POLLS, drain_polls=400_000_000
+    ) as copier:
+        copier.pause()
+        picked_rows, picked_slots = [3, 0], [5, 2]
+        copier.post(*_plan(4, picked_rows, picked_slots))
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        copier.wait()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        stats = copier.stats()
+        _assert_matches_reference(sources, destinations, picked_rows, picked_slots)
+    assert stats["timeouts"] == 1
+    assert stats["drains"] == 0
+    assert stats["drain_timeouts"] == 0
+    assert stats["fallback_count"] == 2
+    assert elapsed < 1.0
+
+
+def test_failed_copy_is_published_unserviced_and_the_wait_falls_back_at_once():
+    """A request whose copy failed is published marked unserviced, so its wait copies it in-graph
+    without spending the timeout."""
+    generator = torch.Generator().manual_seed(43)
+    sources = _sources(20, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 20)
+    rows, slots = _pick(generator, 20, 20, 6)
+    with _copier(sources, destinations, capacity=8, timeout_polls=400_000_000) as copier:
+        copier.inject_fault(fail_copies=True)
+        copier.post(*_plan(8, rows, slots))
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        copier.wait()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        stats = copier.stats()
+        _assert_matches_reference(sources, destinations, rows, slots)
+        trace = copier.trace()
+    assert trace[-1]["status"] == "copy_failed"
+    assert stats["copy_errors"] == 1
+    assert stats["timeouts"] == 0
+    assert stats["fallback_count"] == len(rows)
+    assert elapsed < 1.0
+
+
 def test_timeout_polls_bound_the_wait_when_thread_is_paused():
     generator = torch.Generator().manual_seed(31)
     sources = _sources(8, EXPERT_LIKE_SHAPES, generator)

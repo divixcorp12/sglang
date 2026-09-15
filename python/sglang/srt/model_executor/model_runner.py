@@ -774,10 +774,10 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_DOORBELL needs a decode CUDA graph batch size of 1"
                 )
-            if self.ps.tp_size > 1:
+            if self.ps.tp_size > 1 or self.ps.pp_size > 1:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_DOORBELL runs one spin thread on one CPU core "
-                    "and cannot run with tensor parallelism"
+                    "and cannot run with tensor or pipeline parallelism"
                 )
         if budget_mb == 0:
             return

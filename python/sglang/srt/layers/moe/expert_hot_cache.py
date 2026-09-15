@@ -1195,8 +1195,9 @@ class ExpertHotCacheManager:
         is sized to four times the largest per-layer miss copy at 8 GiB/s, at
         least 20 ms, and a zero degraded budget to twice that copy, at least
         4096 polls, taking a poll as 250 ns. A zero drain budget is about 2 s:
-        a timed-out wait keeps waiting that long for copies the thread had
-        already queued, so they cannot land on a later forward's scratch rows.
+        a timed-out wait whose request the thread had already claimed keeps
+        waiting that long for its queued copies, so they cannot land on a
+        later forward's scratch rows; an unclaimed request falls back at once.
         """
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
 
@@ -1293,6 +1294,7 @@ class ExpertHotCacheManager:
                         "posted",
                         "waits",
                         "timeouts",
+                        "drains",
                         "drain_timeouts",
                         "degraded",
                         "record_mismatches",

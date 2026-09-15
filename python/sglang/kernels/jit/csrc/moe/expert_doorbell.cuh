@@ -5,12 +5,17 @@
 // Request page (pinned host bytes, GPU-written, CPU-read):
 //   [0]  u32 head      last posted sequence; release-stored LAST by the poster
 //   [4]  u32 abandoned last sequence a waiter gave up on
+//   [8]  u32 claimed   last sequence the thread claimed, written before it
+//                      reads the abandoned word for that sequence
 //   [16] ring records, record k holds sequence (k + 1) mod ring:
-//        {u32 seq, u32 count, u32 tag, u32 reserved,
+//        {u32 seq, u32 count, u32 tag, u32 unserviced,
 //         int64 source_rows[capacity], int32 destination_slots[capacity]}
+//        the poster zeroes `unserviced`; the thread sets it before publishing
+//        a request it did not copy
 //
 // Device state (int32 words): posted, fallback count, degraded, timeouts,
-// waits, last polls, record mismatches, resolved, then one sequence per tag.
+// waits, last polls, record mismatches, resolved, drain timeouts, drains,
+// drain pending, then one sequence per tag.
 // Completion lives in a separate device word written only by the thread's
 // four-byte host-to-device copy, queued behind that request's row copies on
 // the thread's stream, so the word reaches a sequence only after the rows it
@@ -31,6 +36,7 @@
 #include <time.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -46,8 +52,10 @@ namespace expert_doorbell {
 constexpr int kBlockSize = 32;
 constexpr int64_t kHeadOffset = 0;
 constexpr int64_t kAbandonedOffset = 4;
+constexpr int64_t kClaimedOffset = 8;
 constexpr int64_t kPageHeaderBytes = 16;
 constexpr int64_t kRecordHeaderBytes = 16;
+constexpr int64_t kRecordUnservicedOffset = 12;
 
 constexpr int64_t kPosted = 0;
 constexpr int64_t kFallbackCount = 1;
@@ -58,10 +66,14 @@ constexpr int64_t kLastPolls = 5;
 constexpr int64_t kRecordMismatches = 6;
 constexpr int64_t kResolved = 7;
 constexpr int64_t kDrainTimeouts = 8;
-constexpr int64_t kTagBase = 9;
+constexpr int64_t kDrains = 9;
+constexpr int64_t kDrainPending = 10;
+constexpr int64_t kTagBase = 11;
 
 constexpr int64_t kFirstChunkPolls = 256;
 constexpr int64_t kChunkGrowth = 4;
+constexpr int64_t kFirstDrainPolls = 1 << 16;
+constexpr int64_t kDrainGrowth = 64;
 
 constexpr int64_t kPollAcquire = 0;
 constexpr int64_t kPollVolatile = 1;
@@ -126,6 +138,76 @@ __device__ __forceinline__ uint32_t load_completion(const uint32_t* done, int64_
   return load_acquire_device(done);
 }
 
+__device__ __forceinline__ uint32_t load_acquire_system(const uint32_t* address) {
+  uint32_t value;
+  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
+  return value;
+}
+
+__device__ __host__ __forceinline__ bool reached(uint32_t observed, uint32_t seq) {
+  return static_cast<int32_t>(observed - seq) >= 0;
+}
+
+// Polls the completion word for `seq` up to `limit` times, confirms a
+// completed poll with a device-scope acquire, and adds the polls to the
+// last-polls word.
+__device__ __forceinline__ uint32_t poll_completion(
+    const uint32_t* done, uint32_t seq, int64_t limit, int64_t poll_mode, int32_t* state) {
+  int64_t polls = 0;
+  uint32_t observed;
+  for (;;) {
+    observed = load_completion(done, poll_mode);
+    if (reached(observed, seq) || polls >= limit) {
+      break;
+    }
+#if __CUDA_ARCH__ >= 700
+    __nanosleep(64);
+#endif
+    ++polls;
+  }
+  if (poll_mode != kPollAcquire && reached(observed, seq)) {
+    observed = load_acquire_device(done);
+  }
+  state[kLastPolls] += static_cast<int32_t>(polls);
+  return observed;
+}
+
+// The planned row count of `seq`'s record for the fallback launch, or zero
+// with a counted mismatch when a later request overwrote the record.
+__device__ __forceinline__ int64_t planned_fallback(const uint8_t* page, int32_t* state, int64_t record, uint32_t seq) {
+  const auto header = reinterpret_cast<const uint32_t*>(page + record);
+  if (header[0] != seq) {
+    state[kRecordMismatches] += 1;
+    return 0;
+  }
+  return static_cast<int64_t>(header[1]);
+}
+
+// The fallback row count for a published `seq`: its planned count when the
+// thread marked the request unserviced, otherwise zero.
+__device__ __forceinline__ int64_t unserviced_fallback(const uint8_t* page, int32_t* state, int64_t record, uint32_t seq) {
+  const auto unserviced = reinterpret_cast<const uint32_t*>(page + record + kRecordUnservicedOffset);
+  return load_acquire_system(unserviced) == 0 ? 0 : planned_fallback(page, state, record, seq);
+}
+
+// Copies lane `lane`'s stride of the first `count` planned entries of the
+// record into the fallback plan.
+__device__ __forceinline__ void load_fallback_lane(
+    const uint8_t* page,
+    int64_t record,
+    int64_t capacity,
+    int64_t* fallback_rows,
+    int32_t* fallback_slots,
+    int64_t lane,
+    int64_t count) {
+  const auto record_rows = reinterpret_cast<const int64_t*>(page + record + kRecordHeaderBytes);
+  const auto record_slots = reinterpret_cast<const int32_t*>(page + record + kRecordHeaderBytes + 8 * capacity);
+  for (int64_t entry = lane; entry < count; entry += kBlockSize) {
+    fallback_rows[entry] = record_rows[entry];
+    fallback_slots[entry] = record_slots[entry];
+  }
+}
+
 }  // namespace expert_doorbell
 
 // Thread 0 claims the next sequence and fills the record header; every lane
@@ -183,13 +265,15 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
 // growing poll budgets and those copies run between chunks; once a chunk
 // resolves the sequence the remaining chunks return at once. If the final
 // chunk also runs out, it marks the sequence abandoned and the copier
-// degraded, and loads the request's plan back from its record so the
-// fallback launch that follows copies it; otherwise the fallback count stays
-// zero. It then polls for up to `drain_polls` more until the thread publishes
-// the sequence: the thread publishes an abandoned sequence it skips, and
-// publishes a serviced one only behind its row copies, so a copy the thread
-// had already queued lands before the wait returns instead of after a later
-// write to the same slots. A drain that runs out is counted.
+// degraded, then reads the thread's claim. The thread claims a sequence
+// before it reads the abandoned word and queues copies only for a sequence it
+// saw not abandoned, so a sequence still unclaimed is never copied: its plan
+// is loaded back from the record for the fallback launch at once. A claimed
+// sequence may have copies queued, so it is left pending for the drain
+// launches that follow. Every published sequence the thread did not copy is
+// marked unserviced in its record, and a chunk that resolves such a sequence
+// loads its plan for the fallback too; otherwise the fallback count stays
+// zero.
 __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbell_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
@@ -203,7 +287,6 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
     int64_t chunk_degraded_polls,
     int64_t chunk_index,
     int64_t final_chunk,
-    int64_t drain_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   __shared__ int64_t shared_fallback;
@@ -217,63 +300,81 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
       state[kWaits] += 1;
       state[kLastPolls] = 0;
       state[kFallbackCount] = 0;
+      state[kDrainPending] = 0;
     }
     if (static_cast<uint32_t>(state[kResolved]) != seq) {
       const int64_t limit = state[kDegraded] != 0 ? chunk_degraded_polls : chunk_timeout_polls;
-      int64_t polls = 0;
-      uint32_t observed;
-      for (;;) {
-        observed = load_completion(done, poll_mode);
-        if (static_cast<int32_t>(observed - seq) >= 0 || polls >= limit) {
-          break;
-        }
-#if __CUDA_ARCH__ >= 700
-        __nanosleep(64);
-#endif
-        ++polls;
-      }
-      if (poll_mode != kPollAcquire && static_cast<int32_t>(observed - seq) >= 0) {
-        observed = load_acquire_device(done);
-      }
-      state[kLastPolls] += static_cast<int32_t>(polls);
-      if (static_cast<int32_t>(observed - seq) >= 0) {
+      const uint32_t observed = poll_completion(done, seq, limit, poll_mode, state);
+      if (reached(observed, seq)) {
         state[kResolved] = static_cast<int32_t>(seq);
         state[kDegraded] = 0;
+        shared_fallback = unserviced_fallback(page, state, record, seq);
       } else if (final_chunk != 0) {
         state[kDegraded] = 1;
         state[kTimeouts] += 1;
         store_release_system(reinterpret_cast<uint32_t*>(page + kAbandonedOffset), seq);
-        const auto header = reinterpret_cast<const uint32_t*>(page + record);
-        if (header[0] == seq) {
-          shared_fallback = static_cast<int64_t>(header[1]);
+        if (reached(load_acquire_system(reinterpret_cast<const uint32_t*>(page + kClaimedOffset)), seq)) {
+          state[kDrains] += 1;
+          state[kDrainPending] = static_cast<int32_t>(seq);
         } else {
-          state[kRecordMismatches] += 1;
-        }
-        state[kFallbackCount] = static_cast<int32_t>(shared_fallback);
-        int64_t drained = 0;
-        for (;;) {
-          observed = load_acquire_device(done);
-          if (static_cast<int32_t>(observed - seq) >= 0 || drained >= drain_polls) {
-            break;
-          }
-#if __CUDA_ARCH__ >= 700
-          __nanosleep(64);
-#endif
-          ++drained;
-        }
-        if (static_cast<int32_t>(observed - seq) < 0) {
-          state[kDrainTimeouts] += 1;
+          shared_fallback = planned_fallback(page, state, record, seq);
         }
       }
+      state[kFallbackCount] = static_cast<int32_t>(shared_fallback);
     }
   }
   __syncthreads();
-  const auto record_rows = reinterpret_cast<const int64_t*>(page + shared_record + kRecordHeaderBytes);
-  const auto record_slots = reinterpret_cast<const int32_t*>(page + shared_record + kRecordHeaderBytes + 8 * capacity);
-  for (int64_t entry = threadIdx.x; entry < shared_fallback; entry += kBlockSize) {
-    fallback_rows[entry] = record_rows[entry];
-    fallback_slots[entry] = record_slots[entry];
+  load_fallback_lane(page, shared_record, capacity, fallback_rows, fallback_slots, threadIdx.x, shared_fallback);
+}
+
+// One chunk of a drain, which runs only for the sequence the final wait chunk
+// left pending. It polls the completion word until the thread publishes the
+// sequence, which the thread queues behind that request's copies, so copies it
+// had queued land before the wait returns instead of after a later write to
+// the same slots. On a stream the thread created, copies it queues while a
+// chunk runs are held back until that chunk ends, so a drain is a chain of
+// launches with growing budgets; a copy queued during the last, largest chunk
+// on such a stream is only seen once that chunk runs out, which is why serving
+// passes a torch-created stream. A published sequence
+// marked unserviced loads its plan for the fallback launch; a drain whose
+// final chunk runs out is counted and loads the plan as well.
+__global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbell_drain_kernel(
+    uint8_t* __restrict__ page,
+    int32_t* __restrict__ state,
+    const uint32_t* __restrict__ done,
+    int64_t* __restrict__ fallback_rows,
+    int32_t* __restrict__ fallback_slots,
+    int64_t tag,
+    int64_t capacity,
+    int64_t ring,
+    int64_t chunk_polls,
+    int64_t final_chunk,
+    int64_t poll_mode) {
+  using namespace expert_doorbell;
+  __shared__ int64_t shared_fallback;
+  __shared__ int64_t shared_record;
+  if (threadIdx.x == 0) {
+    const uint32_t seq = static_cast<uint32_t>(state[kTagBase + tag]);
+    const int64_t record = record_offset(seq, capacity, ring);
+    shared_record = record;
+    shared_fallback = 0;
+    if (state[kDrainPending] != 0 && static_cast<uint32_t>(state[kDrainPending]) == seq) {
+      const uint32_t observed = poll_completion(done, seq, chunk_polls, poll_mode, state);
+      if (reached(observed, seq)) {
+        state[kDrainPending] = 0;
+        state[kResolved] = static_cast<int32_t>(seq);
+        state[kDegraded] = 0;
+        shared_fallback = unserviced_fallback(page, state, record, seq);
+      } else if (final_chunk != 0) {
+        state[kDrainPending] = 0;
+        state[kDrainTimeouts] += 1;
+        shared_fallback = planned_fallback(page, state, record, seq);
+      }
+      state[kFallbackCount] = static_cast<int32_t>(shared_fallback);
+    }
   }
+  __syncthreads();
+  load_fallback_lane(page, shared_record, capacity, fallback_rows, fallback_slots, threadIdx.x, shared_fallback);
 }
 
 void expert_doorbell_post(
@@ -339,12 +440,35 @@ void expert_doorbell_wait(
         chunk_degraded,
         chunk,
         static_cast<int64_t>(final_chunk),
-        drain_polls,
         poll_mode);
     if (final_chunk) {
       break;
     }
     budget *= kChunkGrowth;
+  }
+  int64_t drain_left = drain_polls;
+  int64_t drain_budget = kFirstDrainPolls;
+  for (;;) {
+    const int64_t chunk_polls = drain_budget < drain_left ? drain_budget : drain_left;
+    drain_left -= chunk_polls;
+    const bool final_chunk = drain_left == 0;
+    host::LaunchKernel(1, kBlockSize, stream)(
+        expert_doorbell_drain_kernel,
+        static_cast<uint8_t*>(page.data_ptr()),
+        static_cast<int32_t*>(state.data_ptr()),
+        static_cast<const uint32_t*>(done.data_ptr()),
+        static_cast<int64_t*>(fallback_rows.data_ptr()),
+        static_cast<int32_t*>(fallback_slots.data_ptr()),
+        tag,
+        capacity,
+        ring,
+        chunk_polls,
+        static_cast<int64_t>(final_chunk),
+        poll_mode);
+    if (final_chunk) {
+      break;
+    }
+    drain_budget *= kDrainGrowth;
   }
   host::LaunchKernel(kExpertTransferGridSize, kExpertTransferBlockSize, stream)(
       copy_expert_row_segments_gpu_kernel,
@@ -438,9 +562,11 @@ inline size_t widest_segment_set(const std::vector<int64_t>& set_offsets) {
 /// into the device completion word. Segments are grouped into sets by
 /// ``set_offsets``: with one set every request copies it, otherwise a request
 /// copies the set its tag names and a tag without a set is an invalid record.
-/// ``late_completions`` counts requests whose copies completed at or before
-/// the latest abandoned sequence, an upper bound on copies that landed after
-/// their waiter fell back. Completion is published
+/// Every request ends in a publish; one the thread did not copy is first
+/// marked unserviced in its record. ``late_completions`` counts serviced
+/// requests at or before the latest abandoned sequence: copies queued before
+/// their waiter timed out, which that waiter's drain waited for unless the
+/// drain ran out (``drain_timeouts``). Completion is published
 /// into the device completion word, so completion becomes visible to the GPU
 /// no earlier than the row copies it covers. Every publish reads its own
 /// pinned word, which is never rewritten while an earlier publish from it is
@@ -516,6 +642,14 @@ class DoorbellThread {
 
   void pause(bool paused) {
     paused_.store(paused);
+  }
+
+  /// Fault injection: sleep `service_delay_ns` after deciding to copy a
+  /// request and before queuing its copies, and report every copy as failed
+  /// without issuing it when `fail_copies` is set.
+  void inject(int64_t service_delay_ns, bool fail_copies) {
+    service_delay_ns_.store(service_delay_ns);
+    fail_copies_.store(fail_copies);
   }
 
   void counters(int64_t* out) const {
@@ -601,39 +735,40 @@ class DoorbellThread {
     counters_[kRunning].store(0);
   }
 
+  /// Service one request. The claim is written before the abandoned word is
+  /// read, and copies are queued only after that read, so a waiter that
+  /// abandons the request and then finds it unclaimed knows no copy of it
+  /// will ever be queued. Every request ends in a publish.
   void service(uint32_t seq, uint32_t head, int64_t seen_ns) {
     TraceEntry entry;
     entry.seq = seq;
     entry.seen_ns = seen_ns;
+    uint8_t* const record = page_ + record_offset(seq, capacity_, ring_);
+    *reinterpret_cast<volatile uint32_t*>(page_ + kClaimedOffset) = seq;
     const uint32_t abandoned = read_host_word(page_ + kAbandonedOffset);
     if (abandoned != 0 && static_cast<int32_t>(seq - abandoned) <= 0) {
-      entry.status = static_cast<int64_t>(RequestStatus::kSkippedAbandoned);
       counters_[kSkippedAbandonedCount].fetch_add(1);
-      publish(seq, entry, false);
+      finish_unserviced(seq, entry, record, RequestStatus::kSkippedAbandoned);
       return;
     }
     if (static_cast<int64_t>(head - seq) >= ring_ - 1) {
-      entry.status = static_cast<int64_t>(RequestStatus::kSkippedOverrun);
       counters_[kSkippedOverrunCount].fetch_add(1);
-      push_trace(entry);
+      finish_unserviced(seq, entry, record, RequestStatus::kSkippedOverrun);
       return;
     }
-    const uint8_t* record = page_ + record_offset(seq, capacity_, ring_);
     const uint32_t count = read_host_word(record + 4);
     const size_t sets = set_offsets_.size() - 1;
     const size_t set = sets == 1 ? 0 : static_cast<size_t>(read_host_word(record + 8));
     if (read_host_word(record) != seq || count > static_cast<uint32_t>(capacity_) || set >= sets) {
-      entry.status = static_cast<int64_t>(RequestStatus::kInvalidRecord);
       counters_[kInvalidRecords].fetch_add(1);
-      push_trace(entry);
+      finish_unserviced(seq, entry, record, RequestStatus::kInvalidRecord);
       return;
     }
     std::memcpy(rows_.data(), record + kRecordHeaderBytes, 8 * count);
     std::memcpy(slots_.data(), record + kRecordHeaderBytes + 8 * capacity_, 4 * count);
     if (read_host_word(record) != seq) {
-      entry.status = static_cast<int64_t>(RequestStatus::kInvalidRecord);
       counters_[kInvalidRecords].fetch_add(1);
-      push_trace(entry);
+      finish_unserviced(seq, entry, record, RequestStatus::kInvalidRecord);
       return;
     }
     entry.count = count;
@@ -665,14 +800,18 @@ class DoorbellThread {
       ++rows_copied;
     }
 
-    const ::cudaError_t copy_status = copies == 0 ? ::cudaSuccess
-                                     : copy_api_ == kPerSegmentCopy ? copy_per_segment(copies)
-                                                                    : copy_batch(copies);
+    const int64_t service_delay_ns = service_delay_ns_.load(std::memory_order_relaxed);
+    if (service_delay_ns > 0) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(service_delay_ns));
+    }
+    const ::cudaError_t copy_status = fail_copies_.load(std::memory_order_relaxed) ? ::cudaErrorUnknown
+                                      : copies == 0                                ? ::cudaSuccess
+                                      : copy_api_ == kPerSegmentCopy               ? copy_per_segment(copies)
+                                                                                   : copy_batch(copies);
     if (copy_status != ::cudaSuccess) {
-      entry.status = static_cast<int64_t>(RequestStatus::kCopyFailed);
       counters_[kCopyErrors].fetch_add(1);
       counters_[kLastCopyError].store(static_cast<int64_t>(copy_status));
-      push_trace(entry);
+      finish_unserviced(seq, entry, record, RequestStatus::kCopyFailed);
       return;
     }
 
@@ -681,6 +820,18 @@ class DoorbellThread {
     counters_[kBytesCopied].fetch_add(entry.bytes);
     counters_[kServiced].fetch_add(1);
     publish(seq, entry, true);
+  }
+
+  /// Mark a request the thread did not copy as unserviced in its record, when
+  /// the record still holds it, then publish it, so a waiter that sees the
+  /// publish copies the request itself. A partial copy queued before a failure
+  /// lands before that publish.
+  void finish_unserviced(uint32_t seq, TraceEntry& entry, uint8_t* record, RequestStatus status) {
+    entry.status = static_cast<int64_t>(status);
+    if (read_host_word(record) == seq) {
+      *reinterpret_cast<volatile uint32_t*>(record + kRecordUnservicedOffset) = 1;
+    }
+    publish(seq, entry, false);
   }
 
   /// Queue the four-byte publish of `seq` into the completion word behind
@@ -796,6 +947,8 @@ class DoorbellThread {
   std::atomic<bool> failed_{false};
   std::atomic<bool> stop_{false};
   std::atomic<bool> paused_{false};
+  std::atomic<int64_t> service_delay_ns_{0};
+  std::atomic<bool> fail_copies_{false};
   std::atomic<int64_t> counters_[kCounterCount];
   std::mutex trace_mutex_;
   std::vector<TraceEntry> trace_;
@@ -887,6 +1040,12 @@ void expert_doorbell_stop(int64_t handle) {
 void expert_doorbell_pause(int64_t handle, int64_t paused) {
   if (auto thread = expert_doorbell::find_thread(handle)) {
     thread->pause(paused != 0);
+  }
+}
+
+void expert_doorbell_inject(int64_t handle, int64_t service_delay_ns, int64_t fail_copies) {
+  if (auto thread = expert_doorbell::find_thread(handle)) {
+    thread->inject(service_delay_ns, fail_copies != 0);
   }
 }
 

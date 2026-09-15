@@ -573,7 +573,7 @@ class TestExpertGraphGather(unittest.TestCase):
         still quiesced stands in for any wait that timed out around a capture: it leaves the
         copier degraded, and resuming must clear that before serving."""
         model = _streamed_model((21,))
-        manager = _manager(model, True, doorbell_drain_polls=40_000)
+        manager = _manager(model, True)
         layer = model.get_submodule("0")
         streamer = layer._nvfp4_expert_streamer
         cache = manager.caches[0]
@@ -632,48 +632,43 @@ class TestExpertGraphGather(unittest.TestCase):
             manager.doorbell.stop()
 
     def test_doorbell_timeout_waits_for_the_copy_the_thread_already_queued(self):
-        """A copy the thread queued before its wait timed out lands before the gather returns.
+        """A copy the thread queued after its wait timed out lands before the gather returns.
 
-        The copier's stream is kept busy so the thread's copy is queued behind that work and the
-        wait times out. Returning at the timeout would let the queued copy land after a later
-        forward's fallback wrote the same scratch rows; the drain makes the completion word reach
-        the request before the gather returns.
+        The thread claims the request, then sleeps before queuing its copies, so the wait times
+        out on a claimed request. Returning at the timeout would let the copy land after a later
+        forward wrote the same scratch rows; the gather instead drains until the copy landed and
+        skips the fallback.
         """
         model = _streamed_model((21,))
         manager = _manager(
-            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=80_000_000
+            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=400_000_000
         )
         layer = model.get_submodule("0")
         streamer = layer._nvfp4_expert_streamer
         copier = manager.doorbell
         resident = sorted(manager.caches[0].resident_experts())
         missing = [e for e in range(EXPERTS) if e not in resident]
-        stall_in = torch.randn((2048, 2048), device="cuda")
-        stall_out = torch.empty_like(stall_in)
         try:
-            torch.cuda.synchronize()
-            with torch.cuda.stream(copier.stream):
-                for _ in range(400):
-                    torch.matmul(stall_in, stall_in, out=stall_out)
+            copier.inject_fault(service_delay_s=1.0)
             ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
-            compact, tensors = streamer.gather(ids)
-            torch.cuda.current_stream().synchronize()
-            returned = copier.stats()
-            self.assertEqual(returned["timeouts"], 1)
-            self.assertEqual(returned["drain_timeouts"], 0)
-            self.assertGreaterEqual(returned["done"], returned["posted"])
             torch.cuda.synchronize()
+            started = time.perf_counter()
+            compact, tensors = streamer.gather(ids)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - started
+            stats = copier.stats()
+            self.assertEqual(stats["timeouts"], 1)
+            self.assertEqual(stats["drains"], 1)
+            self.assertEqual(stats["drain_timeouts"], 0)
+            self.assertEqual(stats["fallback_count"], 0)
+            self.assertGreaterEqual(elapsed, 0.8)
             self._assert_rows(layer, ids, compact, tensors)
-            deadline = time.perf_counter() + 5.0
-            while copier.stats()["late_completions"] == 0 and time.perf_counter() < deadline:
-                time.sleep(0.01)
-            self.assertEqual(copier.stats()["late_completions"], 1)
         finally:
             copier.stop()
 
     def test_doorbell_gather_falls_back_to_correct_rows_when_the_thread_stalls(self):
         model = _streamed_model((21,))
-        manager = _manager(model, True, doorbell_drain_polls=40_000)
+        manager = _manager(model, True)
         layer = model.get_submodule("0")
         streamer = layer._nvfp4_expert_streamer
         copier = manager.doorbell
