@@ -824,6 +824,7 @@ class ExpertHotCacheManager:
         doorbell_timeout_polls: int = 0,
         doorbell_degraded_polls: int = 0,
         doorbell_drain_polls: int = 0,
+        doorbell_plan_capacity: int = 0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1028,6 +1029,7 @@ class ExpertHotCacheManager:
                 doorbell_timeout_polls,
                 doorbell_degraded_polls,
                 doorbell_drain_polls,
+                doorbell_plan_capacity,
             )
             if expert_doorbell
             else None
@@ -1184,22 +1186,35 @@ class ExpertHotCacheManager:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
 
     def _start_doorbell(
-        self, cpu_core: int, timeout_polls: int, degraded_polls: int, drain_polls: int
+        self,
+        cpu_core: int,
+        timeout_polls: int,
+        degraded_polls: int,
+        drain_polls: int,
+        plan_capacity: int = 0,
     ) -> "ExpertDoorbellCopier":
-        """Serve every graph-gather layer's host miss copies through one doorbell thread.
+        """Serve every graph-gather layer's host miss plans through one doorbell thread.
 
-        The thread copies on a torch-created stream (a stream the thread creates
-        itself is held behind CUDA-graph replays, E32) with one batched copy in
-        stream order per request; each layer posts under its own tag, so the
-        thread and the fallback use that layer's segments. A zero wait budget
-        is sized to four times the largest per-layer miss copy at 8 GiB/s, at
-        least 20 ms, and a zero degraded budget to twice that copy, at least
-        4096 polls, taking a poll as 250 ns. A zero drain budget is about 2 s:
-        a timed-out wait whose request the thread had already claimed keeps
-        waiting that long for its queued copies, so they cannot land on a
-        later forward's scratch rows; an unclaimed request falls back at once.
+        Each layer becomes one target-layer tag of a shared ``DoorbellRowBackend``
+        (``expert_row_plan``), posting and resolving its own static-capacity
+        plan; rows the thread does not deliver are copied in-graph as the
+        residual. The thread copies on a torch-created stream (a stream the
+        thread creates itself is held behind CUDA-graph replays, E32) with one
+        batched copy in stream order per request. ``plan_capacity`` 0 uses the
+        scratch rows; a larger capacity is allowed, but plans still count at most
+        the scratch rows. A zero resolve budget is sized to four times the
+        largest per-layer miss copy at 8 GiB/s, at least 20 ms, and a zero
+        degraded budget to twice that copy, at least 4096 polls, taking a poll
+        as 250 ns. A zero drain budget is about 2 s: that long after a timed-out
+        resolve of a request the thread had committed to, the copier is disabled
+        for the rest of the process and the resolve keeps waiting for that
+        request's copies, so none lands on a later forward's scratch rows.
         """
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+        from sglang.srt.layers.moe.expert_row_plan import (
+            DoorbellRowBackend,
+            ExpertRowPlan,
+        )
 
         link_bytes_per_s = 8 * 1024**3
         poll_s = 250e-9
@@ -1216,9 +1231,12 @@ class ExpertHotCacheManager:
         capacities = {streamer.graph_gather_rows for streamer in served}
         if len(capacities) != 1:
             raise ValueError("doorbell layers must share one graph-gather row count")
-        capacity = capacities.pop()
+        scratch_rows = capacities.pop()
+        if plan_capacity < 0:
+            raise ValueError("SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY cannot be negative")
+        capacity = max(plan_capacity, scratch_rows)
         largest_copy_s = (
-            capacity
+            scratch_rows
             * max(streamer.host_bytes_per_expert for streamer in served)
             / link_bytes_per_s
         )
@@ -1239,9 +1257,19 @@ class ExpertHotCacheManager:
             src_access_order="stream",
             stream=torch.cuda.Stream(device),
         )
+        backend = DoorbellRowBackend(
+            copier,
+            {tag: streamer._graph_row_segments for tag, streamer in enumerate(served)},
+        )
         for tag, streamer in enumerate(served):
-            streamer.doorbell = copier
-            streamer.doorbell_tag = tag
+            streamer.row_tag = tag
+            streamer.row_backend = backend
+            if capacity != streamer.row_plan.capacity:
+                cache = streamer.hot_cache
+                streamer.row_plan = ExpertRowPlan.for_scratch(
+                    capacity, cache.capacity, scratch_rows, device
+                )
+        self._doorbell_disabled_logged = False
         spin_cpu = copier.stats()["spin_cpu"]
         if cpu_core >= 0 and spin_cpu != cpu_core:
             logger.warning(
@@ -1255,7 +1283,10 @@ class ExpertHotCacheManager:
             json.dumps(
                 {
                     "layers": len(served),
-                    "capacity_rows": capacity,
+                    "backend": backend.name,
+                    "mode": "current",
+                    "plan_capacity_rows": capacity,
+                    "scratch_rows": scratch_rows,
                     "cpu_core": cpu_core,
                     "timeout_polls": timeout_polls,
                     "degraded_polls": degraded_polls,
@@ -1284,6 +1315,13 @@ class ExpertHotCacheManager:
         if doorbell is None:
             return
         stats = doorbell.stats()
+        if stats.get("disabled") and not getattr(self, "_doorbell_disabled_logged", False):
+            self._doorbell_disabled_logged = True
+            logger.warning(
+                "Expert doorbell disabled after a drain ran out (%d drain timeouts): "
+                "every later miss copy runs in-graph for the rest of the process",
+                stats.get("drain_timeouts", 0),
+            )
         logger.info(
             "Expert doorbell %s",
             json.dumps(
@@ -1291,6 +1329,9 @@ class ExpertHotCacheManager:
                     key: stats.get(key)
                     for key in (
                         "running",
+                        "disabled",
+                        "disabled_posts",
+                        "discarded_disabled",
                         "posted",
                         "waits",
                         "timeouts",

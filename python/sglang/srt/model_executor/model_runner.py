@@ -774,10 +774,25 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_DOORBELL needs a decode CUDA graph batch size of 1"
                 )
-            if self.ps.tp_size > 1 or self.ps.pp_size > 1:
+            if (
+                self.ps.tp_size > 1
+                or self.ps.pp_size > 1
+                or (getattr(self.server_args, "dp_size", 1) or 1) > 1
+            ):
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_DOORBELL runs one spin thread on one CPU core "
-                    "and cannot run with tensor or pipeline parallelism"
+                    "and cannot run with tensor, pipeline or data parallelism"
+                )
+            doorbell_mode = envs.SGLANG_MOE_EXPERT_DOORBELL_MODE.get()
+            if doorbell_mode == "next_layer":
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL_MODE=next_layer is reserved for expert "
+                    "prediction and is not implemented"
+                )
+            if doorbell_mode != "current":
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL_MODE must be 'current' "
+                    f"(got {doorbell_mode!r})"
                 )
         if budget_mb == 0:
             return
@@ -823,6 +838,7 @@ class ModelRunner:
             doorbell_timeout_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS.get(),
             doorbell_degraded_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS.get(),
             doorbell_drain_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS.get(),
+            doorbell_plan_capacity=envs.SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:

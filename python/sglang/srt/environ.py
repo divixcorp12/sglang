@@ -337,9 +337,15 @@ class Envs:
     # per-layer miss copy.
     SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS = EnvInt(0)
     SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS = EnvInt(0)
-    # Polls a timed-out wait keeps waiting for the thread's queued copies
-    # before returning; 0 uses about 2 s.
+    # Polls a timed-out resolve of a request the thread committed to drains
+    # before the doorbell is disabled for good (the resolve then keeps waiting
+    # for that request's copies); 0 uses about 2 s.
     SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS = EnvInt(0)
+    # Which layer a doorbell plan targets: "current" posts and resolves layer
+    # L's misses inside layer L; "next_layer" is reserved for prediction.
+    SGLANG_MOE_EXPERT_DOORBELL_MODE = EnvStr("current")
+    # Static plan capacity per target layer; 0 uses the layer's scratch rows.
+    SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY = EnvInt(0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)

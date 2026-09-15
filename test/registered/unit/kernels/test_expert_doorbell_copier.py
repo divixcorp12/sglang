@@ -91,6 +91,7 @@ def _copier(sources, destinations, capacity=CAPACITY, **kwargs):
     from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
 
     kwargs.setdefault("cpu_core", SPIN_CORE)
+    kwargs.setdefault("stream", torch.cuda.Stream())
     return ExpertDoorbellCopier(expert_row_segments(list(zip(sources, destinations))), capacity, **kwargs)
 
 
@@ -431,13 +432,21 @@ def test_graph_replay_post_compute_wait_follows_changing_plans():
     assert after["record_mismatches"] == 0
 
 
-def test_graph_launch_holds_thread_copies_until_launch_ends():
-    """Characterizes the blocker measured on RTX 5090, driver 610.57, torch 2.13.
+def test_capture_refuses_a_thread_created_stream():
+    """Copies on a stream the thread creates are held behind CUDA-graph replays (E29, E32), so a
+    copier without a caller stream refuses to be captured."""
+    generator = torch.Generator().manual_seed(59)
+    sources = _sources(8, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 8)
+    with _copier(sources, destinations, capacity=4, stream=None) as copier:
+        plan = _plan(4, [1, 2], [3, 4])
+        with pytest.raises(RuntimeError, match="stream=torch.cuda.Stream"):
+            _capture(lambda: copier.post(*plan))
 
-    Host-to-device copies the thread queues while a CUDA graph launch runs do
-    not execute until that launch's GPU work ends, so they cannot overlap the
-    graph's compute; the same post and compute launched eagerly do overlap.
-    """
+
+def test_graph_launch_lets_torch_stream_copies_overlap_compute():
+    """On a torch-created stream the thread's copies overlap a CUDA graph launch's compute, as
+    they do when the same post and compute run eagerly (E32 on RTX 5090, driver 610.57)."""
     generator = torch.Generator().manual_seed(53)
     sources = _sources(128, EXPERT_LIKE_SHAPES, generator)
     destinations = _destinations(sources, 128)
@@ -471,7 +480,7 @@ def test_graph_launch_holds_thread_copies_until_launch_ends():
     graph_copy_ms, graph_compute_ms = measured["graph"]
     eager_copy_ms, eager_compute_ms = measured["eager"]
     assert graph_compute_ms > 2.0 and eager_compute_ms > 2.0, measured
-    assert graph_copy_ms > 0.8 * graph_compute_ms, measured
+    assert graph_copy_ms < 0.5 * graph_compute_ms, measured
     assert eager_copy_ms < 0.5 * eager_compute_ms, measured
 
 
@@ -593,6 +602,7 @@ def test_timed_out_wait_drains_a_claimed_request_until_its_copies_land():
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
         stats = copier.stats()
+        delivered = int(copier.delivered[0].item())
         _assert_matches_reference(sources, destinations, rows, slots)
         _zero(destinations)
         time.sleep(1.5)
@@ -601,7 +611,8 @@ def test_timed_out_wait_drains_a_claimed_request_until_its_copies_land():
     assert stats["timeouts"] == 1
     assert stats["drains"] == 1
     assert stats["drain_timeouts"] == 0
-    assert stats["fallback_count"] == 0
+    assert stats["disabled"] == 0
+    assert delivered == 1
     assert stats["done"] >= stats["posted"]
     assert elapsed >= 0.8
     assert landed_after == [0] * len(destinations)
@@ -625,11 +636,12 @@ def test_timed_out_wait_on_an_unclaimed_request_falls_back_without_draining():
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
         stats = copier.stats()
+        delivered = int(copier.delivered[0].item())
         _assert_matches_reference(sources, destinations, picked_rows, picked_slots)
     assert stats["timeouts"] == 1
     assert stats["drains"] == 0
     assert stats["drain_timeouts"] == 0
-    assert stats["fallback_count"] == 2
+    assert delivered == 0
     assert elapsed < 1.0
 
 
@@ -649,12 +661,13 @@ def test_failed_copy_is_published_unserviced_and_the_wait_falls_back_at_once():
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
         stats = copier.stats()
+        delivered = int(copier.delivered[0].item())
         _assert_matches_reference(sources, destinations, rows, slots)
         trace = copier.trace()
     assert trace[-1]["status"] == "copy_failed"
     assert stats["copy_errors"] == 1
     assert stats["timeouts"] == 0
-    assert stats["fallback_count"] == len(rows)
+    assert delivered == 0
     assert elapsed < 1.0
 
 
@@ -695,6 +708,66 @@ def test_outstanding_requests_for_two_tags_both_copy():
     assert stats["serviced"] == 2
 
 
+def test_resolve_reports_only_its_own_tags_delivery():
+    """With two target-layer tags outstanding, each resolve reports its own tag's request, and a
+    resolve of a tag with nothing posted reports nothing delivered without waiting."""
+    generator = torch.Generator().manual_seed(67)
+    sources = _sources(50, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 40)
+    rows, slots = _pick(generator, 50, 40, 12)
+    with _copier(sources, destinations, capacity=6, max_tags=4, timeout_polls=400_000_000) as copier:
+        copier.pause()
+        copier.post(*_plan(6, rows[:6], slots[:6]), tag=1)
+        copier.post(*_plan(6, rows[6:], slots[6:]), tag=2)
+        empty = copier.resolve(tag=3)
+        torch.cuda.synchronize()
+        empty_flag = int(empty.item())
+        idle = copier.stats()
+        copier.resume()
+        second = copier.resolve(tag=2)
+        torch.cuda.synchronize()
+        second_flag = int(second.item())
+        first_before_resolve = int(copier.delivered[1].item())
+        first = copier.resolve(tag=1)
+        torch.cuda.synchronize()
+        first_flag = int(first.item())
+        stats = copier.stats()
+    _assert_matches_reference(sources, destinations, rows, slots)
+    assert empty_flag == 0
+    assert idle["waits"] == 0 and idle["timeouts"] == 0
+    assert second_flag == 1
+    assert first_before_resolve == 0
+    assert first_flag == 1
+    assert stats["timeouts"] == 0
+    assert stats["serviced"] == 2
+
+
+def test_resolving_an_earlier_tag_does_not_wait_for_a_later_tags_request():
+    """The thread services and publishes requests in order, so resolving tag L returns once L's
+    own request lands even while a later tag's request is still being copied."""
+    generator = torch.Generator().manual_seed(71)
+    sources = _sources(40, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 40)
+    rows, slots = _pick(generator, 40, 40, 8)
+    with _copier(sources, destinations, capacity=4, max_tags=4, timeout_polls=400_000_000) as copier:
+        copier.inject_fault(service_delay_s=0.5)
+        copier.post(*_plan(4, rows[:4], slots[:4]), tag=1)
+        copier.post(*_plan(4, rows[4:], slots[4:]), tag=2)
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        copier.resolve(tag=1)
+        torch.cuda.synchronize()
+        first_s = time.perf_counter() - started
+        copier.resolve(tag=2)
+        torch.cuda.synchronize()
+        both_s = time.perf_counter() - started
+        stats = copier.stats()
+    _assert_matches_reference(sources, destinations, rows, slots)
+    assert stats["serviced"] == 2 and stats["timeouts"] == 0
+    assert first_s < 0.8, first_s
+    assert both_s >= 0.9, both_s
+
+
 def test_stop_drains_posted_requests_and_is_idempotent():
     generator = torch.Generator().manual_seed(41)
     sources = _sources(30, EXPERT_LIKE_SHAPES, generator)
@@ -713,18 +786,28 @@ def test_stop_drains_posted_requests_and_is_idempotent():
             copier.post(*_plan(12, rows, slots))
 
 
-def test_rows_outside_a_segment_are_refused_not_copied():
+def test_a_plan_with_rows_outside_a_segment_is_refused_whole_and_resolves_undelivered():
+    """The thread copies none of a plan that names a row or slot outside a segment and publishes
+    it unserviced, so its resolve reports nothing delivered instead of a partial copy."""
     generator = torch.Generator().manual_seed(43)
     sources = _sources(10, EXPERT_LIKE_SHAPES, generator)
     destinations = _destinations(sources, 10)
-    with _copier(sources, destinations, capacity=3) as copier:
+    _zero(destinations)
+    with _copier(sources, destinations, capacity=3, timeout_polls=400_000_000) as copier:
         copier.post(*_plan(3, [1, 10, 2], [0, 1, 99]))
-        copier.wait()
+        delivered = copier.resolve()
         torch.cuda.synchronize()
         stats = copier.stats()
-    _assert_matches_reference(sources, destinations, [1], [0])
-    assert stats["copy_errors"] == 2
-    assert stats["rows_copied"] == 1
+        delivered_flag = int(delivered.item())
+        status = copier.trace()[-1]["status"]
+    assert [int(destination.view(torch.uint8).count_nonzero()) for destination in destinations] == [0] * len(
+        destinations
+    )
+    assert delivered_flag == 0
+    assert status == "invalid_record"
+    assert stats["copy_errors"] == 1
+    assert stats["rows_copied"] == 0
+    assert stats["timeouts"] == 0
 
 
 def test_rejects_invalid_construction_and_plans():

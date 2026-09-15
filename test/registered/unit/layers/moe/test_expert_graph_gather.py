@@ -532,7 +532,9 @@ class TestExpertGraphGather(unittest.TestCase):
         try:
             self.assertIsNone(plain.doorbell)
             for layer in plain_model.children():
-                self.assertIsNone(layer._nvfp4_expert_streamer.doorbell)
+                self.assertEqual(layer._nvfp4_expert_streamer.row_backend.name, "in_graph")
+            for layer in doorbell_model.children():
+                self.assertEqual(layer._nvfp4_expert_streamer.row_backend.name, "doorbell")
             generator = torch.Generator().manual_seed(5)
             no_miss_steps = 0
             steps = 0
@@ -660,11 +662,284 @@ class TestExpertGraphGather(unittest.TestCase):
             self.assertEqual(stats["timeouts"], 1)
             self.assertEqual(stats["drains"], 1)
             self.assertEqual(stats["drain_timeouts"], 0)
-            self.assertEqual(stats["fallback_count"], 0)
+            self.assertEqual(int(copier.delivered[0].item()), 1)
             self.assertGreaterEqual(elapsed, 0.8)
             self._assert_rows(layer, ids, compact, tensors)
         finally:
             copier.stop()
+
+    def test_doorbell_disables_after_a_drain_runs_out_and_no_late_copy_lands(self):
+        """A drain that runs out disables the copier for good and keeps waiting for the request
+        the thread committed to, so its late copy lands before the gather returns. Later
+        forwards post nothing, serve their different plans into the same scratch rows in-graph,
+        and those rows stay exact after the delayed copy would have landed."""
+        model = _streamed_model((21,))
+        manager = _manager(
+            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=70_000
+        )
+        layer = model.get_submodule("0")
+        streamer = layer._nvfp4_expert_streamer
+        copier = manager.doorbell
+        resident = sorted(manager.caches[0].resident_experts())
+        missing = [e for e in range(EXPERTS) if e not in resident]
+        try:
+            copier.inject_fault(service_delay_s=1.0)
+            ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            compact, tensors = streamer.gather(ids)
+            torch.cuda.synchronize()
+            first_s = time.perf_counter() - started
+            self._assert_rows(layer, ids, compact, tensors)
+            disabled = copier.stats()
+            copier.inject_fault()
+            later_routes = (
+                missing[::-1][:TOP_K],
+                [missing[1], missing[0], missing[3], missing[2]],
+            )
+            for routes in later_routes:
+                ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
+                compact, tensors = streamer.gather(ids)
+                torch.cuda.synchronize()
+                self._assert_rows(layer, ids, compact, tensors)
+            time.sleep(1.5)
+            torch.cuda.synchronize()
+            self._assert_rows(layer, ids, compact, tensors)
+            after = copier.stats()
+            self.assertEqual(disabled["disabled"], 1)
+            self.assertEqual(disabled["drain_timeouts"], 1)
+            self.assertEqual(after["posted"], disabled["posted"])
+            self.assertEqual(after["disabled_posts"], len(later_routes))
+            self.assertGreaterEqual(first_s, 0.8)
+        finally:
+            copier.stop()
+
+    def _host_scratch_rows(self, cache):
+        return {
+            name: cache.tensors[name][cache.capacity :].view(torch.uint8).cpu()
+            for name in NVFP4_STREAM_TENSORS[:4]
+        }
+
+    def _assert_host_rows(self, layer, ids, compact, tensors):
+        for name in NVFP4_STREAM_TENSORS[:4]:
+            self.assertTrue(
+                torch.equal(
+                    tensors[name][compact.long()].view(torch.uint8).cpu(),
+                    _source_bytes(layer, name, ids),
+                ),
+                name,
+            )
+
+    def test_planner_filters_residents_dedupes_and_clamps_by_priority(self):
+        from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan, ExpertRowPlanner
+
+        layer = _layer()
+        streamer, cache = self._graph_streamer(layer)
+        planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+        plan = ExpertRowPlan.for_scratch(6, cache.capacity, TOP_K, cache.device)
+        cases = (
+            (torch.tensor([0, 2, 3, 5, 7], dtype=torch.int64), None, [0, 2, 3, 5]),
+            (
+                torch.tensor([7, -1, 2, 2, 1], dtype=torch.int64),
+                torch.tensor([0.1, 9.0, 0.5, 0.9, 5.0]),
+                [2, 7],
+            ),
+            (
+                torch.tensor([False, True, False, True, False, False, True, True]),
+                torch.tensor([0.0, 9.0, 0.0, 0.2, 0.0, 0.0, 9.0, 0.7]),
+                [7, 3],
+            ),
+        )
+        for candidates, priority, expected in cases:
+            planner.plan_candidates(
+                candidates.cuda(), plan, None if priority is None else priority.cuda()
+            )
+            count = int(plan.count.item())
+            self.assertEqual(plan.expert_ids[:count].tolist(), expected)
+        self.assertEqual(
+            plan.slots[:TOP_K].tolist(),
+            [cache.capacity + row for row in range(TOP_K)],
+        )
+
+    def test_same_plan_through_both_backends_writes_identical_rows_and_masks(self):
+        from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+        from sglang.srt.layers.moe.expert_row_plan import (
+            DoorbellRowBackend,
+            ExpertRowPlan,
+            ExpertRowPlanner,
+            InGraphRowBackend,
+        )
+
+        layers = (_layer(seed=41), _layer(seed=41))
+        built = [self._graph_streamer(layer) for layer in layers]
+        for _, cache in built:
+            for tensor in cache.tensors.values():
+                tensor[cache.capacity :].view(torch.uint8).zero_()
+        copier = ExpertDoorbellCopier(
+            built[1][0]._graph_row_segments,
+            TOP_K,
+            cpu_core=DOORBELL_SPIN_CORE,
+            stream=torch.cuda.Stream(),
+        )
+        backends = (
+            InGraphRowBackend({0: built[0][0]._graph_row_segments}),
+            DoorbellRowBackend(copier, {0: built[1][0]._graph_row_segments}),
+        )
+        planners = [
+            ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+            for _, cache in built
+        ]
+        plans = [
+            ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+            for _, cache in built
+        ]
+        try:
+            for candidates in ([0, 2, 3, 5], [7, 5], [], [2, 0, 7, 3]):
+                masks = []
+                for backend, planner, plan in zip(backends, planners, plans):
+                    planner.plan_candidates(
+                        torch.tensor(candidates, dtype=torch.int64, device="cuda"), plan
+                    )
+                    backend.post(0, plan)
+                    delivery = backend.resolve(0, plan)
+                    backend.copy_residual(0, delivery)
+                    masks.append(delivery.mask())
+                torch.cuda.synchronize()
+                self.assertEqual(masks[0].tolist(), masks[1].tolist(), candidates)
+                self.assertEqual(sum(masks[0].tolist()), len(candidates))
+                for name, rows in self._host_scratch_rows(built[0][1]).items():
+                    self.assertTrue(
+                        torch.equal(rows, self._host_scratch_rows(built[1][1])[name]),
+                        f"{name} candidates={candidates}",
+                    )
+                for row, expert in enumerate(candidates):
+                    for name in NVFP4_STREAM_TENSORS[:4]:
+                        self.assertTrue(
+                            torch.equal(
+                                built[0][1].tensors[name][built[0][1].capacity + row]
+                                .view(torch.uint8)
+                                .cpu(),
+                                _source_bytes(layers[0], name, torch.tensor([expert]))[0],
+                            )
+                        )
+            self.assertEqual(copier.stats()["timeouts"], 0)
+        finally:
+            copier.stop()
+
+    def test_residual_after_a_partly_wrong_plan_serves_actual_routes_byte_exact(self):
+        """A plan that predicted some routed experts and some unrouted ones: routes to delivered
+        experts read their scratch rows, the other misses are the residual copied in-graph into
+        rows no needed delivered expert occupies, through either backend."""
+        from sglang.kernels.ops.moe.expert_cache_transfer import (
+            copy_expert_row_segments_gpu,
+        )
+        from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+        from sglang.srt.layers.moe.expert_row_plan import (
+            DoorbellRowBackend,
+            ExpertRowPlan,
+            ExpertRowPlanner,
+            InGraphRowBackend,
+            plan_residual_routes,
+        )
+
+        for kind in ("in_graph", "doorbell"):
+            layer = _layer(seed=33)
+            streamer, cache = self._graph_streamer(layer)
+            segments = streamer._graph_row_segments
+            copier = None
+            if kind == "doorbell":
+                copier = ExpertDoorbellCopier(
+                    segments, TOP_K, cpu_core=DOORBELL_SPIN_CORE, stream=torch.cuda.Stream()
+                )
+                backend = DoorbellRowBackend(copier, {0: segments})
+            else:
+                backend = InGraphRowBackend({0: segments})
+            planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+            plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+            residual = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+            try:
+                for predicted, routes in (
+                    ([0, 2, 5], [2, 3, 6, 7]),
+                    ([7, 3], [3, 7, 0, 2]),
+                    ([5, 0, 2, 3], [1, 4, 6, 1]),
+                    ([], [0, 2, 3, 5]),
+                ):
+                    planner.plan_candidates(
+                        torch.tensor(predicted, dtype=torch.int64, device="cuda"), plan
+                    )
+                    backend.post(0, plan)
+                    delivery = backend.resolve(0, plan)
+                    backend.copy_residual(0, delivery)
+                    ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
+                    remap = plan_residual_routes(
+                        ids.reshape(-1).long(),
+                        cache.expert_to_slot,
+                        cache.capacity,
+                        delivery,
+                        residual,
+                    )
+                    copy_expert_row_segments_gpu(
+                        segments, residual.expert_ids, residual.slots, residual.count
+                    )
+                    torch.cuda.synchronize()
+                    expected_residual = len(
+                        {e for e in routes if e not in (1, 4, 6) and e not in predicted}
+                    )
+                    self.assertEqual(int(residual.count.item()), expected_residual)
+                    self._assert_host_rows(
+                        layer, ids, remap.reshape(ids.shape), cache.tensors
+                    )
+            finally:
+                if copier is not None:
+                    copier.stop()
+
+    def test_planner_and_in_graph_backend_replay_in_a_cuda_graph(self):
+        from sglang.srt.layers.moe.expert_row_plan import (
+            ExpertRowPlan,
+            ExpertRowPlanner,
+            InGraphRowBackend,
+        )
+
+        layer = _layer(seed=55)
+        streamer, cache = self._graph_streamer(layer)
+        planner = ExpertRowPlanner(cache.expert_to_slot, cache.capacity, TOP_K)
+        plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+        backend = InGraphRowBackend({0: streamer._graph_row_segments})
+        candidates = torch.full((6,), -1, dtype=torch.int64, device="cuda")
+        priority = torch.zeros(6, dtype=torch.float32, device="cuda")
+
+        def body():
+            planner.plan_candidates(candidates, plan, priority)
+            backend.post(0, plan)
+            backend.resolve(0, plan)
+
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            body()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            body()
+        for ids, scores, expected in (
+            ([0, 2, 3, 5, 7, -1], [0.0, 1.0, 2.0, 3.0, 4.0, 0.0], [7, 5, 3, 2]),
+            ([1, 0, 4, -1, -1, -1], [9.0, 1.0, 9.0, 0.0, 0.0, 0.0], [0]),
+            ([3, 3, 7, 2, -1, -1], [0.1, 0.9, 0.2, 0.5, 0.0, 0.0], [3, 2, 7]),
+        ):
+            candidates.copy_(torch.tensor(ids, dtype=torch.int64))
+            priority.copy_(torch.tensor(scores))
+            graph.replay()
+            torch.cuda.synchronize()
+            count = int(plan.count.item())
+            self.assertEqual(plan.expert_ids[:count].tolist(), expected)
+            for row, expert in enumerate(expected):
+                for name in NVFP4_STREAM_TENSORS[:4]:
+                    self.assertTrue(
+                        torch.equal(
+                            cache.tensors[name][cache.capacity + row].view(torch.uint8).cpu(),
+                            _source_bytes(layer, name, torch.tensor([expert]))[0],
+                        ),
+                        f"{name} ids={ids}",
+                    )
 
     def test_doorbell_gather_falls_back_to_correct_rows_when_the_thread_stalls(self):
         model = _streamed_model((21,))

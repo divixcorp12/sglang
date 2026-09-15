@@ -3,13 +3,14 @@
 Inside a CUDA graph, ``ExpertDoorbellCopier.post`` launches a kernel that
 writes a copy plan into a pinned request page and bumps its sequence last. A
 C++ thread spinning on that sequence copies the planned pinned rows to their
-device slots with one batched copy on its own CUDA stream, then queues a
-four-byte publish of the sequence into a device completion word.
-``ExpertDoorbellCopier.wait`` launches a chain of short kernels that block
-until that word reaches the request's sequence, or after ``timeout_polls``
-polls in total fall back to the in-graph copy of the same plan, or, when the
-thread had already claimed the request, drain until its copies land. Neither
-call synchronizes the host or breaks the graph.
+device slots with one batched copy on a CUDA stream, then queues an eight-byte
+publish of ``{sequence, unserviced}`` into device completion words.
+``ExpertDoorbellCopier.resolve`` launches a chain of short kernels that block
+until those words reach the tag's request and set the tag's device delivered
+flag, or give up after ``timeout_polls`` and report nothing delivered; when
+the thread had already committed to the request they drain until its copies
+land. ``wait`` is ``resolve`` followed by the in-graph copy of whatever was
+not delivered. None of these calls synchronizes the host or breaks the graph.
 """
 
 from __future__ import annotations
@@ -25,14 +26,15 @@ from sglang.kernels.jit.utils import load_jit
 from sglang.kernels.ops.moe.expert_cache_transfer import (
     ExpertRowSegments,
     _validate_plan,
+    copy_expert_row_segments_gpu,
 )
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_PAGE_HEADER_BYTES = 16
+_ABANDONED_BASE = 16
 _RECORD_HEADER_BYTES = 16
-_TAG_BASE = 11
+_TAG_BASE = 12
 _PUBLISH_RING = 1024
 _TRACE_ROWS = 4096
 _POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
@@ -41,7 +43,7 @@ _COPY_APIS = {"batch": 0, "per_segment": 1}
 _SRC_ACCESS_ORDERS = {"stream": 1, "during_call": 2, "any": 3}
 _STATE_WORDS = {
     "posted": 0,
-    "fallback_count": 1,
+    "disabled": 1,
     "degraded": 2,
     "timeouts": 3,
     "waits": 4,
@@ -51,6 +53,7 @@ _STATE_WORDS = {
     "drain_timeouts": 8,
     "drains": 9,
     "drain_pending": 10,
+    "disabled_posts": 11,
 }
 _COUNTERS = (
     "serviced",
@@ -69,9 +72,9 @@ _COUNTERS = (
     "src_access_order",
     "external_stream",
     "late_completions",
+    "discarded_disabled",
 )
 _RESET_AFTER_CAPTURE = (
-    "fallback_count",
     "degraded",
     "timeouts",
     "waits",
@@ -88,6 +91,7 @@ _STATUSES = (
     "skipped_overrun",
     "invalid_record",
     "copy_failed",
+    "discarded_disabled",
 )
 _TRACE_FIELDS = (
     "seq",
@@ -105,7 +109,7 @@ _TRACE_FIELDS = (
 def _jit_expert_doorbell_module() -> Module:
     names = (
         "expert_doorbell_post",
-        "expert_doorbell_wait",
+        "expert_doorbell_resolve",
         "expert_doorbell_start",
         "expert_doorbell_stop",
         "expert_doorbell_pause",
@@ -124,13 +128,22 @@ def _record_bytes(capacity: int) -> int:
     return (_RECORD_HEADER_BYTES + 12 * capacity + 7) // 8 * 8
 
 
+def _header_bytes(max_tags: int) -> int:
+    return (_ABANDONED_BASE + 4 * max_tags + 7) // 8 * 8
+
+
+def _capturing() -> bool:
+    return torch.cuda.graphs.is_current_stream_capturing()
+
+
 class ExpertDoorbellCopier:
     """Copies planned expert rows through a CPU thread without a host sync.
 
-    ``post`` and ``wait`` only launch kernels, so both can be captured in a
-    CUDA graph and replayed with plans and counts that change between replays.
-    Each ``tag`` names one outstanding request, e.g. the MoE layer the rows are
-    for; ``wait(tag)`` waits for the latest ``post`` with that tag.
+    ``post``, ``resolve`` and ``wait`` only launch kernels, so they can be
+    captured in a CUDA graph and replayed with plans and counts that change
+    between replays. Each ``tag`` names one outstanding request, e.g. the
+    target MoE layer of its rows; ``resolve(tag)`` resolves the latest ``post``
+    with that tag, independently of requests outstanding for other tags.
 
     ``head_store`` selects how the poster publishes the sequence to the host:
     ``"release"`` (a system-scope release store) or ``"volatile"`` (a volatile
@@ -139,41 +152,42 @@ class ExpertDoorbellCopier:
     ``copy_api`` selects how the thread issues row copies: ``"batch"`` (one
     ``cudaMemcpyBatchAsync`` per request, every copy with ``src_access_order``
     ``"stream"``, ``"during_call"`` or ``"any"``) or ``"per_segment"`` (one
-    ``cudaMemcpyAsync`` per segment row, stream order only). ``stream`` is a
-    ``torch.cuda.Stream`` the thread copies on instead of a stream it creates
-    itself; the copier keeps a reference to it. ``stats()`` reports the
+    ``cudaMemcpyAsync`` per segment row, stream order only). ``stream`` is the
+    ``torch.cuda.Stream`` the thread copies on; the copier keeps a reference to
+    it. Without one the thread creates its own stream, whose copies CUDA-graph
+    replays hold back (E32), so ``post`` and ``resolve`` refuse to be captured
+    in a graph then; that mode exists for probes. ``stats()`` reports the
     configured values and ``last_copy_error``, the CUDA status of the latest
     failed copy call.
 
     ``segments`` is one ``ExpertRowSegments`` copied by every request, or a
     sequence of them, one per tag: a request copies its tag's set and ``wait``
-    falls back through that set, so one thread serves layers whose rows live in
-    different tensors.
+    copies its residual through that set, so one thread serves layers whose
+    rows live in different tensors.
 
     Invariants the caller must uphold:
 
     * A destination slot named by a posted request must not be read by any
-      kernel launched before that request's ``wait`` returns, and must not be
-      written by anyone else until then. The thread writes slots on its own
-      stream at any time between ``post`` and completion.
-    * A timed-out ``wait`` whose request the thread had not claimed falls
-      back at once: the thread claims a request before it checks whether the
-      waiter abandoned it, so an unclaimed request is never copied. A claimed
-      request is drained for up to ``drain_polls`` until the thread publishes
-      it, behind any copies it queued, so those copies land before the wait
-      returns (``drains`` counts these). A request the thread did not copy is
-      published marked unserviced, and its wait falls back.
-    * ``drain_timeouts`` counts drains that ran out and fell back. The
-      thread may still be finishing that request's queued copies; they write
-      the same source rows into the same slots the fallback wrote, so such a
-      slot must not be reassigned to a different row until the thread has
-      caught up (``stats()["last_seen"]`` at or past that request and nothing
-      pending).
+      kernel launched before that request's ``resolve`` returns, and must not
+      be written by anyone else until then. The thread writes slots on its
+      own stream at any time between ``post`` and completion.
+    * The plan tensors passed to ``post`` must not change until that tag's
+      ``wait`` launched, since ``wait`` copies the undelivered plan from them.
+    * A resolve that times out on a request the thread has not committed to
+      reports it undelivered at once: the thread commits (writes its claim)
+      before it checks whether the request was abandoned, and copies only
+      after that check. A committed request is drained until its copies land
+      (``drains``). A drain that runs out of ``drain_polls`` disables the
+      copier for good (``disabled``, ``drain_timeouts``) and keeps waiting
+      for that committed request's copies, so no copy ever lands after its
+      resolve returned; once disabled every later ``post`` posts nothing
+      (``disabled_posts``) and the thread discards what it had not committed
+      to (``discarded_disabled``).
     * Source rows must stay allocated, registered and unchanged while any
       request naming them is outstanding.
     * At most ``ring - 1`` requests may be posted between a ``post`` and its
-      ``wait``; older records are overwritten and a timed-out wait on an
-      overwritten record copies nothing (counted in ``record_mismatches``).
+      ``resolve``; an older record is overwritten and its request reports
+      undelivered (counted in ``record_mismatches``).
     """
 
     def __init__(
@@ -238,17 +252,20 @@ class ExpertDoorbellCopier:
         self.poll_mode = _POLL_MODES[poll_mode]
         self.head_store = _HEAD_STORES[head_store]
         self.device = device
+        self.header_bytes = _header_bytes(max_tags)
         self.page = torch.zeros(
-            _PAGE_HEADER_BYTES + ring * _record_bytes(capacity),
+            self.header_bytes + ring * _record_bytes(capacity),
             dtype=torch.uint8,
             pin_memory=True,
         )
         self.state = torch.zeros(_TAG_BASE + max_tags, dtype=torch.int32, device=device)
-        self.done = torch.zeros(1, dtype=torch.int32, device=device)
-        self.fallback_rows = torch.zeros(capacity, dtype=torch.int64, device=device)
-        self.fallback_slots = torch.zeros(capacity, dtype=torch.int32, device=device)
+        self.delivered = torch.zeros(max_tags, dtype=torch.int32, device=device)
+        self.done = torch.zeros(2, dtype=torch.int32, device=device)
+        self._undelivered = torch.zeros((max_tags, 1), dtype=torch.int32, device=device)
+        self._one = torch.ones(1, dtype=torch.int32, device=device)
+        self._posted_plans: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.publish_words = torch.zeros(
-            _PUBLISH_RING, dtype=torch.int32, pin_memory=True
+            2 * _PUBLISH_RING, dtype=torch.int32, pin_memory=True
         )
         self.segment_table = torch.tensor(
             [
@@ -278,6 +295,8 @@ class ExpertDoorbellCopier:
             self.publish_words,
             capacity,
             ring,
+            self.header_bytes,
+            max_tags,
             device.index if device.index is not None else torch.cuda.current_device(),
             cpu_core,
             int(prefer_overlap),
@@ -293,6 +312,13 @@ class ExpertDoorbellCopier:
         if not 0 <= tag < self.max_tags:
             raise ValueError(f"tag must be in [0, {self.max_tags}).")
 
+    def _check_capture(self) -> None:
+        if self.stream is None and _capturing():
+            raise RuntimeError(
+                "expert doorbell copies on a thread-created stream are held behind "
+                "CUDA-graph replays; pass stream=torch.cuda.Stream() to capture them."
+            )
+
     def post(
         self,
         source_rows: torch.Tensor,
@@ -304,38 +330,69 @@ class ExpertDoorbellCopier:
         if self._stopped:
             raise RuntimeError("expert doorbell thread is stopped.")
         self._check_tag(tag)
+        self._check_capture()
         _validate_plan(self.device, source_rows, destination_slots, count)
         if source_rows.numel() != self.capacity:
             raise ValueError("plan tensors must match the copier capacity.")
+        self._posted_plans[tag] = (source_rows, destination_slots, count)
         self._module.expert_doorbell_post(
             self.page,
             self.state,
+            self.delivered,
             source_rows,
             destination_slots,
             count,
             tag,
             self.capacity,
             self.ring,
+            self.header_bytes,
             self.head_store,
         )
 
-    def wait(self, tag: int = 0) -> None:
-        """Launch the kernels that wait for ``tag``'s request or copy it in-graph."""
+    def resolve(self, tag: int = 0) -> torch.Tensor:
+        """Launch the kernels that resolve ``tag``'s request.
+
+        Returns the tag's int32 delivered flag, a one-element device view that
+        holds 1 once the resolve launched if the thread copied the whole plan,
+        and 0 if it copied none of it.
+        """
         self._check_tag(tag)
-        self._module.expert_doorbell_wait(
+        self._check_capture()
+        self._module.expert_doorbell_resolve(
             self.page,
             self.state,
+            self.delivered,
             self.done,
-            self.fallback_rows,
-            self.fallback_slots,
-            self.segment_sets[tag if len(self.segment_sets) > 1 else 0].table,
             tag,
             self.capacity,
             self.ring,
+            self.header_bytes,
             self.timeout_polls,
             self.degraded_polls,
             self.drain_polls,
             self.poll_mode,
+        )
+        return self.delivered[tag : tag + 1]
+
+    def undelivered_count(self, tag: int, count: torch.Tensor) -> torch.Tensor:
+        """The planned row count still to copy after ``resolve(tag)``: ``count`` or 0."""
+        buffer = self._undelivered[tag]
+        torch.sub(self._one, self.delivered[tag : tag + 1], out=buffer)
+        torch.mul(buffer, count, out=buffer)
+        return buffer
+
+    def wait(self, tag: int = 0) -> None:
+        """Resolve ``tag``'s request, then copy in-graph whatever was not delivered."""
+        self._check_tag(tag)
+        if tag not in self._posted_plans:
+            raise RuntimeError(f"no request was posted for tag {tag}.")
+        source_rows, destination_slots, count = self._posted_plans[tag]
+        self.resolve(tag)
+        copy_expert_row_segments_gpu(
+            self.segment_sets[tag if len(self.segment_sets) > 1 else 0],
+            source_rows,
+            destination_slots,
+            self.undelivered_count(tag, count),
         )
 
     def pause(self) -> None:
@@ -346,25 +403,26 @@ class ExpertDoorbellCopier:
         self._module.expert_doorbell_pause(self._handle, 0)
 
     def inject_fault(self, service_delay_s: float = 0.0, fail_copies: bool = False) -> None:
-        """Make the thread sleep ``service_delay_s`` before queuing each request's copies,
-        or report every copy as failed without issuing it; the defaults clear both."""
+        """Make the thread sleep ``service_delay_s`` after committing to each request and
+        before queuing its copies, or report every copy as failed without issuing it; the
+        defaults clear both."""
         self._module.expert_doorbell_inject(
             self._handle, int(service_delay_s * 1e9), int(fail_copies)
         )
 
     def reset_wait_state(self) -> None:
-        """Zero the wait counters and the degraded flag, keeping sequences.
+        """Zero the resolve counters and the degraded flag, keeping sequences and ``disabled``.
 
-        Waits captured while the thread is quiesced time out and leave the
+        Resolves captured while the thread is quiesced time out and leave the
         copier degraded; call this before resuming so serving starts with full
-        wait budgets and counters that only count serving waits.
+        budgets and counters that only count serving resolves.
         """
         torch.cuda.synchronize(self.device)
         for name in _RESET_AFTER_CAPTURE:
             self.state[_STATE_WORDS[name]] = 0
 
     def quiesce(self, timeout_s: float = 10.0) -> None:
-        """Pause the thread once every request posted so far is serviced and its copies completed.
+        """Pause the thread once every request posted so far is published.
 
         Synchronizes the device. Use it before capturing a CUDA graph so the
         thread issues no copies while the capture runs, and ``resume`` after.
@@ -398,7 +456,7 @@ class ExpertDoorbellCopier:
         stats = dict(zip(_COUNTERS, counters.tolist())) if found else {"running": 0}
         state = self.state.cpu().tolist()
         stats.update({name: state[index] for name, index in _STATE_WORDS.items()})
-        stats["done"] = int(self.done.item())
+        stats["done"] = int(self.done[0].item())
         return stats
 
     def trace(self) -> list[dict[str, int | str]]:
