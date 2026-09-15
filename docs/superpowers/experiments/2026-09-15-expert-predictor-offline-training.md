@@ -186,6 +186,15 @@ peak combined GPU memory was ~24 GB with GPU utilization pinned near
 | shifted_test / prefill | 16 | **0.772** | 0.030 | 0.306 |
 | shifted_test / prefill | 32 | **0.888** | 0.059 | 0.436 |
 
+`same_expert` compares source layer L's own selected IDs directly against
+layer L+1's native labels (`metrics.same_expert_baseline_candidates` on
+`topk_ids` from `load_layer_rows(..., layer_id=source_layer, ...)`, scored
+against `next_topk_ids`). Expert IDs carry no cross-layer identity, so this
+is expected to sit at chance -- 10/512 = 0.0195 at budget 10 -- and the
+observed 0.019-0.021 confirms it. Read it as a **chance-level reference**,
+not a meaningful competitor; `popularity` (the real per-layer baseline) is
+the one worth comparing LLaPor against.
+
 LLaPor beats both baselines by a wide margin at every budget/phase, on both
 dev and the shifted-domain test set (FinanceBench, unseen document domain).
 Full budgets 10/12/16/24/32 are in `evaluate_report.json`.
