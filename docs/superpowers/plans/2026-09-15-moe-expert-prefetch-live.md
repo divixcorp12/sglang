@@ -86,7 +86,7 @@
 | Window from copy(L) end to copy(L+1) start | 0.267 ms before a linear-attention layer, 0.290 ms before a full-attention layer (p50) | E28 |
 | In-graph miss copy | 0.2239 ms/row + 0.006 ms (11.5 GiB/s) | E28 |
 | Doorbell copy on a torch-created stream | ≈0.209 ms/row (0.628 ms for 3 rows, 12.4 GiB/s) | E32 |
-| Doorbell post → thread sees the request | 29–75 µs | E29/E32 |
+| Doorbell post → thread sees the request | Below what the bench resolves; price as ≈0, with 0.03 ms as sensitivity. The 29–75 µs "reaction" is an artifact: it compares Python noticing a CUDA event against the thread's timestamp, and E32 read negative. The busy-spin thread (`expert_doorbell.cuh` 792–813) sees a head change within ~1 µs. The trusted figure is end to end: doorbell in graph beats the in-graph kernel by 4–7% at 1–10 rows. | E29/E32, experiment log ~1574 |
 | Doorbell waiting on an already-landed request | 15–22 µs | E29 |
 | Misses per layer per token | mean 2.72, p90 6 at 4,957 slots; production now has 4,180 slots, so expect more | E28 |
 | Idea-2 ceiling (perfect recall, free prediction) | ≈10 ms/token (+15%) | E28 |
@@ -101,13 +101,13 @@ These findings go to crypto-c9 with the Task 3 and Task 7 reports. Phase B picks
 
 - **LLaPor (target L+1, source L's router features).**
   - Candidates for L+1 are ready after TopK(L), inside layer L, before L's gather in launch order.
-  - **Gap window** (a copy that starts after L's own miss copy): E28's 0.267/0.290 ms. That fits `floor(0.267 / 0.2299) = 1` in-graph row. The doorbell (29–75 µs reaction + 0.209 ms/row) also lands about 1 row without a wait.
+  - **Gap window** (a copy that starts after L's own miss copy): E28's 0.267/0.290 ms. That fits `floor(0.267 / 0.2299) = 1` in-graph row. The doorbell (reaction ≈0 + 0.209 ms/row) also lands about 1 row without a wait.
   - **Overlap window** (a copy that starts before L's miss copy): gap + L's copy time ≈ 0.267 + 0.006 + 2.72 × 0.2239 ≈ 0.88 ms, about 3 rows. It is valid only if two concurrent copy launches don't slow each other. E27 measured copy vs compute only; Task 7 measures copy vs copy.
 - **APEX (target L, source L's pre-mixer).**
   - **Metric:** the success metric is demand-loading wait saved, not whether a whole row lands before the router. A copy that starts at the pre-mixer hook and finishes after routing still saves its head start, provided the demand path joins it instead of restarting it.
-  - **Window:** launch-order time from L's pre-mixer hook to L's own miss copy, i.e. norm + mixer + shared expert + router + planning. It is ≈ 0.267 − 0.06 ≈ 0.21 ms (linear) and 0.23 ms (full): E28's gap minus ~0.06 ms of L−1's MoE kernels. The DMA head start is shorter: minus the doorbell reaction (29–75 µs) and minus the scorer's own GPU time (unmeasured until Task 7).
+  - **Window:** launch-order time from L's pre-mixer hook to L's own miss copy, i.e. norm + mixer + shared expert + router + planning. It is ≈ 0.267 − 0.06 ≈ 0.21 ms (linear) and 0.23 ms (full): E28's gap minus ~0.06 ms of L−1's MoE kernels. The DMA head start is shorter by the scorer's own GPU time, unmeasured until Task 7. The doorbell reaction is negligible, since the old 29–75 µs figure is a bench artifact (see the timing table).
   - **Join semantics (checked in `cc/doorbell-serving` 19c3ac656e, `expert_doorbell.py`):** once the thread commits a request, `resolve` drains it until its copies land, so progress is kept. Delivery is **all-or-nothing** per tag: resolve waits for every posted row, including mispredicted ones.
-  - **Consequence:** wait after routing = `max(0, reaction + n_posted·0.209 + 0.007 − window)`. At 30 µs reaction the wait is ≈0.06 ms at B=1, ≈0.27 ms at B=2 and ≈0.48 ms at B=3, so break-even is ≈0.26, 1.2 and 2.1 hits. Ideal per-layer bound at B=1 with a perfect hit is ≈0.16 ms, ≈8 ms/token over 48 layers.
+  - **Consequence:** wait after routing = `max(0, reaction + n_posted·0.209 + 0.007 − window)`. With reaction ≈0 and the linear window (0.207 ms), the wait including the 0.02 ms completed-wait cost is ≈0.03 ms at B=1, ≈0.24 ms at B=2 and ≈0.45 ms at B=3. Break-even is ≈0.13, 1.1 and 2.0 hits. The ideal per-layer bound at B=1 with a perfect hit is ≈0.19 ms, ≈9 ms/token over 48 layers, before scorer cost.
   - **Compared with LLaPor:** APEX's window is only ≈0.06 ms shorter than LLaPor's gap window. LLaPor is clearly ahead only if the overlap window (≈0.88 ms) holds, which needs Task 7.
   - **Decision:** APEX is not ruled out on timing. Task 3 prices it with an oracle bound, scorer cost and both delivery variants (see the Task 3 amendment). It goes live only if it clears the gate and crypto-c9's layer supports a same-layer post at the pre-mixer hook. Its scorer is built (Task 2) and runs in shadow (Task 6).
 
@@ -1104,6 +1104,7 @@ Run on divix01: `CUDA_VISIBLE_DEVICES="" /data/models/slang/.venv/bin/python scr
   - `prefix` (hypothetical copier change) lands rows in priority order and waits only through the deepest offered rank that is an actual miss: `max(0, reaction + (deepest_hit_rank+1)·0.209 + 0.007 − window)`. A row with no hits waits only `DOORBELL_COMPLETED_WAIT_MS`.
   - Price both.
 - **Splits:** by mixer kind (linear vs full attention) and by `forward.kind` (prefill vs decode).
+- **Reaction:** `--reaction-ms` defaults to `0,0.03`. The old 29–75 µs is a bench artifact, so the gate uses r0.0.
 - **Tests:** CPU unit tests for the oracle posted-count path and the prefix wait.
 
 ```python
@@ -1158,7 +1159,7 @@ def main():
     parser.add_argument("--model-config", type=Path, required=True)
     parser.add_argument("--predictor", choices=("llapor", "apex"), required=True)
     parser.add_argument("--budgets", default="1,2,3,4,6,8,10,16,32")
-    parser.add_argument("--reaction-ms", default="0.03,0.075")
+    parser.add_argument("--reaction-ms", default="0,0.03")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     header = json.loads((args.capture_dir / "capture.json").read_text())
@@ -1254,7 +1255,7 @@ Write `docs/superpowers/experiments/2026-09-15-expert-prefetch-offline-gate.md` 
 - **Per-mixer-kind means.**
 - **Parity output** from Step 5.
 - **A decision under these rules** (all on `shifted_test`, budget ≤ 10). The decision is whether Phase B is worth running, and which budget to give crypto-c9:
-  - **GO:** `side_saving_ms_per_token_gap` ≥ 3.0 or `saving_ms_per_token_r0.075` ≥ 3.0 for some budget. Record each argmax budget.
+  - **GO:** `side_saving_ms_per_token_gap` ≥ 3.0 or `saving_ms_per_token_r0.0` ≥ 3.0 for some budget, with r0.03 reported as sensitivity (the measured reaction is a bench artifact). Record each argmax budget.
   - **Conditional GO:** only `side_saving_ms_per_token_overlap` reaches 3.0. Phase B then depends on Task 7 showing that concurrent copies do not slow each other.
   - **NO-GO:** none of the above. Report to the user before Task 4. Tasks 4–7 still run only if the user says so; the shadow run still measures scoring cost.
   - **Gate metric:** saved demand wait in ms/token *after* scorer cost, not whether rows land inside the window. Don't write "doesn't fit" as a verdict. For each GO, state which arm (predictor or oracle), delivery variant, scorer cost and budget clears 3.0.
