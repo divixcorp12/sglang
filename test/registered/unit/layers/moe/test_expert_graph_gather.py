@@ -653,7 +653,7 @@ class TestExpertGraphGather(unittest.TestCase):
         try:
             torch.cuda.synchronize()
             with torch.cuda.stream(copier.stream):
-                for _ in range(40):
+                for _ in range(400):
                     torch.matmul(stall_in, stall_in, out=stall_out)
             ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
             compact, tensors = streamer.gather(ids)
