@@ -1572,6 +1572,45 @@ Host controls, same run: an idle 3-row copy takes 0.627 ms. A torch side-stream 
 - Eager post → copy complete matches E29 (0.667 / 2.139 / 6.276 ms).
 - The bench's "reaction" column is negative here: the Python event spin observes the GPU post after the thread already has. It isn't meaningful and isn't reported.
 
+### E32c: the two controls skipped in E32b (13:20:56–13:23:46, driver `cc-doorbell/e32c.sh`, tmux `cc-doorbell-e32c`, `696b8cc96b`)
+
+All runs under `run.sh` / `cc-gpu.lock`, EXIT 0, byte-exact, flipped byte caught, 0 copy errors. Results `cc-doorbell/results/e32c_*.jsonl`, logs `cc-doorbell/logs/e32c_*.log`.
+
+**(i) Own-stream baseline probe (batch, own stream, `stream`), 30 rows, `--timeout-polls 200000`** (`e32c_base_r30_p200k`):
+
+| Case | Timeouts / token (of 48) | Done after layer, p50 | Token p50 | Serviced |
+|---|---:|---:|---:|---:|
+| doorbell_layers | 48 | 519.4 ms | 1045.1 ms | 960 |
+| compute_graphs_eager_post | 45 (43–45) | 886.9 ms | 1061.9 ms | 960 |
+
+- Still held with a budget that covers the 6.05 ms copy, matching the 20000-poll run (521 ms / 1049 ms).
+- Caveat: after a wait's first timeout the waiter drops to degraded ~1 ms budgets (`degraded_polls` 4096) until a wait succeeds, so the 200000-poll budget only governs the first wait. The 519 ms done-after-layer time is what proves the hold. The torch-stream arms never time out, so the caveat doesn't touch them.
+
+**(ii) `bench_doorbell.py`, 1,024 production-sized rows, 40 iterations + 5 warmup, `--timeout-polls 200000`, `prefer_overlap` on, p50 per replay in graph.**
+
+Torch stream, (b) (`e32c_bench_torch_p200k`):
+
+| Rows | In-graph kernel (GiB/s) | Doorbell in graph | Thread copy (GiB/s) | Timeouts (of 45) | Eager post → done |
+|---:|---|---:|---:|---:|---:|
+| 1 | 0.245 ms (10.5) | 0.239 ms | 0.219 ms (11.8) | 0 | 0.254 ms |
+| 3 | 0.702 ms (11.0) | 0.662 ms | 0.633 ms (12.2) | 0 | 0.694 ms |
+| 10 | 2.275 ms (11.3) | 2.109 ms | 2.074 ms (12.4) | 0 | 2.147 ms |
+| 30 | 6.758 ms (11.4) | **6.241 ms** | 6.204 ms (12.45) | **0** | 6.298 ms |
+
+Own stream (`e32c_bench_own_p200k`):
+
+| Rows | In-graph kernel (GiB/s) | Doorbell in graph | Thread copy (GiB/s) | Timeouts (of 45) | Eager post → done |
+|---:|---|---:|---:|---:|---:|
+| 1 | 0.242 ms (10.6) | 1.301 ms | 1.495 ms (1.72) | 45 | 0.247 ms |
+| 3 | 0.698 ms (11.1) | 1.752 ms | 2.355 ms (3.28) | 45 | 0.664 ms |
+| 10 | 2.273 ms (11.3) | 3.333 ms | 5.318 ms (4.84) | 45 | 2.142 ms |
+| 30 | 6.757 ms (11.4) | 7.819 ms | 13.815 ms (5.59) | 45 | 6.287 ms |
+
+- On a torch stream the in-graph doorbell beats the in-graph kernel at every size: −2.4% / −5.7% / −7.3% / −7.7% at 1 / 3 / 10 / 30 rows, and 30 rows completes without fallback.
+- On its own stream it is held in graph at every size: the thread copy stretches to cover the replay, and the ~1 ms in-graph overhead is the degraded wait plus fallback, matching E29. Eager copies are unaffected on both streams; waiting on an already-completed request takes 16–21 µs.
+- The link-rate edge at 30 rows (≈8%) matches the figure used in the step-2 estimate, so the ≈2.4 ms/token estimate stands.
+- Production: SIGTERM to pid 787756 at 13:20:22, GPU free 13:20:43, no other session's job on the GPU before or during; relaunched unchanged at 13:24:13 (tmux `cc-nvfp4-prod-e32c`, run `run-20260915-132413`): health 200 at 13:28:05, 4,180 slots, 0 OOM, 24,694 MiB at idle. Down 7 min 43 s.
+
 ### Production during E32
 
 - The trainers of session `sglang-nvfp4-ef` held the GPU 12:16–12:47:53, outside `cc-gpu.lock`.
@@ -1591,10 +1630,8 @@ Host controls, same run: an idle 3-row copy takes 0.627 ms. A torch side-stream 
   - With `--timeout-polls 20000` (≈5 ms) the 6.05 ms copy timed out every wait.
   - With 200000 polls: 0/48 timeouts, requests land 6.3–6.4 ms after their layer, token 339–345 ms, byte-exact.
   - (c) stays held at 30 rows (584 ms). The success criterion of NVFP4_DOORBELL_COPIER.md §6 step 1 is met at both 3 and 30 rows.
-- **Link rate is kept.** On a torch stream the thread copies at 11.9–12.4 GiB/s, and the in-graph doorbell beats the in-graph kernel by 4–7% at 1–10 rows.
-- **Not run (lead's call: keep production up):**
-  - (i) Baseline at 30 rows with `--timeout-polls 200000`. The 20000-poll baseline lands 521 ms after the layer, far past either budget, so it is held regardless, but that control is informal.
-  - (ii) `bench_doorbell.py` at 30 rows with a 200000-poll budget. At the default budget the 30-row doorbell falls back.
+- **Link rate is kept.** On a torch stream the thread copies at 11.8–12.45 GiB/s, and the in-graph doorbell beats the in-graph kernel at every size: by 2.4–7.7% at 1–30 rows (E32c).
+- **Controls completed in E32c:** the own-stream baseline stays held at 30 rows with a 200000-poll budget (519 ms after the layer against a 6.05 ms copy), and the torch-stream bench completes at 30 rows with 0 timeouts.
 - **Serving caveat:** `timeout_polls` must cover the largest expected copy. The default in `ExpertDoorbellCopier` is 2,000,000 polls; the probe and bench used 20000.
 - **Next (§6 step 2):** re-price against the in-graph kernel for overlap. The go threshold is ≥3 ms/token.
   - Rough E28-based estimate: 2.72 misses/layer × 0.224 ms/row ≈ 0.61 ms of copy per layer. The doorbell's link-rate edge (12.4 vs 11.4 GiB/s, ≈8%) saves ≈0.05 ms/layer, ≈2.4 ms/token over 48 layers.
