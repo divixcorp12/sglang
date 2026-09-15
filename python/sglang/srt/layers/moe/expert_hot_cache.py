@@ -7,19 +7,25 @@ import logging
 import math
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
     SparseNextLayerPolicy,
 )
-from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
+from sglang.srt.layers.moe.expert_residency import (
+    ExpertResidencyPolicy,
+    advance_residency_policies,
+    decide_residency_policies,
+)
 from sglang.srt.layers.moe.expert_residency_clock import (
     ForwardKind,
     ResidencyBoundaryClock,
@@ -28,10 +34,14 @@ from sglang.srt.layers.moe.expert_residency_clock import (
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
 
 from sglang.srt.layers.moe.expert_transfer import (
+    NVFP4_TRANSFER_TENSOR_COUNT,
     AsyncExpertTransferExecutor,
     ExpertCopySubmission,
+    ExpertRowCopyRequest,
+    ExpertRowCopyRoutes,
+    ExpertTransferTicket,
     FixedRowTransferPlan,
-    submit_expert_row_copies,
+    submit_expert_row_copy_batch,
 )
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -147,6 +157,32 @@ class ExpertHotCache:
             else None
         )
         self.last_copy_submission: ExpertCopySubmission | None = None
+        self.promotion_in_flight: HotCachePromotion | None = None
+        self._copy_routes: dict[tuple, ExpertRowCopyRoutes] = {}
+        self._slot_batch_depth = 0
+        self._slots_dirty = False
+        self._slot_upload_recorded = False
+        if capacity:
+            self._slot_upload_host = torch.zeros(
+                (3, capacity), dtype=torch.int64
+            ).pin_memory()
+            self._slot_upload_rows = self._slot_upload_host.numpy()
+            self._slot_upload_device = torch.zeros(
+                (3, capacity), dtype=torch.int64, device=self.device
+            )
+            self._slot_upload_event = torch.cuda.Event()
+            self._slot_ids = torch.arange(
+                capacity, dtype=torch.long, device=self.device
+            )
+            self._slot_dump_targets = np.arange(
+                streamer.num_experts, streamer.num_experts + capacity, dtype=np.int64
+            )
+            self._mapping_scratch = torch.full(
+                (streamer.num_experts + capacity,),
+                -1,
+                dtype=torch.long,
+                device=self.device,
+            )
 
     @staticmethod
     def capacity_for_budget(streamer: ExpertStreamer, budget_bytes: int) -> int:
@@ -156,21 +192,68 @@ class ExpertHotCache:
             raise ValueError("hot cache byte budget cannot be negative")
         return min(streamer.num_experts, budget_bytes // streamer.bytes_per_expert)
 
-    def _publish_mapping(self) -> None:
-        mapping = [-1] * self.streamer.num_experts
-        for slot, expert_id in enumerate(self.slot_to_expert):
-            if self.slot_states[slot] is HotCacheSlotState.READY:
-                mapping[expert_id] = slot
-        self.expert_to_slot.copy_(
-            torch.tensor(mapping, dtype=torch.long, device=self.device)
+    def _publish_slots(self) -> None:
+        """Push host slot states, generations and the expert-to-slot mapping to the device.
+
+        The host lists are authoritative. One non-blocking copy of a pinned
+        ``[3, capacity]`` buffer carries each slot's state, generation and
+        mapping target: its expert when READY, otherwise a dump index past the
+        experts unique to the slot. The mapping is rebuilt on the device with
+        ``index_copy_`` and copied into ``expert_to_slot`` in place. The pinned
+        buffer is rewritten only after its previous upload has run.
+        """
+        self._slots_dirty = False
+        if getattr(self, "device_residency", None) is not None:
+            raise RuntimeError("hot cache slots are owned by the GPU residency update")
+        if not self.capacity:
+            return
+        if self._slot_upload_recorded:
+            self._slot_upload_event.synchronize()
+        rows = self._slot_upload_rows
+        rows[0] = self.slot_states
+        rows[1] = self._slot_generations
+        ready = rows[0] == int(HotCacheSlotState.READY)
+        rows[2] = np.where(
+            ready, np.asarray(self.slot_to_expert, dtype=np.int64), self._slot_dump_targets
         )
+        upload = self._slot_upload_device
+        upload.copy_(self._slot_upload_host, non_blocking=True)
+        self._slot_upload_event.record(torch.cuda.current_stream(self.device))
+        self._slot_upload_recorded = True
+        self.slot_state.copy_(upload[0])
+        self.slot_generations.copy_(upload[1])
+        self._mapping_scratch.fill_(-1)
+        self._mapping_scratch.index_copy_(0, upload[2], self._slot_ids)
+        self.expert_to_slot.copy_(self._mapping_scratch[: self.streamer.num_experts])
+
+    def wait_for_slot_publication(self) -> None:
+        """Block the host until the last slot publication has run on the device."""
+        if self._slot_upload_recorded:
+            self._slot_upload_event.synchronize()
+
+    @contextmanager
+    def _slot_batch(self, publish: bool = True) -> Iterator[None]:
+        """Collect lifecycle changes and publish them once as the outermost batch exits.
+
+        ``publish=False`` leaves the collected changes for an explicit
+        :meth:`_publish_slots`, including when the batch exits by an exception.
+        """
+        self._slot_batch_depth += 1
+        try:
+            yield
+        finally:
+            self._slot_batch_depth -= 1
+            if publish and not self._slot_batch_depth and self._slots_dirty:
+                self._publish_slots()
 
     def _set_slot_state(self, slot: int, state: HotCacheSlotState) -> None:
         self.slot_states[slot] = state
-        self.slot_state[slot] = int(state)
+        self._slots_dirty = True
 
     def resident_experts(self) -> frozenset[int]:
         """Return only mappings that are ready for a gather consumer."""
+        if getattr(self, "device_residency", None) is not None:
+            raise RuntimeError("hot cache slots are owned by the GPU residency update")
         return frozenset(
             expert
             for expert, state in zip(self.slot_to_expert, self.slot_states)
@@ -200,6 +283,12 @@ class ExpertHotCache:
         A READY victim can only be reused when the caller confirms its last
         consumer has completed.
         """
+        with self._slot_batch():
+            return self._reserve(placements, consumer_complete)
+
+    def _reserve(
+        self, placements: Sequence[tuple[int, int]], consumer_complete: bool
+    ) -> tuple[HotCacheSlotTicket, ...]:
         assignments = tuple((index(expert), index(slot)) for expert, slot in placements)
         if len({expert for expert, _ in assignments}) != len(assignments):
             raise ValueError("hot cache expert IDs must be unique")
@@ -239,7 +328,6 @@ class ExpertHotCache:
         for expert, slot in assignments:
             generation = self._slot_generations[slot] + 1
             self._slot_generations[slot] = generation
-            self.slot_generations[slot] = generation
             self.slot_to_expert[slot] = expert
             self._set_slot_state(slot, HotCacheSlotState.RESERVED)
             tickets.append(HotCacheSlotTicket(slot, expert, generation))
@@ -249,15 +337,16 @@ class ExpertHotCache:
         """Mark a valid reservation as loading; reject stale tickets."""
         if not self._ticket_matches(ticket, HotCacheSlotState.RESERVED):
             return False
-        self._set_slot_state(ticket.slot, HotCacheSlotState.LOADING)
+        with self._slot_batch():
+            self._set_slot_state(ticket.slot, HotCacheSlotState.LOADING)
         return True
 
     def publish_ready(self, ticket: HotCacheSlotTicket) -> bool:
         """Publish a fully copied six-tensor slot after its ticket completes."""
         if not self._ticket_matches(ticket, HotCacheSlotState.LOADING):
             return False
-        self._set_slot_state(ticket.slot, HotCacheSlotState.READY)
-        self._publish_mapping()
+        with self._slot_batch():
+            self._set_slot_state(ticket.slot, HotCacheSlotState.READY)
         return True
 
     def cancel(self, ticket: HotCacheSlotTicket) -> bool:
@@ -266,8 +355,9 @@ class ExpertHotCache:
             ticket, HotCacheSlotState.RESERVED, HotCacheSlotState.LOADING
         ):
             return False
-        self.slot_to_expert[ticket.slot] = -1
-        self._set_slot_state(ticket.slot, HotCacheSlotState.FREE)
+        with self._slot_batch():
+            self.slot_to_expert[ticket.slot] = -1
+            self._set_slot_state(ticket.slot, HotCacheSlotState.FREE)
         return True
 
     def ticket_for_slot(self, slot: int) -> HotCacheSlotTicket:
@@ -287,9 +377,9 @@ class ExpertHotCache:
             ticket, HotCacheSlotState.READY
         ):
             return False
-        self.slot_to_expert[ticket.slot] = -1
-        self._set_slot_state(ticket.slot, HotCacheSlotState.FREE)
-        self._publish_mapping()
+        with self._slot_batch():
+            self.slot_to_expert[ticket.slot] = -1
+            self._set_slot_state(ticket.slot, HotCacheSlotState.FREE)
         return True
 
     def _load_reserved(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
@@ -297,7 +387,7 @@ class ExpertHotCache:
         if not tickets:
             return
         assert self._transfer_executor is not None
-        if len(self.streamer.tensor_names) != 6:
+        if len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT:
             for ticket in tickets:
                 if not self.begin_loading(ticket):
                     raise RuntimeError("hot cache reservation became stale")
@@ -312,70 +402,133 @@ class ExpertHotCache:
                 if not self.publish_ready(ticket):
                     raise RuntimeError("hot cache completion ticket became stale")
             return
-        assert self._transfer_plan is not None
-        expert_rows = [ticket.expert_id for ticket in tickets]
-        destination_slots = [ticket.slot for ticket in tickets]
-        sources = {
-            name: _tensor_data(getattr(self.streamer.layer, name))
-            for name in self.streamer.tensor_names
-        }
-        source_rows = expert_rows
-        secondary_source_rows = None
-        use_secondary_source_rows = [False] * len(self.streamer.tensor_names)
-        pinned_cache = self.streamer.pinned_host_cache
-        if pinned_cache is not None and pinned_cache.cached_names:
-            pinned_cache.ensure_rows(torch.tensor(expert_rows, device=self.device))
-            cached_rows = [
-                pinned_cache._expert_to_slot.get(expert_id, -1)
-                for expert_id in expert_rows
-            ]
-            if all(slot >= 0 for slot in cached_rows):
-                secondary_source_rows = cached_rows
-                for position, name in enumerate(self.streamer.tensor_names):
-                    if name in pinned_cache.tensors:
-                        sources[name] = pinned_cache.tensors[name]
-                        use_secondary_source_rows[position] = True
-        self._transfer_plan.set_rows(
-            source_rows,
-            destination_slots,
-            [ticket.generation for ticket in tickets],
+        promotion = self._prepare_promotion(tickets)
+        current_stream = torch.cuda.current_stream(self.device)
+        ticket = submit_hot_cache_promotions([promotion], producer_stream=current_stream)
+        self._transfer_executor.wait(ticket, current_stream)
+        self.complete_promotion(promotion)
+        self.wait_for_slot_publication()
+
+    def _copy_routes_for(
+        self, sources: Mapping[str, torch.Tensor], use_secondary: Sequence[bool]
+    ) -> ExpertRowCopyRoutes:
+        """Routes validated once per backend, secondary selection and source storage."""
+        key = (
+            self.copy_backend,
+            tuple(use_secondary),
+            tuple(
+                (source.data_ptr(), source.dtype, tuple(source.shape), source.device)
+                for source in sources.values()
+            ),
         )
-        if secondary_source_rows is not None:
-            self._transfer_plan.secondary_source_rows.zero_()
-            self._transfer_plan.secondary_source_rows[: len(secondary_source_rows)].copy_(
-                torch.as_tensor(
-                    secondary_source_rows,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-            )
-        try:
-            if not all(self.begin_loading(ticket) for ticket in tickets):
-                raise RuntimeError("hot cache reservation became stale")
-            submission = submit_expert_row_copies(
-                self._transfer_executor,
-                self._transfer_plan,
+        routes = self._copy_routes.get(key)
+        if routes is None:
+            routes = ExpertRowCopyRoutes(
                 [(sources[name], self.tensors[name]) for name in self.streamer.tensor_names],
                 backend=self.copy_backend,
-                source_rows_cpu=source_rows,
-                destination_slots_cpu=destination_slots,
-                secondary_source_rows_cpu=secondary_source_rows,
-                use_secondary_source_rows=use_secondary_source_rows,
-                producer_stream=torch.cuda.current_stream(self.device),
+                use_secondary_source_rows=use_secondary,
             )
-            self._transfer_executor.wait(
-                submission.ticket, torch.cuda.current_stream(self.device)
+            if len(self._copy_routes) >= 4:
+                self._copy_routes.clear()
+            self._copy_routes[key] = routes
+        return routes
+
+    def _prepare_promotion(
+        self, tickets: Sequence[HotCacheSlotTicket]
+    ) -> HotCachePromotion:
+        """Stage reserved tickets' rows in the transfer plan and mark them loading.
+
+        Nothing is copied and nothing is published. On failure every ticket is
+        cancelled.
+        """
+        assert self._transfer_plan is not None
+        try:
+            expert_rows = [ticket.expert_id for ticket in tickets]
+            destination_slots = [ticket.slot for ticket in tickets]
+            sources = {
+                name: _tensor_data(getattr(self.streamer.layer, name))
+                for name in self.streamer.tensor_names
+            }
+            secondary_source_rows = None
+            use_secondary_source_rows = [False] * len(self.streamer.tensor_names)
+            pinned_cache = self.streamer.pinned_host_cache
+            if pinned_cache is not None and pinned_cache.cached_names:
+                pinned_cache.ensure_rows(torch.tensor(expert_rows, device=self.device))
+                cached_rows = [
+                    pinned_cache._expert_to_slot.get(expert_id, -1)
+                    for expert_id in expert_rows
+                ]
+                if all(slot >= 0 for slot in cached_rows):
+                    secondary_source_rows = cached_rows
+                    for position, name in enumerate(self.streamer.tensor_names):
+                        if name in pinned_cache.tensors:
+                            sources[name] = pinned_cache.tensors[name]
+                            use_secondary_source_rows[position] = True
+            self._transfer_plan.set_rows(
+                expert_rows,
+                destination_slots,
+                [ticket.generation for ticket in tickets],
+                secondary_source_rows=secondary_source_rows,
             )
-            if not all(self.publish_ready(ticket) for ticket in tickets):
-                raise RuntimeError("hot cache completion ticket became stale")
-            self.last_copy_submission = submission
-        except Exception:
+            routes = self._copy_routes_for(sources, use_secondary_source_rows)
+            with self._slot_batch(publish=False):
+                if not all(self.begin_loading(ticket) for ticket in tickets):
+                    raise RuntimeError("hot cache reservation became stale")
+        except BaseException:
+            self._cancel_tickets(tickets)
+            raise
+        promotion = HotCachePromotion(
+            self,
+            tuple(tickets),
+            routes,
+            expert_rows,
+            destination_slots,
+            secondary_source_rows,
+        )
+        self.promotion_in_flight = promotion
+        return promotion
+
+    def _cancel_tickets(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
+        with self._slot_batch():
             for ticket in tickets:
                 self.cancel(ticket)
+
+    def abort_promotion(self, promotion: HotCachePromotion) -> None:
+        """Cancel a promotion whose copies were never submitted and publish the slots."""
+        if self.promotion_in_flight is promotion:
+            self.promotion_in_flight = None
+        self._cancel_tickets(promotion.tickets)
+
+    def complete_promotion(self, promotion: HotCachePromotion) -> None:
+        """Publish a promotion's slots after its copies completed, in one device push.
+
+        A promotion completes at most once: completing one that is not in
+        flight raises instead of publishing its tickets again.
+        """
+        if self.promotion_in_flight is not promotion:
+            raise RuntimeError("hot cache promotion is not in flight")
+        self.promotion_in_flight = None
+        try:
+            with self._slot_batch():
+                if not all(self.publish_ready(ticket) for ticket in promotion.tickets):
+                    raise RuntimeError("hot cache completion ticket became stale")
+        except BaseException:
+            self._cancel_tickets(promotion.tickets)
             raise
 
-    def reassign(self, expert_ids: Sequence[int]) -> HotCacheUpdateStats:
-        """Synchronously replace slots through the generation-safe lifecycle."""
+    def stage_reassign(
+        self, expert_ids: Sequence[int], *, publish: bool
+    ) -> tuple[HotCacheUpdateStats, HotCachePromotion | None]:
+        """Retire evicted slots and reserve promoted ones without copying rows.
+
+        Returns the update's statistics and, when rows must be copied, the
+        staged promotion to submit with :func:`submit_hot_cache_promotions`
+        and finish with :meth:`complete_promotion`. With ``publish`` the
+        retired and loading slots reach the device before this returns, as a
+        caller must require when gathers may run before the copies complete;
+        otherwise they reach it with the completed promotion. An update with
+        nothing to copy is always published.
+        """
         desired = [index(expert_id) for expert_id in expert_ids]
         if len(desired) > self.capacity:
             raise ValueError("expert selection exceeds hot cache capacity")
@@ -386,6 +539,8 @@ class ExpertHotCache:
             for expert_id in desired
         ):
             raise ValueError("hot cache expert ID is outside the expert range")
+        if self.promotion_in_flight is not None:
+            raise RuntimeError("hot cache promotion is still in flight")
         wanted = set(desired)
         existing = {
             expert
@@ -395,22 +550,51 @@ class ExpertHotCache:
         promoted = [expert_id for expert_id in desired if expert_id not in existing]
         evicted = existing - wanted
         if not promoted and not evicted:
-            return HotCacheUpdateStats(0, 0, 0)
-        for slot, expert_id in enumerate(self.slot_to_expert):
-            if expert_id in evicted:
-                self.retire(self.ticket_for_slot(slot), consumer_complete=True)
-        free_slots = [
-            slot
-            for slot, state in enumerate(self.slot_states)
-            if state is HotCacheSlotState.FREE
-        ]
-        if len(free_slots) < len(promoted):
-            raise RuntimeError("hot cache has no free slots for reassignment")
-        tickets = self.reserve(tuple(zip(promoted, free_slots)), consumer_complete=True)
-        self._load_reserved(tickets)
-        return HotCacheUpdateStats(
-            len(promoted), len(evicted), len(promoted) * self.bytes_per_expert
+            return HotCacheUpdateStats(0, 0, 0), None
+        promotion = None
+        try:
+            with self._slot_batch(publish=False):
+                for slot, expert_id in enumerate(self.slot_to_expert):
+                    if expert_id in evicted:
+                        self.retire(self.ticket_for_slot(slot), consumer_complete=True)
+                free_slots = [
+                    slot
+                    for slot, state in enumerate(self.slot_states)
+                    if state is HotCacheSlotState.FREE
+                ]
+                if len(free_slots) < len(promoted):
+                    raise RuntimeError("hot cache has no free slots for reassignment")
+                tickets = self.reserve(
+                    tuple(zip(promoted, free_slots)), consumer_complete=True
+                )
+                if len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT:
+                    self._load_reserved(tickets)
+                elif tickets:
+                    promotion = self._prepare_promotion(tickets)
+        except BaseException:
+            self._publish_slots()
+            raise
+        if promotion is None or publish:
+            self._publish_slots()
+        return (
+            HotCacheUpdateStats(
+                len(promoted), len(evicted), len(promoted) * self.bytes_per_expert
+            ),
+            promotion,
         )
+
+    def reassign(self, expert_ids: Sequence[int]) -> HotCacheUpdateStats:
+        """Synchronously replace slots through the generation-safe lifecycle."""
+        stats, promotion = self.stage_reassign(expert_ids, publish=False)
+        if promotion is not None:
+            current_stream = torch.cuda.current_stream(self.device)
+            ticket = submit_hot_cache_promotions(
+                [promotion], producer_stream=current_stream
+            )
+            self._transfer_executor.wait(ticket, current_stream)
+            self.complete_promotion(promotion)
+        self.wait_for_slot_publication()
+        return stats
 
     def prefetch_destinations(
         self, candidates: Sequence[int], protected_slots: Sequence[int]
@@ -486,6 +670,61 @@ class ExpertHotCache:
             self.slot_state.data_ptr(),
             self.slot_generations.data_ptr(),
         )
+
+
+@dataclass(eq=False)
+class HotCachePromotion:
+    """One cache's reserved slots whose rows are staged but not yet published."""
+
+    cache: ExpertHotCache
+    tickets: tuple[HotCacheSlotTicket, ...]
+    routes: ExpertRowCopyRoutes
+    source_rows: list[int]
+    destination_slots: list[int]
+    secondary_source_rows: list[int] | None
+    submission: ExpertCopySubmission | None = None
+
+
+def submit_hot_cache_promotions(
+    promotions: Sequence[HotCachePromotion], *, producer_stream
+) -> ExpertTransferTicket:
+    """Submit staged promotions' row copies behind one transfer ticket.
+
+    The copies wait for ``producer_stream``, so device work queued before this
+    call (slot publication, plan uploads, a forward still running) precedes
+    them. Each cache's ``last_copy_submission`` reports its own rows. If the
+    submission fails, every promotion is cancelled and published.
+    """
+    promotions = tuple(promotions)
+    executor = promotions[0].cache._transfer_executor
+    try:
+        if any(
+            promotion.cache._transfer_executor is not executor
+            for promotion in promotions
+        ):
+            raise ValueError("hot cache promotions must share one transfer executor")
+        submissions = submit_expert_row_copy_batch(
+            executor,
+            [
+                ExpertRowCopyRequest(
+                    promotion.routes,
+                    promotion.cache._transfer_plan,
+                    promotion.source_rows,
+                    promotion.destination_slots,
+                    promotion.secondary_source_rows,
+                )
+                for promotion in promotions
+            ],
+            producer_stream=producer_stream,
+        )
+    except BaseException:
+        for promotion in promotions:
+            promotion.cache.abort_promotion(promotion)
+        raise
+    for promotion, submission in zip(promotions, submissions):
+        promotion.submission = submission
+        promotion.cache.last_copy_submission = submission
+    return submissions[0].ticket
 
 
 def normalize_expert_frequency_seed(data: Mapping[str, Any]) -> torch.Tensor:
@@ -577,8 +816,16 @@ class ExpertHotCacheManager:
         decay_tokens: int = 0,
         promotion_sigmas: float = 0.0,
         graph_gather_max_rows: int = 0,
+        async_promotions: bool = False,
+        gpu_residency_update: bool = False,
+        gpu_residency_max_promotions: int = 64,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
+
+        ``async_promotions`` returns from a residency boundary once the
+        promotion copies are submitted; their slots become hits on the first
+        forward after the copies complete, and a layer with copies in flight
+        skips later boundaries until they land.
 
         ``graph_gather_batch_size`` > 0 is the tokens of the largest graph
         forward; it reserves ``graph_gather_scratch_rows(tokens, top_k,
@@ -703,6 +950,9 @@ class ExpertHotCacheManager:
             update_prefill_tokens, update_decode_forwards, enabled=dynamic
         )
         manager.min_residence_forwards = min_residence_forwards
+        manager.async_promotions = bool(async_promotions)
+        manager._inflight_promotions = []
+        manager.deferred_residency_updates = 0
         manager.benefit_ratio = benefit_ratio
         manager.log_interval = log_interval
         manager.metrics_path = Path(metrics_path) if metrics_path else None
@@ -758,6 +1008,15 @@ class ExpertHotCacheManager:
             if rows:
                 streamers[layer_id].enable_graph_gather(rows)
         manager._share_graph_counters()
+        manager.gpu_residency = None
+        if gpu_residency_update:
+            if not dynamic:
+                raise ValueError("GPU residency update requires dynamic residency")
+            from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+            manager.gpu_residency = GpuResidencyUpdater(
+                manager, max_promotions=gpu_residency_max_promotions
+            )
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -905,6 +1164,93 @@ class ExpertHotCacheManager:
                 register.zero_()
         for policy in self.residency_policies.values():
             policy.pending_counts.zero_()
+        self.finish_promotions()
+        if getattr(self, "gpu_residency", None) is not None:
+            self.gpu_residency.reset_after_capture(self._boundary_clock)
+
+    def finish_promotions(self) -> None:
+        """Publish every in-flight promotion, ordering the current stream behind its copies.
+
+        The host does not block; slots are published on the device after the
+        copies. Call before shutdown or anything that must see a settled cache.
+        """
+        self._publish_completed_promotions(wait=True)
+
+    def _publish_completed_promotions(self, wait: bool) -> None:
+        """Publish in-flight promotions whose copies landed, or all of them with ``wait``."""
+        pending = []
+        for ticket, promotions in getattr(self, "_inflight_promotions", ()):
+            cache = promotions[0].cache
+            executor = cache._transfer_executor
+            if not executor.has_completed(ticket):
+                if not wait:
+                    pending.append((ticket, promotions))
+                    continue
+                executor.wait(ticket, torch.cuda.current_stream(cache.device))
+            for promotion in promotions:
+                promotion.cache.complete_promotion(promotion)
+        self._inflight_promotions = pending
+
+    def _update_residency(self, boundary_tokens: int | None, mode: str) -> None:
+        """Advance every layer's scores, decide together and copy all promotions at once.
+
+        Scores advance by fused launches and are read back once; changed layers
+        stage their slot changes and submit every promoted row behind one
+        transfer ticket. Synchronously the current stream then waits for the
+        copies and the slots are published behind them without blocking the
+        host; with ``async_promotions`` publication waits for a later forward.
+        """
+        clock = self._boundary_clock
+        layers = [
+            (layer_id, self.caches[layer_id], self.residency_policies[layer_id])
+            for layer_id in self._layer_ids
+            if layer_id in self.caches and layer_id in self.residency_policies
+        ]
+        advance_residency_policies([policy for _, _, policy in layers], boundary_tokens)
+        deciding = []
+        for layer in layers:
+            layer_id, cache, _ = layer
+            if clock.forwards - self._last_update[layer_id] < self.min_residence_forwards:
+                continue
+            if cache.promotion_in_flight is not None:
+                self.deferred_residency_updates += 1
+                continue
+            deciding.append(layer)
+        decisions = decide_residency_policies(
+            [policy for _, _, policy in deciding],
+            [cache.resident_experts() for _, cache, _ in deciding],
+        )
+        staged = []
+        try:
+            for (layer_id, cache, policy), decision in zip(deciding, decisions):
+                if not decision.promotions and not decision.evictions:
+                    continue
+                policy.schedule_transfers(exact_demand=(), decision=decision)
+                update, promotion = cache.stage_reassign(
+                    decision.desired_experts, publish=self.async_promotions
+                )
+                self._last_update[layer_id] = clock.forwards
+                if promotion is None:
+                    self._record_update(layer_id, update, mode)
+                else:
+                    staged.append((layer_id, update, promotion))
+        except BaseException:
+            for _, _, promotion in staged:
+                promotion.cache.abort_promotion(promotion)
+            raise
+        if not staged:
+            return
+        promotions = [promotion for _, _, promotion in staged]
+        current_stream = torch.cuda.current_stream(promotions[0].cache.device)
+        ticket = submit_hot_cache_promotions(promotions, producer_stream=current_stream)
+        for layer_id, update, _ in staged:
+            self._record_update(layer_id, update, mode)
+        if self.async_promotions:
+            self._inflight_promotions.append((ticket, promotions))
+            return
+        promotions[0].cache._transfer_executor.wait(ticket, current_stream)
+        for promotion in promotions:
+            promotion.cache.complete_promotion(promotion)
 
     @staticmethod
     def _pinned_cache_stats(streamer: ExpertStreamer) -> tuple[int, int]:
@@ -1114,6 +1460,27 @@ class ExpertHotCacheManager:
                 str(layer_id): policy.snapshot_metrics()
                 for layer_id, policy in policies.items()
             }
+        if getattr(self, "async_promotions", False):
+            result["residency_async"] = {
+                "deferred_updates": self.deferred_residency_updates,
+                "inflight_submissions": len(self._inflight_promotions),
+            }
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            device = updater.snapshot()
+            result["residency_gpu"] = device
+            for row, layer_id in enumerate(updater.layer_ids):
+                bytes_per_expert = self.caches[layer_id].bytes_per_expert
+                for phase, mode in enumerate(("decode", "prefill")):
+                    entry = result[mode][str(layer_id)]
+                    entry["promotions"] += device["promotions"][phase][row]
+                    entry["evictions"] += device["evictions"][phase][row]
+                    entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                metrics = result.get("residency_policy", {}).get(str(layer_id))
+                if metrics is not None:
+                    metrics["boundary_updates"] += device["boundary_updates"][row]
+                    metrics["promotions"] += device["promotions"][0][row] + device["promotions"][1][row]
+                    metrics["evictions"] += device["evictions"][0][row] + device["evictions"][1][row]
         return result
 
     def on_expert_distribution(
@@ -1132,6 +1499,8 @@ class ExpertHotCacheManager:
         kind, tokens = classify_forward(forward_batch)
         if kind is ForwardKind.DRAFT:
             return
+        if getattr(self, "_inflight_promotions", None):
+            self._publish_completed_promotions(wait=False)
         counts = single_pass_data.get("global_physical_count")
         if counts is None:
             return
@@ -1195,22 +1564,17 @@ class ExpertHotCacheManager:
             counters.pinned_evictions += evictions - previous_evictions
             self._last_pinned_cache_stats[layer_id] = (admissions, evictions)
         self._accumulate_registers(mode, counts, eager_gathered)
-        for layer_id in self._layer_ids if qualifying else ():
-            cache = self.caches.get(layer_id)
-            policy = self.residency_policies.get(layer_id)
-            if cache is None or policy is None:
-                continue
-            policy.advance(boundary_tokens)
-            if clock.forwards - self._last_update[layer_id] < self.min_residence_forwards:
-                continue
-            decision = policy.decide(cache.resident_experts())
-            if not decision.promotions and not decision.evictions:
-                continue
-            policy.schedule_transfers(exact_demand=(), decision=decision)
-            self._record_update(
-                layer_id, cache.reassign(decision.desired_experts), mode
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            first = self._layer_positions[updater.layer_ids[0]]
+            updater.observe_forward(
+                kind,
+                tokens,
+                qualifying,
+                graph_served=kind is not ForwardKind.IDLE and not eager_gathered[first],
             )
-            self._last_update[layer_id] = clock.forwards
+        elif qualifying:
+            self._update_residency(boundary_tokens, mode)
         if clock.forwards % self.log_interval == 0:
             self._write_trace(mode)
 

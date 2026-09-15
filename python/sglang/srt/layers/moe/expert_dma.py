@@ -39,39 +39,9 @@ class ExpertDMABackend:
         destination_slots: Sequence[int],
     ) -> str:
         """Copy selected rows on the current CUDA stream and return the path used."""
-        source_matrix, destination_matrix = self._validate_tensors(source, destination)
-        source_indices = self._validate_indices(
-            source_rows, source_matrix.shape[0], "source_rows"
+        self.actual_backend = ExpertDMARowRoute(source, destination).copy_rows(
+            source_rows, destination_slots
         )
-        destination_indices = self._validate_indices(
-            destination_slots, destination_matrix.shape[0], "destination_slots"
-        )
-        if len(source_indices) != len(destination_indices):
-            raise ValueError(
-                "source_rows and destination_slots must have the same number"
-            )
-        if not source_indices:
-            raise ValueError("expert DMA transfer requires at least one row")
-
-        if _aot_transfer_available():
-            transfer_embedding_ranges_direct(
-                source_matrix,
-                destination_matrix,
-                *_coalesce_ranges(
-                    source_indices,
-                    destination_indices,
-                    _registration_run_end(source_matrix),
-                ),
-            )
-            self.actual_backend = "dma"
-        else:
-            for source_row, destination_slot in zip(
-                source_indices, destination_indices
-            ):
-                destination_matrix[destination_slot : destination_slot + 1].copy_(
-                    source_matrix[source_row : source_row + 1], non_blocking=True
-                )
-            self.actual_backend = "fallback"
         return self.actual_backend
 
     @staticmethod
@@ -102,6 +72,66 @@ class ExpertDMABackend:
         if any(row < 0 or row >= limit for row in indices):
             raise ValueError(f"expert DMA {name} are outside tensor rows")
         return indices
+
+
+class ExpertDMARowRoute:
+    """One validated source and destination pair for repeated DMA row copies.
+
+    Tensor validation, the AOT-availability check and the registration bound
+    are resolved once, so a caller that copies the same pair every update
+    pays only index checks, range coalescing and the copy-engine call.
+    """
+
+    def __init__(self, source: torch.Tensor, destination: torch.Tensor) -> None:
+        self.source_matrix, self.destination_matrix = (
+            ExpertDMABackend._validate_tensors(source, destination)
+        )
+        self.aot_available = _aot_transfer_available()
+        self.run_end = (
+            _registration_run_end(self.source_matrix) if self.aot_available else None
+        )
+
+    def copy_rows(
+        self,
+        source_rows: Sequence[int],
+        destination_slots: Sequence[int],
+        coalesced: dict[object, tuple[list[int], list[int], list[int]]] | None = None,
+    ) -> str:
+        """Copy selected rows on the current CUDA stream and return the path used.
+
+        ``coalesced`` shares merged ranges between routes whose registration
+        bound is the same, for callers copying one row list into several pairs.
+        """
+        source_indices = ExpertDMABackend._validate_indices(
+            source_rows, self.source_matrix.shape[0], "source_rows"
+        )
+        destination_indices = ExpertDMABackend._validate_indices(
+            destination_slots, self.destination_matrix.shape[0], "destination_slots"
+        )
+        if len(source_indices) != len(destination_indices):
+            raise ValueError(
+                "source_rows and destination_slots must have the same number"
+            )
+        if not source_indices:
+            raise ValueError("expert DMA transfer requires at least one row")
+        if not self.aot_available:
+            for source_row, destination_slot in zip(
+                source_indices, destination_indices
+            ):
+                self.destination_matrix[destination_slot : destination_slot + 1].copy_(
+                    self.source_matrix[source_row : source_row + 1], non_blocking=True
+                )
+            return "fallback"
+        key = (self.run_end, id(source_rows), id(destination_slots))
+        ranges = None if coalesced is None or self.run_end is not None else coalesced.get(key)
+        if ranges is None:
+            ranges = _coalesce_ranges(source_indices, destination_indices, self.run_end)
+            if coalesced is not None and self.run_end is None:
+                coalesced[key] = ranges
+        transfer_embedding_ranges_direct(
+            self.source_matrix, self.destination_matrix, *ranges
+        )
+        return "dma"
 
 
 def _coalesce_ranges(

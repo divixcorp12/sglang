@@ -756,6 +756,22 @@ class ModelRunner:
                     )
         if budget_mb == 0:
             return
+        if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():
+            if get_parallel().enable_dp_attention:
+                raise ValueError(
+                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with DP attention: "
+                    "idle batches replay the decode graph and would count twice"
+                )
+            if self.spec_algorithm.is_speculative():
+                raise ValueError(
+                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with speculative "
+                    "decoding: verify commits do not reach the device clock"
+                )
+            if (get_exec().graph.cuda_graph_config.decode.max_bs or 0) > 1:
+                raise ValueError(
+                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE needs a decode CUDA graph batch "
+                    "size of 1: padded batches would add graph rows as tokens"
+                )
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 
         manager = ExpertHotCacheManager.from_model(
@@ -774,6 +790,9 @@ class ModelRunner:
             copy_backend=envs.SGLANG_MOE_EXPERT_COPY_BACKEND.get(),
             graph_gather_batch_size=graph_gather_batch_size,
             graph_gather_max_rows=envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get(),
+            async_promotions=envs.SGLANG_MOE_HOT_ASYNC_PROMOTIONS.get(),
+            gpu_residency_update=envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get(),
+            gpu_residency_max_promotions=envs.SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:

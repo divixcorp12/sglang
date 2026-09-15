@@ -320,6 +320,14 @@ class Envs:
     # Standard deviations of routing-count noise a candidate expert must lead
     # the expert it replaces by, on top of SGLANG_MOE_HOT_BENEFIT_RATIO.
     SGLANG_MOE_HOT_PROMOTION_SIGMAS = EnvFloat(0.0)
+    # Return from a residency boundary once promotion copies are submitted and
+    # publish the promoted slots on a later forward after the copies complete.
+    SGLANG_MOE_HOT_ASYNC_PROMOTIONS = EnvBool(False)
+    # Run the decode residency update as device ops inside the captured decode
+    # graph; requires SGLANG_MOE_HOT_DYNAMIC and SGLANG_MOE_EXPERT_GRAPH_GATHER.
+    SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
+    # Most experts one layer promotes at a decode boundary on the GPU path.
+    SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)
