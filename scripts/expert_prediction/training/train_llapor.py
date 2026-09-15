@@ -125,7 +125,7 @@ def train_pair(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            epoch_loss += float(loss) * idx.numel()
+            epoch_loss += float(loss.detach()) * idx.numel()
         epoch_loss /= perm.numel()
 
         dev_idx = dev_mask.nonzero(as_tuple=True)[0].to(device)
