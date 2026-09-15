@@ -16,6 +16,7 @@ import json
 import os
 import random
 import subprocess
+import sys
 import urllib.request
 
 CONVFINQA_PATH = "/mnt/nvme2/nvfp4-work/benchmarks/convfinqa/data/dev.json"
@@ -58,8 +59,7 @@ def _load_financebench_records():
     return records
 
 
-def build_convfinqa_sessions(n, seed):
-    records = _load_convfinqa_records()
+def _eligible_convfinqa_records(records):
     eligible = []
     for r in records:
         questions = r.get("annotation", {}).get("dialogue_break") or []
@@ -67,51 +67,62 @@ def build_convfinqa_sessions(n, seed):
         if 3 <= len(questions) <= 6 and len(answers) == len(questions):
             eligible.append(r)
     eligible.sort(key=lambda r: r["id"])
+    return eligible
+
+
+def _convfinqa_session(r, session_id, split):
+    questions = r["annotation"]["dialogue_break"]
+    answers = r["annotation"]["exe_ans_list"]
+    pre_text = "\n".join(r.get("pre_text") or [])
+    post_text = "\n".join(r.get("post_text") or [])
+    table_md = _render_table_markdown(r.get("table") or [])
+
+    turns = []
+    for qi, question in enumerate(questions):
+        if qi == 0:
+            content = (
+                ANSWER_INSTRUCTION
+                + pre_text
+                + "\n\n"
+                + table_md
+                + "\n\n"
+                + post_text
+                + "\n\nQuestion: "
+                + question
+            )
+        else:
+            content = "Question: " + question + "\n\n" + ANSWER_INSTRUCTION.rstrip("\n")
+        turns.append(content)
+
+    context_chars = len(pre_text) + len(table_md) + len(post_text)
+    return {
+        "session_id": session_id,
+        "source": r["id"],
+        "domain": "convfinqa",
+        "split": split,
+        "turns": turns,
+        "expected": list(answers),
+        "context_chars": context_chars,
+    }
+
+
+def build_convfinqa_sessions(n, seed):
+    eligible = _eligible_convfinqa_records(_load_convfinqa_records())
     rng = random.Random(seed)
     sampled_indices = sorted(rng.sample(range(len(eligible)), min(n, len(eligible))))
     sampled = [eligible[i] for i in sampled_indices]
-    sampled.sort(key=lambda r: r["id"])
-
     n_train = int(len(sampled) * 0.8)
-    sessions = []
-    for idx, r in enumerate(sampled):
-        split = "train" if idx < n_train else "val"
-        questions = r["annotation"]["dialogue_break"]
-        answers = r["annotation"]["exe_ans_list"]
-        pre_text = "\n".join(r.get("pre_text") or [])
-        post_text = "\n".join(r.get("post_text") or [])
-        table_md = _render_table_markdown(r.get("table") or [])
+    return [
+        _convfinqa_session(r, f"cfq-{idx}", "train" if idx < n_train else "val")
+        for idx, r in enumerate(sampled)
+    ]
 
-        turns = []
-        for qi, question in enumerate(questions):
-            if qi == 0:
-                content = (
-                    ANSWER_INSTRUCTION
-                    + pre_text
-                    + "\n\n"
-                    + table_md
-                    + "\n\n"
-                    + post_text
-                    + "\n\nQuestion: "
-                    + question
-                )
-            else:
-                content = "Question: " + question + "\n\n" + ANSWER_INSTRUCTION.rstrip("\n")
-            turns.append(content)
 
-        context_chars = len(pre_text) + len(table_md) + len(post_text)
-        sessions.append(
-            {
-                "session_id": f"cfq-{idx}",
-                "source": r["id"],
-                "domain": "convfinqa",
-                "split": split,
-                "turns": turns,
-                "expected": list(answers),
-                "context_chars": context_chars,
-            }
-        )
-    return sessions
+def build_convfinqa_sessions_all(path, split, id_prefix):
+    with open(path) as f:
+        records = json.load(f)
+    eligible = _eligible_convfinqa_records(records)
+    return [_convfinqa_session(r, f"{id_prefix}-{r['id']}", split) for r in eligible]
 
 
 def _pdf_cache_path(doc_name):
@@ -182,6 +193,32 @@ def _build_financebench_context(pdf_path, evidence_pages, num_pages):
     return context
 
 
+def _financebench_session(r, doc_name, context):
+    turn1 = (
+        "Answer the question using the filing excerpt below.\n\n"
+        + context
+        + "\n\nQuestion: "
+        + r["question"]
+    )
+    turn2 = "Show the calculation or the exact line items you used, and state any caveats."
+    return {
+        "session_id": f"fb-{r['financebench_id']}",
+        "source": doc_name,
+        "domain": "financebench",
+        "split": "holdout",
+        "turns": [turn1, turn2],
+        "expected": [r["answer"], None],
+        "context_chars": len(context),
+    }
+
+
+def _financebench_evidence_pages(r):
+    pages = sorted(
+        {e["evidence_page_num"] for e in r.get("evidence") or [] if e.get("evidence_page_num")}
+    )
+    return pages or [1]
+
+
 def build_financebench_sessions(m, seed):
     records = _load_financebench_records()
     by_doc = {}
@@ -197,33 +234,50 @@ def build_financebench_sessions(m, seed):
         r = by_doc[doc_name]
         pdf_path = _download_pdf(doc_name)
         num_pages = _pdf_page_count(pdf_path)
-        evidence_pages = sorted(
-            {e["evidence_page_num"] for e in r.get("evidence") or [] if e.get("evidence_page_num")}
+        context = _build_financebench_context(
+            pdf_path, _financebench_evidence_pages(r), num_pages
         )
-        if not evidence_pages:
-            evidence_pages = [1]
-        context = _build_financebench_context(pdf_path, evidence_pages, num_pages)
-
-        turn1 = (
-            "Answer the question using the filing excerpt below.\n\n"
-            + context
-            + "\n\nQuestion: "
-            + r["question"]
-        )
-        turn2 = "Show the calculation or the exact line items you used, and state any caveats."
-
-        sessions.append(
-            {
-                "session_id": f"fb-{r['financebench_id']}",
-                "source": doc_name,
-                "domain": "financebench",
-                "split": "holdout",
-                "turns": [turn1, turn2],
-                "expected": [r["answer"], None],
-                "context_chars": len(context),
-            }
-        )
+        sessions.append(_financebench_session(r, doc_name, context))
     return sessions
+
+
+def build_financebench_sessions_all():
+    """One session per question (150 total), reusing the PDF download/page-count per doc_name."""
+    records = _load_financebench_records()
+    pdf_paths = {}
+    page_counts = {}
+    sessions = []
+    for r in records:
+        doc_name = r["doc_name"]
+        try:
+            if doc_name not in pdf_paths:
+                pdf_paths[doc_name] = _download_pdf(doc_name)
+                page_counts[doc_name] = _pdf_page_count(pdf_paths[doc_name])
+            context = _build_financebench_context(
+                pdf_paths[doc_name], _financebench_evidence_pages(r), page_counts[doc_name]
+            )
+        except Exception as exc:
+            print(f"skip fb-{r['financebench_id']} ({doc_name}): {exc}", file=sys.stderr)
+            continue
+        sessions.append(_financebench_session(r, doc_name, context))
+    return sessions
+
+
+def _interleave_sessions(groups, seed):
+    """Deterministic proportional interleave: each group is shuffled, then merged
+    so that group X's i-th (of n) session lands at fractional position (i+0.5)/n.
+    This keeps the mix representative from the start of the file, since a byte
+    cap on the consuming capture run will likely truncate before the end."""
+    rng = random.Random(seed)
+    keyed = []
+    for name, sessions in groups:
+        shuffled = list(sessions)
+        rng.shuffle(shuffled)
+        total = len(shuffled)
+        for i, s in enumerate(shuffled):
+            keyed.append(((i + 0.5) / total if total else 0.0, name, s))
+    keyed.sort(key=lambda t: (t[0], t[1]))
+    return [s for _, _, s in keyed]
 
 
 def main():
@@ -231,15 +285,36 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--convfinqa", type=int, default=0)
     parser.add_argument("--financebench", type=int, default=0)
+    parser.add_argument(
+        "--convfinqa-all",
+        action="append",
+        default=[],
+        metavar="PATH=SPLIT",
+        help="Take all eligible ConvFinQA dialogues from PATH, labeled SPLIT. Repeatable.",
+    )
+    parser.add_argument(
+        "--financebench-all",
+        action="store_true",
+        help="One session per FinanceBench question (150 total) instead of sampling by document.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    sessions = []
+    groups = []
     if args.convfinqa:
-        sessions.extend(build_convfinqa_sessions(args.convfinqa, args.seed))
+        groups.append(("cfq-sample", build_convfinqa_sessions(args.convfinqa, args.seed)))
+    for spec in args.convfinqa_all:
+        path, sep, split = spec.partition("=")
+        if not sep:
+            raise SystemExit(f"--convfinqa-all expects PATH=SPLIT, got {spec!r}")
+        groups.append((f"cfq-{split}", build_convfinqa_sessions_all(path, split, f"cfq-{split}")))
     if args.financebench:
-        sessions.extend(build_financebench_sessions(args.financebench, args.seed))
+        groups.append(("fb-sample", build_financebench_sessions(args.financebench, args.seed)))
+    if args.financebench_all:
+        groups.append(("fb-holdout", build_financebench_sessions_all()))
+
+    sessions = _interleave_sessions(groups, args.seed)
 
     if args.dry_run:
         for s in sessions:
