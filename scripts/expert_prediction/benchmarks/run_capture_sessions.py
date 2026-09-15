@@ -185,10 +185,21 @@ def main():
         action="store_true",
         help="Echo reasoning and answers to stdout as they stream.",
     )
+    parser.add_argument(
+        "--stop-when-capture-stopped",
+        metavar="CAPTURE_DIR",
+        help="Stop issuing new sessions once CAPTURE_DIR/capture-stopped.json exists "
+        "(the writer hit its byte cap and further traffic would be wasted GPU time).",
+    )
     args = parser.parse_args()
 
     sessions = _load_sessions(args.sessions)
     done_turns, done_contents = _load_done_turns(args.results)
+    stop_marker = (
+        os.path.join(args.stop_when_capture_stopped, "capture-stopped.json")
+        if args.stop_when_capture_stopped
+        else None
+    )
 
     run_count = 0
     with open(args.results, "a") as results_f:
@@ -196,6 +207,9 @@ def main():
             if _session_fully_done(done_turns, session):
                 continue
             if args.max_sessions is not None and run_count >= args.max_sessions:
+                break
+            if stop_marker is not None and os.path.exists(stop_marker):
+                print(f"capture stopped ({stop_marker}); ending driver", flush=True)
                 break
             run_count += 1
 
