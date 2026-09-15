@@ -34,6 +34,11 @@ is `work/latest.log`. Plan these experiments serve:
 | E18 | 09-13 20:02 | Stage 3: graphed NEXTN at K=40 (eager rerun, eager trace, untraced graph + 4,096-token prefill, traced graph) | Graph works (3 graphs, 0 breaks, prefill OK, peak 30.0 GiB, stable replies identical) but **speed gate failed**: 9.03 tok/s vs eager 9.10 and the 22 target. K=40 scratch cuts slots 3,106 → 2,141, raising bytes 1.50 → 1.79 GiB/verify |
 | E19 | 09-13 20:36 | Non-speculative decode, E16c policy, production graph, on the Stage 3 workload (direct comparison with E18) | **Plain decode wins:** 10.37 tok/s vs graphed NEXTN 9.03 (+15%), wall 156 s vs 170 s, 0.448 GiB/token vs 0.553 per accepted NEXTN token, peak 26.5 GiB; server left up on 7868 |
 | E20 | 09-13 21:23 | Offline replay: FP8-freed slots at the 14 GiB serving baseline (4,957 → 6,236 / 6,466 slots, policy 4/1/2/0) | Positive: +10.6% / +12.5% predicted tok/s (11.42 → 12.63 / 12.85); per-slot tok/s gain barely flattens; extrapolated beyond the E16 fit range |
+| E21 | 09-14 14:40 | CPU experts spike: kernel microbenchmark (node 1, ≤ 4 threads), `kt_kernel` research, round-trip cost analysis, ik_llama / llama.cpp baselines | Positive pending a GPU prototype: `kt_kernel` native NVFP4 computes 130 experts per token in 25.8 ms at 4 threads (0.5% error), under the 43 ms in-graph break-even, so ~14 tok/s is predicted vs 11.42; Python graph breaks don't win; ik_llama with all experts on CPU decodes 6.5 tok/s at 4 threads and 13.9–16.7 at 18 threads, already above SGLang's 10.37 |
+| E22 | 09-14 17:45 | GPU microbenchmark: host→GPU expert copy paths vs the PCIe Gen3 x16 ceiling, including krasis's `cuMemcpyBatchAsync` ANY / prefer-overlap settings | Krasis settings: no gain (production DMA already 12.6–12.7 of 12.8 GiB/s). **The in-graph miss kernel runs at 38–50% of the link** (4.9–6.4 GiB/s), so link-class in-graph copies would save an estimated 22–27 ms/token. The DMA path isn't graph-capturable, and the cost model's 44 ms doesn't match the benchmark's 52–69 ms |
+| E23 | 09-14 18:34 | CUDA 13 driver graph nodes for expert copies: BatchMemOp semantics, MEMCPY nodes captured in torch's CUDA graph, host retarget and GPU-predicate IF fan-out | Viable only with a host sync per layer: BatchMemOp nodes can't copy; captured MEMCPY nodes run 11.8 GiB/s byte-exact inside torch's graph, but targets are host-only; IF fan-out ≈ 1.7 s/token at 512 experts. Nets ~15–20 ms/token only with a thin C++ break (estimate) |
+| E24 | 09-14 18:44 | Warp-aligned in-graph copy kernel: 23-variant screen (grid, block, load width, layout) and final W1–W4 eager + graph replay on an exclusive GPU | Positive: 11.2–11.5 GiB/s (89% of link) vs the original 5.0–6.6, byte-exact, no graph break; closes ~80% of the gap to the link; estimated 22–37 ms/token saved; integration is a kernel-only change in `expert_cache_transfer.cuh` |
+| E25 | 09-14 20:33 | Serving A/B of E24's 16 B kernel: base/proto/base at production settings, logprob margins, in-graph shadow copy under real decode, dynamic-residency-off pair | Positive, cleared: 0 differing bytes over 452,088 real miss rows; saves 17.1–17.3 ms/token (13.4 → 17.4 tok/s, +29%) at production settings and 54.5 ms/token (+63%) with residency off; greedy parity unusable because the stock server is itself nondeterministic |
 
 ## Standard NEXTN workload
 
@@ -736,5 +741,285 @@ NEXTN 3 steps / topk 1 / 4 draft tokens, decode and prefill CUDA graphs disabled
   - Workload is the E1 session only.
 - **Verdict:**
   - FP8's slot value holds at 14 GiB: about +11% predicted.
-  - FP8 is now implemented behind `SGLANG_ONLINE_FP8_GROUPS` (design `docs/superpowers/specs/2026-09-13-fp8-nonexpert-weights-design.md`; CPU tests 17/17). Nothing is committed.
+  - FP8 is now implemented behind `SGLANG_ONLINE_FP8_GROUPS` (design `docs/superpowers/specs/2026-09-13-fp8-nonexpert-weights-design.md`; CPU tests 17/17). It is committed in `fa66acb84f` but not deployed.
   - The GPU accuracy session (phase A, about 70 min) is parked at the user's request until the prefetch design is settled.
+
+## E21 — CPU experts spike: run cache misses on the CPU instead of copying them
+
+- **Question:** during bs1 decode, can cache-miss experts run on divix01's CPU faster than today's PCIe copy?
+  - Today a token costs about 96 ms: about 36 ms of fixed GPU work plus about 52–60 ms of expert copies (E19/E20).
+  - At 14 GiB there are 2.71 misses per layer, 130.2 per token (E20).
+- **Hardware:**
+  - 2× Xeon Gold 6154 (Skylake-SP, 18 cores per socket), AVX-512 F/BW/CD/DQ/VL with no VNNI, AMX or avx512_bf16; 188 GB RAM.
+  - PCIe Gen3 x16. The GPU and the production host arena are on NUMA node 0.
+- **Four lanes, 09-14 14:40–15:10:**
+  - kernel microbenchmark (CPU only, `taskset -c 64-71`, ≤ 4 threads);
+  - `kt_kernel` source and docs research;
+  - round-trip cost analysis from existing traces;
+  - ik_llama baseline.
+- **Artifacts:**
+  - divix01 `nvfp4-work/cc-cpu-spike/bench/REPORT.md`, with scripts, raw JSONL and command logs (94 + 5 runs, all EXIT=0);
+  - `nvfp4-work/cc-ikbench/` (`t4-plegpu.log`);
+  - laptop scratchpad `cpu-spike/{kt-kernel-research,ikllama-baseline}.md`.
+
+### Kernel compute for 130 experts per token
+
+- **Setup:** cores 64-71 (node 1), memory on node 1, cold medians. Weights rotate across distinct copies, so they are not warm in L3.
+- **Break-even against E20's 11.42 tok/s:** about 43 ms if the CPU call runs inside the CUDA graph, about 22 ms with Python graph breaks.
+
+| Kernel | Output error vs dequantized NVFP4 | 1 thread | 2 threads | 4 threads |
+|---|---|---|---|---|
+| `kt_kernel` NVFP4 (native, no re-quantization) | 0.52% | 103.4 | 53.8 | **25.8** |
+| ggml Q8_0 | 1.5% | 79.3 | 39.4 | 26.5 |
+| ggml Q4_K (Q5_0 down) | 10.3% | 54.0 | 30.4 | 17.9 |
+| ggml Q4_0 | 13.7% | 57.5 | 32.9 | 18.4 |
+| torch bf16 | 0.54% | 151.7 | 91.2 | 55.1 |
+| torch fp32 | 0 | 189.1 | 112.4 | 96.5 |
+| torch int8 weight-only | 1.5% | 939 | 489 | 251 |
+
+- **Thread scaling, 1→2→4:** `kt_kernel` 1.92× and 4.01×, nearly linear. ggml Q4_K 1.78× and 3.0×. fp32 1.96× at 4 threads, which is bandwidth-bound.
+- **Cross-NUMA** (node-0 memory, node-1 cores): 4-bit paths are 1.16–1.27× slower; `kt_kernel` is 1.17× slower.
+- **RAM:** all 24,576 experts fit only as 4-bit, about 68 GB. bf16 needs 242 GB and Q8_0 needs 128 GB.
+- **`kt_kernel` gotchas:**
+  - The NVFP4 output buffer must be bf16. A float32 buffer silently returns garbage (relative error 1.22).
+  - Its WorkerPool pins its own threads and calls `numa_bind`, which escapes `taskset`. The benchmark blocked this with an LD_PRELOAD shim plus an affinity assertion.
+
+### Round-trip and graph cost (analysis, existing traces)
+
+- **Transfer:** a 2560-dim bf16 hidden state GPU→CPU→GPU with sync takes about 0.03–0.06 ms per layer, 1.5–3 ms per token. Trace medians: memcpy under 1 µs, `cudaMemcpyAsync` 0.007–0.013 ms, sync 0.002–0.004 ms.
+- **Graph breaks:** a Python break costs about 2.65 ms measured (09-12 breakable-graph trace, 144 top-level ops per break), or an assumed ~0.45 ms for a lean break. At 48 breaks per token that is 127 or 22 ms.
+- **`kt_kernel` avoids breaks:** it runs CPU submit/sync as `cudaLaunchHostFunc` stream callbacks, and graph capture only preallocates pinned buffers per batch size.
+- **Model:** s/token = F + M + 48·(b + r) + C, with F = 35.9 ms, M (promotions) = 7.6 ms, r = 0.03 ms.
+
+| C (CPU compute, ms/token) | In-graph callback | Lean break | Deferred (`kt_max_deferred`) |
+|---|---|---|---|
+| 10 | 18.2 tok/s | 13.3 | 22.3 |
+| 20 | 15.4 | 11.8 | 22.3 |
+| 26 (measured `kt_kernel`, 4 threads) | **~14.1** | ~11.0 | 22.3 |
+| 40 | 11.8 | 9.5 | 22.3 |
+
+- **Deferral:** upstream defers the lowest-scoring experts and adds their output one layer late. The paper reports −0.5% LiveBench with 6 of 8 deferred. Deferring *cold* experts, which can include top-1, is untested.
+
+### `kt_kernel` capability (source and docs)
+
+- **NVFP4 support:** kt-kernel ≥ 0.7.0.post4 has `--kt-method NVFP4`. It reads this ModelOpt checkpoint directly (`NVFP4SafeTensorLoader`), group 16, AVX2 kernel only on this CPU.
+- **Fork glue is stale:** our `kt_ep_wrapper.py` equals upstream sgl-project, which predates kt-kernel 0.7 (`num_gpu_experts` vs `gpu_experts_mask`) and supports fixed IDs 0..N-1 only.
+- **kvcache-ai/sglang is further along:** per-layer masks, frequency placement, and a dynamic expert update that is graph-safe.
+  - It has no NVFP4 layerwise prefill.
+  - It probably lacks the `qwen4_exp` architecture.
+- **Blockers:**
+  - kt-kernel pins torch 2.9.1, so it must be built from source with `--no-deps`.
+  - It keeps its own RAM copy of all experts (issue #2084), next to our ~65 GiB arena.
+
+### Baselines with experts on the CPU
+
+- **Unsloth Studio llama.cpp (09-08/09):** `UD-Q3_K_XL`, 36 unpinned threads, `--fit on` (split not logged). Median decode 12.41 tok/s over 25 requests, sagging from 13–15 to 11.5–12.7; prefill 185 tok/s for prompts of 1k tokens or more. Speculation acceptance was about 1/64.
+- **ik_llama sweep (09-14 15:01–15:05):** ji-farthing IQ4_KT, `-ot exps=CPU`, all 480 experts per token on CPU, PLE on host (the loader ignored the GPU request), 2.3 GiB weights on GPU, `-c 10240 -ub 2048 -n 64`, `taskset -c 0-3 -t 4`.
+
+  | Depth | Prefill tok/s, 4 threads | Decode tok/s, 4 threads | Prefill tok/s, 18 threads | Decode tok/s, 18 threads |
+  |---|---|---|---|---|
+  | 0 | 690.45 | 6.48 | 689.79 | **16.72** |
+  | 2048 | 687.68 | 6.57 | 679.58 | **15.78** |
+  | 4096 | 652.60 | 6.45 | 653.16 | **16.55** |
+  | 6144 | 642.19 | 6.50 | 644.23 | **16.12** |
+  | 8192 | 627.33 | 6.69 | 630.84 | **13.87** |
+
+  - **Runs:** the 4-thread run was `taskset -c 0-3`, 15:01–15:05 (`t4-plegpu.log`). The 18-thread run was `taskset -c 0-17 -t 18 -tb 18`, 15:13:45–15:16:01, EXIT=0 (`t18-plegpu.log`; the tag says plegpu but PLE was on host).
+  - **Scaling:** decode rises about 2.5× from 4 to 18 threads; prefill does not change with threads.
+  - **Noise:** each depth is one 64-token sample, so the 8192 row may be noise.
+  - **Memory:** VRAM peak about 6.1 GiB; host RSS peak about 92 GB.
+  - **Output quality is not checked:** the loader logged `Oops: tensor with strange name per_layer_token_embd.weight`, and this is a sweep, not a generation.
+- **Operations:**
+  - SGLang :7867 was stopped 14:57:23–15:09:13 for the 4-thread run (user-approved).
+  - It was stopped again at 15:13:24 for the 18-thread run and left down at the user's request.
+  - The 18-thread run on cores 0-17 was a one-time exception to the ≤ 4-thread rule, approved by the user.
+
+### Caveats
+
+- Compute timings use synthetic inputs, and harnesses differ: `kt_kernel` includes a Python submit/sync, while ggml times graph compute only.
+- Node 1 is not the deployment node. Nothing above 4 threads has been measured on the kernels.
+- Untested:
+  - whether `kt_kernel` host callbacks replay correctly inside the CUDA graph;
+  - whether flashinfer_cutlass skips −1 expert ids;
+  - the accuracy of deferring cold experts.
+
+### Verdict
+
+- **Positive, pending a GPU prototype.**
+  - Native NVFP4 CPU compute (26 ms at 4 threads) is under the 43 ms in-graph break-even.
+  - It predicts about 14 tok/s against 11.42 (+23%), and about 17 tok/s if 8 cores scale linearly. That beats E20's FP8 slot gain (+11%) and the prefetch cap (1.10–1.17×).
+  - Python graph breaks do not win (~11 tok/s).
+  - **Independent confirmation:** ik_llama with *all* 480 experts per token on the CPU (no GPU expert cache at all) decodes 13.9–16.7 tok/s at 18 threads, already above SGLang's measured 10.37 and E20's predicted 11.42. A hybrid that keeps a hot GPU cache and computes only about 130 misses on the CPU should do better. That comparison is untested, and ik_llama's IQ4_KT is a different quant with output quality unchecked.
+- **Next:** a GPU prototype that measures in-graph CPU callbacks, correctness versus eager, and C on node-0 cores. It needs a design that shares one host copy of the experts.
+
+## E22 — Host→GPU expert copy paths against the PCIe link (GPU microbenchmark)
+
+- **Question:** how far are our expert copies from what PCIe Gen3 x16 carries? Does krasis's `cuMemcpyBatchAsync` setup (`src/pcie_batch.rs`: `srcAccessOrder` ANY plus prefer-overlap-with-compute flag) beat production's DMA call?
+- **Run:**
+  - 09-14 17:4x–18:05 CDT on divix01, with SGLang :7867 already down (user request) and the GPU idle before every run.
+  - `taskset -c 64-71`, at most 4 threads, host memory `numactl --membind=0` (production arena placement).
+  - Four runs, all EXIT=0: r1 arena-style registered, 2048 rows; r2 `pin_memory`; r3 1 GiB registration chunks; r4 node-1 memory, 1024 rows.
+  - 40 iterations each, median and p90.
+  - Byte-exact check on all 6 NVFP4 tensors per row, every method, every run: all True.
+- **Artifacts:** divix01 `nvfp4-work/cc-pcie-bench/` (`REPORT.md`, `tables.md`, `results.jsonl`, `run_all.log`).
+- **Workloads:**
+  - W1: one batch of 130 scattered rows (335 MiB).
+  - W2: 48 calls of 3 rows (144 rows, 380 MiB), shaped like per-layer calls.
+  - A row is 6 segments totalling 2,764,808 bytes.
+
+### Results (r1)
+
+| Method | W1 median / p90 ms | W1 GiB/s | W2 median / p90 ms | W2 GiB/s | W2 ms/call |
+|---|---|---|---|---|---|
+| M0 link ceiling: 1 GiB contiguous pinned copy | 77.92 / 77.96 | **12.83** | – | – | – |
+| M1 in-graph kernel `copy_expert_row_segments_gpu`, eager | 51.86 / 56.42 | 6.45 | 75.83 / 77.01 | 4.89 | 1.58 |
+| M2 same kernel inside a CUDA graph (production miss path) | 52.39 / 57.35 | **6.39** | 76.03 / 77.55 | **4.88** | 1.58 |
+| M3 production DMA (`transfer_embedding_ranges_direct`, own stream) | 26.40 / 26.42 | **12.68** | 29.48 / 29.50 | **12.58** | 0.61 |
+| M3 on torch's default stream (NULL handle → per-range `cudaMemcpyAsync`) | 27.81 / 27.86 | 12.04 | 30.98 / 31.04 | 11.97 | 0.65 |
+| Control: `cuMemcpyBatchAsync`, Stream order, flags 0, one batch | 26.56 / 26.60 | 12.60 | 29.01 / 29.04 | 12.78 | 0.60 |
+| M4 `cuMemcpyBatchAsync`, ANY, flags 0 | 26.55 / 26.60 | 12.61 | 29.01 / 29.03 | 12.78 | 0.60 |
+| M5 `cuMemcpyBatchAsync`, ANY, flags 1 (prefer overlap) | 26.74 / 26.76 | 12.52 | 29.01 / 29.04 | 12.78 | 0.60 |
+| M6 CPU `index_select` into pinned staging + one copy | 65.77 / 70.82 | 5.09 | 72.96 / 77.12 | 5.08 | 1.52 |
+
+- **Variant runs:** r2–r4 matched r1 within about 3%.
+- **Link:** Gen3 x16 in all 17 samples under a sustained copy loop. Idle read Gen1, which is power-saving downtraining.
+- **Contention:** a synthetic ~22.6 ms matmul queue ran on a separate compute stream.
+  - The copy on its own stream finished at 27.7–28.0 ms for all flag settings, and compute was not delayed.
+  - A copy on the compute stream waited behind it (about 46 ms) in every variant.
+  - `flags = 1` changed nothing.
+
+### Verdict
+
+- **Krasis settings: no gain.** Production DMA is already at 99% of the link. ANY and prefer-overlap stayed within ±1.5%. Their small W2 edge also appears in the Stream-order control, so it comes from one batched call instead of 6 per-tensor calls. Expected effect on the 7.6 ms of promotions: about 0 ms (estimate).
+- **The in-graph miss kernel is the transfer bottleneck.** It runs at 50% (one 130-row launch) and 38% (48 per-layer launches) of the link.
+  - Graph replay equals eager, so launch overhead isn't the limit. The kernel's GPU threads read host memory one uint32 word at a time.
+  - At link-class speed, the ~44 ms per token of miss copies would drop to about 17–22 ms, saving 22–27 ms (estimate): 0.335 GiB ÷ 12.6 GiB/s ≈ 27 ms.
+  - That is a larger lever than FP8 slots (E20) or prefetch (E2 cap).
+- **Obstacle:** the fast DMA path is a host-side driver call and can't be captured in the decode graph. Candidate fixes:
+  - a faster in-graph kernel (bigger host reads per GPU thread);
+  - CUDA 13 graph batch-memop nodes (`cuGraphAddBatchMemOpNode`, exposed by `cuda.bindings.driver`), with PyTorch integration unverified;
+  - per-layer graph breaks with DMA, where break cost (E21: ~0.45–2.65 ms × 48) likely eats the saving.
+- **Open discrepancy:** at the benchmark's in-graph rate, 130 rows would cost 52–69 ms, more than the 44 ms the 0.1347 s/GiB cost model implies (7.4 GiB/s effective). Production's real launch shape (dedup, row counts, interleaving) may differ, so reconcile it with a production-shaped trace before relying on the ratio.
+- **Caveats:**
+  - CPU on node-1 cores; the node-1 run used 1024 rows.
+  - M2 timings exclude plan-buffer uploads.
+  - The in-graph kernel was not measured under compute contention.
+  - The contention load was synthetic, not a real MoE decode.
+
+## E23 — CUDA 13 graph nodes for expert copies (`cuGraphAddBatchMemOpNode`, MEMCPY nodes)
+
+- **Question:** can E22's link-class copy be put inside the decode CUDA graph through the driver graph API (option (b) of E22's obstacle list)? Does it work with PyTorch's CUDA graphs, and can the copy targets come from GPU memory so no host sync is needed?
+- **Run:**
+  - 09-14 18:16–18:34 CDT on divix01, :7867 down. All GPU runs under `flock cc-gpu.lock` with `GPU_APPS_BEFORE: []` (an earlier p1 attempt exited 3 because another session's server held the GPU, so nothing was measured there).
+  - Exits: p1=0, p2_smoke=0, p2=0. Same-process medians. Byte-exact on every correctness check.
+  - Sources checked: CUDA 13.4 `cuda.h`, `cuda_device_runtime_api.h`, torch 2.13 `libtorch_cuda.so` imports and `torch/_higher_order_ops/cudagraph_conditional_nodes.py`.
+- **Artifacts:** divix01 `nvfp4-work/cc-cugraph/` (`REPORT.md`, `probe1.py`, `probe2.py`, `results.jsonl`, `logs/`, `run.log`).
+
+### Findings
+
+- **BatchMemOp nodes can't copy.** Their ops are WAIT/WRITE_VALUE_32/64, BARRIER, ATOMIC_REDUCTION and FLUSH_REMOTE_WRITES (`cuda.h:571-580`), with only address/value/flags changeable per launch from the host (`cuda.h:21557-21602`). The spike's premise was false.
+- **MEMCPY nodes do copy**, one copy per node. They can be retargeted per launch only from the host (`cudaGraphExecMemcpyNodeSetParams1D`: 1-D, same context, no zero length; `cuda.h:22583-22627`). Updates take effect on the next launch.
+- **torch 2.13 `CUDAGraph` is this driver API** (`cudaStreamBeginCapture`, `cudaGraphInstantiateWithFlags`, `cudaGraphLaunch`). A pinned `copy_` or `cuMemcpyHtoDAsync_v2` on arena-registered rows, issued during capture, becomes a MEMCPY node in torch's own graph.
+  - Replay copies the host bytes as they are at replay time.
+  - Nodes interleave with kernels: matmul → copies → kernel reading the rows was exact.
+  - 8 rows = 48 nodes, captured in 4.9 ms, instantiated in 0.25 ms.
+- **`cuMemcpyBatchAsync` can't be captured:** rc=900, `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
+- **No API reads copy pointers from device memory**, so a GPU-computed plan needs a device→host read per MoE layer.
+  - Plan sync: 0.025 ms on an idle GPU, 0.246 ms queued behind one matmul. The cost is the graph break around it, not the sync.
+  - Retarget: 0.028 ms for 18 nodes (about 1.5 µs per node).
+- **The sync-free route (GPU-predicate IF nodes choosing prebuilt copies) is not viable.** IF nodes cost about 7.0 µs each per launch even when nothing copies (E=64: 1.34 ms / 192 IFs; E=128: 2.69 ms / 384 IFs). At 512 experts × 10 slots × 48 layers that is about 1.7 s per token and about 1.47M memcpy nodes (estimate). SWITCH and WHILE don't reduce this.
+
+### Results (same process, medians)
+
+| Method | W1 1×130 rows | W2 48×3 rows |
+|---|---|---|
+| M0 link ceiling | 12.83 GiB/s | – |
+| M2 in-graph kernel | 52.89 ms, 6.33 GiB/s | 76.02 ms (1.584 ms/call), 4.88 GiB/s |
+| M3c batch DMA (not capturable) | 26.57 ms, 12.60 GiB/s | 29.01 ms (0.604 ms/call), 12.78 GiB/s |
+| **Captured MEMCPY nodes** | **28.41 ms, 11.78 GiB/s** (780 nodes) | **31.43 ms (0.655 ms/call), 11.80 GiB/s** |
+| Captured MEMCPY nodes, retargeted before every launch | – | 31.48 ms, 11.78 GiB/s |
+
+A single 3-row launch (18 nodes) took 0.659 ms, so launch overhead is negligible.
+
+### Verdict
+
+- **Viable only with a host sync per MoE layer.** Captured MEMCPY nodes reach 92% of the link inside torch's graph, byte-exact, but choosing their targets needs the routing plan on the host.
+- **Integration shape:** per MoE layer, a graph segment up to the routing plan; read the plan device→host; `SetParams1D` on K×6 nodes; disable unused slots (`cuGraphNodeSetEnabled`, `cuda.h:22971`, untested); launch the copies-plus-experts segment. The K_max × 6 per-segment `cuMemcpyHtoDAsync` calls replace `copy_expert_row_segments_gpu`, stay on the graph stream, and must point inside the registered allocations.
+- **Net effect (estimate):** W2-shape copies drop to 0.41× of the current kernel, roughly 44 → 18 ms, saving about 26 ms/token. But 48 breaks at E21's Python cost (0.45–2.65 ms each) is 22–127 ms, which eats that. Only a thin C++ break (about 5–10 ms/token, estimate) nets about 15–20 ms/token.
+- **Compare with E24:** a faster in-graph kernel needs no break at all. Its correctness-only smoke run (other GPU load present) reached 10.6–11.35 GiB/s, which, if it holds on an exclusive GPU, beats this route.
+- **Untested:** `cuGraphNodeSetEnabled`; SGLang's real breakable graph; contention with real decode compute.
+
+## E24 — Warp-aligned in-graph copy kernel (bigger host reads per GPU thread)
+
+- **Question:** can `copy_expert_row_segments_gpu` reach link-class speed inside the CUDA graph by reading more host memory per GPU thread (E22's option (a))?
+- **Run:**
+  - 09-14 18:16–18:44 CDT on divix01, :7867 down. Detached worktree `cc-copykernel/worktree` at `fa66acb84f`, isolated JIT cache; the only change is a new templated file `expert_cache_transfer_spike.cuh` (grid, block, load width, layout) with distinct symbols.
+  - Smoke (18:22, EXIT=0): correctness only; another session's server shared the GPU, so its timings don't count.
+  - First screen lost to a bug in the stray-write check (25 GiB allocation, fixed). Re-run screen EXIT=0 at 18:39, final EXIT=0 at 18:44.
+  - Every timed run under `flock cc-gpu.lock`, with GPU process snapshots before and after each measurement (`gpu_exclusive` per row).
+  - Final: 2048 arena-registered rows, 40 iterations, eager and graph replay, byte-exact on all 6 segments and a stray-write check per row.
+- **Artifacts:** divix01 `nvfp4-work/cc-copykernel/` (`REPORT.md`, `final.jsonl`, `screen.jsonl`, `smoke.jsonl`, `bench_ck.py`, `run_screen.sh`, `summarize_ck.py`, `kernel_vs_orig.diff`, `kernel_new_file.diff`, `logs/`).
+- **Workloads:** W1 1×130 rows, W2 48×3, W3 48×10 (production-like), W4 48×1.
+
+### Results (final, CUDA-graph replay, median / p90 ms, GiB/s)
+
+| Variant | W1 1×130 | W2 48×3 | W3 48×10 | W4 48×1 |
+|---|---|---|---|---|
+| Original kernel | 50.94 / 54.34 (6.57) | 73.45 / 76.60 (5.05) | 211.29 / 214.05 (5.85) | 15.38 / 15.71 (8.04) |
+| **g8b256u32L2** (32 B loads, contiguous chunk per warp) | **29.41 / 29.43 (11.38)** | **32.39 / 32.40 (11.45)** | **107.45 / 107.49 (11.50)** | **10.95 / 10.96 (11.29)** |
+| g8b256u16L1 (16 B loads, interleaved, whole warps per row) | 29.92 / 29.98 (11.19) | 32.58 / 32.59 (11.38) | 107.79 / 107.81 (11.47) | 11.03 / 11.04 (11.21) |
+| M0 link ceiling (1 GiB contiguous pinned) | 77.90 ms (12.84) | – | – | – |
+
+- Eager matched graph replay within 0.1 ms.
+- The rewrite closes 77% (W1), 82% (W2) and 81% (W3) of the gap to the link, and is within 10–11% of production DMA (E22 M3), which can't be graph-captured (E23).
+- Screen: grid 4–32, block 128–512 and interleaved vs contiguous chunks all plateau at ~11.4 GiB/s. Wider loads on the original layout only reach 8.8 GiB/s (W1 smoke). Per-thread contiguous reads were slower than the original.
+
+### Verdict
+
+- **Positive.** The in-graph copy reaches 89% of the link with no graph break and no host sync, byte-exact under replay. It beats E23's captured MEMCPY route, which needs a per-layer break.
+- **Why it works:** the original kernel's lanes don't align with the 32-thread warps, so every 4 B host read is its own access. Giving each row whole warps, with a warp's threads reading adjacent host memory, lets the device batch the reads; 16 B or 32 B loads finish the job.
+- **Estimated saving:** 22–37 ms per token for ~130 miss rows over 48 layers (estimate): 57 → 29 ms at the W3 shape, 66 → 29 ms at W2, 44 → 22 ms scaling the cost model's figure by the measured ratio. At E20's 14 GiB baseline (s/token ≈ 87.6 ms), the cost-model-consistent 22 ms saving gives roughly 11.4 → 15 tok/s (estimate, unmeasured in serving). The upper 37 ms exceeds the model's 44 ms copy budget's reach and depends on resolving E22's discrepancy.
+- **Integration:** change only the lane geometry and load width in `expert_cache_transfer.cuh`. The op signature, `LaunchKernel(8,256)`, `ExpertRowSegments` and `_gather_graph` stay unchanged, with no Python change. Prefer the 16 B `v2.b64` form (hisparse already uses it); the 32 B `v4.b64` form is at most 0.5 ms faster and is used nowhere else. Tests: count 0/1/max, more rows than warps, a misaligned segment, graph replay with a changing count.
+- **Caveats:**
+  - Synthetic random rows on one GPU; not measured under concurrent decode compute; plan uploads not timed.
+  - The remaining ~11% below the link wasn't isolated.
+  - E22's discrepancy between the benchmark and the 44 ms cost model is still unreconciled, so the serving gain needs a real decode measurement.
+
+## E25 — Serving A/B of the warp-aligned copy kernel (E24's 16 B variant)
+
+- **Question:** does E24's kernel speed up real decode, and is it correct under real routing?
+- **Run:**
+  - 09-14 18:58–20:33 CDT on divix01, :7867 down. Detached worktrees at `fa66acb84f`: `base` (unmodified kernel, md5 81ba5d63…), `proto` (only `expert_cache_transfer.cuh` changed to g8b256u16L1, md5 608fce6c…, plus a new test file), `shadow` (proto plus debug shadow copy behind `SGLANG_MOE_SHADOW_COPY_CHECK=1`). Separate JIT caches.
+  - Serving flags and expert-stream env copied from `run-nvfp4-e16c-public.sh` (14 GiB cache). One server at a time on 127.0.0.1:31207, each holding `flock cc-gpu.lock` for its life on an otherwise empty GPU; `sglang.__file__` logged from inside each server.
+  - Workload: 8 fixed prompts × 512 greedy tokens, same order every run.
+  - Waits: another session's server held the GPU at 18:59–19:06. The first base1 launch exited 90 at startup (`sglang/cli/main.py` has no `__main__` guard) without using the GPU; the launcher now calls `main()`.
+- **Artifacts:** divix01 `nvfp4-work/cc-copykernel-ab/` (`REPORT.md` md5 72842dcd…, `kernel.patch` md5 7ae646ed…, `shadow_debug.patch`, `run_ab.sh`, `run_followups.sh`, `run-ab-server.sh`, `decode_workload.py`, `margin_ab.py`, `summarize_ab.py`, `shadow_selftest.py`, `negative_check_helper.py`, `servers/`, `logs/`).
+
+### Correctness
+
+- **Kernel tests:** 101 collected, 101 passed, exit 0 (existing expert-cache-transfer tests plus new count 0/1/max, more rows than warps, misaligned segment, graph replay with changing count). The first run had 12 failures from a dtype bug in the test's reference helper. A negative check showed the fixed helper fails on a flipped byte and on a stray write, for all 6 segment types and count 0.
+- **Shadow copy in real decode (the gate):** both kernels copied the same miss plan into separate rows inside the decode CUDA graph, compared on the GPU. 196,464 launches (~4,093 forwards × 48 layers), 452,088 real miss rows, **0 differing rows, 0 differing bytes** across 41 snapshots. Launch counts grew by exactly 48 per forward, so the check ran on every replay. Its self-test counted one corrupted byte exactly.
+- **Greedy parity can't gate this server:** base1 ≠ base2 ≠ base3 on 8/8 prompts, and proto1 ≠ proto2 likewise.
+- **Logprob margins (two-sided, proto2 vs base3 and base_dyn0 vs proto_dyn0):** at every first divergence each run chose the other's runner-up, margin ≤ 0.5 nats. Logprobs come in 0.0625 steps; the median top-1/top-2 margin over all positions is 4.5.
+- **Stock-server finding:** base2 (unmodified) flipped at prompt 1, token 2 ('\n' opening a thinking block vs '\n\n' closing `<think>` empty) at a 6.5-nat margin by proto2's logits. The unmodified server has a large nondeterminism source of its own; not investigated.
+
+### Speed (one run per arm)
+
+| Pair | Base ms/token | Proto ms/token | Saved |
+|---|---:|---:|---:|
+| base1 vs proto1, no logprobs | 74.88 | 57.77 | 17.1 |
+| base2 vs proto1, no logprobs | 75.10 | 57.77 | 17.3 |
+| base3 vs proto2, logprobs on | 75.81 | 58.72 | 17.1 |
+| base_dyn0 vs proto_dyn0, `SGLANG_MOE_HOT_DYNAMIC=0` | 142.22 | 87.74 | 54.5 |
+
+- Production settings: median decode 13.48 / 13.24 → 17.41 tok/s (+29%); TTFT unchanged (1.43 → 1.39 s). Miss load matched across arms: 111.5–111.9 rows (0.288 GiB) per forward.
+- Dynamic residency off: 6.77 → 11.01 tok/s (+63%) at 299 rows (0.77–0.785 GiB) per forward. The pre-registered prediction (written 20:20:59, before proto_dyn0 ran) was 45.7 ms; measured 54.5 ms (117%). The saving scales with miss load: 3.2× the saving for 2.7× the load.
+- This workload's absolute tok/s differs from E19's 10.37 (different prompts and lengths); only within-experiment deltas count.
+
+### Verdict
+
+- **Positive, cleared.** The kernel is byte-identical to the original under real decode and saves 17.1–17.3 ms/token at production settings, 78% of E24's 22 ms estimate.
+- **Cost-model reconciliation (E22):** the implied in-serving cost of the original kernel is about 0.147–0.158 s/GiB (estimate, assuming proto runs at its microbenchmark rate), close to the cost model's 0.1347 s/GiB. E22's microbenchmark overstated the original kernel's small-launch cost.
+- **Hand-off:** `kernel.patch` holds only the kernel change and tests, with no Python caller changes, and passes `git apply --check` on the fork at `4b083ae749` (not applied). `shadow_debug.patch` is debug-only.
+- **Not run:** repeated runs per arm (no confidence intervals); base self-consistency with dynamic residency off; chat-template or concurrent traffic; per-op copy timing in serving; root cause of the stock server's 6.5-nat flip.
+- **End state:** at 20:33:29 no GPU compute process, nothing listening on 31207 or 7867, tmux session gone; nothing committed or pushed.

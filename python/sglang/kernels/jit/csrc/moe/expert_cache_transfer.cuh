@@ -32,22 +32,47 @@ __device__ __forceinline__ void store_expert_device_word_cached(uint32_t* addres
 #endif
 }
 
-__device__ __forceinline__ void copy_expert_row_lane(
-    const uint8_t* src_row, uint8_t* dst_row, int64_t row_bytes, int64_t lane, int64_t lanes) {
-  const bool word_aligned =
-      ((reinterpret_cast<uintptr_t>(src_row) | reinterpret_cast<uintptr_t>(dst_row)) & 3) == 0;
-  const int64_t word_bytes = word_aligned ? (row_bytes / sizeof(uint32_t)) * sizeof(uint32_t) : 0;
+__device__ __forceinline__ void copy_expert_host_unit16(const uint8_t* src, uint8_t* dst) {
+#ifdef USE_ROCM
+  reinterpret_cast<uint64_t*>(dst)[0] = reinterpret_cast<const uint64_t*>(src)[0];
+  reinterpret_cast<uint64_t*>(dst)[1] = reinterpret_cast<const uint64_t*>(src)[1];
+#else
+  uint64_t lo, hi;
+  asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(src) : "memory");
+  asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" : : "l"(dst), "l"(lo), "l"(hi) : "memory");
+#endif
+}
 
-  if (word_aligned) {
-    const auto src_words = reinterpret_cast<const uint32_t*>(src_row);
-    auto dst_words = reinterpret_cast<uint32_t*>(dst_row);
-    const int64_t word_count = word_bytes / sizeof(uint32_t);
-    for (int64_t word = lane; word < word_count; word += lanes) {
-      store_expert_device_word_cached(dst_words + word, load_expert_host_word_noncoherent(src_words + word));
-    }
+// Copies lane `lane` of warp `warp` out of `warps` warps sharing one row.
+// Unit i of the row belongs to lane i % 32 of warp (i / 32) % warps, so the 32
+// lanes of a warp touch 32 adjacent 16-byte units on every step and the device
+// batches them into one tile read instead of issuing scattered 4-byte loads.
+// Bytes past the last whole 16-byte unit, or rows whose addresses are not
+// 16-byte aligned, fall back to 4-byte words and then single bytes in the same
+// lane pattern.
+__device__ __forceinline__ void copy_expert_row_lane(
+    const uint8_t* src_row, uint8_t* dst_row, int64_t row_bytes, int64_t warp, int64_t warps, int64_t lane) {
+  const int64_t stride = warps * kExpertTransferWarpSize;
+  const int64_t first = warp * kExpertTransferWarpSize + lane;
+  const bool unit_aligned =
+      ((reinterpret_cast<uintptr_t>(src_row) | reinterpret_cast<uintptr_t>(dst_row)) & 15) == 0;
+  const int64_t unit_count = unit_aligned ? row_bytes / 16 : 0;
+  for (int64_t unit = first; unit < unit_count; unit += stride) {
+    copy_expert_host_unit16(src_row + 16 * unit, dst_row + 16 * unit);
   }
 
-  for (int64_t byte = word_bytes + lane; byte < row_bytes; byte += lanes) {
+  const int64_t tail = 16 * unit_count;
+  const bool word_aligned =
+      ((reinterpret_cast<uintptr_t>(src_row + tail) | reinterpret_cast<uintptr_t>(dst_row + tail)) & 3) == 0;
+  const int64_t word_count = word_aligned ? (row_bytes - tail) / 4 : 0;
+  const auto src_words = reinterpret_cast<const uint32_t*>(src_row + tail);
+  auto dst_words = reinterpret_cast<uint32_t*>(dst_row + tail);
+  for (int64_t word = first; word < word_count; word += stride) {
+    store_expert_device_word_cached(dst_words + word, load_expert_host_word_noncoherent(src_words + word));
+  }
+
+  const int64_t byte_tail = tail + 4 * word_count;
+  for (int64_t byte = byte_tail + first; byte < row_bytes; byte += stride) {
     dst_row[byte] = src_row[byte];
   }
 }
@@ -58,8 +83,9 @@ __device__ __forceinline__ void copy_expert_row_segments_lane(
     int64_t segment_count,
     int64_t source_row,
     int64_t destination_slot,
-    int64_t lane,
-    int64_t lanes) {
+    int64_t warp,
+    int64_t warps,
+    int64_t lane) {
   for (int64_t segment = 0; segment < segment_count; ++segment) {
     const int64_t* entry = segments + 3 * segment;
     const int64_t row_bytes = entry[2];
@@ -67,16 +93,17 @@ __device__ __forceinline__ void copy_expert_row_segments_lane(
         reinterpret_cast<const uint8_t*>(static_cast<intptr_t>(entry[0])) + source_row * row_bytes,
         reinterpret_cast<uint8_t*>(static_cast<intptr_t>(entry[1])) + destination_slot * row_bytes,
         row_bytes,
-        lane,
-        lanes);
+        warp,
+        warps,
+        lane);
   }
 }
 
 // Every launched thread works on the rows the device-side count selects. With
-// fewer rows than threads, each row owns a contiguous range of threads, one lane
-// per thread, so a handful of misses reads host memory with hundreds of
-// concurrent lanes; contiguity keeps each launch block on one row's host pages.
-// With more rows than threads, each thread walks one row in every `threads`.
+// no more rows than warps, each row owns a contiguous range of whole warps, so
+// every lane of a warp reads the same row and adjacent host units stay in one
+// warp. With more rows than warps, each warp walks one row in every `warps`,
+// all 32 of its lanes on that row.
 __device__ __forceinline__ void copy_expert_rows_for_thread(
     const int64_t* segments,
     int64_t segment_count,
@@ -89,23 +116,28 @@ __device__ __forceinline__ void copy_expert_rows_for_thread(
     return;
   }
 
-  if (active_count <= total_threads) {
-    const int64_t row = thread * active_count / total_threads;
-    const int64_t first_thread = (row * total_threads + active_count - 1) / active_count;
-    const int64_t next_thread = ((row + 1) * total_threads + active_count - 1) / active_count;
+  const int64_t warp = thread / kExpertTransferWarpSize;
+  const int64_t lane = thread % kExpertTransferWarpSize;
+  const int64_t total_warps = total_threads / kExpertTransferWarpSize;
+
+  if (active_count <= total_warps) {
+    const int64_t row = warp * active_count / total_warps;
+    const int64_t first_warp = (row * total_warps + active_count - 1) / active_count;
+    const int64_t next_warp = ((row + 1) * total_warps + active_count - 1) / active_count;
     copy_expert_row_segments_lane(
         segments,
         segment_count,
         source_rows[row],
         static_cast<int64_t>(destination_slots[row]),
-        thread - first_thread,
-        next_thread - first_thread);
+        warp - first_warp,
+        next_warp - first_warp,
+        lane);
     return;
   }
 
-  for (int64_t row = thread; row < active_count; row += total_threads) {
+  for (int64_t row = warp; row < active_count; row += total_warps) {
     copy_expert_row_segments_lane(
-        segments, segment_count, source_rows[row], static_cast<int64_t>(destination_slots[row]), 0, 1);
+        segments, segment_count, source_rows[row], static_cast<int64_t>(destination_slots[row]), 0, 1, lane);
   }
 }
 
