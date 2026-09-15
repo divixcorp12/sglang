@@ -12,14 +12,12 @@ or a doorbell request's completion, was first observed by a spin loop.
     layers_copy_after_first  replay 0, queue copy, replay 1..K-1
     layers_copy_after_all    replay 0..K-1, then queue copy
     layers_gate_after_first  replay 0, queue copy, host waits for the copy, replay 1..K-1
-(c) The doorbell between per-layer graphs. Graph j = [wait(tag j) if j > 0 and waits in graph] + compute +
-    post(tag j+1). The thread is quiesced across every capture.
-    doorbell_layers                       waits in graph, release head store, acquire polls
-    doorbell_layers_gated                 as above, host waits for request j+1 to be enqueued before replay j+1
-    doorbell_post_only_layers             graph j = compute + post; all waits eager after the token
-    doorbell_layers_volatile_head         waits in graph, volatile head store
-    doorbell_post_only_layers_volatile_head
-    doorbell_layers_volatile_head_nc_poll waits in graph, volatile head store, noncoherent polls
+(c) The doorbell between K per-layer graphs; the thread is quiesced across every capture. Each case sets:
+    post      "graph": graph j posts tag j+1; "eager": graph j is compute only and the host launches the
+              post for tag j+1 eagerly right after replaying graph j
+    waits     "graph": graph j > 0 starts with wait(tag j); "eager": every wait is launched after the token
+    gated     host waits for the thread to enqueue request j+1 before launching replay j+1
+    head_store / poll_mode / prefer_overlap as in ExpertDoorbellCopier
 """
 
 import argparse
@@ -34,12 +32,15 @@ ROW_BYTES = 2_764_808
 SOURCE_ROWS = 32
 
 DOORBELL_CASES = (
-    ("doorbell_layers", "release", "acquire", True, False),
-    ("doorbell_layers_gated", "release", "acquire", True, True),
-    ("doorbell_post_only_layers", "release", "acquire", False, False),
-    ("doorbell_layers_volatile_head", "volatile", "acquire", True, False),
-    ("doorbell_post_only_layers_volatile_head", "volatile", "acquire", False, False),
-    ("doorbell_layers_volatile_head_nc_poll", "volatile", "noncoherent", True, False),
+    {"name": "doorbell_layers", "post": "graph", "waits": "graph"},
+    {"name": "doorbell_layers_gated", "post": "graph", "waits": "graph", "gated": True},
+    {"name": "doorbell_post_only_layers", "post": "graph", "waits": "eager"},
+    {"name": "doorbell_post_only_layers_no_overlap_flag", "post": "graph", "waits": "eager", "prefer_overlap": False},
+    {"name": "doorbell_layers_volatile_head", "post": "graph", "waits": "graph", "head_store": "volatile"},
+    {"name": "doorbell_layers_volatile_head_nc_poll", "post": "graph", "waits": "graph", "head_store": "volatile",
+     "poll_mode": "noncoherent"},
+    {"name": "compute_graphs_eager_post", "post": "eager", "waits": "eager"},
+    {"name": "compute_graphs_eager_post_no_overlap_flag", "post": "eager", "waits": "eager", "prefer_overlap": False},
 )
 
 
@@ -225,17 +226,25 @@ class Probe:
               "copy_done_minus_last_launched_layer_end_ms": summary(minus_last_launched_end),
               "exact": exact}, self.out)
 
-    def run_doorbell(self, name, head_store, poll_mode, waits_in_graph, gated):
+    def run_doorbell(self, case):
         from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
 
+        name = case["name"]
+        post_in_graph = case["post"] == "graph"
+        waits_in_graph = case["waits"] == "graph"
+        gated = case.get("gated", False)
+        settings = {
+            "head_store": case.get("head_store", "release"),
+            "poll_mode": case.get("poll_mode", "acquire"),
+            "prefer_overlap": case.get("prefer_overlap", True),
+        }
         rows, layers = self.args.rows, self.args.layers
         source = self.source.view(SOURCE_ROWS, ROW_BYTES)
         destination = self.destination.view(SOURCE_ROWS, ROW_BYTES)
         segments = expert_row_segments([(source, destination)])
         with ExpertDoorbellCopier(segments, rows, max_tags=layers + 1, cpu_core=self.args.spin_core,
-                                  timeout_polls=self.args.timeout_polls, head_store=head_store,
-                                  poll_mode=poll_mode) as copier:
+                                  timeout_polls=self.args.timeout_polls, **settings) as copier:
             plans = []
             generator = torch.Generator().manual_seed(7)
             for _ in range(layers + 1):
@@ -243,11 +252,15 @@ class Probe:
                 destination_slots = torch.randperm(SOURCE_ROWS, generator=generator)[:rows].to(DEV, torch.int32)
                 plans.append((source_rows, destination_slots, torch.tensor([rows], dtype=torch.int32, device=DEV)))
 
+            def post(index):
+                copier.post(*plans[index + 1], tag=index + 1)
+
             def layer(index):
                 if waits_in_graph and index > 0:
                     copier.wait(tag=index)
                 self.compute(self.args.layer_matmuls)
-                copier.post(*plans[index + 1], tag=index + 1)
+                if post_in_graph:
+                    post(index)
 
             try:
                 graphs = [
@@ -268,6 +281,8 @@ class Probe:
                 for index, graph in enumerate(graphs):
                     graph.replay()
                     ends.append(main_event())
+                    if not post_in_graph:
+                        post(index)
                     if gated:
                         seq = before["posted"] + index + 1
                         deadline = time.perf_counter() + 5.0
@@ -291,9 +306,9 @@ class Probe:
                         holds.append((request["complete_ns"] - end_times[index]) / 1e6)
                 timeouts.append(after["timeouts"] - before["timeouts"])
                 elapsed.append((finished - launched) / 1e6)
-            emit({"probe": name, "rows": rows, "layers": layers, "head_store": head_store, "poll_mode": poll_mode,
-                  "waits_in_graph": waits_in_graph, "gated": gated, "timeouts_per_token": summary(timeouts),
-                  "waits_per_token": layers, "token_ms": summary(elapsed),
+            emit({"probe": name, "rows": rows, "layers": layers, "post": case["post"], "waits": case["waits"],
+                  "gated": gated, **settings, "timeouts_per_token": summary(timeouts), "waits_per_token": layers,
+                  "token_ms": summary(elapsed),
                   "request_complete_minus_posting_layer_end_ms": summary(holds) if holds else None}, self.out)
 
     def run(self):
@@ -308,7 +323,9 @@ class Probe:
                 self.run_layers(name, idle_ms)
         if not self.args.skip_doorbell:
             for case in DOORBELL_CASES:
-                self.run_doorbell(*case)
+                if self.args.cases and case["name"] not in self.args.cases:
+                    continue
+                self.run_doorbell(case)
 
 
 def main():
@@ -323,6 +340,7 @@ def main():
     parser.add_argument("--timeout-polls", type=int, default=20_000)
     parser.add_argument("--skip-doorbell", action="store_true")
     parser.add_argument("--doorbell-only", action="store_true")
+    parser.add_argument("--cases", nargs="*", default=[])
     parser.add_argument("--out", default="probe_hold.jsonl")
     Probe(parser.parse_args()).run()
 
