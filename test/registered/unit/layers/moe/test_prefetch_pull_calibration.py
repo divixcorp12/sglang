@@ -4,6 +4,7 @@ import os
 import importlib.util
 import json
 import tempfile
+import subprocess
 from unittest import mock
 from pathlib import Path
 
@@ -82,6 +83,18 @@ def test_all_resident_and_no_candidate_do_not_create_a_false_useful_post():
     assert sum(score["physical_demand_rows"]) == 0
 
 
+def test_resident_fallback_candidate_is_not_an_eligible_calibration_opportunity():
+    """A valid fallback ID must not contaminate score bands after residency filtering."""
+    histogram = _histogram()
+    histogram.stage(3, torch.tensor([2]), torch.tensor(0.7), torch.tensor(0.2), torch.tensor(False))
+    histogram.record_target(3, torch.tensor([2]), torch.tensor([True]), torch.tensor([4]))
+    score = histogram.snapshot()["layers"]["3"]["score"]
+    assert sum(score["opportunity"]) == 0
+    assert sum(score["target_useful"]) == 0
+    assert sum(score["target_wasted"]) == 0
+    assert sum(score["physical_demand_rows"]) == 0
+
+
 def test_reset_drops_graph_capture_warmup_counts_without_reallocating_state():
     """Capture replay must not be included in the profiling-run histogram."""
     histogram = _histogram()
@@ -143,6 +156,23 @@ def test_extended_summarizer_keeps_roles_fixed_and_bootstraps_paired_sessions():
     assert b["posted_rows"] == 4
     assert b["useful_precision"] == 0.75
     assert module.paired_session_bootstrap(b, c, seed=20260916, resamples=10_000) == [10.0, 10.0]
+    b_repeat = dict(b)
+    b_repeat["p95_turn_decode_ms_per_token"] = 22.0
+    assert module.baseline_p95_repeatability_envelope([b, b_repeat]) == [19.5, 22.0]
     with pytest.raises(ValueError, match="mixed commits"):
         c["manifest"]["commit"] = "def"
         module.paired_session_bootstrap(b, c, seed=20260916, resamples=1)
+
+
+def test_launcher_rejects_any_truthy_calibration_in_timed_run():
+    """Boolean spellings such as true must not silently bypass the timed-arm guard."""
+    script = Path(__file__).parents[5] / "scripts/expert_prediction/run-shadow-server.sh"
+    result = subprocess.run(
+        ["bash", str(script), "test", "7999", "off"],
+        env={**os.environ, "RUN_KIND": "timed", "PREFETCH_CALIBRATION": "true"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "profiling-only" in result.stderr
