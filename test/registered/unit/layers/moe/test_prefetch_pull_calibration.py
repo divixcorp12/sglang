@@ -83,6 +83,22 @@ def test_all_resident_and_no_candidate_do_not_create_a_false_useful_post():
     assert sum(score["physical_demand_rows"]) == 0
 
 
+def test_target_observations_count_every_scored_target_before_residency_or_fallback():
+    """Fixed scorer/control costs need a denominator independent of pull eligibility."""
+    histogram = _histogram()
+    histogram.stage(
+        target_layer=3,
+        candidate_id=torch.tensor([-1]),
+        top_score=torch.tensor(0.9),
+        margin=torch.tensor(0.1),
+        source_eligible=torch.tensor(False),
+    )
+
+    record = histogram.snapshot()["layers"]["3"]
+    assert record["target_observations"] == 1
+    assert sum(record["score"]["source_eligible"]) == 0
+
+
 def test_resident_fallback_candidate_is_not_an_eligible_calibration_opportunity():
     """A valid fallback ID must not contaminate score bands after residency filtering."""
     histogram = _histogram()
@@ -117,6 +133,7 @@ def test_reset_drops_graph_capture_warmup_counts_without_reallocating_state():
     assert histogram.candidate_ids.data_ptr() == ids_address
     assert sum(score["opportunity"]) == 0
     assert sum(score["physical_demand_rows"]) == 0
+    assert histogram.snapshot()["layers"]["3"]["target_observations"] == 0
 
 
 def test_calibration_collection_is_disabled_unless_explicitly_requested():
@@ -196,7 +213,7 @@ def test_calibration_writer_emits_versioned_histogram_and_launcher_provenance():
     path = Path(tempfile.mkdtemp()) / "pull-calibration.json"
     histogram.write(path, {"commit": "abc", "predictor": "llapor", "cache_size": 10240, "top_k": 8})
     payload = json.loads(path.read_text())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["bin_count"] == 256
     assert payload["provenance"] == {"commit": "abc", "predictor": "llapor", "cache_size": 10240, "top_k": 8}
     assert sum(payload["layers"]["3"]["score"]["target_useful"]) == 1

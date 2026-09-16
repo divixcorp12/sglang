@@ -17,7 +17,7 @@ class PullCalibrationHistogram:
     :meth:`snapshot`, called from a normal metrics flush or profiling teardown.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     BINS = 256
     _FIELDS = (
         "opportunity",
@@ -40,6 +40,10 @@ class PullCalibrationHistogram:
         shape = (count, self.BINS, len(self._FIELDS))
         self._score_counts = torch.zeros(shape, dtype=torch.int64, device=device)
         self._margin_counts = torch.zeros_like(self._score_counts)
+        # This is intentionally independent of candidate validity and target
+        # residency: calibration must price every scorer/control invocation,
+        # not just the subset that became a pull opportunity.
+        self._target_observations = torch.zeros(count, dtype=torch.int64, device=device)
 
     @classmethod
     def bin_index(cls, value: torch.Tensor) -> int:
@@ -66,6 +70,7 @@ class PullCalibrationHistogram:
         self.top_scores[row].copy_(top_score.reshape(()))
         self.margins[row].copy_(margin.reshape(()))
         self.source_eligible[row].copy_(source_eligible.reshape(()))
+        self._target_observations[row].add_(1)
 
     def record_target(
         self,
@@ -102,6 +107,7 @@ class PullCalibrationHistogram:
         """Drop graph-capture warmup counts without changing captured addresses."""
         self._score_counts.zero_()
         self._margin_counts.zero_()
+        self._target_observations.zero_()
 
     def snapshot(self) -> dict:
         """Materialize the versioned host contract at a normal metrics boundary."""
@@ -119,6 +125,7 @@ class PullCalibrationHistogram:
             "bin_edges": "uniform [0,1], lower-inclusive; 1.0 is in bin 255",
             "layers": {
                 str(layer_id): {
+                    "target_observations": int(self._target_observations[row].item()),
                     "score": serialize(self._score_counts[row]),
                     "margin": serialize(self._margin_counts[row]),
                 }

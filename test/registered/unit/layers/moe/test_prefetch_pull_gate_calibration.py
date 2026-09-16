@@ -46,9 +46,10 @@ def _histogram(*, session: str, useful_score_bin: int, useful_margin_bin: int = 
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "bin_count": bins,
         "range": [0.0, 1.0],
+        "bin_edges": "uniform [0,1], lower-inclusive; 1.0 is in bin 255",
         "complete": True,
         "provenance": {
             "commit": "abc123",
@@ -62,7 +63,11 @@ def _histogram(*, session: str, useful_score_bin: int, useful_margin_bin: int = 
             "shape_provenance": "BS1",
             "top_k": "top-k-unique",
         },
-        "layers": {"3": {"score": feature(useful_score_bin), "margin": feature(useful_margin_bin)}},
+        "layers": {"3": {
+            "target_observations": 8,
+            "score": feature(useful_score_bin),
+            "margin": feature(useful_margin_bin),
+        }},
     }
 
 
@@ -97,6 +102,7 @@ def test_selects_positive_heldout_top_score_threshold_and_emits_complete_artifac
     assert artifact["target_layers"] == [3]
     assert artifact["training_session_set_checksum"] == "sessions-train"
     assert artifact["heldout_session_set_checksum"] == "sessions-heldout"
+    assert artifact["calibration_miss_regime"]["bin_edges"] == "uniform [0,1], lower-inclusive; 1.0 is in bin 255"
     assert layer["feature"] == "top_score"
     assert layer["threshold"] == pytest.approx(224 / 256)
     # 4 useful rows * 10 - 4 posted rows * 1 - 4 physical demand rows * .5.
@@ -130,6 +136,42 @@ def test_rejects_incomplete_or_out_of_scope_histograms_before_selection():
     wrong_scope["provenance"]["batch_size"] = 2
     with pytest.raises(ValueError, match="BS1"):
         module.calibrate_gate(wrong_scope, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+
+def test_rejects_missing_target_observation_denominator_and_noncanonical_bin_edges():
+    module = _module()
+    train = _histogram(session="train", useful_score_bin=224)
+    del train["layers"]["3"]["target_observations"]
+    with pytest.raises(ValueError, match="target_observations"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+    train = _histogram(session="train", useful_score_bin=224)
+    train["bin_edges"] = "close enough"
+    with pytest.raises(ValueError, match="bin_edges"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+
+def test_prices_fixed_costs_by_target_observations_not_source_eligible():
+    module = _module()
+    train = _histogram(session="train", useful_score_bin=224)
+    heldout = _histogram(session="heldout", useful_score_bin=224)
+    train["layers"]["3"]["target_observations"] = 100
+    heldout["layers"]["3"]["target_observations"] = 100
+    costs = _costs()
+    costs["layers"]["3"]["scorer_plus_selection_cost"] = 0.1
+    artifact = module.calibrate_gate(train, heldout, costs)
+
+    # 40 useful value - 10 fixed target-observation cost - 4 posted - 2 demand.
+    assert artifact["layers"]["3"]["training_net_value"] == pytest.approx(24.0)
+
+
+@pytest.mark.parametrize("invalid_sessions", (None, "train", [], ["train", "train"], [" "]))
+def test_rejects_missing_or_invalid_session_id_lists(invalid_sessions):
+    module = _module()
+    train = _histogram(session="train", useful_score_bin=224)
+    train["provenance"]["session_ids"] = invalid_sessions
+    with pytest.raises(ValueError, match="session_ids"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
 
 
 def test_refuses_to_emit_gate_when_no_positive_train_threshold_survives_heldout():
