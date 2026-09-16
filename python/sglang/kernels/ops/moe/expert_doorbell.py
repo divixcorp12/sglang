@@ -1,0 +1,695 @@
+"""Doorbell expert-row copies: GPU-posted plans copied by a CPU spin thread.
+
+Inside a CUDA graph, ``ExpertDoorbellCopier.post`` launches a kernel that
+writes a copy plan into a pinned request page and bumps its sequence last. A
+C++ thread spinning on that sequence copies the planned pinned rows to their
+device slots with one batched copy on a CUDA stream, then queues an eight-byte
+publish of ``{sequence, sequence if copied else 0}`` into device completion
+words.
+``ExpertDoorbellCopier.resolve`` launches a chain of short kernels that block
+until those words reach the tag's request and set the tag's device delivered
+flag, or give up after ``timeout_polls`` and report nothing delivered; when
+the thread had already committed to the request they drain until its copies
+land. ``wait`` is ``resolve`` followed by the in-graph copy of whatever was
+not delivered. None of these calls synchronizes the host or breaks the graph.
+"""
+
+from __future__ import annotations
+
+import atexit
+import functools
+import logging
+import time
+import weakref
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.kernels.jit.utils import load_jit
+from sglang.kernels.ops.moe.expert_cache_transfer import (
+    ExpertRowSegments,
+    _validate_plan,
+    copy_expert_row_segments_gpu,
+)
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+_ABANDONED_BASE = 16
+_RECORD_HEADER_BYTES = 16
+_TAG_BASE = 13
+_CLAIMED_OFFSET = 4
+_FATAL_OFFSET = 12
+_PUBLISH_RING = 1024
+_TRACE_ROWS = 4096
+_POLL_MODES = {"acquire": 0, "volatile": 1, "noncoherent": 2}
+_HEAD_STORES = {"release": 0, "volatile": 1}
+_COPY_APIS = {"batch": 0, "per_segment": 1}
+_SRC_ACCESS_ORDERS = {"stream": 1, "during_call": 2, "any": 3}
+_STATE_WORDS = {
+    "posted": 0,
+    "disabled": 1,
+    "degraded": 2,
+    "timeouts": 3,
+    "waits": 4,
+    "last_polls": 5,
+    "record_mismatches": 6,
+    "resolved": 7,
+    "drain_timeouts": 8,
+    "drains": 9,
+    "drain_pending": 10,
+    "disabled_posts": 11,
+}
+_COUNTERS = (
+    "serviced",
+    "skipped_abandoned",
+    "skipped_overrun",
+    "invalid_records",
+    "copy_errors",
+    "rows_copied",
+    "bytes_copied",
+    "trace_count",
+    "running",
+    "spin_cpu",
+    "last_seen",
+    "last_copy_error",
+    "copy_api",
+    "src_access_order",
+    "external_stream",
+    "late_completions",
+    "discarded_disabled",
+    "completed_seq",
+)
+_RESET_AFTER_CAPTURE = (
+    "degraded",
+    "timeouts",
+    "waits",
+    "last_polls",
+    "record_mismatches",
+    "drain_timeouts",
+    "drains",
+    "drain_pending",
+)
+_STATUSES = (
+    "pending",
+    "serviced",
+    "skipped_abandoned",
+    "skipped_overrun",
+    "invalid_record",
+    "copy_failed",
+    "discarded_disabled",
+)
+_TRACE_FIELDS = (
+    "seq",
+    "count",
+    "seen_ns",
+    "enqueued_ns",
+    "complete_ns",
+    "bytes",
+    "status",
+    "publish_slot",
+)
+
+
+@functools.cache
+def _jit_expert_doorbell_module() -> Module:
+    names = (
+        "expert_doorbell_post",
+        "expert_doorbell_resolve",
+        "expert_doorbell_start",
+        "expert_doorbell_stop",
+        "expert_doorbell_pause",
+        "expert_doorbell_inject",
+        "expert_doorbell_counters",
+        "expert_doorbell_trace",
+    )
+    return load_jit(
+        "expert_doorbell",
+        cuda_files=["moe/expert_doorbell.cuh"],
+        cuda_wrappers=[(name, name) for name in names],
+    )
+
+
+def _record_bytes(capacity: int) -> int:
+    return (_RECORD_HEADER_BYTES + 12 * capacity + 7) // 8 * 8
+
+
+def _header_bytes(max_tags: int) -> int:
+    return (_ABANDONED_BASE + 4 * max_tags + 7) // 8 * 8
+
+
+def _capturing() -> bool:
+    return torch.cuda.graphs.is_current_stream_capturing()
+
+
+def _reached(observed: int, seq: int) -> bool:
+    """Whether 32-bit sequence ``observed`` is at or after ``seq``, across wraparound."""
+    return ((observed - seq) & 0xFFFFFFFF) < 0x80000000
+
+
+logger = logging.getLogger(__name__)
+
+_LIVE_COPIERS: weakref.WeakSet = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_live_copiers() -> None:
+    """Stop every copier still running at interpreter exit, while CUDA is still up.
+
+    Otherwise the process-wide thread registry is destroyed during static
+    teardown with its threads still running. The hook skips the device
+    synchronize: this path also runs after a scheduler exception, where a wedged
+    device would hang it, and the thread's own drain still finishes copies
+    already posted. A copier whose stop fails does not keep the others running.
+    """
+    for copier in list(_LIVE_COPIERS):
+        try:
+            copier.stop(synchronize=False)
+        except Exception:
+            logger.exception("Stopping an expert doorbell copier at exit failed.")
+
+
+class ExpertDoorbellCopier:
+    """Copies planned expert rows through a CPU thread without a host sync.
+
+    ``post``, ``resolve`` and ``wait`` only launch kernels, so they can be
+    captured in a CUDA graph and replayed with plans and counts that change
+    between replays. Each ``tag`` names one outstanding request, e.g. the
+    target MoE layer of its rows; ``resolve(tag)`` resolves the latest ``post``
+    with that tag, independently of requests outstanding for other tags.
+
+    ``head_store`` selects how the poster publishes the sequence to the host:
+    ``"release"`` (a system-scope release store) or ``"volatile"`` (a volatile
+    global store).
+
+    ``copy_api`` selects how the thread issues row copies: ``"batch"`` (one
+    ``cudaMemcpyBatchAsync`` per request, every copy with ``src_access_order``
+    ``"stream"``, ``"during_call"`` or ``"any"``) or ``"per_segment"`` (one
+    ``cudaMemcpyAsync`` per segment row, stream order only). ``stream`` is the
+    ``torch.cuda.Stream`` the thread copies on; the copier keeps a reference to
+    it. Without one the thread creates its own stream, whose copies CUDA-graph
+    replays hold back (E32), so ``post`` and ``resolve`` refuse to be captured
+    in a graph then; that mode exists for probes. ``stats()`` reports the
+    configured values and ``last_copy_error``, the CUDA status of the latest
+    failed copy call.
+
+    ``segments`` is one ``ExpertRowSegments`` copied by every request, or a
+    sequence of them, one per tag: a request copies its tag's set and ``wait``
+    copies its residual through that set, so one thread serves layers whose
+    rows live in different tensors.
+
+    Invariants the caller must uphold:
+
+    * A destination slot named by a posted request must not be read by any
+      kernel launched before that request's ``resolve`` returns, and must not
+      be written by anyone else until then. The thread writes slots on its
+      own stream at any time between ``post`` and completion.
+    * The plan tensors passed to ``post`` must not change until that tag's
+      ``wait`` launched, since ``wait`` copies the undelivered plan from them.
+    * A resolve that times out on a request the thread has not committed to
+      reports it undelivered at once: the thread commits (writes its claim)
+      before it checks whether the request was abandoned, and copies only
+      after that check. A committed request is drained until its copies land
+      (``drains``), in one launch of at most ``drain_polls`` polls: a
+      never-launched kernel's launch blocks until all queued device work
+      finishes and holds the thread's copy call with it (E34, E34f), so only a
+      bounded total wait bounds that stall. A drain that runs out disables the
+      copier for good (``disabled``, ``drain_timeouts``), raises the page's
+      fatal word to its sequence and resolves undelivered at once, so the
+      caller's residual copy serves the plan. The thread's copies of that
+      request may still land afterwards, writing the same bytes to the same
+      slots. Before the next forward writes those slots with a different plan,
+      the caller must run ``fail_stop_check``, which waits until the thread
+      has completed every sequence up to the fatal word; a watchdog thread
+      aborts the process with an ERROR on stderr if that takes longer than
+      ``fatal_wait_s``. Once disabled every later ``post`` posts nothing
+      (``disabled_posts``) and the thread discards what it had not committed
+      to (``discarded_disabled``).
+    * Source rows must stay allocated, registered and unchanged while any
+      request naming them is outstanding.
+    * At most ``ring - 1`` requests may be posted between a ``post`` and its
+      ``resolve``; an older record is overwritten and its request reports
+      undelivered (counted in ``record_mismatches``).
+    """
+
+    def __init__(
+        self,
+        segments: ExpertRowSegments | Sequence[ExpertRowSegments],
+        capacity: int,
+        *,
+        ring: int = 64,
+        max_tags: int = 64,
+        cpu_core: int = 71,
+        timeout_polls: int = 2_000_000,
+        degraded_polls: int = 4_096,
+        drain_polls: int = 8_000_000,
+        fatal_wait_s: float = 30.0,
+        prefer_overlap: bool = True,
+        poll_mode: str = "acquire",
+        head_store: str = "release",
+        copy_api: str = "batch",
+        src_access_order: str = "stream",
+        stream: torch.cuda.Stream | None = None,
+        prime_slot: int | None = None,
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive.")
+        if ring < 2:
+            raise ValueError("ring must hold at least two requests.")
+        if max_tags <= 0:
+            raise ValueError("max_tags must be positive.")
+        if timeout_polls < 0 or degraded_polls < 0 or drain_polls < 0:
+            raise ValueError("poll limits must not be negative.")
+        if not fatal_wait_s > 0:
+            raise ValueError("fatal_wait_s must be positive.")
+        if poll_mode not in _POLL_MODES:
+            raise ValueError(f"poll_mode must be one of {sorted(_POLL_MODES)}.")
+        if head_store not in _HEAD_STORES:
+            raise ValueError(f"head_store must be one of {sorted(_HEAD_STORES)}.")
+        if copy_api not in _COPY_APIS:
+            raise ValueError(f"copy_api must be one of {sorted(_COPY_APIS)}.")
+        if src_access_order not in _SRC_ACCESS_ORDERS:
+            raise ValueError(
+                f"src_access_order must be one of {sorted(_SRC_ACCESS_ORDERS)}."
+            )
+        if copy_api == "per_segment" and src_access_order != "stream":
+            raise ValueError("src_access_order applies only to copy_api='batch'.")
+        segment_sets = (
+            (segments,) if isinstance(segments, ExpertRowSegments) else tuple(segments)
+        )
+        if not segment_sets:
+            raise ValueError("segments must hold at least one segment set.")
+        if len(segment_sets) > 1 and max_tags < len(segment_sets):
+            raise ValueError("max_tags must cover every segment set.")
+        device = segment_sets[0].table.device
+        if any(segment_set.table.device != device for segment_set in segment_sets):
+            raise ValueError("every segment set must share one CUDA device.")
+        if stream is not None and stream.device != device:
+            raise ValueError("stream must be on the copier's device.")
+        self.stream = stream
+        self.segment_sets = segment_sets
+        self.segments = segment_sets[0]
+        self.capacity = capacity
+        self.ring = ring
+        self.max_tags = max_tags
+        self.timeout_polls = timeout_polls
+        self.degraded_polls = degraded_polls
+        self.drain_polls = drain_polls
+        self.fatal_wait_s = fatal_wait_s
+        self.poll_mode = _POLL_MODES[poll_mode]
+        self.head_store = _HEAD_STORES[head_store]
+        self.device = device
+        self.header_bytes = _header_bytes(max_tags)
+        self.page = torch.zeros(
+            self.header_bytes + ring * _record_bytes(capacity),
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        self.state = torch.zeros(_TAG_BASE + max_tags, dtype=torch.int32, device=device)
+        self.delivered = torch.zeros(max_tags, dtype=torch.int32, device=device)
+        self.done = torch.zeros(2, dtype=torch.int32, device=device)
+        self._undelivered = torch.zeros((max_tags, 1), dtype=torch.int32, device=device)
+        self._one = torch.ones(1, dtype=torch.int32, device=device)
+        self._posted_plans: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.publish_words = torch.zeros(
+            2 * _PUBLISH_RING, dtype=torch.int32, pin_memory=True
+        )
+        self.segment_table = torch.tensor(
+            [
+                [
+                    source.data_ptr(),
+                    destination.data_ptr(),
+                    source.numel() // source.shape[0] * source.element_size(),
+                    source.shape[0],
+                    destination.shape[0],
+                ]
+                for segment_set in segment_sets
+                for source, destination in segment_set.pairs
+            ],
+            dtype=torch.int64,
+        )
+        set_sizes = [len(segment_set.pairs) for segment_set in segment_sets]
+        self.set_offsets = torch.tensor(
+            [sum(set_sizes[:index]) for index in range(len(set_sizes) + 1)],
+            dtype=torch.int64,
+        )
+        self._module = _jit_expert_doorbell_module()
+        self._handle = self._module.expert_doorbell_start(
+            self.page,
+            self.segment_table,
+            self.set_offsets,
+            self.done,
+            self.publish_words,
+            capacity,
+            ring,
+            self.header_bytes,
+            max_tags,
+            device.index if device.index is not None else torch.cuda.current_device(),
+            cpu_core,
+            int(prefer_overlap),
+            _COPY_APIS[copy_api],
+            _SRC_ACCESS_ORDERS[src_access_order],
+            stream.cuda_stream if stream is not None else 0,
+            int(fatal_wait_s * 1e9),
+        )
+        if self._handle < 0:
+            raise RuntimeError("expert doorbell thread failed to start.")
+        self._stopped = False
+        self.prime_s = 0.0
+        _LIVE_COPIERS.add(self)
+        if prime_slot is not None:
+            self._prime(prime_slot)
+
+    def _prime(self, slot: int) -> None:
+        """Run one timed-out wait with a one-row residual copy before serving.
+
+        Empirically required for availability, not for correctness: in a
+        process that has not run this path, the first drain that overlaps a
+        thread copy stalled 25/25 times until its budget ran out (E34 3b, 3c,
+        3d, 3f, 3h), which now disables the copier for the life of the process;
+        after this prime it passed 5/5 (E34 3g). Why it primes is not
+        understood. Correctness and boundedness do not depend on it: an
+        unprimed copier still resolves within its budgets with correct bytes.
+
+        The thread is paused while the prime request is posted, resolved and
+        copied in-graph, so it claims nothing (checked). The request's abandoned
+        word stays set while the thread is resumed and consumes it through its
+        normal path as ``skipped_abandoned``, publishing it unserviced with no
+        copy; the constructor waits for that publish (``completed_seq``) and
+        checks that nothing was serviced, one request was skipped, no copy
+        failed and the slot still holds the residual copy's bytes. Only then
+        are the wait state reset and the abandoned word cleared, so the thread
+        can never service the prime request later. The residual copy writes
+        source row 0 of the first segment set into ``slot``, which the caller
+        must not read before it writes that slot itself (serving passes a
+        graph-gather scratch row, before capture).
+        """
+        destination_rows = min(destination.shape[0] for _, destination in self.segment_sets[0].pairs)
+        if not 0 <= slot < destination_rows:
+            raise ValueError(f"prime_slot must be in [0, {destination_rows}).")
+        started = time.perf_counter()
+        self.pause()
+        source_rows = torch.zeros(self.capacity, dtype=torch.int64, device=self.device)
+        destination_slots = torch.full((self.capacity,), slot, dtype=torch.int32, device=self.device)
+        count = torch.ones(1, dtype=torch.int32, device=self.device)
+        self.post(source_rows, destination_slots, count, tag=0)
+        self._module.expert_doorbell_resolve(
+            self.page,
+            self.state,
+            self.delivered,
+            self.done,
+            0,
+            self.capacity,
+            self.ring,
+            self.header_bytes,
+            1,
+            1,
+            0,
+            self.poll_mode,
+        )
+        copy_expert_row_segments_gpu(
+            self.segment_sets[0], source_rows, destination_slots, self.undelivered_count(0, count)
+        )
+        torch.cuda.synchronize(self.device)
+        before = self.stats()
+        claimed = int(self.page[_CLAIMED_OFFSET : _CLAIMED_OFFSET + 4].view(torch.int32)[0])
+        if claimed != 0 or before["serviced"] != 0 or int(self.delivered[0].item()) != 0:
+            self.stop(synchronize=False)
+            raise RuntimeError("expert doorbell prime reached the thread; refusing to serve.")
+        prime_seq = before["posted"] & 0xFFFFFFFF
+        pairs = self.segment_sets[0].pairs
+        def slot_bytes(destination: torch.Tensor) -> torch.Tensor:
+            return destination[slot : slot + 1].reshape(-1).view(torch.uint8)
+
+        residual = [slot_bytes(destination).clone() for _, destination in pairs]
+        self._posted_plans.pop(0, None)
+        self.resume()
+        deadline = time.perf_counter() + 5.0
+        while not _reached(self.completed_seq(), prime_seq):
+            if time.perf_counter() > deadline:
+                self.stop(synchronize=False)
+                raise RuntimeError(
+                    "expert doorbell thread did not consume the prime request within 5 s; refusing to serve."
+                )
+            time.sleep(0.0005)
+        after = self.stats()
+        second_writer = any(
+            not torch.equal(slot_bytes(destination), kept) for (_, destination), kept in zip(pairs, residual)
+        )
+        if (
+            after["serviced"] != before["serviced"]
+            or after["skipped_abandoned"] - before["skipped_abandoned"] != 1
+            or after["copy_errors"] != 0
+            or second_writer
+        ):
+            self.stop(synchronize=False)
+            raise RuntimeError(
+                "expert doorbell prime request was not consumed as skipped_abandoned without a copy "
+                f"(serviced {after['serviced']}, skipped_abandoned {after['skipped_abandoned']}, "
+                f"copy_errors {after['copy_errors']}, slot rewritten {second_writer}); refusing to serve."
+            )
+        self.reset_wait_state()
+        self.page[_ABANDONED_BASE : _ABANDONED_BASE + 4].view(torch.int32)[0] = 0
+        self.prime_s = time.perf_counter() - started
+
+    def _check_tag(self, tag: int) -> None:
+        if not 0 <= tag < self.max_tags:
+            raise ValueError(f"tag must be in [0, {self.max_tags}).")
+
+    def _check_capture(self) -> None:
+        if self.stream is None and _capturing():
+            raise RuntimeError(
+                "expert doorbell copies on a thread-created stream are held behind "
+                "CUDA-graph replays; pass stream=torch.cuda.Stream() to capture them."
+            )
+
+    def post(
+        self,
+        source_rows: torch.Tensor,
+        destination_slots: torch.Tensor,
+        count: torch.Tensor,
+        tag: int = 0,
+    ) -> None:
+        """Launch the kernel that posts ``count`` planned rows for ``tag``."""
+        if self._stopped:
+            raise RuntimeError("expert doorbell thread is stopped.")
+        self._check_tag(tag)
+        self._check_capture()
+        _validate_plan(self.device, source_rows, destination_slots, count)
+        if source_rows.numel() != self.capacity:
+            raise ValueError("plan tensors must match the copier capacity.")
+        self._posted_plans[tag] = (source_rows, destination_slots, count)
+        self._module.expert_doorbell_post(
+            self.page,
+            self.state,
+            self.delivered,
+            source_rows,
+            destination_slots,
+            count,
+            tag,
+            self.capacity,
+            self.ring,
+            self.header_bytes,
+            self.head_store,
+        )
+
+    def resolve(self, tag: int = 0) -> torch.Tensor:
+        """Launch the kernels that resolve ``tag``'s request.
+
+        Returns the tag's int32 delivered flag, a one-element device view that
+        holds 1 once the resolve launched if the thread copied the whole plan,
+        and 0 if it copied none of it.
+        """
+        self._check_tag(tag)
+        self._check_capture()
+        self._module.expert_doorbell_resolve(
+            self.page,
+            self.state,
+            self.delivered,
+            self.done,
+            tag,
+            self.capacity,
+            self.ring,
+            self.header_bytes,
+            self.timeout_polls,
+            self.degraded_polls,
+            self.drain_polls,
+            self.poll_mode,
+        )
+        return self.delivered[tag : tag + 1]
+
+    def undelivered_count(self, tag: int, count: torch.Tensor) -> torch.Tensor:
+        """The planned row count still to copy after ``resolve(tag)``: ``count`` or 0."""
+        buffer = self._undelivered[tag]
+        torch.sub(self._one, self.delivered[tag : tag + 1], out=buffer)
+        torch.mul(buffer, count, out=buffer)
+        return buffer
+
+    def wait(self, tag: int = 0) -> None:
+        """Resolve ``tag``'s request, then copy in-graph whatever was not delivered."""
+        self._check_tag(tag)
+        if tag not in self._posted_plans:
+            raise RuntimeError(f"no request was posted for tag {tag}.")
+        source_rows, destination_slots, count = self._posted_plans[tag]
+        self.resolve(tag)
+        copy_expert_row_segments_gpu(
+            self.segment_sets[tag if len(self.segment_sets) > 1 else 0],
+            source_rows,
+            destination_slots,
+            self.undelivered_count(tag, count),
+        )
+
+    def pause(self) -> None:
+        """Keep the thread spinning but stop it servicing requests."""
+        self._module.expert_doorbell_pause(self._handle, 1)
+
+    def resume(self) -> None:
+        self._module.expert_doorbell_pause(self._handle, 0)
+
+    def inject_fault(
+        self,
+        service_delay_s: float = 0.0,
+        fail_copies: bool = False,
+        defer_landing_s: Sequence[float] = (),
+    ) -> None:
+        """Make the thread sleep ``service_delay_s`` after committing to each request and
+        before queuing its copies, report every copy as failed without issuing it, or land the
+        next committed requests ``defer_landing_s[k]`` after their claim each while it keeps
+        claiming later ones (publishes stay in sequence order); the defaults clear all three."""
+        deferrals = torch.tensor([int(seconds * 1e9) for seconds in defer_landing_s], dtype=torch.int64)
+        self._module.expert_doorbell_inject(
+            self._handle, int(service_delay_s * 1e9), int(fail_copies), deferrals
+        )
+
+    def completed_seq(self) -> int:
+        """The latest sequence whose publish the thread saw complete (host counter, no device read).
+
+        Publishes complete in sequence order, so every sequence up to it has completed."""
+        counters = torch.zeros(len(_COUNTERS), dtype=torch.int64)
+        if not self._module.expert_doorbell_counters(self._handle, counters):
+            return 0
+        return int(counters[_COUNTERS.index("completed_seq")]) & 0xFFFFFFFF
+
+    def fatal_seq(self) -> int:
+        """The highest sequence whose drain ran out, 0 when none (host page word)."""
+        return int(self.page[_FATAL_OFFSET : _FATAL_OFFSET + 4].view(torch.int32)[0]) & 0xFFFFFFFF
+
+    def fail_stop_check(self, synchronize: bool = False, poll_s: float = 0.001) -> float:
+        """Hold the caller until every committed copy a drain gave up on has landed.
+
+        Call it after each forward that can post and before the next one. The
+        fatal word is written by device kernels, so it is current only after
+        the forward's device work finished: callers whose result handling
+        already synchronized pass ``synchronize=False``; otherwise
+        ``synchronize=True`` synchronizes the current stream unconditionally.
+
+        It cannot skip that synchronize on the grounds that no post ran. A
+        replayed CUDA graph posts from the device without entering Python, so
+        a "did a post run since the last check" flag is False on exactly the
+        steps that posted, and the check would then read a stale zero fatal
+        word and return at once -- the failure it exists to catch. The cost is
+        one stream synchronize per forward on a stream the caller is about to
+        wait on anyway.
+
+        With no exhausted drain it reads two host words after that synchronize
+        and returns 0.0 without a device-wide synchronize. Otherwise it sleeps
+        until the thread has completed every sequence up to the fatal word and
+        returns the seconds waited; the watchdog aborts the process if that
+        exceeds ``fatal_wait_s``, and this raises after twice that as a
+        backstop.
+        """
+        if synchronize:
+            torch.cuda.current_stream(self.device).synchronize()
+        fatal = self.fatal_seq()
+        if fatal == 0 or _reached(self.completed_seq(), fatal):
+            return 0.0
+        started = time.perf_counter()
+        deadline = started + 2 * self.fatal_wait_s
+        while True:
+            time.sleep(poll_s)
+            fatal = self.fatal_seq()
+            if _reached(self.completed_seq(), fatal):
+                return time.perf_counter() - started
+            if time.perf_counter() > deadline:
+                raise RuntimeError(
+                    f"expert doorbell request {fatal} did not complete within twice the fatal wait "
+                    "and the watchdog did not abort"
+                )
+
+    def reset_wait_state(self) -> None:
+        """Zero the resolve counters and the degraded flag, keeping sequences and ``disabled``.
+
+        Resolves captured while the thread is quiesced time out and leave the
+        copier degraded; call this before resuming so serving starts with full
+        budgets and counters that only count serving resolves.
+        """
+        torch.cuda.synchronize(self.device)
+        for name in _RESET_AFTER_CAPTURE:
+            self.state[_STATE_WORDS[name]] = 0
+
+    def quiesce(self, timeout_s: float = 10.0) -> None:
+        """Pause the thread once every request posted so far is published.
+
+        Synchronizes the device. Use it before capturing a CUDA graph so the
+        thread issues no copies while the capture runs, and ``resume`` after.
+        """
+        torch.cuda.synchronize(self.device)
+        posted = int(self.state[_STATE_WORDS["posted"]].item()) & 0xFFFFFFFF
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            trace = self.trace()
+            last = trace[-1] if trace else None
+            caught_up = posted == 0 or (
+                last is not None and last["seq"] == posted and last["complete_ns"] != 0
+            )
+            if caught_up:
+                self.pause()
+                return
+        raise RuntimeError("expert doorbell thread did not catch up before the quiesce timeout.")
+
+    def stop(self, synchronize: bool = True) -> None:
+        """Drain every request posted so far, then join the thread.
+
+        With ``synchronize`` the device first finishes every queued post, so the
+        thread drains requests that were still in flight on the device.
+        """
+        if self._stopped:
+            return
+        if synchronize:
+            torch.cuda.synchronize(self.device)
+        self._module.expert_doorbell_stop(self._handle)
+        self._stopped = True
+
+    def stats(self) -> dict[str, int]:
+        """Thread counters plus the device state words (synchronizes the device)."""
+        counters = torch.zeros(len(_COUNTERS), dtype=torch.int64)
+        found = self._module.expert_doorbell_counters(self._handle, counters)
+        stats = dict(zip(_COUNTERS, counters.tolist())) if found else {"running": 0}
+        state = self.state.cpu().tolist()
+        stats.update({name: state[index] for name, index in _STATE_WORDS.items()})
+        stats["done"] = int(self.done[0].item())
+        stats["fatal_seq"] = self.fatal_seq()
+        return stats
+
+    def trace(self) -> list[dict[str, int | str]]:
+        """The thread's most recent requests, oldest first."""
+        rows = torch.zeros((_TRACE_ROWS, len(_TRACE_FIELDS)), dtype=torch.int64)
+        written = self._module.expert_doorbell_trace(self._handle, rows)
+        entries = []
+        for values in rows[:written].tolist():
+            entry: dict[str, int | str] = dict(zip(_TRACE_FIELDS, values))
+            entry["status"] = _STATUSES[values[_TRACE_FIELDS.index("status")]]
+            entries.append(entry)
+        return entries
+
+    def __enter__(self) -> ExpertDoorbellCopier:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.stop()
+
+    def __del__(self) -> None:
+        if getattr(self, "_stopped", True) is False:
+            self._module.expert_doorbell_stop(self._handle)
+            self._stopped = True

@@ -819,6 +819,13 @@ class ExpertHotCacheManager:
         async_promotions: bool = False,
         gpu_residency_update: bool = False,
         gpu_residency_max_promotions: int = 64,
+        expert_doorbell: bool = False,
+        doorbell_cpu_core: int = 71,
+        doorbell_timeout_polls: int = 0,
+        doorbell_degraded_polls: int = 0,
+        doorbell_drain_polls: int = 0,
+        doorbell_plan_capacity: int = 0,
+        doorbell_fatal_wait_s: float = 30.0,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1017,6 +1024,18 @@ class ExpertHotCacheManager:
             manager.gpu_residency = GpuResidencyUpdater(
                 manager, max_promotions=gpu_residency_max_promotions
             )
+        manager.doorbell = (
+            manager._start_doorbell(
+                doorbell_cpu_core,
+                doorbell_timeout_polls,
+                doorbell_degraded_polls,
+                doorbell_drain_polls,
+                doorbell_plan_capacity,
+                doorbell_fatal_wait_s,
+            )
+            if expert_doorbell
+            else None
+        )
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -1167,6 +1186,221 @@ class ExpertHotCacheManager:
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
+
+    def _start_doorbell(
+        self,
+        cpu_core: int,
+        timeout_polls: int,
+        degraded_polls: int,
+        drain_polls: int,
+        plan_capacity: int = 0,
+        fatal_wait_s: float = 30.0,
+    ) -> "ExpertDoorbellCopier":
+        """Serve every graph-gather layer's host miss plans through one doorbell thread.
+
+        Each layer becomes one target-layer tag of a shared ``DoorbellRowBackend``
+        (``expert_row_plan``), posting and resolving its own static-capacity
+        plan; rows the thread does not deliver are copied in-graph as the
+        residual. The thread copies on a torch-created stream (a stream the
+        thread creates itself is held behind CUDA-graph replays, E32) with one
+        batched copy in stream order per request. ``plan_capacity`` 0 uses the
+        scratch rows; a larger capacity is allowed, but plans still count at most
+        the scratch rows. A zero resolve budget is sized to four times the
+        largest per-layer miss copy at 8 GiB/s, at least 20 ms, and a zero
+        degraded budget to twice that copy, at least 4096 polls, converting at
+        256 ns per poll, the lower end of the 256-270 ns measured on the RTX 5090
+        (E34), so each budget lasts at least its wall-time target. A zero drain
+        budget is 524,288 polls (134-142 ms), one launch: a never-launched
+        kernel's launch blocks until all queued device work finishes (E34f), so
+        only the total queued wait bounds a stall. When a drain runs out the
+        copier is disabled for the rest of the process and the resolve returns
+        undelivered, served by the residual copy; ``doorbell_fail_stop_check``
+        must run before the next forward and holds until the committed copies
+        landed, and the copier's watchdog aborts the process with an ERROR if
+        they have not landed ``fatal_wait_s`` later.
+
+        The copier is primed before serving (``ExpertDoorbellCopier._prime``)
+        into the first layer's first scratch row, which nothing reads before
+        capture; the prime is empirically required for availability (E34 3g),
+        not for correctness.
+        """
+        from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+        from sglang.srt.layers.moe.expert_row_plan import (
+            DoorbellRowBackend,
+            ExpertRowPlan,
+        )
+
+        link_bytes_per_s = 8 * 1024**3
+        poll_s = 256e-9
+        served = [
+            self.streamers[layer_id]
+            for layer_id in self._layer_ids
+            if self.streamers[layer_id].graph_gather_rows > 0
+            and self.streamers[layer_id]._graph_row_segments is not None
+        ]
+        if not served:
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_DOORBELL needs graph-gather layers with host rows"
+            )
+        capacities = {streamer.graph_gather_rows for streamer in served}
+        if len(capacities) != 1:
+            raise ValueError("doorbell layers must share one graph-gather row count")
+        scratch_rows = capacities.pop()
+        if plan_capacity < 0:
+            raise ValueError("SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY cannot be negative")
+        capacity = max(plan_capacity, scratch_rows)
+        largest_copy_s = (
+            scratch_rows
+            * max(streamer.host_bytes_per_expert for streamer in served)
+            / link_bytes_per_s
+        )
+        timeout_polls = timeout_polls or int(max(0.02, 4 * largest_copy_s) / poll_s) + 1
+        degraded_polls = degraded_polls or max(4096, int(2 * largest_copy_s / poll_s) + 1)
+        drain_polls = drain_polls or 524_288
+        device = served[0].hot_cache.device
+        copier = ExpertDoorbellCopier(
+            [streamer._graph_row_segments for streamer in served],
+            capacity,
+            ring=max(64, 2 * len(served)),
+            max_tags=len(served),
+            cpu_core=cpu_core,
+            timeout_polls=timeout_polls,
+            degraded_polls=degraded_polls,
+            drain_polls=drain_polls,
+            fatal_wait_s=fatal_wait_s,
+            copy_api="batch",
+            src_access_order="stream",
+            stream=torch.cuda.Stream(device),
+            prime_slot=served[0].hot_cache.capacity,
+        )
+        backend = DoorbellRowBackend(
+            copier,
+            {tag: streamer._graph_row_segments for tag, streamer in enumerate(served)},
+        )
+        for tag, streamer in enumerate(served):
+            streamer.row_tag = tag
+            streamer.row_backend = backend
+            if capacity != streamer.row_plan.capacity:
+                cache = streamer.hot_cache
+                streamer.row_plan = ExpertRowPlan.for_scratch(
+                    capacity, cache.capacity, scratch_rows, device
+                )
+        self._doorbell_disabled_logged = False
+        spin_cpu = copier.stats()["spin_cpu"]
+        if cpu_core >= 0 and spin_cpu != cpu_core:
+            logger.warning(
+                "Expert doorbell thread asked for CPU %d but runs on CPU %d; "
+                "check the process CPU affinity",
+                cpu_core,
+                spin_cpu,
+            )
+        logger.info(
+            "Expert doorbell startup %s",
+            json.dumps(
+                {
+                    "layers": len(served),
+                    "backend": backend.name,
+                    "mode": "current",
+                    "plan_capacity_rows": capacity,
+                    "scratch_rows": scratch_rows,
+                    "cpu_core": cpu_core,
+                    "timeout_polls": timeout_polls,
+                    "degraded_polls": degraded_polls,
+                    "drain_polls": drain_polls,
+                    "fatal_wait_s": fatal_wait_s,
+                    "largest_copy_bytes": int(largest_copy_s * link_bytes_per_s),
+                    "prime_s": round(copier.prime_s, 4),
+                    "spin_cpu": spin_cpu,
+                },
+                sort_keys=True,
+            ),
+        )
+        return copier
+
+    def quiesce_doorbell(self) -> None:
+        """Drain and pause the doorbell thread before a CUDA graph capture."""
+        if getattr(self, "doorbell", None) is not None:
+            self.doorbell.quiesce()
+
+    def resume_doorbell(self) -> None:
+        """Clear capture-time wait state and let the doorbell thread service again."""
+        if getattr(self, "doorbell", None) is not None:
+            self.doorbell.reset_wait_state()
+            self.doorbell.resume()
+
+    def stop_doorbell(self) -> None:
+        """Drain and join the doorbell threads; idempotent.
+
+        Called from the scheduler's graceful shutdown before host resources are
+        released, so the process never reaches interpreter teardown with a running
+        copier thread (that ended in std::terminate and a scheduler stuck in the
+        driver). The copier module's atexit hook covers other exit paths.
+        """
+        if getattr(self, "doorbell", None) is not None:
+            self.doorbell.stop()
+
+    def doorbell_fail_stop_check(self, synchronize: bool = False) -> float:
+        """Hold until every committed doorbell copy a drain gave up on has landed.
+
+        The scheduler calls this after each forward's results are processed and
+        before the next forward, in every forward mode, since any forward with a
+        1-token gather posts to the doorbell, and it passes ``synchronize=True``.
+        That synchronizes the current stream unconditionally: the fatal word is
+        written by device kernels, and a replayed CUDA graph posts from the device
+        without entering Python, so a "did a post run" flag would read False on
+        exactly the steps that posted. With no exhausted drain it then reads two
+        host words and returns 0.0 without a device-wide synchronize; see
+        ``ExpertDoorbellCopier.fail_stop_check``.
+        """
+        doorbell = getattr(self, "doorbell", None)
+        if doorbell is None:
+            return 0.0
+        return doorbell.fail_stop_check(synchronize=synchronize)
+
+    def _log_doorbell(self) -> None:
+        doorbell = getattr(self, "doorbell", None)
+        if doorbell is None:
+            return
+        stats = doorbell.stats()
+        if stats.get("disabled") and not getattr(self, "_doorbell_disabled_logged", False):
+            self._doorbell_disabled_logged = True
+            logger.warning(
+                "Expert doorbell disabled after a drain ran out (%d drain timeouts): "
+                "every later miss copy runs in-graph for the rest of the process",
+                stats.get("drain_timeouts", 0),
+            )
+        logger.info(
+            "Expert doorbell %s",
+            json.dumps(
+                {
+                    key: stats.get(key)
+                    for key in (
+                        "running",
+                        "disabled",
+                        "disabled_posts",
+                        "discarded_disabled",
+                        "fatal_seq",
+                        "completed_seq",
+                        "posted",
+                        "waits",
+                        "timeouts",
+                        "drains",
+                        "drain_timeouts",
+                        "degraded",
+                        "record_mismatches",
+                        "serviced",
+                        "skipped_abandoned",
+                        "skipped_overrun",
+                        "invalid_records",
+                        "copy_errors",
+                        "last_copy_error",
+                        "rows_copied",
+                        "late_completions",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
 
     def finish_promotions(self) -> None:
         """Publish every in-flight promotion, ordering the current stream behind its copies.
@@ -1481,6 +1715,9 @@ class ExpertHotCacheManager:
                     metrics["boundary_updates"] += device["boundary_updates"][row]
                     metrics["promotions"] += device["promotions"][0][row] + device["promotions"][1][row]
                     metrics["evictions"] += device["evictions"][0][row] + device["evictions"][1][row]
+        doorbell = getattr(self, "doorbell", None)
+        if doorbell is not None:
+            result["doorbell"] = doorbell.stats()
         return result
 
     def on_expert_distribution(
@@ -1577,6 +1814,7 @@ class ExpertHotCacheManager:
             self._update_residency(boundary_tokens, mode)
         if clock.forwards % self.log_interval == 0:
             self._write_trace(mode)
+            self._log_doorbell()
 
     def on_speculative_commit(self, accepted_tokens: int) -> None:
         """Correct the oldest outstanding verify's drafted tokens to those it committed.

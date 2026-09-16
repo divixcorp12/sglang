@@ -754,6 +754,52 @@ class ModelRunner:
                         "gather; capped scratch (option B) needs the overflow "
                         "re-verify path of NEXTN offload plan phase 3"
                     )
+        if envs.SGLANG_MOE_EXPERT_DOORBELL.get():
+            if budget_mb == 0 or graph_gather_batch_size < 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL requires SGLANG_MOE_EXPERT_GRAPH_GATHER "
+                    "and SGLANG_MOE_HOT_GPU_MB"
+                )
+            if get_parallel().enable_dp_attention:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL cannot run with DP attention: idle "
+                    "batches replay the decode graph and would post plans nobody reads"
+                )
+            if self.spec_algorithm.is_speculative():
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL cannot run with speculative decoding: "
+                    "verify and draft graphs are not quiesced around capture"
+                )
+            if (get_exec().graph.cuda_graph_config.decode.max_bs or 0) > 1:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL needs a decode CUDA graph batch size of 1"
+                )
+            if (
+                self.ps.tp_size > 1
+                or self.ps.pp_size > 1
+                or (getattr(self.server_args, "dp_size", 1) or 1) > 1
+            ):
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL runs one spin thread on one CPU core "
+                    "and cannot run with tensor, pipeline or data parallelism"
+                )
+            doorbell_mode = envs.SGLANG_MOE_EXPERT_DOORBELL_MODE.get()
+            if doorbell_mode == "next_layer":
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL_MODE=next_layer is reserved for expert "
+                    "prediction and is not implemented"
+                )
+            if doorbell_mode != "current":
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL_MODE must be 'current' "
+                    f"(got {doorbell_mode!r})"
+                )
+            if not get_schedule().disable_overlap_schedule:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL requires --disable-overlap-schedule: its "
+                    "fail-stop check must run after a forward's results are processed and "
+                    "before the next forward starts"
+                )
         if budget_mb == 0:
             return
         if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():
@@ -793,6 +839,13 @@ class ModelRunner:
             async_promotions=envs.SGLANG_MOE_HOT_ASYNC_PROMOTIONS.get(),
             gpu_residency_update=envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get(),
             gpu_residency_max_promotions=envs.SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS.get(),
+            expert_doorbell=envs.SGLANG_MOE_EXPERT_DOORBELL.get(),
+            doorbell_cpu_core=envs.SGLANG_MOE_EXPERT_DOORBELL_CPU.get(),
+            doorbell_timeout_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS.get(),
+            doorbell_degraded_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS.get(),
+            doorbell_drain_polls=envs.SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS.get(),
+            doorbell_plan_capacity=envs.SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY.get(),
+            doorbell_fatal_wait_s=envs.SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S.get(),
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:
@@ -1258,9 +1311,10 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
-        capture = capture_cuda_graphs(
-            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+        with self._expert_doorbell_quiesced():
+            capture = capture_cuda_graphs(
+                model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
         if getattr(self, "expert_hot_cache_manager", None) is not None:
             self.expert_hot_cache_manager.discard_graph_capture_routes()
         self.eager_runner = capture.eager_runner
@@ -1632,9 +1686,23 @@ class ModelRunner:
         """Return the model layers used by prefill CUDA graph execution."""
         return compute_attention_and_moe_layers(layer_model)
 
+    @contextlib.contextmanager
+    def _expert_doorbell_quiesced(self):
+        """Pause the expert doorbell thread for a graph capture; its copies invalidate one."""
+        manager = getattr(self, "expert_hot_cache_manager", None)
+        if manager is None or getattr(manager, "doorbell", None) is None:
+            yield
+            return
+        manager.quiesce_doorbell()
+        try:
+            yield
+        finally:
+            manager.resume_doorbell()
+
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
-        capture = capture_decode_graph(model_runner=self)
+        with self._expert_doorbell_quiesced():
+            capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
         self.graph_memory_usage = replace_graph_memory_usage(
             self.graph_memory_usage,
@@ -1649,11 +1717,12 @@ class ModelRunner:
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
-        capture = capture_prefill_graph(
-            model_runner=self,
-            eager_runner=self.eager_runner,
-            force_for_draft_worker=force_for_draft_worker,
-        )
+        with self._expert_doorbell_quiesced():
+            capture = capture_prefill_graph(
+                model_runner=self,
+                eager_runner=self.eager_runner,
+                force_for_draft_worker=force_for_draft_worker,
+            )
         self.prefill_cuda_graph_runner = capture.runner
         self.graph_memory_usage = replace_graph_memory_usage(
             self.graph_memory_usage,

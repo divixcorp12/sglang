@@ -328,6 +328,27 @@ class Envs:
     SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
     # Most experts one layer promotes at a decode boundary on the GPU path.
     SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
+    # Serve graph-gather miss copies through the doorbell copier thread: the
+    # gather posts its miss plan and waits in-graph, falling back to the
+    # in-graph copy on timeout. Requires SGLANG_MOE_EXPERT_GRAPH_GATHER.
+    SGLANG_MOE_EXPERT_DOORBELL = EnvBool(False)
+    SGLANG_MOE_EXPERT_DOORBELL_CPU = EnvInt(71)
+    # Wait budgets in polls (about 250 ns each); 0 sizes them from the largest
+    # per-layer miss copy.
+    SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS = EnvInt(0)
+    SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS = EnvInt(0)
+    # Polls a timed-out resolve of a request the thread committed to drains
+    # before the doorbell is disabled for good (the resolve then keeps waiting
+    # for that request's copies); 0 uses about 2 s.
+    SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS = EnvInt(0)
+    # Which layer a doorbell plan targets: "current" posts and resolves layer
+    # L's misses inside layer L; "next_layer" is reserved for prediction.
+    SGLANG_MOE_EXPERT_DOORBELL_MODE = EnvStr("current")
+    # Seconds a disabled drain may wait for a committed copy before the
+    # doorbell watchdog aborts the process (a crash instead of a hang).
+    SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S = EnvFloat(30.0)
+    # Static plan capacity per target layer; 0 uses the layer's scratch rows.
+    SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY = EnvInt(0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)

@@ -10,10 +10,11 @@ gathers, which follow the host update of forward ``f``. Every READY slot must
 hold its expert's host rows byte for byte.
 """
 
+import os
 import random
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -163,6 +164,169 @@ def _burst_routes(window):
 def _decode_promotions(manager):
     counters = manager.snapshot_counters()["decode"]
     return [counters[str(layer)]["promotions"] for layer in range(LAYERS)]
+
+
+DOORBELL_SPIN_CORE = int(os.environ.get("DOORBELL_SPIN_CORE", "71"))
+
+
+def _reference_gather_graph(self, topk_ids):
+    """``ExpertStreamer._gather_graph`` as of 7de955329a, verbatim: the pre-doorbell path."""
+    from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes
+
+    self._check_graph_sources()
+    if self.residency_update is not None:
+        self.residency_update.on_graph_forward(topk_ids.shape[0])
+    cache = self.hot_cache
+    flat = topk_ids.reshape(-1).long()
+    count = flat.numel()
+    plan = plan_graph_routes(
+        flat, cache.expert_to_slot, self.graph_gather_rows, cache.capacity
+    )
+    plan_rows = plan.source_rows.numel()
+    scratch = self._graph_scratch_slots[:plan_rows]
+    self._graph_source_rows[:plan_rows].copy_(plan.source_rows)
+    self._graph_miss_count.copy_(plan.miss_plan_rows.reshape(1))
+    for source, destination in self._graph_device_pairs:
+        destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
+            0,
+            scratch,
+            source.view(torch.uint8)
+            .reshape(source.shape[0], -1)
+            .index_select(0, plan.source_rows),
+        )
+    if self._graph_row_segments is not None:
+        self._copy_row_segments_gpu(
+            self._graph_row_segments,
+            self._graph_source_rows,
+            self._graph_destination_slots,
+            self._graph_miss_count,
+        )
+    self.graph_counters[0].add_(count)
+    self.graph_counters[1].add_(plan.routed_miss_rows)
+    self.graph_unique_counters[0].add_(plan.unique_hit_rows)
+    self.graph_unique_counters[1].add_(plan.unique_miss_rows)
+    if self.residency_policy is not None:
+        self.residency_policy.pending_counts.index_add_(
+            0, flat, self._graph_ones[:count]
+        )
+    return plan.remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
+
+
+def _gather_harness(manager):
+    """Static routes, per-layer output rows and a forward that gathers every layer into them."""
+    streamers = [manager.streamers[layer_id] for layer_id in sorted(manager.streamers)]
+    static = torch.zeros((LAYERS, 1, TOP_K), dtype=torch.int32, device="cuda")
+    static[:, 0, 1] = 1
+    outputs = [
+        {
+            name: torch.zeros((TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda")
+            for name, tensor in streamer.hot_cache.tensors.items()
+        }
+        for streamer in streamers
+    ]
+
+    def forward():
+        for layer, streamer in enumerate(streamers):
+            compact, tensors = streamer.gather(static[layer])
+            for name, output in outputs[layer].items():
+                output.copy_(tensors[name][compact.reshape(-1).long()])
+
+    return static, outputs, forward
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestGatherAcrossResidencyUpdates(unittest.TestCase):
+    def _captured(self, manager, forward):
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                forward()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        manager.quiesce_doorbell()
+        try:
+            with torch.cuda.graph(graph):
+                forward()
+        finally:
+            manager.resume_doorbell()
+        manager.discard_graph_capture_routes()
+        return graph
+
+    def test_gathers_match_the_pre_doorbell_path_across_residency_updates(self):
+        """Gathers, then residency updates, then more gathers, with the host (Python) update and
+        with SGLANG_MOE_GPU_RESIDENCY_UPDATE, the doorbell off and on. Each step's gathered rows,
+        per-layer hit and miss counters and residency state must equal a twin manager whose
+        streamers run 7de955329a's ``_gather_graph``, and the rows must equal the source rows.
+        The GPU update rebinds each cache's ``expert_to_slot`` to its own table, so a gather
+        planner holding the startup mapping diverges at the first update."""
+        for gpu in (False, True):
+            for doorbell in (False, True):
+                with self.subTest(gpu_residency_update=gpu, doorbell=doorbell):
+                    self._run_mode(gpu, doorbell)
+
+    def _run_mode(self, gpu, doorbell):
+        current_model, reference_model = _model(), _model()
+        current = _manager(
+            current_model,
+            gpu,
+            expert_doorbell=doorbell,
+            doorbell_cpu_core=DOORBELL_SPIN_CORE,
+        )
+        reference = _manager(reference_model, gpu)
+        for streamer in reference.streamers.values():
+            streamer._gather_graph = MethodType(_reference_gather_graph, streamer)
+        try:
+            harnesses = []
+            for manager in (current, reference):
+                static, outputs, forward = _gather_harness(manager)
+                graph = self._captured(manager, forward) if gpu else None
+                harnesses.append((manager, static, outputs, forward, graph))
+            generator = random.Random(11)
+            promotions = 0
+            for step in range(17):
+                routes = _decode_routes(generator, step)
+                route_tensor = torch.tensor(routes, dtype=torch.int32, device="cuda")
+                for manager, static, outputs, forward, graph in harnesses:
+                    static.copy_(route_tensor)
+                    if graph is not None:
+                        graph.replay()
+                    else:
+                        forward()
+                torch.cuda.synchronize()
+                context = f"gpu={gpu} doorbell={doorbell} step {step}"
+                current_outputs, reference_outputs = harnesses[0][2], harnesses[1][2]
+                for layer in range(LAYERS):
+                    source_layer = current_model.get_submodule(str(layer))
+                    experts = torch.tensor(routes[layer][0])
+                    for name in NVFP4_STREAM_TENSORS:
+                        actual = current_outputs[layer][name].view(torch.uint8).cpu()
+                        self.assertTrue(
+                            torch.equal(actual, reference_outputs[layer][name].view(torch.uint8).cpu()),
+                            f"{context} layer {layer} {name} differs from the reference path",
+                        )
+                        expected = getattr(source_layer, name)[experts.to(getattr(source_layer, name).device)]
+                        self.assertTrue(
+                            torch.equal(actual.reshape(-1), expected.reshape(-1).view(torch.uint8).cpu()),
+                            f"{context} layer {layer} {name} differs from the source rows",
+                        )
+                current_counters = current.snapshot_counters()["decode"]
+                reference_counters = reference.snapshot_counters()["decode"]
+                for layer in range(LAYERS):
+                    for field in ("hot_hits", "miss_rows", "promotions", "evictions"):
+                        self.assertEqual(
+                            current_counters[str(layer)][field],
+                            reference_counters[str(layer)][field],
+                            f"{context} layer {layer} {field}",
+                        )
+                assert_states_equal(self, device_state(current), device_state(reference), context)
+                promotions = sum(current_counters[str(layer)]["promotions"] for layer in range(LAYERS))
+                counts = {"global_physical_count": _counts(routes)}
+                current.on_expert_distribution(_decode_batch(), counts)
+                reference.on_expert_distribution(_decode_batch(), counts)
+            self.assertGreater(promotions, 0, f"gpu={gpu} doorbell={doorbell}: no residency update happened")
+        finally:
+            if current.doorbell is not None:
+                current.doorbell.stop()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

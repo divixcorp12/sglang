@@ -16,6 +16,11 @@ import triton.language as tl
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
 from sglang.srt.layers.moe.expert_route_plan import NO_DEDUP_LIMIT as _NO_DEDUP_LIMIT
 from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes, should_dedup
+from sglang.srt.layers.moe.expert_row_plan import (
+    ExpertRowPlan,
+    ExpertRowPlanner,
+    InGraphRowBackend,
+)
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 logger = logging.getLogger(__name__)
@@ -515,6 +520,10 @@ class ExpertStreamer:
         self.pinned_host_cache = None
         self.residency_policy = None
         self.residency_update = None
+        self.row_planner = None
+        self.row_plan = None
+        self.row_backend = None
+        self.row_tag = 0
         self.before_eager_gather = None
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
@@ -622,6 +631,17 @@ class ExpertStreamer:
         )
         self._graph_destination_slots = self._graph_scratch_slots.to(torch.int32)
         self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
+        self.row_planner = ExpertRowPlanner(cache, cache.capacity, max_rows)
+        self.row_plan = ExpertRowPlan(
+            expert_ids=self._graph_source_rows,
+            slots=self._graph_destination_slots,
+            count=self._graph_miss_count,
+        )
+        self.row_backend = (
+            InGraphRowBackend({self.row_tag: self._graph_row_segments})
+            if self._graph_row_segments is not None
+            else None
+        )
         self._graph_ones = torch.ones(max_rows, dtype=torch.float32, device=device)
         self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
@@ -636,13 +656,9 @@ class ExpertStreamer:
         cache = self.hot_cache
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
-        plan = plan_graph_routes(
-            flat, cache.expert_to_slot, self.graph_gather_rows, cache.capacity
-        )
-        plan_rows = plan.source_rows.numel()
-        scratch = self._graph_scratch_slots[:plan_rows]
-        self._graph_source_rows[:plan_rows].copy_(plan.source_rows)
-        self._graph_miss_count.copy_(plan.miss_plan_rows.reshape(1))
+        plan = self.row_planner.route_plan(flat)
+        scratch = self._graph_scratch_slots[: plan.source_rows.numel()]
+        self.row_planner.fill_routes(plan, self.row_plan)
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,
@@ -651,13 +667,10 @@ class ExpertStreamer:
                 .reshape(source.shape[0], -1)
                 .index_select(0, plan.source_rows),
             )
-        if self._graph_row_segments is not None:
-            self._copy_row_segments_gpu(
-                self._graph_row_segments,
-                self._graph_source_rows,
-                self._graph_destination_slots,
-                self._graph_miss_count,
-            )
+        if self.row_backend is not None:
+            self.row_backend.post(self.row_tag, self.row_plan)
+            delivery = self.row_backend.resolve(self.row_tag, self.row_plan)
+            self.row_backend.copy_residual(self.row_tag, delivery)
         self.graph_counters[0].add_(count)
         self.graph_counters[1].add_(plan.routed_miss_rows)
         self.graph_unique_counters[0].add_(plan.unique_hit_rows)
