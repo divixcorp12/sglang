@@ -11,12 +11,26 @@ port=${2:?port}
 predictors=${3:?predictors or off}
 radix=${4:-}
 [ "$predictors" = off ] && predictors=""
-hot_gpu_mb=${HOT_GPU_MB:-12288}
+hot_gpu_mb=${HOT_GPU_MB:-10240}
 predictor=${PREFETCH_PREDICTOR:-off}
 [ "$predictor" = off ] && predictor=""
 prefetch_model_dir=${PREFETCH_MODEL_DIR:-/mnt/nvme2/nvfp4-work/expert-prediction-models/20260915-121630}
-prefetch_budget=${PREFETCH_BUDGET:-3}
+prefetch_budget=${PREFETCH_BUDGET:-2}
 prefetch_candidates=${PREFETCH_CANDIDATES:-16}
+prefetch_pull_mode=${PREFETCH_PULL_MODE:-off}
+shadow_recall=${PREFETCH_SHADOW_RECALL:-0}
+calibration=${PREFETCH_CALIBRATION:-0}
+run_kind=${RUN_KIND:-timed}
+arm=${EXPERIMENT_ARM:-}
+session_ids=${SESSION_IDS:-}
+session_set_checksum=${SESSION_SET_CHECKSUM:-}
+checkpoint_checksum=${PREFETCH_CHECKPOINT_CHECKSUM:-unknown}
+case "$run_kind" in timed|profiling) ;; *) echo "RUN_KIND must be timed or profiling" >&2; exit 2 ;; esac
+case "$prefetch_pull_mode" in off|count_zero|always) ;; *) echo "PREFETCH_PULL_MODE is invalid" >&2; exit 2 ;; esac
+if [ "$run_kind" = timed ] && [ "$calibration" = 1 ]; then
+    echo "REFUSING_TO_START: calibration is profiling-only; timed B/C/Cr/N/D runs must disable it" >&2
+    exit 2
+fi
 capture_dir=""
 if [ "${CAPTURE:-}" = 1 ]; then
     capture_dir=/mnt/nvme2/nvfp4-work/expert-prediction-capture/$name/$(date +%Y%m%d-%H%M%S)
@@ -52,11 +66,13 @@ mkdir -p "$run_dir/profiles" "$work/runtime-tmp"
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} candidates=$prefetch_candidates budget=$prefetch_budget: $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} pull_mode=$prefetch_pull_mode shadow_recall=$shadow_recall calibration=$calibration run_kind=$run_kind fused_plan=1 candidates=$prefetch_candidates budget=$prefetch_budget output=$run_dir: $(date --iso-8601=seconds)"
     git status --short --branch
     git log -1 --oneline
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
 } 2>&1 | tee -a "$log"
+commit=$(git rev-parse HEAD)
+printf '{"arm":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","session_ids":"%s","session_set_checksum":"%s","paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","startup_log":"%s"}}\n' "$arm" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$session_ids" "$session_set_checksum" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$log" > "$run_dir/run-manifest.json"
 
 exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \
@@ -95,6 +111,9 @@ exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR="$prefetch_model_dir" \
     SGLANG_MOE_EXPERT_PREFETCH_BUDGET="$prefetch_budget" \
     SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES="$prefetch_candidates" \
+    SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE="$prefetch_pull_mode" \
+    SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL="$shadow_recall" \
+    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION="$calibration" \
     SGLANG_TORCH_PROFILER_DIR="$run_dir/profiles" \
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$run_dir/profiles/expert-distribution" \
     SGLANG_VLM_CACHE_SIZE_MB=0 \
