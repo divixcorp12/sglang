@@ -81,6 +81,7 @@ cd "$worktree"
 } 2>&1 | tee -a "$log"
 commit=$(git rev-parse HEAD)
 printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","session_ids":%s,"session_set_checksum":"%s","shape_provenance":"%s","top_k":"%s","calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]"},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$top_k" "$calibration" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$log" > "$run_dir/run-manifest.json"
+calibration_provenance=$(printf '{"commit":"%s","predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","cache_size":%s,"session_ids":%s,"session_set_checksum":"%s","shape_provenance":"%s","top_k":"%s","bin_count":256,"bin_edges":"uniform [0,1]"}' "$commit" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$hot_gpu_mb" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$top_k")
 
 exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \
@@ -122,6 +123,8 @@ exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE="$prefetch_pull_mode" \
     SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL="$shadow_recall" \
     SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION="$calibration" \
+    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE="$run_dir/pull-calibration.json" \
+    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE="$calibration_provenance" \
     SGLANG_TORCH_PROFILER_DIR="$run_dir/profiles" \
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$run_dir/profiles/expert-distribution" \
     SGLANG_VLM_CACHE_SIZE_MB=0 \

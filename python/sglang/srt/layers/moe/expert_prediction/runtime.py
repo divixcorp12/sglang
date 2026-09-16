@@ -47,6 +47,8 @@ class PrefetchSettings(msgspec.Struct, frozen=True):
     pull_mode: str = "off"
     shadow_recall: bool = True
     calibration: bool = False
+    calibration_file: Path | None = None
+    calibration_provenance: str = ""
 
 
 class ExpertPredictionRuntime:
@@ -189,6 +191,8 @@ class ExpertPredictionRuntime:
                 pull_mode=pull_mode,
                 shadow_recall=envs.SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL.get(),
                 calibration=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get(),
+                calibration_file=(Path(envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE.get()) if envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE.get() else None),
+                calibration_provenance=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE.get(),
             )
         return cls.build(
             model=model,
@@ -281,6 +285,8 @@ class ExpertPredictionRuntime:
                 pull_mode=prefetch.pull_mode,
                 shadow_recall=prefetch.shadow_recall,
                 calibration=prefetch.calibration,
+                calibration_file=prefetch.calibration_file,
+                calibration_provenance=prefetch.calibration_provenance,
             )
         )
         logger.info(
@@ -342,6 +348,7 @@ class ExpertPredictionRuntime:
                         json.dumps({"prefetch": self.prefetch.metrics_record(), "forwards": self.forwards})
                         + "\n"
                     )
+                self.prefetch.write_calibration()
         except OSError as error:
             logger.warning(
                 "MoE expert prediction metrics write failed, disabling further writes: "

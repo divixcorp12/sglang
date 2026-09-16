@@ -60,7 +60,7 @@ def summarize_arm(spec: str) -> dict:
     decode_ms = [1000.0 / turn["decode_tokens_per_sec"] for turn in good]
     hot_rows = _decode_counters(hot_path)
     posted = sum(row.get("side_pull_posted_rows", 0) for row in hot_rows)
-    useful = sum(row.get("side_pull_useful_rows", 0) for row in hot_rows)
+    useful = sum(row.get("side_pull_useful_posts", 0) for row in hot_rows)
     wasted = sum(row.get("side_pull_wasted_rows", 0) for row in hot_rows)
     return {
         "arm": arm,
@@ -78,11 +78,16 @@ def summarize_arm(spec: str) -> dict:
         "useful_rows": useful,
         "wasted_rows": wasted,
         "useful_precision": useful / posted if posted else None,
-        "_session_decode_ms": {
-            turn["session_id"]: 1000.0 / turn["decode_tokens_per_sec"]
-            for turn in good if "session_id" in turn
-        },
+        "_session_decode_ms": _session_decode_ms(good),
     }
+
+
+def _session_decode_ms(turns: list[dict]) -> dict[str, float]:
+    grouped: dict[str, list[float]] = {}
+    for turn in turns:
+        if "session_id" in turn:
+            grouped.setdefault(turn["session_id"], []).append(1000.0 / turn["decode_tokens_per_sec"])
+    return {session: statistics.mean(values) for session, values in grouped.items()}
 
 
 def paired_session_bootstrap(left: dict, right: dict, *, seed: int = 20260916, resamples: int = 10_000) -> list[float]:
@@ -90,7 +95,10 @@ def paired_session_bootstrap(left: dict, right: dict, *, seed: int = 20260916, r
     for key in ("commit", "cache_size"):
         if left["manifest"].get(key) != right["manifest"].get(key):
             raise ValueError(f"mixed {key}s are not comparable")
-    sessions = sorted(set(left["_session_decode_ms"]) & set(right["_session_decode_ms"]))
+    left_sessions, right_sessions = set(left["_session_decode_ms"]), set(right["_session_decode_ms"])
+    if left_sessions != right_sessions:
+        raise ValueError("mismatched session sets are not comparable")
+    sessions = sorted(left_sessions)
     if not sessions:
         raise ValueError("no paired sessions")
     deltas = [right["_session_decode_ms"][s] - left["_session_decode_ms"][s] for s in sessions]

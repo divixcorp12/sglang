@@ -449,6 +449,8 @@ class Envs:
     # Profiling-only graph-captured score/margin histograms. Timed throughput
     # arms leave this false so the observer has no allocation or device work.
     SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION = EnvBool(False)
+    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE = EnvStr("")
+    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE = EnvStr("")
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)

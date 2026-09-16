@@ -8,6 +8,7 @@ captured side-stream pull of each target's top candidate through ``expert_gpu_pu
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -267,6 +268,8 @@ class PrefetchScoring:
         pull_mode: str = "off",
         shadow_recall: bool = True,
         calibration: bool = False,
+        calibration_file: Path | None = None,
+        calibration_provenance: str = "",
     ) -> "PrefetchScoring":
         by_layer = {spec.layer_id: spec for spec in specs}
         if width > min(spec.num_experts for spec in specs):
@@ -325,13 +328,15 @@ class PrefetchScoring:
             ),
             puller=puller,
             calibration=histogram,
+            calibration_file=calibration_file,
+            calibration_provenance=calibration_provenance,
         )
         store.after_write = scoring._on_write
         logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s calibration=%s",
                     predictor, len(checkpoints), width, budget, scoring.state_nbytes, pull_mode, shadow_recall, calibration)
         return scoring
 
-    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None, calibration=None) -> None:
+    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None, calibration=None, calibration_file=None, calibration_provenance="") -> None:
         self.predictor = predictor
         self.targets = sorted(scorers)
         # Source layer -> target layer for a next-layer predictor; empty for same-layer predictors.
@@ -344,6 +349,8 @@ class PrefetchScoring:
         self.recall = recall
         self.puller = puller
         self.calibration = calibration
+        self._calibration_file = calibration_file
+        self._calibration_provenance = calibration_provenance
 
     @property
     def required_features(self) -> frozenset[RouteFeature]:
@@ -407,3 +414,9 @@ class PrefetchScoring:
         if self.calibration is not None:
             record["pull_calibration"] = self.calibration.snapshot()
         return record
+
+    def write_calibration(self) -> None:
+        if self.calibration is None or self._calibration_file is None:
+            return
+        provenance = json.loads(self._calibration_provenance or "{}")
+        self.calibration.write(self._calibration_file, provenance)

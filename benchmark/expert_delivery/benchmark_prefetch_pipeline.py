@@ -42,7 +42,9 @@ def _measure(device, count, iterations):
     for _ in range(iterations):
         ready, copy_start, copy_end, joined, residual_start, residual_end, consumed = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
         ready.record()
+        target.ready.record()
         with torch.cuda.stream(pipeline.side_stream):
+            pipeline.side_stream.wait_event(target.ready)
             copy_start.record()
         pipeline.post_target(target)
         with torch.cuda.stream(pipeline.side_stream):

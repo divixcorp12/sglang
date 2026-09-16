@@ -140,7 +140,7 @@ def test_extended_summarizer_keeps_roles_fixed_and_bootstraps_paired_sessions():
     ])
     prediction = write("prediction.jsonl", [{"prefetch": {"observed_miss_rate": 0.25}}])
     hot = write("hot.jsonl", [{"counters": {"decode": {"0": {
-        "resident_slots": 12, "side_pull_posted_rows": 4, "side_pull_useful_rows": 3,
+        "resident_slots": 12, "side_pull_posted_rows": 4, "side_pull_useful_posts": 3,
         "side_pull_wasted_rows": 1,
     }}}}])
     manifest = write("manifest.json", [{"commit": "abc", "cache_size": 10240, "session_ids": ["s1", "s2"]}])

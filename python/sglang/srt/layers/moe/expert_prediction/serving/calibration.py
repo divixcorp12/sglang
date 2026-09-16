@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
+from pathlib import Path
 
 import torch
 
@@ -119,3 +121,11 @@ class PullCalibrationHistogram:
                 for layer_id, row in self._rows.items()
             },
         }
+
+    def write(self, path: Path, provenance: dict) -> None:
+        """Atomically publish the profiling artifact at a normal metrics flush."""
+        payload = self.snapshot()
+        payload["provenance"] = provenance
+        temporary = path.with_suffix(path.suffix + ".partial")
+        temporary.write_text(json.dumps(payload, sort_keys=True))
+        temporary.replace(path)
