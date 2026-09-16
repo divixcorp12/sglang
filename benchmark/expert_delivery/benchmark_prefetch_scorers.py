@@ -14,6 +14,25 @@ from pathlib import Path
 import torch
 
 
+def load_captured_features(capture_dir: Path, *, source_layer: int, target_layer: int) -> dict[str, torch.Tensor]:
+    """Load one representative canonical CAPTURE=1 row with LLaPor source mapping."""
+    from sglang.srt.layers.moe.expert_prediction.capture_reader import load_shard, read_manifest
+    from sglang.srt.layers.moe.expert_prediction.capture_schema import feature_key
+    from sglang.srt.layers.moe.expert_prediction.contracts import RouteFeature
+    entries = read_manifest(capture_dir)
+    if not entries:
+        raise ValueError("capture has no completed safetensors shard")
+    tensors = load_shard(capture_dir, entries[0]["shard"]).tensors
+    def get(layer: int, feature: RouteFeature) -> torch.Tensor:
+        return tensors[feature_key(layer, feature)][:1].cuda()
+    return {
+        "router_input": get(source_layer, RouteFeature.ROUTER_INPUT),
+        "topk_ids": get(source_layer, RouteFeature.TOPK_IDS),
+        "topk_weights": get(source_layer, RouteFeature.TOPK_WEIGHTS),
+        "pre_mixer": get(target_layer, RouteFeature.PRE_MIXER),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--predictor", choices=("llapor", "apex"), required=True)
@@ -30,27 +49,15 @@ def main():
     from sglang.srt.layers.moe.expert_prediction.serving.checkpoints import load_prefetch_checkpoints
     from sglang.srt.layers.moe.expert_prediction.serving.scorers import ApexScorer, LlaporScorer
 
-    from sglang.srt.layers.moe.expert_prediction.capture_reader import load_shard, read_manifest
-    from sglang.srt.layers.moe.expert_prediction.capture_schema import feature_key
-    from sglang.srt.layers.moe.expert_prediction.contracts import RouteFeature
     capture_dir = Path(args.capture_dir)
     header = json.loads((capture_dir / "header.json").read_text())
-    entries = read_manifest(capture_dir)
-    if not entries:
-        raise ValueError("capture has no completed safetensors shard")
-    tensors = load_shard(capture_dir, entries[0]["shard"]).tensors
     specs = [MoeLayerSpec(**shape) for shape in header["layers"]]
     checkpoints = load_prefetch_checkpoints(Path(args.model_dir), predictor=args.predictor, specs=specs)
     by_layer = {spec.layer_id: spec for spec in specs}
     bank = PrefetchCandidateBank(layer_ids=list(checkpoints), width=args.width, device=torch.device("cuda"))
     for target, checkpoint in checkpoints.items():
         source = checkpoint.source_layer if args.predictor == "llapor" else target
-        feature = {
-            "router_input": tensors[feature_key(source, RouteFeature.ROUTER_INPUT)][:1].cuda(),
-            "topk_ids": tensors[feature_key(source, RouteFeature.TOPK_IDS)][:1].cuda(),
-            "topk_weights": tensors[feature_key(source, RouteFeature.TOPK_WEIGHTS)][:1].cuda(),
-            "pre_mixer": tensors[feature_key(target, RouteFeature.PRE_MIXER)][:1].cuda(),
-        }
+        feature = load_captured_features(capture_dir, source_layer=source, target_layer=target)
         scorer = (LlaporScorer(checkpoint, num_experts=by_layer[target].num_experts, dtype=torch.bfloat16, device=torch.device("cuda")) if args.predictor == "llapor" else ApexScorer(checkpoint, num_experts=by_layer[target].num_experts, tau=args.tau, dtype=torch.bfloat16, device=torch.device("cuda")))
         residency = torch.full((by_layer[target].num_experts,), -1, dtype=torch.int32, device="cuda")
         def score_and_select():

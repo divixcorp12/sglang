@@ -211,6 +211,7 @@ def test_canonical_capture_loader_uses_llapor_source_layer_features():
         "layer.1.topk_ids": torch.tensor([[1, 2]], dtype=torch.int16),
         "layer.1.topk_weights": torch.tensor([[0.7, 0.3]]),
         "layer.2.router_input": torch.full((1, 3), 22.0),
+        "layer.2.pre_mixer": torch.full((1, 3), 33.0),
     }
     save_file(tensors, str(root / "shard-000000.safetensors"), metadata={"request_ids": "[]"})
     (root / "manifest.jsonl").write_text(json.dumps({"shard": "shard-000000.safetensors", "rows": 1}) + "\n")
