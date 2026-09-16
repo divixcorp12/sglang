@@ -87,7 +87,16 @@ class DedicatedPrefetchSlot:
 
 
 class BudgetRecall:
-    """Non-resident native routes, and those the first ``budget`` non-resident candidates cover."""
+    """Non-resident native routes, and those the first ``budget`` non-resident candidates cover.
+
+    Discontinuity at c48b3c69e5 (2026-09-16): before it, ``budget_recall`` counted
+    non-resident coverage within the top-W bank; after, within the non-resident-only
+    bank. Figures recorded before that commit (llapor 0.383/0.389, apex 0.424/0.420)
+    are not comparable to figures after it. The rise affects both predictors by an
+    amount that grows with the write-to-observe distance, so next-layer and same-layer
+    arms are not comparable to each other across the seam either, not only to their own
+    pre-change values.
+    """
 
     def __init__(self, *, layer_ids: Sequence[int], budget: int, device: torch.device) -> None:
         if budget < 1:
