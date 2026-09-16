@@ -22,17 +22,68 @@ class PrefetchCandidateBank:
         self.ids = torch.arange(width, dtype=torch.int64, device=device).repeat(len(self._rows), 1)
         self.scores = torch.zeros((len(self._rows), width), dtype=torch.float32, device=device)
 
-    def write(self, target_layer: int, expert_scores: torch.Tensor) -> None:
-        top = torch.topk(expert_scores.sum(dim=0), self.width)
+    def write(
+        self,
+        target_layer: int,
+        expert_scores: torch.Tensor,
+        *,
+        expert_to_slot: torch.Tensor | None = None,
+    ) -> None:
+        """Rewrite one target's rows with its ``width`` best candidates.
+
+        With ``expert_to_slot`` omitted, ranks every expert by summed score, matching
+        the pre-residency-filtering behaviour existing callers still rely on. With it
+        given, residency and non-finite scores are excluded *before* truncation to
+        ``width``, so a resident expert can never crowd out a nonresident one; ties and
+        excluded scores break by ascending expert id, via a stable descending sort over
+        distinct expert ids. When fewer than ``width`` candidates survive exclusion, the
+        remaining rows fall back to excluded experts (still valid, distinct ids) rather
+        than a sentinel — the offering is empty, never a garbage index.
+        """
+        summed = expert_scores.sum(dim=0)
+        excluded = ~torch.isfinite(summed)
+        if expert_to_slot is not None:
+            excluded = excluded | (expert_to_slot >= 0)
+        ranked = torch.where(excluded, summed.new_full((), float("-inf")), summed)
+        order = torch.argsort(ranked, descending=True, stable=True)
+        top = order[: self.width]
         row = self._rows[target_layer]
-        self.ids[row].copy_(top.indices)
-        self.scores[row].copy_(top.values)
+        self.ids[row].copy_(top)
+        self.scores[row].copy_(summed.index_select(0, top))
 
     def ids_for(self, target_layer: int) -> torch.Tensor:
         return self.ids[self._rows[target_layer]]
 
     def scores_for(self, target_layer: int) -> torch.Tensor:
         return self.scores[self._rows[target_layer]]
+
+
+class DedicatedPrefetchSlot:
+    """The one speculative row appended after ``[0, capacity + demand_rows)`` per layer.
+
+    Reserved inside the existing per-layer contiguous cache allocation (plan section
+    7.1, "Scratch layout and budget"): its index is ``capacity + demand_rows``, so it
+    adds no new resident-capacity slot and no new demand-scratch row, only the one
+    trailing row appended to the allocation. It must never be published into
+    ``expert_to_slot`` and never become a residency eviction or promotion destination.
+    """
+
+    def __init__(self, *, capacity: int, demand_rows: int) -> None:
+        if capacity < 0 or demand_rows < 0:
+            raise ValueError("dedicated prefetch slot capacity and demand rows must be nonnegative")
+        self.capacity = capacity
+        self.demand_rows = demand_rows
+        self.index = capacity + demand_rows
+
+    def assert_within_allocation(self, allocation_rows: int) -> None:
+        """Raise unless the reserved row is exactly the trailing row of ``allocation_rows``."""
+        if allocation_rows != self.index + 1:
+            raise ValueError("dedicated prefetch slot is not the trailing row of the cache allocation")
+
+    def assert_excluded_from_mapping(self, expert_to_slot: torch.Tensor) -> None:
+        """Raise if any expert is mapped to the reserved row through the permanent mapping."""
+        if bool((expert_to_slot == self.index).any()):
+            raise RuntimeError("dedicated prefetch slot is reachable through expert_to_slot")
 
 
 class BudgetRecall:
