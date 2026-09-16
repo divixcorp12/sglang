@@ -11,7 +11,7 @@
 - **Phase A:** load the trained LLaPor (and APEX) checkpoints in serving from a model-agnostic place.
   - Score each target layer's experts inside the decode CUDA graph with no host syncs.
   - Publish per-target-layer candidate ids (int64 `[C]`) and float32 priorities as stable device tensors.
-  - Validate offline (recall of non-resident native experts within a budget) and live in shadow mode: the same metric, no prefetch, logprobs exactly unchanged, scoring cost measured.
+  - Validate offline (recall of non-resident native experts within a budget) and live in shadow mode: the same metric, no prefetch, logprobs unchanged **relative to the same-arm nondeterminism baseline** (see Task 6; decode is not bit-reproducible run to run on this box), scoring cost measured.
 - **Phase B:** once the shared copy layer merges, adapt those candidates to its plan interface, then run the 4-cell prefetch × doorbell matrix with live tok/s.
 
 **Architecture:**
@@ -48,8 +48,8 @@
   - These come from crypto-c9 at merge: exact names, slot and count dtypes, who filters residents and clamps to a budget, delivered/residual accounting, backend selection, and env flags.
   - Do not code against the unmerged branch.
 - **Shadow scoring must not change outputs.**
-  - Scoring off must be production: exact logprobs against the pre-change commit `7de955329a`.
-  - Scoring on only appends kernels that read tap buffers and write the bank and counters, so logprobs must stay exactly equal to scoring off.
+  - Scoring off must be production: logprobs against the pre-change commit `7de955329a`, **judged against the same-arm baseline, not against bit-exactness**. Measured 2026-09-15: REF-vs-REF flips 5 of 768 probe tokens, so exact equality is not a property this server has.
+  - Scoring on only appends kernels that read tap buffers and write the bank and counters, so logprobs must stay **within that same baseline** of scoring off. Equality is not available to assert: a build that adds scoring machinery may change kernel selection, fusion or reduction order without changing semantics, and near-ties then resolve differently.
 - **Env names do not collide** with the doorbell branch. That branch defines `SGLANG_MOE_EXPERT_DOORBELL*` and keeps `SGLANG_MOE_PREFETCH_MAX_CANDIDATES`. Phase A uses `SGLANG_MOE_EXPERT_PREFETCH_*`.
 - **Model-agnostic placement:**
   - Nothing goes in `python/sglang/srt/models/*` and nothing hardcodes Qwen3.8-Next dimensions.
@@ -1904,8 +1904,8 @@ git commit -m "feat(nvfp4): add prefetch scoring launcher knobs, A/B subset, log
 | Cell | Build and env | Checks |
 |---|---|---|
 | `REF` | detached worktree at `7de955329a`, predictor unset | reference |
-| `S0` | this branch, predictor unset | `compare_logprobs.py --exact` vs REF, and tok/s within REF's pass-to-pass spread: the off path is production |
-| `S1` | this branch, `PREFETCH_PREDICTOR=llapor`, same `HOT_GPU_MB` | `--exact` vs S0: scoring changes nothing. Tok/s S1 − S0 is the in-graph scoring cost. Live `budget_recall` vs Task 3's `shifted_test`/`dev` budget recall at B = `PREFETCH_BUDGET` |
+| `S0` | this branch, predictor unset | flip count vs REF **comparable to the REF-vs-REF baseline** (`--exact` reported as a diagnostic, not a gate), and tok/s within REF's pass-to-pass spread: the off path is production |
+| `S1` | this branch, `PREFETCH_PREDICTOR=llapor`, same `HOT_GPU_MB` | flip count vs S0 comparable to the same baseline. Tok/s S1 − S0 is the in-graph scoring cost. Live `budget_recall` vs Task 3's `shifted_test`/`dev` budget recall at B = `PREFETCH_BUDGET` |
 | `S2` (optional) | `PREFETCH_PREDICTOR=apex` | same as S1, for APEX's cost and recall |
 
 **Preconditions:** Tasks 1–5 merged, and their tests pass on the synced divix01 worktree. Task 3's report exists; a NO-GO there needs the user's explicit go-ahead for this task.
@@ -1936,8 +1936,10 @@ git commit -m "feat(nvfp4): add prefetch scoring launcher knobs, A/B subset, log
     - Otherwise stop and report the log excerpt.
 
 - [ ] **Step 4: Gates.**
-  - **Exact checks:** `compare_logprobs.py --exact REF-p1 S0-p1` and `--exact S0-p1 S1-p1` (and S2) must pass.
-    - An S1 flip means scoring perturbed the model forward: allocator-driven kernel choice, a stream bug, or a write into a live buffer.
+  - **Exactness is RETIRED as a pass/fail gate (measured 2026-09-15).** `compare_logprobs.py --exact REF-p1 S0-p1` returned 5 flips; the control `--exact REF-p1 REF-p2` returned **5 flips against the same arm**, same 1/8-multiple margins, largely different indices (only 7 and 43 recur). The gate was measuring run-to-run nondeterminism. Run every `--exact` comparison and report the counts as a diagnostic, but do not stop on them.
+    - **Replacement criterion:** an arm passes if its flip count is comparable to the same-arm baseline. Materially higher (≈2x or more), flips at clear margins rather than near-ties, or flips clustering structurally is a stop-and-report. Also report answer-level agreement (ConvFinQA `correct`), since a flip that changes a final answer is not a last-rank expert swap.
+    - **The baseline is a single sample of 5**, so "comparable" is a judgement, not a test. An arm landing near the line is escalated, not ruled on.
+    - **Do not read a flip as "scoring perturbed the forward."** That inference was in this plan and the control falsified it: a build difference can change kernel selection, fusion or reduction order with identical semantics. Distinguish numerical (flips at near-ties, expert sets differing only by last-rank swaps) from semantic (clear margins, or larger expert-set differences) before concluding anything. Credit: crypto-c9 raised this before the control reported.
     - Root-cause it before Phase B; do not relax the gate.
   - **Throughput:** S0's median tok/s must lie within REF's two-pass spread.
   - **Recall:** live `budget_recall` within ±0.05 (absolute) of Task 3's `dev` value at the same budget means the offline gate is trusted for Phase B. Outside that band, the report explains it (residency drift, prompt mix).
