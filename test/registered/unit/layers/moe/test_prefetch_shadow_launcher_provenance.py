@@ -53,12 +53,14 @@ def test_provenance_only_mode_emits_canonical_bs1_topk_unique_metadata(tmp_path)
     assert calibration["top_k"] == 10
     assert calibration["top_k_unique"] is True
     assert calibration["shape_provenance"] == expected_shape
+    assert manifest["trace"] is None
+    assert "trace_report" not in manifest["paths"]
 
 
 def test_trace_provenance_only_mode_records_diagnostic_trace_configuration(tmp_path):
     """Trace manifests describe the requested wrapper without running it."""
     run_dir = tmp_path / "trace-run"
-    trace_command = 'nsys profile --trace=cuda,nvtx,osrt --name="pcie trace"'
+    trace_command = "nsys profile --trace=cuda,nvtx,osrt"
     result = subprocess.run(
         ["bash", str(LAUNCHER), "trace-provenance", "7999", "off"],
         cwd=ROOT,
@@ -106,6 +108,52 @@ def test_trace_mode_requires_explicit_wrapper_even_for_provenance_only(tmp_path)
 
     assert result.returncode == 2
     assert "PREFETCH_TRACE_COMMAND" in result.stderr
+
+
+def test_trace_mode_rejects_whitespace_only_wrapper_even_for_provenance_only(tmp_path):
+    """Tokenization must not turn whitespace into an empty executable."""
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "blank-trace-command", "7999", "off"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUN_KIND": "trace",
+            "PREFETCH_TRACE_COMMAND": "  \t  ",
+            "PREFETCH_PROVENANCE_ONLY": "1",
+            "PREFETCH_WORKTREE": str(ROOT),
+            "PREFETCH_RUN_DIR": str(tmp_path / "run"),
+            "MODEL_TOP_K": "10",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "PREFETCH_TRACE_COMMAND" in result.stderr
+
+
+def test_trace_mode_rejects_shell_quoted_wrapper_even_for_provenance_only(tmp_path):
+    """The wrapper contract accepts simple argv tokens, not shell syntax."""
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "quoted-trace-command", "7999", "off"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUN_KIND": "trace",
+            "PREFETCH_TRACE_COMMAND": 'nsys profile --name="pcie trace"',
+            "PREFETCH_PROVENANCE_ONLY": "1",
+            "PREFETCH_WORKTREE": str(ROOT),
+            "PREFETCH_RUN_DIR": str(tmp_path / "run"),
+            "MODEL_TOP_K": "10",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "simple whitespace-separated argv tokens" in result.stderr
 
 
 def test_trace_mode_refuses_calibration_even_for_provenance_only(tmp_path):

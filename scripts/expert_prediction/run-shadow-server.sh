@@ -60,10 +60,20 @@ if [ "$run_kind" = trace ] && [ -z "$trace_command" ]; then
 fi
 trace_command_argv=()
 trace_config=null
+trace_paths=""
+trace_env=()
 if [ "$run_kind" = trace ]; then
     # This deliberately parses simple argv tokens only; it never evaluates shell input.
-    # A wrapper with an argument containing whitespace is unsupported.
+    # Shell quotes, backslashes, and arguments containing whitespace are unsupported.
     read -r -a trace_command_argv <<< "$trace_command"
+    if [ "${#trace_command_argv[@]}" -eq 0 ]; then
+        echo "PREFETCH_TRACE_COMMAND must contain simple whitespace-separated argv tokens" >&2
+        exit 2
+    fi
+    if [[ "$trace_command" == *"'"* || "$trace_command" == *'"'* || "$trace_command" == *\\* ]]; then
+        echo "PREFETCH_TRACE_COMMAND supports simple whitespace-separated argv tokens only; shell quotes and backslashes are rejected" >&2
+        exit 2
+    fi
     trace_command_json=$(printf '%s' "$trace_command" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))')
 fi
 capture_dir=""
@@ -87,10 +97,12 @@ ple_cache=/mnt/nvme2/ple-cache/qwen38-nvfp4
 expert_seed=/data/models/slang/slang-dev-2bit/qwen3.8-flash-next-24gb-sglang/assets/expert_freq.pt
 run_dir=${PREFETCH_RUN_DIR:-$work/cc-expert-prediction/servers/$name/run-$(date +%Y%m%d-%H%M%S)}
 log=$run_dir/server.log
-trace_report_path=$run_dir/trace/report
 if [ "$run_kind" = trace ]; then
+    trace_report_path=$run_dir/trace/report
     trace_report_path_json=$(printf '%s' "$trace_report_path" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))')
     trace_config=$(printf '{"diagnostic_only":true,"command":%s,"report_path":%s}' "$trace_command_json" "$trace_report_path_json")
+    trace_paths=$(printf ',"trace_report":%s' "$trace_report_path_json")
+    trace_env=("PREFETCH_TRACE_REPORT_PATH=$trace_report_path")
 fi
 
 # This object is deliberately typed rather than derived from a display string:
@@ -100,7 +112,7 @@ shape_provenance='{"batch_size":1,"top_k":10,"top_k_unique":true,"cuda_graph_dec
 
 write_provenance() {
     calibration_provenance=$(printf '{"commit":"%s","predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","cache_size":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"bin_count":256,"bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255"}' "$commit" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$hot_gpu_mb" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance")
-    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","trace":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","trace_report":"%s","startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$trace_config" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$trace_report_path" "$log" > "$run_dir/run-manifest.json"
+    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","trace":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json"%s,"startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$trace_config" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$trace_paths" "$log" > "$run_dir/run-manifest.json"
 }
 
 if [ "$provenance_only" = 1 ]; then
@@ -120,13 +132,16 @@ if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
     exit 1
 fi
 
-mkdir -p "$run_dir/profiles" "$run_dir/trace" "$work/runtime-tmp"
+mkdir -p "$run_dir/profiles" "$work/runtime-tmp"
+if [ "$run_kind" = trace ]; then
+    mkdir -p "$run_dir/trace"
+fi
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
     echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} pull_mode=$prefetch_pull_mode shadow_recall=$shadow_recall calibration=$calibration run_kind=$run_kind fused_plan=1 candidates=$prefetch_candidates budget=$prefetch_budget output=$run_dir: $(date --iso-8601=seconds)"
     if [ "$run_kind" = trace ]; then
-        echo "trace diagnostic-only wrapper=$trace_command report_path=$trace_report_path; wrapper uses simple whitespace-separated argv tokens only (embedded-whitespace arguments are unsupported)"
+        echo "trace diagnostic-only wrapper=$trace_command report_path=$trace_report_path; wrapper uses simple whitespace-separated argv tokens only (shell quotes, backslashes, and embedded-whitespace arguments are unsupported)"
     fi
     git status --short --branch
     git log -1 --oneline
@@ -179,7 +194,7 @@ exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE="$calibration_provenance" \
     SGLANG_TORCH_PROFILER_DIR="$run_dir/profiles" \
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$run_dir/profiles/expert-distribution" \
-    PREFETCH_TRACE_REPORT_PATH="$trace_report_path" \
+    "${trace_env[@]}" \
     SGLANG_VLM_CACHE_SIZE_MB=0 \
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB=4 \
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S=5 \
