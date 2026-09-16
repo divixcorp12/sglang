@@ -802,6 +802,20 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(wrong["routed_miss_rows"], 2)
         self.assertEqual(wrong["side_pull_rows"], 1)
 
+    def test_side_pull_telemetry_keeps_delivery_and_route_quantities_separate(self):
+        manager = self.manager(dynamic=False)
+        # Two physical deliveries: one covered useful traffic and one wasted row.
+        # Covered/residual are route counts and therefore intentionally not folded
+        # into the physical-row ledger.
+        manager.record_side_pull_delivery(0, "prefill", covered=2, residual=3, wasted=1, posted=2)
+        row = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(row["side_pull_posted_rows"], 2)
+        self.assertEqual(row["side_pull_useful_posts"], 1)
+        self.assertEqual(row["side_pull_wasted_rows"], 1)
+        self.assertEqual(row["side_pull_covered_routes"], 2)
+        self.assertEqual(row["side_pull_residual_routes"], 3)
+        self.assertEqual(row["side_pull_useful_precision"], 0.5)
+
     def test_multi_token_overlap_on_predicted_expert_records_one_physical_row(self):
         """``covered`` can exceed 1 on overlap; ``posted`` -- not ``covered + wasted`` -- is the row count.
 

@@ -65,7 +65,7 @@ def _set_candidate(bank, hot_caches, target_layer, expert_id):
     bank.write(target_layer, scores, expert_to_slot=hot_caches[target_layer].expert_to_slot)
 
 
-def _build_puller(device, *, layer_ids=(1,), capacity=6, scratch_rows=2, enable_hits=()):
+def _build_puller(device, *, layer_ids=(1,), capacity=6, scratch_rows=2, enable_hits=(), pull_mode="always"):
     from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
     from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
 
@@ -75,7 +75,13 @@ def _build_puller(device, *, layer_ids=(1,), capacity=6, scratch_rows=2, enable_
     for lid in enable_hits:
         hot_caches[lid].expert_to_slot[0] = 0
     bank = PrefetchCandidateBank(layer_ids=list(layer_ids), width=1, device=device)
-    puller = PrefetchPuller(bank=bank, layer_ids=list(layer_ids), hot_caches=hot_caches, device=device)
+    puller = PrefetchPuller(
+        bank=bank,
+        layer_ids=list(layer_ids),
+        hot_caches=hot_caches,
+        device=device,
+        pull_mode=pull_mode,
+    )
     return puller, bank, hot_caches, layer
 
 
@@ -142,6 +148,56 @@ class TestPrefetchPullerCorrectness(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchPullerLifecycle(unittest.TestCase):
+    def test_graph_replay_publishes_a_coherent_zero_payload_plan_without_touching_the_dedicated_slot(self):
+        """A count-zero control replays the normal post/join graph with no delivered row."""
+        device = torch.device("cuda")
+        puller, bank, hot_caches, _ = _build_puller(device, pull_mode="count_zero")
+        candidate = 13
+        _set_candidate(bank, hot_caches, 1, candidate)
+        cache = hot_caches[1]
+        slot = puller.slot_for(1)
+        cache.tensors["w"].fill_(-1.0)
+        flat_ids = torch.tensor([candidate], device=device)
+        missed_mask = torch.tensor([True], device=device)
+        demand_remap = torch.tensor([0], dtype=torch.int64, device=device)
+
+        def step():
+            puller.post_target(1)
+            return puller.join_target(
+                1,
+                flat_ids=flat_ids,
+                missed_mask=missed_mask,
+                demand_remap=demand_remap,
+            )
+
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            remap = step()
+        puller.stats[1].counts.zero_()  # Ignore the capture warmup replay.
+
+        original_demand_rows = demand_remap.clone()
+        expected_slot = cache.tensors["w"][slot].clone()
+        for should_post in (False, True, False, True):
+            puller._should_post[1].fill_(should_post)
+            graph.replay()
+            torch.cuda.synchronize()
+            plan = puller._plans[1]
+            if should_post:
+                self.assertEqual((plan.expert_ids.item(), plan.count.item()), (candidate, 1))
+                self.assertEqual(remap.item(), slot)
+                expected_slot = cache.tensors["w"][slot].clone()
+            else:
+                self.assertEqual((plan.expert_ids.item(), plan.count.item()), (-1, 0))
+                self.assertEqual(remap.item(), original_demand_rows.item())
+                torch.testing.assert_close(cache.tensors["w"][slot], expected_slot)
+        covered, residual, wasted, posted = puller.stats[1].snapshot()
+        self.assertEqual((covered, residual, wasted, posted), (2, 2, 0, 2))
+
     def test_setup_rejects_a_hot_cache_allocated_without_the_trailing_row(self):
         # Reject unsupported concurrent-state sharing at setup, not at first
         # corrupted read: a hot cache with no reserved trailing row would have
