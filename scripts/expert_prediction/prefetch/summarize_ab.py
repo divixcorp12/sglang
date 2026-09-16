@@ -99,6 +99,22 @@ def paired_session_bootstrap(left: dict, right: dict, *, seed: int = 20260916, r
     return [round(_percentile(samples, 2.5), 12), round(_percentile(samples, 97.5), 12)]
 
 
+def baseline_p95_repeatability_envelope(passes: list[dict]) -> list[float]:
+    """Inclusive min/max p95 across provenance-identical same-session B passes."""
+    if not passes:
+        raise ValueError("at least one baseline pass is required")
+    reference = passes[0]["manifest"]
+    for entry in passes[1:]:
+        manifest = entry["manifest"]
+        for key in ("commit", "cache_size", "session_ids"):
+            if manifest.get(key) != reference.get(key):
+                raise ValueError(f"baseline passes differ in {key}")
+    values = [entry["p95_turn_decode_ms_per_token"] for entry in passes]
+    if any(value is None for value in values):
+        raise ValueError("baseline pass has no qualifying turns")
+    return [min(values), max(values)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", nargs="+", help="arm=results:prediction:hot-cache:manifest")

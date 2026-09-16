@@ -78,14 +78,15 @@ class PullCalibrationHistogram:
             return
         candidate = self.candidate_ids[row]
         valid = candidate >= 0
+        eligible = valid & self.source_eligible[row]
         useful = (missed_mask & (flat_ids == candidate)).any()
         values = torch.stack(
             (
-                valid.to(torch.int64),
-                (valid & self.source_eligible[row]).to(torch.int64),
-                (valid & useful).to(torch.int64),
-                (valid & ~useful).to(torch.int64),
-                valid.to(torch.int64) * physical_demand_rows.reshape(()).to(torch.int64),
+                eligible.to(torch.int64),
+                eligible.to(torch.int64),
+                (eligible & useful).to(torch.int64),
+                (eligible & ~useful).to(torch.int64),
+                eligible.to(torch.int64) * physical_demand_rows.reshape(()).to(torch.int64),
             )
         ).reshape(1, -1)
         self._score_counts[row].index_add_(0, self._bin_tensor(self.top_scores[row]).reshape(1), values)

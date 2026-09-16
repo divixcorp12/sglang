@@ -22,11 +22,19 @@ shadow_recall=${PREFETCH_SHADOW_RECALL:-0}
 calibration=${PREFETCH_CALIBRATION:-0}
 run_kind=${RUN_KIND:-timed}
 arm=${EXPERIMENT_ARM:-}
-session_ids=${SESSION_IDS:-}
+pass_id=${RUN_PASS_ID:-}
+session_ids_json=${SESSION_IDS_JSON:-[]}
 session_set_checksum=${SESSION_SET_CHECKSUM:-}
 checkpoint_checksum=${PREFETCH_CHECKPOINT_CHECKSUM:-unknown}
+model_shapes=${MODEL_SHAPES:-unknown}
+top_k=${MODEL_TOP_K:-unknown}
 case "$run_kind" in timed|profiling) ;; *) echo "RUN_KIND must be timed or profiling" >&2; exit 2 ;; esac
 case "$prefetch_pull_mode" in off|count_zero|always) ;; *) echo "PREFETCH_PULL_MODE is invalid" >&2; exit 2 ;; esac
+case "${calibration,,}" in
+    1|true|yes|y) calibration=1 ;;
+    0|false|no|n) calibration=0 ;;
+    *) echo "PREFETCH_CALIBRATION must be a boolean" >&2; exit 2 ;;
+esac
 if [ "$run_kind" = timed ] && [ "$calibration" = 1 ]; then
     echo "REFUSING_TO_START: calibration is profiling-only; timed B/C/Cr/N/D runs must disable it" >&2
     exit 2
@@ -72,7 +80,7 @@ cd "$worktree"
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
 } 2>&1 | tee -a "$log"
 commit=$(git rev-parse HEAD)
-printf '{"arm":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","session_ids":"%s","session_set_checksum":"%s","paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","startup_log":"%s"}}\n' "$arm" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$session_ids" "$session_set_checksum" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$log" > "$run_dir/run-manifest.json"
+printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","session_ids":%s,"session_set_checksum":"%s","shape_provenance":"%s","top_k":"%s","calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]"},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$top_k" "$calibration" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$log" > "$run_dir/run-manifest.json"
 
 exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \

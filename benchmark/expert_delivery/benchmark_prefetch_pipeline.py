@@ -40,12 +40,31 @@ def _measure(device, count, iterations):
     target = pipeline.create_target(f"count-{count}", segments, plan, 1)
     samples = []
     for _ in range(iterations):
-        ready, posted, joined, consumed = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
-        ready.record(); pipeline.post_target(target); posted.record(); pipeline.join_target(target); joined.record()
-        # The consumer-ready event is after a real load of the destination row.
+        ready, copy_start, copy_end, joined, residual_start, residual_end, consumed = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
+        ready.record()
+        with torch.cuda.stream(pipeline.side_stream):
+            copy_start.record()
+        pipeline.post_target(target)
+        with torch.cuda.stream(pipeline.side_stream):
+            copy_end.record()
+        pipeline.join_target(target)
+        joined.record()
+        # Use the same registered source/destination geometry for ordinary
+        # residual demand, deliberately distinct from the side-pull slot.
+        residual_start.record()
+        for source, destination in pairs:
+            destination[0].copy_(source[0], non_blocking=True)
+        residual_end.record()
+        # The consumer-ready event is after a real load of the target row.
         sum(destination[1].float().sum() for _, destination in pairs).item()
         consumed.record(); consumed.synchronize()
-        samples.append({"ready_to_copy_start_ms": ready.elapsed_time(posted), "copy_ms": posted.elapsed_time(joined), "join_exposure_ms": posted.elapsed_time(joined), "consumer_ready_ms": ready.elapsed_time(consumed)})
+        samples.append({
+            "ready_to_copy_start_ms": ready.elapsed_time(copy_start),
+            "copy_ms": copy_start.elapsed_time(copy_end),
+            "join_exposure_ms": copy_end.elapsed_time(joined),
+            "residual_demand_ms": residual_start.elapsed_time(residual_end),
+            "consumer_ready_ms": ready.elapsed_time(consumed),
+        })
     if count:
         for source, destination in pairs:
             torch.testing.assert_close(destination[1].cpu(), source[0])
