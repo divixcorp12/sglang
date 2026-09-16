@@ -139,7 +139,7 @@ def test_all_miss_uses_every_scratch_row():
 @pytest.mark.parametrize("top_k", [1, 10, 32])
 def test_supported_top_k_sizes(top_k):
     for seed in range(20):
-        rng = random.Random((seed, top_k))
+        rng = random.Random(seed * 1000 + top_k)
         ids = torch.tensor(
             rng.sample(range(EXPERTS), top_k), device="cuda", dtype=torch.int64
         )
