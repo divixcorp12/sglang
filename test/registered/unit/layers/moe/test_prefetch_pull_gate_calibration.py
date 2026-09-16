@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -60,8 +61,8 @@ def _histogram(*, session: str, useful_score_bin: int, useful_margin_bin: int = 
             "session_set_checksum": f"sessions-{session}",
             "batch_size": 1,
             "top_k_unique": True,
-            "shape_provenance": "BS1",
-            "top_k": "top-k-unique",
+            "shape_provenance": {"batch_size": 1, "top_k": 8, "top_k_unique": True},
+            "top_k": 8,
         },
         "layers": {"3": {
             "target_observations": 8,
@@ -148,6 +149,70 @@ def test_rejects_missing_target_observation_denominator_and_noncanonical_bin_edg
     train = _histogram(session="train", useful_score_bin=224)
     train["bin_edges"] = "close enough"
     with pytest.raises(ValueError, match="bin_edges"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+
+def test_rejects_observation_denominator_below_histogram_totals_or_mismatched_features():
+    module = _module()
+    train = _histogram(session="train", useful_score_bin=224)
+    train["layers"]["3"]["target_observations"] = 7
+    with pytest.raises(ValueError, match="target_observations"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+    train = _histogram(session="train", useful_score_bin=224)
+    train["layers"]["3"]["margin"]["physical_demand_rows"][0] += 1
+    with pytest.raises(ValueError, match="score/margin"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+
+def test_rejects_noncanonical_or_contradictory_scope_metadata():
+    module = _module()
+    train = _histogram(session="train", useful_score_bin=224)
+    train["provenance"]["top_k"] = "top-k-unique"
+    with pytest.raises(ValueError, match="top_k"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+    train = _histogram(session="train", useful_score_bin=224)
+    train["provenance"]["shape_provenance"]["top_k"] = 4
+    with pytest.raises(ValueError, match="shape_provenance"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+    train = _histogram(session="train", useful_score_bin=224)
+    train["provenance"]["shape_provenance"]["batch_size"] = True
+    with pytest.raises(ValueError, match="shape_provenance"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+    train = _histogram(session="train", useful_score_bin=224)
+    del train["provenance"]["shape_provenance"]
+    with pytest.raises(ValueError, match="shape_provenance"):
+        module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
+
+
+@pytest.mark.parametrize("bad_cost", (float("nan"), float("inf"), -float("inf")))
+def test_rejects_nonfinite_measured_costs_and_never_returns_nonfinite_values(bad_cost):
+    module = _module()
+    costs = _costs()
+    costs["layers"]["3"]["posted_row_cost"] = bad_cost
+    with pytest.raises(ValueError, match="finite"):
+        module.calibrate_gate(
+            _histogram(session="train", useful_score_bin=224),
+            _histogram(session="heldout", useful_score_bin=224),
+            costs,
+        )
+
+    artifact = module.calibrate_gate(
+        _histogram(session="train", useful_score_bin=224),
+        _histogram(session="heldout", useful_score_bin=224),
+        _costs(),
+    )
+    assert all(math.isfinite(layer["training_net_value"]) for layer in artifact["layers"].values())
+
+
+def test_rejects_nonfinite_cache_size_input():
+    module = _module()
+    train = _histogram(session="train", useful_score_bin=224)
+    train["provenance"]["cache_size"] = float("nan")
+    with pytest.raises(ValueError, match="cache_size"):
         module.calibrate_gate(train, _histogram(session="heldout", useful_score_bin=224), _costs())
 
 

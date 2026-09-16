@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -65,7 +66,10 @@ def _as_payload(value: Mapping[str, Any] | str | Path) -> dict[str, Any]:
 def _require_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be numeric")
-    return float(value)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{label} must be finite")
+    return numeric
 
 
 def _validate_histogram(payload: Mapping[str, Any]) -> None:
@@ -80,10 +84,12 @@ def _validate_histogram(payload: Mapping[str, Any]) -> None:
     provenance = payload.get("provenance")
     if not isinstance(provenance, Mapping):
         raise ValueError("pull calibration is missing provenance")
-    for key in (*PROVENANCE_KEYS, "shape_provenance", "top_k"):
+    for key in PROVENANCE_KEYS:
         if provenance.get(key) in (None, ""):
             raise ValueError(f"pull calibration provenance is missing {key}")
-    _validate_bs1_topk_unique(provenance)
+    if isinstance(provenance["cache_size"], bool) or not isinstance(provenance["cache_size"], int) or provenance["cache_size"] < 0:
+        raise ValueError("pull calibration provenance cache_size must be a nonnegative integer")
+    _validate_scope_metadata(provenance)
 
     layers = payload.get("layers")
     if not isinstance(layers, Mapping) or not layers:
@@ -98,25 +104,48 @@ def _validate_histogram(payload: Mapping[str, Any]) -> None:
         target_observations = record.get("target_observations")
         if isinstance(target_observations, bool) or not isinstance(target_observations, int) or target_observations < 0:
             raise ValueError(f"layer {layer} target_observations must be a nonnegative integer")
+        totals: dict[str, dict[str, int]] = {}
         for feature in FEATURES:
             counters = record.get(feature)
             if not isinstance(counters, Mapping):
                 raise ValueError(f"layer {layer} is missing {feature} histogram")
-            _validate_counters(layer, feature, counters)
+            totals[feature] = _validate_counters(layer, feature, counters)
+        if totals["score"] != totals["margin"]:
+            raise ValueError(f"layer {layer} score/margin aggregate totals differ")
+        for field in ("source_eligible", "opportunity", "target_useful", "target_wasted"):
+            if target_observations < totals["score"][field]:
+                raise ValueError(f"layer {layer} target_observations is below {field} total")
 
 
-def _validate_bs1_topk_unique(provenance: Mapping[str, Any]) -> None:
-    batch_size = provenance.get("batch_size", provenance.get("bs"))
-    shape = str(provenance.get("shape_provenance", "")).upper()
-    if (batch_size is not None and batch_size != 1) or (batch_size is None and "BS1" not in shape):
-        raise ValueError("calibration artifact is outside BS1 scope")
+def _validate_scope_metadata(provenance: Mapping[str, Any]) -> None:
+    """Require a typed, self-consistent BS1/top-k-unique profiling scope."""
+    batch_size = provenance.get("batch_size")
     top_k = provenance.get("top_k")
-    top_k_unique = provenance.get("top_k_unique") is True
-    if not top_k_unique and "UNIQUE" not in str(top_k).upper():
+    top_k_unique = provenance.get("top_k_unique")
+    shape = provenance.get("shape_provenance")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size != 1:
+        raise ValueError("calibration artifact is outside BS1 scope")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("calibration artifact top_k must be a positive integer")
+    if top_k_unique is not True:
         raise ValueError("calibration artifact is outside top-k-unique scope")
+    if not isinstance(shape, Mapping):
+        raise ValueError("calibration artifact shape_provenance must be an object")
+    shape_batch_size = shape.get("batch_size")
+    shape_top_k = shape.get("top_k")
+    if (
+        isinstance(shape_batch_size, bool)
+        or not isinstance(shape_batch_size, int)
+        or isinstance(shape_top_k, bool)
+        or not isinstance(shape_top_k, int)
+        or shape_batch_size != batch_size
+        or shape_top_k != top_k
+        or shape.get("top_k_unique") is not True
+    ):
+        raise ValueError("calibration artifact shape_provenance contradicts canonical scope metadata")
 
 
-def _validate_counters(layer: str, feature: str, counters: Mapping[str, Any]) -> None:
+def _validate_counters(layer: str, feature: str, counters: Mapping[str, Any]) -> dict[str, int]:
     values: dict[str, list[int]] = {}
     for field in COUNTERS:
         raw = counters.get(field)
@@ -132,6 +161,7 @@ def _validate_counters(layer: str, feature: str, counters: Mapping[str, Any]) ->
             raise ValueError(f"layer {layer} {feature} bin {index} has inconsistent posted outcomes")
         if eligible < posted:
             raise ValueError(f"layer {layer} {feature} bin {index} has fewer source-eligible than posted rows")
+    return {field: sum(raw) for field, raw in values.items()}
 
 
 def _validate_pair(train: Mapping[str, Any], heldout: Mapping[str, Any]) -> None:
@@ -140,7 +170,7 @@ def _validate_pair(train: Mapping[str, Any], heldout: Mapping[str, Any]) -> None
     for key in PROVENANCE_KEYS:
         if train_provenance[key] != heldout_provenance[key]:
             raise ValueError(f"calibration provenance mismatch for {key}")
-    for key in ("shape_provenance", "top_k"):
+    for key in ("batch_size", "top_k", "top_k_unique", "shape_provenance"):
         if train_provenance.get(key) != heldout_provenance.get(key):
             raise ValueError(f"calibration provenance mismatch for {key}")
     if train["bin_edges"] != heldout["bin_edges"]:
@@ -211,7 +241,10 @@ def _net_value(selected: Mapping[str, int], target_observations: int, costs: Map
     demand = selected["physical_demand_rows"] * _require_number(
         costs["physical_demand_row_cost"], "physical_demand_row_cost"
     )
-    return useful_value - fixed - posted - demand
+    net_value = useful_value - fixed - posted - demand
+    if not math.isfinite(net_value):
+        raise ValueError("calibration net value is not finite")
+    return net_value
 
 
 def _select_layer(train: Mapping[str, Any], heldout: Mapping[str, Any], costs: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -311,9 +344,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     artifact = calibrate_gate(args.train, args.heldout, args.costs)
     temporary = args.out.with_suffix(args.out.suffix + ".partial")
-    temporary.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+    temporary.write_text(json.dumps(artifact, indent=2, sort_keys=True, allow_nan=False) + "\n")
     temporary.replace(args.out)
-    print(json.dumps(artifact, indent=2, sort_keys=True))
+    print(json.dumps(artifact, indent=2, sort_keys=True, allow_nan=False))
 
 
 if __name__ == "__main__":
