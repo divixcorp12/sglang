@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
 NO_DEDUP_LIMIT = 64
+FUSED_MAX_ROUTES = 32
 
 
 def should_dedup(topk_ids: torch.Tensor) -> bool:
@@ -81,3 +83,85 @@ def plan_graph_routes(
         unique_miss_rows=unique_misses,
         routed_miss_rows=count - hit.sum(),
     )
+
+
+def supports_fused_graph_routes(
+    flat: torch.Tensor, expert_to_slot: torch.Tensor, scratch_rows: int
+) -> bool:
+    """Whether `plan_graph_routes_fused` may serve this gather.
+
+    The fused kernel is BS1 and unique-ID only: one warp, one route per lane,
+    no duplicate-ID handling. A caller whose routes may repeat (prefill,
+    speculative verify batches) must keep using `plan_graph_routes`.
+    """
+    return (
+        flat.is_cuda
+        and flat.ndim == 1
+        and 0 < flat.numel() <= FUSED_MAX_ROUTES
+        and flat.numel() <= scratch_rows
+        and expert_to_slot.dtype == torch.int64
+        and expert_to_slot.device == flat.device
+    )
+
+
+_ZERO_PREFETCH_STATE: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _zero_prefetch_state(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """A permanent zero-count prefetch state: no route is ever a covered miss."""
+    state = _ZERO_PREFETCH_STATE.get(device)
+    if state is None:
+        state = (
+            torch.zeros(1, dtype=torch.int64, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+        )
+        _ZERO_PREFETCH_STATE[device] = state
+    return state
+
+
+def plan_graph_routes_fused(
+    flat: torch.Tensor,
+    expert_to_slot: torch.Tensor,
+    scratch_base: int,
+    remap_dtype: torch.dtype,
+    source_rows_out: torch.Tensor,
+    slots_out: torch.Tensor,
+    count_out: torch.Tensor,
+    graph_counters: Optional[torch.Tensor] = None,
+    graph_unique_counters: Optional[torch.Tensor] = None,
+    route_counts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """`plan_graph_routes`'s BS1, unique-ID fast path: one fused kernel launch.
+
+    Reproduces its exact semantics for unique-ID ``flat``. Prediction inputs
+    are wired into the call but permanently disabled: prefetch count is
+    always zero, so every nonresident route is a residual scratch row, never
+    a covered miss. ``source_rows_out`` and ``slots_out`` are written for
+    every one of ``flat``'s routes (residual routes first), matching
+    ``GraphRoutePlan.source_rows``' full-vector contract; ``count_out``
+    receives the residual row count. Writes ``graph_counters``,
+    ``graph_unique_counters`` and ``route_counts`` in place when given,
+    instead of returning fresh per-call tensors for them.
+
+    Returns the per-route remap in ``remap_dtype``, shaped like ``flat``.
+    """
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    prefetch_expert, prefetch_count = _zero_prefetch_state(flat.device)
+    remap_out = torch.empty(flat.shape, dtype=remap_dtype, device=flat.device)
+    plan_unique_routes_cuda(
+        flat,
+        expert_to_slot,
+        scratch_base,
+        source_rows_out,
+        slots_out,
+        count_out,
+        remap_out,
+        graph_counters,
+        graph_unique_counters,
+        route_counts,
+        prefetch_expert,
+        prefetch_count,
+        0,
+    )
+    return remap_out

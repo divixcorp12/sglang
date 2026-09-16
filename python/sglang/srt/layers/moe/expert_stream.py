@@ -13,9 +13,15 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
 from sglang.srt.layers.moe.expert_route_plan import NO_DEDUP_LIMIT as _NO_DEDUP_LIMIT
-from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes, should_dedup
+from sglang.srt.layers.moe.expert_route_plan import (
+    plan_graph_routes,
+    plan_graph_routes_fused,
+    should_dedup,
+    supports_fused_graph_routes,
+)
 from sglang.srt.layers.moe.expert_row_plan import (
     ExpertRowPlan,
     ExpertRowPlanner,
@@ -631,6 +637,9 @@ class ExpertStreamer:
         )
         self._graph_destination_slots = self._graph_scratch_slots.to(torch.int32)
         self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
+        self._graph_fused_slots_scratch = torch.empty(
+            max_rows, dtype=torch.int32, device=device
+        )
         self.row_planner = ExpertRowPlanner(cache, cache.capacity, max_rows)
         self.row_plan = ExpertRowPlan(
             expert_ids=self._graph_source_rows,
@@ -656,30 +665,55 @@ class ExpertStreamer:
         cache = self.hot_cache
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
-        plan = self.row_planner.route_plan(flat)
-        scratch = self._graph_scratch_slots[: plan.source_rows.numel()]
-        self.row_planner.fill_routes(plan, self.row_plan)
+        expert_to_slot = self.row_planner.expert_to_slot
+        if envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get() and supports_fused_graph_routes(
+            flat, expert_to_slot, self.graph_gather_rows
+        ):
+            route_counts = (
+                self.residency_policy.pending_counts
+                if self.residency_policy is not None
+                else None
+            )
+            remap = plan_graph_routes_fused(
+                flat,
+                expert_to_slot,
+                self.row_planner.scratch_base,
+                topk_ids.dtype,
+                self._graph_source_rows[:count],
+                self._graph_fused_slots_scratch[:count],
+                self._graph_miss_count,
+                self.graph_counters,
+                self.graph_unique_counters,
+                route_counts,
+            )
+            source_rows = self._graph_source_rows[:count]
+        else:
+            plan = self.row_planner.route_plan(flat)
+            self.row_planner.fill_routes(plan, self.row_plan)
+            remap = plan.remap
+            source_rows = plan.source_rows
+            self.graph_counters[0].add_(count)
+            self.graph_counters[1].add_(plan.routed_miss_rows)
+            self.graph_unique_counters[0].add_(plan.unique_hit_rows)
+            self.graph_unique_counters[1].add_(plan.unique_miss_rows)
+            if self.residency_policy is not None:
+                self.residency_policy.pending_counts.index_add_(
+                    0, flat, self._graph_ones[:count]
+                )
+        scratch = self._graph_scratch_slots[: source_rows.numel()]
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,
                 scratch,
                 source.view(torch.uint8)
                 .reshape(source.shape[0], -1)
-                .index_select(0, plan.source_rows),
+                .index_select(0, source_rows),
             )
         if self.row_backend is not None:
             self.row_backend.post(self.row_tag, self.row_plan)
             delivery = self.row_backend.resolve(self.row_tag, self.row_plan)
             self.row_backend.copy_residual(self.row_tag, delivery)
-        self.graph_counters[0].add_(count)
-        self.graph_counters[1].add_(plan.routed_miss_rows)
-        self.graph_unique_counters[0].add_(plan.unique_hit_rows)
-        self.graph_unique_counters[1].add_(plan.unique_miss_rows)
-        if self.residency_policy is not None:
-            self.residency_policy.pending_counts.index_add_(
-                0, flat, self._graph_ones[:count]
-            )
-        return plan.remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
+        return remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
 
     def _check_graph_sources(self) -> None:
         """Raise if a layer tensor was rebound after its graph gather plan froze it."""

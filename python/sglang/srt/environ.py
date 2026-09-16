@@ -391,6 +391,11 @@ class Envs:
     # Serve decode-sized expert gathers without host syncs so CUDA graphs capture
     # them; requires SGLANG_MOE_EXPERT_HOST_ARENA and SGLANG_MOE_HOT_GPU_MB.
     SGLANG_MOE_EXPERT_GRAPH_GATHER = EnvBool(False)
+    # Plan a graph-gather's BS1, unique-ID, top_k<=32 routes with one fused
+    # CUDA kernel launch instead of the general tensor-op sequence; requires
+    # SGLANG_MOE_EXPERT_GRAPH_GATHER. Shapes/dtypes outside that specialization
+    # fall back to the general path unchanged.
+    SGLANG_MOE_EXPERT_FUSED_PLAN = EnvBool(False)
     # Speculative decoding only: cap each layer's graph-gather scratch rows below
     # one per verify route (decode max_bs x draft tokens x top_k); 0 keeps that bound.
     # Startup rejects a cap below one request's routes: that needs phase 3's overflow path.
