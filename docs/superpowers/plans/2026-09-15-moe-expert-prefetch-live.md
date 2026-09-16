@@ -142,6 +142,13 @@ These findings go to crypto-c9 with the Task 3 and Task 7 reports. Phase B picks
 
 Owned by crypto-c9's copy layer. Task 3 still reports budget recall at 1–10 *and* 16/32 rows, so that decision has data.
 
+**Scratch-write ownership (raised by crypto-c9; written down on both sides).** Their doorbell correctness argument needs layer L's scratch rows to be written *only* by layer L's own copy and its residual copy. A second writer fails open: a late copy overwrites a row the layer is already computing with, giving a silently wrong token with no error and no counter.
+
+- **Phase A writes nothing.** It reads `expert_to_slot` and produces ids plus priorities; it allocates no rows and issues no copy (`serving/runtime.py`, `serving/candidates.py`). No collision is possible with anything shipped today.
+- **Phase B allocates nothing either.** We do not open a second pool and must not: destinations come from their planner. On their draft, `ExpertRowPlan.for_scratch(capacity, scratch_base, scratch_rows)` addresses `scratch_base + r` — *the same per-layer pool the graph gather uses*, clamped to `scratch_rows` (10 today). So prefetch rows and gather rows are the same pool by their design, and the disjointness argument has to hold inside their layer, not ours.
+- **Why it holds today, to be confirmed at merge, not assumed:** one outstanding post per tag; the reservation rule keeps a posted slot unread and unwritten by anyone else until its resolve; `plan_residual_routes` assigns residual rows that no needed delivered expert occupies; and the fail-stop drain guarantees no copy lands after its resolve returned. The prefetch write and the gather's scratch write are then the *same* write, issued once per tag.
+- **The hazard if any of those weakens:** a timed-out-then-late landing, or a second post on a live tag, writes a row residual has since reassigned. B1 Step 1 records the confirmed argument before any code is written.
+
 ### What stays outside the decode graph, and why
 
 1. Checkpoint load, checksum and spec validation, dtype casting, and buffer allocation: one-time setup.
@@ -2020,7 +2027,8 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
   - how destination slots are chosen;
   - which flag turns prefetch on;
   - how the in-graph and doorbell backends are selected;
-  - whether a same-layer (APEX) target is supported.
+  - whether a same-layer (APEX) target is supported;
+  - **the scratch-write disjointness argument**, confirmed against the merged code, not assumed: one outstanding post per tag, the reservation rule, residual rows avoiding delivered ones, and no copy landing after its resolve returned. If any of the four no longer holds, stop and raise it before writing the adapter.
 - [ ] **Step 2: Write the adapter** (`serving/<adapter>.py`, name TBD). At the point the merged layer designates, map `PrefetchScoring.bank.ids_for(T)` and `.scores_for(T)` into its plan:
   - with resident filtering (`expert_to_slot.index_select(ids) < 0`) and a top-B by priority, only if the interface leaves that to the producer;
   - or into a `[num_experts]` priority mask via one `scatter_`, if that is what it takes.
