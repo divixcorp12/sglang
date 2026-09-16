@@ -1067,6 +1067,13 @@ class ExpertHotCacheManager:
         manager._trace_sequence = 0
         manager._trace_next_write = 0
         manager._trace_skipped: set[int] = set()
+        manager._trace_ready: dict[int, tuple[Path, str]] = {}
+        # Completed snapshots may arrive out of order across the fixed telemetry
+        # pools.  Bound their host staging too: optional records drop rather
+        # than accumulating behind one delayed D2H event or a slow disk.
+        manager._trace_reorder_limit = 4
+        manager._trace_flush_active = False
+        manager._trace_drain_thread: threading.Thread | None = None
         if manager.metrics_path is not None:
             atexit.register(manager.close_telemetry)
         for layer_id, expert_ids in selected.items():
@@ -1882,11 +1889,23 @@ class ExpertHotCacheManager:
             writer.prepare_close()
         for writer in telemetry:
             writer.finish_close()
+        with self._trace_write_condition:
+            drain_thread = self._trace_drain_thread
+        if drain_thread is not None and drain_thread is not threading.current_thread():
+            drain_thread.join()
 
     def _skip_trace_sequence(self, sequence: int) -> None:
         with self._trace_write_condition:
             self._trace_skipped.add(sequence)
             self._advance_trace_sequence()
+            if self._trace_ready and not self._trace_flush_active:
+                self._trace_flush_active = True
+                self._trace_drain_thread = threading.Thread(
+                    target=self._drain_trace_records,
+                    name="moe-hot-cache-trace-drain",
+                    daemon=True,
+                )
+                self._trace_drain_thread.start()
             self._trace_write_condition.notify_all()
 
     def _advance_trace_sequence(self) -> None:
@@ -1898,23 +1917,68 @@ class ExpertHotCacheManager:
         self, buffers: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]
     ) -> None:
         """Build and append a trace from writer-owned CPU tensors only."""
+        sequence = metadata["sequence"]
+        try:
+            trace = {
+                "timestamp_ns": metadata["timestamp_ns"],
+                "phase": metadata["phase"],
+                "counters": self._trace_counters_from_host(buffers, metadata),
+                "route_statistics": self._trace_routes_from_host(buffers),
+                "telemetry": metadata["telemetry"],
+            }
+            encoded = json.dumps(trace, sort_keys=True) + "\n"
+        except Exception:
+            # Formatting is optional work too.  Release this sequence so a
+            # later completed snapshot never waits behind a bad record.
+            logger.exception("Could not format optional telemetry trace")
+            self._skip_trace_sequence(sequence)
+            return
+
         with self._trace_write_condition:
-            while metadata["sequence"] != self._trace_next_write:
-                self._trace_write_condition.wait()
-            try:
-                trace = {
-                    "timestamp_ns": metadata["timestamp_ns"],
-                    "phase": metadata["phase"],
-                    "counters": self._trace_counters_from_host(buffers, metadata),
-                    "route_statistics": self._trace_routes_from_host(buffers),
-                    "telemetry": metadata["telemetry"],
-                }
-                with metadata["path"].open("a", encoding="utf-8") as destination:
-                    destination.write(json.dumps(trace, sort_keys=True) + "\n")
-            finally:
-                self._trace_next_write += 1
+            self._advance_trace_sequence()
+            if len(self._trace_ready) >= self._trace_reorder_limit:
+                if sequence != self._trace_next_write:
+                    self._trace_skipped.add(sequence)
+                    self._advance_trace_sequence()
+                    self._trace_write_condition.notify_all()
+                    return
+                # Prefer the earliest sequence needed to make progress over
+                # the farthest completed record when the reorder buffer fills.
+                evicted = max(self._trace_ready)
+                del self._trace_ready[evicted]
+                self._trace_skipped.add(evicted)
+            self._trace_ready[sequence] = (metadata["path"], encoded)
+            if self._trace_flush_active:
+                return
+            self._trace_flush_active = True
+
+        # Exactly one background worker drains ready records.  The condition
+        # protects only sequence state; JSON construction and file I/O happen
+        # outside it, so an inference-thread drop never waits on a slow disk.
+        self._drain_trace_records()
+
+    def _drain_trace_records(self) -> None:
+        """Write staged trace records in sequence order without owning state locks."""
+        while True:
+            with self._trace_write_condition:
                 self._advance_trace_sequence()
-                self._trace_write_condition.notify_all()
+                record = self._trace_ready.pop(self._trace_next_write, None)
+                if record is None:
+                    self._trace_flush_active = False
+                    if self._trace_drain_thread is threading.current_thread():
+                        self._trace_drain_thread = None
+                    return
+            path, encoded = record
+            try:
+                with path.open("a", encoding="utf-8") as destination:
+                    destination.write(encoded)
+            except Exception:
+                logger.exception("Could not write optional telemetry trace")
+            finally:
+                with self._trace_write_condition:
+                    self._trace_next_write += 1
+                    self._advance_trace_sequence()
+                    self._trace_write_condition.notify_all()
 
     def _trace_counters_from_host(
         self, buffers: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]
@@ -1929,6 +1993,11 @@ class ExpertHotCacheManager:
                 if graph_rows is not None
                 else None
             )
+            requested_unique = (
+                buffers[prefix + "unique_experts"].tolist()
+                if graph_rows is not None
+                else None
+            )
             gathers = buffers[prefix + "gathers"].tolist() if graph_rows is not None else None
             rows = graph_rows.tolist() if graph_rows is not None else None
             for position, layer_id in enumerate(self._layer_ids):
@@ -1936,7 +2005,7 @@ class ExpertHotCacheManager:
                 streamer = self.streamers[layer_id]
                 if graph_rows is not None:
                     routed, routed_missed = rows[position]
-                    requested_unique, unique_hit, unique_missed = graph_unique[position]
+                    unique_hit, unique_missed = graph_unique[position]
                     row["requested_rows"] += unique_hit + unique_missed
                     row["routed_rows"] += routed
                     row["miss_rows"] += unique_missed
@@ -1949,7 +2018,7 @@ class ExpertHotCacheManager:
                     )
                     row["h2d_bytes"] += unique_missed * streamer.host_bytes_per_expert
                     row["backing_source_bytes"] += unique_missed * streamer.bytes_per_expert
-                    row["requested_unique_experts"] += requested_unique
+                    row["requested_unique_experts"] += requested_unique[position]
                     side_pull = metadata["side_pull_snapshots"].get((mode, layer_id))
                     if side_pull is not None:
                         covered, residual, wasted, posted = side_pull

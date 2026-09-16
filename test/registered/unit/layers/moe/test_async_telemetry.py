@@ -42,6 +42,20 @@ class _Backend:
         event.ready = True
 
 
+class _BlockingEnqueueBackend(_Backend):
+    """Hold copy submission open to exercise the schedule/close boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enqueue_started = threading.Event()
+        self.release_enqueue = threading.Event()
+
+    def enqueue(self, buffers, sources, event):
+        self.enqueue_started.set()
+        self.release_enqueue.wait(timeout=5)
+        super().enqueue(buffers, sources, event)
+
+
 class TestAsyncTelemetry(unittest.TestCase):
     def test_completed_slot_hands_the_writer_an_immutable_accepted_snapshot(self):
         backend = _Backend()
@@ -157,6 +171,49 @@ class TestAsyncTelemetry(unittest.TestCase):
         finally:
             unblock.set()
             telemetry.finish_close()
+
+    def test_close_never_releases_a_slot_before_its_copy_submission_returns(self):
+        backend = _BlockingEnqueueBackend()
+        written = []
+        telemetry = AsyncTelemetry(
+            sources={"counter": [0]},
+            backend=backend,
+            writer=lambda buffers, _metadata: written.append(list(buffers["counter"])),
+            slots=1,
+            writer_jobs=1,
+            thread_name="telemetry-test",
+        )
+        scheduled = threading.Thread(
+            target=lambda: telemetry.schedule({"counter": [7]}, {})
+        )
+        close_started = threading.Event()
+        close_finished = threading.Event()
+
+        def close():
+            close_started.set()
+            telemetry.close()
+            close_finished.set()
+
+        closer = threading.Thread(target=close)
+        try:
+            scheduled.start()
+            self.assertTrue(backend.enqueue_started.wait(timeout=1))
+            closer.start()
+            self.assertTrue(close_started.wait(timeout=1))
+            self.assertFalse(close_finished.wait(timeout=0.1))
+            self.assertEqual(written, [])
+
+            backend.release_enqueue.set()
+            scheduled.join(timeout=1)
+            closer.join(timeout=1)
+            self.assertFalse(scheduled.is_alive())
+            self.assertTrue(close_finished.is_set())
+            self.assertEqual(written, [[7]])
+        finally:
+            backend.release_enqueue.set()
+            scheduled.join(timeout=1)
+            closer.join(timeout=1)
+            telemetry.close()
 
 
 if __name__ == "__main__":

@@ -150,16 +150,19 @@ class AsyncTelemetry:
             slot.metadata = MappingProxyType(dict(metadata))
             self._pending.append(slot)
             self._stats["accepted"] += 1
-        try:
-            self._backend.enqueue(slot.buffers, sources, slot.event)
-        except Exception:
-            with self._lock:
+            try:
+                # Keep the slot pending until the nonblocking submission has
+                # returned.  Teardown may synchronize and hand pending slots
+                # to the writer immediately after this lock is released, so it
+                # must never observe a slot whose copy has not been submitted.
+                self._backend.enqueue(slot.buffers, sources, slot.event)
+            except Exception:
                 self._pending.remove(slot)
                 self._free.append(slot)
                 self._stats["accepted"] -= 1
                 self._stats["dropped_pending"] += 1
-            logger.exception("Could not queue optional telemetry snapshot")
-            return False
+                logger.exception("Could not queue optional telemetry snapshot")
+                return False
         return True
 
     def poll(self) -> None:

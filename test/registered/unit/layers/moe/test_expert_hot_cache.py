@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -15,6 +16,90 @@ from sglang.srt.layers.moe.expert_stream import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
+
+
+class _BlockingTracePath:
+    """In-memory trace destination that pauses its first write."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.lines = []
+
+    def open(self, *_args, **_kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def write(self, line):
+        self.lines.append(line)
+        self.started.set()
+        self.release.wait(timeout=5)
+
+
+class TestTraceWriteOrdering(unittest.TestCase):
+    def test_blocked_file_write_does_not_block_later_trace_or_drop(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+
+        manager = ExpertHotCacheManager.__new__(ExpertHotCacheManager)
+        manager._trace_write_condition = threading.Condition()
+        manager._trace_sequence = 3
+        manager._trace_next_write = 0
+        manager._trace_skipped = set()
+        manager._trace_ready = {}
+        manager._trace_reorder_limit = 4
+        manager._trace_flush_active = False
+        manager._trace_drain_thread = None
+        manager._trace_counters_from_host = lambda _buffers, _metadata: {}
+        manager._trace_routes_from_host = lambda _buffers: {}
+        path = _BlockingTracePath()
+        metadata = {
+            "sequence": 0,
+            "timestamp_ns": 1,
+            "phase": "prefill",
+            "telemetry": {},
+            "path": path,
+        }
+        writing = threading.Thread(
+            target=manager._write_trace_snapshot, args=({}, metadata)
+        )
+        later_metadata = {**metadata, "sequence": 1, "phase": "decode"}
+        queued = threading.Event()
+        dropped = threading.Event()
+
+        try:
+            writing.start()
+            self.assertTrue(path.started.wait(timeout=1))
+            later = threading.Thread(
+                target=lambda: (
+                    manager._write_trace_snapshot({}, later_metadata),
+                    queued.set(),
+                )
+            )
+            later.start()
+            dropper = threading.Thread(
+                target=lambda: (manager._skip_trace_sequence(2), dropped.set())
+            )
+            dropper.start()
+            self.assertTrue(queued.wait(timeout=0.5))
+            self.assertTrue(dropped.wait(timeout=0.5))
+        finally:
+            path.release.set()
+            writing.join(timeout=1)
+            if "later" in locals():
+                later.join(timeout=1)
+            if "dropper" in locals():
+                dropper.join(timeout=1)
+
+        self.assertFalse(writing.is_alive())
+        self.assertEqual(
+            [json.loads(line)["phase"] for line in path.lines], ["prefill", "decode"]
+        )
+        self.assertEqual(manager._trace_next_write, 3)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -795,6 +880,26 @@ class TestExpertHotCacheManager(unittest.TestCase):
             (record,) = [json.loads(line) for line in trace.read().splitlines()]
         self.assertEqual(record["phase"], "decode")
         self.assertIn("telemetry", record)
+
+    def test_trace_emits_graph_unique_counter_record(self):
+        with tempfile.NamedTemporaryFile() as trace:
+            manager = self.manager(dynamic=False, metrics_path=trace.name)
+            registers = manager._registers_for("prefill", torch.device("cuda"), 4)
+            registers["graph_rows"][0].copy_(torch.tensor([7, 3], device="cuda"))
+            registers["graph_unique_rows"][0].copy_(torch.tensor([2, 5], device="cuda"))
+            registers["unique_experts"][0] = 7
+            registers["gathers"][0] = 1
+
+            manager._schedule_trace("prefill")
+            manager.close_telemetry()
+
+            trace.seek(0)
+            (record,) = [json.loads(line) for line in trace.read().splitlines()]
+
+        counters = record["counters"]["prefill"]["0"]
+        self.assertEqual(counters["requested_unique_experts"], 7)
+        self.assertEqual(counters["hot_hits"], 2)
+        self.assertEqual(counters["unique_miss_rows"], 5)
 
     def test_no_trace_consumer_skips_dense_route_history_and_affinity(self):
         manager = self.manager(dynamic=False, log_interval=1000)
