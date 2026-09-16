@@ -148,31 +148,43 @@ def _build_delayed_target(tag: str):
     return device, source, destination, pipeline, target
 
 
-def _post_with_delay(device: torch.device, pipeline, target) -> None:
-    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+def _patch_delayed_copy(monkeypatch) -> None:
+    """Make ``post_target``'s own side-stream copy call incur a large,
+    device-clock-bound delay before it runs, by wrapping the production copy
+    function at the exact module attribute ``post_target`` calls. This drives
+    the delay through the real ``ExpertGpuPullPipeline.post_target`` body
+    instead of a hand-duplicated reimplementation of it, so these tests catch
+    a regression in where ``post_target`` records ``done`` relative to the
+    copy, not just a regression in a copy of that ordering.
+    """
+    import sglang.srt.layers.moe.expert_gpu_pull as expert_gpu_pull_module
 
-    origin = torch.cuda.current_stream(device)
-    target.ready.record(origin)
-    with torch.cuda.stream(pipeline.side_stream):
-        pipeline.side_stream.wait_event(target.ready)
+    original_copy = expert_gpu_pull_module.copy_expert_row_segments_gpu
+
+    def delayed_copy(segments, source_rows, destination_slots, count) -> None:
         torch.cuda._sleep(_DELAY_CYCLES)
-        copy_expert_row_segments_gpu(
-            target.segments, target.plan.expert_ids, target.plan.slots, target.plan.count
-        )
-        target.done.record(pipeline.side_stream)
+        original_copy(segments, source_rows, destination_slots, count)
+
+    monkeypatch.setattr(
+        expert_gpu_pull_module, "copy_expert_row_segments_gpu", delayed_copy
+    )
 
 
-def _capture_and_replay_delayed_fork(*, join: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """Capture a delayed fork, joining only when ``join`` is true, then replay.
+def _capture_and_replay_delayed_fork(
+    monkeypatch, *, join: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Capture a delayed fork through the real ``post_target``, joining only
+    when ``join`` is true, then replay.
 
     The result is read after synchronizing only the origin stream's own
     event, never the whole device, so an unjoined fork cannot accidentally
     pass by virtue of the test itself waiting for the side stream.
     """
     device, source, destination, pipeline, target = _build_delayed_target("delayed-capture")
+    _patch_delayed_copy(monkeypatch)
 
     def body() -> None:
-        _post_with_delay(device, pipeline, target)
+        pipeline.post_target(target)
         if join:
             pipeline.join_target(target)
 
@@ -196,7 +208,7 @@ def _capture_and_replay_delayed_fork(*, join: bool) -> tuple[torch.Tensor, torch
     return source, result
 
 
-def test_removing_the_join_makes_graph_capture_itself_refuse_to_end():
+def test_removing_the_join_makes_graph_capture_itself_refuse_to_end(monkeypatch):
     """The single most important assertion in this stage.
 
     A fork/join test that passes without the join has verified nothing. This
@@ -208,15 +220,25 @@ def test_removing_the_join_makes_graph_capture_itself_refuse_to_end():
     at all.
     """
     with pytest.raises(RuntimeError, match="unjoined"):
-        _capture_and_replay_delayed_fork(join=False)
+        _capture_and_replay_delayed_fork(monkeypatch, join=False)
 
 
-def test_join_makes_a_delayed_fork_deterministically_correct():
-    source, destination = _capture_and_replay_delayed_fork(join=True)
+def test_join_makes_a_delayed_fork_deterministically_correct(monkeypatch):
+    """Regression guard on where ``post_target`` records ``done``.
+
+    Runs the real ``post_target``/``join_target`` pair with the copy delayed
+    at its actual call site, then reads the result after synchronizing only
+    the origin stream's own event -- never a whole-device sync, which would
+    wait out the delay regardless of whether the graph's join edge is
+    correct and so could not catch a ``done`` recorded too early.
+    """
+    source, destination = _capture_and_replay_delayed_fork(monkeypatch, join=True)
     torch.testing.assert_close(destination[2].cpu(), source[1])
 
 
-def test_forking_without_a_join_leaves_the_destination_unwritten_when_observed_early():
+def test_forking_without_a_join_leaves_the_destination_unwritten_when_observed_early(
+    monkeypatch,
+):
     """A second, independent view of the same load-bearing join, in eager mode.
 
     Outside of capture, CUDA does not refuse an unjoined fork -- it is only
@@ -225,12 +247,14 @@ def test_forking_without_a_join_leaves_the_destination_unwritten_when_observed_e
     work is confirmed complete (never after a device-wide synchronization)
     shows the actual data-level symptom the capture-time error prevents from
     ever reaching a captured graph: the destination still holds its sentinel
-    value, not the pulled row.
+    value, not the pulled row. This also drives the real ``post_target``, not
+    a duplicate of its body.
     """
     device, source, destination, pipeline, target = _build_delayed_target("delayed-eager")
+    _patch_delayed_copy(monkeypatch)
     origin = torch.cuda.current_stream(device)
 
-    _post_with_delay(device, pipeline, target)
+    pipeline.post_target(target)
 
     origin_done = torch.cuda.Event(enable_timing=False)
     origin_done.record(origin)
@@ -362,6 +386,61 @@ def test_target_tag_lookup_and_duplicate_registration():
     assert pipeline.target("only-tag") is target
     with pytest.raises(ValueError, match="already registered"):
         pipeline.create_target("only-tag", segments, plan, slot=0)
+
+
+def test_join_all_joins_every_registered_target_before_capture_ends():
+    """``join_all`` must itself close out every posted target's fork.
+
+    Two targets share one pipeline; the captured body posts both and calls
+    only ``join_all`` (never a per-target ``join_target``), mirroring the
+    target-disabled/model-tail case in section 7.4 where a generic tail join
+    is responsible for every outstanding fork. Capture must succeed -- an
+    unjoined fork would raise at ``capture_end`` per the test above -- and
+    both destinations must be byte-exact after replay.
+    """
+    from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+    from sglang.srt.layers.moe.expert_gpu_pull import ExpertGpuPullPipeline
+    from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
+
+    device = torch.device("cuda")
+    row_bytes = 128
+    row_count = 4
+    pipeline = ExpertGpuPullPipeline(device)
+
+    def make_target(tag: str, expert_id: int):
+        source = _pinned_source(row_count, row_bytes, seed=hash(tag) % 1000)
+        destination = _sentinel_destination(2, row_bytes, device)
+        plan = ExpertRowPlan(
+            expert_ids=torch.tensor([expert_id], dtype=torch.int64, device=device),
+            slots=torch.tensor([1], dtype=torch.int32, device=device),
+            count=torch.tensor([1], dtype=torch.int32, device=device),
+        )
+        segments = expert_row_segments([(source, destination)])
+        target = pipeline.create_target(tag, segments, plan, slot=1)
+        return source, destination, target
+
+    source_a, destination_a, target_a = make_target("join-all-a", 0)
+    source_b, destination_b, target_b = make_target("join-all-b", 2)
+
+    def body() -> None:
+        pipeline.post_target(target_a)
+        pipeline.post_target(target_b)
+        pipeline.join_all()
+
+    _warmup(device, pipeline, body)
+    destination_a.fill_(255)
+    destination_b.fill_(255)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(destination_a[1].cpu(), source_a[0])
+    torch.testing.assert_close(destination_b[1].cpu(), source_b[2])
+    del graph
 
 
 def test_create_target_rejects_a_plan_with_capacity_other_than_one():
