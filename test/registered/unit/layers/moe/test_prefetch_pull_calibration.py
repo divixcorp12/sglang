@@ -218,3 +218,25 @@ def test_canonical_capture_loader_uses_llapor_source_layer_features():
     loaded = module.load_captured_features(root, source_layer=1, target_layer=2)
     assert loaded["router_input"].tolist() == [[11.0, 11.0, 11.0]]
     assert loaded["topk_ids"].tolist() == [[1, 2]]
+
+
+def test_pipeline_timing_helper_records_copy_start_after_wait_before_copy():
+    """The measured copy interval must bracket the actual production-equivalent call."""
+    script = Path(__file__).parents[5] / "benchmark/expert_delivery/benchmark_prefetch_pipeline.py"
+    spec = importlib.util.spec_from_file_location("benchmark_prefetch_pipeline", script)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    calls = []
+    class Event:
+        device = "cuda"
+        def record(self, *args): calls.append("start" if self is start else "end" if self is end else "ready" if self is ready else "done")
+    class Stream:
+        def wait_event(self, event): calls.append("wait")
+    class Ctx:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+    ready, done, start, end = Event(), Event(), Event(), Event()
+    target = type("T", (), {"device":"cuda", "ready":ready, "done":done, "segments":1, "plan":type("P", (), {"expert_ids":2,"slots":3,"count":4})()})()
+    pipeline = type("P", (), {"side_stream":Stream()})()
+    with mock.patch.object(module.torch.cuda, "current_stream", return_value="origin"), mock.patch.object(module.torch.cuda, "stream", return_value=Ctx()):
+        module.post_target_timed(pipeline, target, start, end, lambda *_: calls.append("copy"))
+    assert calls == ["ready", "wait", "start", "copy", "end", "done"]

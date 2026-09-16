@@ -31,6 +31,18 @@ def _segments(device):
     return expert_row_segments(pairs), pairs
 
 
+def post_target_timed(pipeline, target, copy_start, copy_end, copy_fn):
+    """Production-equivalent side post with timing events bracketing only copy."""
+    origin = torch.cuda.current_stream(target.device)
+    target.ready.record(origin)
+    with torch.cuda.stream(pipeline.side_stream):
+        pipeline.side_stream.wait_event(target.ready)
+        copy_start.record(pipeline.side_stream)
+        copy_fn(target.segments, target.plan.expert_ids, target.plan.slots, target.plan.count)
+        copy_end.record(pipeline.side_stream)
+        target.done.record(pipeline.side_stream)
+
+
 def _measure(device, count, iterations):
     from sglang.srt.layers.moe.expert_gpu_pull import ExpertGpuPullPipeline
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
@@ -45,14 +57,7 @@ def _measure(device, count, iterations):
         ready.record()
         # Inline the production post sequence so copy_start brackets the real
         # copy kernel rather than its preceding cross-stream dependency.
-        origin = torch.cuda.current_stream(device)
-        target.ready.record(origin)
-        with torch.cuda.stream(pipeline.side_stream):
-            pipeline.side_stream.wait_event(target.ready)
-            copy_start.record(pipeline.side_stream)
-            copy_expert_row_segments_gpu(target.segments, target.plan.expert_ids, target.plan.slots, target.plan.count)
-            copy_end.record(pipeline.side_stream)
-            target.done.record(pipeline.side_stream)
+        post_target_timed(pipeline, target, copy_start, copy_end, copy_expert_row_segments_gpu)
         pipeline.join_target(target)
         joined.record()
         # Use the same registered source/destination geometry for ordinary
