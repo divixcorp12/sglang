@@ -720,6 +720,57 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(counters["file_misses"], 2)
         self.assertEqual(counters["backing_source_bytes"], 40)
 
+    def test_side_pull_delivery_adds_physical_rows_but_not_logical_misses(self):
+        """A useful vs. wasted side-pull delivery changes total host rows, not logical misses.
+
+        Reproduces the plan's worked example: actual routing always misses on
+        two distinct experts. A useful prediction is delivered ahead of
+        routing, so only the other actual miss still crosses the ordinary
+        demand path; a wrong prediction is delivered and wasted, so both
+        actual misses still cross it. The demand-path portion is set
+        directly on the counters here because the upstream wiring that lets
+        a real gather skip a row already delivered by prediction is a
+        different file's work and is not landed yet; this test exercises the
+        aggregation contract `record_side_pull_delivery` and
+        `snapshot_counters` maintain, not that upstream skip.
+        """
+
+        def observed(demand_rows, delivered_rows):
+            manager = self.manager(dynamic=False)
+            counters = manager._counters["prefill"][0]
+            counters.unique_miss_rows = 2
+            counters.routed_miss_rows = 2
+            counters.miss_rows = demand_rows
+            manager.record_side_pull_delivery(
+                0, "prefill", delivered_rows=delivered_rows, delivered_bytes=7 * delivered_rows
+            )
+            return manager.snapshot_counters()["prefill"]["0"]
+
+        useful = observed(demand_rows=1, delivered_rows=1)
+        self.assertEqual(useful["miss_rows"], 2)
+        self.assertEqual(useful["unique_miss_rows"], 2)
+        self.assertEqual(useful["routed_miss_rows"], 2)
+        self.assertEqual(useful["side_pull_rows"], 1)
+        self.assertEqual(useful["side_pull_bytes"], 7)
+
+        wrong = observed(demand_rows=2, delivered_rows=1)
+        self.assertEqual(wrong["miss_rows"], 3)
+        self.assertEqual(wrong["unique_miss_rows"], 2)
+        self.assertEqual(wrong["routed_miss_rows"], 2)
+        self.assertEqual(wrong["side_pull_rows"], 1)
+        self.assertEqual(wrong["side_pull_bytes"], 7)
+
+    def test_side_pull_bytes_are_a_separate_ledger_from_promotion_bytes(self):
+        manager = self.manager(dynamic=False)
+        counters = manager._counters["prefill"][0]
+        counters.migration_bytes = 40
+        counters.promotions = 1
+        manager.record_side_pull_delivery(0, "prefill", delivered_rows=1, delivered_bytes=7)
+        row = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(row["side_pull_bytes"], 7)
+        self.assertEqual(row["migration_bytes"], 40)
+        self.assertEqual(row["promotions"], 1)
+
     def test_invalid_config_and_seed_do_not_allocate_slots(self):
         for options in (
             {"budget_bytes": -1},

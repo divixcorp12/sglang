@@ -747,6 +747,17 @@ def normalize_expert_frequency_seed(data: Mapping[str, Any]) -> torch.Tensor:
 
 @dataclass
 class _OperationalCounters:
+    """One phase/layer's cumulative telemetry.
+
+    ``miss_rows`` is the total count of physical host-copy rows: every row
+    actually copied to serve this layer, whether through the ordinary demand
+    path (``unique_missed`` routes with no resident slot) or delivered ahead
+    of routing by the one-row side-stream pull (``side_pull_rows``), useful or
+    wasted. ``unique_miss_rows`` and ``routed_miss_rows`` stay logical counts
+    of distinct and routed actual misses and never include a side-pull row
+    that a miss did not itself require crossing the demand path for.
+    """
+
     requested_rows: int = 0
     miss_rows: int = 0
     hot_hits: int = 0
@@ -778,6 +789,8 @@ class _OperationalCounters:
     routed_miss_rows: int = 0
     unique_miss_rows: int = 0
     gathers: int = 0
+    side_pull_rows: int = 0
+    side_pull_bytes: int = 0
 
 
 _PHASES = {
@@ -1823,3 +1836,25 @@ class ExpertHotCacheManager:
         the next boundary advances scores by the corrected token count.
         """
         self._boundary_clock.commit(accepted_tokens)
+
+    def record_side_pull_delivery(
+        self, layer_id: int, mode: str, delivered_rows: int, delivered_bytes: int = 0
+    ) -> None:
+        """Add one forward's side-pull dedicated-slot delivery to physical host rows.
+
+        ``delivered_rows``/``delivered_bytes`` count rows copied into the
+        reserved one-row prediction slot this forward, independent of whether
+        the predicted expert later matched an actual miss: a wasted
+        prediction is still a physical copy. They add to ``miss_rows`` (total
+        physical demand-copy rows) and to ``side_pull_rows``/
+        ``side_pull_bytes`` (delivery-only totals), never to
+        ``unique_miss_rows`` or ``routed_miss_rows``, which stay logical
+        counts of distinct and routed actual misses. No caller in this build
+        reaches this method; the candidate selection and serving wiring that
+        decides what to predict and calls it once a row is posted and
+        resolved lands separately.
+        """
+        counters = self._counters[mode][layer_id]
+        counters.miss_rows += delivered_rows
+        counters.side_pull_rows += delivered_rows
+        counters.side_pull_bytes += delivered_bytes
