@@ -491,6 +491,27 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(self.manager(budget_bytes=19), None)
         self.assertEqual(self.manager(budget_bytes=0), None)
 
+    def test_from_model_charges_prefetch_pull_row_before_selecting_resident_slots(self):
+        """A one-row budget cannot silently allocate a resident plus its pull row."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+            manager = self.manager(budget_bytes=20, dynamic=False)
+
+        self.assertIsNone(manager)
+
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+            manager = self.manager(budget_bytes=40, dynamic=False)
+
+        self.assertEqual({layer: cache.capacity for layer, cache in manager.caches.items()}, {0: 1})
+        self.assertEqual(manager.residency_bytes, 20)
+        self.assertEqual(manager.prefetch_pull_bytes, 20)
+        self.assertEqual(manager.allocation_bytes, 40)
+        counters = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(counters["residency_bytes"], 20)
+        self.assertEqual(counters["prefetch_pull_bytes"], 20)
+        self.assertEqual(counters["allocation_bytes"], 40)
+
     def test_copy_backend_reaches_each_cache_before_initial_population(self):
         manager = self.manager(copy_backend="dma")
 
@@ -888,17 +909,8 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(row["side_pull_rows"], 1)
         self.assertEqual(row["miss_rows"], 1)
 
-    def test_side_pull_snapshot_overlays_fresh_each_read_without_a_remembered_delta(self):
-        """A later, smaller cumulative read is reported as-is, never as a decrement.
-
-        `record_side_pull_delivery` stores the latest snapshot and overlays it
-        fresh at `snapshot_counters()` time; it never diffs against a prior
-        call. This manufactures the smaller read directly with a second call
-        rather than through a capture reset; production clears the contiguous
-        producer bank after warmup. The contract under test is that this
-        class's overlay has no memory of a prior value, which holds regardless
-        of why a later read is smaller.
-        """
+    def test_side_pull_counter_reset_starts_a_fresh_telemetry_epoch(self):
+        """A reset source does not retain stale rows or manufacture negative deltas."""
         manager = self.manager(dynamic=False)
         manager.record_side_pull_delivery(0, "prefill", covered=3, residual=1, wasted=2, posted=5)
         before = manager.snapshot_counters()["prefill"]["0"]
@@ -956,6 +968,42 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(
             row["side_pull_bytes"], manager.streamers[0].bytes_per_expert
         )
+
+    def test_cumulative_side_pull_snapshots_stay_with_the_phase_that_delivered_them(self):
+        """A decode snapshot must add only new pull rows, never prefill's total."""
+
+        class _FakePuller:
+            def __init__(self):
+                self.values = {0: (1, 0, 0, 1)}
+
+            def poll_delivery_stats(self):
+                return self.values
+
+        manager = self.manager(dynamic=False)
+        puller = _FakePuller()
+        manager.register_prefetch_puller(puller)
+        counts = [[0] * 4 for _ in range(3)]
+
+        self.observe(manager, counts, mode=self.mode.EXTEND)
+        first = manager.snapshot_counters()
+        self.assertEqual(first["prefill"]["0"]["side_pull_rows"], 1)
+        self.assertEqual(first["decode"]["0"]["side_pull_rows"], 0)
+
+        self.observe(manager, counts, mode=self.mode.DECODE)
+        second = manager.snapshot_counters()
+        self.assertEqual(second["prefill"]["0"]["side_pull_rows"], 1)
+        self.assertEqual(second["decode"]["0"]["side_pull_rows"], 0)
+
+        puller.values[0] = (2, 0, 0, 2)
+        self.observe(manager, counts, mode=self.mode.DECODE)
+        third = manager.snapshot_counters()
+        self.assertEqual(third["prefill"]["0"]["side_pull_rows"], 1)
+        self.assertEqual(third["decode"]["0"]["side_pull_rows"], 1)
+
+        self.observe(manager, counts, mode=self.mode.EXTEND)
+        fourth = manager.snapshot_counters()
+        self.assertEqual(fourth["prefill"]["0"]["side_pull_rows"], 1)
+        self.assertEqual(fourth["decode"]["0"]["side_pull_rows"], 1)
 
     def test_discard_graph_capture_routes_resets_a_registered_pullers_stats(self):
         manager = self.manager(dynamic=False)

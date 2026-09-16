@@ -1,6 +1,7 @@
 """Live prefetch scoring runs from generic tap writes, rewrites stable bank rows, and never synchronizes."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -19,9 +20,24 @@ class _Cache:
         self.expert_to_slot[:6] = torch.arange(6, device=device)
 
 
+class _ServingCache:
+    """Small real pull target: the selector owns its one trailing cache row."""
+
+    def __init__(self, device):
+        self.capacity = 0
+        self.scratch_rows = 0
+        self.expert_to_slot = torch.full(
+            (EXPERTS,), -1, dtype=torch.long, device=device
+        )
+        layer = torch.nn.Module()
+        layer.weight = torch.empty((EXPERTS, 1), device=device)
+        self.streamer = SimpleNamespace(layer=layer, tensor_names=("weight",))
+        self.tensors = {"weight": torch.empty((1, 1), device=device)}
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchScoringRuntime(unittest.TestCase):
-    def _build(self):
+    def _build(self, *, pull_mode="off", shadow_recall=True, calibration=False):
         from sglang.srt.layers.moe.expert_prediction.serving import runtime as serving_runtime
         from sglang.srt.layers.moe.expert_prediction.serving.checkpoints import LlaporCheckpoint
         from sglang.srt.layers.moe.expert_prediction.training import llapor
@@ -39,11 +55,13 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
         }
         store = FeatureStore(specs=specs, features=serving_runtime.PrefetchScoring.features_for("llapor"),
                              max_rows=1, device=device, hidden_dtype=torch.bfloat16)
-        hot_caches = {i: _Cache(device) for i in range(3)}
+        cache_type = _ServingCache if pull_mode != "off" else _Cache
+        hot_caches = {i: cache_type(device) for i in range(3)}
         scoring = serving_runtime.PrefetchScoring.from_checkpoints(
             predictor="llapor", checkpoints=checkpoints, specs=specs, store=store,
             hot_caches=hot_caches,
             width=8, budget=2, tau=0.95, dtype=torch.bfloat16, device=device,
+            pull_mode=pull_mode, shadow_recall=shadow_recall, calibration=calibration,
         )
         return scoring, store, hot_caches
 
@@ -94,6 +112,25 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
         after = scoring.recall.snapshot()[1]
         # With every expert now resident (rebound mapping), no route can be a miss.
         self.assertEqual(after[0] - before[0], 0)
+
+    def test_serving_top1_posts_a_real_pull_without_shadow_or_calibration_consumers(self):
+        scoring, store, _ = self._build(
+            pull_mode="always", shadow_recall=False, calibration=False
+        )
+
+        self.assertTrue(scoring._serving_top1)
+        self.assertIsNone(scoring.recall)
+        self.assertIsNone(scoring.calibration)
+        self.assertEqual(scoring.bank.width, 1)
+
+        self._tap(store, 0)
+        target = 1
+        self.assertEqual(scoring.puller.posted_count_for(target).item(), 1)
+        self.assertGreaterEqual(scoring.puller.predicted_expert_for(target).item(), 0)
+        scoring.puller.join_unsupported_target(target)
+        self.assertIsNone(scoring.puller.poll_delivery_stats())
+        torch.cuda.synchronize()
+        self.assertEqual(scoring.puller.poll_delivery_stats()[target], (0, 0, 1, 1))
 
     def test_replay_updates_candidates_and_metrics_without_python(self):
         scoring, store, _ = self._build()

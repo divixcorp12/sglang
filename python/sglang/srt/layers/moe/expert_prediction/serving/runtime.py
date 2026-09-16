@@ -108,9 +108,9 @@ class PullDeliveryStats:
 
     ``counts`` is strictly additive between resets. ``ExpertHotCacheManager.
     discard_graph_capture_routes`` zeros it with the sibling graph/residency counters,
-    removing the captured warmup replay before normal serving resumes. A periodic
-    overlay-fresh flush stores the latest cumulative snapshot rather than a diff, so it
-    remains correct across that reset.
+    removing the captured warmup replay before normal serving resumes. The hot-cache
+    manager differences periodic cumulative snapshots before assigning each delta to
+    the active forward phase; clearing both sides at warmup keeps that baseline valid.
     ``counts[3]`` (``posted``) is the PHYSICAL row count and is what feeds a "rows
     delivered" telemetry sink (e.g. ``ExpertHotCacheManager.record_side_pull_delivery``);
     ``counts[0]`` (``covered``) is ROUTE-level and can overcount physical rows on a
@@ -189,6 +189,18 @@ class PrefetchPuller:
         self._outcome_counter_bank = torch.zeros(
             (len(self._counter_layers), 4), dtype=torch.int64, device=device
         )
+        # Metrics reads must not make the serving stream wait for a D2H copy.
+        # Own a fixed pinned buffer and fence each asynchronous copy; callers
+        # consume only a completed prior copy and otherwise keep serving.
+        self._delivery_snapshot_host = torch.empty(
+            self._outcome_counter_bank.shape,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._delivery_snapshot_ready = torch.cuda.Event(enable_timing=False)
+        self._delivery_snapshot_pending = False
+        self._delivery_snapshot_discarded = False
         self.stats: dict[int, PullDeliveryStats] = {}
         for layer_id in self._counter_layers:
             cache = hot_caches.get(layer_id)
@@ -285,16 +297,57 @@ class PrefetchPuller:
         return None if stats is None else stats.counts
 
     def snapshot_delivery_stats(self) -> dict[int, tuple[int, int, int, int]]:
-        """Read the whole target bank with one host transfer for a real consumer."""
+        """Synchronously read delivery counters for diagnostics only.
+
+        Serving metrics use :meth:`poll_delivery_stats`, which transfers to an
+        owned pinned buffer without waiting for the GPU. This compatibility
+        method remains for explicit callers that require an immediate read.
+        """
         values = self._outcome_counter_bank.cpu().tolist()
         return {
             layer_id: tuple(values[row])
             for layer_id, row in self._counter_rows.items()
         }
 
+    def poll_delivery_stats(self) -> dict[int, tuple[int, int, int, int]] | None:
+        """Return the last completed nonblocking counter snapshot, if any.
+
+        The first call queues a D2H copy and returns ``None``. Later calls do
+        the same after consuming a completed copy; an unfinished copy is never
+        waited on. The returned values can lag one metrics interval by design,
+        while their cumulative counter semantics preserve every phase delta.
+        """
+        if self._delivery_snapshot_pending:
+            if not self._delivery_snapshot_ready.query():
+                return None
+            self._delivery_snapshot_pending = False
+            if self._delivery_snapshot_discarded:
+                self._delivery_snapshot_discarded = False
+                self._queue_delivery_snapshot()
+                return None
+            values = self._delivery_snapshot_host.tolist()
+            result = {
+                layer_id: tuple(values[row])
+                for layer_id, row in self._counter_rows.items()
+            }
+            self._queue_delivery_snapshot()
+            return result
+        self._queue_delivery_snapshot()
+        return None
+
+    def _queue_delivery_snapshot(self) -> None:
+        self._delivery_snapshot_host.copy_(
+            self._outcome_counter_bank, non_blocking=True
+        )
+        self._delivery_snapshot_ready.record(
+            torch.cuda.current_stream(self._outcome_counter_bank.device)
+        )
+        self._delivery_snapshot_pending = True
+
     def discard_delivery_stats(self) -> None:
         """Reset all target counters in a single graph-stable device operation."""
         self._outcome_counter_bank.zero_()
+        self._delivery_snapshot_discarded = self._delivery_snapshot_pending
 
     def slot_for(self, target_layer: int) -> int:
         """The dedicated slot index reserved for ``target_layer``'s pull."""

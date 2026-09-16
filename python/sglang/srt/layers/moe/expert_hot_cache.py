@@ -124,6 +124,10 @@ class ExpertHotCache:
         self.bytes_per_expert = streamer.bytes_per_expert
         self.capacity_bytes = capacity * self.bytes_per_expert
         self.scratch_bytes = scratch_rows * self.bytes_per_expert
+        self.prefetch_pull_bytes = (
+            self.bytes_per_expert if self.reserves_prefetch_pull_row else 0
+        )
+        self.allocation_bytes = allocation_rows * self.bytes_per_expert
         devices = {
             _tensor_data(getattr(streamer.layer, name)).device
             for name in streamer.tensor_names
@@ -962,19 +966,34 @@ class ExpertHotCacheManager:
                 else 0
             )
         selected = {layer_id: [] for layer_id in streamers}
+        pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
+        allocated_layers = {layer_id for layer_id, rows in scratch_rows.items() if rows}
         remaining = budget_bytes - sum(
             rows * streamers[layer_id].bytes_per_expert
             for layer_id, rows in scratch_rows.items()
         )
+        # Graph-gather scratch makes a cache allocation unconditional. Reserve its
+        # dedicated side-pull row before considering any resident slots. For a
+        # layer without scratch, its first resident slot pays for the same row
+        # atomically below, so a selection can never overcommit the physical
+        # cache allocation by one expert row.
+        if pull_row_enabled:
+            remaining -= sum(
+                streamers[layer_id].bytes_per_expert for layer_id in allocated_layers
+            )
         if remaining < 0:
             raise ValueError(
-                "expert hot cache budget cannot hold the graph-gather scratch rows"
+                "expert hot cache budget cannot hold the graph-gather scratch and pull rows"
             )
         for _, expert_id, layer_id in candidates:
             slot_bytes = streamers[layer_id].bytes_per_expert
-            if slot_bytes <= remaining:
+            pull_row_bytes = (
+                slot_bytes if pull_row_enabled and layer_id not in allocated_layers else 0
+            )
+            if slot_bytes + pull_row_bytes <= remaining:
                 selected[layer_id].append(expert_id)
-                remaining -= slot_bytes
+                remaining -= slot_bytes + pull_row_bytes
+                allocated_layers.add(layer_id)
         if not any(selected.values()) and not any(scratch_rows.values()):
             return None
         manager = cls()
@@ -1026,6 +1045,7 @@ class ExpertHotCacheManager:
         manager._graph_counters = None
         manager._graph_unique_counters = None
         manager._side_pull_snapshots = {}
+        manager._last_side_pull_totals = {}
         manager._last_observer_mode = None
         # Unlike `residency_policies`, a `PrefetchPuller` cannot be populated here:
         # it is built from this manager's own `caches` by `PrefetchScoring`, which
@@ -1091,10 +1111,12 @@ class ExpertHotCacheManager:
                 {
                     "requested_bytes": budget_bytes,
                     "residency_bytes": manager.residency_bytes,
+                    "allocation_bytes": manager.allocation_bytes,
                     "slots": sum(cache.capacity for cache in manager.caches.values()),
                     "scratch_bytes": sum(
                         cache.scratch_bytes for cache in manager.caches.values()
                     ),
+                    "prefetch_pull_bytes": manager.prefetch_pull_bytes,
                     "layers": len(manager.caches),
                     "cuda_allocated_bytes": sum(
                         torch.cuda.memory_allocated(device) for device in devices
@@ -1174,6 +1196,15 @@ class ExpertHotCacheManager:
     @property
     def residency_bytes(self) -> int:
         return sum(cache.capacity_bytes for cache in self.caches.values())
+
+    @property
+    def allocation_bytes(self) -> int:
+        """Physical cache bytes, including graph scratch and the pull row."""
+        return sum(cache.allocation_bytes for cache in self.caches.values())
+
+    @property
+    def prefetch_pull_bytes(self) -> int:
+        return sum(cache.prefetch_pull_bytes for cache in self.caches.values())
 
     def _record_update(
         self, layer_id: int, update: HotCacheUpdateStats, phase: str = "prefill"
@@ -1263,6 +1294,7 @@ class ExpertHotCacheManager:
         if calibration is not None:
             calibration.reset()
         self._side_pull_snapshots.clear()
+        self._last_side_pull_totals.clear()
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
@@ -1840,6 +1872,11 @@ class ExpertHotCacheManager:
                     row["side_pull_useful_precision"] = (posted - wasted) / posted if posted else 0.0
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
+                row["allocation_bytes"] = cache.allocation_bytes if cache else 0
+                row["scratch_bytes"] = cache.scratch_bytes if cache else 0
+                row["prefetch_pull_bytes"] = (
+                    cache.prefetch_pull_bytes if cache else 0
+                )
                 result[mode][str(layer_id)] = row
         coordinators = getattr(self, "prefetch_coordinators", {})
         if coordinators:
@@ -1885,7 +1922,11 @@ class ExpertHotCacheManager:
         puller = getattr(self, "_prefetch_puller", None)
         if mode is None or puller is None:
             return
-        if hasattr(puller, "snapshot_delivery_stats"):
+        if hasattr(puller, "poll_delivery_stats"):
+            snapshots = puller.poll_delivery_stats()
+            if snapshots is None:
+                return
+        elif hasattr(puller, "snapshot_delivery_stats"):
             snapshots = puller.snapshot_delivery_stats()
         else:
             snapshots = {
@@ -2002,13 +2043,14 @@ class ExpertHotCacheManager:
     def record_side_pull_delivery(
         self, layer_id: int, mode: str, covered: int, residual: int, wasted: int, posted: int
     ) -> None:
-        """Store one side-pull target's latest cumulative delivery snapshot.
+        """Attribute new rows from one cumulative side-pull delivery snapshot.
 
         ``covered``/``residual``/``wasted``/``posted`` are the FULL cumulative
         totals a producer's ``PullDeliveryStats.snapshot()`` returns at this
-        call, not a delta since the last call -- this stores the latest read
-        and overlays it fresh at ``snapshot_counters()`` time, exactly like
-        this class's own CUDA-graph register totals. ``posted`` is the
+        call. The manager differences them from the prior producer read, then
+        adds only the delta to this ``(mode, layer_id)`` ledger. This prevents
+        a decode snapshot from relabeling prefill's already-reported pulls.
+        ``posted`` is the
         producer's PHYSICAL row count (1 per forward a real prediction was
         posted, regardless of how many routes it covered or none), and is
         what this class adds to ``miss_rows``/``side_pull_rows``. ``covered``
@@ -2020,10 +2062,24 @@ class ExpertHotCacheManager:
         logical counts of distinct and routed actual misses read from the
         ordinary routing path.
 
-        Safe to call at any cadence: nothing here remembers a prior read to
-        diff against, so a later call can never look like a decrement no
-        matter what the producer's cumulative total does between calls.
-        ``discard_graph_capture_routes`` resets the producer's device counters
-        after graph warmup, and a later periodic snapshot replaces this one.
+        ``discard_graph_capture_routes`` clears both producer and manager
+        baselines after graph warmup. A smaller source total also defensively
+        starts a fresh telemetry epoch, so a reset cannot produce a negative
+        phase delta or retain warmup rows.
         """
-        self._side_pull_snapshots[(mode, layer_id)] = (covered, residual, wasted, posted)
+        current = tuple(index(value) for value in (covered, residual, wasted, posted))
+        previous = self._last_side_pull_totals.get(layer_id)
+        if previous is None:
+            delta = current
+        elif any(value < prior for value, prior in zip(current, previous)):
+            for key in tuple(self._side_pull_snapshots):
+                if key[1] == layer_id:
+                    del self._side_pull_snapshots[key]
+            delta = current
+        else:
+            delta = tuple(value - prior for value, prior in zip(current, previous))
+        self._last_side_pull_totals[layer_id] = current
+        accumulated = self._side_pull_snapshots.get((mode, layer_id), (0, 0, 0, 0))
+        self._side_pull_snapshots[(mode, layer_id)] = tuple(
+            prior + value for prior, value in zip(accumulated, delta)
+        )
