@@ -2058,6 +2058,12 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
 
 ## Risks
 
+0. **Bus-bound vs latency-bound is unresolved (crypto-c9, measured facts, 2026-09-15).** Prefetch hides latency; it never reduces bytes. If serving is bus-bound, every saving in Task 3 shrinks.
+   - divix01's host link is **PCIe gen3 x16**, ~11 GB/s realistic, a platform limit rather than the card's (device reports gen5). E28's 11.5 GiB/s in-graph and E32's 12.4 GiB/s are at that ceiling, so copies and the demand path compete for one saturated resource.
+   - Production counters (build `56a5920489`): `gather_copy_engine_bytes` 0 and `h2d_bytes` = `backing_source_bytes`, i.e. every miss crosses as in-kernel `ld.global.nc` reads. That is the in-graph kernel path, so Task 3's 0.2239 ms/row baseline is the right one, but it also means the link carries every miss.
+   - Geometry: 48 MoE layers x 10 experts = 480 expert rows per token at 2.76 MB, ~1.32 GB uncached per token.
+   - crypto-c9's earlier "bandwidth-bound at ~17 GB/s" was withdrawn as unmeasured. A direct gathers / miss-rows / h2d per token measurement is queued; **do not tune against either assumption until it lands.**
+   - **Miss-rate mismatch:** production sampled 64% miss rows while warming (a floor), against ~3.15 misses per layer (~31%) in the capture's residency, which Task 3 priced. Re-price against the measured steady-state residency before Phase B commits a budget.
 1. **The window may be too short to pay.**
    - The gap window fits 1 row per layer, in-graph or doorbell.
    - Only an overlapped copy (≈0.88 ms, ~3 rows) approaches E28's ~10 ms/token ceiling, and that needs concurrent copies not to contend (unmeasured; Task 7).
