@@ -354,7 +354,7 @@ class ExpertPredictionRuntime:
                         json.dumps({"prefetch": self.prefetch.metrics_record(), "forwards": self.forwards})
                         + "\n"
                     )
-                self.prefetch.write_calibration()
+                self.prefetch.write_calibration(complete=False)
         except OSError as error:
             logger.warning(
                 "MoE expert prediction metrics write failed, disabling further writes: "
@@ -375,7 +375,7 @@ class ExpertPredictionRuntime:
         if self.capture is not None:
             self.capture.close()
         if self.prefetch is not None:
-            self.prefetch.write_calibration()
+            self.prefetch.write_calibration(complete=True)
             self.store.after_write = None
         self._taps.remove()
         for remove in self._pre_mixer_removers:

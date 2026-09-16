@@ -417,8 +417,8 @@ class PrefetchScoring:
             record["pull_calibration"] = self.calibration.snapshot()
         return record
 
-    def write_calibration(self) -> None:
+    def write_calibration(self, *, complete: bool = True) -> None:
         if self.calibration is None or self._calibration_file is None:
             return
         provenance = json.loads(self._calibration_provenance or "{}")
-        self.calibration.write(self._calibration_file, provenance, complete=True)
+        self.calibration.write(self._calibration_file, provenance, complete=complete)

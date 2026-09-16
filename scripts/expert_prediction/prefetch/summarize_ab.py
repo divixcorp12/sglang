@@ -62,9 +62,14 @@ def summarize_arm(spec: str) -> dict:
     posted = sum(row.get("side_pull_posted_rows", 0) for row in hot_rows)
     useful = sum(row.get("side_pull_useful_posts", 0) for row in hot_rows)
     wasted = sum(row.get("side_pull_wasted_rows", 0) for row in hot_rows)
+    manifest = _manifest(manifest_path)
+    calibration_path = manifest.get("paths", {}).get("calibration")
+    if calibration_path and Path(calibration_path).exists():
+        from sglang.srt.layers.moe.expert_prediction.serving.calibration import PullCalibrationHistogram
+        PullCalibrationHistogram.require_complete(Path(calibration_path))
     return {
         "arm": arm,
-        "manifest": _manifest(manifest_path),
+        "manifest": manifest,
         "median_decode_tok_s": statistics.median([turn["decode_tokens_per_sec"] for turn in good]) if good else None,
         "p50_turn_decode_ms_per_token": _percentile(decode_ms, 50),
         "p95_turn_decode_ms_per_token": _percentile(decode_ms, 95),

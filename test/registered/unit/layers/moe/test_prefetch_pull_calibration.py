@@ -212,6 +212,14 @@ def test_incomplete_setup_artifact_is_rejected_until_graceful_completion():
     assert PullCalibrationHistogram.require_complete(path)["complete"] is True
 
 
+def test_periodic_calibration_write_stays_incomplete_until_close():
+    from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchScoring
+    scoring = object.__new__(PrefetchScoring)
+    scoring.calibration = mock.Mock(); scoring._calibration_file = Path("/tmp/c.json"); scoring._calibration_provenance = "{}"
+    scoring.write_calibration(complete=False)
+    scoring.calibration.write.assert_called_once_with(Path("/tmp/c.json"), {}, complete=False)
+
+
 def test_canonical_capture_loader_uses_llapor_source_layer_features():
     """Using target-layer router input for LLaPor would benchmark the wrong model path."""
     script = Path(__file__).parents[5] / "benchmark/expert_delivery/benchmark_prefetch_scorers.py"
