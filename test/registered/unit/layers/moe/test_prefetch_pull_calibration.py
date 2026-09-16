@@ -176,3 +176,44 @@ def test_launcher_rejects_any_truthy_calibration_in_timed_run():
     )
     assert result.returncode == 2
     assert "profiling-only" in result.stderr
+
+
+def test_calibration_writer_emits_versioned_histogram_and_launcher_provenance():
+    """A manifest path without a durable profiling artifact would be misleading."""
+    histogram = _histogram()
+    histogram.stage(3, torch.tensor([1]), torch.tensor(0.4), torch.tensor(0.1), torch.tensor(True))
+    histogram.record_target(3, torch.tensor([1]), torch.tensor([True]), torch.tensor([2]))
+    path = Path(tempfile.mkdtemp()) / "pull-calibration.json"
+    histogram.write(path, {"commit": "abc", "predictor": "llapor", "cache_size": 10240, "top_k": 8})
+    payload = json.loads(path.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["bin_count"] == 256
+    assert payload["provenance"] == {"commit": "abc", "predictor": "llapor", "cache_size": 10240, "top_k": 8}
+    assert sum(payload["layers"]["3"]["score"]["target_useful"]) == 1
+
+
+def test_canonical_capture_loader_uses_llapor_source_layer_features():
+    """Using target-layer router input for LLaPor would benchmark the wrong model path."""
+    script = Path(__file__).parents[5] / "benchmark/expert_delivery/benchmark_prefetch_scorers.py"
+    spec = importlib.util.spec_from_file_location("benchmark_prefetch_scorers", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from safetensors.torch import save_file
+
+    root = Path(tempfile.mkdtemp())
+    (root / "header.json").write_text(json.dumps({"layers": [
+        {"layer_id": 1, "num_experts": 4, "top_k": 2, "hidden_size": 3},
+        {"layer_id": 2, "num_experts": 4, "top_k": 2, "hidden_size": 3},
+    ]}))
+    tensors = {
+        "layer.1.router_input": torch.full((1, 3), 11.0),
+        "layer.1.topk_ids": torch.tensor([[1, 2]], dtype=torch.int16),
+        "layer.1.topk_weights": torch.tensor([[0.7, 0.3]]),
+        "layer.2.router_input": torch.full((1, 3), 22.0),
+    }
+    save_file(tensors, str(root / "shard-000000.safetensors"), metadata={"request_ids": "[]"})
+    (root / "manifest.jsonl").write_text(json.dumps({"shard": "shard-000000.safetensors", "rows": 1}) + "\n")
+    loaded = module.load_captured_features(root, source_layer=1, target_layer=2)
+    assert loaded["router_input"].tolist() == [[11.0, 11.0, 11.0]]
+    assert loaded["topk_ids"].tolist() == [[1, 2]]
