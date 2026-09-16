@@ -911,10 +911,13 @@ class TestExpertHotCacheManager(unittest.TestCase):
             counts=torch.tensor([3, 1, 2, 1], dtype=torch.int64, device="cuda")
         )
         manager.register_prefetch_puller(SimpleNamespace(stats={0: stats}))
+        manager.record_side_pull_delivery(0, "prefill", covered=3, residual=1, wasted=2, posted=1)
 
         manager.discard_graph_capture_routes()
 
         self.assertTrue(bool((stats.counts == 0).all()))
+        row = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(row["side_pull_posted_rows"], 0)
 
     def test_invalid_config_and_seed_do_not_allocate_slots(self):
         for options in (
