@@ -39,25 +39,35 @@ def _layer_tensor(layer: torch.nn.Module, name: str) -> torch.Tensor:
 
 def pull_outcome_counts(
     flat_ids: torch.Tensor, missed_mask: torch.Tensor, predicted_expert: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-forward pull outcome: covered/residual actual-miss route counts and a waste flag.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-forward pull outcome: covered/residual actual-miss ROUTE counts, a waste flag,
+    and the PHYSICAL row count this forward actually delivered.
 
     ``flat_ids`` are this forward's routed expert ids and ``missed_mask`` marks
     the ones the ordinary residency check already found non-resident (the
     demand-path miss set); only those can be "covered" by a speculative pull.
-    ``covered`` counts actual-miss routes equal to ``predicted_expert``;
-    ``residual`` counts actual-miss routes that are not, and so still cross
-    the ordinary demand path. ``wasted`` is true when a real prediction
-    (``predicted_expert != -1``) covered no route this forward -- the posted
-    pull's row went unused. All three are device tensors; nothing here reads
-    the device.
+    ``covered`` counts actual-miss ROUTES equal to ``predicted_expert`` -- in a
+    multi-token forward several tokens can route to the same predicted expert,
+    so this can exceed 1. ``residual`` counts actual-miss routes that are not,
+    and so still cross the ordinary demand path. ``wasted`` is true when a real
+    prediction (``predicted_expert != -1``) covered no route this forward --
+    the posted pull's row went unused.
+
+    ``posted`` is the PHYSICAL row count: 1 when a real prediction was posted
+    this forward (regardless of how many routes it covered, or none), 0 when
+    nothing was posted. A capacity-1 side pull delivers exactly one row per
+    posted forward; ``covered`` (route-level) must never stand in for it --
+    summing ``covered`` across a multi-token forward with overlap on the
+    predicted expert overcounts the physical rows actually copied. All four
+    are device tensors; nothing here reads the device.
     """
     valid = predicted_expert.reshape(()) >= 0
     matches = missed_mask & (flat_ids == predicted_expert)
     covered = matches.sum()
     residual = missed_mask.sum() - covered
     wasted = valid & (covered == 0)
-    return covered, residual, wasted
+    posted = valid.to(torch.int64)
+    return covered, residual, wasted, posted
 
 
 def route_covered_residual(
@@ -81,20 +91,33 @@ def route_covered_residual(
 
 
 class PullDeliveryStats:
-    """Device counters for one target layer's pull outcomes; host-read only via ``snapshot``."""
+    """Device counters for one target layer's pull outcomes; host-read only via ``snapshot``.
+
+    ``counts`` is strictly additive (``add_`` only, never decremented) so a periodic
+    overlay-fresh flush -- store the latest cumulative snapshot, never diff against a
+    baseline a recapture can zero -- never has to coordinate with graph recapture.
+    ``counts[3]`` (``posted``) is the PHYSICAL row count and is what feeds a "rows
+    delivered" telemetry sink (e.g. ``ExpertHotCacheManager.record_side_pull_delivery``);
+    ``counts[0]`` (``covered``) is ROUTE-level and can overcount physical rows on a
+    multi-token forward with overlap on the predicted expert -- never substitute one for
+    the other.
+    """
 
     def __init__(self, device: torch.device) -> None:
-        self.counts = torch.zeros(3, dtype=torch.int64, device=device)
+        self.counts = torch.zeros(4, dtype=torch.int64, device=device)
 
-    def add(self, covered: torch.Tensor, residual: torch.Tensor, wasted: torch.Tensor) -> None:
+    def add(
+        self, covered: torch.Tensor, residual: torch.Tensor, wasted: torch.Tensor, posted: torch.Tensor
+    ) -> None:
         self.counts[0].add_(covered)
         self.counts[1].add_(residual)
         self.counts[2].add_(wasted.to(torch.int64))
+        self.counts[3].add_(posted)
 
-    def snapshot(self) -> tuple[int, int, int]:
-        """Host read of cumulative (covered, residual, wasted); call only at metric log intervals."""
+    def snapshot(self) -> tuple[int, int, int, int]:
+        """Host read of cumulative (covered, residual, wasted, posted); metric log intervals only."""
         values = self.counts.cpu().tolist()
-        return values[0], values[1], values[2]
+        return values[0], values[1], values[2], values[3]
 
 
 class PrefetchPuller:
@@ -175,8 +198,8 @@ class PrefetchPuller:
             return demand_remap
         self._pipeline.join_target(target)
         predicted = self._plans[target_layer].expert_ids
-        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, predicted)
-        self.stats[target_layer].add(covered, residual, wasted)
+        covered, residual, wasted, posted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        self.stats[target_layer].add(covered, residual, wasted, posted)
         return route_covered_residual(
             flat_ids, missed_mask, predicted, self._slots[target_layer].index, demand_remap
         )
