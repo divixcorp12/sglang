@@ -322,6 +322,143 @@ def test_fused_plan_captures_and_replays_with_changed_ids():
         assert int(graph_unique_counters[1].item()) == int(oracle.unique_miss_rows)
 
 
+def test_plan_graph_routes_fused_wires_prefetch_coverage_matching_the_cpu_oracle():
+    """Stage C4 bullet 1: a real (nonzero) prefetch matches the CPU oracle's new masking.
+
+    Both ``plan_graph_routes`` (CPU) and ``plan_graph_routes_fused`` (this
+    kernel) now accept ``prefetch_expert``/``prefetch_slot``; the fused
+    kernel's ``prefetched`` lane must agree with the CPU planner bit for bit,
+    not just in the disabled (Stage A) state the rest of this file drives.
+    """
+    from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes_fused
+
+    ids = torch.tensor([5, 2, 9, 1], device="cuda", dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2] = 7  # expert 2 hits; 5, 9, 1 are actual misses
+    predicted = torch.tensor([9], dtype=torch.int64, device="cuda")  # covers a real miss
+    prefetch_slot = 55
+    scratch_base = 10
+
+    source_rows_out = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+    slots_out = torch.full((4,), -1, dtype=torch.int32, device="cuda")
+    count_out = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    graph_counters = torch.zeros(2, dtype=torch.int64, device="cuda")
+    graph_unique_counters = torch.zeros(2, dtype=torch.int64, device="cuda")
+
+    remap = plan_graph_routes_fused(
+        ids,
+        expert_to_slot,
+        scratch_base,
+        torch.int64,
+        source_rows_out,
+        slots_out,
+        count_out,
+        graph_counters,
+        graph_unique_counters,
+        None,
+        prefetch_expert=predicted,
+        prefetch_slot=prefetch_slot,
+    )
+
+    oracle = plan_graph_routes(
+        ids, expert_to_slot, ids.numel(), scratch_base,
+        prefetch_expert=predicted, prefetch_slot=prefetch_slot,
+    )
+    torch.testing.assert_close(remap, oracle.remap)
+    torch.testing.assert_close(source_rows_out, oracle.source_rows)
+    assert int(count_out.item()) == int(oracle.miss_plan_rows)
+    assert int(graph_counters[1].item()) == int(oracle.routed_miss_rows)
+    assert int(graph_unique_counters[1].item()) == int(oracle.unique_miss_rows)
+    # Position 2 is expert 9 -- the covered route -- and must redirect straight
+    # to the dedicated slot, one fewer residual scratch row than the disabled case.
+    assert remap[2].item() == prefetch_slot
+    assert int(count_out.item()) == 2  # 5 and 1 remain; 9 is covered, 2 is a hot hit
+
+
+def test_plan_graph_routes_fused_omitting_prefetch_reproduces_the_disabled_state():
+    from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes_fused
+
+    ids = torch.tensor([5, 2, 9, 1], device="cuda", dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2] = 7
+    scratch_base = 10
+    source_rows_out = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+    slots_out = torch.full((4,), -1, dtype=torch.int32, device="cuda")
+    count_out = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+
+    remap = plan_graph_routes_fused(
+        ids, expert_to_slot, scratch_base, torch.int64,
+        source_rows_out, slots_out, count_out,
+    )
+    oracle = plan_graph_routes(ids, expert_to_slot, ids.numel(), scratch_base)
+    torch.testing.assert_close(remap, oracle.remap)
+    torch.testing.assert_close(source_rows_out, oracle.source_rows)
+    assert int(count_out.item()) == int(oracle.miss_plan_rows) == 3
+
+
+def test_prefetch_covered_lane_capture_replays_with_a_changed_prediction():
+    """The hard constraint: a captured graph's node count and tensor extents
+    cannot change on replay. This drives a real (count=1) prefetch state
+    through capture and several replays with a *changed* predicted expert
+    (device tensor, no recapture) -- exactly `_gather_graph`'s call shape --
+    and checks each replay's residual count and remap against the CPU oracle
+    fed the same prefetch state, matching this file's existing capture
+    pattern (`test_fused_plan_captures_and_replays_with_changed_ids`).
+    """
+    from sglang.srt.layers.moe.expert_route_plan import plan_unique_routes_cuda
+
+    device = "cuda"
+    ids = torch.tensor([5, 2, 9, 1], device=device, dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2] = 7
+    scratch_base = 10
+    prefetch_slot = 55
+
+    source_rows_out = torch.full((4,), -1, dtype=torch.int64, device=device)
+    slots_out = torch.full((4,), -1, dtype=torch.int32, device=device)
+    count_out = torch.full((1,), -1, dtype=torch.int32, device=device)
+    remap_out = torch.full((4,), -1, dtype=torch.int64, device=device)
+    prefetch_expert = torch.full((1,), -1, dtype=torch.int64, device=device)
+    prefetch_count = torch.ones(1, dtype=torch.int32, device=device)
+
+    def run():
+        plan_unique_routes_cuda(
+            ids,
+            expert_to_slot,
+            scratch_base,
+            source_rows_out,
+            slots_out,
+            count_out,
+            remap_out,
+            None,
+            None,
+            None,
+            prefetch_expert,
+            prefetch_count,
+            prefetch_slot,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for predicted_value in (-1, 9, 5, -1, 1, 2):
+        prefetch_expert.fill_(predicted_value)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        predicted_tensor = prefetch_expert.clone()
+        oracle = plan_graph_routes(
+            ids, expert_to_slot, ids.numel(), scratch_base,
+            prefetch_expert=predicted_tensor, prefetch_slot=prefetch_slot,
+        )
+        torch.testing.assert_close(source_rows_out, oracle.source_rows)
+        torch.testing.assert_close(remap_out, oracle.remap)
+        assert int(count_out.item()) == int(oracle.miss_plan_rows)
+
+
 def test_gate_refuses_multi_token_calls_even_when_shape_would_otherwise_qualify():
     """`graph_gather_rows` is sized `tokens * top_k`, so a multi-token call's
     combined route count can still fit `scratch_rows`; only requiring exactly

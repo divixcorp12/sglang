@@ -879,6 +879,13 @@ class ModelRunner:
             pp_size=self.ps.pp_size,
             expert_hot_cache_manager=self.expert_hot_cache_manager,
         )
+        prefetch = self.expert_prediction_runtime.prefetch
+        if (
+            prefetch is not None
+            and prefetch.puller is not None
+            and self.expert_hot_cache_manager is not None
+        ):
+            self.expert_hot_cache_manager.register_prefetch_puller(prefetch.puller)
 
     def maybe_init_expert_host_arena(self):
         """Move host expert rows into registered memory before the expert caches."""

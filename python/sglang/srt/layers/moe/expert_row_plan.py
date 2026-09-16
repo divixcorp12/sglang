@@ -151,15 +151,28 @@ class ExpertRowPlanner:
     def num_experts(self) -> int:
         return self.expert_to_slot.numel()
 
-    def route_plan(self, flat: torch.Tensor) -> GraphRoutePlan:
+    def route_plan(
+        self,
+        flat: torch.Tensor,
+        *,
+        prefetch_expert: torch.Tensor | None = None,
+        prefetch_slot: int = -1,
+    ) -> GraphRoutePlan:
         """Plan int64 routes ``flat`` against the live expert-to-slot mapping.
 
         Distinct misses take scratch rows in first-appearance order, matching
         the returned ``remap``. ``flat.numel()`` must not exceed the scratch
-        rows or the plan capacity.
+        rows or the plan capacity. ``prefetch_expert``/``prefetch_slot``
+        forward a side-stream pull's posted prediction to ``plan_graph_routes``,
+        excluding a covered route from the scratch plan; see its docstring.
         """
         return plan_graph_routes(
-            flat, self.expert_to_slot, self.scratch_rows, self.scratch_base
+            flat,
+            self.expert_to_slot,
+            self.scratch_rows,
+            self.scratch_base,
+            prefetch_expert=prefetch_expert,
+            prefetch_slot=prefetch_slot,
         )
 
     @staticmethod
@@ -168,9 +181,18 @@ class ExpertRowPlanner:
         plan.expert_ids[: route.source_rows.numel()].copy_(route.source_rows)
         plan.count.copy_(route.miss_plan_rows.reshape(1))
 
-    def plan_routes(self, flat: torch.Tensor, plan: ExpertRowPlan) -> GraphRoutePlan:
+    def plan_routes(
+        self,
+        flat: torch.Tensor,
+        plan: ExpertRowPlan,
+        *,
+        prefetch_expert: torch.Tensor | None = None,
+        prefetch_slot: int = -1,
+    ) -> GraphRoutePlan:
         """``route_plan`` followed by ``fill_routes``: the router-miss producer."""
-        route = self.route_plan(flat)
+        route = self.route_plan(
+            flat, prefetch_expert=prefetch_expert, prefetch_slot=prefetch_slot
+        )
         self.fill_routes(route, plan)
         return route
 

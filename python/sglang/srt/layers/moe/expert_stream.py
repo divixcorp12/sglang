@@ -676,6 +676,19 @@ class ExpertStreamer:
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
         expert_to_slot = self.row_planner.expert_to_slot
+        prefetch_puller = getattr(self, "prefetch_puller", None)
+        # Read before planning, not after: the planner needs the posted prediction to
+        # exclude its covered row from the demand-scratch plan (the row-skip this
+        # dispatch exists for). Safe without the pull's stream join -- see
+        # `PrefetchPuller.predicted_expert_for`.
+        prefetch_expert = (
+            prefetch_puller.predicted_expert_for(self.layer_id)
+            if prefetch_puller is not None
+            else None
+        )
+        prefetch_slot = (
+            prefetch_puller.slot_for(self.layer_id) if prefetch_expert is not None else -1
+        )
         fused = self._fused_plan_enabled and supports_fused_graph_routes(
             topk_ids, expert_to_slot, self.graph_gather_rows
         )
@@ -696,16 +709,19 @@ class ExpertStreamer:
                 self.graph_counters,
                 self.graph_unique_counters,
                 route_counts,
+                prefetch_expert=prefetch_expert,
+                prefetch_slot=prefetch_slot,
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]
         else:
-            plan = self.row_planner.route_plan(flat)
+            plan = self.row_planner.route_plan(
+                flat, prefetch_expert=prefetch_expert, prefetch_slot=prefetch_slot
+            )
             scratch = self._graph_scratch_slots[: plan.source_rows.numel()]
             self.row_planner.fill_routes(plan, self.row_plan)
             remap = plan.remap
             source_rows = plan.source_rows
-        prefetch_puller = getattr(self, "prefetch_puller", None)
         if prefetch_puller is not None:
             # Join after actual routing: `remap`/`expert_to_slot` above are this
             # forward's real routing decision, not the prediction that posted the

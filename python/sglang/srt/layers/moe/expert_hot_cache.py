@@ -1012,6 +1012,10 @@ class ExpertHotCacheManager:
         manager._graph_counters = None
         manager._graph_unique_counters = None
         manager._side_pull_snapshots = {}
+        # Unlike `residency_policies`, a `PrefetchPuller` cannot be populated here:
+        # it is built from this manager's own `caches` by `PrefetchScoring`, which
+        # runs after `from_model` returns. See `register_prefetch_puller`.
+        manager._prefetch_puller = None
         for layer_id, expert_ids in selected.items():
             if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -1192,12 +1196,24 @@ class ExpertHotCacheManager:
         self._graph_counters = shared
         self._graph_unique_counters = unique_counters
 
+    def register_prefetch_puller(self, puller: Any) -> None:
+        """Register the side-stream ``PrefetchPuller`` built from this manager's caches.
+
+        Built later than this manager (``PrefetchScoring`` needs ``self.caches``
+        first), so it cannot be populated internally at construction the way
+        ``residency_policies`` is; call this once it exists, before the first
+        ``discard_graph_capture_routes`` or metrics read that should see it.
+        """
+        self._prefetch_puller = puller
+
     def discard_graph_capture_routes(self) -> None:
         """Drop routes and counters that CUDA-graph warmup and capture recorded.
 
         Captured gathers execute once while recording, so their dummy routes
         land in the residency counts, graph counters, and route registers like
-        a real forward.
+        a real forward. A registered ``PrefetchPuller``'s ``PullDeliveryStats``
+        gets the same treatment: its warmup replay posts and joins a dummy pull
+        exactly like a real forward's, so it is purged here too.
         """
         if self._graph_counters is not None:
             self._graph_counters.zero_()
@@ -1207,6 +1223,10 @@ class ExpertHotCacheManager:
                 register.zero_()
         for policy in self.residency_policies.values():
             policy.pending_counts.zero_()
+        puller = getattr(self, "_prefetch_puller", None)
+        if puller is not None:
+            for stats in puller.stats.values():
+                stats.counts.zero_()
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
@@ -1846,6 +1866,10 @@ class ExpertHotCacheManager:
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
         if clock.forwards % self.log_interval == 0:
+            puller = getattr(self, "_prefetch_puller", None)
+            if puller is not None:
+                for layer_id, stats in puller.stats.items():
+                    self.record_side_pull_delivery(layer_id, mode, *stats.snapshot())
             self._write_trace(mode)
             self._log_doorbell()
 

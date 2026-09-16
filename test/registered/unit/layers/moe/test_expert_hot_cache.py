@@ -854,6 +854,54 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(row["migration_bytes"], 40)
         self.assertEqual(row["promotions"], 1)
 
+    def test_registered_prefetch_puller_feeds_record_side_pull_delivery_automatically(self):
+        """Stage C4 bullet 2/3: the call site, not just the aggregation contract.
+
+        Earlier tests in this class call `record_side_pull_delivery` directly,
+        exercising only the aggregation math. This drives the actual
+        `on_expert_distribution` call site a registered puller must reach,
+        with `posted` -- never `covered + wasted` -- landing in the counters.
+        """
+
+        class _FakeStats:
+            def __init__(self, device, covered, residual, wasted, posted):
+                self.counts = torch.tensor(
+                    [covered, residual, wasted, posted], dtype=torch.int64, device=device
+                )
+
+            def snapshot(self):
+                values = self.counts.cpu().tolist()
+                return values[0], values[1], values[2], values[3]
+
+        class _FakePuller:
+            def __init__(self, stats):
+                self.stats = stats
+
+        manager = self.manager(dynamic=False, log_interval=1)
+        puller = _FakePuller(
+            {0: _FakeStats("cuda", covered=2, residual=0, wasted=0, posted=1)}
+        )
+        manager.register_prefetch_puller(puller)
+
+        self.observe(manager, [[0, 0, 1, 1], [0] * 4, [0] * 4])
+
+        row = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(row["side_pull_rows"], 1)  # posted, not covered + wasted (2)
+        self.assertEqual(
+            row["side_pull_bytes"], manager.streamers[0].bytes_per_expert
+        )
+
+    def test_discard_graph_capture_routes_resets_a_registered_pullers_stats(self):
+        manager = self.manager(dynamic=False)
+        stats = SimpleNamespace(
+            counts=torch.tensor([3, 1, 2, 1], dtype=torch.int64, device="cuda")
+        )
+        manager.register_prefetch_puller(SimpleNamespace(stats={0: stats}))
+
+        manager.discard_graph_capture_routes()
+
+        self.assertTrue(bool((stats.counts == 0).all()))
+
     def test_invalid_config_and_seed_do_not_allocate_slots(self):
         for options in (
             {"budget_bytes": -1},

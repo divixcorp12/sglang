@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
@@ -190,6 +190,22 @@ class PrefetchPuller:
         plan.expert_ids.copy_(self.bank.ids_for(target_layer)[:1])
         plan.count.fill_(1)
         self._pipeline.post_target(target)
+
+    def predicted_expert_for(self, target_layer: int) -> Optional[torch.Tensor]:
+        """This forward's posted prediction for ``target_layer``, or ``None`` if it is not a pull target.
+
+        The same int64 ``[1]`` device tensor ``join_target`` reads back for its
+        stats. Safe to read before ``join_target``'s stream join: ``post_target``
+        wrote it on the caller's own (main) stream, so ordinary same-stream
+        ordering already covers the value, unlike the pulled row's data, which
+        lives on the side stream ``join_target`` joins.
+        """
+        plan = self._plans.get(target_layer)
+        return None if plan is None else plan.expert_ids
+
+    def slot_for(self, target_layer: int) -> int:
+        """The dedicated slot index reserved for ``target_layer``'s pull."""
+        return self._slots[target_layer].index
 
     def join_target(
         self,
