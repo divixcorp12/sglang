@@ -228,6 +228,28 @@ class TestPrefetchScoringCpu(unittest.TestCase):
             bank.write(1, scores, expert_to_slot=expert_to_slot)
             self.assertEqual(bank.ids_for(1).tolist(), [3])
 
+    def test_single_width_fallback_matches_the_reference_candidate_bank(self):
+        """A serving-only fallback still uses the exact stable reference bank."""
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
+
+        scores = torch.full((3, EXPERTS), -5.0)
+        scores[:, 4] = -1.0  # finite negative scores remain eligible
+        scores[:, 7] = 2.0
+        scores[:, 9] = 2.0  # tie after reduction must choose 7
+        scores[0, 12] = float("nan")
+        resident = torch.full((EXPERTS,), -1, dtype=torch.long)
+        resident[7] = 0  # the best tied score is unavailable to a pull
+
+        reference = PrefetchCandidateBank(layer_ids=[1], width=4, device=torch.device("cpu"))
+        serving = PrefetchCandidateBank(layer_ids=[1], width=1, device=torch.device("cpu"))
+        reference.write(1, scores, expert_to_slot=resident)
+        serving.write(1, scores, expert_to_slot=resident)
+
+        self.assertEqual(serving.width, 1)
+        self.assertEqual(serving.ids_for(1).tolist(), reference.ids_for(1)[:1].tolist())
+        self.assertEqual(serving.valid_for(1).tolist(), reference.valid_for(1)[:1].tolist())
+        torch.testing.assert_close(serving.scores_for(1), reference.scores_for(1)[:1])
+
     def test_dedicated_prefetch_slot_index_sits_after_capacity_and_demand_rows(self):
         from sglang.srt.layers.moe.expert_prediction.serving.candidates import DedicatedPrefetchSlot
 

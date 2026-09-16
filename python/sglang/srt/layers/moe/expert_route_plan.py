@@ -144,6 +144,7 @@ def supports_fused_graph_routes(
     """
     return (
         topk_ids.is_cuda
+        and topk_ids.dtype in (torch.int32, torch.int64)
         and topk_ids.ndim >= 1
         and topk_ids.shape[0] == 1
         and 0 < topk_ids.numel() <= FUSED_MAX_ROUTES
@@ -193,6 +194,7 @@ def plan_graph_routes_fused(
     prefetch_slot: int = -1,
     prefetch_count: Optional[torch.Tensor] = None,
     outcome_counters: Optional[torch.Tensor] = None,
+    remap_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """`plan_graph_routes`'s BS1, unique-ID fast path: one fused kernel launch.
 
@@ -216,7 +218,9 @@ def plan_graph_routes_fused(
     posted]. The first two are logical routes; the last two are physical
     speculative rows.
 
-    Returns the per-route remap in ``remap_dtype``, shaped like ``flat``.
+    ``remap_out`` can provide a graph-stable output buffer in ``remap_dtype``;
+    otherwise an eager compatibility allocation is used. Returns that
+    per-route remap, shaped like ``flat``.
     """
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
@@ -225,7 +229,15 @@ def plan_graph_routes_fused(
         prefetch_slot = 0
     elif prefetch_count is None:
         prefetch_count = _one_prefetch_count(flat.device)
-    remap_out = torch.empty(flat.shape, dtype=remap_dtype, device=flat.device)
+    if remap_out is None:
+        remap_out = torch.empty(flat.shape, dtype=remap_dtype, device=flat.device)
+    elif (
+        remap_out.shape != flat.shape
+        or remap_out.dtype != remap_dtype
+        or remap_out.device != flat.device
+        or not remap_out.is_contiguous()
+    ):
+        raise ValueError("remap_out must be a contiguous remap_dtype buffer matching flat")
     plan_unique_routes_cuda(
         flat,
         expert_to_slot,

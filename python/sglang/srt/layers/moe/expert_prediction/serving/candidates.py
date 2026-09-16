@@ -14,7 +14,13 @@ class PrefetchCandidateBank:
     initialised to distinct experts so an unwritten row is still a valid index.
     """
 
-    def __init__(self, *, layer_ids: Sequence[int], width: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        *,
+        layer_ids: Sequence[int],
+        width: int,
+        device: torch.device,
+    ) -> None:
         if width < 1:
             raise ValueError("prefetch candidate width must be positive")
         self.width = width
@@ -50,6 +56,10 @@ class PrefetchCandidateBank:
         if expert_to_slot is not None:
             excluded = excluded | (expert_to_slot >= 0)
         ranked = torch.where(excluded, summed.new_full((), float("-inf")), summed)
+        # The candidate bank is deliberately the reference top-W path. Serving
+        # top-1 avoids it altogether through the JIT selector owned by
+        # PrefetchPuller; recall, calibration, and analysis keep this stable
+        # sort to preserve their complete candidate-bank contract.
         order = torch.argsort(ranked, descending=True, stable=True)
         top = order[: self.width]
         row = self._rows[target_layer]

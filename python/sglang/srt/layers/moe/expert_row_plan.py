@@ -157,12 +157,13 @@ class ExpertRowPlanner:
         *,
         prefetch_expert: torch.Tensor | None = None,
         prefetch_slot: int = -1,
+        prefetch_count: torch.Tensor | None = None,
     ) -> GraphRoutePlan:
         """Plan int64 routes ``flat`` against the live expert-to-slot mapping.
 
         Distinct misses take scratch rows in first-appearance order, matching
         the returned ``remap``. ``flat.numel()`` must not exceed the scratch
-        rows or the plan capacity. ``prefetch_expert``/``prefetch_slot``
+        rows or the plan capacity. ``prefetch_expert``/``prefetch_slot``/``prefetch_count``
         forward a side-stream pull's posted prediction to ``plan_graph_routes``,
         excluding a covered route from the scratch plan; see its docstring.
         """
@@ -173,6 +174,7 @@ class ExpertRowPlanner:
             self.scratch_base,
             prefetch_expert=prefetch_expert,
             prefetch_slot=prefetch_slot,
+            prefetch_count=prefetch_count,
         )
 
     @staticmethod
@@ -188,10 +190,14 @@ class ExpertRowPlanner:
         *,
         prefetch_expert: torch.Tensor | None = None,
         prefetch_slot: int = -1,
+        prefetch_count: torch.Tensor | None = None,
     ) -> GraphRoutePlan:
         """``route_plan`` followed by ``fill_routes``: the router-miss producer."""
         route = self.route_plan(
-            flat, prefetch_expert=prefetch_expert, prefetch_slot=prefetch_slot
+            flat,
+            prefetch_expert=prefetch_expert,
+            prefetch_slot=prefetch_slot,
+            prefetch_count=prefetch_count,
         )
         self.fill_routes(route, plan)
         return route

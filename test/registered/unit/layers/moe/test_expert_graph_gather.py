@@ -23,14 +23,14 @@ _HOST_SHAPES = {
 }
 
 
-def _layer(seed=21, pinned=True):
+def _layer(seed=21, pinned=True, experts=EXPERTS):
     generator = torch.Generator().manual_seed(seed)
     layer = torch.nn.Module()
     for name in NVFP4_STREAM_TENSORS[:4]:
         rows = torch.randint(
             0,
             256,
-            (EXPERTS,) + _HOST_SHAPES[name],
+            (experts,) + _HOST_SHAPES[name],
             dtype=torch.uint8,
             generator=generator,
         )
@@ -40,7 +40,7 @@ def _layer(seed=21, pinned=True):
             rows = rows.pin_memory()
         setattr(layer, name, torch.nn.Parameter(rows, requires_grad=False))
     for name in NVFP4_STREAM_TENSORS[4:]:
-        values = torch.rand(EXPERTS, generator=generator).cuda()
+        values = torch.rand(experts, generator=generator).cuda()
         setattr(layer, name, torch.nn.Parameter(values, requires_grad=False))
     layer.top_k = TOP_K
     return layer
@@ -1184,7 +1184,7 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
     sums them.
     """
 
-    def _build(self, layer_id=0):
+    def _build(self, layer_id=0, *, capacity=0, max_rows=TOP_K, experts=EXPERTS, fused=False):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
         from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
@@ -1192,12 +1192,15 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
         )
         from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
 
-        layer = _layer()
+        layer = _layer(experts=experts)
         layer.layer_id = layer_id
         streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
-        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"):
-            cache = ExpertHotCache(streamer, capacity=0, scratch_rows=TOP_K)
-        streamer.enable_graph_gather(TOP_K)
+        with (
+            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"),
+            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(str(fused).lower()),
+        ):
+            cache = ExpertHotCache(streamer, capacity=capacity, scratch_rows=max_rows)
+            streamer.enable_graph_gather(max_rows)
         bank = PrefetchCandidateBank(layer_ids=[layer_id], width=1, device="cuda")
         puller = PrefetchPuller(
             bank=bank, layer_ids=[layer_id], hot_caches={layer_id: cache}, device="cuda"
@@ -1252,3 +1255,113 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
         self.assertEqual(posted, 1)  # physical: one row, not one per route
         self.assertEqual(demand_rows, 0)  # neither duplicate consumes a scratch row
         self.assertEqual(demand_rows + posted, 1)
+
+    def test_stale_positive_id_with_zero_posted_count_remains_residual_through_gather(self):
+        """The production gather must forward the posted count to its planner.
+
+        This deliberately models a stale plan ID from an older replay together
+        with this replay's no-offer count.  The side branch is still posted and
+        joined so the captured fork/join shape remains valid, but the route must
+        use ordinary demand scratch rather than the speculative row.
+        """
+        streamer, cache, _bank, puller = self._build()
+        ids = torch.tensor([[5, 6]], dtype=torch.int32, device="cuda")
+        plan = puller._plans[0]
+        plan.expert_ids.fill_(5)
+        plan.count.zero_()
+        puller._pipeline.post_target(puller._targets[0])
+
+        compact, _ = streamer.gather(ids)
+        torch.cuda.synchronize()
+
+        self.assertEqual(int(streamer.row_plan.count.item()), 2)
+        self.assertNotIn(puller.slot_for(0), compact.reshape(-1).tolist())
+        self.assertEqual(puller.stats[0].snapshot(), (0, 2, 0, 0))
+
+    def test_target_consumption_clears_metadata_before_an_unposted_replay(self):
+        """A target can never reuse an already-consumed source offer.
+
+        The first replay has a real pull.  The second deliberately has no
+        source post at all, modelling an unsupported source hook; it must
+        therefore behave as a no-offer replay instead of reusing the first
+        plan's positive ID/count.
+        """
+        streamer, cache, bank, puller = self._build()
+        ids = torch.tensor([[5, 6]], dtype=torch.int32, device="cuda")
+        self._set_candidate(bank, cache, 0, 5)
+        puller.post_target(0)
+        first, _ = streamer.gather(ids)
+        torch.cuda.synchronize()
+        self.assertIn(puller.slot_for(0), first.reshape(-1).tolist())
+
+        second, _ = streamer.gather(ids)
+        torch.cuda.synchronize()
+        self.assertEqual(int(streamer.row_plan.count.item()), 2)
+        self.assertNotIn(puller.slot_for(0), second.reshape(-1).tolist())
+
+    def test_tail_gather_drains_and_clears_an_unusable_source_offer(self):
+        """A graph-unsupported target cannot leak its source pull into replay."""
+        streamer, cache, bank, puller = self._build(max_rows=1)
+        self._set_candidate(bank, cache, 0, 5)
+        puller.post_target(0)
+
+        # Two routes exceed graph capacity, so production takes the eager/tail
+        # branch that cannot consume the dedicated slot.
+        streamer.gather(torch.tensor([[5, 6]], dtype=torch.int32, device="cuda"))
+        torch.cuda.synchronize()
+        self.assertEqual((puller._plans[0].expert_ids.item(), puller._plans[0].count.item()), (-1, 0))
+
+    def test_fused_gather_records_correct_wrong_resident_and_32_route_outcomes_once(self):
+        """The production fast path owns one outcome ledger per replay.
+
+        These cases exercise the whole gather boundary, rather than only the
+        route kernel: source metadata is posted, the fused planner reads its
+        actual count, and the target joins without a second remap or counter
+        addition.  The last case also keeps physical rows separate from the
+        logical route counts at the top-32 serving limit.
+        """
+        cases = (
+            # capacity, routes, posted id, expected [covered, residual, wasted, posted], demand rows
+            (0, [5, 6], 5, [1, 1, 0, 1], 1),
+            (0, [5, 6], 3, [0, 2, 1, 1], 2),
+            (1, [5, 6], 5, [0, 1, 1, 1], 1),
+            (0, list(range(32)), 0, [1, 31, 0, 1], 31),
+        )
+        for capacity, routes, predicted, expected, expected_demand_rows in cases:
+            with self.subTest(routes=len(routes), predicted=predicted, capacity=capacity):
+                streamer, cache, bank, puller = self._build(
+                    capacity=capacity,
+                    max_rows=len(routes),
+                    experts=max(EXPERTS, len(routes)),
+                    fused=True,
+                )
+                if capacity:
+                    cache.reassign([predicted])
+                    # Model a prediction that became resident after posting.
+                    plan = puller._plans[0]
+                    plan.expert_ids.fill_(predicted)
+                    plan.count.fill_(1)
+                    puller._pipeline.post_target(puller._targets[0])
+                else:
+                    self._set_candidate(bank, cache, 0, predicted)
+                    puller.post_target(0)
+
+                ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
+                compact, _ = streamer.gather(ids)
+                torch.cuda.synchronize()
+
+                self.assertEqual(compact.dtype, torch.int32)
+                self.assertEqual(
+                    compact.data_ptr(),
+                    streamer._graph_fused_remaps[torch.int32].data_ptr(),
+                    "fused graph replay must use its persistent native-int32 remap",
+                )
+                self.assertEqual(int(streamer.row_plan.count.item()), expected_demand_rows)
+                self.assertEqual(puller.stats[0].snapshot(), tuple(expected))
+                self.assertEqual(
+                    expected_demand_rows + expected[3],
+                    len(set(routes)),
+                    "residual demand rows plus posted pulls are physical rows, not covered routes",
+                )
+                if capacity:
+                    self.assertEqual(compact.reshape(-1)[0].item(), 0)

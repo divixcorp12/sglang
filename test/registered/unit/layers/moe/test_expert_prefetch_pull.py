@@ -1,16 +1,10 @@
-"""Stage C2 bullets 6-7: PrefetchPuller correctness and lifecycle against a real-shaped hot cache.
+"""PrefetchPuller correctness and lifecycle against real-shaped cache storage.
 
-``ExpertHotCache`` (expert_hot_cache.py, out of C2's scope -- see stage-c2-report.md)
-does not yet allocate ``DedicatedPrefetchSlot``'s trailing row: its tensors are
-``(capacity + scratch_rows, ...)``, one row short of ``capacity + scratch_rows + 1``.
-``_FakeHotCache`` below is a test-only stand-in shaped the way a hot cache with that
-row *would* be, so ``PrefetchPuller`` itself -- construction, the setup assertions
-against real allocation/real expert_to_slot, the captured post/join, and the
-covered/residual remap -- is exercised end to end through the real production
-classes. The one missing piece, confirmed separately, is that constructing a
-``PrefetchPuller`` against the *actual* production ``ExpertHotCache`` raises at
-setup (``assert_within_allocation``) rather than silently indexing out of bounds --
-see ``test_prefetch_puller_rejects_a_hot_cache_allocated_without_the_trailing_row``.
+``ExpertHotCache`` now reserves ``DedicatedPrefetchSlot``'s trailing row when
+the pull mode is enabled. ``_FakeHotCache`` keeps these unit cases focused on
+the pull plan and payload contract while matching that production allocation
+shape. The deliberately truncated fixture still proves setup rejects a broken
+cache before a pull can index past its allocation.
 """
 
 import unittest
@@ -84,6 +78,38 @@ def _build_puller(device, *, layer_ids=(1,), capacity=6, scratch_rows=2, enable_
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchPullerCorrectness(unittest.TestCase):
+    def test_jit_top1_writes_persistent_id_valid_and_count_with_reference_ties(self):
+        """The serving kernel owns the final no-offer-safe pull plan state."""
+        from sglang.kernels.ops.moe.expert_prefetch_top1 import (
+            select_prefetch_top1_cuda,
+            supports_prefetch_top1_cuda,
+        )
+
+        device = torch.device("cuda")
+        scores = torch.full((1, EXPERTS), -4.0, device=device)
+        scores[0, 3] = 2.0
+        scores[0, 8] = 2.0
+        resident = torch.full((EXPERTS,), -1, dtype=torch.int64, device=device)
+        resident[3] = 0
+        expert_id = torch.full((1,), 99, dtype=torch.int64, device=device)
+        valid = torch.ones(1, dtype=torch.bool, device=device)
+        count = torch.ones(1, dtype=torch.int32, device=device)
+        self.assertTrue(supports_prefetch_top1_cuda(scores, resident))
+
+        select_prefetch_top1_cuda(scores, resident, expert_id, valid, count)
+        torch.cuda.synchronize()
+        self.assertEqual(expert_id.item(), 8)
+        self.assertTrue(valid.item())
+        self.assertEqual(count.item(), 1)
+
+        select_prefetch_top1_cuda(
+            torch.full_like(scores, float("nan")), resident, expert_id, valid, count
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(expert_id.item(), -1)
+        self.assertFalse(valid.item())
+        self.assertEqual(count.item(), 0)
+
     def test_pulled_row_is_byte_exact_from_the_predicted_expert_not_a_neighbor(self):
         device = torch.device("cuda")
         puller, bank, hot_caches, _ = _build_puller(device)
@@ -145,6 +171,19 @@ class TestPrefetchPullerCorrectness(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchPullerLifecycle(unittest.TestCase):
+    def test_delivery_stats_share_one_contiguous_snapshot_bank(self):
+        device = torch.device("cuda")
+        puller, _bank, _hot_caches, _ = _build_puller(device, layer_ids=(3, 1))
+        self.assertTrue(puller._outcome_counter_bank.is_contiguous())
+        puller.stats[1].counts.copy_(torch.tensor([1, 2, 0, 1], device=device))
+        puller.stats[3].counts.copy_(torch.tensor([0, 4, 1, 1], device=device))
+        self.assertEqual(
+            puller.snapshot_delivery_stats(),
+            {1: (1, 2, 0, 1), 3: (0, 4, 1, 1)},
+        )
+        puller.discard_delivery_stats()
+        self.assertTrue(bool((puller._outcome_counter_bank == 0).all()))
+
     def test_graph_replay_resets_metadata_when_a_live_candidate_becomes_resident(self):
         # The candidate bank keeps an in-range ID for graph stability. Replays
         # must instead publish -1/count=0 every time the live map makes that
@@ -212,6 +251,27 @@ class TestPrefetchPullerLifecycle(unittest.TestCase):
         self.assertEqual((plan.expert_ids.item(), plan.count.item()), (-1, 0))
         self.assertEqual(remap.item(), demand_remap.item())
 
+    def test_post_rechecks_a_rebound_live_residency_map(self):
+        """GPU residency may replace, not mutate, expert_to_slot between replays."""
+        device = torch.device("cuda")
+        puller, bank, hot_caches, _ = _build_puller(device)
+        candidate = 13
+        _set_candidate(bank, hot_caches, 1, candidate)
+        rebound = hot_caches[1].expert_to_slot.clone()
+        rebound[candidate] = 0
+        hot_caches[1].expert_to_slot = rebound
+
+        puller.post_target(1)
+        remap = puller.join_target(
+            1,
+            flat_ids=torch.tensor([candidate], device=device),
+            missed_mask=torch.tensor([True], device=device),
+            demand_remap=torch.tensor([123], dtype=torch.int64, device=device),
+        )
+        torch.cuda.synchronize()
+        self.assertEqual((puller._plans[1].expert_ids.item(), puller._plans[1].count.item()), (-1, 0))
+        self.assertEqual(remap.item(), 123)
+
     def test_graph_replay_publishes_a_coherent_zero_payload_plan_without_touching_the_dedicated_slot(self):
         """A count-zero control replays the normal post/join graph with no delivered row."""
         device = torch.device("cuda")
@@ -273,8 +333,8 @@ class TestPrefetchPullerLifecycle(unittest.TestCase):
         layer = _source_layer(device)
         streamer = _FakeStreamer(layer)
         cache = _FakeHotCache(streamer, capacity=6, scratch_rows=2, device=device)
-        # Truncate to exactly what production ExpertHotCache.__init__ allocates today:
-        # (capacity + scratch_rows), one row short of the dedicated slot.
+        # Deliberately remove production's trailing dedicated row, leaving
+        # exactly (capacity + scratch_rows) rows and proving setup rejects it.
         cache.tensors["w"] = cache.tensors["w"][:-1].clone()
         bank = PrefetchCandidateBank(layer_ids=[1], width=1, device=device)
         with self.assertRaises(ValueError):

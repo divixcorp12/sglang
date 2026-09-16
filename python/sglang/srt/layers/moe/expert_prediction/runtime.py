@@ -48,6 +48,7 @@ class PrefetchSettings(msgspec.Struct, frozen=True):
     tau: float
     pull_mode: str = "off"
     shadow_recall: bool = True
+    fused_top1: bool = True
     calibration: bool = False
     calibration_file: Path | None = None
     calibration_provenance: str = ""
@@ -196,6 +197,7 @@ class ExpertPredictionRuntime:
                 tau=envs.SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU.get(),
                 pull_mode=pull_mode,
                 shadow_recall=envs.SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL.get(),
+                fused_top1=envs.SGLANG_MOE_EXPERT_PREFETCH_FUSED_TOP1.get(),
                 calibration=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get(),
                 calibration_file=(Path(envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE.get()) if envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_FILE.get() else None),
                 calibration_provenance=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION_PROVENANCE.get(),
@@ -290,6 +292,7 @@ class ExpertPredictionRuntime:
                 device=device,
                 pull_mode=prefetch.pull_mode,
                 shadow_recall=prefetch.shadow_recall,
+                fused_top1=prefetch.fused_top1,
                 calibration=prefetch.calibration,
                 calibration_file=prefetch.calibration_file,
                 calibration_provenance=prefetch.calibration_provenance,

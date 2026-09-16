@@ -1017,9 +1017,16 @@ class ExpertHotCacheManager:
         }
         manager._layer_index = {}
         manager._registers = {}
+        # Route history and its dense affinity matrix are observer work, not
+        # residency input.  Start them only when an on-disk trace consumes
+        # them; next-layer prefetch enables both before its first forward.
+        manager._collect_route_history = manager.metrics_path is not None
+        manager._collect_affinity = manager.metrics_path is not None
+        manager._gathered_zero_masks = {}
         manager._graph_counters = None
         manager._graph_unique_counters = None
         manager._side_pull_snapshots = {}
+        manager._last_observer_mode = None
         # Unlike `residency_policies`, a `PrefetchPuller` cannot be populated here:
         # it is built from this manager's own `caches` by `PrefetchScoring`, which
         # runs after `from_model` returns. See `register_prefetch_puller`.
@@ -1106,6 +1113,11 @@ class ExpertHotCacheManager:
         max_candidates = index(max_candidates)
         if max_candidates <= 0:
             return
+        # The prefetch policy consumes the route tables, including the dense
+        # adjacent-layer affinity relation.  This happens during setup, before
+        # any observer forward can allocate registers.
+        self._collect_route_history = True
+        self._collect_affinity = True
         policy = SparseNextLayerPolicy(max_candidates)
         self.prefetch_coordinators = {}
         layer_ids = sorted(self.streamers)
@@ -1242,8 +1254,11 @@ class ExpertHotCacheManager:
             policy.pending_counts.zero_()
         puller = getattr(self, "_prefetch_puller", None)
         if puller is not None:
-            for stats in puller.stats.values():
-                stats.counts.zero_()
+            if hasattr(puller, "discard_delivery_stats"):
+                puller.discard_delivery_stats()
+            else:
+                for stats in puller.stats.values():
+                    stats.counts.zero_()
         calibration = getattr(self, "_prefetch_calibration", None)
         if calibration is not None:
             calibration.reset()
@@ -1566,10 +1581,12 @@ class ExpertHotCacheManager:
             layers = len(self._layer_ids)
             registers = {
                 "popularity": torch.zeros(
-                    (layers, experts), dtype=torch.float64, device=device
+                    (layers if self._collect_route_history else 0, experts),
+                    dtype=torch.float64,
+                    device=device,
                 ),
                 "affinity": torch.zeros(
-                    (max(layers - 1, 0), experts, experts),
+                    (max(layers - 1, 0) if self._collect_affinity else 0, experts, experts),
                     dtype=torch.float32,
                     device=device,
                 ),
@@ -1581,6 +1598,22 @@ class ExpertHotCacheManager:
                 "gathers": torch.zeros(layers, dtype=torch.int64, device=device),
             }
             self._registers[phase] = registers
+        elif self._collect_route_history and not registers["popularity"].shape[0]:
+            layers = len(self._layer_ids)
+            registers["popularity"] = torch.zeros(
+                (layers, experts), dtype=torch.float64, device=device
+            )
+            if self._collect_affinity:
+                registers["affinity"] = torch.zeros(
+                    (max(layers - 1, 0), experts, experts),
+                    dtype=torch.float32,
+                    device=device,
+                )
+        elif self._collect_affinity and not registers["affinity"].shape[0]:
+            layers = len(self._layer_ids)
+            registers["affinity"] = torch.zeros(
+                (max(layers - 1, 0), experts, experts), dtype=torch.float32, device=device
+            )
         return registers
 
     def _accumulate_registers(
@@ -1602,17 +1635,38 @@ class ExpertHotCacheManager:
             index = torch.tensor(self._layer_ids, dtype=torch.long, device=device)
             self._layer_index[device] = index
         rows = counts.detach().to(device=device, non_blocking=True).index_select(0, index)
-        registers["popularity"].add_(rows)
-        if registers["affinity"].shape[0]:
+        if self._collect_route_history:
+            registers["popularity"].add_(rows)
+        if self._collect_affinity and registers["affinity"].shape[0]:
             routed = rows.to(torch.float32)
             registers["affinity"].baddbmm_(
                 routed[:-1].unsqueeze(2), routed[1:].unsqueeze(1)
             )
-        gathered = torch.tensor(eager_gathered, dtype=torch.bool)
-        if device.type == "cuda":
-            gathered = gathered.pin_memory().to(device, non_blocking=True)
+        if any(eager_gathered):
+            # Eager fallback owns a host list, so retain its one-shot pinned
+            # transfer. Reusing that host storage without an ownership event
+            # would race the preceding asynchronous H2D copy.
+            gathered = torch.tensor(eager_gathered, dtype=torch.bool)
+            if device.type == "cuda":
+                gathered = gathered.pin_memory().to(device, non_blocking=True)
+        elif self._graph_counters is not None:
+            # Graph replay already maintains this device-visible truth. This
+            # common path avoids the per-forward pinned mask and device temp.
+            gathered = self._gathered_zero_masks.get(device)
+            if gathered is None:
+                gathered = torch.empty(len(self._layer_ids), dtype=torch.bool, device=device)
+                self._gathered_zero_masks[device] = gathered
+            torch.gt(self._graph_counters[:, 0], 0, out=gathered)
+        else:
+            gathered = self._gathered_zero_masks.get(device)
+            if gathered is None:
+                gathered = torch.zeros(len(self._layer_ids), dtype=torch.bool, device=device)
+                self._gathered_zero_masks[device] = gathered
+            else:
+                gathered.zero_()
         if self._graph_counters is not None:
-            gathered = gathered | (self._graph_counters[:, 0] > 0)
+            if any(eager_gathered):
+                gathered.logical_or_(self._graph_counters[:, 0] > 0)
             registers["graph_rows"].add_(self._graph_counters)
             registers["graph_unique_rows"].add_(self._graph_unique_counters)
             self._graph_counters.zero_()
@@ -1661,7 +1715,7 @@ class ExpertHotCacheManager:
         pairs = list(zip(self._layer_ids, self._layer_ids[1:]))
         for phase in self._counters:
             registers = self._registers.get(phase)
-            if registers is None:
+            if registers is None or not registers["popularity"].shape[0]:
                 result[phase] = {
                     "popularity": {str(layer_id): [] for layer_id in self._layer_ids},
                     "affinity": {},
@@ -1699,6 +1753,7 @@ class ExpertHotCacheManager:
 
     def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | float | None]]]:
         """Return JSON-compatible cumulative totals and current allocation gauges."""
+        self._refresh_side_pull_delivery()
         result = {}
         register_totals = {
             phase: torch.cat(
@@ -1719,6 +1774,7 @@ class ExpertHotCacheManager:
             totals = register_totals.get(mode)
             for layer_id, counters in layers.items():
                 row = asdict(counters)
+                graph_logical_unique_misses = 0
                 if totals is not None:
                     (
                         routed,
@@ -1744,17 +1800,40 @@ class ExpertHotCacheManager:
                         unique_missed * streamer.bytes_per_expert
                     )
                     row["requested_unique_experts"] += unique
+                    graph_logical_unique_misses = unique_missed
                 side_pull = self._side_pull_snapshots.get((mode, layer_id))
                 if side_pull is not None:
                     covered, residual, wasted, posted = side_pull
                     delivered = posted
+                    # One useful capacity-one post replaces one distinct
+                    # demand expert, regardless of how many logical routes
+                    # covered that expert. The planner's unique-miss counter
+                    # intentionally retains the logical demand total, so
+                    # remove that one would-be demand copy before adding the
+                    # side-stream's actual physical copy.
+                    useful_posts = posted - wasted
+                    covered_demand_rows = min(useful_posts, graph_logical_unique_misses)
+                    streamer = self.streamers[layer_id]
+                    row["miss_rows"] -= covered_demand_rows
+                    row["h2d_bytes"] -= covered_demand_rows * streamer.host_bytes_per_expert
+                    row["backing_source_bytes"] -= covered_demand_rows * streamer.bytes_per_expert
                     row["miss_rows"] += delivered
                     row["side_pull_rows"] += delivered
                     row["side_pull_bytes"] += (
-                        delivered * self.streamers[layer_id].bytes_per_expert
+                        delivered * streamer.bytes_per_expert
+                    )
+                    row["side_pull_h2d_bytes"] = delivered * streamer.host_bytes_per_expert
+                    row["side_pull_d2d_bytes"] = delivered * (
+                        streamer.bytes_per_expert - streamer.host_bytes_per_expert
+                    )
+                    row["residual_demand_rows"] = (
+                        graph_logical_unique_misses - covered_demand_rows
+                    )
+                    row["residual_demand_h2d_bytes"] = (
+                        row["residual_demand_rows"] * streamer.host_bytes_per_expert
                     )
                     row["side_pull_posted_rows"] = posted
-                    row["side_pull_useful_posts"] = posted - wasted
+                    row["side_pull_useful_posts"] = useful_posts
                     row["side_pull_wasted_rows"] = wasted
                     row["side_pull_covered_routes"] = covered
                     row["side_pull_residual_routes"] = residual
@@ -1800,6 +1879,21 @@ class ExpertHotCacheManager:
             result["doorbell"] = doorbell.stats()
         return result
 
+    def _refresh_side_pull_delivery(self) -> None:
+        """Read pull counters only when a caller actually asks for a snapshot."""
+        mode = self._last_observer_mode
+        puller = getattr(self, "_prefetch_puller", None)
+        if mode is None or puller is None:
+            return
+        if hasattr(puller, "snapshot_delivery_stats"):
+            snapshots = puller.snapshot_delivery_stats()
+        else:
+            snapshots = {
+                layer_id: stats.snapshot() for layer_id, stats in puller.stats.items()
+            }
+        for layer_id, values in snapshots.items():
+            self.record_side_pull_delivery(layer_id, mode, *values)
+
     def on_expert_distribution(
         self, forward_batch: ForwardBatch, single_pass_data: Mapping[str, Any]
     ) -> None:
@@ -1829,6 +1923,7 @@ class ExpertHotCacheManager:
                 "recorder counts do not match expert cache layers and experts"
             )
         mode = _PHASES[kind]
+        self._last_observer_mode = mode
         clock = self._boundary_clock
         boundary_tokens = clock.observe(kind, tokens)
         qualifying = boundary_tokens is not None
@@ -1893,10 +1988,6 @@ class ExpertHotCacheManager:
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
         if clock.forwards % self.log_interval == 0:
-            puller = getattr(self, "_prefetch_puller", None)
-            if puller is not None:
-                for layer_id, stats in puller.stats.items():
-                    self.record_side_pull_delivery(layer_id, mode, *stats.snapshot())
             self._write_trace(mode)
             self._log_doorbell()
 

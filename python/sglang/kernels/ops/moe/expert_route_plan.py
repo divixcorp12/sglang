@@ -130,7 +130,8 @@ def plan_unique_routes_cuda(
     Zero prefetch_count disables coverage; prefetch_slot is a fixed integer.
     outcome_counters is an optional persistent int64[4] accumulator ordered
     [covered routes, residual routes, wasted posted rows, posted rows].
-    Caller has joined prefetch completion before invoking this function.
+    The posted prefetch metadata must be published before this call. The
+    caller joins the side-stream payload before it consumes a covered remap.
     """
     _validate_route_plan_inputs(
         topk_ids,

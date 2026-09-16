@@ -16,6 +16,10 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_prefetch_top1 import (
+    select_prefetch_top1_cuda,
+    supports_prefetch_top1_cuda,
+)
 from sglang.srt.layers.moe.expert_gpu_pull import ExpertGpuPullPipeline, ExpertGpuPullTarget
 from sglang.srt.layers.moe.expert_prediction.contracts import MoeLayerSpec, RouteFeature
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
@@ -114,8 +118,14 @@ class PullDeliveryStats:
     the other.
     """
 
-    def __init__(self, device: torch.device) -> None:
-        self.counts = torch.zeros(4, dtype=torch.int64, device=device)
+    def __init__(self, device: torch.device | None = None, *, counts: torch.Tensor | None = None) -> None:
+        if counts is None:
+            if device is None:
+                raise ValueError("PullDeliveryStats needs a device or a persistent counter view")
+            counts = torch.zeros(4, dtype=torch.int64, device=device)
+        if counts.dtype != torch.int64 or counts.numel() != 4 or not counts.is_contiguous():
+            raise ValueError("PullDeliveryStats counters must be a contiguous int64[4] tensor")
+        self.counts = counts
 
     def add(
         self, covered: torch.Tensor, residual: torch.Tensor, wasted: torch.Tensor, posted: torch.Tensor
@@ -157,6 +167,7 @@ class PrefetchPuller:
         hot_caches: Mapping[int, Any],
         device: torch.device,
         pull_mode: str = "always",
+        fused_top1: bool = False,
     ) -> None:
         if pull_mode not in {"count_zero", "always"}:
             raise ValueError(f"unsupported prefetch pull mode: {pull_mode}")
@@ -165,10 +176,21 @@ class PrefetchPuller:
         self._slots: dict[int, DedicatedPrefetchSlot] = {}
         self._targets: dict[int, ExpertGpuPullTarget] = {}
         self._plans: dict[int, ExpertRowPlan] = {}
+        self._selected_valid: dict[int, torch.Tensor] = {}
         self._should_post: dict[int, torch.Tensor] = {}
-        self._expert_to_slot: dict[int, torch.Tensor] = {}
+        # The GPU residency owner can replace expert_to_slot between graph
+        # replays. Keep the cache object and read its live map when posting.
+        self._hot_caches = dict(hot_caches)
+        self._fused_top1 = fused_top1
+        self._counter_layers = tuple(sorted(layer_ids))
+        self._counter_rows = {layer_id: row for row, layer_id in enumerate(self._counter_layers)}
+        # A single contiguous bank makes every periodic delivery snapshot one
+        # D2H transfer, instead of one transfer per target layer.
+        self._outcome_counter_bank = torch.zeros(
+            (len(self._counter_layers), 4), dtype=torch.int64, device=device
+        )
         self.stats: dict[int, PullDeliveryStats] = {}
-        for layer_id in layer_ids:
+        for layer_id in self._counter_layers:
             cache = hot_caches.get(layer_id)
             if cache is None:
                 raise ValueError(f"expert prefetch pull needs a hot cache for target layer {layer_id}")
@@ -190,11 +212,13 @@ class PrefetchPuller:
                 f"prefetch_pull_{layer_id}", segments, plan, slot.index
             )
             self._plans[layer_id] = plan
-            self._expert_to_slot[layer_id] = cache.expert_to_slot
+            self._selected_valid[layer_id] = torch.zeros(1, dtype=torch.bool, device=device)
             self._should_post[layer_id] = torch.tensor(
                 pull_mode == "always", dtype=torch.bool, device=device
             )
-            self.stats[layer_id] = PullDeliveryStats(device)
+            self.stats[layer_id] = PullDeliveryStats(
+                counts=self._outcome_counter_bank[self._counter_rows[layer_id]]
+            )
 
     def post_target(self, target_layer: int) -> None:
         target = self._targets.get(target_layer)
@@ -203,10 +227,40 @@ class PrefetchPuller:
         plan = self._plans[target_layer]
         candidate = self.bank.ids_for(target_layer)[:1]
         valid = self._should_post[target_layer] & self.bank.valid_for(target_layer)[:1]
-        valid = valid & (self._expert_to_slot[target_layer].index_select(0, candidate) < 0)
+        valid = valid & (
+            self._hot_caches[target_layer].expert_to_slot.index_select(0, candidate) < 0
+        )
         plan.expert_ids.copy_(torch.where(valid, candidate, candidate.new_full((1,), -1)))
         plan.count.copy_(valid.to(torch.int32).reshape(1))
+        self._selected_valid[target_layer].copy_(valid)
         self._pipeline.post_target(target)
+
+    def select_and_post_target(self, target_layer: int, scores: torch.Tensor) -> bool:
+        """Select and post a serving candidate, using JIT only when it is exact.
+
+        Returns whether the JIT kernel was used.  Its fallback is the complete
+        reference candidate-bank path, not an approximation.  The JIT owns the
+        persistent ``id``, ``valid`` and ``count`` buffers consumed by both the
+        side pull and the target gather planner.
+        """
+        target = self._targets.get(target_layer)
+        if target is None:
+            return False
+        plan = self._plans[target_layer]
+        expert_to_slot = self._hot_caches[target_layer].expert_to_slot
+        if self._fused_top1 and supports_prefetch_top1_cuda(scores, expert_to_slot):
+            select_prefetch_top1_cuda(
+                scores,
+                expert_to_slot,
+                plan.expert_ids,
+                self._selected_valid[target_layer],
+                plan.count,
+            )
+            self._pipeline.post_target(target)
+            return True
+        self.bank.write(target_layer, scores, expert_to_slot=expert_to_slot)
+        self.post_target(target_layer)
+        return False
 
     def predicted_expert_for(self, target_layer: int) -> Optional[torch.Tensor]:
         """This forward's posted prediction for ``target_layer``, or ``None`` if it is not a pull target.
@@ -220,6 +274,28 @@ class PrefetchPuller:
         plan = self._plans.get(target_layer)
         return None if plan is None else plan.expert_ids
 
+    def posted_count_for(self, target_layer: int) -> Optional[torch.Tensor]:
+        """The current forward's persistent posted-row count for graph planning."""
+        plan = self._plans.get(target_layer)
+        return None if plan is None else plan.count
+
+    def outcome_counters_for(self, target_layer: int) -> Optional[torch.Tensor]:
+        """Persistent planner-owned outcome counters for a fused target gather."""
+        stats = self.stats.get(target_layer)
+        return None if stats is None else stats.counts
+
+    def snapshot_delivery_stats(self) -> dict[int, tuple[int, int, int, int]]:
+        """Read the whole target bank with one host transfer for a real consumer."""
+        values = self._outcome_counter_bank.cpu().tolist()
+        return {
+            layer_id: tuple(values[row])
+            for layer_id, row in self._counter_rows.items()
+        }
+
+    def discard_delivery_stats(self) -> None:
+        """Reset all target counters in a single graph-stable device operation."""
+        self._outcome_counter_bank.zero_()
+
     def slot_for(self, target_layer: int) -> int:
         """The dedicated slot index reserved for ``target_layer``'s pull."""
         return self._slots[target_layer].index
@@ -231,18 +307,26 @@ class PrefetchPuller:
         flat_ids: torch.Tensor,
         missed_mask: torch.Tensor,
         demand_remap: torch.Tensor,
+        planner_owned: bool = False,
+        clear_after_join: bool = False,
     ) -> torch.Tensor:
         target = self._targets.get(target_layer)
         if target is None:
             return demand_remap
         self._pipeline.join_target(target)
+        if planner_owned:
+            # The fused planner has already written its final remap and all
+            # four outcomes into this target's persistent counter tensor.
+            if clear_after_join:
+                self._clear_plan(target_layer)
+            return demand_remap
         predicted = self._plans[target_layer].expert_ids
         posted_count = self._plans[target_layer].count
         covered, residual, wasted, posted = pull_outcome_counts(
             flat_ids, missed_mask, predicted, posted_count
         )
         self.stats[target_layer].add(covered, residual, wasted, posted)
-        return route_covered_residual(
+        remap = route_covered_residual(
             flat_ids,
             missed_mask,
             predicted,
@@ -250,6 +334,29 @@ class PrefetchPuller:
             demand_remap,
             posted_count,
         )
+        if clear_after_join:
+            self._clear_plan(target_layer)
+        return remap
+
+    def _clear_plan(self, target_layer: int) -> None:
+        plan = self._plans[target_layer]
+        plan.expert_ids.fill_(-1)
+        plan.count.zero_()
+        self._selected_valid[target_layer].zero_()
+
+    def join_unsupported_target(self, target_layer: int) -> None:
+        """Drain and clear a target whose gather is outside graph support.
+
+        The source scoring hook can still have forked a count-zero-or-one pull.
+        Joining before eager/tail gather keeps the no-op fork/join capture
+        structure valid; clearing after the join prevents stale metadata from
+        leaking into the next replay.
+        """
+        target = self._targets.get(target_layer)
+        if target is None:
+            return
+        self._pipeline.join_target(target)
+        self._clear_plan(target_layer)
 
 _FEATURES = {
     "llapor": frozenset({RouteFeature.ROUTER_INPUT, RouteFeature.TOPK_IDS, RouteFeature.TOPK_WEIGHTS}),
@@ -290,6 +397,7 @@ class PrefetchScoring:
         calibration: bool = False,
         calibration_file: Path | None = None,
         calibration_provenance: str = "",
+        fused_top1: bool = True,
     ) -> "PrefetchScoring":
         by_layer = {spec.layer_id: spec for spec in specs}
         if width > min(spec.num_experts for spec in specs):
@@ -307,7 +415,18 @@ class PrefetchScoring:
                        for target, c in checkpoints.items()}
             source_of = {target: target for target in checkpoints}
             next_target = {}
-        bank = PrefetchCandidateBank(layer_ids=list(checkpoints), width=width, device=device)
+        # A real serving pull consumes exactly one candidate. Observability
+        # consumers need the reference top-W ordering, so only collapse the
+        # bank when shadow recall, calibration, and count-zero diagnostics are
+        # all absent.
+        serving_top1 = (
+            fused_top1 and pull_mode == "always" and not shadow_recall and not calibration
+        )
+        bank = PrefetchCandidateBank(
+            layer_ids=list(checkpoints),
+            width=1 if serving_top1 else width,
+            device=device,
+        )
         puller = (
             PrefetchPuller(
                 bank=bank,
@@ -315,6 +434,7 @@ class PrefetchScoring:
                 hot_caches=hot_caches,
                 device=device,
                 pull_mode=pull_mode,
+                fused_top1=serving_top1,
             )
             if pull_mode != "off"
             else None
@@ -352,8 +472,9 @@ class PrefetchScoring:
             calibration_provenance=calibration_provenance,
         )
         store.after_write = scoring._on_write
-        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s calibration=%s",
-                    predictor, len(checkpoints), width, budget, scoring.state_nbytes, pull_mode, shadow_recall, calibration)
+        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d bank_width=%d serving_top1=%s budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s calibration=%s",
+                    predictor, len(checkpoints), width, bank.width, serving_top1, budget,
+                    scoring.state_nbytes, pull_mode, shadow_recall, calibration)
         return scoring
 
     def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None, calibration=None, calibration_file=None, calibration_provenance="") -> None:
@@ -368,6 +489,7 @@ class PrefetchScoring:
         self.bank = bank
         self.recall = recall
         self.puller = puller
+        self._serving_top1 = bool(puller is not None and puller._fused_top1)
         self.calibration = calibration
         self._calibration_file = calibration_file
         self._calibration_provenance = calibration_provenance
@@ -402,6 +524,12 @@ class PrefetchScoring:
                 )
             else:
                 scores = self._scorers[target](self._store.view(layer_id, RouteFeature.PRE_MIXER, rows))
+        if self._serving_top1 and self.puller is not None:
+            # The real CUDA kernel writes the pull plan directly.  This branch
+            # is selected only when no reference-bank consumer exists; on an
+            # unsupported shape/dtype the puller executes the exact fallback.
+            self.puller.select_and_post_target(target, scores)
+            return
         # Passing expert_to_slot here (rather than the prior zero-arg call) is the seam
         # documented on BudgetRecall: bank.write now excludes residency before truncating
         # to width, so BudgetRecall.observe's own residency re-check at :57 sees a bank

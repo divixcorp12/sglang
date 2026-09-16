@@ -738,21 +738,34 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(counters["requested_unique_experts"], 2)
 
     def test_observer_accumulates_metrics_without_host_synchronization(self):
-        manager = self.manager(dynamic=False, log_interval=1000)
-        counts = torch.tensor([[2, 0, 0, 1], [0] * 4, [0, 3, 1, 0]], device="cuda")
-        batch = self.batch(mode=self.mode.DECODE)
-        manager.on_expert_distribution(batch, {"global_physical_count": counts})
-        torch.cuda.synchronize()
-
-        torch.cuda.set_sync_debug_mode("error")
-        try:
+        with tempfile.NamedTemporaryFile() as trace:
+            manager = self.manager(dynamic=False, log_interval=1000, metrics_path=trace.name)
+            counts = torch.tensor([[2, 0, 0, 1], [0] * 4, [0, 3, 1, 0]], device="cuda")
+            batch = self.batch(mode=self.mode.DECODE)
             manager.on_expert_distribution(batch, {"global_physical_count": counts})
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.synchronize()
 
-        statistics = manager.snapshot_route_statistics()["decode"]
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                manager.on_expert_distribution(batch, {"global_physical_count": counts})
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+
+            statistics = manager.snapshot_route_statistics()["decode"]
         self.assertEqual(statistics["popularity"]["2"], [[1, 6.0], [2, 2.0]])
         self.assertEqual(statistics["affinity"]["0->2"], [[0, 1, 12.0], [3, 1, 6.0]])
+
+    def test_no_trace_consumer_skips_dense_route_history_and_affinity(self):
+        manager = self.manager(dynamic=False, log_interval=1000)
+        counts = torch.tensor([[2, 0, 0, 1], [0] * 4, [0, 3, 1, 0]], device="cuda")
+        manager.on_expert_distribution(
+            self.batch(mode=self.mode.DECODE), {"global_physical_count": counts}
+        )
+        registers = manager._registers["decode"]
+        self.assertEqual(registers["popularity"].shape[0], 0)
+        self.assertEqual(registers["affinity"].shape[0], 0)
+        # Lightweight graph/residency accounting remains live independently.
+        self.assertEqual(registers["graph_rows"].shape[0], len(manager.streamers))
 
     def test_zero_budget_ignores_seed_and_inactive_policy(self):
         self.assertIsNone(
@@ -835,6 +848,27 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(row["side_pull_residual_routes"], 3)
         self.assertEqual(row["side_pull_useful_precision"], 0.5)
 
+    def test_graph_side_pull_telemetry_does_not_double_count_covered_demand_h2d(self):
+        """Covered logical demand is replaced by the posted physical pull row."""
+        manager = self.manager(dynamic=False)
+        registers = manager._registers_for("prefill", torch.device("cuda"), 4)
+        # Two distinct logical demand misses; one is covered by the one-row
+        # pull. The ordinary graph ledger initially sees both.
+        registers["graph_rows"][0].copy_(torch.tensor([2, 2], device="cuda"))
+        registers["graph_unique_rows"][0].copy_(torch.tensor([0, 2], device="cuda"))
+        registers["unique_experts"][0] = 2
+        registers["gathers"][0] = 1
+        manager.record_side_pull_delivery(0, "prefill", covered=1, residual=1, wasted=0, posted=1)
+
+        row = manager.snapshot_counters()["prefill"]["0"]
+        streamer = manager.streamers[0]
+        self.assertEqual(row["unique_miss_rows"], 2)  # logical demand remains visible
+        self.assertEqual(row["residual_demand_rows"], 1)
+        self.assertEqual(row["side_pull_rows"], 1)
+        self.assertEqual(row["miss_rows"], 2)  # one residual demand + one pull
+        self.assertEqual(row["h2d_bytes"], streamer.host_bytes_per_expert)
+        self.assertEqual(row["side_pull_h2d_bytes"], streamer.host_bytes_per_expert)
+
     def test_multi_token_overlap_on_predicted_expert_records_one_physical_row(self):
         """``covered`` can exceed 1 on overlap; ``posted`` -- not ``covered + wasted`` -- is the row count.
 
@@ -860,11 +894,10 @@ class TestExpertHotCacheManager(unittest.TestCase):
         `record_side_pull_delivery` stores the latest snapshot and overlays it
         fresh at `snapshot_counters()` time; it never diffs against a prior
         call. This manufactures the smaller read directly with a second call
-        rather than through a real recapture, since nothing in this codebase
-        actually resets the producer's device counters today (see
-        `record_side_pull_delivery`'s docstring) -- the contract under test is
-        that this class's own overlay has no memory of the prior value, which
-        holds regardless of why a later read is smaller.
+        rather than through a capture reset; production clears the contiguous
+        producer bank after warmup. The contract under test is that this
+        class's overlay has no memory of a prior value, which holds regardless
+        of why a later read is smaller.
         """
         manager = self.manager(dynamic=False)
         manager.record_side_pull_delivery(0, "prefill", covered=3, residual=1, wasted=2, posted=5)
@@ -888,12 +921,12 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(row["promotions"], 1)
 
     def test_registered_prefetch_puller_feeds_record_side_pull_delivery_automatically(self):
-        """Stage C4 bullet 2/3: the call site, not just the aggregation contract.
+        """A real in-memory snapshot consumes the registered puller once.
 
         Earlier tests in this class call `record_side_pull_delivery` directly,
-        exercising only the aggregation math. This drives the actual
-        `on_expert_distribution` call site a registered puller must reach,
-        with `posted` -- never `covered + wasted` -- landing in the counters.
+        exercising only the aggregation math. This drives the actual snapshot
+        consumer path a registered puller must reach, with `posted` -- never
+        `covered + wasted` -- landing in the counters.
         """
 
         class _FakeStats:

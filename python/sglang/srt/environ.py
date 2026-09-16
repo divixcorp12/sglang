@@ -446,6 +446,10 @@ class Envs:
     # Keep BudgetRecall enabled by default for compatibility, but let matched
     # performance arms exclude its device work independently of pull telemetry.
     SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL = EnvBool(True)
+    # Serving-only BS1 fp32 candidate selection. When disabled (or when any
+    # recall/calibration/analysis consumer is active), use the reference
+    # stable top-W candidate bank instead.
+    SGLANG_MOE_EXPERT_PREFETCH_FUSED_TOP1 = EnvBool(True)
     # Profiling-only graph-captured score/margin histograms. Timed throughput
     # arms leave this false so the observer has no allocation or device work.
     SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION = EnvBool(False)

@@ -650,6 +650,17 @@ class ExpertStreamer:
             if self._fused_plan_enabled
             else None
         )
+        # The fused planner preserves a router's native int32 ids (or int64
+        # where a model uses them) and writes directly into a stable remap.
+        # Separate buffers avoid a dtype conversion/allocation during replay.
+        self._graph_fused_remaps = (
+            {
+                dtype: torch.empty(max_rows, dtype=dtype, device=device)
+                for dtype in (torch.int32, torch.int64)
+            }
+            if self._fused_plan_enabled
+            else None
+        )
         self.row_planner = ExpertRowPlanner(cache, cache.capacity, max_rows)
         self.row_plan = ExpertRowPlan(
             expert_ids=self._graph_source_rows,
@@ -673,9 +684,14 @@ class ExpertStreamer:
         if self.residency_update is not None:
             self.residency_update.on_graph_forward(topk_ids.shape[0])
         cache = self.hot_cache
-        flat = topk_ids.reshape(-1).long()
-        count = flat.numel()
         expert_to_slot = self.row_planner.expert_to_slot
+        fused = self._fused_plan_enabled and supports_fused_graph_routes(
+            topk_ids, expert_to_slot, self.graph_gather_rows
+        )
+        # The JIT planner supports the router's native IDs.  Its generic
+        # counterpart relies on index_select, which requires int64.
+        flat = topk_ids.reshape(-1) if fused else topk_ids.reshape(-1).long()
+        count = flat.numel()
         prefetch_puller = getattr(self, "prefetch_puller", None)
         # Read before planning, not after: the planner needs the posted prediction to
         # exclude its covered row from the demand-scratch plan (the row-skip this
@@ -689,8 +705,15 @@ class ExpertStreamer:
         prefetch_slot = (
             prefetch_puller.slot_for(self.layer_id) if prefetch_expert is not None else -1
         )
-        fused = self._fused_plan_enabled and supports_fused_graph_routes(
-            topk_ids, expert_to_slot, self.graph_gather_rows
+        prefetch_count = (
+            prefetch_puller.posted_count_for(self.layer_id)
+            if prefetch_expert is not None
+            else None
+        )
+        prefetch_outcomes = (
+            prefetch_puller.outcome_counters_for(self.layer_id)
+            if prefetch_expert is not None
+            else None
         )
         if fused:
             route_counts = (
@@ -711,12 +734,18 @@ class ExpertStreamer:
                 route_counts,
                 prefetch_expert=prefetch_expert,
                 prefetch_slot=prefetch_slot,
+                prefetch_count=prefetch_count,
+                outcome_counters=prefetch_outcomes,
+                remap_out=self._graph_fused_remaps[flat.dtype][:count],
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]
         else:
             plan = self.row_planner.route_plan(
-                flat, prefetch_expert=prefetch_expert, prefetch_slot=prefetch_slot
+                flat,
+                prefetch_expert=prefetch_expert,
+                prefetch_slot=prefetch_slot,
+                prefetch_count=prefetch_count,
             )
             scratch = self._graph_scratch_slots[: plan.source_rows.numel()]
             self.row_planner.fill_routes(plan, self.row_plan)
@@ -732,6 +761,8 @@ class ExpertStreamer:
                 flat_ids=flat,
                 missed_mask=expert_to_slot[flat] < 0,
                 demand_remap=remap,
+                planner_owned=fused,
+                clear_after_join=True,
             )
         calibration = getattr(self, "prefetch_calibration", None)
         if calibration is not None:
@@ -1179,6 +1210,12 @@ class ExpertStreamer:
             raise ValueError("selected expert IDs must be on CUDA")
         if 0 < topk_ids.numel() <= self.graph_gather_rows:
             return self._gather_graph(topk_ids)
+        # A source score can still have forked this target's side pull when an
+        # eager/tail shape falls outside graph-gather support. It is not usable
+        # there, but must join before this state can be reused.
+        prefetch_puller = getattr(self, "prefetch_puller", None)
+        if prefetch_puller is not None:
+            prefetch_puller.join_unsupported_target(self.layer_id)
         if self.before_eager_gather is not None:
             self.before_eager_gather()
         flat_ids = topk_ids.reshape(-1)
