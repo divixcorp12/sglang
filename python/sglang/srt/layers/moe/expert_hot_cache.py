@@ -1066,7 +1066,9 @@ class ExpertHotCacheManager:
         manager._trace_write_condition = threading.Condition()
         manager._trace_sequence = 0
         manager._trace_next_write = 0
-        manager._trace_skipped: set[int] = set()
+        # Inclusive sorted ranges keep a stalled earliest write from retaining
+        # one Python object per later dropped trace.
+        manager._trace_skipped: list[tuple[int, int]] = []
         manager._trace_ready: dict[int, tuple[Path, str]] = {}
         # Completed snapshots may arrive out of order across the fixed telemetry
         # pools.  Bound their host staging too: optional records drop rather
@@ -1896,7 +1898,7 @@ class ExpertHotCacheManager:
 
     def _skip_trace_sequence(self, sequence: int) -> None:
         with self._trace_write_condition:
-            self._trace_skipped.add(sequence)
+            self._mark_trace_sequence_skipped(sequence)
             self._advance_trace_sequence()
             if self._trace_ready and not self._trace_flush_active:
                 self._trace_flush_active = True
@@ -1909,9 +1911,35 @@ class ExpertHotCacheManager:
             self._trace_write_condition.notify_all()
 
     def _advance_trace_sequence(self) -> None:
-        while self._trace_next_write in self._trace_skipped:
-            self._trace_skipped.remove(self._trace_next_write)
-            self._trace_next_write += 1
+        while (
+            self._trace_skipped
+            and self._trace_skipped[0][0] <= self._trace_next_write
+        ):
+            _start, end = self._trace_skipped.pop(0)
+            if end >= self._trace_next_write:
+                self._trace_next_write = end + 1
+
+    def _mark_trace_sequence_skipped(self, sequence: int) -> None:
+        """Add one skipped sequence to the sorted, inclusive skip ranges.
+
+        Callers hold ``_trace_write_condition``.  A completed snapshot can be
+        dropped out of order, so merge both preceding and following ranges.
+        """
+        ranges = self._trace_skipped
+        position = 0
+        while position < len(ranges) and ranges[position][1] + 1 < sequence:
+            position += 1
+        start = end = sequence
+        if position and ranges[position - 1][1] + 1 >= start:
+            start = ranges[position - 1][0]
+            end = max(end, ranges[position - 1][1])
+            position -= 1
+            del ranges[position]
+        while position < len(ranges) and ranges[position][0] <= end + 1:
+            start = min(start, ranges[position][0])
+            end = max(end, ranges[position][1])
+            del ranges[position]
+        ranges.insert(position, (start, end))
 
     def _write_trace_snapshot(
         self, buffers: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]
@@ -1938,7 +1966,7 @@ class ExpertHotCacheManager:
             self._advance_trace_sequence()
             if len(self._trace_ready) >= self._trace_reorder_limit:
                 if sequence != self._trace_next_write:
-                    self._trace_skipped.add(sequence)
+                    self._mark_trace_sequence_skipped(sequence)
                     self._advance_trace_sequence()
                     self._trace_write_condition.notify_all()
                     return
@@ -1946,7 +1974,7 @@ class ExpertHotCacheManager:
                 # the farthest completed record when the reorder buffer fills.
                 evicted = max(self._trace_ready)
                 del self._trace_ready[evicted]
-                self._trace_skipped.add(evicted)
+                self._mark_trace_sequence_skipped(evicted)
             self._trace_ready[sequence] = (metadata["path"], encoded)
             if self._trace_flush_active:
                 return
