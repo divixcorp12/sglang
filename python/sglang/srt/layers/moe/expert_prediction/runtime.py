@@ -365,7 +365,7 @@ class ExpertPredictionRuntime:
             self._metrics_path = None
 
     def close(self) -> None:
-        if self._closed:
+        if getattr(self, "_closed", False):
             return
         self._closed = True
         # A short profiling run may stop before its periodic metrics boundary;
