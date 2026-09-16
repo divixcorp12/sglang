@@ -96,7 +96,7 @@ def paired_session_bootstrap(left: dict, right: dict, *, seed: int = 20260916, r
     deltas = [right["_session_decode_ms"][s] - left["_session_decode_ms"][s] for s in sessions]
     generator = random.Random(seed)
     samples = [statistics.mean(generator.choices(deltas, k=len(deltas))) for _ in range(resamples)]
-    return [_percentile(samples, 2.5), _percentile(samples, 97.5)]
+    return [round(_percentile(samples, 2.5), 12), round(_percentile(samples, 97.5), 12)]
 
 
 def main() -> None:
