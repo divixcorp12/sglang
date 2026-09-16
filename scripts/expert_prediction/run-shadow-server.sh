@@ -62,9 +62,14 @@ trace_command_argv=()
 trace_config=null
 trace_paths=""
 trace_env=()
+launch_env=(env)
 if [ "$run_kind" = trace ]; then
     # This deliberately parses simple argv tokens only; it never evaluates shell input.
     # Shell quotes, backslashes, and arguments containing whitespace are unsupported.
+    if [[ "$trace_command" == *$'\n'* || "$trace_command" == *$'\r'* ]]; then
+        echo "PREFETCH_TRACE_COMMAND must not contain line breaks" >&2
+        exit 2
+    fi
     read -r -a trace_command_argv <<< "$trace_command"
     if [ "${#trace_command_argv[@]}" -eq 0 ]; then
         echo "PREFETCH_TRACE_COMMAND must contain simple whitespace-separated argv tokens" >&2
@@ -75,6 +80,8 @@ if [ "$run_kind" = trace ]; then
         exit 2
     fi
     trace_command_json=$(printf '%s' "$trace_command" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))')
+else
+    launch_env+=(-u PREFETCH_TRACE_REPORT_PATH)
 fi
 capture_dir=""
 if [ "${CAPTURE:-}" = 1 ]; then
@@ -150,7 +157,7 @@ cd "$worktree"
 commit=$(git rev-parse HEAD)
 write_provenance
 
-exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
+exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock "${launch_env[@]}" \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \
     PYTHONUNBUFFERED=1 \
     TMPDIR="$work/runtime-tmp" \

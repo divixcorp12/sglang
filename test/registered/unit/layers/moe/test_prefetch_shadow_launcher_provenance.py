@@ -156,6 +156,38 @@ def test_trace_mode_rejects_shell_quoted_wrapper_even_for_provenance_only(tmp_pa
     assert "simple whitespace-separated argv tokens" in result.stderr
 
 
+def test_trace_mode_rejects_multiline_wrapper_before_tokenization(tmp_path):
+    """A manifest must never describe wrapper text that the launcher ignores."""
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "multiline-trace-command", "7999", "off"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUN_KIND": "trace",
+            "PREFETCH_TRACE_COMMAND": "nsys profile\nignored-command",
+            "PREFETCH_PROVENANCE_ONLY": "1",
+            "PREFETCH_WORKTREE": str(ROOT),
+            "PREFETCH_RUN_DIR": str(tmp_path / "run"),
+            "MODEL_TOP_K": "10",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "line breaks" in result.stderr
+
+
+def test_non_trace_launch_contract_unsets_inherited_trace_report_path():
+    """Timed and profiling launches cannot inherit a caller's trace destination."""
+    launcher = LAUNCHER.read_text()
+
+    assert 'launch_env=(env)' in launcher
+    assert 'launch_env+=(-u PREFETCH_TRACE_REPORT_PATH)' in launcher
+    assert 'exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock "${launch_env[@]}"' in launcher
+
+
 def test_trace_mode_refuses_calibration_even_for_provenance_only(tmp_path):
     """Trace diagnostics must not create calibration artifacts."""
     result = subprocess.run(
