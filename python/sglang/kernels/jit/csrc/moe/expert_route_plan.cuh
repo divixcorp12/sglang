@@ -53,15 +53,24 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
   const unsigned active_mask = __ballot_sync(0xffffffffu, active);
   const unsigned hit_mask = __ballot_sync(0xffffffffu, hot_hit);
   const unsigned miss_mask = __ballot_sync(0xffffffffu, residual);
+  const unsigned prefetched_mask = __ballot_sync(0xffffffffu, prefetched);
   const unsigned earlier = (1u << lane) - 1u;
   const unsigned rank = __popc(miss_mask & earlier);
-  const unsigned total = __popc(miss_mask);
+  // `residual_copy_rows`: nonresident routes not covered by prefetch, the
+  // scratch-row count the copy backend actually reads. `demand_misses`:
+  // every nonresident route, prefetch-covered ones included; it only equals
+  // `residual_copy_rows` because Stage A's prefetch is permanently
+  // disabled (`prefetched_mask` is always zero), and the two must stay
+  // distinct so a later stage can wire prefetch in without relabeling a
+  // covered miss as a hot-cache hit.
+  const unsigned residual_copy_rows = __popc(miss_mask);
+  const unsigned demand_misses = __popc(miss_mask | prefetched_mask);
 
   if (active) {
     const int32_t destination = hot_hit
                                      ? static_cast<int32_t>(slot)
                                      : (prefetched ? prefetch_slot : scratch_base + static_cast<int32_t>(rank));
-    const unsigned dest_pos = residual ? rank : (total + lane - rank);
+    const unsigned dest_pos = residual ? rank : (residual_copy_rows + lane - rank);
     source_rows_out[dest_pos] = expert;
     slots_out[dest_pos] = destination;
     remap_out[lane] = static_cast<RemapT>(destination);
@@ -71,16 +80,16 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
   }
 
   if (lane == 0) {
-    count_out[0] = static_cast<int32_t>(total);
+    count_out[0] = static_cast<int32_t>(residual_copy_rows);
     if (graph_counters != nullptr) {
       auto* counters = reinterpret_cast<unsigned long long*>(graph_counters);
       atomicAdd(counters, static_cast<unsigned long long>(__popc(active_mask)));
-      atomicAdd(counters + 1, static_cast<unsigned long long>(total));
+      atomicAdd(counters + 1, static_cast<unsigned long long>(demand_misses));
     }
     if (graph_unique_counters != nullptr) {
       auto* unique_counters = reinterpret_cast<unsigned long long*>(graph_unique_counters);
       atomicAdd(unique_counters, static_cast<unsigned long long>(__popc(hit_mask)));
-      atomicAdd(unique_counters + 1, static_cast<unsigned long long>(total));
+      atomicAdd(unique_counters + 1, static_cast<unsigned long long>(demand_misses));
     }
   }
 }

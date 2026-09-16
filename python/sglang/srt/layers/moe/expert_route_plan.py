@@ -86,21 +86,27 @@ def plan_graph_routes(
 
 
 def supports_fused_graph_routes(
-    flat: torch.Tensor, expert_to_slot: torch.Tensor, scratch_rows: int
+    topk_ids: torch.Tensor, expert_to_slot: torch.Tensor, scratch_rows: int
 ) -> bool:
     """Whether `plan_graph_routes_fused` may serve this gather.
 
     The fused kernel is BS1 and unique-ID only: one warp, one route per lane,
-    no duplicate-ID handling. A caller whose routes may repeat (prefill,
-    speculative verify batches) must keep using `plan_graph_routes`.
+    no duplicate-ID handling. ``graph_gather_rows`` is sized ``tokens *
+    top_k``, so a multi-token call can pass the route-count and scratch
+    checks below while carrying several requests' routes, which may repeat
+    an expert across tokens (``plan_graph_routes`` dedups that; this kernel
+    does not). Requiring exactly one token row (``topk_ids.shape[0] == 1``)
+    is what actually guarantees unique IDs here: one token's own top-k routes
+    are always distinct.
     """
     return (
-        flat.is_cuda
-        and flat.ndim == 1
-        and 0 < flat.numel() <= FUSED_MAX_ROUTES
-        and flat.numel() <= scratch_rows
+        topk_ids.is_cuda
+        and topk_ids.ndim >= 1
+        and topk_ids.shape[0] == 1
+        and 0 < topk_ids.numel() <= FUSED_MAX_ROUTES
+        and topk_ids.numel() <= scratch_rows
         and expert_to_slot.dtype == torch.int64
-        and expert_to_slot.device == flat.device
+        and expert_to_slot.device == topk_ids.device
     )
 
 

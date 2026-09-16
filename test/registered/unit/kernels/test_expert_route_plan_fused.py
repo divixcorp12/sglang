@@ -89,6 +89,19 @@ def run_fused_case(
     )
 
 
+def _expected_slots(ids: torch.Tensor, oracle: SimpleNamespace) -> torch.Tensor:
+    """The destination each compacted `oracle.source_rows` position should hold.
+
+    IDs are unique, so each compacted position corresponds to exactly one
+    original route; that route's `remap` value is the destination the fused
+    kernel's `slots_out` must carry at that position.
+    """
+    match = ids.unsqueeze(1) == oracle.source_rows.unsqueeze(0)
+    assert bool((match.sum(dim=0) == 1).all())
+    origin = match.float().argmax(dim=0)
+    return oracle.remap[origin]
+
+
 def assert_matches_reference(
     ids: torch.Tensor, resident: list[int], scratch_base: int
 ) -> SimpleNamespace:
@@ -98,6 +111,7 @@ def assert_matches_reference(
 
     torch.testing.assert_close(result.source_rows, oracle.source_rows)
     torch.testing.assert_close(result.remap, oracle.remap)
+    torch.testing.assert_close(result.slots.to(torch.int64), _expected_slots(ids, oracle))
     assert int(result.count.item()) == int(oracle.miss_plan_rows)
     assert int(result.graph_counters[0].item()) == ids.numel()
     assert int(result.graph_counters[1].item()) == int(oracle.routed_miss_rows)
@@ -121,6 +135,7 @@ def test_unique_plan_matches_reference_worked_case():
 
     torch.testing.assert_close(result.source_rows, ids.new_tensor([5, 9, 2, 1]))
     torch.testing.assert_close(result.remap, ids.new_tensor([10, 7, 11, 3]))
+    torch.testing.assert_close(result.slots, ids.new_tensor([10, 11, 7, 3], dtype=torch.int32))
     assert int(result.count.item()) == 2
     torch.testing.assert_close(result.source_rows, oracle.source_rows)
     torch.testing.assert_close(result.remap, oracle.remap)
@@ -206,3 +221,115 @@ def test_planning_reads_no_device_value_on_the_host():
     oracle = plan_graph_routes(ids, expert_to_slot, ids.numel(), 2)
     torch.testing.assert_close(result.source_rows, oracle.source_rows)
     torch.testing.assert_close(result.remap, oracle.remap)
+
+
+def test_route_counts_none_is_accepted():
+    """`route_counts=None` is the normal production shape whenever the layer
+    has no residency policy; it exercises the tvm_ffi Optional<TensorView>
+    binding for an absent tensor, distinct from an absent-but-allocated one."""
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    ids = torch.tensor([5, 2, 9, 1], device="cuda", dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2], expert_to_slot[1] = 7, 3
+    oracle = plan_graph_routes(ids, expert_to_slot, ids.numel(), 10)
+
+    source_rows_out = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+    slots_out = torch.full((4,), -1, dtype=torch.int32, device="cuda")
+    count_out = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    remap_out = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+    prefetch_expert = torch.zeros(1, dtype=torch.int64, device="cuda")
+    prefetch_count = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    plan_unique_routes_cuda(
+        ids,
+        expert_to_slot,
+        10,
+        source_rows_out,
+        slots_out,
+        count_out,
+        remap_out,
+        None,
+        None,
+        None,
+        prefetch_expert,
+        prefetch_count,
+        0,
+    )
+
+    torch.testing.assert_close(source_rows_out, oracle.source_rows)
+    torch.testing.assert_close(remap_out, oracle.remap)
+    assert int(count_out.item()) == int(oracle.miss_plan_rows)
+
+
+def test_fused_plan_captures_and_replays_with_changed_ids():
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    device = "cuda"
+    ids = torch.zeros(4, dtype=torch.int64, device=device)
+    ids.copy_(torch.tensor([5, 2, 9, 1], device=device))
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2], expert_to_slot[1] = 7, 3
+    scratch_base = 10
+
+    source_rows_out = torch.full((4,), -1, dtype=torch.int64, device=device)
+    slots_out = torch.full((4,), -1, dtype=torch.int32, device=device)
+    count_out = torch.full((1,), -1, dtype=torch.int32, device=device)
+    remap_out = torch.full((4,), -1, dtype=torch.int64, device=device)
+    graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
+    graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
+    route_counts = torch.zeros(expert_to_slot.numel(), dtype=torch.float32, device=device)
+    prefetch_expert = torch.zeros(1, dtype=torch.int64, device=device)
+    prefetch_count = torch.zeros(1, dtype=torch.int32, device=device)
+
+    def run():
+        plan_unique_routes_cuda(
+            ids,
+            expert_to_slot,
+            scratch_base,
+            source_rows_out,
+            slots_out,
+            count_out,
+            remap_out,
+            graph_counters,
+            graph_unique_counters,
+            route_counts,
+            prefetch_expert,
+            prefetch_count,
+            0,
+        )
+
+    run()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for replay_ids in ([9, 1, 5, 2], [0, 31, 4, 5], [2, 7, 5, 9]):
+        ids.copy_(torch.tensor(replay_ids, device=device, dtype=torch.int64))
+        graph_counters.zero_()
+        graph_unique_counters.zero_()
+        route_counts.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        oracle = plan_graph_routes(ids, expert_to_slot, ids.numel(), scratch_base)
+        torch.testing.assert_close(source_rows_out, oracle.source_rows)
+        torch.testing.assert_close(remap_out, oracle.remap)
+        assert int(count_out.item()) == int(oracle.miss_plan_rows)
+        assert int(graph_counters[1].item()) == int(oracle.routed_miss_rows)
+        assert int(graph_unique_counters[1].item()) == int(oracle.unique_miss_rows)
+
+
+def test_gate_refuses_multi_token_calls_even_when_shape_would_otherwise_qualify():
+    from sglang.srt.layers.moe.expert_route_plan import supports_fused_graph_routes
+
+    expert_to_slot = _expert_to_slot([1, 6])
+    single_token = torch.tensor([[1, 2, 2, 6]], device="cuda", dtype=torch.int64)
+    multi_token = torch.tensor(
+        [[1, 2, 2, 6], [3, 4, 4, 5]], device="cuda", dtype=torch.int64
+    )
+
+    assert supports_fused_graph_routes(single_token, expert_to_slot, scratch_rows=8)
+    assert not supports_fused_graph_routes(multi_token, expert_to_slot, scratch_rows=8)
