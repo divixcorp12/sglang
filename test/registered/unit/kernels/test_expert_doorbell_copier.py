@@ -23,6 +23,8 @@ pytestmark = pytest.mark.skipif(
 
 CAPACITY = 200
 SPIN_CORE = int(os.environ.get("DOORBELL_SPIN_CORE", "71"))
+PRIME_IN_TESTS = os.environ.get("DOORBELL_TEST_UNPRIMED") != "1"
+PRIME_SKIPS = 1 if PRIME_IN_TESTS else 0
 STALL_TIMEOUT_POLLS = 20_000
 
 EXPERT_LIKE_SHAPES = (
@@ -87,12 +89,21 @@ def _pick(generator, source_count, slot_count, rows):
 
 
 def _copier(sources, destinations, capacity=CAPACITY, **kwargs):
+    """A copier over ``sources`` -> ``destinations``, primed as serving primes it unless
+    ``prime_slot`` is passed explicitly or DOORBELL_TEST_UNPRIMED=1. A default prime writes the
+    last destination slot, which is zeroed again before the copier is returned."""
     from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
     from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
 
     kwargs.setdefault("cpu_core", SPIN_CORE)
     kwargs.setdefault("stream", torch.cuda.Stream())
-    return ExpertDoorbellCopier(expert_row_segments(list(zip(sources, destinations))), capacity, **kwargs)
+    default_prime = "prime_slot" not in kwargs
+    if default_prime:
+        kwargs["prime_slot"] = min(d.shape[0] for d in destinations) - 1 if PRIME_IN_TESTS else None
+    copier = ExpertDoorbellCopier(expert_row_segments(list(zip(sources, destinations))), capacity, **kwargs)
+    if default_prime and PRIME_IN_TESTS:
+        _zero(destinations)
+    return copier
 
 
 def _load_plan(plan, rows, slots):
@@ -570,33 +581,70 @@ def test_stalled_thread_times_out_and_falls_back_with_correct_bytes():
             torch.cuda.synchronize()
             _assert_matches_reference(sources, destinations, picked_rows, picked_slots)
         recovered = copier.stats()
-    assert recovered["skipped_abandoned"] == 5
+    assert recovered["skipped_abandoned"] == 5 + PRIME_SKIPS
     assert recovered["serviced"] == stats["serviced"] + 3
     assert recovered["timeouts"] == stats["timeouts"]
     assert recovered["degraded"] == 0
+
+
+def _wait_for_claim(copier, deadline_s=30.0):
+    """Block until the thread has written the latest posted sequence into the page's claimed word.
+
+    Waiting on the claim makes "the thread claimed the request before the wait timed out" a
+    precondition instead of a race the thread has to win within the wait's poll budget."""
+    posted = int(copier.stats()["posted"]) & 0xFFFFFFFF
+    claimed_word = copier.page[4:8].view(torch.int32)
+    deadline = time.perf_counter() + deadline_s
+    while time.perf_counter() < deadline:
+        claimed = int(claimed_word.item()) & 0xFFFFFFFF
+        if claimed == posted:
+            return
+        time.sleep(0.0005)
+    raise AssertionError(
+        f"the doorbell thread did not claim sequence {posted} within {deadline_s} s "
+        f"(claimed word {int(claimed_word.item()) & 0xFFFFFFFF}); the drain precondition never held"
+    )
 
 
 def test_timed_out_wait_drains_a_claimed_request_until_its_copies_land():
     """A request the thread claimed before its wait timed out is drained, not copied again: the
     wait returns only after the thread's delayed copies landed, so nothing lands after it.
 
-    The thread copies on a torch-created stream, as serving does: copies queued on a stream the
-    thread created are held back until the running drain chunk ends."""
+    The test waits for the thread's claim before calling wait(), so the drain path is exercised
+    whatever the CPU scheduling. The thread copies on a torch-created stream, as serving does.
+
+    The copy is held 60 ms after the claim against a 524,288-poll drain (134-142 ms at 256-270 ns
+    per poll, the serving drain budget), so the drain must see it land. The copier is primed as
+    serving primes it (``_copier``); an unprimed process stalls this overlap until the drain runs
+    out (E34), which DOORBELL_TEST_UNPRIMED=1 shows as a failure here.
+
+    This is where the positive recovery property lives, because this is the path that can deliver
+    it. Measured on divix01 (E35i): the copy is enqueued 60.002 ms after the wait starts, i.e.
+    ~55 ms AFTER the drain kernel went resident (the drain becomes resident 5.12-5.40 ms in, at
+    20,000 polls), and it completes in 6 MICROSECONDS with the drain still spinning; nsys (E35j)
+    shows two copies executing inside this arm's drain window on the copier's own stream while the
+    drain kernel occupies stream 7. The graph-gather path cannot do this at any budget -- see
+    test_doorbell_drain_on_this_path_ends_at_its_budget_and_never_recovers_the_copy -- so asserting
+    recovery there is a test that cannot pass, and it is asserted here instead.
+
+    Red: raising service_delay_s above the drain budget, or running under DOORBELL_TEST_UNPRIMED=1,
+    turns drain_timeouts to 1 and delivered to 0 and fails these assertions."""
     generator = torch.Generator().manual_seed(37)
     sources = _sources(20, EXPERT_LIKE_SHAPES, generator)
     destinations = _destinations(sources, 20)
-    rows, slots = _pick(generator, 20, 20, 7)
+    rows, slots = _pick(generator, 20, 19, 7)
     with _copier(
         sources,
         destinations,
         capacity=8,
         timeout_polls=STALL_TIMEOUT_POLLS,
-        drain_polls=400_000_000,
+        drain_polls=524_288,
         stream=torch.cuda.Stream(),
     ) as copier:
-        copier.inject_fault(service_delay_s=1.0)
+        copier.inject_fault(service_delay_s=0.06)
         copier.post(*_plan(8, rows, slots))
         torch.cuda.synchronize()
+        _wait_for_claim(copier)
         started = time.perf_counter()
         copier.wait()
         torch.cuda.synchronize()
@@ -605,16 +653,15 @@ def test_timed_out_wait_drains_a_claimed_request_until_its_copies_land():
         delivered = int(copier.delivered[0].item())
         _assert_matches_reference(sources, destinations, rows, slots)
         _zero(destinations)
-        time.sleep(1.5)
+        time.sleep(0.3)
         torch.cuda.synchronize()
         landed_after = [int(destination.view(torch.uint8).count_nonzero()) for destination in destinations]
     assert stats["timeouts"] == 1
     assert stats["drains"] == 1
-    assert stats["drain_timeouts"] == 0
+    assert stats["drain_timeouts"] == 0, (stats, elapsed)
     assert stats["disabled"] == 0
     assert delivered == 1
     assert stats["done"] >= stats["posted"]
-    assert elapsed >= 0.8
     assert landed_after == [0] * len(destinations)
 
 
@@ -770,6 +817,7 @@ def test_resolving_an_earlier_tag_does_not_wait_for_a_later_tags_request():
 
 _FAIL_STOP_CHILD = """
 import sys
+import time
 import torch
 from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
 from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
@@ -792,16 +840,25 @@ slots = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda")
 count = torch.tensor([2], dtype=torch.int32, device="cuda")
 copier.post(rows, slots, count)
 print("POSTED", flush=True)
+claimed_word = copier.page[4:8].view(torch.int32)
+deadline = time.perf_counter() + 30.0
+while int(claimed_word.item()) != 1:
+    if time.perf_counter() > deadline:
+        raise AssertionError("the doorbell thread never claimed the request; the drain precondition never held")
+    time.sleep(0.0005)
 copier.resolve()
 torch.cuda.synchronize()
-print("RETURNED", copier.stats(), flush=True)
+print("RETURNED", flush=True)
+copier.fail_stop_check()
+print("CHECKED", copier.stats(), flush=True)
 """
 
 
 def test_a_disabled_drain_that_outlives_the_fatal_wait_aborts_the_process():
-    """Fail-stop: a committed copy stuck past the drain budget disables the copier, and if it
-    still has not landed after the fatal wait the watchdog aborts the process with an ERROR
-    instead of hanging the resolve or returning before the copy lands."""
+    """Fail-stop: a committed copy stuck past the drain budget disables the copier and resolves
+    undelivered at once, and the host fail-stop check that must run before the next forward holds
+    until the copy lands; if it has not landed after the fatal wait the watchdog aborts the
+    process with an ERROR instead of letting the next forward run or hanging it."""
     import signal
     import subprocess
     import sys
@@ -814,11 +871,426 @@ def test_a_disabled_drain_that_outlives_the_fatal_wait_aborts_the_process():
         timeout=120,
     )
     elapsed = time.perf_counter() - started
-    assert "POSTED" in child.stdout, child.stderr[-2000:]
-    assert "RETURNED" not in child.stdout, child.stdout
+    assert "RETURNED" in child.stdout, (child.stdout[-2000:], child.stderr[-2000:])
+    assert "CHECKED" not in child.stdout, child.stdout
     assert child.returncode == -signal.SIGABRT, (child.returncode, child.stderr[-2000:])
     assert "ERROR expert doorbell" in child.stderr, child.stderr[-2000:]
     assert elapsed < 60.0
+
+
+_COLD_LAUNCH_DURING_DRAIN_CHILD = """
+import json
+import sys
+import time
+import torch
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+core = int(sys.argv[1])
+TIMEOUT_POLLS = 20_000
+DRAIN_POLLS = 524_288
+CALIBRATION_POLLS = 2_000_000
+source = torch.randint(0, 256, (8, 64), dtype=torch.uint8).pin_memory()
+destination = torch.zeros((8, 64), dtype=torch.uint8, device="cuda")
+rows = torch.tensor([1, 2, 0, 0], dtype=torch.int64, device="cuda")
+slots = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda")
+count = torch.tensor([2], dtype=torch.int32, device="cuda")
+
+with ExpertDoorbellCopier(
+    expert_row_segments([(source, destination)]), 4, cpu_core=core, stream=torch.cuda.Stream(),
+    timeout_polls=CALIBRATION_POLLS, drain_polls=DRAIN_POLLS, fatal_wait_s=30.0,
+) as calibration:
+    calibration.pause()
+    calibration.post(rows, slots, count)
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    calibration.resolve()
+    torch.cuda.synchronize()
+    poll_s = (time.perf_counter() - started) / CALIBRATION_POLLS
+    calibration.resume()
+
+copier = ExpertDoorbellCopier(
+    expert_row_segments([(source, destination)]), 4, cpu_core=core, stream=torch.cuda.Stream(),
+    timeout_polls=TIMEOUT_POLLS, drain_polls=DRAIN_POLLS, fatal_wait_s=5.0,
+)
+for _ in range(2):
+    copier.post(rows, slots, count)
+    copier.wait()
+    torch.cuda.synchronize()
+destination.zero_()
+torch.cuda.synchronize()
+left = torch.empty(5, dtype=torch.int16, device="cuda")
+right = torch.empty(5, dtype=torch.int16, device="cuda")
+out = torch.empty(5, dtype=torch.int16, device="cuda")
+copier.inject_fault(service_delay_s=1.0)
+copier.post(rows, slots, count)
+torch.cuda.synchronize()
+claimed_word = copier.page[4:8].view(torch.int32)
+posted = int(copier.stats()["posted"]) & 0xFFFFFFFF
+deadline = time.perf_counter() + 30.0
+while time.perf_counter() < deadline and (int(claimed_word.item()) & 0xFFFFFFFF) != posted:
+    time.sleep(0.0005)
+print("CLAIMED", flush=True)
+copier.wait()
+time.sleep(0.05)
+launch_started = time.perf_counter()
+torch.bitwise_xor(left, right, out=out)
+launch_s = time.perf_counter() - launch_started
+torch.cuda.synchronize()
+time.sleep(1.5)
+torch.cuda.synchronize()
+bytes_ok = bool(torch.equal(destination[3:5].cpu(), source[1:3]))
+print("RESULT", json.dumps({
+    "poll_s": poll_s, "launch_s": launch_s, "timeout_polls": TIMEOUT_POLLS, "drain_polls": DRAIN_POLLS,
+    "bytes_ok": bytes_ok, "stats": copier.stats(),
+}), flush=True)
+copier.stop()
+"""
+
+
+def test_a_cold_launch_during_a_drain_returns_within_the_queued_wait_bound():
+    """A never-launched kernel's launch blocks until all queued device work finishes, and the
+    thread's copy call blocks with it (E34, E34f). A drain running into such a launch must end
+    within its own bounded budget, fall back in-graph with correct bytes, and not abort the
+    process when the held copy lands afterwards, instead of waiting for a copy that cannot land
+    until the drain and an in-kernel fatal poll give up.
+
+    Bound: the whole queued wait is at most timeout_polls + drain_polls polls, at the poll cost
+    the child measures on this GPU; x1.25 for poll jitter, plus 0.5 s, which is 13x the largest
+    first-launch cost measured on an idle device (37 ms, E34f)."""
+    import json
+    import subprocess
+    import sys
+
+    child = subprocess.run(
+        [sys.executable, "-c", _COLD_LAUNCH_DURING_DRAIN_CHILD, str(SPIN_CORE)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert child.returncode == 0, (child.returncode, child.stdout[-2000:], child.stderr[-2000:])
+    result = json.loads(child.stdout.split("RESULT", 1)[1].strip().splitlines()[0])
+    bound_s = (result["timeout_polls"] + result["drain_polls"]) * result["poll_s"] * 1.25 + 0.5
+    assert result["launch_s"] <= bound_s, (result, bound_s)
+    assert result["bytes_ok"], result
+    assert result["stats"]["drain_timeouts"] == 1, result
+    assert "ERROR expert doorbell: request" not in child.stderr, child.stderr[-2000:]
+
+
+_LATE_LANDING_CHILD = """
+import json
+import sys
+import time
+import torch
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+core = int(sys.argv[1])
+source = torch.randint(0, 256, (8, 64), dtype=torch.uint8).pin_memory()
+destination = torch.zeros((8, 64), dtype=torch.uint8, device="cuda")
+copier = ExpertDoorbellCopier(
+    expert_row_segments([(source, destination)]), 4, cpu_core=core, stream=torch.cuda.Stream(),
+    timeout_polls=20_000, drain_polls=70_000, fatal_wait_s=5.0,
+)
+rows = torch.tensor([1, 2, 0, 0], dtype=torch.int64, device="cuda")
+slots = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda")
+count = torch.tensor([2], dtype=torch.int32, device="cuda")
+copier.post(rows, slots, count)
+copier.wait()
+torch.cuda.synchronize()
+destination.zero_()
+torch.cuda.synchronize()
+copier.inject_fault(service_delay_s=1.0)
+copier.post(rows, slots, count)
+torch.cuda.synchronize()
+claimed_word = copier.page[4:8].view(torch.int32)
+posted = int(copier.stats()["posted"]) & 0xFFFFFFFF
+deadline = time.perf_counter() + 30.0
+while time.perf_counter() < deadline and (int(claimed_word.item()) & 0xFFFFFFFF) != posted:
+    time.sleep(0.0005)
+started = time.perf_counter()
+copier.wait()
+torch.cuda.synchronize()
+resolved_s = time.perf_counter() - started
+fallback_ok = bool(torch.equal(destination[3:5].cpu(), source[1:3]))
+time.sleep(2.5)
+torch.cuda.synchronize()
+landed_ok = bool(torch.equal(destination[3:5].cpu(), source[1:3]))
+print("RESULT", json.dumps({
+    "resolved_s": resolved_s, "fallback_ok": fallback_ok, "landed_ok": landed_ok,
+    "delivered": int(copier.delivered[0].item()), "stats": copier.stats(),
+}), flush=True)
+copier.stop()
+"""
+
+
+def test_a_drain_that_runs_out_resolves_undelivered_at_once_and_a_late_landing_does_not_abort():
+    """A claimed copy still in flight when the drain budget runs out: the resolve returns at once
+    with the request undelivered and the copier disabled, the in-graph fallback writes the
+    planned bytes, and the thread's copy landing later (well inside the fatal wait) clears the
+    fail-stop without aborting the process. No resolve waits in the kernel for the fatal wait.
+
+    resolved_s < 0.8: the thread's copy is held for 1.0 s, and the timeout plus drain budgets are
+    90,000 polls, 23-93 ms at 256-1,028 ns per poll."""
+    import json
+    import subprocess
+    import sys
+
+    child = subprocess.run(
+        [sys.executable, "-c", _LATE_LANDING_CHILD, str(SPIN_CORE)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert child.returncode == 0, (child.returncode, child.stdout[-2000:], child.stderr[-2000:])
+    result = json.loads(child.stdout.split("RESULT", 1)[1].strip().splitlines()[0])
+    assert result["resolved_s"] < 0.8, result
+    assert result["delivered"] == 0, result
+    assert result["fallback_ok"] and result["landed_ok"], result
+    assert result["stats"]["drain_timeouts"] == 1, result
+    assert result["stats"]["disabled"] == 1, result
+    assert "ERROR expert doorbell: request" not in child.stderr, child.stderr[-2000:]
+
+
+_TWO_EXHAUSTED_DRAINS_CHILD = """
+import json
+import sys
+import time
+import torch
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+
+core = int(sys.argv[1])
+second_landing_s = float(sys.argv[2])
+fatal_wait_s = float(sys.argv[3])
+resolve_order = (0, 1) if sys.argv[4] == "ascending" else (1, 0)
+source = torch.randint(0, 256, (8, 64), dtype=torch.uint8).pin_memory()
+destination = torch.zeros((8, 64), dtype=torch.uint8, device="cuda")
+copier = ExpertDoorbellCopier(
+    expert_row_segments([(source, destination)]), 4, max_tags=2, cpu_core=core, stream=torch.cuda.Stream(),
+    timeout_polls=20_000, drain_polls=70_000, fatal_wait_s=fatal_wait_s, prime_slot=0,
+)
+plans = {
+    0: (torch.tensor([1, 2, 0, 0], dtype=torch.int64, device="cuda"),
+        torch.tensor([3, 4, 0, 0], dtype=torch.int32, device="cuda"),
+        torch.tensor([2], dtype=torch.int32, device="cuda")),
+    1: (torch.tensor([5, 6, 0, 0], dtype=torch.int64, device="cuda"),
+        torch.tensor([6, 7, 0, 0], dtype=torch.int32, device="cuda"),
+        torch.tensor([2], dtype=torch.int32, device="cuda")),
+}
+for tag in (0, 1):
+    copier.post(*plans[tag], tag=tag)
+    copier.wait(tag=tag)
+    torch.cuda.synchronize()
+destination.zero_()
+torch.cuda.synchronize()
+copier.inject_fault(defer_landing_s=(1.0, second_landing_s))
+for tag in (0, 1):
+    copier.post(*plans[tag], tag=tag)
+torch.cuda.synchronize()
+claimed_word = copier.page[4:8].view(torch.int32)
+posted = int(copier.stats()["posted"]) & 0xFFFFFFFF
+deadline = time.perf_counter() + 30.0
+while time.perf_counter() < deadline and (int(claimed_word.item()) & 0xFFFFFFFF) != posted:
+    time.sleep(0.0005)
+claimed_at = time.perf_counter()
+# Both resolve orders matter. Descending (tag 1 first) makes the LAST drain to run out carry the
+# LOWER sequence, so a fatal word holding the latest sequence would wait only for the first
+# landing; ascending makes the FIRST one carry the lower sequence, so a fatal word that keeps the
+# sequence it saw first would do the same. Only "highest sequence wins" passes both.
+for tag in resolve_order:
+    copier.wait(tag=tag)
+torch.cuda.synchronize()
+resolved_s = time.perf_counter() - claimed_at
+delivered = copier.delivered.cpu().tolist()
+fatal_word = int(copier.page[12:16].view(torch.int32).item()) & 0xFFFFFFFF
+print("RESOLVED", json.dumps({"resolved_s": resolved_s, "delivered": delivered, "fatal_word": fatal_word, "posted": posted}), flush=True)
+waited_s = copier.fail_stop_check()
+checked_s = time.perf_counter() - claimed_at
+completed_seq = copier.completed_seq()
+bytes_ok = bool(torch.equal(destination[3:5].cpu(), source[1:3]) and torch.equal(destination[6:8].cpu(), source[5:7]))
+fresh = (torch.tensor([7, 0, 0, 0], dtype=torch.int64, device="cuda"),
+         torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda"),
+         torch.tensor([1], dtype=torch.int32, device="cuda"))
+copier.post(*fresh, tag=0)
+copier.wait(tag=0)
+torch.cuda.synchronize()
+fresh_ok = bool(torch.equal(destination[0:1].cpu(), source[7:8]))
+print("CHECKED", json.dumps({
+    "waited_s": waited_s, "checked_s": checked_s, "completed_seq": completed_seq, "bytes_ok": bytes_ok,
+    "fresh_ok": fresh_ok, "stats": copier.stats(),
+}), flush=True)
+copier.stop()
+"""
+
+
+def _run_two_exhausted_drains(second_landing_s, fatal_wait_s, resolve_order="descending"):
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _TWO_EXHAUSTED_DRAINS_CHILD,
+            str(SPIN_CORE),
+            str(second_landing_s),
+            str(fatal_wait_s),
+            resolve_order,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _child_json(stdout, label):
+    return __import__("json").loads(stdout.split(label, 1)[1].strip().splitlines()[0])
+
+
+@pytest.mark.parametrize("resolve_order", ["ascending", "descending"])
+def test_two_drains_exhausted_in_one_sequence_hold_the_fail_stop_until_both_late_copies_land(resolve_order):
+    """Two tags' requests are both committed (claimed) before either resolve, and each copy lands
+    only after its drain runs out. Both drains exhaust in the same eager sequence; the fatal word
+    holds the higher sequence, and the host fail-stop check returns only once the thread has
+    completed every committed sequence up to it: after the second landing, not the first. Nothing
+    aborts, both plans' bytes are correct, and a post on the now disabled copier is served in-graph.
+
+    The landings are deferred 1.0 s and 1.5 s after the claim; the timeout plus drain budget is
+    90,000 polls (23-93 ms at 256-1,028 ns per poll), so resolved_s < 0.8 separates a bounded
+    drain from one that waits for a landing, and checked_s >= 1.4 shows the check waited for the
+    second landing."""
+    child = _run_two_exhausted_drains(1.5, 5.0, resolve_order)
+    assert child.returncode == 0, (child.returncode, child.stdout[-2000:], child.stderr[-2000:])
+    resolved = _child_json(child.stdout, "RESOLVED")
+    checked = _child_json(child.stdout, "CHECKED")
+    assert resolved["resolved_s"] < 0.8, resolved
+    assert resolved["delivered"] == [0, 0], resolved
+    assert resolved["fatal_word"] == resolved["posted"], resolved
+    assert 1.4 <= checked["checked_s"] < 5.0, checked
+    assert checked["waited_s"] > 0.0, checked
+    assert checked["completed_seq"] >= resolved["posted"], checked
+    assert checked["bytes_ok"] and checked["fresh_ok"], checked
+    assert checked["stats"]["drain_timeouts"] == 2, checked
+    assert checked["stats"]["disabled"] == 1, checked
+    assert checked["stats"]["disabled_posts"] == 1, checked
+    assert child.stderr.count("ERROR expert doorbell: drain exhausted") == 1, child.stderr[-2000:]
+
+
+def test_a_second_exhausted_drain_whose_copy_never_lands_aborts_after_the_fatal_wait():
+    """The same two exhausted drains, but the second committed copy lands 30 s after its claim,
+    past a 2 s fatal wait. The first landing (1.0 s) does not satisfy the fail-stop: the
+    watchdog aborts the process with an ERROR while the host check is still waiting."""
+    import signal
+
+    started = time.perf_counter()
+    child = _run_two_exhausted_drains(30.0, 2.0)
+    elapsed = time.perf_counter() - started
+    assert "RESOLVED" in child.stdout, (child.stdout[-2000:], child.stderr[-2000:])
+    assert "CHECKED" not in child.stdout, child.stdout[-2000:]
+    assert child.returncode == -signal.SIGABRT, (child.returncode, child.stderr[-2000:])
+    assert "did not complete" in child.stderr, child.stderr[-2000:]
+    assert elapsed < 30.0
+
+
+def test_the_fail_stop_check_without_an_exhausted_drain_costs_one_stream_synchronize(monkeypatch):
+    """A step whose resolves all landed reads host words only: the check must not wait, must never
+    synchronize the whole device, and must cost nothing beyond the single current-stream
+    synchronize its caller asked for.
+
+    It deliberately does NOT assert that a step without posts skips the synchronize. A replayed
+    CUDA graph posts from the device without entering Python, so any "did a post run" flag reads
+    False on exactly the steps that posted; a check that skipped the synchronize on that basis
+    would read a stale zero fatal word and return at once, which is the failure the check exists
+    to catch. ``synchronize=True`` therefore always synchronizes, and the property worth pinning
+    is that it is ONE stream synchronize and never a device-wide one.
+
+    Red: restoring the skip (gating the synchronize on a posted-since-check flag) leaves
+    ``synchronizes`` empty for the synchronize=True call and fails the stream assertion below;
+    widening it to torch.cuda.synchronize() records "device" and fails the device assertion."""
+    generator = torch.Generator().manual_seed(97)
+    sources = _sources(20, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 20)
+    rows, slots = _pick(generator, 20, 19, 5)
+    with _copier(sources, destinations, capacity=8) as copier:
+        copier.post(*_plan(8, rows, slots))
+        copier.wait()
+        torch.cuda.synchronize()
+
+        synchronizes = []
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: synchronizes.append("device"))
+        monkeypatch.setattr(torch.cuda.Stream, "synchronize", lambda self: synchronizes.append("stream"))
+        started = time.perf_counter()
+        waited_without_synchronize = copier.fail_stop_check()
+        after_caller_synchronized = list(synchronizes)
+        waited_with_synchronize = copier.fail_stop_check(synchronize=True)
+        elapsed = time.perf_counter() - started
+        monkeypatch.undo()
+        stats = copier.stats()
+    assert "device" not in synchronizes, synchronizes
+    assert after_caller_synchronized == [], after_caller_synchronized
+    assert synchronizes == ["stream"], synchronizes
+    assert waited_without_synchronize == 0.0 and waited_with_synchronize == 0.0
+    assert elapsed < 0.01
+    assert stats["disabled"] == 0 and stats["drain_timeouts"] == 0
+
+
+def test_the_constructor_prime_writes_only_its_slot_and_leaves_serving_state_clean():
+    """The prime is a paused timed-out wait with a one-row residual copy into ``prime_slot``. It
+    must queue no thread copy (the thread, resumed, claims the abandoned prime request and skips
+    it), write nothing but that slot, and leave the resolve counters, degraded and disabled clean,
+    so a later request is serviced normally. The abandoned word is cleared only after the thread
+    consumed the prime request, and the reset keeps the sequence counters."""
+    generator = torch.Generator().manual_seed(101)
+    sources = _sources(20, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 20)
+    with _copier(sources, destinations, capacity=8, prime_slot=19) as copier:
+        torch.cuda.synchronize()
+        primed_mismatch = _reference_mismatch(sources, destinations, [0], [19])
+        primed = copier.stats()
+        prime_seq = int(primed["posted"])
+        prime_row = copier.trace()[-1]
+        abandoned = int(copier.page[16:20].view(torch.int32).item())
+        prime_s = copier.prime_s
+        _zero(destinations)
+        rows, slots = _pick(generator, 20, 19, 6)
+        copier.post(*_plan(8, rows, slots))
+        copier.wait()
+        torch.cuda.synchronize()
+        served_mismatch = _reference_mismatch(sources, destinations, rows, slots)
+        served = copier.stats()
+    assert primed_mismatch is None
+    assert primed["serviced"] == 0 and primed["skipped_abandoned"] == 1
+    assert prime_row["seq"] == prime_seq and prime_row["status"] == "skipped_abandoned", prime_row
+    assert prime_row["bytes"] == 0 or prime_row["enqueued_ns"] != 0, prime_row
+    for name in ("timeouts", "waits", "degraded", "disabled", "drains", "drain_timeouts"):
+        assert primed[name] == 0, (name, primed)
+    assert abandoned == 0
+    assert primed["completed_seq"] == prime_seq and prime_seq == 1, primed
+    assert 0.0 < prime_s < 5.0
+    assert served_mismatch is None
+    assert served["serviced"] == 1 and served["timeouts"] == 0
+
+
+def test_the_prime_request_is_never_serviced_by_the_thread():
+    """The prime request must end as skipped_abandoned and never be copied by the thread, however
+    long after construction: a thread copy of it could land on its slot at any later time, for
+    example during capture. Checked after a pause long enough for a resumed thread to have
+    serviced it had its abandoned word been cleared before the thread consumed it."""
+    generator = torch.Generator().manual_seed(103)
+    sources = _sources(20, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 20)
+    with _copier(sources, destinations, capacity=8, prime_slot=19) as copier:
+        time.sleep(0.2)
+        torch.cuda.synchronize()
+        stats = copier.stats()
+        mismatch = _reference_mismatch(sources, destinations, [0], [19])
+        statuses = [row["status"] for row in copier.trace()]
+    assert stats["serviced"] == 0, stats
+    assert stats["skipped_abandoned"] == 1, stats
+    assert stats["copy_errors"] == 0, stats
+    assert statuses == ["skipped_abandoned"], statuses
+    assert mismatch is None
 
 
 _EXIT_WITH_LIVE_COPIER_CHILD = """
@@ -898,9 +1370,13 @@ def child(mode, core, err_path, ready):
     if mode == "sigterm_fatal_wait":
         copier.inject_fault(service_delay_s=120.0)
         copier.post(rows, slots, count)
-        ready.set()
+        claimed_word = copier.page[4:8].view(torch.int32)
+        while int(claimed_word.item()) != 1:
+            time.sleep(0.0005)
         copier.resolve()
         torch.cuda.synchronize()
+        ready.set()
+        copier.fail_stop_check()
         return
     copier.post(rows, slots, count)
     copier.wait()
@@ -941,7 +1417,8 @@ if __name__ == "__main__":
 def test_a_scheduler_like_process_with_a_live_copier_exits_cleanly(mode, tmp_path):
     """Mirror the sglang scheduler process: a spawned child that set PDEATHSIG and installs no
     SIGTERM handler runs a live copier, then either returns from its target (the ShutdownReq
-    path), or is sent SIGTERM while idle or while a disabled drain is in its fatal wait. It must
+    path), or is sent SIGTERM while idle or while its fail-stop check waits for a committed copy a
+    disabled drain gave up on. It must
     exit within 10 s with no "terminate called" (a joinable thread destroyed at teardown, which
     left production's scheduler stuck in the driver)."""
     import re
@@ -985,6 +1462,95 @@ def test_stop_drains_posted_requests_and_is_idempotent():
         _assert_matches_reference(sources, destinations, rows, slots)
         with pytest.raises(RuntimeError, match="stopped"):
             copier.post(*_plan(12, rows, slots))
+
+
+def test_the_exit_hook_stops_every_copier_without_a_device_sync(monkeypatch):
+    """The exit hook also runs after a scheduler exception, where the device may be wedged. With
+    a synchronize that raises, it must still stop every live copier, and the thread's own drain
+    must still land the requests already posted."""
+    from sglang.kernels.ops.moe import expert_doorbell
+
+    generator = torch.Generator().manual_seed(43)
+    sources = _sources(30, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 30)
+    rows, slots = _pick(generator, 30, 30, 12)
+    copiers = [_copier(sources, destinations, capacity=12) for _ in range(2)]
+    for copier in copiers:
+        copier.post(*_plan(12, rows, slots))
+    torch.cuda.synchronize()
+
+    def wedged_synchronize(*args, **kwargs):
+        raise RuntimeError("wedged device")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", wedged_synchronize)
+    expert_doorbell._stop_live_copiers()
+    monkeypatch.undo()
+    assert [copier.stats()["running"] for copier in copiers] == [0, 0]
+    _assert_matches_reference(sources, destinations, rows, slots)
+
+
+def _scheduler_stub(expert_hot_cache_manager):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    return SimpleNamespace(
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(expert_hot_cache_manager=expert_hot_cache_manager)
+        ),
+        hisparse_coordinator=None,
+        tree_cache=MagicMock(),
+        decode_offload_manager=None,
+    )
+
+
+def _release_scheduler_host_resources(stub):
+    from unittest.mock import patch
+
+    from sglang.srt.managers import scheduler as scheduler_module
+
+    with (
+        patch.object(scheduler_module, "destroy_global_experts_capturer"),
+        patch.object(scheduler_module, "destroy_global_indexer_capturer"),
+        patch.object(scheduler_module, "rank_consensus_checker"),
+    ):
+        scheduler_module.Scheduler.release_host_resources(stub)
+
+
+def test_scheduler_shutdown_stops_the_doorbell_through_the_model_runner():
+    """The graceful scheduler shutdown reaches the copier through
+    tp_worker.model_runner.expert_hot_cache_manager and the manager's own stop_doorbell."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+
+    generator = torch.Generator().manual_seed(47)
+    sources = _sources(30, EXPERT_LIKE_SHAPES, generator)
+    destinations = _destinations(sources, 30)
+    rows, slots = _pick(generator, 30, 30, 12)
+    copier = _copier(sources, destinations, capacity=12)
+    copier.post(*_plan(12, rows, slots))
+    manager = SimpleNamespace(doorbell=copier)
+    manager.stop_doorbell = lambda: ExpertHotCacheManager.stop_doorbell(manager)
+    stub = _scheduler_stub(manager)
+
+    _release_scheduler_host_resources(stub)
+
+    assert copier.stats()["running"] == 0
+    _assert_matches_reference(sources, destinations, rows, slots)
+    stub.tree_cache.release_host_resources.assert_called_once()
+
+
+def test_a_failing_doorbell_stop_still_releases_the_scheduler_host_resources():
+    from unittest.mock import MagicMock
+
+    manager = MagicMock()
+    manager.stop_doorbell.side_effect = RuntimeError("CUDA error: an illegal memory access")
+    stub = _scheduler_stub(manager)
+
+    _release_scheduler_host_resources(stub)
+
+    manager.stop_doorbell.assert_called_once()
+    stub.tree_cache.release_host_resources.assert_called_once()
 
 
 def test_a_plan_with_rows_outside_a_segment_is_refused_whole_and_resolves_undelivered():

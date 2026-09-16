@@ -633,17 +633,40 @@ class TestExpertGraphGather(unittest.TestCase):
         finally:
             manager.doorbell.stop()
 
-    def test_doorbell_timeout_waits_for_the_copy_the_thread_already_queued(self):
-        """A copy the thread queued after its wait timed out lands before the gather returns.
+    def test_doorbell_drain_on_this_path_ends_at_its_budget_and_never_recovers_the_copy(self):
+        """A drain on the gather path runs its whole budget and resolves undelivered, whatever
+        the copy delay: the copy the thread queued does not land until the drain retires.
 
-        The thread claims the request, then sleeps before queuing its copies, so the wait times
-        out on a claimed request. Returning at the timeout would let the copy land after a later
-        forward wrote the same scratch rows; the gather instead drains until the copy landed and
-        skips the fallback.
+        This is a property of the path, not of the budget. Measured on divix01 (E35g/E35h/E35i/
+        E35j/E35k): the thread returns from cudaMemcpyBatchAsync during the drain (enqueued_ns is
+        set, so this is not the E34 deadlock), the host call costs ~89 us, the copy sits at the
+        head of its own non-blocking stream with nothing queued ahead of it, and nsys shows the
+        copy is absent from the device timeline for the whole drain, first executing 16.8 us AFTER
+        the drain retires. Nothing else is dispatched during the drain either: exactly one GPU row
+        starts inside a 1.024 s window, the drain kernel itself. The hold therefore tracks the
+        drain's RETIREMENT, not the copy delay -- 0.05 s and 1.0 s delays both stall the full
+        budget -- so a larger budget only stalls longer and can never recover the copy.
+
+        The same copier, with the same batch API, the same pinned host-to-device copy, the same
+        kind of private stream and a copy enqueued after the drain is already resident, DOES land
+        mid-drain on the copier path in 6 us: see
+        test_timed_out_wait_drains_a_claimed_request_until_its_copies_land, which is where the
+        positive recovery property lives. Five mechanisms were excluded by measurement (cold
+        launch, copy-engine starvation, CUDA-graph replay, pinnedness/memory kind, and channel
+        multiplexing at CUDA_DEVICE_MAX_CONNECTIONS=32); the cause is unnamed, the behaviour is
+        not.
+
+        The consequence for serving is that a timeout on this path always exhausts the drain and
+        always ends in fail-stop disable. That is what the design already does, and it is why this
+        test asserts the bounded ending rather than a recovery the path cannot deliver.
+
+        Red: asserting drain_timeouts == 0 and delivered == 1 here -- the properties this test
+        carried before -- fails on every budget, which is what re-aimed it.
         """
         model = _streamed_model((21,))
+        budget_polls = 4_000_000
         manager = _manager(
-            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=400_000_000
+            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=budget_polls
         )
         layer = model.get_submodule("0")
         streamer = layer._nvfp4_expert_streamer
@@ -651,7 +674,7 @@ class TestExpertGraphGather(unittest.TestCase):
         resident = sorted(manager.caches[0].resident_experts())
         missing = [e for e in range(EXPERTS) if e not in resident]
         try:
-            copier.inject_fault(service_delay_s=1.0)
+            copier.inject_fault(service_delay_s=0.2)
             ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
             torch.cuda.synchronize()
             started = time.perf_counter()
@@ -661,18 +684,24 @@ class TestExpertGraphGather(unittest.TestCase):
             stats = copier.stats()
             self.assertEqual(stats["timeouts"], 1)
             self.assertEqual(stats["drains"], 1)
-            self.assertEqual(stats["drain_timeouts"], 0)
-            self.assertEqual(int(copier.delivered[0].item()), 1)
-            self.assertGreaterEqual(elapsed, 0.8)
+            self.assertEqual(stats["drain_timeouts"], 1)
+            self.assertEqual(stats["disabled"], 1)
+            self.assertEqual(int(copier.delivered[0].item()), 0)
+            self.assertEqual(stats["copy_errors"], 0)
             self._assert_rows(layer, ids, compact, tensors)
+            self.assertGreaterEqual(stats["last_polls"], budget_polls)
+            self.assertGreater(elapsed, 0.2)
+            manager.doorbell_fail_stop_check()
+            self.assertEqual(copier.stats()["late_completions"], 1)
         finally:
             copier.stop()
 
     def test_doorbell_disables_after_a_drain_runs_out_and_no_late_copy_lands(self):
-        """A drain that runs out disables the copier for good and keeps waiting for the request
-        the thread committed to, so its late copy lands before the gather returns. Later
-        forwards post nothing, serve their different plans into the same scratch rows in-graph,
-        and those rows stay exact after the delayed copy would have landed."""
+        """A drain that runs out disables the copier for good and the gather returns at once,
+        served in-graph with exact rows. The fail-stop check the scheduler runs before the next
+        forward holds until the committed late copy has landed. Later forwards post nothing,
+        serve their different plans into the same scratch rows in-graph, and those rows stay
+        exact."""
         model = _streamed_model((21,))
         manager = _manager(
             model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=70_000
@@ -691,6 +720,8 @@ class TestExpertGraphGather(unittest.TestCase):
             torch.cuda.synchronize()
             first_s = time.perf_counter() - started
             self._assert_rows(layer, ids, compact, tensors)
+            waited_s = manager.doorbell_fail_stop_check()
+            checked_s = time.perf_counter() - started
             disabled = copier.stats()
             copier.inject_fault()
             later_routes = (
@@ -710,7 +741,9 @@ class TestExpertGraphGather(unittest.TestCase):
             self.assertEqual(disabled["drain_timeouts"], 1)
             self.assertEqual(after["posted"], disabled["posted"])
             self.assertEqual(after["disabled_posts"], len(later_routes))
-            self.assertGreaterEqual(first_s, 0.8)
+            self.assertLess(first_s, 0.8)
+            self.assertGreater(waited_s, 0.0)
+            self.assertGreaterEqual(checked_s, 0.8)
         finally:
             copier.stop()
 
