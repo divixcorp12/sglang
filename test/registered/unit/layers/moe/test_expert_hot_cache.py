@@ -101,26 +101,26 @@ class TestTraceWriteOrdering(unittest.TestCase):
         )
         self.assertEqual(manager._trace_next_write, 3)
 
-    def test_stalled_earliest_trace_compresses_later_drops_and_preserves_order(self):
-        """A stalled writer must not retain one bookkeeping entry per later drop."""
+    def test_stalled_trace_caps_disjoint_drop_attempts_and_recovers_in_order(self):
+        """A stalled head bounds later optional telemetry before sequence allocation."""
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 
-        dropped_count = 4096
+        window_limit = 16
+        attempted_drops = 4096
         manager = ExpertHotCacheManager.__new__(ExpertHotCacheManager)
         manager._trace_write_condition = threading.Condition()
-        manager._trace_sequence = dropped_count + 2
+        manager._trace_sequence = 0
         manager._trace_next_write = 0
-        # The production representation keeps inclusive, merged skip ranges.
         manager._trace_skipped = []
         manager._trace_ready = {}
-        manager._trace_reorder_limit = 4
+        manager._trace_reorder_limit = window_limit
         manager._trace_flush_active = False
         manager._trace_drain_thread = None
         manager._trace_counters_from_host = lambda _buffers, _metadata: {}
         manager._trace_routes_from_host = lambda _buffers: {}
         path = _BlockingTracePath()
         metadata = {
-            "sequence": 0,
+            "sequence": manager._reserve_trace_sequence(),
             "timestamp_ns": 1,
             "phase": "prefill",
             "telemetry": {},
@@ -129,39 +129,46 @@ class TestTraceWriteOrdering(unittest.TestCase):
         writing = threading.Thread(
             target=manager._write_trace_snapshot, args=({}, metadata)
         )
-        later_metadata = {
-            **metadata,
-            "sequence": dropped_count + 1,
-            "phase": "decode",
-        }
-        later = None
-
         try:
             writing.start()
             self.assertTrue(path.started.wait(timeout=1))
-            # Drop the contiguous range out of sequence order: the missing
-            # first drop must merge into the already-recorded later range.
-            for sequence in range(2, dropped_count + 1):
-                manager._skip_trace_sequence(sequence)
-            manager._skip_trace_sequence(1)
-            self.assertEqual(manager._trace_skipped, [(1, dropped_count)])
+            # Alternate accepted records and disjoint attempted drops. Once
+            # the ordered window fills behind sequence 0, all remaining
+            # attempts must be discarded before reserving a sequence.
+            for attempted_drop in range(2, attempted_drops * 2 + 1, 2):
+                accepted = manager._reserve_trace_sequence()
+                if accepted is not None:
+                    manager._write_trace_snapshot(
+                        {},
+                        {
+                            **metadata,
+                            "sequence": accepted,
+                            "phase": f"decode-{accepted}",
+                        },
+                    )
+                sequence = manager._reserve_trace_sequence()
+                if sequence is not None:
+                    self.assertEqual(sequence, attempted_drop)
+                    manager._skip_trace_sequence(sequence)
 
-            later = threading.Thread(
-                target=manager._write_trace_snapshot, args=({}, later_metadata)
+            self.assertEqual(manager._trace_sequence, window_limit)
+            self.assertEqual(manager._trace_next_write, 0)
+            self.assertEqual(
+                manager._trace_skipped,
+                [(sequence, sequence) for sequence in range(2, window_limit, 2)],
             )
-            later.start()
+            self.assertEqual(len(manager._trace_ready), window_limit // 2)
         finally:
             path.release.set()
             writing.join(timeout=2)
-            if later is not None:
-                later.join(timeout=2)
 
         self.assertFalse(writing.is_alive())
-        self.assertFalse(later.is_alive())
         self.assertEqual(
-            [json.loads(line)["phase"] for line in path.lines], ["prefill", "decode"]
+            [json.loads(line)["phase"] for line in path.lines],
+            ["prefill"]
+            + [f"decode-{sequence}" for sequence in range(1, window_limit, 2)],
         )
-        self.assertEqual(manager._trace_next_write, dropped_count + 2)
+        self.assertEqual(manager._trace_next_write, window_limit)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

@@ -1878,9 +1878,9 @@ class ExpertHotCacheManager:
                 thread_name="moe-hot-cache-trace",
             )
             self._trace_telemetry[key] = telemetry
-        with self._trace_write_condition:
-            sequence = self._trace_sequence
-            self._trace_sequence += 1
+        sequence = self._reserve_trace_sequence()
+        if sequence is None:
+            return
         if not telemetry.schedule(sources, self._trace_metadata(phase, telemetry, sequence)):
             self._skip_trace_sequence(sequence)
 
@@ -1909,6 +1909,25 @@ class ExpertHotCacheManager:
                 )
                 self._trace_drain_thread.start()
             self._trace_write_condition.notify_all()
+
+    def _reserve_trace_sequence(self) -> int | None:
+        """Reserve one bounded ordered-trace slot, or drop optional telemetry.
+
+        The window includes every accepted sequence after ``_trace_next_write``:
+        device copies still pending, records staged for the writer, and skipped
+        sequence ranges.  Capping it here prevents a blocked earliest write
+        from turning later dropped samples into unbounded skip bookkeeping.
+        """
+        with self._trace_write_condition:
+            self._advance_trace_sequence()
+            if (
+                self._trace_sequence - self._trace_next_write
+                >= self._trace_reorder_limit
+            ):
+                return None
+            sequence = self._trace_sequence
+            self._trace_sequence += 1
+            return sequence
 
     def _advance_trace_sequence(self) -> None:
         while (
