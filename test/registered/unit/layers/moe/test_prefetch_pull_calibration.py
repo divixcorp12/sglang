@@ -240,3 +240,25 @@ def test_pipeline_timing_helper_records_copy_start_after_wait_before_copy():
     with mock.patch.object(module.torch.cuda, "current_stream", return_value="origin"), mock.patch.object(module.torch.cuda, "stream", return_value=Ctx()):
         module.post_target_timed(pipeline, target, start, end, lambda *_: calls.append("copy"))
     assert calls == ["ready", "wait", "start", "copy", "end", "done"]
+
+
+def test_runtime_close_final_flushes_short_profiling_run_once():
+    """A sub-interval profiling run must publish its calibration artifact at teardown."""
+    from sglang.srt.layers.moe.expert_prediction.runtime import ExpertPredictionRuntime
+    runtime = object.__new__(ExpertPredictionRuntime)
+    runtime._metrics_path = Path("/tmp/prediction.jsonl")
+    runtime.forwards = 3
+    runtime._log_interval = 100
+    runtime.capture = None
+    runtime.prefetch = None
+    runtime.store = type("Store", (), {"after_write": None})()
+    runtime._taps = type("Taps", (), {"remove": lambda self: None})()
+    runtime._pre_mixer_removers = []
+    with mock.patch.object(runtime, "_append_metrics") as flush:
+        runtime.close()
+    flush.assert_called_once_with()
+
+    runtime.forwards = 100
+    with mock.patch.object(runtime, "_append_metrics") as flush:
+        runtime.close()
+    flush.assert_not_called()
