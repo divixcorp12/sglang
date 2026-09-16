@@ -1,9 +1,14 @@
 """Contract tests for the graph-captured prefetch calibration observer."""
 
 import os
+import importlib.util
+import json
+import tempfile
 from unittest import mock
+from pathlib import Path
 
 import torch
+import pytest
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prediction.serving.calibration import (
@@ -96,3 +101,48 @@ def test_calibration_collection_is_disabled_unless_explicitly_requested():
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION", None)
         assert envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get() is False
+
+
+def test_extended_summarizer_keeps_roles_fixed_and_bootstraps_paired_sessions():
+    """Mixed run provenance or a shape-guessed metrics file would invalidate a comparison."""
+    script = Path(__file__).parents[5] / "scripts/expert_prediction/prefetch/summarize_ab.py"
+    spec = importlib.util.spec_from_file_location("summarize_ab", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    directory = Path(tempfile.mkdtemp())
+
+    def write(name, records):
+        path = directory / name
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        return path
+
+    b_results = write("b-results.jsonl", [
+        {"session_id": "s1", "completion_tokens": 64, "decode_tokens_per_sec": 100, "ttft": 0.1},
+        {"session_id": "s2", "completion_tokens": 64, "decode_tokens_per_sec": 50, "ttft": 0.2, "finish_reason": "length"},
+    ])
+    c_results = write("c-results.jsonl", [
+        {"session_id": "s1", "completion_tokens": 64, "decode_tokens_per_sec": 50, "ttft": 0.1},
+        {"session_id": "s2", "completion_tokens": 64, "decode_tokens_per_sec": 100 / 3, "ttft": 0.2},
+    ])
+    prediction = write("prediction.jsonl", [{"prefetch": {"observed_miss_rate": 0.25}}])
+    hot = write("hot.jsonl", [{"counters": {"decode": {"0": {
+        "resident_slots": 12, "side_pull_posted_rows": 4, "side_pull_useful_rows": 3,
+        "side_pull_wasted_rows": 1,
+    }}}}])
+    manifest = write("manifest.json", [{"commit": "abc", "cache_size": 10240, "session_ids": ["s1", "s2"]}])
+    b = module.summarize_arm(f"B={b_results}:{prediction}:{hot}:{manifest}")
+    c = module.summarize_arm(f"C={c_results}:{prediction}:{hot}:{manifest}")
+
+    assert b["median_decode_tok_s"] == 75
+    assert b["p50_turn_decode_ms_per_token"] == 15
+    assert b["p95_turn_decode_ms_per_token"] == 20
+    assert b["truncation_count"] == 1
+    assert b["observed_miss_rate"] == 0.25
+    assert b["resident_slots"] == 12
+    assert b["posted_rows"] == 4
+    assert b["useful_precision"] == 0.75
+    assert module.paired_session_bootstrap(b, c, seed=20260916, resamples=10_000) == [10.0, 10.0]
+    with pytest.raises(ValueError, match="mixed commits"):
+        c["manifest"]["commit"] = "def"
+        module.paired_session_bootstrap(b, c, seed=20260916, resamples=1)
