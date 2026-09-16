@@ -93,9 +93,15 @@ def route_covered_residual(
 class PullDeliveryStats:
     """Device counters for one target layer's pull outcomes; host-read only via ``snapshot``.
 
-    ``counts`` is strictly additive (``add_`` only, never decremented) so a periodic
-    overlay-fresh flush -- store the latest cumulative snapshot, never diff against a
-    baseline a recapture can zero -- never has to coordinate with graph recapture.
+    ``counts`` is strictly additive (``add_`` only, never decremented) and, today,
+    **never reset by anything** -- not by ``ExpertHotCacheManager.discard_graph_capture_routes``
+    (unlike the sibling graph/residency counters that method zeroes) and not by any other
+    hook. A periodic overlay-fresh flush -- store the latest cumulative snapshot, never diff
+    against a prior read -- is correct regardless of whether a reset ever happens, since it
+    never depends on one; but it also means one bounded bias survives forever: a captured
+    ``join_target`` call runs once during the graph's warmup replay and its dummy forward's
+    counts land here exactly like a real one, the same "warmup lands in the counts like a
+    real forward" effect ``discard_graph_capture_routes`` exists to purge for its siblings.
     ``counts[3]`` (``posted``) is the PHYSICAL row count and is what feeds a "rows
     delivered" telemetry sink (e.g. ``ExpertHotCacheManager.record_side_pull_delivery``);
     ``counts[0]`` (``covered``) is ROUTE-level and can overcount physical rows on a

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.srt.layers.moe.expert_prediction.serving.candidates import DedicatedPrefetchSlot
 from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
 from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes, should_dedup
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
@@ -208,6 +209,33 @@ class TestGraphRoutePlan(unittest.TestCase):
                     list(range(len(resident), len(resident) + routes.numel())),
                 )
                 self.assert_plan_serves_routes(routes, resident, routes.numel())
+
+    def test_demand_scratch_writer_never_reaches_the_dedicated_prefetch_slot(self):
+        """The demand-copy remap stays one row below the reserved prefetch slot at MAX occupancy.
+
+        `DedicatedPrefetchSlot.assert_excluded_from_mapping` only ever checks
+        the permanent `expert_to_slot` mapping -- the reservation is also
+        unreachable by the demand-scratch writer, but only because
+        `plan_graph_routes`'s miss-rank remap bounds `rank < unique_misses <=
+        scratch_rows`, one below `scratch_base + scratch_rows`. This drives
+        that bound at MAX occupancy (every route a distinct miss, filling
+        every scratch row) against the real `DedicatedPrefetchSlot.index`,
+        rather than trusting the arithmetic never to change.
+        """
+        scratch_rows = 12
+        for resident in ([], [0], [5, 6, 7]):
+            capacity = len(resident)
+            slot = DedicatedPrefetchSlot(capacity=capacity, demand_rows=scratch_rows)
+            with self.subTest(resident=resident):
+                nonresident = [e for e in range(EXPERTS) if e not in resident][:scratch_rows]
+                self.assertEqual(len(nonresident), scratch_rows)
+                flat = torch.tensor(nonresident, dtype=torch.long)
+                plan = plan_graph_routes(
+                    flat, _expert_to_slot(resident), scratch_rows, capacity
+                )
+                self.assertEqual(int(plan.unique_miss_rows), scratch_rows)
+                self.assertNotIn(slot.index, plan.remap.tolist())
+                self.assertEqual(int(plan.remap.max()), slot.index - 1)
 
     def test_planning_reads_no_device_value_on_the_host(self):
         flat = torch.tensor([4, 2, 4, 9, 0, 2, 7, 7], dtype=torch.long)

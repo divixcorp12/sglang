@@ -1705,8 +1705,8 @@ class ExpertHotCacheManager:
                     row["requested_unique_experts"] += unique
                 side_pull = self._side_pull_snapshots.get((mode, layer_id))
                 if side_pull is not None:
-                    covered, _residual, wasted = side_pull
-                    delivered = covered + wasted
+                    _covered, _residual, _wasted, posted = side_pull
+                    delivered = posted
                     row["miss_rows"] += delivered
                     row["side_pull_rows"] += delivered
                     row["side_pull_bytes"] += (
@@ -1858,29 +1858,35 @@ class ExpertHotCacheManager:
         self._boundary_clock.commit(accepted_tokens)
 
     def record_side_pull_delivery(
-        self, layer_id: int, mode: str, covered: int, residual: int, wasted: int
+        self, layer_id: int, mode: str, covered: int, residual: int, wasted: int, posted: int
     ) -> None:
         """Store one side-pull target's latest cumulative delivery snapshot.
 
-        ``covered``/``residual``/``wasted`` are the FULL cumulative totals a
-        producer's ``PullDeliveryStats.snapshot()`` returns at this call, not
-        a delta since the last call -- this stores the latest read and
-        overlays it fresh at ``snapshot_counters()`` time, exactly like this
-        class's own CUDA-graph register totals. A per-forward pull is
-        capacity-1 (one dedicated row), and posts it whether or not the
-        prediction proves correct, so ``covered + wasted`` is this class's
-        best available estimate of physical rows delivered; it can overcount
-        a multi-token forward whose several routes all match the same
-        delivered expert, since ``covered`` sums matched routes rather than
-        delivered rows, and the producer does not expose a per-forward
-        "posted" count to correct for that. Never touches ``unique_miss_rows``
-        or ``routed_miss_rows``, which stay logical counts of distinct and
-        routed actual misses read from the ordinary routing path.
+        ``covered``/``residual``/``wasted``/``posted`` are the FULL cumulative
+        totals a producer's ``PullDeliveryStats.snapshot()`` returns at this
+        call, not a delta since the last call -- this stores the latest read
+        and overlays it fresh at ``snapshot_counters()`` time, exactly like
+        this class's own CUDA-graph register totals. ``posted`` is the
+        producer's PHYSICAL row count (1 per forward a real prediction was
+        posted, regardless of how many routes it covered or none), and is
+        what this class adds to ``miss_rows``/``side_pull_rows``. ``covered``
+        sums matched ROUTES rather than delivered rows, so it can exceed 1 on
+        a multi-token forward with overlap on the predicted expert; ``covered
+        + wasted`` would overcount physical rows in that case, which is why
+        ``posted`` -- not that sum -- is the delivered-row count used here.
+        Never touches ``unique_miss_rows`` or ``routed_miss_rows``, which stay
+        logical counts of distinct and routed actual misses read from the
+        ordinary routing path.
 
-        Safe to call at any cadence, including a read taken after a
-        recapture reset the producer's device counters back through zero:
-        nothing here remembers a prior read to diff against, so there is no
-        delta to lose or double-count across that reset, the same guarantee
-        ``discard_graph_capture_routes`` relies on for the register totals.
+        Safe to call at any cadence: nothing here remembers a prior read to
+        diff against, so a later call can never look like a decrement no
+        matter what the producer's cumulative total does between calls.
+        Unlike this class's own CUDA-graph register totals, the producer's
+        ``PullDeliveryStats.counts`` is **not** reset by
+        ``discard_graph_capture_routes`` or by anything else -- a capture
+        event's warmup replay adds its one dummy forward's counts to
+        ``PullDeliveryStats`` exactly like a real one, a bounded, permanent
+        bias of one warmup sample per capture rather than a value this
+        method's cadence can correct for.
         """
-        self._side_pull_snapshots[(mode, layer_id)] = (covered, residual, wasted)
+        self._side_pull_snapshots[(mode, layer_id)] = (covered, residual, wasted, posted)

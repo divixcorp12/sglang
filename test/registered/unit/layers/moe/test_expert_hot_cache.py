@@ -776,13 +776,13 @@ class TestExpertHotCacheManager(unittest.TestCase):
         producer's `PullDeliveryStats.snapshot()` contract, not deltas.
         """
 
-        def observed(demand_rows, covered, residual, wasted):
+        def observed(demand_rows, covered, residual, wasted, posted):
             manager = self.manager(dynamic=False)
             counters = manager._counters["prefill"][0]
             counters.unique_miss_rows = 2
             counters.routed_miss_rows = 2
             counters.miss_rows = demand_rows
-            manager.record_side_pull_delivery(0, "prefill", covered, residual, wasted)
+            manager.record_side_pull_delivery(0, "prefill", covered, residual, wasted, posted)
             row = manager.snapshot_counters()["prefill"]["0"]
             self.assertEqual(
                 row["side_pull_bytes"],
@@ -790,33 +790,55 @@ class TestExpertHotCacheManager(unittest.TestCase):
             )
             return row
 
-        useful = observed(demand_rows=1, covered=1, residual=0, wasted=0)
+        useful = observed(demand_rows=1, covered=1, residual=0, wasted=0, posted=1)
         self.assertEqual(useful["miss_rows"], 2)
         self.assertEqual(useful["unique_miss_rows"], 2)
         self.assertEqual(useful["routed_miss_rows"], 2)
         self.assertEqual(useful["side_pull_rows"], 1)
 
-        wrong = observed(demand_rows=2, covered=0, residual=0, wasted=1)
+        wrong = observed(demand_rows=2, covered=0, residual=0, wasted=1, posted=1)
         self.assertEqual(wrong["miss_rows"], 3)
         self.assertEqual(wrong["unique_miss_rows"], 2)
         self.assertEqual(wrong["routed_miss_rows"], 2)
         self.assertEqual(wrong["side_pull_rows"], 1)
 
+    def test_multi_token_overlap_on_predicted_expert_records_one_physical_row(self):
+        """``covered`` can exceed 1 on overlap; ``posted`` -- not ``covered + wasted`` -- is the row count.
+
+        Two tokens routing to the same predicted, delivered expert give
+        ``covered=2`` from the producer's route-level count, but a
+        capacity-1 side pull only ever copies one physical row per posted
+        forward. ``side_pull_rows``/``miss_rows`` must reflect ``posted=1``,
+        not ``covered + wasted == 2``.
+        """
+        manager = self.manager(dynamic=False)
+        counters = manager._counters["prefill"][0]
+        counters.unique_miss_rows = 1
+        counters.routed_miss_rows = 2
+        counters.miss_rows = 0
+        manager.record_side_pull_delivery(0, "prefill", covered=2, residual=0, wasted=0, posted=1)
+        row = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(row["side_pull_rows"], 1)
+        self.assertEqual(row["miss_rows"], 1)
+
     def test_side_pull_snapshot_overlays_fresh_each_read_without_a_remembered_delta(self):
-        """A later cumulative read after a smaller (recapture-reset) one is not a decrement.
+        """A later, smaller cumulative read is reported as-is, never as a decrement.
 
         `record_side_pull_delivery` stores the latest snapshot and overlays it
         fresh at `snapshot_counters()` time; it never diffs against a prior
-        call. A read taken right after a recapture zeroed the producer's
-        device counters must therefore report exactly that new (smaller)
-        cumulative value, not a negative delta against the pre-recapture one.
+        call. This manufactures the smaller read directly with a second call
+        rather than through a real recapture, since nothing in this codebase
+        actually resets the producer's device counters today (see
+        `record_side_pull_delivery`'s docstring) -- the contract under test is
+        that this class's own overlay has no memory of the prior value, which
+        holds regardless of why a later read is smaller.
         """
         manager = self.manager(dynamic=False)
-        manager.record_side_pull_delivery(0, "prefill", covered=3, residual=1, wasted=2)
+        manager.record_side_pull_delivery(0, "prefill", covered=3, residual=1, wasted=2, posted=5)
         before = manager.snapshot_counters()["prefill"]["0"]
         self.assertEqual(before["side_pull_rows"], 5)
 
-        manager.record_side_pull_delivery(0, "prefill", covered=0, residual=0, wasted=0)
+        manager.record_side_pull_delivery(0, "prefill", covered=0, residual=0, wasted=0, posted=0)
         after = manager.snapshot_counters()["prefill"]["0"]
         self.assertEqual(after["side_pull_rows"], 0)
         self.assertEqual(after["miss_rows"], 0)
@@ -826,7 +848,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
         counters = manager._counters["prefill"][0]
         counters.migration_bytes = 40
         counters.promotions = 1
-        manager.record_side_pull_delivery(0, "prefill", covered=1, residual=0, wasted=0)
+        manager.record_side_pull_delivery(0, "prefill", covered=1, residual=0, wasted=0, posted=1)
         row = manager.snapshot_counters()["prefill"]["0"]
         self.assertGreater(row["side_pull_bytes"], 0)
         self.assertEqual(row["migration_bytes"], 40)
