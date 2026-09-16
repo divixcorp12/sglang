@@ -1413,7 +1413,7 @@ class ExpertHotCacheManager:
     def _publish_completed_promotions(self, wait: bool) -> None:
         """Publish in-flight promotions whose copies landed, or all of them with ``wait``."""
         pending = []
-        for ticket, promotions in getattr(self, "_inflight_promotions", ()):
+        for ticket, promotions in self._inflight_promotions:
             cache = promotions[0].cache
             executor = cache._transfer_executor
             if not executor.has_completed(ticket):
@@ -1694,7 +1694,7 @@ class ExpertHotCacheManager:
                 str(layer_id): policy.snapshot_metrics()
                 for layer_id, policy in policies.items()
             }
-        if getattr(self, "async_promotions", False):
+        if self.async_promotions:
             result["residency_async"] = {
                 "deferred_updates": self.deferred_residency_updates,
                 "inflight_submissions": len(self._inflight_promotions),
@@ -1736,7 +1736,7 @@ class ExpertHotCacheManager:
         kind, tokens = classify_forward(forward_batch)
         if kind is ForwardKind.DRAFT:
             return
-        if getattr(self, "_inflight_promotions", None):
+        if self._inflight_promotions:
             self._publish_completed_promotions(wait=False)
         counts = single_pass_data.get("global_physical_count")
         if counts is None:
