@@ -356,6 +356,12 @@ class PrefetchPuller:
         if target is None:
             return
         self._pipeline.join_target(target)
+        # The payload still crossed the side stream even though this target
+        # cannot consume its dedicated row. Attribute it as a physical wasted
+        # post rather than silently dropping tail/eager traffic from telemetry.
+        posted = (self._plans[target_layer].count.reshape(()) == 1).to(torch.int64)
+        zero = self.stats[target_layer].counts.new_zeros(())
+        self.stats[target_layer].add(zero, zero, posted.bool(), posted)
         self._clear_plan(target_layer)
 
 _FEATURES = {

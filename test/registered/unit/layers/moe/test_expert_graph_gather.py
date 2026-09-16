@@ -1310,6 +1310,7 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
         streamer.gather(torch.tensor([[5, 6]], dtype=torch.int32, device="cuda"))
         torch.cuda.synchronize()
         self.assertEqual((puller._plans[0].expert_ids.item(), puller._plans[0].count.item()), (-1, 0))
+        self.assertEqual(puller.stats[0].snapshot(), (0, 0, 1, 1))
 
     def test_fused_gather_records_correct_wrong_resident_and_32_route_outcomes_once(self):
         """The production fast path owns one outcome ledger per replay.
