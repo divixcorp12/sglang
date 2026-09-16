@@ -1207,13 +1207,22 @@ class ExpertHotCacheManager:
         scratch rows; a larger capacity is allowed, but plans still count at most
         the scratch rows. A zero resolve budget is sized to four times the
         largest per-layer miss copy at 8 GiB/s, at least 20 ms, and a zero
-        degraded budget to twice that copy, at least 4096 polls, taking a poll
-        as 250 ns. A zero drain budget is about 2 s: that long after a timed-out
-        resolve of a request the thread had committed to, the copier is disabled
-        for the rest of the process and the resolve keeps waiting for that
-        request's copies, so none lands on a later forward's scratch rows. If
-        they have not landed ``fatal_wait_s`` later, the copier's watchdog
-        aborts the process with an ERROR on stderr.
+        degraded budget to twice that copy, at least 4096 polls, converting at
+        256 ns per poll, the lower end of the 256-270 ns measured on the RTX 5090
+        (E34), so each budget lasts at least its wall-time target. A zero drain
+        budget is 524,288 polls (134-142 ms), one launch: a never-launched
+        kernel's launch blocks until all queued device work finishes (E34f), so
+        only the total queued wait bounds a stall. When a drain runs out the
+        copier is disabled for the rest of the process and the resolve returns
+        undelivered, served by the residual copy; ``doorbell_fail_stop_check``
+        must run before the next forward and holds until the committed copies
+        landed, and the copier's watchdog aborts the process with an ERROR if
+        they have not landed ``fatal_wait_s`` later.
+
+        The copier is primed before serving (``ExpertDoorbellCopier._prime``)
+        into the first layer's first scratch row, which nothing reads before
+        capture; the prime is empirically required for availability (E34 3g),
+        not for correctness.
         """
         from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
         from sglang.srt.layers.moe.expert_row_plan import (
@@ -1222,7 +1231,7 @@ class ExpertHotCacheManager:
         )
 
         link_bytes_per_s = 8 * 1024**3
-        poll_s = 250e-9
+        poll_s = 256e-9
         served = [
             self.streamers[layer_id]
             for layer_id in self._layer_ids
@@ -1247,7 +1256,7 @@ class ExpertHotCacheManager:
         )
         timeout_polls = timeout_polls or int(max(0.02, 4 * largest_copy_s) / poll_s) + 1
         degraded_polls = degraded_polls or max(4096, int(2 * largest_copy_s / poll_s) + 1)
-        drain_polls = drain_polls or int(2.0 / poll_s)
+        drain_polls = drain_polls or 524_288
         device = served[0].hot_cache.device
         copier = ExpertDoorbellCopier(
             [streamer._graph_row_segments for streamer in served],
@@ -1262,6 +1271,7 @@ class ExpertHotCacheManager:
             copy_api="batch",
             src_access_order="stream",
             stream=torch.cuda.Stream(device),
+            prime_slot=served[0].hot_cache.capacity,
         )
         backend = DoorbellRowBackend(
             copier,
@@ -1299,6 +1309,7 @@ class ExpertHotCacheManager:
                     "drain_polls": drain_polls,
                     "fatal_wait_s": fatal_wait_s,
                     "largest_copy_bytes": int(largest_copy_s * link_bytes_per_s),
+                    "prime_s": round(copier.prime_s, 4),
                     "spin_cpu": spin_cpu,
                 },
                 sort_keys=True,
@@ -1328,20 +1339,29 @@ class ExpertHotCacheManager:
         if getattr(self, "doorbell", None) is not None:
             self.doorbell.stop()
 
+    def doorbell_fail_stop_check(self, synchronize: bool = False) -> float:
+        """Hold until every committed doorbell copy a drain gave up on has landed.
+
+        The scheduler calls this after each forward's results are processed and
+        before the next forward, in every forward mode, since any forward with a
+        1-token gather posts to the doorbell, and it passes ``synchronize=True``.
+        That synchronizes the current stream unconditionally: the fatal word is
+        written by device kernels, and a replayed CUDA graph posts from the device
+        without entering Python, so a "did a post run" flag would read False on
+        exactly the steps that posted. With no exhausted drain it then reads two
+        host words and returns 0.0 without a device-wide synchronize; see
+        ``ExpertDoorbellCopier.fail_stop_check``.
+        """
+        doorbell = getattr(self, "doorbell", None)
+        if doorbell is None:
+            return 0.0
+        return doorbell.fail_stop_check(synchronize=synchronize)
+
     def _log_doorbell(self) -> None:
         doorbell = getattr(self, "doorbell", None)
         if doorbell is None:
             return
         stats = doorbell.stats()
-        if stats.get("fatal_timeouts"):
-            logger.error(
-                "Expert doorbell: a disabled drain ran past its fatal bound without the watchdog "
-                "aborting (%d times); rows may be corrupt, stopping the scheduler",
-                stats["fatal_timeouts"],
-            )
-            raise RuntimeError(
-                "expert doorbell fatal wait exhausted: a committed copy never completed"
-            )
         if stats.get("disabled") and not getattr(self, "_doorbell_disabled_logged", False):
             self._doorbell_disabled_logged = True
             logger.warning(
@@ -1359,7 +1379,8 @@ class ExpertHotCacheManager:
                         "disabled",
                         "disabled_posts",
                         "discarded_disabled",
-                        "fatal_timeouts",
+                        "fatal_seq",
+                        "completed_seq",
                         "posted",
                         "waits",
                         "timeouts",

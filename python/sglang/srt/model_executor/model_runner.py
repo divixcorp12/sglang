@@ -794,6 +794,12 @@ class ModelRunner:
                     "SGLANG_MOE_EXPERT_DOORBELL_MODE must be 'current' "
                     f"(got {doorbell_mode!r})"
                 )
+            if not get_schedule().disable_overlap_schedule:
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_DOORBELL requires --disable-overlap-schedule: its "
+                    "fail-stop check must run after a forward's results are processed and "
+                    "before the next forward starts"
+                )
         if budget_mb == 0:
             return
         if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():

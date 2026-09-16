@@ -9,9 +9,10 @@
 //                      before its final abandoned/disabled check and before
 //                      it queues any copy
 //   [8]  u32 disabled  release-stored 1 by the first drain that runs out
-//   [12] u32 fatal     sequence a disabled drain is still waiting for (0 when
-//                      none); the thread's watchdog aborts the process if it
-//                      stays set longer than the fatal wait
+//   [12] u32 fatal     highest sequence whose drain ran out (0 when none),
+//                      written only by drain kernels; the thread's watchdog
+//                      aborts the process if the thread has not completed
+//                      every sequence up to it within the fatal wait
 //   [16] u32 abandoned[max_tags]  last sequence a resolve of that tag gave up on
 //   [header_bytes] ring records, record k holds sequence (k + 1) mod ring:
 //        {u32 seq, u32 count, u32 tag, u32 unserviced,
@@ -83,12 +84,10 @@ constexpr int64_t kDrainTimeouts = 8;
 constexpr int64_t kDrains = 9;
 constexpr int64_t kDrainPending = 10;
 constexpr int64_t kDisabledPosts = 11;
-constexpr int64_t kFatalTimeouts = 12;
 constexpr int64_t kTagBase = 13;
 
 constexpr int64_t kFirstChunkPolls = 256;
 constexpr int64_t kChunkGrowth = 4;
-constexpr int64_t kFirstDrainPolls = 1 << 16;
 
 constexpr int64_t kPollAcquire = 0;
 constexpr int64_t kPollVolatile = 1;
@@ -187,7 +186,8 @@ __device__ __forceinline__ uint32_t poll_completion(
   if (poll_mode != kPollAcquire && reached(observed, seq)) {
     observed = load_acquire_device(done);
   }
-  state[kLastPolls] += static_cast<int32_t>(polls < 0x7fffffffLL ? polls : 0x7fffffffLL);
+  int64_t total = static_cast<int64_t>(state[kLastPolls]) + polls;
+  state[kLastPolls] = static_cast<int32_t>(total < 0x7fffffffLL ? total : 0x7fffffffLL);
   return observed;
 }
 
@@ -338,20 +338,22 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
   }
 }
 
-// One chunk of a drain, which runs only for the sequence the final resolve
-// chunk left pending: the thread had committed to copy it. It polls the
-// completion word until the thread publishes the sequence, which the thread
-// queues behind that request's copies, so they land before the resolve
-// returns instead of after a later write to the same slots. If the final
-// chunk runs out, the copier is disabled for good (the thread discards every
-// request it has not committed to, and later posts post nothing), the chunk
-// release-stores the sequence into the page's fatal word and keeps waiting
-// for this committed request's copies, since returning earlier would let
-// them land on rows a later forward writes. The thread's watchdog aborts the
-// process if that word stays set past the fatal wait, so a stuck copy is a
-// crash rather than a hang. `fatal_polls` bounds the wait only as a backstop
-// for a watchdog that could not act: that exhaustion is counted and resolves
-// undelivered.
+// The drain, which runs only for the sequence the final resolve chunk left
+// pending: the thread had committed to copy it. It polls the completion word
+// until the thread publishes the sequence, which the thread queues behind that
+// request's copies, so they land before the resolve returns. It is one launch
+// with a bounded total: a never-launched kernel's launch blocks until all
+// queued device work finishes, and the thread's copy call with it (E34,
+// E34f), so chunking the wait bounds nothing; only its total does. If the
+// budget runs out, the copier is disabled for good (the thread discards every
+// request it has not committed to, and later posts post nothing), the fatal
+// word is raised to this sequence unless it already names a later one, and
+// the request resolves undelivered at once, so the caller's residual copy
+// serves the plan. The thread's copies of it may still land, on the same rows
+// with the same bytes, inside this forward; the host fail-stop check before
+// the next forward waits until the thread has completed every sequence up to
+// the fatal word, and the watchdog aborts the process if that takes longer
+// than the fatal wait.
 __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbell_drain_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
@@ -361,9 +363,7 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
     int64_t capacity,
     int64_t ring,
     int64_t header_bytes,
-    int64_t chunk_polls,
-    int64_t final_chunk,
-    int64_t fatal_polls,
+    int64_t drain_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   if (threadIdx.x != 0) {
@@ -374,28 +374,23 @@ __global__ __launch_bounds__(expert_doorbell::kBlockSize, 1) void expert_doorbel
     return;
   }
   const int64_t record = record_offset(seq, capacity, ring, header_bytes);
-  uint32_t observed = poll_completion(done, seq, chunk_polls, poll_mode, state);
+  const uint32_t observed = poll_completion(done, seq, drain_polls, poll_mode, state);
+  state[kDrainPending] = 0;
+  state[kResolved] = static_cast<int32_t>(seq);
   if (!reached(observed, seq)) {
-    if (final_chunk == 0) {
-      return;
-    }
     state[kDrainTimeouts] += 1;
     if (state[kDisabled] == 0) {
       state[kDisabled] = 1;
       store_release_system(reinterpret_cast<uint32_t*>(page + kDisabledOffset), 1u);
     }
-    store_release_system(reinterpret_cast<uint32_t*>(page + kFatalOffset), seq);
-    observed = poll_completion(done, seq, fatal_polls, poll_mode, state);
-    if (!reached(observed, seq)) {
-      state[kFatalTimeouts] += 1;
-      state[kDrainPending] = 0;
-      state[kResolved] = static_cast<int32_t>(seq);
-      return;
+    const auto fatal = reinterpret_cast<uint32_t*>(page + kFatalOffset);
+    const uint32_t raised = load_acquire_system(fatal);
+    if (raised == 0 || reached(seq, raised)) {
+      store_release_system(fatal, seq);
     }
-    store_release_system(reinterpret_cast<uint32_t*>(page + kFatalOffset), 0u);
+    delivered[tag] = 0;
+    return;
   }
-  state[kDrainPending] = 0;
-  state[kResolved] = static_cast<int32_t>(seq);
   state[kDegraded] = 0;
   delivered[tag] = delivered_flag(page, state, done, record, seq);
 }
@@ -440,7 +435,6 @@ void expert_doorbell_resolve(
     int64_t timeout_polls,
     int64_t degraded_polls,
     int64_t drain_polls,
-    int64_t fatal_polls,
     int64_t poll_mode) {
   using namespace expert_doorbell;
   const auto stream = host::LaunchKernel::resolve_device(state.device());
@@ -477,30 +471,18 @@ void expert_doorbell_resolve(
     }
     budget *= kChunkGrowth;
   }
-  int64_t drain_left = drain_polls;
-  for (int64_t drain_chunk = 0;; ++drain_chunk) {
-    const int64_t chunk_polls =
-        drain_chunk == 0 && kFirstDrainPolls < drain_left ? kFirstDrainPolls : drain_left;
-    drain_left -= chunk_polls;
-    const bool final_chunk = drain_left == 0;
-    host::LaunchKernel(1, kBlockSize, stream)(
-        expert_doorbell_drain_kernel,
-        page_data,
-        state_data,
-        delivered_data,
-        done_data,
-        tag,
-        capacity,
-        ring,
-        header_bytes,
-        chunk_polls,
-        static_cast<int64_t>(final_chunk),
-        fatal_polls,
-        poll_mode);
-    if (final_chunk) {
-      break;
-    }
-  }
+  host::LaunchKernel(1, kBlockSize, stream)(
+      expert_doorbell_drain_kernel,
+      page_data,
+      state_data,
+      delivered_data,
+      done_data,
+      tag,
+      capacity,
+      ring,
+      header_bytes,
+      drain_polls,
+      poll_mode);
 }
 
 namespace expert_doorbell {
@@ -533,6 +515,7 @@ enum Counter : int64_t {
   kExternalStream,
   kLateCompletions,
   kDiscardedDisabledCount,
+  kCompletedSeq,
   kCounterCount,
 };
 
@@ -694,11 +677,16 @@ class DoorbellThread {
   }
 
   /// Fault injection: sleep `service_delay_ns` after committing to copy a
-  /// request and before queuing its copies, and report every copy as failed
-  /// without issuing it when `fail_copies` is set.
-  void inject(int64_t service_delay_ns, bool fail_copies) {
+  /// request and before queuing its copies, report every copy as failed
+  /// without issuing it when `fail_copies` is set, and defer the landing of
+  /// the next committed requests by `defer_landing_ns[k]` each, in order,
+  /// without holding up later claims.
+  void inject(int64_t service_delay_ns, bool fail_copies, std::vector<int64_t> defer_landing_ns) {
     service_delay_ns_.store(service_delay_ns);
     fail_copies_.store(fail_copies);
+    std::lock_guard<std::mutex> guard(fault_mutex_);
+    defer_landing_ns_ = std::move(defer_landing_ns);
+    defer_next_ = 0;
   }
 
   void counters(int64_t* out) const {
@@ -730,33 +718,53 @@ class DoorbellThread {
 
  private:
   /// Fail-stop watchdog, on its own thread so a spin thread stuck inside a CUDA
-  /// call cannot silence it. A disabled drain release-stores the sequence it
-  /// still waits for into the page's fatal word and clears it once that
-  /// request's copies landed; if the same sequence stays there longer than the
-  /// fatal wait, the watchdog reports it on stderr and aborts the process, since
-  /// the resolve can neither return safely nor wait forever. It keeps watching
-  /// past `stop()` while a fatal wait is in progress, and marks the process
-  /// non-dumpable before aborting so a scheduler holding tens of GB of pinned
-  /// rows does not write a core file before it can be restarted.
+  /// call cannot silence it. A drain that ran out raises the page's fatal word
+  /// to its sequence; the fail-stop holds while the thread has not completed
+  /// every sequence up to that word. The completed sequence is the host-side
+  /// `kCompletedSeq` counter the spin thread stores from each completed publish
+  /// event, in publish order, which is sequence order; the watchdog reads no
+  /// device state and writes nothing to the page. It reports the first
+  /// exhausted drain once on stderr, and aborts the process if the fail-stop
+  /// holds for longer than the fatal wait, timed from the first moment it saw
+  /// it hold and not restarted when a later drain raises the word, since
+  /// neither decode nor the copy landing on rows a later forward writes is
+  /// acceptable. It keeps watching past `stop()` while the fail-stop holds,
+  /// and marks the process non-dumpable before aborting so a scheduler holding
+  /// tens of GB of pinned rows does not write a core file before it can be
+  /// restarted.
   void watch() {
-    uint32_t watched = 0;
     int64_t since_ns = 0;
-    while (!stop_.load(std::memory_order_relaxed) || read_host_word(page_ + kFatalOffset) != 0) {
-      const uint32_t waiting = read_host_word(page_ + kFatalOffset);
+    bool reported = false;
+    for (;;) {
+      const uint32_t fatal = read_host_word(page_ + kFatalOffset);
+      const uint32_t completed = static_cast<uint32_t>(counters_[kCompletedSeq].load());
+      const bool holding = fatal != 0 && !reached(completed, fatal);
+      if (stop_.load(std::memory_order_relaxed) && !holding) {
+        break;
+      }
+      if (fatal != 0 && !reported) {
+        reported = true;
+        std::fprintf(
+            stderr,
+            "ERROR expert doorbell: drain exhausted for request %u; copier disabled for the life of the "
+            "process; the in-graph copy serves every later plan\n",
+            fatal);
+        std::fflush(stderr);
+      }
       const int64_t now_ns = monotonic_ns();
-      if (waiting == 0) {
-        watched = 0;
-      } else if (waiting != watched) {
-        watched = waiting;
+      if (!holding) {
+        since_ns = 0;
+      } else if (since_ns == 0) {
         since_ns = now_ns;
       } else if (now_ns - since_ns > fatal_wait_ns_) {
         std::fprintf(
             stderr,
             "ERROR expert doorbell: request %u was committed to copy but did not complete %.1f s after "
-            "the copier was disabled (last seen %lld, serviced %lld); aborting the process instead of "
-            "hanging decode or letting the copy land on rows a later forward writes\n",
-            waiting,
+            "the copier was disabled (completed %u, last seen %lld, serviced %lld); aborting the process "
+            "instead of hanging decode or letting the copy land on rows a later forward writes\n",
+            fatal,
             static_cast<double>(fatal_wait_ns_) / 1e9,
+            completed,
             static_cast<long long>(counters_[kLastSeen].load()),
             static_cast<long long>(counters_[kServiced].load()));
         std::fflush(stderr);
@@ -792,6 +800,7 @@ class DoorbellThread {
     for (;;) {
       const bool stopping = stop_.load(std::memory_order_relaxed);
       poll_completions();
+      land_deferred(false);
       if (paused_.load(std::memory_order_relaxed) && !stopping) {
         __builtin_ia32_pause();
         continue;
@@ -811,6 +820,7 @@ class DoorbellThread {
       }
       __builtin_ia32_pause();
     }
+    land_deferred(true);
     ::cudaStreamSynchronize(stream_);
     poll_completions();
     for (auto event : publish_events_) {
@@ -905,6 +915,17 @@ class DoorbellThread {
     if (service_delay_ns > 0) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(service_delay_ns));
     }
+    const int64_t defer_ns = next_landing_defer_ns();
+    if (defer_ns > 0 || !deferred_.empty()) {
+      defer(seq, tag, entry, RequestStatus::kServiced, copies, rows_copied, defer_ns);
+      return;
+    }
+    land(seq, tag, entry, copies, rows_copied);
+  }
+
+  /// Issue a committed request's copies, already staged in `sources_`,
+  /// `destinations_` and `sizes_`, and publish it.
+  void land(uint32_t seq, uint32_t tag, TraceEntry& entry, size_t copies, int64_t rows_copied) {
     const ::cudaError_t copy_status = fail_copies_.load(std::memory_order_relaxed) ? ::cudaErrorUnknown
                                       : copies == 0                                ? ::cudaSuccess
                                       : copy_api_ == kPerSegmentCopy               ? copy_per_segment(copies)
@@ -912,7 +933,7 @@ class DoorbellThread {
     if (copy_status != ::cudaSuccess) {
       counters_[kCopyErrors].fetch_add(1);
       counters_[kLastCopyError].store(static_cast<int64_t>(copy_status));
-      finish_unserviced(seq, tag, entry, record, RequestStatus::kCopyFailed);
+      publish_unserviced(seq, tag, entry, RequestStatus::kCopyFailed);
       return;
     }
 
@@ -923,17 +944,84 @@ class DoorbellThread {
     publish(seq, tag, entry, true);
   }
 
+  /// End a request the thread did not copy. While a fault-injected landing is
+  /// deferred it queues behind it, so publishes stay in sequence order.
+  void finish_unserviced(uint32_t seq, uint32_t tag, TraceEntry& entry, uint8_t* record, RequestStatus status) {
+    (void)record;
+    if (!deferred_.empty()) {
+      defer(seq, tag, entry, status, 0, 0, 0);
+      return;
+    }
+    publish_unserviced(seq, tag, entry, status);
+  }
+
   /// Mark a request the thread did not copy as unserviced in its record, when
   /// the record still holds it, then publish it, so its resolve reports it
   /// undelivered. A partial copy queued before a failure lands before that
   /// publish.
-  void finish_unserviced(uint32_t seq, uint32_t tag, TraceEntry& entry, uint8_t* record, RequestStatus status) {
+  void publish_unserviced(uint32_t seq, uint32_t tag, TraceEntry& entry, RequestStatus status) {
     entry.status = static_cast<int64_t>(status);
+    uint8_t* const record = page_ + record_offset(seq, capacity_, ring_, header_bytes_);
     if (read_host_word(record) == seq) {
       write_host_word(record + kRecordUnservicedOffset, 1);
       _mm_mfence();
     }
     publish(seq, tag, entry, false);
+  }
+
+  /// Fault injection: the next deferral in `inject`'s list, 0 once it is used up.
+  int64_t next_landing_defer_ns() {
+    std::lock_guard<std::mutex> guard(fault_mutex_);
+    return defer_next_ < defer_landing_ns_.size() ? defer_landing_ns_[defer_next_++] : 0;
+  }
+
+  /// Fault injection: queue a request's landing (copies and publish, or the
+  /// unserviced publish) `defer_ns` from now, and never before the landing
+  /// queued ahead of it, so the thread keeps claiming later requests while
+  /// publishes stay in sequence order.
+  void defer(
+      uint32_t seq, uint32_t tag, const TraceEntry& entry, RequestStatus status, size_t copies, int64_t rows_copied,
+      int64_t defer_ns) {
+    const int64_t own_due_ns = monotonic_ns() + defer_ns;
+    const int64_t previous_due_ns = deferred_.empty() ? 0 : deferred_.back().due_ns;
+    Deferred item;
+    item.seq = seq;
+    item.tag = tag;
+    item.entry = entry;
+    item.status = status;
+    item.copies = copies;
+    item.rows_copied = rows_copied;
+    item.due_ns = own_due_ns > previous_due_ns ? own_due_ns : previous_due_ns;
+    item.sources.assign(sources_.begin(), sources_.begin() + static_cast<std::ptrdiff_t>(copies));
+    item.destinations.assign(destinations_.begin(), destinations_.begin() + static_cast<std::ptrdiff_t>(copies));
+    item.sizes.assign(sizes_.begin(), sizes_.begin() + static_cast<std::ptrdiff_t>(copies));
+    deferred_.push_back(std::move(item));
+  }
+
+  /// Fault injection: land deferred requests in order once due; with `wait`,
+  /// sleep until each is due and land them all.
+  void land_deferred(bool wait) {
+    while (!deferred_.empty()) {
+      const int64_t now_ns = monotonic_ns();
+      if (deferred_.front().due_ns > now_ns) {
+        if (!wait) {
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::nanoseconds(deferred_.front().due_ns - now_ns));
+      }
+      Deferred item = std::move(deferred_.front());
+      deferred_.erase(deferred_.begin());
+      if (item.status != RequestStatus::kServiced) {
+        publish_unserviced(item.seq, item.tag, item.entry, item.status);
+        continue;
+      }
+      for (size_t index = 0; index < item.copies; ++index) {
+        sources_[index] = item.sources[index];
+        destinations_[index] = item.destinations[index];
+        sizes_[index] = item.sizes[index];
+      }
+      land(item.seq, item.tag, item.entry, item.copies, item.rows_copied);
+    }
   }
 
   /// Queue the eight-byte publish of `{seq, serviced ? seq : 0}` into the completion
@@ -996,6 +1084,7 @@ class DoorbellThread {
       }
       const int64_t complete_ns = monotonic_ns();
       const uint32_t seq = static_cast<uint32_t>(publish_words_[2 * slot]);
+      counters_[kCompletedSeq].store(seq);
       const uint32_t abandoned =
           read_host_word(page_ + kAbandonedBase + 4 * static_cast<int64_t>(publish_tags_[slot]));
       if (publish_serviced_[slot] != 0 && abandoned != 0 && static_cast<int32_t>(seq - abandoned) <= 0) {
@@ -1064,6 +1153,22 @@ class DoorbellThread {
   std::atomic<bool> paused_{false};
   std::atomic<int64_t> service_delay_ns_{0};
   std::atomic<bool> fail_copies_{false};
+  struct Deferred {
+    uint32_t seq = 0;
+    uint32_t tag = 0;
+    TraceEntry entry;
+    RequestStatus status = RequestStatus::kServiced;
+    size_t copies = 0;
+    int64_t rows_copied = 0;
+    int64_t due_ns = 0;
+    std::vector<void*> sources;
+    std::vector<void*> destinations;
+    std::vector<size_t> sizes;
+  };
+  std::mutex fault_mutex_;
+  std::vector<int64_t> defer_landing_ns_;
+  size_t defer_next_ = 0;
+  std::vector<Deferred> deferred_;
   std::atomic<int64_t> counters_[kCounterCount];
   std::mutex trace_mutex_;
   std::vector<TraceEntry> trace_;
@@ -1164,9 +1269,13 @@ void expert_doorbell_pause(int64_t handle, int64_t paused) {
   }
 }
 
-void expert_doorbell_inject(int64_t handle, int64_t service_delay_ns, int64_t fail_copies) {
+void expert_doorbell_inject(
+    int64_t handle, int64_t service_delay_ns, int64_t fail_copies, tvm::ffi::TensorView defer_landing_ns) {
   if (auto thread = expert_doorbell::find_thread(handle)) {
-    thread->inject(service_delay_ns, fail_copies != 0);
+    const auto values = static_cast<const int64_t*>(defer_landing_ns.data_ptr());
+    const int64_t count = defer_landing_ns.size(0);
+    std::vector<int64_t> deferrals(count > 0 ? values : nullptr, count > 0 ? values + count : nullptr);
+    thread->inject(service_delay_ns, fail_copies != 0, std::move(deferrals));
   }
 }
 
