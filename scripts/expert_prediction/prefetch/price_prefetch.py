@@ -36,6 +36,14 @@ def _mixer_kinds(model_config: Path, layer_ids) -> dict[int, str]:
     return {layer: layer_types[layer] if layer < len(layer_types) else "unknown" for layer in layer_ids}
 
 
+def _popularity_scores(rows, splits, num_experts: int) -> torch.Tensor:
+    """Static per-layer expert frequency prior from the train split, broadcast to every row."""
+    native_train = rows.features["topk_ids"][split_mask(rows, splits, "train")]
+    counts = torch.zeros(num_experts, dtype=torch.float32)
+    counts.index_add_(0, native_train.reshape(-1), torch.ones(native_train.numel()))
+    return counts.unsqueeze(0).expand(rows.features["topk_ids"].shape[0], -1)
+
+
 def _scores(predictor, checkpoint, rows, experts):
     cpu = torch.device("cpu")
     if predictor == "llapor":
@@ -99,7 +107,7 @@ def main():
     parser.add_argument("--sessions", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--model-config", type=Path, required=True)
-    parser.add_argument("--predictor", choices=("llapor", "apex", "oracle"), required=True)
+    parser.add_argument("--predictor", choices=("llapor", "apex", "oracle", "popularity"), required=True)
     parser.add_argument("--budgets", default="1,2,3,4,6,8,10,16,32")
     parser.add_argument("--reaction-ms", default="0,0.03")
     parser.add_argument("--scorer-ms", default="0,0.02,0.05")
@@ -115,15 +123,20 @@ def main():
     experts = specs[0].num_experts
 
     is_oracle = args.predictor == "oracle"
-    models = None if is_oracle else load_prefetch_checkpoints(args.model_dir, predictor=args.predictor, specs=specs)
+    is_popularity = args.predictor == "popularity"
+    # Popularity, like the oracle, is not tied to a checkpoint set: it scores every target layer
+    # from a static train-split frequency prior instead of a loaded model.
+    models = None if is_oracle or is_popularity else load_prefetch_checkpoints(
+        args.model_dir, predictor=args.predictor, specs=specs
+    )
     # The oracle is priced under every target layer, for both the LLaPor (gap) and the APEX
     # (same-layer) window reduction, since it isn't tied to either checkpoint set.
-    layer_ids = sorted(spec.layer_id for spec in specs) if is_oracle else sorted(models)
+    layer_ids = sorted(spec.layer_id for spec in specs) if is_oracle or is_popularity else sorted(models)
 
     per_layer = {}
     for target in layer_ids:
-        checkpoint = None if is_oracle else models[target]
-        if is_oracle or args.predictor == "apex":
+        checkpoint = None if is_oracle or is_popularity else models[target]
+        if is_oracle or is_popularity or args.predictor == "apex":
             source_layer = target
             rows = load_layer_rows(args.capture_dir, splits, layer_id=target,
                                    features=(RouteFeature.PRE_MIXER, RouteFeature.TOPK_IDS), residency_layer=target)
@@ -136,7 +149,12 @@ def main():
                 next_layer_topk=target, residency_layer=target,
             )
             native_all = rows.features["next_topk_ids"]
-        scores_all = None if is_oracle else _scores(args.predictor, checkpoint, rows, experts)
+        if is_oracle:
+            scores_all = None
+        elif is_popularity:
+            scores_all = _popularity_scores(rows, splits, experts)
+        else:
+            scores_all = _scores(args.predictor, checkpoint, rows, experts)
         windows = (
             {"apex_window": WINDOW_MS[kinds[target]] - APEX_WINDOW_REDUCTION_MS, "llapor_window": WINDOW_MS[kinds[target]]}
             if is_oracle
