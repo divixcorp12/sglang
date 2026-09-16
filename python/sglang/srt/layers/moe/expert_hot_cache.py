@@ -102,7 +102,7 @@ class ExpertHotCache:
     def __init__(self, streamer: ExpertStreamer, capacity: int, scratch_rows: int = 0):
         """``scratch_rows`` extra rows after the slots receive graph-gather misses.
 
-        With ``SGLANG_MOE_EXPERT_PREFETCH_PULL`` on, one further trailing row is
+        With a non-off ``SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE``, one further trailing row is
         appended for ``DedicatedPrefetchSlot`` (plan section 7.1): its index is
         ``capacity + scratch_rows``, so the allocation must be exactly one row
         larger than the flag-off shape for ``PrefetchPuller``'s setup-time
@@ -117,7 +117,9 @@ class ExpertHotCache:
         self.streamer = streamer
         self.capacity = capacity
         self.scratch_rows = scratch_rows
-        self.reserves_prefetch_pull_row = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.get()
+        self.reserves_prefetch_pull_row = (
+            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
+        )
         allocation_rows = capacity + scratch_rows + int(self.reserves_prefetch_pull_row)
         self.bytes_per_expert = streamer.bytes_per_expert
         self.capacity_bytes = capacity * self.bytes_per_expert
@@ -1683,7 +1685,7 @@ class ExpertHotCacheManager:
         with self.metrics_path.open("a", encoding="utf-8") as destination:
             destination.write(json.dumps(trace, sort_keys=True) + "\n")
 
-    def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | None]]]:
+    def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | float | None]]]:
         """Return JSON-compatible cumulative totals and current allocation gauges."""
         result = {}
         register_totals = {

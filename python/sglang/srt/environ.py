@@ -195,6 +195,18 @@ class EnvPrefetchPullMode(EnvField):
         return mode
 
 
+class EnvPrefetchPredictor(EnvStr):
+    """Reject a configured pull mode before ModelRunner skips prediction setup."""
+
+    def get(self) -> str:
+        predictor = super().get()
+        if not predictor and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"
+            )
+        return predictor
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -413,7 +425,7 @@ class Envs:
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_SHARD_ROWS = EnvInt(4096)
     SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES = EnvInt(2)
     # In-graph expert prefetch candidate scoring (shadow until the shared copy layer consumes it): "", "llapor" or "apex".
-    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR = EnvStr("")
+    SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR = EnvPrefetchPredictor("")
     SGLANG_MOE_EXPERT_PREFETCH_MODEL_DIR = EnvStr("")
     # Candidates per target layer kept in the device bank.
     SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES = EnvInt(16)
