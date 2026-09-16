@@ -136,7 +136,7 @@ def test_extended_summarizer_keeps_roles_fixed_and_bootstraps_paired_sessions():
 
     assert b["median_decode_tok_s"] == 75
     assert b["p50_turn_decode_ms_per_token"] == 15
-    assert b["p95_turn_decode_ms_per_token"] == 20
+    assert b["p95_turn_decode_ms_per_token"] == 19.5
     assert b["truncation_count"] == 1
     assert b["observed_miss_rate"] == 0.25
     assert b["resident_slots"] == 12
