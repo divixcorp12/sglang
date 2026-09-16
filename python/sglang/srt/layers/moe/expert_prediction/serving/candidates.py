@@ -21,6 +21,10 @@ class PrefetchCandidateBank:
         self._rows = {layer_id: row for row, layer_id in enumerate(sorted(layer_ids))}
         self.ids = torch.arange(width, dtype=torch.int64, device=device).repeat(len(self._rows), 1)
         self.scores = torch.zeros((len(self._rows), width), dtype=torch.float32, device=device)
+        # IDs deliberately retain in-range fallbacks so pre-existing readers never
+        # index a sentinel. This tensor is the separate, graph-stable contract for
+        # whether each fallback is actually an offer.
+        self.valid = torch.zeros((len(self._rows), width), dtype=torch.bool, device=device)
 
     def write(
         self,
@@ -38,7 +42,8 @@ class PrefetchCandidateBank:
         excluded scores break by ascending expert id, via a stable descending sort over
         distinct expert ids. When fewer than ``width`` candidates survive exclusion, the
         remaining rows fall back to excluded experts (still valid, distinct ids) rather
-        than a sentinel — the offering is empty, never a garbage index.
+        than a sentinel. ``valid_for`` distinguishes those non-offers from the selected
+        eligible prefix, so a fallback can never become a garbage pull index.
         """
         summed = expert_scores.sum(dim=0)
         excluded = ~torch.isfinite(summed)
@@ -50,12 +55,17 @@ class PrefetchCandidateBank:
         row = self._rows[target_layer]
         self.ids[row].copy_(top)
         self.scores[row].copy_(summed.index_select(0, top))
+        self.valid[row].copy_((~excluded).index_select(0, top))
 
     def ids_for(self, target_layer: int) -> torch.Tensor:
         return self.ids[self._rows[target_layer]]
 
     def scores_for(self, target_layer: int) -> torch.Tensor:
         return self.scores[self._rows[target_layer]]
+
+    def valid_for(self, target_layer: int) -> torch.Tensor:
+        """Persistent offer validity for ``ids_for(target_layer)``'s fallback-safe IDs."""
+        return self.valid[self._rows[target_layer]]
 
 
 class DedicatedPrefetchSlot:
@@ -110,11 +120,12 @@ class BudgetRecall:
         *,
         target_layer: int,
         candidate_ids: torch.Tensor,
+        candidate_valid: torch.Tensor,
         topk_ids: torch.Tensor,
         expert_to_slot: torch.Tensor,
     ) -> None:
         resident = expert_to_slot >= 0
-        offered_mask = ~resident.index_select(0, candidate_ids)
+        offered_mask = candidate_valid & ~resident.index_select(0, candidate_ids)
         offered_mask &= torch.cumsum(offered_mask.to(torch.int64), dim=0) <= self.budget
         offered = torch.where(offered_mask, candidate_ids, torch.full_like(candidate_ids, -1))
         native = topk_ids.reshape(-1).long()

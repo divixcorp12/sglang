@@ -38,7 +38,10 @@ def _layer_tensor(layer: torch.nn.Module, name: str) -> torch.Tensor:
 
 
 def pull_outcome_counts(
-    flat_ids: torch.Tensor, missed_mask: torch.Tensor, predicted_expert: torch.Tensor
+    flat_ids: torch.Tensor,
+    missed_mask: torch.Tensor,
+    predicted_expert: torch.Tensor,
+    posted_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-forward pull outcome: covered/residual actual-miss ROUTE counts, a waste flag,
     and the PHYSICAL row count this forward actually delivered.
@@ -62,7 +65,9 @@ def pull_outcome_counts(
     are device tensors; nothing here reads the device.
     """
     valid = predicted_expert.reshape(()) >= 0
-    matches = missed_mask & (flat_ids == predicted_expert)
+    if posted_count is not None:
+        valid = valid & (posted_count.reshape(()) == 1)
+    matches = missed_mask & valid & (flat_ids == predicted_expert)
     covered = matches.sum()
     residual = missed_mask.sum() - covered
     wasted = valid & (covered == 0)
@@ -76,6 +81,7 @@ def route_covered_residual(
     predicted_expert: torch.Tensor,
     slot_index: int,
     demand_remap: torch.Tensor,
+    posted_count: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Redirect actual-miss routes for ``predicted_expert`` to the dedicated ``slot_index``.
 
@@ -86,7 +92,10 @@ def route_covered_residual(
     posted this forward) never equals a real expert id, so nothing is
     redirected.
     """
-    covered = missed_mask & (flat_ids == predicted_expert)
+    valid = predicted_expert.reshape(()) >= 0
+    if posted_count is not None:
+        valid = valid & (posted_count.reshape(()) == 1)
+    covered = missed_mask & valid & (flat_ids == predicted_expert)
     return torch.where(covered, torch.full_like(demand_remap, slot_index), demand_remap)
 
 
@@ -157,6 +166,7 @@ class PrefetchPuller:
         self._targets: dict[int, ExpertGpuPullTarget] = {}
         self._plans: dict[int, ExpertRowPlan] = {}
         self._should_post: dict[int, torch.Tensor] = {}
+        self._expert_to_slot: dict[int, torch.Tensor] = {}
         self.stats: dict[int, PullDeliveryStats] = {}
         for layer_id in layer_ids:
             cache = hot_caches.get(layer_id)
@@ -180,6 +190,7 @@ class PrefetchPuller:
                 f"prefetch_pull_{layer_id}", segments, plan, slot.index
             )
             self._plans[layer_id] = plan
+            self._expert_to_slot[layer_id] = cache.expert_to_slot
             self._should_post[layer_id] = torch.tensor(
                 pull_mode == "always", dtype=torch.bool, device=device
             )
@@ -191,7 +202,8 @@ class PrefetchPuller:
             return
         plan = self._plans[target_layer]
         candidate = self.bank.ids_for(target_layer)[:1]
-        valid = self._should_post[target_layer]
+        valid = self._should_post[target_layer] & self.bank.valid_for(target_layer)[:1]
+        valid = valid & (self._expert_to_slot[target_layer].index_select(0, candidate) < 0)
         plan.expert_ids.copy_(torch.where(valid, candidate, candidate.new_full((1,), -1)))
         plan.count.copy_(valid.to(torch.int32).reshape(1))
         self._pipeline.post_target(target)
@@ -225,10 +237,18 @@ class PrefetchPuller:
             return demand_remap
         self._pipeline.join_target(target)
         predicted = self._plans[target_layer].expert_ids
-        covered, residual, wasted, posted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        posted_count = self._plans[target_layer].count
+        covered, residual, wasted, posted = pull_outcome_counts(
+            flat_ids, missed_mask, predicted, posted_count
+        )
         self.stats[target_layer].add(covered, residual, wasted, posted)
         return route_covered_residual(
-            flat_ids, missed_mask, predicted, self._slots[target_layer].index, demand_remap
+            flat_ids,
+            missed_mask,
+            predicted,
+            self._slots[target_layer].index,
+            demand_remap,
+            posted_count,
         )
 
 _FEATURES = {
@@ -366,6 +386,7 @@ class PrefetchScoring:
         if self.recall is not None and feature is RouteFeature.TOPK_IDS and layer_id in self._scorers:
             self.recall.observe(
                 target_layer=layer_id, candidate_ids=self.bank.ids_for(layer_id),
+                candidate_valid=self.bank.valid_for(layer_id),
                 topk_ids=self._store.view(layer_id, RouteFeature.TOPK_IDS, rows),
                 expert_to_slot=self._hot_caches[layer_id].expert_to_slot,
             )
@@ -394,7 +415,8 @@ class PrefetchScoring:
                 candidates[:1],
                 ordered_scores[:1],
                 ordered_scores[:1] - ordered_scores[1:2] if self.bank.width > 1 else ordered_scores[:1],
-                self._hot_caches[target].expert_to_slot.index_select(0, candidates[:1]) < 0,
+                self.bank.valid_for(target)[:1]
+                & (self._hot_caches[target].expert_to_slot.index_select(0, candidates[:1]) < 0),
             )
         if self.puller is not None:
             self.puller.post_target(target)

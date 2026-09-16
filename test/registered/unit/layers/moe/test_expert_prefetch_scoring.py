@@ -104,7 +104,13 @@ class TestPrefetchScoringCpu(unittest.TestCase):
         expert_to_slot[[2, 4]] = torch.tensor([0, 1])
         candidates = torch.tensor([2, 6, 4, 8, 10], dtype=torch.long)
         topk_ids = torch.tensor([[2, 8, 10, 12]])
-        recall.observe(target_layer=1, candidate_ids=candidates, topk_ids=topk_ids, expert_to_slot=expert_to_slot)
+        recall.observe(
+            target_layer=1,
+            candidate_ids=candidates,
+            candidate_valid=torch.ones_like(candidates, dtype=torch.bool),
+            topk_ids=topk_ids,
+            expert_to_slot=expert_to_slot,
+        )
         self.assertEqual(recall.snapshot(), {1: (3, 1)})
 
     def test_bank_write_without_expert_to_slot_matches_prior_plain_topk_behavior(self):
@@ -149,6 +155,52 @@ class TestPrefetchScoringCpu(unittest.TestCase):
         self.assertEqual(len(set(ids.tolist())), bank.width)
         self.assertTrue(bool(((ids >= 0) & (ids < EXPERTS)).all()))
         self.assertTrue(bool((expert_to_slot[ids] >= 0).all()))
+        self.assertEqual(bank.valid_for(1).tolist(), [False, False, False])
+
+    def test_bank_marks_all_nonfinite_scores_as_no_offer(self):
+        # A fallback ID is deliberately in range, but it is not an offer when
+        # every score is nonfinite. Removing validity would make an always-mode
+        # pull attempt one of these fallback rows.
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
+
+        bank = PrefetchCandidateBank(layer_ids=[1], width=2, device=torch.device("cpu"))
+        scores = torch.full((1, EXPERTS), float("nan"))
+        scores[0, 0] = float("inf")
+        scores[0, 1] = float("-inf")
+        bank.write(1, scores, expert_to_slot=torch.full((EXPERTS,), -1, dtype=torch.long))
+        self.assertTrue(bool(((bank.ids_for(1) >= 0) & (bank.ids_for(1) < EXPERTS)).all()))
+        self.assertEqual(bank.valid_for(1).tolist(), [False, False])
+
+    def test_bank_marks_only_selected_eligible_candidates_valid(self):
+        # When the width exceeds live opportunities, trailing fallback IDs must
+        # not acquire offer semantics merely by being valid array indices.
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
+
+        bank = PrefetchCandidateBank(layer_ids=[1], width=3, device=torch.device("cpu"))
+        scores = torch.zeros(1, EXPERTS)
+        scores[0, 5] = 5.0
+        scores[0, 6] = 4.0
+        expert_to_slot = torch.arange(EXPERTS, dtype=torch.long)
+        expert_to_slot[[5, 6]] = -1
+        bank.write(1, scores, expert_to_slot=expert_to_slot)
+        self.assertEqual(bank.ids_for(1)[:2].tolist(), [5, 6])
+        self.assertEqual(bank.valid_for(1).tolist(), [True, True, False])
+
+    def test_budget_recall_does_not_count_an_invalid_fallback_candidate(self):
+        # Valid fallback IDs must not inflate recall: this candidate happens to
+        # match an actual miss but was never an offer.
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import BudgetRecall
+
+        recall = BudgetRecall(layer_ids=[1], budget=1, device=torch.device("cpu"))
+        expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.long)
+        recall.observe(
+            target_layer=1,
+            candidate_ids=torch.tensor([8]),
+            candidate_valid=torch.tensor([False]),
+            topk_ids=torch.tensor([[8]]),
+            expert_to_slot=expert_to_slot,
+        )
+        self.assertEqual(recall.snapshot(), {1: (1, 0)})
 
     def test_bank_invalid_scores_never_beat_a_valid_lower_score(self):
         # NaN and -inf are invalid and must never be selected over a valid, merely
@@ -287,6 +339,27 @@ class TestPullOutcomeCpu(unittest.TestCase):
         remap = route_covered_residual(flat_ids, missed_mask, predicted, 999, demand_remap)
         self.assertEqual(remap.tolist(), demand_remap.tolist())
 
+    def test_count_zero_blocks_a_stale_positive_id_from_covering_a_route(self):
+        # A plan buffer can contain a stale, in-range ID while its current
+        # count says no payload was posted. The count, not the ID, owns offer
+        # semantics: no route may redirect to the dedicated row.
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import (
+            pull_outcome_counts,
+            route_covered_residual,
+        )
+
+        flat_ids, missed_mask, demand_remap = self._scenario()
+        stale_id = torch.tensor([42])
+        count_zero = torch.tensor([0], dtype=torch.int32)
+        covered, residual, wasted, posted = pull_outcome_counts(
+            flat_ids, missed_mask, stale_id, count_zero
+        )
+        self.assertEqual((covered.item(), residual.item(), wasted.item(), posted.item()), (0, 2, False, 0))
+        remap = route_covered_residual(
+            flat_ids, missed_mask, stale_id, 999, demand_remap, count_zero
+        )
+        self.assertEqual(remap.tolist(), demand_remap.tolist())
+
     def test_delayed_correct_prediction_only_covers_once_it_arrives(self):
         # A prediction posted one forward too late (still -1 this step) cannot cover
         # this step's miss even though the *next* step's identical prediction would.
@@ -380,7 +453,13 @@ class TestPrefetchScoringCuda(unittest.TestCase):
         torch.cuda.set_sync_debug_mode("error")
         try:
             bank.write(1, scorer(router_input, topk_ids, topk_weights))
-            recall.observe(target_layer=1, candidate_ids=bank.ids_for(1), topk_ids=topk_ids, expert_to_slot=expert_to_slot)
+            recall.observe(
+                target_layer=1,
+                candidate_ids=bank.ids_for(1),
+                candidate_valid=bank.valid_for(1),
+                topk_ids=topk_ids,
+                expert_to_slot=expert_to_slot,
+            )
         finally:
             torch.cuda.set_sync_debug_mode("default")
 
@@ -391,7 +470,13 @@ class TestPrefetchScoringCuda(unittest.TestCase):
 
         def step():
             bank.write(1, scorer(router_input, topk_ids, topk_weights))
-            recall.observe(target_layer=1, candidate_ids=bank.ids_for(1), topk_ids=topk_ids, expert_to_slot=expert_to_slot)
+            recall.observe(
+                target_layer=1,
+                candidate_ids=bank.ids_for(1),
+                candidate_valid=bank.valid_for(1),
+                topk_ids=topk_ids,
+                expert_to_slot=expert_to_slot,
+            )
 
         side = torch.cuda.Stream()
         with torch.cuda.stream(side):

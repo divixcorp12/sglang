@@ -145,6 +145,73 @@ class TestPrefetchPullerCorrectness(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchPullerLifecycle(unittest.TestCase):
+    def test_graph_replay_resets_metadata_when_a_live_candidate_becomes_resident(self):
+        # The candidate bank keeps an in-range ID for graph stability. Replays
+        # must instead publish -1/count=0 every time the live map makes that
+        # candidate ineligible; otherwise a prior offer can leak into a later
+        # forward and suppress its demand route.
+        device = torch.device("cuda")
+        puller, bank, hot_caches, _ = _build_puller(device)
+        candidate = 13
+        _set_candidate(bank, hot_caches, 1, candidate)
+        cache = hot_caches[1]
+        flat_ids = torch.tensor([candidate], device=device)
+        missed_mask = torch.tensor([True], device=device)
+        demand_remap = torch.tensor([123], dtype=torch.int64, device=device)
+
+        def step():
+            puller.post_target(1)
+            return puller.join_target(
+                1,
+                flat_ids=flat_ids,
+                missed_mask=missed_mask,
+                demand_remap=demand_remap,
+            )
+
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            remap = step()
+
+        for becomes_resident in (True, True, False, True):
+            cache.expert_to_slot[candidate] = 0 if becomes_resident else -1
+            graph.replay()
+            torch.cuda.synchronize()
+            plan = puller._plans[1]
+            if becomes_resident:
+                self.assertEqual((plan.expert_ids.item(), plan.count.item()), (-1, 0))
+                self.assertEqual(remap.item(), demand_remap.item())
+            else:
+                self.assertEqual((plan.expert_ids.item(), plan.count.item()), (candidate, 1))
+                self.assertEqual(remap.item(), puller.slot_for(1))
+
+    def test_post_rechecks_residency_and_resets_a_former_offer_to_no_offer(self):
+        # A candidate can become resident after scoring and before the graph's
+        # posting node. It must publish a coherent no-offer plan, rather than
+        # copying the now-resident fallback row or retaining an earlier ID.
+        device = torch.device("cuda")
+        puller, bank, hot_caches, _ = _build_puller(device)
+        candidate = 13
+        _set_candidate(bank, hot_caches, 1, candidate)
+        hot_caches[1].expert_to_slot[candidate] = 0
+        demand_remap = torch.tensor([123], dtype=torch.int64, device=device)
+        # Calling post after the live residency update is the production order.
+        puller.post_target(1)
+        remap = puller.join_target(
+            1,
+            flat_ids=torch.tensor([candidate], device=device),
+            missed_mask=torch.tensor([True], device=device),
+            demand_remap=demand_remap,
+        )
+        torch.cuda.synchronize()
+        plan = puller._plans[1]
+        self.assertEqual((plan.expert_ids.item(), plan.count.item()), (-1, 0))
+        self.assertEqual(remap.item(), demand_remap.item())
+
     def test_graph_replay_publishes_a_coherent_zero_payload_plan_without_touching_the_dedicated_slot(self):
         """A count-zero control replays the normal post/join graph with no delivered row."""
         device = torch.device("cuda")
