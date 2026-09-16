@@ -2108,6 +2108,20 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
      | apex | 0.422 | **3.32** (3.26-3.38) | -1.92 | -1.24 | -0.16 |
 
      So **LLaPor is workload-dependent**, not negative: under water on high-locality traffic, positive from roughly 2 misses/layer upward. **APEX needs ~3.3 misses/layer**, above everything measured and marginal even at the capture's 3.15 — its better recall does not cover its higher scoring cost.
+   - **Recall is NOT double-counted in the table above.** `budget_hits` returns `(missed & covered).sum()`, and `doorbell_saving_ms` prices `hits * IN_GRAPH_ROW_MS`, so Task 3's 3.238/3.001 already have each predictor's own recall baked in — "all_or_nothing" names the *delivery* variant, not a recall assumption. The scaling above therefore uses the RATIO `recall_live / recall_t3` (1.129 LLaPor, 1.032 APEX) to move from the offline recall to the live one, never the raw recall. Had it used raw recall both break-evens would be too low by about `1/recall` — roughly 4.7 misses/layer for LLaPor, which would put it above everything measured. (Check raised by crypto-c9; verified against the code, not against the name.)
+   - **The wasted-byte term, which the net figures above EXCLUDE.** At B=2 the predictor offers `48 x 2 = 96` rows/token = **265 MB/token**, against 65-99 measured demand-miss rows/token. Rows that hit would have been fetched anyway, so the incremental traffic is `96 - hits`:
+
+     | miss/layer | predictor | wasted rows/token | wasted MB | bus time @12.08 GB/s | measured idle link |
+     |---|---|---|---|---|---|
+     | 1.36 (M3 A) | llapor | 70.8 | 195.8 | **16.2 ms** | 20.6 ms |
+     | 1.36 | apex | 68.5 | 189.3 | 15.7 ms | 20.6 ms |
+     | 2.06 (M3 B) | llapor | 57.8 | 159.9 | **13.2 ms** | 21.2 ms |
+     | 2.06 | apex | 54.3 | 150.1 | 12.4 ms | 21.2 ms |
+     | 3.15 (capture) | llapor | 37.6 | 104.1 | 8.6 ms | not measured |
+
+   - **It fits, but it eats most of the headroom, and it must not be subtracted as latency.** Bus occupancy is only a cost where it lands on the critical path; with idle link available these bytes overlap compute. So the honest statement is: the term is **8.6-16.2 ms/token of bus time against ~20.6-21.2 ms of idle link — 62% to 79% of the measured headroom consumed**, tightest on the high-locality prompt where there is least to gain. Naively subtracting it from net would overstate the cost as badly as omitting it understates it.
+   - **Critically, that idle link was measured WITHOUT prefetch running.** M3 characterises the no-prefetch steady state; turning prefetch on consumes the very headroom that makes it safe. At B=2 prefetch roughly **doubles H2D traffic** (265 MB offered against 171-260 MB currently moved). So "the bus is not saturated" is a much weaker safety argument than the earlier entry in this file implies: it is true of the system as measured, not of the system with prefetch enabled.
+   - **Precision is the lever, and B is the knob.** Wasted rows scale with `B x 48` while hits scale with recall x misses, so dropping to B=1 halves the offered traffic and cuts the waste far more than it cuts the hits. Any future arm should price B=1 before B=2.
    - **Two things that could still break this, stated rather than resolved:** recall may not be invariant to miss count (if the surviving misses are the genuinely cold ones, recall drops and the scaling is worse than linear), and the 3.2 ms saving is itself a Task 3 estimate, never a measured quantity.
 1. **The window may be too short to pay.**
    - The gap window fits 1 row per layer, in-graph or doorbell.
