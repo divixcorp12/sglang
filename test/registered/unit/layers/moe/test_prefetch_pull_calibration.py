@@ -300,4 +300,4 @@ def test_runtime_close_writes_empty_profiling_artifact_without_metrics():
     runtime._taps = type("Taps", (), {"remove": lambda self: None})(); runtime._pre_mixer_removers = []
     runtime.prefetch = mock.Mock()
     runtime.close()
-    runtime.prefetch.write_calibration.assert_called_once_with()
+    runtime.prefetch.write_calibration.assert_called_once_with(complete=True)
