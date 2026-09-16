@@ -33,6 +33,7 @@ def _segments(device):
 
 def _measure(device, count, iterations):
     from sglang.srt.layers.moe.expert_gpu_pull import ExpertGpuPullPipeline
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
     from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
     segments, pairs = _segments(device)
     plan = ExpertRowPlan(torch.tensor([0], device=device), torch.tensor([1], dtype=torch.int32, device=device), torch.tensor([count], dtype=torch.int32, device=device))
@@ -42,13 +43,16 @@ def _measure(device, count, iterations):
     for _ in range(iterations):
         ready, copy_start, copy_end, joined, residual_start, residual_end, consumed = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
         ready.record()
-        target.ready.record()
+        # Inline the production post sequence so copy_start brackets the real
+        # copy kernel rather than its preceding cross-stream dependency.
+        origin = torch.cuda.current_stream(device)
+        target.ready.record(origin)
         with torch.cuda.stream(pipeline.side_stream):
             pipeline.side_stream.wait_event(target.ready)
-            copy_start.record()
-        pipeline.post_target(target)
-        with torch.cuda.stream(pipeline.side_stream):
-            copy_end.record()
+            copy_start.record(pipeline.side_stream)
+            copy_expert_row_segments_gpu(target.segments, target.plan.expert_ids, target.plan.slots, target.plan.count)
+            copy_end.record(pipeline.side_stream)
+            target.done.record(pipeline.side_stream)
         pipeline.join_target(target)
         joined.record()
         # Use the same registered source/destination geometry for ordinary

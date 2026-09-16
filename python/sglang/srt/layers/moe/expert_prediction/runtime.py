@@ -359,6 +359,10 @@ class ExpertPredictionRuntime:
             self._metrics_path = None
 
     def close(self) -> None:
+        # A short profiling run may stop before its periodic metrics boundary;
+        # emit its final artifact exactly once at ordinary teardown.
+        if self._metrics_path is not None and self.forwards and self.forwards % self._log_interval:
+            self._append_metrics()
         if self.capture is not None:
             self.capture.close()
         if self.prefetch is not None:

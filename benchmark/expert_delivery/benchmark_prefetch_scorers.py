@@ -19,10 +19,15 @@ def load_captured_features(capture_dir: Path, *, source_layer: int, target_layer
     from sglang.srt.layers.moe.expert_prediction.capture_reader import load_shard, read_manifest
     from sglang.srt.layers.moe.expert_prediction.capture_schema import feature_key
     from sglang.srt.layers.moe.expert_prediction.contracts import RouteFeature
-    entries = read_manifest(capture_dir)
-    if not entries:
-        raise ValueError("capture has no completed safetensors shard")
-    tensors = load_shard(capture_dir, entries[0]["shard"]).tensors
+    required = [feature_key(source_layer, feature) for feature in (RouteFeature.ROUTER_INPUT, RouteFeature.TOPK_IDS, RouteFeature.TOPK_WEIGHTS)] + [feature_key(target_layer, RouteFeature.PRE_MIXER)]
+    tensors = None
+    for entry in read_manifest(capture_dir):
+        candidate = load_shard(capture_dir, entry["shard"]).tensors
+        if all(key in candidate for key in required):
+            tensors = candidate
+            break
+    if tensors is None:
+        raise ValueError("no canonical capture shard has all required scorer features")
     def get(layer: int, feature: RouteFeature) -> torch.Tensor:
         return tensors[feature_key(layer, feature)][:1].cuda()
     return {
@@ -50,7 +55,8 @@ def main():
     from sglang.srt.layers.moe.expert_prediction.serving.scorers import ApexScorer, LlaporScorer
 
     capture_dir = Path(args.capture_dir)
-    header = json.loads((capture_dir / "header.json").read_text())
+    from sglang.srt.layers.moe.expert_prediction.capture_writer import HEADER_NAME
+    header = json.loads((capture_dir / HEADER_NAME).read_text())
     specs = [MoeLayerSpec(**shape) for shape in header["layers"]]
     checkpoints = load_prefetch_checkpoints(Path(args.model_dir), predictor=args.predictor, specs=specs)
     by_layer = {spec.layer_id: spec for spec in specs}

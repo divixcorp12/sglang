@@ -85,7 +85,7 @@ class PullCalibrationHistogram:
         values = torch.stack(
             (
                 eligible.to(torch.int64),
-                eligible.to(torch.int64),
+                self.source_eligible[row].to(torch.int64),
                 (eligible & useful).to(torch.int64),
                 (eligible & ~useful).to(torch.int64),
                 eligible.to(torch.int64) * physical_demand_rows.reshape(()).to(torch.int64),

@@ -202,7 +202,7 @@ def test_canonical_capture_loader_uses_llapor_source_layer_features():
     from safetensors.torch import save_file
 
     root = Path(tempfile.mkdtemp())
-    (root / "header.json").write_text(json.dumps({"layers": [
+    (root / "capture.json").write_text(json.dumps({"layers": [
         {"layer_id": 1, "num_experts": 4, "top_k": 2, "hidden_size": 3},
         {"layer_id": 2, "num_experts": 4, "top_k": 2, "hidden_size": 3},
     ]}))
