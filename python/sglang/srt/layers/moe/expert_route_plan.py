@@ -50,6 +50,7 @@ def plan_graph_routes(
     scratch_base: int,
     prefetch_expert: Optional[torch.Tensor] = None,
     prefetch_slot: int = -1,
+    prefetch_count: Optional[torch.Tensor] = None,
 ) -> GraphRoutePlan:
     """Plan a gather that gives each distinct missed expert one scratch row.
 
@@ -62,12 +63,15 @@ def plan_graph_routes(
     device value is read on the host, so a CUDA graph can capture the plan
     and replay it for any routes.
 
-    ``prefetch_expert`` is an optional int64 CUDA scalar (or one-element)
-    tensor holding a side-stream pull's predicted expert id for this forward;
-    omitting it, or a negative id, disables the check (no real topk id is
-    ever negative). Every nonresident route whose expert equals it -- every
-    duplicate of it, too -- is excluded from the demand-scratch plan and
-    remapped straight to ``prefetch_slot`` instead of a scratch row,
+    ``prefetch_expert`` is an optional int64 scalar (or one-element) tensor
+    holding a side-stream pull's predicted expert id for this forward.
+    ``prefetch_count`` is its real int32 posted-row count when supplied;
+    only exactly one posted row enables coverage. Omitting the count retains
+    the historical compatibility behavior: a supplied expert enables the
+    check. Omitting the expert, or using a negative id, disables the check
+    (no real topk id is ever negative). Every covered nonresident route --
+    every duplicate of it, too -- is excluded from the demand-scratch plan
+    and remapped straight to ``prefetch_slot`` instead of a scratch row,
     mirroring ``plan_unique_routes_kernel``'s ``prefetched`` lane. This never
     changes ``unique_miss_rows``/``routed_miss_rows``, which stay logical
     counts of every nonresident route whether or not prefetch covers it;
@@ -80,8 +84,11 @@ def plan_graph_routes(
     hit = slots >= 0
     if prefetch_expert is None:
         prefetched = torch.zeros_like(hit)
-    else:
+    elif prefetch_count is None:
         prefetched = ~hit & (flat == prefetch_expert.reshape(()))
+    else:
+        posted = prefetch_count.reshape(()) == 1
+        prefetched = ~hit & posted & (flat == prefetch_expert.reshape(()))
     residual = ~hit & ~prefetched
     sorted_ids, order = torch.sort(flat, stable=True)
     group_starts = torch.ones_like(hit)
@@ -184,17 +191,19 @@ def plan_graph_routes_fused(
     route_counts: Optional[torch.Tensor] = None,
     prefetch_expert: Optional[torch.Tensor] = None,
     prefetch_slot: int = -1,
+    prefetch_count: Optional[torch.Tensor] = None,
+    outcome_counters: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """`plan_graph_routes`'s BS1, unique-ID fast path: one fused kernel launch.
 
     Reproduces its exact semantics for unique-ID ``flat``, prefetch coverage
     included. ``prefetch_expert`` is an optional int64 CUDA scalar (or
     one-element) tensor holding a side-stream pull's predicted expert id for
-    this forward; omitting it reproduces Stage A's permanently-disabled
-    state, prefetch count pinned at zero so no route can ever be a covered
-    miss. Given, it enables the kernel's ``prefetched`` lane: the nonresident
-    route matching it is excluded from the residual scratch plan and
-    remapped straight to ``prefetch_slot``. ``source_rows_out`` and
+    this forward. ``prefetch_count`` can supply the real persistent posted
+    count; only a value of one enables coverage. Its omission preserves
+    compatibility for existing callers by using a permanent count of one
+    when an expert is supplied. Without an expert, a permanent zero count
+    disables coverage. ``source_rows_out`` and
     ``slots_out`` are written for every one of ``flat``'s routes (residual
     routes first), matching ``GraphRoutePlan.source_rows``' full-vector
     contract; ``count_out`` receives the residual row count, which shrinks
@@ -202,7 +211,10 @@ def plan_graph_routes_fused(
     ``graph_counters``, ``graph_unique_counters`` and ``route_counts`` in
     place when given, instead of returning fresh per-call tensors for them;
     these stay logical (prefetch-covered routes still count as misses there),
-    matching ``plan_graph_routes``.
+    matching ``plan_graph_routes``. ``outcome_counters`` optionally holds a
+    persistent int64[4] accumulator ordered [covered, residual, wasted,
+    posted]. The first two are logical routes; the last two are physical
+    speculative rows.
 
     Returns the per-route remap in ``remap_dtype``, shaped like ``flat``.
     """
@@ -211,7 +223,7 @@ def plan_graph_routes_fused(
     if prefetch_expert is None:
         prefetch_expert, prefetch_count = _zero_prefetch_state(flat.device)
         prefetch_slot = 0
-    else:
+    elif prefetch_count is None:
         prefetch_count = _one_prefetch_count(flat.device)
     remap_out = torch.empty(flat.shape, dtype=remap_dtype, device=flat.device)
     plan_unique_routes_cuda(
@@ -228,5 +240,6 @@ def plan_graph_routes_fused(
         prefetch_expert,
         prefetch_count,
         prefetch_slot,
+        outcome_counters,
     )
     return remap_out

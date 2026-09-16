@@ -47,6 +47,16 @@ def _validate_counters(name: str, tensor: Optional[torch.Tensor], device: torch.
         raise ValueError(f"{name} must be an int64 CUDA tensor of two elements.")
 
 
+def _validate_outcome_counters(
+    name: str, tensor: Optional[torch.Tensor], device: torch.device
+) -> None:
+    if tensor is None:
+        return
+    _validate_device_tensor(name, tensor, device)
+    if tensor.dtype != torch.int64 or tensor.numel() != 4:
+        raise ValueError(f"{name} must be an int64 CUDA tensor of four elements.")
+
+
 def _validate_route_plan_inputs(
     topk_ids: torch.Tensor,
     expert_to_slot: torch.Tensor,
@@ -59,6 +69,7 @@ def _validate_route_plan_inputs(
     route_counts: Optional[torch.Tensor],
     prefetch_expert: torch.Tensor,
     prefetch_count: torch.Tensor,
+    outcome_counters: Optional[torch.Tensor],
 ) -> None:
     if topk_ids.device.type != "cuda":
         raise ValueError("topk_ids must be a CUDA tensor.")
@@ -87,6 +98,7 @@ def _validate_route_plan_inputs(
     _validate_scalar("prefetch_count", prefetch_count, device, torch.int32)
     _validate_counters("graph_counters", graph_counters, device)
     _validate_counters("graph_unique_counters", graph_unique_counters, device)
+    _validate_outcome_counters("outcome_counters", outcome_counters, device)
     if route_counts is not None:
         _validate_device_tensor("route_counts", route_counts, device)
         if route_counts.dtype != torch.float32:
@@ -109,12 +121,15 @@ def plan_unique_routes_cuda(
     prefetch_expert: torch.Tensor,
     prefetch_count: torch.Tensor,
     prefetch_slot: int,
+    outcome_counters: Optional[torch.Tensor] = None,
 ) -> None:
     """Write a BS1, K<=32 plan into supplied stable CUDA buffers.
 
     route_counts is an optional per-expert float32 counter tensor.
     prefetch_expert is int64[1], prefetch_count is int32[1].
     Zero prefetch_count disables coverage; prefetch_slot is a fixed integer.
+    outcome_counters is an optional persistent int64[4] accumulator ordered
+    [covered routes, residual routes, wasted posted rows, posted rows].
     Caller has joined prefetch completion before invoking this function.
     """
     _validate_route_plan_inputs(
@@ -129,6 +144,7 @@ def plan_unique_routes_cuda(
         route_counts,
         prefetch_expert,
         prefetch_count,
+        outcome_counters,
     )
     module = _jit_expert_route_plan_module(topk_ids.dtype, remap_out.dtype)
     module.plan_unique_routes_gpu(
@@ -145,4 +161,5 @@ def plan_unique_routes_cuda(
         prefetch_expert,
         prefetch_count,
         int(prefetch_slot),
+        outcome_counters,
     )

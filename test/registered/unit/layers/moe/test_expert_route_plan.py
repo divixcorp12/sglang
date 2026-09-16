@@ -402,6 +402,31 @@ class TestGraphRoutePlanPrefetchSkip(unittest.TestCase):
         self.assertEqual(int(plan.miss_plan_rows), 2)
         self.assertNotIn(self.PREFETCH_SLOT, plan.remap.tolist())
 
+    def test_zero_posted_count_does_not_cover_a_stale_prefetch_id(self):
+        """A stale positive ID is not an offer unless its row was posted.
+
+        This catches the routing bug where a previous forward's predicted ID
+        could redirect a current demand route to speculative storage after a
+        no-offer publication reset only the count to zero.
+        """
+        flat = torch.tensor([5, 9], dtype=torch.long)
+        expert_to_slot = _expert_to_slot([])
+        stale_prediction = torch.tensor([5], dtype=torch.long)
+        no_post = torch.zeros(1, dtype=torch.int32)
+
+        plan = plan_graph_routes(
+            flat,
+            expert_to_slot,
+            scratch_rows=2,
+            scratch_base=0,
+            prefetch_expert=stale_prediction,
+            prefetch_count=no_post,
+            prefetch_slot=self.PREFETCH_SLOT,
+        )
+
+        self.assertEqual(int(plan.miss_plan_rows), 2)
+        self.assertNotIn(self.PREFETCH_SLOT, plan.remap.tolist())
+
 
 if __name__ == "__main__":
     unittest.main()

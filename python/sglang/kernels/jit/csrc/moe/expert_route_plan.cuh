@@ -40,7 +40,8 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
     float* __restrict__ route_counts,
     const int64_t* __restrict__ prefetch_expert,
     const int32_t* __restrict__ prefetch_count,
-    int32_t prefetch_slot) {
+    int32_t prefetch_slot,
+    int64_t* __restrict__ outcome_counters) {
   const unsigned lane = threadIdx.x;
   const bool active = static_cast<int>(lane) < top_k;
   const int64_t expert = active ? static_cast<int64_t>(topk_ids[lane]) : 0;
@@ -91,6 +92,23 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
       atomicAdd(unique_counters, static_cast<unsigned long long>(__popc(hit_mask)));
       atomicAdd(unique_counters + 1, static_cast<unsigned long long>(demand_misses));
     }
+    if (outcome_counters != nullptr) {
+      // These are outcome counters for the one-row speculative offer, not
+      // transfer-volume counters. `covered_routes` and `residual_routes`
+      // retain logical route multiplicity. `posted_rows` and `wasted_rows`
+      // are physical speculative rows, so they are at most one per forward.
+      // Coverage is gated by the real posted count: a stale positive ID with
+      // count zero must remain a residual demand route.
+      const unsigned covered_routes = __popc(prefetched_mask);
+      const unsigned residual_routes = __popc(miss_mask);
+      const unsigned posted_rows = prefetch_count[0] == 1 ? 1u : 0u;
+      const unsigned wasted_rows = posted_rows && covered_routes == 0 ? 1u : 0u;
+      auto* outcomes = reinterpret_cast<unsigned long long*>(outcome_counters);
+      atomicAdd(outcomes, static_cast<unsigned long long>(covered_routes));
+      atomicAdd(outcomes + 1, static_cast<unsigned long long>(residual_routes));
+      atomicAdd(outcomes + 2, static_cast<unsigned long long>(wasted_rows));
+      atomicAdd(outcomes + 3, static_cast<unsigned long long>(posted_rows));
+    }
   }
 }
 
@@ -113,7 +131,8 @@ void plan_unique_routes_gpu(
     tvm::ffi::Optional<tvm::ffi::TensorView> route_counts,
     tvm::ffi::TensorView prefetch_expert,
     tvm::ffi::TensorView prefetch_count,
-    int64_t prefetch_slot) {
+    int64_t prefetch_slot,
+    tvm::ffi::Optional<tvm::ffi::TensorView> outcome_counters) {
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
   int64_t* graph_counters_ptr =
       graph_counters.has_value() ? static_cast<int64_t*>(graph_counters.value().data_ptr()) : nullptr;
@@ -122,6 +141,9 @@ void plan_unique_routes_gpu(
                                            : nullptr;
   float* route_counts_ptr =
       route_counts.has_value() ? static_cast<float*>(route_counts.value().data_ptr()) : nullptr;
+  int64_t* outcome_counters_ptr = outcome_counters.has_value()
+                                      ? static_cast<int64_t*>(outcome_counters.value().data_ptr())
+                                      : nullptr;
   host::LaunchKernel(1, kExpertRoutePlanWarpSize, stream)(
       plan_unique_routes_kernel<IdT, RemapT>,
       static_cast<const IdT*>(topk_ids.data_ptr()),
@@ -137,7 +159,8 @@ void plan_unique_routes_gpu(
       route_counts_ptr,
       static_cast<const int64_t*>(prefetch_expert.data_ptr()),
       static_cast<const int32_t*>(prefetch_count.data_ptr()),
-      static_cast<int32_t>(prefetch_slot));
+      static_cast<int32_t>(prefetch_slot),
+      outcome_counters_ptr);
 }
 
 }  // namespace sglang

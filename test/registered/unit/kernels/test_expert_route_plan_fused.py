@@ -47,8 +47,11 @@ def run_fused_case(
     expert_to_slot: torch.Tensor,
     scratch_base: int,
     remap_dtype: torch.dtype = torch.int64,
+    prefetch_expert: int = -1,
+    prefetch_count: int = 0,
+    outcome_counters: torch.Tensor | None = None,
 ) -> SimpleNamespace:
-    """Allocate outputs/counters, supply zero-prefetch state, and run the kernel."""
+    """Allocate stable outputs/counters and run the kernel."""
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
     device = ids.device
@@ -60,8 +63,12 @@ def run_fused_case(
     graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
     graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
     route_counts = torch.zeros(expert_to_slot.numel(), dtype=torch.float32, device=device)
-    prefetch_expert = torch.zeros(1, dtype=torch.int64, device=device)
-    prefetch_count = torch.zeros(1, dtype=torch.int32, device=device)
+    prefetch_expert_tensor = torch.full(
+        (1,), prefetch_expert, dtype=torch.int64, device=device
+    )
+    prefetch_count_tensor = torch.full(
+        (1,), prefetch_count, dtype=torch.int32, device=device
+    )
 
     plan_unique_routes_cuda(
         ids,
@@ -74,9 +81,10 @@ def run_fused_case(
         graph_counters,
         graph_unique_counters,
         route_counts,
-        prefetch_expert,
-        prefetch_count,
+        prefetch_expert_tensor,
+        prefetch_count_tensor,
         0,
+        outcome_counters,
     )
     return SimpleNamespace(
         source_rows=source_rows_out,
@@ -86,6 +94,7 @@ def run_fused_case(
         graph_counters=graph_counters,
         graph_unique_counters=graph_unique_counters,
         route_counts=route_counts,
+        outcome_counters=outcome_counters,
     )
 
 
@@ -149,6 +158,45 @@ def test_all_hit_has_no_residual_rows():
 def test_all_miss_uses_every_scratch_row():
     ids = torch.tensor([4, 1, 3, 2], device="cuda", dtype=torch.int64)
     assert_matches_reference(ids, resident=[], scratch_base=0)
+
+
+@pytest.mark.parametrize(
+    ("ids", "resident", "prefetch_expert", "prefetch_count", "expected_outcomes", "expected_residual"),
+    [
+        ([5, 9], [], 5, 0, [0, 2, 0, 0], 2),  # stale ID is no offer
+        ([5, 9], [], 5, 1, [1, 1, 0, 1], 1),  # useful prediction
+        ([5, 9], [], 8, 1, [0, 2, 1, 1], 2),  # wrong prediction
+        ([5, 9], [5], 5, 1, [0, 1, 1, 1], 1),  # predicted row is already resident
+        ([5, 2], [2], 5, 1, [1, 0, 0, 1], 0),  # no residual demand rows
+        (list(range(32)), [], 0, 1, [1, 31, 0, 1], 31),
+    ],
+)
+def test_outcome_counters_are_posted_count_aware_and_route_logical(
+    ids, resident, prefetch_expert, prefetch_count, expected_outcomes, expected_residual
+):
+    """Planner-owned outcomes count logical routes, not physical demand rows.
+
+    The deliberate stale-ID case prevents a previous forward's positive ID
+    from suppressing a current demand copy after the current forward posted
+    count zero.
+    """
+    route_ids = torch.tensor(ids, device="cuda", dtype=torch.int64)
+    outcomes = torch.tensor([7, 11, 13, 17], device="cuda", dtype=torch.int64)
+    result = run_fused_case(
+        route_ids,
+        _expert_to_slot(resident),
+        scratch_base=len(resident),
+        prefetch_expert=prefetch_expert,
+        prefetch_count=prefetch_count,
+        outcome_counters=outcomes,
+    )
+
+    torch.testing.assert_close(
+        result.outcome_counters,
+        torch.tensor([7, 11, 13, 17], device="cuda", dtype=torch.int64)
+        + torch.tensor(expected_outcomes, device="cuda", dtype=torch.int64),
+    )
+    assert int(result.count.item()) == expected_residual
 
 
 @pytest.mark.parametrize("top_k", [1, 10, 32])
@@ -336,6 +384,7 @@ def test_plan_graph_routes_fused_wires_prefetch_coverage_matching_the_cpu_oracle
     expert_to_slot = _expert_to_slot([])
     expert_to_slot[2] = 7  # expert 2 hits; 5, 9, 1 are actual misses
     predicted = torch.tensor([9], dtype=torch.int64, device="cuda")  # covers a real miss
+    posted_count = torch.ones(1, dtype=torch.int32, device="cuda")
     prefetch_slot = 55
     scratch_base = 10
 
@@ -344,6 +393,7 @@ def test_plan_graph_routes_fused_wires_prefetch_coverage_matching_the_cpu_oracle
     count_out = torch.full((1,), -1, dtype=torch.int32, device="cuda")
     graph_counters = torch.zeros(2, dtype=torch.int64, device="cuda")
     graph_unique_counters = torch.zeros(2, dtype=torch.int64, device="cuda")
+    outcome_counters = torch.zeros(4, dtype=torch.int64, device="cuda")
 
     remap = plan_graph_routes_fused(
         ids,
@@ -358,17 +408,25 @@ def test_plan_graph_routes_fused_wires_prefetch_coverage_matching_the_cpu_oracle
         None,
         prefetch_expert=predicted,
         prefetch_slot=prefetch_slot,
+        prefetch_count=posted_count,
+        outcome_counters=outcome_counters,
     )
 
     oracle = plan_graph_routes(
         ids, expert_to_slot, ids.numel(), scratch_base,
-        prefetch_expert=predicted, prefetch_slot=prefetch_slot,
+        prefetch_expert=predicted,
+        prefetch_slot=prefetch_slot,
+        prefetch_count=posted_count,
     )
     torch.testing.assert_close(remap, oracle.remap)
     torch.testing.assert_close(source_rows_out, oracle.source_rows)
     assert int(count_out.item()) == int(oracle.miss_plan_rows)
     assert int(graph_counters[1].item()) == int(oracle.routed_miss_rows)
     assert int(graph_unique_counters[1].item()) == int(oracle.unique_miss_rows)
+    torch.testing.assert_close(
+        outcome_counters,
+        torch.tensor([1, 2, 0, 1], dtype=torch.int64, device="cuda"),
+    )
     # Position 2 is expert 9 -- the covered route -- and must redirect straight
     # to the dedicated slot, one fewer residual scratch row than the disabled case.
     assert remap[2].item() == prefetch_slot
