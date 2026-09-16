@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import atexit
 
-import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -15,6 +15,7 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prediction.adapters import install_pre_mixer_taps
+from sglang.srt.layers.moe.async_telemetry import AsyncTelemetry, TorchTelemetryBackend
 from sglang.srt.layers.moe.expert_prediction.base import ExpertPredictor
 from sglang.srt.layers.moe.expert_prediction.capture import CaptureSettings, RouteCapture
 from sglang.srt.layers.moe.expert_prediction.capture_schema import CAPTURE_FEATURES
@@ -98,6 +99,7 @@ class ExpertPredictionRuntime:
         self.capture = capture
         self.prefetch = prefetch
         self._closed = False
+        self._telemetry = self._make_telemetry() if metrics_path is not None else None
         # ModelRunner has no teardown hook for this optional runtime. Register
         # with the process owner so short profiling jobs flush on server exit.
         atexit.register(self.close)
@@ -327,6 +329,10 @@ class ExpertPredictionRuntime:
         )
 
     def on_forward_end(self, forward_batch: Any) -> None:
+        # Event queries are nonblocking.  Completed slots become writer-owned;
+        # unfinished GPU copies remain untouched until a later forward.
+        if self._telemetry is not None:
+            self._telemetry.poll()
         if self.capture is not None:
             self.capture.on_forward_end(
                 forward_batch, taps_supported=not self._taps.unsupported_layers
@@ -345,24 +351,66 @@ class ExpertPredictionRuntime:
             self._append_metrics()
 
     def _append_metrics(self) -> None:
+        telemetry = self._telemetry
+        if telemetry is None or self._metrics_path is None:
+            return
+        telemetry.schedule(
+            self._metric_tensors(),
+            {
+                "path": self._metrics_path,
+                "timestamp_ns": time.time_ns(),
+                "forwards": self.forwards,
+                "eligible_forwards": self.eligible_forwards,
+                "telemetry": telemetry.stats(),
+            },
+        )
+
+    def _metric_tensors(self) -> dict[str, torch.Tensor]:
+        tensors = {"shadow_totals": self.metrics._totals}
+        if self.prefetch is not None:
+            tensors.update(self.prefetch.telemetry_tensors())
+        return tensors
+
+    def _make_telemetry(self) -> AsyncTelemetry:
+        sources = self._metric_tensors()
+        return AsyncTelemetry(
+            sources=sources,
+            backend=TorchTelemetryBackend(sources),
+            writer=self._write_metrics_snapshot,
+            thread_name="moe-prediction-metrics",
+        )
+
+    def _write_metrics_snapshot(
+        self, buffers: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]
+    ) -> None:
+        """Serialize a completed CPU snapshot away from the inference thread."""
+        path = metadata["path"]
         try:
-            self.metrics.append_jsonl(
-                self._metrics_path,
-                forwards=self.forwards,
-                eligible_forwards=self.eligible_forwards,
+            self.metrics.append_jsonl_from_host(
+                path,
+                buffers["shadow_totals"],
+                forwards=metadata["forwards"],
+                eligible_forwards=metadata["eligible_forwards"],
+                timestamp_ns=metadata["timestamp_ns"],
+                telemetry=metadata["telemetry"],
             )
             if self.prefetch is not None:
-                with self._metrics_path.open("a", encoding="utf-8") as destination:
+                with path.open("a", encoding="utf-8") as destination:
                     destination.write(
-                        json.dumps({"prefetch": self.prefetch.metrics_record(), "forwards": self.forwards})
+                        msgspec.json.encode(
+                            {
+                                "prefetch": self.prefetch.metrics_record_from_host(buffers),
+                                "forwards": metadata["forwards"],
+                            }
+                        ).decode()
                         + "\n"
                     )
-                self.prefetch.write_calibration(complete=False)
+                self.prefetch.write_calibration_from_host(buffers, complete=False)
         except OSError as error:
             logger.warning(
                 "MoE expert prediction metrics write failed, disabling further writes: "
                 "path=%s error=%s",
-                self._metrics_path,
+                path,
                 error,
             )
             self._metrics_path = None
@@ -375,6 +423,8 @@ class ExpertPredictionRuntime:
         # emit its final artifact exactly once at ordinary teardown.
         if self._metrics_path is not None and self.forwards and self.forwards % self._log_interval:
             self._append_metrics()
+        if self._telemetry is not None:
+            self._telemetry.close()
         if self.capture is not None:
             self.capture.close()
         if self.prefetch is not None:

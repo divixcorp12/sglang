@@ -610,21 +610,73 @@ class PrefetchScoring:
 
     def metrics_record(self) -> dict:
         """Host read of the device counters; call only at metric log intervals."""
+        tensors = self.telemetry_tensors()
+        return self.metrics_record_from_host(
+            {name: tensor.cpu() for name, tensor in tensors.items()}
+        )
+
+    def telemetry_tensors(self) -> dict[str, torch.Tensor]:
+        """Device counters needed for a self-contained periodic telemetry sample."""
+        tensors: dict[str, torch.Tensor] = {}
+        if self.recall is not None:
+            tensors["prefetch_recall_counts"] = self.recall.counts
+        if self.calibration is not None:
+            tensors.update(
+                {
+                    "prefetch_calibration_score_counts": self.calibration._score_counts,
+                    "prefetch_calibration_margin_counts": self.calibration._margin_counts,
+                    "prefetch_calibration_target_observations": self.calibration._target_observations,
+                }
+            )
+        return tensors
+
+    def metrics_record_from_host(self, tensors: Mapping[str, torch.Tensor]) -> dict:
+        """Format the completed CPU half of a telemetry hand-off.
+
+        All caller-provided tensors must be immutable CPU buffers owned by the
+        background writer; this method must never dereference a live device
+        counter.
+        """
         if self.recall is None:
             record = {"predictor": self.predictor, "shadow_recall_enabled": False}
             if self.calibration is not None:
-                record["pull_calibration"] = self.calibration.snapshot()
+                record["pull_calibration"] = self._calibration_from_host(tensors)
             return record
-        layers = {str(layer): {"missed_routes": missed, "covered_routes": covered}
-                  for layer, (missed, covered) in self.recall.snapshot().items()}
+        values = tensors["prefetch_recall_counts"].tolist()
+        layers = {
+            str(layer): {"missed_routes": int(values[row][0]), "covered_routes": int(values[row][1])}
+            for layer, row in self.recall._rows.items()
+        }
         missed = sum(v["missed_routes"] for v in layers.values())
         covered = sum(v["covered_routes"] for v in layers.values())
         record = {"predictor": self.predictor, "budget": self.recall.budget,
                 "budget_recall": covered / missed if missed else 0.0, "layers": layers,
                 "shadow_recall_enabled": True}
         if self.calibration is not None:
-            record["pull_calibration"] = self.calibration.snapshot()
+            record["pull_calibration"] = self._calibration_from_host(tensors)
         return record
+
+    def _calibration_from_host(self, tensors: Mapping[str, torch.Tensor]) -> dict:
+        assert self.calibration is not None
+        return self.calibration.snapshot_from_host(
+            tensors["prefetch_calibration_score_counts"],
+            tensors["prefetch_calibration_margin_counts"],
+            tensors["prefetch_calibration_target_observations"],
+        )
+
+    def write_calibration_from_host(
+        self, tensors: Mapping[str, torch.Tensor], *, complete: bool = False
+    ) -> None:
+        """Publish a calibration file from the writer's owned CPU buffers."""
+        if self.calibration is None or self._calibration_file is None:
+            return
+        provenance = json.loads(self._calibration_provenance or "{}")
+        self.calibration.write_from_snapshot(
+            self._calibration_file,
+            provenance,
+            self._calibration_from_host(tensors),
+            complete=complete,
+        )
 
     def write_calibration(self, *, complete: bool = True) -> None:
         if self.calibration is None or self._calibration_file is None:

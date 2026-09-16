@@ -178,6 +178,7 @@ class TestExpertPredictionRuntime(unittest.TestCase):
         for _ in range(2):
             _decode(model, runtime)
         self.assertEqual(runtime.forwards, 2)
+        runtime.close()
         (line,) = path.read_text().splitlines()
         record = json.loads(line)
         self.assertEqual(record["forwards"], 2)
@@ -267,6 +268,7 @@ class TestExpertPredictionRuntime(unittest.TestCase):
         with self.assertLogs("sglang.srt.layers.moe.expert_prediction", "WARNING"):
             for _ in range(2):
                 _decode(model, runtime)
+            runtime.close()
         self.assertEqual(runtime.forwards, 2)
 
     def test_from_env_rejects_misconfigured_prefetch(self):

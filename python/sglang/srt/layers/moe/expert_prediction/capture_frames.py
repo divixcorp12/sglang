@@ -62,13 +62,13 @@ class CaptureFrame:
 
 
 class FramePool:
-    """Fixed frames; ``acquire`` blocks while the writer still holds every frame."""
+    """Fixed frames with an explicit nonblocking acquisition path for serving."""
 
     def __init__(self, frames: Sequence[CaptureFrame]) -> None:
         if not frames:
             raise ValueError("SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES must be positive")
         self._frames = tuple(frames)
-        self._free: queue.SimpleQueue[CaptureFrame] = queue.SimpleQueue()
+        self._free: queue.Queue[CaptureFrame] = queue.Queue(maxsize=len(frames))
         for frame in frames:
             self._free.put(frame)
 
@@ -77,11 +77,22 @@ class FramePool:
         return self._frames[0].capacity
 
     @property
+    def frames(self) -> int:
+        return len(self._frames)
+
+    @property
     def nbytes(self) -> int:
         return sum(frame.nbytes for frame in self._frames)
 
     def acquire(self, timeout: float | None = None) -> CaptureFrame:
         return self._free.get(timeout=timeout)
+
+    def try_acquire(self) -> CaptureFrame | None:
+        """Return an owned frame now, or ``None`` without delaying inference."""
+        try:
+            return self._free.get_nowait()
+        except queue.Empty:
+            return None
 
     def release(self, frame: CaptureFrame) -> None:
         frame.event = None

@@ -91,36 +91,37 @@ class ShardWriter:
         self._shard_index = 0
         self.written_bytes = 0
         self.stopped = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._stop_reason: str | None = None
+        self._stop_recorded = False
         self._reset_shard()
         self._write_header()
-        self._queue: queue.SimpleQueue[PendingForward | None] = queue.SimpleQueue()
+        # Frame ownership independently bounds submissions, and this queue
+        # makes that bound explicit if a caller bypasses the pool.
+        self._queue: queue.Queue[PendingForward | None] = queue.Queue(
+            maxsize=pool.frames
+        )
         self._thread = threading.Thread(
             target=self._run, name="moe-expert-capture-writer", daemon=True
         )
         self._thread.start()
 
-    def submit(self, pending: PendingForward) -> None:
-        self._queue.put(pending)
+    def submit(self, pending: PendingForward) -> bool:
+        """Accept frame ownership now, or report backpressure without waiting."""
+        if self.stopped.is_set():
+            return False
+        try:
+            self._queue.put_nowait(pending)
+        except queue.Full:
+            return False
+        return True
 
     def stop(self, reason: str) -> None:
-        if self.stopped.is_set():
-            return
-        self.stopped.set()
-        logger.warning(
-            "MoE expert capture stopped: %s (written_bytes=%d)", reason, self.written_bytes
-        )
-        try:
-            (self._directory / STOPPED_NAME).write_text(
-                json.dumps(
-                    {
-                        "reason": reason,
-                        "written_bytes": self.written_bytes,
-                        "timestamp_ns": time.time_ns(),
-                    }
-                )
-            )
-        except OSError:
-            logger.exception("MoE expert capture could not record its stop reason")
+        with self._stop_lock:
+            if self.stopped.is_set():
+                return
+            self._stop_reason = reason
+            self.stopped.set()
 
     def close(self) -> None:
         if self._thread.is_alive():
@@ -133,15 +134,41 @@ class ShardWriter:
                 item = self._queue.get(timeout=self._idle_flush_s)
             except queue.Empty:
                 self._guarded(self._flush)
+                self._guarded(self._record_stop)
                 continue
             if item is None:
                 self._guarded(self._flush)
+                self._guarded(self._record_stop)
                 return
             try:
                 if not self.stopped.is_set():
                     self._guarded(lambda: self._ingest(item))
             finally:
                 self._pool.release(item.frame)
+                self._guarded(self._record_stop)
+
+    def _record_stop(self) -> None:
+        """Persist a serving-thread stop decision on the background writer."""
+        with self._stop_lock:
+            if not self.stopped.is_set() or self._stop_recorded:
+                return
+            reason = self._stop_reason
+            self._stop_recorded = True
+        try:
+            (self._directory / STOPPED_NAME).write_text(
+                json.dumps(
+                    {
+                        "reason": reason,
+                        "written_bytes": self.written_bytes,
+                        "timestamp_ns": time.time_ns(),
+                    }
+                )
+            )
+            logger.warning(
+                "MoE expert capture stopped: %s (written_bytes=%d)", reason, self.written_bytes
+            )
+        except OSError:
+            logger.exception("MoE expert capture could not record its stop reason")
 
     def _guarded(self, action: Callable[[], None]) -> None:
         try:

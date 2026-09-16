@@ -2,6 +2,8 @@
 
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
+import tempfile
 
 import torch
 
@@ -12,6 +14,28 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, stage="base-a", runner_config="1-gpu-small")
 
 HIDDEN, EXPERTS, TOP_K = 16, 32, 4
+
+
+class TestCalibrationHostSnapshots(unittest.TestCase):
+    def test_owned_host_snapshot_preserves_calibration_schema_and_write_contract(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.calibration import (
+            PullCalibrationHistogram,
+        )
+
+        histogram = PullCalibrationHistogram(layer_ids=(7,), device=torch.device("cpu"))
+        histogram._target_observations[0] = 3
+        histogram._score_counts[0, 4, 0] = 2
+        histogram._margin_counts[0, 5, 2] = 1
+        snapshot = histogram.snapshot_from_host(
+            histogram._score_counts.clone(),
+            histogram._margin_counts.clone(),
+            histogram._target_observations.clone(),
+        )
+        self.assertEqual(snapshot, histogram.snapshot())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            histogram.write_from_snapshot(path, {"run": "test"}, snapshot, complete=True)
+            self.assertEqual(PullCalibrationHistogram.require_complete(path)["layers"]["7"]["target_observations"], 3)
 
 
 class _Cache:

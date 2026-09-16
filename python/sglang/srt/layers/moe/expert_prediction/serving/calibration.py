@@ -111,8 +111,32 @@ class PullCalibrationHistogram:
 
     def snapshot(self) -> dict:
         """Materialize the versioned host contract at a normal metrics boundary."""
+        return self.snapshot_from_host(
+            self._score_counts.cpu(),
+            self._margin_counts.cpu(),
+            self._target_observations.cpu(),
+        )
+
+    def snapshot_from_host(
+        self,
+        score_counts: torch.Tensor,
+        margin_counts: torch.Tensor,
+        target_observations: torch.Tensor,
+    ) -> dict:
+        """Format completed owned CPU buffers without reading a device.
+
+        The normal serving path queues those buffers with the shared async
+        telemetry pool.  ``snapshot`` retains the explicit synchronous API for
+        offline callers and teardown.
+        """
+        if any(
+            tensor.device.type != "cpu"
+            for tensor in (score_counts, margin_counts, target_observations)
+        ):
+            raise ValueError("calibration snapshot_from_host needs CPU-owned tensors")
+
         def serialize(counts: torch.Tensor) -> dict[str, list[int]]:
-            values = counts.cpu().tolist()
+            values = counts.tolist()
             return {
                 field: [int(bin_values[index]) for bin_values in values]
                 for index, field in enumerate(self._FIELDS)
@@ -125,9 +149,9 @@ class PullCalibrationHistogram:
             "bin_edges": "uniform [0,1], lower-inclusive; 1.0 is in bin 255",
             "layers": {
                 str(layer_id): {
-                    "target_observations": int(self._target_observations[row].item()),
-                    "score": serialize(self._score_counts[row]),
-                    "margin": serialize(self._margin_counts[row]),
+                    "target_observations": int(target_observations[row]),
+                    "score": serialize(score_counts[row]),
+                    "margin": serialize(margin_counts[row]),
                 }
                 for layer_id, row in self._rows.items()
             },
@@ -135,7 +159,12 @@ class PullCalibrationHistogram:
 
     def write(self, path: Path, provenance: dict, *, complete: bool = True) -> None:
         """Atomically publish the profiling artifact at a normal metrics flush."""
-        payload = self.snapshot()
+        self.write_from_snapshot(path, provenance, self.snapshot(), complete=complete)
+
+    @staticmethod
+    def write_from_snapshot(path: Path, provenance: dict, snapshot: dict, *, complete: bool = True) -> None:
+        """Publish an already materialized snapshot; suitable for a CPU writer."""
+        payload = dict(snapshot)
         payload["provenance"] = provenance
         payload["complete"] = complete
         temporary = path.with_suffix(path.suffix + ".partial")

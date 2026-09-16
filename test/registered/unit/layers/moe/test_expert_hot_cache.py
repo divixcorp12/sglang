@@ -678,6 +678,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
                 "sglang.srt.layers.moe.expert_hot_cache", level="INFO"
             ):
                 self.observe(manager, counts)
+            manager.close_telemetry()
             trace.seek(0)
             logged = json.loads(trace.read().splitlines()[0])
         self.assertEqual(logged["counters"]["prefill"]["0"]["backing_source_bytes"], 40)
@@ -693,6 +694,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
             ):
                 self.observe(manager, counts)
                 self.observe(manager, counts)
+            manager.close_telemetry()
             trace.seek(0)
             self.assertEqual(len(trace.read().splitlines()), 1)
 
@@ -705,6 +707,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
             self.observe(manager, counts, mode=self.mode.TARGET_VERIFY)
             self.observe(manager, counts, mode=self.mode.DRAFT_EXTEND_V2)
             self.observe(manager, counts, mode=self.mode.DECODE)
+            manager.close_telemetry()
             trace.seek(0)
             records = [json.loads(line) for line in trace.read().splitlines()]
         self.assertEqual(
@@ -775,6 +778,23 @@ class TestExpertHotCacheManager(unittest.TestCase):
             statistics = manager.snapshot_route_statistics()["decode"]
         self.assertEqual(statistics["popularity"]["2"], [[1, 6.0], [2, 2.0]])
         self.assertEqual(statistics["affinity"]["0->2"], [[0, 1, 12.0], [3, 1, 6.0]])
+
+    def test_trace_boundary_queues_a_snapshot_without_host_synchronization(self):
+        with tempfile.NamedTemporaryFile() as trace:
+            manager = self.manager(dynamic=False, log_interval=1, metrics_path=trace.name)
+            counts = torch.tensor([[2, 0, 0, 1], [0] * 4, [0, 3, 1, 0]], device="cuda")
+            batch = self.batch(mode=self.mode.DECODE)
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                manager.on_expert_distribution(batch, {"global_physical_count": counts})
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            manager.close_telemetry()
+            trace.seek(0)
+            (record,) = [json.loads(line) for line in trace.read().splitlines()]
+        self.assertEqual(record["phase"], "decode")
+        self.assertIn("telemetry", record)
 
     def test_no_trace_consumer_skips_dense_route_history_and_affinity(self):
         manager = self.manager(dynamic=False, log_interval=1000)

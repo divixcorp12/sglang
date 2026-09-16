@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
+import copy
 import json
 import logging
 import math
 import os
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -18,6 +21,7 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.async_telemetry import AsyncTelemetry, TorchTelemetryBackend
 from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
     SparseNextLayerPolicy,
@@ -1055,6 +1059,16 @@ class ExpertHotCacheManager:
         # caches. It deliberately has a separate registration: profiling runs
         # use pull mode off and therefore have no PrefetchPuller to piggyback on.
         manager._prefetch_calibration = None
+        # Trace schemas grow only when a new serving phase first creates its
+        # device registers.  Keep an independent fixed-slot pool per schema so
+        # adding that optional phase never waits for an older trace to drain.
+        manager._trace_telemetry: dict[tuple[tuple[str, tuple[int, ...], str], ...], AsyncTelemetry] = {}
+        manager._trace_write_condition = threading.Condition()
+        manager._trace_sequence = 0
+        manager._trace_next_write = 0
+        manager._trace_skipped: set[int] = set()
+        if manager.metrics_path is not None:
+            atexit.register(manager.close_telemetry)
         for layer_id, expert_ids in selected.items():
             if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -1771,17 +1785,263 @@ class ExpertHotCacheManager:
             result[phase] = {"popularity": popularity, "affinity": affinity}
         return result
 
-    def _write_trace(self, phase: str) -> None:
-        if self.metrics_path is None:
-            return
-        trace = {
+    def _trace_sources(self) -> dict[str, torch.Tensor]:
+        """Live device buffers copied as one stream-ordered trace snapshot."""
+        sources: dict[str, torch.Tensor] = {}
+        for phase, registers in self._registers.items():
+            for name, tensor in registers.items():
+                sources[f"register:{phase}:{name}"] = tensor
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            sources.update(
+                {
+                    "gpu_residency:promotions": updater.promotions,
+                    "gpu_residency:evictions": updater.evictions,
+                    "gpu_residency:boundary_updates": updater.boundary_updates,
+                    "gpu_residency:truncated_layers": updater.truncated,
+                }
+            )
+        return sources
+
+    def _trace_metadata(
+        self, phase: str, telemetry: AsyncTelemetry, sequence: int
+    ) -> dict[str, Any]:
+        """Immutable host state paired with a trace's immutable device buffers."""
+        counters = {
+            mode: {
+                str(layer_id): asdict(values)
+                for layer_id, values in layers.items()
+            }
+            for mode, layers in self._counters.items()
+        }
+        coordinators = getattr(self, "prefetch_coordinators", {})
+        policies = getattr(self, "residency_policies", {})
+        metadata: dict[str, Any] = {
+            "path": self.metrics_path,
             "timestamp_ns": time.time_ns(),
             "phase": phase,
-            "counters": self.snapshot_counters(),
-            "route_statistics": self.snapshot_route_statistics(),
+            "sequence": sequence,
+            "counters": counters,
+            "side_pull_snapshots": copy.deepcopy(self._side_pull_snapshots),
+            "prefetch": {
+                str(layer_id): coordinator.snapshot_stats()
+                for layer_id, coordinator in coordinators.items()
+            },
+            "residency_policy": {
+                str(layer_id): policy.snapshot_metrics()
+                for layer_id, policy in policies.items()
+            },
+            "telemetry": telemetry.stats(),
         }
-        with self.metrics_path.open("a", encoding="utf-8") as destination:
-            destination.write(json.dumps(trace, sort_keys=True) + "\n")
+        if self.async_promotions:
+            metadata["residency_async"] = {
+                "deferred_updates": self.deferred_residency_updates,
+                "inflight_submissions": len(self._inflight_promotions),
+            }
+        doorbell = getattr(self, "doorbell", None)
+        if doorbell is not None:
+            metadata["doorbell"] = doorbell.stats()
+        updater = getattr(self, "gpu_residency", None)
+        if updater is not None:
+            metadata["gpu_residency_layers"] = tuple(updater.layer_ids)
+        return metadata
+
+    def _schedule_trace(self, phase: str) -> None:
+        """Queue optional trace telemetry without waiting or performing file I/O."""
+        if self.metrics_path is None:
+            return
+        self._refresh_side_pull_delivery()
+        sources = self._trace_sources()
+        if not sources:
+            return
+        key = tuple(
+            sorted(
+                (name, tuple(tensor.shape), str(tensor.dtype))
+                for name, tensor in sources.items()
+            )
+        )
+        telemetry = self._trace_telemetry.get(key)
+        if telemetry is None:
+            telemetry = AsyncTelemetry(
+                sources=sources,
+                backend=TorchTelemetryBackend(sources),
+                writer=self._write_trace_snapshot,
+                thread_name="moe-hot-cache-trace",
+            )
+            self._trace_telemetry[key] = telemetry
+        with self._trace_write_condition:
+            sequence = self._trace_sequence
+            self._trace_sequence += 1
+        if not telemetry.schedule(sources, self._trace_metadata(phase, telemetry, sequence)):
+            self._skip_trace_sequence(sequence)
+
+    def close_telemetry(self) -> None:
+        """Flush optional traces after serving has stopped; never call on a forward."""
+        telemetry = tuple(getattr(self, "_trace_telemetry", {}).values())
+        for writer in telemetry:
+            writer.prepare_close()
+        for writer in telemetry:
+            writer.finish_close()
+
+    def _skip_trace_sequence(self, sequence: int) -> None:
+        with self._trace_write_condition:
+            self._trace_skipped.add(sequence)
+            self._advance_trace_sequence()
+            self._trace_write_condition.notify_all()
+
+    def _advance_trace_sequence(self) -> None:
+        while self._trace_next_write in self._trace_skipped:
+            self._trace_skipped.remove(self._trace_next_write)
+            self._trace_next_write += 1
+
+    def _write_trace_snapshot(
+        self, buffers: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]
+    ) -> None:
+        """Build and append a trace from writer-owned CPU tensors only."""
+        with self._trace_write_condition:
+            while metadata["sequence"] != self._trace_next_write:
+                self._trace_write_condition.wait()
+            try:
+                trace = {
+                    "timestamp_ns": metadata["timestamp_ns"],
+                    "phase": metadata["phase"],
+                    "counters": self._trace_counters_from_host(buffers, metadata),
+                    "route_statistics": self._trace_routes_from_host(buffers),
+                    "telemetry": metadata["telemetry"],
+                }
+                with metadata["path"].open("a", encoding="utf-8") as destination:
+                    destination.write(json.dumps(trace, sort_keys=True) + "\n")
+            finally:
+                self._trace_next_write += 1
+                self._advance_trace_sequence()
+                self._trace_write_condition.notify_all()
+
+    def _trace_counters_from_host(
+        self, buffers: Mapping[str, torch.Tensor], metadata: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Apply completed device counter snapshots to their accepted host bases."""
+        result = copy.deepcopy(metadata["counters"])
+        for mode, layers in result.items():
+            prefix = f"register:{mode}:"
+            graph_rows = buffers.get(prefix + "graph_rows")
+            graph_unique = (
+                buffers[prefix + "graph_unique_rows"].tolist()
+                if graph_rows is not None
+                else None
+            )
+            gathers = buffers[prefix + "gathers"].tolist() if graph_rows is not None else None
+            rows = graph_rows.tolist() if graph_rows is not None else None
+            for position, layer_id in enumerate(self._layer_ids):
+                row = layers[str(layer_id)]
+                streamer = self.streamers[layer_id]
+                if graph_rows is not None:
+                    routed, routed_missed = rows[position]
+                    requested_unique, unique_hit, unique_missed = graph_unique[position]
+                    row["requested_rows"] += unique_hit + unique_missed
+                    row["routed_rows"] += routed
+                    row["miss_rows"] += unique_missed
+                    row["routed_miss_rows"] += routed_missed
+                    row["unique_miss_rows"] += unique_missed
+                    row["gathers"] += gathers[position]
+                    row["hot_hits"] += unique_hit
+                    row["d2d_bytes"] += routed * (
+                        streamer.bytes_per_expert - streamer.host_bytes_per_expert
+                    )
+                    row["h2d_bytes"] += unique_missed * streamer.host_bytes_per_expert
+                    row["backing_source_bytes"] += unique_missed * streamer.bytes_per_expert
+                    row["requested_unique_experts"] += requested_unique
+                    side_pull = metadata["side_pull_snapshots"].get((mode, layer_id))
+                    if side_pull is not None:
+                        covered, residual, wasted, posted = side_pull
+                        useful_posts = posted - wasted
+                        covered_demand_rows = min(useful_posts, unique_missed)
+                        row["miss_rows"] -= covered_demand_rows
+                        row["h2d_bytes"] -= covered_demand_rows * streamer.host_bytes_per_expert
+                        row["backing_source_bytes"] -= covered_demand_rows * streamer.bytes_per_expert
+                        row["miss_rows"] += posted
+                        row["side_pull_rows"] += posted
+                        row["side_pull_bytes"] += posted * streamer.bytes_per_expert
+                        row["side_pull_h2d_bytes"] = posted * streamer.host_bytes_per_expert
+                        row["side_pull_d2d_bytes"] = posted * (
+                            streamer.bytes_per_expert - streamer.host_bytes_per_expert
+                        )
+                        row["residual_demand_rows"] = unique_missed - covered_demand_rows
+                        row["residual_demand_h2d_bytes"] = (
+                            row["residual_demand_rows"] * streamer.host_bytes_per_expert
+                        )
+                        row["side_pull_posted_rows"] = posted
+                        row["side_pull_useful_posts"] = useful_posts
+                        row["side_pull_wasted_rows"] = wasted
+                        row["side_pull_covered_routes"] = covered
+                        row["side_pull_residual_routes"] = residual
+                        row["side_pull_useful_precision"] = (
+                            (posted - wasted) / posted if posted else 0.0
+                        )
+                cache = self.caches.get(layer_id)
+                row["residency_bytes"] = cache.capacity_bytes if cache else 0
+                row["allocation_bytes"] = cache.allocation_bytes if cache else 0
+                row["scratch_bytes"] = cache.scratch_bytes if cache else 0
+                row["prefetch_pull_bytes"] = cache.prefetch_pull_bytes if cache else 0
+        if metadata["prefetch"]:
+            result["prefetch"] = metadata["prefetch"]
+        if metadata["residency_policy"]:
+            result["residency_policy"] = metadata["residency_policy"]
+        if "residency_async" in metadata:
+            result["residency_async"] = metadata["residency_async"]
+        if "doorbell" in metadata:
+            result["doorbell"] = metadata["doorbell"]
+        if "gpu_residency_layers" in metadata:
+            device = {}
+            for name in (
+                "gpu_residency:promotions",
+                "gpu_residency:evictions",
+                "gpu_residency:boundary_updates",
+                "gpu_residency:truncated_layers",
+            ):
+                device[name.rsplit(":", 1)[-1]] = buffers[name].tolist()
+            result["residency_gpu"] = device
+            for row, layer_id in enumerate(metadata["gpu_residency_layers"]):
+                bytes_per_expert = self.caches[layer_id].bytes_per_expert
+                for phase, mode in enumerate(("decode", "prefill")):
+                    entry = result[mode][str(layer_id)]
+                    entry["promotions"] += device["promotions"][phase][row]
+                    entry["evictions"] += device["evictions"][phase][row]
+                    entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                policy = result.get("residency_policy", {}).get(str(layer_id))
+                if policy is not None:
+                    policy["boundary_updates"] += device["boundary_updates"][row]
+                    policy["promotions"] += device["promotions"][0][row] + device["promotions"][1][row]
+                    policy["evictions"] += device["evictions"][0][row] + device["evictions"][1][row]
+        return result
+
+    def _trace_routes_from_host(self, buffers: Mapping[str, torch.Tensor]) -> dict[str, Any]:
+        result = {}
+        pairs = list(zip(self._layer_ids, self._layer_ids[1:]))
+        for phase in self._counters:
+            popularity = buffers.get(f"register:{phase}:popularity")
+            affinity = buffers.get(f"register:{phase}:affinity")
+            if popularity is None or popularity.shape[0] == 0:
+                result[phase] = {
+                    "popularity": {str(layer_id): [] for layer_id in self._layer_ids},
+                    "affinity": {},
+                }
+                continue
+            experts = popularity.shape[1]
+            popular_entries = self._top_entries(popularity)
+            affinity_entries = self._top_entries(affinity.flatten(1))
+            result[phase] = {
+                "popularity": {
+                    str(layer_id): [[index, value] for index, value in entries]
+                    for layer_id, entries in zip(self._layer_ids, popular_entries)
+                },
+                "affinity": {
+                    f"{source}->{target}": [
+                        [flat // experts, flat % experts, value] for flat, value in entries
+                    ]
+                    for (source, target), entries in zip(pairs, affinity_entries)
+                },
+            }
+        return result
 
     def snapshot_counters(self) -> dict[str, dict[str, dict[str, int | float | None]]]:
         """Return JSON-compatible cumulative totals and current allocation gauges."""
@@ -1948,6 +2208,10 @@ class ExpertHotCacheManager:
         boundary; ``min_residence_forwards`` only holds back that layer's slot
         changes.
         """
+        # A query-only poll gives completed trace buffers to their writer while
+        # every later forward continues without waiting for a D2H copy.
+        for telemetry in tuple(self._trace_telemetry.values()):
+            telemetry.poll()
         kind, tokens = classify_forward(forward_batch)
         if kind is ForwardKind.DRAFT:
             return
@@ -2029,7 +2293,7 @@ class ExpertHotCacheManager:
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
         if clock.forwards % self.log_interval == 0:
-            self._write_trace(mode)
+            self._schedule_trace(mode)
             self._log_doorbell()
 
     def on_speculative_commit(self, accepted_tokens: int) -> None:

@@ -74,6 +74,18 @@ class TestScoreCandidates(unittest.TestCase):
 
 
 class TestShadowMetrics(unittest.TestCase):
+    def test_snapshot_from_owned_host_totals_matches_the_device_snapshot_contract(self):
+        metrics = ShadowMetrics(
+            predictor_names=("a",), layer_ids=(3,), device=torch.device("cpu")
+        )
+        metrics.add(
+            predictor_index=0,
+            target_layer=3,
+            counts=torch.tensor([2, 4, 1, 2, 4, 2, 7]),
+        )
+        owned_host_totals = metrics._totals.clone()
+        self.assertEqual(metrics.snapshot_from_host(owned_host_totals), metrics.snapshot())
+
     def test_snapshot_aggregates_layers_and_appends_jsonl(self):
         metrics = ShadowMetrics(
             predictor_names=("a", "b"), layer_ids=(0, 1), device=torch.device("cpu")

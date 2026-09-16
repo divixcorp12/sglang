@@ -92,10 +92,21 @@ class ShadowMetrics:
 
     def snapshot(self) -> dict:
         """Synchronizes with the device; returns JSON-ready per-layer counters and totals."""
-        totals = self._totals.cpu().tolist()
+        return self.snapshot_from_host(self._totals.cpu())
+
+    def snapshot_from_host(self, totals: torch.Tensor) -> dict:
+        """Format an already-owned CPU copy without a device read or file write.
+
+        ``AsyncTelemetry`` calls this only on its background writer after the
+        stream-recorded D2H copy completed.  The explicit ``snapshot`` method
+        remains available for diagnostics that intentionally request a sync.
+        """
+        if totals.device.type != "cpu":
+            raise ValueError("ShadowMetrics snapshot_from_host needs CPU-owned totals")
+        values = totals.tolist()
         result = {}
         for predictor_index, name in enumerate(self._predictor_names):
-            per_layer = totals[predictor_index]
+            per_layer = values[predictor_index]
             layers = {
                 str(layer_id): dict(zip(COUNTER_NAMES, per_layer[i]))
                 for i, layer_id in enumerate(self._layer_ids)
@@ -112,11 +123,31 @@ class ShadowMetrics:
         return result
 
     def append_jsonl(self, path: Path, *, forwards: int, eligible_forwards: int) -> None:
+        self.append_jsonl_from_host(
+            path,
+            self._totals.cpu(),
+            forwards=forwards,
+            eligible_forwards=eligible_forwards,
+        )
+
+    def append_jsonl_from_host(
+        self,
+        path: Path,
+        totals: torch.Tensor,
+        *,
+        forwards: int,
+        eligible_forwards: int,
+        timestamp_ns: int | None = None,
+        telemetry: dict[str, int] | None = None,
+    ) -> None:
+        """Append a record from an owned CPU snapshot on a writer thread."""
         record = {
-            "timestamp_ns": time.time_ns(),
+            "timestamp_ns": time.time_ns() if timestamp_ns is None else timestamp_ns,
             "forwards": forwards,
             "eligible_forwards": eligible_forwards,
-            "predictors": self.snapshot(),
+            "predictors": self.snapshot_from_host(totals),
         }
+        if telemetry is not None:
+            record["telemetry"] = telemetry
         with path.open("a", encoding="utf-8") as destination:
             destination.write(json.dumps(record, sort_keys=True) + "\n")

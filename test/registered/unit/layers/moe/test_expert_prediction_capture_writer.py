@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -67,6 +68,26 @@ def _submit(writer, pool, *, index, kind, rid, positions, token_ids):
 
 
 class TestShardWriter(unittest.TestCase):
+    def test_frame_pool_exhaustion_is_observable_without_waiting(self):
+        pool = _pool()
+        first = pool.try_acquire()
+        second = pool.try_acquire()
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIsNone(pool.try_acquire())
+        pool.release(first)
+        pool.release(second)
+
+    def test_stop_defers_stop_artifact_io_to_the_writer_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "capture"
+            writer = _writer(directory, _pool())
+            with mock.patch.object(Path, "write_text") as write_text:
+                writer.stop("test backpressure")
+                self.assertEqual(write_text.call_count, 0)
+            writer.close()
+            self.assertIn("test backpressure", (directory / STOPPED_NAME).read_text())
+
     def test_round_trip_through_reader(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "capture"

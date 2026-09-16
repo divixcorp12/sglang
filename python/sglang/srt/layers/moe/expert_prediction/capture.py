@@ -151,11 +151,14 @@ class RouteCapture:
             return
         if frame is None:
             frame = self._stage_store_rows(rows)
+            if frame is None:
+                self._writer.stop("capture frame pool exhausted")
+                return
         self._stage_identity(frame=frame, forward_batch=forward_batch, rows=rows)
         if self._use_events:
             frame.event = torch.cuda.Event()
             frame.event.record()
-        self._writer.submit(
+        if not self._writer.submit(
             PendingForward(
                 record=ForwardRecord(
                     forward_index=self.forwards,
@@ -165,7 +168,10 @@ class RouteCapture:
                 ),
                 frame=frame,
             )
-        )
+        ):
+            self._release(frame)
+            self._writer.stop("capture writer backlog exhausted")
+            return
         self.forwards += 1
 
     def _spill(self, layer_id: int, feature: RouteFeature, rows: torch.Tensor) -> None:
@@ -178,11 +184,16 @@ class RouteCapture:
             )
             return
         if self._frame is None:
-            self._frame = self._pool.acquire()
+            self._frame = self._pool.try_acquire()
+            if self._frame is None:
+                self._writer.stop("capture frame pool exhausted")
+                return
         self._frame.stage(layer_id=layer_id, feature=feature, rows=rows)
 
-    def _stage_store_rows(self, rows: int) -> CaptureFrame:
-        frame = self._pool.acquire()
+    def _stage_store_rows(self, rows: int) -> CaptureFrame | None:
+        frame = self._pool.try_acquire()
+        if frame is None:
+            return None
         for spec in self._specs:
             for feature in CAPTURE_FEATURES:
                 frame.stage(
