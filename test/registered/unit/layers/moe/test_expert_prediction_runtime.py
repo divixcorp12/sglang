@@ -151,6 +151,14 @@ class TestExpertPredictionRuntime(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE.*PREFETCH_PREDICTOR"):
                 ExpertPredictionRuntime.from_env(**common)
 
+    def test_prefetch_predictor_startup_guard_rejects_a_non_off_pull_mode(self):
+        # ModelRunner checks this field before it imports or constructs the
+        # prediction runtime, so this configuration boundary must reject an
+        # otherwise-silent pull mode itself.
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("count_zero"):
+            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE.*PREFETCH_PREDICTOR"):
+                envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
+
     def test_layer_pairs_by_offset(self):
         self.assertEqual(layer_pairs((0, 2, 5), 0), ((0, 0), (2, 2), (5, 5)))
         self.assertEqual(layer_pairs((0, 2, 5), 1), ((0, 2), (2, 5)))

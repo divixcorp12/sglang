@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -96,6 +98,23 @@ class TestExpertHotCache(unittest.TestCase):
         self.assertNotIn(slot.index, on.expert_to_slot.tolist())
         for name, tensor in on.tensors.items():
             self.assertLess(slot.index, tensor.shape[0])
+
+    def test_nonlegacy_pull_mode_reserves_the_dedicated_trailing_row(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
+            DedicatedPrefetchSlot,
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_PULL", None)
+            os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE", None)
+            with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("count_zero"):
+                cache = self.cache_type(self.streamer, capacity=2, scratch_rows=3)
+
+        slot = DedicatedPrefetchSlot(capacity=cache.capacity, demand_rows=cache.scratch_rows)
+        self.assertTrue(cache.reserves_prefetch_pull_row)
+        for tensor in cache.tensors.values():
+            slot.assert_within_allocation(tensor.shape[0])
 
     def test_reassignment_preserves_pointers_and_retained_rows(self):
         cache = self.cache_type(self.streamer, capacity=2)
