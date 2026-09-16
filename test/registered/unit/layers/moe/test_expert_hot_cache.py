@@ -58,6 +58,45 @@ class TestExpertHotCache(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cache_type.capacity_for_budget(self.streamer, -1)
 
+    def test_prefetch_pull_flag_reserves_exactly_one_trailing_row(self):
+        """The dedicated slot's real allocation and real mapping, not the formula alone.
+
+        `DedicatedPrefetchSlot` (plan section 7.1) is `PrefetchPuller`'s own
+        contract for this row; this test drives it against `ExpertHotCache`'s
+        actual tensors and `expert_to_slot` rather than trusting that the two
+        arithmetic expressions agree. C1 warned that a slot reachable by two
+        writers corrupts silently -- both would write plausible data -- so
+        the mapping check matters as much as the shape check.
+        """
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
+            DedicatedPrefetchSlot,
+        )
+
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("false"):
+            off = self.cache_type(self.streamer, capacity=2, scratch_rows=3)
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"):
+            on = self.cache_type(self.streamer, capacity=2, scratch_rows=3)
+
+        off_rows = next(iter(off.tensors.values())).shape[0]
+        on_rows = next(iter(on.tensors.values())).shape[0]
+        self.assertEqual(off_rows, 5)
+        self.assertEqual(on_rows, 6)
+        self.assertFalse(off.reserves_prefetch_pull_row)
+        self.assertTrue(on.reserves_prefetch_pull_row)
+
+        slot = DedicatedPrefetchSlot(capacity=on.capacity, demand_rows=on.scratch_rows)
+        slot.assert_within_allocation(on_rows)
+        with self.assertRaises(ValueError):
+            slot.assert_within_allocation(off_rows)
+
+        slot.assert_excluded_from_mapping(on.expert_to_slot)
+        on.reassign([0, 1])
+        slot.assert_excluded_from_mapping(on.expert_to_slot)
+        self.assertNotIn(slot.index, on.expert_to_slot.tolist())
+        for name, tensor in on.tensors.items():
+            self.assertLess(slot.index, tensor.shape[0])
+
     def test_reassignment_preserves_pointers_and_retained_rows(self):
         cache = self.cache_type(self.streamer, capacity=2)
         pointers = cache.data_ptrs()
@@ -732,42 +771,64 @@ class TestExpertHotCacheManager(unittest.TestCase):
         a real gather skip a row already delivered by prediction is a
         different file's work and is not landed yet; this test exercises the
         aggregation contract `record_side_pull_delivery` and
-        `snapshot_counters` maintain, not that upstream skip.
+        `snapshot_counters` maintain, not that upstream skip. ``covered``/
+        ``residual``/``wasted`` are passed as full cumulative snapshots, the
+        producer's `PullDeliveryStats.snapshot()` contract, not deltas.
         """
 
-        def observed(demand_rows, delivered_rows):
+        def observed(demand_rows, covered, residual, wasted):
             manager = self.manager(dynamic=False)
             counters = manager._counters["prefill"][0]
             counters.unique_miss_rows = 2
             counters.routed_miss_rows = 2
             counters.miss_rows = demand_rows
-            manager.record_side_pull_delivery(
-                0, "prefill", delivered_rows=delivered_rows, delivered_bytes=7 * delivered_rows
+            manager.record_side_pull_delivery(0, "prefill", covered, residual, wasted)
+            row = manager.snapshot_counters()["prefill"]["0"]
+            self.assertEqual(
+                row["side_pull_bytes"],
+                row["side_pull_rows"] * manager.streamers[0].bytes_per_expert,
             )
-            return manager.snapshot_counters()["prefill"]["0"]
+            return row
 
-        useful = observed(demand_rows=1, delivered_rows=1)
+        useful = observed(demand_rows=1, covered=1, residual=0, wasted=0)
         self.assertEqual(useful["miss_rows"], 2)
         self.assertEqual(useful["unique_miss_rows"], 2)
         self.assertEqual(useful["routed_miss_rows"], 2)
         self.assertEqual(useful["side_pull_rows"], 1)
-        self.assertEqual(useful["side_pull_bytes"], 7)
 
-        wrong = observed(demand_rows=2, delivered_rows=1)
+        wrong = observed(demand_rows=2, covered=0, residual=0, wasted=1)
         self.assertEqual(wrong["miss_rows"], 3)
         self.assertEqual(wrong["unique_miss_rows"], 2)
         self.assertEqual(wrong["routed_miss_rows"], 2)
         self.assertEqual(wrong["side_pull_rows"], 1)
-        self.assertEqual(wrong["side_pull_bytes"], 7)
+
+    def test_side_pull_snapshot_overlays_fresh_each_read_without_a_remembered_delta(self):
+        """A later cumulative read after a smaller (recapture-reset) one is not a decrement.
+
+        `record_side_pull_delivery` stores the latest snapshot and overlays it
+        fresh at `snapshot_counters()` time; it never diffs against a prior
+        call. A read taken right after a recapture zeroed the producer's
+        device counters must therefore report exactly that new (smaller)
+        cumulative value, not a negative delta against the pre-recapture one.
+        """
+        manager = self.manager(dynamic=False)
+        manager.record_side_pull_delivery(0, "prefill", covered=3, residual=1, wasted=2)
+        before = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(before["side_pull_rows"], 5)
+
+        manager.record_side_pull_delivery(0, "prefill", covered=0, residual=0, wasted=0)
+        after = manager.snapshot_counters()["prefill"]["0"]
+        self.assertEqual(after["side_pull_rows"], 0)
+        self.assertEqual(after["miss_rows"], 0)
 
     def test_side_pull_bytes_are_a_separate_ledger_from_promotion_bytes(self):
         manager = self.manager(dynamic=False)
         counters = manager._counters["prefill"][0]
         counters.migration_bytes = 40
         counters.promotions = 1
-        manager.record_side_pull_delivery(0, "prefill", delivered_rows=1, delivered_bytes=7)
+        manager.record_side_pull_delivery(0, "prefill", covered=1, residual=0, wasted=0)
         row = manager.snapshot_counters()["prefill"]["0"]
-        self.assertEqual(row["side_pull_bytes"], 7)
+        self.assertGreater(row["side_pull_bytes"], 0)
         self.assertEqual(row["migration_bytes"], 40)
         self.assertEqual(row["promotions"], 1)
 

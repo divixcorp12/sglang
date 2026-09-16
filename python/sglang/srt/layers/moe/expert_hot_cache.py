@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
     SparseNextLayerPolicy,
@@ -99,7 +100,14 @@ class ExpertHotCache:
     """
 
     def __init__(self, streamer: ExpertStreamer, capacity: int, scratch_rows: int = 0):
-        """``scratch_rows`` extra rows after the slots receive graph-gather misses."""
+        """``scratch_rows`` extra rows after the slots receive graph-gather misses.
+
+        With ``SGLANG_MOE_EXPERT_PREFETCH_PULL`` on, one further trailing row is
+        appended for ``DedicatedPrefetchSlot`` (plan section 7.1): its index is
+        ``capacity + scratch_rows``, so the allocation must be exactly one row
+        larger than the flag-off shape for ``PrefetchPuller``'s setup-time
+        ``assert_within_allocation`` to accept it.
+        """
         capacity = index(capacity)
         scratch_rows = index(scratch_rows)
         if not 0 <= capacity <= streamer.num_experts:
@@ -109,6 +117,8 @@ class ExpertHotCache:
         self.streamer = streamer
         self.capacity = capacity
         self.scratch_rows = scratch_rows
+        self.reserves_prefetch_pull_row = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.get()
+        allocation_rows = capacity + scratch_rows + int(self.reserves_prefetch_pull_row)
         self.bytes_per_expert = streamer.bytes_per_expert
         self.capacity_bytes = capacity * self.bytes_per_expert
         self.scratch_bytes = scratch_rows * self.bytes_per_expert
@@ -124,7 +134,7 @@ class ExpertHotCache:
         )
         self.tensors = {
             name: torch.empty(
-                (capacity + scratch_rows,) + tuple(source.shape[1:]),
+                (allocation_rows,) + tuple(source.shape[1:]),
                 dtype=source.dtype,
                 device=self.device,
             )
@@ -1001,6 +1011,7 @@ class ExpertHotCacheManager:
         manager._registers = {}
         manager._graph_counters = None
         manager._graph_unique_counters = None
+        manager._side_pull_snapshots = {}
         for layer_id, expert_ids in selected.items():
             if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -1692,6 +1703,15 @@ class ExpertHotCacheManager:
                         unique_missed * streamer.bytes_per_expert
                     )
                     row["requested_unique_experts"] += unique
+                side_pull = self._side_pull_snapshots.get((mode, layer_id))
+                if side_pull is not None:
+                    covered, _residual, wasted = side_pull
+                    delivered = covered + wasted
+                    row["miss_rows"] += delivered
+                    row["side_pull_rows"] += delivered
+                    row["side_pull_bytes"] += (
+                        delivered * self.streamers[layer_id].bytes_per_expert
+                    )
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
                 result[mode][str(layer_id)] = row
@@ -1838,23 +1858,29 @@ class ExpertHotCacheManager:
         self._boundary_clock.commit(accepted_tokens)
 
     def record_side_pull_delivery(
-        self, layer_id: int, mode: str, delivered_rows: int, delivered_bytes: int = 0
+        self, layer_id: int, mode: str, covered: int, residual: int, wasted: int
     ) -> None:
-        """Add one forward's side-pull dedicated-slot delivery to physical host rows.
+        """Store one side-pull target's latest cumulative delivery snapshot.
 
-        ``delivered_rows``/``delivered_bytes`` count rows copied into the
-        reserved one-row prediction slot this forward, independent of whether
-        the predicted expert later matched an actual miss: a wasted
-        prediction is still a physical copy. They add to ``miss_rows`` (total
-        physical demand-copy rows) and to ``side_pull_rows``/
-        ``side_pull_bytes`` (delivery-only totals), never to
-        ``unique_miss_rows`` or ``routed_miss_rows``, which stay logical
-        counts of distinct and routed actual misses. No caller in this build
-        reaches this method; the candidate selection and serving wiring that
-        decides what to predict and calls it once a row is posted and
-        resolved lands separately.
+        ``covered``/``residual``/``wasted`` are the FULL cumulative totals a
+        producer's ``PullDeliveryStats.snapshot()`` returns at this call, not
+        a delta since the last call -- this stores the latest read and
+        overlays it fresh at ``snapshot_counters()`` time, exactly like this
+        class's own CUDA-graph register totals. A per-forward pull is
+        capacity-1 (one dedicated row), and posts it whether or not the
+        prediction proves correct, so ``covered + wasted`` is this class's
+        best available estimate of physical rows delivered; it can overcount
+        a multi-token forward whose several routes all match the same
+        delivered expert, since ``covered`` sums matched routes rather than
+        delivered rows, and the producer does not expose a per-forward
+        "posted" count to correct for that. Never touches ``unique_miss_rows``
+        or ``routed_miss_rows``, which stay logical counts of distinct and
+        routed actual misses read from the ordinary routing path.
+
+        Safe to call at any cadence, including a read taken after a
+        recapture reset the producer's device counters back through zero:
+        nothing here remembers a prior read to diff against, so there is no
+        delta to lose or double-count across that reset, the same guarantee
+        ``discard_graph_capture_routes`` relies on for the register totals.
         """
-        counters = self._counters[mode][layer_id]
-        counters.miss_rows += delivered_rows
-        counters.side_pull_rows += delivered_rows
-        counters.side_pull_bytes += delivered_bytes
+        self._side_pull_snapshots[(mode, layer_id)] = (covered, residual, wasted)
