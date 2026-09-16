@@ -53,3 +53,81 @@ def test_provenance_only_mode_emits_canonical_bs1_topk_unique_metadata(tmp_path)
     assert calibration["top_k"] == 10
     assert calibration["top_k_unique"] is True
     assert calibration["shape_provenance"] == expected_shape
+
+
+def test_trace_provenance_only_mode_records_diagnostic_trace_configuration(tmp_path):
+    """Trace manifests describe the requested wrapper without running it."""
+    run_dir = tmp_path / "trace-run"
+    trace_command = 'nsys profile --trace=cuda,nvtx,osrt --name="pcie trace"'
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "trace-provenance", "7999", "off"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUN_KIND": "trace",
+            "PREFETCH_TRACE_COMMAND": trace_command,
+            "PREFETCH_PROVENANCE_ONLY": "1",
+            "PREFETCH_WORKTREE": str(ROOT),
+            "PREFETCH_RUN_DIR": str(run_dir),
+            "MODEL_TOP_K": "10",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((run_dir / "run-manifest.json").read_text())
+    assert manifest["run_kind"] == "trace"
+    assert manifest["trace"] == {
+        "diagnostic_only": True,
+        "command": trace_command,
+        "report_path": str(run_dir / "trace" / "report"),
+    }
+
+
+def test_trace_mode_requires_explicit_wrapper_even_for_provenance_only(tmp_path):
+    """A trace run cannot accidentally launch without its audited wrapper."""
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "missing-trace-command", "7999", "off"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUN_KIND": "trace",
+            "PREFETCH_PROVENANCE_ONLY": "1",
+            "PREFETCH_WORKTREE": str(ROOT),
+            "PREFETCH_RUN_DIR": str(tmp_path / "run"),
+            "MODEL_TOP_K": "10",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "PREFETCH_TRACE_COMMAND" in result.stderr
+
+
+def test_trace_mode_refuses_calibration_even_for_provenance_only(tmp_path):
+    """Trace diagnostics must not create calibration artifacts."""
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "trace-calibration", "7999", "off"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUN_KIND": "trace",
+            "PREFETCH_TRACE_COMMAND": "nsys profile",
+            "PREFETCH_CALIBRATION": "1",
+            "PREFETCH_PROVENANCE_ONLY": "1",
+            "PREFETCH_WORKTREE": str(ROOT),
+            "PREFETCH_RUN_DIR": str(tmp_path / "run"),
+            "MODEL_TOP_K": "10",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "trace" in result.stderr.lower()
+    assert "calibration" in result.stderr.lower()
