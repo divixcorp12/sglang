@@ -323,10 +323,16 @@ def test_fused_plan_captures_and_replays_with_changed_ids():
 
 
 def test_gate_refuses_multi_token_calls_even_when_shape_would_otherwise_qualify():
+    """`graph_gather_rows` is sized `tokens * top_k`, so a multi-token call's
+    combined route count can still fit `scratch_rows`; only requiring exactly
+    one token row keeps a multi-request batch off this path. `single_token`
+    is duplicate-free on purpose: a within-row duplicate cannot arise from
+    real routing (see `supports_fused_graph_routes`'s docstring), so this
+    fixture must not assert anything about duplicate handling."""
     from sglang.srt.layers.moe.expert_route_plan import supports_fused_graph_routes
 
     expert_to_slot = _expert_to_slot([1, 6])
-    single_token = torch.tensor([[1, 2, 2, 6]], device="cuda", dtype=torch.int64)
+    single_token = torch.tensor([[1, 2, 3, 6]], device="cuda", dtype=torch.int64)
     multi_token = torch.tensor(
         [[1, 2, 2, 6], [3, 4, 4, 5]], device="cuda", dtype=torch.int64
     )

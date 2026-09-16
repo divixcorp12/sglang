@@ -637,9 +637,14 @@ class ExpertStreamer:
         )
         self._graph_destination_slots = self._graph_scratch_slots.to(torch.int32)
         self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
+        # Read once here rather than in `_gather_graph`: `EnvBool.get()` is an
+        # uncached `os.getenv` read, and reading it again per call could
+        # disagree with this setup-time read and index a buffer that was
+        # never allocated.
+        self._fused_plan_enabled = envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()
         self._graph_fused_slots_scratch = (
             torch.empty(max_rows, dtype=torch.int32, device=device)
-            if envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()
+            if self._fused_plan_enabled
             else None
         )
         self.row_planner = ExpertRowPlanner(cache, cache.capacity, max_rows)
@@ -668,7 +673,7 @@ class ExpertStreamer:
         flat = topk_ids.reshape(-1).long()
         count = flat.numel()
         expert_to_slot = self.row_planner.expert_to_slot
-        fused = envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get() and supports_fused_graph_routes(
+        fused = self._fused_plan_enabled and supports_fused_graph_routes(
             topk_ids, expert_to_slot, self.graph_gather_rows
         )
         if fused:

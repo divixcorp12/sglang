@@ -96,8 +96,18 @@ def supports_fused_graph_routes(
     checks below while carrying several requests' routes, which may repeat
     an expert across tokens (``plan_graph_routes`` dedups that; this kernel
     does not). Requiring exactly one token row (``topk_ids.shape[0] == 1``)
-    is what actually guarantees unique IDs here: one token's own top-k routes
-    are always distinct.
+    is what actually guarantees unique IDs here.
+
+    Within one token row, uniqueness holds structurally rather than by
+    construction of this predicate: `torch.topk` returns distinct indices,
+    and the logical-to-physical expert remap applied before this gather
+    (`topk_ids_logical_to_physical`, `eplb/expert_location_dispatch.py`) maps
+    distinct logical experts to distinct physical replicas, because the
+    physical-to-logical direction (`phy2log`, `eplb/lplb_solver.py`) is a
+    function -- every physical expert belongs to exactly one logical expert,
+    so two different logical experts can never land on the same physical ID.
+    A within-row duplicate therefore cannot arise from real routing; this
+    function does not itself check for one.
     """
     return (
         topk_ids.is_cuda
