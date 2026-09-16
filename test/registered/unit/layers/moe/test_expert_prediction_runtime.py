@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -111,6 +113,44 @@ def _decode(model, runtime, rows=3, mode=ForwardMode.DECODE):
 
 
 class TestExpertPredictionRuntime(unittest.TestCase):
+    def test_prefetch_pull_mode_defaults_to_off_and_parses_all_modes(self):
+        field = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE", None)
+            os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_PULL", None)
+            self.assertEqual(field.get(), "off")
+            for value in ("off", "count_zero", "always"):
+                with field.override(value):
+                    self.assertEqual(field.get(), value)
+
+    def test_prefetch_pull_mode_rejects_unknown_and_contradictory_legacy_settings(self):
+        field = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE
+        legacy = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE"):
+            with field.override("not-a-mode"):
+                field.get()
+        with self.assertRaisesRegex(ValueError, "contradict"):
+            with field.override("off"):
+                with legacy.override(True):
+                    field.get()
+
+    def test_prefetch_pull_mode_requires_a_prefetch_predictor(self):
+        common = dict(
+            model=FakeModel(),
+            gpu_id=0,
+            hidden_dtype=torch.float32,
+            decode_max_bs=1,
+            tokens_per_request=1,
+            tp_size=1,
+            moe_ep_size=1,
+            attn_dp_size=None,
+            pp_size=1,
+            expert_hot_cache_manager=None,
+        )
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE.*PREFETCH_PREDICTOR"):
+                ExpertPredictionRuntime.from_env(**common)
+
     def test_layer_pairs_by_offset(self):
         self.assertEqual(layer_pairs((0, 2, 5), 0), ((0, 0), (2, 2), (5, 5)))
         self.assertEqual(layer_pairs((0, 2, 5), 1), ((0, 2), (2, 5)))
