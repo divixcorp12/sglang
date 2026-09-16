@@ -120,11 +120,15 @@ class TestAsyncTelemetry(unittest.TestCase):
             thread_name="telemetry-test",
         )
         try:
-            for value in (1, 2, 3):
-                self.assertTrue(telemetry.schedule({"counter": [value]}, {}))
-                backend.events[value - 1].ready = True
-                telemetry.poll()
+            self.assertTrue(telemetry.schedule({"counter": [1]}, {}))
+            backend.events[-1].ready = True
+            telemetry.poll()
             self.assertTrue(started.wait(timeout=1))
+
+            for value in (2, 3):
+                self.assertTrue(telemetry.schedule({"counter": [value]}, {}))
+                backend.events[-value].ready = True
+                telemetry.poll()
             self.assertEqual(telemetry.stats()["dropped_writer"], 1)
         finally:
             unblock.set()
