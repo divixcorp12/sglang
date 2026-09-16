@@ -27,7 +27,8 @@ session_ids_json=${SESSION_IDS_JSON:-[]}
 session_set_checksum=${SESSION_SET_CHECKSUM:-}
 checkpoint_checksum=${PREFETCH_CHECKPOINT_CHECKSUM:-unknown}
 model_shapes=${MODEL_SHAPES:-unknown}
-top_k=${MODEL_TOP_K:-unknown}
+model_top_k=${MODEL_TOP_K:-10}
+provenance_only=${PREFETCH_PROVENANCE_ONLY:-0}
 case "$run_kind" in timed|profiling) ;; *) echo "RUN_KIND must be timed or profiling" >&2; exit 2 ;; esac
 case "$prefetch_pull_mode" in off|count_zero|always) ;; *) echo "PREFETCH_PULL_MODE is invalid" >&2; exit 2 ;; esac
 case "${calibration,,}" in
@@ -35,6 +36,15 @@ case "${calibration,,}" in
     0|false|no|n) calibration=0 ;;
     *) echo "PREFETCH_CALIBRATION must be a boolean" >&2; exit 2 ;;
 esac
+case "${provenance_only,,}" in
+    1|true|yes|y) provenance_only=1 ;;
+    0|false|no|n) provenance_only=0 ;;
+    *) echo "PREFETCH_PROVENANCE_ONLY must be a boolean" >&2; exit 2 ;;
+esac
+if [ "$model_top_k" != 10 ]; then
+    echo "MODEL_TOP_K must be the production BS1 top-k value 10" >&2
+    exit 2
+fi
 if [ "$run_kind" = timed ] && [ "$calibration" = 1 ]; then
     echo "REFUSING_TO_START: calibration is profiling-only; timed B/C/Cr/N/D runs must disable it" >&2
     exit 2
@@ -51,15 +61,33 @@ else
 fi
 
 work=/data/models/slang/nvfp4-work
-worktree=$work/cc-expert-prediction/worktree
+worktree=${PREFETCH_WORKTREE:-$work/cc-expert-prediction/worktree}
 flashinfer_overlay=$work/flashinfer-0.6.18-cu130-overlay
 model=/mnt/nvme2/huggingface_hub/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47
 cache_model_path=/data/models/huggingface_hub/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47
 expert_cache=/mnt/nvme2/nvfp4-work/qwen38-nvfp4-expert-cache-v1
 ple_cache=/mnt/nvme2/ple-cache/qwen38-nvfp4
 expert_seed=/data/models/slang/slang-dev-2bit/qwen3.8-flash-next-24gb-sglang/assets/expert_freq.pt
-run_dir=$work/cc-expert-prediction/servers/$name/run-$(date +%Y%m%d-%H%M%S)
+run_dir=${PREFETCH_RUN_DIR:-$work/cc-expert-prediction/servers/$name/run-$(date +%Y%m%d-%H%M%S)}
 log=$run_dir/server.log
+
+# This object is deliberately typed rather than derived from a display string:
+# the CUDA graph flags below declare BS1 and the model's routing geometry is
+# fixed at top-k 10.  The offline gate calibrator rejects ambiguous metadata.
+shape_provenance='{"batch_size":1,"top_k":10,"top_k_unique":true,"cuda_graph_decode_batch_size":1,"cuda_graph_max_decode_batch_size":1}'
+
+write_provenance() {
+    calibration_provenance=$(printf '{"commit":"%s","predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","cache_size":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"bin_count":256,"bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255"}' "$commit" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$hot_gpu_mb" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance")
+    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$log" > "$run_dir/run-manifest.json"
+}
+
+if [ "$provenance_only" = 1 ]; then
+    mkdir -p "$run_dir"
+    commit=$(git -C "$worktree" rev-parse HEAD)
+    write_provenance
+    printf 'wrote provenance-only manifest: %s\n' "$run_dir/run-manifest.json"
+    exit 0
+fi
 
 if ss -ltn 'sport = :7867' | grep -q LISTEN; then
     echo "REFUSING_TO_START: production on 7867 is up or relaunching" >&2
@@ -80,8 +108,7 @@ cd "$worktree"
     sha256sum python/sglang/srt/model_executor/model_runner.py python/sglang/srt/layers/moe/expert_prediction/*.py
 } 2>&1 | tee -a "$log"
 commit=$(git rev-parse HEAD)
-printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","session_ids":%s,"session_set_checksum":"%s","shape_provenance":"%s","top_k":"%s","calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]"},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json","startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$top_k" "$calibration" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$log" > "$run_dir/run-manifest.json"
-calibration_provenance=$(printf '{"commit":"%s","predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","cache_size":%s,"session_ids":%s,"session_set_checksum":"%s","shape_provenance":"%s","top_k":"%s","bin_count":256,"bin_edges":"uniform [0,1]"}' "$commit" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$hot_gpu_mb" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$top_k")
+write_provenance
 
 exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock env \
     PYTHONPATH="$flashinfer_overlay:$worktree/python" \
