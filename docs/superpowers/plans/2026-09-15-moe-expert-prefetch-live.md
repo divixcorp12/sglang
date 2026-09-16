@@ -146,8 +146,14 @@ Owned by crypto-c9's copy layer. Task 3 still reports budget recall at 1–10 *a
 
 - **Phase A writes nothing.** It reads `expert_to_slot` and produces ids plus priorities; it allocates no rows and issues no copy (`serving/runtime.py`, `serving/candidates.py`). No collision is possible with anything shipped today.
 - **Phase B allocates nothing either.** We do not open a second pool and must not: destinations come from their planner. On their draft, `ExpertRowPlan.for_scratch(capacity, scratch_base, scratch_rows)` addresses `scratch_base + r` — *the same per-layer pool the graph gather uses*, clamped to `scratch_rows` (10 today). So prefetch rows and gather rows are the same pool by their design, and the disjointness argument has to hold inside their layer, not ours.
-- **Why it holds today, to be confirmed at merge, not assumed:** one outstanding post per tag; the reservation rule keeps a posted slot unread and unwritten by anyone else until its resolve; `plan_residual_routes` assigns residual rows that no needed delivered expert occupies; and the fail-stop drain guarantees no copy lands after its resolve returned. The prefetch write and the gather's scratch write are then the *same* write, issued once per tag.
-- **The hazard if any of those weakens:** a timed-out-then-late landing, or a second post on a live tag, writes a row residual has since reassigned. B1 Step 1 records the confirmed argument before any code is written.
+- **Why it holds today — confirmed-as-of-now by crypto-c9, not frozen** (their rework is in flight, step 3's tests are unwritten, and one outstanding experiment could still change the gather path). The prefetch write and the gather's scratch write are the *same* write, issued once per tag, because we post through their planner rather than beside it.
+  1. One outstanding post per tag. *Accepted by crypto-c9.*
+  2. The reservation rule keeps a posted slot unread and unwritten by anyone else until its resolve. *Not yet re-confirmed against the reworked code.*
+  3. `plan_residual_routes` assigns residual rows that no needed delivered expert occupies. *Not yet re-confirmed against the reworked code.*
+  4. **A late copy CAN land after its resolve returned** — measured, not theoretical: `late_completions` 1, with copies arriving 28.96 ms and 101.4 s after enqueue, after the drain exhausted and the doorbell was disabled. The bytes do reach the scratch row. The actual guarantee is one step out: an exhausted drain stickily disables the doorbell, records the failing sequence, and **aborts the process ~30 s later**, so no token is computed from that row. Not "no copy lands", but "a copy may land and nothing survives to consume it".
+- **Do not infer that a scratch row is safe to reuse once resolve returns.** That inference is false on exactly the failing path. The real invariant depends on the abort happening and on nothing reading that row in the ~30 s window before it does — conditions someone can weaken later without noticing they were load-bearing.
+- **Honest description of the doorbell at merge:** a modest gain whose failure mode is a server abort, not a degraded request. The user has not ruled on whether that trade is acceptable.
+- **The hazard if any of these weakens:** a timed-out-then-late landing, or a second post on a live tag, writes a row residual has since reassigned. B1 Step 1 re-confirms all four against the merged code before any code is written.
 
 ### What stays outside the decode graph, and why
 
@@ -2028,7 +2034,7 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
   - which flag turns prefetch on;
   - how the in-graph and doorbell backends are selected;
   - whether a same-layer (APEX) target is supported;
-  - **the scratch-write disjointness argument**, confirmed against the merged code, not assumed: one outstanding post per tag, the reservation rule, residual rows avoiding delivered ones, and no copy landing after its resolve returned. If any of the four no longer holds, stop and raise it before writing the adapter.
+  - **the scratch-write disjointness argument**, confirmed against the merged code, not assumed: one outstanding post per tag, the reservation rule, residual rows avoiding delivered ones, and — the corrected fourth — that a late copy *may* write a scratch row after its resolve returned, with safety resting on the sticky disable plus process abort rather than on the copy never landing. If any of the four no longer holds, stop and raise it before writing the adapter.
 - [ ] **Step 2: Write the adapter** (`serving/<adapter>.py`, name TBD). At the point the merged layer designates, map `PrefetchScoring.bank.ids_for(T)` and `.scores_for(T)` into its plan:
   - with resident filtering (`expert_to_slot.index_select(ids) < 0`) and a top-B by priority, only if the interface leaves that to the producer;
   - or into a `[num_experts]` priority mask via one `scatter_`, if that is what it takes.
@@ -2077,6 +2083,7 @@ Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/n
      - **Our design already takes the cheaper half of crypto-c9's point:** prefetch writes only dedicated scratch rows, never evicting a resident expert (the residency updater stays the sole writer of hot slots), so there is no double-fetch-on-eviction term. The wasted-byte term remains.
      - This is one more reason the **evictable-hot-slot follow-up stays unbuilt**: near saturation it converts a wasted fetch into two.
    - A gen4/gen5 platform change (BIOS PCIe generation or a chipset-fed slot) is worth 2-4x and is the only lever that raises the ceiling; every predictor, ours included, only redistributes what is under it.
+   - **The doorbell does not unlock more bus.** Copy engine 13.313 vs in-kernel 12.081 GB/s is 1.10x, so it buys ~10% plus an unquantified overlap benefit. Phase B's value must not rest on the doorbell moving materially more bytes than the in-graph kernel; it rests on starting the same bytes earlier.
    - crypto-c9's earlier "bandwidth-bound at ~17 GB/s" was withdrawn as unmeasured. A direct gathers / miss-rows / h2d per token measurement is queued; **do not tune against either assumption until it lands.**
    - **Miss-rate mismatch:** production sampled 64% miss rows while warming (a floor), against ~3.15 misses per layer (~31%) in the capture's residency, which Task 3 priced. Re-price against the measured steady-state residency before Phase B commits a budget.
 1. **The window may be too short to pay.**
