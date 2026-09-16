@@ -1024,6 +1024,10 @@ class ExpertHotCacheManager:
         # it is built from this manager's own `caches` by `PrefetchScoring`, which
         # runs after `from_model` returns. See `register_prefetch_puller`.
         manager._prefetch_puller = None
+        # The profiling-only calibration observer is also constructed after the
+        # caches. It deliberately has a separate registration: profiling runs
+        # use pull mode off and therefore have no PrefetchPuller to piggyback on.
+        manager._prefetch_calibration = None
         for layer_id, expert_ids in selected.items():
             if expert_ids or scratch_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
@@ -1031,6 +1035,7 @@ class ExpertHotCacheManager:
                 cache = ExpertHotCache(
                     layer_streamer, len(expert_ids), scratch_rows[layer_id]
                 )
+                cache._owner_manager = manager
                 manager.caches[layer_id] = cache
                 manager._record_update(layer_id, cache.reassign(expert_ids))
                 if dynamic:
@@ -1214,6 +1219,10 @@ class ExpertHotCacheManager:
         """
         self._prefetch_puller = puller
 
+    def register_prefetch_calibration(self, calibration: Any) -> None:
+        """Register the profiling observer so graph-capture warmup can be purged."""
+        self._prefetch_calibration = calibration
+
     def discard_graph_capture_routes(self) -> None:
         """Drop routes and counters that CUDA-graph warmup and capture recorded.
 
@@ -1235,6 +1244,9 @@ class ExpertHotCacheManager:
         if puller is not None:
             for stats in puller.stats.values():
                 stats.counts.zero_()
+        calibration = getattr(self, "_prefetch_calibration", None)
+        if calibration is not None:
+            calibration.reset()
         self._side_pull_snapshots.clear()
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:

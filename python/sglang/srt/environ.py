@@ -446,6 +446,9 @@ class Envs:
     # Keep BudgetRecall enabled by default for compatibility, but let matched
     # performance arms exclude its device work independently of pull telemetry.
     SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL = EnvBool(True)
+    # Profiling-only graph-captured score/margin histograms. Timed throughput
+    # arms leave this false so the observer has no allocation or device work.
+    SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)

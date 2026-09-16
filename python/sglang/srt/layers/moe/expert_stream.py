@@ -733,6 +733,14 @@ class ExpertStreamer:
                 missed_mask=expert_to_slot[flat] < 0,
                 demand_remap=remap,
             )
+        calibration = getattr(self, "prefetch_calibration", None)
+        if calibration is not None:
+            calibration.record_target(
+                self.layer_id,
+                flat,
+                expert_to_slot[flat] < 0,
+                self.row_plan.count,
+            )
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,

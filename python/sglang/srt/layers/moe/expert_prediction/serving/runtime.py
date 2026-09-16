@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
     DedicatedPrefetchSlot,
     PrefetchCandidateBank,
 )
+from sglang.srt.layers.moe.expert_prediction.serving.calibration import PullCalibrationHistogram
 from sglang.srt.layers.moe.expert_prediction.serving.checkpoints import load_prefetch_checkpoints
 from sglang.srt.layers.moe.expert_prediction.serving.scorers import ApexScorer, LlaporScorer
 from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
@@ -265,6 +266,7 @@ class PrefetchScoring:
         device: torch.device,
         pull_mode: str = "off",
         shadow_recall: bool = True,
+        calibration: bool = False,
     ) -> "PrefetchScoring":
         by_layer = {spec.layer_id: spec for spec in specs}
         if width > min(spec.num_experts for spec in specs):
@@ -294,9 +296,24 @@ class PrefetchScoring:
             if pull_mode != "off"
             else None
         )
+        histogram = (
+            PullCalibrationHistogram(layer_ids=list(checkpoints), device=device)
+            if calibration
+            else None
+        )
         if puller is not None:
             for layer_id in checkpoints:
                 hot_caches[layer_id].streamer.prefetch_puller = puller
+        if histogram is not None:
+            managers = set()
+            for layer_id in checkpoints:
+                cache = hot_caches[layer_id]
+                cache.streamer.prefetch_calibration = histogram
+                manager = getattr(cache, "_owner_manager", None)
+                if manager is not None:
+                    managers.add(manager)
+            for manager in managers:
+                manager.register_prefetch_calibration(histogram)
         scoring = cls(
             predictor=predictor, scorers=scorers, source_of=source_of, next_target=next_target, store=store,
             hot_caches=hot_caches,
@@ -307,13 +324,14 @@ class PrefetchScoring:
                 else None
             ),
             puller=puller,
+            calibration=histogram,
         )
         store.after_write = scoring._on_write
-        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s",
-                    predictor, len(checkpoints), width, budget, scoring.state_nbytes, pull_mode, shadow_recall)
+        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s calibration=%s",
+                    predictor, len(checkpoints), width, budget, scoring.state_nbytes, pull_mode, shadow_recall, calibration)
         return scoring
 
-    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None) -> None:
+    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None, calibration=None) -> None:
         self.predictor = predictor
         self.targets = sorted(scorers)
         # Source layer -> target layer for a next-layer predictor; empty for same-layer predictors.
@@ -325,6 +343,7 @@ class PrefetchScoring:
         self.bank = bank
         self.recall = recall
         self.puller = puller
+        self.calibration = calibration
 
     @property
     def required_features(self) -> frozenset[RouteFeature]:
@@ -358,17 +377,33 @@ class PrefetchScoring:
         # to width, so BudgetRecall.observe's own residency re-check at :57 sees a bank
         # that is already non-resident-only, not top-W-then-filtered.
         self.bank.write(target, scores, expert_to_slot=self._hot_caches[target].expert_to_slot)
+        if self.calibration is not None:
+            candidates = self.bank.ids_for(target)
+            ordered_scores = self.bank.scores_for(target) / rows
+            self.calibration.stage(
+                target,
+                candidates[:1],
+                ordered_scores[:1],
+                ordered_scores[:1] - ordered_scores[1:2] if self.bank.width > 1 else ordered_scores[:1],
+                self._hot_caches[target].expert_to_slot.index_select(0, candidates[:1]) < 0,
+            )
         if self.puller is not None:
             self.puller.post_target(target)
 
     def metrics_record(self) -> dict:
         """Host read of the device counters; call only at metric log intervals."""
         if self.recall is None:
-            return {"predictor": self.predictor, "shadow_recall_enabled": False}
+            record = {"predictor": self.predictor, "shadow_recall_enabled": False}
+            if self.calibration is not None:
+                record["pull_calibration"] = self.calibration.snapshot()
+            return record
         layers = {str(layer): {"missed_routes": missed, "covered_routes": covered}
                   for layer, (missed, covered) in self.recall.snapshot().items()}
         missed = sum(v["missed_routes"] for v in layers.values())
         covered = sum(v["covered_routes"] for v in layers.values())
-        return {"predictor": self.predictor, "budget": self.recall.budget,
+        record = {"predictor": self.predictor, "budget": self.recall.budget,
                 "budget_recall": covered / missed if missed else 0.0, "layers": layers,
                 "shadow_recall_enabled": True}
+        if self.calibration is not None:
+            record["pull_calibration"] = self.calibration.snapshot()
+        return record

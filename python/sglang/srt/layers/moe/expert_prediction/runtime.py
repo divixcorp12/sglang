@@ -46,6 +46,7 @@ class PrefetchSettings(msgspec.Struct, frozen=True):
     tau: float
     pull_mode: str = "off"
     shadow_recall: bool = True
+    calibration: bool = False
 
 
 class ExpertPredictionRuntime:
@@ -187,6 +188,7 @@ class ExpertPredictionRuntime:
                 tau=envs.SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU.get(),
                 pull_mode=pull_mode,
                 shadow_recall=envs.SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL.get(),
+                calibration=envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get(),
             )
         return cls.build(
             model=model,
@@ -278,6 +280,7 @@ class ExpertPredictionRuntime:
                 device=device,
                 pull_mode=prefetch.pull_mode,
                 shadow_recall=prefetch.shadow_recall,
+                calibration=prefetch.calibration,
             )
         )
         logger.info(
