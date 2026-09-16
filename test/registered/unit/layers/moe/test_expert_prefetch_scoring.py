@@ -41,6 +41,24 @@ def _route_features(rows=3, device="cpu"):
 
 
 class TestPrefetchScoringCpu(unittest.TestCase):
+    def test_metrics_record_labels_disabled_shadow_recall(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchScoring
+
+        scoring = PrefetchScoring(
+            predictor="llapor",
+            scorers={},
+            source_of={},
+            next_target={},
+            store=None,
+            hot_caches={},
+            bank=None,
+            recall=None,
+        )
+        self.assertEqual(
+            scoring.metrics_record(),
+            {"predictor": "llapor", "shadow_recall_enabled": False},
+        )
+
     def test_llapor_fp32_scorer_equals_training_forward(self):
         from sglang.srt.layers.moe.expert_prediction.serving.scorers import LlaporScorer
 

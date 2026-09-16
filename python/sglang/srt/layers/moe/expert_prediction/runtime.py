@@ -44,7 +44,8 @@ class PrefetchSettings(msgspec.Struct, frozen=True):
     width: int
     budget: int
     tau: float
-    enable_pull: bool = False
+    pull_mode: str = "off"
+    shadow_recall: bool = True
 
 
 class ExpertPredictionRuntime:
@@ -141,6 +142,11 @@ class ExpertPredictionRuntime:
                 max_bytes=envs.SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_MAX_GB.get() * 2**30,
             )
         prefetch_predictor = envs.SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR.get()
+        pull_mode = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get()
+        if pull_mode != "off" and not prefetch_predictor:
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR"
+            )
         prefetch = None
         if prefetch_predictor:
             if tokens_per_request != 1:
@@ -168,9 +174,9 @@ class ExpertPredictionRuntime:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR cannot run with SGLANG_MOE_PREFETCH_MAX_CANDIDATES"
                 )
-            if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.get() and not envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+            if pull_mode != "off" and not envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
                 raise ValueError(
-                    "SGLANG_MOE_EXPERT_PREFETCH_PULL needs SGLANG_MOE_EXPERT_GRAPH_GATHER; the join it "
+                    "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE needs SGLANG_MOE_EXPERT_GRAPH_GATHER; the join it "
                     "drives lives in ExpertStreamer._gather_graph"
                 )
             prefetch = PrefetchSettings(
@@ -179,7 +185,8 @@ class ExpertPredictionRuntime:
                 width=envs.SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES.get(),
                 budget=envs.SGLANG_MOE_EXPERT_PREFETCH_BUDGET.get(),
                 tau=envs.SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU.get(),
-                enable_pull=envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.get(),
+                pull_mode=pull_mode,
+                shadow_recall=envs.SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL.get(),
             )
         return cls.build(
             model=model,
@@ -269,7 +276,8 @@ class ExpertPredictionRuntime:
                 tau=prefetch.tau,
                 dtype=hidden_dtype,
                 device=device,
-                enable_pull=prefetch.enable_pull,
+                pull_mode=prefetch.pull_mode,
+                shadow_recall=prefetch.shadow_recall,
             )
         )
         logger.info(

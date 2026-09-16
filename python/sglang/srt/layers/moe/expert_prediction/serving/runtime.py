@@ -2,10 +2,8 @@
 
 Every per-token op runs from ``FeatureStore.after_write`` during eager forwards and graph
 capture, so replay executes recorded kernels only. ``bank`` rows feed the shared copy
-layer; with ``SGLANG_MOE_EXPERT_PREFETCH_PULL`` (default off), ``PrefetchPuller`` also
-posts and joins a captured side-stream pull of each target's top candidate through
-``expert_gpu_pull.py`` -- scoring-only (the prior, still-default behaviour) never touches
-the copy path.
+layer; a non-off ``SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE`` also posts and joins a
+captured side-stream pull of each target's top candidate through ``expert_gpu_pull.py``.
 """
 
 from __future__ import annotations
@@ -93,15 +91,11 @@ def route_covered_residual(
 class PullDeliveryStats:
     """Device counters for one target layer's pull outcomes; host-read only via ``snapshot``.
 
-    ``counts`` is strictly additive (``add_`` only, never decremented) and, today,
-    **never reset by anything** -- not by ``ExpertHotCacheManager.discard_graph_capture_routes``
-    (unlike the sibling graph/residency counters that method zeroes) and not by any other
-    hook. A periodic overlay-fresh flush -- store the latest cumulative snapshot, never diff
-    against a prior read -- is correct regardless of whether a reset ever happens, since it
-    never depends on one; but it also means one bounded bias survives forever: a captured
-    ``join_target`` call runs once during the graph's warmup replay and its dummy forward's
-    counts land here exactly like a real one, the same "warmup lands in the counts like a
-    real forward" effect ``discard_graph_capture_routes`` exists to purge for its siblings.
+    ``counts`` is strictly additive between resets. ``ExpertHotCacheManager.
+    discard_graph_capture_routes`` zeros it with the sibling graph/residency counters,
+    removing the captured warmup replay before normal serving resumes. A periodic
+    overlay-fresh flush stores the latest cumulative snapshot rather than a diff, so it
+    remains correct across that reset.
     ``counts[3]`` (``posted``) is the PHYSICAL row count and is what feeds a "rows
     delivered" telemetry sink (e.g. ``ExpertHotCacheManager.record_side_pull_delivery``);
     ``counts[0]`` (``covered``) is ROUTE-level and can overcount physical rows on a
@@ -151,12 +145,16 @@ class PrefetchPuller:
         layer_ids: Sequence[int],
         hot_caches: Mapping[int, Any],
         device: torch.device,
+        pull_mode: str = "always",
     ) -> None:
+        if pull_mode not in {"count_zero", "always"}:
+            raise ValueError(f"unsupported prefetch pull mode: {pull_mode}")
         self.bank = bank
         self._pipeline = ExpertGpuPullPipeline(device)
         self._slots: dict[int, DedicatedPrefetchSlot] = {}
         self._targets: dict[int, ExpertGpuPullTarget] = {}
         self._plans: dict[int, ExpertRowPlan] = {}
+        self._should_post: dict[int, torch.Tensor] = {}
         self.stats: dict[int, PullDeliveryStats] = {}
         for layer_id in layer_ids:
             cache = hot_caches.get(layer_id)
@@ -180,6 +178,9 @@ class PrefetchPuller:
                 f"prefetch_pull_{layer_id}", segments, plan, slot.index
             )
             self._plans[layer_id] = plan
+            self._should_post[layer_id] = torch.tensor(
+                pull_mode == "always", dtype=torch.bool, device=device
+            )
             self.stats[layer_id] = PullDeliveryStats(device)
 
     def post_target(self, target_layer: int) -> None:
@@ -187,8 +188,10 @@ class PrefetchPuller:
         if target is None:
             return
         plan = self._plans[target_layer]
-        plan.expert_ids.copy_(self.bank.ids_for(target_layer)[:1])
-        plan.count.fill_(1)
+        candidate = self.bank.ids_for(target_layer)[:1]
+        valid = self._should_post[target_layer]
+        plan.expert_ids.copy_(torch.where(valid, candidate, candidate.new_full((1,), -1)))
+        plan.count.copy_(valid.to(torch.int32).reshape(1))
         self._pipeline.post_target(target)
 
     def predicted_expert_for(self, target_layer: int) -> Optional[torch.Tensor]:
@@ -260,7 +263,8 @@ class PrefetchScoring:
         tau: float,
         dtype: torch.dtype,
         device: torch.device,
-        enable_pull: bool = False,
+        pull_mode: str = "off",
+        shadow_recall: bool = True,
     ) -> "PrefetchScoring":
         by_layer = {spec.layer_id: spec for spec in specs}
         if width > min(spec.num_experts for spec in specs):
@@ -280,8 +284,14 @@ class PrefetchScoring:
             next_target = {}
         bank = PrefetchCandidateBank(layer_ids=list(checkpoints), width=width, device=device)
         puller = (
-            PrefetchPuller(bank=bank, layer_ids=list(checkpoints), hot_caches=hot_caches, device=device)
-            if enable_pull
+            PrefetchPuller(
+                bank=bank,
+                layer_ids=list(checkpoints),
+                hot_caches=hot_caches,
+                device=device,
+                pull_mode=pull_mode,
+            )
+            if pull_mode != "off"
             else None
         )
         if puller is not None:
@@ -291,12 +301,16 @@ class PrefetchScoring:
             predictor=predictor, scorers=scorers, source_of=source_of, next_target=next_target, store=store,
             hot_caches=hot_caches,
             bank=bank,
-            recall=BudgetRecall(layer_ids=list(checkpoints), budget=budget, device=device),
+            recall=(
+                BudgetRecall(layer_ids=list(checkpoints), budget=budget, device=device)
+                if shadow_recall
+                else None
+            ),
             puller=puller,
         )
         store.after_write = scoring._on_write
-        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull=%s",
-                    predictor, len(checkpoints), width, budget, scoring.state_nbytes, enable_pull)
+        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s",
+                    predictor, len(checkpoints), width, budget, scoring.state_nbytes, pull_mode, shadow_recall)
         return scoring
 
     def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None) -> None:
@@ -321,7 +335,7 @@ class PrefetchScoring:
         return sum(t.numel() * t.element_size() for s in self._scorers.values() for t in (*s.parameters(), *s.buffers()))
 
     def _on_write(self, layer_id: int, feature: RouteFeature, rows: int) -> None:
-        if feature is RouteFeature.TOPK_IDS and layer_id in self._scorers:
+        if self.recall is not None and feature is RouteFeature.TOPK_IDS and layer_id in self._scorers:
             self.recall.observe(
                 target_layer=layer_id, candidate_ids=self.bank.ids_for(layer_id),
                 topk_ids=self._store.view(layer_id, RouteFeature.TOPK_IDS, rows),
@@ -349,9 +363,12 @@ class PrefetchScoring:
 
     def metrics_record(self) -> dict:
         """Host read of the device counters; call only at metric log intervals."""
+        if self.recall is None:
+            return {"predictor": self.predictor, "shadow_recall_enabled": False}
         layers = {str(layer): {"missed_routes": missed, "covered_routes": covered}
                   for layer, (missed, covered) in self.recall.snapshot().items()}
         missed = sum(v["missed_routes"] for v in layers.values())
         covered = sum(v["covered_routes"] for v in layers.values())
         return {"predictor": self.predictor, "budget": self.recall.budget,
-                "budget_recall": covered / missed if missed else 0.0, "layers": layers}
+                "budget_recall": covered / missed if missed else 0.0, "layers": layers,
+                "shadow_recall_enabled": True}

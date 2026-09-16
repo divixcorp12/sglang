@@ -75,13 +75,10 @@ def _build_puller(device, *, layer_ids=(1,), capacity=6, scratch_rows=2, enable_
     for lid in enable_hits:
         hot_caches[lid].expert_to_slot[0] = 0
     bank = PrefetchCandidateBank(layer_ids=list(layer_ids), width=1, device=device)
-    puller = PrefetchPuller(
-        bank=bank,
-        layer_ids=list(layer_ids),
-        hot_caches=hot_caches,
-        device=device,
-        pull_mode=pull_mode,
-    )
+    kwargs = dict(bank=bank, layer_ids=list(layer_ids), hot_caches=hot_caches, device=device)
+    if pull_mode != "always":
+        kwargs["pull_mode"] = pull_mode
+    puller = PrefetchPuller(**kwargs)
     return puller, bank, hot_caches, layer
 
 

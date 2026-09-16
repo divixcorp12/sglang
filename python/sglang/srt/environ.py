@@ -150,6 +150,51 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvPrefetchPullMode(EnvField):
+    """Resolve the prefetch-pull delivery mode and its temporary boolean alias."""
+
+    _MODES = frozenset({"off", "count_zero", "always"})
+
+    def __init__(self, legacy_name: str):
+        super().__init__("off")
+        self.legacy_name = legacy_name
+
+    def parse(self, value: str) -> str:
+        mode = value.lower()
+        if mode not in self._MODES:
+            raise ValueError(
+                f'"{value}" is not a valid pull mode; expected one of "off", "count_zero", or "always"'
+            )
+        return mode
+
+    def get(self) -> str:
+        mode_value = os.getenv(self.name)
+        legacy_value = os.getenv(self.legacy_name)
+        if mode_value is None:
+            if legacy_value is None:
+                return "off"
+            try:
+                return "always" if EnvBool(False).parse(legacy_value) else "off"
+            except ValueError as error:
+                raise ValueError(f"{self.legacy_name}: {error}") from error
+        try:
+            mode = self.parse(mode_value)
+        except ValueError as error:
+            raise ValueError(f"{self.name}: {error}") from error
+        if legacy_value is None:
+            return mode
+        try:
+            legacy_mode = "always" if EnvBool(False).parse(legacy_value) else "off"
+        except ValueError as error:
+            raise ValueError(f"{self.legacy_name}: {error}") from error
+        if mode != legacy_mode:
+            raise ValueError(
+                f"{self.name}={mode!r} contradicts {self.legacy_name}={legacy_value!r}; "
+                "set only one, or use matching off/false or always/true values"
+            )
+        return mode
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -381,6 +426,14 @@ class Envs:
     # cache allocated with the trailing DedicatedPrefetchSlot row. Default off:
     # the plan forbids enabling this by default on synthetic evidence.
     SGLANG_MOE_EXPERT_PREFETCH_PULL = EnvBool(False)
+    # Delivery-mode replacement for the legacy boolean above. ``count_zero``
+    # preserves the captured post/join graph while publishing a no-payload plan.
+    SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE = EnvPrefetchPullMode(
+        "SGLANG_MOE_EXPERT_PREFETCH_PULL"
+    )
+    # Keep BudgetRecall enabled by default for compatibility, but let matched
+    # performance arms exclude its device work independently of pull telemetry.
+    SGLANG_MOE_EXPERT_PREFETCH_SHADOW_RECALL = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)

@@ -801,6 +801,12 @@ class _OperationalCounters:
     gathers: int = 0
     side_pull_rows: int = 0
     side_pull_bytes: int = 0
+    side_pull_posted_rows: int = 0
+    side_pull_useful_posts: int = 0
+    side_pull_wasted_rows: int = 0
+    side_pull_covered_routes: int = 0
+    side_pull_residual_routes: int = 0
+    side_pull_useful_precision: float = 0.0
 
 
 _PHASES = {
@@ -1725,13 +1731,19 @@ class ExpertHotCacheManager:
                     row["requested_unique_experts"] += unique
                 side_pull = self._side_pull_snapshots.get((mode, layer_id))
                 if side_pull is not None:
-                    _covered, _residual, _wasted, posted = side_pull
+                    covered, residual, wasted, posted = side_pull
                     delivered = posted
                     row["miss_rows"] += delivered
                     row["side_pull_rows"] += delivered
                     row["side_pull_bytes"] += (
                         delivered * self.streamers[layer_id].bytes_per_expert
                     )
+                    row["side_pull_posted_rows"] = posted
+                    row["side_pull_useful_posts"] = posted - wasted
+                    row["side_pull_wasted_rows"] = wasted
+                    row["side_pull_covered_routes"] = covered
+                    row["side_pull_residual_routes"] = residual
+                    row["side_pull_useful_precision"] = (posted - wasted) / posted if posted else 0.0
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
                 result[mode][str(layer_id)] = row
@@ -1905,12 +1917,7 @@ class ExpertHotCacheManager:
         Safe to call at any cadence: nothing here remembers a prior read to
         diff against, so a later call can never look like a decrement no
         matter what the producer's cumulative total does between calls.
-        Unlike this class's own CUDA-graph register totals, the producer's
-        ``PullDeliveryStats.counts`` is **not** reset by
-        ``discard_graph_capture_routes`` or by anything else -- a capture
-        event's warmup replay adds its one dummy forward's counts to
-        ``PullDeliveryStats`` exactly like a real one, a bounded, permanent
-        bias of one warmup sample per capture rather than a value this
-        method's cadence can correct for.
+        ``discard_graph_capture_routes`` resets the producer's device counters
+        after graph warmup, and a later periodic snapshot replaces this one.
         """
         self._side_pull_snapshots[(mode, layer_id)] = (covered, residual, wasted, posted)
