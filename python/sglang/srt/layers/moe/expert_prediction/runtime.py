@@ -44,6 +44,7 @@ class PrefetchSettings(msgspec.Struct, frozen=True):
     width: int
     budget: int
     tau: float
+    enable_pull: bool = False
 
 
 class ExpertPredictionRuntime:
@@ -167,12 +168,18 @@ class ExpertPredictionRuntime:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR cannot run with SGLANG_MOE_PREFETCH_MAX_CANDIDATES"
                 )
+            if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.get() and not envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+                raise ValueError(
+                    "SGLANG_MOE_EXPERT_PREFETCH_PULL needs SGLANG_MOE_EXPERT_GRAPH_GATHER; the join it "
+                    "drives lives in ExpertStreamer._gather_graph"
+                )
             prefetch = PrefetchSettings(
                 predictor=prefetch_predictor,
                 model_dir=Path(model_dir),
                 width=envs.SGLANG_MOE_EXPERT_PREFETCH_CANDIDATES.get(),
                 budget=envs.SGLANG_MOE_EXPERT_PREFETCH_BUDGET.get(),
                 tau=envs.SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU.get(),
+                enable_pull=envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.get(),
             )
         return cls.build(
             model=model,
@@ -262,6 +269,7 @@ class ExpertPredictionRuntime:
                 tau=prefetch.tau,
                 dtype=hidden_dtype,
                 device=device,
+                enable_pull=prefetch.enable_pull,
             )
         )
         logger.info(

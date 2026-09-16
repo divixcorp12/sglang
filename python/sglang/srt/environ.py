@@ -375,6 +375,12 @@ class Envs:
     # Rows per layer the shadow budget-recall metric credits.
     SGLANG_MOE_EXPERT_PREFETCH_BUDGET = EnvInt(3)
     SGLANG_MOE_EXPERT_PREFETCH_APEX_TAU = EnvFloat(0.95)
+    # Post the candidate bank's best non-resident target-layer expert onto the
+    # captured side stream (expert_gpu_pull.py) and join it into the covered/
+    # residual remap; requires SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR and a hot
+    # cache allocated with the trailing DedicatedPrefetchSlot row. Default off:
+    # the plan forbids enabling this by default on synthetic evidence.
+    SGLANG_MOE_EXPERT_PREFETCH_PULL = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)

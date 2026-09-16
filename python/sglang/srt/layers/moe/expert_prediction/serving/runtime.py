@@ -1,8 +1,11 @@
 """Live expert prefetch scoring: per-target-layer candidates written inside the decode graph from tap writes.
 
 Every per-token op runs from ``FeatureStore.after_write`` during eager forwards and graph
-capture, so replay executes recorded kernels only. Phase B hands ``bank`` rows to the
-shared copy layer; this module never touches the copy path.
+capture, so replay executes recorded kernels only. ``bank`` rows feed the shared copy
+layer; with ``SGLANG_MOE_EXPERT_PREFETCH_PULL`` (default off), ``PrefetchPuller`` also
+posts and joins a captured side-stream pull of each target's top candidate through
+``expert_gpu_pull.py`` -- scoring-only (the prior, still-default behaviour) never touches
+the copy path.
 """
 
 from __future__ import annotations
@@ -13,13 +16,170 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+from sglang.srt.layers.moe.expert_gpu_pull import ExpertGpuPullPipeline, ExpertGpuPullTarget
 from sglang.srt.layers.moe.expert_prediction.contracts import MoeLayerSpec, RouteFeature
 from sglang.srt.layers.moe.expert_prediction.feature_store import FeatureStore
-from sglang.srt.layers.moe.expert_prediction.serving.candidates import BudgetRecall, PrefetchCandidateBank
+from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
+    BudgetRecall,
+    DedicatedPrefetchSlot,
+    PrefetchCandidateBank,
+)
 from sglang.srt.layers.moe.expert_prediction.serving.checkpoints import load_prefetch_checkpoints
 from sglang.srt.layers.moe.expert_prediction.serving.scorers import ApexScorer, LlaporScorer
+from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
 
 logger = logging.getLogger(__name__)
+
+
+def _layer_tensor(layer: torch.nn.Module, name: str) -> torch.Tensor:
+    value = getattr(layer, name)
+    return value.data if isinstance(value, torch.nn.Parameter) else value
+
+
+def pull_outcome_counts(
+    flat_ids: torch.Tensor, missed_mask: torch.Tensor, predicted_expert: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-forward pull outcome: covered/residual actual-miss route counts and a waste flag.
+
+    ``flat_ids`` are this forward's routed expert ids and ``missed_mask`` marks
+    the ones the ordinary residency check already found non-resident (the
+    demand-path miss set); only those can be "covered" by a speculative pull.
+    ``covered`` counts actual-miss routes equal to ``predicted_expert``;
+    ``residual`` counts actual-miss routes that are not, and so still cross
+    the ordinary demand path. ``wasted`` is true when a real prediction
+    (``predicted_expert != -1``) covered no route this forward -- the posted
+    pull's row went unused. All three are device tensors; nothing here reads
+    the device.
+    """
+    valid = predicted_expert.reshape(()) >= 0
+    matches = missed_mask & (flat_ids == predicted_expert)
+    covered = matches.sum()
+    residual = missed_mask.sum() - covered
+    wasted = valid & (covered == 0)
+    return covered, residual, wasted
+
+
+def route_covered_residual(
+    flat_ids: torch.Tensor,
+    missed_mask: torch.Tensor,
+    predicted_expert: torch.Tensor,
+    slot_index: int,
+    demand_remap: torch.Tensor,
+) -> torch.Tensor:
+    """Redirect actual-miss routes for ``predicted_expert`` to the dedicated ``slot_index``.
+
+    Only rows ``missed_mask`` marks non-resident can be redirected -- a
+    resident hit already has its own slot and must keep it. Every other row
+    keeps its existing ``demand_remap`` destination, the ordinary demand-scratch
+    row the miss path already assigned it. ``predicted_expert`` at -1 (nothing
+    posted this forward) never equals a real expert id, so nothing is
+    redirected.
+    """
+    covered = missed_mask & (flat_ids == predicted_expert)
+    return torch.where(covered, torch.full_like(demand_remap, slot_index), demand_remap)
+
+
+class PullDeliveryStats:
+    """Device counters for one target layer's pull outcomes; host-read only via ``snapshot``."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.counts = torch.zeros(3, dtype=torch.int64, device=device)
+
+    def add(self, covered: torch.Tensor, residual: torch.Tensor, wasted: torch.Tensor) -> None:
+        self.counts[0].add_(covered)
+        self.counts[1].add_(residual)
+        self.counts[2].add_(wasted.to(torch.int64))
+
+    def snapshot(self) -> tuple[int, int, int]:
+        """Host read of cumulative (covered, residual, wasted); call only at metric log intervals."""
+        values = self.counts.cpu().tolist()
+        return values[0], values[1], values[2]
+
+
+class PrefetchPuller:
+    """Speculative one-row side-stream pull of a target layer's best non-resident candidate.
+
+    Reserves ``DedicatedPrefetchSlot``'s trailing row of each target's hot-cache
+    tensor allocation (plan section 7.1) and drives a captured
+    ``ExpertGpuPullPipeline`` pull for it. ``post_target`` forks the pull from
+    the current stream -- call it after the caller's own demand copies for this
+    step, since the whole point is that the pull overlaps real compute rather
+    than sitting immediately before its own join. ``join_target`` folds the
+    pull back in after the target layer's actual routing and returns the
+    covered/residual remap.
+
+    Construction asserts every reservation against the hot cache's *real*
+    tensor allocation and *real* ``expert_to_slot``, not the formula alone: a
+    hot cache built without the trailing row raises here, at setup, rather
+    than corrupting a demand-scratch row silently at the first pull.
+    """
+
+    def __init__(
+        self,
+        *,
+        bank: PrefetchCandidateBank,
+        layer_ids: Sequence[int],
+        hot_caches: Mapping[int, Any],
+        device: torch.device,
+    ) -> None:
+        self.bank = bank
+        self._pipeline = ExpertGpuPullPipeline(device)
+        self._slots: dict[int, DedicatedPrefetchSlot] = {}
+        self._targets: dict[int, ExpertGpuPullTarget] = {}
+        self._plans: dict[int, ExpertRowPlan] = {}
+        self.stats: dict[int, PullDeliveryStats] = {}
+        for layer_id in layer_ids:
+            cache = hot_caches.get(layer_id)
+            if cache is None:
+                raise ValueError(f"expert prefetch pull needs a hot cache for target layer {layer_id}")
+            slot = DedicatedPrefetchSlot(capacity=cache.capacity, demand_rows=cache.scratch_rows)
+            allocation_rows = next(iter(cache.tensors.values())).shape[0]
+            slot.assert_within_allocation(allocation_rows)
+            slot.assert_excluded_from_mapping(cache.expert_to_slot)
+            streamer = cache.streamer
+            pairs = [
+                (_layer_tensor(streamer.layer, name), cache.tensors[name]) for name in streamer.tensor_names
+            ]
+            segments = expert_row_segments(pairs)
+            expert_ids = torch.full((1,), -1, dtype=torch.int64, device=device)
+            slots_t = torch.full((1,), slot.index, dtype=torch.int32, device=device)
+            count = torch.zeros(1, dtype=torch.int32, device=device)
+            plan = ExpertRowPlan(expert_ids=expert_ids, slots=slots_t, count=count)
+            self._slots[layer_id] = slot
+            self._targets[layer_id] = self._pipeline.create_target(
+                f"prefetch_pull_{layer_id}", segments, plan, slot.index
+            )
+            self._plans[layer_id] = plan
+            self.stats[layer_id] = PullDeliveryStats(device)
+
+    def post_target(self, target_layer: int) -> None:
+        target = self._targets.get(target_layer)
+        if target is None:
+            return
+        plan = self._plans[target_layer]
+        plan.expert_ids.copy_(self.bank.ids_for(target_layer)[:1])
+        plan.count.fill_(1)
+        self._pipeline.post_target(target)
+
+    def join_target(
+        self,
+        target_layer: int,
+        *,
+        flat_ids: torch.Tensor,
+        missed_mask: torch.Tensor,
+        demand_remap: torch.Tensor,
+    ) -> torch.Tensor:
+        target = self._targets.get(target_layer)
+        if target is None:
+            return demand_remap
+        self._pipeline.join_target(target)
+        predicted = self._plans[target_layer].expert_ids
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        self.stats[target_layer].add(covered, residual, wasted)
+        return route_covered_residual(
+            flat_ids, missed_mask, predicted, self._slots[target_layer].index, demand_remap
+        )
 
 _FEATURES = {
     "llapor": frozenset({RouteFeature.ROUTER_INPUT, RouteFeature.TOPK_IDS, RouteFeature.TOPK_WEIGHTS}),
@@ -55,6 +215,7 @@ class PrefetchScoring:
         tau: float,
         dtype: torch.dtype,
         device: torch.device,
+        enable_pull: bool = False,
     ) -> "PrefetchScoring":
         by_layer = {spec.layer_id: spec for spec in specs}
         if width > min(spec.num_experts for spec in specs):
@@ -72,18 +233,28 @@ class PrefetchScoring:
                        for target, c in checkpoints.items()}
             source_of = {target: target for target in checkpoints}
             next_target = {}
+        bank = PrefetchCandidateBank(layer_ids=list(checkpoints), width=width, device=device)
+        puller = (
+            PrefetchPuller(bank=bank, layer_ids=list(checkpoints), hot_caches=hot_caches, device=device)
+            if enable_pull
+            else None
+        )
+        if puller is not None:
+            for layer_id in checkpoints:
+                hot_caches[layer_id].streamer.prefetch_puller = puller
         scoring = cls(
             predictor=predictor, scorers=scorers, source_of=source_of, next_target=next_target, store=store,
             hot_caches=hot_caches,
-            bank=PrefetchCandidateBank(layer_ids=list(checkpoints), width=width, device=device),
+            bank=bank,
             recall=BudgetRecall(layer_ids=list(checkpoints), budget=budget, device=device),
+            puller=puller,
         )
         store.after_write = scoring._on_write
-        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d",
-                    predictor, len(checkpoints), width, budget, scoring.state_nbytes)
+        logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d budget=%d state_bytes=%d pull=%s",
+                    predictor, len(checkpoints), width, budget, scoring.state_nbytes, enable_pull)
         return scoring
 
-    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall) -> None:
+    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None) -> None:
         self.predictor = predictor
         self.targets = sorted(scorers)
         # Source layer -> target layer for a next-layer predictor; empty for same-layer predictors.
@@ -94,6 +265,7 @@ class PrefetchScoring:
         self._hot_caches = dict(hot_caches)
         self.bank = bank
         self.recall = recall
+        self.puller = puller
 
     @property
     def required_features(self) -> frozenset[RouteFeature]:
@@ -122,7 +294,13 @@ class PrefetchScoring:
                 )
             else:
                 scores = self._scorers[target](self._store.view(layer_id, RouteFeature.PRE_MIXER, rows))
-        self.bank.write(target, scores)
+        # Passing expert_to_slot here (rather than the prior zero-arg call) is the seam
+        # documented on BudgetRecall: bank.write now excludes residency before truncating
+        # to width, so BudgetRecall.observe's own residency re-check at :57 sees a bank
+        # that is already non-resident-only, not top-W-then-filtered.
+        self.bank.write(target, scores, expert_to_slot=self._hot_caches[target].expert_to_slot)
+        if self.puller is not None:
+            self.puller.post_target(target)
 
     def metrics_record(self) -> dict:
         """Host read of the device counters; call only at metric log intervals."""

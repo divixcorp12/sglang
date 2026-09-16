@@ -198,6 +198,126 @@ class TestPrefetchScoringCpu(unittest.TestCase):
             reservation.assert_excluded_from_mapping(expert_to_slot)
 
 
+class TestPullOutcomeCpu(unittest.TestCase):
+    """Stage C2 bullet 4: exact miss-accounting values for the dedicated-slot pull's remap.
+
+    Fixed scenario throughout: actual misses are experts {42, 117} (rows 1 and
+    2 of 4); rows 0 and 3 (experts 7, 8) are resident hits and never appear in
+    ``missed_mask``.
+    """
+
+    def _scenario(self):
+        missed_mask = torch.tensor([False, True, True, False])
+        flat_ids = torch.tensor([7, 42, 117, 8])
+        demand_remap = torch.tensor([100, 101, 102, 103])
+        return flat_ids, missed_mask, demand_remap
+
+    def test_correct_prediction_covers_only_the_predicted_miss(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import (
+            pull_outcome_counts,
+            route_covered_residual,
+        )
+
+        flat_ids, missed_mask, demand_remap = self._scenario()
+        predicted = torch.tensor([42])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (1, 1, False))
+        remap = route_covered_residual(flat_ids, missed_mask, predicted, 999, demand_remap)
+        # Only expert 42's row is redirected to the dedicated slot (999); expert 117
+        # (and the two resident hits) keep their existing demand-path destination.
+        self.assertEqual(remap.tolist(), [100, 999, 102, 103])
+
+    def test_wrong_prediction_covers_nothing_and_counts_as_waste(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import (
+            pull_outcome_counts,
+            route_covered_residual,
+        )
+
+        flat_ids, missed_mask, demand_remap = self._scenario()
+        predicted = torch.tensor([93])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (0, 2, True))
+        remap = route_covered_residual(flat_ids, missed_mask, predicted, 999, demand_remap)
+        self.assertEqual(remap.tolist(), demand_remap.tolist())
+
+    def test_count_zero_actual_all_hit_has_nothing_to_cover(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import pull_outcome_counts
+
+        flat_ids = torch.tensor([7, 8, 9, 10])
+        missed_mask = torch.zeros(4, dtype=torch.bool)
+        demand_remap = torch.tensor([100, 101, 102, 103])
+        predicted = torch.tensor([42])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        # Nothing was a miss, so a real prediction (42) necessarily covered nothing:
+        # this is the "wasted" branch, not a covered/residual split.
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (0, 0, True))
+
+    def test_nothing_posted_leaves_every_miss_on_the_demand_path(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import (
+            pull_outcome_counts,
+            route_covered_residual,
+        )
+
+        flat_ids, missed_mask, demand_remap = self._scenario()
+        predicted = torch.tensor([-1])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, predicted)
+        # -1 (no post) never equals a real expert id and is never "waste": nothing
+        # was attempted, so there is nothing to have wasted.
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (0, 2, False))
+        remap = route_covered_residual(flat_ids, missed_mask, predicted, 999, demand_remap)
+        self.assertEqual(remap.tolist(), demand_remap.tolist())
+
+    def test_delayed_correct_prediction_only_covers_once_it_arrives(self):
+        # A prediction posted one forward too late (still -1 this step) cannot cover
+        # this step's miss even though the *next* step's identical prediction would.
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import pull_outcome_counts
+
+        flat_ids, missed_mask, demand_remap = self._scenario()
+        del demand_remap
+        late = torch.tensor([-1])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, late)
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (0, 2, False))
+        on_time = torch.tensor([42])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, on_time)
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (1, 1, False))
+
+    def test_delayed_wrong_prediction_stays_wasted_once_it_arrives(self):
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import pull_outcome_counts
+
+        flat_ids, missed_mask, demand_remap = self._scenario()
+        del demand_remap
+        late = torch.tensor([-1])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, late)
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (0, 2, False))
+        on_time_wrong = torch.tensor([93])
+        covered, residual, wasted = pull_outcome_counts(flat_ids, missed_mask, on_time_wrong)
+        self.assertEqual((covered.item(), residual.item(), wasted.item()), (0, 2, True))
+
+    def test_first_and_last_row_targets_behave_like_any_other_row(self):
+        # The predicted expert sitting in the first or last flat position must count
+        # exactly like a middle one -- no off-by-one in `missed_mask`/`flat_ids` indexing.
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import (
+            pull_outcome_counts,
+            route_covered_residual,
+        )
+
+        flat_ids = torch.tensor([42, 7, 8, 117])
+        missed_mask = torch.tensor([True, False, False, True])
+        demand_remap = torch.tensor([200, 201, 202, 203])
+        first = pull_outcome_counts(flat_ids, missed_mask, torch.tensor([42]))
+        self.assertEqual((first[0].item(), first[1].item(), first[2].item()), (1, 1, False))
+        self.assertEqual(
+            route_covered_residual(flat_ids, missed_mask, torch.tensor([42]), 999, demand_remap).tolist(),
+            [999, 201, 202, 203],
+        )
+        last = pull_outcome_counts(flat_ids, missed_mask, torch.tensor([117]))
+        self.assertEqual((last[0].item(), last[1].item(), last[2].item()), (1, 1, False))
+        self.assertEqual(
+            route_covered_residual(flat_ids, missed_mask, torch.tensor([117]), 999, demand_remap).tolist(),
+            [200, 201, 202, 999],
+        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchScoringCuda(unittest.TestCase):
     def _parts(self):

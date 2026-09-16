@@ -531,6 +531,9 @@ class ExpertStreamer:
         self.row_backend = None
         self.row_tag = 0
         self.before_eager_gather = None
+        # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and this
+        # layer is a scored prefetch target; see PrefetchPuller.join_target in serving/runtime.py.
+        self.prefetch_puller = None
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
@@ -702,6 +705,18 @@ class ExpertStreamer:
             self.row_planner.fill_routes(plan, self.row_plan)
             remap = plan.remap
             source_rows = plan.source_rows
+        prefetch_puller = getattr(self, "prefetch_puller", None)
+        if prefetch_puller is not None:
+            # Join after actual routing: `remap`/`expert_to_slot` above are this
+            # forward's real routing decision, not the prediction that posted the
+            # pull. The dedicated slot the pull wrote is never in `scratch`
+            # (plan section 7.1), so the ordinary demand copy below cannot race it.
+            remap = prefetch_puller.join_target(
+                self.layer_id,
+                flat_ids=flat,
+                missed_mask=expert_to_slot[flat] < 0,
+                demand_remap=remap,
+            )
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(
                 0,
