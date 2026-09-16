@@ -2007,3 +2007,56 @@ Preserved at `/tmp/claude-1000/-home-dimitri-data-divix-crypto/49d0b835-1dcf-495
 **Separate latent defect, ruled out as this cause but real.** `AsyncExpertTransferExecutor._by_device` (`srt/layers/moe/expert_transfer.py:201`) is a process-wide class dict keyed by CUDA device, populated from `ExpertHotCache.__init__` whenever capacity>0 — true in every test here — and never reset anywhere in the suite, `ExpertHotCacheManager`, or `ExpertDoorbellCopier.stop()`. Its `id()` and sequence counters do not correlate with the flip, so it is not this mechanism; it remains an unconditional, never-reset singleton.
 
 **The family again, and the sharpest specimen yet.** Every prior member was a *check* whose success was indistinguishable from the condition it reported on. This one is a **test whose PASS was the failure mode** — green because the process was cold, and cold is the condition that does not resemble production. Running it in isolation, the standard remedy for flakiness, is exactly what manufactured the artifact.
+
+### E38, the budget_recall discontinuity: passing expert_to_slot at the bank.write call site (2026-09-16, divix01)
+
+**What changed and where.** `c48b3c69e5` (Stage C2, serving wiring for the side-stream expert-pull
+dedicated slot) changed `PrefetchScoring._on_write`'s sole `bank.write` call
+(`serving/runtime.py`) from `self.bank.write(target, scores)` to
+`self.bank.write(target, scores, expert_to_slot=self._hot_caches[target].expert_to_slot)`. C1
+(`c0b5cf6145`) added the optional `expert_to_slot` parameter but explicitly refused to write this
+note, having derived from the call graph — not the formula — that its own commit changed nothing:
+the one call site still passed no `expert_to_slot`. This commit is the one that changes it.
+
+**The discontinuity.** Before `c48b3c69e5`, `budget_recall` counted non-resident coverage within
+the top-W bank: `PrefetchCandidateBank.write` ranked every expert by summed score with no residency
+filter, so a bank of width W could be filled entirely with already-hot experts, and
+`BudgetRecall.observe`'s own residency re-check (`candidates.py:107-109`) then masked those out
+after the fact. After `c48b3c69e5`, the bank itself excludes resident and non-finite-score experts
+before truncating to width, so `observe`'s residency re-check now sees a bank that is already
+non-resident-only. The old offering is a strict prefix of the new one (residency-exclusion moved
+earlier in the pipeline, nothing removed), so `budget_recall` can only rise, for a reason that has
+nothing to do with prediction quality. Figures recorded before `c48b3c69e5` (llapor 0.383/0.389,
+apex 0.424/0.420 — headline numbers in another session's plan and its Task 6 report) are not
+comparable to figures recorded after it.
+
+**Why the two predictor arms move by different amounts.** Residency is sampled at two points:
+`bank.write` filters at the *source* layer's score trigger, `observe` re-checks at the *target*
+layer's `TOPK_IDS` write (`runtime.py:106-125`). LLaPor is next-layer (target = source + 1), so its
+`bank.write` precedes its `observe` by a full layer's worth of GPU residency updates; APEX is
+same-layer (`PRE_MIXER` → `TOPK_IDS` within the same layer), a much shorter window. The two arms'
+write-to-observe distance differs, so the inflation this seam introduces is not the same magnitude
+for both — llapor and apex are not comparable to each other across the seam, not only to their own
+pre-change values.
+
+**Open empirical question, not settled here.** Does residency actually change within the
+write-to-observe window in production traffic? `runtime.py:111` passes `expert_to_slot` as a live
+tensor reference and `resident = expert_to_slot >= 0` evaluates fresh at `observe`. Two prior
+sessions verified the window is structurally open (the reference is live, not snapshotted); neither
+verified that anything actually evicts or promotes an expert inside it during a real forward. If
+residency is in practice frozen across one forward's write-to-observe span, the eviction-driven part
+of this discontinuity collapses and only the differing-magnitude structural point survives. Left
+unmeasured pending GPU time (Stage C2 is authoring under GPU serialization with `stage-c3-telemetry`
+holding the device first); an assertion or counter watching one `expert_to_slot` tensor across a
+forward would settle it and does not need a benchmark.
+
+**Also unresolved, offered as reading, not fact.** `runtime.py:134` computes `budget_recall` as
+`covered / missed` pooled across all layers, not per-layer then averaged, so the inflation this seam
+introduces is weighted by each layer's miss volume. Whether that amplifies or damps the per-arm
+difference above has not been worked out.
+
+**Scope note.** This entry documents `budget_recall`'s discontinuity, which is now live
+unconditionally (not behind a flag). The one-row side-stream pull itself
+(`PrefetchPuller`, `SGLANG_MOE_EXPERT_PREFETCH_PULL`) is separate, gated, and default off — see the
+Stage C2 report for its own status, including a confirmed setup-time blocker in
+`ExpertHotCache`'s tensor allocation (out of this commit's file scope).
