@@ -405,7 +405,7 @@ def test_prefetch_covered_lane_capture_replays_with_a_changed_prediction():
     fed the same prefetch state, matching this file's existing capture
     pattern (`test_fused_plan_captures_and_replays_with_changed_ids`).
     """
-    from sglang.srt.layers.moe.expert_route_plan import plan_unique_routes_cuda
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
     device = "cuda"
     ids = torch.tensor([5, 2, 9, 1], device=device, dtype=torch.int64)

@@ -1167,3 +1167,88 @@ class TestExpertGraphGather(unittest.TestCase):
             self.assertEqual(recovered["late_completions"], 0)
         finally:
             copier.stop()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
+    """Stage C4 bullet 4: bullet 1's row-skip re-derived through the real gather path.
+
+    Unlike the earlier Stage C tests (`test_expert_hot_cache.py`'s
+    `test_side_pull_delivery_adds_physical_rows_but_not_logical_misses` and its
+    multi-token sibling), this drives an actual ``ExpertStreamer._gather_graph``
+    call -- real ``ExpertHotCache``, real ``PrefetchPuller``, real
+    ``plan_graph_routes`` -- rather than setting counters directly. Total
+    physical rows is ``streamer.row_plan.count`` (what a copy backend actually
+    reads, shrunk by the skip) plus ``posted`` (the side pull's own physical
+    delivery), summed the way ``ExpertHotCacheManager.record_side_pull_delivery``
+    sums them.
+    """
+
+    def _build(self, layer_id=0):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
+            PrefetchCandidateBank,
+        )
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
+
+        layer = _layer()
+        layer.layer_id = layer_id
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"):
+            cache = ExpertHotCache(streamer, capacity=0, scratch_rows=TOP_K)
+        streamer.enable_graph_gather(TOP_K)
+        bank = PrefetchCandidateBank(layer_ids=[layer_id], width=1, device="cuda")
+        puller = PrefetchPuller(
+            bank=bank, layer_ids=[layer_id], hot_caches={layer_id: cache}, device="cuda"
+        )
+        streamer.prefetch_puller = puller
+        return streamer, cache, bank, puller
+
+    def _set_candidate(self, bank, cache, layer_id, expert_id):
+        scores = torch.zeros(1, cache.streamer.num_experts, device=bank.ids.device)
+        scores[0, expert_id] = 1.0
+        bank.write(layer_id, scores, expert_to_slot=cache.expert_to_slot)
+
+    def _run(self, streamer, bank, cache, puller, layer_id, ids, predicted_expert):
+        self._set_candidate(bank, cache, layer_id, predicted_expert)
+        puller.post_target(layer_id)
+        streamer.gather(ids)
+        torch.cuda.synchronize()
+        physical_demand_rows = int(streamer.row_plan.count.item())
+        covered, _residual, _wasted, posted = puller.stats[layer_id].snapshot()
+        return physical_demand_rows, covered, posted
+
+    def test_useful_prediction_gives_two_total_physical_rows(self):
+        streamer, cache, bank, puller = self._build()
+        ids = torch.tensor([[5, 6]], dtype=torch.int32, device="cuda")  # both nonresident
+        demand_rows, _covered, posted = self._run(
+            streamer, bank, cache, puller, 0, ids, predicted_expert=5
+        )
+        self.assertEqual(posted, 1)
+        self.assertEqual(demand_rows, 1)  # only expert 6 still crosses the demand path
+        self.assertEqual(demand_rows + posted, 2)
+
+    def test_wrong_prediction_gives_three_total_physical_rows(self):
+        streamer, cache, bank, puller = self._build()
+        ids = torch.tensor([[5, 6]], dtype=torch.int32, device="cuda")  # same two misses
+        demand_rows, _covered, posted = self._run(
+            streamer, bank, cache, puller, 0, ids, predicted_expert=3
+        )
+        self.assertEqual(posted, 1)
+        self.assertEqual(demand_rows, 2)  # neither miss excluded
+        self.assertEqual(demand_rows + posted, 3)
+
+    def test_multi_token_overlap_on_covered_expert_gives_one_total_physical_row(self):
+        """Two token rows routing to the same predicted, delivered expert:
+        route-level ``covered`` is 2, but the demand path excludes both
+        (one distinct expert) and the pull delivers exactly one row."""
+        streamer, cache, bank, puller = self._build()
+        ids = torch.tensor([[5], [5]], dtype=torch.int32, device="cuda")  # two tokens, top_k=1
+        demand_rows, covered, posted = self._run(
+            streamer, bank, cache, puller, 0, ids, predicted_expert=5
+        )
+        self.assertEqual(covered, 2)  # route-level: both routes matched
+        self.assertEqual(posted, 1)  # physical: one row, not one per route
+        self.assertEqual(demand_rows, 0)  # neither duplicate consumes a scratch row
+        self.assertEqual(demand_rows + posted, 1)
