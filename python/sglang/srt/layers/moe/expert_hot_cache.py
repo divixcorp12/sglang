@@ -1233,6 +1233,7 @@ class ExpertHotCacheManager:
         if puller is not None:
             for stats in puller.stats.values():
                 stats.counts.zero_()
+        self._side_pull_snapshots.clear()
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
