@@ -1,5 +1,8 @@
 """Contract tests for the graph-captured prefetch calibration observer."""
 
+import os
+from unittest import mock
+
 import torch
 
 from sglang.srt.environ import envs
@@ -90,5 +93,6 @@ def test_reset_drops_graph_capture_warmup_counts_without_reallocating_state():
 
 def test_calibration_collection_is_disabled_unless_explicitly_requested():
     """Timed arms must not accidentally pay for profiling-only observation."""
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.override(None):
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION", None)
         assert envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get() is False
