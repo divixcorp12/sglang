@@ -126,12 +126,12 @@ class TestExpertPredictionRuntime(unittest.TestCase):
     def test_prefetch_pull_mode_rejects_unknown_and_contradictory_legacy_settings(self):
         field = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE
         legacy = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE"):
-            with field.override("not-a-mode"):
+        with field.override("not-a-mode"):
+            with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE"):
                 field.get()
-        with self.assertRaisesRegex(ValueError, "contradict"):
-            with field.override("off"):
-                with legacy.override(True):
+        with field.override("off"):
+            with legacy.override(True):
+                with self.assertRaisesRegex(ValueError, "contradict"):
                     field.get()
 
     def test_prefetch_pull_mode_requires_a_prefetch_predictor(self):
