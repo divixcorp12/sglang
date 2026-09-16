@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+
 import json
 import logging
 from pathlib import Path
@@ -94,6 +96,10 @@ class ExpertPredictionRuntime:
         self._reported_unsupported = False
         self.capture = capture
         self.prefetch = prefetch
+        self._closed = False
+        # ModelRunner has no teardown hook for this optional runtime. Register
+        # with the process owner so short profiling jobs flush on server exit.
+        atexit.register(self.close)
 
     @classmethod
     def from_env(
@@ -359,6 +365,9 @@ class ExpertPredictionRuntime:
             self._metrics_path = None
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         # A short profiling run may stop before its periodic metrics boundary;
         # emit its final artifact exactly once at ordinary teardown.
         if self._metrics_path is not None and self.forwards and self.forwards % self._log_interval:

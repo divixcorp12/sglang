@@ -113,6 +113,15 @@ def _decode(model, runtime, rows=3, mode=ForwardMode.DECODE):
 
 
 class TestExpertPredictionRuntime(unittest.TestCase):
+    def test_runtime_registers_server_exit_teardown_once(self):
+        """ModelRunner owns no close hook, so the server process exit owns this flush."""
+        with mock.patch("sglang.srt.layers.moe.expert_prediction.runtime.atexit.register") as register:
+            _model, runtime = _runtime()
+        register.assert_called_once_with(runtime.close)
+        runtime.close()
+        runtime.close()
+        self.assertTrue(runtime._closed)
+
     def test_prefetch_pull_mode_defaults_to_off_and_parses_all_modes(self):
         field = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE
         with mock.patch.dict(os.environ, {}, clear=False):
