@@ -938,6 +938,40 @@ class TestExpertHotCacheManager(unittest.TestCase):
         row = manager.snapshot_counters()["prefill"]["0"]
         self.assertEqual(row["side_pull_posted_rows"], 0)
 
+    def test_discard_graph_capture_routes_resets_calibration_independently_of_puller(self):
+        """Profiling uses pull mode off, so its observer needs its own lifecycle hook."""
+        from sglang.srt.layers.moe.expert_prediction.serving.calibration import (
+            PullCalibrationHistogram,
+        )
+
+        manager = self.manager(dynamic=False)
+        pull_stats = SimpleNamespace(
+            counts=torch.tensor([3, 1, 2, 1], dtype=torch.int64, device="cuda")
+        )
+        manager.register_prefetch_puller(SimpleNamespace(stats={0: pull_stats}))
+        calibration = PullCalibrationHistogram(layer_ids=(0,), device=torch.device("cuda"))
+        calibration.stage(
+            0,
+            torch.tensor([1], device="cuda"),
+            torch.tensor(0.25, device="cuda"),
+            torch.tensor(0.1, device="cuda"),
+            torch.tensor(True, device="cuda"),
+        )
+        calibration.record_target(
+            0,
+            torch.tensor([1], device="cuda"),
+            torch.tensor([True], device="cuda"),
+            torch.tensor([1], device="cuda"),
+        )
+        manager.register_prefetch_calibration(calibration)
+
+        manager.discard_graph_capture_routes()
+
+        self.assertTrue(bool((pull_stats.counts == 0).all()))
+        score = calibration.snapshot()["layers"]["0"]["score"]
+        self.assertEqual(sum(score["opportunity"]), 0)
+        self.assertEqual(sum(score["physical_demand_rows"]), 0)
+
     def test_invalid_config_and_seed_do_not_allocate_slots(self):
         for options in (
             {"budget_bytes": -1},

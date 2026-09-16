@@ -2,6 +2,7 @@
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_prediction.serving.calibration import (
     PullCalibrationHistogram,
 )
@@ -85,3 +86,9 @@ def test_reset_drops_graph_capture_warmup_counts_without_reallocating_state():
     assert histogram.candidate_ids.data_ptr() == ids_address
     assert sum(score["opportunity"]) == 0
     assert sum(score["physical_demand_rows"]) == 0
+
+
+def test_calibration_collection_is_disabled_unless_explicitly_requested():
+    """Timed arms must not accidentally pay for profiling-only observation."""
+    with envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.override(None):
+        assert envs.SGLANG_MOE_EXPERT_PREFETCH_CALIBRATION.get() is False
