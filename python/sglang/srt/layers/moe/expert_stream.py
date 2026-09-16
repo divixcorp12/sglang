@@ -740,6 +740,7 @@ class ExpertStreamer:
                 flat,
                 expert_to_slot[flat] < 0,
                 self.row_plan.count,
+                expert_to_slot,
             )
         for source, destination in self._graph_device_pairs:
             destination.view(torch.uint8).reshape(destination.shape[0], -1).index_copy_(

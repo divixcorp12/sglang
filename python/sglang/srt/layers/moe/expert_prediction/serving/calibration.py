@@ -73,6 +73,7 @@ class PullCalibrationHistogram:
         flat_ids: torch.Tensor,
         missed_mask: torch.Tensor,
         physical_demand_rows: torch.Tensor,
+        expert_to_slot: torch.Tensor | None = None,
     ) -> None:
         """Add one target-routing result to both score and margin histograms."""
         row = self._rows.get(target_layer)
@@ -80,7 +81,10 @@ class PullCalibrationHistogram:
             return
         candidate = self.candidate_ids[row]
         valid = candidate >= 0
-        eligible = valid & self.source_eligible[row]
+        target_nonresident = valid
+        if expert_to_slot is not None:
+            target_nonresident = valid & (expert_to_slot[candidate.clamp_min(0)] < 0)
+        eligible = valid & self.source_eligible[row] & target_nonresident
         useful = (missed_mask & (flat_ids == candidate)).any()
         values = torch.stack(
             (

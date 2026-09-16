@@ -95,6 +95,16 @@ def test_resident_fallback_candidate_is_not_an_eligible_calibration_opportunity(
     assert sum(score["physical_demand_rows"]) == 0
 
 
+def test_target_residency_change_removes_opportunity_but_keeps_source_observation():
+    histogram = _histogram()
+    histogram.stage(3, torch.tensor([2]), torch.tensor(0.7), torch.tensor(0.2), torch.tensor(True))
+    histogram.record_target(3, torch.tensor([2]), torch.tensor([True]), torch.tensor([1]), torch.tensor([-1, -1, 4]))
+    score = histogram.snapshot()["layers"]["3"]["score"]
+    assert sum(score["source_eligible"]) == 1
+    assert sum(score["opportunity"]) == 0
+    assert sum(score["target_useful"]) == 0
+
+
 def test_reset_drops_graph_capture_warmup_counts_without_reallocating_state():
     """Capture replay must not be included in the profiling-run histogram."""
     histogram = _histogram()
@@ -262,3 +272,14 @@ def test_runtime_close_final_flushes_short_profiling_run_once():
     with mock.patch.object(runtime, "_append_metrics") as flush:
         runtime.close()
     flush.assert_not_called()
+
+
+def test_runtime_close_writes_empty_profiling_artifact_without_metrics():
+    from sglang.srt.layers.moe.expert_prediction.runtime import ExpertPredictionRuntime
+    runtime = object.__new__(ExpertPredictionRuntime)
+    runtime._metrics_path = None; runtime.forwards = 0; runtime._log_interval = 100
+    runtime.capture = None; runtime.store = type("Store", (), {"after_write": None})()
+    runtime._taps = type("Taps", (), {"remove": lambda self: None})(); runtime._pre_mixer_removers = []
+    runtime.prefetch = mock.Mock()
+    runtime.close()
+    runtime.prefetch.write_calibration.assert_called_once_with()

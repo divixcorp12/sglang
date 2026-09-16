@@ -366,6 +366,7 @@ class ExpertPredictionRuntime:
         if self.capture is not None:
             self.capture.close()
         if self.prefetch is not None:
+            self.prefetch.write_calibration()
             self.store.after_write = None
         self._taps.remove()
         for remove in self._pre_mixer_removers:
