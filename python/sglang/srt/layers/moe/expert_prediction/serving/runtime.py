@@ -351,6 +351,8 @@ class PrefetchScoring:
         self.calibration = calibration
         self._calibration_file = calibration_file
         self._calibration_provenance = calibration_provenance
+        if self.calibration is not None and self._calibration_file is not None:
+            self.calibration.write(self._calibration_file, json.loads(calibration_provenance or "{}"), complete=False)
 
     @property
     def required_features(self) -> frozenset[RouteFeature]:
@@ -419,4 +421,4 @@ class PrefetchScoring:
         if self.calibration is None or self._calibration_file is None:
             return
         provenance = json.loads(self._calibration_provenance or "{}")
-        self.calibration.write(self._calibration_file, provenance)
+        self.calibration.write(self._calibration_file, provenance, complete=True)

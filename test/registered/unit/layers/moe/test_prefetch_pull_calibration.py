@@ -202,6 +202,16 @@ def test_calibration_writer_emits_versioned_histogram_and_launcher_provenance():
     assert sum(payload["layers"]["3"]["score"]["target_useful"]) == 1
 
 
+def test_incomplete_setup_artifact_is_rejected_until_graceful_completion():
+    histogram = _histogram()
+    path = Path(tempfile.mkdtemp()) / "pull-calibration.json"
+    histogram.write(path, {"commit": "abc"}, complete=False)
+    with pytest.raises(ValueError, match="incomplete"):
+        PullCalibrationHistogram.require_complete(path)
+    histogram.write(path, {"commit": "abc"}, complete=True)
+    assert PullCalibrationHistogram.require_complete(path)["complete"] is True
+
+
 def test_canonical_capture_loader_uses_llapor_source_layer_features():
     """Using target-layer router input for LLaPor would benchmark the wrong model path."""
     script = Path(__file__).parents[5] / "benchmark/expert_delivery/benchmark_prefetch_scorers.py"

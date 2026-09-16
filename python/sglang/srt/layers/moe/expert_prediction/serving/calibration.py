@@ -126,10 +126,18 @@ class PullCalibrationHistogram:
             },
         }
 
-    def write(self, path: Path, provenance: dict) -> None:
+    def write(self, path: Path, provenance: dict, *, complete: bool = True) -> None:
         """Atomically publish the profiling artifact at a normal metrics flush."""
         payload = self.snapshot()
         payload["provenance"] = provenance
+        payload["complete"] = complete
         temporary = path.with_suffix(path.suffix + ".partial")
         temporary.write_text(json.dumps(payload, sort_keys=True))
         temporary.replace(path)
+
+    @staticmethod
+    def require_complete(path: Path) -> dict:
+        payload = json.loads(path.read_text())
+        if not payload.get("complete", False):
+            raise ValueError("incomplete pull calibration artifact is invalid for decisions")
+        return payload
