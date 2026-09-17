@@ -381,6 +381,16 @@ class GpuResidencyUpdater:
         if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(False)
         if self.insert_direct:
+            # Warm-up and capture gathers insert for real, unlike stage 1's, whose boundary is
+            # gated by ``enabled`` and so stays inert until here. They cannot be gated the same
+            # way: the redirect has to be inside the captured graph, so it has to run during the
+            # capture. What they leave behind is consistent -- each row holds the expert the
+            # mapping names -- but the experts are the capture's dummy routes rather than the
+            # seed's, for at most one gather width per layer, which demand traffic replaces
+            # within a few forwards. Drop their counts, as this call does for every other
+            # capture-recorded counter, so the trace measures serving and not the warm-up.
+            self.gather_insertions.zero_()
+            self.gather_evictions.zero_()
             # Rank a shortlist now, eagerly: the first replay's gather reads it before any
             # boundary has run, and a capture-time shortlist would name pre-warm-up slots.
             self._rank_victims(self.route_counts > 0)
