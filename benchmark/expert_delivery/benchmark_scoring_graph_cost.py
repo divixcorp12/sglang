@@ -14,8 +14,9 @@ Components:
   c  mlp           predictor MLP, float, sigmoid
   d  bank16 / top1 width-16 reference bank write vs JIT top-1 selector
   e  recall        BudgetRecall.observe
-Composites run the real ``PrefetchScoring`` hook (C arm: pull off, recall off)
-and, when ``--sparse`` is given, the same with the sparse scorer.
+Composites run the real ``PrefetchScoring`` hook for the C arm (pull off, recall
+off, calibration off) with the width-16 reference bank and with the default
+selection for that configuration.
 """
 
 from __future__ import annotations
@@ -71,7 +72,6 @@ def main() -> None:
     parser.add_argument("--model-dir", default="/mnt/nvme2/nvfp4-work/expert-prediction-models/20260915-121630")
     parser.add_argument("--replays", type=int, default=2000)
     parser.add_argument("--residents", type=int, default=160)
-    parser.add_argument("--sparse", action="store_true", help="also time the sparse first-layer scorer")
     parser.add_argument("--only", default="", help="comma list of component names")
     args = parser.parse_args()
 
@@ -225,17 +225,9 @@ def main() -> None:
         "d_bank16": bank_write16,
         "d_top1": top1,
         "e_recall": recall_observe,
-        "C_arm_total": c_arm_hook(scoring_for()),
+        "C_arm_total_ref_bank16": c_arm_hook(scoring_for(fused_top1=False)),
+        "C_arm_total_default": c_arm_hook(scoring_for()),
     }
-    if args.sparse:
-        components["C_arm_total_sparse"] = c_arm_hook(scoring_for(sparse_scorer=True))
-        sparse_scoring = scoring_for(sparse_scorer=True)
-
-        def sparse_full():
-            for t in targets:
-                sparse_scoring._scorers[t](*inputs(t))
-
-        components["bc_scorer_sparse"] = sparse_full
     only = {name for name in args.only.split(",") if name}
     pool = torch.cuda.graph_pool_handle()
     meta = {
