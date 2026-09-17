@@ -3,7 +3,8 @@
 # cc-expert-prediction worktree on 127.0.0.1:<port>. <predictors> is a comma list or "off".
 # Usage: run-shadow-server.sh <name> <port> <predictors|off> [radix]
 # Refuses to start while any process holds the GPU. Runs in the foreground; the session backgrounds it.
-# Env: HOT_GPU_MB (default 14336), CAPTURE=1 to record expert prediction training data.
+# Env: HOT_GPU_MB (default 14336), CAPTURE=1 to record expert prediction training data,
+# OVERLAP_SCHEDULE=1 to run the overlap scheduler (default 0 passes --disable-overlap-schedule).
 # RUN_KIND=trace with a PREFETCH_TRACE_COMMAND starting with sudo relays the environment via trace-env-relay.sh.
 set -euo pipefail
 
@@ -31,6 +32,7 @@ checkpoint_checksum=${PREFETCH_CHECKPOINT_CHECKSUM:-unknown}
 model_shapes=${MODEL_SHAPES:-unknown}
 model_top_k=${MODEL_TOP_K:-10}
 provenance_only=${PREFETCH_PROVENANCE_ONLY:-0}
+overlap_schedule=${OVERLAP_SCHEDULE:-0}
 case "$run_kind" in timed|profiling|trace) ;; *) echo "RUN_KIND must be timed, profiling, or trace" >&2; exit 2 ;; esac
 case "$prefetch_pull_mode" in off|count_zero|always) ;; *) echo "PREFETCH_PULL_MODE is invalid" >&2; exit 2 ;; esac
 case "${calibration,,}" in
@@ -42,6 +44,11 @@ case "${provenance_only,,}" in
     1|true|yes|y) provenance_only=1 ;;
     0|false|no|n) provenance_only=0 ;;
     *) echo "PREFETCH_PROVENANCE_ONLY must be a boolean" >&2; exit 2 ;;
+esac
+case "${overlap_schedule,,}" in
+    1|true|yes|y) overlap_schedule=1; overlap_flags=() ;;
+    0|false|no|n) overlap_schedule=0; overlap_flags=(--disable-overlap-schedule) ;;
+    *) echo "OVERLAP_SCHEDULE must be a boolean" >&2; exit 2 ;;
 esac
 if [ "$model_top_k" != 10 ]; then
     echo "MODEL_TOP_K must be the production BS1 top-k value 10" >&2
@@ -127,7 +134,7 @@ shape_provenance='{"batch_size":1,"top_k":10,"top_k_unique":true,"cuda_graph_dec
 
 write_provenance() {
     calibration_provenance=$(printf '{"commit":"%s","predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","cache_size":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"bin_count":256,"bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255"}' "$commit" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$hot_gpu_mb" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance")
-    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","trace":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json"%s,"startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$trace_config" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$trace_paths" "$log" > "$run_dir/run-manifest.json"
+    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"overlap_schedule":%s,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","trace":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json"%s,"startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$overlap_schedule" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$trace_config" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$trace_paths" "$log" > "$run_dir/run-manifest.json"
 }
 
 if [ "$provenance_only" = 1 ]; then
@@ -154,7 +161,7 @@ fi
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} pull_mode=$prefetch_pull_mode shadow_recall=$shadow_recall calibration=$calibration run_kind=$run_kind fused_plan=1 candidates=$prefetch_candidates budget=$prefetch_budget output=$run_dir: $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} pull_mode=$prefetch_pull_mode shadow_recall=$shadow_recall calibration=$calibration run_kind=$run_kind overlap_schedule=$overlap_schedule fused_plan=1 candidates=$prefetch_candidates budget=$prefetch_budget output=$run_dir: $(date --iso-8601=seconds)"
     if [ "$run_kind" = trace ]; then
         echo "trace diagnostic-only wrapper=$trace_command report_path=$trace_report_path; wrapper uses simple whitespace-separated argv tokens only (shell quotes, backslashes, and embedded-whitespace arguments are unsupported)"
     fi
@@ -232,7 +239,7 @@ exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock "${launch_env[@]
         --max-running-requests 1 \
         --mamba-ssm-dtype bfloat16 \
         --mem-fraction-static 0.95 \
-        --disable-overlap-schedule \
+        "${overlap_flags[@]}" \
         "${radix_flags[@]}" \
         --language-model-only \
         --cuda-graph-backend-decode breakable \
