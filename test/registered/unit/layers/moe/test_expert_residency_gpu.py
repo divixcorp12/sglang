@@ -1014,15 +1014,24 @@ class TestInsertOnMissDirect(unittest.TestCase):
         """Stage DIRECT commits residency for a row the moment its copy is issued. Anything that
         can write that row from another stream, or serve it from somewhere else, breaks that."""
         from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
 
-        with self.assertRaisesRegex(ValueError, "DOORBELL_PLAN_CAPACITY"):
-            _manager(_model(), gpu=True, expert_doorbell=True, doorbell_plan_capacity=4, **DIRECT)
         with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
             with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE=off"):
                 _manager(_model(), gpu=True, **DIRECT)
+
+        # A plan whose buffers are not the gather's own: the doorbell backend posts one, and then
+        # its thread owns those slots on another stream.
         manager = _manager(_model(), gpu=True, **DIRECT)
         streamer = next(iter(manager.streamers.values()))
-        streamer.pinned_host_cache = SimpleNamespace(capacity=1)
+        streamer.row_plan = ExpertRowPlan.for_scratch(
+            TOP_K, streamer.hot_cache.capacity, TOP_K, streamer.hot_cache.device
+        )
+        with self.assertRaisesRegex(ValueError, "DOORBELL_PLAN_CAPACITY"):
+            manager.gpu_residency.check_miss_plans()
+
+        manager = _manager(_model(), gpu=True, **DIRECT)
+        next(iter(manager.streamers.values())).pinned_host_cache = SimpleNamespace(capacity=1)
         with self.assertRaisesRegex(ValueError, "pinned host cache"):
             manager.gpu_residency.check_miss_plans()
 

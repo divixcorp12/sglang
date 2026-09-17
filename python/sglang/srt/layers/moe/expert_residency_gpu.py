@@ -663,9 +663,12 @@ class GpuResidencyUpdater:
         slots.scatter_(0, targets, torch.where(live, new_experts, -1))
         self.slot_state[row].scatter_(0, targets, _READY)
         self.slot_generations[row].scatter_add_(0, targets, live.to(torch.long))
-        self.slot_state[row, slot_dump] = _FREE
-        slots[slot_dump] = -1
-        self.slot_generations[row, slot_dump] = 0
+        # ``tensor[i, j] = scalar`` stages the value through a pageable CPU tensor, which a graph
+        # capture refuses; the batched boundary gets away with a whole-column slice, a per-layer
+        # commit does not. Fill a one-element view instead, which stays on the device.
+        self.slot_state[row, slot_dump : slot_dump + 1].fill_(_FREE)
+        slots[slot_dump : slot_dump + 1].fill_(-1)
+        self.slot_generations[row, slot_dump : slot_dump + 1].fill_(0)
         self.gather_insertions[row].add_(live.sum())
         self.gather_evictions[row].add_(evicted.sum())
 
