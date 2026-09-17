@@ -264,15 +264,30 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
                 with self.subTest(gpu_residency_update=gpu, doorbell=doorbell):
                     self._run_mode(gpu, doorbell)
 
-    def _run_mode(self, gpu, doorbell):
+    def test_gathers_match_the_pre_doorbell_path_across_insert_on_miss_updates(self):
+        """The same cross-residency check with SGLANG_MOE_HOT_INSERT_ON_MISS: every forward's
+        misses are copied from scratch rows into slots before the next forward's gathers, so a
+        planner, doorbell plan or remap that read a stale mapping or stale scratch row would
+        return rows that differ from the reference path or from the source rows."""
+        for doorbell in (False, True):
+            with self.subTest(doorbell=doorbell):
+                self._run_mode(True, doorbell, insert_on_miss=True)
+
+    def _run_mode(self, gpu, doorbell, insert_on_miss=False):
         current_model, reference_model = _model(), _model()
+        mode = (
+            dict(update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=0.98)
+            if insert_on_miss
+            else {}
+        )
         current = _manager(
             current_model,
             gpu,
             expert_doorbell=doorbell,
             doorbell_cpu_core=DOORBELL_SPIN_CORE,
+            **mode,
         )
-        reference = _manager(reference_model, gpu)
+        reference = _manager(reference_model, gpu, **mode)
         for streamer in reference.streamers.values():
             streamer._gather_graph = MethodType(_reference_gather_graph, streamer)
         try:
@@ -311,15 +326,25 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
                         )
                 current_counters = current.snapshot_counters()["decode"]
                 reference_counters = reference.snapshot_counters()["decode"]
+                fields = ("hot_hits", "miss_rows", "promotions", "evictions")
+                if insert_on_miss:
+                    fields += ("insertions", "insertion_evictions")
                 for layer in range(LAYERS):
-                    for field in ("hot_hits", "miss_rows", "promotions", "evictions"):
+                    for field in fields:
                         self.assertEqual(
                             current_counters[str(layer)][field],
                             reference_counters[str(layer)][field],
                             f"{context} layer {layer} {field}",
                         )
                 assert_states_equal(self, device_state(current), device_state(reference), context)
-                promotions = sum(current_counters[str(layer)]["promotions"] for layer in range(LAYERS))
+                changed = "insertions" if insert_on_miss else "promotions"
+                promotions = sum(current_counters[str(layer)][changed] for layer in range(LAYERS))
+                if insert_on_miss:
+                    self.assertEqual(
+                        sum(current_counters[str(layer)]["promotions"] for layer in range(LAYERS)),
+                        0,
+                        f"{context}: insert-on-miss decode boundaries must not promote host rows",
+                    )
                 counts = {"global_physical_count": _counts(routes)}
                 current.on_expert_distribution(_decode_batch(), counts)
                 reference.on_expert_distribution(_decode_batch(), counts)
@@ -531,6 +556,357 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         cache.tensors["w13_weight"][mapped_slot, 0, 0] += 1
         with self.assertRaises(AssertionError):
             assert_slot_rows(self, gpu, self.gpu_model)
+
+
+IOM_DECAY = 0.98
+IOM = dict(update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=IOM_DECAY)
+
+
+class _InsertOnMissReference:
+    """Host model of insert-on-miss decode boundaries, written without the device code.
+
+    A decode forward first applies the previous forward's boundary: every layer's
+    scores become ``scores * decay**tokens + route counts`` in float32, and each
+    of that forward's missed experts still nonresident takes, in plan order, a
+    free slot (lowest first) or else the slot of the resident with the lowest
+    ``(score, -expert)`` among residents with no route since the last boundary.
+    Misses beyond the free and evictable slots stay out and count as truncated.
+    Then the forward's routes gather against the resulting mapping.
+    """
+
+    def __init__(self, manager, decay=IOM_DECAY):
+        self.decay = decay
+        self.caches = [cache for _, cache in sorted(manager.caches.items())]
+        self.mapping = [cache.expert_to_slot.tolist() for cache in self.caches]
+        self.slots = []
+        for row, cache in enumerate(self.caches):
+            slots = [-1] * cache.capacity
+            for expert, slot in enumerate(self.mapping[row]):
+                if slot >= 0:
+                    slots[slot] = expert
+            self.slots.append(slots)
+        self.generations = [cache.slot_generations.tolist() for cache in self.caches]
+        self.scores = torch.stack(
+            [manager.residency_policies[layer_id]._scores.detach().cpu() for layer_id in sorted(manager.caches)]
+        ).to(torch.float32)
+        self.pending = torch.zeros_like(self.scores)
+        self.tokens = 0
+        self.plans = None
+        self.insertions = [0] * LAYERS
+        self.evictions = [0] * LAYERS
+        self.truncated = [0] * LAYERS
+        self.hits = [0] * LAYERS
+        self.misses = [0] * LAYERS
+
+    def boundary(self):
+        factor = torch.tensor(self.decay**self.tokens, dtype=torch.float32)
+        self.scores = self.scores * factor + self.pending
+        routed = self.pending > 0
+        self.pending = torch.zeros_like(self.pending)
+        self.tokens = 0
+        plans, self.plans = self.plans, None
+        if plans is None:
+            return
+        for row, plan in enumerate(plans):
+            mapping, slots = self.mapping[row], self.slots[row]
+            want = [expert for expert in plan if mapping[expert] < 0]
+            free = [slot for slot, expert in enumerate(slots) if expert < 0]
+            victims = sorted(
+                (slot for slot, expert in enumerate(slots) if expert >= 0 and not routed[row, expert]),
+                key=lambda slot: (float(self.scores[row, slots[slot]]), -slots[slot]),
+            )
+            targets = free + victims
+            if len(want) > len(targets):
+                self.truncated[row] += 1
+            for expert, slot in zip(want, targets):
+                if slots[slot] >= 0:
+                    mapping[slots[slot]] = -1
+                    self.evictions[row] += 1
+                mapping[expert] = slot
+                slots[slot] = expert
+                self.generations[row][slot] += 1
+                self.insertions[row] += 1
+
+    def decode_forward(self, routes):
+        """Apply the pending boundary, then gather one decode token's routes."""
+        if self.plans is not None:
+            self.boundary()
+        self.plans = []
+        for row, layer_routes in enumerate(routes):
+            plan = []
+            for expert in [expert for token in layer_routes for expert in token]:
+                self.pending[row, expert] += 1
+                if self.mapping[row][expert] >= 0:
+                    self.hits[row] += 1
+                elif expert not in plan:
+                    plan.append(expert)
+                    self.misses[row] += 1
+            self.plans.append(plan)
+        self.tokens += 1
+
+    def eager_prefill(self, routes, tokens):
+        """A prefill below the prefill boundary: flush a pending boundary, then only count."""
+        if self.plans is not None:
+            self.boundary()
+        for row, layer_routes in enumerate(routes):
+            for token in layer_routes:
+                for expert in token:
+                    self.pending[row, expert] += 1
+        self.tokens += tokens
+
+    def assert_matches(self, test, manager, context):
+        updater = manager.gpu_residency
+        for row, cache in enumerate(self.caches):
+            test.assertEqual(cache.expert_to_slot.tolist(), self.mapping[row], f"{context} layer {row} mapping")
+            test.assertEqual(
+                cache.slot_state.tolist(),
+                [READY if expert >= 0 else 0 for expert in self.slots[row]],
+                f"{context} layer {row} slot state",
+            )
+            test.assertEqual(cache.slot_generations.tolist(), self.generations[row], f"{context} layer {row} generations")
+            test.assertEqual(
+                updater.slot_to_expert[row, : cache.capacity].tolist(), self.slots[row], f"{context} layer {row} slots"
+            )
+        test.assertEqual(updater.insert_scores.cpu().tolist(), self.scores.tolist(), f"{context} scores")
+        test.assertEqual(updater.route_counts.cpu().tolist(), self.pending.tolist(), f"{context} route counts")
+        snapshot = updater.snapshot()
+        test.assertEqual(snapshot["insertions"], self.insertions, f"{context} insertions")
+        test.assertEqual(snapshot["insertion_evictions"], self.evictions, f"{context} insertion evictions")
+        test.assertEqual(snapshot["insertion_truncated"], self.truncated, f"{context} insertion truncated")
+        decode = manager.snapshot_counters()["decode"]
+        for row in range(LAYERS):
+            test.assertEqual(decode[str(row)]["hot_hits"], self.hits[row], f"{context} layer {row} hot hits")
+            test.assertEqual(decode[str(row)]["miss_rows"], self.misses[row], f"{context} layer {row} misses")
+            test.assertEqual(decode[str(row)]["promotions"], 0, f"{context} layer {row} decode promotions")
+            test.assertEqual(decode[str(row)]["insertions"], self.insertions[row], f"{context} layer {row} insertions")
+
+
+def _random_routes(generator):
+    return [[generator.sample(range(EXPERTS), TOP_K)] for _ in range(LAYERS)]
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestInsertOnMiss(unittest.TestCase):
+    """SGLANG_MOE_HOT_INSERT_ON_MISS: a decode forward's missed experts move from scratch rows into slots."""
+
+    def setUp(self):
+        self.model = _model()
+
+    def capture(self, manager):
+        static, outputs, forward = _gather_harness(manager)
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                forward()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+        manager.discard_graph_capture_routes()
+        return graph, static, outputs
+
+    def assert_outputs(self, routes, outputs, context):
+        for layer in range(LAYERS):
+            source_layer = self.model.get_submodule(str(layer))
+            experts = torch.tensor(routes[layer][0])
+            for name in NVFP4_STREAM_TENSORS:
+                source = getattr(source_layer, name)
+                expected = source[experts.to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
+                self.assertTrue(torch.equal(actual, expected), f"{context} layer {layer} {name} gathered rows")
+
+    def replay(self, manager, reference, graph, static, outputs, routes, context):
+        reference.decode_forward(routes)
+        static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assert_outputs(routes, outputs, context)
+        reference.assert_matches(self, manager, context)
+        assert_slot_rows(self, manager, self.model, context)
+        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+
+    def test_flag_off_builds_the_unchanged_updater(self):
+        """Off (the default, or explicitly), the updater has no insertion state, counters or trace
+        buffers; the environment switch turns the mode on without a model runner argument."""
+        from sglang.srt.environ import envs
+
+        for explicit in (None, False):
+            with self.subTest(explicit=explicit):
+                options = {} if explicit is None else dict(insert_on_miss=explicit)
+                manager = _manager(_model(), gpu=True, **options)
+                updater = manager.gpu_residency
+                self.assertFalse(updater.insert_on_miss)
+                self.assertIsNone(updater.insert_segments)
+                self.assertNotIn("insertions", updater.snapshot())
+                self.assertFalse(any("insertion" in name for name in manager._trace_sources()))
+                self.assertNotIn("insertions", manager.snapshot_counters()["decode"]["0"])
+        with envs.SGLANG_MOE_HOT_INSERT_ON_MISS.override(True), envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.override(0.99):
+            manager = _manager(_model(), gpu=True, update_decode_forwards=1)
+            self.assertTrue(manager.gpu_residency.insert_on_miss)
+            self.assertAlmostEqual(manager.gpu_residency.insert_on_miss_decay, 0.99)
+
+    def test_mode_requires_the_gpu_update_and_a_boundary_every_decode_forward(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE"):
+            _manager(_model(), gpu=False, **IOM)
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"):
+            _manager(_model(), gpu=True, **dict(IOM, update_decode_forwards=4))
+        with self.assertRaisesRegex(ValueError, "decay"):
+            _manager(_model(), gpu=True, **dict(IOM, insert_on_miss_decay=1.5))
+
+    def test_captured_decode_inserts_every_miss_before_the_next_forward(self):
+        """Each replay applies the previous forward's insertions: mapping, slots, generations, scores,
+        counters and every resident slot's bytes match the host reference at every step, and the
+        gathered rows match the source rows."""
+        manager = _manager(self.model, gpu=True, seed_scale=(1, 3, 9), **IOM)
+        capacities = [cache.capacity for _, cache in sorted(manager.caches.items())]
+        self.assertGreater(len(set(capacities)), 1, capacities)
+        reference = _InsertOnMissReference(manager)
+        graph, static, outputs = self.capture(manager)
+        reference.assert_matches(self, manager, "after capture")
+        generator = random.Random(3)
+        for step in range(40):
+            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}")
+        self.assertGreater(sum(reference.insertions), 0)
+        self.assertGreater(sum(reference.evictions), 0)
+
+    def test_missed_experts_are_resident_after_one_forward(self):
+        manager = _manager(self.model, gpu=True, **IOM)
+        graph, static, outputs = self.capture(manager)
+        reference = _InsertOnMissReference(manager)
+        generator = random.Random(4)
+        previous = None
+        for step in range(12):
+            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}")
+            if previous is not None:
+                for row, cache in enumerate(reference.caches):
+                    for expert in previous[row]:
+                        self.assertGreaterEqual(int(cache.expert_to_slot[expert]), 0, f"step {step} layer {row} expert {expert}")
+            previous = [list(plan) for plan in reference.plans]
+        self.assertGreater(sum(reference.insertions), 0)
+        self.assertEqual(sum(reference.truncated), 0)
+
+    def test_victim_is_the_lowest_score_resident_not_routed_in_that_forward(self):
+        manager = _manager(self.model, gpu=True, **IOM)
+        updater = manager.gpu_residency
+        graph, static, outputs = self.capture(manager)
+        cache = manager.caches[0]
+        mapping = cache.expert_to_slot.tolist()
+        residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
+        outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+        self.assertGreaterEqual(len(residents), 3)
+        self.assertTrue(outsiders)
+        self.assertEqual(len(residents), cache.capacity, "a free slot would take the miss before any victim")
+        lowest, second, miss = residents[0], residents[1], outsiders[0]
+        scores = torch.full((EXPERTS,), 100.0)
+        scores[lowest], scores[second] = 1.0, 2.0
+        updater.insert_scores[0].copy_(scores)
+        others = [[[0, 1]] for _ in range(LAYERS - 1)]
+        routes = [[[lowest, miss]]] + others
+        static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        torch.cuda.synchronize()
+        self.assertEqual(int(cache.expert_to_slot[miss]), -1)
+        routes = [[[lowest, residents[2]]]] + others
+        static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(int(cache.expert_to_slot[miss]), mapping[second], "the miss takes the lowest unrouted resident's slot")
+        self.assertEqual(int(cache.expert_to_slot[second]), -1)
+        self.assertEqual(int(cache.expert_to_slot[lowest]), mapping[lowest], "a routed resident is never evicted")
+        assert_slot_rows(self, manager, self.model, "victim")
+        self.assert_outputs(routes, outputs, "victim")
+
+    def test_layers_without_free_or_evictable_slots_truncate(self):
+        manager = _manager(self.model, gpu=True, seed_scale=(0, 1, 1), **IOM)
+        self.assertEqual(manager.caches[0].capacity, 0)
+        reference = _InsertOnMissReference(manager)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(5)
+        for step in range(10):
+            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}")
+        self.assertGreater(reference.truncated[0], 0)
+        self.assertEqual(reference.insertions[0], 0)
+        self.assertGreater(sum(reference.insertions[1:]), 0)
+
+    def test_eager_prefills_flush_insertions_and_keep_rows_exact(self):
+        """A short eager prefill flushes the pending insertions before its first gather and adds its
+        routes and tokens to the next boundary; a boundary-sized prefill promotes host rows as before,
+        and decode insertions resume on consistent slots."""
+        manager = _manager(self.model, gpu=True, **IOM)
+        updater = manager.gpu_residency
+        reference = _InsertOnMissReference(manager)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(6)
+
+        def prefill(tokens):
+            routes = [[generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)] for _ in range(LAYERS)]
+            for layer, streamer in sorted(manager.streamers.items()):
+                streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
+            manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
+            torch.cuda.synchronize()
+            return routes
+
+        for step in range(4):
+            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"decode {step}")
+        self.assertTrue(updater.host_pending)
+        pending_plans = [list(plan) for plan in reference.plans]
+        reference.eager_prefill(prefill(6), 6)
+        reference.assert_matches(self, manager, "short prefill")
+        assert_slot_rows(self, manager, self.model, "short prefill")
+        self.assertTrue(any(pending_plans), "the flushed boundary had no misses to insert")
+        for step in range(4, 8):
+            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"decode {step}")
+        prefill(24)
+        assert_slot_rows(self, manager, self.model, "boundary prefill")
+        self.assertEqual(sum(updater.snapshot()["promotions"][0]), 0)
+        inserted = sum(updater.snapshot()["insertions"])
+        for step in range(8, 14):
+            routes = _random_routes(generator)
+            static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assert_outputs(routes, outputs, f"decode {step}")
+            assert_slot_rows(self, manager, self.model, f"decode {step}")
+            for row, cache in enumerate(updater.caches):
+                mapping = cache.expert_to_slot.tolist()
+                slots = updater.slot_to_expert[row, : cache.capacity].tolist()
+                for expert, slot in enumerate(mapping):
+                    if slot >= 0:
+                        self.assertEqual(slots[slot], expert)
+                self.assertEqual(sum(slot >= 0 for slot in mapping), sum(expert >= 0 for expert in slots))
+            manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        self.assertGreater(sum(updater.snapshot()["insertions"]), inserted)
+        self.assertEqual(sum(updater.snapshot()["promotions"][0]), 0)
+
+    def test_decode_forward_hook_is_sync_free(self):
+        manager = _manager(self.model, gpu=True, **IOM)
+        graph, static, _ = self.capture(manager)
+        counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64, device="cuda")}
+        graph.replay()
+        manager.on_expert_distribution(_decode_batch(), counts)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for step in range(5):
+                static.copy_((static + 3 + step).remainder(EXPERTS))
+                graph.replay()
+                manager.on_expert_distribution(_decode_batch(), counts)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+        self.assertGreater(sum(manager.gpu_residency.snapshot()["insertions"]), 0)
+
+    def test_reference_helper_fails_on_a_wrong_victim(self):
+        manager = _manager(self.model, gpu=True, **IOM)
+        reference = _InsertOnMissReference(manager)
+        reference.assert_matches(self, manager, "startup")
+        row = 1
+        slot = next(slot for slot, expert in enumerate(reference.slots[row]) if expert >= 0)
+        reference.mapping[row][reference.slots[row][slot]] = -1
+        reference.slots[row][slot] = -1
+        with self.assertRaises(AssertionError):
+            reference.assert_matches(self, manager, "perturbed")
 
 
 if __name__ == "__main__":
