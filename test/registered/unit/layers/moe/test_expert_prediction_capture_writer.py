@@ -57,7 +57,7 @@ def _submit(writer, pool, *, index, kind, rid, positions, token_ids):
             tensor[:rows] = torch.tensor(positions).unsqueeze(1) % 8
         else:
             tensor[:rows] = torch.tensor(positions, dtype=tensor.dtype).unsqueeze(1)
-    writer.submit(
+    accepted = writer.submit(
         PendingForward(
             record=ForwardRecord(
                 forward_index=index, kind=kind, rids=(rid,), rows_per_request=(rows,)
@@ -65,6 +65,9 @@ def _submit(writer, pool, *, index, kind, rid, positions, token_ids):
             frame=frame,
         )
     )
+    # A rejected submission leaves frame ownership with the caller, as in serving.
+    if not accepted:
+        pool.release(frame)
 
 
 class TestShardWriter(unittest.TestCase):

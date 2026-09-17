@@ -935,9 +935,11 @@ class TestExpertHotCacheManager(unittest.TestCase):
 
     def test_trace_boundary_queues_a_snapshot_without_host_synchronization(self):
         with tempfile.NamedTemporaryFile() as trace:
-            manager = self.manager(dynamic=False, log_interval=1, metrics_path=trace.name)
+            manager = self.manager(dynamic=False, log_interval=2, metrics_path=trace.name)
             counts = torch.tensor([[2, 0, 0, 1], [0] * 4, [0, 3, 1, 0]], device="cuda")
             batch = self.batch(mode=self.mode.DECODE)
+            # The first forward allocates per-device registers; only the boundary forward is checked.
+            manager.on_expert_distribution(batch, {"global_physical_count": counts})
             torch.cuda.synchronize()
             torch.cuda.set_sync_debug_mode("error")
             try:

@@ -476,7 +476,7 @@ class TestExpertGraphGather(unittest.TestCase):
             benefit_ratio=1.0,
             graph_gather_batch_size=1,
         )
-        with self.assertRaisesRegex(ValueError, "scratch rows"):
+        with self.assertRaisesRegex(ValueError, "scratch and pull rows"):
             ExpertHotCacheManager.from_model(
                 model, budget_bytes=streamer.bytes_per_expert * (TOP_K - 1), **options
             )
@@ -1360,9 +1360,9 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
                 self.assertEqual(int(streamer.row_plan.count.item()), expected_demand_rows)
                 self.assertEqual(puller.stats[0].snapshot(), tuple(expected))
                 self.assertEqual(
-                    expected_demand_rows + expected[3],
-                    len(set(routes)),
-                    "residual demand rows plus posted pulls are physical rows, not covered routes",
+                    expected_demand_rows,
+                    expected[1],
+                    "residual routes are demand rows; covered routes and posted pulls are not",
                 )
                 if capacity:
                     self.assertEqual(compact.reshape(-1)[0].item(), 0)

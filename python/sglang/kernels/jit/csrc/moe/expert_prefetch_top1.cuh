@@ -7,6 +7,7 @@
 
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <stdint.h>
 
 namespace sglang {
@@ -25,7 +26,7 @@ __global__ __launch_bounds__(kExpertPrefetchTop1Threads, 1) void select_prefetch
     int64_t* __restrict__ expert_id_out,
     bool* __restrict__ valid_out,
     int32_t* __restrict__ count_out) {
-  float best_score = -CUDART_INF_F;
+  float best_score = -std::numeric_limits<float>::infinity();
   int best_id = INT_MAX;
   for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
     const float score = scores[expert];
