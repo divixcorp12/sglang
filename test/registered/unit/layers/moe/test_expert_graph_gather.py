@@ -1148,6 +1148,8 @@ class TestExpertGraphGather(unittest.TestCase):
         resident = sorted(manager.caches[0].resident_experts())
         missing = [e for e in range(EXPERTS) if e not in resident]
         try:
+            # The manager primes the copier with one request consumed as skipped_abandoned.
+            primed = copier.stats()
             copier.pause()
             ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
             compact, tensors = streamer.gather(ids)
@@ -1163,7 +1165,7 @@ class TestExpertGraphGather(unittest.TestCase):
             torch.cuda.synchronize()
             self._assert_rows(layer, ids, compact, tensors)
             recovered = copier.stats()
-            self.assertEqual(recovered["skipped_abandoned"], 1)
+            self.assertEqual(recovered["skipped_abandoned"] - primed["skipped_abandoned"], 1)
             self.assertEqual(recovered["late_completions"], 0)
         finally:
             copier.stop()
