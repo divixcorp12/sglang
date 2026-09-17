@@ -897,6 +897,51 @@ class TestInsertOnMiss(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertGreater(sum(manager.gpu_residency.snapshot()["insertions"]), 0)
 
+    def test_prefetch_covered_misses_and_the_pull_row_stay_out_of_insertions(self):
+        """A route served from the dedicated pull row is not a demand miss, so it is not inserted,
+        and insertion never reads or writes the pull row (``capacity + scratch_rows``)."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
+
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"):
+            manager = _manager(self.model, gpu=True, **IOM)
+        cache, streamer = manager.caches[0], manager.streamers[0]
+        self.assertTrue(cache.reserves_prefetch_pull_row)
+        bank = PrefetchCandidateBank(layer_ids=[0], width=1, device="cuda")
+        puller = PrefetchPuller(bank=bank, layer_ids=[0], hot_caches={0: cache}, device="cuda")
+        streamer.prefetch_puller = puller
+        pull_row = puller.slot_for(0)
+        self.assertEqual(pull_row, cache.capacity + cache.scratch_rows)
+        manager.discard_graph_capture_routes()
+        mapping = cache.expert_to_slot.tolist()
+        covered, missed = [expert for expert, slot in enumerate(mapping) if slot < 0][:2]
+        residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
+        others = [[[0, 1]] for _ in range(LAYERS - 1)]
+
+        def forward(routes):
+            for layer, layer_streamer in sorted(manager.streamers.items()):
+                layer_streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
+            torch.cuda.synchronize()
+            manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+
+        scores = torch.zeros(1, EXPERTS, device="cuda")
+        scores[0, covered] = 1.0
+        bank.write(0, scores, expert_to_slot=cache.expert_to_slot)
+        puller.post_target(0)
+        forward([[[covered, missed]]] + others)
+        self.assertEqual(puller.stats[0].snapshot()[0], 1, "the covered route was not served from the pull row")
+        pull_bytes = {name: tensor[pull_row].clone() for name, tensor in cache.tensors.items()}
+        forward([[residents[:2]]] + others)
+        forward([[residents[:2]]] + others)
+        self.assertGreaterEqual(int(cache.expert_to_slot[missed]), 0, "the demand miss was not inserted")
+        self.assertEqual(int(cache.expert_to_slot[covered]), -1, "a pull-covered route was inserted")
+        self.assertTrue((cache.expert_to_slot < cache.capacity).all())
+        self.assertEqual(manager.gpu_residency.snapshot()["insertions"][0], 1)
+        for name, tensor in cache.tensors.items():
+            self.assertTrue(torch.equal(tensor[pull_row], pull_bytes[name]), f"pull row {name} was written")
+        assert_slot_rows(self, manager, self.model, "pull row")
+
     def test_reference_helper_fails_on_a_wrong_victim(self):
         manager = _manager(self.model, gpu=True, **IOM)
         reference = _InsertOnMissReference(manager)
