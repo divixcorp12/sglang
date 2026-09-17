@@ -4,9 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_triton import (
     _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
+    fused_hc_mix_launch_ctas,
     fused_hc_mix_supported,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -78,6 +80,62 @@ def test_fused_hc_mix_no_less_accurate_than_eager():
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
+
+
+def _device_sms() -> int:
+    return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+@pytest.mark.parametrize("cap", [0, 1, 16, 64, 1 << 20])
+def test_fused_hc_mix_launch_ctas_follows_cap(cap):
+    sms = _device_sms()
+    with envs.SGLANG_OPT_HC_MIX_MAX_CTAS.override(cap):
+        ctas = fused_hc_mix_launch_ctas(torch.device("cuda"))
+    assert ctas == (sms if cap <= 0 else min(cap, sms))
+
+
+def test_fused_hc_mix_default_leaves_sms_free():
+    """The default launch must not claim every SM: a CTA per SM waits at the
+    device-wide barrier for any SM a concurrent expert-row copy holds."""
+    assert fused_hc_mix_launch_ctas(torch.device("cuda")) < _device_sms()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 7, _FUSED_MIX_MAX_ROWS])
+@pytest.mark.parametrize("cap", [1, 7, 16, 64])
+def test_capped_launch_matches_all_sm_launch(dtype, num_tokens, cap):
+    x, w_down, w_up = _make_inputs(num_tokens, dtype)
+    with envs.SGLANG_OPT_HC_MIX_MAX_CTAS.override(0):
+        full = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    with envs.SGLANG_OPT_HC_MIX_MAX_CTAS.override(cap):
+        capped = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    # Only the fp32 accumulation order differs between launches.
+    torch.testing.assert_close(capped, full, rtol=1e-3, atol=1e-4)
+    ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.testing.assert_close(capped.to(torch.float64), ref, **_TOLERANCES[dtype])
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_default_launch_replays_in_cuda_graph(num_tokens):
+    x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
+    static_x = x.clone()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fused_hc_mix(static_x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        static_out = fused_hc_mix(static_x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    for seed in range(3):
+        torch.manual_seed(100 + seed)
+        static_x.copy_(torch.randn_like(static_x))
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _reference_mix(static_x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+        torch.testing.assert_close(
+            static_out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+        )
 
 
 if __name__ == "__main__":
