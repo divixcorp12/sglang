@@ -89,11 +89,17 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
         )
         return scoring, store, hot_caches
 
-    def _tap(self, store, layer):
+    def _tap_inputs(self, layer):
         generator = torch.Generator().manual_seed(layer)
-        store.write(layer, RouteFeature.ROUTER_INPUT, torch.randn(1, HIDDEN, generator=generator).to("cuda", torch.bfloat16))
-        store.write(layer, RouteFeature.TOPK_IDS, torch.randperm(EXPERTS, generator=generator)[:TOP_K].unsqueeze(0).cuda())
-        store.write(layer, RouteFeature.TOPK_WEIGHTS, torch.rand(1, TOP_K, generator=generator).cuda())
+        return {
+            RouteFeature.ROUTER_INPUT: torch.randn(1, HIDDEN, generator=generator).to("cuda", torch.bfloat16),
+            RouteFeature.TOPK_IDS: torch.randperm(EXPERTS, generator=generator)[:TOP_K].unsqueeze(0).cuda(),
+            RouteFeature.TOPK_WEIGHTS: torch.rand(1, TOP_K, generator=generator).cuda(),
+        }
+
+    def _tap(self, store, layer, inputs=None):
+        for feature, value in (inputs or self._tap_inputs(layer)).items():
+            store.write(layer, feature, value)
 
     def test_source_tap_rewrites_the_next_layers_bank_row_in_place(self):
         scoring, store, _ = self._build()
@@ -110,11 +116,13 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
         _, store, _ = self._build()
         for layer in range(3):
             self._tap(store, layer)
+        # Pageable host-to-device uploads synchronize; the taps receive device tensors.
+        inputs = [self._tap_inputs(layer) for layer in range(3)]
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
             for layer in range(3):
-                self._tap(store, layer)
+                self._tap(store, layer, inputs[layer])
         finally:
             torch.cuda.set_sync_debug_mode("default")
 
