@@ -14,13 +14,15 @@ Use the recorded final-code baseline to start the pipeline changes that attack t
 
 ## Current code state
 
-Branch: `codex/nvfp4-expert-stream-main`. `shared/codex/nvfp4-expert-stream-main` is at `0283eacb74`. The following are local and on divix01 only (fetched from a git bundle), **not pushed**:
+Branch: `codex/nvfp4-expert-stream-main`, pushed to `shared` at `70100da7a4`. Commits added after `0283eacb74`:
 
 | Commit | Content |
 | --- | --- |
 | `cdc70383bc` | This handoff (first version). |
 | `c27fc6f3f8` | Fix: JIT top-1 kernel used undefined `CUDART_INF_F` and never compiled; plus four CUDA test fixes (capture-writer frame release, sync-test warm-up, budget regex, physical-row assertion). |
 | `57c842ae6e` | Launcher relays its environment through a sudo-prefixed `PREFETCH_TRACE_COMMAND` (`sudo` `env_reset` otherwise drops every `SGLANG_*` setting). |
+| `9304aa4c9a` | Handoff update with validation and baseline. |
+| `70100da7a4` | Project `CLAUDE.md`: use graph-mode Nsight tracing for timing. |
 
 Earlier work in the branch:
 
@@ -76,14 +78,25 @@ Gaps: no final-code B (D-vs-B rests on the old-commit B), and APEX has only one 
 - Do not reset, clean, stash, or alter unrelated `.omc`, untracked docs, `python/uv.lock`, or user files.
 - Shadow worktree `/data/models/slang/nvfp4-work/cc-expert-prediction/worktree` is detached at `57c842ae6e`. Deliver new commits to it by push to `shared` (after asking) or by git bundle.
 
+## Decode-cost analysis (2026-09-17)
+
+Full detail and rulings in the ledger. Per decode token (LLaPor D trace, node-mode, ~10% inflated): demand copies ~45 ms, model compute ~15 ms, pull copies ~17 ms.
+
+- Pulls sit on demand copies: 62% of pull time overlaps a demand copy; only 26% overlaps compute.
+- Copy vs compute contention is ~free (≤2.5% either side, GPU microbenchmark, bytes validated); copy vs copy shares the link (pull +97%, demand +~1 row).
+- No inter-layer idle: the copy-free window between layers is ~0.34 ms, ~0.30 ms of it compute. A 1-row pull takes ~0.24 ms, so it fits a compute window.
+- The ~9 ms step-tail idle is mostly an nsys `--cuda-graph-trace=node` artifact (~6 ms in `cudaGraphLaunch`); real host tail ~3–4 ms (batch prep 2.4 ms, output/IPC 0.55 ms). Use `--cuda-graph-trace=graph` for timing traces (project `CLAUDE.md`).
+- Cross-token end-of-step prefetch is not worth it (best 8.7 misses covered at 22% precision with 40 rows).
+- Misses concentrate in layers 0–2 (59–69%); wasted pulls concentrate in layers 15/31/39/40 (43–58% precision).
+
 ## Next actions
 
-1. Decide with the user whether to push `c27fc6f3f8`/`57c842ae6e` to `shared` and whether to run a final-code B to close the D-vs-B gap.
-2. Start the pipeline changes against this baseline, LLaPor first (the ledger ruling treats this baseline as satisfying the Task 3 gate for LLaPor; APEX still needs its own evidence):
-   - Reduce scoring cost (the C-B loss), including separating the width-16 bank cost from predictor cost.
-   - Task 3: move LLaPor payload launch behind the source layer's demand transfer, measured as paired D-N against the unchanged N control plus trace evidence of no overlap.
-3. Benchmark each change with the same per-arm protocol (runner: `cc-expert-prediction/matrix-tail.sh "<predictor> <pass> <arm>" ...` with `MATRIX_DIR` set, or a fresh matrix dir). Use a separate `RUN_KIND=trace` run for traces; a sudo-prefixed trace command is relayed automatically.
-4. Optional cleanup on divix01 (ask first): `cc-expert-prediction/baseline-0fe8d526df` worktree, `trace-relay-proto/`, `fix-57c842ae6e*.bundle`, the 3.9 GB trace `report.sqlite`.
+1. Task 3, compute-window placement: post each LLaPor pull after the source layer's demand copy so it overlaps compute, never a demand copy; verify with a graph-mode trace and paired D vs N timing. Ceiling ~10 ms/token (~+15%).
+2. Static per-layer pull gating: disable pulls for low-precision layers; measure D-gated vs D.
+3. Host-side decode overhead: establish why overlap scheduling is disabled with expert streaming and whether it can be enabled; reduce per-step metadata kernel launches (~2.4 ms/token batch prep).
+4. Strategy review of early-layer misses (cache allocation toward layers 0–2) and an investigation of compressing hot-cache experts.
+5. Final-code B is still missing; APEX has one D pass.
+6. Optional cleanup on divix01 (ask first): `cc-expert-prediction/baseline-0fe8d526df` worktree, `trace-relay-proto/`, `fix-57c842ae6e*.bundle`, the 3.9 GB trace `report.sqlite`.
 
 ## Operational patterns
 
