@@ -1049,40 +1049,44 @@ class TestInsertOnMissDirect(unittest.TestCase):
 
     def test_no_forward_ever_lands_a_copy_in_a_row_it_reads(self):
         """The safety property itself, checked per replay against the pre-gather mapping: a
-        destination is never a slot this forward routes to, destinations are distinct, and a
-        shortlist entry the forward does route is skipped rather than overwritten."""
+        destination is never a slot this forward routes to, destinations are distinct, every miss
+        finds a slot, and a routed resident is never the one evicted.
+
+        The shortlist this forward uses is ranked by the boundary at the top of the same forward,
+        before any gather, so it cannot be read from outside beforehand. These are the observable
+        consequences instead: where each miss landed, and what survived.
+        """
         manager = _manager(self.model, gpu=True, **DIRECT)
         updater = manager.gpu_residency
         graph, static, outputs = self.capture(manager)
         generator = random.Random(11)
-        seen_disqualified = 0
+        inserted_total = 0
         for step in range(30):
             routes = _random_routes(generator)
             before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
-            shortlist = updater.victims.tolist()
-            valid = updater.victim_valid.tolist()
             self.step(manager, graph, static, outputs, routes, f"step {step}")
             for row, mapping in enumerate(before):
+                cache = manager.caches[sorted(manager.caches)[row]]
                 read = {mapping[expert] for expert in routes[row][0] if mapping[expert] >= 0}
                 wanted = [expert for expert in routes[row][0] if mapping[expert] < 0]
-                destinations = [
-                    slot
-                    for slot, ok in zip(shortlist[row], valid[row])
-                    if ok and slot not in read
-                ][: len(wanted)]
-                self.assertEqual(
-                    len(destinations), len(wanted), f"step {step} layer {row} ran out of victims"
+                landed = [int(cache.expert_to_slot[expert]) for expert in wanted]
+                self.assertNotIn(-1, landed, f"step {step} layer {row}: a miss found no slot")
+                self.assertFalse(
+                    read & set(landed),
+                    f"step {step} layer {row}: copied into a row this forward reads",
                 )
-                self.assertEqual(len(set(destinations)), len(destinations), "destinations collide")
-                cache = manager.caches[sorted(manager.caches)[row]]
-                for expert, slot in zip(wanted, destinations):
-                    self.assertEqual(int(cache.expert_to_slot[expert]), slot, f"step {step}")
-                seen_disqualified += sum(
-                    1 for slot, ok in zip(shortlist[row], valid[row]) if ok and slot in read
-                )
-        self.assertGreater(seen_disqualified, 0, "no forward ever routed a shortlisted slot")
+                self.assertEqual(len(set(landed)), len(landed), f"step {step} destinations collide")
+                for expert in routes[row][0]:
+                    if mapping[expert] >= 0:
+                        self.assertEqual(
+                            int(cache.expert_to_slot[expert]),
+                            mapping[expert],
+                            f"step {step} layer {row}: a routed resident was evicted",
+                        )
+                inserted_total += len(wanted)
+        self.assertGreater(inserted_total, 0, "no forward ever missed")
         self.assertEqual(sum(updater.snapshot()["insertion_truncated"]), 0)
-        self.assertGreater(sum(updater.snapshot()["insertions"]), 0)
+        self.assertEqual(sum(updater.snapshot()["insertions"]), inserted_total)
 
     def test_every_resident_slot_holds_its_own_expert_after_every_forward(self):
         """Byte-exactness of the copy path where it now matters most, since a miss copy lands in a
@@ -1136,17 +1140,19 @@ class TestInsertOnMissDirect(unittest.TestCase):
         mapping = cache.expert_to_slot.tolist()
         residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
         outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
-        self.assertGreaterEqual(len(residents), 3)
+        self.assertGreaterEqual(len(residents), 4)
         self.assertTrue(outsiders)
         lowest, second, miss = residents[0], residents[1], outsiders[0]
-        scores = torch.full((EXPERTS,), 100.0)
-        scores[lowest], scores[second] = 1.0, 2.0
-        updater.insert_scores[0].copy_(scores)
-        updater._rank_victims(updater.route_counts > 0)
-        torch.cuda.synchronize()
-        free = [slot for slot in range(cache.capacity) if slot not in mapping]
-        self.assertFalse(free, "a free slot would take the miss before any scored victim")
+        self.assertEqual(len(residents), cache.capacity, "a free slot would take the miss first")
         others = [[[0, 1]] for _ in range(LAYERS - 1)]
+        # Neutral step first, so neither candidate carries a route count into the ranking that
+        # the boundary at the top of the scored step folds into its score.
+        self.step(manager, graph, static, outputs, [[[residents[2], residents[3]]]] + others, "warm")
+        scores = torch.full((EXPERTS,), 100.0)
+        # Far enough apart that the boundary's decay and route counts cannot reorder them.
+        scores[lowest], scores[second] = 1.0, 50.0
+        updater.insert_scores[0].copy_(scores)
+        torch.cuda.synchronize()
         routes = [[[lowest, miss]]] + others
         self.step(manager, graph, static, outputs, routes, "routed victim")
         self.assertEqual(
