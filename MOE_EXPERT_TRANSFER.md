@@ -151,7 +151,9 @@ it there changes nothing.
 Therefore the env changes below are step 2, not step 1:
 
 1. **Get the code to prod first.** Fetch and fast-forward the
-   `main-port-probe-7bc4eb` worktree to `f2c6cd2cbc`. That advances prod by 158
+   `main-port-probe-7bc4eb` worktree to the tip of
+   `shared/codex/nvfp4-expert-stream-main` (do not pin a SHA from this document
+   — it is written before the commit that contains it). That advances prod by 158
    commits — far more than our four optimizations — so it needs its own
    validation pass, not a flag flip. (The worktree's own `git status` reports
    "behind 13" against a stale remote-tracking ref; fetch first. The 158 figure
