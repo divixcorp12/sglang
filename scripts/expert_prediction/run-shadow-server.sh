@@ -4,6 +4,7 @@
 # Usage: run-shadow-server.sh <name> <port> <predictors|off> [radix]
 # Refuses to start while any process holds the GPU. Runs in the foreground; the session backgrounds it.
 # Env: HOT_GPU_MB (default 14336), CAPTURE=1 to record expert prediction training data.
+# RUN_KIND=trace with a PREFETCH_TRACE_COMMAND starting with sudo relays the environment via trace-env-relay.sh.
 set -euo pipefail
 
 name=${1:?name}
@@ -110,6 +111,13 @@ if [ "$run_kind" = trace ]; then
     trace_config=$(printf '{"diagnostic_only":true,"command":%s,"report_path":%s}' "$trace_command_json" "$trace_report_path_json")
     trace_paths=$(printf ',"trace_report":%s' "$trace_report_path_json")
     trace_env=("PREFETCH_TRACE_REPORT_PATH=$trace_report_path")
+    if [ "${trace_command_argv[0]}" = sudo ]; then
+        # sudo resets the environment; relay it so the traced server keeps its configuration.
+        # nsys under sudo starts its target as the invoking user, which the relay does not change.
+        relay=$worktree/scripts/expert_prediction/trace-env-relay.sh
+        relay_env=$run_dir/trace/launch.env
+        trace_command_argv=("$relay" save "$relay_env" "${trace_command_argv[@]}" "$relay" restore "$relay_env")
+    fi
 fi
 
 # This object is deliberately typed rather than derived from a display string:
