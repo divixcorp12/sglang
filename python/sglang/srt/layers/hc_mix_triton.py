@@ -1,9 +1,13 @@
 """Fused HC low-rank mix for decode-size batches.
 
 One persistent kernel replaces the five-kernel `GatedResidual._mix_compute` chain.
-One CTA per SM keeps every CTA resident, so the software grid barrier cannot deadlock;
-the last CTA to finish resets the barrier counters,
-so a captured CUDA graph replays with them in their initial state.
+The launch uses at most one CTA per SM, so every CTA stays resident and the
+software grid barrier cannot deadlock; the last CTA to finish resets the barrier
+counters, so a captured CUDA graph replays with them in their initial state.
+The launch is capped below the SM count (``SGLANG_OPT_HC_MIX_MAX_CTAS``): the
+barrier waits for every launched CTA, so a CTA queued behind an SM that a
+concurrent expert-row copy holds for a PCIe read stalls the whole kernel until
+that read finishes.
 Row counts beyond ``_FUSED_MIX_MAX_ROWS`` stay on the torch.compile path.
 """
 
@@ -148,6 +152,15 @@ def _get_counters(device: torch.device) -> torch.Tensor:
     return buf
 
 
+def fused_hc_mix_launch_ctas(device: torch.device) -> int:
+    """CTAs for one fused mix launch: the SM count, capped by the env knob (0 = no cap)."""
+    from sglang.srt.environ import envs
+
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    cap = envs.SGLANG_OPT_HC_MIX_MAX_CTAS.get()
+    return sms if cap <= 0 else min(cap, sms)
+
+
 def _deterministic_inference() -> bool:
     from sglang.srt.runtime_context import get_exec
 
@@ -190,7 +203,7 @@ def fused_hc_mix(
     lowrank = w_down.shape[0]
     rows_pad = 16
     device = hyper_input_normed.device
-    num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+    num_ctas = fused_hc_mix_launch_ctas(device)
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
