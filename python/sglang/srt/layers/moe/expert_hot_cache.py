@@ -827,6 +827,21 @@ _PHASES = {
 }
 
 
+_INSERTION_TRACE_NAMES = (
+    "gpu_residency:insertions",
+    "gpu_residency:insertion_evictions",
+    "gpu_residency:insertion_truncated",
+)
+
+
+def _add_insertions(entry: dict[str, Any], device: Mapping[str, list], row: int) -> None:
+    """Report a layer's insert-on-miss copies with its decode counters; they are device rows, not migrations."""
+    entry["insertions"] = entry.get("insertions", 0) + device["insertions"][row]
+    entry["insertion_evictions"] = (
+        entry.get("insertion_evictions", 0) + device["insertion_evictions"][row]
+    )
+
+
 class ExpertHotCacheManager:
     """Allocate a global slot budget and observe the recorder after each forward.
 
@@ -865,6 +880,8 @@ class ExpertHotCacheManager:
         doorbell_drain_polls: int = 0,
         doorbell_plan_capacity: int = 0,
         doorbell_fatal_wait_s: float = 30.0,
+        insert_on_miss: bool | None = None,
+        insert_on_miss_decay: float | None = None,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -885,7 +902,27 @@ class ExpertHotCacheManager:
         instead of once per boundary, and ``promotion_sigmas`` adds that many
         standard deviations of count noise to the lead a promotion needs; see
         :class:`ExpertResidencyPolicy`.
+        ``insert_on_miss`` and ``insert_on_miss_decay`` default to
+        ``SGLANG_MOE_HOT_INSERT_ON_MISS`` and its decay; see
+        :class:`GpuResidencyUpdater`.
         """
+        if insert_on_miss is None:
+            insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS.get()
+        if insert_on_miss_decay is None:
+            insert_on_miss_decay = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.get()
+        if insert_on_miss:
+            if not gpu_residency_update:
+                raise ValueError(
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS requires SGLANG_MOE_GPU_RESIDENCY_UPDATE"
+                )
+            if index(update_decode_forwards) != 1:
+                raise ValueError(
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS requires SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"
+                )
+            if not 0.0 < insert_on_miss_decay <= 1.0:
+                raise ValueError(
+                    "insert-on-miss decay (SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY) must be in (0, 1]"
+                )
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
@@ -1113,7 +1150,10 @@ class ExpertHotCacheManager:
             from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
 
             manager.gpu_residency = GpuResidencyUpdater(
-                manager, max_promotions=gpu_residency_max_promotions
+                manager,
+                max_promotions=gpu_residency_max_promotions,
+                insert_on_miss=bool(insert_on_miss),
+                insert_on_miss_decay=float(insert_on_miss_decay),
             )
         manager.doorbell = (
             manager._start_doorbell(
@@ -1127,6 +1167,8 @@ class ExpertHotCacheManager:
             if expert_doorbell
             else None
         )
+        if manager.gpu_residency is not None and manager.gpu_residency.insert_on_miss:
+            manager.gpu_residency.check_miss_plans()
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -1810,6 +1852,14 @@ class ExpertHotCacheManager:
                     "gpu_residency:truncated_layers": updater.truncated,
                 }
             )
+            if updater.insert_on_miss:
+                sources.update(
+                    {
+                        "gpu_residency:insertions": updater.insertions,
+                        "gpu_residency:insertion_evictions": updater.insertion_evictions,
+                        "gpu_residency:insertion_truncated": updater.insertion_truncated,
+                    }
+                )
         return sources
 
     def _trace_metadata(
@@ -1853,6 +1903,7 @@ class ExpertHotCacheManager:
         updater = getattr(self, "gpu_residency", None)
         if updater is not None:
             metadata["gpu_residency_layers"] = tuple(updater.layer_ids)
+            metadata["gpu_residency_insert_on_miss"] = updater.insert_on_miss
         return metadata
 
     def _schedule_trace(self, phase: str) -> None:
@@ -2113,7 +2164,7 @@ class ExpertHotCacheManager:
                 "gpu_residency:evictions",
                 "gpu_residency:boundary_updates",
                 "gpu_residency:truncated_layers",
-            ):
+            ) + (_INSERTION_TRACE_NAMES if metadata["gpu_residency_insert_on_miss"] else ()):
                 device[name.rsplit(":", 1)[-1]] = buffers[name].tolist()
             result["residency_gpu"] = device
             for row, layer_id in enumerate(metadata["gpu_residency_layers"]):
@@ -2123,6 +2174,8 @@ class ExpertHotCacheManager:
                     entry["promotions"] += device["promotions"][phase][row]
                     entry["evictions"] += device["evictions"][phase][row]
                     entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                if "insertions" in device:
+                    _add_insertions(result["decode"][str(layer_id)], device, row)
                 policy = result.get("residency_policy", {}).get(str(layer_id))
                 if policy is not None:
                     policy["boundary_updates"] += device["boundary_updates"][row]
@@ -2282,6 +2335,8 @@ class ExpertHotCacheManager:
                     entry["promotions"] += device["promotions"][phase][row]
                     entry["evictions"] += device["evictions"][phase][row]
                     entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                if "insertions" in device:
+                    _add_insertions(result["decode"][str(layer_id)], device, row)
                 metrics = result.get("residency_policy", {}).get(str(layer_id))
                 if metrics is not None:
                     metrics["boundary_updates"] += device["boundary_updates"][row]

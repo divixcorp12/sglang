@@ -385,6 +385,12 @@ class Envs:
     SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
     # Most experts one layer promotes at a decode boundary on the GPU path.
     SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
+    # Decode boundaries copy the previous forward's missed experts from scratch
+    # rows into slots instead of promoting host rows; requires
+    # SGLANG_MOE_GPU_RESIDENCY_UPDATE and SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1.
+    SGLANG_MOE_HOT_INSERT_ON_MISS = EnvBool(False)
+    # Per-token decay of the scores that pick insert-on-miss victims.
+    SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
     # Serve graph-gather miss copies through the doorbell copier thread: the
     # gather posts its miss plan and waits in-graph, falling back to the
     # in-graph copy on timeout. Requires SGLANG_MOE_EXPERT_GRAPH_GATHER.

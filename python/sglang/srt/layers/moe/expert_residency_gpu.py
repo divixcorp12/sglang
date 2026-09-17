@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.moe.expert_residency import decide_residency_on_device
+from sglang.srt.layers.moe.expert_residency import (
+    decide_residency_on_device,
+    residency_rank_keys,
+)
 from sglang.srt.layers.moe.expert_residency_clock import ForwardKind
 
 if TYPE_CHECKING:
@@ -45,6 +48,13 @@ class GpuResidencyUpdater:
     the best in rank order; prefill boundaries are uncapped. Promotions are
     copied from the registered host rows straight into the evicted or free
     slots on the current stream, ahead of the gathers that read them.
+
+    With ``insert_on_miss`` (every decode forward is a boundary), a decode
+    boundary promotes no host rows. Instead each layer's missed experts of the
+    previous forward, still in its scratch rows, are copied device to device
+    into free slots, then into the slots of the residents with the lowest
+    per-token decayed route score among residents that forward did not route.
+    Prefill boundaries keep the promotion decision above.
     """
 
     def __init__(
@@ -53,6 +63,8 @@ class GpuResidencyUpdater:
         *,
         max_promotions: int,
         decay_table_tokens: int = 1 << 14,
+        insert_on_miss: bool = False,
+        insert_on_miss_decay: float = 0.98,
     ) -> None:
         layer_ids = [
             layer_id
@@ -142,6 +154,13 @@ class GpuResidencyUpdater:
         self.boundary_updates = torch.zeros(layers, dtype=torch.long, device=device)
         self.truncated = torch.zeros(layers, dtype=torch.long, device=device)
 
+        self.insert_on_miss = bool(insert_on_miss)
+        self.insert_on_miss_decay = float(insert_on_miss_decay)
+        self.insert_scores = None
+        self.insert_segments = None
+        if self.insert_on_miss:
+            self._init_insert_on_miss()
+
         streamers[0].residency_update = self
         streamers[0].before_eager_gather = self.flush
 
@@ -166,6 +185,69 @@ class GpuResidencyUpdater:
             "lower SGLANG_MOE_HOT_DECAY_TOKENS"
         )
 
+    def _init_insert_on_miss(self) -> None:
+        from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
+
+        if self.update_decode_forwards != 1:
+            raise ValueError("insert-on-miss needs a residency boundary after every decode forward")
+        if not 0.0 < self.insert_on_miss_decay <= 1.0:
+            raise ValueError("insert-on-miss decay must be in (0, 1]")
+        rows = {streamer.graph_gather_rows for streamer in self.streamers}
+        if len(rows) != 1:
+            raise ValueError("insert-on-miss needs one graph-gather row count on every layer")
+        device, layers = self.device, self.num_layers
+        self.miss_rows = rows.pop()
+        # Victims are ranked over every slot column, padded to at least one column per miss row.
+        self.victim_columns = max(self.max_capacity + 1, self.miss_rows)
+        self.miss_columns = torch.arange(self.miss_rows, dtype=torch.long, device=device)
+        self.insert_scores = self.scores.clone()
+        values = (
+            [1.0, 1.0]
+            if self.insert_on_miss_decay == 1.0
+            else self._tabulate_decay(lambda tokens: self.insert_on_miss_decay**tokens, 1 << 16)
+        )
+        self.insert_decay_table_tokens = len(values) - 1
+        self.insert_decay_table = torch.tensor(values, dtype=torch.float32, device=device)
+        # A layer's plan is fresh from its graph gather until a boundary inserts it.
+        self.plans_fresh = torch.zeros(layers, dtype=torch.bool, device=device)
+        self.insert_sources = torch.zeros((layers, self.miss_rows), dtype=torch.int64, device=device)
+        self.insert_slots = torch.zeros((layers, self.miss_rows), dtype=torch.int32, device=device)
+        self.insert_counts = torch.zeros((layers, 1), dtype=torch.int32, device=device)
+        self.insertions = torch.zeros(layers, dtype=torch.long, device=device)
+        self.insertion_evictions = torch.zeros(layers, dtype=torch.long, device=device)
+        self.insertion_truncated = torch.zeros(layers, dtype=torch.long, device=device)
+        # Scratch rows and slots of every tensor, host-backed or not, live in the cache's own tensors.
+        self.insert_segments = [
+            expert_row_segments([(tensor, tensor) for tensor in cache.tensors.values()])
+            for cache in self.caches
+        ]
+
+    def check_miss_plans(self) -> None:
+        """Refuse a layer whose copy backend posts a plan other than the gather's own miss buffers.
+
+        Insertions read the scratch row of each missed expert from those buffers.
+        """
+        for streamer in self.streamers:
+            plan = streamer.row_plan
+            if (
+                plan.expert_ids.data_ptr() != streamer._graph_source_rows.data_ptr()
+                or plan.count.data_ptr() != streamer._graph_miss_count.data_ptr()
+            ):
+                raise ValueError(
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS needs each graph gather's own miss plan; "
+                    "leave SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY at 0"
+                )
+
+    @staticmethod
+    def _tabulate_decay(decay_of_tokens, limit: int) -> list[float]:
+        values = []
+        for tokens in range(limit + 1):
+            value = decay_of_tokens(tokens)
+            values.append(value)
+            if float(torch.tensor(value, dtype=torch.float32)) == 0.0:
+                return values
+        raise ValueError("insert-on-miss decay is too close to one to tabulate exactly")
+
     def on_graph_forward(self, tokens: int) -> None:
         """At the first streamed layer's graph gather: apply a pending boundary, then count this forward.
 
@@ -173,6 +255,8 @@ class GpuResidencyUpdater:
         """
         if self.update_decode_forwards > 0:
             self._apply(self.boundary_pending & self.enabled, self.max_promotions, _DECODE_PHASE)
+        if self.insert_on_miss:
+            self.plans_fresh.fill_(True)
         self._count(tokens, decode=True)
 
     def flush(self) -> None:
@@ -219,15 +303,22 @@ class GpuResidencyUpdater:
         self.boundary_pending.fill_(False)
         self.host_pending = False
         self.enabled.fill_(True)
+        if self.insert_on_miss:
+            self.plans_fresh.fill_(False)
 
     def snapshot(self) -> dict[str, list]:
         """Host copies of the device counters, for the metrics trace only."""
-        return {
+        snapshot = {
             "promotions": self.promotions.cpu().tolist(),
             "evictions": self.evictions.cpu().tolist(),
             "boundary_updates": self.boundary_updates.cpu().tolist(),
             "truncated_layers": self.truncated.cpu().tolist(),
         }
+        if self.insert_on_miss:
+            snapshot["insertions"] = self.insertions.cpu().tolist()
+            snapshot["insertion_evictions"] = self.insertion_evictions.cpu().tolist()
+            snapshot["insertion_truncated"] = self.insertion_truncated.cpu().tolist()
+        return snapshot
 
     def _decode_boundary_reached(self) -> torch.Tensor:
         if self.update_decode_forwards < 1:
@@ -243,11 +334,31 @@ class GpuResidencyUpdater:
 
     def _apply(self, gate: torch.Tensor, width: int, phase: int) -> None:
         """Run one masked boundary: every tensor keeps its value where ``gate`` is false."""
-        experts = self.num_experts
+        inserting = self.insert_on_miss and phase == _DECODE_PHASE
+        if self.insert_on_miss:
+            insert_decay = self.insert_decay_table.index_select(
+                0, self.tokens.clamp(max=self.insert_decay_table_tokens)
+            )
+            self.insert_scores.copy_(
+                torch.where(gate, self.insert_scores * insert_decay + self.route_counts, self.insert_scores)
+            )
+        routed = self.route_counts > 0 if inserting else None
         decay = self.decay_table.index_select(0, self.tokens.clamp(max=self.decay_table_tokens))
         self.scores.copy_(torch.where(gate, self.scores * decay + self.route_counts, self.scores))
         self.route_counts.masked_fill_(gate, 0.0)
         eligible = gate & (self.forwards - self.last_update >= self.min_residence_forwards)
+        if inserting:
+            self._insert_misses(gate, routed)
+            self.boundary_updates.add_(eligible.to(torch.long))
+        else:
+            self._promote(eligible, width, phase)
+        self.tokens.masked_fill_(gate, 0)
+        self.decode_forwards.masked_fill_(gate, 0)
+        self.boundary_pending.masked_fill_(gate, False)
+
+    def _promote(self, eligible: torch.Tensor, width: int, phase: int) -> None:
+        """Decide promotions from the scores and copy promoted host rows into their slots."""
+        experts = self.num_experts
         decision = decide_residency_on_device(
             self.scores,
             self.mapping[:, :experts] >= 0,
@@ -295,9 +406,74 @@ class GpuResidencyUpdater:
         self.truncated.add_((decision.needed_promotions > width).to(torch.long))
         changed = (decision.promotion_counts > 0) | (decision.eviction_counts > 0)
         self.last_update.copy_(torch.where(changed, self.forwards, self.last_update))
-        self.tokens.masked_fill_(gate, 0)
-        self.decode_forwards.masked_fill_(gate, 0)
-        self.boundary_pending.masked_fill_(gate, False)
+
+    def _insert_misses(self, gate: torch.Tensor, routed: torch.Tensor) -> None:
+        """Copy the last forward's fresh, still nonresident misses from scratch rows into slots.
+
+        Plan row ``r`` of a layer names the expert in scratch row ``capacity + r``
+        (``plan_graph_routes``). Targets are free slots in slot order, then
+        residents with no route since the previous boundary, lowest
+        ``(insert score, -expert)`` first; misses beyond them are not inserted.
+        """
+        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+        experts, width, slot_dump = self.num_experts, self.miss_rows, self.max_capacity
+        columns = self.miss_columns.unsqueeze(0)
+        miss_ids = torch.stack([streamer._graph_source_rows[:width] for streamer in self.streamers])
+        miss_counts = torch.cat([streamer._graph_miss_count for streamer in self.streamers]).to(torch.long)
+        wanted = (
+            (columns < miss_counts.unsqueeze(1))
+            & (gate & self.plans_fresh).unsqueeze(1)
+            & (self.mapping.gather(1, miss_ids) < 0)
+        )
+        order = torch.argsort((~wanted).to(torch.uint8), dim=1, stable=True)
+        wanted_counts = wanted.sum(dim=1)
+        new_experts = miss_ids.gather(1, order)
+        source_rows = self.capacity.unsqueeze(1) + order
+
+        slot_experts = self.slot_to_expert.clamp(min=0)
+        free = (self.slot_state == _FREE) & self.slot_valid
+        evictable = (
+            (self.slot_state == _READY)
+            & self.slot_valid
+            & (self.slot_to_expert >= 0)
+            & ~routed.gather(1, slot_experts)
+        )
+        never = torch.iinfo(torch.int64).max
+        slot_keys = torch.full(
+            (self.num_layers, self.victim_columns), never, dtype=torch.int64, device=self.device
+        )
+        slot_keys[:, : slot_dump + 1] = torch.where(
+            free,
+            self.slot_ids.unsqueeze(0) - (slot_dump + 1),
+            torch.where(evictable, residency_rank_keys(self.insert_scores).gather(1, slot_experts), never),
+        )
+        ranked = torch.sort(slot_keys, dim=1)
+        targets = ranked.indices[:, :width].clamp(max=slot_dump)
+        insert_counts = torch.minimum(wanted_counts, (ranked.values[:, :width] < never).sum(dim=1))
+        insert = columns < insert_counts.unsqueeze(1)
+        evicted = insert & ~free.gather(1, targets)
+        destinations = torch.where(insert, targets, slot_dump)
+        self.mapping.scatter_(1, torch.where(evicted, self.slot_to_expert.gather(1, targets), experts), -1)
+        self.mapping.scatter_(1, torch.where(insert, new_experts, experts), destinations)
+        self.slot_to_expert.scatter_(1, destinations, torch.where(insert, new_experts, -1))
+        self.slot_state.scatter_(1, destinations, _READY)
+        self.slot_generations.scatter_add_(1, destinations, insert.to(torch.long))
+        self.slot_state[:, slot_dump] = _FREE
+        self.slot_to_expert[:, slot_dump] = -1
+        self.slot_generations[:, slot_dump] = 0
+        self.insert_sources.copy_(torch.where(insert, source_rows, 0))
+        self.insert_slots.copy_(destinations)
+        self.insert_counts.copy_(insert_counts.unsqueeze(1))
+        for row, segments in enumerate(self.insert_segments):
+            copy_expert_row_segments_gpu(
+                segments, self.insert_sources[row], self.insert_slots[row], self.insert_counts[row]
+            )
+        self.insertions.add_(insert_counts)
+        self.insertion_evictions.add_(evicted.sum(dim=1))
+        self.insertion_truncated.add_((wanted_counts > insert_counts).to(torch.long))
+        self.last_update.copy_(torch.where(insert_counts > 0, self.forwards, self.last_update))
+        self.plans_fresh.masked_fill_(gate, False)
 
     def _copy_promotions(self, width: int) -> None:
         """Copy each layer's promoted rows into its destination slots on the current stream."""
