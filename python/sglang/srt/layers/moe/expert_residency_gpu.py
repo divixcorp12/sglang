@@ -26,6 +26,9 @@ _FREE = 0
 _READY = 3
 _DECODE_PHASE = 0
 _PREFILL_PHASE = 1
+_STAGE_OFF = 0
+_STAGE_SCRATCH = 1
+_STAGE_DIRECT = 2
 
 
 class GpuResidencyUpdater:
@@ -63,7 +66,7 @@ class GpuResidencyUpdater:
         *,
         max_promotions: int,
         decay_table_tokens: int = 1 << 14,
-        insert_on_miss: bool = False,
+        insert_on_miss: bool | int = False,
         insert_on_miss_decay: float = 0.98,
     ) -> None:
         layer_ids = [
@@ -154,15 +157,22 @@ class GpuResidencyUpdater:
         self.boundary_updates = torch.zeros(layers, dtype=torch.long, device=device)
         self.truncated = torch.zeros(layers, dtype=torch.long, device=device)
 
-        self.insert_on_miss = bool(insert_on_miss)
+        self.insert_stage = int(insert_on_miss)
+        self.insert_on_miss = self.insert_stage != _STAGE_OFF
+        self.insert_direct = self.insert_stage == _STAGE_DIRECT
         self.insert_on_miss_decay = float(insert_on_miss_decay)
         self.insert_scores = None
         self.insert_tensors = None
+        self.victims = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
         streamers[0].residency_update = self
         streamers[0].before_eager_gather = self.flush
+        if self.insert_direct:
+            for row, streamer in enumerate(streamers):
+                streamer.residency_direct = self
+                streamer.residency_row = row
 
     @staticmethod
     def _decay_values(policy, limit: int) -> list[float]:
@@ -214,6 +224,9 @@ class GpuResidencyUpdater:
         self.insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.insertion_evictions = torch.zeros(layers, dtype=torch.long, device=device)
         self.insertion_truncated = torch.zeros(layers, dtype=torch.long, device=device)
+        if self.insert_direct:
+            self._init_insert_direct()
+            return
         # Scratch rows and slots of every tensor, host-backed or not, live in the cache's own tensors.
         # Byte-row views: a fixed-shape index copy measured ~0.007 ms/row D2D on the RTX 5090,
         # against ~0.054 ms/row for copy_expert_row_segments_gpu with a device count.
@@ -222,11 +235,68 @@ class GpuResidencyUpdater:
             for cache in self.caches
         ]
 
-    def check_miss_plans(self) -> None:
-        """Refuse a layer whose copy backend posts a plan other than the gather's own miss buffers.
+    def _init_insert_direct(self) -> None:
+        """Stage DIRECT: a victim shortlist per layer, and the guarantee that every miss finds one.
 
-        Insertions read the scratch row of each missed expert from those buffers.
+        Each boundary ranks ``miss_rows`` candidate slots per layer. A gather
+        disqualifies the shortlist entries its own forward routes to and sends
+        its miss copies straight into the survivors, so no scratch row is read
+        or written and the cache keeps those rows as residency.
+
+        Capacity guarantee. A graph gather serves at most ``miss_rows`` routes,
+        so its distinct hits ``H`` and distinct misses ``M`` satisfy
+        ``H + M <= miss_rows``. Each hit route disqualifies at most one entry,
+        leaving at least ``miss_rows - H >= M`` survivors whenever the shortlist
+        is full. It is full while a layer has ``miss_rows`` eligible candidates,
+        and with a boundary every forward at most ``miss_rows`` residents were
+        routed since the last one, so ``capacity >= 2 * miss_rows`` suffices.
+        Below that a miss could find no slot, and with no scratch row to fall
+        back on its routes would read another expert, so the mode is refused
+        rather than allowed to truncate.
         """
+        width = self.miss_rows
+        for layer_id, cache in zip(self.layer_ids, self.caches):
+            if cache.capacity < 2 * width:
+                raise ValueError(
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
+                    f"twice its graph-gather rows; layer {layer_id} has {cache.capacity} "
+                    f"slots for {width} rows. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
+                )
+        device, layers = self.device, self.num_layers
+        # Shortlisted slots per layer, and which of those columns name a real slot.
+        self.victims = torch.zeros((layers, width), dtype=torch.long, device=device)
+        self.victim_valid = torch.zeros((layers, width), dtype=torch.bool, device=device)
+        self.victims_fresh = False
+        self.gather_lanes = torch.arange(width, dtype=torch.long, device=device)
+        self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
+        self.gather_evictions = torch.zeros(layers, dtype=torch.long, device=device)
+        self._pending_commit = None
+
+    def check_miss_plans(self) -> None:
+        """Refuse every backend that could write a cache row this mode does not control.
+
+        One guard, not three, because these three refusals are the whole safety
+        argument and separated ones get dropped piecemeal in a later refactor.
+
+        * The plan must be the gather's own miss buffers. SCRATCH reads each
+          missed expert's scratch row from them; DIRECT drives both the copy and
+          the residency commit from that one ``count``, which is what makes them
+          unable to disagree.
+        * The doorbell copier writes slots from its own stream at any time
+          between post and completion, and reports a timed-out request
+          undelivered while its copy may still land. Under DIRECT that would
+          overwrite a slot the mapping has already committed.
+        * A prefetch pull owns a dedicated row and covers routes that then never
+          enter residency, and it reads cache rows from a side stream.
+        """
+        from sglang.srt.environ import envs
+
+        if self.insert_direct and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+            raise ValueError(
+                "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs "
+                "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE=off: a side-stream pull reads and writes "
+                "cache rows this mode commits residency for"
+            )
         for streamer in self.streamers:
             plan = streamer.row_plan
             if (
@@ -234,8 +304,13 @@ class GpuResidencyUpdater:
                 or plan.count.data_ptr() != streamer._graph_miss_count.data_ptr()
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS needs each graph gather's own miss plan; "
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan; "
                     "leave SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY at 0"
+                )
+            if self.insert_direct and streamer.pinned_host_cache is not None:
+                raise ValueError(
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
+                    "pinned host cache"
                 )
 
     @staticmethod
@@ -255,7 +330,7 @@ class GpuResidencyUpdater:
         """
         if self.update_decode_forwards > 0:
             self._apply(self.boundary_pending & self.enabled, self.max_promotions, _DECODE_PHASE)
-        if self.insert_on_miss:
+        if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(True)
         self._count(tokens, decode=True)
 
@@ -303,8 +378,12 @@ class GpuResidencyUpdater:
         self.boundary_pending.fill_(False)
         self.host_pending = False
         self.enabled.fill_(True)
-        if self.insert_on_miss:
+        if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(False)
+        if self.insert_direct:
+            # Rank a shortlist now, eagerly: the first replay's gather reads it before any
+            # boundary has run, and a capture-time shortlist would name pre-warm-up slots.
+            self._rank_victims(self.route_counts > 0)
 
     def snapshot(self) -> dict[str, list]:
         """Host copies of the device counters, for the metrics trace only."""
@@ -315,8 +394,13 @@ class GpuResidencyUpdater:
             "truncated_layers": self.truncated.cpu().tolist(),
         }
         if self.insert_on_miss:
-            snapshot["insertions"] = self.insertions.cpu().tolist()
-            snapshot["insertion_evictions"] = self.insertion_evictions.cpu().tolist()
+            insertions, evictions = self.insertions, self.insertion_evictions
+            if self.insert_direct:
+                # DIRECT inserts in the gathers, so its counters live there; the trace keeps
+                # the same key names, as they count the same event.
+                insertions, evictions = self.gather_insertions, self.gather_evictions
+            snapshot["insertions"] = insertions.cpu().tolist()
+            snapshot["insertion_evictions"] = evictions.cpu().tolist()
             snapshot["insertion_truncated"] = self.insertion_truncated.cpu().tolist()
         return snapshot
 
@@ -342,16 +426,24 @@ class GpuResidencyUpdater:
             self.insert_scores.copy_(
                 torch.where(gate, self.insert_scores * insert_decay + self.route_counts, self.insert_scores)
             )
-        routed = self.route_counts > 0 if inserting else None
+        routed = self.route_counts > 0 if self.insert_on_miss else None
         decay = self.decay_table.index_select(0, self.tokens.clamp(max=self.decay_table_tokens))
         self.scores.copy_(torch.where(gate, self.scores * decay + self.route_counts, self.scores))
         self.route_counts.masked_fill_(gate, 0.0)
         eligible = gate & (self.forwards - self.last_update >= self.min_residence_forwards)
         if inserting:
-            self._insert_misses(gate, routed)
+            # DIRECT inserted during the gathers themselves; the boundary only proposes the next
+            # forward's victims. SCRATCH still copies the previous forward's misses out of scratch.
+            if self.insert_direct:
+                self._rank_victims(routed)
+            else:
+                self._insert_misses(gate, routed)
             self.boundary_updates.add_(eligible.to(torch.long))
         else:
             self._promote(eligible, width, phase)
+            if self.insert_direct:
+                # A prefill boundary rewrote the mapping, so the shortlist it ranked is stale.
+                self._rank_victims(routed)
         self.tokens.masked_fill_(gate, 0)
         self.decode_forwards.masked_fill_(gate, 0)
         self.boundary_pending.masked_fill_(gate, False)
@@ -472,6 +564,110 @@ class GpuResidencyUpdater:
         self.insertion_truncated.add_((wanted_counts > insert_counts).to(torch.long))
         self.last_update.copy_(torch.where(insert_counts > 0, self.forwards, self.last_update))
         self.plans_fresh.masked_fill_(gate, False)
+
+    def _rank_victims(self, routed: torch.Tensor) -> None:
+        """Propose each layer's next ``miss_rows`` victim slots: free slots first, then the
+        lowest-scored residents this window did not route.
+
+        This is only a proposal. It is ranked before the next forward's routing
+        is known, so it may name a slot that forward reads; the gather that
+        commits removes those itself (:meth:`gather_destinations`). The
+        ``routed`` filter here is a quality heuristic that keeps warm rows out
+        of the shortlist, never the safety property.
+        """
+        slot_dump = self.max_capacity
+        width = self.miss_rows
+        slot_experts = self.slot_to_expert.clamp(min=0)
+        free = (self.slot_state == _FREE) & self.slot_valid
+        evictable = (
+            (self.slot_state == _READY)
+            & self.slot_valid
+            & (self.slot_to_expert >= 0)
+            & ~routed.gather(1, slot_experts)
+        )
+        never = torch.iinfo(torch.int64).max
+        keys = torch.full(
+            (self.num_layers, self.victim_columns), never, dtype=torch.int64, device=self.device
+        )
+        keys[:, : slot_dump + 1] = torch.where(
+            free,
+            self.slot_ids.unsqueeze(0) - (slot_dump + 1),
+            torch.where(evictable, residency_rank_keys(self.insert_scores).gather(1, slot_experts), never),
+        )
+        ranked = torch.sort(keys, dim=1)
+        self.victims.copy_(ranked.indices[:, :width].clamp(max=slot_dump))
+        self.victim_valid.copy_(ranked.values[:, :width] < never)
+        self.victims_fresh = True
+
+    def gather_destinations(
+        self, row: int, remap: torch.Tensor, route_slots: torch.Tensor, scratch_base: int
+    ) -> torch.Tensor:
+        """Point one layer's gather at victim slots instead of scratch rows.
+
+        ``route_slots`` is the gather's own ``expert_to_slot`` lookup of every
+        route: a slot for a hit, ``-1`` for a miss. A shortlist entry equal to
+        one of those slots is a row this forward reads, so it is dropped here,
+        which is the whole safety argument -- the choice is made with the
+        forward's routing in hand even though the shortlist was ranked before
+        it. The surviving entries take the miss lanes in rank order, and
+        ``_init_insert_direct`` proves there are always enough of them.
+
+        Writes the destinations into the gather's own plan slots and returns
+        the remap with every miss lane translated. Fixed shape, device only.
+        """
+        streamer = self.streamers[row]
+        victims, valid = self.victims[row], self.victim_valid[row]
+        # A miss lane's slot is -1 and a padded column is clamped to the dump index, so
+        # neither can equal a real routed slot; only genuine hits disqualify an entry.
+        hazard = (route_slots.unsqueeze(1) == victims.unsqueeze(0)).any(dim=0)
+        order = torch.argsort((hazard | ~valid).to(torch.uint8), stable=True)
+        usable = victims.index_select(0, order)
+        usable_valid = (valid & ~hazard).index_select(0, order)
+        live = (self.gather_lanes < streamer._graph_miss_count.long()) & usable_valid
+        # Lanes past the miss count are never copied (the copy reads the same count) and
+        # never remapped to, so their destination only has to stay inside the allocation.
+        destinations = torch.where(live, usable, torch.zeros_like(usable))
+        streamer._graph_destination_slots.copy_(destinations.to(torch.int32))
+        self._pending_commit = (row, streamer, destinations, live)
+        # The fused planner keeps the router's native ids, so remap may be int32; index_select
+        # takes int64 only, and the result carries the destinations' dtype back to the caller,
+        # which casts to the router's dtype as it always has.
+        rank = (remap - scratch_base).clamp(min=0, max=self.miss_rows - 1).long()
+        return torch.where(remap >= scratch_base, destinations.index_select(0, rank), remap)
+
+    def commit_gather(self) -> None:
+        """Commit the residency of the gather whose copies were just issued."""
+        row, streamer, destinations, live = self._pending_commit
+        self._pending_commit = None
+        self._commit_gather(row, streamer, destinations, live)
+
+    def _commit_gather(
+        self, row: int, streamer, destinations: torch.Tensor, live: torch.Tensor
+    ) -> None:
+        """Move residency onto the rows this gather is about to copy.
+
+        The mask is the same ``_graph_miss_count`` the copy kernel reads, so the
+        mapping can never claim a row the copy did not write: there is one count,
+        not two that could disagree. The writes are issued after the copy on the
+        gather's own stream, and every backend that could write a slot from
+        another stream is refused at startup (:meth:`check_miss_plans`).
+        """
+        experts, slot_dump = self.num_experts, self.max_capacity
+        new_experts = streamer._graph_source_rows[: self.miss_rows]
+        slots = self.slot_to_expert[row]
+        targets = torch.where(live, destinations, slot_dump)
+        evicted = live & (slots.gather(0, destinations) >= 0)
+        mapping = self.mapping[row]
+        mapping.scatter_(0, torch.where(evicted, slots.gather(0, destinations), experts), -1)
+        mapping.scatter_(0, torch.where(live, new_experts, experts), targets)
+        slots.scatter_(0, targets, torch.where(live, new_experts, -1))
+        self.slot_state[row].scatter_(0, targets, _READY)
+        self.slot_generations[row].scatter_add_(0, targets, live.to(torch.long))
+        self.slot_state[row, slot_dump] = _FREE
+        slots[slot_dump] = -1
+        self.slot_generations[row, slot_dump] = 0
+        self.gather_insertions[row].add_(live.sum())
+        self.gather_evictions[row].add_(evicted.sum())
 
     def _copy_promotions(self, width: int) -> None:
         """Copy each layer's promoted rows into its destination slots on the current stream."""

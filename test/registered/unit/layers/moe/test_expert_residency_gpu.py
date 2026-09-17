@@ -14,6 +14,7 @@ import os
 import random
 import tempfile
 import unittest
+import unittest.mock
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -740,10 +741,31 @@ class TestInsertOnMiss(unittest.TestCase):
                 self.assertNotIn("insertions", updater.snapshot())
                 self.assertFalse(any("insertion" in name for name in manager._trace_sources()))
                 self.assertNotIn("insertions", manager.snapshot_counters()["decode"]["0"])
-        with envs.SGLANG_MOE_HOT_INSERT_ON_MISS.override(True), envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.override(0.99):
+        stage = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE
+        with stage.override(1), envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.override(0.99):
             manager = _manager(_model(), gpu=True, update_decode_forwards=1)
             self.assertTrue(manager.gpu_residency.insert_on_miss)
+            self.assertFalse(manager.gpu_residency.insert_direct)
             self.assertAlmostEqual(manager.gpu_residency.insert_on_miss_decay, 0.99)
+
+    def test_the_retired_boolean_still_selects_stage_one(self):
+        """`combined-iom`'s measured arms set SGLANG_MOE_HOT_INSERT_ON_MISS=1. The stage enum keeps
+        that value, so those arms keep running stage 1 -- with a DeprecationWarning, not silently
+        falling back to off and simply looking slower."""
+        from sglang.srt.environ import InsertOnMissStage, envs
+
+        self.assertEqual(int(InsertOnMissStage.OFF), 0)
+        self.assertEqual(int(InsertOnMissStage.SCRATCH), 1)
+        with unittest.mock.patch.dict(os.environ, {"SGLANG_MOE_HOT_INSERT_ON_MISS": "1"}):
+            envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.clear()
+            with self.assertWarns(DeprecationWarning):
+                resolved = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
+            self.assertEqual(resolved, InsertOnMissStage.SCRATCH)
+        envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.clear()
+
+    def test_an_unknown_stage_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"):
+            _manager(_model(), gpu=True, update_decode_forwards=1, insert_on_miss=3)
 
     def test_mode_requires_the_gpu_update_and_a_boundary_every_decode_forward(self):
         with self.assertRaisesRegex(ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE"):
@@ -907,6 +929,266 @@ class TestInsertOnMiss(unittest.TestCase):
         reference.slots[row][slot] = -1
         with self.assertRaises(AssertionError):
             reference.assert_matches(self, manager, "perturbed")
+
+
+DIRECT = dict(update_decode_forwards=1, insert_on_miss=2, insert_on_miss_decay=IOM_DECAY)
+
+
+def _cache_bytes(cache):
+    """Every row of every tensor of one cache, as host bytes, for a no-touch comparison."""
+    return {
+        name: tensor.view(torch.uint8).reshape(tensor.shape[0], -1).cpu().clone()
+        for name, tensor in cache.tensors.items()
+    }
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestInsertOnMissDirect(unittest.TestCase):
+    """Stage DIRECT: a gather copies each miss straight into a victim slot, and no scratch is held.
+
+    The victim shortlist is ranked by the previous boundary, before this forward's routing exists.
+    Safety therefore does not come from the ranking; it comes from the gather dropping every
+    shortlist entry its own forward routes to. These tests pin that split down.
+    """
+
+    def setUp(self):
+        self.model = _model()
+
+    def capture(self, manager):
+        static, outputs, forward = _gather_harness(manager)
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                forward()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+        manager.discard_graph_capture_routes()
+        return graph, static, outputs
+
+    def step(self, manager, graph, static, outputs, routes, context):
+        static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for layer in range(LAYERS):
+            source_layer = self.model.get_submodule(str(layer))
+            experts = torch.tensor(routes[layer][0])
+            for name in NVFP4_STREAM_TENSORS:
+                source = getattr(source_layer, name)
+                expected = source[experts.to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
+                self.assertTrue(torch.equal(actual, expected), f"{context} layer {layer} {name}")
+        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        torch.cuda.synchronize()
+
+    # ----- shape of the allocation -----
+
+    def test_direct_holds_no_scratch_and_spends_the_rows_on_residency(self):
+        """The whole point: the graph gather keeps its route width but stops reserving rows for it,
+        so the same budget buys strictly more slots than stage 1 does."""
+        scratch = _manager(_model(), gpu=True, **IOM)
+        direct = _manager(_model(), gpu=True, **DIRECT)
+        for cache in direct.caches.values():
+            self.assertEqual(cache.scratch_rows, 0)
+            self.assertEqual(cache.scratch_bytes, 0)
+            for tensor in cache.tensors.values():
+                self.assertEqual(tensor.shape[0], cache.capacity)
+        for streamer in direct.streamers.values():
+            self.assertEqual(streamer.graph_gather_rows, TOP_K)
+            self.assertEqual(streamer._graph_device_pairs, ())
+        scratch_slots = sum(cache.capacity for cache in scratch.caches.values())
+        direct_slots = sum(cache.capacity for cache in direct.caches.values())
+        self.assertGreater(direct_slots, scratch_slots)
+        self.assertEqual(direct_slots - scratch_slots, LAYERS * TOP_K)
+
+    def test_a_layer_too_small_to_guarantee_a_victim_is_refused(self):
+        """Below twice the gather width a forward could route every shortlist entry, and with no
+        scratch row left there would be nowhere safe for that miss to land. Refuse, never truncate."""
+        with self.assertRaisesRegex(ValueError, "twice its graph-gather rows"):
+            _manager(_model(), gpu=True, seed_scale=(0, 1, 1), **DIRECT)
+
+    # ----- the consolidated safety guard (one guard, three reasons) -----
+
+    def test_every_backend_that_could_write_a_slot_off_stream_is_refused(self):
+        """Stage DIRECT commits residency for a row the moment its copy is issued. Anything that
+        can write that row from another stream, or serve it from somewhere else, breaks that."""
+        from sglang.srt.environ import envs
+
+        with self.assertRaisesRegex(ValueError, "DOORBELL_PLAN_CAPACITY"):
+            _manager(_model(), gpu=True, expert_doorbell=True, doorbell_plan_capacity=4, **DIRECT)
+        with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+            with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE=off"):
+                _manager(_model(), gpu=True, **DIRECT)
+        manager = _manager(_model(), gpu=True, **DIRECT)
+        streamer = next(iter(manager.streamers.values()))
+        streamer.pinned_host_cache = SimpleNamespace(capacity=1)
+        with self.assertRaisesRegex(ValueError, "pinned host cache"):
+            manager.gpu_residency.check_miss_plans()
+
+    def test_the_copy_and_the_commit_read_one_count(self):
+        """Structural, and the reason a short copy cannot leave a slot wrongly READY: the residency
+        commit is masked by the very tensor the copy kernel reads its row count from. There are not
+        two counts that could disagree, so there is no ordering window to get wrong."""
+        manager = _manager(_model(), gpu=True, **DIRECT)
+        for streamer in manager.streamers.values():
+            self.assertIs(streamer.row_plan.count, streamer._graph_miss_count)
+            self.assertIs(streamer.row_plan.slots, streamer._graph_destination_slots)
+            self.assertIs(streamer.row_plan.expert_ids, streamer._graph_source_rows)
+
+    # ----- the capacity proof, exercised -----
+
+    def test_no_forward_ever_lands_a_copy_in_a_row_it_reads(self):
+        """The safety property itself, checked per replay against the pre-gather mapping: a
+        destination is never a slot this forward routes to, destinations are distinct, and a
+        shortlist entry the forward does route is skipped rather than overwritten."""
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(11)
+        seen_disqualified = 0
+        for step in range(30):
+            routes = _random_routes(generator)
+            before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
+            shortlist = updater.victims.tolist()
+            valid = updater.victim_valid.tolist()
+            self.step(manager, graph, static, outputs, routes, f"step {step}")
+            for row, mapping in enumerate(before):
+                read = {mapping[expert] for expert in routes[row][0] if mapping[expert] >= 0}
+                wanted = [expert for expert in routes[row][0] if mapping[expert] < 0]
+                destinations = [
+                    slot
+                    for slot, ok in zip(shortlist[row], valid[row])
+                    if ok and slot not in read
+                ][: len(wanted)]
+                self.assertEqual(
+                    len(destinations), len(wanted), f"step {step} layer {row} ran out of victims"
+                )
+                self.assertEqual(len(set(destinations)), len(destinations), "destinations collide")
+                cache = manager.caches[sorted(manager.caches)[row]]
+                for expert, slot in zip(wanted, destinations):
+                    self.assertEqual(int(cache.expert_to_slot[expert]), slot, f"step {step}")
+                seen_disqualified += sum(
+                    1 for slot, ok in zip(shortlist[row], valid[row]) if ok and slot in read
+                )
+        self.assertGreater(seen_disqualified, 0, "no forward ever routed a shortlisted slot")
+        self.assertEqual(sum(updater.snapshot()["insertion_truncated"]), 0)
+        self.assertGreater(sum(updater.snapshot()["insertions"]), 0)
+
+    def test_every_resident_slot_holds_its_own_expert_after_every_forward(self):
+        """Byte-exactness of the copy path where it now matters most, since a miss copy lands in a
+        live cache row rather than scratch."""
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(12)
+        for step in range(20):
+            self.step(manager, graph, static, outputs, _random_routes(generator), f"step {step}")
+            assert_slot_rows(self, manager, self.model, f"step {step}")
+
+    def test_a_forward_changes_only_the_rows_it_inserts_into(self):
+        """No-touch: the fixed-shape lanes past the miss count must not write anywhere, which is
+        why every tensor copies through the count-exact segment kernel instead of an index copy."""
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(13)
+        for step in range(8):
+            routes = _random_routes(generator)
+            before = {
+                layer_id: _cache_bytes(cache) for layer_id, cache in sorted(manager.caches.items())
+            }
+            mappings = {
+                layer_id: cache.expert_to_slot.tolist()
+                for layer_id, cache in sorted(manager.caches.items())
+            }
+            self.step(manager, graph, static, outputs, routes, f"step {step}")
+            for row, (layer_id, cache) in enumerate(sorted(manager.caches.items())):
+                after = _cache_bytes(cache)
+                inserted = {
+                    int(cache.expert_to_slot[expert])
+                    for expert in routes[row][0]
+                    if mappings[layer_id][expert] < 0
+                }
+                for name, rows in after.items():
+                    for slot in range(cache.capacity):
+                        if slot in inserted:
+                            continue
+                        self.assertTrue(
+                            torch.equal(rows[slot], before[layer_id][name][slot]),
+                            f"step {step} layer {layer_id} slot {slot} {name} changed unexpectedly",
+                        )
+
+    def test_the_victim_is_the_lowest_scored_resident_the_forward_does_not_route(self):
+        """Ranking quality is stage 1's rule, unchanged; what is new is that routing the shortlisted
+        slot pushes the miss onto the next entry instead of evicting a row in use."""
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        graph, static, outputs = self.capture(manager)
+        cache = manager.caches[0]
+        mapping = cache.expert_to_slot.tolist()
+        residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
+        outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+        self.assertGreaterEqual(len(residents), 3)
+        self.assertTrue(outsiders)
+        lowest, second, miss = residents[0], residents[1], outsiders[0]
+        scores = torch.full((EXPERTS,), 100.0)
+        scores[lowest], scores[second] = 1.0, 2.0
+        updater.insert_scores[0].copy_(scores)
+        updater._rank_victims(updater.route_counts > 0)
+        torch.cuda.synchronize()
+        free = [slot for slot in range(cache.capacity) if slot not in mapping]
+        self.assertFalse(free, "a free slot would take the miss before any scored victim")
+        others = [[[0, 1]] for _ in range(LAYERS - 1)]
+        routes = [[[lowest, miss]]] + others
+        self.step(manager, graph, static, outputs, routes, "routed victim")
+        self.assertEqual(
+            int(cache.expert_to_slot[miss]),
+            mapping[second],
+            "routing the top-ranked victim must push the miss to the next entry",
+        )
+        self.assertEqual(int(cache.expert_to_slot[lowest]), mapping[lowest], "a routed row survives")
+        self.assertEqual(int(cache.expert_to_slot[second]), -1)
+        assert_slot_rows(self, manager, self.model, "routed victim")
+
+    def test_the_shortlist_is_ranked_before_the_first_replay(self):
+        """`reset_after_capture` must leave a usable shortlist: the first replay's gather reads it
+        before any boundary has run, and a shortlist captured during warm-up would name stale slots."""
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        self.capture(manager)
+        self.assertTrue(updater.victims_fresh)
+        self.assertTrue(bool(updater.victim_valid.any()))
+
+    def test_decode_forward_is_sync_free(self):
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        graph, static, _ = self.capture(manager)
+        counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64, device="cuda")}
+        graph.replay()
+        manager.on_expert_distribution(_decode_batch(), counts)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for step in range(5):
+                static.copy_((static + 3 + step).remainder(EXPERTS))
+                graph.replay()
+                manager.on_expert_distribution(_decode_batch(), counts)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+        self.assertGreater(sum(manager.gpu_residency.snapshot()["insertions"]), 0)
+
+    def test_stage_one_is_unchanged_by_stage_two_existing(self):
+        """Stage 1 must stay byte-identical as the fallback: it keeps its scratch rows, its
+        device-pair index copy and its boundary insertion path."""
+        manager = _manager(_model(), gpu=True, **IOM)
+        updater = manager.gpu_residency
+        self.assertTrue(updater.insert_on_miss)
+        self.assertFalse(updater.insert_direct)
+        self.assertIsNone(updater.victims)
+        self.assertIsNotNone(updater.insert_tensors)
+        for cache in manager.caches.values():
+            self.assertEqual(cache.scratch_rows, TOP_K)
+        for streamer in manager.streamers.values():
+            self.assertNotEqual(streamer._graph_device_pairs, ())
 
 
 if __name__ == "__main__":

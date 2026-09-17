@@ -576,7 +576,7 @@ class ExpertStreamer:
             and 0 < topk_ids.numel() <= self.graph_gather_rows
         )
 
-    def enable_graph_gather(self, max_rows: int) -> None:
+    def enable_graph_gather(self, max_rows: int, scratch_destinations: bool = True) -> None:
         """Serve gathers of at most ``max_rows`` routes with device-only operations.
 
         Misses are pulled from registered host rows into the hot cache's scratch
@@ -597,7 +597,9 @@ class ExpertStreamer:
         cache = self.hot_cache
         if max_rows < 1:
             raise ValueError("graph gather needs at least one route row")
-        if cache is None or cache.scratch_rows < max_rows:
+        if cache is None:
+            raise ValueError("graph gather needs a hot cache")
+        if scratch_destinations and cache.scratch_rows < max_rows:
             raise ValueError("graph gather needs a hot cache scratch row per route")
         if self.pinned_host_cache is not None:
             raise ValueError(
@@ -618,7 +620,7 @@ class ExpertStreamer:
         self._graph_sources = {
             name: _tensor_data(getattr(self.layer, name)) for name in self.tensor_names
         }
-        self._graph_device_pairs = tuple(
+        device_pairs = tuple(
             (source, cache.tensors[name])
             for name, source in self._graph_sources.items()
             if source.device.type == "cuda"
@@ -629,11 +631,27 @@ class ExpertStreamer:
             if source.device.type == "cpu"
         ]
         self._copy_row_segments_gpu = copy_expert_row_segments_gpu
+        if scratch_destinations:
+            # Device-source tensors take a separate fixed-shape index copy of every route row.
+            # Its padding lanes past the miss count land in spare scratch rows, harmlessly.
+            self._graph_device_pairs = device_pairs
+            segment_pairs = host_pairs
+        else:
+            # Without scratch there is no harmless landing place for a padding lane, so every
+            # pair goes through the segment kernel, which copies exactly ``count`` rows.
+            # ``_validate_row_pair`` accepts CUDA sources, and one launch replaces two.
+            self._graph_device_pairs = ()
+            segment_pairs = host_pairs + list(device_pairs)
         self._graph_row_segments = (
-            expert_row_segments(host_pairs) if host_pairs else None
+            expert_row_segments(segment_pairs) if segment_pairs else None
         )
-        self._graph_scratch_slots = torch.arange(
-            cache.capacity, cache.capacity + max_rows, dtype=torch.long, device=device
+        self._graph_scratch_slots = (
+            torch.arange(
+                cache.capacity, cache.capacity + max_rows, dtype=torch.long, device=device
+            )
+            if scratch_destinations
+            # Overwritten with victim slots by every gather; zero is a valid row until then.
+            else torch.zeros(max_rows, dtype=torch.long, device=device)
         )
         self._graph_source_rows = torch.zeros(
             max_rows, dtype=torch.int64, device=device
@@ -751,6 +769,17 @@ class ExpertStreamer:
             self.row_planner.fill_routes(plan, self.row_plan)
             remap = plan.remap
             source_rows = plan.source_rows
+        direct = getattr(self, "residency_direct", None)
+        if direct is not None:
+            # Stage DIRECT: send the miss lanes into victim slots instead of scratch rows.
+            # `expert_to_slot` is still this forward's pre-gather mapping here, so its slots
+            # are exactly the rows the gather is about to read.
+            remap = direct.gather_destinations(
+                self.residency_row,
+                remap,
+                expert_to_slot.index_select(0, flat.long()),
+                self.row_planner.scratch_base,
+            )
         if prefetch_puller is not None:
             # Join after actual routing: `remap`/`expert_to_slot` above are this
             # forward's real routing decision, not the prediction that posted the
@@ -785,6 +814,10 @@ class ExpertStreamer:
             self.row_backend.post(self.row_tag, self.row_plan)
             delivery = self.row_backend.resolve(self.row_tag, self.row_plan)
             self.row_backend.copy_residual(self.row_tag, delivery)
+        if direct is not None:
+            # Strictly after the copies, on this same stream: residency only claims a row
+            # once the copy that fills it has been issued ahead of it.
+            direct.commit_gather()
         if not fused:
             self.graph_counters[0].add_(count)
             self.graph_counters[1].add_(plan.routed_miss_rows)

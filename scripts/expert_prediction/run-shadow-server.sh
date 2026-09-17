@@ -5,6 +5,8 @@
 # Refuses to start while any process holds the GPU. Runs in the foreground; the session backgrounds it.
 # Env: HOT_GPU_MB (default 14336), CAPTURE=1 to record expert prediction training data.
 # HOT_INSERT_ON_MISS=1 selects insert-on-miss residency (decode boundary every forward), HOT_INSERT_ON_MISS_DECAY its decay.
+# HOT_INSERT_ON_MISS_STAGE=0|1|2 selects the stage instead (2 = miss copies land directly in victim slots) and
+# exports SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE; without it the retired boolean is exported unchanged.
 # RUN_KIND=trace with a PREFETCH_TRACE_COMMAND starting with sudo relays the environment via trace-env-relay.sh.
 set -euo pipefail
 
@@ -32,18 +34,22 @@ checkpoint_checksum=${PREFETCH_CHECKPOINT_CHECKSUM:-unknown}
 model_shapes=${MODEL_SHAPES:-unknown}
 model_top_k=${MODEL_TOP_K:-10}
 provenance_only=${PREFETCH_PROVENANCE_ONLY:-0}
-insert_on_miss=${HOT_INSERT_ON_MISS:-0}
+insert_on_miss=${HOT_INSERT_ON_MISS_STAGE:-${HOT_INSERT_ON_MISS:-0}}
+# Stage 2 exports the stage variable; stage 0/1 keep exporting the retired boolean verbatim, so an
+# existing matrix's exact-match environment check still sees the environment it recorded.
+insert_on_miss_var=$([ -n "${HOT_INSERT_ON_MISS_STAGE:-}" ] && echo SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE || echo SGLANG_MOE_HOT_INSERT_ON_MISS)
 insert_on_miss_decay=${HOT_INSERT_ON_MISS_DECAY:-0.98}
 case "${insert_on_miss,,}" in
+    2) insert_on_miss=2 ;;
     1|true|yes|y) insert_on_miss=1 ;;
     0|false|no|n) insert_on_miss=0 ;;
-    *) echo "HOT_INSERT_ON_MISS must be a boolean" >&2; exit 2 ;;
+    *) echo "HOT_INSERT_ON_MISS must be a boolean, HOT_INSERT_ON_MISS_STAGE one of 0/1/2" >&2; exit 2 ;;
 esac
 if ! [[ "$insert_on_miss_decay" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]]; then
     echo "HOT_INSERT_ON_MISS_DECAY must be a decimal in (0, 1]" >&2
     exit 2
 fi
-hot_update_decode_forwards=$([ "$insert_on_miss" = 1 ] && echo 1 || echo 4)
+hot_update_decode_forwards=$([ "$insert_on_miss" != 0 ] && echo 1 || echo 4)
 case "$run_kind" in timed|profiling|trace) ;; *) echo "RUN_KIND must be timed, profiling, or trace" >&2; exit 2 ;; esac
 case "$prefetch_pull_mode" in off|count_zero|always) ;; *) echo "PREFETCH_PULL_MODE is invalid" >&2; exit 2 ;; esac
 case "${calibration,,}" in
@@ -197,7 +203,7 @@ exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock "${launch_env[@]
     SGLANG_MOE_HOT_SEED="$expert_seed" \
     SGLANG_MOE_HOT_DYNAMIC=1 \
     SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS="$hot_update_decode_forwards" \
-    SGLANG_MOE_HOT_INSERT_ON_MISS="$insert_on_miss" \
+    "$insert_on_miss_var"="$insert_on_miss" \
     SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY="$insert_on_miss_decay" \
     SGLANG_MOE_HOT_DECAY_TOKENS=1 \
     SGLANG_MOE_HOT_PROMOTION_SIGMAS=0 \

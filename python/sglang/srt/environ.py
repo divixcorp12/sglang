@@ -311,6 +311,25 @@ class DsparkFoldedSampling(IntEnum):
     FORCE = 2
 
 
+class InsertOnMissStage(IntEnum):
+    """How a decode boundary gives a missed expert residency.
+
+    OFF promotes host rows at the boundary, as before. SCRATCH copies the
+    previous forward's misses device-to-device out of the graph gather's
+    scratch rows into their slots. DIRECT lands each miss copy straight in a
+    victim slot chosen from a shortlist the previous boundary ranked, so the
+    device-to-device hop disappears and the scratch rows return to the cache.
+
+    The values are ordered so that the retired boolean
+    ``SGLANG_MOE_HOT_INSERT_ON_MISS`` keeps its meaning: ``0`` is OFF and ``1``
+    is SCRATCH, the behaviour that boolean selected.
+    """
+
+    OFF = 0
+    SCRATCH = 1
+    DIRECT = 2
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -385,10 +404,14 @@ class Envs:
     SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)
     # Most experts one layer promotes at a decode boundary on the GPU path.
     SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS = EnvInt(64)
-    # Decode boundaries copy the previous forward's missed experts from scratch
-    # rows into slots instead of promoting host rows; requires
-    # SGLANG_MOE_GPU_RESIDENCY_UPDATE and SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1.
-    SGLANG_MOE_HOT_INSERT_ON_MISS = EnvBool(False)
+    # Decode boundaries serve misses out of residency instead of promoting host
+    # rows; see InsertOnMissStage. Requires SGLANG_MOE_GPU_RESIDENCY_UPDATE and
+    # SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1. The deprecated boolean
+    # SGLANG_MOE_HOT_INSERT_ON_MISS still selects stage 1 (SCRATCH), because the
+    # enum keeps that boolean's 0/1 values.
+    SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE = EnvIntWithAlias(
+        InsertOnMissStage.OFF, deprecated_name="SGLANG_MOE_HOT_INSERT_ON_MISS"
+    )
     # Per-token decay of the scores that pick insert-on-miss victims.
     SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
     # Serve graph-gather miss copies through the doorbell copier thread: the

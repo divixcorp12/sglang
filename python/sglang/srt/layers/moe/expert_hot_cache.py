@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.environ import InsertOnMissStage, envs
 from sglang.srt.layers.moe.async_telemetry import AsyncTelemetry, TorchTelemetryBackend
 from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
@@ -880,7 +880,7 @@ class ExpertHotCacheManager:
         doorbell_drain_polls: int = 0,
         doorbell_plan_capacity: int = 0,
         doorbell_fatal_wait_s: float = 30.0,
-        insert_on_miss: bool | None = None,
+        insert_on_miss: bool | int | None = None,
         insert_on_miss_decay: float | None = None,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
@@ -902,22 +902,29 @@ class ExpertHotCacheManager:
         instead of once per boundary, and ``promotion_sigmas`` adds that many
         standard deviations of count noise to the lead a promotion needs; see
         :class:`ExpertResidencyPolicy`.
-        ``insert_on_miss`` and ``insert_on_miss_decay`` default to
-        ``SGLANG_MOE_HOT_INSERT_ON_MISS`` and its decay; see
-        :class:`GpuResidencyUpdater`.
+        ``insert_on_miss`` is an :class:`InsertOnMissStage` and defaults with
+        ``insert_on_miss_decay`` to ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE`` and its
+        decay; see :class:`GpuResidencyUpdater`. Stage DIRECT reserves no
+        graph-gather scratch at all, because its gathers copy into victim slots.
         """
         if insert_on_miss is None:
-            insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS.get()
+            insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
+        insert_on_miss = int(insert_on_miss)
+        if insert_on_miss not in tuple(InsertOnMissStage):
+            raise ValueError(
+                f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE must be one of "
+                f"{[int(stage) for stage in InsertOnMissStage]}, not {insert_on_miss}"
+            )
         if insert_on_miss_decay is None:
             insert_on_miss_decay = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.get()
         if insert_on_miss:
             if not gpu_residency_update:
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS requires SGLANG_MOE_GPU_RESIDENCY_UPDATE"
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE requires SGLANG_MOE_GPU_RESIDENCY_UPDATE"
                 )
             if index(update_decode_forwards) != 1:
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS requires SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE requires SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"
                 )
             if not 0.0 < insert_on_miss_decay <= 1.0:
                 raise ValueError(
@@ -994,21 +1001,27 @@ class ExpertHotCacheManager:
         graph_gather_batch_size = index(graph_gather_batch_size)
         if graph_gather_batch_size < 0:
             raise ValueError("graph gather batch size cannot be negative")
-        scratch_rows = {}
+        gather_rows = {}
         for layer_id, streamer in streamers.items():
             top_k = getattr(streamer.layer, "top_k", None)
             if graph_gather_batch_size and top_k is None:
                 raise ValueError("graph gather needs each streamed layer's top_k")
-            scratch_rows[layer_id] = (
+            gather_rows[layer_id] = (
                 graph_gather_scratch_rows(
                     graph_gather_batch_size, top_k, graph_gather_max_rows
                 )
                 if graph_gather_batch_size
                 else 0
             )
+        # A DIRECT gather lands its misses in victim slots, so it needs the same route width
+        # but none of the rows: those rows go back to the budget as residency.
+        direct = insert_on_miss == InsertOnMissStage.DIRECT
+        scratch_rows = {
+            layer_id: 0 if direct else rows for layer_id, rows in gather_rows.items()
+        }
         selected = {layer_id: [] for layer_id in streamers}
         pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
-        allocated_layers = {layer_id for layer_id, rows in scratch_rows.items() if rows}
+        allocated_layers = {layer_id for layer_id, rows in gather_rows.items() if rows and not direct}
         remaining = budget_bytes - sum(
             rows * streamers[layer_id].bytes_per_expert
             for layer_id, rows in scratch_rows.items()
@@ -1035,7 +1048,7 @@ class ExpertHotCacheManager:
                 selected[layer_id].append(expert_id)
                 remaining -= slot_bytes + pull_row_bytes
                 allocated_layers.add(layer_id)
-        if not any(selected.values()) and not any(scratch_rows.values()):
+        if not any(selected.values()) and not any(gather_rows.values()):
             return None
         manager = cls()
         manager.streamers = streamers
@@ -1116,7 +1129,7 @@ class ExpertHotCacheManager:
         if manager.metrics_path is not None:
             atexit.register(manager.close_telemetry)
         for layer_id, expert_ids in selected.items():
-            if expert_ids or scratch_rows[layer_id]:
+            if expert_ids or gather_rows[layer_id]:
                 layer_streamer = streamers[layer_id]
                 layer_streamer.expert_copy_backend = copy_backend
                 cache = ExpertHotCache(
@@ -1139,9 +1152,11 @@ class ExpertHotCacheManager:
                     )
                     layer_streamer.residency_policy = policy
                     manager.residency_policies[layer_id] = policy
-        for layer_id, rows in scratch_rows.items():
+        for layer_id, rows in gather_rows.items():
             if rows:
-                streamers[layer_id].enable_graph_gather(rows)
+                streamers[layer_id].enable_graph_gather(
+                    rows, scratch_destinations=not direct
+                )
         manager._share_graph_counters()
         manager.gpu_residency = None
         if gpu_residency_update:
@@ -1152,7 +1167,7 @@ class ExpertHotCacheManager:
             manager.gpu_residency = GpuResidencyUpdater(
                 manager,
                 max_promotions=gpu_residency_max_promotions,
-                insert_on_miss=bool(insert_on_miss),
+                insert_on_miss=int(insert_on_miss),
                 insert_on_miss_decay=float(insert_on_miss_decay),
             )
         manager.doorbell = (
@@ -1174,6 +1189,10 @@ class ExpertHotCacheManager:
             "Expert hot cache startup %s",
             json.dumps(
                 {
+                    # The stage the process actually resolved, not the one a launcher meant to
+                    # ask for: a matrix verifies this line, so an intent/behaviour mismatch
+                    # (a retired alias, a typo) fails verification instead of a later number.
+                    "insert_on_miss_stage": InsertOnMissStage(insert_on_miss).name,
                     "requested_bytes": budget_bytes,
                     "residency_bytes": manager.residency_bytes,
                     "allocation_bytes": manager.allocation_bytes,
