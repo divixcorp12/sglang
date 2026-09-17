@@ -1181,6 +1181,7 @@ class HotCacheStartupTests(unittest.TestCase):
                 runner.model = torch.nn.Module()
                 runner.model_config = object()
                 runner.ps = SimpleNamespace(moe_ep_size=1, moe_ep_rank=0)
+                runner.is_draft_worker = False
                 events = []
                 for name in (
                     "init_memory_saver_adapter",
