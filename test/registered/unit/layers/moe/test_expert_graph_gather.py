@@ -1,6 +1,8 @@
 """Sync-free expert gather: CUDA-graph replays match source rows for any routes."""
 
 import os
+import subprocess
+import sys
 import time
 import unittest
 from types import SimpleNamespace
@@ -91,6 +93,25 @@ def _cache_rows(manager):
         for layer_id, cache in manager.caches.items()
         for name, tensor in cache.tensors.items()
     }
+
+
+_FRESH_PROCESS_ENV = "EXPERT_GRAPH_GATHER_FRESH_PROCESS"
+
+
+def _run_in_fresh_process(case, test_id):
+    """Run one test of this module by itself in a new interpreter and require it to pass."""
+    _, class_name, method = test_id.rsplit(".", 2)
+    child = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"{__file__}::{class_name}::{method}"],
+        env={**os.environ, _FRESH_PROCESS_ENV: "1"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    output = child.stdout[-6000:] + child.stderr[-2000:]
+    case.assertEqual(child.returncode, 0, output)
+    case.assertRegex(child.stdout, r"\b1 passed\b", output)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -662,7 +683,13 @@ class TestExpertGraphGather(unittest.TestCase):
 
         Red: asserting drain_timeouts == 0 and delivered == 1 here -- the properties this test
         carried before -- fails on every budget, which is what re-aimed it.
+
+        The stall holds only for the first gather-path drain in a process; later drains recover
+        the copy, so the body runs alone in a fresh interpreter whatever ran before it.
         """
+        if os.environ.get(_FRESH_PROCESS_ENV) != "1":
+            _run_in_fresh_process(self, self.id())
+            return
         model = _streamed_model((21,))
         budget_polls = 4_000_000
         manager = _manager(
@@ -1148,6 +1175,8 @@ class TestExpertGraphGather(unittest.TestCase):
         resident = sorted(manager.caches[0].resident_experts())
         missing = [e for e in range(EXPERTS) if e not in resident]
         try:
+            # The manager primes the copier with one request consumed as skipped_abandoned.
+            primed = copier.stats()
             copier.pause()
             ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
             compact, tensors = streamer.gather(ids)
@@ -1163,7 +1192,7 @@ class TestExpertGraphGather(unittest.TestCase):
             torch.cuda.synchronize()
             self._assert_rows(layer, ids, compact, tensors)
             recovered = copier.stats()
-            self.assertEqual(recovered["skipped_abandoned"], 1)
+            self.assertEqual(recovered["skipped_abandoned"] - primed["skipped_abandoned"], 1)
             self.assertEqual(recovered["late_completions"], 0)
         finally:
             copier.stop()

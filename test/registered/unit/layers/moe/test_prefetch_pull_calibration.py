@@ -296,12 +296,14 @@ def test_runtime_close_final_flushes_short_profiling_run_once():
     runtime._log_interval = 100
     runtime.capture = None
     runtime.prefetch = None
+    runtime._telemetry = mock.Mock()
     runtime.store = type("Store", (), {"after_write": None})()
     runtime._taps = type("Taps", (), {"remove": lambda self: None})()
     runtime._pre_mixer_removers = []
     with mock.patch.object(runtime, "_append_metrics") as flush:
         runtime.close()
     flush.assert_called_once_with()
+    runtime._telemetry.close.assert_called_once_with()
 
     runtime.forwards = 100
     with mock.patch.object(runtime, "_append_metrics") as flush:
@@ -313,6 +315,7 @@ def test_runtime_close_writes_empty_profiling_artifact_without_metrics():
     from sglang.srt.layers.moe.expert_prediction.runtime import ExpertPredictionRuntime
     runtime = object.__new__(ExpertPredictionRuntime)
     runtime._metrics_path = None; runtime.forwards = 0; runtime._log_interval = 100
+    runtime._telemetry = None
     runtime.capture = None; runtime.store = type("Store", (), {"after_write": None})()
     runtime._taps = type("Taps", (), {"remove": lambda self: None})(); runtime._pre_mixer_removers = []
     runtime.prefetch = mock.Mock()
