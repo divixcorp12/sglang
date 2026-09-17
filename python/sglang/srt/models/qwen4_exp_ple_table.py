@@ -581,8 +581,9 @@ class PleFileRowBatchStager:
 
         The pinned row buffer is reused every step while the previous step's
         non-blocking upload may still be queued. The blocking device-to-host
-        id copy synchronizes the stream before the rows are overwritten, so it
-        must stay blocking.
+        id copy synchronizes the stream before the rows are overwritten, and
+        under the overlap scheduler it is what waits for the previous forward's
+        sampled token, so it must stay blocking.
         """
         if len(input_ids) != len(self._row_bytes):
             raise ValueError("batched PLE staging needs one id tensor per table")

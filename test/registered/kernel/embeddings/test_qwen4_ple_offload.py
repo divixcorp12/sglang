@@ -635,6 +635,50 @@ def test_qwen4_model_stages_every_ple_layer_with_one_native_read(monkeypatch, tm
             assert torch.equal(captured(layer).view(torch.uint8), rows.view(torch.uint8))
 
 
+def test_qwen4_replay_staging_waits_for_ids_pending_on_the_forward_stream(
+    monkeypatch, tmp_path
+):
+    """Under the overlap scheduler a replay's decode ids are still being written by the
+    previous forward when staging starts; the staged rows must be the final ids' rows."""
+    heads, graph = 2, 3
+    vocab = (0, 5000)
+    layer, table = _uring_file_layer(
+        monkeypatch, tmp_path, "bf16", torch.bfloat16, 80, vocab, heads=heads, graph=graph
+    )
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.layers = [SimpleNamespace(ple=None), SimpleNamespace(ple=layer)]
+    model._start_layer, model._end_layer = 0, len(model.layers)
+    model.has_ple = True
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 9
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "_prepare_ple_batch",
+        lambda *_a, **_k: SimpleNamespace(physical_tokens=1),
+    )
+    forward_batch = SimpleNamespace(input_ids="ids")
+    forward_stream = torch.cuda.Stream()
+    final = torch.tensor([[4001, 4002]], dtype=torch.int64, device="cuda")
+    with torch.cuda.stream(forward_stream):
+        layer.lookup = torch.tensor([[11, 12]], dtype=torch.int64, device="cuda")
+        model.prepare_decode_graph_replay(forward_batch, graph_tokens=graph)
+        pending = torch.zeros_like(final)
+        # The previous forward is still running when the next batch is staged.
+        torch.cuda._sleep(200_000_000)
+        pending.copy_(final)
+        layer.lookup = pending
+        model.prepare_decode_graph_replay(forward_batch, graph_tokens=graph)
+    torch.cuda.synchronize()
+
+    byte_rows = table.view(torch.uint8).view(table.shape[0], -1)
+    expected = torch.zeros_like(layer._graph_prefetch_buffers[graph])
+    expected[:1] = (
+        byte_rows[final.reshape(-1).cpu()].to("cuda").view(table.dtype).reshape(1, -1)
+    )
+    staged = layer._graph_prefetch_buffers[graph]
+    assert torch.equal(staged.view(torch.uint8), expected.view(torch.uint8))
+
 if __name__ == "__main__":
     import sys
 
