@@ -255,6 +255,20 @@ class GpuResidencyUpdater:
         rather than allowed to truncate.
         """
         width = self.miss_rows
+        for layer_id, streamer in zip(self.layer_ids, self.streamers):
+            # Without a host-source tensor the merged segment table would carry this layer's
+            # full expert rows, and the segment kernel reads its count on the device, so it
+            # cannot size its grid to them: measured ~0.054 ms/row against ~0.007 for the
+            # index copy it replaces. That trade is only free because the rows it actually
+            # takes over here are the per-expert scalars (8 B/row in production), while the
+            # megabyte rows were already on this kernel. A layer with nothing on the host has
+            # nothing to stream and no reason to insert on miss, so refuse rather than
+            # silently move its rows onto the slower path.
+            if not streamer._graph_host_pair_count:
+                raise ValueError(
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
+                    f"layer {layer_id} keeps every streamed tensor on the device"
+                )
         for layer_id, cache in zip(self.layer_ids, self.caches):
             if cache.capacity < 2 * width:
                 raise ValueError(

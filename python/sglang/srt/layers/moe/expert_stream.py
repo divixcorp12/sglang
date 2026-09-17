@@ -645,6 +645,9 @@ class ExpertStreamer:
         self._graph_row_segments = (
             expert_row_segments(segment_pairs) if segment_pairs else None
         )
+        # Stage 2 merges the device pairs into the segment table, so the table's existence no
+        # longer says whether anything is host-backed. Record that separately.
+        self._graph_host_pair_count = len(host_pairs)
         self._graph_scratch_slots = (
             torch.arange(
                 cache.capacity, cache.capacity + max_rows, dtype=torch.long, device=device

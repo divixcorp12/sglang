@@ -1002,6 +1002,22 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertGreater(direct_slots, scratch_slots)
         self.assertEqual(direct_slots - scratch_slots, LAYERS * TOP_K)
 
+    def test_a_layer_with_nothing_on_the_host_is_refused(self):
+        """Stage 2 folds the device-source tensors into the segment kernel, which reads its row
+        count on the device and so cannot size its grid to them -- measured ~0.054 ms/row against
+        ~0.007 for the index copy it replaces (see `_init_insert_on_miss`). That is free only
+        because the rows it takes over are the per-expert scalars, 8 B/row in production, while the
+        megabyte rows were already on that kernel. A layer holding every tensor on the device would
+        put its full rows on the slower path instead, so refuse it."""
+        model = _model()
+        for layer_id in range(LAYERS):
+            layer = model.get_submodule(str(layer_id))
+            for name in NVFP4_STREAM_TENSORS[:4]:
+                setattr(layer, name, getattr(layer, name).cuda())
+            layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        with self.assertRaisesRegex(ValueError, "host-source expert tensors"):
+            _manager(model, gpu=True, **DIRECT)
+
     def test_a_layer_too_small_to_guarantee_a_victim_is_refused(self):
         """Below twice the gather width a forward could route every shortlist entry, and with no
         scratch row left there would be nowhere safe for that miss to land. Refuse, never truncate."""
