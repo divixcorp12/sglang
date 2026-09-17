@@ -1871,14 +1871,14 @@ class ExpertHotCacheManager:
                     "gpu_residency:truncated_layers": updater.truncated,
                 }
             )
-            if updater.insert_on_miss:
-                sources.update(
-                    {
-                        "gpu_residency:insertions": updater.insertions,
-                        "gpu_residency:insertion_evictions": updater.insertion_evictions,
-                        "gpu_residency:insertion_truncated": updater.insertion_truncated,
-                    }
-                )
+            # Through the same accessor snapshot() uses: this is the path that fills
+            # hot-cache.metrics.jsonl, and the stages hold these counters in different tensors.
+            sources.update(
+                {
+                    f"gpu_residency:{name}": counter
+                    for name, counter in updater.insertion_counters().items()
+                }
+            )
         return sources
 
     def _trace_metadata(

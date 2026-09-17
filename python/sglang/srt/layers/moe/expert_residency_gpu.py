@@ -403,16 +403,34 @@ class GpuResidencyUpdater:
             "boundary_updates": self.boundary_updates.cpu().tolist(),
             "truncated_layers": self.truncated.cpu().tolist(),
         }
-        if self.insert_on_miss:
-            insertions, evictions = self.insertions, self.insertion_evictions
-            if self.insert_direct:
-                # DIRECT inserts in the gathers, so its counters live there; the trace keeps
-                # the same key names, as they count the same event.
-                insertions, evictions = self.gather_insertions, self.gather_evictions
-            snapshot["insertions"] = insertions.cpu().tolist()
-            snapshot["insertion_evictions"] = evictions.cpu().tolist()
-            snapshot["insertion_truncated"] = self.insertion_truncated.cpu().tolist()
+        for name, counter in self.insertion_counters().items():
+            snapshot[name] = counter.cpu().tolist()
         return snapshot
+
+    def insertion_counters(self) -> dict[str, torch.Tensor]:
+        """The active stage's insertion counters, keyed by the name both readers publish them under.
+
+        One accessor for the metrics trace and for :meth:`snapshot`, because
+        they count the same events and the stages keep them in different
+        tensors: SCRATCH increments at the boundary, DIRECT in the gathers. A
+        second copy of that choice is a counter that silently reads zero on
+        whichever path nobody updated -- and a Stage 2 arm reporting zero
+        insertions reads as the feature being off rather than as a bug.
+
+        ``insertion_truncated`` stays a shared tripwire. DIRECT refuses at
+        startup every configuration that could truncate, so its staying zero is
+        the invariant, not an absence of instrumentation.
+        """
+        if not self.insert_on_miss:
+            return {}
+        insertions, evictions = self.insertions, self.insertion_evictions
+        if self.insert_direct:
+            insertions, evictions = self.gather_insertions, self.gather_evictions
+        return {
+            "insertions": insertions,
+            "insertion_evictions": evictions,
+            "insertion_truncated": self.insertion_truncated,
+        }
 
     def _decode_boundary_reached(self) -> torch.Tensor:
         if self.update_decode_forwards < 1:

@@ -1191,6 +1191,47 @@ class TestInsertOnMissDirect(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertGreater(sum(manager.gpu_residency.snapshot()["insertions"]), 0)
 
+    def test_the_metrics_trace_and_the_snapshot_report_the_same_insertions(self):
+        """`_trace_sources` fills hot-cache.metrics.jsonl; `snapshot()` has no caller in the serving
+        tree. So every test here can pass while a real arm's metrics report insertions = 0, which
+        reads as the feature being off rather than as a bug.
+
+        Both stages, because the durable failure is someone moving a counter for one stage and
+        updating only one of the two readers. Pinning them to the same tensor object is what makes
+        that impossible rather than merely currently-true.
+        """
+        for stage, options in ((1, IOM), (2, DIRECT)):
+            with self.subTest(stage=stage):
+                model = _model()
+                manager = _manager(model, gpu=True, **options)
+                updater = manager.gpu_residency
+                graph, static, outputs = self.capture(manager)
+                generator = random.Random(20 + stage)
+                for step in range(6):
+                    self.step(manager, graph, static, outputs, _random_routes(generator), f"s{step}")
+
+                sources = manager._trace_sources()
+                snapshot = updater.snapshot()
+                for name in ("insertions", "insertion_evictions", "insertion_truncated"):
+                    published = sources[f"gpu_residency:{name}"]
+                    self.assertIs(
+                        published,
+                        updater.insertion_counters()[name],
+                        f"stage {stage}: the trace publishes a different tensor than snapshot reads",
+                    )
+                    self.assertEqual(published.cpu().tolist(), snapshot[name], f"stage {stage} {name}")
+                self.assertGreater(
+                    sum(snapshot["insertions"]), 0, f"stage {stage} inserted nothing to report"
+                )
+                self.assertGreater(sum(sources["gpu_residency:insertions"].cpu().tolist()), 0)
+                # The per-layer decode counters are folded from the same device values.
+                decode = manager.snapshot_counters()["decode"]
+                self.assertEqual(
+                    sum(decode[str(row)]["insertions"] for row in range(LAYERS)),
+                    sum(snapshot["insertions"]),
+                    f"stage {stage}: per-layer counters disagree with the snapshot",
+                )
+
     def test_stage_one_is_unchanged_by_stage_two_existing(self):
         """Stage 1 must stay byte-identical as the fallback: it keeps its scratch rows, its
         device-pair index copy and its boundary insertion path."""
