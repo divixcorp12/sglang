@@ -31,6 +31,7 @@ class PrefetchCandidateBank:
         # index a sentinel. This tensor is the separate, graph-stable contract for
         # whether each fallback is actually an offer.
         self.valid = torch.zeros((len(self._rows), width), dtype=torch.bool, device=device)
+        self._top1_count: torch.Tensor | None = None
 
     def write(
         self,
@@ -66,6 +67,30 @@ class PrefetchCandidateBank:
         self.ids[row].copy_(top)
         self.scores[row].copy_(summed.index_select(0, top))
         self.valid[row].copy_((~excluded).index_select(0, top))
+
+    def write_top1(self, target_layer: int, expert_scores: torch.Tensor, *, expert_to_slot: torch.Tensor) -> bool:
+        """Rewrite one target's first candidate with the JIT eligible top-1 selector.
+
+        Only for a bank nobody reads beyond ``valid`` and the first id: a no-offer row
+        holds id ``-1`` (not an in-range fallback) and ``scores`` is not written. The
+        selected id and validity equal :meth:`write`'s first row. Unsupported inputs
+        fall back to :meth:`write`. Returns whether the JIT kernel ran.
+        """
+        from sglang.kernels.ops.moe.expert_prefetch_top1 import (
+            select_prefetch_top1_cuda,
+            supports_prefetch_top1_cuda,
+        )
+
+        if not supports_prefetch_top1_cuda(expert_scores, expert_to_slot):
+            self.write(target_layer, expert_scores, expert_to_slot=expert_to_slot)
+            return False
+        if self._top1_count is None:
+            self._top1_count = torch.zeros((len(self._rows), 1), dtype=torch.int32, device=self.ids.device)
+        row = self._rows[target_layer]
+        select_prefetch_top1_cuda(
+            expert_scores, expert_to_slot, self.ids[row, :1], self.valid[row, :1], self._top1_count[row]
+        )
+        return True
 
     def ids_for(self, target_layer: int) -> torch.Tensor:
         return self.ids[self._rows[target_layer]]

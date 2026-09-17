@@ -182,6 +182,7 @@ class PrefetchPuller:
         # replays. Keep the cache object and read its live map when posting.
         self._hot_caches = dict(hot_caches)
         self._fused_top1 = fused_top1
+        self._pull_always = pull_mode == "always"
         self._counter_layers = tuple(sorted(layer_ids))
         self._counter_rows = {layer_id: row for row, layer_id in enumerate(self._counter_layers)}
         # A single contiguous bank makes every periodic delivery snapshot one
@@ -268,6 +269,12 @@ class PrefetchPuller:
                 self._selected_valid[target_layer],
                 plan.count,
             )
+            if not self._pull_always:
+                # count_zero: keep the selector's work but publish the reference
+                # post_target plan for should_post=False (no offer, no payload).
+                plan.expert_ids.fill_(-1)
+                plan.count.zero_()
+                self._selected_valid[target_layer].zero_()
             self._pipeline.post_target(target)
             return True
         self.bank.write(target_layer, scores, expert_to_slot=expert_to_slot)
@@ -474,13 +481,11 @@ class PrefetchScoring:
                        for target, c in checkpoints.items()}
             source_of = {target: target for target in checkpoints}
             next_target = {}
-        # A real serving pull consumes exactly one candidate. Observability
-        # consumers need the reference top-W ordering, so only collapse the
-        # bank when shadow recall, calibration, and count-zero diagnostics are
-        # all absent.
-        serving_top1 = (
-            fused_top1 and pull_mode == "always" and not shadow_recall and not calibration
-        )
+        # A pull (real or count-zero) consumes exactly one candidate, and with the
+        # pull off nothing reads the bank at all. Observability consumers need the
+        # reference top-W ordering, so only collapse the bank when shadow recall
+        # and calibration are both absent.
+        serving_top1 = fused_top1 and not shadow_recall and not calibration
         bank = PrefetchCandidateBank(
             layer_ids=list(checkpoints),
             width=1 if serving_top1 else width,
@@ -529,6 +534,7 @@ class PrefetchScoring:
             calibration=histogram,
             calibration_file=calibration_file,
             calibration_provenance=calibration_provenance,
+            serving_top1=serving_top1,
         )
         store.after_write = scoring._on_write
         logger.info("MoE expert prefetch scoring: predictor=%s targets=%d width=%d bank_width=%d serving_top1=%s budget=%d state_bytes=%d pull_mode=%s shadow_recall=%s calibration=%s",
@@ -536,7 +542,7 @@ class PrefetchScoring:
                     scoring.state_nbytes, pull_mode, shadow_recall, calibration)
         return scoring
 
-    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None, calibration=None, calibration_file=None, calibration_provenance="") -> None:
+    def __init__(self, *, predictor, scorers, source_of, next_target, store, hot_caches, bank, recall, puller=None, calibration=None, calibration_file=None, calibration_provenance="", serving_top1=False) -> None:
         self.predictor = predictor
         self.targets = sorted(scorers)
         # Source layer -> target layer for a next-layer predictor; empty for same-layer predictors.
@@ -548,7 +554,7 @@ class PrefetchScoring:
         self.bank = bank
         self.recall = recall
         self.puller = puller
-        self._serving_top1 = bool(puller is not None and puller._fused_top1)
+        self._serving_top1 = bool(serving_top1)
         self.calibration = calibration
         self._calibration_file = calibration_file
         self._calibration_provenance = calibration_provenance
@@ -583,11 +589,15 @@ class PrefetchScoring:
                 )
             else:
                 scores = self._scorers[target](self._store.view(layer_id, RouteFeature.PRE_MIXER, rows))
-        if self._serving_top1 and self.puller is not None:
-            # The real CUDA kernel writes the pull plan directly.  This branch
-            # is selected only when no reference-bank consumer exists; on an
-            # unsupported shape/dtype the puller executes the exact fallback.
-            self.puller.select_and_post_target(target, scores)
+        if self._serving_top1:
+            # The real CUDA kernel writes the pull plan (or, with the pull off,
+            # the unread bank row) directly. This branch is selected only when no
+            # reference-bank consumer exists; on an unsupported shape/dtype both
+            # paths execute the exact reference fallback.
+            if self.puller is not None:
+                self.puller.select_and_post_target(target, scores)
+            else:
+                self.bank.write_top1(target, scores, expert_to_slot=self._hot_caches[target].expert_to_slot)
             return
         # Passing expert_to_slot here (rather than the prior zero-arg call) is the seam
         # documented on BudgetRecall: bank.write now excludes residency before truncating
