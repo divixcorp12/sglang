@@ -414,6 +414,11 @@ class Envs:
     )
     # Per-token decay of the scores that pick insert-on-miss victims.
     SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY = EnvFloat(0.98)
+    # Run stage 1's boundary insert copies through the fused masked Triton
+    # kernel instead of index_select + index_copy_. Byte-identical output; one
+    # pass instead of two, and idle lanes move no bytes. Off by default until a
+    # serving arm accepts it, so the measured stage-1 config stays reproducible.
+    SGLANG_MOE_HOT_FUSED_INSERT = EnvBool(False)
     # Serve graph-gather miss copies through the doorbell copier thread: the
     # gather posts its miss plan and waits in-graph, falling back to the
     # in-graph copy on timeout. Requires SGLANG_MOE_EXPERT_GRAPH_GATHER.

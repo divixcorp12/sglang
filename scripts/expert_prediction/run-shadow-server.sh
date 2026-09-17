@@ -7,6 +7,8 @@
 # HOT_INSERT_ON_MISS=1 selects insert-on-miss residency (decode boundary every forward), HOT_INSERT_ON_MISS_DECAY its decay.
 # HOT_INSERT_ON_MISS_STAGE=0|1|2 selects the stage instead (2 = miss copies land directly in victim slots) and
 # exports SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE; without it the retired boolean is exported unchanged.
+# HOT_FUSED_INSERT=1 runs stage 1's boundary insert copies through the fused masked kernel; it exports
+# SGLANG_MOE_HOT_FUSED_INSERT only when set, so an existing arm's exact-match environment check is unchanged.
 # RUN_KIND=trace with a PREFETCH_TRACE_COMMAND starting with sudo relays the environment via trace-env-relay.sh.
 set -euo pipefail
 
@@ -50,6 +52,14 @@ if ! [[ "$insert_on_miss_decay" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]]; then
     exit 2
 fi
 hot_update_decode_forwards=$([ "$insert_on_miss" != 0 ] && echo 1 || echo 4)
+# Unset exports nothing at all, so every arm recorded before this flag existed keeps the exact
+# environment it recorded; only an arm that asks for the fused kernel carries the variable.
+fused_insert=${HOT_FUSED_INSERT:-0}
+case "${fused_insert,,}" in
+    1|true|yes|y) fused_insert=1; fused_insert_env=(SGLANG_MOE_HOT_FUSED_INSERT=1) ;;
+    0|false|no|n) fused_insert=0; fused_insert_env=() ;;
+    *) echo "HOT_FUSED_INSERT must be a boolean" >&2; exit 2 ;;
+esac
 case "$run_kind" in timed|profiling|trace) ;; *) echo "RUN_KIND must be timed, profiling, or trace" >&2; exit 2 ;; esac
 case "$prefetch_pull_mode" in off|count_zero|always) ;; *) echo "PREFETCH_PULL_MODE is invalid" >&2; exit 2 ;; esac
 case "${calibration,,}" in
@@ -146,7 +156,7 @@ shape_provenance='{"batch_size":1,"top_k":10,"top_k_unique":true,"cuda_graph_dec
 
 write_provenance() {
     calibration_provenance=$(printf '{"commit":"%s","predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","cache_size":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"bin_count":256,"bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255"}' "$commit" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$hot_gpu_mb" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance")
-    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s,"insert_on_miss":%s,"insert_on_miss_decay":%s,"hot_update_decode_forwards":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","trace":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json"%s,"startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$insert_on_miss" "$insert_on_miss_decay" "$hot_update_decode_forwards" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$trace_config" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$trace_paths" "$log" > "$run_dir/run-manifest.json"
+    printf '{"arm":"%s","pass_id":"%s","commit":"%s","flags":{"fused_plan":1,"pull_mode":"%s","shadow_recall":%s,"calibration":%s,"candidates":%s,"budget":%s,"insert_on_miss":%s,"insert_on_miss_decay":%s,"fused_insert":%s,"hot_update_decode_forwards":%s},"cache_size":%s,"predictor":"%s","checkpoint_dir":"%s","checkpoint_checksum":"%s","run_kind":"%s","trace":%s,"session_ids":%s,"session_set_checksum":"%s","model_shapes":"%s","shape_provenance":%s,"batch_size":1,"top_k":10,"top_k_unique":true,"calibration_provenance":{"enabled":%s,"bin_count":256,"range":"[0,1]","bin_edges":"uniform [0,1], lower-inclusive; 1.0 is in bin 255","batch_size":1,"top_k":10,"top_k_unique":true,"shape_provenance":%s},"paths":{"results":"%s/results.jsonl","prediction_metrics":"%s/expert-prediction.metrics.jsonl","hot_cache_metrics":"%s/hot-cache.metrics.jsonl","calibration":"%s/pull-calibration.json"%s,"startup_log":"%s"}}\n' "$arm" "$pass_id" "$commit" "$prefetch_pull_mode" "$shadow_recall" "$calibration" "$prefetch_candidates" "$prefetch_budget" "$insert_on_miss" "$insert_on_miss_decay" "$fused_insert" "$hot_update_decode_forwards" "$hot_gpu_mb" "${predictor:-empty}" "$prefetch_model_dir" "$checkpoint_checksum" "$run_kind" "$trace_config" "$session_ids_json" "$session_set_checksum" "$model_shapes" "$shape_provenance" "$calibration" "$shape_provenance" "$run_dir" "$run_dir" "$run_dir" "$run_dir" "$trace_paths" "$log" > "$run_dir/run-manifest.json"
 }
 
 if [ "$provenance_only" = 1 ]; then
@@ -173,7 +183,7 @@ fi
 ln -sfn "$run_dir" "$work/cc-expert-prediction/servers/$name/latest"
 cd "$worktree"
 {
-    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} pull_mode=$prefetch_pull_mode shadow_recall=$shadow_recall calibration=$calibration run_kind=$run_kind fused_plan=1 candidates=$prefetch_candidates budget=$prefetch_budget insert_on_miss=$insert_on_miss insert_on_miss_decay=$insert_on_miss_decay hot_update_decode_forwards=$hot_update_decode_forwards output=$run_dir: $(date --iso-8601=seconds)"
+    echo "cc-expert-prediction server $name port=$port predictors=${predictors:-off} radix=$([ "$radix" = radix ] && echo on || echo off) hot_gpu_mb=$hot_gpu_mb capture_dir=${capture_dir:-none} predictor=${predictor:-off} pull_mode=$prefetch_pull_mode shadow_recall=$shadow_recall calibration=$calibration run_kind=$run_kind fused_plan=1 candidates=$prefetch_candidates budget=$prefetch_budget insert_on_miss=$insert_on_miss insert_on_miss_decay=$insert_on_miss_decay fused_insert=$fused_insert hot_update_decode_forwards=$hot_update_decode_forwards output=$run_dir: $(date --iso-8601=seconds)"
     if [ "$run_kind" = trace ]; then
         echo "trace diagnostic-only wrapper=$trace_command report_path=$trace_report_path; wrapper uses simple whitespace-separated argv tokens only (shell quotes, backslashes, and embedded-whitespace arguments are unsupported)"
     fi
@@ -204,6 +214,7 @@ exec flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock "${launch_env[@]
     SGLANG_MOE_HOT_DYNAMIC=1 \
     SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS="$hot_update_decode_forwards" \
     "$insert_on_miss_var"="$insert_on_miss" \
+    ${fused_insert_env[@]+"${fused_insert_env[@]}"} \
     SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY="$insert_on_miss_decay" \
     SGLANG_MOE_HOT_DECAY_TOKENS=1 \
     SGLANG_MOE_HOT_PROMOTION_SIGMAS=0 \

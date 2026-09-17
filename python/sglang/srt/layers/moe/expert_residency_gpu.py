@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
 from sglang.srt.layers.moe.expert_residency import (
     decide_residency_on_device,
     residency_rank_keys,
@@ -68,6 +69,7 @@ class GpuResidencyUpdater:
         decay_table_tokens: int = 1 << 14,
         insert_on_miss: bool | int = False,
         insert_on_miss_decay: float = 0.98,
+        fused_insert: bool = False,
     ) -> None:
         layer_ids = [
             layer_id
@@ -161,8 +163,10 @@ class GpuResidencyUpdater:
         self.insert_on_miss = self.insert_stage != _STAGE_OFF
         self.insert_direct = self.insert_stage == _STAGE_DIRECT
         self.insert_on_miss_decay = float(insert_on_miss_decay)
+        self.fused_insert = bool(fused_insert)
         self.insert_scores = None
         self.insert_tensors = None
+        self.insert_active = None
         self.victims = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
@@ -228,12 +232,34 @@ class GpuResidencyUpdater:
             self._init_insert_direct()
             return
         # Scratch rows and slots of every tensor, host-backed or not, live in the cache's own tensors.
-        # Byte-row views: a fixed-shape index copy measured ~0.007 ms/row D2D on the RTX 5090,
-        # against ~0.054 ms/row for copy_expert_row_segments_gpu with a device count.
+        #
+        # Byte-row views, D2D on an RTX 5090. Two regimes, because this card has ~128 MB of L2
+        # and the answer depends on whether the rows are in it:
+        #
+        #   cached      ~0.007 ms/row index copy, ~0.054 for copy_expert_row_segments_gpu
+        #   production  ~0.0105 ms/row index copy, ~0.125 for the segment kernel,
+        #               ~0.0037 for the fused masked kernel below
+        #
+        # The cached pair is what `iom-cuda-tests.sh` reports: it copies 20 rows back and forth
+        # inside a single 221 MB tensor, so ~55 MB stays resident in L2 across every rep and
+        # nothing goes to HBM. Quote it only as a cached number. The production pair was measured
+        # over 48 separate layer tensors -- a 4.9 GiB working set with no L2 reuse between layers,
+        # which is the shape this loop actually runs in, 48 layers x 6 tensors per boundary.
+        #
+        # The design decision rests on the production regime, and the cached numbers understate
+        # the margin rather than inventing it: the index copy beats the segment kernel by 7.7x
+        # cached and by 11.9x on a real working set. What the cached numbers *do* hide is the
+        # absolute cost of this loop, by 1.5x, and the segment kernel's by 2.3x.
         self.insert_tensors = [
             tuple(tensor.view(torch.uint8).reshape(tensor.shape[0], -1) for tensor in cache.tensors.values())
             for cache in self.caches
         ]
+        if self.fused_insert:
+            # One active flag per lane, read on the device inside the kernel, so an idle lane
+            # moves no bytes while the launch shape stays fixed and no count reaches the host.
+            self.insert_active = torch.zeros(
+                (layers, self.miss_rows), dtype=torch.int32, device=device
+            )
 
     def _init_insert_direct(self) -> None:
         """Stage DIRECT: a victim shortlist per layer, and the guarantee that every miss finds one.
@@ -258,8 +284,10 @@ class GpuResidencyUpdater:
         for layer_id, streamer in zip(self.layer_ids, self.streamers):
             # Without a host-source tensor the merged segment table would carry this layer's
             # full expert rows, and the segment kernel reads its count on the device, so it
-            # cannot size its grid to them: measured ~0.054 ms/row against ~0.007 for the
-            # index copy it replaces. That trade is only free because the rows it actually
+            # cannot size its grid to them: ~0.125 ms/row against ~0.0105 for the index copy
+            # it replaces, on a production-shaped working set (see `_init_insert_on_miss` for
+            # both regimes; the cached 0.054/0.007 pair understates this gap). That trade is
+            # only free because the rows it actually
             # takes over here are the per-expert scalars (8 B/row in production), while the
             # megabyte rows were already on this kernel. A layer with nothing on the host has
             # nothing to stream and no reason to insert on miss, so refuse rather than
@@ -594,13 +622,23 @@ class GpuResidencyUpdater:
         self.slot_state[:, slot_dump] = _FREE
         self.slot_to_expert[:, slot_dump] = -1
         self.slot_generations[:, slot_dump] = 0
-        # Unused columns copy their own scratch row onto itself, so every column's destination is distinct.
+        # Unused columns copy their own scratch row onto itself, so every column's destination is
+        # distinct. The fused kernel skips them outright and does not need that, but both paths
+        # read the same two buffers and the self-copy keeps them meaningful either way.
         self.insert_sources.copy_(torch.where(insert, source_rows, self.scratch_columns))
         self.insert_destinations.copy_(torch.where(insert, targets, self.scratch_columns))
-        for row, tensors in enumerate(self.insert_tensors):
-            sources, destinations_row = self.insert_sources[row], self.insert_destinations[row]
-            for rows in tensors:
-                rows.index_copy_(0, destinations_row, rows.index_select(0, sources))
+        if self.fused_insert:
+            self.insert_active.copy_(insert)
+            for row, tensors in enumerate(self.insert_tensors):
+                sources, destinations_row = self.insert_sources[row], self.insert_destinations[row]
+                active = self.insert_active[row]
+                for rows in tensors:
+                    insert_expert_rows(rows, sources, destinations_row, active)
+        else:
+            for row, tensors in enumerate(self.insert_tensors):
+                sources, destinations_row = self.insert_sources[row], self.insert_destinations[row]
+                for rows in tensors:
+                    rows.index_copy_(0, destinations_row, rows.index_select(0, sources))
         self.insertions.add_(insert_counts)
         self.insertion_evictions.add_(evicted.sum(dim=1))
         self.insertion_truncated.add_((wanted_counts > insert_counts).to(torch.long))

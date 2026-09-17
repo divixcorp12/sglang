@@ -931,6 +931,156 @@ class TestInsertOnMiss(unittest.TestCase):
             reference.assert_matches(self, manager, "perturbed")
 
 
+FUSED = dict(IOM, fused_insert=True)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestFusedInsert(unittest.TestCase):
+    """SGLANG_MOE_HOT_FUSED_INSERT: the same boundary copy in one masked pass instead of two.
+
+    The claim being defended is that this is a cost change and nothing else, so
+    the tests compare it byte for byte against the ``index_copy_`` path it
+    replaces -- over the whole cache, not only the slots the boundary wrote,
+    because a kernel that also disturbed a scratch row or an unrelated slot
+    would satisfy the residency reference and still be wrong.
+    """
+
+    def _run(self, fused, steps=30, seed=3):
+        """Drive one manager through a fixed route sequence; return its bytes and state."""
+        model = _model()
+        options = dict(FUSED) if fused else dict(IOM)
+        manager = _manager(model, gpu=True, seed_scale=(1, 3, 9), **options)
+        static, outputs, forward = _gather_harness(manager)
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                forward()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+        manager.discard_graph_capture_routes()
+        generator = random.Random(seed)
+        for _ in range(steps):
+            routes = _random_routes(generator)
+            static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+            graph.replay()
+            torch.cuda.synchronize()
+            manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        return (
+            manager,
+            model,
+            [_cache_bytes(cache) for _, cache in sorted(manager.caches.items())],
+            device_state(manager),
+            manager.gpu_residency.snapshot(),
+        )
+
+    def test_the_fused_kernel_is_byte_identical_to_the_index_copy_path(self):
+        """Same routes, same seed, both paths: every byte of every cache tensor agrees, including
+        the scratch rows and the slots this run never inserted into, and so does every piece of
+        residency state and every insertion counter."""
+        eager_manager, eager_model, eager_bytes, eager_state, eager_counts = self._run(False)
+        fused_manager, _, fused_bytes, fused_state, fused_counts = self._run(True)
+        self.assertEqual(fused_state, eager_state)
+        self.assertEqual(fused_counts, eager_counts)
+        self.assertGreater(sum(eager_counts["insertions"]), 0, "the run must actually insert")
+        for row, (eager_rows, fused_rows) in enumerate(zip(eager_bytes, fused_bytes)):
+            self.assertEqual(sorted(fused_rows), sorted(eager_rows))
+            for name, expected in eager_rows.items():
+                self.assertTrue(
+                    torch.equal(fused_rows[name], expected),
+                    f"layer {row} {name} differs between the fused and index-copy paths",
+                )
+        assert_slot_rows(self, fused_manager, eager_model, "fused")
+
+    def test_the_fused_boundary_still_matches_the_host_reference(self):
+        """Byte-for-byte agreement with the other path would be worthless if both were wrong, so
+        the fused path is also checked against the independent host model of the boundary."""
+        model = _model()
+        manager = _manager(model, gpu=True, seed_scale=(1, 3, 9), **FUSED)
+        reference = _InsertOnMissReference(manager)
+        # Borrow stage 1's own capture/replay/assert loop verbatim, so the fused path is held to
+        # the same checks rather than a re-implementation of them that might drift.
+        harness = TestInsertOnMiss(methodName="test_an_unknown_stage_is_refused")
+        harness.model = model
+        graph, static, outputs = harness.capture(manager)
+        reference.assert_matches(self, manager, "after capture")
+        generator = random.Random(3)
+        for step in range(20):
+            harness.replay(
+                manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}"
+            )
+
+    def test_an_idle_lane_moves_no_bytes_and_a_masked_lane_is_not_read(self):
+        """The whole point of the mask is that traffic follows the insertion count while the launch
+        shape stays fixed. Drive the kernel directly with one active lane out of many and a
+        deliberately poisoned source for every inactive lane: a kernel that loaded an idle lane
+        would copy poison into a live slot."""
+        from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
+
+        lanes, slots, row_bytes = 6, 10, 777
+        rows = torch.randint(0, 256, (slots + lanes, row_bytes), dtype=torch.uint8, device="cuda")
+        before = rows.clone()
+        sources = torch.full((lanes,), slots, dtype=torch.int64, device="cuda")
+        sources[0] = slots + 1
+        destinations = torch.zeros(lanes, dtype=torch.int64, device="cuda")
+        destinations[0] = 4
+        active = torch.zeros(lanes, dtype=torch.int32, device="cuda")
+        active[0] = 1
+        insert_expert_rows(rows, sources, destinations, active)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(rows[4], before[slots + 1]), "the active lane must copy its row")
+        untouched = [row for row in range(slots + lanes) if row != 4]
+        self.assertTrue(
+            torch.equal(rows[untouched], before[untouched]),
+            "an inactive lane wrote a row it should never have read",
+        )
+
+    def test_the_flag_is_refused_where_it_would_measure_the_wrong_path(self):
+        """Stage 0 has no boundary copy loop and stage 2 lands its copies in the gather, so the flag
+        does nothing there. A silent no-op would let an arm report a fused number for an unfused
+        run, so both are refused rather than accepted."""
+        for stage in (0, 2):
+            with self.subTest(stage=stage):
+                with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_FUSED_INSERT"):
+                    _manager(
+                        _model(),
+                        gpu=True,
+                        update_decode_forwards=1,
+                        insert_on_miss=stage,
+                        fused_insert=True,
+                    )
+
+    def test_the_environment_switch_selects_the_kernel_and_defaults_off(self):
+        from sglang.srt.environ import envs
+
+        manager = _manager(_model(), gpu=True, **IOM)
+        self.assertFalse(manager.gpu_residency.fused_insert)
+        self.assertIsNone(manager.gpu_residency.insert_active)
+        with envs.SGLANG_MOE_HOT_FUSED_INSERT.override(True):
+            manager = _manager(_model(), gpu=True, **IOM)
+        self.assertTrue(manager.gpu_residency.fused_insert)
+        self.assertEqual(
+            manager.gpu_residency.insert_active.shape,
+            (LAYERS, manager.gpu_residency.miss_rows),
+        )
+
+    def test_a_malformed_plan_is_refused_instead_of_corrupting_a_row(self):
+        from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
+
+        rows = torch.zeros((8, 16), dtype=torch.uint8, device="cuda")
+        lane = torch.zeros(2, dtype=torch.int64, device="cuda")
+        active = torch.ones(2, dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "contiguous 2D row view"):
+            insert_expert_rows(rows.t(), lane, lane, active)
+        with self.assertRaisesRegex(ValueError, "same lanes"):
+            insert_expert_rows(rows, lane, lane[:1], active)
+        with self.assertRaisesRegex(TypeError, "integer tensor"):
+            insert_expert_rows(rows, lane, lane, active.to(torch.float32))
+        with self.assertRaisesRegex(ValueError, "same device"):
+            insert_expert_rows(rows, lane, lane, active.cpu())
+
+
 DIRECT = dict(update_decode_forwards=1, insert_on_miss=2, insert_on_miss_decay=IOM_DECAY)
 
 
@@ -1004,8 +1154,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
 
     def test_a_layer_with_nothing_on_the_host_is_refused(self):
         """Stage 2 folds the device-source tensors into the segment kernel, which reads its row
-        count on the device and so cannot size its grid to them -- measured ~0.054 ms/row against
-        ~0.007 for the index copy it replaces (see `_init_insert_on_miss`). That is free only
+        count on the device and so cannot size its grid to them -- ~0.125 ms/row against ~0.0105
+        for the index copy it replaces, on a production-shaped working set (see
+        `_init_insert_on_miss` for both regimes). That is free only
         because the rows it takes over are the per-expert scalars, 8 B/row in production, while the
         megabyte rows were already on that kernel. A layer holding every tensor on the device would
         put its full rows on the slower path instead, so refuse it."""

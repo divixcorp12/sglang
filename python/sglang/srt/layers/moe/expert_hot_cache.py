@@ -882,6 +882,7 @@ class ExpertHotCacheManager:
         doorbell_fatal_wait_s: float = 30.0,
         insert_on_miss: bool | int | None = None,
         insert_on_miss_decay: float | None = None,
+        fused_insert: bool | None = None,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -906,7 +907,13 @@ class ExpertHotCacheManager:
         ``insert_on_miss_decay`` to ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE`` and its
         decay; see :class:`GpuResidencyUpdater`. Stage DIRECT reserves no
         graph-gather scratch at all, because its gathers copy into victim slots.
+        ``fused_insert`` defaults to ``SGLANG_MOE_HOT_FUSED_INSERT`` and runs
+        stage SCRATCH's boundary copies through the fused masked kernel; it is
+        byte-identical to the index copy it replaces and only changes its cost.
         """
+        if fused_insert is None:
+            fused_insert = envs.SGLANG_MOE_HOT_FUSED_INSERT.get()
+        fused_insert = bool(fused_insert)
         if insert_on_miss is None:
             insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
         insert_on_miss = int(insert_on_miss)
@@ -930,6 +937,16 @@ class ExpertHotCacheManager:
                 raise ValueError(
                     "insert-on-miss decay (SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY) must be in (0, 1]"
                 )
+        if fused_insert and insert_on_miss != InsertOnMissStage.SCRATCH:
+            # The fused kernel replaces stage SCRATCH's boundary copy loop and nothing else:
+            # stage OFF has no such loop, and stage DIRECT lands its copies in the gather. A
+            # run that sets this flag anywhere else would report a fused arm having measured
+            # the unfused path, so refuse instead of accepting it as a no-op.
+            raise ValueError(
+                "SGLANG_MOE_HOT_FUSED_INSERT only applies to "
+                f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE={int(InsertOnMissStage.SCRATCH)} "
+                f"({InsertOnMissStage.SCRATCH.name}), not stage {insert_on_miss}"
+            )
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
@@ -1169,6 +1186,7 @@ class ExpertHotCacheManager:
                 max_promotions=gpu_residency_max_promotions,
                 insert_on_miss=int(insert_on_miss),
                 insert_on_miss_decay=float(insert_on_miss_decay),
+                fused_insert=fused_insert,
             )
         manager.doorbell = (
             manager._start_doorbell(
@@ -1193,6 +1211,7 @@ class ExpertHotCacheManager:
                     # ask for: a matrix verifies this line, so an intent/behaviour mismatch
                     # (a retired alias, a typo) fails verification instead of a later number.
                     "insert_on_miss_stage": InsertOnMissStage(insert_on_miss).name,
+                    "fused_insert": fused_insert,
                     "requested_bytes": budget_bytes,
                     "residency_bytes": manager.residency_bytes,
                     "allocation_bytes": manager.allocation_bytes,
