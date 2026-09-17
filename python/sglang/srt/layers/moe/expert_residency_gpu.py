@@ -157,7 +157,7 @@ class GpuResidencyUpdater:
         self.insert_on_miss = bool(insert_on_miss)
         self.insert_on_miss_decay = float(insert_on_miss_decay)
         self.insert_scores = None
-        self.insert_segments = None
+        self.insert_tensors = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -186,8 +186,6 @@ class GpuResidencyUpdater:
         )
 
     def _init_insert_on_miss(self) -> None:
-        from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
-
         if self.update_decode_forwards != 1:
             raise ValueError("insert-on-miss needs a residency boundary after every decode forward")
         if not 0.0 < self.insert_on_miss_decay <= 1.0:
@@ -210,15 +208,17 @@ class GpuResidencyUpdater:
         self.insert_decay_table = torch.tensor(values, dtype=torch.float32, device=device)
         # A layer's plan is fresh from its graph gather until a boundary inserts it.
         self.plans_fresh = torch.zeros(layers, dtype=torch.bool, device=device)
+        self.scratch_columns = self.capacity.unsqueeze(1) + self.miss_columns.unsqueeze(0)
         self.insert_sources = torch.zeros((layers, self.miss_rows), dtype=torch.int64, device=device)
-        self.insert_slots = torch.zeros((layers, self.miss_rows), dtype=torch.int32, device=device)
-        self.insert_counts = torch.zeros((layers, 1), dtype=torch.int32, device=device)
+        self.insert_destinations = torch.zeros_like(self.insert_sources)
         self.insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.insertion_evictions = torch.zeros(layers, dtype=torch.long, device=device)
         self.insertion_truncated = torch.zeros(layers, dtype=torch.long, device=device)
         # Scratch rows and slots of every tensor, host-backed or not, live in the cache's own tensors.
-        self.insert_segments = [
-            expert_row_segments([(tensor, tensor) for tensor in cache.tensors.values()])
+        # Byte-row views: a fixed-shape index copy measured ~0.007 ms/row D2D on the RTX 5090,
+        # against ~0.054 ms/row for copy_expert_row_segments_gpu with a device count.
+        self.insert_tensors = [
+            tuple(tensor.view(torch.uint8).reshape(tensor.shape[0], -1) for tensor in cache.tensors.values())
             for cache in self.caches
         ]
 
@@ -415,8 +415,6 @@ class GpuResidencyUpdater:
         residents with no route since the previous boundary, lowest
         ``(insert score, -expert)`` first; misses beyond them are not inserted.
         """
-        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
-
         experts, width, slot_dump = self.num_experts, self.miss_rows, self.max_capacity
         columns = self.miss_columns.unsqueeze(0)
         miss_ids = torch.stack([streamer._graph_source_rows[:width] for streamer in self.streamers])
@@ -462,13 +460,13 @@ class GpuResidencyUpdater:
         self.slot_state[:, slot_dump] = _FREE
         self.slot_to_expert[:, slot_dump] = -1
         self.slot_generations[:, slot_dump] = 0
-        self.insert_sources.copy_(torch.where(insert, source_rows, 0))
-        self.insert_slots.copy_(destinations)
-        self.insert_counts.copy_(insert_counts.unsqueeze(1))
-        for row, segments in enumerate(self.insert_segments):
-            copy_expert_row_segments_gpu(
-                segments, self.insert_sources[row], self.insert_slots[row], self.insert_counts[row]
-            )
+        # Unused columns copy their own scratch row onto itself, so every column's destination is distinct.
+        self.insert_sources.copy_(torch.where(insert, source_rows, self.scratch_columns))
+        self.insert_destinations.copy_(torch.where(insert, targets, self.scratch_columns))
+        for row, tensors in enumerate(self.insert_tensors):
+            sources, destinations_row = self.insert_sources[row], self.insert_destinations[row]
+            for rows in tensors:
+                rows.index_copy_(0, destinations_row, rows.index_select(0, sources))
         self.insertions.add_(insert_counts)
         self.insertion_evictions.add_(evicted.sum(dim=1))
         self.insertion_truncated.add_((wanted_counts > insert_counts).to(torch.long))

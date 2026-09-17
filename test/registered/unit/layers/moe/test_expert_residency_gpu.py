@@ -721,9 +721,9 @@ class TestInsertOnMiss(unittest.TestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assert_outputs(routes, outputs, context)
+        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
         reference.assert_matches(self, manager, context)
         assert_slot_rows(self, manager, self.model, context)
-        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
 
     def test_flag_off_builds_the_unchanged_updater(self):
         """Off (the default, or explicitly), the updater has no insertion state, counters or trace
@@ -736,7 +736,7 @@ class TestInsertOnMiss(unittest.TestCase):
                 manager = _manager(_model(), gpu=True, **options)
                 updater = manager.gpu_residency
                 self.assertFalse(updater.insert_on_miss)
-                self.assertIsNone(updater.insert_segments)
+                self.assertIsNone(updater.insert_tensors)
                 self.assertNotIn("insertions", updater.snapshot())
                 self.assertFalse(any("insertion" in name for name in manager._trace_sources()))
                 self.assertNotIn("insertions", manager.snapshot_counters()["decode"]["0"])
