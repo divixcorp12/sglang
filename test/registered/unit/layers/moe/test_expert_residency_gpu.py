@@ -931,8 +931,12 @@ class TestInsertOnMiss(unittest.TestCase):
         puller.post_target(0)
         forward([[[covered, missed]]] + others)
         self.assertEqual(puller.stats[0].snapshot()[0], 1, "the covered route was not served from the pull row")
+        self.assertEqual(
+            int(streamer.row_plan.count.item()), 1, "the covered route still took a demand scratch row"
+        )
         pull_bytes = {name: tensor[pull_row].clone() for name, tensor in cache.tensors.items()}
-        forward([[residents[:2]]] + others)
+        # The next forward's first gather applies that forward's boundary; a later forward would be
+        # free to evict the insertion again, which is ordinary victim churn, not this invariant.
         forward([[residents[:2]]] + others)
         self.assertGreaterEqual(int(cache.expert_to_slot[missed]), 0, "the demand miss was not inserted")
         self.assertEqual(int(cache.expert_to_slot[covered]), -1, "a pull-covered route was inserted")
