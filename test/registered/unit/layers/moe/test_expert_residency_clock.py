@@ -163,6 +163,8 @@ class TestResidencyBoundaryClock(unittest.TestCase):
 
     def test_manager_ignores_draft_forwards_before_touching_state(self):
         bare = ExpertHotCacheManager.__new__(ExpertHotCacheManager)
+        # Every manager polls its trace telemetry first; that is not residency state.
+        bare._trace_telemetry = {}
         counts = {"global_physical_count": object()}
         draft_prefill = _batch(ForwardMode.EXTEND, tokens=40, spec_info=_draft_input())
 
