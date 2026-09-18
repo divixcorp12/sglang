@@ -101,7 +101,7 @@ def test_lm_head_loads_via_vocab_parallel_embedding_create_weights_order():
     from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
     cfg = Exl3Config.from_config(HF_QUANT)
-    layer = ParallelLMHead(129280, 5120, quant_config=cfg)
+    layer = ParallelLMHead(129280, 5120, quant_config=cfg, enable_tp=False)
     assert layer.exl3_in == 5120
     assert layer.exl3_out_part == 129280
 
