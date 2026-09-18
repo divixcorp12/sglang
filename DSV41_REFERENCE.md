@@ -634,22 +634,42 @@ Then recompute the break-even. **DSpark ships only if measured α clears it** (�
 ## 11. Phases
 
 **Phase 0 — no GPU:**
-1. **Base branch.** Branch `dsv41` off the mainline (Stage B included) and merge
-   `upstream-scope/dsv4.1` into it (§6).
-2. Bit-exact Engram hash parity test (ids, not just vocab size) against `engram.py`.
-   Re-run the cache simulation with **exact LRU**, stated granularity, and separate
-   weight-row and scale-row hit rates. Keep the script in the repo.
-3. Diff our quant files against `dsv4.1`'s `fp8.py`/`fp8_utils.py`/`mxfp4*`.
-4. Read upstream's Engram `_HostTable`/gather and the DSpark worker/planner in full.
-   Check `dspark_layers_to_capture` and whether `_HostTable` can back a partial RAM tier.
-5. Build the per-expert aligned offset table from the EXL3 headers. **Define the EXL3
-   slot layout** (per-tensor padded offsets) and where padding happens (§9.2).
-6. **Earlier proxies for routing skew**, so `G`/`f` are not first seen in Phase 3: any
-   expert-load statistics in the tech report, and any routing data in the EXL3
-   calibration trace (`cal_trace_dsv41_flash_workload.json`, if obtainable). Treat
-   these as proxies only.
-7. Find the vLLM EXL3 implementation the card references.
-8. Agree a **go/no-go tok/s bar** (§12) before GPU phases start.
+1. **Base branch — done.** Branch `dsv41` off the mainline (Stage B included), merged
+   `upstream-scope/dsv4.1` into it (§6). Task 1: merge commit `c64b2bd653` (base
+   `85e8eddc54`), then the upstream-tip follow-up merge `9e5cc68bd8` (`a5b84f11e5`,
+   0 conflicts). **Open:** the GPU suite (Task 1 Step 8) is still pending, deferred
+   until a GPU window is approved (§6, "Result (2026-09-18, Task 1)").
+2. **Done — Task 5 / §5.** Bit-exact Engram hash parity test
+   (`test/manual/dsv41/test_engram_parity.py`) and the exact-LRU re-run
+   (`scripts/dsv41/engram_cache_sim.py`, unit-tested against a brute-force LRU) are
+   both in §5, with the stated granularity (1,500,000 tokens, 48 accesses/token) and
+   the RAM-budget table. Weight-row and scale-row hit rates were not separated (the
+   simulation tracks 264 B combined rows, §5's "logical" row); if that split matters
+   for Phase 3, re-run with the two counted independently.
+3. **Not done in this task.** No diff of our quant files against `dsv4.1`'s
+   `fp8.py`/`fp8_utils.py`/`mxfp4*` was run; §6 records what `dsv4.1` touches there
+   at a file level, not a line diff. Do this diff in Phase 1 alongside the sm_120
+   kernel-matrix walk.
+4. **Done — §14.2.** Upstream's Engram `_HostTable`/gather read in full; the gather
+   takes a row index, not a raw offset, so a slot map can sit in front of it, but the
+   allocation, addressing and miss semantics all need to change (§14.2).
+5. **Done — Task 3 landed the layout, this task fixed its default — §14.1.** The
+   per-expert aligned offset table is `Exl3ExpertLayout`
+   (`python/sglang/srt/layers/moe/exl3_expert_layout.py`); the slot layout is
+   `build_exl3_slot_layout` (`python/sglang/srt/layers/moe/exl3_slot_layout.py`),
+   whose default alignment this task changed from 128 B to 16 B (§14.1). Padding site
+   (NVMe→RAM host memcpy vs RAM→VRAM segment copy): §14.1(c) recommends the
+   RAM→VRAM segment copy.
+6. **Done — §14.5.** No per-expert load statistics or plots exist in the tech report;
+   the calibration trace is confirmed not obtainable (not in the downloaded files).
+   `G`/`f` remain unmeasured; Phase 1's truncated-model router statistics (§11 Phase 1)
+   are the next, still-partial proxy.
+7. **Done — §14.4.** No official or single canonical vLLM EXL3 implementation exists.
+   Record: issue and repos found, §14.4.
+8. **Still open (§12.1).** The go/no-go tok/s bar needs an owner decision; nothing in
+   this task's research resolves it.
+
+**Phase 1 plan: write next, from §14.**
 
 **GPU window items** (each needs crypto-c9 scheduling; a small-VRAM microbenchmark
 beside production perturbs production latency, so decide explicitly):
@@ -744,6 +764,232 @@ beside production perturbs production latency, so decide explicitly):
 
 ---
 
+## 14. Phase 0 findings
+
+Task 6. Worktree `dsv41-worktrees/dsv41` @ `03c1617238`, merged `upstream-scope/dsv4.1`
+tip `a5b84f11e5`; exllamav3 cloned `--depth 1` at research time (commit not pinned by
+upstream, MIT). Line numbers below are from that state; the brief's line numbers had
+drifted from a prior snapshot, so symbols were located by name.
+
+### 14.1 exllamav3 alignment requirements
+
+**(a) Minimum alignment.** `trellis` needs **16 bytes**; `suh`/`svh` need **8 bytes**.
+- The fused MoE kernel's B pointer (`trellis`) is `const uint16_t*`
+  (`EXL3_MOE_KERNEL_ARGS`, `exllamav3_ext/quant/exl3_moe_common.cuh:31-39`), threaded
+  through `moe_gemm_tile` (`exl3_moe_kernel.cuh:25-52`) into
+  `exl3_gemm_kernel_inner` (`exl3_gemm_inner.cuh:26-27`, parameter `B`). There, the B
+  tile is cast `(const int4*) gl_b_ptr` and copied with `cp_async`
+  (`exl3_gemm_inner.cuh:264-267`), which lowers to `cp.async.cg.shared.global` with a
+  hard-coded 16-byte transfer size (`ptx.cuh:159-168`, `cp_async`: `const int bytes =
+  16`). `cp.async.cg` requires both its global and shared addresses to be 16-byte
+  aligned (CUDA `cp.async` semantics); nothing in the kernel checks or corrects for
+  misalignment, so an unaligned trellis pointer is undefined behavior, not a slow
+  path.
+- `suh`/`svh` are `const half*` arrays (`exl3_moe_common.cuh:33,35,37`) offset in
+  128-element (256 B) strides (`exl3_moe_kernel.cuh:143,150,212-214,260-271`;
+  `exl3_gemm_kernel.cuh:25,66,74,163,202,276,284`) and loaded as `half4`
+  (`hadamard_inner.cuh:106,112`, `had_hf_r_128_inner`). `half4` is declared
+  `__align__(8)` (`exllamav3_ext/util.cuh:8`), so the vectorized cast needs only
+  8-byte alignment — 256 B stride from an 8-byte-aligned base always lands 8-byte
+  aligned, so in practice any tensor placed on an 8 B (or coarser) boundary works.
+- No file in exllamav3 asserts or requires alignment wider than 16 B anywhere
+  (checked `exllamav3_ext/quant/*.cu*`, `doc/env_vars.md`); the closest textual
+  mentions of "128" are tile shapes (`MOE_TILESIZE_N`, `N_TILE=128`), not pointer
+  alignment.
+
+**(b) 128 B vs 16 B default.** **16 B is correct; 128 B was an unsupported guess.**
+Evidence above shows the hard floor is 16 B (trellis) / 8 B (suh, svh); no exllamav3
+code path needs more. The size cost of the wider default was also negligible either
+way — 128 B padding adds at most 112 B/tensor x 12 tensors ≈ 1.3 KB per 13.3 MB
+expert, so this was purely a correctness-of-requirement question, not a
+size-budget one. **Changed**: `build_exl3_slot_layout`'s `alignment` default in
+`python/sglang/srt/layers/moe/exl3_slot_layout.py` from `128` to `16`, in commit
+`5322cb4847` (separate from this docs commit), with a new test
+`test_default_alignment_is_16_bytes` in
+`test/registered/unit/layers/moe/test_exl3_slot_layout.py` asserting the default
+matches the explicit `alignment=16` layout. Run on divix01 (`taskset -c 0-63`):
+`6 passed` (see task-6-report.md for full output). This also answers the doc-figure
+follow-up: DSV41_REFERENCE.md never quoted a padded/aligned slot-byte total (only the
+raw 13,315,596 B row and the raw trellis offset 14,852), so no other §3/§4/§9.2
+figure needed a change.
+
+**(c) Padding site: RAM→VRAM segment copy, not a host memcpy.** Recommend padding
+inside the existing `copy_expert_row_segments_gpu` device-side gather
+(`python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh:200-213`), not as a
+separate NVMe→RAM host memcpy pass.
+- That kernel already takes a `{src, dst, bytes}` segment list per call
+  (`copy_expert_row_segments_gpu_kernel`, used by `:200-213`) — exactly the shape of
+  the 12-segment plan `Exl3SlotLayout.segments` already produces
+  (`exl3_slot_layout.py:17-21`).
+- Its per-row copy (`copy_expert_row_lane`, `:53-78`) checks `src`/`dst` alignment at
+  runtime and **degrades gracefully**: 16-byte vectorized loads
+  (`copy_expert_host_unit16`, `:35-44`, `ld.global.nc.v2.b64`) when both pointers are
+  16-byte aligned, else 4-byte scalar words via `load_expert_host_word_noncoherent`
+  (`:17`, `ld.global.nc.u32`) down to a final byte tail (`:74-77`). So even if the
+  RAM-side source offset is not 16-byte aligned (which it usually will not be — the
+  raw row sits at whatever offset the O_DIRECT superset read left it inside its RAM
+  buffer, §9.2), the copy is still correct; it only loses the vectorized fast path
+  for that one gather, while its VRAM destination — the only address `exl3_moe`'s
+  `cp.async` cares about — is written at the slot's aligned offset regardless.
+- A host memcpy at NVMe→RAM admission would need its own ~13 MB, ~1-2 ms/admission
+  CPU copy (§9.2's existing estimate) on top of the link/NVMe time, and would still
+  need the RAM buffer's own base address to be 16-byte aligned for the *host*
+  memcpy's writes to be simply offset-correct. Padding at RAM→VRAM instead reuses an
+  existing, already-tested kernel and avoids adding a new CPU-bound step to the
+  admission path.
+- Consequence for Phase 1-3: keep RAM-cache rows in their raw (unpadded, byte-8
+  contiguous) 13,315,596 B layout — this also keeps the RAM tier's ~75 GB / ~5,630-
+  expert budget (§9.1) exactly as measured, with no RAM-side padding tax — and do the
+  per-tensor re-placement only in the RAM→VRAM `copy_expert_row_segments_gpu` call,
+  using `Exl3SlotLayout` segments (source = raw row offsets, destination = the VRAM
+  slot's 16-byte-aligned offsets).
+- Not fully confirmed: whether `exl3_moe` also needs `suh`/`svh` at a stricter
+  alignment than 8 B in some other code path this search did not reach (e.g. a
+  batched/coop variant, `exl3_moe_coop.cu`); the coop kernel was not read in this
+  pass. §13's existing open item stands; if Phase 2 finds a stricter requirement
+  there, only the segment destination offsets need widening, not this decision.
+
+### 14.2 Can upstream's `_HostTable` back a partial Engram RAM tier?
+
+**The gather takes a row index, not a raw table offset**, but two things still have
+to change for a genuine N-slot cache — the current design is a *shard* of the full
+table, not a *cache* of it.
+
+- `EngramEmbedding.forward` for the host-table (shared) layout calls `engram_gather`
+  directly with `self.weight.data_ptr()`/`self.scale.data_ptr()` and the raw ids
+  (`python/sglang/srt/layers/engram.py:738-757`). The Triton kernel
+  (`python/sglang/kernels/ops/embeddings/engram_gather.py:17-42`) computes
+  `local = idx - row_lo` and addresses `w_ptr + local * DIM + offs` — an index, not a
+  byte offset the caller precomputes. So a slot map (id → slot number) can be
+  inserted **before** the kernel call, by translating `ids` into slot ids (or by
+  adding a `slot_map_ptr` argument the kernel dereferences before the existing
+  `local` arithmetic), without changing the pointer-arithmetic style of the kernel.
+- **What has to change to size the table at N slots instead of all rows:**
+  1. **Allocation.** `EngramEmbedding._init_host_table`
+     (`engram.py:703-716`) sizes the table at `n = num_embeddings` (shared layout) or
+     `self.rows` (per-rank shard) — the full compressed-vocab row count (99,092 x
+     24 rows/layer, §5), not a cache budget. This has to become a chosen N (e.g. the
+     5 GB / ~19M-row budget from §5) independent of `num_embeddings`.
+  2. **Addressing and miss semantics.** `_engram_gather_kernel`'s `owned = (idx >=
+     row_lo) & (idx < row_hi)` (`engram_gather.py:29-31`) is a *contiguous shard
+     range* test, correct for "this TP rank's slice of the full table," not "this id
+     is resident in the cache." A slot-indexed cache needs a real lookup (e.g. a
+     hash table or direct-mapped array keyed by `idx`) that returns either a slot
+     number or a miss. Critically, today's "not owned" path **zero-fills and relies
+     on the sharded all-reduce to sum in the owning rank's contribution**
+     (`engram.py:773-787`, `_lookup`/`_owned_rows`); that trick is semantically wrong
+     for a genuine cache miss (there is no other rank holding the row — it has to be
+     fetched from RAM/NVMe, per §9.3), so the miss path itself, not just the
+     addressing, needs a redesign.
+- Net: `_HostTable`'s mechanics (memfd/anon mmap, `cudaHostRegister`, huge pages,
+  `class _HostTable` at `engram.py:549-651`) are reusable as-is for a reduced-size
+  backing buffer; the row-index gather convention is reusable as the calling
+  convention. What is not reusable without changes is the allocation-size
+  computation and the shard-membership test that currently stands in for "hit."
+
+### 14.3 DSpark target layers and planner
+
+- **`dspark_layers_to_capture` has no V4.1-specific hardcoded list in our fork.** It
+  is a per-instance attribute (`self.dspark_layers_to_capture: Optional[List[int]] =
+  None`, `python/sglang/srt/models/deepseek_v4.py:4076`) set at runtime via
+  `set_dspark_layers_to_capture` (`deepseek_v4.py:4767-4775`), called from
+  `attention_backend_setup.py:57-58` with `dflash_target_layer_ids`. That value comes
+  from `resolve_spec_aux_hidden_state_config`
+  (`model_executor/model_runner_components/spec_aux_hidden_state.py:198-208`), which
+  for DSpark prefers `dspark_draft_config.target_layer_ids`
+  (`spec_aux_hidden_state.py:199-201`) — **parsed from the draft checkpoint's own HF
+  config**, not from anything in sglang. So the "37-39" figure in
+  DSV41_REFERENCE.md §10 is from the DeepSeek reference code
+  (`inference/model.py:1089-1157`), not from an sglang default; whatever the actual
+  DSV4.1-Flash DSpark draft checkpoint's config specifies is what our fork will use
+  once that checkpoint is loaded. **Not independently confirmed**: this task did not
+  have the actual DSpark draft config file to read the DSV4.1 value directly — only
+  the code path that will consume it. Confirm by reading the draft checkpoint's
+  config once downloaded (Phase 1).
+- **Maximum verify tokens for graph capture** is set by `resolved_max_verify_len()`
+  (`python/sglang/srt/speculative/dspark_components/dspark_planner.py:912-913`:
+  `self.max_verify_len or (self.gamma + 1)`), where `gamma =
+  speculative_num_draft_tokens - 1`
+  (`dspark_gamma_from_num_draft_tokens`, `dspark_config.py:51-58`). That resolves to
+  the same `speculative_num_draft_tokens` CLI value that
+  `max_speculative_num_draft_tokens()` (`python/sglang/srt/runtime_context.py:2020`)
+  reports, which is what actually sizes CUDA-graph capture:
+  `model_runner.py:744-748` multiplies `graph_gather_batch_size` by
+  `decode_num_tokens_per_req(num_draft_tokens=max_speculative_num_draft_tokens())`
+  (matching §8's existing citation `model_runner.py:740-750`). So
+  `DSparkVerifyPlanner`'s per-request dynamic verify length
+  (`_dynamic_graph_tier`, `dspark_planner.py:135`) is bounded above by the same
+  static `resolved_max_verify_len()` the graph was captured for — the planner picks
+  a length at or under the captured maximum; it does not itself resize the graph.
+
+### 14.4 Find the vLLM EXL3 implementation
+
+**No official or single canonical implementation exists.** Searches run (no `gh`
+binary on the laptop or divix01; used WebSearch/WebFetch instead, recorded per the
+brief's fallback):
+- WebSearch: `vllm-project vllm exl3 quantization github`
+- WebSearch: `vllm EXL3 quantization pull request exllamav3`
+- WebFetch: `https://github.com/vllm-project/vllm/issues/19896`
+- WebFetch: `https://github.com/vcruz305/vllm-exl3`
+
+Findings:
+- **vLLM upstream**: [Issue #19896](https://github.com/vllm-project/vllm/issues/19896)
+  ("[Feature]: EXL3 support"), opened 2025-06-20, **closed as not planned** (stale,
+  90+ days inactive). No in-tree `--quantization exl3` exists in
+  `vllm/model_executor/layers/quantization`.
+- **Out-of-tree plugins**: several near-identically-described repos —
+  `vcruz305/vllm-exl3`, `Blackwellboy/vllm-exl3`, `fattchris/vllm-exl3`,
+  `lna-lab/vllm-exl3`, `joeynyc/vllm-exl3` — each described as "An out-of-tree vLLM
+  plugin registering `--quantization exl3` for EXL3 (ExLlamaV3 trellis) packs,"
+  serving "routed MoE experts and declared dense EXL3 tensors through ExLlamaV3 and
+  optional native CUDA kernels." **Does support MoE** per that description. One
+  fetched repo (`vcruz305/vllm-exl3`) mentions a compiled
+  `exllamav3_ext.ngram_dequant` kernel (used for the n-gram/Engram-adjacent
+  embedding path) but the README text pulled did not enumerate `exl3_moe`/
+  `exl3_gemm`/`exl3_gemv` by name; it describes calling into "ExLlamaV3 and optional
+  native CUDA kernels" generically. **Not confirmed**: which exact exllamav3 kernel
+  entry points (e.g. `exl3_moe_kernel` vs a Python-level `nn.Module` call into
+  exllamav3's own `linear.py`/`block_sparse_mlp.py`) these plugins call — the repos'
+  source was not read past the fetched README summary.
+- The repeated near-identical descriptions across five differently-named accounts
+  suggest a template or mirrored project rather than five independent
+  implementations; treat all of them as one unverified community source, not five
+  corroborating ones.
+- **Consequence for Phase 1-3**: there is no vetted prior-art integration to port
+  from. The nearest genuine prior art remains exllamav3 itself (§7); any of these
+  vLLM plugins is, at best, a reference for how someone else wired the same kernels
+  into a serving loop, not a dependency or a source of ported code (license/
+  provenance unverified, and vLLM's own maintainers declined the feature).
+
+### 14.5 Earlier proxies for routing skew
+
+Ran (on divix01, one small PDF, `pdftotext` present at `/usr/bin/pdftotext`):
+```
+ssh divix01 'pdftotext -layout /mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw/DeepSeek_V41_Tech_Report.pdf - | grep -n -i -B2 -A6 "load balanc\|expert load\|routing\|utilization"'
+```
+**No per-expert load statistics or plots exist in the tech report.** The matches are
+all qualitative/architectural, not measured skew data:
+- §2.2 (line ~336-342, ~367-376): describes "modality-specific load balancing" —
+  separate auxiliary-loss-free correction biases for text vs. image tokens, updated
+  from "their respective expert loads" — a training-time mechanism description, no
+  numbers.
+- Later matches (routing-replay for RL, image-sharding load balancing, "expert
+  routing" persisted for rollout resumption) are all training/infra sections
+  unrelated to inference-time per-expert load distribution.
+- No table, histogram, or per-layer/per-expert utilization figure was found anywhere
+  in the report's text extraction.
+- **The EXL3 calibration trace `cal_trace_dsv41_flash_workload.json` is confirmed
+  not present** in the downloaded files at `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw/`
+  (51 files enumerated in §1; no file by that name or pattern). No expert or Engram
+  data was read beyond this file-listing check, per the task's constraint.
+- **Consequence for Phase 1-3**: `G` and `f` (§9.4) have **no proxy signal at all**
+  from the tech report or the EXL3 export. The only remaining earlier proxy is
+  Phase 1's truncated-model router statistics (§11 Phase 1, "Record router
+  statistics from the truncated model as a first, partial skew signal") — that
+  remains the first real data point, not confirmatory of anything found here.
+
+---
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
@@ -756,3 +1002,5 @@ beside production perturbs production latency, so decide explicitly):
 - divix01 analysis: `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/`
   (`cross-token/spec_window_summary.txt`, `strategy/static_curves.json`).
 - Our fork: §8 line references; [`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md).
+- vLLM EXL3 (§14.4): <https://github.com/vllm-project/vllm/issues/19896>,
+  <https://github.com/vcruz305/vllm-exl3>.
