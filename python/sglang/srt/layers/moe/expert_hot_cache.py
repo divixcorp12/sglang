@@ -1056,15 +1056,33 @@ class ExpertHotCacheManager:
             raise ValueError(
                 "expert hot cache budget cannot hold the graph-gather scratch and pull rows"
             )
+        # DIRECT refuses any layer holding fewer than twice its gather rows (see
+        # `_init_insert_direct`), so a seed that scores one layer low would refuse the
+        # whole budget. Give every layer that floor from its own best experts first; the
+        # scores then spend the rest. When every layer clears the floor anyway, the
+        # selection is unchanged: each layer's picks are its top-scored experts either way.
+        floors = {
+            layer_id: min(2 * rows, streamers[layer_id].num_experts) if direct else 0
+            for layer_id, rows in gather_rows.items()
+        }
+        chosen = {layer_id: set() for layer_id in streamers}
+        for floor_pass in (True, False):
+            for _, expert_id, layer_id in candidates:
+                if expert_id in chosen[layer_id] or (
+                    floor_pass and len(chosen[layer_id]) >= floors[layer_id]
+                ):
+                    continue
+                slot_bytes = streamers[layer_id].bytes_per_expert
+                pull_row_bytes = (
+                    slot_bytes if pull_row_enabled and layer_id not in allocated_layers else 0
+                )
+                if slot_bytes + pull_row_bytes <= remaining:
+                    chosen[layer_id].add(expert_id)
+                    remaining -= slot_bytes + pull_row_bytes
+                    allocated_layers.add(layer_id)
         for _, expert_id, layer_id in candidates:
-            slot_bytes = streamers[layer_id].bytes_per_expert
-            pull_row_bytes = (
-                slot_bytes if pull_row_enabled and layer_id not in allocated_layers else 0
-            )
-            if slot_bytes + pull_row_bytes <= remaining:
+            if expert_id in chosen[layer_id]:
                 selected[layer_id].append(expert_id)
-                remaining -= slot_bytes + pull_row_bytes
-                allocated_layers.add(layer_id)
         if not any(selected.values()) and not any(gather_rows.values()):
             return None
         manager = cls()

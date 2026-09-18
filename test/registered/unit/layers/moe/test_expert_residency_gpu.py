@@ -1246,9 +1246,12 @@ class TestInsertOnMissDirect(unittest.TestCase):
 
     def test_a_layer_too_small_to_guarantee_a_victim_is_refused(self):
         """Below twice the gather width a forward could route every shortlist entry, and with no
-        scratch row left there would be nowhere safe for that miss to land. Refuse, never truncate."""
+        scratch row left there would be nowhere safe for that miss to land. Refuse, never truncate.
+        The allocator gives every layer that floor first, so only a budget short of all the floors
+        together leaves a layer under it: here one slot short of three floors."""
+        floors = LAYERS * 2 * TOP_K
         with self.assertRaisesRegex(ValueError, "twice its graph-gather rows"):
-            _manager(_model(), gpu=True, seed_scale=(0, 1, 1), **DIRECT)
+            _manager(_model(), gpu=True, budget_bytes=56 * (floors - 1), **DIRECT)
 
     # ----- the consolidated safety guard (one guard, three reasons) -----
 
@@ -1503,6 +1506,24 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertGreater(inserted_total, 0, "no forward ever missed")
         self.assertEqual(sum(updater.snapshot()["insertion_truncated"]), 0)
         self.assertEqual(sum(updater.snapshot()["insertions"]), inserted_total)
+
+    def test_a_low_scored_layer_still_gets_its_slot_floor(self):
+        """The seed splits the budget across layers by score, so a layer the seed rates low could
+        fall under DIRECT's twice-the-gather-rows floor and refuse a budget that holds every
+        layer's floor. Here the budget is exactly three floors: by score alone layers 1 and 2 would
+        take 10 slots each and leave layer 0 with 4 for a 2-token gather's 8. Every layer gets
+        its floor, from its own best experts."""
+        tokens, scale = 2, (0.01, 1, 1)
+        floor = 2 * tokens * TOP_K
+        manager = _manager(
+            self.model, gpu=True, seed_scale=scale, graph_gather_batch_size=tokens,
+            budget_bytes=56 * LAYERS * floor, **DIRECT,
+        )
+        capacities = [manager.caches[layer].capacity for layer in range(LAYERS)]
+        self.assertEqual(capacities, [floor] * LAYERS)
+        best = sorted(range(EXPERTS), key=lambda expert: (-((expert * 7) % 5), expert))[:floor]
+        resident = {expert for expert, slot in enumerate(manager.caches[0].expert_to_slot.tolist()) if slot >= 0}
+        self.assertEqual(resident, set(best))
 
     def test_the_shortlist_is_ranked_before_the_first_replay(self):
         """`reset_after_capture` must leave a usable shortlist: the first replay's gather reads it
