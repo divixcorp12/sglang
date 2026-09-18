@@ -68,6 +68,31 @@ def test_incomplete_group_raises():
         run(_exl3("layers.0.attn.wo_a.slice.0", 64, 16, 1), groups=2)
 
 
+@pytest.mark.parametrize(
+    "stem",
+    [
+        "layers.2.attn.wq_a",
+        "layers.2.attn.wq_b",
+        "layers.2.attn.wkv",
+        "layers.2.attn.wo_b",
+        "layers.2.attn.indexer.wq_b",
+        "layers.2.ffn.shared_experts.w1",
+        "layers.2.ffn.shared_experts.w3",
+        "layers.2.ffn.shared_experts.w2",
+        "layers.1.engram.wkv",
+        "head",
+    ],
+)
+@pytest.mark.parametrize("suffix", ["suh", "svh", "mul1", "trellis"])
+def test_remap_treats_exl3_suffixes_like_weight(stem, suffix):
+    from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    remap = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format
+    as_weight = remap(f"{stem}.weight")
+    as_exl3 = remap(f"{stem}.{suffix}")
+    assert as_exl3.rsplit(".", 1)[0] == as_weight.rsplit(".", 1)[0]
+
+
 if __name__ == "__main__":
     import sys
 

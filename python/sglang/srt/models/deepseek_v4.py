@@ -797,6 +797,12 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
+        # EXL3 stores wq_a and wkv as separate trellis-quantized linears; fusing
+        # them would require concatenating trellis codebooks, which EXL3 cannot
+        # do. The checkpoint's separate wq_a/wkv keys would then have nowhere
+        # to land once this layer only allocates a fused wqkv_a.
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            fuse = False
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
@@ -5094,6 +5100,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if self.quant_config is not None and self.quant_config.get_name() == "exl3":
+            from sglang.srt.models.deepseek_v4_exl3_weights import (
+                adapt_exl3_weights,
+                dense_on_device,
+            )
+
+            weights = adapt_exl3_weights(weights, dense_on_device, self.config.o_groups)
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
