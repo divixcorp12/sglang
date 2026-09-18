@@ -313,13 +313,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # CONTRACT: MoeRunnerConfig.swiglu_limit (moe_runner/base.py:60) is the
             # DeepSeek V4 swiglu clamp field; deep_gemm._apply_swiglu_limit
             # (moe_runner/deep_gemm.py:1666-1667) clamps up to +-limit and gate to
-            # <= limit, matching exl3_moe_loop exactly. routed_scaling_factor is
-            # NOT applied here: DeepseekV2MoE only fuses it into topk_weights when
-            # quant_method.fuse_routed_scaling_factor_in_topk is True (layer.py:108-110,
-            # unset here so it defaults False), and otherwise multiplies it into
-            # final_hidden_states itself after combine (deepseek_v2.py:1083, 1310).
-            # UnquantizedFusedMoEMethod.forward_cpu -> moe_forward_native
-            # (fused_moe_native.py:61-163) likewise never applies routed_scaling_factor.
+            # <= limit, matching exl3_moe_loop exactly.
             cfg.swiglu_limit,
         )
+        # On CUDA, DeepseekV2MoE never scales the routed output itself (its multiply is
+        # under `not _is_cuda`): the runner does, unless the factor is already fused into
+        # topk_weights -- as the unquantized triton path does (unquant.py:1075).
+        if cfg.routed_scaling_factor is not None and not layer.should_fuse_routed_scaling_factor_in_topk:
+            out = out * cfg.routed_scaling_factor
         return StandardCombineInput(hidden_states=out)

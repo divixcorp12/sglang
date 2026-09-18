@@ -131,3 +131,25 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_apply_scales_routed_output_unless_fused(monkeypatch, fused):
+    # DeepseekV2MoE leaves routed_scaling_factor to the runner on CUDA; the EXL3 method
+    # must apply it exactly once (not again when it is fused into topk_weights).
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.quantization import exl3 as exl3_mod
+
+    layer, method = _moe()
+    layer.should_fuse_routed_scaling_factor_in_topk = fused
+    layer.exl3_w13, layer.exl3_w2 = [], []
+    method.moe_runner_config = SimpleNamespace(
+        routed_scaling_factor=1.5, swiglu_limit=10.0, apply_router_weight_on_input=False
+    )
+    base = torch.ones(3, HIDDEN)
+    monkeypatch.setattr(exl3_mod, "exl3_moe_loop", lambda *a, **k: base.clone())
+    topk = SimpleNamespace(topk_weights=torch.ones(3, 2), topk_ids=torch.zeros(3, 2, dtype=torch.int32))
+    dispatch = SimpleNamespace(hidden_states=torch.zeros(3, HIDDEN), topk_output=topk)
+    out = method.apply(layer, dispatch).hidden_states
+    assert torch.equal(out, base if fused else base * 1.5)
