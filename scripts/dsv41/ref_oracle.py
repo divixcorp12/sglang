@@ -261,8 +261,12 @@ def build_model(ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len
     ref.Expert = _make_lazy_expert()
     ref.ParallelEngramEmbedding = _make_file_engram()
 
+    from transformers import AutoTokenizer
+
+    # The reference Engram builds its compressed token map from the tokenizer.
+    tokenizer = AutoTokenizer.from_pretrained(trunc_dir)
     with torch.device("cuda"):
-        model = ref.Transformer(ref.ModelArgs(**kwargs), tokenizer=None)
+        model = ref.Transformer(ref.ModelArgs(**kwargs), tokenizer=tokenizer)
 
     state, routed, shared = _load_checkpoint(trunc_dir, device="cuda")
     missing, unexpected = model.load_state_dict(state, strict=False)
