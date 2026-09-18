@@ -342,6 +342,7 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `codex/nvfp4-expert-stream-main` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
 | 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. 37k-token peak **31,647 MiB at chunk 4096 (safe); chunk 8192 OOMs** | `matrix/cache-20260918-161820`, `matrix/memprobe-20260918-171612` |
 | 30 | **Draft (MTP) experts requantized FP8 → NVFP4 at load** | `46735b12b4` (`SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT=1`) | **Draft 2.46 → 1.45 GB; free after startup 3.05 → 4.04 GB.** Accept length 2.546 → 2.564, speed tie (26.096 → 26.198, 19/29 turns, p = 0.07), both at 13,312 MB. Enabler for a bigger cache | `matrix/draft-20260918-173157` |
+| 32 | **Spend the draft's freed GB on the hot cache: 14,336 MB** (NVFP4 draft) | flag only, on `46735b12b4` | **26.877 → 28.101 (+6.65% paired median)** vs 13,312 MB, both NVFP4 draft; 27/29 turns, p = 8.1e-7; 2.28 ms/token; 5,048 → 5,437 slots, hit rate 72.67 → 74.20%, 335 → 321 MB/token. 37k-token peak **31,667 MiB at chunk 4096 (safe)** | `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224` |
 
 ### Rejected / closed
 
@@ -725,7 +726,7 @@ NEXTN work, under `cc-expert-prediction/`:
 | 13,312 MB memory probe | `mem-probe-hot.sh` (HOT_MB, CHUNKS); `matrix/memprobe-20260918-171612` |
 | torch.compile smoke | `torch-compile-smoke.sh`; `matrix/tcsmoke-20260918-163830` |
 | NVFP4 draft arm | `draft-arm.sh`, worktree `wt-draftfp4` (+ `wt-draftfp4.patch`), `draft_paired.py`, `cache_counters.py`, `run_stubbed.py`; `matrix/draft-20260918-173157` |
-| NVFP4 draft + 14,336 MB | `draftcache-chain.sh` (runs `mem-probe-draft.sh`, then `draftcache-arm.sh` only if the probe survives); `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224` (in flight) |
+| NVFP4 draft + 14,336 MB | `draftcache-chain.sh` (runs `mem-probe-draft.sh`, then `draftcache-arm.sh` only if the probe survives); `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224`; `draftcache_paired.py` |
 
 The `_hc_mix` persistent-kernel pattern is recorded as **checked and
 inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
@@ -941,6 +942,20 @@ worktree `wt-draftfp4` for both, 13,312 MB, chunk 4096, D first):
   class name `ModelOptNvFp4FusedMoEMethod`, so the online subclass is never
   streamed. `test_requantized_draft_experts_stay_on_the_gpu` guards this.
 - **Output cannot change:** every draft token is verified by the target.
+- **Spent on the cache** (`draftcache-chain.sh`: probe, then arm only if it
+  survives). At 14,336 MB the 37k-token peak is 31,667 MiB at chunk 4096, the
+  same ~940 MiB margin as 13,312 MB with the FP8 draft. The arm (E first):
+
+  | | budget | slots | median tok/s | mean | hit rate | H2D / token | accept length |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | D | 13,312 MB | 5,048 | 26.877 | 26.696 | 72.67% | 335 MB | 2.567 |
+  | **E** | **14,336 MB** | **5,437** | **28.101** | **28.360** | **74.20%** | **321 MB** | 2.604 |
+
+  Paired: **E faster on 27/29 turns, p = 8.1e-7**, median +1.901 tok/s (ratio
+  1.0665), 2.28 ms/token saved. Over the day the stack went 12,288 MB FP8 draft
+  (25.21) → 13,312 MB (27.08) → 14,336 MB with the NVFP4 draft (28.10), each
+  step a paired same-build arm; cross-arm drift is ~2%, so read the chain by
+  its paired steps, not the absolute numbers.
 - **Test gotcha:** `test_modelopt_nvfp4.py` imports `sglang.test.test_utils`,
   which pulls in `datasets` and dies on divix01's pyarrow; `run_stubbed.py`
   stubs that one module to run the file there.
