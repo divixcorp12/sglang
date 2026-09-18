@@ -247,6 +247,7 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    extra_kv_u8 = _extra_kv_to_64(extra_kv_u8, extra_idx)
     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
     _sparse_mla_sm120_paged_attention(
@@ -474,10 +475,29 @@ def _page_mark_kernel(
     tl.store(mask_ptr + page, tl.full((BLOCK,), 1, tl.int8), mask=keep)
 
 
+def _extra_kv_to_64(
+    extra_kv_u8: Optional[torch.Tensor], extra_idx: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """The extra (compressed) KV pool at FlashInfer's page_block_size=64.
+
+    DSV4.1's c2 pool pages at 256 // 2 = 128 tokens, which the SM120 kernels
+    reject; token indices are invariant under the split, as for the main pool.
+    """
+    if extra_kv_u8 is None or extra_kv_u8.ndim < 3:
+        return extra_kv_u8
+    src_pbs = extra_kv_u8.shape[1]
+    if src_pbs == _PBS_DST:
+        return extra_kv_u8
+    return _split_kv_pages_to_64(
+        extra_kv_u8, src_pbs, touched_indices=extra_idx, tag=":extra"
+    )
+
+
 def _split_kv_pages_to_64(
     kv_u8: torch.Tensor,
     src_pbs: int,
     touched_indices: Optional[torch.Tensor] = None,
+    tag: str = "",
 ) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
@@ -501,7 +521,8 @@ def _split_kv_pages_to_64(
     # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
     buffers = get_resources().buffers
-    key = f"flash_mla_sm120_split:{dev}"
+    # ``tag`` keeps separate persistent buffers per source pool (main vs extra).
+    key = f"flash_mla_sm120_split{tag}:{dev}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         # The first allocation can happen under inference mode (autotune), but
@@ -530,7 +551,7 @@ def _split_kv_pages_to_64(
     if use_mask:
         # Persistent per-device int8 mask, zeroed each call (cheap memset,
         # captured cleanly by CUDA graph). 1 = page is referenced this step.
-        mkey = f"flash_mla_sm120_mask:{dev}"
+        mkey = f"flash_mla_sm120_mask{tag}:{dev}"
         mbuf = buffers.get(mkey)
         if mbuf is None or mbuf.shape[0] < N:
             # The first allocation can happen under inference mode (autotune),
@@ -628,13 +649,12 @@ def _flash_mla_flashinfer(
         if extra_k_cache is not None and extra_k_cache.dtype != torch.uint8
         else extra_k_cache
     )
-    extra_kv_64 = extra_kv_u8
-
     extra_idx = (
         extra_indices.squeeze(1)
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    extra_kv_64 = _extra_kv_to_64(extra_kv_u8, extra_idx)
 
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
