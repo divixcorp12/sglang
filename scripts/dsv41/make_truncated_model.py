@@ -8,6 +8,25 @@ import argparse
 import copy
 import json
 import os
+import struct
+
+# Byte width per safetensors dtype tag, used only to recompute the index's
+# metadata.total_size from the *headers* of the kept shards (never tensor
+# data) after filtering the weight map.
+_DTYPE_NBYTES = {
+    "F64": 8,
+    "F32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I64": 8,
+    "I32": 4,
+    "I16": 2,
+    "I8": 1,
+    "U8": 1,
+    "BOOL": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+}
 
 # Real text_config key names (Task 7 Step 1, verified against
 # /mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw/config.json on divix01).
@@ -20,6 +39,7 @@ _KEYS = {
     "engram_ids": "engram_layer_ids",
     "engram_rows": "engram_num_embeddings",
     "nextn": "num_nextn_predict_layers",
+    "dspark_targets": "dspark_target_layer_ids",
 }
 _DROP_PREFIXES = ("mtp.", "vision.", "aligner.", "image_")
 _COPY_FILES = (
@@ -43,6 +63,7 @@ def truncate_text_config(text_config: dict, n_layers: int) -> dict:
     t[_KEYS["engram_ids"]] = [i for i, _ in kept]
     t[_KEYS["engram_rows"]] = [r for _, r in kept]
     t[_KEYS["nextn"]] = 0
+    t[_KEYS["dspark_targets"]] = [i for i in t[_KEYS["dspark_targets"]] if i < n_layers]
     return t
 
 
@@ -55,6 +76,35 @@ def select_weight_map(weight_map: dict, n_layers: int) -> dict:
             continue
         out[name] = shard
     return out
+
+
+def _read_safetensors_header(path: str) -> dict:
+    """Read only a safetensors file's JSON header (shape/dtype), never tensor data."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(header_len))
+
+
+def recompute_total_size(src: str, weight_map: dict) -> int:
+    """Sum kept-tensor byte sizes from the kept shards' headers only."""
+    names_by_shard: dict = {}
+    for name, shard in weight_map.items():
+        names_by_shard.setdefault(shard, []).append(name)
+    total = 0
+    for shard, names in names_by_shard.items():
+        header = _read_safetensors_header(os.path.join(src, shard))
+        for name in names:
+            info = header.get(name)
+            if not info or "dtype" not in info or "shape" not in info:
+                continue
+            nbytes = _DTYPE_NBYTES.get(info["dtype"])
+            if nbytes is None:
+                continue
+            n = 1
+            for d in info["shape"]:
+                n *= d
+            total += n * nbytes
+    return total
 
 
 def main():
@@ -76,6 +126,8 @@ def main():
     with open(os.path.join(args.src, "model.safetensors.index.json")) as f:
         index = json.load(f)
     index["weight_map"] = select_weight_map(index["weight_map"], args.n_layers)
+    if isinstance(index.get("metadata"), dict) and "total_size" in index["metadata"]:
+        index["metadata"]["total_size"] = recompute_total_size(args.src, index["weight_map"])
     with open(os.path.join(args.dst, "model.safetensors.index.json"), "w") as f:
         json.dump(index, f)
 

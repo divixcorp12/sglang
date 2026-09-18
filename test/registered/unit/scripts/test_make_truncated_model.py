@@ -26,6 +26,7 @@ def _config():
         K["engram_ids"]: [1, 14],
         K["engram_rows"]: [384006168, 384016682],
         K["nextn"]: 3,
+        K["dspark_targets"]: [37, 38, 39],
         "hidden_size": 5120,
     }
 
@@ -38,6 +39,7 @@ def test_truncates_every_layer_indexed_field():
     assert t[K["candidate"]] == -1
     assert t[K["engram_ids"]] == [1] and t[K["engram_rows"]] == [384006168]
     assert t[K["nextn"]] == 0 and t["hidden_size"] == 5120
+    assert t[K["dspark_targets"]] == []
 
 
 def test_does_not_mutate_input():
