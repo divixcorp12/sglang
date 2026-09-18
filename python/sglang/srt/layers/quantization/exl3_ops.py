@@ -133,11 +133,17 @@ def random_exl3_tensors(
 ) -> Exl3Tensors:
     """A valid EXL3 linear with random contents: every int16 trellis state decodes."""
     g = torch.Generator(device="cpu").manual_seed(seed)
+    cpu = torch.device("cpu")
     trellis = torch.randint(
-        -32768, 32768, (in_features // 16, out_features // 16, 16 * bits), generator=g, dtype=torch.int32
+        -32768,
+        32768,
+        (in_features // 16, out_features // 16, 16 * bits),
+        generator=g,
+        dtype=torch.int32,
+        device=cpu,
     ).to(torch.int16)
-    sign = lambda n: (torch.randint(0, 2, (n,), generator=g) * 2 - 1).to(torch.float16)
-    svh = sign(out_features) * (0.5 + torch.rand(out_features, generator=g)).to(torch.float16)
+    sign = lambda n: (torch.randint(0, 2, (n,), generator=g, device=cpu) * 2 - 1).to(torch.float16)
+    svh = sign(out_features) * (0.5 + torch.rand(out_features, generator=g, device=cpu)).to(torch.float16)
     return Exl3Tensors(
         trellis=trellis.to(device),
         suh=sign(in_features).to(device),

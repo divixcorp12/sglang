@@ -30,7 +30,10 @@ def _rel(a, b):
 def test_gemm_matches_reference(in_f, out_f, bits, rows):
     t = random_exl3_tensors(in_f, out_f, bits, device="cuda", seed=in_f + out_f + bits)
     x = torch.randn(rows, in_f, device="cuda", dtype=torch.bfloat16)
-    assert _rel(exl3_linear(x, t, torch.float32), exl3_linear_reference(x, t)) < 5e-3
+    # exllamav3's regular kernel at m=1 measured 0.66-0.79% on sm_120 (m>=8: 0.03-0.05%), EXL3_GEMV=0
+    # or not; see DSV41_REFERENCE.md section 15.1.
+    tol = 1.2e-2 if rows == 1 else 5e-3
+    assert _rel(exl3_linear(x, t, torch.float32), exl3_linear_reference(x, t)) < tol
 
 
 @pytest.mark.parametrize("in_f,out_f,bits", SHAPES)
