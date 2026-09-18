@@ -1,0 +1,723 @@
+# DeepSeek V4.1 Flash — scoping reference
+
+**Status: scoping only (revised 2026-09-18 after review). Nothing is implemented.**
+This doc records what the model is, what it costs in bytes, what exists upstream / in
+exllamav3 / in our fork, and what has to be built to serve it with our expert-streaming
+stack on divix01. Companion to [`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md), whose
+rule still governs: **on a saturated link, only bytes/token matter.**
+
+Every number is tagged **[measured]** (read from checkpoint headers, files or sysfs),
+**[source]** (quoted from code, docs or the tech report), or **[estimate]** (derived;
+needs a measurement before anyone quotes it).
+
+**Owner decisions (2026-09-18):**
+- EXL3 3.0 bpw experts.
+- **DSpark in scope.**
+- **~90 GB host RAM**, used as a *cache* tier.
+- Expert weights and Engram tables read from NVMe with our io_uring reader.
+- **Experts move to `/mnt/nvme1`** (Gen3 x4); **Engram tables stay on `/mnt/nvme2`**
+  (Gen3 x2). The owner will do the copy later.
+
+The design that follows is in §9. Decisions still open are in §12.
+
+---
+
+## TL;DR
+
+1. **The model is much bigger than Qwen3.8, in every byte dimension that matters.**
+   552B backbone + 196B Engram params [source]. The EXL3 routed expert is
+   **13,315,596 B** [measured], 4.8x the Qwen3.8 NVFP4 row. Routed experts total
+   204.5 GB and the Engram tables 203 GB [measured].
+2. **The design is three tiers: NVMe → ~90 GB host-RAM cache → VRAM hot cache**, for
+   both experts and Engram rows (§9).
+   - Experts are read **straight from the original EXL3 shards**, with one aligned read
+     per expert and no on-disk re-layout. Every expert's 12 tensors are byte-contiguous,
+     and none spans a file [measured].
+   - **But a raw row is not a kernel-ready slot.** `w1.trellis` starts at byte 14,852
+     of the row, which is not 16 B-aligned, and exllamav3 loads trellis with 128-bit
+     `cp.async`. The slot layout and where the padding happens are a Phase 0 decision
+     (§9.2).
+3. **The one hard problem is shared by both tiers: a RAM miss inside a CUDA-graph
+   decode.**
+   - Today's in-graph gather reads host RAM via `ld.global.nc` and has no miss path.
+   - Four mechanisms are compared in §9.3. None has been prototyped.
+   - Each needs a bounded wait and a defined failure path; a stuck NVMe read must not
+     wedge the stream.
+   - For experts the NVMe read is on the critical path whatever the mechanism (the
+     route is only known at the layer). For Engram layer 1 it can overlap layer 0, but
+     only with a split-submit or device-poll design.
+4. **Drives.** `/mnt/nvme2` is Gen3 x2, ~1.9 GB/s, ~7 ms per expert [measured link].
+   `/mnt/nvme1` is Gen3 x4, ~3.4 ms per expert on an *idle* drive [estimate]. It is not
+   idle: an `op-reth` node's datadir lives on it, alongside other workloads, and the
+   P310 is a DRAM-less QLC drive. The x4 figure needs a loaded fio measurement.
+5. **Engram caches well on our corpus, but the simulation must be re-run.** At most 83%
+   of row reads can hit (16.6M unique rows/layer in 98.9M reads). A conservative
+   lower-bound method gives ≥69% at 5 GB. The script was not preserved, so re-run it
+   with exact LRU in Phase 0. Engram NVMe traffic is small either way (§5).
+6. **DSpark changes the budget:**
+   - Resident draft weights (6.75 GiB) cost ~544 target-expert slots, **~31% of the
+     VRAM hot cache**.
+   - Its 6-token verify makes **Stage B (#14) mandatory**: per-layer miss scratch would
+     be 17.9 GiB. Stage B is on our mainline since 2026-09-18 (`797be6f678`, merged into
+     `codex/nvfp4-expert-stream-main` @ `b59edf2dc4`).
+   - On the Qwen stand-in, speculation moves ~35% more expert bytes per accepted token at
+     α=0.7, with break-even at α≈0.84–0.93.
+   - **Rule: ship DSpark only if measured α clears the DSV4.1 break-even** (§10, §12).
+7. **Throughput envelope** [estimate]: ~3–8 tok/s, link plus NVMe only, before compute
+   and slot-admission cost (§9.4). It depends on two unmeasured numbers: the VRAM miss
+   rate `G`, and the fraction `f` of those misses that also miss RAM. Nothing in the
+   current phase order measures them before Phase 3; §11 adds earlier proxies.
+8. **Upstream SGLang `dsv4.1` is a V4 extension, not a new model**, and touches none of
+   our streaming files. Branch `dsv41` off the mainline and *merge* `dsv4.1` (a squashed
+   cherry-pick leaves 29 of 110 files unapplied; the merge conflicts in 12)
+   (§6). No stack runs EXL3 in SGLang. exllamav3 (MIT) has a fused, sm_120-tuned EXL3
+   MoE kernel to vendor (§7).
+9. **It cannot coexist with production.** It needs the whole 32 GB card and most of
+   the RAM budget. Every GPU session means production downtime, which crypto-c9
+   schedules and the owner approves.
+
+---
+
+## 1. What is on divix01
+
+| Path | Contents | Size |
+|---|---|---|
+| `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw/` | Complete EXL3 export, 51 files: 41 shards, `config.json`, `quantization_config.json`, `model.safetensors.index.json` (192,452 tensors), `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, tech report, model card | Index `total_size` 219,307,470,008 B; files on disk 219,267,406,428 B (204.2 GiB) [measured] |
+| `/mnt/nvme2/DeepSeek-V4.1-Flash/model-0004{7,8}-of-00048.safetensors` | **The two Engram tables**, one module per shard. Required by the EXL3 card: EXL3 only quantized the Engram `wkv` linears | 101.5 GB each [measured] |
+| `/mnt/nvme2/DeepSeek-V4.1-Flash/.cache/huggingface/download/*.incomplete` | Two stale partial blobs from an earlier attempt | ~167 GB, **reclaimable** (not deleted) |
+| `/mnt/nvme2/huggingface_hub/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be…/` | HF-cache snapshot: `config.json`, `README.md`, `inference/` (reference code incl. `engram.py`), `encoding/`, tech report, shards 1–2 | 2.2 GB |
+| `/mnt/nvme2/nvfp4-work/benchmarks/full/{sessions,results}.jsonl` | Our benchmark corpus: 2,674 ConvFinQA/FinanceBench sessions with generated completions. Used for the Engram simulation | — |
+
+The other 46 official shards (backbone FP8 + MXFP4 experts) are **not** downloaded.
+
+### Host [measured 2026-09-18]
+
+- 188 GB RAM. 64 GB swapfile on `/mnt/nvme4`, with 30–60 GB in use at different times
+  that day.
+- Co-tenants besides production include `op-reth` (datadir on nvme1), reth, op-node and
+  QuestDB, so the DSV4.1 server gets a ~90 GB budget, not the whole machine.
+- RTX 5090 32,607 MiB. The whole host is Gen3; see MOE_EXPERT_TRANSFER, "The link is at
+  line rate".
+
+### NVMe drives [measured, sysfs]
+
+| Mount | Drive | Link now | Max | Free | Role / co-tenants |
+|---|---|---|---|---|---|
+| `/mnt/nvme2` | Samsung 990 EVO Plus 2 TB | **Gen3 x2** (~1.9 GB/s) | Gen5 x4 | 219 GB | **Engram tables.** Production's PLE cache also reads from it |
+| `/mnt/nvme1` | Crucial P310 4 TB (DRAM-less QLC) | Gen3 x4 (~3.9 GB/s) | Gen4 x4 | 1.7 TB | **Experts (after the copy).** Shared with `op-reth` (write load bursty: 50–1,800 IOPS observed), `questdb-import`, `inductor_cache`, `okx_backfill_temp` |
+| `/mnt/nvme0` | Samsung 990 EVO Plus 2 TB | Gen3 x4 | Gen5 x4 | 518 GB | — |
+| `/mnt/nvme4` | SPCC 2 TB | Gen3 x4 | Gen4 x4 | 623 GB | Holds the swapfile |
+
+The same Samsung model negotiates x4 in `nvme0`, so nvme2's x2 is a property of the slot
+or its wiring.
+
+**The expert copy.** Reading 205 GB off nvme2 takes ~2 min at line rate (1.9 GB/s). The P310's
+sustained QLC write rate after its SLC cache fills is unknown and could make the copy
+far slower. Schedule it when production is down, or throttle it, because it contends
+with production's PLE reads.
+
+---
+
+## 2. Architecture
+
+Reference: `inference/model.py`, `inference/engram.py` in the official repo, and the
+tech report, *"Pushing the Limits of KV Cache Compression"*.
+
+| Property | Value |
+|---|---|
+| Backbone layers | **40**, all MoE; there are no dense FFN layers (`model.py:929`, `get_moe_config` `:142-149`). All 15,360 routed experts are 3 bpw in the EXL3 export [measured] |
+| DSpark layers | 3 draft stages (idx 40–42 of `compress_ratios`, which is why it has 43 entries), each with its own attention and a 128-expert / top-3 MoE |
+| Routed experts | 384/layer, top-6, 1 shared expert (always on) |
+| Hidden / moe_intermediate | 5120 / 2304 → 35,389,440 params per expert |
+| Router | `sqrtsoftplus` scores, `noaux_tc` (bias on selection only), `routed_scaling_factor` 1.5, `norm_topk_prob`. A separate VL routing bias for image tokens. `swiglu_limit` 10 |
+| Attention ("CSA2") | MLA-style: q LoRA 1280 → 64 heads x 512. **One 512-d latent per token (MQA)**. Grouped O-LoRA (8 x 1024). A 128-token sliding window plus, where `compress_ratio>0`, up to 512 compressed positions picked by a learned sparse indexer |
+| `compress_ratios` | Layers 0–1: `0` (SWA only). Layers 2–19: `2`. Layers 20–39: `1`. A 20-layer causal *encoder* + 20-layer *decoder*, split at 20 |
+| Cross-layer reuse | Only `kv_source_layer_ids` [2,8,14,20] compute compressed KV. Only `index_source_layer_ids` (8 layers) run the indexer. A two-level candidate filter at layer 20. The reference uses a global mutable singleton (`SharedAttentionRuntime`) |
+| Engram | n-gram hash memory at layers **1 and 14** (§5) |
+| Hyper-connections (mHC) | Residual carried as 4 streams, Sinkhorn-balanced mixing. Our fork's `hc_mix` already serves V4 |
+| DSpark | A separately trained draft (§10). **Not EAGLE/MTP**; upstream's flag is `--speculative-algorithm DSPARK` |
+| Vision | ViT (32 layers) + aligner, BF16, ~0.9 GB. `--language-model-only` skips it |
+| Context | 1M (YaRN x16 over 64K) |
+| Params | 552B backbone + 196B Engram; 8B activated/token prefill, 16B decode [source; the split is unexplained; possibly DSpark counted in decode] |
+
+**Quantization in the official checkpoint** [source: `kernel.py`, `convert.py`]:
+- Non-expert weights are FP8 E4M3, block 32x32, UE8M0 scales.
+- Routed experts are **OCP MXFP4** (E2M1, one E8M0 scale per 32 along K).
+
+---
+
+## 3. Byte geometry, against Qwen3.8
+
+| | Qwen3.8 NVFP4 (today) | DSV4.1 EXL3 3.0 bpw | DSV4.1 official MXFP4 |
+|---|---:|---:|---:|
+| MoE layers x experts, top-k | 48 x 512, top-10 | 40 x 384, top-6 | 40 x 384, top-6 |
+| Bytes / routed expert | 2,764,800 | **13,315,596** [measured] | 18,800,640 [computed from shapes] |
+| Routed rows / token, nothing cached | 480 | 240 | 240 |
+| Routed bytes / token, nothing cached | 1.33 GB | 3.20 GB | 4.51 GB |
+| All routed experts | 67.9 GB | **204.5 GB** [measured] | 288.8 GB |
+| Link time / miss row at 12.02 GB/s | 0.23 ms | **1.11 ms** | 1.56 ms |
+| NVMe time / miss row, nvme2 (x2) / idle x4 drive | — | ~7.0 / ~3.4 ms [estimate] | ~9.9 / ~4.8 ms |
+
+**EXL3 expert layout on disk** [measured, all 41 shard headers + index]:
+- 12 tensors per expert, stored in this order:
+  - `w1.suh` F16[5120] (10,240 B)
+  - `w1.svh` F16[2304] (4,608 B)
+  - `w1.mul1` I32[] (4 B)
+  - `w1.trellis` I16[320,144,48]
+  - then the same four for `w2` and `w3`.
+- 3.010 bits/param.
+- **Byte-contiguous with zero gaps. No expert crosses a shard file** (all 15,360 checked).
+- File start offsets are not 4 KiB-aligned. An O_DIRECT superset read wastes 500–4,596 B
+  per 13.3 MB expert.
+- **Inside the row, `w1.trellis` sits at byte 14,852 (≡ 4 mod 16).** It is misaligned
+  for 128-bit loads (§9.2).
+
+**EXL3 export breakdown** [measured]:
+
+| Component | GiB | Bits |
+|---|---:|---|
+| Routed experts | 190.48 | 3 |
+| DSpark (`mtp.*`, 4,836 tensors) | 6.75 | 4 |
+| Attention, gates, Engram `wkv` | 3.32 | 5 (attention) |
+| Embedding | 1.23 | — |
+| Shared experts | 0.83 | higher |
+| Vision + aligner | 0.90 | native BF16 |
+| LM head | 0.46 | 6 |
+| hc / norms | ~0.15 | — |
+
+One DSpark draft expert is **17,739,276 B** at 4 bpw [measured, `mtp.0.ffn.experts.0.*`].
+The `mtp.*` tensors are absent from `quantization_config.json`'s `tensor_storage` but
+present in the shards.
+
+---
+
+## 4. VRAM budget (production stopped, Stage B merged)
+
+Usable VRAM is taken as 31.8 GiB (32,607 MiB) [measured]. Stage B is assumed, because
+§10 makes it mandatory, so there is no miss-scratch row.
+
+| Item | GiB | Notes |
+|---|---:|---|
+| Attention + gates + Engram `wkv` + shared + head + hc | 4.76 | [measured bytes] |
+| Embedding | 1.23 | Can move to host (+99 slots) |
+| KV + indexer caches at 40K ctx | ≤0.87 | 584 B/token/layer on the sm_120 `v4` layout (upstream `deepseek_v4_memory_pool.py:132-142`). This is the upper bound if all 40 layers allocate; far less if only the SWA windows + 4 KV-source layers do. Confirm when porting |
+| Activations, graphs, workspace | ~3 | [estimate] |
+| **Hot cache, no DSpark** | **31.8 − 9.86 = ~21.9** | ≈ **1,770 slots** of 15,360 = 11.5% [estimate] |
+| DSpark draft, fully resident | 6.75 | ≈ 544 slots, **31%** of the above. A draft-expert cache is the alternative (§10) |
+| **Hot cache, DSpark resident** | **~15.2** | ≈ **1,220 slots** = 7.9% [estimate] |
+
+Qwen today: 13.8% coverage. Before Stage B lands, subtract 2.98 GiB (240 slots) for the
+non-speculative Stage A scratch, and 17.9 GiB for a 6-token verify, which does not fit.
+
+---
+
+## 5. Engram
+
+[source: `inference/engram.py`, `model.py`; upstream `upstream-scope/dsv4.1`]
+
+**Access pattern:**
+- Tokens map to a compressed vocab of 99,092 (NFKC, lower-cased, accents stripped).
+- For each position, 2-, 3- and 4-grams are rolling-XOR hashed with per-layer odd
+  multipliers, into disjoint prime-sized bucket ranges.
+- That gives **24 rows/layer/token and 48 rows/token**.
+- A row is 256 B FP8 E4M3 plus an 8 B E8M0 scale row (block 32), so 264 B logical.
+- **Row ids depend only on token ids.**
+
+**On disk** [measured]: `embed.weight` `[~384M, 256]` F8_E4M3 at offset 0 of each shard's
+data section, then `embed.scale` `[~384M, 8]` F8_E8M0 about 98.3 GB later. So:
+- A row costs **two reads** unless the scales (6.1 GB for both layers) are held in RAM or
+  the tables are re-laid out.
+- Our reader works in 4 KiB pages, so a token on a full RAM miss touches 96 pages
+  (384 KiB) against 12 KiB of payload: ~0.2 ms at 1.9 GB/s [estimate].
+
+**Reader: already exists.** `read_paged_rows` / `PagedRowSource`
+(`model_loader/file_row_reader.py`, `kernels/jit/csrc/io/uring_file_reader.cpp:236-334`)
+was built for Qwen4 PLE's 160 B rows. It dedupes and coalesces pages and handles mixed
+row sizes in one io_uring submission.
+
+**Upstream implementation** (`layers/engram.py`, `kernels/ops/embeddings/engram_gather.py`):
+- **Hashing runs on the GPU and inside the graph** for decode
+  (`engram_hash_ids_and_commit`, `engram.py:315-330`) and for DSpark target-verify
+  (whole draft block, `:294-299`; `commit_after_verify` `:438-459`). Prefill hashing is
+  eager (`deepseek_v4.py:731-738`).
+- **The gather is one Triton kernel** reading a raw pointer to VRAM or to a pinned host
+  table (`_HostTable`, `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`, `engram.py:549-706`:
+  memfd/anon mmap, `cudaHostRegister`, hugepages). It dequantizes inline.
+- **Upstream has no NVMe tier.** The whole 203 GB lives in VRAM (TP4–8) or host RAM.
+- **Open:** can our RAM tier simply be upstream's `_HostTable` at reduced size plus a slot
+  map, rather than a new cache?
+
+**Cache behaviour** [measured, needs re-run]:
+- A NumPy port of the hash reproduces the compressed vocab exactly (99,092). The run
+  used our benchmark corpus with generated completions (4.12M tokens, DSV4.1 tokenizer)
+  and 264 B rows (weight and scale together), with the budget split 50/50 between the
+  two layers.
+- **Ceiling:** 16.6M unique rows/layer out of 98.9M accesses, so **≤83% of reads can
+  ever hit** (an earlier draft wrongly said 56%). The whole unique set is
+  33.2M x 264 B = 8.8 GB.
+- **The hit rates below are a loose lower bound.** They come from a raw access-gap test
+  (hit iff fewer than *budget* accesses since last use), which undercounts true LRU. That
+  is why 10 GB shows 75% although it holds every unique row (true LRU would reach ~83%).
+
+| RAM cache | Warm hit rate (≥, lower bound) | Cold per-session |
+|---:|---:|---:|
+| 1 GB | 55.3% | 31.9% |
+| 2 GB | 60.9% | 31.9% |
+| 5 GB | 68.9% | 31.9% |
+| 10 GB | 75.3% | 31.9% |
+| 20 GB | 80.5% | 31.9% |
+
+- **The simulation script was not preserved.** Phase 0 re-runs it with exact LRU and a
+  bit-exact hash parity test.
+- The corpus is repetitive financial text, so general traffic will reuse less.
+- Engram NVMe traffic is small at any of these rates, so the 5 GB allocation in §9.1 is
+  an [estimate], not a finding.
+
+**Timing is the constraint, not bandwidth.**
+- Layer 1 needs its rows about one layer's compute after the token is sampled:
+  ~2.5–4 ms [estimate].
+- A RAM-miss fetch is ~0.2–1 ms [estimate].
+- io_uring runs on the CPU and needs the ids. Under overlap scheduling the host learns
+  the token one step late.
+- Layer 14 has ~13 layers of slack.
+- §9.3 covers which mechanisms can overlap the layer-1 fetch with layer 0.
+
+**Our fork has no Engram code** (0 matches in `models/deepseek_v4.py`, 32 in upstream).
+
+---
+
+## 6. Upstream SGLang `dsv4.1` branch
+
+Fetched read-only as `upstream-scope/dsv4.1` @ `85e8eddc54` (and `upstream-scope/main`).
+
+**Shape of the change.** 197 commits, 110 files, +9,506/−719 against merge-base
+`1f0c73e9bd`.
+- **Config.** `configs/deepseek_v41.py` (88 lines) remaps `DeepseekV41ForCausalLM` onto
+  `DeepseekV4ForCausalLM`.
+- **Model.** `models/deepseek_v4.py` +1,646 (vision, mHC, Engram, candidate indexer).
+- **Attention.** `layers/attention/deepseek_v4_backend.py` +2,239, `dsv4/dsv41_sparse.py`,
+  Triton/Gluon kernels.
+- **MoE.** `topk.py` gains `sqrtsoftplus` and packed top-k; `moe_fused_gate.py`.
+- **Quant.** `fp8.py`/`fp8_utils.py` view block-FP8 as MXFP8;
+  `mxfp4_flashinfer_trtllm_moe.py`.
+- **Speculation.** DSpark (§10).
+- **Chat/parsers.**
+- **Env vars:** `SGLANG_DSV4_KV_LAYOUT`, `SGLANG_DSV41_TORCH_PREFILL_INDEXER`,
+  `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`, `SGLANG_DSPARK_NVLINK_VOCAB_GATHER`.
+
+**MoE.** `flashinfer_mxfp4` is the only runner upstream has used, through the generic
+`FusedMoE`/`select_experts`. The recipes (`docs/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx`)
+cover H200/B200/B300/GB300/MI350X only, at TP4–TP8.
+
+`validate_deepseek_v41_features()` (`arg_groups/deepseek_v4_hook.py:256+`):
+- Allows DSpark as the only speculation.
+- Rejects `--enable-hisparse`, two-batch overlap, PP, the unified KV layout, and
+  `--dsv4-attn-backend trtllm`.
+- **Does not reject overlap scheduling.**
+
+### sm_120 (RTX 5090) matrix [source; none of it tested]
+
+| Kernel / path | sm_120 status |
+|---|---|
+| FlashMLA decode | `flash_mla_sm120` path exists, and predates this branch |
+| `swapab_attention` fast decode | sm_100 only; not taken |
+| DeepGEMM `fp8_fp4` MQA logits (indexer) | Gated on capability ≥ 10, so *attempted*. **Coverage unverified.** Torch fallback for prefill (`SGLANG_DSV41_TORCH_PREFILL_INDEXER`). krasis's `deepseek_v4_compressor.cuh` has portable CUDA indexer-score kernels (V4 geometry) usable as a reference fallback |
+| `sparse_prefill_fwd` | Explicitly not sm_120; dense prefill fallback |
+| V4.1 compact KV layouts (528 / 288 B/token) | sm_100 only. sm_120 uses legacy `v4` 584 B/token/layer |
+| `flashinfer_mxfp4` MoE | Unverified on sm_120. Irrelevant on the EXL3 path |
+
+The `lmsysorg/sglang:dev-dsv41` image was not inspected.
+
+### Divergence and porting strategy
+
+- Our HEAD (`codex/nvfp4-expert-stream-main`) is 256 ahead / 462 behind `dsv4.1`, from
+  merge-base `7bc4eb3740`.
+- `dsv4.1` touches **none** of `expert_stream.py`, `expert_hot_cache.py`,
+  `expert_residency*.py`, `model_runner.py`, `scheduler.py` or
+  `moe_runner/flashinfer_cutlass.py`.
+- **Conflict hotspot:** `layers/moe/fused_moe_triton/layer.py` (+34/−19 upstream,
+  +93/−0 ours). Re-validate `topk.py` against the streamer.
+- **Base.** The mainline includes Stage B since 2026-09-18 (`SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE`,
+  `797be6f678`, now under `codex/nvfp4-expert-stream-main` @ `b59edf2dc4`).
+- **Strategy (measured 2026-09-18): merge, don't cherry-pick.**
+  - Applied to our base, the squashed 110-file `dsv4.1` diff leaves 29 files
+    unapplied, because upstream's branch point is 270 commits newer than ours.
+  - A real `git merge upstream-scope/dsv4.1` conflicts in only 12 files:
+    `modelopt_quant.py`, `scheduler.py`, the Qwen4 PLE files, and a few config/test
+    files.
+  - Do it on a new branch `dsv41` off the mainline
+    (plan: `docs/superpowers/plans/2026-09-18-dsv41-phase0.md`).
+  - `dsv41` then carries ~467 upstream commits, so **never merge it wholesale into the
+    production branch**, and **do not rebase** the expert-stream work onto `dsv4.1`.
+
+---
+
+## 7. EXL3 and exllamav3
+
+Repo: `turboderp-org/exllamav3`, **MIT**. The checkpoint was converted with v1.4.2,
+codebook `mul1`, `out_scales=always`, `--hq`.
+
+- **Format.** QTIP-style trellis: Hadamard-rotated weights with sign vectors `suh`/`svh`,
+  int16 trellis tiles decoded through a procedural `mul1` codebook, no separate scales.
+  Loader: `exllamav3/modules/linear.py:403-421`.
+- **Kernels.**
+  - `exllamav3_ext/quant/exl3_moe.cu` (+ `exl3_moe_coop.cu`) is a **fused MoE MLP**,
+    bincount-driven, with bsz ≤ 8 decode tiles and sm_120 tile selection
+    (`doc/env_vars.md:344-357`).
+  - **It takes per-expert pointer arrays** (`ptrs_trellis/ptrs_suh/ptrs_svh`,
+    `block_sparse_mlp.py`). So a slot-indexed hot cache can be exposed by rewriting
+    pointer tables in-graph, which is cheaper than our NVFP4 remap path.
+  - The trellis is loaded with 128-bit `cp.async` through `int4*` casts
+    (`exl3_gemm_inner.cuh`), which needs at least 16 B-aligned trellis.
+  - `exl3_gemv.cu` does dense decode.
+- **DeepSeek V4.** `architecture/deepseek_v4{,_mtp,_vision}.py`.
+  `_RATIO_TO_TYPE = {0: "sliding", 4: "csa", 128: "hca"}` **raises `KeyError` on V4.1's
+  ratios 1 and 2 today**. Engram support is not confirmed. exllamav3 is **not
+  installed** anywhere on divix01.
+- **Its own offload** (`model/moe_cpu_host.py`) assumes every expert fits in host RAM.
+- **The card's runtime is vLLM** (`--quantization exl3`,
+  `--hf-overrides '{"engram_table_dir": ...}'`, DSpark via `--speculative-config`). That
+  vLLM EXL3 path is the nearest prior art for an SGLang EXL3 quant method. Find it.
+- **SM-contention risk.** Trellis decode is real ALU work. The `hc_mix` lesson says
+  measure it against in-flight copies before committing.
+
+---
+
+## 8. Our fork's integration surface
+
+(`codex/nvfp4-expert-stream-main` @ `557c1fbaec`; line numbers are jump targets.)
+
+**Hook point: the quant method.** `ModelOptFp4MoEMethod.process_weights_after_loading`
+sets `layer._nvfp4_expert_streamer` (`modelopt_quant.py:2963`). Consumers discover it by
+`getattr` walk: `model_runner.py:718,745,747`, `qwen2_moe.py:772`,
+`fused_moe_triton/layer.py:1572`, `expert_host_arena.py:65`, `expert_hot_cache.py:957`.
+No other quant method attaches a streamer, and there is no EXL3 code anywhere.
+
+**A row is a hard-coded NVFP4 tuple** (`NVFP4_STREAM_TENSORS`, `expert_stream.py:40-47`).
+Expert count, bytes/row and top-k are derived from shapes (`_validate_sources`, `:820`).
+**Per-tensor alignment inside a slot is not parametric** (§9.2).
+
+**Pieces relevant to the three tiers:**
+
+| Piece | State |
+|---|---|
+| `ExpertHostArena` (`expert_host_arena.py:42`) | Holds **100%** of rows. The in-graph gather (`expert_cache_transfer.cuh:17-71`) reads it by fixed address via `ld.global.nc`; there is **no miss path**. The gather plan assumes `expert_ids` name host source rows (`expert_row_plan.py:7,74`). It has to become a slot-indexed RAM cache |
+| `ExpertPinnedHostCache` (`expert_stream.py:89-285`) | Bounded LRU of rows in pinned RAM, fed by io_uring. **Eager-only**: `ensure_rows` calls `.tolist()` and keeps Python bookkeeping. Disabled in production |
+| `ExpertFileRowReader` / `uring_direct` (`expert_file_reader.py:25-140`) | Needs the offloader's re-laid-out per-tensor files (`utils/offloader.py:264-347`). An EXL3 variant can point `AlignedRowSource` at the **original shards** with a per-expert aligned offset table |
+| `read_paged_rows` (`file_row_reader.py`) | Sub-page row reader (PLE). Reusable for Engram as-is |
+| `copy_expert_row_segments_gpu` (`expert_cache_transfer.cuh:200`) | Already takes `{src, dst, bytes}` segment lists: a candidate place to pad a raw row into an aligned slot |
+| Doorbell (`expert_doorbell.py/.cuh`) | Refuses overlap scheduling (`model_runner.py:797-801`), all speculative decoding (`:769-772`) and decode graph bs > 1 (`:773-775`). The overlap refusal is a *placement* constraint (fail-stop check after results), not physics |
+| `SGLANG_MOE_GPU_RESIDENCY_UPDATE` (insert-on-miss lives here) | Refuses speculative decoding (`:812-815`, "verify commits do not reach the device clock") and decode graph bs > 1 (`:816-820`, "padded batches would add graph rows as tokens") |
+| `breakable` decode graph (`runner_backend/breakable_cuda_graph_backend.py`) | Segments captured graphs with eager host code between them. **Our `deepseek_v4.py` already wraps every attention layer in `eager_on_graph` (`:620`)**, so DSV4 already has ~40 breaks/forward, and the eager break functions already run under overlap scheduling in the shipping Qwen config |
+| Graph-gather scratch (`..._GRAPH_GATHER_SCRATCH_ROWS`) | Already multiplies by `verify_tokens` under speculation (`model_runner.py:740-750`) |
+| CUDA host nodes / `cudaLaunchHostFunc` | **Not used anywhere** in `python/sglang/kernels/jit/csrc` or `sgl-kernel`. Would need a new C++ entry point |
+
+**Also needed:**
+- A pin primitive for the shared expert. The hot cache has none; residency is only
+  emergent. Phase 3.
+- Streaming wired into `deepseek_v4.py`'s MoE forward. It has no expert-stream
+  references today.
+- A check of grouped `noaux_tc` top-k (`deepseek_v2.py:657-671`) against `sqrtsoftplus`.
+
+**Existing DeepSeek support:**
+- `models/deepseek_v4.py` (4,039 lines), `deepseek_v4_nextn.py`, `deepseek_v4_dspark.py`
+  and `layers/attention/dsv4/`.
+- No V4.1 code: no Engram, no ratio-1/2 generalization, no vision.
+- PLE offload and the Mamba flags drop out.
+
+---
+
+## 9. Three-tier design: NVMe → ~90 GB RAM → VRAM
+
+### 9.1 RAM budget split [estimate]
+
+| Item | GB | Notes |
+|---|---:|---|
+| Process, non-expert host state, io_uring staging | ~10 | Measure |
+| Engram RAM cache (rows + scales, 264 B) | ~5 | [estimate]. The simulation needs a re-run (§5). The unique set on our corpus is 8.8 GB |
+| **Expert RAM cache** | **~75** | ≈ **5,630 experts, 36.7%** of 15,360 |
+| VRAM hot cache | — | 1,220–1,770 slots (§4), all also held in RAM (inclusive). Distinct coverage = the RAM tier, ~36.7% |
+
+**Pinning ~80 GB at startup.** `cudaHostRegister` on this much memory takes real time
+and interacts with THP. Measure it. Upstream's `_HostTable` uses `MADV_HUGEPAGE` /
+`MADV_COLLAPSE`.
+
+**Hierarchy: inclusive, VRAM eviction = drop** (both decided 2026-09-18).
+- Promotion RAM→VRAM **keeps** the RAM copy.
+- An evicted VRAM row is **dropped**, with no D2H demote. It is still in RAM, so its
+  next use is a RAM hit (1.11 ms), not an NVMe read.
+- The cost: RAM duplicates the VRAM-resident set (1,220–1,770 rows, 16–24 GB), so
+  distinct coverage is the RAM tier alone, ~5,630 experts (36.7%).
+- The rejected alternative, exclusive with drop, would have covered ~45–48% of experts
+  distinct, but every dropped row would have gone back to NVMe.
+- The Phase 3 routing trace should confirm the trade.
+
+### 9.2 Reading from NVMe, and the slot layout
+
+**Experts:**
+- One O_DIRECT read per expert, straight from the EXL3 shard (on nvme1 after the copy),
+  using a per-expert `(file, aligned_offset, aligned_len)` table computed from headers.
+  There is no on-disk re-layout.
+- The reader takes the expert directory as a parameter (nvme2 now, nvme1 later).
+
+**Slot layout (Phase 0 decision):**
+- A raw row copied byte-for-byte leaves `w1.trellis` at an offset ≡ 4 mod 16. exllamav3
+  needs ≥16 B alignment (128 B preferred), so the slot needs per-tensor padded offsets.
+- The O_DIRECT superset read also leaves the row itself at a file-dependent offset
+  inside its RAM buffer.
+- Where to pad:
+  - **NVMe→RAM**: a host memcpy of ~13 MB per admission, ~1–2 ms on one core
+    [estimate]. That is comparable to the 1.11 ms link term, so add it to §9.4.
+  - **RAM→VRAM**: a 12-segment `copy_expert_row_segments_gpu` gather. Check the source
+    alignment its word loads need.
+- Also confirm whether `exl3_moe` needs `suh`/`svh` aligned as well as the trellis.
+
+**Engram:**
+- `read_paged_rows`: 48 weight pages plus 48 scale pages per token on a full RAM miss.
+- Options if contention shows up: hold the 6.1 GB of scales in RAM (halving the reads),
+  or re-lay out the tables shard by shard (peak +101.5 GB).
+
+**GPUDirect Storage is not an option.** On GeForce, cuFile runs only in compatibility
+mode, which bounces through host memory ([NVIDIA
+forum](https://forums.developer.nvidia.com/t/gds-requirement-for-cards/184489),
+[GDS O_DIRECT guide](https://docs.nvidia.com/gpudirect-storage/o-direct-guide/index.html)).
+
+### 9.3 The shared hard problem: a RAM miss inside a CUDA-graph decode
+
+The in-graph gather can read a row that is in RAM, through a slot index or pointer
+table. **Nothing can wait for NVMe from inside the graph today.**
+
+**What any mechanism must satisfy:**
+- **Bounded wait plus a defined failure path.** A failed or stuck io_uring read must not
+  wedge the stream and every `synchronize()` after it. Candidates:
+  - a fail-stop flag read by the next kernel plus a watchdog (as the doorbell does);
+  - drop-on-miss as a *safety valve* only, which is a narrower ask than option D as a
+    policy.
+- **Experts:** the route is only known at the layer, so the NVMe read is on the critical
+  path in every option. §9.4 models it serially.
+- **Engram layer 1:** the ids are known at graph start (GPU hash), so a design that
+  *submits* early and *waits* before layer 1 can hide the read behind layer 0.
+
+| Option | How | Overlap scheduling | DSpark | Engram overlap with layer 0 | Main costs / risks | Size |
+|---|---|---|---|---|---|---|
+| **A. `breakable`-graph host break** after each MoE router and before Engram layers | D2H ids → host checks the RAM map → io_uring misses → publish slots → resume. Either new segments per MoE layer, or router placement moved before the existing attention break (to decide) | Works: DSV4 already runs ~40 eager breaks/forward under overlap. But a D2H sync in a break stalls the single scheduler thread and re-exposes ~2.3 ms/token of host prep, **~1–2% at a 110–200 ms token** | OK: breaks see the verify-batch union | Only with a separate early submit | Scheduler-thread stall; more segments | L |
+| **B. CUDA-graph host nodes, split** (`cudaLaunchHostFunc` captured as host nodes) | Node 1 at graph start: *submit* io_uring reads for known ids. Node 2 before the consumer: *wait* with a bounded timeout, then write the slot table | Likely compatible: no Python or scheduler in the loop (overlap uses a single scheduler thread plus `FutureMap`, `overlap_utils.py:248`) | OK | **Yes**, the submit/wait split | The stream is idle for the whole wait. Host functions may make no CUDA calls and may serialize with each other (a 7 ms callback blocks every other host callback). New C++ entry point. Capture with `torch.cuda.graph` and the breakable backend untested. **An unsplit, blocking B cannot hide the Engram read** | L |
+| **C. CPU io_uring thread + device-side poll** | The GPU posts ids to mapped memory. A CPU thread reads NVMe into a RAM slot and writes a completion flag. A kernel polls the flag with a watchdog. Doorbell-*like*, but redesigned: not the doorbell's all-or-nothing tag semantics and not its current guards | Placement of the fail-stop check must be redesigned (the doorbell's refusal is placement, not physics) | Needs the same guard redesign §10 already requires | **Yes**, by posting at graph start | A polling kernel occupies SMs during the wait (the `hc_mix` lesson); a late-landing write needs the doorbell's race analysis | L |
+| D. Drop missing experts from top-k (policy) | Compute with the resident subset | — | Muddies accept/reject | — | Lossy. **Owner sign-off plus accuracy eval** | M |
+
+**Phase 0 prototype acceptance criteria** (whichever of A, B or C is tried first):
+- Measured per-callback or per-break overhead at the RAM-hit path.
+- Stream-idle time on a forced NVMe miss.
+- A demonstrated timeout that fails stop without hanging the process.
+- Capture under the breakable backend with overlap scheduling on.
+
+### 9.4 Throughput model [estimate]
+
+`ms/token ≈ G x 1.11 + f x G x t_nvme + admission + compute`, where:
+- `G` = VRAM misses/token (240 routed rows/token, no speculation).
+- `f` = fraction of those misses that also miss RAM.
+- `t_nvme` = 7.0 ms on nvme2, 3.4 ms on an *idle* x4 drive.
+- `admission` = any host-side padding copy (§9.2).
+
+Engram adds <1 ms.
+
+| G | f | nvme2 link+NVMe ms | tok/s | idle x4 (nvme1) ms | tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 84 (35%) | 10% | 152 | 6.6 | 122 | 8.2 |
+| 84 | 25% | 240 | 4.2 | 165 | 6.1 |
+| 108 (45%) | 10% | 196 | 5.1 | 157 | 6.4 |
+| 108 | 25% | 309 | 3.2 | 212 | 4.7 |
+
+- The experts will be on nvme1, so the right-hand columns apply, but they assume an idle
+  drive. nvme1 carries `op-reth` and is DRAM-less QLC, so measure it under load.
+- Compute is excluded; EXL3 BS1 decode cost is unmeasured.
+- A *uniform* router is the worst case: ~90% of routed rows miss VRAM (G≈216), and
+  with 36.7% of experts in RAM, f≈60%. That is ~680 ms/token on an idle x4 drive and
+  ~1.15 s on nvme2. The design rests on routing skew keeping f low.
+- **At f ≥ 25% the system is NVMe-bound, and no software change in this doc fixes that.**
+
+---
+
+## 10. DSpark (in scope)
+
+[source: `inference/model.py:1089-1157`, report §2.4.3, upstream
+`srt/speculative/dspark_components/*` and `kernels/ops/speculative/dspark/*`]
+
+**Mechanics.**
+- Three draft stages with sliding-window attention and their own 128-expert/top-3 MoE,
+  fed by target hidden states from layers **37–39** in the reference code. Upstream's
+  `dspark_layers_to_capture` for V4.1 is not yet checked.
+- `TargetHiddenKvInjector` (`dspark_kv_inject.py`) writes those hidden states into the
+  draft KV every verify step.
+- One draft forward proposes a 5-token block; a Markov head refines it and a confidence
+  head scores it.
+- **Verify processes up to 6 tokens** (anchor + 5; `dspark_config.py`).
+- `DSparkVerifyPlanner` (`srt/speculative/dspark_components/dspark_planner.py:70`,
+  `_dynamic_graph_tier` at `:135`) picks each request's verify length. It uses
+  confidence-based survival (`kernels/ops/speculative/dspark/dspark_schedule.py`) and a
+  profiled steps/s table (`dspark_components/dspark_sps.py`). So k is dynamic.
+- The tech report gives **no acceptance-rate numbers**.
+
+**Byte model.** On the Qwen stand-in (`analysis/cross-token/spec_window_summary.txt`):
+- The union of experts grows sublinearly (1.68x reuse at N=8), but miss rows grow faster
+  than accepted tokens unless α is high.
+- **+35% rows per accepted token at α=0.7, N=4; break-even α≈0.84–0.93.**
+- Expert NVMe cost is **bandwidth-bound** (13.3 MB per read), so "amortizing one stall
+  over 6 tokens" does not rescue the byte model. It helps only Engram's small,
+  latency-bound reads.
+- DSV4.1's overlap curve (384 experts, top-6) is unmeasured.
+
+**Costs specific to this stack:**
+- **Draft residency.** 6.75 GiB ≈ 544 target slots, ~31% of the no-DSpark hot cache.
+  The draft touches only 9 experts/step (~160 MB). The alternative is a small draft-expert
+  cache, but it has its own catch: **a draft-expert miss sits on the critical path
+  *before* every verify**, 17.7 MB = ~1.5 ms link + ~4.5 ms NVMe on an idle x4 drive,
+  costlier than a target miss. Deciding needs draft routing skew. It also means two
+  hot-cache managers sharing one VRAM budget.
+- **Stage B is mandatory.** Stage A keeps per-layer miss scratch until the boundary: at
+  k=6, up to 36 rows/layer x 40 = 1,440 rows = 17.9 GiB. Deduplicate the union before
+  the gather.
+- **Guards to redesign.** Both the GPU residency updater (insert-on-miss, +14.2% on Qwen)
+  and the doorbell refuse:
+  - `is_speculative()` (verify commits do not reach the device clock);
+  - **decode graph bs > 1**, because their accounting treats graph rows as tokens.
+
+  A verify forward is `bs x draft_token_num` tokens, so the row-as-token accounting must
+  be redesigned, not just the speculation check. Insert-on-miss must learn batched verify
+  misses and verify-then-commit ordering.
+- **Graph shapes.** Decode, draft-block and verify (possibly per tier via
+  `_dynamic_graph_tier`). Each needs its own scratch and gather sizing.
+
+**Measurement gate, then a rule.** On the running model, measure:
+1. DSV4.1's cross-token expert-union curve at N=2/4/6.
+2. Draft routing skew.
+3. Real α on representative traffic.
+
+Then recompute the break-even. **DSpark ships only if measured α clears it** (§12).
+
+---
+
+## 11. Phases
+
+**Phase 0 — no GPU:**
+1. **Base branch.** Branch `dsv41` off the mainline (Stage B included) and merge
+   `upstream-scope/dsv4.1` into it (§6).
+2. Bit-exact Engram hash parity test (ids, not just vocab size) against `engram.py`.
+   Re-run the cache simulation with **exact LRU**, stated granularity, and separate
+   weight-row and scale-row hit rates. Keep the script in the repo.
+3. Diff our quant files against `dsv4.1`'s `fp8.py`/`fp8_utils.py`/`mxfp4*`.
+4. Read upstream's Engram `_HostTable`/gather and the DSpark worker/planner in full.
+   Check `dspark_layers_to_capture` and whether `_HostTable` can back a partial RAM tier.
+5. Build the per-expert aligned offset table from the EXL3 headers. **Define the EXL3
+   slot layout** (per-tensor padded offsets) and where padding happens (§9.2).
+6. **Earlier proxies for routing skew**, so `G`/`f` are not first seen in Phase 3: any
+   expert-load statistics in the tech report, and any routing data in the EXL3
+   calibration trace (`cal_trace_dsv41_flash_workload.json`, if obtainable). Treat
+   these as proxies only.
+7. Find the vLLM EXL3 implementation the card references.
+8. Agree a **go/no-go tok/s bar** (§12) before GPU phases start.
+
+**GPU window items** (each needs crypto-c9 scheduling; a small-VRAM microbenchmark
+beside production perturbs production latency, so decide explicitly):
+- Prototype one miss mechanism (§9.3) against the acceptance criteria there. It needs a
+  new C++ entry point for B.
+- When production is down: fio on **nvme1 with `op-reth` running** (13 MB random reads
+  at QD 6–36) and on nvme2 (4 KiB random reads at QD48). Measure host RAM free with
+  production stopped, and `cudaHostRegister` time for ~80 GB.
+
+**Phase 1 — model bring-up, not streaming (production down):**
+- The ported model on the Stage-B base.
+- Correctness oracle: a **truncated model** (SWA layers 0–1, Engram layer 1, a KV-source
+  layer, part of the ratio-2 band, plus the head), fully resident, checked against the
+  reference `inference/` code, **or a patched exllamav3**: stock exllamav3 raises
+  `KeyError` on V4.1 and is not installed.
+- Walk the sm_120 kernel matrix (§6). Record router statistics from the truncated model
+  as a first, partial skew signal.
+
+**Phase 2 — EXL3 quant method:**
+- Vendor `exl3_moe.cu`/`exl3_gemv.cu` behind a new quant method and MoE runner, using the
+  pointer-array interface and the slot layout from Phase 0.
+- Establish parity on the truncated model.
+- Microbenchmark BS1 decode, including SM contention with a concurrent copy.
+
+**Phase 3 — three-tier streaming (non-speculative first):**
+- Generalize the streamer.
+- Add the EXL3 shard reader.
+- Turn the arena into a slot-indexed RAM cache: inclusive of VRAM, with VRAM eviction
+  = drop.
+- Pin the shared expert.
+- Build the chosen miss mechanism with its failure path.
+- Add the Engram RAM cache and NVMe reads.
+- **Record `G`, `f` and the hot-cache seed, and check them against the go/no-go bar.**
+
+**Phase 4 — DSpark:**
+- Run the measurement gate (§10), then apply the α rule.
+- Build batched verify misses and the guard/accounting redesign.
+- Decide draft residency vs a draft cache; build the verify graph shapes.
+
+**Phase 5 — serving and quality:**
+- Measure tok/s against §9.4.
+- Run a quality check of EXL3 3.0 bpw with `scripts/fp8_accuracy/` or equivalent.
+
+---
+
+## 12. Open decisions
+
+**Decided:**
+- ~~Drive for the experts~~: they move to `/mnt/nvme1`; the owner does the copy later
+  (schedule it, §1).
+- ~~VRAM eviction~~: **drop**, with no D2H demote (§9.1).
+- ~~RAM copy on promotion~~: **keep it**; the hierarchy is inclusive (§9.1).
+
+**Open:**
+1. **Go/no-go bar.** What tok/s justifies the downtime and the Phase 2–3 investment?
+   The envelope is ~3–8 tok/s before compute, against 19.36 tok/s on Qwen today
+   (MOE_EXPERT_TRANSFER).
+2. **Miss mechanism**: A, B (split) or C (§9.3), decided after the prototype.
+3. **Overlap scheduling.** At DSV4.1 token times it is worth ~1–2%, not Qwen's ~4%.
+   Keep it only if the chosen mechanism is compatible.
+4. **Failure policy** for an NVMe read that fails or times out inside a graph: fail-stop,
+   or drop-on-miss as a safety valve (§9.3).
+5. **Drop-on-miss as a policy (option D).** Lossy. Only with sign-off plus an accuracy
+   eval.
+6. **DSpark ship rule**: ships only if measured α clears the DSV4.1 break-even (§10).
+7. **Production downtime budget** for the GPU items and Phases 1–5.
+8. **Disk**: reclaim the 167 GB of stale `.incomplete` blobs on nvme2.
+
+---
+
+## 13. Risks and open questions
+
+- **Routing skew (`G`, `f`) is unknown**, and the entire §9.4 envelope rests on it.
+- nvme1's real throughput under `op-reth` write load (DRAM-less QLC) is unknown. So is
+  its sustained write rate for the 205 GB copy.
+- The miss mechanisms are unprototyped. Option B's host-callback serialization and
+  stream-idle behaviour and option C's SM cost while polling are unmeasured.
+- The EXL3 slot alignment: whether `exl3_moe` also needs `suh`/`svh` aligned, and the
+  admission-copy cost.
+- The §4 KV figure: whether all 40 layers allocate 584 B/token.
+- sm_120 coverage of the DeepGEMM `fp8_fp4` indexer and of FlashMLA with the V4.1
+  layout is unverified.
+- EXL3 3.0 bpw quality on our workload is unmeasured; the card's scores are for the
+  unquantized model.
+- The Engram simulation needs a re-run (§5), and the corpus is narrow.
+- The global-singleton cross-layer KV reuse needs a batched design. Upstream presumably
+  solved it; confirm during the `dsv41` merge.
+- The 8B/16B activated-param split is unexplained.
+- Host memory is shared with co-tenants, and swap use varied between 30 and 60 GB in
+  one day.
+
+---
+
+## Sources
+
+- Official repo snapshot and tech report (paths in §1).
+- EXL3 model card: <https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-3.0bpw>.
+- exllamav3: <https://github.com/turboderp-org/exllamav3>.
+- SGLang `dsv4.1`: <https://github.com/sgl-project/sglang/tree/dsv4.1> (local
+  `upstream-scope/dsv4.1` @ `85e8eddc54`).
+- CUDA runtime docs for `cudaLaunchHostFunc` (host-function restrictions and stream
+  semantics).
+- divix01 analysis: `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/`
+  (`cross-token/spec_window_summary.txt`, `strategy/static_curves.json`).
+- Our fork: §8 line references; [`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md).
