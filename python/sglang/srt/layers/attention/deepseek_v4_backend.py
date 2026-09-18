@@ -1388,8 +1388,11 @@ class DeepseekV4AttnBackend(
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
+            # The low-ratio (c1/c2) indexer-K pools are always fp4 and always read
+            # through DeepGEMM, even when SGLANG_FP8_PAGED_MQA_LOGITS_TORCH is on.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                get_platform().is_sm120
+                and (self.enable_deepseek_v4_fp4_indexer or compress_ratio in (1, 2))
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -1577,6 +1580,7 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
+            force_deep_gemm_metadata=get_platform().is_sm120,
         )
 
     @property
