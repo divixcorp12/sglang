@@ -2,8 +2,9 @@
 
 State as of `797be6f678` (`insert-on-miss-stage-b`, fast-forwarded into
 `codex/nvfp4-expert-stream-main` 2026-09-18) — all accepted
-optimizations merged, plus insert-on-miss **stage 2 (DIRECT)**, accepted
-2026-09-18 on an acceptance-grade paired serving arm. Suite on that merge:
+optimizations merged, plus insert-on-miss **stage 2 (DIRECT)** and the **fused
+route planner** (`SGLANG_MOE_EXPERT_FUSED_PLAN=1`), both accepted 2026-09-18 on
+acceptance-grade paired serving arms. Suite on that merge:
 1 failed / 860 passed, the single failure being the long-characterised doorbell
 copier flake (four distinct parametrisations, clears in isolation).
 
@@ -24,20 +25,30 @@ scratch + 48 pull rows; **stage 2 needs no scratch, so the same budget gives
 | Baseline (no optimizations) | 13.96 | — |
 | + insert-on-miss (stage 1, SCRATCH) | 15.98 | +14.2% |
 | + overlap scheduling + hc_mix CTA cap | 16.645 | +19.2% |
-| **+ insert-on-miss stage 2 (DIRECT) — SHIP THIS** | **19.360** | **+38.7%** |
-| + prefetch enabled on top | 15.93 | −4.3% ✗ |
+| + insert-on-miss stage 2 (DIRECT) | 19.360 | +38.7% |
+| **+ fused route planner — SHIP THIS** | **20.695** | **+48.2%** |
+| + prefetch enabled on top (of stage 2's predecessor) | 15.93 | −4.3% ✗ |
 
-**Everything that worked reduces or re-schedules bytes; nothing that worked came
-from prediction.** Prefetch is implemented, measured, and deliberately left off.
+**Nothing that worked came from prediction.** Prefetch is implemented, measured,
+and deliberately left off.
 
 The governing constraint: at ~140 miss rows/token x 0.2239 ms/row, the PCIe path
-is the dominant term. Only changes that reduce bytes/token move the needle —
-**stage 2 wins by moving 388.0 MB/token instead of 430.5.**
+is ~62% of each token — **stage 2 wins by moving 388.0 MB/token instead of
+430.5.** But the link and the compute run **serialized on one stream**, so the
+other ~38% is on the critical path too: the fused planner moves no bytes and
+wins by cutting ~65 bookkeeping kernels per layer (see
+[the decode trace](#nsight-decode-trace-2026-09-18--the-per-row-constant-measured-in-graph)).
 
 Stage 2 accepted 2026-09-18 on an acceptance-grade paired arm: **19.360 vs
 18.541 median, faster on 27 of 29 paired turns (p < 1e-5)**, mechanism confirmed
 by +480 slots → +3.09 points of hit rate → 9.9% fewer miss rows. See
 [Acceptance arm](#acceptance-arm-2026-09-18--the-shipping-decision).
+
+Fused route planner accepted 2026-09-18 on a second acceptance-grade paired arm:
+**20.695 vs 19.442 median, faster on 28 of 29 paired turns (p = 5.6e-8)**,
+2.77 ms/token saved, hit rate unchanged. The shipped-config control reproduced
+the day before's 19.360 within drift. See
+[Fused route planner arm](#fused-route-planner-arm-2026-09-18).
 
 ---
 
@@ -48,6 +59,7 @@ by +480 slots → +3.09 points of hit rate → 9.9% fewer miss rows. See
 | Variable | Default | What it does |
 |---|---|---|
 | `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | `0` (OFF) | **The big one.** `0` OFF, `1` SCRATCH, `2` DIRECT. **Ship `2`.** A miss is paid once instead of every token. SCRATCH (+14.2%) copies the previous forward's misses out of the gather's scratch rows into slots at the boundary. DIRECT lands each miss straight in a victim slot chosen from a shortlist the previous boundary ranked, so the D2D hop disappears **and the 1.33 GB scratch region returns to the cache as +480 slots (+14.1% capacity at no VRAM cost)** — worth a further **+4.4%** over SCRATCH. Requires `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1` and `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`. |
+| `SGLANG_MOE_EXPERT_FUSED_PLAN` | `False` | **Ship `1` (+6.4%).** Replaces the graph gather's generic route planning (~65 small torch ops per layer: sorts, scans, masks, counter adds) with one warp-sized JIT kernel. Pure compute: moves no bytes and leaves residency unchanged. BS1 only — `supports_fused_graph_routes` requires one token row with unique IDs and falls back to the generic planner otherwise. Tested against stage 2 by `test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one`. |
 | `SGLANG_MOE_HOT_INSERT_ON_MISS` | — | **Deprecated alias** for the above, kept because the enum preserves its 0/1 meaning. `1` selects SCRATCH. Prefer the `_STAGE` form. |
 | `SGLANG_MOE_HOT_FUSED_INSERT` | `False` | Runs **stage 1's** boundary insert through a fused masked Triton kernel: one pass instead of two, and idle lanes move no bytes. Cuts that boundary ~45% (5.32 ms/token isolated, 4.28 ms/token in an arm). **Not on the shipping path** — stage 2 has no insert loop to fuse, and this flag is hard-refused on any stage but SCRATCH so an arm cannot report a fused number for an unfused run. Keep off unless you are deliberately running stage 1. |
 | `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY` | `0.98` | Per-token decay on the insertion score that ranks eviction victims. Lower = forgets faster. |
@@ -65,13 +77,15 @@ graph-gather plus GPU residency update.
 
 ### Winning config
 
-This is exactly what produced **19.360 tok/s**
-(`servers/accept-C/run-20260917-211615`, acceptance grade, 29 records, 0 errors).
-Paths are divix01's; change the four at the top for another host.
+This is the config that produced **20.695 tok/s**
+(`servers/fplan-F/run-20260918-032147`, acceptance grade, 29 records, 0 errors),
+except that the arm ran a **10,240 MB** hot cache where this block shows
+production's 12,288. Paths are divix01's; change the four at the top for another host.
 
-> **The one line that changed from the 16.645 config** is
+> **Two lines changed from the 16.645 config:**
 > `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2` in place of
-> `SGLANG_MOE_HOT_INSERT_ON_MISS=1`. Everything else is identical.
+> `SGLANG_MOE_HOT_INSERT_ON_MISS=1` (19.360), then
+> `SGLANG_MOE_EXPERT_FUSED_PLAN=1` (20.695). Everything else is identical.
 > Stage 2 requires `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` and
 > `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1`, both already present.
 >
@@ -119,6 +133,7 @@ taskset -c 0-63 env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
   SGLANG_MOE_EXPERT_FILE_READER=uring_direct \
   SGLANG_MOE_EXPERT_HOST_ARENA=1 \
   SGLANG_MOE_EXPERT_GRAPH_GATHER=1 \
+  SGLANG_MOE_EXPERT_FUSED_PLAN=1 \
   SGLANG_MOE_EXPERT_COPY_BACKEND=dma \
   SGLANG_MOE_PINNED_HOST_MB=0 \
   \
@@ -198,46 +213,33 @@ The tested wrapper is `scripts/expert_prediction/run-shadow-server.sh`, which ad
 run provenance, the GPU lock and metrics files:
 
 ```bash
-OVERLAP_SCHEDULE=1 HOT_GPU_MB=10240 HOT_INSERT_ON_MISS_STAGE=2 HOT_INSERT_ON_MISS_DECAY=0.98 \
+OVERLAP_SCHEDULE=1 HOT_GPU_MB=10240 HOT_INSERT_ON_MISS_STAGE=2 HOT_INSERT_ON_MISS_DECAY=0.98 FUSED_PLAN=1 \
 PREFETCH_PREDICTOR= PREFETCH_PULL_MODE=off RUN_KIND=timed PREFETCH_RUN_DIR=/path/to/run \
   scripts/expert_prediction/run-shadow-server.sh myserver 31047 off
 ```
 
 ### What production runs today, and the delta
 
-The live production server is launched by
+The production server is launched by
 **`divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh`** (port 7867,
 `0.0.0.0`). That *script* is not in this repo, but the *code* it runs is: the
-worktree `main-port-probe-7bc4eb` is checked out on **this same branch**,
-`codex/nvfp4-expert-stream-main`, at commit `d43c59b58a`.
+worktree `main-port-probe-7bc4eb`, **detached at `797be6f678`** since 2026-09-18
+(it was on `d43c59b58a`, 158 commits behind and without `INSERT_ON_MISS`).
 
-**Prod is 158+ commits behind, and the gap is the whole problem.** `d43c59b58a`
-is an ancestor of the current tip and contains **zero occurrences of
-`INSERT_ON_MISS`** — the flag does not exist in the code prod is running. Setting
-it there changes nothing.
+**As of 2026-09-18 the script carries the full winning config.** Four changes
+against the pre-campaign script, each with a backup alongside:
 
-Therefore the env changes below are step 2, not step 1:
+| Setting | Before | Now | Why | Backup |
+|---|---|---|---|---|
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | unset (off) | **`2`** | +14.2% for stage 1, a further +4.4% for stage 2's +480 slots | `.bak-pre-stage2-20260918` |
+| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a boundary every decode forward. **Stage 2 requires 1 — see the launcher warning above** | same |
+| `--disable-overlap-schedule` | present | **removed** | +4.5% / +2.9%. Its absence *is* the optimization | same |
+| `SGLANG_MOE_EXPERT_FUSED_PLAN` | unset | **`1`** | +6.4% | `.bak-pre-fusedplan-20260918` |
 
-1. **Get the code to prod first.** Fetch and fast-forward the
-   `main-port-probe-7bc4eb` worktree to the tip of
-   `shared/codex/nvfp4-expert-stream-main` (do not pin a SHA from this document
-   — it is written before the commit that contains it). That advances prod by 158
-   commits — far more than our four optimizations — so it needs its own
-   validation pass, not a flag flip. (The worktree's own `git status` reports
-   "behind 13" against a stale remote-tracking ref; fetch first. The 158 figure
-   is computed where both commits are present and is the one to trust.)
-2. **Then change exactly three things:**
-
-| Setting | Prod today | Should be | Why |
-|---|---|---|---|
-| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | unset (off) | **`2`** | +14.2% for stage 1, and a further +4.4% for stage 2's +480 slots. The largest single win |
-| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a residency boundary after every decode forward; it refuses to initialise otherwise. **Stage 2 requires 1 — see the launcher warning above** |
-| `--disable-overlap-schedule` | **present** | **remove the flag** | +4.5% / +2.9%. Its absence *is* the optimization |
-
-The hc_mix CTA cap needs no change once the code is there — `SGLANG_OPT_HC_MIX_MAX_CTAS`
-defaults to 128. Note that removing `--disable-overlap-schedule` also depends on
-code prod does not yet have: the overlap admission path came from
-`host-decode-overhead` @ `90914e33ac`. All three changes are gated on step 1.
+Validated after the stage-2 change: healthy in 201 s, `DIRECT`, 4,660 slots,
+`scratch_bytes: 0`, coherent generation. **The fused-planner line was added after
+that validation and has not been started under the prod script yet** — prod was
+left down after the 2026-09-18 traces.
 
 Keep everything else prod already has, including `--tool-call-parser auto`,
 `SGLANG_QWEN4_PLE_FILE_READER=uring`, `SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY=1`,
@@ -287,6 +289,9 @@ at that budget.
 - Suite on the merged build is **1 failed / 860 passed**; the single failure is
   the doorbell copier flake (four parametrisations, clears 10/10 in isolation in
   two separate trees). The six earlier base failures are fixed by main-tip.
+- **The fused planner is BS1-only by construction.** At more than one token row it
+  falls back to the generic planner automatically, so it cannot break a larger
+  batch — but its +6.4% does not carry over either.
 - **Stage 2 has never run on production hardware under production load** — only
   on divix01's benchmark harness at BS1. It is accepted on a paired serving arm,
   which is the strongest evidence this campaign produced, not on production
@@ -308,6 +313,8 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 3 | **hc_mix CTA cap** | `hc-mix-stall` @ `732acac42f` | **D 14.089 → 14.713 (+4.4%)**; B flat (13.836 → 13.962) | `matrix/hcmix-20260917-113135`; microbench `analysis/hc-mix-stall/` |
 | 4 | Top-1 prefetch selector | `scoring-cost` @ `3baf985d33` | C 13.33 → 13.81; D unchanged. Width-16 bank cost 2.37 ms, scorer 1.71 ms | `servers/scoring-*` |
 | — | **Combined (1+2+3+4)** | `combined-iom` @ `f727a001f7` | **combo-B 16.645** | `servers/combo-b-p1/run-20260917-141132` |
+| 14 | **Insert-on-miss stage 2 (DIRECT)** | `insert-on-miss-stage-b` @ `797be6f678` | **18.541 → 19.360 (+4.4%)** over stage 1 + fused insert kernel | `matrix/accept-20260917-205847`; see backlog row 14 |
+| 21 | **Fused route planner** | flag only, on `797be6f678` (planner code predates the campaign) | **19.442 → 20.695 (+6.4%)**, 28/29 paired turns, p = 5.6e-8; 2.77 ms/token; hit rate unchanged | `matrix/fplan-20260918-032147` |
 
 ### Rejected / closed
 
@@ -333,15 +340,22 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 16 | Reduce the 2.76 MB row size | Directly attacks bytes/token | **Closed by arithmetic.** Row size is set by the model (NVFP4 4-bit weights + E4M3 blockscales); it is not a tunable. The only mechanism that shrinks it is compression, which is #12 |
 | 17 | Fused scorer kernel | 1.7 ms D scoring cost | Only useful if prefetch is revived |
 | 18 | Fix 8 known test failures | Suite to zero | In flight on `fix-known-test-failures` |
+| 22 | **Fold stage 2's gather bookkeeping into the fused planner** | ≤ ~1.9–2.4 ms/token (trace upper bound, like the planner's 3.8–4.4 that realized 2.77) | Not started. `gather_destinations` (~16–23 kernels/layer) and `_commit_gather` (22) are what remains of the tail after #21. Supersedes the handoff's B2, whose ~1% was scoped against stage 1 |
 | 20 | **Offline blockscale re-coding** (precomputed codebook) | **+1.6%** lossless (6-bit) / **+3.2%** lossy (4-bit) | **DEFERRED — do not pick this up without asking the repo owner first.** Not blocked on evidence; it is an open decision about accuracy budget, and it is the owner's call to make |
 
 ### The pattern
 
 Two sophisticated ideas failed for the same structural reason. **On a saturated
-link, only reducing bytes helps.** Prefetch *re-times* bytes (−4.3%).
-Speculation *re-groups* bytes (−35% at realistic acceptance). Residency policy
-*reduces* bytes (+14.2%). Use this as the filter for any new proposal: does it
-change bytes/token?
+link, re-timing or re-grouping bytes does not help.** Prefetch *re-times* bytes
+(−4.3%). Speculation *re-groups* bytes (−35% at realistic acceptance). Residency
+policy *reduces* bytes (+14.2%).
+
+The filter has a second branch, found by trace rather than theory: the link and
+the compute run **serialized on one stream** (~62% / ~38% of a token), so
+removing work from the compute side shortens the token as directly as removing
+bytes does. The fused planner moves no bytes and won +6.4%. Ask of any new
+proposal: **does it change bytes/token, or remove work from that one stream?**
+Moving work *around* on it (re-timing) is the pattern that has failed.
 
 ### The link is at line rate, and the host caps it at Gen3
 
@@ -420,13 +434,24 @@ time. 36% of layer calls miss nothing.
 on one stream; summed kernel time 14.67 s vs GPU-busy union 14.49 s. The idle
 window above is structural, not incidental.
 
-**The small-kernel tail is the one new target.** ~6,800 kernels per token on the
-compute stream; 2.54M of the window's kernels ran under 2 µs, 4.3 ms/token of
-execution plus the inter-node gaps. Per-layer counts of `bitwise_and`,
-`bitwise_not`, `where`, `fill`, `sum`, `index_select` at 6–7 each look like
-hot-cache routing bookkeeping — **unverified attribution**. It does not touch
-the link, so it only pays directly on the ~20 ms compute share, and more if the
-idle window is ever filled.
+**The small-kernel tail is hot-cache bookkeeping — verified, and partly
+removed.** Each layer runs the same 137 kernels (146 on the 12 full-attention
+layers); gaps between them average only 0.35 µs. Between the router and the MoE
+GEMM sit **107 bookkeeping kernels, ~130 µs/layer, 6.2 ms/token** — more than
+twice the MoE runner (54 µs) and as much as the rest of the layer (134 µs).
+Split by code order (boundaries +-7 kernels):
+
+| block | kernels/layer | ms/token |
+|---|---:|---:|
+| generic route planning + counters (`if not fused:` branch) | ~62–69 | ~3.8–4.4 |
+| stage 2 `gather_destinations` | ~16–23 | ~1.0–1.5 |
+| stage 2 `_commit_gather` | 22 | ~0.9 |
+
+The first block is what `SGLANG_MOE_EXPERT_FUSED_PLAN` replaces — which production
+was **not** running (see [the arm](#fused-route-planner-arm-2026-09-18)); it
+realized 2.77 ms/token of the 3.8–4.4 upper bound. The other two are backlog #22.
+The ordered sequence for one layer is saved as
+`run-20260918-004721/profiles/layer-kernel-sequence.txt`.
 
 **Open:** 15.35 GB of plain H2D memcpy in the window (670 ops, ~34 MB/token)
 is not the segment kernel and is unattributed — prefill inside the window or
@@ -643,6 +668,16 @@ Under `/data/models/slang/nvfp4-work/cc-e16c-public/` (production-config traces)
 | Graph-mode trace, 120 s (kernel table is prefill-only, see above) | `run-20260918-000659/profiles/report.nsys-rep` |
 | Traced launcher (node mode, `--delay=360 --duration=20`) / graph-mode backup | `../run-nvfp4-e16c-public-TRACED.sh` / `.bak-graphmode` |
 | Trace load driver (health `-m 60`, quits after 3 consecutive failures) | `drive.sh` |
+| One layer's ordered kernel sequence (node-mode trace) | `run-20260918-004721/profiles/layer-kernel-sequence.txt` |
+
+Fused route planner work, under `cc-expert-prediction/`:
+
+| What | Where |
+|---|---|
+| Arm | `matrix/fplan-20260918-032147`, `servers/fplan-{F,C}/run-2026091803*`; the first C attempt is marked `ABORTED` |
+| Arm script / paired analysis | `fplan-arm.sh` / `fplan_paired.py` |
+| Worktree | `wt-fusedplan` @ `797be6f678` + the test and launcher change |
+| CUDA test runner (`ALLOW_SHARED_GPU=1` waives the census check, keeps the lock) | `run-fusedplan-tests.sh`, logs `logs/cuda-tests-fusedplan-*` |
 
 The `_hc_mix` persistent-kernel pattern is recorded as **checked and
 inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
@@ -659,6 +694,43 @@ turns with 3.7% different token totals at temperature 0. The check cannot
 discriminate a code change from the stack's own nondeterminism. Byte-identity
 rests on the unit tests, which control routes and compare every byte of every
 cache tensor including untouched scratch rows.
+
+### Fused route planner arm 2026-09-18
+
+`matrix/fplan-20260918-032147`, script `fplan-arm.sh` (a copy of `accept-arm.sh`),
+build `797be6f678` in `wt-fusedplan`, acceptance grade (8 sessions / 29 turns /
+768 tokens), `OVERLAP_SCHEDULE=1`, 10,240 MB, one cold server per condition,
+env verified from `/proc/<pid>/environ`, empty census before, between and after.
+F ran first.
+
+| | condition | median tok/s | mean | hit rate |
+|---|---|---:|---:|---:|
+| C | stage 2, generic planner (shipped) | 19.442 | 19.649 | 71.07% |
+| **F** | **stage 2 + `SGLANG_MOE_EXPERT_FUSED_PLAN=1`** | **20.695** | **20.834** | 70.73% |
+
+Paired: **F faster on 28/29 turns, one-sided sign test p = 5.6e-8**, median
++1.254 tok/s (ratio 1.060), **2.77 ms/token saved** (mean 2.94). C reproduced the
+previous day's 19.360 within drift.
+
+- **Mechanism is compute, not caching:** F's hit rate is 0.34 points *lower*.
+- **Not a length artifact.** The servers generated different lengths on most
+  turns (F +1.9% tokens) and long generations run faster, but the 5 identical-length
+  turns give the same median, +1.254 (4/5 faster); within 10% length, 12/13.
+- **Correctness:** `test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one`
+  runs twin stage-2 managers (generic vs fused) through 30 captured decode steps
+  and requires identical residency, counters and slot bytes, with the generic
+  planner mocked to fail. It kills a mutant that permutes the planner's
+  rank-to-expert layout at step 0. Related suites: 298 passed, 0 failed.
+
+**Gotcha: every earlier arm that says `fused_plan=1` ran the generic planner.**
+`run-shadow-server.sh` printed `fused_plan=1` as a hard-coded literal in the run
+manifest and startup banner (since `ee9c86f189`) and never exported
+`SGLANG_MOE_EXPERT_FUSED_PLAN`, which defaults to `False`. The planner, reviewed
+and approved in Stage A, was therefore never measured in serving until this arm,
+and the claim "fused plan 1" in the prefetch handoff's baseline arms is false.
+The launcher now takes `FUSED_PLAN=1`, exports the variable only when set, and
+records the real value. Same lesson as the `OVERLAP_SCHEDULE` gotcha: **verify a
+flag in the server's environment, not in what the harness says it did.**
 
 ### Acceptance arm 2026-09-18 — the shipping decision
 
