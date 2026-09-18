@@ -51,6 +51,9 @@ def main():
     p.add_argument("--oracle", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--k", type=int, default=20)
+    # Prompts past 144 rows run EXL3 linears through a dense reconstruction (the 1.3 GB head
+    # among them), which needs headroom outside the static pool.
+    p.add_argument("--mem-fraction-static", type=float, default=0.7)
     args = p.parse_args()
 
     import sglang
@@ -61,7 +64,7 @@ def main():
         disable_cuda_graph=True,
         disable_shared_experts_fusion=True,
         context_length=4096,
-        mem_fraction_static=0.8,
+        mem_fraction_static=args.mem_fraction_static,
     )
     oracle = np.load(args.oracle)
     results = []
