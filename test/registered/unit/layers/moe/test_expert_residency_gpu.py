@@ -19,6 +19,7 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
 from sglang.srt.layers.moe.expert_stream import NVFP4_STREAM_TENSORS, ExpertStreamer
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -1016,8 +1017,6 @@ class TestFusedInsert(unittest.TestCase):
         shape stays fixed. Drive the kernel directly with one active lane out of many and a
         deliberately poisoned source for every inactive lane: a kernel that loaded an idle lane
         would copy poison into a live slot."""
-        from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
-
         lanes, slots, row_bytes = 6, 10, 777
         rows = torch.randint(0, 256, (slots + lanes, row_bytes), dtype=torch.uint8, device="cuda")
         before = rows.clone()
@@ -1065,22 +1064,36 @@ class TestFusedInsert(unittest.TestCase):
             (LAYERS, manager.gpu_residency.miss_rows),
         )
 
-    def test_startup_warms_the_kernel_without_moving_a_byte(self):
+    def test_the_startup_warm_up_moves_no_bytes(self):
         """Triton JITs on first call and specialises on row length, and the boundary's first call
-        can land inside graph capture. Startup compiles every specialisation with no lane active;
-        a warm-up that moved anything would corrupt a seeded cache before the first forward."""
+        can land inside graph capture, so startup compiles every specialisation with no lane
+        active. A warm-up that moved anything would corrupt a seeded cache before the first
+        forward. Replay startup's own launch on the built caches and require it to be inert.
+
+        Comparing two separately built managers would not test this: cache rows no slot holds are
+        allocated with ``torch.empty`` and differ between allocations whatever the warm-up did.
+        """
         model = _model()
-        plain = _manager(_model(), gpu=True, **IOM)
-        warmed = _manager(model, gpu=True, **FUSED)
-        for (_, expected), (_, actual) in zip(sorted(plain.caches.items()), sorted(warmed.caches.items())):
-            before, after = _cache_bytes(expected), _cache_bytes(actual)
-            for name, rows in before.items():
-                self.assertTrue(torch.equal(after[name], rows), f"{name} moved during warm-up")
-        assert_slot_rows(self, warmed, model, "after warm-up")
+        manager = _manager(model, gpu=True, **FUSED)
+        updater = manager.gpu_residency
+        self.assertTrue(torch.equal(updater.insert_active, torch.zeros_like(updater.insert_active)))
+        before = [_cache_bytes(cache) for _, cache in sorted(manager.caches.items())]
+        for row, tensors in enumerate(updater.insert_tensors):
+            for rows_view in tensors:
+                insert_expert_rows(
+                    rows_view,
+                    updater.insert_sources[row],
+                    updater.insert_destinations[row],
+                    updater.insert_active[row],
+                )
+        torch.cuda.synchronize()
+        for row, (cache, expected) in enumerate(zip([c for _, c in sorted(manager.caches.items())], before)):
+            actual = _cache_bytes(cache)
+            for name, rows in expected.items():
+                self.assertTrue(torch.equal(actual[name], rows), f"layer {row} {name} moved during warm-up")
+        assert_slot_rows(self, manager, model, "after warm-up")
 
     def test_a_malformed_plan_is_refused_instead_of_corrupting_a_row(self):
-        from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
-
         rows = torch.zeros((8, 16), dtype=torch.uint8, device="cuda")
         lane = torch.zeros(2, dtype=torch.int64, device="cuda")
         active = torch.ones(2, dtype=torch.int32, device="cuda")
