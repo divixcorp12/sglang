@@ -199,12 +199,6 @@ def handle_offload_compatibility(server_args: Any) -> None:
                 "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY stages rows only before decode "
                 "replays; disable prefill CUDA graph capture"
             )
-        if not cfg.disable_overlap_schedule:
-            raise ValueError(
-                "SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY requires "
-                "--disable-overlap-schedule: decode token ids must be final "
-                "before replay"
-            )
     if prefetch_candidates < 0:
         raise ValueError("SGLANG_MOE_PREFETCH_MAX_CANDIDATES must be nonnegative")
     if prefetch_candidates and (not hot_budget_mb or not pinned_budget_mb):
@@ -231,8 +225,15 @@ def handle_offload_compatibility(server_args: Any) -> None:
         raise ValueError("NVFP4 hot caching requires --moe-a2a-backend none")
     if cfg.enable_waterfill:
         raise ValueError("NVFP4 hot caching does not support Waterfill")
-    if not cfg.disable_overlap_schedule:
-        raise ValueError("NVFP4 hot caching requires --disable-overlap-schedule")
+    # Graph gather with GPU residency keeps route accounting and slot changes on the
+    # forward stream, so result processing may trail the next launch.
+    if not cfg.disable_overlap_schedule and not (
+        graph_gather and envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
+    ):
+        raise ValueError(
+            "NVFP4 hot caching requires --disable-overlap-schedule unless "
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER=1 and SGLANG_MOE_GPU_RESIDENCY_UPDATE=1"
+        )
     if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
         raise ValueError("NVFP4 hot caching requires both batch overlap modes disabled")
     if cfg.max_running_requests != 1:

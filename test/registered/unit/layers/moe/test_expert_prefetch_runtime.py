@@ -61,7 +61,7 @@ class _ServingCache:
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestPrefetchScoringRuntime(unittest.TestCase):
-    def _build(self, *, pull_mode="off", shadow_recall=True, calibration=False):
+    def _build(self, *, pull_mode="off", shadow_recall=True, calibration=False, fused_top1=True):
         from sglang.srt.layers.moe.expert_prediction.serving import runtime as serving_runtime
         from sglang.srt.layers.moe.expert_prediction.serving.checkpoints import LlaporCheckpoint
         from sglang.srt.layers.moe.expert_prediction.training import llapor
@@ -86,14 +86,21 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
             hot_caches=hot_caches,
             width=8, budget=2, tau=0.95, dtype=torch.bfloat16, device=device,
             pull_mode=pull_mode, shadow_recall=shadow_recall, calibration=calibration,
+            fused_top1=fused_top1,
         )
         return scoring, store, hot_caches
 
-    def _tap(self, store, layer):
+    def _tap_inputs(self, layer):
         generator = torch.Generator().manual_seed(layer)
-        store.write(layer, RouteFeature.ROUTER_INPUT, torch.randn(1, HIDDEN, generator=generator).to("cuda", torch.bfloat16))
-        store.write(layer, RouteFeature.TOPK_IDS, torch.randperm(EXPERTS, generator=generator)[:TOP_K].unsqueeze(0).cuda())
-        store.write(layer, RouteFeature.TOPK_WEIGHTS, torch.rand(1, TOP_K, generator=generator).cuda())
+        return {
+            RouteFeature.ROUTER_INPUT: torch.randn(1, HIDDEN, generator=generator).to("cuda", torch.bfloat16),
+            RouteFeature.TOPK_IDS: torch.randperm(EXPERTS, generator=generator)[:TOP_K].unsqueeze(0).cuda(),
+            RouteFeature.TOPK_WEIGHTS: torch.rand(1, TOP_K, generator=generator).cuda(),
+        }
+
+    def _tap(self, store, layer, inputs=None):
+        for feature, value in (inputs or self._tap_inputs(layer)).items():
+            store.write(layer, feature, value)
 
     def test_source_tap_rewrites_the_next_layers_bank_row_in_place(self):
         scoring, store, _ = self._build()
@@ -110,11 +117,13 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
         _, store, _ = self._build()
         for layer in range(3):
             self._tap(store, layer)
+        # Pageable host-to-device uploads synchronize; the taps receive device tensors.
+        inputs = [self._tap_inputs(layer) for layer in range(3)]
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
             for layer in range(3):
-                self._tap(store, layer)
+                self._tap(store, layer, inputs[layer])
         finally:
             torch.cuda.set_sync_debug_mode("default")
 
@@ -155,6 +164,115 @@ class TestPrefetchScoringRuntime(unittest.TestCase):
         self.assertIsNone(scoring.puller.poll_delivery_stats())
         torch.cuda.synchronize()
         self.assertEqual(scoring.puller.poll_delivery_stats()[target], (0, 0, 1, 1))
+
+    def _reference_top1(self, scoring, store, target):
+        """The width-W reference bank's first (id, valid) for the target's current source features."""
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
+
+        source = target - 1
+        with torch.no_grad():
+            scores = scoring._scorers[target](
+                store.view(source, RouteFeature.ROUTER_INPUT, 1),
+                store.view(source, RouteFeature.TOPK_IDS, 1),
+                store.view(source, RouteFeature.TOPK_WEIGHTS, 1),
+            )
+        reference = PrefetchCandidateBank(layer_ids=[target], width=8, device=torch.device("cuda"))
+        reference.write(target, scores, expert_to_slot=scoring._hot_caches[target].expert_to_slot)
+        valid = bool(reference.valid_for(target)[0].item())
+        return (int(reference.ids_for(target)[0].item()) if valid else -1), valid
+
+    def test_pull_off_without_consumers_selects_the_reference_top1(self):
+        scoring, store, hot_caches = self._build(pull_mode="off", shadow_recall=False)
+        self.assertTrue(scoring._serving_top1)
+        self.assertEqual(scoring.bank.width, 1)
+        for layer in range(3):
+            self._tap(store, layer)
+        torch.cuda.synchronize()
+        for target in (1, 2):
+            expected = self._reference_top1(scoring, store, target)
+            got_valid = bool(scoring.bank.valid_for(target)[0].item())
+            got_id = int(scoring.bank.ids_for(target)[0].item())
+            self.assertEqual((got_id if got_valid else -1, got_valid), expected)
+
+    def test_pull_off_top1_no_offer_when_every_expert_is_resident(self):
+        scoring, store, hot_caches = self._build(pull_mode="off", shadow_recall=False)
+        hot_caches[1].expert_to_slot = torch.arange(EXPERTS, device="cuda")
+        self._tap(store, 0)
+        torch.cuda.synchronize()
+        self.assertFalse(bool(scoring.bank.valid_for(1)[0].item()))
+
+    def test_count_zero_uses_the_top1_selector_and_posts_no_payload(self):
+        scoring, store, _ = self._build(pull_mode="count_zero", shadow_recall=False)
+        self.assertTrue(scoring._serving_top1)
+        self.assertEqual(scoring.bank.width, 1)
+        self._tap(store, 0)
+        torch.cuda.synchronize()
+        target = 1
+        self.assertEqual(scoring.puller.posted_count_for(target).item(), 0)
+        self.assertEqual(scoring.puller.predicted_expert_for(target).item(), -1)
+        self.assertFalse(bool(scoring.puller._selected_valid[target].item()))
+        scoring.puller.join_unsupported_target(target)
+        self.assertIsNone(scoring.puller.poll_delivery_stats())
+        torch.cuda.synchronize()
+        self.assertEqual(scoring.puller.poll_delivery_stats()[target], (0, 0, 0, 0))
+
+    def test_top1_modes_replay_in_a_graph_without_synchronizing(self):
+        for pull_mode in ("off", "count_zero"):
+            with self.subTest(pull_mode=pull_mode):
+                scoring, store, _ = self._build(pull_mode=pull_mode, shadow_recall=False)
+                inputs = {layer: (torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device="cuda"),
+                                  torch.zeros(1, TOP_K, dtype=torch.long, device="cuda"),
+                                  torch.zeros(1, TOP_K, device="cuda")) for layer in range(3)}
+
+                def forward():
+                    for layer, (x, ids, w) in inputs.items():
+                        store.write(layer, RouteFeature.ROUTER_INPUT, x)
+                        store.write(layer, RouteFeature.TOPK_IDS, ids)
+                        store.write(layer, RouteFeature.TOPK_WEIGHTS, w)
+                    if scoring.puller is not None:
+                        for target in (1, 2):
+                            scoring.puller.join_unsupported_target(target)
+
+                side = torch.cuda.Stream()
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        forward()
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    forward()
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    forward()
+                for seed in range(4):
+                    generator = torch.Generator().manual_seed(50 + seed)
+                    for layer, (x, ids, w) in inputs.items():
+                        x.copy_(torch.randn(1, HIDDEN, generator=generator).to("cuda", torch.bfloat16))
+                        ids.copy_(torch.randperm(EXPERTS, generator=generator)[:TOP_K].unsqueeze(0).cuda())
+                        w.copy_(torch.rand(1, TOP_K, generator=generator).cuda())
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    if pull_mode == "off":
+                        for target in (1, 2):
+                            valid = bool(scoring.bank.valid_for(target)[0].item())
+                            got = (int(scoring.bank.ids_for(target)[0].item()) if valid else -1, valid)
+                            self.assertEqual(got, self._reference_top1(scoring, store, target))
+
+    def test_fused_top1_off_keeps_the_reference_bank_in_every_pull_mode(self):
+        for pull_mode in ("off", "count_zero", "always"):
+            with self.subTest(pull_mode=pull_mode):
+                scoring, _, _ = self._build(pull_mode=pull_mode, shadow_recall=False, fused_top1=False)
+                self.assertFalse(scoring._serving_top1)
+                self.assertEqual(scoring.bank.width, 8)
+
+    def test_width_consumers_keep_the_reference_bank(self):
+        for pull_mode in ("off", "count_zero"):
+            with self.subTest(pull_mode=pull_mode):
+                scoring, _, _ = self._build(pull_mode=pull_mode, shadow_recall=True)
+                self.assertFalse(scoring._serving_top1)
+                self.assertEqual(scoring.bank.width, 8)
 
     def test_replay_updates_candidates_and_metrics_without_python(self):
         scoring, store, _ = self._build()

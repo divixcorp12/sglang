@@ -1038,7 +1038,6 @@ class HotCacheConfigurationTests(unittest.TestCase):
                 for algorithm in ("NGRAM", "EAGLE3", "STANDALONE")
             ),
             (dict(dllm_algorithm="LowConfidence", **file_ple), "DLLM"),
-            (dict(disable_overlap_schedule=False, **file_ple), "overlap"),
             (dict(), "file-backed PLE"),
         )
         for changes, message in cases:
@@ -1053,6 +1052,28 @@ class HotCacheConfigurationTests(unittest.TestCase):
         args.cuda_graph_config.prefill.backend = "breakable"
         with self.assertRaisesRegex(ValueError, "disable prefill CUDA graph"):
             memory_hook.handle_offload_compatibility(args)
+
+    def test_overlap_schedule_admits_only_graph_gather_with_gpu_residency(self):
+        """Overlap processes a forward's results after the next launch; host-side
+        residency updates were never validated there, while file-backed PLE staging is."""
+        file_ple = dict(ple_offload_embedding=True, ple_offload_backend="file")
+        self.enable_graph_gather()
+        os.environ["SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY"] = "1"
+        overlap = self.decode_args(
+            "breakable", disable_overlap_schedule=False, **file_ple
+        )
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1"):
+            memory_hook.handle_offload_compatibility(overlap)
+        os.environ["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] = "1"
+        memory_hook.handle_offload_compatibility(overlap)
+
+        os.environ.update(
+            SGLANG_MOE_EXPERT_GRAPH_GATHER="0", SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY="0"
+        )
+        with self.assertRaisesRegex(ValueError, "disable-overlap-schedule"):
+            memory_hook.handle_offload_compatibility(
+                self.decode_args("breakable", disable_overlap_schedule=False)
+            )
 
     def test_graph_gather_requires_its_cache_envelope(self):
         self.enable_graph_gather()
@@ -1181,6 +1202,7 @@ class HotCacheStartupTests(unittest.TestCase):
                 runner.model = torch.nn.Module()
                 runner.model_config = object()
                 runner.ps = SimpleNamespace(moe_ep_size=1, moe_ep_rank=0)
+                runner.is_draft_worker = False
                 events = []
                 for name in (
                     "init_memory_saver_adapter",

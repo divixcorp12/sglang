@@ -14,7 +14,7 @@ Use the recorded final-code baseline to start the pipeline changes that attack t
 
 ## Current code state
 
-Branch: `codex/nvfp4-expert-stream-main`, pushed to `shared` at `70100da7a4`. Commits added after `0283eacb74`:
+Branch: `codex/nvfp4-expert-stream-main`, pushed to `shared` at `f2c6cd2cbc` (the 2026-09-17 optimizations and test fixes are merged; see Implementation results). Commits added after `0283eacb74`:
 
 | Commit | Content |
 | --- | --- |
@@ -68,7 +68,7 @@ What the baseline says about the current system (exploratory):
 4. Expert row copies dominate GPU time; selection cost is negligible under the top-1 kernel.
 5. Confound: C/Cr/N use the width-16 reference bank, D uses top-1. N-to-D mixes payload and selector effects, and part of C's cost may be the wider bank.
 
-Gaps: no final-code B (D-vs-B rests on the old-commit B), and APEX has only one D pass. Each missing arm is one ~18 min cold run.
+Gaps: APEX has only one D pass. Final-code B was measured on 2026-09-17 (13.976 and 13.854 median, host-overhead matrix), confirming D ≈ B.
 
 ## Safety rules
 
@@ -89,14 +89,121 @@ Full detail and rulings in the ledger. Per decode token (LLaPor D trace, node-mo
 - Cross-token end-of-step prefetch is not worth it (best 8.7 misses covered at 22% precision with 40 rows).
 - Misses concentrate in layers 0–2 (59–69%); wasted pulls concentrate in layers 15/31/39/40 (43–58% precision).
 
+## Implementation results (2026-09-17)
+
+Full detail, commits and run directories are in the ledger. The accepted work is merged to `codex/nvfp4-expert-stream-main` @ `f2c6cd2cbc`; the rejected and in-flight branches remain separate. Compare arms only within the same matrix; CPU placement differs from the 2026-09-16 baseline.
+
+| Work | Branch @ commit | Result | Status |
+| --- | --- | --- | --- |
+| Insert-on-miss residency (missed experts promoted D2D from scratch into slots each decode step) | `insert-on-miss` @ `679e1a7fb2` | B: 13.99 → **15.98 tok/s (+14.2%, −8.9 ms/token)**; misses 190 → 155 rows/token, decode H2D promotions 21 → 0; +190 MiB peak | Accepted; parity repeat and combined build running |
+| Overlap scheduling with expert streaming | `host-decode-overhead` @ `90914e33ac` | B: +4.5% / +2.9% median over two pairs (~2.2–2.4 ms/token); base arms 13.98 / 13.85 are the final-code B | Accepted |
+| Batch-prep reduction | — | With overlap on, ≤1.07 ms/step host work can still delay the GPU | No change needed |
+| Top-1 selector in all pull modes | `scoring-cost` @ `3baf985d33` | C 13.33 → 13.81 (+2.6 ms/token); D unchanged (already top-1). Scoring breakdown: width-16 bank 2.37 ms, scorer 1.71 ms, shadow recall 1.88 ms | Accepted for C/N |
+| Task 3 compute-window pull placement | `task3-compute-window-r2` @ `e08dd952ac` | Pull-over-demand overlap 62.9% → 0%, but D 14.1–14.3 → 13.5–13.75: pulls now stall `_hc_mix_persistent_kernel` (13 µs → 186 µs, 47×/step) | **Rejection reversed — see below** |
+| Task 3 re-test on top of the hc_mix fix | `task3-on-hcmix` @ `ba362b5bd7` | Control (cap only) 14.903; both 15.375 / 15.280, mean 15.328 = **+0.425 tok/s, +2.9%** on top of the cap's own +4.4%. Matrix `t3hc-20260917-131434`, 29 records / 0 errors per arm. Suites 140 passed, 5 known failures | Directional win, not ABBA-clean (one control only; drift ~0.19 tok/s is ~45% of the effect) |
+| `_hc_mix` copy-stall fix (cap the fused mix's grid so copies always find free SMs) | `hc-mix-stall` @ `732acac42f` | **D 14.089 → 14.713 (+4.4%)**; B 13.836 → 13.962 (noise, no pulls to stall behind). D's lead over B widens +1.8% → +5.4%. New `SGLANG_OPT_HC_MIX_MAX_CTAS` (default 128, `0` = old behaviour) | Accepted |
+| Static per-layer pull gating | `pull-layer-gating` @ `fa5b873a34` | Estimated 0.1–0.5 ms/token, below noise | Timing cancelled; code kept |
+| Layer-0 token-id table | — | Offline best ~0.85–0.91 ms/token (ceiling 1.41) | No-go |
+| Strategy review / compression | — | Insert-on-miss and 12 GiB budget are the top levers; lossless NVFP4 compression ~0.95 ratio | Compression not viable |
+
+Combined build (`combined-iom` @ `f727a001f7` = insert-on-miss + overlap + scoring + hc-mix), one arm per condition, adjacent in time, 29 records / 0 errors each:
+
+| | combo-B (prefetch off) | combo-D (LLaPor, pull always) |
+| --- | ---: | ---: |
+| median tok/s | **16.645** | **15.928** |
+| miss rows/token over the link | 159.8 | 181.0 |
+| insertions = evictions per token | 159.5 | 133.9 |
+| residency slots | 3403 | 3355 |
+| pull posted / useful / wasted per token | 0 | 46.5 / 36.0 / 10.5 (77.4%) |
+| peak GPU MiB | 27,621 | 27,663 |
+
+**Ruling: prefetch does not earn its keep on top of the full stack — it costs 4.3%.** Best known configuration is the full stack with prefetch OFF at 16.645, i.e. baseline 13.96 -> 16.645 (**+19%**), entirely from non-predictive work (residency, scheduling, a kernel fix). Direction established; magnitude approximate (one arm per condition, so drift is not differenced out, but the 0.72 tok/s gap is well outside the ~0.3 noise floor and the arms ran 20 min apart).
+
+D moves 21 more rows/token over the link. Three mechanisms, increasing size:
+
+1. Pull-row slot cost, ~1.4 rows/token (48 slots, one per layer).
+2. Wasted pulls, ~10.5 rows/token at 77.4% precision.
+3. **Prefetch starves insert-on-miss of residency, ~9 rows/token.** A pull-covered route is served from the dedicated pull row, so it is correctly not a demand miss and is therefore never inserted; the expert stays nonresident and misses again later. Insertions fall 159.5 -> 133.9/token. Under insert-on-miss, every covered route is a learning opportunity removed from the cache. The two features actively fight each other. This was not anticipated.
+
+Arithmetic check: +21 rows/token at 0.23 ms/row implies ~+4.9 ms/token, while the measured gap is ~+2.7 ms/token. The measurement is smaller than the row count predicts, consistent with pull copies partially overlapping compute — so the counters understate prefetch's disadvantage rather than overstate it.
+
+Follow-up simulated and closed (2026-09-17, `analysis/strategy/sim_pull.py`, CPU-only; `sim_policy.py` left untouched). Policies over the same captured traces:
+
+| policy | slots | link rows/token | insertions/token |
+| --- | ---: | ---: | ---: |
+| A no pull | 3403 | **147.5** | 147.4 |
+| B pull, covered not inserted (today) | 3355 | **168.0** | 121.4 |
+| C pull, covered inserted from the pull row | 3355 | **160.4** | 148.9 |
+| C + pull row returned | 3403 | **159.0** | 147.4 |
+
+Inserting covered experts is a real repair — it recovers ~9 rows/token over today's behaviour (~2 ms/token) — but it does **not** rescue prefetch: C is still +11.5 rows/token worse than not prefetching at all, extrapolating to ~16.4 tok/s against combo-B's 16.645.
+
+**The calibration gate failed** (A −7.7%, B insertions −9.3%; the capture holds 13,685 decode rows for these sessions against 9,657 in the timed arm, so longer generations with better locality). The conclusion survives anyway because it rests on an identity rather than on the model's levels:
+
+> **C − A = wasted rows = posted x (1 − precision)**
+
+Once covered experts enter residency, every other prefetch cost cancels — each posted row either replaces a demand row or is waste. The simulator produced 11.5 rows/token for both quantities independently, as the algebra requires. At the measured 77.4% precision and 46.5 posted rows/token that is ~10.5 rows/token which no residency change can recover, because the byte has already crossed the link.
+
+**Ruling: prefetch is unprofitable on this stack and the line is closed.** For it to win, precision would have to approach 100% (from 77.4%), or re-timing copies into compute windows would have to pay — and the measured arms already tested that, with D landing 0.72 tok/s behind B. Two independent lines of evidence agree, and the identity explains why the measurement came out as it did.
+
+Caveat: the pull selector was a sampling model (measured per-layer posting rate and precision), not LLaPor, because the capture records hidden states but no pull decisions. So C's *benefit* may be understated with the real selector; the *cost* term is measured, not modelled, and it is the term that decides.
+
+Prefetch cost accounting (as of 2026-09-17) — why prediction quality is not the lever:
+
+- Precision is fine: 77.7% (396,419 useful of 510,326 posted, always-pull arm). The predictor is not guessing wrong.
+- Coverage is small: pulls cover ~19% of misses (36.2 useful of 190 misses/token); the other 154 arrive as demand copies regardless.
+- Prefetch cannot reduce bytes, only re-time them. At 2.76 MB/row, 190 misses is ~525 MB/token, ~46 ms of link time inside a ~68 ms token — the copy path is already ~2/3 saturated by demand traffic, so there is little idle link to hide pulls in. Wasted pulls (10.4 rows/token) consume ~2.5 ms of that scarce headroom.
+- Enabling the pull row **costs one residency slot per layer**, shrinking the hot cache that insert-on-miss fills and raising miss pressure. Found 2026-09-17 while diagnosing the pull-row test.
+- Consequence: byte-reducing levers (larger budget, insert-on-miss Stage B) beat better prediction. A predictor at 95% precision would still only re-time 19% of the traffic.
+
+Speculative decoding / larger tokens-per-forward — measured and rejected (2026-09-17, `analysis/cross-token/spec_window.py`, CPU-only, 299,687 sliding windows over the 303,935-token capture with recorded residency). **N=1 reproduces the recorded miss rate to 0.2% (156.52 vs 156.8), so these numbers are calibrated, unlike the pull simulator's ~8% level bias.**
+
+| N tokens/forward | routed reuse | miss reuse | miss rows/token | rows per accepted token @ a=0.7 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.00x | 1.00x | 156.5 | 156.5 |
+| 2 | 1.19x | 1.09x | 144.0 | 169.5 |
+| 4 | 1.40x | 1.17x | 133.4 | **210.7 (+35%)** |
+| 8 | 1.68x | 1.28x | 122.7 | 312.4 |
+
+The mechanism: consecutive tokens do share experts (1.68x union reuse at N=8), but **the shared experts are the popular ones already resident**. Those repeats are cache hits, and hits are free; the rows that actually cross PCIe barely repeat (miss reuse only 1.28x). Batching tokens captures reuse exactly where it was already worthless.
+
+Break-even acceptance is a=0.841 (N=2), 0.894 (N=4), 0.929 (N=8); a realistic MTP head is well below that, so speculation moves MORE bytes per useful token than plain decode (~13.8 tok/s estimated at a=0.7, N=4, against 16.645 today). Even the impossible best case — every draft accepted, no verification cost — only reaches 122.7 rows/token, and that ignores verification compute, the draft head, and a 981-row per-forward working set against 4,180 slots that would itself churn the cache. Benefit is uniform across layers (N=8/N=1 ratio 0.72-0.90, L0 worst at 0.897), so no subset of layers pays off disproportionately.
+
+Note this is the second time an idea has failed for the same structural reason: **on a link that is the bottleneck, only reducing bytes helps.** Prefetch re-times bytes (fails); speculation re-groups bytes (fails). Residency policy, row compression, and reducing the 2.76 MB row size change bytes and are where effort should go.
+
+Lessons:
+
+- Serving-level greedy bit parity is not available on this stack: the base build is not repeatable against itself even with a frozen hot cache. Accept on unit-level byte-exact tests plus discrete-value logprob comparison and large-margin flip counts.
+- "Copy overlapping compute is free" was false for `_hc_mix_persistent_kernel` because it launched one CTA per SM behind a device-wide barrier: a copy holding a few SMs kept the barrier closed. Fixed by capping the grid. A persistent kernel that both fills every SM and waits at a device-wide barrier cannot tolerate a concurrent copy — check both ingredients before writing one.
+- A trace sweep found `_hc_mix` to be the only such kernel here: it outlives the copy it overlaps in 100% of 44,842 instances, while all 20 other kernels do so in 0%. Use "does the kernel outlive the copy" as the test; a with/without-overlap duration ratio is confounded by phase on an always-pull arm, where nearly every copy-free sample is prefill.
+- Graph-mode Nsight traces hide kernels inside the decode graph; use node mode (attribution only) for copy-overlap questions.
+- Read a red *new* test differently from a red *established* one. The pull-row test was written during combo prep and had never been green; its first failure looked like a combined-build regression and triggered a GPU hold, but the code was correct and the test asserted residency one forward too late (under the pull row's reduced capacity, normal eviction churn removed the freshly inserted row). Before calling a failure a regression, check `git branch --contains` on the test's commit and diff the implementation files across the branches — here they were byte-identical, which exonerated the merge immediately.
+
+Timing protocol (user ruling, 2026-09-17): two tiers.
+
+- Screening arm (~10 min): same cold-server, startup verification and warm-up, then 4 sessions (~15 turns) at max 384 tokens. Use only when a microbenchmark or model predicts ≥0.5 tok/s. Pair arms by session/turn; a same-day old-build control may be reused when the expected effect is well above the ~0.2 tok/s cross-matrix drift.
+- Acceptance arm (~18 min): the full protocol (8 sessions / 29 turns / 768 tokens, ABBA order). Required before accepting a change, and for any hot-cache or residency change, whose steady state takes most of a session to reach.
+
+Iteration-speed rulings (user, 2026-09-17). Arm cost breaks down as ~26 s process start, **129 s weight load**, 62 s graph capture + hot-cache fill, ~60 s warm-up, ~13 min timed (measured on `t3hc-llapor-d-both-p2`). Only the last line buys measurement; the first four are overhead.
+
+- Keep the page cache between arms: the launcher runs `weight_loader_drop_cache_after_load=True`, which re-reads weights from NVMe every arm. Retaining it should save ~90 s/arm at no measurement cost (188 GB RAM, ~85 GB free). Verify the host expert arena is unaffected before trusting numbers from it, and never change this mid-matrix — all arms in one matrix must share the setting.
+- Screening arms (15 turns / 384 tokens) are the default for go/no-go; full arms only for acceptance. Precision scales as 1/sqrt(n): spread ~0.15 tok/s at 29 turns, ~0.21 at 15, so the smallest reliably detectable effect moves from ~0.3 to ~0.42 tok/s (~3%). Task 3's +3.2% would have been marginal on a screening arm — screening filters, it does not accept.
+- ABBA only when the expected effect is within ~5x drift. Observed drift is ~0.19 tok/s over a day (14.713 -> 14.903 for the same build). Above ~1 tok/s expected effect, two arms suffice.
+- Microbenchmark first for kernel and copy-path work; spend serving arms only to confirm the winner. The hc_mix microbenchmark picked the CTA cap in minutes and its prediction held at +4.4% in the full matrix.
+
 ## Next actions
 
-1. Task 3, compute-window placement: post each LLaPor pull after the source layer's demand copy so it overlaps compute, never a demand copy; verify with a graph-mode trace and paired D vs N timing. Ceiling ~10 ms/token (~+15%).
-2. Static per-layer pull gating: disable pulls for low-precision layers; measure D-gated vs D.
-3. Host-side decode overhead: establish why overlap scheduling is disabled with expert streaming and whether it can be enabled; reduce per-step metadata kernel launches (~2.4 ms/token batch prep).
-4. Strategy review of early-layer misses (cache allocation toward layers 0–2) and an investigation of compressing hot-cache experts.
-5. Final-code B is still missing; APEX has one D pass.
-6. Optional cleanup on divix01 (ask first): `cc-expert-prediction/baseline-0fe8d526df` worktree, `trace-relay-proto/`, `fix-57c842ae6e*.bundle`, the 3.9 GB trace `report.sqlite`.
+1. Done: `_hc_mix` copy stall fixed (`hc-mix-stall` @ `732acac42f`, +4.4% on D), and the Task 3 re-test on top of it returned +2.9% (`task3-on-hcmix` @ `ba362b5bd7`), reversing its rejection. Task 3 is NOT in the running combined build: it conflicts with `scoring-cost` in `expert_prediction/serving/runtime.py` (7 hunks each, same pull-scheduling region) and the conflict was not resolved in time. Fold it in as a second increment after combo-B/combo-D, which also yields its marginal value on top of the full stack. A full ABBA is still owed before Task 3 is "accepted" rather than "directional".
+2. Done: insert-on-miss parity clean over 8 arms, and the combined build measured. **Ship `combined-iom` @ `f727a001f7` with prefetch OFF (16.645 tok/s, +19% over baseline).** Prefetch costs 4.3% on top of this stack — see the combined-build table above.
+3. In progress: pre-existing test failure fixes (`fix-known-test-failures`).
+4. Next candidates, in the order the bandwidth analysis implies:
+   - ~~Insert pull-covered experts~~ — simulated and closed; recovers ~9 rows/token but leaves prefetch +11.5 rows/token behind no-pull. Prefetch line is closed. Only revisit if precision can approach 100%.
+   - Insert-on-miss Stage B: miss copies land directly in victim slots, returning the 480 scratch rows to the cache (+480 slots, ~+14%, at no VRAM cost — about 2/3 of the 12 GiB budget's benefit for free). Hard part: victims must be chosen at gather time, before the forward's routing is known, with a correctness hazard of evicting a row the same forward needs.
+   - 12 GiB budget (+741 slots, +2 GB VRAM; strategy estimate −6 ms/token, re-derive headroom after insert-on-miss).
+   - Fused scorer kernel (1.7 ms D scoring cost) — only worth it if prefetch is revived by the first item.
+   - Task 3 increment on top of the shipped stack, with a full ABBA to convert its +2.9% from directional to accepted. Note Task 3 relocates *pull* copies, so its value depends on prefetch staying on; if prefetch ships off, Task 3 is moot.
+5. APEX still has one D pass. Deploying to prod is gated on advancing the `main-port-probe-7bc4eb` worktree (158 commits behind, no `INSERT_ON_MISS` in its code) — see the prod section of `MOE_EXPERT_TRANSFER.md`.
+6. Optional cleanup on divix01 (ask first): nested `wt-task3/wt-task3-base`, `cc-expert-prediction/baseline-0fe8d526df` worktree, `trace-relay-proto/`, `fix-57c842ae6e*.bundle`, the 3.9 GB trace `report.sqlite`, and finished agent worktrees.
 
 ## Operational patterns
 

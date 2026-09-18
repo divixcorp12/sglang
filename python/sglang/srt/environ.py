@@ -1293,6 +1293,12 @@ class Envs:
     # MI300X (gfx942) and MI355X (gfx950) — 2.0 oversubscribed the CUs and regressed high-batch
     # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
     SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
+    # Most CTAs one fused HC mix launch (hc_mix_triton.py) uses; 0 launches one
+    # CTA per SM. Its device-wide barrier waits for every CTA, so a launch that
+    # claims every SM stalls behind SMs held by concurrent expert-row copies.
+    # On a 170-SM RTX 5090, 168 CTAs still stall for the whole copy, 160 do
+    # not, and 128 matches the all-SM launch's uncontended latency.
+    SGLANG_OPT_HC_MIX_MAX_CTAS = EnvInt(128)
 
     # Torch Compile
     # Compact extend-attention query-tile grid: AMD/HIP-only optimization
