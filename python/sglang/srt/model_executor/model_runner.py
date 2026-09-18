@@ -808,11 +808,6 @@ class ModelRunner:
                     "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with DP attention: "
                     "idle batches replay the decode graph and would count twice"
                 )
-            if self.spec_algorithm.is_speculative():
-                raise ValueError(
-                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with speculative "
-                    "decoding: verify commits do not reach the device clock"
-                )
             if (get_exec().graph.cuda_graph_config.decode.max_bs or 0) > 1:
                 raise ValueError(
                     "SGLANG_MOE_GPU_RESIDENCY_UPDATE needs a decode CUDA graph batch "

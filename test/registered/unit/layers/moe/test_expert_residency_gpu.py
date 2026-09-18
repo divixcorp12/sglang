@@ -214,14 +214,14 @@ def _reference_gather_graph(self, topk_ids):
     return plan.remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
 
 
-def _gather_harness(manager):
+def _gather_harness(manager, tokens=1):
     """Static routes, per-layer output rows and a forward that gathers every layer into them."""
     streamers = [manager.streamers[layer_id] for layer_id in sorted(manager.streamers)]
-    static = torch.zeros((LAYERS, 1, TOP_K), dtype=torch.int32, device="cuda")
-    static[:, 0, 1] = 1
+    static = torch.zeros((LAYERS, tokens, TOP_K), dtype=torch.int32, device="cuda")
+    static[:, :, 1] = 1
     outputs = [
         {
-            name: torch.zeros((TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda")
+            name: torch.zeros((tokens * TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda")
             for name, tensor in streamer.hot_cache.tensors.items()
         }
         for streamer in streamers
@@ -1179,8 +1179,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def setUp(self):
         self.model = _model()
 
-    def capture(self, manager):
-        static, outputs, forward = _gather_harness(manager)
+    def capture(self, manager, tokens=1):
+        static, outputs, forward = _gather_harness(manager, tokens)
         side = torch.cuda.Stream()
         with torch.cuda.stream(side):
             for _ in range(3):
@@ -1437,6 +1437,72 @@ class TestInsertOnMissDirect(unittest.TestCase):
                     twin.graph_unique_counters.tolist(), streamer.graph_unique_counters.tolist(), context
                 )
         self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
+
+    def test_a_speculative_verify_forward_keeps_direct_exact(self):
+        """NEXTN replays a TARGET_VERIFY graph whose gather serves several tokens, with repeated
+        experts across them, and the speculative worker then commits fewer tokens than it drafted.
+        The commit only corrects the host clock's decay tokens, never a boundary, so the device
+        clock must still count every forward the host does. Each miss must still land in a slot no
+        token of the forward reads. Runs with the fused planner on, as production does: a
+        multi-token gather must fall back to the generic planner rather than fail."""
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        tokens = 2
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+            manager = _manager(
+                self.model, gpu=True, graph_gather_batch_size=tokens,
+                budget_bytes=56 * LAYERS * (EXPERTS - 2), **DIRECT,
+            )
+        updater = manager.gpu_residency
+        verify = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(draft_token_num=tokens, is_draft_input=lambda: False),
+            extend_num_tokens=tokens,
+            batch_size=1,
+        )
+        graph, static, outputs = self.capture(manager, tokens)
+        generator = random.Random(15)
+        inserted_total = 0
+        for step in range(30):
+            context = f"step {step}"
+            routes = [
+                [generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)]
+                for _ in range(LAYERS)
+            ]
+            before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
+            static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for layer, mapping in enumerate(before):
+                source_layer = self.model.get_submodule(str(layer))
+                flat = [expert for token in routes[layer] for expert in token]
+                for name in NVFP4_STREAM_TENSORS:
+                    source = getattr(source_layer, name)
+                    expected = source[torch.tensor(flat).to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                    actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
+                    self.assertTrue(torch.equal(actual, expected), f"{context} layer {layer} {name}")
+                cache = manager.caches[sorted(manager.caches)[layer]]
+                read = {mapping[expert] for expert in flat if mapping[expert] >= 0}
+                wanted = sorted({expert for expert in flat if mapping[expert] < 0})
+                landed = [int(cache.expert_to_slot[expert]) for expert in wanted]
+                self.assertNotIn(-1, landed, f"{context} layer {layer}: a miss found no slot")
+                self.assertFalse(read & set(landed), f"{context} layer {layer}: copied into a row it reads")
+                self.assertEqual(len(set(landed)), len(landed), f"{context} destinations collide")
+                for expert in set(flat) - set(wanted):
+                    self.assertEqual(
+                        int(cache.expert_to_slot[expert]), mapping[expert],
+                        f"{context} layer {layer}: a routed resident was evicted",
+                    )
+                inserted_total += len(wanted)
+            manager.on_expert_distribution(verify, {"global_physical_count": _counts(routes)})
+            manager.on_speculative_commit(generator.randint(1, tokens))
+            torch.cuda.synchronize()
+            assert_slot_rows(self, manager, self.model, context)
+            self.assertEqual(int(updater.forwards.item()), manager._boundary_clock.forwards, context)
+        self.assertGreater(inserted_total, 0, "no forward ever missed")
+        self.assertEqual(sum(updater.snapshot()["insertion_truncated"]), 0)
+        self.assertEqual(sum(updater.snapshot()["insertions"]), inserted_total)
 
     def test_the_shortlist_is_ranked_before_the_first_replay(self):
         """`reset_after_capture` must leave a usable shortlist: the first replay's gather reads it
