@@ -340,7 +340,8 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 24 | Per-layer slot floor for stage 2 | `e1d227a4bd` | Enabler, no speed of its own: lets 4 draft tokens start at 12,288 MB. **N4 vs N3: tie** (11/29 turns, median −1.5%, p = 0.27 two-sided); keep 3 | `matrix/nextn-20260918-123932` |
 | 25 | **Prefill staging in place, allocated once** | `844bb9d7a5` | **Peak VRAM 32,143 → 30,587 MiB** (37k-token prompt, NEXTN-3, 12,288 MB); prefill time unchanged | `matrix/memprobe-20260918-144144` |
 | 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `codex/nvfp4-expert-stream-main` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
-| 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. Long-prompt peak at 13,312 MB **not probed** | `matrix/cache-20260918-161820` |
+| 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. 37k-token peak **31,647 MiB at chunk 4096 (safe); chunk 8192 OOMs** | `matrix/cache-20260918-161820`, `matrix/memprobe-20260918-171612` |
+| 30 | **Draft (MTP) experts requantized FP8 → NVFP4 at load** | `46735b12b4` (`SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT=1`) | **Draft 2.46 → 1.45 GB; free after startup 3.05 → 4.04 GB.** Accept length 2.546 → 2.564, speed tie (26.096 → 26.198, 19/29 turns, p = 0.07), both at 13,312 MB. Enabler for a bigger cache | `matrix/draft-20260918-173157` |
 
 ### Rejected / closed
 
@@ -355,6 +356,7 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 11 | Cross-token end-of-step prefetch | 8.7 misses covered at 22% precision with 40 rows | Coverage and precision both too low |
 | 12 | **Lossless NVFP4 compression** | Whole row ~0.95; **subparts differ enormously** (see below) | The compressible part is too small a share, and GPU decode eats the saving |
 | 13 | Batch-prep reduction | ≤1.07 ms/step host work | No change needed once overlap is on |
+| 31 | `--enable-torch-compile` (decode) | Smoke only | **Does not start.** Capture fails in `QSAIndexer`, which has no plain-PyTorch path; the breakable graph backend documents "No torch.compile". Needs a compile-safe indexer path and dynamo-disabled break markers, then an A/B; expected gain 0–3% (decode is PCIe-bound). Deferred. `matrix/tcsmoke-20260918-163830` |
 
 ### Backlog (not started / in flight)
 
@@ -367,7 +369,7 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 17 | Fused scorer kernel | 1.7 ms D scoring cost | Only useful if prefetch is revived |
 | 18 | Fix 8 known test failures | Suite to zero | In flight on `fix-known-test-failures` |
 | 22 | **Fold stage 2's gather bookkeeping into the fused planner** | ≤ ~1.9–2.4 ms/token (trace upper bound, like the planner's 3.8–4.4 that realized 2.77) | Not started. `gather_destinations` (~16–23 kernels/layer) and `_commit_gather` (22) are what remains of the tail after #21. Supersedes the handoff's B2, whose ~1% was scoped against stage 1 |
-| 26 | **Chunked prefill 8192** | Long-prompt prefill **−28% / −36%** (31k / 37k tokens) at +420 MiB peak over 4096, measured *before* pre-sizing | One clean probe on the pre-sized build still owed (the first attempt lost its memory to other GPU jobs mid-load). TTFT only; decode unaffected |
+| 26 | **Chunked prefill 8192** | Long-prompt prefill **−28% / −36%** (31k / 37k tokens) at +420 MiB peak over 4096, measured *before* pre-sizing | **Does not fit at 13,312 MB**: OOM on the first 31k prompt (160 MiB short in attention). Only viable at 12,288 MB or once more VRAM is freed. TTFT only; decode unaffected |
 | 28 | Token embedding to pinned host memory | 1.18 GiB (~+450 slots), lossless; decode reads one 5 KB row per token | Not started. No option exists; copy the PLE offload pattern. The LM head (also 1.18 GiB) cannot move: every token multiplies against all of it |
 | 29 | Prefill MoE in expert groups | Staging ~4x smaller again | Not started; needs the fused-MoE runner to split and re-sum per group. Only after #28 |
 | 20 | **Offline blockscale re-coding** (precomputed codebook) | **+1.6%** lossless (6-bit) / **+3.2%** lossy (4-bit) | **DEFERRED — do not pick this up without asking the repo owner first.** Not blocked on evidence; it is an open decision about accuracy budget, and it is the owner's call to make |
@@ -720,6 +722,10 @@ NEXTN work, under `cc-expert-prediction/`:
 | Memory probe (waits for arms, retries a lost lock) | `mem-probe.sh`; `matrix/memprobe-20260918-{125301,140008,144144}` |
 | Staging test runners (lock-queued) | `run-staging-green.sh`, `run-presize-tests.sh`; logs `logs/cuda-tests-{staging,presize}-*` |
 | Cache-budget arm | `cache-arm.sh`; `matrix/cache-20260918-161820` (`-161749` is `ABORTED`) |
+| 13,312 MB memory probe | `mem-probe-hot.sh` (HOT_MB, CHUNKS); `matrix/memprobe-20260918-171612` |
+| torch.compile smoke | `torch-compile-smoke.sh`; `matrix/tcsmoke-20260918-163830` |
+| NVFP4 draft arm | `draft-arm.sh`, worktree `wt-draftfp4` (+ `wt-draftfp4.patch`), `draft_paired.py`, `cache_counters.py`, `run_stubbed.py`; `matrix/draft-20260918-173157` |
+| NVFP4 draft + 14,336 MB | `draftcache-chain.sh` (runs `mem-probe-draft.sh`, then `draftcache-arm.sh` only if the probe survives); `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224` (in flight) |
 
 The `_hc_mix` persistent-kernel pattern is recorded as **checked and
 inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
@@ -907,9 +913,37 @@ Paired: **B faster on 24/29 turns, one-sided sign test p = 2.7e-4**, median
 +1.615 tok/s (ratio 1.061, min -2.44, max +3.69), 2.16 ms/token saved. Accept
 length 2.55 (N) vs 2.57 (B): the gain is bytes, not speculation.
 
-- **Not yet safe to deploy.** The +1,024 MB comes out of the ~1.5 GB the staging
-  change freed; the 37k-token peak at 13,312 MB is estimated at ~31,600 of
-  32,607 MiB but was not measured. Run `mem-probe.sh` at 13,312 MB first.
+- **Safe at chunk 4096, not at 8192.** `mem-probe-hot.sh` at 13,312 MB
+  (`matrix/memprobe-20260918-171612`): the 37k-token prompt peaks at 31,647 of
+  32,607 MiB (~960 MiB spare, 3.05 GB free after startup). At chunk 8192 the
+  first 31k prompt OOMs in attention with our own process holding 31.17 GiB.
+
+**NVFP4 draft experts** (`matrix/draft-20260918-173157`, `draft-arm.sh`, same
+worktree `wt-draftfp4` for both, 13,312 MB, chunk 4096, D first):
+
+| | draft experts | draft load | free after startup | accept length | median tok/s | hit rate |
+|---|---|---:|---:|---:|---:|---:|
+| B | FP8 128x128 block (as shipped) | 2.46 GB | 3.05 GB | 2.546 | 26.096 | 72.37% |
+| **D** | **NVFP4, requantized at load** | **1.45 GB** | **4.04 GB** | **2.564** | **26.198** | 72.28% |
+
+- **Why the draft was FP8:** the model card says the MTP module was copied
+  byte-for-byte from Qwen's FP8 release; only the main model's routed experts
+  were quantized (with calibrated scales). A normal forward never runs the MTP
+  layer, so it could not be calibrated for W4A4; FP8 block scales need no
+  calibration.
+- **How:** `ModelOptMixedPrecisionConfig.get_quant_method` hands an
+  `FP8_BLOCK_SCALES` MoE built in draft scope to the existing
+  `ModelOptNvFp4OnlineFusedMoEMethod`, which dequantizes each FP8 expert and
+  requantizes it to NVFP4 as it loads. Activation scale is per-tensor 1.0
+  (per-token scales need the TRT-LLM or CuTe DSL MoE backends; we run
+  `flashinfer_cutlass`). Accept length shows 1.0 is good enough.
+- **The draft stays resident:** the offloader matches the quant method's exact
+  class name `ModelOptNvFp4FusedMoEMethod`, so the online subclass is never
+  streamed. `test_requantized_draft_experts_stay_on_the_gpu` guards this.
+- **Output cannot change:** every draft token is verified by the target.
+- **Test gotcha:** `test_modelopt_nvfp4.py` imports `sglang.test.test_utils`,
+  which pulls in `datasets` and dies on divix01's pyarrow; `run_stubbed.py`
+  stubs that one module to run the file there.
 - **Script gotcha:** the requested-bytes check needs `grep -qF` on a precomputed
   number; an unquoted pattern lost its quotes through `ssh` and the first launch
   (`-161749`, `ABORTED`) was stopped before it ran.
