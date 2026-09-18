@@ -1228,6 +1228,13 @@ class Envs:
     # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # Path to a pinned exllamav3 checkout (see exl3_ext.EXLLAMAV3_COMMIT) whose
+    # exllamav3_ext/ sources are JIT-built into the EXL3 quant method's CUDA
+    # extension. Empty disables the extension entirely.
+    SGLANG_EXL3_SRC = EnvStr("")
+    # Build directory for the JIT-built EXL3 extension (torch.utils.cpp_extension
+    # cache); expanded with os.path.expanduser at use.
+    SGLANG_EXL3_BUILD_DIR = EnvStr("~/.cache/sglang/exl3_ext")
 
     # ===================================================================
     # Humming quantization
