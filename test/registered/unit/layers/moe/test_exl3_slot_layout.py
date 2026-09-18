@@ -38,6 +38,15 @@ def test_real_expert_16_byte_slots():
     assert layout.dst_offset("w1.trellis") == 14_864
 
 
+def test_default_alignment_is_16_bytes():
+    """exllamav3's hard minimum is 16 B (trellis `cp.async` on `int4*`) and 8 B
+    (`suh`/`svh` via `half4`); see DSV41_REFERENCE.md §14.1. 128 B buys nothing
+    exllamav3 needs, so the default matches the 16 B floor, not a padded guess."""
+    default_layout = build_exl3_slot_layout(_real_expert_spans())
+    explicit_layout = build_exl3_slot_layout(_real_expert_spans(), alignment=16)
+    assert default_layout == explicit_layout
+
+
 def test_segments_preserve_order_and_do_not_overlap():
     spans = _real_expert_spans()
     layout = build_exl3_slot_layout(spans, alignment=128)
