@@ -1406,6 +1406,38 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertEqual(int(cache.expert_to_slot[second]), -1)
         assert_slot_rows(self, manager, self.model, "routed victim")
 
+    def test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one(self):
+        """`gather_destinations` takes a miss lane's rank from ``remap - scratch_base``, its expert
+        from ``_graph_source_rows[rank]`` and its liveness from ``_graph_miss_count``. Under
+        SGLANG_MOE_EXPERT_FUSED_PLAN one kernel writes all three, so a drift in that layout would
+        copy misses into the wrong slots. Twins, one per planner, must stay identical."""
+        from sglang.srt.environ import envs
+
+        generic = _manager(self.model, gpu=True, **DIRECT)
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+            fused = _manager(_model(), gpu=True, **DIRECT)
+        for streamer in fused.streamers.values():
+            streamer.row_planner.route_plan = unittest.mock.Mock(
+                side_effect=AssertionError("the fused manager fell back to the generic planner")
+            )
+        twins = [(manager, *self.capture(manager)) for manager in (generic, fused)]
+        generator = random.Random(14)
+        for step in range(30):
+            routes = _random_routes(generator)
+            for manager, graph, static, outputs in twins:
+                self.step(manager, graph, static, outputs, routes, f"step {step}")
+            context = f"step {step}"
+            assert_states_equal(self, device_state(fused), device_state(generic), context)
+            assert_slot_rows(self, fused, self.model, context)
+            self.assertEqual(fused.gpu_residency.snapshot(), generic.gpu_residency.snapshot(), context)
+            for layer_id, streamer in generic.streamers.items():
+                twin = fused.streamers[layer_id]
+                self.assertEqual(twin.graph_counters.tolist(), streamer.graph_counters.tolist(), context)
+                self.assertEqual(
+                    twin.graph_unique_counters.tolist(), streamer.graph_unique_counters.tolist(), context
+                )
+        self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
+
     def test_the_shortlist_is_ranked_before_the_first_replay(self):
         """`reset_after_capture` must leave a usable shortlist: the first replay's gather reads it
         before any boundary has run, and a shortlist captured during warm-up would name stale slots."""
