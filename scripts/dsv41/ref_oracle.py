@@ -102,7 +102,7 @@ def flashmla_kv_fake_quant_(x):
     return x
 
 
-def use_flashmla_kv_quant(ref, kv_dim: int = 512):
+def use_flashmla_kv_quant(ref, kv_dim: int = 512, compressed: bool = True):
     """Swap the reference's in-place attention-KV fake quant (fp8 per 32 over the whole vector,
     fp4 per 16 for compressed KV -- the training convention) for SGLang's cache format, so the
     oracle isolates implementation differences from the KV storage format. Indexer quant is
@@ -117,7 +117,7 @@ def use_flashmla_kv_quant(ref, kv_dim: int = 512):
 
     def fp4_act_quant(x, *args, **kwargs):
         inplace = kwargs.get("inplace", args[1] if len(args) > 1 else False)
-        if inplace and x.shape[-1] == kv_dim:
+        if compressed and inplace and x.shape[-1] == kv_dim:
             return flashmla_kv_fake_quant_(x)
         return orig_fp4_act_quant(x, *args, **kwargs)
 
@@ -517,9 +517,11 @@ def _parse_args():
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument(
         "--kv-quant",
-        choices=("reference", "flashmla"),
+        choices=("reference", "flashmla", "flashmla-window"),
         default="reference",
-        help="attention-KV rounding: the reference's training convention, or SGLang's FlashMLA cache format",
+        help="attention-KV rounding: the reference's training convention; SGLang's FlashMLA format "
+        "for window and compressed KV; or for the window KV only (SGLang's compressed cache rounds "
+        "like the reference's fp4, per the layer-2 bisect)",
     )
     parser.add_argument("--sessions", default=_DEFAULT_SESSIONS, help="sessions.jsonl for --router-corpus/--make-prompts")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -542,8 +544,8 @@ def main() -> int:
         raise SystemExit("--tag is required for --prompts/--router-corpus")
 
     ref, _ = _import_reference(args.snapshot)
-    if args.kv_quant == "flashmla":
-        use_flashmla_kv_quant(ref)
+    if args.kv_quant.startswith("flashmla"):
+        use_flashmla_kv_quant(ref, compressed=args.kv_quant == "flashmla")
     model = build_model(ref, args.snapshot, args.trunc, args.engram_dir, args.max_seq_len)
 
     if args.router_corpus is not None:
