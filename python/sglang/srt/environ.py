@@ -1197,6 +1197,9 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Load a ModelOpt MIXED_PRECISION draft's FP8_BLOCK_SCALES experts as NVFP4
+    # (per-tensor activation scale 1.0); target layers are unaffected.
+    SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
