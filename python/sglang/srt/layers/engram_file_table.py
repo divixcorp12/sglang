@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.moe.exl3_expert_layout import read_safetensors_header
+from sglang.srt.layers.quantization.exl3_ops import assert_not_capturing
 
 
 class EngramFileTable:
@@ -45,6 +46,7 @@ class EngramFileTable:
         raise FileNotFoundError(f"{weight_key} not found in {table_dir}")
 
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        assert_not_capturing("EngramFileTable.lookup")
         flat = indices.reshape(-1).cpu().numpy()
         weight = torch.from_numpy(self.weight[flat]).to(indices.device).view(torch.float8_e4m3fn)
         scale = torch.from_numpy(self.scale[flat]).to(indices.device).view(torch.float8_e8m0fnu)

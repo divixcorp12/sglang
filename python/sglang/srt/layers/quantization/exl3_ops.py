@@ -19,6 +19,21 @@ AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 
 
+def assert_not_capturing(module_name: str) -> None:
+    """Raise if called while a CUDA graph is being captured.
+
+    EXL3 / Engram file-table paths make host syncs (``.tolist()``, ``torch.where``,
+    ``.cpu()``) and only work eagerly; under capture they fail with an opaque
+    CUDA error. Call this at the entry of every such path so the failure names
+    the actual cause instead.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{module_name}: EXL3 / Engram file-table paths run eagerly only; "
+            "launch with --disable-cuda-graph"
+        )
+
+
 @dataclass(frozen=True)
 class Exl3Tensors:
     trellis: torch.Tensor
@@ -110,6 +125,7 @@ def exl3_moe_loop(
     Mirrors the reference Expert.forward: up clamped to +-limit and gate to <= limit
     in fp32, the route weight applied before w2.
     """
+    assert_not_capturing("exl3_moe_loop")
     out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
     flat = topk_ids.reshape(-1)
     counts = torch.bincount(flat[flat >= 0], minlength=len(w2)).tolist()

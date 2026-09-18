@@ -115,6 +115,21 @@ def test_tensors_reject_wrong_dtype():
         )
 
 
+def test_moe_loop_raises_under_cuda_graph_capture(monkeypatch):
+    # exl3_moe_loop makes host syncs (.tolist(), torch.where) and only works
+    # eagerly; under capture it must fail loudly instead of hitting an opaque
+    # CUDA "operation not permitted when stream is capturing" error.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    t, _ = _fake(HIDDEN, INTER, 0)
+    x = torch.randn(1, HIDDEN)
+    topk_ids = torch.zeros(1, 1, dtype=torch.int64)
+    topk_weights = torch.ones(1, 1)
+    with pytest.raises(RuntimeError, match="disable-cuda-graph"):
+        exl3_moe_loop(x, topk_weights, topk_ids, [(t, t)], [t], LIMIT, linear=lambda x, t, out_dtype=None: x)
+
+
 if __name__ == "__main__":
     import sys
 

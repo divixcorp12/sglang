@@ -69,6 +69,18 @@ def test_row_count_mismatch_raises(table):
         EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS + 1, dim=DIM)
 
 
+def test_lookup_raises_under_cuda_graph_capture(table, monkeypatch):
+    # lookup() makes a host sync (.cpu()) and only works eagerly; under capture
+    # it must fail loudly instead of hitting an opaque CUDA capture error.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    directory, *_ = table
+    t = EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
+    with pytest.raises(RuntimeError, match="disable-cuda-graph"):
+        t.lookup(torch.tensor([0]))
+
+
 if __name__ == "__main__":
     import sys
 

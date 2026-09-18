@@ -21,7 +21,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear, exl3_moe_loop
+from sglang.srt.layers.quantization.exl3_ops import (
+    Exl3Tensors,
+    assert_not_capturing,
+    exl3_linear,
+    exl3_moe_loop,
+)
 from sglang.srt.utils import set_weight_attrs
 
 EXL3_PARAMS = ("trellis", "suh", "svh", "mul1")
@@ -293,6 +298,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def apply(self, layer: nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        assert_not_capturing("Exl3MoEMethod.apply")
         cfg = self.moe_runner_config
         # CONTRACT: exl3_moe_loop applies the route weight before w2 and does not
         # apply it on the input; reject configs that ask otherwise, matching
