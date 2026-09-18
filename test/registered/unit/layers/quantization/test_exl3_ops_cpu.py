@@ -76,13 +76,14 @@ def test_loop_without_limit_does_not_clamp():
     assert torch.allclose(got, (F.silu(gate) * up) @ dd, rtol=1e-5)
 
 
-def test_loop_zero_limit_clamps():
-    """swiglu_limit=0.0 must still clamp (it is falsy, not None)."""
+def test_loop_zero_limit_does_not_clamp():
+    # Matches the reference and LazyExpert: swiglu_limit=0.0 means "no limit",
+    # same as None, not "clamp to zero" (exl3_ops.py exl3_moe_loop).
     x = torch.full((1, HIDDEN), 3.0)
     t_g, gd = _fake(HIDDEN, INTER, 1)
     t_u, ud = _fake(HIDDEN, INTER, 2)
     t_d, dd = _fake(INTER, HIDDEN, 3)
-    table = {id(t_g): gd, id(t_u): ud, id(t_d): dd}
+    table = {id(t_g): gd * 100, id(t_u): ud * 100, id(t_d): dd}
 
     def linear(x, t, out_dtype=None):
         return (x.float() @ table[id(t)]).to(out_dtype or x.dtype)
@@ -90,8 +91,7 @@ def test_loop_zero_limit_clamps():
     got = exl3_moe_loop(
         x, torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.long), [(t_g, t_u)], [t_d], 0.0, linear=linear
     )
-    gate = (x @ table[id(t_g)]).clamp(max=0.0)
-    up = (x @ table[id(t_u)]).clamp(-0.0, 0.0)
+    gate, up = x @ table[id(t_g)], x @ table[id(t_u)]
     assert torch.allclose(got, (F.silu(gate) * up) @ dd, rtol=1e-5)
 
 
