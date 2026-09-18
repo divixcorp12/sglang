@@ -73,14 +73,16 @@ def test_sharded_create_weights_rejected():
 
 def test_wrong_shape_expert_detected():
     layer, method = _moe()
-    # Every expert's w1 (gate) part is self-consistently loaded with the wrong
-    # in_features, so `_materialize`'s cross-expert consistency check does not
-    # catch it; only the hidden/inter shape check in
-    # `process_weights_after_loading` should.
+    # w1 and w3 share one physical w13_* param per slot, so both must be given
+    # the same (wrong) in_features to stay self-consistent: `_materialize`'s
+    # cross-expert/cross-slot consistency check only compares shapes to each
+    # other, not against hidden/inter, so it lets this pass. Only the
+    # hidden/inter shape check added to `process_weights_after_loading` should
+    # catch it.
     for e in range(E):
         for shard, (in_f, out_f), prefix in (
             ("w1", (HIDDEN + 16, INTER), "w13"),
-            ("w3", (HIDDEN, INTER), "w13"),
+            ("w3", (HIDDEN + 16, INTER), "w13"),
             ("w2", (INTER, HIDDEN), "w2"),
         ):
             fill = 10 * e + {"w1": 1, "w3": 3, "w2": 2}[shard]
