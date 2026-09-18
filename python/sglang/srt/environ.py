@@ -1732,6 +1732,10 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # When set, every EngramEmbedding serves rows from this directory's safetensors
+    # shards via np.memmap instead of loading the table (device or host memory).
+    # The layer-1 table is 101.5 GB, larger than the host RAM budget on some rigs.
+    SGLANG_DSV41_ENGRAM_TABLE_DIR = EnvStr("")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

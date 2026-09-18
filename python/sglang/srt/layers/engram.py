@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.engram_file_table import EngramFileTable
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -684,6 +685,13 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self.file_table: Optional[EngramFileTable] = None
+        table_dir = envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get()
+        if table_dir:
+            if self.tp_size != 1:
+                raise NotImplementedError("the file-backed Engram table is TP1 only")
+            self.file_table = EngramFileTable.open(table_dir, layer_id, num_embeddings, dim)
+            return
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -742,6 +750,10 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self.file_table is not None:
+            if indices.shape[0] == 0:
+                return self._empty(indices)
+            return self.file_table.lookup(indices)
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)
