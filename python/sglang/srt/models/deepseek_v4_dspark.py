@@ -359,6 +359,7 @@ class DSparkAttention(MqaAttentionBase):
                 wo_a,
                 is_decode=forward_batch.forward_mode.is_decode(),
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                fast_path=self.is_dsv41,
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
@@ -392,8 +393,6 @@ class DSparkV4MarkovHead(nn.Module):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
-        # The sharded greedy fold and the NVLink vocab gather ship with V4.1;
-        # a V4 head keeps the block sampler and the NCCL all-gather.
         self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(
@@ -852,7 +851,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.moe_routed_quant_stream = (
             torch.cuda.Stream()
-            if use_multi_stream and torch.version.cuda is not None
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
             else None
         )
         self.hc_stats_stream = (
