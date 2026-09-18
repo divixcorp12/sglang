@@ -247,31 +247,35 @@ row sizes in one io_uring submission.
 - **Open:** can our RAM tier simply be upstream's `_HostTable` at reduced size plus a slot
   map, rather than a new cache?
 
-**Cache behaviour** [measured, needs re-run]:
-- A NumPy port of the hash reproduces the compressed vocab exactly (99,092). The run
-  used our benchmark corpus with generated completions (4.12M tokens, DSV4.1 tokenizer)
-  and 264 B rows (weight and scale together), with the budget split 50/50 between the
-  two layers.
-- **Ceiling:** 16.6M unique rows/layer out of 98.9M accesses, so **≤83% of reads can
-  ever hit** (an earlier draft wrongly said 56%). The whole unique set is
-  33.2M x 264 B = 8.8 GB.
-- **The hit rates below are a loose lower bound.** They come from a raw access-gap test
-  (hit iff fewer than *budget* accesses since last use), which undercounts true LRU. That
-  is why 10 GB shows 75% although it holds every unique row (true LRU would reach ~83%).
+**Cache behaviour** [measured, exact LRU, 1,500,000 tokens]:
+- Exact-LRU simulation over both Engram layers sharing one cache, driven by upstream's
+  own `EngramHasher`/`compute_engram_hash_ids` (bit-exact parity with DeepSeek's
+  reference, `test/manual/dsv41/test_engram_parity.py`). Stack distances come from a
+  Fenwick-tree reuse-distance scan (`scripts/dsv41/engram_cache_sim.py`), unit-tested
+  against a brute-force `OrderedDict` LRU
+  (`test/manual/dsv41/test_engram_cache_sim.py`, 9 passed).
+- Corpus: our benchmark corpus (`/mnt/nvme2/nvfp4-work/benchmarks/full/{sessions,results}.jsonl`,
+  795 sessions), prompts plus the recorded completions, DSV4.1-Flash tokenizer,
+  no chat template, capped at 1,500,000 tokens (48 accesses/token, 72,000,000
+  accesses total). Full JSON:
+  `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-engram/cache_sim.json`.
+- **hit_ceiling = 71.70%** (unique_rows = 20,376,046 of 72,000,000 accesses;
+  unique_set_gb = 5.38 GB). **session_cold_hit_rate = 35.18%** (share of accesses whose
+  previous touch of the same row was in the same session).
 
-| RAM cache | Warm hit rate (≥, lower bound) | Cold per-session |
-|---:|---:|---:|
-| 1 GB | 55.3% | 31.9% |
-| 2 GB | 60.9% | 31.9% |
-| 5 GB | 68.9% | 31.9% |
-| 10 GB | 75.3% | 31.9% |
-| 20 GB | 80.5% | 31.9% |
+| RAM cache | hit_rate | misses/token (mean) | misses/token (p99) |
+|---:|---:|---:|---:|
+| 1 GB | 60.82% | 18.81 | 48.0 |
+| 2 GB | 66.30% | 16.18 | 48.0 |
+| 5 GB | 71.68% | 13.59 | 48.0 |
+| 10 GB | 71.70% | 13.58 | 48.0 |
+| 20 GB | 71.70% | 13.58 | 48.0 |
 
-- **The simulation script was not preserved.** Phase 0 re-runs it with exact LRU and a
-  bit-exact hash parity test.
-- The corpus is repetitive financial text, so general traffic will reuse less.
-- Engram NVMe traffic is small at any of these rates, so the 5 GB allocation in §9.1 is
-  an [estimate], not a finding.
+- `hit_rate` is non-decreasing with budget and never exceeds `hit_ceiling`, as expected
+  of exact LRU; 5 GB already holds effectively the whole unique working set for this
+  corpus, so 10 GB and 20 GB add nothing further.
+- The corpus is repetitive financial text, so general traffic will reuse less; treat
+  these numbers as an upper bound on real-traffic hit rate, not a general estimate.
 
 **Timing is the constraint, not bandwidth.**
 - Layer 1 needs its rows about one layer's compute after the token is sampled:
@@ -463,7 +467,7 @@ Expert count, bytes/row and top-k are derived from shapes (`_validate_sources`, 
 | Item | GB | Notes |
 |---|---:|---|
 | Process, non-expert host state, io_uring staging | ~10 | Measure |
-| Engram RAM cache (rows + scales, 264 B) | ~5 | [estimate]. The simulation needs a re-run (§5). The unique set on our corpus is 8.8 GB |
+| Engram RAM cache (rows + scales, 264 B) | 5 | [measured, exact LRU, §5]. Rule: smallest budget within 5 points of `hit_ceiling` (71.70%) — 5 GB reaches 71.68%, within 0.02 points, so larger budgets are not worth it on this corpus |
 | **Expert RAM cache** | **~75** | ≈ **5,630 experts, 36.7%** of 15,360 |
 | VRAM hot cache | — | 1,220–1,770 slots (§4), all also held in RAM (inclusive). Distinct coverage = the RAM tier, ~36.7% |
 
