@@ -65,6 +65,9 @@ def main():
         disable_shared_experts_fusion=True,
         context_length=4096,
         mem_fraction_static=args.mem_fraction_static,
+        # DSV4 reserves its SWA pool from the request cap up front; prompts run one
+        # at a time, and the default cap leaves no budget for the full pool.
+        max_running_requests=4,
     )
     oracle = np.load(args.oracle)
     results = []
