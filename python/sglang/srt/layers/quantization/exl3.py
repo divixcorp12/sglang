@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear
+from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear, exl3_moe_loop
 from sglang.srt.utils import set_weight_attrs
 
 EXL3_PARAMS = ("trellis", "suh", "svh", "mul1")
@@ -158,12 +158,104 @@ class Exl3LinearMethod(LinearMethodBase):
         return y if bias is None else y + bias
 
 
+_SLOTS = {"w1": ("w13", 0), "w3": ("w13", 1), "w2": ("w2", 0)}
+
+
+def _load_expert(layer, prefix, name, param, loaded_weight, weight_name=None, *, shard_id, expert_id):
+    want_prefix, slot = _SLOTS[shard_id]
+    if want_prefix != prefix:
+        raise ValueError(f"exl3: {shard_id} routed to {prefix}_{name}")
+    local = layer.exl3_local_expert(expert_id)
+    if local < 0:
+        return
+    _materialize(param, (layer.exl3_num_experts, 2 if prefix == "w13" else 1), loaded_weight)
+    param.data[local, slot].copy_(loaded_weight)
+    layer.exl3_loaded.add((prefix, name, local, slot))
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
     def __init__(self, config: Exl3Config):
         self.config = config
+        self.moe_runner_config = None
 
-    def create_weights(self, *args, **kwargs):
-        raise NotImplementedError("exl3 MoE lands in Task 4")
+    def create_weights(
+        self,
+        layer: nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        layer.exl3_num_experts = num_experts
+        layer.exl3_hidden = hidden_size
+        layer.exl3_inter = intermediate_size_per_partition
+        layer.exl3_loaded = set()
+        # CONTRACT: map a global expert id to this rank's local slot (-1 = not ours),
+        # using the same helper FusedMoE.weight_loader uses (identity at TP1/EP1).
+        # Evidence: fused_moe_triton/layer.py:993-1000 (_map_global_expert_id_to_local_expert_id)
+        # and :1031 (weight_loader calling it before _weight_loader_impl).
+        layer.exl3_local_expert = getattr(
+            layer, "_map_global_expert_id_to_local_expert_id", lambda expert_id: expert_id
+        )
+        for prefix in ("w13", "w2"):
+            for name in EXL3_PARAMS:
+                param = nn.Parameter(torch.empty(0, dtype=torch.int8), requires_grad=False)
+                set_weight_attrs(
+                    param, {"weight_loader": functools.partial(_load_expert, layer, prefix, name)}
+                )
+                layer.register_parameter(f"{prefix}_{name}", param)
 
-    def apply(self, layer, dispatch_output):
-        raise NotImplementedError("exl3 MoE lands in Task 4")
+    def create_moe_runner(self, layer: nn.Module, moe_runner_config) -> None:
+        self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        for e in range(layer.exl3_num_experts):
+            for prefix, slots in (("w13", (0, 1)), ("w2", (0,))):
+                for slot in slots:
+                    missing = [n for n in EXL3_PARAMS if (prefix, n, e, slot) not in layer.exl3_loaded]
+                    if missing:
+                        raise RuntimeError(f"exl3: expert {e} {prefix}[{slot}] is missing {missing}")
+
+        def tensors(prefix, e, slot):
+            return Exl3Tensors(
+                trellis=getattr(layer, f"{prefix}_trellis")[e, slot],
+                suh=getattr(layer, f"{prefix}_suh")[e, slot],
+                svh=getattr(layer, f"{prefix}_svh")[e, slot],
+                mul1=True,
+            )
+
+        layer.exl3_w13 = [(tensors("w13", e, 0), tensors("w13", e, 1)) for e in range(layer.exl3_num_experts)]
+        layer.exl3_w2 = [tensors("w2", e, 0) for e in range(layer.exl3_num_experts)]
+
+    def apply(self, layer: nn.Module, dispatch_output):
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        cfg = self.moe_runner_config
+        # CONTRACT: exl3_moe_loop applies the route weight before w2 and does not
+        # apply it on the input; reject configs that ask otherwise, matching
+        # moe_forward_native (fused_moe_native.py:66) and fused_moe_forward_native
+        # (fused_moe_native.py:30), which both raise NotImplementedError() for
+        # apply_router_weight_on_input=True.
+        if getattr(cfg, "apply_router_weight_on_input", False):
+            raise NotImplementedError("exl3 MoE: apply_router_weight_on_input")
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        out = exl3_moe_loop(
+            dispatch_output.hidden_states,
+            topk_weights,
+            topk_ids,
+            layer.exl3_w13,
+            layer.exl3_w2,
+            # CONTRACT: MoeRunnerConfig.swiglu_limit (moe_runner/base.py:60) is the
+            # DeepSeek V4 swiglu clamp field; deep_gemm._apply_swiglu_limit
+            # (moe_runner/deep_gemm.py:1666-1667) clamps up to +-limit and gate to
+            # <= limit, matching exl3_moe_loop exactly. routed_scaling_factor is
+            # NOT applied here: DeepseekV2MoE only fuses it into topk_weights when
+            # quant_method.fuse_routed_scaling_factor_in_topk is True (layer.py:108-110,
+            # unset here so it defaults False), and otherwise multiplies it into
+            # final_hidden_states itself after combine (deepseek_v2.py:1083, 1310).
+            # UnquantizedFusedMoEMethod.forward_cpu -> moe_forward_native
+            # (fused_moe_native.py:61-163) likewise never applies routed_scaling_factor.
+            cfg.swiglu_limit,
+        )
+        return StandardCombineInput(hidden_states=out)
