@@ -1,11 +1,17 @@
 # MoE expert transfer — paths, results, and how to run it
 
-State as of `f2c6cd2cbc` on `codex/nvfp4-expert-stream-main` — all accepted
-optimizations merged, plus the pre-existing test-failure fixes.
+State as of `797be6f678` (`insert-on-miss-stage-b`, fast-forwarded into
+`codex/nvfp4-expert-stream-main` 2026-09-18) — all accepted
+optimizations merged, plus insert-on-miss **stage 2 (DIRECT)**, accepted
+2026-09-18 on an acceptance-grade paired serving arm. Suite on that merge:
+1 failed / 860 passed, the single failure being the long-characterised doorbell
+copier flake (four distinct parametrisations, clears in isolation).
 
 Geometry for scale: 48 layers, 512 experts/layer, top_k 10, one expert row =
 2,764,800 B. About 480 routed rows/token if nothing is cached. The experiments
-below ran a **10,240 MB** hot cache = 3,403 slots + 480 scratch + 48 pull rows.
+below ran a **10,240 MB** hot cache. Stage 1 splits that into 3,403 slots + 480
+scratch + 48 pull rows; **stage 2 needs no scratch, so the same budget gives
+3,883 slots + 0 scratch** — the +14.1% capacity that wins the campaign.
 (Earlier production notes referenced a 12 GiB / 4,180-slot cache; that budget has
 **not** been measured with these optimizations — see Backlog.)
 
@@ -16,16 +22,22 @@ below ran a **10,240 MB** hot cache = 3,403 slots + 480 scratch + 48 pull rows.
 | Configuration | tok/s | vs baseline |
 |---|---:|---:|
 | Baseline (no optimizations) | 13.96 | — |
-| + insert-on-miss | 15.98 | +14.2% |
-| **+ overlap scheduling + hc_mix CTA cap (SHIP THIS)** | **16.645** | **+19.2%** |
+| + insert-on-miss (stage 1, SCRATCH) | 15.98 | +14.2% |
+| + overlap scheduling + hc_mix CTA cap | 16.645 | +19.2% |
+| **+ insert-on-miss stage 2 (DIRECT) — SHIP THIS** | **19.360** | **+38.7%** |
 | + prefetch enabled on top | 15.93 | −4.3% ✗ |
 
 **Everything that worked reduces or re-schedules bytes; nothing that worked came
 from prediction.** Prefetch is implemented, measured, and deliberately left off.
 
-The governing constraint: at 159.8 miss rows/token x 0.23 ms/row, the PCIe path
-is **~61% saturated** inside a 60.1 ms token. Only changes that reduce bytes/token
-move the needle.
+The governing constraint: at ~140 miss rows/token x 0.2239 ms/row, the PCIe path
+is the dominant term. Only changes that reduce bytes/token move the needle —
+**stage 2 wins by moving 388.0 MB/token instead of 430.5.**
+
+Stage 2 accepted 2026-09-18 on an acceptance-grade paired arm: **19.360 vs
+18.541 median, faster on 27 of 29 paired turns (p < 1e-5)**, mechanism confirmed
+by +480 slots → +3.09 points of hit rate → 9.9% fewer miss rows. See
+[Acceptance arm](#acceptance-arm-2026-09-18--the-shipping-decision).
 
 ---
 
@@ -35,7 +47,9 @@ move the needle.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `SGLANG_MOE_HOT_INSERT_ON_MISS` | `False` | **The big one (+14.2%).** Each decode boundary promotes the layer's missed experts from their scratch rows into real cache slots, so a miss is paid once instead of every token. Requires `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1` (a residency boundary after every decode forward). Costs ~190 MiB peak. |
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | `0` (OFF) | **The big one.** `0` OFF, `1` SCRATCH, `2` DIRECT. **Ship `2`.** A miss is paid once instead of every token. SCRATCH (+14.2%) copies the previous forward's misses out of the gather's scratch rows into slots at the boundary. DIRECT lands each miss straight in a victim slot chosen from a shortlist the previous boundary ranked, so the D2D hop disappears **and the 1.33 GB scratch region returns to the cache as +480 slots (+14.1% capacity at no VRAM cost)** — worth a further **+4.4%** over SCRATCH. Requires `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1` and `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`. |
+| `SGLANG_MOE_HOT_INSERT_ON_MISS` | — | **Deprecated alias** for the above, kept because the enum preserves its 0/1 meaning. `1` selects SCRATCH. Prefer the `_STAGE` form. |
+| `SGLANG_MOE_HOT_FUSED_INSERT` | `False` | Runs **stage 1's** boundary insert through a fused masked Triton kernel: one pass instead of two, and idle lanes move no bytes. Cuts that boundary ~45% (5.32 ms/token isolated, 4.28 ms/token in an arm). **Not on the shipping path** — stage 2 has no insert loop to fuse, and this flag is hard-refused on any stage but SCRATCH so an arm cannot report a fused number for an unfused run. Keep off unless you are deliberately running stage 1. |
 | `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY` | `0.98` | Per-token decay on the insertion score that ranks eviction victims. Lower = forgets faster. |
 | `SGLANG_OPT_HC_MIX_MAX_CTAS` | `128` | **On by default (+4.4% under load).** Caps the fused HC-mix grid below the SM count. Uncapped, the kernel launched one CTA per SM behind a device-wide barrier, so any overlapping expert copy froze it from 13 us to 186 us. `0` restores the old all-SM launch. On a GPU with <=128 SMs this is a no-op and the stall returns. |
 | `SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE` | `off` | Prefetch pull arm: `off` / `count_zero` / `always`. **Leave off** — measured −4.3%. Requires `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR`. |
@@ -51,8 +65,42 @@ graph-gather plus GPU residency update.
 
 ### Winning config
 
-This is exactly what produced 16.645 tok/s (`servers/combo-b-p1/run-20260917-141132`).
+This is exactly what produced **19.360 tok/s**
+(`servers/accept-C/run-20260917-211615`, acceptance grade, 29 records, 0 errors).
 Paths are divix01's; change the four at the top for another host.
+
+> **The one line that changed from the 16.645 config** is
+> `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2` in place of
+> `SGLANG_MOE_HOT_INSERT_ON_MISS=1`. Everything else is identical.
+> Stage 2 requires `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` and
+> `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1`, both already present.
+>
+> Do **not** also set `SGLANG_MOE_HOT_FUSED_INSERT`. It applies to stage 1 only
+> and is hard-refused on stage 2 — deliberately, so an arm cannot report a fused
+> number for an unfused run. See [the kernel's status](#the-fused-insert-kernel-correct-tested-and-off-the-shipping-path).
+
+> ### ⚠ Check `hot_update_decode_forwards` on every stage-2 arm
+>
+> `scripts/expert_prediction/run-shadow-server.sh` derives it:
+>
+> ```bash
+> hot_update_decode_forwards=$([ "$insert_on_miss" != 0 ] && echo 1 || echo 4)   # correct
+> hot_update_decode_forwards=$([ "$insert_on_miss" = 1 ] && echo 1 || echo 4)    # main-tip: WRONG for stage 2
+> ```
+>
+> **Main-tip still tests `= 1`.** Under stage 2, `insert_on_miss=2`, so upstream's
+> version yields **4** — a different residency update cadence, applied silently.
+> Stage 2 requires 1.
+>
+> This is the dangerous shape: **the launcher has no test coverage.** Nothing in
+> the 861-test suite reads it. Anyone who merges main and resolves this file by
+> taking one side wholesale reintroduces the bug, and every arm still runs, still
+> reports, and is quietly measuring a different cadence. It arrived once already
+> bundled inside a textual conflict on a ~1000-character `printf` and nearly went
+> through as "take theirs".
+>
+> **The check:** the run manifest records `hot_update_decode_forwards`. On any
+> stage-2 arm it must read **1**, not 4.
 
 ```bash
 # --- host-specific paths ---
@@ -74,10 +122,10 @@ taskset -c 0-63 env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
   SGLANG_MOE_EXPERT_COPY_BACKEND=dma \
   SGLANG_MOE_PINNED_HOST_MB=0 \
   \
-  SGLANG_MOE_HOT_GPU_MB=10240 \
+  SGLANG_MOE_HOT_GPU_MB=12288 \
   SGLANG_MOE_HOT_DYNAMIC=1 \
   SGLANG_MOE_HOT_SEED="$EXPERT_SEED" \
-  SGLANG_MOE_HOT_INSERT_ON_MISS=1 \
+  SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 \
   SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY=0.98 \
   SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1 \
   SGLANG_MOE_HOT_DECAY_TOKENS=1 \
@@ -126,11 +174,31 @@ optimization. Adding that flag costs ~4%.
 Deliberately unset, all measured and rejected: `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR`,
 `..._PULL_MODE`, `SGLANG_MOE_EXPERT_DOORBELL`.
 
+**The doorbell and overlap scheduling are mutually exclusive.**
+`model_runner.py:797-801` refuses at startup: `SGLANG_MOE_EXPERT_DOORBELL`
+requires `--disable-overlap-schedule`. Since the shipping config removes that
+flag to gain +4%, the doorbell (path 2 below) **cannot be enabled at all** — the
+server will not start. Stage B refuses it independently, for the async-write
+reason in path 2. Treat the doorbell as dead in this configuration unless
+someone is prepared to give up overlap scheduling and re-measure.
+
+**Sync audit, 2026-09-17: with overlap scheduling on there are ZERO CUDA
+synchronisations per decode forward in this code.** The one per-forward
+candidate, `doorbell_fail_stop_check(synchronize=True)` at `scheduler.py:4623`,
+early-returns on `doorbell is None` and never touches the device. The eager
+gather's ~8 syncs/layer are prefill-only here: `..._GRAPH_GATHER_SCRATCH_ROWS`
+defaults to 0, so the graph gather is never undersized, and a nonzero value is
+refused without speculative decoding. The `log_interval` trace boundary is
+non-blocking by construction (`AsyncTelemetry`, background D2H). This is
+CI-guarded: 10 registered tests run the decode path under
+`torch.cuda.set_sync_debug_mode`, so a newly introduced sync fails a test rather
+than silently costing throughput.
+
 The tested wrapper is `scripts/expert_prediction/run-shadow-server.sh`, which adds
 run provenance, the GPU lock and metrics files:
 
 ```bash
-OVERLAP_SCHEDULE=1 HOT_GPU_MB=10240 HOT_INSERT_ON_MISS=1 HOT_INSERT_ON_MISS_DECAY=0.98 \
+OVERLAP_SCHEDULE=1 HOT_GPU_MB=10240 HOT_INSERT_ON_MISS_STAGE=2 HOT_INSERT_ON_MISS_DECAY=0.98 \
 PREFETCH_PREDICTOR= PREFETCH_PULL_MODE=off RUN_KIND=timed PREFETCH_RUN_DIR=/path/to/run \
   scripts/expert_prediction/run-shadow-server.sh myserver 31047 off
 ```
@@ -143,8 +211,8 @@ The live production server is launched by
 worktree `main-port-probe-7bc4eb` is checked out on **this same branch**,
 `codex/nvfp4-expert-stream-main`, at commit `d43c59b58a`.
 
-**Prod is 158 commits behind, and the gap is the whole problem.** `d43c59b58a`
-is an ancestor of `f2c6cd2cbc`, and it contains **zero occurrences of
+**Prod is 158+ commits behind, and the gap is the whole problem.** `d43c59b58a`
+is an ancestor of the current tip and contains **zero occurrences of
 `INSERT_ON_MISS`** — the flag does not exist in the code prod is running. Setting
 it there changes nothing.
 
@@ -162,8 +230,8 @@ Therefore the env changes below are step 2, not step 1:
 
 | Setting | Prod today | Should be | Why |
 |---|---|---|---|
-| `SGLANG_MOE_HOT_INSERT_ON_MISS` | unset (off) | **`1`** | +14.2%, the largest single win |
-| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a residency boundary after every decode forward; it refuses to initialise otherwise |
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | unset (off) | **`2`** | +14.2% for stage 1, and a further +4.4% for stage 2's +480 slots. The largest single win |
+| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a residency boundary after every decode forward; it refuses to initialise otherwise. **Stage 2 requires 1 — see the launcher warning above** |
 | `--disable-overlap-schedule` | **present** | **remove the flag** | +4.5% / +2.9%. Its absence *is* the optimization |
 
 The hc_mix CTA cap needs no change once the code is there — `SGLANG_OPT_HC_MIX_MAX_CTAS`
@@ -212,10 +280,17 @@ at that budget.
 
 - Measured only at **BS1** (`--max-running-requests 1`, decode graph captured for
   `bs=[1]`). Concurrency changes the memory split between KV and the hot cache.
-- Measured at **10,240 MB** hot cache, not production's 12 GiB.
+- Measured at **10,240 MB** hot cache, not production's 12 GiB. At 12 GiB stage 2
+  would give ~4,660 slots against stage 1's ~4,180 — the same +480, unmeasured.
 - `--weight-loader-drop-cache-after-load` is in the benchmark launcher and costs
   129 s of startup re-reading weights. Drop it in production.
-- Suite has 8 known pre-existing failures unrelated to this work (fix in flight).
+- Suite on the merged build is **1 failed / 860 passed**; the single failure is
+  the doorbell copier flake (four parametrisations, clears 10/10 in isolation in
+  two separate trees). The six earlier base failures are fixed by main-tip.
+- **Stage 2 has never run on production hardware under production load** — only
+  on divix01's benchmark harness at BS1. It is accepted on a paired serving arm,
+  which is the strongest evidence this campaign produced, not on production
+  traffic.
 
 ---
 
@@ -245,18 +320,20 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 9 | Static per-layer pull gating | Est. 0.1–0.5 ms/token, below noise | Timing cancelled; code kept on `pull-layer-gating` @ `fa5b873a34` |
 | 10 | Layer-0 token-id table | Best ~0.85–0.91 ms/token vs 1.41 ceiling | Below the 1 ms gate; no code |
 | 11 | Cross-token end-of-step prefetch | 8.7 misses covered at 22% precision with 40 rows | Coverage and precision both too low |
-| 12 | Lossless NVFP4 compression | ~0.95 ratio | Not viable |
+| 12 | **Lossless NVFP4 compression** | Whole row ~0.95; **subparts differ enormously** (see below) | The compressible part is too small a share, and GPU decode eats the saving |
 | 13 | Batch-prep reduction | ≤1.07 ms/step host work | No change needed once overlap is on |
 
 ### Backlog (not started / in flight)
 
 | # | Item | Expected | Status |
 |---|---|---|---|
-| 14 | **Insert-on-miss Stage B** | +480 slots (+14.1% cache) at **no VRAM cost**; curve says −4.02 ms/token, **+7.2% → ~17.8 tok/s** (upper estimate) | **In flight.** Design approved: boundary *proposes* victim shortlist, gather *disqualifies* entries this forward routes to. Risk: per-layer bookkeeping adds ~500–700 graph nodes/step |
+| 14 | **Insert-on-miss stage 2 (DIRECT)** | **+4.4% measured** over stage 1 + fused kernel | **ACCEPTED, ship it.** 19.360 vs 18.541 median, faster on 27/29 paired turns (p < 1e-5). +480 slots at no VRAM cost, +3.09 points hit rate, 9.9% fewer miss rows, 42.5 MB/token less over PCIe |
+| 19 | Fused masked insert kernel | ~45% off stage 1's boundary (5.32 ms isolated / 4.28 ms in-arm) | **Kept, default-off, stage-1 only.** Correct and tested, but stage 2 has no insert loop to fuse, so it is on no live path. Retained for a memory-constrained config where the 1.33 GB scratch is affordable but 3883 slots are not |
 | 15 | 12 GiB budget | +741 slots; curve says −6.08 ms/token (independent estimate said −6) | Not started; needs +2 GB VRAM |
-| 16 | Reduce the 2.76 MB row size | Directly attacks bytes/token | Not started — the only untried lever in the winning category |
+| 16 | Reduce the 2.76 MB row size | Directly attacks bytes/token | **Closed by arithmetic.** Row size is set by the model (NVFP4 4-bit weights + E4M3 blockscales); it is not a tunable. The only mechanism that shrinks it is compression, which is #12 |
 | 17 | Fused scorer kernel | 1.7 ms D scoring cost | Only useful if prefetch is revived |
 | 18 | Fix 8 known test failures | Suite to zero | In flight on `fix-known-test-failures` |
+| 20 | **Offline blockscale re-coding** (precomputed codebook) | **+1.6%** lossless (6-bit) / **+3.2%** lossy (4-bit) | **DEFERRED — do not pick this up without asking the repo owner first.** Not blocked on evidence; it is an open decision about accuracy budget, and it is the owner's call to make |
 
 ### The pattern
 
@@ -265,6 +342,480 @@ link, only reducing bytes helps.** Prefetch *re-times* bytes (−4.3%).
 Speculation *re-groups* bytes (−35% at realistic acceptance). Residency policy
 *reduces* bytes (+14.2%). Use this as the filter for any new proposal: does it
 change bytes/token?
+
+### The link is at line rate, and the host caps it at Gen3
+
+`2,764,800 B / 0.23 ms = 12.02 GB/s`, against a practical PCIe Gen3 x16 ceiling
+of ~12.3 GB/s. **The transfers run at ~98% of line rate.** There is no packing,
+merging, coalescing or batching win available on the wire — a transfer-size
+sweep would only re-confirm this ceiling.
+
+`nvidia-smi -q` reports, for the RTX 5090:
+
+```
+Device Max : 5      ← the card supports PCIe Gen5
+Host Max   : 3      ← the motherboard negotiates Gen3
+Current    : 3
+```
+
+The card is Gen5-capable and the **host board is Gen3**, confirmed by the owner
+as a hardware property, not a BIOS or slot misconfiguration. At Gen4 the 36.8 ms
+transfer term would be ~18 ms and at Gen5 ~9 ms — 60.1 → ~41 or ~32 ms/token,
+i.e. ~24 or ~31 tok/s against today's 19.360. **The link is worth more than
+every software optimization in this document combined, and it is unavailable.**
+Record it so nobody re-derives the hope: on this host, `12.3 GB/s` is a wall.
+
+### The idle window is real, fragmented, and still unexploited
+
+Prefetch (#5, #6) and speculation (#7) were closed on *prediction quality*, not
+on bandwidth availability. The distinction matters, because the bandwidth is
+genuinely there:
+
+- PCIe is busy **31.4 ms of a 51.65 ms token → ~61% duty cycle** (140.3 miss
+  rows x 0.2239 ms). Stage 2 cut both the numerator and the token, so the *ratio*
+  is unchanged — the link is still the binding term.
+- The remaining **~20 ms is idle link time.**
+
+But it is **not one contiguous block.** Per layer: 51.65/48 = 1.076 ms of wall
+time, of which 2.92 misses x 0.2239 = 0.654 ms is transfer, leaving **~0.42 ms of
+idle link per layer** — under two rows' worth, arriving 48 times per token in
+small pieces.
+
+That shape is why filling it is hard rather than merely unattempted. To use
+layer L's idle window you must issue transfers for layer L+1, whose routes are
+not yet known — so anything that fills it is *speculative* by construction, and
+lands back on precision. Prefetch failed at `C − A = posted x (1 − precision)`;
+it did not fail for lack of link capacity.
+
+**What is closed vs what is open.** One *approach* to filling the window (one-layer-ahead
+top-1 prediction) is closed on measurement. The window itself is not closed, and
+larger batch is the other way at it: more tokens per forward amortizes each miss
+row over more work without needing any prediction. Revisit from here, not from
+prefetch.
+
+### Nsight decode trace 2026-09-18 — the per-row constant, measured in-graph
+
+Production config (stage 2, 12 GiB / 4,660 slots, overlap on), node-mode
+capture of 20 s ≈ 456 decode steps. Report:
+`cc-e16c-public/run-20260918-004721/profiles/report.nsys-rep` (see inventory).
+
+**The segment kernel is pure link time.** Bucketing
+`copy_expert_row_segments_gpu_kernel` by rows moved (21,888 calls = 48 x 456):
+
+| rows | calls | µs/row |
+|---:|---:|---:|
+| 0 | 7,975 | — (0.5 µs total) |
+| 1 | 5,410 | 228.5 |
+| 2 | 3,467 | 226.1 |
+| 4 | 1,206 | 225.0 |
+| 7 | 282 | 224.7 |
+| 10 | 40 | 224.5 |
+
+Flat at 225–228 µs/row from 1 to 10 rows = 12.2 GB/s, with no per-call fixed
+cost. This independently confirms the 0.2239 ms/row constant above from inside
+the graph, and closes kernel-side tuning of this path: duration = misses x row
+time. 36% of layer calls miss nothing.
+
+**Transfer and compute are serialized.** The segment kernel and all compute run
+on one stream; summed kernel time 14.67 s vs GPU-busy union 14.49 s. The idle
+window above is structural, not incidental.
+
+**The small-kernel tail is the one new target.** ~6,800 kernels per token on the
+compute stream; 2.54M of the window's kernels ran under 2 µs, 4.3 ms/token of
+execution plus the inter-node gaps. Per-layer counts of `bitwise_and`,
+`bitwise_not`, `where`, `fill`, `sum`, `index_select` at 6–7 each look like
+hot-cache routing bookkeeping — **unverified attribution**. It does not touch
+the link, so it only pays directly on the ~20 ms compute share, and more if the
+idle window is ever filled.
+
+**Open:** 15.35 GB of plain H2D memcpy in the window (670 ops, ~34 MB/token)
+is not the segment kernel and is unattributed — prefill inside the window or
+PLE staging are the candidates.
+
+**Gotchas from this capture (each cost a run):**
+
+- **A graph-mode trace's kernel table excludes the graph body.** In the earlier
+  graph-mode capture, 0 of 152,184 kernel rows carried a `graphId` and total
+  kernel time was 693 ms in a 120 s window. Its top kernel, `index_copy`
+  (`expert_stream.py`'s miss stitch, paired 1:1 with `_scatter_hot_rows_kernel`),
+  was **prefill only** (1,440 = 48 x 6 tensors x 5 prefills). Use graph mode for
+  timing, node mode for attribution.
+- **The trace driver flatters hit rate.** It repeats one prompt at temperature 0,
+  so the window ran at **84.4%** (1.56 misses per layer call) against 70.6% in
+  the acceptance arm, while the cumulative counters said 47% (cold first
+  request). Take miss counts from the acceptance arm, not from a trace.
+- **SGLang `/health` runs a real 1-token generation** — 3+ s on a cold cache. A
+  driver with `curl -m 3 /health` as its liveness test quits immediately.
+- **`ssh -n` discards stdin**, so `cat <<EOF | ssh -n host 'cat > f'` writes an
+  empty file. Pass content in the command argument (e.g. base64).
+
+### Row size does not change prefetch economics
+
+A natural and incorrect intuition: smaller rows would make wrong predictions
+cheaper, so prefetch might become profitable. It does not, because **cost and
+benefit both scale with row bytes.** A correct prediction moves `R/B` seconds off
+the critical path; a wrong one adds `R/B` seconds of link occupancy. Halving `R`
+halves both, and the break-even precision is unchanged. The same cancellation
+applies to posting more candidates and to slot capacity (a wasted slot is `R`
+bytes, and halving `R` doubles the slot count).
+
+The only genuinely `R`-dependent term is *timeliness* — whether a posted row
+completes inside the window before it is needed — and at ~1 posted row per layer
+against a ~0.42 ms window that holds ~2 rows, we are not window-limited. So the
+one effect that smaller rows would help is not the one that is binding.
+
+Note the reverse for compression specifically: decompression cost scales with
+*output* bytes, which do not shrink, so a wrongly prefetched compressed row costs
+the same decode work as a correct one. Compression would make prefetch economics
+slightly **worse**, not better.
+
+### Compression: the subparts differ enormously, and it still does not pay
+
+The headline "~0.95 ratio" hides the interesting structure. Measured per tensor
+(`analysis/compression/tables.txt`, 7 layers x 12 experts):
+
+| Tensor | Share of row | Entropy | zstd-1 ratio | Verdict |
+|---|---:|---|---:|---|
+| `w13_weight`, `w2_weight` | **~89%** | **3.945 bits of 4** (nibble H0) | **1.0000** (lz4 *expands* to 1.0039) | Incompressible |
+| `w13_blockscale`, `w2_blockscale` | **~11%** | **~4.5 bits of 8**, only ~52 distinct byte values | **0.48–0.50** | **Compresses ~2x** |
+
+So the answer to "are subparts compressible" is **yes, and they are at opposite
+extremes.** The 4-bit weight codes are at 98.6% of maximum entropy — quantization
+to NVFP4 is *designed* to use the full code range, and the sign bit measures a
+full 1.000 bits. Nothing will compress them; cross-expert concatenation with a
+128 MB window and long-distance matching still returns exactly 1.0000.
+
+The blockscales are the opposite: FP8 E4M3 values that are always positive, drawn
+from ~52 of 256 codes, and spatially correlated (order-1 entropy drops 4.5 → 4.1).
+They halve.
+
+**But 11% of the row halving is a 5.3% row saving** — the table's own
+`scales-only-compressed row ratio` is 0.946–0.947, and an ideal static ANS coder
+over both parts reaches only 0.933. Converting the best case: 6.6% of the 36.8 ms
+transfer term is **~2.4 ms/token, ~+4%**.
+
+That ceiling then has to pay for decode. CPU decompression is measured at
+~0.7 ms/row, which at ~140 rows/token is ~98 ms — two orders of magnitude too
+slow, so decode must be on the GPU, where it competes for SMs with MoE compute.
+Decoding ~49 MB/token of blockscales at realistic GPU rANS throughput plausibly
+costs 0.5–2.4 ms, i.e. **somewhere between "most of the win" and "all of it"** —
+and the `_hc_mix` lesson says SM contention during in-flight copies is exactly
+where this class of idea dies.
+
+Closed, but closed with a number: the ceiling is ~+4% before decode cost, not
+zero. If the link were ever faster, this would need re-deriving rather than
+re-assuming.
+
+### Arm gotcha: `iom-matrix.sh` does not set `OVERLAP_SCHEDULE`
+
+`combo-matrix.sh` sets `OVERLAP_SCHEDULE=1`. **`iom-matrix.sh` predates that flag
+and never sets it**, so anything built from that template defaults to 0 and the
+launcher passes `--disable-overlap-schedule`. An arm built from it is *not* the
+winning config, and nothing in its results says so.
+
+This cost a full screening arm on 2026-09-17. The only symptom was a 3.3%
+baseline gap against the 16.645 reference, which is easy to explain away as
+protocol — and a protocol explanation turned out to be ~60% of it, which is the
+most dangerous size for a wrong explanation to be.
+
+**Always check `overlap_schedule` in the run manifest, not the script.** It is
+now a field that has demonstrably gone wrong once.
+
+Decomposition of that gap, produced by re-cutting the recorded reference rather
+than re-measuring it (a technique worth reusing — it cost zero GPU):
+
+| cut of `combo-b-p1` | median |
+|---|---:|
+| as recorded, 29 turns | 16.645 |
+| same 4 sessions only | 16.643 |
+| only turns ≤384 tokens | 16.257 |
+| both cuts together | **16.324** |
+| screening condition A (overlap **off**) | **16.105** |
+
+Session count explains 0.002 — nothing. The 384-token cap explains 0.32, because
+**long generations run faster** (17.99 vs 16.26 tok/s); this is the positive
+length/throughput correlation, and it means short-turn protocols understate
+absolute tok/s. The residual 0.219 is scheduler plus noise, below the 0.42
+screening floor. A merge regression was **not** supported.
+
+### Screening arm 2026-09-17 (overlap **off** — orderings valid, effect sizes not)
+
+`matrix/fused-20260917-195153`, 16 turns, one run each, merged build `797be6f678`.
+
+| | condition | tok/s | ms/token | miss rows/tok | slots | hit rate |
+|---|---|---:|---:|---:|---:|---:|
+| A | stage 1 unfused | 16.105 | 62.09 | 184.9 | 3403 | 66.21% |
+| B | stage 1 + fused kernel | 17.296 | 57.82 | 191.5 | 3403 | 65.69% |
+| C | **stage 2 (DIRECT)** | **18.157** | **55.08** | **172.5** | **3883** | **69.45%** |
+
+**B − A = +1.190 (+7.4%). C − B = +0.861 (+5.0%).**
+
+Read this arm carefully: all three conditions shared the wrong scheduler setting,
+so the **orderings and the mechanism stand** while the **effect sizes on the
+shipping config do not**. The mechanism is the durable part: C moves 7% fewer
+miss rows than A and 10% fewer than B, with hit rate 3.8 points higher and
+`scratch_bytes: 0`. On a saturated link that is the only thing that ever helps,
+and it is visible directly rather than inferred from the clock.
+
+**Stage 2 beat the fused kernel, inverting both predictions** — the team lead's
+(−0.40) and the implementer's own paper analysis (net negative). Both were wrong
+in the same direction by ~1.26 tok/s. The standing lesson: *when a measurement
+misses the model by three times the effect size, the model is what failed.*
+
+Measured noise floor, from two recorded passes of an identical config: **0.050
+tok/s** apart (acceptance grade). B−A is ~24x that.
+
+Kernel corroboration, two independent instruments: isolated benchmark **5.32
+ms/token**, serving arm **4.28 ms/token**. 20% apart, arm lower — expected, since
+the benchmark ran 64 experts/71 slots against the arm's 512/3403.
+
+**C − B is not pure capacity.** C carries no boundary insert loop at all where B
+still runs the fused one, so the delta is capacity gain + B's residual loop cost
+− C's in-graph overhead: three terms, one measurement. It has not been
+decomposed, and a decomposition that happens to reconcile it with the model
+should be distrusted.
+
+### Measurement facts worth not rediscovering
+
+Each of these cost real time to establish. Size any future claim against them.
+
+**Greedy decoding is not reproducible on this stack.** Same-config acceptance
+repeats produce **0 of 29 identical completions** at temperature 0, with 3.7%
+different token totals. Consequence, as a rule: *no serving arm can demonstrate
+byte-equivalence of two code paths.* Controlled equivalence evidence lives in
+unit tests that fix the routes; never in an arm.
+
+**Noise floors, measured rather than assumed:**
+
+| grade | floor |
+|---|---:|
+| same-config acceptance repeats | **0.050 tok/s** |
+| off-pair acceptance | 0.117 tok/s |
+| screening | **~0.42 tok/s** |
+
+**tok/s correlates positively with generation length** (+0.68 to +0.79), so short
+turns understate absolute throughput. *Direction matters when judging a result:*
+at screening the slowest arm generated the most tokens, so the confound pushed
+against the observed ordering and those deltas were conservative. At acceptance
+B and C landed 0.4% apart in tokens, which is what makes the paired test clean.
+
+**A fresh-process comparison is not a valid control here.** Two identically-built
+unfused managers differ in 8 tensors once the caching allocator is dirty. A
+warm-up control that ran clean did so only because it ran in a clean process — it
+passed by testing nothing. Anything comparing built caches must dirty the
+allocator first.
+
+### Closed: the shared 10-row scratch pool
+
+Recorded because it is attractive from the outside and will be re-proposed.
+Killed on paper, two independent reasons:
+
+1. **It is stage 2 plus an extra copy.** Freeing the scratch rows requires the
+   insert to happen inside the gather, per layer — exactly where stage 2 already
+   puts its work, needing the same victim selection with the same hazard check.
+   So it pays stage 2's per-layer node cost *and* its victim machinery, then adds
+   a D2D scratch->slot hop that stage 2 does not do at all, while saving 470 rows
+   instead of 480. **Dominated on both axes.**
+2. **The indexing does not permit it.** Scratch rows are not a separate pool:
+   each layer's cache tensor is allocated `capacity + miss_rows`, and
+   `scratch_columns = capacity + miss_columns` puts them *inside* that tensor. A
+   shared pool needs a second tensor and a new addressing scheme through the
+   whole gather and remap path.
+
+### Artifact inventory (divix01)
+
+Under `/data/models/slang/nvfp4-work/cc-expert-prediction/`:
+
+| What | Where |
+|---|---|
+| Screening arm | `matrix/fused-20260917-195153`, `servers/fused-{A,B,C}` |
+| Acceptance arm | `matrix/accept-20260917-205847`, `servers/accept-{B,C}` |
+| Analysis scripts | `accept_report.py`, `accept_paired.py`, `baseline_gap.py`, `noisefloor.py`, `determinism.py`, `confound.py`, `fused_replay_overhead.py` |
+| Compression study | `analysis/compression/` (`tables.txt`, `results_full.json`) |
+| D2D constants bench | `iom-cuda-tests.sh` (carries a caveat block; `.pre-caveat` backup alongside) |
+| Worktree | `wt-stageb` @ `797be6f678` |
+
+Under `/data/models/slang/nvfp4-work/cc-e16c-public/` (production-config traces):
+
+| What | Where |
+|---|---|
+| Decode trace, node mode, 20 s, loaded | `run-20260918-004721/profiles/report.nsys-rep` (laptop copy: `~/data/divix/traces/stage2-decode-nodemode-20260918-004721.nsys-rep`) |
+| Graph-mode trace, 120 s (kernel table is prefill-only, see above) | `run-20260918-000659/profiles/report.nsys-rep` |
+| Traced launcher (node mode, `--delay=360 --duration=20`) / graph-mode backup | `../run-nvfp4-e16c-public-TRACED.sh` / `.bak-graphmode` |
+| Trace load driver (health `-m 60`, quits after 3 consecutive failures) | `drive.sh` |
+
+The `_hc_mix` persistent-kernel pattern is recorded as **checked and
+inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
+docstring: those lanes share nothing, so there is no device-wide barrier to need,
+and the one-CTA-per-SM cap would only starve a kernel whose job is to saturate
+HBM. Read it there before re-deriving it.
+
+### Retired check: insertions/token is not a byte-identity test at serving level
+
+A and B differ 3.5% in insertions/token, which looks like evidence the fused
+kernel is not byte-identical. **It is not evidence.** Greedy runs on this stack
+diverge run to run: two passes of an *identical* config produce 0/29 identical
+turns with 3.7% different token totals at temperature 0. The check cannot
+discriminate a code change from the stack's own nondeterminism. Byte-identity
+rests on the unit tests, which control routes and compare every byte of every
+cache tensor including untouched scratch rows.
+
+### Acceptance arm 2026-09-18 — the shipping decision
+
+`matrix/accept-20260917-205847`, acceptance grade, `OVERLAP_SCHEDULE=1`,
+8 sessions / 29 turns / 768 tokens, merged build `797be6f678`.
+
+| | B stage 1 + fused | C stage 2 (DIRECT) |
+|---|---:|---:|
+| median tok/s | 18.541 | **19.360** |
+| mean tok/s | 18.536 | 19.381 |
+| ms/token | 53.94 | **51.65** |
+| insertions / token | 155.5 | 139.9 |
+| miss rows / token | 155.7 | **140.3** |
+| requested rows / token | 479.8 | 477.9 |
+| hit rate | 67.55% | **70.64%** |
+| slots | 3403 | **3883** |
+| H2D per token | 430.5 MB | **388.0 MB** |
+| records / errors | 29 / 0 | 29 / 0 |
+
+**C - B = +0.819 median (+4.4%), 16x the 0.050 tok/s acceptance noise floor.**
+
+**The paired test is the real evidence.** Both arms ran the same 8 sessions and
+the same 29 turns, so the comparison is turn-by-turn rather than
+distribution-to-distribution: **C is faster on 27 of 29 paired turns**, median
+paired delta +0.879, sd 0.518, worst case -0.646. Sign test p < 1e-5. Token
+totals are 0.4% apart (9922 vs 9963), which removes the generation-length
+confound that complicated the screening arm.
+
+**The mechanism, and it closes exactly.** Stage 2 needs no scratch region, so
+`scratch_bytes` goes 1.327 GB -> 0 and that memory becomes cache: 3403 -> 3883
+slots, +14.1%. Check the byte accounting against the row accounting:
+
+```
+C: 140.3 miss rows x 2,764,800 B = 387.9 MB/token   (reported 388.0)
+B: 155.7 miss rows x 2,764,800 B = 430.5 MB/token   (reported 430.5)
+```
+
+Rows and bytes agree independently, so the win is physical, not a clock artifact.
+
+Partial-exposure check: 42.5 MB/token saved at the arm's ~8.0 GB/s average H2D
+rate would be ~5.3 ms/token if fully exposed; observed gain is 2.29 ms/token, so
+roughly 40% of the saved transfer sits on the critical path and the rest was
+already overlapped. Treat that as order-of-magnitude agreement, not a tight
+prediction — it is a single-rate model over an overlapped pipeline.
+
+**Screening predicted this.** Screening C-B was +0.861; acceptance says +0.819.
+The scheduler did not change the conclusion. That is a result, not an assumption
+that was made in advance.
+
+### The fused insert kernel: correct, tested, and off the shipping path
+
+`SGLANG_MOE_HOT_FUSED_INSERT` cuts stage 1's boundary insert cost by ~45%
+(5.32 ms/token isolated, 4.28 ms/token in a serving arm — two instruments, 20%
+apart). It is byte-exact, covered by 31 tests, and **it optimises stage 1 only.**
+
+Stage 2 has no scratch boundary at all, so there is no insert loop to fuse. The
+flag hard-refuses any stage but SCRATCH — a deliberate guard, so that an arm can
+never report a fused number for an unfused run.
+
+**Decision (2026-09-18): kept, default-off, documented as stage-1 only.** It
+costs nothing at runtime and keeps a tested optimisation available if stage 1 is
+ever wanted for a memory-constrained config where the 1.33 GB scratch region is
+affordable but 3883 slots are not. It is not on the shipping path, and it should
+not be cited as part of the shipped result.
+
+### Counter gotcha: hot-cache counters are cumulative and include warm-up
+
+Per-token rates derived from the hot-cache counters must divide by **all** tokens
+the server has processed, not just timed ones. The counters run from server start
+and include the 5 warm-up requests. Dividing by timed tokens inflates every
+per-token rate by roughly 15%.
+
+**The available check that catches it instantly:** `requested_rows/token` has a
+hard physical ceiling of `48 layers x top_k 10 = 480`. A screening report gave
+547, 558 and 564 — impossible on their face, and nobody checked them against the
+bound. With the correct denominator every arm lands at 470-480, a near-constant,
+which is what that quantity must be.
+
+Corrected screening figures (the tok/s medians never depended on this, and the
+orderings and mechanism are unaffected): A 158.6, B 161.5, C 143.7
+insertions/token.
+
+### Backlog #20: offline blockscale re-coding — DEFERRED, ask first
+
+> **Do not start this without consulting the repo owner.** It is deferred by
+> decision, not by lack of evidence. The lossy variant changes model numerics,
+> and that trade is the owner's to make, not an implementer's.
+
+This is **not** the rejected #12. What made #12 non-viable was that entropy
+decoding (zstd/rANS) has to run on the critical path, is sequential per stream,
+and competes for SMs with MoE compute — plausibly 0.5–2.4 ms against a ~2.4 ms
+saving. A **precomputed codebook** replaces entropy decoding with a LUT gather
+from a 16- or 64-entry table resident in L1. Expanding ~49 MB/token of
+blockscales is ~74 MB of HBM traffic, **~0.05 ms**. The cost that killed #12
+disappears.
+
+The enabling idea: the host arena and the cache slot need not hold the same
+form. Store compact on the host, transfer compact, expand into the slot. Host
+arena also drops ~3 GB of its 67.9 GB as a side effect.
+
+| Scheme | Blockscale bits | Row saving | Throughput | Accuracy risk |
+|---|---:|---:|---:|---|
+| 6-bit codebook | 8 → 6 | 2.6% | **~+1.6%** | **None — lossless** |
+| 4-bit codebook | 8 → 4 | 5.2% | **~+3.2%** | Needs a real eval |
+
+**6 bits is the lossless floor**, verified not assumed: `results_full.json`
+records distinct scale values both per layer (45–61) and per expert
+(`scale_ctx/n_distinct`, 39–56). Both exceed 32, so 5 bits would be lossy.
+Capturing the true 4.5-bit entropy needs variable-length coding, which is #12
+again.
+
+Blockscale share is ~10.5%, derived two independent ways: from NVFP4 format
+arithmetic (1 E4M3 byte per 16 elements against 4-bit weights), and from the
+archive's `scales-only-compressed row ratio 0.947` against a 0.49 scale ratio.
+
+**Known complications, all real:**
+
+1. **Swizzled layout.** The slot holds `w13_blockscale_swizzled`, read directly
+   by the flashinfer_cutlass kernel. Expansion must reproduce the swizzle
+   exactly. Static and computable at load, but this is where bugs would hide.
+2. **6-bit is not byte-aligned** (4 values per 3 bytes) — awkward precisely in
+   the *safe* variant. 4-bit packs cleanly at 2 per byte.
+3. **The lossy variant re-quantizes the quantizer.** Blockscales carry each
+   16-element block's dynamic range; coarsening to 16 codes adds relative error
+   to every weight in the block, against E4M3's ~3% typical precision. This is
+   the class of change that looks fine on perplexity and breaks on specific
+   tasks. `scripts/fp8_accuracy/` has the harness.
+
+**Ranking.** Below #19 (+7–8%, no accuracy risk) and #14 (+5%, no accuracy risk).
+Its significance is categorical rather than numerical: it is the **only live idea
+that reduces bytes on the wire**, and the wire is the 36.8 ms term. Everything
+else in the queue attacks miss count or D2D traffic.
+
+### Measurement gotcha: the recorded per-row constants are cache-flattered
+
+The comment at `expert_residency_gpu.py:218-219` cites **0.007 ms/row** for
+`index_copy_` and **0.054 ms/row** for `copy_expert_row_segments_gpu`. On a
+production-shaped working set those are **0.0105 and 0.125 ms/row — 1.5x and
+2.3x worse.**
+
+The cause is the benchmark, not the kernels. `iom-cuda-tests.sh` allocates a
+single `(80, 2_764_808)` uint8 tensor (221 MB) and copies rows 70–79 into rows
+0–9, the same 20 rows, 200 reps. That touches ~55 MB against the RTX 5090's
+**128 MB L2**, so it never leaves cache and measures L2 bandwidth rather than
+HBM. Re-measured with 48 separate layer tensors (4.9 GiB working set, which is
+production's real access pattern), the constants move as above.
+
+Two consequences:
+
+1. **Anywhere those numbers are used to reason about production cost, they
+   understate it.** The design decision they justified — `index_copy_` over the
+   segment kernel — still stands, and by a *wider* margin (0.0105 vs 0.125 is
+   11.9x, against the recorded 7.7x).
+2. **The general rule:** a microbenchmark that reuses one tensor across reps on
+   this card is measuring L2. Size the working set past 128 MB, and sanity-check
+   the implied bandwidth against the card's HBM spec — an impossible number
+   (3.1 TB/s was the tell here) is the cheapest available detector.
 
 ---
 

@@ -91,6 +91,13 @@ Full detail and rulings in the ledger. Per decode token (LLaPor D trace, node-mo
 
 ## Implementation results (2026-09-17)
 
+> **Superseded headline.** Everything below stands as measured, but the campaign's
+> final result is **stage 2 (DIRECT) at 19.360 tok/s**, accepted 2026-09-18 on an
+> acceptance-grade paired arm. Where this section says "best known is 16.645",
+> read that as "best known *as of 2026-09-17*". See **Next actions** and
+> [`MOE_EXPERT_TRANSFER.md`](../../../MOE_EXPERT_TRANSFER.md).
+
+
 Full detail, commits and run directories are in the ledger. The accepted work is merged to `codex/nvfp4-expert-stream-main` @ `f2c6cd2cbc`; the rejected and in-flight branches remain separate. Compare arms only within the same matrix; CPU placement differs from the 2026-09-16 baseline.
 
 | Work | Branch @ commit | Result | Status |
@@ -193,25 +200,60 @@ Iteration-speed rulings (user, 2026-09-17). Arm cost breaks down as ~26 s proces
 
 ## Next actions
 
-1. Done: `_hc_mix` copy stall fixed (`hc-mix-stall` @ `732acac42f`, +4.4% on D), and the Task 3 re-test on top of it returned +2.9% (`task3-on-hcmix` @ `ba362b5bd7`), reversing its rejection. Task 3 is NOT in the running combined build: it conflicts with `scoring-cost` in `expert_prediction/serving/runtime.py` (7 hunks each, same pull-scheduling region) and the conflict was not resolved in time. Fold it in as a second increment after combo-B/combo-D, which also yields its marginal value on top of the full stack. A full ABBA is still owed before Task 3 is "accepted" rather than "directional".
-2. Done: insert-on-miss parity clean over 8 arms, and the combined build measured. **Ship `combined-iom` @ `f727a001f7` with prefetch OFF (16.645 tok/s, +19% over baseline).** Prefetch costs 4.3% on top of this stack — see the combined-build table above.
-3. In progress: pre-existing test failure fixes (`fix-known-test-failures`).
-4. Next candidates, in the order the bandwidth analysis implies:
-   - ~~Insert pull-covered experts~~ — simulated and closed; recovers ~9 rows/token but leaves prefetch +11.5 rows/token behind no-pull. Prefetch line is closed. Only revisit if precision can approach 100%.
-   - Insert-on-miss Stage B: miss copies land directly in victim slots, returning the 480 scratch rows to the cache (+480 slots, ~+14%, at no VRAM cost — about 2/3 of the 12 GiB budget's benefit for free). Hard part: victims must be chosen at gather time, before the forward's routing is known, with a correctness hazard of evicting a row the same forward needs.
-   - 12 GiB budget (+741 slots, +2 GB VRAM; strategy estimate −6 ms/token, re-derive headroom after insert-on-miss).
-   - Fused scorer kernel (1.7 ms D scoring cost) — only worth it if prefetch is revived by the first item.
-   - Task 3 increment on top of the shipped stack, with a full ABBA to convert its +2.9% from directional to accepted. Note Task 3 relocates *pull* copies, so its value depends on prefetch staying on; if prefetch ships off, Task 3 is moot.
-5. APEX still has one D pass. Deploying to prod is gated on advancing the `main-port-probe-7bc4eb` worktree (158 commits behind, no `INSERT_ON_MISS` in its code) — see the prod section of `MOE_EXPERT_TRANSFER.md`.
-6. Optional cleanup on divix01 (ask first): nested `wt-task3/wt-task3-base`, `cc-expert-prediction/baseline-0fe8d526df` worktree, `trace-relay-proto/`, `fix-57c842ae6e*.bundle`, the 3.9 GB trace `report.sqlite`, and finished agent worktrees.
+**Campaign landed 2026-09-18. Shipping config is insert-on-miss stage 2 (DIRECT)
+at 19.360 tok/s, +38.7% over the 13.96 baseline.** Branch
+`insert-on-miss-stage-b` @ `797be6f678`, fast-forwarded into
+`codex/nvfp4-expert-stream-main` 2026-09-18, **not pushed** — the repo owner pushes.
+Full results, the winning config and every closed line live in
+[`MOE_EXPERT_TRANSFER.md`](../../../MOE_EXPERT_TRANSFER.md), which is now the
+authoritative document; this file is history plus what remains.
+
+1. **Done and accepted.** Stage 2 beat stage 1 + fused kernel **19.360 vs 18.541
+   median, faster on 27 of 29 paired turns (p < 1e-5)**, acceptance grade,
+   `OVERLAP_SCHEDULE=1`. Mechanism: no scratch region -> 3403 -> 3883 slots ->
+   +3.09 points hit rate -> 9.9% fewer miss rows -> 42.5 MB/token less over PCIe.
+2. **Done, but off the shipping path.** The fused masked insert kernel cuts stage
+   1's boundary ~45%, and stage 2 has no such boundary. Kept default-off,
+   stage-1 only, by owner decision. Do not cite it as part of the shipped result.
+3. **Closed since the last revision:** Stage B's in-graph penalty estimate (it was
+   contaminated — the two stages did unequal work in the same harness); the shared
+   10-row scratch pool (dominated by stage 2, and the indexing forbids it); the
+   row-size lever (set by the model, not tunable); PCIe Gen4/5 (**the host board
+   is Gen3 — confirmed hardware, not configuration**).
+4. **Still open, in the order the bandwidth analysis implies:**
+   - **12 GiB budget** — never measured. At 12 GiB stage 2 gives ~4,660 slots
+     against stage 1's ~4,180. Same +480, and the only untried capacity lever.
+   - **B2** (fold the insert into `plan_graph_routes_fused`). **Re-derive its value
+     against stage 2 as shipped** — its original ~1% was scoped against a model
+     that has since changed twice.
+   - **#20 offline blockscale re-coding** — +1.6% lossless / +3.2% lossy.
+     **DEFERRED: do not start without asking the repo owner.** The lossy variant
+     changes model numerics and that trade is theirs.
+   - Fused scorer kernel — only if prefetch is ever revived, which the evidence
+     says it should not be.
+5. **Prod deployment is still gated** on advancing the `main-port-probe-7bc4eb`
+   worktree (158+ commits behind, no `INSERT_ON_MISS` in its code). Note
+   production on 7867 was observed **down** on 2026-09-18 and was not touched.
+6. **Read before running any arm:** the `hot_update_decode_forwards` launcher
+   warning in `MOE_EXPERT_TRANSFER.md`. Main-tip's `run-shadow-server.sh` tests
+   `= 1`, which silently yields 4 under stage 2. That file has no test coverage,
+   so the failure is silent and the arm still reports a number.
+7. Optional cleanup on divix01 (ask first): nested `wt-task3/wt-task3-base`,
+   `cc-expert-prediction/baseline-0fe8d526df` worktree, `trace-relay-proto/`,
+   `fix-57c842ae6e*.bundle`, the 3.9 GB trace `report.sqlite`, and finished agent
+   worktrees including `wt-stageb`.
 
 ## Operational patterns
 
 SSH:
 
 ```bash
-ssh -n -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o BatchMode=yes divix01 '<command>'
+timeout 90 ssh -n -o BatchMode=yes divix01 '<command>'
 ```
+
+**Do not pass `ControlMaster=no` or `ControlPath=none`** — an earlier revision of
+this file recommended them and that guidance is withdrawn. Use the plain form
+above.
 
 Retry read-only status checks after transient SSH resets. Never use broad `pgrep` patterns that can match the checking shell itself. Stop only PIDs conclusively shown to be self-started shadow processes (the runner SIGTERMs the `sglang serve` child of its own `flock` launcher).
 
