@@ -384,7 +384,7 @@ The `lmsysorg/sglang:dev-dsv41` image was not inspected.
   - Self-review confirmed every expert-stream/doorbell/hot-cache identifier
     count in `scheduler.py` is preserved from ours, plus upstream's new
     `tree_cache.flush_pending_backups()` call.
-  - GPU suite (Task 1 Step 8): pending — deferred until a GPU window is approved.
+  - GPU suite (Task 1 Step 8): run 2026-09-18: 860/861 vs baseline 861/861, the one failure a known flaky doorbell test (§15.2).
   - Follow-up merge of the upstream tip a5b84f11e5 (11 commits: block-fp8/mxfp8
     quant merge, V4.1-only gating, renames) — `9e5cc68bd8`, 0 conflicts, no fixes
     needed (semantic re-check of `environ.py`, `fused_moe_triton/layer.py`, and
@@ -721,8 +721,8 @@ Then recompute the break-even. **DSpark ships only if measured α clears it** (�
 1. **Base branch — done.** Branch `dsv41` off the mainline (Stage B included), merged
    `upstream-scope/dsv4.1` into it (§6). Task 1: merge commit `c64b2bd653` (base
    `85e8eddc54`), then the upstream-tip follow-up merge `9e5cc68bd8` (`a5b84f11e5`,
-   0 conflicts). **Open:** the GPU suite (Task 1 Step 8) is still pending, deferred
-   until a GPU window is approved (§6, "Result (2026-09-18, Task 1)").
+   0 conflicts). The GPU suite (Task 1 Step 8) ran 2026-09-18: no merge
+   regression (§15.2).
 2. **Done — Task 5 / §5.** Bit-exact Engram hash parity test
    (`test/manual/dsv41/test_engram_parity.py`) and the exact-LRU re-run
    (`scripts/dsv41/engram_cache_sim.py`, unit-tested against a brute-force LRU) are
@@ -1110,6 +1110,116 @@ all qualitative/architectural, not measured skew data:
   remains the first real data point, not confirmatory of anything found here.
 
 ---
+
+## 15. Phase 1 findings
+
+All runs on divix01's RTX 5090 (sm_120) on 2026-09-18, production down, under
+`cc-gpu.lock`. Artifacts: `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase1/`
+(`ANA` below).
+
+### 15.1 Window A (kernels on sm_120)
+
+- **exllamav3 extension build:** `/usr/local/cuda-13.2/bin/nvcc` (13.2), 5 min 50 s
+  wall for the first JIT build.
+- **EXL3 GPU tests (`test_exl3_{ops,method,moe}_gpu.py`):** 31/31 pass after
+  `aeff379ef7`. The first run was 20 pass / 11 fail: 5 were a test-harness bug (a CPU
+  generator under a leaked `set_default_device("cuda")`); 6 were `rows=1` GEMM cases at
+  0.66–0.79% relative error against a 5e-3 bound. That is exllamav3's regular kernel at
+  m=1 (its GEMV path is off on Blackwell; `EXL3_GEMV=0` changes nothing); m≥8 is
+  0.03–0.05%. Ruling: `rows=1` tolerance 1.2e-2 with the measured values recorded; the
+  m=1 precision is parked for Phase 2b (shape-index sweep or upstream report).
+- **Reference `inference/kernel.py` under tilelang (`ANA/windowA-smoke.log`):** ok
+  `act_quant`, `fp4_act_quant`, `hc_split_sinkhorn`. `fp8_gemm` and `fp4_gemm` fail in
+  the smoke harness only (wrong C dtype; `fill_cuda` unimplemented for
+  `float4_e2m1fn_x2`); the oracle never calls them on this path. `sparse_attn` fails
+  for real at the model's shape: 64 heads × 512 needs 141,312 B of dynamic shared
+  memory, above sm_120's 99 KB. Fix: `ref_oracle.make_head_split_sparse_attn` runs it
+  on 16-head groups (`d375a74e9a`, test `test/manual/dsv41/test_ref_sparse_attn_head_split.py`).
+- **DeepGEMM on sm_120:** `sgl-deep-gemm` has no sm_120 paged MQA logits; the
+  owner installed the `lucifer1004/DeepGEMM-sm120` fork (2.8.0+b6acafe) into the
+  shared venv (production loads it on its next restart). Against an fp64 reference
+  (`ANA/dg_check.py`): page 64 dense fp32 7.9e-8, sparse bf16 4.3e-3 (bf16 floor
+  2.3e-3); page 128 dense exact, sparse mean 4.8e-4 with 2/1006 columns ~2 bf16 ulps at
+  the row max (accepted: the indexer only ranks). On sm_120 the dense path needs fp32
+  weights, the sparse path bf16, and `num_heads` must be 32 (V4.1's
+  `index_n_heads`). Wired in `8709dde032`.
+
+### 15.2 Window B (truncated bring-up, oracle, router skew)
+
+The truncated model is `dsv41-trunc3`: layers 0–2 (compress ratios 0, 0, 2; layers 0–1
+pure SWA), EXL3 experts, Engram from shard 47, `candidate_source_layer_id=-1`.
+
+- **Phase 0 MoE suite (Phase 0 Task 1 Step 8):** same 41 files on both worktrees. Baseline `wt-stageb` (`797be6f678`): 861 passed.
+  `wt-dsv41` (`bacaf8c63b`, post-merge): 860 passed, 1 failed —
+  `test_expert_doorbell_copier.py::test_a_second_exhausted_drain_whose_copy_never_lands_aborts_after_the_fatal_wait`,
+  a known timing-flaky test (owner: fixed on the main production branch, not yet in
+  `dsv41`'s fork point `b59edf2dc4`); not a merge regression. No other difference.
+  Resolves §6's and §11's "GPU suite pending".
+- **EXL3 vs official FP8 `layers.1.engram.wkv`**
+  (`test/manual/dsv41/test_exl3_vs_fp8_engram_wkv.py`): relative RMS 0.0392, cosine
+  0.99923; the transposed orientation gives 1.414, which pins the orientation.
+- **Launch smoke:** PASS at `124f0db954` (4 tokens, 107 s end to end including JIT).
+  Needs `SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1` (shared venv has sglang-kernel
+  0.4.6.post1; the branch wants 0.4.7). Load memory (`ANA/memtrace.log`): 3.4 GiB init
+  + 3 × 4.74 GiB routed experts = 18.5 GiB. Fixes found on the way:
+
+  | Commit | Fix |
+  |---|---|
+  | `e7fb0e29e2` | shared expert: probe `gate_up_proj` for `trellis` (EXL3 has no `weight`) |
+  | `8709dde032` | candidate indexer: skip when `candidate_source_layer_id < 0`; allow DeepGEMM paged sparse logits on sm_120 |
+  | `9050e4f52e` | EXL3 MoE: read `topk_weights`/`topk_ids` by name (the fused gate returns 4 fields) |
+  | `a98ecbe65e` | force DeepGEMM indexer metadata on sm_120 for c1/c2 pools (decode) and prefill |
+  | `124f0db954` | split the c2 extra KV pool (128-token pages) to 64 for FlashInfer's sm_120 sparse MLA |
+
+- **sm_120 paths taken** (truncated model): attention decode `flash_mla_sm120`
+  (sparse MLA, FlashInfer, 64-token pages); prefill sparse through the same backend
+  with the torch prefill indexer (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`); c2 indexer
+  logits via the DeepGEMM sm_120 fork; routed experts through `Exl3MoEMethod`
+  (trellis weights resident, 3 × 4.74 GiB); the shared expert keeps a dense copy; other
+  EXL3 linears use the native kernel and fall back to a per-call dense reconstruction
+  above 144 rows (the 1.3 GB head among them, hence `mem_fraction_static` 0.7);
+  candidate indexer off (no source layer below layer 20).
+- **Oracle vs SGLang** (4 prompts × 256 tokens, `ANA/prompts.jsonl`). The plan's
+  bar (top-1 ≥ 0.98, mean |Δlogprob| ≤ 0.05) was not met; per-layer bisection
+  (`ANA/bisect/`) found:
+
+  | Iteration | top-1 | mean \|Δlp\| | Finding |
+  |---|---:|---:|---|
+  | first run | OOM | — | `exl3._materialize` thread race: concurrent loads zeroed experts and double-allocated (29 GiB). Fixed `ca5c3e0ef8` (lock) |
+  | vs `oracle-p4` | 0.66 | 0.43 | `routed_scaling_factor` (1.5) never applied to EXL3 MoE output on CUDA. Fixed `b45b6c3971` |
+  | vs `oracle-p4` | 0.891 | 0.116 | layer-0 attention error fully explained by the window-KV storage format (reference fp8/32 over 512 dims vs FlashMLA fp8/64 over 448 + bf16 RoPE): predicted 0.0237, measured 0.0237 |
+  | vs `oracle-p4fm` (FlashMLA KV everywhere) | 0.908 | 0.109 | compressed KV already rounds like the reference fp4; quantizing it the FlashMLA way over-corrects |
+  | vs `oracle-p4fw` (FlashMLA window KV) | **0.921** | **0.084** | per-layer hidden error 0.63% / 1.08% / 2.65%; router overlap 0.994 / 0.986 / 0.969 |
+
+  **Noise floor:** two legitimate oracles that differ only in KV rounding disagree
+  more than SGLang does: `oracle-p4` vs `oracle-p4fw` top-1 0.887, mean |Δlp| 0.111.
+  The truncated model's logits are flat (oracle top-1 probability median 0.092), so
+  tiny numeric differences flip the argmax. **Ruling:** Step 5 is accepted on a
+  noise-floor criterion (SGLang-vs-oracle disagreement ≤ oracle-vs-oracle, with no
+  unexplained module in the bisect), since the absolute bar sits below the floor for a
+  3-layer model. Cost if wrong: a sub-1%-per-layer bug could hide until the full-model
+  run, which has sharper logits. The merged tree (`c55f1572b0`, §6.1) reproduces the
+  final row exactly.
+- **Router skew** (`ANA/router-corpus200.json`; 200 first turns, ≤1,024 prefill tokens
+  each, reference-oracle routing):
+
+  | Layer | Gini | unused experts | top 5% mass | top 20% | static hit 7.9% | 11.5% | 36.7% |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 0 | 0.603 | 1 | 0.307 | 0.619 | 0.389 | 0.471 | 0.806 |
+  | 1 | 0.649 | 5 | 0.362 | 0.673 | 0.444 | 0.530 | 0.836 |
+  | 2 | 0.754 | 2 | 0.502 | 0.787 | 0.585 | 0.659 | 0.899 |
+
+  Hit rates are for an in-sample, per-layer static top-k cache (optimistic for a
+  static cache; blind to within-session locality, which a dynamic cache can exploit).
+  **Implication for §9.4:** with a static cache the mean VRAM hit is 0.553 at 11.5%
+  residency, so `G` ≈ 240 × 0.447 ≈ **107** (the 45% rows), and ≈ **127** at 7.9%
+  with DSpark resident. The RAM tier (36.7%) misses 15.3% of rows, so `f` ≈
+  0.153 / 0.447 ≈ **34%** (29% at 7.9%). That is above the 25% line where §9.4 says the
+  system is NVMe-bound: ≈ 243 ms/token (4.1 tok/s) on an idle x4 drive, ≈ 374 ms (2.7
+  tok/s) on nvme2, compute excluded. This moves §9.4 toward its pessimistic rows. It
+  is a first, partial signal: three shallow layers only (skew rises with depth here,
+  Gini 0.60 → 0.75), prefill routing rather than decode, and static rather than
+  dynamic caching. The full-model decode trace in Phase 3 is the real test.
 
 ## Sources
 
