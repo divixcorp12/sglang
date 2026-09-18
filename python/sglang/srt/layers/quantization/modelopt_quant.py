@@ -808,12 +808,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
+        fp8_block_config: Fp8Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.fp8_pb_wo_config = fp8_pb_wo_config
         self.mxfp8_config = mxfp8_config
+        self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
 
@@ -870,6 +872,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules = quantization_section.get("exclude_modules")
             quantized_layers = quantization_section.get("quantized_layers", {})
 
+        # ModelOpt emits `ignore: []` or omits it; is_layer_skipped iterates it.
         exclude_modules = list(exclude_modules or [])
 
         if quant_algo != "MIXED_PRECISION":
@@ -912,6 +915,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        # ModelOpt FP8_BLOCK_SCALES: 128x128 block fp8 with weight_scale_inv.
+        fp8_block_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -936,6 +946,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             fp8_config=fp8_config,
             fp8_pb_wo_config=fp8_pb_wo_config,
             mxfp8_config=mxfp8_config,
+            fp8_block_config=fp8_block_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -996,6 +1007,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             )
             candidates.append("model." + prefix[len("model.language_model.") :])
         elif prefix.startswith("model."):
+            # VL models such as Qwen4-Exp name the text stack `model.layers.*`
+            # while ModelOpt keys it `model.language_model.layers.*`.
             candidates.append("model.language_model." + prefix[len("model.") :])
 
         return tuple(dict.fromkeys(candidates))
@@ -1024,6 +1037,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
                 return Fp8LinearMethod(self.fp8_pb_wo_config)
+            if quant_algo == "FP8_BLOCK_SCALES":
+                return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
@@ -1056,6 +1071,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
+            if quant_algo == "FP8_BLOCK_SCALES":
+                return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":

@@ -10,9 +10,10 @@ from unittest.mock import patch
 
 import sglang.srt.layers.quantization.fp8 as fp8
 from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestFp8MoeRunnerFallback(unittest.TestCase):
+class TestFp8MoeRunnerFallback(CustomTestCase):
     def _runner_backend_for(self, global_backend):
         method = fp8.Fp8MoEMethod.__new__(fp8.Fp8MoEMethod)
         with patch.object(fp8, "get_moe_runner_backend", return_value=global_backend):
