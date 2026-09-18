@@ -13,6 +13,9 @@ lifting the `SGLANG_MOE_GPU_RESIDENCY_UPDATE` speculation guard): **+9.6% over
 the shipped config at production's 12,288 MB, 29/29 paired turns** — but only
 with 3 draft tokens, and at 31.9 of 32 GB. See
 [NEXTN arm](#nextn-speculative-decoding-arm-2026-09-18). Committed, not deployed.
+Four draft tokens now start (per-layer slot floor) but **tie** three; keep 3. Prefill
+staging was cut from 2.6 GB to 1.3 GB (**−1.5 GB peak VRAM**, see
+[Prefill staging and VRAM](#prefill-staging-and-vram-2026-09-18)).
 
 Geometry for scale: 48 layers, 512 experts/layer, top_k 10, one expert row =
 2,764,800 B. About 480 routed rows/token if nothing is cached. The experiments
@@ -334,7 +337,10 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | — | **Combined (1+2+3+4)** | `combined-iom` @ `f727a001f7` | **combo-B 16.645** | `servers/combo-b-p1/run-20260917-141132` |
 | 14 | **Insert-on-miss stage 2 (DIRECT)** | `insert-on-miss-stage-b` @ `797be6f678` | **18.541 → 19.360 (+4.4%)** over stage 1 + fused insert kernel | `matrix/accept-20260917-205847`; see backlog row 14 |
 | 21 | **Fused route planner** | flag only, on `797be6f678` (planner code predates the campaign) | **19.442 → 20.695 (+6.4%)**, 28/29 paired turns, p = 5.6e-8; 2.77 ms/token; hit rate unchanged | `matrix/fplan-20260918-032147` |
+| 24 | Per-layer slot floor for stage 2 | `e1d227a4bd` | Enabler, no speed of its own: lets 4 draft tokens start at 12,288 MB. **N4 vs N3: tie** (11/29 turns, median −1.5%, p = 0.27 two-sided); keep 3 | `matrix/nextn-20260918-123932` |
+| 25 | **Prefill staging in place, allocated once** | `844bb9d7a5` | **Peak VRAM 32,143 → 30,587 MiB** (37k-token prompt, NEXTN-3, 12,288 MB); prefill time unchanged | `matrix/memprobe-20260918-144144` |
 | 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `codex/nvfp4-expert-stream-main` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
+| 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. Long-prompt peak at 13,312 MB **not probed** | `matrix/cache-20260918-161820` |
 
 ### Rejected / closed
 
@@ -361,6 +367,9 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 17 | Fused scorer kernel | 1.7 ms D scoring cost | Only useful if prefetch is revived |
 | 18 | Fix 8 known test failures | Suite to zero | In flight on `fix-known-test-failures` |
 | 22 | **Fold stage 2's gather bookkeeping into the fused planner** | ≤ ~1.9–2.4 ms/token (trace upper bound, like the planner's 3.8–4.4 that realized 2.77) | Not started. `gather_destinations` (~16–23 kernels/layer) and `_commit_gather` (22) are what remains of the tail after #21. Supersedes the handoff's B2, whose ~1% was scoped against stage 1 |
+| 26 | **Chunked prefill 8192** | Long-prompt prefill **−28% / −36%** (31k / 37k tokens) at +420 MiB peak over 4096, measured *before* pre-sizing | One clean probe on the pre-sized build still owed (the first attempt lost its memory to other GPU jobs mid-load). TTFT only; decode unaffected |
+| 28 | Token embedding to pinned host memory | 1.18 GiB (~+450 slots), lossless; decode reads one 5 KB row per token | Not started. No option exists; copy the PLE offload pattern. The LM head (also 1.18 GiB) cannot move: every token multiplies against all of it |
+| 29 | Prefill MoE in expert groups | Staging ~4x smaller again | Not started; needs the fused-MoE runner to split and re-sum per group. Only after #28 |
 | 20 | **Offline blockscale re-coding** (precomputed codebook) | **+1.6%** lossless (6-bit) / **+3.2%** lossy (4-bit) | **DEFERRED — do not pick this up without asking the repo owner first.** Not blocked on evidence; it is an open decision about accuracy budget, and it is the owner's call to make |
 
 ### The pattern
@@ -707,6 +716,10 @@ NEXTN work, under `cc-expert-prediction/`:
 | Arm script / paired analysis | `nextn-arm.sh` / `nextn_paired.py` (its "C"/"F" labels mean F/N) |
 | Worktree | `wt-nextn` @ `797be6f678` + the guard removal, test and launcher switch (`wt-nextn.patch`) |
 | CUDA test runner | `run-nextn-tests.sh`, logs `logs/cuda-tests-nextn-*` |
+| N4 vs N3 arm / paired | `matrix/nextn-20260918-123932` / `nextn4_paired.py` (its "C"/"F" mean N3/N4) |
+| Memory probe (waits for arms, retries a lost lock) | `mem-probe.sh`; `matrix/memprobe-20260918-{125301,140008,144144}` |
+| Staging test runners (lock-queued) | `run-staging-green.sh`, `run-presize-tests.sh`; logs `logs/cuda-tests-{staging,presize}-*` |
+| Cache-budget arm | `cache-arm.sh`; `matrix/cache-20260918-161820` (`-161749` is `ABORTED`) |
 
 The `_hc_mix` persistent-kernel pattern is recorded as **checked and
 inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
@@ -827,6 +840,79 @@ and 12/12 within 10% are faster.
 that raises inside the `with` leaks the value into every later test in the
 process; a failing draft of the test above left `SGLANG_MOE_EXPERT_FUSED_PLAN=true`
 set and produced four unrelated-looking `test_expert_graph_gather` failures.
+
+### Prefill staging and VRAM 2026-09-18
+
+**Where the 32 GB goes** (NEXTN-3, 12,288 MB, from the server log):
+
+| Item | Size |
+|---|---:|
+| Hot cache | 12.0 GiB |
+| Target non-expert weights | 10.05 GB (linear attention 3.89 GiB, full attention 1.42, embed_tokens 1.18, lm_head 1.18, shared experts 0.44, other ~1.9; vision skipped by `--language-model-only`) |
+| NEXTN draft layer (mostly its FP8 experts) | 2.46 GB |
+| KV (target + draft) / Mamba + spec scratch / CUDA graphs | 1.0 / 0.44 / 0.49 GB |
+| Free after startup | 4.08 GB, consumed at the prefill peak |
+
+**The prefill peak was staging, and it does not scale with the chunk.** The
+eager hot-cache gather stages every routed expert of a layer, and a 2048- or
+4096-token chunk routes to 480–495 of 512. It held them **twice** — misses in a
+`hot_cache_misses` buffer, then stitched into the kernel's buffer by the
+`index_copy` at `expert_stream.py:1033` — and grew both a step at a time
+(13–21 regrowths per prefill), leaving each outgrown buffer in the allocator's
+cache: **2.6 GB of staging**. So chunk 2048 freed nothing (peak 32,145 vs 32,143
+MiB) and prefilled 60% slower.
+
+`844bb9d7a5`: misses take the kernel buffer's first rows so their copies land in
+place (hits after them, routes remapped), and the buffer is allocated at a whole
+layer's experts on first use. Probe: `mem-probe.sh`, NEXTN-3 at 12,288 MB, a
+30,906- then a 37,274-token prompt, `nvidia-smi` sampled every 100 ms:
+
+| Build | chunk | Peak MiB | 31k / 37k prefill | OOM |
+|---|---:|---:|---:|---|
+| before | 4096 | 32,143 | 35.0 / 38.9 s | no |
+| before | 2048 | 32,145 | 56.6 / 61.9 s | no |
+| in place | 4096 | 31,387 | 33.9 / 38.7 s | no |
+| in place | 8192 | 31,807 | **24.3 / 24.7 s** | no |
+| **in place + allocated once** | 4096 | **30,587** | 34.3 / 37.5 s | no |
+
+- **Bigger chunks are faster prefill.** Each expert copied over PCIe serves
+  every token of the chunk that routes to it, and prefill is ~90% transfer
+  (~50 GB per 4096-token chunk at a 23% prefill hit rate). That is also why
+  CUDA graphs for prefill are not worth building: they remove launch overhead
+  from a 4.5 s chunk.
+- **Tests:** `test_eager_hot_cache_gather_stages_a_layer_once` (old: 2.0 layers
+  at peak) and `test_growing_prefill_gathers_do_not_regrow_staging` (old: 1.75
+  layers) both fail on the old code. Device-to-device assembly now counts hit
+  rows only (three test expectations updated). All MoE suites: 726 passed.
+- **Gotcha: a peak-memory test must not index on the device.** Building the
+  routed rows to check correctness (`tensors[name][compact]`) allocated 2x the
+  staging and made the first version of the regrowth test fail identically on
+  old and new code.
+- **Gotcha: 10 test files in `test/registered/unit/layers/moe/` do not import**
+  on divix01's venv (`pyarrow` has no `PyExtensionType`). A plain pytest run of
+  the directory aborts at collection; use `--continue-on-collection-errors`.
+- **Gotcha: another session shares `cc-gpu.lock`** with short back-to-back jobs.
+  Check-then-launch loses the race (the launcher's `flock --nonblock` exits at
+  once); queue with a blocking `flock -w` or retry a launch that leaves no log.
+
+**Cache-budget arm** (`matrix/cache-20260918-161820`, `cache-arm.sh`, acceptance
+grade, same build, NEXTN-3 + stage 2 + fused planner, B first):
+
+| | budget | slots | median tok/s | mean | speculative-phase hit rate | H2D / token |
+|---|---:|---:|---:|---:|---:|---:|
+| N | 12,288 MB | 4,660 | 25.208 | 25.192 | 70.17% | 372 MB |
+| **B** | **13,312 MB** | **5,048** | **27.081** | **26.514** | **72.11%** | **345 MB** |
+
+Paired: **B faster on 24/29 turns, one-sided sign test p = 2.7e-4**, median
++1.615 tok/s (ratio 1.061, min -2.44, max +3.69), 2.16 ms/token saved. Accept
+length 2.55 (N) vs 2.57 (B): the gain is bytes, not speculation.
+
+- **Not yet safe to deploy.** The +1,024 MB comes out of the ~1.5 GB the staging
+  change freed; the 37k-token peak at 13,312 MB is estimated at ~31,600 of
+  32,607 MiB but was not measured. Run `mem-probe.sh` at 13,312 MB first.
+- **Script gotcha:** the requested-bytes check needs `grep -qF` on a precomputed
+  number; an unquoted pattern lost its quotes through `ssh` and the first launch
+  (`-161749`, `ABORTED`) was stopped before it ran.
 
 ### Acceptance arm 2026-09-18 — the shipping decision
 
