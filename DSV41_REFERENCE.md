@@ -206,7 +206,8 @@ Usable VRAM is taken as 31.8 GiB (32,607 MiB) [measured]. Stage B is assumed, be
 | Embedding | 1.23 | Can move to host (+99 slots) |
 | KV + indexer caches at 40K ctx | ≤0.87 | 584 B/token/layer on the sm_120 `v4` layout (upstream `deepseek_v4_memory_pool.py:132-142`). This is the upper bound if all 40 layers allocate; far less if only the SWA windows + 4 KV-source layers do. Confirm when porting. **Also confirm the pool-configurator interaction**: the pool configurator's request-cap SWA sizing (`pool_configurator.py:807`, present since the pre-squash tip, §6.1) reserves SWA slots from `max_running_requests` before sizing the full pool; our own `compare_oracle.py` needed `max_running_requests=4` to avoid a starved full pool at `mem_fraction_static=0.7` (`bacaf8c63b`) — the EXL3 serving config will need the same check once it exists |
 | Activations, graphs, workspace | ~3 | [estimate] |
-| **Hot cache, no DSpark** | **31.8 − 9.86 = ~21.9** | ≈ **1,770 slots** of 15,360 = 11.5% [estimate] |
+| Dequantized EXL3 modules (`wo_a`, compressor, indexer `wk`) | 2.8 | `wo_a`: 40 × 8,192×4,096 bf16 (8 groups × `o_lora_rank` 1,024; 64 heads × 512 / 8) = 2,684,354,560 B ≈ 2.50 GiB. Compressor (`DeepseekV41Compressor`, `layers/attention/dsv4/dsv41_sparse.py:98`): `wkv` 5,120×512 bf16 = 5.24 MB on the 20 ratio-1 layers, `wkv`+`wgate` = 10.49 MB on the 18 ratio-2 layers (config `compress_ratios`: 2 × 0, 20 × 1, 18 × 2) = 293.6 MB ≈ 0.27 GiB. Indexer `wk` 512×128 bf16 = 131 KB per `index_source_layer_ids` layer, negligible. Total ≈ 2.8 GiB. All come from `deepseek_v4_exl3_weights.adapt_exl3_weights` (`DEQUANT_PREFIX_RE`, `WO_A_SLICE_RE`; `wo_a`'s 8 slices concatenated to `[G·R, D]`), which dequantizes EXL3 trellis to dense bf16 at load and keeps it: a permanent VRAM cost. **Phase 3 must decide whether to keep this row** (dense `wo_a` stays resident) **or remove it** (e.g. by keeping `wo_a` EXL3 and reconstructing per-call like the other attention linears, at a decode-latency cost). Not the same number as §15.2's measured 18.5 GiB truncated-model load memory (3.4 GiB init + 3 × 4.74 GiB routed experts) — that figure is a 3-layer smoke-test load footprint, not a full 40-layer serving budget, and its "3.4 GiB init" already includes some of this row for those 3 layers. |
+| **Hot cache, no DSpark** | **31.8 − 9.86 = ~21.9** | ≈ **1,770 slots** of 15,360 = 11.5% [estimate]. Does not yet subtract the dequantized-EXL3-modules row (2.8 GiB, pending Phase 3's keep/remove decision above); if kept, this drops to ~19.1 GiB ≈ 1,540 slots = 10.0% [estimate] |
 | DSpark draft, fully resident | 6.75 | ≈ 544 slots, **31%** of the above. A draft-expert cache is the alternative (§10) |
 | **Hot cache, DSpark resident** | **~15.2** | ≈ **1,220 slots** = 7.9% [estimate] |
 
@@ -730,15 +731,15 @@ Then recompute the break-even. **DSpark ships only if measured α clears it** (�
    the RAM-budget table. Weight-row and scale-row hit rates were not separated (the
    simulation tracks 264 B combined rows, §5's "logical" row); if that split matters
    for Phase 3, re-run with the two counted independently.
-3. **Superseded, not done.** No diff of our quant files against `dsv4.1`'s
-   `fp8.py`/`fp8_utils.py`/`mxfp4*` was run; §6 records what `dsv4.1` touches there
-   at a file level, not a line diff. As of the 2026-09-18 merge (§6.1) those files are
-   no longer a separate branch to diff against — they, and the follow-on
-   `1b200ffaaa` block-FP8-via-MXFP8 commit, are merged code in `dsv41` now. The
-   remaining work is a *review* pass over the merged quant path for EXL3-path
-   relevance (§6.1 already finds it irrelevant at the file level: it only serves the
-   official MXFP4/FP8 checkpoint), not a diff against an external branch. Do this
-   alongside the sm_120 kernel-matrix walk in Phase 1.
+3. **Done.** `git diff a5b84f11e5 HEAD --stat -- fp8.py fp8_utils.py mxfp4*.py` (the
+   pre-squash tip we scoped Phase 0 against, vs current `dsv41`) is 1 file, +4/−10:
+   `fp8.py`, all of it upstream's own follow-on work (`#39823`) landed by the
+   `c55f1572b0` merge (§6.1), not a fork change. Since that merge, `a5b84f11e5` is no
+   longer the right baseline — the meaningful check is against current upstream:
+   `git diff origin/main HEAD --stat -- fp8.py fp8_utils.py mxfp4*.py` is **empty**.
+   Our fork carries no changes of its own to the FP8/MXFP4 quant files, confirming
+   §6.1's file-level finding that this path serves only the official MXFP4/FP8
+   checkpoint and is irrelevant to the EXL3 path.
 4. **Done — §14.2.** Upstream's Engram `_HostTable`/gather read in full; the gather
    takes a row index, not a raw offset, so a slot map can sit in front of it, but the
    allocation, addressing and miss semantics all need to change (§14.2).
@@ -758,8 +759,6 @@ Then recompute the break-even. **DSpark ships only if measured α clears it** (�
 8. **Still open (§12.1).** The go/no-go tok/s bar needs an owner decision; nothing in
    this task's research resolves it.
 
-**Phase 1 plan: write next, from §14.**
-
 **GPU window items** (each needs crypto-c9 scheduling; a small-VRAM microbenchmark
 beside production perturbs production latency, so decide explicitly):
 - Prototype one miss mechanism (§9.3) against the acceptance criteria there. It needs a
@@ -768,20 +767,23 @@ beside production perturbs production latency, so decide explicitly):
   at QD 6–36) and on nvme2 (4 KiB random reads at QD48). Measure host RAM free with
   production stopped, and `cudaHostRegister` time for ~80 GB.
 
-**Phase 1 — model bring-up, not streaming (production down):**
-- The ported model on the Stage-B base.
-- Correctness oracle: a **truncated model** (SWA layers 0–1, Engram layer 1, a KV-source
-  layer, part of the ratio-2 band, plus the head), fully resident, checked against the
-  reference `inference/` code, **or a patched exllamav3**: stock exllamav3 raises
-  `KeyError` on V4.1 and is not installed.
-- Walk the sm_120 kernel matrix (§6). Record router statistics from the truncated model
-  as a first, partial skew signal.
+**Phase 1+2 (EXL3-first bring-up) — done, 2026-09-18.** Kernel coverage: §15.1 (Window
+A). Model bring-up, oracle and router skew: §15.2 (Window B). **Merge decision** (owner,
+2026-09-18): bring up the EXL3-quantized checkpoint first rather than the original
+Phase 1/Phase 2 split (model bring-up on dense weights, then a separate EXL3 quant-method
+phase), because every backbone linear in this checkpoint is EXL3 and the official
+(MXFP4/FP8) backbone shards were never downloaded — there is no non-EXL3 model to bring
+up first. `Exl3MoEMethod` (trellis-resident routed experts) and the EXL3 linear method
+therefore landed together with model bring-up in this window; the remaining EXL3 MoE
+performance work (below) is the only piece deferred.
 
-**Phase 2 — EXL3 quant method:**
-- Vendor `exl3_moe.cu`/`exl3_gemv.cu` behind a new quant method and MoE runner, using the
-  pointer-array interface and the slot layout from Phase 0.
-- Establish parity on the truncated model.
+**Phase 2b — EXL3 performance (open):**
+- Vendor the fused `exl3_moe.cu`/`exl3_gemv.cu` (bincount layout) behind `Exl3MoEMethod`
+  and the coop decode kernel, using the pointer-array interface and the slot layout from
+  Phase 0, checking parity against `exl3_moe_loop`.
+- Add CUDA-graph capture.
 - Microbenchmark BS1 decode, including SM contention with a concurrent copy.
+- Vendor the proven exllamav3 subset.
 
 **Phase 3 — three-tier streaming (non-speculative first):**
 - Generalize the streamer.
@@ -832,6 +834,13 @@ beside production perturbs production latency, so decide explicitly):
 ## 13. Risks and open questions
 
 - **Routing skew (`G`, `f`) is unknown**, and the entire §9.4 envelope rests on it.
+  **Sharpened, not retired** (§15.2): the truncated model's router proxy gives
+  `G` ≈ 107, `f` ≈ 34% (static cache, 3 layers, prefill only), above §9.4's 25% NVMe-bound
+  line — this pushes §9.4 toward its pessimistic rows (≈243 ms/token idle x4,
+  ≈374 ms/token nvme2). Still only a first, partial signal: three shallow layers (skew
+  rises with depth here, Gini 0.60 → 0.75), prefill rather than decode, and a static
+  rather than dynamic cache (optimistic vs. what a real cache would do). The full-model
+  decode trace in Phase 3 remains the real test.
 - nvme1's real throughput under `op-reth` write load (DRAM-less QLC) is unknown. So is
   its sustained write rate for the 205 GB copy.
 - The miss mechanisms are unprototyped. Option B's host-callback serialization and
@@ -840,10 +849,22 @@ beside production perturbs production latency, so decide explicitly):
   need 8 B (checked in both the main and coop kernels), and padding happens in the
   RAM→VRAM segment copy, not as a separate admission-copy cost.
 - The §4 KV figure: whether all 40 layers allocate 584 B/token.
-- sm_120 coverage of the DeepGEMM `fp8_fp4` indexer and of FlashMLA with the V4.1
-  layout is unverified.
-- EXL3 3.0 bpw quality on our workload is unmeasured; the card's scores are for the
-  unquantized model.
+- **sm_120 coverage of the indexer / FlashMLA**: measured on the truncated model
+  (§15.2). FlashMLA works via `flash_mla_sm120` plus FlashInfer sparse MLA (64-token
+  pages, after splitting the c2 extra KV pool to match); the c2 indexer's DeepGEMM
+  logits work via the `lucifer1004/DeepGEMM-sm120` fork; the prefill indexer runs the
+  torch path (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`). **Still open:** the candidate
+  indexer was not exercised — it needs a source layer at or above layer 20
+  (`candidate_source_layer_id`), which the 3-layer truncated model doesn't reach.
+- **EXL3 3.0 bpw quality on our workload**: measured on the truncated model (§15.2) —
+  SGLang vs. reference oracle top-1 0.921, mean |Δlogprob| 0.084, below the plan's bar
+  (≥0.98 / ≤0.05) but **accepted on a noise-floor ruling**: two legitimate oracles that
+  differ only in KV rounding disagree more than SGLang does (top-1 0.887, mean |Δlp|
+  0.111), and the 3-layer model's logits are flat enough (median top-1 probability
+  0.092) that tiny numeric differences flip the argmax, so the absolute bar isn't a
+  meaningful gate at this depth. Risk if the ruling is wrong: a sub-1%-per-layer bug
+  could hide until the full-model run, where sharper logits would expose it. The
+  card's published scores remain for the unquantized model, not this quantization.
 - The Engram corpus is narrow (repetitive financial text), so general traffic will
   reuse less than the measured curve in §5.
 - The global-singleton cross-layer KV reuse needs a batched design. Upstream presumably
