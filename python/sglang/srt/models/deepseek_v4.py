@@ -5625,10 +5625,23 @@ def _prepare_deepseek_v4_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Keep Expert Pack GGUF weights on the streaming load path."""
+    """Keep Expert Pack GGUF weights, and EXL3's already-dequantized wo_a,
+    off the FP8 wo_a streaming dequant path.
 
-    if quant_config is not None and quant_config.get_name() == "expert_pack":
-        logger.info("Keep Expert Pack GGUF weights on the streaming load path")
+    EXL3's adapter (`adapt_exl3_weights`) already yields the final bf16
+    `*.wo_a.weight`; `_dequant_fp8_wo_a_streaming` would otherwise buffer every
+    one of them waiting for a `*.wo_a.scale` that EXL3 never emits, holding
+    every layer's wo_a (bf16, on CUDA) until the whole checkpoint is consumed.
+    """
+
+    if quant_config is not None and quant_config.get_name() in (
+        "expert_pack",
+        "exl3",
+    ):
+        logger.info(
+            "Keep %s weights off the FP8 wo_a streaming dequant path",
+            quant_config.get_name(),
+        )
         return weights
     return _dequant_fp8_wo_a_streaming(weights)
 

@@ -68,6 +68,47 @@ def test_incomplete_group_raises():
         run(_exl3("layers.0.attn.wo_a.slice.0", 64, 16, 1), groups=2)
 
 
+class _FakeQuantConfig:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+def test_prepare_weights_exl3_passes_wo_a_through_without_buffering():
+    """`_prepare_deepseek_v4_weights` must not route exl3 through the FP8 wo_a
+    streaming dequant, which buffers every `*.wo_a.weight` waiting for a
+    `*.wo_a.scale` that exl3 (already dequantized by the adapter) never
+    emits. Assert laziness directly: each wo_a.weight is yielded without the
+    next input item having been pulled from the source iterator."""
+    from sglang.srt.models.deepseek_v4 import _prepare_deepseek_v4_weights
+
+    pulled = []
+
+    def source():
+        items = [
+            ("layers.0.attn.wo_a.weight", torch.ones(2, 2)),
+            ("layers.1.attn.wo_a.weight", torch.ones(2, 2) * 2),
+        ]
+        for name, tensor in items:
+            pulled.append(name)
+            yield name, tensor
+
+    out = _prepare_deepseek_v4_weights(source(), _FakeQuantConfig("exl3"))
+    name, tensor = next(out)
+    assert name == "layers.0.attn.wo_a.weight"
+    assert float(tensor[0, 0]) == 1.0
+    # The streaming FP8 dequant would have pulled the second item too, while
+    # buffering the first waiting for a scale that never arrives.
+    assert pulled == ["layers.0.attn.wo_a.weight"]
+
+    name, tensor = next(out)
+    assert name == "layers.1.attn.wo_a.weight"
+    assert float(tensor[0, 0]) == 2.0
+    assert pulled == ["layers.0.attn.wo_a.weight", "layers.1.attn.wo_a.weight"]
+
+
 @pytest.mark.parametrize(
     "stem",
     [
