@@ -81,6 +81,47 @@ def test_missing_part_detected():
         method.process_weights_after_loading(layer)
 
 
+def test_sharded_input_rejected():
+    # RowParallelLinear-style sharding: input_size_per_partition < input_size.
+    method = Exl3LinearMethod(Exl3Config.from_config(HF_QUANT))
+    with pytest.raises(NotImplementedError, match="tensor-parallel size 1"):
+        method.create_weights(nn.Module(), 2560, [1280], 5120, 1280, torch.bfloat16)
+
+
+def test_sharded_output_rejected():
+    # ColumnParallelLinear/ParallelLMHead-style sharding: the output partitions
+    # (this rank's slice) sum to less than the layer's full output_size.
+    method = Exl3LinearMethod(Exl3Config.from_config(HF_QUANT))
+    with pytest.raises(NotImplementedError, match="tensor-parallel size 1"):
+        method.create_weights(nn.Module(), 5120, [640], 5120, 1280, torch.bfloat16)
+
+
+def test_string_shard_id_rejected():
+    # QKVParallelLinear loads its q/k/v shards with string shard_ids; exl3 parts
+    # are positional (one per output_partition_sizes entry), so a string id must
+    # fail loudly instead of crashing inside int(shard_id).
+    layer, method = _layer(1, 5120, 1280)
+    tensor = _tensors(5120, 1280, 5, 3)["trellis"]
+    with pytest.raises(NotImplementedError, match="'q'"):
+        layer.trellis.weight_loader(layer.trellis, tensor, "q")
+
+
+def test_gate_prefix_stays_unquantized():
+    # Restores coverage of the ".gate" entry in UNQUANTIZED_PREFIX_SUFFIXES: some
+    # model families (e.g. qwen3_moe, mixtral) implement the router gate as a
+    # LinearBase, in which case get_quant_method IS consulted for it and must
+    # route it to the unquantized path, unlike DeepSeek V4.1's MoEGate (a plain
+    # nn.Module, not a LinearBase -- see test_weights_proj_stays_unquantized's
+    # docstring and task-3-report.md).
+    from sglang.srt.layers.linear import ReplicatedLinear
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    cfg = Exl3Config.from_config(HF_QUANT)
+    prefix = "model.layers.0.mlp.gate"
+    layer = ReplicatedLinear(64, 32, bias=False, quant_config=None, prefix=prefix)
+    assert isinstance(cfg.get_quant_method(layer, prefix), UnquantizedLinearMethod)
+
+
 def test_weights_proj_stays_unquantized():
     # DeepSeek V4.1's indexer.weights_proj is a ReplicatedLinear (LinearBase), so
     # exl3's get_quant_method is actually consulted for it and must route it to

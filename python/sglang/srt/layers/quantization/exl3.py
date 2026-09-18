@@ -93,7 +93,17 @@ def _materialize(param: nn.Parameter, lead: tuple[int, ...], loaded: torch.Tenso
 
 
 def _load_linear_part(layer, name, param, loaded_weight, shard_id=None):
-    part = 0 if shard_id is None else int(shard_id)
+    if shard_id is None:
+        part = 0
+    elif isinstance(shard_id, int):
+        part = shard_id
+    else:
+        raise NotImplementedError(
+            f"exl3: string shard ids ({shard_id!r}) are not supported; "
+            "QKVParallelLinear-style fused q/k/v shards cannot be loaded as "
+            "separate exl3 parts (each exl3 part needs its own trellis/suh/svh, "
+            "one per positional output_partition_sizes entry, not one per named shard)"
+        )
     _materialize(param, (layer.exl3_parts,), loaded_weight)
     param.data[part].copy_(loaded_weight)
     layer.exl3_loaded.add((name, part))
@@ -115,6 +125,17 @@ class Exl3LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # exl3 supports TP=1 only (no sharding of trellis/suh/svh implemented yet).
+        # input_size_per_partition != input_size means row-parallel (RowParallelLinear)
+        # sharding on the input dim; sum(output_partition_sizes) != output_size means
+        # column-parallel (ColumnParallelLinear/QKVParallelLinear/ParallelLMHead)
+        # sharding on the output dim. Both are equalities at TP=1 by construction in
+        # every LinearBase/VocabParallelEmbedding call site (vocab padding included:
+        # ParallelLMHead passes the already-padded output_size, and its per-partition
+        # size equals that padded total when tp_size == 1), so this also correctly
+        # rejects TP>1 for the LM head without needing get_tensor_model_parallel_world_size().
+        if input_size_per_partition != input_size or sum(output_partition_sizes) != output_size:
+            raise NotImplementedError("exl3 supports tensor-parallel size 1 only")
         sizes = list(output_partition_sizes)
         if len(set(sizes)) != 1:
             raise ValueError(f"exl3: merged linear parts must be equal, got {sizes}")
