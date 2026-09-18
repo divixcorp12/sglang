@@ -125,6 +125,9 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
 
 
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if getattr(quant_method, "applies_without_weight", False):
+        return True
+
     if (
         quant_method is None
         or not hasattr(lm_head, "weight")
@@ -1240,6 +1243,9 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
 
 
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if getattr(quant_method, "applies_without_weight", False):
+        return True
+
     if (
         quant_method is None
         or not hasattr(lm_head, "weight")
