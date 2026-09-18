@@ -71,7 +71,10 @@ The design that follows is in §9. Decisions still open are in §12.
 8. **Upstream SGLang `dsv4.1` is a V4 extension, not a new model**, and touches none of
    our streaming files. Branch `dsv41` off the mainline and *merge* `dsv4.1` (a squashed
    cherry-pick leaves 29 of 110 files unapplied; the merge conflicts in 12)
-   (§6). No stack runs EXL3 in SGLang. exllamav3 (MIT) has a fused, sm_120-tuned EXL3
+   (§6). **Done**, twice over: the pre-squash PR branch merged first (`c64b2bd653`),
+   then upstream's final squash `a6cf05817f` (#38798) landed via an `origin/main` merge
+   (`c55f1572b0`, 2026-09-18, §6.1) — the streaming-file claim was reverified against
+   both. No stack runs EXL3 in SGLang. exllamav3 (MIT) has a fused, sm_120-tuned EXL3
    MoE kernel to vendor (§7).
 9. **It cannot coexist with production.** It needs the whole 32 GB card and most of
    the RAM budget. Every GPU session means production downtime, which crypto-c9
@@ -201,7 +204,7 @@ Usable VRAM is taken as 31.8 GiB (32,607 MiB) [measured]. Stage B is assumed, be
 |---|---:|---|
 | Attention + gates + Engram `wkv` + shared + head + hc | 4.76 | [measured bytes] |
 | Embedding | 1.23 | Can move to host (+99 slots) |
-| KV + indexer caches at 40K ctx | ≤0.87 | 584 B/token/layer on the sm_120 `v4` layout (upstream `deepseek_v4_memory_pool.py:132-142`). This is the upper bound if all 40 layers allocate; far less if only the SWA windows + 4 KV-source layers do. Confirm when porting |
+| KV + indexer caches at 40K ctx | ≤0.87 | 584 B/token/layer on the sm_120 `v4` layout (upstream `deepseek_v4_memory_pool.py:132-142`). This is the upper bound if all 40 layers allocate; far less if only the SWA windows + 4 KV-source layers do. Confirm when porting. **Also confirm the pool-configurator interaction**: the pool configurator's request-cap SWA sizing (`pool_configurator.py:807`, present since the pre-squash tip, §6.1) reserves SWA slots from `max_running_requests` before sizing the full pool; our own `compare_oracle.py` needed `max_running_requests=4` to avoid a starved full pool at `mem_fraction_static=0.7` (`bacaf8c63b`) — the EXL3 serving config will need the same check once it exists |
 | Activations, graphs, workspace | ~3 | [estimate] |
 | **Hot cache, no DSpark** | **31.8 − 9.86 = ~21.9** | ≈ **1,770 slots** of 15,360 = 11.5% [estimate] |
 | DSpark draft, fully resident | 6.75 | ≈ 544 slots, **31%** of the above. A draft-expert cache is the alternative (§10) |
@@ -293,7 +296,12 @@ row sizes in one io_uring submission.
 
 ## 6. Upstream SGLang `dsv4.1` branch
 
-Fetched read-only as `upstream-scope/dsv4.1` @ `85e8eddc54` (and `upstream-scope/main`).
+Fetched read-only as `upstream-scope/dsv4.1` @ `85e8eddc54` (and `upstream-scope/main`) at
+Phase 0 scoping time. **Superseded 2026-09-18**: `origin/main` (`aed3fb1cdd`) has since
+landed the same work's *final squash* — `a6cf05817f` ("dsv4.1: remaining model and
+runtime integration", #38798) — plus ~45 other upstream commits, and we merged that into
+`dsv41` (§6.1). The pre-squash file-level shape described immediately below is what Phase
+0's research read; §6.1 records what changed on top of it.
 
 **Shape of the change.** 197 commits, 110 files, +9,506/−719 against merge-base
 `1f0c73e9bd`.
@@ -383,6 +391,71 @@ The `lmsysorg/sglang:dev-dsv41` image was not inspected.
     `decode_cuda_graph_runner.py` found only comment rewording; `modelopt_quant.py`
     and `memory_hook.py` were untouched by these 11 commits, so Task 1's fix
     stands).
+
+### 6.1 2026-09-18 — Upstream #38798 merge
+
+Before this, `dsv41` carried upstream's *pre-squash* `dsv4.1` PR branch (tip
+`a5b84f11e5`, the state §6 above and §14 describe). We then merged `origin/main`
+(`aed3fb1cdd`) into `dsv41` — merge commit **`c55f1572b0`**. That brought in upstream's
+final squash of the same PR, **`a6cf05817f` ("dsv4.1: remaining model and runtime
+integration", #38798)**, plus 45 other `main` commits, including `1b200ffaaa`
+(block-FP8 served through FlashInfer MXFP8 GEMMs, #40039), `0be8a0af0e` (TileLang JIT
+cache dir, #39364), `c46bf5e990` (FlashInfer fused finalize off by default for numerical
+accuracy, #40105), `3ce3b4969f` (NPU `wo_a`), and `7bc9152447` (kernel tests
+consolidated). A follow-up fix, **`bacaf8c63b`**, was needed in our own
+`compare_oracle.py` tool (below).
+
+**What #38798 changed against the pre-squash tip we already had:** little. Against its
+parent on `main` the squash is 103 files, +8,802/−718, but almost all of that was already
+in `dsv41` via the pre-squash merges. Against `a5b84f11e5` (restricted to the squash's
+files) it is **27 files, +801/−127**, concentrated in `deepseek_v4.py`, `deepseek_v2.py`,
+DSpark (`dspark_accept.py`, `dspark_verify.py`, `dspark_worker_v2.py`), `fp8.py`,
+`flashinfer_comm_fusion.py`, `schedule_policy.py`/`tokenizer_manager.py`, and
+pool/autotune tests. Merge conflicts (20 files) and their resolutions are listed in the
+`c55f1572b0` message; our EXL3 no-fuse guard, sm_120 DeepGEMM metadata and
+`candidate_source_layer_id` wiring were kept.
+- **VL routing** (`srt/multimodal/dsv41/vl_routing.py`, `vision_topk`), the V4.1
+  attention/DSpark runner files (`c2_decode_pool.py`, `decode_attention_sm100_gluon.py`,
+  `dsv4/dsv41_sparse.py`, `dspark/commit_swa.py`) and request-cap SWA pool sizing
+  (`compute_swa_request_cap()`, `pool_configurator.py:807`, `_resolve_swa_cap_tokens`
+  at `:1196`) were **all already present at the pre-squash tip**, not new in the squash
+  (`pool_configurator.py` is byte-identical before and after the merge). They are
+  upstream-provided either way. The V4.1 path still sizes SWA from the request cap
+  because `model_overrides/deepseek_v4.py` leaves `swa_full_tokens_ratio` unset for
+  `deepseek_v41`.
+- **`compare_oracle.py` needed `max_running_requests=4` after the merge** (`bacaf8c63b`):
+  at `mem_fraction_static=0.7` the truncated model failed with "DSV4 SWA pool cap
+  (598272 tokens, 0.98 GB) leaves no room for the full KV pool within the available
+  0.83 GB". Pre-merge runs at the same settings loaded. Since the pool sizing code is
+  unchanged, the trigger is elsewhere (a changed default or larger non-KV footprint);
+  **root cause unverified**. With the cap, the merged tree reproduces the pre-merge
+  oracle comparison exactly (top1 0.9206, mean |Δlp| 0.0839 vs `oracle-p4fw`). The
+  EXL3 serving config must set `max_running_requests` deliberately for the same reason.
+- **sm_120 coverage unchanged:** the V4.1 compact KV layouts, the indexer fast paths
+  and `sparse_prefill_fwd` stay sm_100/sm_103-gated; `flash_mla_sm120` remains the
+  sm_120 decode path. The §6 matrix holds as written (static re-read, not re-run).
+- `layers/engram.py` has **zero diff** in `a6cf05817f` (it was already complete
+  pre-squash) — §14.2's findings (allocation sized at `num_embeddings`, not a cache
+  budget; the "owned" test is a contiguous shard-membership check, not a real
+  cache-miss lookup) stand unchanged. STILL OURS.
+- **Confirmed untouched, again:** `git show --stat a6cf05817f` and a scan of the other
+  ~45 `main` commits touch none of `expert_stream.py`, `expert_hot_cache.py`,
+  `expert_residency*.py`, `expert_host_arena.py`, `expert_doorbell.py*`,
+  `model_runner.py`, `scheduler.py`, or `moe_runner/flashinfer_cutlass.py`. §6's and
+  §8's "touches none of our streaming files" claim holds after the final merge, not
+  just the pre-squash one.
+- The block-FP8-via-MXFP8 and FlashInfer-fused-finalize commits (`1b200ffaaa`,
+  `c46bf5e990`) land on the official MXFP4/FP8 checkpoint's quant path
+  (`fp8.py`/`fp8_utils.py`/`mxfp4_flashinfer_trtllm_moe.py`), which §6 already called
+  "Irrelevant on the EXL3 path" — still true; no plan change.
+
+**Doc items this closes or updates:** §10's "`dspark_layers_to_capture` for V4.1 is not
+yet checked" line was already stale before this merge — §14.3 (Task 2/Phase 0) had
+already confirmed `[37, 38, 39]` from `config.json` directly; that finding is
+unaffected by this merge and is now cross-referenced from §10. §11 Phase 0 item 3 ("no
+diff of our quant files against `dsv4.1`'s `fp8.py`/etc. was run") is superseded: those
+files are no longer a separate branch to diff against, they are merged code now (see
+§11's updated note).
 
 ---
 
@@ -589,7 +662,9 @@ Engram adds <1 ms.
 **Mechanics.**
 - Three draft stages with sliding-window attention and their own 128-expert/top-3 MoE,
   fed by target hidden states from layers **37–39** in the reference code. Upstream's
-  `dspark_layers_to_capture` for V4.1 is not yet checked.
+  `dspark_layers_to_capture` for V4.1 is confirmed **`[37, 38, 39]`**, with no separate
+  draft checkpoint — see §14.3 for the full resolution chain (`config.json` keys through
+  to `self.dspark_layers_to_capture`), unaffected by the 2026-09-18 #38798 merge (§6.1).
 - `TargetHiddenKvInjector` (`dspark_kv_inject.py`) writes those hidden states into the
   draft KV every verify step.
 - One draft forward proposes a 5-token block; a Markov head refines it and a confidence
@@ -655,10 +730,15 @@ Then recompute the break-even. **DSpark ships only if measured α clears it** (�
    the RAM-budget table. Weight-row and scale-row hit rates were not separated (the
    simulation tracks 264 B combined rows, §5's "logical" row); if that split matters
    for Phase 3, re-run with the two counted independently.
-3. **Not done in this task.** No diff of our quant files against `dsv4.1`'s
+3. **Superseded, not done.** No diff of our quant files against `dsv4.1`'s
    `fp8.py`/`fp8_utils.py`/`mxfp4*` was run; §6 records what `dsv4.1` touches there
-   at a file level, not a line diff. Do this diff in Phase 1 alongside the sm_120
-   kernel-matrix walk.
+   at a file level, not a line diff. As of the 2026-09-18 merge (§6.1) those files are
+   no longer a separate branch to diff against — they, and the follow-on
+   `1b200ffaaa` block-FP8-via-MXFP8 commit, are merged code in `dsv41` now. The
+   remaining work is a *review* pass over the merged quant path for EXL3-path
+   relevance (§6.1 already finds it irrelevant at the file level: it only serves the
+   official MXFP4/FP8 checkpoint), not a diff against an external branch. Do this
+   alongside the sm_120 kernel-matrix walk in Phase 1.
 4. **Done — §14.2.** Upstream's Engram `_HostTable`/gather read in full; the gather
    takes a row index, not a raw offset, so a slot map can sit in front of it, but the
    allocation, addressing and miss semantics all need to change (§14.2).
