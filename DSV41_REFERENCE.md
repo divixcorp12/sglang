@@ -494,17 +494,26 @@ and interacts with THP. Measure it. Upstream's `_HostTable` uses `MADV_HUGEPAGE`
   There is no on-disk re-layout.
 - The reader takes the expert directory as a parameter (nvme2 now, nvme1 later).
 
-**Slot layout (Phase 0 decision):**
-- A raw row copied byte-for-byte leaves `w1.trellis` at an offset ≡ 4 mod 16. exllamav3
-  needs ≥16 B alignment (128 B preferred), so the slot needs per-tensor padded offsets.
+**Slot layout (Phase 0 decision — resolved, §14.1):**
+- A raw row copied byte-for-byte leaves `w1.trellis` at an offset ≡ 4 mod 16.
+  exllamav3's trellis needs exactly **16 B alignment** (`cp.async.cg` on an `int4*`
+  cast) and `suh`/`svh` need **8 B alignment** (a `half4` cast); nothing in
+  exllamav3 needs wider than 16 B. `build_exl3_slot_layout`'s default is **16 B**
+  (§14.1(a)-(b)), so the slot needs per-tensor padded offsets at that alignment, not
+  128 B.
 - The O_DIRECT superset read also leaves the row itself at a file-dependent offset
   inside its RAM buffer.
-- Where to pad:
-  - **NVMe→RAM**: a host memcpy of ~13 MB per admission, ~1–2 ms on one core
-    [estimate]. That is comparable to the 1.11 ms link term, so add it to §9.4.
-  - **RAM→VRAM**: a 12-segment `copy_expert_row_segments_gpu` gather. Check the source
-    alignment its word loads need.
-- Also confirm whether `exl3_moe` needs `suh`/`svh` aligned as well as the trellis.
+- **Padding site (decided, §14.1(c)): the RAM→VRAM segment copy**
+  (`copy_expert_row_segments_gpu`, `expert_cache_transfer.cuh:200-213`), not a
+  separate NVMe→RAM host memcpy. That kernel's per-row copy already degrades
+  gracefully from 16-byte vectorized loads to 4-byte words to bytes when its source
+  is unaligned (`copy_expert_row_lane`, `:53-78`), so an unaligned RAM-side row is
+  still correct — only the VRAM destination, written at the slot's aligned offset,
+  needs to be 16 B-aligned. RAM-tier rows stay raw/unpadded, so the ~75 GB RAM
+  budget (§9.1) carries no padding tax. A separate NVMe→RAM host memcpy pass was
+  considered and rejected: it would add a distinct ~1–2 ms/admission CPU copy on top
+  of the link/NVMe time for no alignment benefit the segment copy doesn't already
+  give the destination.
 
 **Engram:**
 - `read_paged_rows`: 48 weight pages plus 48 scale pages per token on a full RAM miss.
@@ -747,8 +756,9 @@ beside production perturbs production latency, so decide explicitly):
   its sustained write rate for the 205 GB copy.
 - The miss mechanisms are unprototyped. Option B's host-callback serialization and
   stream-idle behaviour and option C's SM cost while polling are unmeasured.
-- The EXL3 slot alignment: whether `exl3_moe` also needs `suh`/`svh` aligned, and the
-  admission-copy cost.
+- ~~The EXL3 slot alignment~~: resolved (§14.1) — trellis needs 16 B, `suh`/`svh`
+  need 8 B (checked in both the main and coop kernels), and padding happens in the
+  RAM→VRAM segment copy, not as a separate admission-copy cost.
 - The §4 KV figure: whether all 40 layers allocate 584 B/token.
 - sm_120 coverage of the DeepGEMM `fp8_fp4` indexer and of FlashMLA with the V4.1
   layout is unverified.
@@ -843,11 +853,17 @@ separate NVMe→RAM host memcpy pass.
   per-tensor re-placement only in the RAM→VRAM `copy_expert_row_segments_gpu` call,
   using `Exl3SlotLayout` segments (source = raw row offsets, destination = the VRAM
   slot's 16-byte-aligned offsets).
-- Not fully confirmed: whether `exl3_moe` also needs `suh`/`svh` at a stricter
-  alignment than 8 B in some other code path this search did not reach (e.g. a
-  batched/coop variant, `exl3_moe_coop.cu`); the coop kernel was not read in this
-  pass. §13's existing open item stands; if Phase 2 finds a stricter requirement
-  there, only the segment destination offsets need widening, not this decision.
+- **Closed: the batched/coop variant needs no stricter alignment.**
+  `exllamav3_ext/quant/exl3_moe_coop.cu` and `exl3_moe_coop_kernel.cuh` were checked
+  directly (`grep -n "cp.async\|int4\|uint4\|__align__"` over both files: zero
+  matches). The coop kernel loads the trellis through plain 32-bit word pointers —
+  `const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];`
+  (`exl3_moe_coop_kernel.cuh:746`) and the same pattern for `d_trellis` (`:849`) — and
+  `suh`/`svh` through `scale_h4`/`load_h4`, which cast to `const uint2*`
+  (`unpack_h4`/`load_h4`, `exl3_moe_coop_kernel.cuh:148-166`; called at `:625,
+  781, 789, 798, 916`). `uint2` is 8 bytes, matching the main kernel's `half4`
+  requirement exactly — no wider alignment anywhere in the coop path. §13's matching
+  risk entry is closed by this finding.
 
 ### 14.2 Can upstream's `_HostTable` back a partial Engram RAM tier?
 
@@ -871,7 +887,7 @@ table, not a *cache* of it.
      24 rows/layer, §5), not a cache budget. This has to become a chosen N (e.g. the
      5 GB / ~19M-row budget from §5) independent of `num_embeddings`.
   2. **Addressing and miss semantics.** `_engram_gather_kernel`'s `owned = (idx >=
-     row_lo) & (idx < row_hi)` (`engram_gather.py:29-31`) is a *contiguous shard
+     row_lo) & (idx < row_hi)` (`engram_gather.py:33-34`) is a *contiguous shard
      range* test, correct for "this TP rank's slice of the full table," not "this id
      is resident in the cache." A slot-indexed cache needs a real lookup (e.g. a
      hash table or direct-mapped array keyed by `idx`) that returns either a slot
@@ -889,23 +905,48 @@ table, not a *cache* of it.
 
 ### 14.3 DSpark target layers and planner
 
-- **`dspark_layers_to_capture` has no V4.1-specific hardcoded list in our fork.** It
-  is a per-instance attribute (`self.dspark_layers_to_capture: Optional[List[int]] =
-  None`, `python/sglang/srt/models/deepseek_v4.py:4076`) set at runtime via
-  `set_dspark_layers_to_capture` (`deepseek_v4.py:4767-4775`), called from
-  `attention_backend_setup.py:57-58` with `dflash_target_layer_ids`. That value comes
-  from `resolve_spec_aux_hidden_state_config`
-  (`model_executor/model_runner_components/spec_aux_hidden_state.py:198-208`), which
-  for DSpark prefers `dspark_draft_config.target_layer_ids`
-  (`spec_aux_hidden_state.py:199-201`) — **parsed from the draft checkpoint's own HF
-  config**, not from anything in sglang. So the "37-39" figure in
-  DSV41_REFERENCE.md §10 is from the DeepSeek reference code
-  (`inference/model.py:1089-1157`), not from an sglang default; whatever the actual
-  DSV4.1-Flash DSpark draft checkpoint's config specifies is what our fork will use
-  once that checkpoint is loaded. **Not independently confirmed**: this task did not
-  have the actual DSpark draft config file to read the DSV4.1 value directly — only
-  the code path that will consume it. Confirm by reading the draft checkpoint's
-  config once downloaded (Phase 1).
+- **Confirmed: `dspark_target_layer_ids = [37, 38, 39]`, and there is no separate
+  draft checkpoint** — the draft is bundled inside the same EXL3/official checkpoint
+  as prefixed `dspark_*` keys on the *target* model's own `config.json`. Verified by
+  a read-only `config.json` read on divix01:
+  ```
+  ssh divix01 'grep -n "dspark_target_layer_ids\|num_nextn_predict_layers" \
+    /mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw/config.json \
+    /mnt/nvme2/huggingface_hub/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/*/config.json'
+  ```
+  Both files agree:
+  `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw/config.json:158-167` has
+  `"num_nextn_predict_layers": 3` and `"dspark_target_layer_ids": [37, 38, 39]`; the
+  official snapshot's
+  `.../snapshots/dba1be0a40aa45a94ad051997016db3960a90277/config.json:145,148` has
+  the same two keys with the same values. This matches the "37-39" figure already in
+  §10 from the DeepSeek reference code (`inference/model.py:1089-1157`) exactly.
+- **Draft weights are the `mtp.*` tensors inside the main EXL3 checkpoint** — 3
+  stages x 128 experts, verified by Task 2's
+  `test/manual/dsv41/test_exl3_checkpoint_layout.py:27` (`test_draft_experts`):
+  `build_exl3_expert_layout(EXL3_DIR, prefix="mtp")` asserts
+  `(layout.num_layers, layout.num_experts) == (3, 128)` and `row_bytes ==
+  17,739,276` — the same "one DSpark draft expert is 17,739,276 B" figure already in
+  §3.
+- **How our fork reads this from the config**: `checkpoint_bundles_dspark_draft`
+  (`python/sglang/srt/speculative/dspark_components/dspark_config.py:164-176`)
+  detects a bundled draft by checking for any of the prefixed `dspark_*` keys
+  (including `dspark_target_layer_ids`) directly on the *target* hf config — no
+  separate draft checkpoint path is consulted when they're present.
+  `parse_dspark_draft_config`
+  (`dspark_config.py:208-221`) then reads `dspark_target_layer_ids` off that same
+  config object (`_cfg_get(draft_hf_config, "dspark_target_layer_ids", None)`,
+  `:221`) into `DSparkDraftConfig.target_layer_ids`, which
+  `resolve_spec_aux_hidden_state_config`
+  (`model_executor/model_runner_components/spec_aux_hidden_state.py:198-208`) then
+  assigns to `config.dflash_target_layer_ids`
+  (`spec_aux_hidden_state.py:199-201`) — the value `set_dspark_layers_to_capture`
+  (`models/deepseek_v4.py:4767-4775`, called from
+  `attention_backend_setup.py:57-58`) ultimately installs as
+  `self.dspark_layers_to_capture` (`deepseek_v4.py:4076`). So for the DSV4.1-Flash
+  checkpoint this resolves to `[37, 38, 39]` with no separate draft checkpoint or
+  extra download required — the values above are already fully determined, not
+  merely a code path that will consume them once something else is downloaded.
 - **Maximum verify tokens for graph capture** is set by `resolved_max_verify_len()`
   (`python/sglang/srt/speculative/dspark_components/dspark_planner.py:912-913`:
   `self.max_verify_len or (self.gamma + 1)`), where `gamma =
