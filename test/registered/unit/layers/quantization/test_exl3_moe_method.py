@@ -61,6 +61,36 @@ def test_missing_expert_detected():
         method.process_weights_after_loading(layer)
 
 
+def test_sharded_create_weights_rejected():
+    layer = nn.Module()
+    layer.num_experts = E
+    method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+    with pytest.raises(NotImplementedError, match="tensor-parallel size 1"):
+        method.create_weights(
+            layer, E, HIDDEN, INTER, torch.bfloat16, moe_intermediate_size=INTER * 2
+        )
+
+
+def test_wrong_shape_expert_detected():
+    layer, method = _moe()
+    # Every expert's w1 (gate) part is self-consistently loaded with the wrong
+    # in_features, so `_materialize`'s cross-expert consistency check does not
+    # catch it; only the hidden/inter shape check in
+    # `process_weights_after_loading` should.
+    for e in range(E):
+        for shard, (in_f, out_f), prefix in (
+            ("w1", (HIDDEN + 16, INTER), "w13"),
+            ("w3", (HIDDEN, INTER), "w13"),
+            ("w2", (INTER, HIDDEN), "w2"),
+        ):
+            fill = 10 * e + {"w1": 1, "w3": 3, "w2": 2}[shard]
+            for name, tensor in _expert(in_f, out_f, fill).items():
+                param = getattr(layer, f"{prefix}_{name}")
+                param.weight_loader(param, tensor, f"experts.{prefix}_{name}", shard_id=shard, expert_id=e)
+    with pytest.raises(RuntimeError, match=r"expert 0 w13\[0\]"):
+        method.process_weights_after_loading(layer)
+
+
 if __name__ == "__main__":
     import sys
 

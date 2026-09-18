@@ -208,6 +208,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # exl3 supports TP=1 only (no sharding of trellis/suh/svh implemented yet).
+        # FusedMoE.__init__ passes the pre-shard size through as the
+        # `moe_intermediate_size` extra kwarg (fused_moe_triton/layer.py:508-520:
+        # `intermediate_size_per_partition=self.intermediate_size_per_partition,
+        # ..., moe_intermediate_size=intermediate_size`), and computes
+        # `self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size`
+        # (fused_moe_triton/layer.py:402-403). At TP=1 the two are equal; a caller
+        # (e.g. the no-TP-group CPU unit tests) that omits `moe_intermediate_size`
+        # entirely is treated as TP=1 by construction.
+        full_intermediate_size = extra_weight_attrs.get(
+            "moe_intermediate_size", intermediate_size_per_partition
+        )
+        if full_intermediate_size != intermediate_size_per_partition:
+            raise NotImplementedError("exl3 supports tensor-parallel size 1 only")
         layer.exl3_num_experts = num_experts
         layer.exl3_hidden = hidden_size
         layer.exl3_inter = intermediate_size_per_partition
@@ -248,6 +262,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         layer.exl3_w13 = [(tensors("w13", e, 0), tensors("w13", e, 1)) for e in range(layer.exl3_num_experts)]
         layer.exl3_w2 = [tensors("w2", e, 0) for e in range(layer.exl3_num_experts)]
+
+        # Same shape check Exl3LinearMethod does after loading (exl3.py Exl3LinearMethod
+        # .process_weights_after_loading above): a part that decoded to the wrong
+        # in/out shape is caught here rather than surfacing as a garbled matmul later.
+        for e in range(layer.exl3_num_experts):
+            for slot, t in enumerate(layer.exl3_w13[e]):
+                if (t.in_features, t.out_features) != (layer.exl3_hidden, layer.exl3_inter):
+                    raise RuntimeError(
+                        f"exl3: expert {e} w13[{slot}] loaded {t.in_features}x{t.out_features}, "
+                        f"module expects {layer.exl3_hidden}x{layer.exl3_inter}"
+                    )
+            t2 = layer.exl3_w2[e]
+            if (t2.in_features, t2.out_features) != (layer.exl3_inter, layer.exl3_hidden):
+                raise RuntimeError(
+                    f"exl3: expert {e} w2[0] loaded {t2.in_features}x{t2.out_features}, "
+                    f"module expects {layer.exl3_inter}x{layer.exl3_hidden}"
+                )
 
     def apply(self, layer: nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
