@@ -115,7 +115,10 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "NVFP4 routed experts."
         )
     if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
-        raise ValueError("--ple-offload-backend file requires --ple-offload-embedding")
+        raise ValueError(
+            "--ple-offload-backend file requires --ple-offload-embedding: "
+            "the file-backed table is the offloaded table."
+        )
     hot_budget_mb = envs.SGLANG_MOE_HOT_GPU_MB.get()
     pinned_budget_mb = envs.SGLANG_MOE_PINNED_HOST_MB.get()
     prefetch_candidates = envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get()
@@ -301,12 +304,6 @@ def handle_offload_compatibility(server_args: Any) -> None:
         raise ValueError(
             "NVFP4 pinned host caching requires decode CUDA graph capture to be disabled "
             "or breakable, and prefill CUDA graph capture to be disabled"
-        )
-
-    if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
-        raise ValueError(
-            "--ple-offload-backend file requires --ple-offload-embedding: "
-            "the file-backed table is the offloaded table."
         )
 
 

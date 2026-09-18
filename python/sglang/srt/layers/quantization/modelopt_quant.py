@@ -1035,7 +1035,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return online_fp8_or_unquantized(prefix)
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
+            if quant_algo == "FP8_PB_WO":
                 return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "FP8_BLOCK_SCALES":
                 return Fp8LinearMethod(self.fp8_block_config)
@@ -1067,7 +1067,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
-            if quant_algo == "FP8_BLOCK_SCALES":
+            if quant_algo == "FP8_PB_WO":
                 return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)

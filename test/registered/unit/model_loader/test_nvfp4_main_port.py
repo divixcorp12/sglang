@@ -55,7 +55,7 @@ class TestNvfp4MainPort(unittest.TestCase):
             ReplicatedLinear.__new__(ReplicatedLinear), "mtp.layers.0.linear"
         )
         self.assertIsInstance(linear, Fp8LinearMethod)
-        self.assertIs(linear.quant_config, config.fp8_pb_wo_config)
+        self.assertIs(linear.quant_config, config.fp8_block_config)
 
     def test_unquantized_mtp_stays_unquantized(self):
         config = SimpleNamespace(
