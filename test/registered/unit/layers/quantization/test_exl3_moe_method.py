@@ -53,6 +53,40 @@ def test_loads_every_expert_into_its_slot():
     assert (gate.in_features, gate.out_features, gate.bits) == (HIDDEN, INTER, 3)
 
 
+def test_concurrent_loads_keep_every_expert():
+    # deepseek_v4.load_weights runs weight loaders on a thread pool; every thread that finds the
+    # param empty must see one shared buffer, or experts loaded into a replaced buffer are lost.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    for _ in range(20):
+        layer, method = _moe()
+        jobs = []
+        for e in range(E):
+            for shard, (in_f, out_f), prefix in (
+                ("w1", (HIDDEN, INTER), "w13"),
+                ("w3", (HIDDEN, INTER), "w13"),
+                ("w2", (INTER, HIDDEN), "w2"),
+            ):
+                fill = 10 * e + {"w1": 1, "w3": 3, "w2": 2}[shard]
+                for name, tensor in _expert(in_f, out_f, fill).items():
+                    jobs.append((getattr(layer, f"{prefix}_{name}"), tensor, prefix, name, shard, e))
+        barrier = threading.Barrier(len(jobs))
+
+        def load(job):
+            param, tensor, prefix, name, shard, e = job
+            barrier.wait()
+            param.weight_loader(param, tensor, f"experts.{prefix}_{name}", shard_id=shard, expert_id=e)
+
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            list(pool.map(load, jobs))
+        for e in range(E):
+            assert int(layer.w13_trellis[e, 0, 0, 0, 0]) == 10 * e + 1
+            assert int(layer.w13_trellis[e, 1, 0, 0, 0]) == 10 * e + 3
+            assert int(layer.w2_trellis[e, 0, 0, 0, 0]) == 10 * e + 2
+        method.process_weights_after_loading(layer)
+
+
 def test_missing_expert_detected():
     layer, method = _moe()
     _load_all(layer)

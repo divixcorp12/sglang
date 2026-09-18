@@ -10,6 +10,8 @@ from __future__ import annotations
 import functools
 from typing import Any, Dict, List, Optional
 
+import threading
+
 import torch
 from torch import nn
 
@@ -84,11 +86,19 @@ class Exl3Config(QuantizationConfig):
         return []
 
 
+# Weight loaders run on a thread pool (deepseek_v4.load_weights), so several experts of one
+# layer can reach an empty param at once; unguarded, each allocated its own buffer and the
+# losers' copies landed in a discarded one (zeroed experts, and a transient 2-4x VRAM peak).
+_MATERIALIZE_LOCK = threading.Lock()
+
+
 def _materialize(param: nn.Parameter, lead: tuple[int, ...], loaded: torch.Tensor) -> None:
     shape = lead + tuple(loaded.shape)
     if param.numel() == 0:
-        param.data = torch.zeros(shape, dtype=loaded.dtype, device=param.device)
-    elif tuple(param.shape) != shape or param.dtype != loaded.dtype:
+        with _MATERIALIZE_LOCK:
+            if param.numel() == 0:
+                param.data = torch.zeros(shape, dtype=loaded.dtype, device=param.device)
+    if tuple(param.shape) != shape or param.dtype != loaded.dtype:
         raise ValueError(f"exl3: expected {shape} {param.dtype}, got {tuple(loaded.shape)} {loaded.dtype}")
 
 
