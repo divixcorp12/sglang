@@ -85,6 +85,45 @@ def _import_reference(snapshot: str):
 SPARSE_ATTN_HEAD_GROUP = 16
 
 
+FLASHMLA_NOPE_DIM = 448  # FlashMLA DSV4 KV: 448 fp8 dims (ue8m0 scale per 64) + a 64-dim bf16 RoPE tail
+
+
+def flashmla_kv_fake_quant_(x):
+    """In place: the attention-KV rounding of SGLang's FlashMLA cache format, fp8 e4m3 with a
+    power-of-two scale per 64 over the first 448 dims, the RoPE tail left in bf16."""
+    import torch
+
+    nope = x[..., :FLASHMLA_NOPE_DIM].float()
+    blocks = nope.unflatten(-1, (-1, 64))
+    amax = blocks.abs().amax(-1, keepdim=True).clamp(min=1e-12)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).to(torch.float8_e4m3fn).float() * scale
+    x[..., :FLASHMLA_NOPE_DIM] = q.flatten(-2).to(x.dtype)
+    return x
+
+
+def use_flashmla_kv_quant(ref, kv_dim: int = 512):
+    """Swap the reference's in-place attention-KV fake quant (fp8 per 32 over the whole vector,
+    fp4 per 16 for compressed KV -- the training convention) for SGLang's cache format, so the
+    oracle isolates implementation differences from the KV storage format. Indexer quant is
+    untouched (its vectors are 128 wide)."""
+    orig_act_quant, orig_fp4_act_quant = ref.act_quant, ref.fp4_act_quant
+
+    def act_quant(x, *args, **kwargs):
+        inplace = kwargs.get("inplace", args[3] if len(args) > 3 else False)
+        if inplace and x.shape[-1] == kv_dim:
+            return flashmla_kv_fake_quant_(x)
+        return orig_act_quant(x, *args, **kwargs)
+
+    def fp4_act_quant(x, *args, **kwargs):
+        inplace = kwargs.get("inplace", args[1] if len(args) > 1 else False)
+        if inplace and x.shape[-1] == kv_dim:
+            return flashmla_kv_fake_quant_(x)
+        return orig_fp4_act_quant(x, *args, **kwargs)
+
+    ref.act_quant, ref.fp4_act_quant = act_quant, fp4_act_quant
+
+
 def make_head_split_sparse_attn(kernel_mod, group: int = SPARSE_ATTN_HEAD_GROUP):
     """`kernel.sparse_attn` over groups of `group` heads.
 
@@ -476,6 +515,12 @@ def _parse_args():
     parser.add_argument("--out-dir", default="ANA")
     parser.add_argument("--tag", help="suffix for oracle-<tag>.npz / router-<tag>.json")
     parser.add_argument("--max-seq-len", type=int, default=4096)
+    parser.add_argument(
+        "--kv-quant",
+        choices=("reference", "flashmla"),
+        default="reference",
+        help="attention-KV rounding: the reference's training convention, or SGLang's FlashMLA cache format",
+    )
     parser.add_argument("--sessions", default=_DEFAULT_SESSIONS, help="sessions.jsonl for --router-corpus/--make-prompts")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--prompts", help="JSONL of {\"tokens\": [...]} to run through the model")
@@ -497,6 +542,8 @@ def main() -> int:
         raise SystemExit("--tag is required for --prompts/--router-corpus")
 
     ref, _ = _import_reference(args.snapshot)
+    if args.kv_quant == "flashmla":
+        use_flashmla_kv_quant(ref)
     model = build_model(ref, args.snapshot, args.trunc, args.engram_dir, args.max_seq_len)
 
     if args.router_corpus is not None:
