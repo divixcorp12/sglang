@@ -372,6 +372,12 @@ The `lmsysorg/sglang:dev-dsv41` image was not inspected.
     count in `scheduler.py` is preserved from ours, plus upstream's new
     `tree_cache.flush_pending_backups()` call.
   - GPU suite (Task 1 Step 8): pending — deferred until a GPU window is approved.
+  - Follow-up merge of the upstream tip a5b84f11e5 (11 commits: block-fp8/mxfp8
+    quant merge, V4.1-only gating, renames) — `9e5cc68bd8`, 0 conflicts, no fixes
+    needed (semantic re-check of `environ.py`, `fused_moe_triton/layer.py`, and
+    `decode_cuda_graph_runner.py` found only comment rewording; `modelopt_quant.py`
+    and `memory_hook.py` were untouched by these 11 commits, so Task 1's fix
+    stands).
 
 ---
 
