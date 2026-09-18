@@ -349,6 +349,29 @@ The `lmsysorg/sglang:dev-dsv41` image was not inspected.
     (plan: `docs/superpowers/plans/2026-09-18-dsv41-phase0.md`).
   - `dsv41` then carries ~467 upstream commits, so **never merge it wholesale into the
     production branch**, and **do not rebase** the expert-stream work onto `dsv4.1`.
+- **Result (2026-09-18, Task 1).** Merge commit `c64b2bd653` (`merge upstream
+  dsv4.1 (DeepSeek V4.1 support) into dsv41`, parents `86dac964b7` ours /
+  `85e8eddc54` upstream). Conflicts landed exactly on the 12 predicted files.
+  Judgment calls beyond the Step 4 table:
+  - `arg_groups/fields/exec_.py:911-921` (`ple_offload_backend`/`ple_offload_dir`
+    help text) — kept ours' wording rather than a textual union, because the
+    file-backend behaviour those strings describe is ours (selected-row staging
+    fallback), not upstream's fail-fast unified-memory-only design.
+  - `models/qwen4_exp_ple_table.py` and its two paired tests
+    (`test_qwen4_ple_offload.py`, `test_qwen4_exp_ple_table.py`) were add/add
+    conflicts (the file didn't exist at the merge-base) where nearly the whole
+    file is PLE-offload domain; took ours wholesale (796/685/475 lines) rather
+    than hunk-by-hunk, since upstream's smaller versions encode a fundamentally
+    different, superseded file-backend design (`check_file_backend_supported`
+    raises on an unsupported device instead of falling back to selected-row
+    staging).
+  - `test_fp8_moe_runner_fallback.py` took upstream's `CustomTestCase` base
+    class over ours' plain `unittest.TestCase`, matching house test convention;
+    no behavior lost since the assertions are identical.
+  - Self-review confirmed every expert-stream/doorbell/hot-cache identifier
+    count in `scheduler.py` is preserved from ours, plus upstream's new
+    `tree_cache.flush_pending_backups()` call.
+  - GPU suite (Task 1 Step 8): pending — deferred until a GPU window is approved.
 
 ---
 
