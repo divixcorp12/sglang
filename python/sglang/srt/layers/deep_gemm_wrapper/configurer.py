@@ -46,7 +46,9 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
-    if not DEEPGEMM_BLACKWELL:
+    # SM120 builds (e.g. lucifer1004/DeepGEMM-sm120) ship the sparse logits too;
+    # DEEPGEMM_BLACKWELL stays SM100-only because it also selects GEMM/MoE paths.
+    if not (DEEPGEMM_BLACKWELL or (ENABLE_JIT_DEEPGEMM and get_device_sm() == 120)):
         return False
     import deep_gemm
 

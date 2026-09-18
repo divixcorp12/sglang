@@ -546,6 +546,9 @@ class TestCandidateIndexerGating(CustomTestCase):
             self.assertIsNone(candidate_indexer.make_candidate_indexer(0, 8))
         with platform(90), patch(flag, False):
             self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8))
+        # No source layer (a model truncated below it): nothing to build, no DeepGEMM needed.
+        with platform(120), patch(flag, False):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8, -1))
         # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
         with platform(100), patch(flag, False):
             with self.assertRaises(RuntimeError):

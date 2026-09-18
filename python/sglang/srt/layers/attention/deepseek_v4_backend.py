@@ -1210,6 +1210,7 @@ class DeepseekV4AttnBackend(
         self.candidate_indexer = make_candidate_indexer(
             getattr(cfg, "candidate_topk_blocks", 0),
             getattr(cfg, "candidate_block_size", 0),
+            getattr(cfg, "candidate_source_layer_id", -1),
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 

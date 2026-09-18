@@ -40,11 +40,12 @@ class IndexerInputs:
 
 
 def make_candidate_indexer(
-    topk_blocks: int, block_size: int
+    topk_blocks: int, block_size: int, source_layer_id: int = 0
 ) -> Optional[DeepGemmCandidateIndexer]:
     """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
-    indexer selects through masks inline."""
-    if topk_blocks <= 0 or get_platform().device_sm < 100:
+    indexer selects through masks inline, and when no layer publishes candidates
+    (``source_layer_id < 0``, e.g. a model truncated below the source layer)."""
+    if topk_blocks <= 0 or source_layer_id < 0 or get_platform().device_sm < 100:
         return None
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,

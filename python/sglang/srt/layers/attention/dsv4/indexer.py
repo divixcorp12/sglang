@@ -454,6 +454,9 @@ def deep_gemm_fp4_paged_mqa_logits(
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
+    # DeepGEMM takes bf16 head weights only on SM100; SM120 asserts fp32.
+    if weights.dtype != torch.float32 and get_platform().device_sm == 120:
+        weights = weights.float()
     return fp8_fp4_paged_mqa_logits(
         q_fp4,
         k_cache,
