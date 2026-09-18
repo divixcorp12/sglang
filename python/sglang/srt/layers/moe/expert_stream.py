@@ -978,11 +978,14 @@ class ExpertStreamer:
             ), cache.tensors
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
+        # Allocated at a whole layer's experts from the first gather: prefill chunks climb to
+        # nearly all of them, and growing one step at a time left every outgrown buffer in
+        # the allocator's cache at the prefill peak.
         padded = {
             name: _staging_buffer(
                 name,
                 kernel_rows,
-                capacity,
+                max(capacity, self.num_experts),
                 tuple(source.shape[1:]),
                 source.dtype,
                 topk_ids.device,
@@ -992,25 +995,18 @@ class ExpertStreamer:
         }
         gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
         miss_source_ids = source_ids[~hit_mask]
-        if hit_rows == 0:
-            misses = gathered
-            assembly_bytes = 0
-        else:
-            hit_positions = hit_mask.nonzero().flatten()
+        # Misses take the first rows so their copies land in place, with no second
+        # staging buffer as large as a layer's experts; hits fill the rows after them.
+        misses = {name: output[:miss_rows] for name, output in gathered.items()}
+        assembly_bytes = hit_rows * self.bytes_per_expert
+        if hit_rows:
             hot_slots = slots[hit_mask]
-            miss_positions = (~hit_mask).nonzero().flatten()
-            misses = {
-                name: _staging_buffer(
-                    ("hot_cache_misses", name),
-                    miss_rows,
-                    capacity,
-                    tuple(output.shape[1:]),
-                    output.dtype,
-                    output.device,
-                )
-                for name, output in gathered.items()
-            }
-            assembly_bytes = row_count * self.bytes_per_expert
+            order = torch.cat(((~hit_mask).nonzero().flatten(), hit_mask.nonzero().flatten()))
+            rows = _cached_arange(row_count, order.device, order.dtype)
+            row_of_source = torch.empty_like(order)
+            row_of_source[order] = rows
+            compact_ids = row_of_source[compact_ids.long()]
+            hit_positions = rows[miss_rows:]
         pinned_hit_rows = 0
         pinned_miss_rows = 0
         pinned_populated_bytes = 0
@@ -1065,11 +1061,6 @@ class ExpertStreamer:
                     output.view(torch.uint8),
                     row_bytes,
                     BLOCK=1024,
-                )
-                output.view(torch.uint8).reshape(row_count, -1).index_copy_(
-                    0,
-                    miss_positions,
-                    misses[name].view(torch.uint8).reshape(miss_rows, -1),
                 )
         self.last_gather_stats = ExpertGatherStats(
             row_count,

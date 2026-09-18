@@ -373,14 +373,14 @@ class TestExpertHotCache(unittest.TestCase):
             cache = self.cache_type(self.streamer, capacity=2)
             cache.reassign([3, 7])
             compact, _ = self.assert_routes([[7, 1, 7, 2]])
-            self.assertEqual(compact.tolist(), [[0, 1, 2, 3]])
+            self.assertEqual(sorted(compact.reshape(-1).tolist()), [0, 1, 2, 3])
             stats = self.streamer.last_gather_stats
             self.assertEqual(
                 (stats.requested_rows, stats.hot_hit_rows, stats.miss_rows), (4, 2, 2)
             )
             self.assertEqual(stats.h2d_bytes, 112)
             self.assertEqual(stats.source_bytes, 112)
-            self.assertEqual(stats.d2d_bytes, 224)
+            self.assertEqual(stats.d2d_bytes, 112)
 
     def test_mixed_file_rows_and_cuda_alphas_use_their_own_row_spaces(self):
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
@@ -787,7 +787,7 @@ class TestExpertHotCacheManager(unittest.TestCase):
         counters = manager.snapshot_counters()
         self.assertEqual(counters["decode"]["0"]["hot_hits"], 2)
         self.assertEqual(counters["decode"]["0"]["h2d_bytes"], 20)
-        self.assertEqual(counters["decode"]["0"]["d2d_bytes"], 60)
+        self.assertEqual(counters["decode"]["0"]["d2d_bytes"], 40)
         self.assertEqual(counters["decode"]["0"]["requested_unique_experts"], 2)
         self.assertEqual(counters["decode"]["0"]["file_source_bytes"], 0)
         self.assertEqual(counters["prefill"]["0"]["promotions"], 1)

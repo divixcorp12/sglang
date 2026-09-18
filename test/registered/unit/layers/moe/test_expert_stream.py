@@ -167,6 +167,76 @@ class TestExpertStreamer(unittest.TestCase):
 
         torch.testing.assert_close(output, torch.tensor([[5.0, 7.0]], device="cuda"))
 
+    def test_eager_hot_cache_gather_stages_a_layer_once(self):
+        """A prefill chunk routes nearly every expert of a layer, and every eager gather staged
+        its missed rows in a second buffer before stitching them in, holding that layer's
+        experts on the device twice at the prefill peak (2.6 GB in production at 12 GiB). The
+        peak must stay within one staged layer, and every route must still read its own row."""
+        from sglang.srt.layers.moe import expert_stream
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        experts, resident, row_bytes = 128, 32, 64 * 1024
+        layer = _Layer()
+        layer.host_rows = torch.nn.Parameter(
+            torch.randint(0, 256, (experts, row_bytes), dtype=torch.uint8).pin_memory(),
+            requires_grad=False,
+        )
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertHotCache(streamer, capacity=resident)
+        cache.reassign(list(range(0, experts, experts // resident)))
+        ids = torch.randperm(experts, device="cuda").repeat(2).reshape(-1, 4).to(torch.int32)
+        expert_stream._STAGING.clear()
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        compact, tensors = streamer.gather(ids)
+        torch.cuda.synchronize()
+        staged_layer = experts * row_bytes
+        self.assertLess(torch.cuda.max_memory_allocated() - base, 1.5 * staged_layer)
+        self.assertEqual(streamer.last_gather_stats.miss_rows, experts - resident)
+        self.assertTrue(
+            torch.equal(
+                tensors["host_rows"][compact.long()].cpu(),
+                layer.host_rows[ids.long().cpu()],
+            )
+        )
+
+    def test_growing_prefill_gathers_do_not_regrow_staging(self):
+        """Successive prefill chunks route to more and more of a layer's experts. Staging that
+        grows to each new count allocates the larger buffer while the outgrown one is still held,
+        and leaves every outgrown buffer in the allocator's cache (13-17 regrowths per prefill in
+        production). Across growing gathers the peak must stay within one staged layer."""
+        from sglang.srt.layers.moe import expert_stream
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        experts, row_bytes = 128, 64 * 1024
+        layer = _Layer()
+        layer.host_rows = torch.nn.Parameter(
+            torch.randint(0, 256, (experts, row_bytes), dtype=torch.uint8).pin_memory(),
+            requires_grad=False,
+        )
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertHotCache(streamer, capacity=16)
+        cache.reassign(list(range(16)))
+        expert_stream._STAGING.clear()
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        for unique in (32, 64, 96, 128):
+            ids = torch.arange(unique, device="cuda").repeat(2).reshape(-1, 4).to(torch.int32)
+            compact, tensors = streamer.gather(ids)
+            # Index on the host: routed rows built on the device would outweigh the staging.
+            self.assertTrue(
+                torch.equal(
+                    tensors["host_rows"].cpu()[compact.long().cpu()],
+                    layer.host_rows[ids.long().cpu()],
+                ),
+                f"{unique} experts",
+            )
+            del compact, tensors
+        torch.cuda.synchronize()
+        self.assertLess(torch.cuda.max_memory_allocated() - base, 1.25 * experts * row_bytes)
+
     def test_hot_cache_handles_pinned_and_cuda_sources(self):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
 
@@ -188,7 +258,7 @@ class TestExpertStreamer(unittest.TestCase):
         self.assertEqual((stats.hot_hit_rows, stats.miss_rows), (2, 1))
         self.assertEqual(stats.source_bytes, 32)
         self.assertEqual(stats.h2d_bytes, 12)
-        self.assertEqual(stats.d2d_bytes, 116)
+        self.assertEqual(stats.d2d_bytes, 84)
 
     def test_pinned_host_cache_populates_on_demand_and_evicts_bounded_rows(self):
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
