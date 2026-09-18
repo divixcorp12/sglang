@@ -260,6 +260,18 @@ class GpuResidencyUpdater:
             self.insert_active = torch.zeros(
                 (layers, self.miss_rows), dtype=torch.int32, device=device
             )
+            # Compile every specialisation now, with no lane active so not a byte moves. Triton
+            # JITs on first call and specialises on the row length, and the boundary's first call
+            # can land inside graph capture, which would have to compile mid-capture. Warming it
+            # here costs 48 x 6 no-op launches once at startup and removes that from the path.
+            for row, tensors in enumerate(self.insert_tensors):
+                for rows_view in tensors:
+                    insert_expert_rows(
+                        rows_view,
+                        self.insert_sources[row],
+                        self.insert_destinations[row],
+                        self.insert_active[row],
+                    )
 
     def _init_insert_direct(self) -> None:
         """Stage DIRECT: a victim shortlist per layer, and the guarantee that every miss finds one.

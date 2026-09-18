@@ -1065,6 +1065,19 @@ class TestFusedInsert(unittest.TestCase):
             (LAYERS, manager.gpu_residency.miss_rows),
         )
 
+    def test_startup_warms_the_kernel_without_moving_a_byte(self):
+        """Triton JITs on first call and specialises on row length, and the boundary's first call
+        can land inside graph capture. Startup compiles every specialisation with no lane active;
+        a warm-up that moved anything would corrupt a seeded cache before the first forward."""
+        model = _model()
+        plain = _manager(_model(), gpu=True, **IOM)
+        warmed = _manager(model, gpu=True, **FUSED)
+        for (_, expected), (_, actual) in zip(sorted(plain.caches.items()), sorted(warmed.caches.items())):
+            before, after = _cache_bytes(expected), _cache_bytes(actual)
+            for name, rows in before.items():
+                self.assertTrue(torch.equal(after[name], rows), f"{name} moved during warm-up")
+        assert_slot_rows(self, warmed, model, "after warm-up")
+
     def test_a_malformed_plan_is_refused_instead_of_corrupting_a_row(self):
         from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
 
