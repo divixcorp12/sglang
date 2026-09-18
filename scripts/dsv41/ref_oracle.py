@@ -315,7 +315,9 @@ def run_oracle_forward(ref, model, input_ids):
 
     handles = [layer.ffn.gate.register_forward_hook(_hook) for layer in model.layers]
     try:
-        with torch.inference_mode():
+        # inference/generate.py sets the default device to cuda after loading; the
+        # reference forward creates index tensors without an explicit device.
+        with torch.inference_mode(), torch.device("cuda"):
             engram_hashes = (
                 model.engram_hash(input_ids, 0, None) if model.engram_hash is not None else None
             )
