@@ -486,7 +486,11 @@ def _extra_kv_to_64(
     if extra_kv_u8 is None or extra_kv_u8.ndim < 3:
         return extra_kv_u8
     src_pbs = extra_kv_u8.shape[1]
-    if src_pbs == _PBS_DST:
+    if src_pbs <= _PBS_DST or src_pbs % _PBS_DST:
+        # V4's c128 pool (pbs=2) and any pbs that does not divide evenly into
+        # _PBS_DST are not splittable by _split_kv_pages_to_64 (which asserts
+        # src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST); pass through
+        # unsplit, matching the pre-124f0db954 behaviour.
         return extra_kv_u8
     return _split_kv_pages_to_64(
         extra_kv_u8, src_pbs, touched_indices=extra_idx, tag=":extra"
