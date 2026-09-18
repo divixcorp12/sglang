@@ -812,6 +812,10 @@ class DeepseekV2MoE(nn.Module):
                     self.shared_experts.gate_up_proj, "qweight", None
                 )
             if shared_gate_up_weight is None:
+                shared_gate_up_weight = getattr(
+                    self.shared_experts.gate_up_proj, "trellis", None
+                )
+            if shared_gate_up_weight is None:
                 raise ValueError(
                     "shared expert gate/up projection has no weight storage"
                 )
