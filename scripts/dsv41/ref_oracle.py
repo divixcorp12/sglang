@@ -82,6 +82,39 @@ def _import_reference(snapshot: str):
     return ref, ref_engram
 
 
+SPARSE_ATTN_HEAD_GROUP = 16
+
+
+def make_head_split_sparse_attn(kernel_mod, group: int = SPARSE_ATTN_HEAD_GROUP):
+    """`kernel.sparse_attn` over groups of `group` heads.
+
+    The unmodified tilelang kernel keeps a whole [heads, d] q tile in shared memory: at the
+    released 64 heads x 512 it asks for 141312 B, past sm_120's 99 KB, and fails to launch.
+    Heads are independent (the sink is per head), so running 16 at a time -- the head count the
+    reference already pads small models to -- gives the same output within the kernel's own
+    arithmetic.
+    """
+    import torch
+
+    def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+        h = q.size(2)
+        if h <= group:
+            return kernel_mod.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+        outs = [
+            kernel_mod.sparse_attn(
+                q[:, :, s : s + group].contiguous(),
+                kv,
+                attn_sink[s : s + group].contiguous(),
+                topk_idxs,
+                softmax_scale,
+            )
+            for s in range(0, h, group)
+        ]
+        return torch.cat(outs, dim=2)
+
+    return sparse_attn
+
+
 def _make_lazy_expert():
     import torch
     import torch.nn.functional as F
@@ -260,6 +293,7 @@ def build_model(ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len
 
     ref.Expert = _make_lazy_expert()
     ref.ParallelEngramEmbedding = _make_file_engram()
+    ref.sparse_attn = make_head_split_sparse_attn(sys.modules["kernel"])
 
     from transformers import AutoTokenizer
 
