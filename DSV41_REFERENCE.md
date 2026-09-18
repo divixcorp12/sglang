@@ -50,10 +50,11 @@ The design that follows is in §9. Decisions still open are in §12.
    `/mnt/nvme1` is Gen3 x4, ~3.4 ms per expert on an *idle* drive [estimate]. It is not
    idle: an `op-reth` node's datadir lives on it, alongside other workloads, and the
    P310 is a DRAM-less QLC drive. The x4 figure needs a loaded fio measurement.
-5. **Engram caches well on our corpus, but the simulation must be re-run.** At most 83%
-   of row reads can hit (16.6M unique rows/layer in 98.9M reads). A conservative
-   lower-bound method gives ≥69% at 5 GB. The script was not preserved, so re-run it
-   with exact LRU in Phase 0. Engram NVMe traffic is small either way (§5).
+5. **Engram caches well on our corpus, and 5 GB is enough.** Exact-LRU simulation over
+   1.5M tokens puts the ceiling at 71.70% (unique set 5.38 GB); 5 GB already reaches
+   71.68%, 2 GB reaches 66.30%, 1 GB reaches 60.82%, and 35.18% of accesses hit within
+   their own session. The Engram RAM tier does not need more than 5 GB on this corpus;
+   larger budgets buy almost nothing (§5).
 6. **DSpark changes the budget:**
    - Resident draft weights (6.75 GiB) cost ~544 target-expert slots, **~31% of the
      VRAM hot cache**.
@@ -733,7 +734,8 @@ beside production perturbs production latency, so decide explicitly):
   layout is unverified.
 - EXL3 3.0 bpw quality on our workload is unmeasured; the card's scores are for the
   unquantized model.
-- The Engram simulation needs a re-run (§5), and the corpus is narrow.
+- The Engram corpus is narrow (repetitive financial text), so general traffic will
+  reuse less than the measured curve in §5.
 - The global-singleton cross-layer KV reuse needs a batched design. Upstream presumably
   solved it; confirm during the `dsv41` merge.
 - The 8B/16B activated-param split is unexplained.
