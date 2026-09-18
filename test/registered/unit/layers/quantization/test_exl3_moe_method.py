@@ -127,12 +127,6 @@ def test_wrong_shape_expert_detected():
         method.process_weights_after_loading(layer)
 
 
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
-
-
 @pytest.mark.parametrize("fused", [False, True])
 def test_apply_scales_routed_output_unless_fused(monkeypatch, fused):
     # DeepseekV2MoE leaves routed_scaling_factor to the runner on CUDA; the EXL3 method
@@ -153,3 +147,9 @@ def test_apply_scales_routed_output_unless_fused(monkeypatch, fused):
     dispatch = SimpleNamespace(hidden_states=torch.zeros(3, HIDDEN), topk_output=topk)
     out = method.apply(layer, dispatch).hidden_states
     assert torch.equal(out, base if fused else base * 1.5)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

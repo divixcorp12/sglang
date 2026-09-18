@@ -136,7 +136,7 @@ def exl3_moe_loop(
         xe = x[token]
         gate = linear(xe, w13[expert][0], torch.float32)
         up = linear(xe, w13[expert][1], torch.float32)
-        if swiglu_limit is not None:
+        if swiglu_limit is not None and swiglu_limit > 0:
             up = up.clamp(-swiglu_limit, swiglu_limit)
             gate = gate.clamp(max=swiglu_limit)
         h = F.silu(gate) * up * topk_weights[token, slot].float().unsqueeze(-1)
