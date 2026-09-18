@@ -71,6 +71,11 @@ def main():
             got_ids, got_lp = _sglang_topk(engine, tokens, args.k)
             ref_ids = oracle[f"top_ids_{i}"][: len(tokens) - 1]
             ref_lp = oracle[f"top_logprobs_{i}"][: len(tokens) - 1]
+            if not (len(ref_ids) == len(got_ids) == len(tokens) - 1):
+                raise RuntimeError(
+                    f"prompt {i}: row mismatch (oracle {len(ref_ids)}, sglang {len(got_ids)}, "
+                    f"expected {len(tokens) - 1})"
+                )
             results.append(compare_topk(ref_ids, ref_lp, got_ids, got_lp))
     engine.shutdown()
     summary = {k: float(np.mean([r[k] for r in results])) for k in results[0]}
