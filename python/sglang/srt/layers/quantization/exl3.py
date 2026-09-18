@@ -291,7 +291,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # apply_router_weight_on_input=True.
         if getattr(cfg, "apply_router_weight_on_input", False):
             raise NotImplementedError("exl3 MoE: apply_router_weight_on_input")
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        # By name: StandardTopKOutputPacked (moe_fused_gate) carries a 4th field.
+        topk = dispatch_output.topk_output
+        topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         out = exl3_moe_loop(
             dispatch_output.hidden_states,
             topk_weights,
