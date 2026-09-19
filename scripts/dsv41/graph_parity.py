@@ -4,8 +4,10 @@ Arms, each a fresh Engine (shut down before the next), with its own environment
 (the scheduler subprocess inherits os.environ, so each run sets it first):
   eager   - no CUDA graphs, SGLANG_MOE_EXPERT_GRAPH_GATHER=0 (the exl3_moe_loop path);
   graph   - breakable decode graph at bs 1; graph gather as --graph-gather says;
-  debug   - (--debug-arm) the graph arm with --debug-cuda-graph: the same in-graph
-            path run eagerly through the capture machinery (graph gather on);
+  debug   - (--debug-arm) the graph arm with --debug-cuda-graph: the whole forward runs
+            as one eager break (graph gather on). Replay runs with capture mode off, so
+            capture-only paths (the DSV4 alt-stream overlap's MQA prepare) differ from the
+            graph arm; the bitwise graph-vs-debug gate is sound only with --no-overlap;
   control - (--control) a second eager run, for run-to-run nondeterminism.
 Reports eager_vs_graph and debug_vs_eager against R4's bar (1e-3), graph_vs_debug
 bitwise (tolerance 0.0: the capture-correctness gate), eager_vs_eager. Exit status 1
@@ -25,6 +27,10 @@ from trace_corpus import GRAPH_KWARGS  # noqa: E402
 
 LOGPROB_TOL = 1e-3
 ARMS = ("eager", "graph", "debug", "control")
+# Caps the KV pool. The sm120 FlashMLA page-split buffer is sized to the pool
+# (flash_mla_sm120.py, _split_kv_pages_to_64): on the truncated model the pool otherwise
+# grows to fill mem_fraction_static and the buffer OOMs the autotune warmup.
+MAX_TOTAL_TOKENS = 65536
 
 
 def compare(eager: dict, graph: dict, *, logprob_tol: float = LOGPROB_TOL) -> dict:
@@ -53,13 +59,19 @@ def run_env(arm: str, graph_gather: bool) -> dict[str, str]:
     return {"SGLANG_MOE_EXPERT_GRAPH_GATHER": "1" if on else "0"}
 
 
-def engine_kwargs(model: str, arm: str, mem_fraction: float) -> dict:
+def overlap_env(overlap: bool) -> dict[str, str]:
+    """The DSV4 alt-stream overlap, pinned so no Engine inherits another's setting."""
+    return {"SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "1" if overlap else "0"}
+
+
+def engine_kwargs(model: str, arm: str, mem_fraction: float, max_total_tokens: int = MAX_TOTAL_TOKENS) -> dict:
     kwargs = dict(
         model_path=model,
         tp_size=1,
         disable_shared_experts_fusion=True,
         context_length=4096,
         mem_fraction_static=mem_fraction,
+        max_total_tokens=max_total_tokens,
         max_running_requests=4,
         expert_distribution_recorder_mode="per_pass",
         disable_radix_cache=True,
@@ -75,14 +87,24 @@ def engine_kwargs(model: str, arm: str, mem_fraction: float) -> dict:
     return kwargs
 
 
-def _decode(model: str, ids: list[int], new_tokens: int, arm: str, graph_gather: bool, mem_fraction: float) -> dict:
+def _decode(
+    model: str,
+    ids: list[int],
+    new_tokens: int,
+    arm: str,
+    graph_gather: bool,
+    mem_fraction: float,
+    *,
+    overlap: bool = True,
+    max_total_tokens: int = MAX_TOTAL_TOKENS,
+) -> dict:
     import sglang
 
-    env = run_env(arm, graph_gather)
+    env = {**run_env(arm, graph_gather), **overlap_env(overlap)}
     saved = {name: os.environ.get(name) for name in env}
     os.environ.update(env)
     try:
-        engine = sglang.Engine(**engine_kwargs(model, arm, mem_fraction))
+        engine = sglang.Engine(**engine_kwargs(model, arm, mem_fraction, max_total_tokens))
         try:
             out = engine.generate(
                 input_ids=ids,
@@ -107,9 +129,9 @@ def main() -> None:
     p.add_argument("--prompt-file", required=True, help="a text file; its first --prompt-tokens tokens")
     p.add_argument("--prompt-tokens", type=int, default=256)
     p.add_argument("--new-tokens", type=int, default=32)
-    # 0.8 fails on the truncated model: its KV pool grows to fill the budget and the sm120
-    # FlashMLA page-split buffer (sized to the pool) then asks for another 16.6 GiB.
-    p.add_argument("--mem-fraction-static", type=float, default=0.5)
+    p.add_argument("--mem-fraction-static", type=float, default=0.8)
+    p.add_argument("--max-total-tokens", type=int, default=MAX_TOTAL_TOKENS)
+    p.add_argument("--no-overlap", action="store_true", help="run every arm with the DSV4 alt-stream overlap off")
     p.add_argument("--graph-gather", action="store_true", help="the graph arm serves the MoE in-graph")
     p.add_argument("--debug-arm", action="store_true")
     p.add_argument("--control", action="store_true")
@@ -123,7 +145,16 @@ def main() -> None:
         ids = tokenizer(f.read()).input_ids[: args.prompt_tokens]
     arms = ["eager", "graph"] + (["debug"] if args.debug_arm else []) + (["control"] if args.control else [])
     runs = {
-        arm: _decode(args.model, ids, args.new_tokens, arm, args.graph_gather, args.mem_fraction_static)
+        arm: _decode(
+            args.model,
+            ids,
+            args.new_tokens,
+            arm,
+            args.graph_gather,
+            args.mem_fraction_static,
+            overlap=not args.no_overlap,
+            max_total_tokens=args.max_total_tokens,
+        )
         for arm in arms
     }
     report = dict(runs)
