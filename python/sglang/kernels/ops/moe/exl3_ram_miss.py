@@ -166,13 +166,23 @@ def sim_wait(page, seq: int, timeout_s: float) -> int:
     return int(_host_module().exl3_ram_miss_sim_wait(page, seq, int(timeout_s * 1e9)))
 
 
+def seqlock_stress(seconds: float) -> tuple[int, int]:
+    """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted)."""
+    out = torch.zeros(2, dtype=torch.int64)
+    _host_module().exl3_ram_miss_seqlock_stress(int(seconds * 1e9), out)
+    return int(out[0]), int(out[1])
+
+
 _LIVE: weakref.WeakSet[Exl3RamMissHost] = weakref.WeakSet()
 
 
 @atexit.register
 def _stop_live() -> None:
     for host in list(_LIVE):
-        host.stop()
+        try:
+            host.stop()
+        except Exception as error:  # noqa: BLE001 - one host's failure must not leave the rest open
+            sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
 
 
 class Exl3RamMissHost:
@@ -189,6 +199,11 @@ class Exl3RamMissHost:
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
         if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.reads.shape[:2]):
             raise ValueError("slot_map must be int32 [layers, experts]")
+        # C++ indexes both through raw addresses and starts with every slot FREE.
+        if not page.is_contiguous() or not slot_map.is_contiguous() or slot_map.device.type != "cpu":
+            raise ValueError("page and slot_map must be contiguous CPU tensors")
+        if not bool((slot_map == -1).all()):
+            raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
         self._module = _host_module()
         # The C++ service writes through raw addresses of the page, the slot map and the
         # slabs (``tables.keepalive``): this object holds all three, and the finalizer
@@ -296,6 +311,8 @@ class Exl3RamMissHost:
     def stop(self) -> None:
         close = getattr(self, "_close", None)
         if close is not None and close.alive:
-            # One line for the window's records (the corpus arms grep it).
-            sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
-            close()
+            try:
+                # One line for the window's records (the corpus arms grep it).
+                sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
+            finally:
+                close()

@@ -251,6 +251,7 @@ def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_retu
 def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, capsys):
     hosts = []
     for i in range(2):
+        (tmp_path / str(i)).mkdir()
         s = ram_miss_setup(tmp_path / str(i))
         hosts.append(
             Exl3RamMissHost(

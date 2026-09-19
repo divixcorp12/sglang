@@ -566,7 +566,8 @@ class RamTier {
     const uint32_t head = load_acquire(page_ + kDemandHead);
     if (head == 0 || !reached(head, next_demand_)) return false;
     if (head - next_demand_ >= kDemandRecords) {
-      counters_[kOverruns].fetch_add(head - next_demand_ - (kDemandRecords - 1));
+      // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq.
+      counters_[kOverruns].fetch_add(head - next_demand_ - (kDemandRecords - 2));
       next_demand_ = head - kDemandRecords + 2u;
     }
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
@@ -587,7 +588,7 @@ class RamTier {
     const uint32_t head = load_acquire(page_ + kAdviseHead);
     if (head == 0 || !reached(head, next_advice_)) return false;
     if (head - next_advice_ >= kAdviseRecords) {
-      counters_[kAdvisoriesSkipped].fetch_add(head - next_advice_ - (kAdviseRecords - 1));
+      counters_[kAdvisoriesSkipped].fetch_add(head - next_advice_ - (kAdviseRecords - 2));
       next_advice_ = head - kAdviseRecords + 2u;
     }
     uint8_t* record = page_ + record_offset(kAdviseRing, kAdviseRecords, next_advice_);
@@ -602,7 +603,8 @@ class RamTier {
     } else {
       in_advice_.store(true);
       counters_[kAdvisories].fetch_add(1);
-      serve(request, true);
+      int64_t rows = 0;
+      serve(request, true, &rows);
       in_advice_.store(false);
     }
     store_release(page_ + kAdviseDone, next_advice_);
@@ -646,6 +648,10 @@ class RamTier {
 
   void release(int64_t row, int64_t slot) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (tiers_[row].state[slot] == kLoading) {
+      // The service is filling it and will publish it; freeing it would hand it out twice.
+      throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while it is loading");
+    }
     release_locked(row, slot);
     counters_[kVersion].fetch_add(1);
   }
@@ -769,10 +775,14 @@ class RamTier {
   // assigned (D12's recompute), evicting only unprotected, non-hot READY rows; publish.
   // An advisory protects only its own ids, reads one row at a time and gives up when a
   // demand is posted or a pause is requested (its rows so far are released).
-  bool serve(const Request& request, bool advisory) {
-    std::vector<int32_t> wanted = request.protect;
-    for (int32_t expert : request.need) {
-      if (!listed(wanted, expert)) wanted.push_back(expert);
+  // *rows: the rows it read (0 when it failed).
+  bool serve(const Request& request, bool advisory, int64_t* rows) {
+    *rows = 0;
+    std::vector<int32_t> wanted;
+    for (const auto* ids : {&request.protect, &request.need}) {
+      for (int32_t expert : *ids) {
+        if (!listed(wanted, expert)) wanted.push_back(expert);  // one slot per expert (device bytes may repeat)
+      }
     }
     std::vector<int32_t> missing;
     std::vector<int64_t> slots;
@@ -846,8 +856,9 @@ class RamTier {
       }
     }
     if (ok) {
-      counters_[kRowsRead].fetch_add(static_cast<int64_t>(slots.size()));
-      if (advisory) counters_[kAdvisoryRows].fetch_add(static_cast<int64_t>(slots.size()));
+      *rows = static_cast<int64_t>(slots.size());
+      counters_[kRowsRead].fetch_add(*rows);
+      if (advisory) counters_[kAdvisoryRows].fetch_add(*rows);
     }
     return ok;
   }
@@ -856,8 +867,10 @@ class RamTier {
     busy_since_.store(now_ns());
     store_release(page_ + kBusySeq, request.seq);
     if (load_acquire(page_ + kFatal) != 0) counters_[kLateAfterFatal].fetch_add(1);
-    const bool ok = serve(request, false);
-    if (ok) counters_[request.need.empty() ? kTouchOnly : kServedRequests].fetch_add(1);
+    int64_t rows = 0;
+    const bool ok = serve(request, false, &rows);
+    // Classified by what was read: an empty need whose protect ids had to be read is D12's race.
+    if (ok) counters_[rows == 0 ? kTouchOnly : kServedRequests].fetch_add(1);
     _mm_sfence();
     set_status(record, ok ? kServed : kFailed);
     store_release(page_ + kBusySeq, 0);
@@ -891,16 +904,18 @@ inline std::mutex& registry_mutex() {
   return mutex;
 }
 
-inline std::unordered_map<int64_t, std::unique_ptr<RamTier>>& registry() {
-  static std::unordered_map<int64_t, std::unique_ptr<RamTier>> tiers;
+// Shared ownership: every call holds its own reference, so a close() from another Python
+// thread (or a finalizer) frees the service only after the calls in flight return.
+inline std::unordered_map<int64_t, std::shared_ptr<RamTier>>& registry() {
+  static std::unordered_map<int64_t, std::shared_ptr<RamTier>> tiers;
   return tiers;
 }
 
-inline RamTier* find(int64_t handle) {
+inline std::shared_ptr<RamTier> find(int64_t handle) {
   std::lock_guard<std::mutex> guard(registry_mutex());
   const auto found = registry().find(handle);
   if (found == registry().end()) throw std::runtime_error("exl3 RAM miss: unknown handle");
-  return found->second.get();
+  return found->second;
 }
 
 }  // namespace exl3_ram_miss
@@ -919,7 +934,7 @@ int64_t exl3_ram_miss_open(
     int64_t direct) {
   using namespace exl3_ram_miss;
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
-  auto tier = std::make_unique<RamTier>(
+  auto tier = std::make_shared<RamTier>(
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(slot_map.data_ptr()),
       tables_from(reads, file_sizes, segments, slabs, row_bytes, paths, slot_bytes),
@@ -935,7 +950,7 @@ int64_t exl3_ram_miss_open(
 
 void exl3_ram_miss_close(int64_t handle) {
   using namespace exl3_ram_miss;
-  std::unique_ptr<RamTier> tier;
+  std::shared_ptr<RamTier> tier;
   {
     std::lock_guard<std::mutex> guard(registry_mutex());
     const auto found = registry().find(handle);
@@ -947,7 +962,7 @@ void exl3_ram_miss_close(int64_t handle) {
 
 // 1 served a demand record, 2 an advisory record, 0 nothing posted. Refused while a thread pumps.
 int64_t exl3_ram_miss_pump(int64_t handle) {
-  auto* tier = exl3_ram_miss::find(handle);
+  const auto tier = exl3_ram_miss::find(handle);
   if (tier->threaded()) throw std::runtime_error("exl3 RAM miss: pump() while the service thread runs");
   if (tier->pump_demand()) return 1;
   return tier->pump_advice() ? 2 : 0;
@@ -1029,8 +1044,8 @@ int64_t exl3_ram_miss_sim_post(
   std::memcpy(record + kRecProtectCount, &protect_count, 2);
   std::memcpy(record + kRecStatus, &pending, 2);
   std::memcpy(record + kRecAfter, &after32, 4);
-  std::memcpy(record + kRecNeed, need_ids.data(), 4 * need_count);
-  std::memcpy(record + kRecProtect, protect_ids.data(), 4 * protect_count);
+  if (need_count) std::memcpy(record + kRecNeed, need_ids.data(), 4 * need_count);  // data() may be null when empty
+  if (protect_count) std::memcpy(record + kRecProtect, protect_ids.data(), 4 * protect_count);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   store_release(record + kRecSeq, seq);  // payload first, seq last (the seqlock order)
   store_release(base + head_word, seq);
@@ -1064,6 +1079,56 @@ int64_t exl3_ram_miss_sim_wait(TensorView page, int64_t seq, int64_t timeout_ns)
   return 2;
 }
 
+// Test only: a writer thread rewrites one record in a loop with the post kernel's seqlock
+// order (seq = 0, fence, payload, fence, a new seq) while this thread reads it with
+// read_record. out = {records accepted, accepted records whose payload is not their seq's}.
+void exl3_ram_miss_seqlock_stress(int64_t duration_ns, TensorView out) {
+  using namespace exl3_ram_miss;
+  alignas(64) uint8_t record[kRecordBytes] = {};
+  std::atomic<bool> done{false};
+  const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
+  std::thread writer([&] {
+    for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
+      const uint16_t row = static_cast<uint16_t>(round), count = expected_ids(round);
+      const int32_t id = static_cast<int32_t>(round);
+      store_release(record + kRecSeq, 0u);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      std::memset(record + 4, 0, kRecordBytes - 4);
+      std::memcpy(record + kRecRow, &row, 2);
+      std::memcpy(record + kRecNeedCount, &count, 2);
+      std::memcpy(record + kRecProtectCount, &count, 2);
+      std::memcpy(record + kRecAfter, &round, 4);
+      for (int i = 0; i < count; ++i) {
+        std::memcpy(record + kRecNeed + 4 * i, &id, 4);
+        std::memcpy(record + kRecProtect + 4 * i, &id, 4);
+      }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
+    }
+  });
+  int64_t accepted = 0, torn = 0;
+  const int64_t deadline = now_ns() + duration_ns;
+  while (now_ns() < deadline) {
+    const uint32_t seq = load_acquire(record + kRecSeq);
+    Request request;
+    if (seq == 0 || !read_record(record, seq, &request)) continue;
+    ++accepted;
+    const uint32_t round = (seq - 1u) / kDemandRecords;
+    bool whole = request.after == round && request.row == static_cast<uint16_t>(round) &&
+                 request.need.size() == expected_ids(round) && request.protect.size() == expected_ids(round);
+    for (int32_t id : request.need)
+      whole = whole && id == static_cast<int32_t>(round);
+    for (int32_t id : request.protect)
+      whole = whole && id == static_cast<int32_t>(round);
+    if (!whole) ++torn;
+  }
+  done.store(true);
+  writer.join();
+  auto* result = static_cast<int64_t*>(out.data_ptr());
+  result[0] = accepted;
+  result[1] = torn;
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_open, exl3_ram_miss_open);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close, exl3_ram_miss_close);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pump, exl3_ram_miss_pump);
@@ -1080,5 +1145,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_counters, exl3_ram_miss_counters);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_layer_rows, exl3_ram_miss_layer_rows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_post, exl3_ram_miss_sim_post);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_wait, exl3_ram_miss_sim_wait);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_seqlock_stress, exl3_ram_miss_seqlock_stress);
 
 }  // namespace sglang
