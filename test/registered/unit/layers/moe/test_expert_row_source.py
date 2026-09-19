@@ -1,5 +1,6 @@
 """CPU tests for expert host row sources and how the streamer routes host reads."""
 
+import dataclasses
 import os
 import tempfile
 import unittest
@@ -16,7 +17,7 @@ from sglang.srt.layers.moe.expert_row_source import (
     RowReadStats,
     TensorRowSource,
 )
-from sglang.srt.layers.moe.expert_stream import ExpertStreamer
+from sglang.srt.layers.moe.expert_stream import ExpertGatherStats, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.moe_expert_fakes import CountingRowSource
 
@@ -315,6 +316,136 @@ class TestStreamerRowRouting(unittest.TestCase):
         destination = torch.zeros(2, 4, dtype=torch.int16)
         streamer.read_host_rows(torch.tensor([1, 4]), {"b": destination})
         self.assertTrue(torch.equal(destination, layer.b.data[[1, 4]]))
+
+
+class TestGatherReadStats(unittest.TestCase):
+    def test_positional_gather_stats_fields_keep_their_order(self):
+        names = [field.name for field in dataclasses.fields(ExpertGatherStats)]
+        self.assertEqual(
+            names[:15],
+            [
+                "requested_rows",
+                "hot_hit_rows",
+                "miss_rows",
+                "d2d_bytes",
+                "h2d_bytes",
+                "source_bytes",
+                "pinned_host_hit_rows",
+                "pinned_host_miss_rows",
+                "pinned_host_populated_bytes",
+                "transfer_wait_ns",
+                "gather_fallback_used",
+                "copy_engine_bytes",
+                "routed_rows",
+                "routed_miss_rows",
+                "unique_miss_rows",
+            ],
+        )
+        self.assertEqual(
+            names[15:],
+            [
+                "host_read_rows",
+                "host_read_file_bytes",
+                "host_read_split_bytes",
+                "host_read_ns",
+                "host_split_ns",
+            ],
+        )
+        self.assertEqual(ExpertGatherStats(1, 2).host_read_rows, 0)
+
+    def _all_miss_streamer(self, layer, names, row_source, through_row_source):
+        streamer = ExpertStreamer(layer, names, row_source=row_source)
+        streamer.hot_cache = SimpleNamespace(lookup=_all_miss, capacity=1)
+
+        def copy_rows(source_ids, outputs):
+            if through_row_source:
+                staging = {
+                    name: torch.empty_like(output) for name, output in outputs.items()
+                }
+                streamer.read_host_rows(source_ids.cpu(), staging)
+                for name, output in outputs.items():
+                    output.copy_(staging[name])
+            else:
+                for name, output in outputs.items():
+                    torch.index_select(
+                        getattr(layer, name).data, 0, source_ids, out=output
+                    )
+            return 0
+
+        streamer._copy_source_rows = copy_rows
+        return streamer
+
+    def test_reads_inside_a_gather_land_in_its_stats(self):
+        layer = _layer(("a", "b"))
+        source = CountingRowSource({"a": layer.a.data, "b": layer.b.data})
+        streamer = self._all_miss_streamer(layer, ("a", "b"), source, True)
+        ids = torch.tensor([[1, 4], [4, 2]])
+        source_ids, compact_ids = streamer._plan_eager_routes(ids)
+        compact, tensors = streamer._gather_eager_rows(source_ids, compact_ids, ids)
+        stats = streamer.last_gather_stats
+        self.assertEqual(stats.requested_rows, 3)
+        self.assertEqual(stats.host_read_rows, 3)
+        self.assertEqual(stats.host_read_file_bytes, 3 * source.file_bytes_per_expert)
+        self.assertEqual(stats.host_read_ns, 3)
+        self.assertEqual(stats.host_read_split_bytes, 0)
+        self.assertEqual(streamer.background_read_stats, RowReadStats())
+        self.assertTrue(torch.equal(tensors["a"][compact.long()], layer.a.data[ids]))
+
+    def test_a_gather_without_host_reads_keeps_its_stats_object(self):
+        layer = _layer(("a",))
+        streamer = self._all_miss_streamer(layer, ("a",), None, False)
+        created = []
+        original = streamer._gather_cached
+
+        def gather_cached(*args):
+            result = original(*args)
+            created.append(streamer.last_gather_stats)
+            return result
+
+        streamer._gather_cached = gather_cached
+        ids = torch.tensor([[1, 4], [4, 2]])
+        source_ids, compact_ids = streamer._plan_eager_routes(ids)
+        streamer._gather_eager_rows(source_ids, compact_ids, ids)
+        self.assertIs(streamer.last_gather_stats, created[0])
+        self.assertEqual(streamer.last_gather_stats.host_read_rows, 0)
+
+    def test_reads_outside_a_gather_are_background_reads(self):
+        layer = _layer(("a",))
+        source = CountingRowSource({"a": layer.a.data})
+        streamer = ExpertStreamer(layer, ("a",), row_source=source)
+        streamer.read_host_rows(
+            torch.tensor([0, 1]), {"a": torch.zeros(2, 4, dtype=torch.int16)}
+        )
+        self.assertEqual(streamer.background_read_stats.rows, 2)
+        self.assertEqual(streamer.last_gather_stats.host_read_rows, 0)
+
+    def test_manager_counters_sum_host_reads(self):
+        from sglang.srt.layers.moe.expert_hot_cache import (
+            _add_host_read_counters,
+            _OperationalCounters,
+        )
+
+        counters = _OperationalCounters()
+        stats = ExpertGatherStats(
+            host_read_rows=2,
+            host_read_file_bytes=10,
+            host_read_split_bytes=3,
+            host_read_ns=7,
+            host_split_ns=1,
+        )
+        _add_host_read_counters(counters, stats)
+        _add_host_read_counters(counters, stats)
+        _add_host_read_counters(counters, SimpleNamespace())
+        self.assertEqual(
+            (
+                counters.host_read_rows,
+                counters.host_read_file_bytes,
+                counters.host_read_split_bytes,
+                counters.host_read_ns,
+                counters.host_split_ns,
+            ),
+            (4, 20, 6, 14, 2),
+        )
 
 
 if __name__ == "__main__":
