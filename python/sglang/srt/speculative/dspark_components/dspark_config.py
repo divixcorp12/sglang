@@ -163,9 +163,11 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
 
 def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
-    prefixed dspark_* keys on the target hf config. Single source of truth
-    for the bundling convention (draft-path defaulting, draft-arch remap)."""
-    return any(
+    prefixed dspark_* keys on the target hf config, and num_nextn_predict_layers
+    is not 0 (a truncated export keeps the dspark_* keys but drops the draft).
+    Single source of truth for the bundling convention (draft-path defaulting,
+    draft-arch remap)."""
+    has_dspark_keys = any(
         _cfg_get(hf_config, key, None) is not None
         for key in (
             "dspark_block_size",
@@ -174,6 +176,13 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
             "dspark_target_layer_ids",
         )
     )
+    if not has_dspark_keys:
+        return False
+    # Resolved at the same (top-level) place the dspark_* keys above are
+    # resolved -- real target configs flatten text_config onto the top-level
+    # hf_config object before this function ever sees it (see
+    # normalize_deepseek_v41_config), so no text_config fallback is needed here.
+    return _cfg_get(hf_config, "num_nextn_predict_layers", None) != 0
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
