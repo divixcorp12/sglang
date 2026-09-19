@@ -162,6 +162,110 @@ def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(num_added_embeddings=1))
 
 
+
+def test_qwen4_pinned_embedding_binds_an_offered_host_table():
+    table = torch.empty((8, 7), dtype=torch.bfloat16, pin_memory=True)
+    offloaded = Qwen4ExpPinnedHostEmbedding(_make_source_embedding(), host_table=table)
+    rows = torch.arange(8 * 7, dtype=torch.bfloat16).reshape(8, 7)
+    table.copy_(rows)
+
+    ids = torch.tensor([5, 0, 7], device="cuda")
+    assert offloaded.weight.data_ptr() == table.data_ptr()
+    torch.testing.assert_close(
+        offloaded(ids).cpu(), rows.index_select(0, ids.cpu()), rtol=0, atol=0
+    )
+
+
+def test_qwen4_pinned_embedding_rejects_an_unusable_host_table():
+    for table in (
+        torch.empty((8, 7), dtype=torch.bfloat16),
+        torch.empty((9, 7), dtype=torch.bfloat16, pin_memory=True),
+        torch.empty((8, 7), dtype=torch.float32, pin_memory=True),
+    ):
+        with pytest.raises(ValueError, match="bound host table"):
+            Qwen4ExpPinnedHostEmbedding(_make_source_embedding(), host_table=table)
+
+
+def _build_qwen4_embed_tokens(*, host, offer=None):
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.models import qwen3_5
+    from sglang.srt.speculative.draft_shared_weights import (
+        draft_shares_target_embed_and_head,
+    )
+
+    parallel = SimpleNamespace(tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1)
+    pp_group = SimpleNamespace(
+        is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+    )
+    config = SimpleNamespace(
+        vocab_size=64,
+        hidden_size=16,
+        rms_norm_eps=1e-6,
+        hc_count=2,
+        hc_lowrank=2,
+        ple_layer_ids=[],
+        eos_token_id=0,
+        num_hidden_layers=1,
+        full_attention_interval=1,
+        tie_word_embeddings=False,
+        model_type="qwen3_5_text",
+    )
+    with ExitStack() as stack:
+        for owner, name, value in (
+            (qwen3_5, "get_pp_group", lambda: pp_group),
+            (qwen3_5, "make_layers", lambda *a, **k: (nn.ModuleList(), 0, 0)),
+            (qwen3_5, "get_stream", lambda name: None),
+            (qwen3_5, "is_dp_attention_enabled", lambda: False),
+            (qwen4_exp_module, "is_dp_attention_enabled", lambda: False),
+            (qwen4_exp_module, "GatedResidual", lambda *a, **k: nn.Module()),
+        ):
+            stack.enter_context(patch.object(owner, name, value))
+        stack.enter_context(
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.get_parallel",
+                lambda: parallel,
+            )
+        )
+        stack.enter_context(envs.SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING.override(host))
+        stack.enter_context(torch.device("cuda"))
+        stack.enter_context(torch.inference_mode(False))
+        # The model loader builds under the checkpoint dtype.
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        stack.callback(torch.set_default_dtype, default_dtype)
+        if offer is not None:
+            stack.enter_context(draft_shares_target_embed_and_head(offer, None))
+        model = Qwen4ExpModel(config, None, "mtp" if offer is not None else "", offer is not None)
+    return model.embed_tokens
+
+
+def test_qwen4_token_embedding_stays_on_the_gpu_by_default():
+    embed = _build_qwen4_embed_tokens(host=False)
+    assert not isinstance(embed, Qwen4ExpPinnedHostEmbedding)
+    assert embed.weight.is_cuda
+
+
+def test_qwen4_host_token_embedding_serves_target_and_draft_from_one_table():
+    target = _build_qwen4_embed_tokens(host=True)
+    assert isinstance(target, Qwen4ExpPinnedHostEmbedding)
+    assert target.weight.device.type == "cpu" and target.weight.is_pinned()
+    rows = torch.randn(64, 16, dtype=torch.bfloat16)
+    target.weight_loader(target.weight, rows)
+
+    draft = _build_qwen4_embed_tokens(host=True, offer=target.weight)
+    assert isinstance(draft, Qwen4ExpPinnedHostEmbedding)
+    assert draft.weight.data_ptr() == target.weight.data_ptr()
+    assert draft.shares_target_weight
+    assert [name for name, _ in draft.named_parameters()] == ["weight"]
+
+    ids = torch.tensor([3, 63, 0, 17], device="cuda")
+    expected = rows.index_select(0, ids.cpu())
+    for embed in (target, draft):
+        torch.testing.assert_close(embed(ids).cpu(), expected, rtol=0, atol=0)
+
 def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
