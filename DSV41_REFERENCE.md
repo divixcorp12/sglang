@@ -40,7 +40,9 @@ The design that follows is in §9. Decisions still open are in §12.
 3. **The one hard problem is shared by both tiers: a RAM miss inside a CUDA-graph
    decode.**
    - Today's in-graph gather reads host RAM via `ld.global.nc` and has no miss path.
-   - Four mechanisms are compared in §9.3. None has been prototyped.
+   - Four mechanisms are compared in §9.3. **Option C (CPU io_uring thread + device-side
+     wait) was built and measured in Phase 3b (§17):** 2.781 tok/s under breakable CUDA
+     graphs against 1.664 eager on the same four sessions.
    - Each needs a bounded wait and a defined failure path; a stuck NVMe read must not
      wedge the stream.
    - For experts the NVMe read is on the critical path whatever the mechanism (the
@@ -517,7 +519,7 @@ Expert count, bytes/row and top-k are derived from shapes (`_validate_sources`, 
 | `copy_expert_row_segments_gpu` (`expert_cache_transfer.cuh:200`) | Already takes `{src, dst, bytes}` segment lists: a candidate place to pad a raw row into an aligned slot |
 | Doorbell (`expert_doorbell.py/.cuh`) | Refuses overlap scheduling (`model_runner.py:797-801`), all speculative decoding (`:769-772`) and decode graph bs > 1 (`:773-775`). The overlap refusal is a *placement* constraint (fail-stop check after results), not physics |
 | `SGLANG_MOE_GPU_RESIDENCY_UPDATE` (insert-on-miss lives here) | Refuses speculative decoding (`:812-815`, "verify commits do not reach the device clock") and decode graph bs > 1 (`:816-820`, "padded batches would add graph rows as tokens") |
-| `breakable` decode graph (`runner_backend/breakable_cuda_graph_backend.py`) | Segments captured graphs with eager host code between them. **Our `deepseek_v4.py` already wraps every attention layer in `eager_on_graph` (`:620`)**, so DSV4 already has ~40 breaks/forward, and the eager break functions already run under overlap scheduling in the shipping Qwen config |
+| `breakable` decode graph (`runner_backend/breakable_cuda_graph_backend.py`) | Segments captured graphs with eager host code between them. Our `deepseek_v4.py`'s `eager_on_graph` breaks (attention, low-ratio sources, Engram hashing) fire only for **extend** batches (`forward_mode.is_extend()`, `models/deepseek_v4.py:2033-2038`, `:2337-2345`, `:4223-4228` at `dsv41` `4b906b3d4f`), so DSV4 **decode** captures with zero breaks of its own. The ~40 breaks per forward are a prefill property. The eager break functions run under overlap scheduling in the shipping Qwen config (corrected in §17) |
 | Graph-gather scratch (`..._GRAPH_GATHER_SCRATCH_ROWS`) | Already multiplies by `verify_tokens` under speculation (`model_runner.py:740-750`) |
 | CUDA host nodes / `cudaLaunchHostFunc` | **Not used anywhere** in `python/sglang/kernels/jit/csrc` or `sgl-kernel`. Would need a new C++ entry point |
 
@@ -618,7 +620,7 @@ table. **Nothing can wait for NVMe from inside the graph today.**
 
 | Option | How | Overlap scheduling | DSpark | Engram overlap with layer 0 | Main costs / risks | Size |
 |---|---|---|---|---|---|---|
-| **A. `breakable`-graph host break** after each MoE router and before Engram layers | D2H ids → host checks the RAM map → io_uring misses → publish slots → resume. Either new segments per MoE layer, or router placement moved before the existing attention break (to decide) | Works: DSV4 already runs ~40 eager breaks/forward under overlap. But a D2H sync in a break stalls the single scheduler thread and re-exposes ~2.3 ms/token of host prep, **~1–2% at a 110–200 ms token** | OK: breaks see the verify-batch union | Only with a separate early submit | Scheduler-thread stall; more segments | L |
+| **A. `breakable`-graph host break** after each MoE router and before Engram layers | D2H ids → host checks the RAM map → io_uring misses → publish slots → resume. Either new segments per MoE layer, or router placement moved before the existing attention break (to decide) | Works under overlap (Qwen ships eager breaks with it), but DSV4 decode has no breaks today: option A would **add** ~40 per decode forward (§17). A D2H sync in a break stalls the single scheduler thread and re-exposes ~2.3 ms/token of host prep, **~1–2% at a 110–200 ms token** | OK: breaks see the verify-batch union | Only with a separate early submit | Scheduler-thread stall; more segments | L |
 | **B. CUDA-graph host nodes, split** (`cudaLaunchHostFunc` captured as host nodes) | Node 1 at graph start: *submit* io_uring reads for known ids. Node 2 before the consumer: *wait* with a bounded timeout, then write the slot table | Likely compatible: no Python or scheduler in the loop (overlap uses a single scheduler thread plus `FutureMap`, `overlap_utils.py:248`) | OK | **Yes**, the submit/wait split | The stream is idle for the whole wait. Host functions may make no CUDA calls and may serialize with each other (a 7 ms callback blocks every other host callback). New C++ entry point. Capture with `torch.cuda.graph` and the breakable backend untested. **An unsplit, blocking B cannot hide the Engram read** | L |
 | **C. CPU io_uring thread + device-side poll** | The GPU posts ids to mapped memory. A CPU thread reads NVMe into a RAM slot and writes a completion flag. A kernel polls the flag with a watchdog. Doorbell-*like*, but redesigned: not the doorbell's all-or-nothing tag semantics and not its current guards | Placement of the fail-stop check must be redesigned (the doorbell's refusal is placement, not physics) | Needs the same guard redesign §10 already requires | **Yes**, by posting at graph start | A polling kernel occupies SMs during the wait (the `hc_mix` lesson); a late-landing write needs the doorbell's race analysis | L |
 | D. Drop missing experts from top-k (policy) | Compute with the resident subset | — | Muddies accept/reject | — | Lossy. **Owner sign-off plus accuracy eval** | M |
@@ -819,9 +821,13 @@ measured in eager mode on the full 40-layer model:
   worth building).
 
 **Phase 3b — graph-mode three-tier streaming (open):**
-- The in-graph RAM tier.
-- The §9.3 miss mechanism and its failure path.
-- CUDA graphs and graph gather for EXL3.
+- **Option C built and measured (§17):** decode under breakable CUDA graphs at bs 1 with the
+  MoE in-graph (pinned-tier graph gather + fused `exl3_moe`), NVMe misses served by the
+  io_uring thread with a bounded in-graph wait and fail-stop; next-layer advisory prefetch
+  behind `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`.
+- The in-graph RAM tier — done, §17.
+- The §9.3 miss mechanism and its failure path — done, §17.
+- CUDA graphs and graph gather for EXL3 — done, §17.
 - A prefill admission policy for the RAM tier, **only if** the simulation-only arm shows a
   large gap. At 256-token prompts it showed none (admitting prefill misses helped, §16.9);
   it was not run at 512+ tokens.
@@ -829,7 +835,7 @@ measured in eager mode on the full 40-layer model:
   skip the repack).
 - Async reads.
 - Profile the ~0.38 s/token of eager decode that is not RAM-miss I/O (§16.12) before
-  sizing any of the above.
+  sizing any of the above — done, §17 (§17.7).
 
 **Phase 4 — DSpark:**
 - Run the measurement gate (§10), then apply the α rule.
@@ -1666,6 +1672,306 @@ cost that was not isolated).
 - nvme1 fio and the split-versus-repack re-run on nvme1 (§16.4).
 - The full-depth oracle comparison (§16.6), the Engram hit rate on the full model (§16.11),
   and a static-arm run to isolate stalls (§16.12).
+
+## 17. Phase 3b findings (option C)
+
+Phase 3b built §9.3's option C: a CPU io_uring thread serves RAM misses, and the device
+posts the missed ids and waits for them. Decode runs under breakable CUDA graphs with
+the routed MoE inside the graph. The GPU window (Task 16) ran on divix01's RTX 5090 on
+2026-09-19 from 08:52 to 10:16 CDT, production down, under `gpu-run.sh`'s lock. Artifacts:
+`divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/`
+(`ANA` below; `ANA/window.log` is the chronological record). The ledger
+(`.superpowers/sdd/2026-09-19-dsv41-phase3b-optionC/progress.md`) holds every ruling cited
+here.
+
+### 17.1 Scope and code state
+
+- **Phases (R1'):** P1, decode under breakable graphs with the EXL3 MoE as an eager break;
+  P2, the `exl3_moe` probe (the gate); P3, the pinned-tier graph gather and the fused
+  `exl3_moe` in the graph; P4, the RAM-miss service (C++ io_uring thread, device post and
+  wait kernels, fail-stop); P5, next-layer advisory prefetch; P6, the window and this
+  record.
+- **Code state.** `window.log`'s first line is `window start at 475e67af663`. Five bugs
+  found in the window moved the tree during it (§17.8); each run's commit is in
+  `window.log`:
+
+  | Run | Commit |
+  |---|---|
+  | GPU regression (152 passed) | `9554a8ece1` |
+  | §9.3 component acceptance | `9554a8ece1` |
+  | T3 option C parity | `dad6262508` |
+  | Full-model smoke, Engine fail-stop, corpus arm `p1` | `51e3eeb457` |
+  | Corpus arms `c`, `cpf` (rerun) | `4b906b3d4f` |
+
+  The Nsight capture (§17.7) started at 09:52:03, before the `c`/`cpf` rerun, so it ran at
+  `51e3eeb457`. `parity-t3-p1.{json,log}` is from Task 5 (07:12), before the window.
+- **Budgets.** `ANA/env-full.sh` sources 3a's `env.sh` (§16.2: pinned tier
+  `SGLANG_MOE_PINNED_HOST_MB=71680`, 5,644 rows; hot `SGLANG_MOE_HOT_GPU_MB=14336`) and adds
+  `SGLANG_MOE_EXPERT_GRAPH_GATHER=1`, `SGLANG_DSV41_RAM_MISS_TIMEOUT_MS=2000`,
+  `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=0` (`cpf` sets it to 1). `ANA/env-full-p1.sh` sets
+  graph gather to 0. The Step 6 setting (`window.log`) was **`MEM_FRACTION=0.80`,
+  `HOT_MB=14336`**, with no ladder rung needed. The `p1` arm ran with
+  `SGLANG_MOE_HOT_GPU_MB=11288` (`ANA/step8-chain.sh`): 14,336 less option C's scratch
+  of 3,048 MiB.
+- **The DSV4 multi-stream overlap is off** for EXL3 breakable decode (the EXL3 gate,
+  Task 5). The root cause of the first defect was found and fixed: `hc_stats_stream` was
+  forked before the MoE, the EXL3 MoE break ended the segment, and `ffn_stats` launched
+  off-capture (NaNs). The fix re-forks the stats stream after a break (`6f0ad28e16`). A
+  second defect, the MQA alt-stream prepare in segment 0, has an unknown cause, and the
+  two-attempt cap was reached. The gate keeps the overlap off, so its speed-up is
+  forgone in eager and graph modes alike. **Its size was not measured.** Overlap
+  *scheduling* (the scheduler's) stays on: `disable_overlap_schedule': False` in
+  `smoke-full.log` and `corpus-c.log`.
+
+### 17.2 P2 probe (gate)
+
+`ANA/probe-exl3-moe.json` (Task 1, 05:56; layer 3, experts 0, 32, …, 352, 3/3/3 bits).
+Task 16 Step 2 reran the probe test inside the 152-passed regression; the JSON on disk is
+Task 1's. `rel_*` is relative error against the fp32 reference; `max_abs` is fused vs loop.
+
+| `num_active` | Route set (remap) | `rel_fused` | `rel_loop` | `max_abs_fused_vs_loop` |
+|---:|---|---:|---:|---:|
+| 6 | 3,1,8,5,2,6 | 1.031e-3 | 1.038e-2 | 0.0095 |
+| 6 | 11,4,8,0,7,2 | 9.750e-4 | 1.103e-2 | 0.0094 |
+| 6 | 4,5,10,9,8,1 | **1.155e-3** | 1.108e-2 | 0.0160 |
+| 6 | 10,4,11,9,1,6 | 9.670e-4 | 1.071e-2 | 0.0102 |
+| 6 | 6,8,7,5,11,2 | 1.020e-3 | 1.094e-2 | 0.0096 |
+| 6 | 1,10,2,6,11,0 | 1.045e-3 | **1.149e-2** | 0.0108 |
+| 6 | 9,1,0,8,4,7 | 9.958e-4 | 1.096e-2 | 0.0100 |
+| 6 | 0,10,4,8,2,3 | 1.032e-3 | 1.109e-2 | 0.0113 |
+| −1 | 3,1,8,5,2,6 | 9.202e-4 | 1.038e-2 | 0.0096 |
+| −1 | 11,4,8,0,7,2 | 8.814e-4 | 1.103e-2 | 0.0096 |
+| −1 | 4,5,10,9,8,1 | 9.361e-4 | 1.108e-2 | 0.0156 |
+| −1 | 10,4,11,9,1,6 | 8.635e-4 | 1.071e-2 | 0.0101 |
+| −1 | 6,8,7,5,11,2 | 9.476e-4 | 1.094e-2 | 0.0096 |
+| −1 | 1,10,2,6,11,0 | 9.204e-4 | 1.149e-2 | 0.0108 |
+| −1 | 9,1,0,8,4,7 | 8.532e-4 | 1.096e-2 | 0.0099 |
+| −1 | 0,10,4,8,2,3 | 9.457e-4 | 1.109e-2 | 0.0112 |
+
+| `num_active` | Replay vs eager | `eager_us` | `replay_us` |
+|---:|---|---:|---:|
+| **6** | bitwise, 4/4 steps | 242.4 | **110.1** |
+| −1 | bitwise, 4/4 steps | 265.7 | 260.3 |
+
+- **Verdict: PASS**, `num_active` **6** (chosen for its 110.1 µs replay; −1 replays no
+  faster than it runs eager).
+- The fused kernel is **~10x closer to fp32** than `exl3_moe_loop`: max `rel_fused`
+  1.16e-3 against max `rel_loop` 1.15e-2 (`num_active` 6).
+
+### 17.3 Graph decode
+
+Breaks per capture, from the `Breakable CUDA graph captured` lines:
+
+| Run | Model | Arm | Capture |
+|---|---|---|---|
+| `parity-t3-p1.log` (Task 5) | `T3` (3 layers) | P1: EXL3 MoE as an eager break | `segments=5 breaks=4` |
+| `parity-t3-c.log` | `T3` | option C | `segments=2 breaks=1` (graph and debug Engines) |
+| `smoke-full.log`, `corpus-c.log` | full, 40 layers | option C | `segments=3 breaks=2` in each of 4 attention variants (`candidate_all`, `candidate_c2_all`, `candidate_unfiltered`, `candidate_filtered`) |
+| `corpus-p1.log` | full | P1 | `segments=43 breaks=42` in each of the 4 variants |
+
+- Option C leaves only the Engram lookups as breaks: 1 on `T3`, **2 on the full model**
+  (the two Engram layers). P1 adds one break per MoE layer (3 + 1 on `T3`, 40 + 2 on the
+  full model).
+- **DSV4 decode had zero breaks before 3b; the ~40-breaks claim was prefill-only**
+  (corrected in §8 and §9.3). §9.3's option A would therefore *add* ~40 breaks per decode
+  forward. `corpus-p1.log` is that shape (42 breaks), and it ran at 1.973 tok/s against
+  option C's 2.781 (§17.6).
+
+### 17.4 R4 numerics
+
+`ANA/parity-t3-p1.json` and `ANA/parity-t3-c.json`, `T3`, 32 decode tokens:
+
+| Report | Comparison | `first_token_mismatch` | `max_abs_dlogprob` | Pass |
+|---|---|---:|---:|---|
+| `parity-t3-p1` | `eager_vs_graph` | None | 0.0 | ✓ |
+| `parity-t3-p1` | `eager_vs_eager` (control) | None | 0.0 | ✓ |
+| `parity-t3-c` | **`graph_vs_debug`** (the bitwise capture gate) | None | **0.0** | **✓** |
+| `parity-t3-c` | `eager_vs_graph` | 18 | 1.653 | ✗ |
+| `parity-t3-c` | `debug_vs_eager` | 18 | 1.653 | ✗ |
+| `parity-t3-c` | `eager_vs_eager` (control) | None | 0.0 | ✓ |
+
+**`R4: FAIL (fused-kernel numerics)` — first_token_mismatch 18, max_abs_dlogprob 1.653;
+probe rel_fused/rel_loop 1.16e-3/1.15e-2** (`window.log`, Step 5).
+- Before the divergence (steps 0–17) max |dlogprob| was 0.413, median 0.057. At step 18
+  the tokens differ: eager 77062 at −1.064, graph 56642 at −2.718 (task-16 report).
+- **The capture gate passes bitwise.** Graph and debug-eager run the same fused kernel,
+  and they agree exactly, so capture introduces no error. The eager control is bitwise,
+  which rules out run-to-run nondeterminism. What remains is the fused `exl3_moe` against
+  the eager `exl3_moe_loop`.
+- **Observation: the divergence is the eager path's error, not a capture bug.** Against
+  the fp32 reference, the fused path is the more accurate one in every measurement:
+
+  | Source | Fused / graph vs fp32 | `exl3_moe_loop` vs fp32 |
+  |---|---:|---:|
+  | Task 1 probe (`probe-exl3-moe.json`, max over 8 route sets) | 1.16e-3 | 1.15e-2 |
+  | Task 9 GPU test, 3 routes (`task-9-report.md`) | 2.13–2.18e-3 (graph replay) | 1.50–1.57e-2 |
+  | Task 14 GPU test, 2 routes with served misses (`task-14-report.md`) | 2.148e-3, 2.292e-3 | 1.752e-2, 1.478e-2 |
+
+  That is ~10x in the probe and ~7x in the Task 9 and 14 tests. The step-18 divergence
+  was not bisected further.
+- **By ruling this does not block P3** (ledger: "R4 fused-kernel mismatch does not block
+  P3 done if graph vs debug-eager is bitwise identical; record R4 FAIL with numbers"). The
+  fused kernel is a deliberate numeric change. Whether R4's bar should instead be set
+  against the fp32 reference is for the owner.
+
+### 17.5 §9.3 acceptance
+
+| # | Criterion | Result | Source |
+|---:|---|---|---|
+| 1 | Overhead per layer on the RAM-hit path | **18.24 µs/layer**, ×40 = **0.73 ms/token** (test bar < 100 µs). The wait kernel's extra fatal-word read is included | `ram-miss-overheads.json` `hit_path_us_per_layer` |
+| 2 | Stream idle on a forced NVMe miss | 1 row: **11.40 ms** (expected ≈ 8–11, just above). 6 rows: **61.69 ms** (expected ≈ 25–65). Thread: served 3, rows_read 13, read_errors 0 | `ram-miss-overheads.json` |
+| 3 | A timeout fails stop without hanging | **Component:** `test_a_hung_read_times_out_and_everything_after_is_fast` and `test_a_forced_timeout_fails_stop_without_hanging` passed in Step 2 (`cuda-tests.log`). **Engine (`T3`):** fault `demand reads sleep 20.0 s after 50 demands` (09:20:16), capture `segments=2 breaks=1` (09:20:23), prefill (09:20:33), then `ERROR exl3 RAM miss: request 59 timed out or failed; the process must stop` and `RuntimeError: ... fail-stop` through `Scheduler._expert_doorbell_fail_stop_check` (09:20:37; decode, after capture). **rc 137**, not 124 (the Engine's own `kill_process_tree`, not `timeout`). Error to scheduler exit ~19 s; **error to process exit 65 s**. No process left on the GPU | `failstop-t3.log` |
+| 4 | Capture under breakable with overlap scheduling on | `Breakable CUDA graph captured: shape=ShapeKey(size=1, stream_idx=None, variant_label=None, attention_variant='candidate_all') segments=3 breaks=2`, one per variant; `disable_overlap_schedule': False` | `smoke-full.log` |
+
+- **The 65 s is sglang's crash path, not the fail-stop.** The fatal was raised at the
+  first batch check after the 2 s wait timeout. The rest is the parent's SIGQUIT handler:
+  `Sleeping 5 seconds before crash diagnostics` (09:20:37), then `Waiting 60.0 seconds for
+  CUDA coredumps before exiting` (09:20:42), then `kill_process_tree` (09:21:42).
+- The Engine fail-stop ran at `--mem-fraction-static 0.5`. Run 1 at `trace_corpus`'s
+  default 0.85 OOMed in the sm_120 FlashMLA page-split buffer (`_split_kv_pages_to_64`,
+  19.26 GiB; `failstop-t3-run1-oom.log`), the known `T3` issue (§17.8).
+
+### 17.6 Corpus arms (R5)
+
+`ANA/corpus-summary.txt` (from `corpus-{p1,c,cpf}.json`, `trace-{p1,c,cpf}.jsonl`); sessions
+0–3, 256-token prompt, 128 new tokens, `mem_fraction_static` 0.80. tok/s is the mean of
+per-session decode tok/s; ms/token is 1000 / mean. TTFT is the median plus session 0, as
+in §16.12. `G` and `f` are as in §16.8; `f` counts **demand rows only**.
+
+| Arm | Hot slots | tok/s mean | Per session | ms/token | TTFT median / s0 (s) | `G` | `f` | `f_after_warmup` |
+|---|---:|---:|---|---:|---|---:|---:|---:|
+| `p1`: graphs, EXL3 MoE as eager break, hot 11,288 MiB | 888 | **1.973** | 1.663 / 2.121 / 1.758 / 2.350 | 507 | 56.0 / 109.1 | 126.14 | 0.1518 | 0.1400 |
+| **`c`**: option C, prefetch off | 888 | **2.781** | 2.180 / 3.144 / 2.269 / 3.530 | 360 | 56.7 / 98.6 | 126.92 | 0.1460 | 0.1353 |
+| `cpf`: option C, prefetch on | 888 | **2.780** | 2.172 / 3.178 / 2.274 / 3.497 | 360 | 57.2 / 96.1 | 126.92 | 0.1463 | 0.1354 |
+| Window C cold, eager (3a `corpus-cold.json`, sessions 0–3) | 1,128 | **1.664** | 1.433 / 1.768 / 1.510 / 1.947 | 601 | 55.6 / 94.8 | — | — | — |
+
+- **`c` is +67% over Window C** on the same four sessions, and +41% over `p1`. `p1` is +19%
+  over Window C.
+- **Hot capacity.** Graph gather's scratch is 3,195,740,160 B (3,048 MiB) and comes out of
+  the 14,336 MB hot budget, so `c` and `cpf` get **888 slots**
+  (`Expert hot cache startup`: residency 11,824,238,592 B, scratch 3,195,740,160 B, in
+  `corpus-c.log`). `p1` ran at 14,336 − 3,048 = 11,288 MiB with no scratch
+  (`corpus-p1.log`: requested 11,836,325,888 B) and got the same 888 slots and the same
+  residency bytes. **All three arms share one hot capacity, with no slot difference
+  left**, and it is below Window C's 1,128 slots. So the `G` of 126–127 is not comparable
+  with §16.8's 115.03 (1,128 slots, 8 sessions); the `p1`–`c` `G` gap (0.78) has no slot
+  difference behind it.
+- **Prefetch is inert under this predictor.** `cpf`: `advisories` 132,
+  `advisories_skipped` 0, `advisory_rows` **30** over 511 decode tokens (`c`: 0 / 0 / 0).
+  **`cpf − c` = −0.001 tok/s**, inside the per-session spread (per-session differences
+  −0.008 / +0.034 / +0.005 / −0.033, against a 2.180–3.530 range within `c`).
+- Thread counters (cumulative, from the last `graph_step` line; the atexit log line is
+  never written, §17.8 bug 3): `c` served 7,212, touch_only 13,588, rows_read 9,663,
+  evictions 26,202; `cpf` served 7,225, touch_only 13,575, rows_read 9,718 (demand +
+  advisory), evictions 26,255. Both: read_errors 0, overruns 0, late_after_fatal 0,
+  no_victim 0.
+- `decode_tokens`: `p1` 512, `c` 511, `cpf` 511. `c` and `cpf` have 495 `graph_step` lines,
+  16 of which hold 2 steps (§17.8 bug 5).
+
+### 17.7 Per-token breakdown
+
+`ANA/prof-graph.nsys-rep` (6.4 MB, kept): option C, prefetch off, one unseen session
+(`--skip 12`), 64 new tokens, `--cuda-graph-trace=graph`. Capture from decode step 16 to
+61 (`prof-graph.log`); the window of 14.80 s holds **35 decode steps** (summed from
+`trace-prof-graph.jsonl`'s `routed_rows / 240`). The session gave 2.102 tok/s, TTFT
+96.0 s. Analysis: `prof-graph-analysis.log`, `prof-graph-stats_{cuda_api_sum,osrt_sum}.csv`,
+`prof-graph-union.py`, `prof-graph-sched.py`. Eager column: `prof-summary.md` (Window C,
+`prof-decode.nsys-rep`, 3a).
+
+| Per token | Option C graph | Eager (Window C) |
+|---|---:|---:|
+| ms/token in capture | **423** (14.80 s / 35) | 790 |
+| ms/token just after capture | **261** (12 steps) | 690 |
+| Profiler overhead | **~62%** | ~15% |
+| GPU busy | **367 ms** (union of graph, kernel and memcpy intervals, 87%; includes the in-graph RAM-miss waits, so it is not compute) | 238 ms (kernels) |
+| GPU idle | **56 ms** | ~550 ms |
+| `cudaGraphLaunch` | 3.1 calls, **203 ms** (~65 ms each, blocking; 3 segments per step) | — |
+| `cudaMemcpyAsync` (D2H copies) | 26 calls, **138 ms** | ~835 calls, 168 ms |
+| `cudaStreamSynchronize` | 14 calls, **26 ms** | ~784 calls, 51 ms |
+| Kernel launches (`cudaLaunchKernel` + ExC) | **52 calls** (24 ms over the window) | ~7.1k calls, 57 ms |
+| Scheduler thread off-CPU | **26 ms** | ~175 ms |
+| `G` / RAM misses per token in the window | 147 / 16.9 | 122 / 16.9 |
+
+**Prefer corpus tok/s (§17.6) over traced ms/token.** Graph-mode profiler overhead is ~62%
+(423 vs 261 ms), and the after-capture figure rests on 12 steps. A graph-mode trace has
+no graph-body kernel table, so **no kernel ranking** was made.
+
+Which eager buckets moved:
+- **Host work, ~340 ms/token** (Python, torch CPU ops, bookkeeping) plus ~57 ms of launch
+  API: launches fell from ~7.1k to 52 per token. The scheduler now spends its time
+  blocked inside `cudaGraphLaunch` (203 ms/token) and `cudaMemcpyAsync` (138 ms/token),
+  each waiting for the previous segment, in-graph waits included. The residual host-CPU
+  bucket was **not computed** from the graph trace.
+- **Syncs, ~220 ms/token** (168 `cudaMemcpyAsync` + 51 `cudaStreamSynchronize`): now 164 ms
+  (138 + 26) in ~40 calls instead of ~1,600. The remaining copies are the Engram break's
+  syncing copies, and their time is mostly waiting on the GPU.
+- **Read + split, ~182 ms/token** on the scheduler thread (off-CPU ~175 ms): moved to the
+  io_uring thread. Scheduler off-CPU is 26 ms/token. RAM misses per token are unchanged
+  (16.9), so the read time now sits inside the graph as the wait kernels' time, within
+  the 367 ms GPU busy. It was **not measured separately**.
+- **Zero-copy gather, ~172 ms/token** (`_gather_host_rows_kernel`): **not measured.** The
+  graph-mode trace has no graph-body kernel table.
+- **GPU idle** fell from ~550 to 56 ms/token.
+
+### 17.8 Known properties and open items
+
+**Known properties:**
+- **Fail-stop latency (D15).** The forward that timed out finishes with that layer's MoE
+  output dropped (later layers take the sticky fast path). Without overlap scheduling its
+  tokens are the last emitted; with overlap one more forward may run before the
+  after-batch check raises. The Engine run took 65 s from the error to process exit, all
+  of it sglang's crash path (§17.5).
+- **Predictor limitation.** The advisory for layer L+1 uses the previous token's routes,
+  and those rows are usually already in RAM. A low `advisory_rows` (30 over 511 tokens)
+  measures the predictor, not the mechanism.
+- **Scratch VRAM.** Graph gather's scratch is 3,195,740,160 B (≈3.0 GiB) out of the hot
+  budget: 888 slots instead of 1,128 at 14,336 MB.
+- **Profiler overhead** in graph mode is ~62% (§17.7).
+- **`f` and `rows_read`.** The trace's `f` counts demand rows only; the thread's
+  `rows_read` includes advisory rows (demand = `rows_read − advisory_rows`).
+
+**Bugs found and fixed in the window** (red / green, all pushed):
+
+| # | Found at | Bug | Fix |
+|---:|---|---|---|
+| 1 | Step 2 | `env-full.sh`'s `SGLANG_MOE_EXPERT_ROW_SOURCE=shards` leaked into `test_expert_pinned_graph_gather_cuda.py` (4 failures; test isolation, not a product regression) | FW `8a52ba1aa2` (fixture clears the var), merged at `9554a8ece1` |
+| 2 | Step 4 | Every option C Engine was refused at argument resolution: the first offload pass runs before `parse_cuda_graph_config`, and the EXL3 gate read the raw `None` as eager decode | `468888abe4` / `dfdd3f798f`, test narrowed at `dad6262508` |
+| 3 | Step 8 prep | `Engine.shutdown` SIGKILLs the scheduler, so the atexit thread-counter line is never written | `e407139c06` / `e5ea4aaeee`: `graph_step` lines carry the cumulative counters |
+| 4 | Step 6 | `trace_corpus.py` left the Engine at log level `error`, so capture, thread-start and hot-cache lines never appeared | `55f2541d53` / `51e3eeb457`: `--graphs` sets `log_level="info"` |
+| 5 | Step 8 | Under overlap scheduling a per-batch register read lags one step now and then; `live_summary` counted lines as tokens (495 instead of 511; `G` 131.0 instead of 126.9) | `8344f30e61` / `4b906b3d4f`: lines carry `steps`; `c` and `cpf` rerun |
+
+**Open:**
+- **The MQA alt-stream defect** in segment 0 (§17.1). The DSV4 multi-stream overlap stays
+  off for EXL3 breakable decode until it is found; its speed-up is unmeasured.
+- **Raw JSON `--cuda-graph-config` crash** in `memory_hook.py:174-176`: the framework's
+  graph-gather check reads `.decode` off any non-None pre-parse value, so an explicit JSON
+  dict with graph gather would raise `AttributeError` in the pre-parse pass. Flag-only
+  launches pass `None` and are unaffected. Not fixed (framework branch, R3 scope).
+- **Trace lines written before `4b906b3d4f` undercount steps under overlap.** For such a
+  trace use `routed_rows / routed_rows_per_step` (240 on the full model).
+- **P1 `T3` FlashMLA page-split OOM at high mem fractions.** The sm_120 page-split buffer
+  scales with the KV pool: `T3` needs `mem_fraction_static` 0.5, or 0.8 with a
+  `max_total_tokens` cap (`graph_parity.py`). The full model at 0.80 was unaffected.
+- **R4** stays FAIL against the eager loop (§17.4).
+- Parked minors from the ledger that a reader may hit:
+  - the RAM-miss thread is not stopped at a clean scheduler shutdown (the exit hook
+    covers it; Task 14 M3);
+  - a timeout during warmup surfaces only at the first batch check (Task 14 M5);
+  - `pool_host/common.py:171` raises a `TypeError` that masks a `cudaHostRegister` error
+    (Task 13, outside scope);
+  - the slot table's `contains()` is true at slot claim, before the read completes; the
+    device reads the published map and eager paths pause the thread first, so production
+    is unaffected (Task 15 ruling);
+  - the dense NVFP4 path submits its promotion copy after host use closes (default no-op
+    table only; Task 7);
+  - a TODO to upstream an `allow_graph` option for `_EagerGraphView` (Task 3).
+- **Engram hit rate, first reading on the full model.** Bug 4's fix put the
+  `engram row cache:` line into the corpus logs. The last line per arm reads: `p1` 17,889
+  hits of 73,680 accesses (**0.243**), `c` and `cpf` 17,409 of 73,680 (**0.236**), 1,024
+  lookups each (`corpus-{p1,c,cpf}.log`). These are 4 cold sessions against §5's 71.7%
+  exact-LRU ceiling over 1.5M tokens. The line's scope (which phases it counts, whether it
+  is cumulative) was not checked, so §16.11 stays open.
+- Not run in 3b: graph decode at bs > 1 or with DSpark, and nvme1.
 
 ## Sources
 
