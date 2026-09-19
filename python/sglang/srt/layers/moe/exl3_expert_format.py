@@ -112,6 +112,9 @@ class Exl3ExpertFormat:
     key = "exl3"
     supports_graph_gather = False
     supports_host_arena = False
+    # Graph gathers read missed rows from the pinned host tier by pinned slot
+    # (PinnedTierRowBackend); there is no dense [experts, ...] host source.
+    graph_source_kind = "pinned_tier"
     max_gather_rows: Optional[int] = EXL3_MAX_GATHER_ROWS
     names = EXL3_STREAMED_NAMES
 

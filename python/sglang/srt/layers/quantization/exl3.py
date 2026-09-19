@@ -374,7 +374,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def apply(self, layer: nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert_not_capturing("Exl3MoEMethod.apply")
         cfg = self.moe_runner_config
         # CONTRACT: exl3_moe_loop applies the route weight before w2 and does not
         # apply it on the input; reject configs that ask otherwise, matching
@@ -387,7 +386,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         topk = dispatch_output.topk_output
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         streamer = expert_streamer_of(layer)
-        if streamer is not None:
+        if streamer is not None and streamer.serves_graph_gather(topk):
+            out = self._apply_graph(
+                layer, streamer, dispatch_output.hidden_states, topk_weights, topk_ids, cfg.swiglu_limit
+            )
+        elif streamer is not None:
+            assert_not_capturing("Exl3MoEMethod.apply")
             out = self._apply_streamed(
                 layer,
                 streamer,
@@ -397,6 +401,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 cfg.swiglu_limit,
             )
         else:
+            assert_not_capturing("Exl3MoEMethod.apply")
             out = exl3_moe_loop(
                 dispatch_output.hidden_states,
                 topk_weights,
@@ -415,6 +420,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if cfg.routed_scaling_factor is not None and not layer.should_fuse_routed_scaling_factor_in_topk:
             out = out * cfg.routed_scaling_factor
         return StandardCombineInput(hidden_states=out)
+
+    @staticmethod
+    def _apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+        """BS1 decode inside a CUDA graph: device-only gather, then the fused MoE over slots.
+
+        Hits are read in place from the hot cache, misses land in scratch rows from
+        the pinned tier (PinnedTierRowBackend), and routes are recorded on the device
+        by the planner. A row missing from RAM sets the backend's ``keep`` to 0,
+        which drops this layer's routed output; the host fail-stop check stops the
+        process after the forward.
+        """
+        from sglang.srt.layers.quantization.exl3_fused_moe import exl3_fused_moe_for
+
+        if swiglu_limit is None:
+            raise NotImplementedError("exl3 in-graph MoE: a swiglu_limit is required (DSV4.1 sets 10.0)")
+        remap, _ = streamer.gather(topk_ids)
+        fused = exl3_fused_moe_for(layer, streamer)
+        out = fused.run(
+            x,
+            topk_weights.reshape(-1),
+            remap.reshape(-1).long(),
+            streamer.row_backend.keep,
+            swiglu_limit,
+        )
+        return out.to(x.dtype)
 
     @staticmethod
     def _apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
