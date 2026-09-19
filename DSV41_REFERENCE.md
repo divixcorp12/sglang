@@ -93,8 +93,9 @@ The design that follows is in §9. Decisions still open are in §12.
    node-mode trace of option C, 391 ms/step under tracing): 190 ms waiting for NVMe reads
    (10.2 ms per row), 128 ms gathering rows over PCIe (1.06 ms per row), 17 ms of
    compute and ~11 ms in the two Engram breaks, all serialized. The remaining ~41 ms/step
-   in that window is one residency-boundary stall: every 32 decode forwards the hot cache
-   promotes experts synchronously, stalling decode for ~1.2–2.1 s (§18.6).
+   in that window is one outlier residency-boundary stall (2.1 s). On the corpus sessions a
+   boundary costs ~40–80 ms per 32 tokens (<1%) and its promotions pay for themselves:
+   16% fewer VRAM misses, +3.4% tok/s against no decode boundaries (§18.6).
    Overlapping copies with compute is worth at most ~4%. Prefetch with the
    next layer's gate catches 48% of NVMe rows at top-6 but wastes 2.5 reads per useful
    one; a confidence-gated set is estimated at ~6% (one layer ahead) to ~10% (two) of the
@@ -2083,7 +2084,7 @@ calls = **50.6 decode steps**. Session decode 2.289 tok/s (traced). Report
 | `exl3_ram_miss_wait_kernel`: the GPU waits for NVMe reads | **190** | 48.6% |
 | `copy_expert_row_segments_gpu_kernel`: pinned RAM to VRAM gather | **128** | 32.7% |
 | all compute (EXL3 GEMVs, `exl3_moe`, attention, mHC, router, …) | **16.8** | 4.3% |
-| one residency-boundary stall, averaged over the window (§18.6) | ~41 | ~10.6% |
+| one residency-boundary stall (2.1 s, an outlier), averaged over the window (§18.6) | ~41 | ~10.6% |
 | the two Engram breaks (graph → eager → graph) | ~11 | ~2.9% |
 
 - **Everything is serialized.** The union of wait, gather and compute intervals equals
@@ -2214,19 +2215,53 @@ The ~41 ms/step of GPU idle between steps in §18.2 is not a per-step cost.
 - **Cause.** `_update_residency` runs only at a residency boundary. Phase 3a's `env.sh` sets
   `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=32` and `SGLANG_MOE_HOT_ASYNC_PROMOTIONS=0`, so
   every 32nd decode forward promotes experts synchronously, reading from NVMe the rows not
-  in RAM. One boundary costs ~1.2–2.1 s, about 40–65 ms per token over 32 tokens (10–15% of
-  decode). Nothing in the plans records why async promotions are off for DSV4.1.
-- **Measuring it (in flight):** paired Phase 3b `c` arms on sessions 0–3 in
-  `OVL/boundary/`:
-  - `c32`, as now;
-  - `c0`, `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=0`: no decode boundaries, residency still
-    updates at each prefill;
-  - `casync`, `c32` plus `SGLANG_MOE_HOT_ASYNC_PROMOTIONS=1`.
+  in RAM.
+- **`SGLANG_MOE_HOT_ASYNC_PROMOTIONS=1` does nothing for EXL3.** EXL3 streams six tensors per
+  expert (`EXL3_STREAMED_NAMES`), none with a dense source, so `stage_reassign` takes
+  `_load_reserved` and returns no promotion to defer. That path promotes through the
+  pinned tier in chunks (`ExpertHotCache._load_reserved_in_chunks`), and each chunk:
+  1. pauses the RAM-miss thread (`host_use`);
+  2. admits its rows into the pinned tier, reading NVMe for rows not in RAM;
+  3. copies them to the GPU, one kernel per tensor (the 6 stream-37 kernels);
+  4. waits in `current_stream.synchronize()` before the next chunk may evict pinned rows.
+
+  Dropping the sync alone would let the next chunk or the resumed thread overwrite pinned
+  rows a copy still reads. A real async path needs those rows protected until the copy
+  completes, slots published on completion, and the NVMe reads off the scheduler thread.
+  **Since 2026-09-19 the EXL3 requirements refuse the flag** instead of ignoring it.
+
+**Paired arms** (`OVL/boundary/`, `boundary-arms.sh`): Phase 3b's `c` shape (option C,
+sessions 0–3, 256-token prompts, 128 new tokens, 888 slots), `wt-dsv41` at `76829dff55`,
+run back to back on 2026-09-19.
+
+| Arm | Change | tok/s mean | Per session | G | RAM misses/token |
+|---|---|---:|---|---:|---:|
+| `c32` | none | **2.823** | 2.246 / 3.222 / 2.289 / 3.535 | 126.9 | 18.52 |
+| `casync` | `SGLANG_MOE_HOT_ASYNC_PROMOTIONS=1` (ignored, above) | 2.817 | 2.231 / 3.220 / 2.285 / 3.534 | 126.9 | 18.52 |
+| `c0` | `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=0` | 2.729 | 1.844 / 3.252 / 2.317 / 3.502 | 151.8 | 18.98 |
+
+- `c32` reproduces 3b's `c` (2.781). `casync` equals `c32` to within 0.3%, with identical
+  G and RAM misses: the flag is inert.
+- **Decode-time promotions pay for themselves:** they cut G by 16% (24.9 rows/token, ~26 ms
+  of gather at 1.055 ms/row). Net +3.4% tok/s, carried by session 0 (+22%); sessions 1–3
+  are within ±1.3%. Median step 331 ms (`c32`) against 374 ms (`c0`).
+- **A typical boundary is cheap.** Steps at the 32-forward boundaries (and the step after,
+  for overlap lag) average 400 ms against 359 ms for other steps in `c32` (~82 ms of
+  excess per boundary). In `c0`, which has no boundaries, the same positions show ~41 ms,
+  so ~40–80 ms per boundary, **~1–2.5 ms/token (<1%)**. `c32`'s slowest step in 494 was
+  1.6 s; p99 804 ms against `c0`'s 811.
+- So the 2.1 s stall of §18.2's window, and py-spy's 45 ms/step average on the same
+  `--skip 12` session, are a promotion burst on that session, not the typical cost.
+  Extrapolating it (40–65 ms/token) was wrong. How often bursts happen across sessions is
+  unmeasured.
+- **Ruling:** keep `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=32`; defer a real async promotion
+  path (under 1% on these sessions) unless bursts prove common.
 
 ### 18.7 Open
 
-- The boundary arms above: whether decode-time promotions earn back their stall, and
-  whether async promotions work with EXL3 and option C.
+- **How common are promotion bursts?** One session (`--skip 12`) stalled 2.1 s at a boundary;
+  sessions 0–3 never exceeded 1.6 s per step. Tracing more sessions settles whether async
+  promotions are worth building.
 - **Stream 37's copies are the boundary's promotions** (§18.6); they do not run during
   ordinary steps.
 - A prefetch prototype (confidence-gated L+1 or L+2 lookahead, prefetch reads queued

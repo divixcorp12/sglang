@@ -49,6 +49,14 @@ def _check(cfg, budgets) -> None:
     ``full`` cannot work: the Engram lookup reads its ids on the host. A breakable decode
     graph also turns DSV4's alt-stream overlap off (below).
     """
+    if envs.SGLANG_MOE_HOT_ASYNC_PROMOTIONS.get():
+        # EXL3 rows come only from the row source, so the hot cache promotes them
+        # through the pinned tier chunk by chunk, synchronously
+        # (ExpertHotCache._load_reserved_in_chunks); the flag would be ignored.
+        raise ValueError(
+            "SGLANG_MOE_HOT_ASYNC_PROMOTIONS has no effect on EXL3 experts: their "
+            "promotions run synchronously through the pinned host tier; unset it"
+        )
     if envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get() and not budgets.graph_gather:
         raise ValueError(
             "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH posts advisories from the in-graph MoE; "
