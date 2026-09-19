@@ -251,11 +251,19 @@ class TestEagerFormatRequirements(_GateTest):
             memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
     def test_expert_prefetch_is_refused(self):
+        # Satisfy memory_hook's own generic prefetch preconditions (nonzero
+        # budgets, the stat recorder) so the eager format's own refusal, not
+        # that earlier generic one, is what raises here.
         os.environ["SGLANG_MOE_PREFETCH_MAX_CANDIDATES"] = "1"
         with self.assertRaisesRegex(
             ValueError, "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
         ):
-            memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
+            memory_hook.handle_offload_compatibility(
+                _launch(
+                    quantization="eager_test",
+                    expert_distribution_recorder_mode="stat",
+                )
+            )
 
     def test_gpu_residency_update_is_refused(self):
         os.environ["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] = "1"
