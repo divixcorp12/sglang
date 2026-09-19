@@ -224,3 +224,11 @@ def iter_expert_streamers(model: torch.nn.Module) -> Iterator["ExpertStreamer"]:
         streamer = expert_streamer_of(module)
         if streamer is not None:
             yield streamer
+
+
+def resolve_row_source_kind() -> str:
+    """The row source kind ``SGLANG_MOE_EXPERT_ROW_SOURCE`` selects (default ``auto``)."""
+    kind = envs.SGLANG_MOE_EXPERT_ROW_SOURCE.get().strip()
+    if not kind:
+        raise ValueError("SGLANG_MOE_EXPERT_ROW_SOURCE must name a row source kind")
+    return kind

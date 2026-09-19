@@ -499,6 +499,10 @@ class Envs:
     # breaking the graph for the host read.
     SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY = EnvBool(False)
     SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
+    # Where host expert rows are read from: auto | files | tensor, or a kind the
+    # expert format defines. auto keeps each format's default (dense NVFP4 layers:
+    # their expert files through io_uring, unless SGLANG_MOE_EXPERT_FILE_READER=mmap).
+    SGLANG_MOE_EXPERT_ROW_SOURCE = EnvStr("auto")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
     # Copy all host expert rows into registered memory (replaces the pinned LRU).
     SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
