@@ -71,8 +71,10 @@ class EngramFileTable:
 
     def _fetch(self, keys: np.ndarray) -> np.ndarray:
         ids = torch.from_numpy(keys - self._tag)
-        weight = torch.empty((ids.numel(), self.dim), dtype=torch.uint8)
-        scale = torch.empty((ids.numel(), self.dim // self.block), dtype=torch.uint8)
+        # The file reader needs CPU destinations; a default device (the reference
+        # oracle sets "cuda") must not move them.
+        weight = torch.empty((ids.numel(), self.dim), dtype=torch.uint8, device="cpu")
+        scale = torch.empty((ids.numel(), self.dim // self.block), dtype=torch.uint8, device="cpu")
         self._weight_rows.read_rows(ids, weight)
         self._scale_rows.read_rows(ids, scale)
         return torch.cat([weight, scale], dim=1).numpy()
