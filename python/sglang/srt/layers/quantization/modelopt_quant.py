@@ -70,7 +70,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_flags, get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -1053,6 +1053,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "FP8_BLOCK_SCALES":
+                if (
+                    envs.SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT.get()
+                    and get_flags().moe.in_speculative_scope
+                ):
+                    return self._draft_nvfp4_requant_moe_method(prefix)
                 return Fp8MoEMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
@@ -1063,6 +1068,22 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             return None
 
         return None
+
+    def _draft_nvfp4_requant_moe_method(self, prefix: str) -> FusedMoEMethodBase:
+        # Local import: nvfp4_online imports this module.
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            ModelOptNvFp4OnlineFusedMoEMethod,
+            make_modelopt_fp4_online_config_from_fp8,
+        )
+
+        online_config = make_modelopt_fp4_online_config_from_fp8(
+            {
+                "quant_method": "fp8",
+                "weight_block_size": self.fp8_pb_wo_config.weight_block_size,
+                "packed_modules_mapping": self.packed_modules_mapping,
+            }
+        )
+        return ModelOptNvFp4OnlineFusedMoEMethod(online_config, prefix)
 
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):

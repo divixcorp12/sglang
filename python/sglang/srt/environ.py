@@ -378,6 +378,8 @@ class Envs:
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    # Stream ModelOpt NVFP4 routed experts from host memory; required for hot caching.
+    SGLANG_MOE_EXPERT_STREAM = EnvBool(False)
     SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
     SGLANG_MOE_PINNED_HOST_MB = EnvInt(0)
     SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
@@ -498,6 +500,9 @@ class Envs:
     # Stage file-backed PLE rows before decode CUDA-graph replay instead of
     # breaking the graph for the host read.
     SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY = EnvBool(False)
+    # Keep the Qwen4-Exp token embedding in pinned host memory and gather its
+    # rows over PCIe; a speculative draft binds the same host table.
+    SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING = EnvBool(False)
     SGLANG_MOE_EXPERT_FILE_READER = EnvStr("mmap")
     # Where host expert rows are read from: auto | files | tensor, or a kind the
     # expert format defines. auto keeps each format's default (dense NVFP4 layers:
@@ -1201,6 +1206,9 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Load a ModelOpt MIXED_PRECISION draft's FP8_BLOCK_SCALES experts as NVFP4
+    # (per-tensor activation scale 1.0); target layers are unaffected.
+    SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")

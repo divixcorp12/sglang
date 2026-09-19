@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -6,12 +7,21 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import draft_model_build_scope
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptMixedPrecisionConfig,
+)
+from sglang.srt.layers.quantization.nvfp4_online import (
+    ModelOptNvFp4OnlineFusedMoEMethod,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.utils.offloader import _iter_streamed_nvfp4_parameters
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -131,6 +141,56 @@ class TestModelOptNvfp4(CustomTestCase):
                 group_size=16,
                 use_per_token_activation=True,
             )
+
+
+_DRAFT_EXPERTS = "mtp.layers.0.mlp.experts"
+
+
+@patch(
+    "sglang.srt.layers.quantization.modelopt_quant.get_platform",
+    return_value=SimpleNamespace(is_blackwell=True),
+)
+class TestDraftMoeNvfp4Requant(CustomTestCase):
+    """FP8-block draft experts load as NVFP4 only when asked, and only in the draft."""
+
+    def setUp(self):
+        self.config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    _DRAFT_EXPERTS: {"quant_algo": "FP8_BLOCK_SCALES", "group_size": 128},
+                },
+            }
+        )
+        self.moe = FusedMoE.__new__(FusedMoE)
+
+    def test_flag_on_in_draft_scope_requantizes_with_per_tensor_activation(self, _):
+        with envs.SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT.override(True):
+            with draft_model_build_scope():
+                method = self.config.get_quant_method(self.moe, _DRAFT_EXPERTS)
+        self.assertIsInstance(method, ModelOptNvFp4OnlineFusedMoEMethod)
+        self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+        self.assertFalse(method.quant_config.use_per_token_activation)
+
+    def test_requantized_draft_experts_stay_on_the_gpu(self, _):
+        with envs.SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT.override(True):
+            with draft_model_build_scope():
+                method = self.config.get_quant_method(self.moe, _DRAFT_EXPERTS)
+        module = nn.Module()
+        module.quant_method = method
+        self.assertEqual(list(_iter_streamed_nvfp4_parameters(module)), [])
+
+    def test_flag_on_outside_draft_scope_keeps_fp8(self, _):
+        with envs.SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT.override(True):
+            method = self.config.get_quant_method(self.moe, _DRAFT_EXPERTS)
+        self.assertIs(type(method), Fp8MoEMethod)
+
+    def test_flag_off_keeps_fp8(self, _):
+        with envs.SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT.override(False):
+            with draft_model_build_scope():
+                method = self.config.get_quant_method(self.moe, _DRAFT_EXPERTS)
+        self.assertIs(type(method), Fp8MoEMethod)
 
 
 if __name__ == "__main__":
