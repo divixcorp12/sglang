@@ -11,8 +11,21 @@ several batch sizes (rows per reader submission):
   rows, buffered for the three small names).
 
 The repacked copy is written once, next to nothing else, into ``--work-dir``,
-which must sit on the drive being measured; the script deletes it at the end.
-Every reader read is bounded up front by ``--max-read-gb``.
+which must sit on the drive being measured: the run refuses a work dir on
+another device or on a RAM-backed filesystem. It deletes the copy at the end.
+Every read is bounded up front by ``--max-read-gb`` (3.5 GB, the plan's cap,
+warmup reads included) and the write by ``--max-write-gb`` (0.35 GB).
+
+Only the reads are timed. Before each timed pass every destination and bounce
+buffer is faulted in and one row is read (the shard files are opened, the
+io_uring reader is warm), so page-fault cost is outside every region. All three
+arms share one byte basis, ``payload_bytes`` (the six streamed tensors of every
+row, ``gb_per_s``); ``file_bytes`` / ``file_gb_per_s`` count what the drive
+moved (page-aligned supersets on the shard arms). ``deterministic`` on
+``superset_split`` only says the split reproduces the repack pass's split; it
+does not compare with the checkpoint (the source's own tests do). ``verified``
+on ``repacked_per_name`` is a real file round-trip. ``--buffered`` reads through
+the page cache and is for CPU tests, never for drive numbers.
 """
 
 from __future__ import annotations
@@ -25,7 +38,12 @@ import time
 
 import torch
 
-from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+from bench_expert_reads import drop_superset_ranges, superset_file_bytes
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.exl3_expert_format import (  # noqa: F401 (EXL3_STREAMED_NAMES: tests)
+    EXL3_STREAMED_NAMES,
+    Exl3ExpertFormat,
+)
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
 from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
@@ -37,8 +55,13 @@ from sglang.srt.model_loader.file_row_reader import (
 )
 
 
+# A repacked copy on one of these is RAM, not the drive under test.
+_RAM_FILESYSTEMS = frozenset({"tmpfs", "ramfs", "overlay", "devtmpfs"})
+
+
 def _page_aligned(nbytes: int) -> torch.Tensor:
-    storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8)
+    """A page-aligned uint8 buffer, already faulted in (zero-filled, untimed)."""
+    storage = torch.zeros(nbytes + PAGE_BYTES, dtype=torch.uint8)
     start = (-storage.data_ptr()) % PAGE_BYTES
     return storage[start : start + nbytes]
 
@@ -59,16 +82,82 @@ def _drop_cache(path: str) -> None:
         os.close(fd)
 
 
+def _existing_ancestor(path: str) -> str:
+    path = os.path.realpath(path)
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    return path
+
+
+def _device_of(path: str) -> int:
+    return os.stat(path).st_dev
+
+
+def _unescape_mount_point(field: str) -> str:
+    return field.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+
+
+def _fs_type(path: str) -> str:
+    """Filesystem type of the mount that holds ``path`` (from /proc/self/mountinfo)."""
+    path = os.path.realpath(path)
+    best, best_type = "", None
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            head, _, tail = line.partition(" - ")
+            fields = head.split()
+            if len(fields) < 5 or not tail:
+                continue
+            mount_point = _unescape_mount_point(fields[4])
+            inside = mount_point == "/" or path == mount_point or path.startswith(mount_point + "/")
+            if inside and len(mount_point) >= len(best):
+                best, best_type = mount_point, tail.split()[0]
+    if best_type is None:
+        raise SystemExit(f"cannot tell which filesystem holds {path}")
+    return best_type
+
+
+def _check_work_dir(work_dir: str, shard_path: str) -> None:
+    """Refuse a scratch dir that is not on the shards' drive or is RAM-backed."""
+    anchor = _existing_ancestor(work_dir)
+    shard = os.path.realpath(shard_path)
+    if _device_of(anchor) != _device_of(shard):
+        raise SystemExit(
+            f"--work-dir {work_dir} is not on the drive that holds the shards ({shard}); "
+            "the repacked copy must sit on the drive under test"
+        )
+    fs_type = _fs_type(anchor)
+    if fs_type in _RAM_FILESYSTEMS:
+        raise SystemExit(
+            f"--work-dir {work_dir} is on a {fs_type} mount, which is not the drive under test"
+        )
+
+
+def _buffered_names(sources: dict, slabs: dict) -> list[str]:
+    """Names whose repacked reads are buffered: not a page-multiple row, or a misaligned slab."""
+    return sorted(
+        name
+        for name, source in sources.items()
+        if not source.direct or slabs[name].data_ptr() % PAGE_BYTES
+    )
+
+
 def planned_read_bytes(
-    buffer_bytes: int, streamed_bytes: int, rows: int, batches: list[int]
+    buffer_bytes: int,
+    streamed_bytes: int,
+    rows: int,
+    batches: list[int],
+    *,
+    warmup_rows: int = 0,
 ) -> int:
     """Bytes the run reads from the drive under test.
 
     The shards give the repack pass plus two superset modes per batch size; the
     repacked copy, which sits on the same drive, gives one per-name pass per
-    batch size.
+    batch size. Each arm also reads ``warmup_rows`` untimed rows per batch size.
     """
-    return rows * (buffer_bytes * (1 + 2 * len(batches)) + streamed_bytes * len(batches))
+    timed = rows * (buffer_bytes * (1 + 2 * len(batches)) + streamed_bytes * len(batches))
+    warmup = warmup_rows * len(batches) * (2 * buffer_bytes + streamed_bytes)
+    return timed + warmup
 
 
 def run(
@@ -80,21 +169,41 @@ def run(
     *,
     direct: bool = True,
     seed: int = 0,
-    max_read_gb: float = 4.5,
+    max_read_gb: float = 3.5,
+    max_write_gb: float = 0.35,
+    require_same_drive: bool = True,
 ) -> list[dict]:
+    if rows < 1:
+        raise SystemExit("rows must be at least 1")
+    if not batches or any(not 1 <= batch <= rows for batch in batches):
+        raise SystemExit(f"every batch must be in [1, rows={rows}]")
     layout = build_exl3_expert_layout(expert_dir)
     fmt = Exl3ExpertFormat(layout, layer, direct=direct)
     specs = fmt.tensor_specs(None)
     reader = Exl3RowReader(layout, direct=direct)
     streamed_bytes = sum(spec.row_bytes for spec in specs)
-    planned = planned_read_bytes(reader.buffer_bytes, streamed_bytes, rows, batches)
+    planned = planned_read_bytes(reader.buffer_bytes, streamed_bytes, rows, batches, warmup_rows=1)
     if planned > max_read_gb * 1e9:
         raise SystemExit(
             f"this run would read {planned / 1e9:.2f} GB, over --max-read-gb {max_read_gb}"
         )
+    if rows * streamed_bytes > max_write_gb * 1e9:
+        raise SystemExit(
+            f"the repacked copy would write {rows * streamed_bytes / 1e9:.2f} GB, "
+            f"over --max-write-gb {max_write_gb}"
+        )
     if rows > layout.num_experts:
         raise SystemExit(f"layer {layer} has only {layout.num_experts} experts")
     experts = sorted(random.Random(seed).sample(range(layout.num_experts), rows))
+    keys = [(layer, expert) for expert in experts]
+    if require_same_drive:
+        _check_work_dir(work_dir, layout.records[keys[0]].path)
+    context = {
+        "layer": layer,
+        "queue_depth": int(envs.SGLANG_URING_FILE_READER_QUEUE_DEPTH.get()),
+    }
+    file_bytes = superset_file_bytes(layout, keys)
+    payload_bytes = rows * streamed_bytes
 
     created = not os.path.exists(work_dir)
     os.makedirs(work_dir, exist_ok=True)
@@ -118,43 +227,66 @@ def run(
             spec.name: AlignedRowSource(uring, paths[spec.name], spec.row_bytes, rows, direct=direct)
             for spec in specs
         }
+        for path in {layout.records[key].path for key in keys}:
+            reader._file(path)  # opens the shard (and sizes it) before any clock starts
+        ids0 = torch.zeros(1, dtype=torch.int64)
         for batch in batches:
             # superset_raw
             bounce = _page_aligned(batch * reader.buffer_bytes).view(batch, reader.buffer_bytes)
+            reader.read(keys[:1], [bounce[0].data_ptr()])  # untimed warm read
+            if not direct:
+                drop_superset_ranges(layout, keys)
             began = time.perf_counter()
             for start in range(0, rows, batch):
-                chunk = experts[start : start + batch]
-                reader.read(
-                    [(layer, expert) for expert in chunk],
-                    [bounce[i].data_ptr() for i in range(len(chunk))],
-                )
+                chunk = keys[start : start + batch]
+                reader.read(chunk, [bounce[i].data_ptr() for i in range(len(chunk))])
             seconds = time.perf_counter() - began
-            results.append(_row("superset_raw", batch, rows, seconds, layout.row_bytes))
+            results.append(
+                _row("superset_raw", batch, rows, seconds, payload_bytes, file_bytes, direct, context)
+            )
 
             # superset_split
             slabs = _slabs(specs, rows)
             source = Exl3ShardRowSource(reader, layer, fmt.segment_map(), bounce_rows=batch)
+            source.bounce.zero_()  # the shared bounce is only as warm as its last user
+            source.read(torch.tensor(experts[:1]), slabs)  # untimed warm read
+            for slab in slabs.values():
+                slab.zero_()
+            if not direct:
+                drop_superset_ranges(layout, keys)
             began = time.perf_counter()
             stats = source.read(torch.tensor(experts), slabs)
             seconds = time.perf_counter() - began
-            row = _row("superset_split", batch, rows, seconds, streamed_bytes)
+            row = _row("superset_split", batch, rows, seconds, payload_bytes, file_bytes, direct, context)
             row["read_ms_per_row"] = stats.read_ns / 1e6 / rows
             row["split_ms_per_row"] = stats.split_ns / 1e6 / rows
             row["split_share"] = stats.split_ns / max(stats.read_ns + stats.split_ns, 1)
-            row["verified"] = all(torch.equal(slabs[n].view(torch.uint8), truth[n].view(torch.uint8)) for n in slabs)
+            row["deterministic"] = all(
+                torch.equal(slabs[n].view(torch.uint8), truth[n].view(torch.uint8)) for n in slabs
+            )
             results.append(row)
 
             # repacked_per_name
+            slabs = _slabs(specs, rows)
+            read_plans(uring, [repacked[n].plan(ids0, slabs[n], ids0) for n in slabs])  # untimed warm read
+            for slab in slabs.values():
+                slab.zero_()
             for path in paths.values():
                 _drop_cache(path)
-            slabs = _slabs(specs, rows)
             began = time.perf_counter()
             for start in range(0, rows, batch):
                 ids = torch.arange(start, min(start + batch, rows), dtype=torch.int64)
                 read_plans(uring, [repacked[n].plan(ids, slabs[n], ids) for n in slabs])
             seconds = time.perf_counter() - began
-            row = _row("repacked_per_name", batch, rows, seconds, streamed_bytes)
-            row["verified"] = all(torch.equal(slabs[n].view(torch.uint8), truth[n].view(torch.uint8)) for n in slabs)
+            buffered = _buffered_names(repacked, slabs)
+            row = _row(
+                "repacked_per_name", batch, rows, seconds, payload_bytes, payload_bytes,
+                direct and not buffered, context,
+            )
+            row["buffered_names"] = buffered
+            row["verified"] = all(
+                torch.equal(slabs[n].view(torch.uint8), truth[n].view(torch.uint8)) for n in slabs
+            )
             results.append(row)
     finally:
         for path in paths.values():
@@ -166,14 +298,29 @@ def run(
     return results
 
 
-def _row(mode: str, batch: int, rows: int, seconds: float, row_bytes: int) -> dict:
+def _row(
+    mode: str,
+    batch: int,
+    rows: int,
+    seconds: float,
+    payload_bytes: int,
+    file_bytes: int,
+    direct: bool,
+    context: dict,
+) -> dict:
     return {
         "mode": mode,
         "batch": batch,
         "rows": rows,
+        **context,
+        "direct": bool(direct),
         "seconds": seconds,
         "ms_per_row": seconds * 1e3 / rows,
-        "gb_per_s": rows * row_bytes / seconds / 1e9,
+        "bytes_basis": "streamed_payload",
+        "payload_bytes": payload_bytes,
+        "gb_per_s": payload_bytes / seconds / 1e9,
+        "file_bytes": file_bytes,
+        "file_gb_per_s": file_bytes / seconds / 1e9,
     }
 
 
@@ -184,7 +331,8 @@ def main() -> None:
     p.add_argument("--rows", type=int, default=12)
     p.add_argument("--batch", type=int, nargs="+", default=[1, 4, 8])
     p.add_argument("--work-dir", required=True, help="scratch dir on the drive under test")
-    p.add_argument("--max-read-gb", type=float, default=4.5)
+    p.add_argument("--max-read-gb", type=float, default=3.5)
+    p.add_argument("--max-write-gb", type=float, default=0.35)
     p.add_argument("--buffered", action="store_true")
     args = p.parse_args()
     for row in run(
@@ -195,6 +343,7 @@ def main() -> None:
         args.work_dir,
         direct=not args.buffered,
         max_read_gb=args.max_read_gb,
+        max_write_gb=args.max_write_gb,
     ):
         print(json.dumps(row), flush=True)
 
