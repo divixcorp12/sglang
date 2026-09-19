@@ -55,7 +55,8 @@ def engine_kwargs(args) -> dict:
         disable_radix_cache=True,
     )
     if getattr(args, "graphs", False):
-        kwargs.update(GRAPH_KWARGS)
+        # The capture, RAM-miss thread and hot cache startup lines are info logs.
+        kwargs.update(GRAPH_KWARGS, log_level="info")
     else:
         kwargs["disable_cuda_graph"] = True
     return kwargs
