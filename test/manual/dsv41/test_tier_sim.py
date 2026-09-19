@@ -118,6 +118,39 @@ def test_decode_boundaries_promote_a_frequent_expert():
     assert static["vram_misses"] == 3 and static["decode_promotion_rows"] == 0
 
 
+def test_a_call_touches_its_ram_hits_before_admitting_its_misses():
+    # ExpertPinnedHostCache.gather_rows looks up the whole chunk first, so call
+    # [0, 1] touches expert 1 and then evicts 2 for expert 0: 3 RAM misses. Walking
+    # the experts one by one would evict 1 for 0 and miss on 1 again (4).
+    calls = [_call(1, 0, [1]), _call(2, 0, [2]), _call(3, 0, [0, 1])]
+    out = simulate(calls, num_layers=1, num_experts=4, vram_slots=0, ram_slots=2)
+    assert (out["vram_misses"], out["ram_misses"]) == (4, 3)
+
+
+def test_a_promotion_admits_a_missing_row_but_never_touches_a_held_one():
+    # One VRAM slot. Expert 1 is promoted at forward 2 while RAM already holds it
+    # (order 0, 1, 2), and 3 replaces it at forward 5. ensure_rows leaves 1's place
+    # in the LRU order alone, so once it is unpinned it is the oldest evictable row:
+    # forward 7 (expert 5) evicts 1 (after 0 went at forward 6), and forward 8 misses
+    # on 1. A promotion that touched it would have evicted 2 instead.
+    calls = [
+        _call(1, 0, [1, 2]),
+        _call(2, 0, [1, 2]),
+        _call(3, 0, [3]),
+        _call(4, 0, [3]),
+        _call(5, 0, [3]),
+        _call(6, 0, [4]),
+        _call(7, 0, [5]),
+        _call(8, 0, [1]),
+    ]
+    out = simulate(
+        calls, num_layers=1, num_experts=6, vram_slots=1, ram_slots=4, max_gather_rows=2,
+        update_decode_forwards=1, min_residence_forwards=0, benefit_ratio=1.0,
+    )
+    assert (out["decode_promotion_rows"], out["decode_promotion_ram_misses"]) == (2, 0)
+    assert (out["vram_misses"], out["ram_misses"]) == (10, 6)
+
+
 def test_prefill_counts_apart_from_decode():
     calls = [_call(1, 0, [5, 6], tokens=4), _call(2, 0, [5])]
     out = simulate(calls, num_layers=1, num_experts=8, vram_slots=0, ram_slots=4)
@@ -176,6 +209,22 @@ def test_cli_writes_rows_live_numbers_and_a_hot_seed(tmp_path):
     assert {"ms_per_token_nvme2", "ms_per_token_x4", "G", "f", "policy"} <= set(report["rows"][0])
     assert report["live"]["G"] == pytest.approx(1.5) and report["live"]["f"] == pytest.approx(2 / 3)
     assert json.loads(seed.read_text()) == {"count": [[0, 2, 1, 0]]}
+
+
+def test_a_trace_missing_miss_counts_on_a_later_line_reports_no_live_numbers(tmp_path):
+    trace = tmp_path / "trace.jsonl"
+    late = _call(2, 0, [1])
+    del late["vram_miss"], late["ram_miss"]
+    calls = [_call(1, 0, [1], vram_miss=1, ram_miss=1), late]
+    trace.write_text("\n".join(json.dumps(c) for c in calls) + "\n")
+    script = os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts", "dsv41", "tier_sim.py")
+    result = subprocess.run(
+        [sys.executable, script, str(trace), "--vram-slots", "0", "--ram-slots", "4",
+         "--update-decode-forwards", "0", "--num-layers", "1", "--num-experts", "4",
+         "--max-gather-rows", "2"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout)["live"] is None
 
 
 if __name__ == "__main__":
