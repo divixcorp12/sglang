@@ -68,6 +68,9 @@ class ExpertStreamRequirements:
 
     label: str
     check: Callable[[Any, ExpertCacheBudgets], None]
+    # Where graph gathers read host rows: "arena" (SGLANG_MOE_EXPERT_HOST_ARENA,
+    # indexed by expert id) or "pinned_tier" (the format's pinned host tier).
+    graph_gather_host_source: str = "arena"
 
 
 _REGISTRY: dict[str, ExpertStreamRequirements] = {}

@@ -63,6 +63,7 @@ from sglang.srt.layers.moe.expert_route_plan import GraphRoutePlan, plan_graph_r
 
 BACKEND_IN_GRAPH = "in_graph"
 BACKEND_DOORBELL = "doorbell"
+BACKEND_PINNED_TIER = "pinned_tier"
 MODE_CURRENT = "current"
 MODE_NEXT_LAYER = "next_layer"
 
@@ -326,6 +327,55 @@ class DoorbellRowBackend:
             plan.slots,
             self.copier.undelivered_count(tag, plan.count),
         )
+
+
+class PinnedTierRowBackend:
+    """Serves plans of expert ids from a partial pinned host tier, indexed by pinned slot.
+
+    The segment table's sources are the tier's slabs. ``translate`` maps each
+    planned expert through ``host_row_map`` (expert id -> pinned slot, -1 when the
+    row is not in RAM) into ``host_rows``; ``post`` then copies with the segment
+    kernel. A planned row missing from RAM is copied from slot 0 (a valid address),
+    added to the cumulative ``ram_miss`` and sets ``keep`` to 0 for this call, so
+    the caller can drop the layer's routed output and the host can fail stop.
+    Every step is fixed-shape device work, so a CUDA graph can capture it.
+    """
+
+    name = BACKEND_PINNED_TIER
+
+    def __init__(
+        self,
+        segments: Mapping[int, ExpertRowSegments],
+        host_row_map: torch.Tensor,
+        capacity: int,
+    ) -> None:
+        self.segments = dict(segments)
+        self.host_row_map = host_row_map
+        device = host_row_map.device
+        self.host_rows = torch.zeros(capacity, dtype=torch.int64, device=device)
+        self.ram_miss = torch.zeros(1, dtype=torch.int64, device=device)
+        self.keep = torch.ones(1, dtype=torch.float32, device=device)
+        self._lanes = torch.arange(capacity, dtype=torch.int32, device=device)
+
+    def translate(self, tag: int, plan: ExpertRowPlan) -> None:
+        rows = self.host_row_map.index_select(0, plan.expert_ids).to(torch.int64)
+        missing = (rows < 0) & (self._lanes < plan.count)
+        misses = missing.sum().reshape(1)
+        self.ram_miss.add_(misses)
+        self.keep.copy_((misses == 0).to(torch.float32))
+        self.host_rows.copy_(rows.clamp(min=0))
+
+    def post(self, tag: int, plan: ExpertRowPlan) -> None:
+        self.translate(tag, plan)
+        copy_expert_row_segments_gpu(
+            self.segments[tag], self.host_rows, plan.slots, plan.count
+        )
+
+    def resolve(self, tag: int, plan: ExpertRowPlan) -> ExpertRowDelivery:
+        return ExpertRowDelivery(plan, None)
+
+    def copy_residual(self, tag: int, delivery: ExpertRowDelivery) -> None:
+        """``post`` copied every planned row."""
 
 
 def plan_residual_routes(

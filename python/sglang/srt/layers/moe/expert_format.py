@@ -252,21 +252,38 @@ def resolve_row_source_kind() -> str:
     return kind
 
 
-def require_graph_gather_support(streamers: Iterable["ExpertStreamer"]) -> None:
+def graph_source_kind_of(expert_format: Any) -> str:
+    """Where a format's graph gathers read host rows: ``"dense"`` (``[experts, ...]``
+    layer tensors or the host arena, indexed by expert id) or ``"pinned_tier"`` (the
+    layer's pinned host tier, indexed by pinned slot)."""
+    return getattr(expert_format, "graph_source_kind", "dense")
+
+
+def require_graph_gather_support(
+    streamers: Iterable["ExpertStreamer"], *, pinned_tier_ok: bool = False
+) -> None:
     """Raise unless every streamer's format can serve sync-free graph gathers.
 
-    Graph gather, the GPU residency update and the doorbell all read dense,
-    GPU-readable host sources frozen at startup, which spec-only tensors lack.
+    Dense formats need dense, GPU-readable host sources frozen at startup, which
+    spec-only tensors lack. A ``pinned_tier`` format serves graph gathers from its
+    pinned host tier instead; only the plain graph gather supports that
+    (``pinned_tier_ok``), not the GPU residency update or the doorbell, whose
+    copies index host rows by expert id.
     """
     for streamer in streamers:
-        # Every streamer always has a format (DenseLayerFormat by default) and
-        # a has_spec_only_tensors property, so no defensive getattr is needed.
         expert_format = streamer.format
+        key = expert_format.key
+        if pinned_tier_ok and graph_source_kind_of(expert_format) == "pinned_tier":
+            if streamer.pinned_host_cache is None:
+                raise ValueError(
+                    f"expert format {key!r} of layer {streamer.layer_id} serves graph "
+                    "gathers from its pinned host tier; set SGLANG_MOE_PINNED_HOST_MB"
+                )
+            continue
         unsupported = (
             not expert_format.supports_graph_gather or streamer.has_spec_only_tensors
         )
         if unsupported:
-            key = expert_format.key
             raise ValueError(
                 f"expert format {key!r} of layer {streamer.layer_id} does not support "
                 "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER, "

@@ -1092,7 +1092,10 @@ class ExpertHotCacheManager:
         if not streamers:
             return None
         if index(graph_gather_batch_size) or gpu_residency_update or expert_doorbell:
-            require_graph_gather_support(streamers.values())
+            require_graph_gather_support(
+                streamers.values(),
+                pinned_tier_ok=not (gpu_residency_update or expert_doorbell),
+            )
         seed = None
         if seed_path is not None:
             path = Path(seed_path)

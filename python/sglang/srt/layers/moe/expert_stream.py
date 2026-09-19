@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.expert_format import (
     DenseLayerFormat,
     ExpertFormat,
     ExpertTensorSpec,
+    graph_source_kind_of,
     iter_expert_streamers,
     pinned_tier_options_of,
     require_graph_gather_support,
@@ -47,6 +48,7 @@ from sglang.srt.layers.moe.expert_row_plan import (
     ExpertRowPlan,
     ExpertRowPlanner,
     InGraphRowBackend,
+    PinnedTierRowBackend,
 )
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
@@ -677,6 +679,7 @@ class ExpertStreamer:
         self.row_planner = None
         self.row_plan = None
         self.row_backend = None
+        self._graph_pinned_tier = False
         self.row_tag = 0
         self.before_eager_gather = None
         # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and this
@@ -827,7 +830,8 @@ class ExpertStreamer:
         raise if a layer tensor was rebound after this call; replays cannot
         check, and keep reading the tensors frozen here.
         """
-        require_graph_gather_support((self,))
+        pinned_tier = graph_source_kind_of(self.format) == "pinned_tier"
+        require_graph_gather_support((self,), pinned_tier_ok=True)
         from sglang.kernels.ops.moe.expert_cache_transfer import (
             copy_expert_row_segments_gpu,
             expert_row_segments,
@@ -841,7 +845,7 @@ class ExpertStreamer:
             raise ValueError("graph gather needs a hot cache")
         if scratch_destinations and cache.scratch_rows < max_rows:
             raise ValueError("graph gather needs a hot cache scratch row per route")
-        if self.pinned_host_cache is not None:
+        if self.pinned_host_cache is not None and not pinned_tier:
             raise ValueError(
                 "graph gather cannot admit rows through the pinned host cache"
             )
@@ -850,16 +854,22 @@ class ExpertStreamer:
             or getattr(self, "next_layer_prefetch", None) is not None
         ):
             raise ValueError("graph gather cannot run with expert prefetch")
-        for name in self.tensor_names:
-            source = _tensor_data(getattr(self.layer, name))
+        if pinned_tier:
+            # Missed rows are read from the pinned tier's registered slabs by pinned
+            # slot (PinnedTierRowBackend), never from layer attributes.
+            sources = dict(self.pinned_host_cache.tensors)
+        else:
+            sources = {
+                name: _tensor_data(getattr(self.layer, name)) for name in self.tensor_names
+            }
+        for name, source in sources.items():
             if source.device.type == "cpu" and not is_gpu_readable_host_tensor(source):
                 raise ValueError(
                     f"graph gather needs registered host rows; {name!r} is pageable"
                 )
         device = cache.device
-        self._graph_sources = {
-            name: _tensor_data(getattr(self.layer, name)) for name in self.tensor_names
-        }
+        self._graph_sources = sources
+        self._graph_pinned_tier = pinned_tier
         device_pairs = tuple(
             (source, cache.tensors[name])
             for name, source in self._graph_sources.items()
@@ -928,11 +938,18 @@ class ExpertStreamer:
             slots=self._graph_destination_slots,
             count=self._graph_miss_count,
         )
-        self.row_backend = (
-            InGraphRowBackend({self.row_tag: self._graph_row_segments})
-            if self._graph_row_segments is not None
-            else None
-        )
+        if pinned_tier:
+            self.row_backend = PinnedTierRowBackend(
+                {self.row_tag: self._graph_row_segments},
+                self.pinned_host_cache.expert_to_slot,
+                max_rows,
+            )
+        else:
+            self.row_backend = (
+                InGraphRowBackend({self.row_tag: self._graph_row_segments})
+                if self._graph_row_segments is not None
+                else None
+            )
         self._graph_ones = torch.ones(max_rows, dtype=torch.float32, device=device)
         self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
@@ -1075,7 +1092,11 @@ class ExpertStreamer:
     def _check_graph_sources(self) -> None:
         """Raise if a layer tensor was rebound after its graph gather plan froze it."""
         for name, source in self._graph_sources.items():
-            current = _tensor_data(getattr(self.layer, name))
+            current = (
+                self.pinned_host_cache.tensors[name]
+                if self._graph_pinned_tier
+                else _tensor_data(getattr(self.layer, name))
+            )
             if current.data_ptr() != source.data_ptr() or current.device != source.device:
                 raise RuntimeError(
                     f"expert tensor {name!r} moved after graph gather was enabled"

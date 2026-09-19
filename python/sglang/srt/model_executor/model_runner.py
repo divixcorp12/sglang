@@ -714,12 +714,18 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
                 )
-            from sglang.srt.layers.moe.expert_format import iter_expert_streamers
+            from sglang.srt.layers.moe.expert_format import (
+                graph_source_kind_of,
+                iter_expert_streamers,
+            )
 
             streamed = next(iter_expert_streamers(self.model), None) is not None
             if not streamed:
                 return
-            if getattr(self, "expert_host_arena", None) is None:
+            if getattr(self, "expert_host_arena", None) is None and not all(
+                graph_source_kind_of(streamer.format) == "pinned_tier"
+                for streamer in iter_expert_streamers(self.model)
+            ):
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
                 )

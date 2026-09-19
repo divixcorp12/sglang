@@ -151,7 +151,10 @@ def handle_offload_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
             )
-        if not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
+        if not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get() and (
+            expert_stream_requirements_for(server_args, cfg).graph_gather_host_source
+            == "arena"
+        ):
             raise ValueError(
                 "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
             )
