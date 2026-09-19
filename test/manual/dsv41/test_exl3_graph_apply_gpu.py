@@ -20,7 +20,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HIDDEN, INTER, EXPERTS, TOP_K = 1024, 512, 12, 6
 ACT_LIMIT = 10.0
 REL_BOUND = 1.2e-2
-LOOSE_BOUND = 4e-2  # graph vs loop: ~1.5e-2 measured, a wrong expert or weight gives ~1
+# Graph vs loop: 1.51e-2..1.56e-2 measured on these fixed rows. One wrong expert moves the
+# loop's output by 3.5e-2 (the lowest-weight route) to 1.36; permuted weights by 1.10.
+LOOSE_BOUND = 2.5e-2
 
 
 def _reference(x, weights, slots, tensors):
