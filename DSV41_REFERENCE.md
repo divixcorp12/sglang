@@ -1,6 +1,11 @@
 # DeepSeek V4.1 Flash — scoping reference
 
-**Status: scoping only (revised 2026-09-18 after review). Nothing is implemented.**
+**Status (2026-09-19): Phases 0 to 3b are built and measured on divix01.** Decode runs
+under breakable CUDA graphs with option C's in-graph RAM-miss service at 2.781 tok/s on
+four cold sessions (§17). §18 records where a decode step's time goes, what overlap and
+prefetch can buy, and why DSpark does not run yet. Sections 1 to 15 are the original
+scoping (revised 2026-09-18 after review); later sections supersede them where they
+disagree. The work is on `codex/nvfp4-expert-stream-main` since 2026-09-19 (§18.1).
 This doc records what the model is, what it costs in bytes, what exists upstream / in
 exllamav3 / in our fork, and what has to be built to serve it with our expert-streaming
 stack on divix01. Companion to [`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md), whose
@@ -68,6 +73,9 @@ The design that follows is in §9. Decisions still open are in §12.
    - On the Qwen stand-in, speculation moves ~35% more expert bytes per accepted token at
      α=0.7, with break-even at α≈0.84–0.93.
    - **Rule: ship DSpark only if measured α clears the DSV4.1 break-even** (§10, §12).
+   - **It does not run on the EXL3 stack yet** (2026-09-19, §18.5): the full-model dir
+     has no draft, the draft loader has no EXL3 path, and the EXL3 streamer refuses the
+     draft's 128-expert layers.
 7. **Throughput envelope** [estimate]: ~3–8 tok/s, link plus NVMe only, before compute
    and slot-admission cost (§9.4). It depends on the VRAM miss rate `G` and the fraction `f`
    of those misses that also miss RAM. **Measured in Phase 3a (§16.8):** `G` ≈ 115 and
@@ -81,7 +89,15 @@ The design that follows is in §9. Decisions still open are in §12.
    (`c55f1572b0`, 2026-09-18, §6.1) — the streaming-file claim was reverified against
    both. No stack runs EXL3 in SGLang. exllamav3 (MIT) has a fused, sm_120-tuned EXL3
    MoE kernel to vendor (§7).
-9. **It cannot coexist with production.** It needs the whole 32 GB card and most of
+9. **A decode step is half NVMe wait, a third PCIe gather, and 4% compute** (§18.2,
+   node-mode trace of option C, 391 ms/step under tracing): 190 ms waiting for NVMe reads
+   (10.2 ms per row), 128 ms gathering rows over PCIe (1.06 ms per row), 17 ms of
+   compute, ~41 ms of host gap between steps and ~11 ms in the two Engram breaks, all
+   serialized. Overlapping copies with compute is worth at most ~4%. Prefetch with the
+   next layer's gate catches 48% of NVMe rows at top-6 but wastes 2.5 reads per useful
+   one; a confidence-gated set is estimated at ~6% (one layer ahead) to ~10% (two) of the
+   step (§18.4). The previous token's routes, the predictor 3b used, catch none.
+10. **It cannot coexist with production.** It needs the whole 32 GB card and most of
    the RAM budget. Every GPU session means production downtime, which crypto-c9
    schedules and the owner approves.
 
@@ -2021,6 +2037,169 @@ Which eager buckets moved:
   exact-LRU ceiling over 1.5M tokens. The line's scope (which phases it counts, whether it
   is cumulative) was not checked, so §16.11 stays open.
 - Not run in 3b: graph decode at bs > 1 or with DSpark, and nvme1.
+
+## 18. After Phase 3b: where the step goes, and what can hide it (2026-09-19)
+
+Artifacts: `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-overlap/`
+(`OVL` below). `OVL/SUMMARY.md` has the same numbers; scripts are named where used.
+
+### 18.1 Code state and a fixed regression
+
+- `dsv41` merged `cc/moe-expert-plugins` (`ad4998c0fe`, bringing mainline's offload
+  presets, cuda_graph_config normalization and the stage-2 shortlist fix), then was merged
+  with `origin/main` 993d1fccba into `codex/nvfp4-expert-stream-main` (`afca79bc89`,
+  `39362680bb`, pushed to `shared`). That candidate was validated against the Qwen4
+  production config before main was fast-forwarded (decode tok/s and tail NLL at 2.5k and
+  23k tokens matched main within run-to-run spread).
+- **Regression, found by the first DSV4.1 launch after that merge:** every EXL3 launch
+  with a hot cache was refused at argument resolution with `--moe-offload-preset off:
+  SGLANG_MOE_HOT_GPU_MB requires SGLANG_MOE_EXPERT_STREAM=1`. The preset checks
+  (`offload_presets.check_offload_config`, `needs_overlap_off`) applied NVFP4's hot-cache
+  rules to every format; EXL3 streams under `SGLANG_DSV41_EXPERT_STREAM` and keeps overlap
+  scheduling on, and `needs_overlap_off` would also have turned overlap scheduling off.
+  The 146 GPU tests passed because none launches a full DSV4.1 Engine.
+  **Fix `76829dff55`** (on `dsv41`; merged into main at `69c3ca4ce2`): both rules apply
+  only when the launch's quantization method is NVFP4 or not yet known, as
+  `memory_hook`'s per-format requirements already decide; the doorbell's overlap rule
+  still applies to every format. Tests: `test_offload_presets.py` (+4 cases).
+- One CPU test fails only in directory order and predates the fix:
+  `test_server_args.py::TestMultimodalFeatureTransport::test_default_transport_is_cpu_for_unsupported_multinode_model`
+  (passes alone; fails in `test/registered/unit/server_args` at `cef0875dac` too).
+- The shared venv has `sglang-kernel` 0.4.6.post1; upstream now asserts 0.4.7, so every
+  run here sets `SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1` (as `env.sh` always did).
+
+### 18.2 Per-step breakdown (node-mode trace)
+
+`OVL/prof-node.sh` is §17.7's `prof-graph.sh` with `--cuda-graph-trace=node`, 96 new
+tokens and a 20 s capture; option C, prefetch off, session `--skip 12`, `wt-dsv41` at
+`76829dff55`. Capture `segments=3 breaks=2` as in §17.3. The window holds 2,022 MoE layer
+calls = **50.6 decode steps**. Session decode 2.289 tok/s (traced). Report
+`OVL/prof-node.nsys-rep` (17 MB); analysis `layer_breakdown.py`, `align.py`, `gaps.py`.
+
+| Per decode step | ms | Share of 391 ms |
+|---|---:|---:|
+| `exl3_ram_miss_wait_kernel`: the GPU waits for NVMe reads | **190** | 48.6% |
+| `copy_expert_row_segments_gpu_kernel`: pinned RAM to VRAM gather | **128** | 32.7% |
+| all compute (EXL3 GEMVs, `exl3_moe`, attention, mHC, router, …) | **16.8** | 4.3% |
+| gap between steps (host; §18.6) | ~41 | ~10.6% |
+| the two Engram breaks (graph → eager → graph) | ~11 | ~2.9% |
+
+- **Everything is serialized.** The union of wait, gather and compute intervals equals
+  their sum. Streams 141–143 are successive graph launches, never concurrent.
+- Kernel totals over the window: wait 9,603 ms (2,022 calls), gather 6,464 ms (2,022),
+  `exl3_gemv_int8_sq_kernel` 238 ms, `exl3_moe_kernel` 195 ms (96 µs/layer),
+  `exl3_ram_miss_post_kernel` 15 ms (7.5 µs/layer). Stream 37 ran 390 off-graph
+  `copy_expert_rows_gpu_kernel` calls (0.97 s) outside the decode graph.
+- **Per layer:** wall 9.77 ms mean (median 4.77); wait 4.75 ms mean, **median 5 µs**, p90
+  11.6 ms, so only **676 of 2,022** layer calls wait on NVMe; gather 3.20 ms mean; compute
+  0.42 ms.
+- **Per row** (window aligned to `trace-prof-node.jsonl`'s `graph_step` lines at 74.5%
+  per-layer agreement): G = 121.2 VRAM misses and 18.8 RAM misses per step. Gather
+  **1.055 ms/row**, at the PCIe line rate for a 13.3 MB row. NVMe wait **10.16 ms per
+  RAM-miss row** (single-row median 10.55 ms; §17.5 measured 11.40 ms).
+- **Tracing cost.** Node mode charges ~0.77 µs of `cudaGraphLaunch` host time per node
+  (project CLAUDE.md); at ~5,200 kernels per step that is ~4 ms of the between-step gap.
+  GPU kernel durations are unaffected.
+
+### 18.3 Upper bounds on overlap without prediction
+
+Per step, from the per-layer records (`layer_breakdown.py`, `align.py`):
+
+| Change | Bound | Share |
+|---|---:|---:|
+| Copy ∥ compute inside a layer (the MoE for experts already on the GPU, the shared expert and bookkeeping run under the gather) | 15.5 ms | ≤ 4.0% |
+| Gather a layer's RAM-resident missed rows while its NVMe read runs | 20.8 ms | ≤ 5.3% (approximate: rests on the 74.5% alignment) |
+| Engram lookups in the graph (removes both breaks) | ~11 ms | ≤ 2.9% |
+
+Compute is too small to hide the copies behind, and across layers nothing can overlap
+without knowing the next layer's routes, since layer L+1's attention needs layer L's MoE
+output.
+
+### 18.4 Prefetch: can a predictor hide the NVMe reads?
+
+The NVMe wait is 49% of the step, and the drive is idle ~200 ms of each 391 ms step, so
+reads started early, even some wrong ones, have room. The 3b advisory prefetch (`cpf`)
+was inert (−0.001 tok/s, §17.6).
+
+**Probe.** `OVL/probe-run.sh`: arm P1 (graph decode, EXL3 MoE as an eager break, hot
+11,288 MiB = 888 slots, as §17.6's `p1`), sessions 0–3, 256-token prompts, 128 new tokens:
+**1.982 tok/s** (`p1`: 1.973). `OVL/probe-site/sitecustomize.py` (analysis only, on
+`PYTHONPATH`; no product code) wraps `Exl3MoEMethod._apply_streamed` and records, per
+decode MoE call, the MoE input (= the gate's input), the routed top-6, and every expert's
+tier (VRAM / RAM / NVMe) before the gather: 20,480 records = 512 tokens × 40 layers.
+Analysis `lookahead.py` and `lookahead_rank.py` (outputs `lookahead.out`,
+`lookahead_rank.out`).
+
+- **Self-check:** each layer's gate from the checkpoint (`layers.N.ffn.gate.weight` and
+  `.bias`; top-6 of sqrt(softplus(Wx)) + b) on the recorded input reproduces the recorded
+  routes **20,480 of 20,480**. DSV4.1 has no hash-routed layers.
+- NVMe rows: **19.15 per step** (18.26 over layers 1–39, the ones a lookahead can target).
+- **The previous token's routes catch 0.000 of NVMe rows**: those experts were just read
+  into RAM. That is why `cpf` was inert (`advisory_rows` 30 over 511 tokens).
+- **Lookahead:** layer L+d's gate applied to layer L's MoE input, per step:
+
+| Predictor | Recall, all routed | Recall, NVMe rows | Useful NVMe reads | Wasted NVMe reads |
+|---|---:|---:|---:|---:|
+| L+1 top-6 | 0.645 | **0.481** | 8.79 | 22.25 |
+| L+1 top-8 | 0.719 | 0.572 | 10.44 | 41.04 |
+| L+1 top-12 | 0.794 | 0.683 | 12.47 | 90.53 |
+| L+1 top-24 | 0.876 | 0.810 | 14.79 | 284.44 |
+| L+2 top-6 | 0.571 | 0.411 | 7.16 | 26.91 |
+| L+2 top-12 | 0.716 | 0.591 | 10.31 | 98.39 |
+| previous token | 0.376 | 0.000 | 0.00 | 0.42 |
+
+"Wasted" counts predicted experts in the NVMe tier that the token does not route to;
+predictions already in RAM or VRAM cost no drive time.
+
+- **Precision falls steeply with rank.** NVMe-tier candidates at L+1: rank 1 0.681,
+  rank 2 0.528, rank 3 0.375, ranks 4–6 0.193, ranks 7–8 0.081. By confidence
+  sigmoid(20 × (score − 6th score)), the top bin [0.9, 1.0) holds **7.31 candidates per
+  step, 4.52 useful (0.617)**; at L+2, 8.00 and 4.05 (0.506).
+- **What it buys [estimate, not measured].** One layer of lead is ~4.8 ms (median layer
+  without a wait), two ~10 ms, and a read takes ~10.2 ms. The top-confidence L+1 set
+  hides ~4.5 × ~4.8 ≈ **22 ms/step (~6%)**; the L+2 set ~4 × ~10 ≈ **40 ms/step (~10%)**.
+  Each spends ~30–40 ms of idle drive time on wasted reads, which is affordable only if
+  prefetch reads never queue ahead of demand reads (reads serialize on nvme2: 6 rows took
+  61.7 ms, §17.5).
+- A wasted read still lands in the RAM tier and may evict a row a later token needs;
+  neither that nor any later reuse is modelled.
+- **The large levers remain the drive and the RAM tier**: every NVMe row costs ~10 ms on
+  nvme2 (§1: Gen3 x2), and `f` falls with a larger pinned tier (§9.4). Neither needs a
+  predictor.
+
+### 18.5 DSpark does not run on the EXL3 stack yet
+
+Asked to try `--speculative-algorithm DSPARK --speculative-dspark-block-size 5`. Found by
+reading code and checkpoints, not by a launch:
+
+- **The full-model dir has no draft.** `dsv41-full40` (made by
+  `make_truncated_model.py`) sets `num_nextn_predict_layers: 0` and drops every `mtp.*`
+  key (187,350 keys). The original `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw` has 4,836
+  `mtp.*` keys and `num_nextn_predict_layers: 3`. Both keep the `dspark_*` config keys, so
+  `_handle_dspark` would point the draft at the target dir.
+- **The draft loader has no EXL3 path.** `DeepseekV4ForCausalLMDSpark.load_weights` maps
+  only upstream FP8/FP4 names; only the target calls `adapt_exl3_weights`.
+- **The streamer refuses the draft's MoE.** `exl3_streamed` is process-wide
+  (`SGLANG_DSV41_EXPERT_STREAM`), and `build_exl3_expert_streamer` raises when the layer's
+  expert count (128 for the draft) differs from the checkpoint layout's 384.
+- **Verify shape.** Block size 5 gives a 6-token verify; the EXL3 gate allows breakable
+  decode graphs at max batch size 1 only, and option C's scratch and RAM-miss posting are
+  sized for one token per step.
+- Draft experts resident would cost 3 × 128 × 17.7 MB ≈ 6.8 GB, about half of the 888-slot
+  hot cache. §10's rule stands: α must be measured before DSpark ships. **Parked by the
+  owner (2026-09-19) in favour of the prefetch measurement.**
+
+### 18.6 Open
+
+- **The between-step host gap, ~41 ms/step** (63 gaps averaging 33 ms between eager
+  kernels, plus the Engram round trips). §17.7's graph-mode trace put residual host work
+  at 27.8–54.2 ms/token. Not attributed yet; `prof-node.nsys-rep` has Python sampling.
+- **Stream 37's off-graph row copies** (390 calls, 0.97 s in 19.8 s): not attributed. If
+  they run during decode, they share the PCIe link with the gather.
+- A prefetch prototype (confidence-gated L+1 or L+2 lookahead, prefetch reads queued
+  behind demand reads) would check §18.4's estimate.
+- Everything in §17.8's open list stands, including the raw-JSON `--cuda-graph-config`
+  crash in `memory_hook.py`.
 
 ## Sources
 
