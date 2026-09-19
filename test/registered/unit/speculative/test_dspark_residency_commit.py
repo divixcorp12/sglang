@@ -2,7 +2,7 @@
 
 ``DSparkWorkerV2`` cannot be constructed on CPU (it needs a real target
 worker/model runner), so this tests the extracted module function
-``commit_accepted_to_hot_cache`` directly, per the task-7 brief. It mirrors
+``commit_accept_to_hot_cache`` directly, per the task-7 brief. It mirrors
 ``EagleWorkerV2.on_verify_complete_cpu``
 (python/sglang/srt/speculative/eagle_worker_v2.py:1638-1651): the call count
 must be exactly one ``on_speculative_commit`` call per invocation (one per
@@ -16,7 +16,7 @@ import unittest
 
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
-    commit_accepted_to_hot_cache,
+    commit_accept_to_hot_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,11 +37,11 @@ class _FakeHotCacheManager:
 class TestCommitAcceptedToHotCache(CustomTestCase):
     def test_no_manager_is_a_no_op(self):
         # Must not raise when the model builds no expert streamers.
-        commit_accepted_to_hot_cache(None, [3, 1, 4])
+        commit_accept_to_hot_cache(None, [3, 1, 4])
 
     def test_single_request_reports_accepted_plus_bonus(self):
         manager = _FakeHotCacheManager()
-        commit_accepted_to_hot_cache(manager, [3])
+        commit_accept_to_hot_cache(manager, [3])
         self.assertEqual(
             manager.commit_calls,
             [3 + GenerationBatchResult.num_non_draft_tokens_per_req],
@@ -52,7 +52,7 @@ class TestCommitAcceptedToHotCache(CustomTestCase):
         # num_non_draft_tokens_per_req (the bonus token count per request).
         manager = _FakeHotCacheManager()
         num_correct_drafts_per_req = [3, 0, 2, 5]
-        commit_accepted_to_hot_cache(manager, num_correct_drafts_per_req)
+        commit_accept_to_hot_cache(manager, num_correct_drafts_per_req)
         expected = sum(num_correct_drafts_per_req) + len(
             num_correct_drafts_per_req
         ) * GenerationBatchResult.num_non_draft_tokens_per_req
@@ -66,7 +66,7 @@ class TestCommitAcceptedToHotCache(CustomTestCase):
         # zero, never more than one.
         manager = _FakeHotCacheManager()
         for step_accepts in ([1, 2], [0, 0, 3], [4]):
-            commit_accepted_to_hot_cache(manager, step_accepts)
+            commit_accept_to_hot_cache(manager, step_accepts)
         self.assertEqual(len(manager.commit_calls), 3)
 
     def test_empty_batch_still_calls_commit_once_with_zero(self):
@@ -75,7 +75,7 @@ class TestCommitAcceptedToHotCache(CustomTestCase):
         # the batch-result processor always calling on_verify_complete_cpu
         # once per resolved batch, even a degenerate empty one).
         manager = _FakeHotCacheManager()
-        commit_accepted_to_hot_cache(manager, [])
+        commit_accept_to_hot_cache(manager, [])
         self.assertEqual(manager.commit_calls, [0])
 
 

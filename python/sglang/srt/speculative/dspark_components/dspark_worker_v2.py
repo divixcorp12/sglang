@@ -124,7 +124,7 @@ def _configure_target_hidden_projection(
     )
 
 
-def commit_accepted_to_hot_cache(
+def commit_accept_to_hot_cache(
     hot_cache_manager,
     num_correct_drafts_per_req: list[int],
 ) -> None:
@@ -146,14 +146,17 @@ def commit_accepted_to_hot_cache(
     No-op when there is no hot cache manager (draft-only runs, or a model
     that builds no expert streamers).
 
-    Known interaction (see task-5-report.md and task-7-report.md): DSpark's
-    own draft-block forward is misclassified by ``classify_forward``
+    One provisional push per real step (see task-5-report.md,
+    task-7-report.md, task-7b-report.md): DSpark's own draft-block forward
+    used to be misclassified by ``classify_forward``
     (expert_residency_clock.py:26) as ``ForwardKind.VERIFY``, so the
-    residency clock's provisional queue receives two pushes per real step
-    (the draft-block forward's, then this real verify's) but this call
-    drains only one. Fixing the pairing needs a ``classify_forward``
-    change, out of scope here; this function still reports the correct
-    per-real-verify accepted count, matching EAGLE V2's call cadence.
+    residency clock's provisional queue received two pushes per real step
+    (the draft-block forward's, then this real verify's) while this call
+    only ever drains one. It is now marked ``is_draft_block=True`` at
+    construction (``self._draft_block_spec_info`` above) and
+    ``classify_forward`` routes it to ``ForwardKind.DRAFT`` (0 tokens), so
+    exactly one provisional is pushed per real step and this call's single
+    commit pairs with it correctly.
     """
     if hot_cache_manager is None:
         return
@@ -283,6 +286,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
         )
+        # This is DSpark's own internal draft-block forward (see
+        # DraftBlockProposer.propose below): it runs ForwardMode.TARGET_VERIFY
+        # with a borrowed DFlashVerifyInput shape so attention backends treat
+        # it as verify-shaped, but it is not the target's real verify and must
+        # not be double-counted by the residency clock's classify_forward
+        # (expert_residency_clock.py:26). Only this instance is marked; the
+        # real per-step verify SpecInput built in dspark_verify.py is a
+        # separate, freshly-constructed DFlashVerifyInput that defaults to
+        # is_draft_block=False and keeps classifying as ForwardKind.VERIFY.
+        self._draft_block_spec_info.is_draft_block = True
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
             if self.ps.tp_rank == 0:
@@ -570,11 +583,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         """Report this step's accepted tokens to the target's hot cache.
 
         Mirrors ``EagleWorkerV2.on_verify_complete_cpu``
-        (eagle_worker_v2.py:1638); see ``commit_accepted_to_hot_cache`` above
+        (eagle_worker_v2.py:1638); see ``commit_accept_to_hot_cache`` above
         for the exact semantics and the known double-VERIFY interaction with
         DSpark's own draft-block forward.
         """
-        commit_accepted_to_hot_cache(
+        commit_accept_to_hot_cache(
             getattr(self.model_runner, "expert_hot_cache_manager", None),
             num_correct_drafts_per_req,
         )

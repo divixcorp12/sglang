@@ -4,6 +4,8 @@ import random
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 from sglang.srt.layers.moe.expert_residency_clock import (
     ForwardKind,
@@ -11,6 +13,7 @@ from sglang.srt.layers.moe.expert_residency_clock import (
     classify_forward,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -45,6 +48,24 @@ def _draft_extend():
 
 def _verify(draft_token_num=4):
     return _batch(ForwardMode.TARGET_VERIFY, spec_info=_verify_input(draft_token_num))
+
+
+def _draft_block_forward(draft_token_num=4, batch_size=1, *, mark_draft_block: bool):
+    """A draft worker's own internal draft-block forward: ForwardMode.TARGET_VERIFY
+    over a real ``DFlashVerifyInput`` built by the shared
+    ``make_draft_block_spec_info`` helper (draft_worker_common.py), the exact
+    shape both DSpark (dspark_draft.py) and DFlash (dflash_worker_v2.py) run
+    it with. ``mark_draft_block=True`` mirrors what
+    ``DSparkWorkerV2.__init__`` now does to its
+    ``self._draft_block_spec_info`` (dspark_worker_v2.py); ``False`` mirrors
+    DFlash's call site, which does not set it.
+    """
+    spec_info = make_draft_block_spec_info(
+        draft_token_num=draft_token_num, device=torch.device("cpu")
+    )
+    if mark_draft_block:
+        spec_info.is_draft_block = True
+    return _batch(ForwardMode.TARGET_VERIFY, batch_size=batch_size, spec_info=spec_info)
 
 
 def _observe(clock, batch):
@@ -213,6 +234,72 @@ class TestResidencyBoundaryClock(unittest.TestCase):
             ForwardMode.TARGET_VERIFY, batch_size=3, spec_info=_verify_input(4)
         )
         self.assertEqual(classify_forward(batch), (ForwardKind.VERIFY, 12))
+
+    def test_dspark_draft_block_forward_is_classified_as_draft(self):
+        # Task 7b root-cause fix: DSpark's own draft-block forward
+        # (ForwardMode.TARGET_VERIFY over a borrowed, is_draft_block-marked
+        # DFlashVerifyInput -- see dspark_worker_v2.py's
+        # self._draft_block_spec_info) must classify as DRAFT/0, not VERIFY,
+        # so it never contributes provisional tokens to the residency clock.
+        batch = _draft_block_forward(
+            draft_token_num=6, batch_size=2, mark_draft_block=True
+        )
+        self.assertEqual(classify_forward(batch), (ForwardKind.DRAFT, 0))
+
+    def test_dflash_draft_block_forward_without_the_flag_still_classifies_as_verify(
+        self,
+    ):
+        # Regression guard for the "must not change DFlash" constraint:
+        # DFlash's dflash_worker_v2.py builds this exact SpecInput shape via
+        # the same shared make_draft_block_spec_info helper, but does not set
+        # is_draft_block on it, so its classification is bit-for-bit
+        # unchanged by this fix.
+        batch = _draft_block_forward(
+            draft_token_num=6, batch_size=2, mark_draft_block=False
+        )
+        self.assertEqual(classify_forward(batch), (ForwardKind.VERIFY, 12))
+
+    def test_dspark_shaped_sequence_pushes_exactly_one_provisional_per_real_step(self):
+        """Simulate DSpark's real per-step forward order: one internal
+        draft-block forward (dspark_draft.py's DraftBlockProposer.propose),
+        then one real target verify forward
+        (dspark_verify.py's TargetVerifyExecutor), then one
+        on_verify_complete_cpu -> commit_accept_to_hot_cache commit call
+        (dspark_worker_v2.py). Before this fix, the draft-block forward was
+        misclassified VERIFY and pushed a second, spurious provisional every
+        step; with only one commit() call per step, the FIFO queue never
+        drained and pairing free-ran out of phase after step 1 (see
+        task-7-report.md, "The double-VERIFY interaction"). This asserts the
+        queue drains back to empty every step, and that
+        tokens_since_boundary tracks the running sum of accepted tokens
+        exactly -- proof the drafted-token contribution cancels out cleanly
+        instead of leaking across steps.
+        """
+        clock = ResidencyBoundaryClock(1_000_000, 0)
+        draft_token_num = 4
+        total_accepted = 0
+        for step in range(6):
+            self.assertEqual(len(clock._provisional), 0, f"step {step} start")
+
+            draft_block = _draft_block_forward(draft_token_num, mark_draft_block=True)
+            self.assertEqual(classify_forward(draft_block), (ForwardKind.DRAFT, 0))
+            self.assertIsNone(_observe(clock, draft_block))
+            self.assertEqual(
+                len(clock._provisional), 0, f"step {step} after draft-block"
+            )
+
+            verify = _verify(draft_token_num)
+            self.assertEqual(
+                classify_forward(verify), (ForwardKind.VERIFY, draft_token_num)
+            )
+            self.assertIsNone(_observe(clock, verify))
+            self.assertEqual(len(clock._provisional), 1, f"step {step} after verify")
+
+            accepted = 2 + (step % 3)  # varies so a wrong pairing would show up
+            total_accepted += accepted
+            clock.commit(accepted)
+            self.assertEqual(len(clock._provisional), 0, f"step {step} after commit")
+            self.assertEqual(clock.tokens_since_boundary, total_accepted)
 
     def test_minimum_residence_counts_only_target_forwards(self):
         clock = ResidencyBoundaryClock(16, 0)

@@ -414,6 +414,20 @@ class SpecInput(ABC):
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
+    # Set only on the one SpecInput instance a draft worker builds for its own
+    # internal draft-block forward (e.g. DSpark's DraftBlockProposer via
+    # make_draft_block_spec_info in draft_worker_common.py) when that forward
+    # runs verify-shaped (ForwardMode.TARGET_VERIFY, a borrowed *_VERIFY
+    # SpecInput) so attention backends keep treating it as verify-shaped.
+    # classify_forward (expert_residency_clock.py) reads this to route the
+    # forward to ForwardKind.DRAFT for residency accounting instead of
+    # double-counting it as a real target verify; is_draft_input() is left
+    # alone because it drives unrelated attention/padding phase dispatch that
+    # must still see this SpecInput's real (verify) type. Class-level default
+    # (same rationale as ragged_verify_layout above); only the specific call
+    # site that owns such an instance sets it True.
+    is_draft_block: bool = False
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
