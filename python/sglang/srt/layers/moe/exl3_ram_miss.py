@@ -8,7 +8,7 @@ int64 tensors, so the C++ thread reads and splits rows without Python.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 import torch
@@ -29,6 +29,9 @@ class Exl3RamMissTables:
     row_bytes: torch.Tensor  # int64 [6]
     capacity: torch.Tensor  # int64 [L]
     slot_bytes: int
+    # The slab tensors whose addresses are in ``slabs``: the C++ reader writes through
+    # those raw addresses, so the tables own a reference to every slab (M5).
+    keepalive: tuple = field(default=(), repr=False, compare=False)
 
 
 def exl3_ram_miss_tables(
@@ -84,4 +87,5 @@ def exl3_ram_miss_tables(
         row_bytes=row_bytes,
         capacity=capacity,
         slot_bytes=-(-widest // PAGE_BYTES) * PAGE_BYTES,
+        keepalive=tuple(slabs_by_layer[layer_id][name] for layer_id in layer_ids for name in EXL3_STREAMED_NAMES),
     )

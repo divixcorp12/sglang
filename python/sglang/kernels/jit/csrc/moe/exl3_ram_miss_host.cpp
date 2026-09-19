@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -125,11 +126,22 @@ inline Tables tables_from(
   return t;
 }
 
+// Test-only fault injection for RowReader (exl3_ram_miss_read_rows_faulted).
+struct ReadFault {
+  int submit_error = 0;       // errno the `submit_call`-th submit returns (0: no fault)
+  int64_t submit_call = 0;    // 1-based count of submit-and-wait calls over the reader's life
+  bool submit_first = false;  // submit the prepared SQEs before failing (reads are in flight)
+  int cqe_error = 0;          // errno that replaces the `cqe_call`-th completion's result
+  int64_t cqe_call = 0;       // 1-based count of reaped completions over the reader's life
+};
+
 // io_uring superset reads of whole expert rows into a page-aligned bounce, then the
 // per-name split into the pinned slabs (Exl3ShardRowSource.read's copies).
 class RowReader {
  public:
   RowReader(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {}
+  RowReader(const RowReader&) = delete;  // owns fds, the ring and the bounce
+  RowReader& operator=(const RowReader&) = delete;
 
   ~RowReader() {
     if (ring_ready_) io_uring_queue_exit(&ring_);
@@ -138,6 +150,8 @@ class RowReader {
   }
 
   const Tables& tables() const { return t_; }
+
+  void set_fault(const ReadFault& fault) { fault_ = fault; }
 
   bool open() {
     for (const auto& path : t_.paths) {
@@ -160,24 +174,33 @@ class RowReader {
   // Read `experts` of streamed row `row` into `slots`, `step` rows per io_uring batch
   // (at most kBounceRows). `abandon()` runs before each batch; true stops the read.
   // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned.
+  // Every return leaves the ring empty: nothing in flight, nothing prepared (I1).
+  //
+  // This is the hot path and checks nothing: `row`, `experts` and `slots` must be in
+  // range and `experts.size() == slots.size()`. The service (Task 11) and
+  // read_rows_once (Python) validate at their boundaries.
   int read(
       int64_t row,
       const std::vector<int32_t>& experts,
       const std::vector<int64_t>& slots,
       size_t step,
       const std::function<bool()>& abandon) {
+    if (!ring_ready_) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     for (size_t first = 0; first < experts.size(); first += step) {
       if (abandon()) return -1;
       const size_t count = std::min<size_t>(step, experts.size() - first);
       std::vector<int64_t> done(count, 0);
       std::vector<int64_t> expected(count, 0);
+      std::vector<int> retries(count, 0);
       std::vector<const Read*> reads(count);
       for (size_t i = 0; i < count; ++i) {
         reads[i] = &t_.reads[static_cast<size_t>(row * t_.experts + experts[first + i])];
         expected[i] = std::min(reads[i]->length, t_.file_sizes[reads[i]->file] - reads[i]->offset);
       }
-      size_t pending = 0;
+      // SQEs prepared and not yet reaped (in the SQ ring or in the kernel). At most
+      // kBounceRows < kQueueDepth, so io_uring_get_sqe never runs out.
+      unsigned pending = 0;
       auto submit = [&](size_t i) {
         io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         const int64_t remaining = reads[i]->length - done[i];
@@ -188,34 +211,57 @@ class RowReader {
         ++pending;
       };
       for (size_t i = 0; i < count; ++i) submit(i);
+      bool failed = false;
+      int soft_errors = 0;
       while (pending > 0) {
-        if (io_uring_submit_and_wait(&ring_, 1) < 0) return 0;
+        const int rc = submit_and_wait();
+        if (rc < 0) {
+          // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
+          // (uring_file_reader.cpp). Anything else, or a soft error that never clears, fails.
+          const bool soft = rc == -EINTR || rc == -EAGAIN || rc == -EBUSY;
+          if (!soft || ++soft_errors > kMaxSoftErrors) {
+            failed = true;
+            break;
+          }
+        } else {
+          soft_errors = 0;
+        }
         io_uring_cqe* cqe;
         unsigned head;
         unsigned seen = 0;
         std::vector<size_t> again;
-        bool failed = false;
         io_uring_for_each_cqe(&ring_, head, cqe) {
           ++seen;
           --pending;
           const size_t i = static_cast<size_t>(io_uring_cqe_get_data64(cqe));
-          if (cqe->res < 0 || (cqe->res == 0 && done[i] < expected[i])) {
+          int res = cqe->res;
+          ++cqes_;
+          if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
+          if (res == -EINTR || res == -EAGAIN) {
+            if (++retries[i] > kMaxRetries) {
+              failed = true;
+            } else {
+              again.push_back(i);  // resubmit the same range (M3)
+            }
+            continue;
+          }
+          if (res < 0 || (res == 0 && done[i] < expected[i])) {
             failed = true;
             continue;
           }
-          done[i] += cqe->res;
+          done[i] += res;
+          // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
+          // offset + done, bounce + done and length - done stay block-aligned and the
+          // resubmit is a legal direct read. At EOF, done == expected: no resubmit.
           if (done[i] < expected[i]) again.push_back(i);
         }
         io_uring_cq_advance(&ring_, seen);
-        if (failed) {
-          while (pending > 0) {  // drain what is still in flight before the bounce is reused
-            io_uring_cqe* rest;
-            if (io_uring_wait_cqe(&ring_, &rest) == 0) io_uring_cqe_seen(&ring_, rest);
-            --pending;
-          }
-          return 0;
-        }
+        if (failed) break;
         for (size_t i : again) submit(i);
+      }
+      if (failed) {
+        drain(pending);
+        return 0;
       }
       for (size_t i = 0; i < count; ++i) {
         const uint8_t* base = bounce_ + i * t_.slot_bytes + reads[i]->start;
@@ -231,19 +277,68 @@ class RowReader {
   }
 
  private:
+  static constexpr int kMaxSoftErrors = 1000;
+  static constexpr int kMaxRetries = 8;
+
+  int submit_and_wait() {
+    ++submits_;
+    if (fault_.submit_error != 0 && submits_ == fault_.submit_call) {
+      if (fault_.submit_first) io_uring_submit(&ring_);
+      return -fault_.submit_error;
+    }
+    return io_uring_submit_and_wait(&ring_, 1);
+  }
+
+  // After a failure, empty the ring before the bounce is reused or freed: reap every
+  // read the kernel holds, then drop SQEs that were prepared but never consumed by
+  // resetting the ring (the kernel has not seen them, so nothing can write the bounce).
+  // `pending` counts both; io_uring_sq_ready counts the unconsumed ones
+  // (uring_file_reader.cpp abandon_after_submit_failure_).
+  void drain(unsigned pending) {
+    const unsigned unsubmitted = std::min(pending, io_uring_sq_ready(&ring_));
+    unsigned in_kernel = pending - unsubmitted;
+    while (in_kernel > 0) {
+      io_uring_cqe* cqe = nullptr;
+      const int rc = io_uring_wait_cqe(&ring_, &cqe);
+      if (rc == -EINTR || rc == -EAGAIN) continue;
+      // A read could still land in the bounce later: no safe way to go on.
+      if (rc < 0) std::terminate();
+      io_uring_cqe_seen(&ring_, cqe);
+      --in_kernel;
+    }
+    if (unsubmitted > 0) {
+      io_uring_queue_exit(&ring_);
+      ring_ready_ = io_uring_queue_init(kQueueDepth, &ring_, 0) == 0;
+      if (!ring_ready_) std::fprintf(stderr, "ERROR exl3 RAM miss: io_uring ring reset failed\n");
+    }
+  }
+
   Tables t_;
   bool direct_;
   std::vector<int> fds_;
   uint8_t* bounce_ = nullptr;
   io_uring ring_{};
   bool ring_ready_ = false;
+  ReadFault fault_{};
+  int64_t submits_ = 0;
+  int64_t cqes_ = 0;
 };
 
 }  // namespace exl3_ram_miss
 
 using exl3_ram_miss::TensorView;
 
+namespace {
+
+std::vector<int64_t> slots_of(TensorView slots) {
+  const auto* data = static_cast<const int64_t*>(slots.data_ptr());
+  return std::vector<int64_t>(data, data + slots.size(0));
+}
+
+}  // namespace
+
 // Read `experts` of streamed row `row` into `slots` once, synchronously (tests, tools).
+// Arguments are validated by the Python wrapper (read_rows_once).
 int64_t exl3_ram_miss_read_rows(
     TensorView reads,
     TensorView file_sizes,
@@ -255,16 +350,50 @@ int64_t exl3_ram_miss_read_rows(
     int64_t direct,
     int64_t row,
     TensorView experts,
-    TensorView slots) {
+    TensorView slots,
+    int64_t step) {
   using namespace exl3_ram_miss;
   RowReader reader(tables_from(reads, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
-  const auto* slot_data = static_cast<const int64_t*>(slots.data_ptr());
-  return reader.read(
-      row, ids_of(experts), std::vector<int64_t>(slot_data, slot_data + slots.size(0)), kBounceRows,
-      [] { return false; });
+  return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; });
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows, exl3_ram_miss_read_rows);
+
+// Test only: one reader reads `experts` into `slots` with `fault` injected
+// ([submit_error, submit_call, submit_first, cqe_error, cqe_call]), then reads
+// `then_experts` into `then_slots` with no fault. Results go to `results[0..1]`.
+void exl3_ram_miss_read_rows_faulted(
+    TensorView reads,
+    TensorView file_sizes,
+    TensorView segments,
+    TensorView slabs,
+    TensorView row_bytes,
+    std::string paths,
+    int64_t slot_bytes,
+    int64_t direct,
+    int64_t row,
+    TensorView experts,
+    TensorView slots,
+    TensorView then_experts,
+    TensorView then_slots,
+    TensorView fault,
+    TensorView results) {
+  using namespace exl3_ram_miss;
+  auto* out = static_cast<int64_t*>(results.data_ptr());
+  RowReader reader(tables_from(reads, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  if (!reader.open()) {
+    out[0] = out[1] = 0;
+    return;
+  }
+  const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+  reader.set_fault(ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4]});
+  const auto never = [] { return false; };
+  out[0] = reader.read(row, ids_of(experts), slots_of(slots), kBounceRows, never);
+  reader.set_fault(ReadFault{});
+  out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, never);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_faulted, exl3_ram_miss_read_rows_faulted);
 
 }  // namespace sglang
