@@ -63,7 +63,7 @@ def _rel(y, ref):
     return float((y.float() - ref.float()).norm() / ref.float().norm())
 
 
-def _layers(tmp_path, monkeypatch, timeout_ms=2000):
+def _layers(tmp_path, timeout_ms=2000):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -75,8 +75,12 @@ def _layers(tmp_path, monkeypatch, timeout_ms=2000):
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
-    monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_TIMEOUT_MS", str(timeout_ms))
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+    with (
+        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
+        envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
+        # Read when attach builds the device side, so attach runs inside this block.
+        envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
+    ):
         layer = torch.nn.Module()
         layer.layer_id = 0
         layer.top_k = TOP_K
@@ -87,16 +91,16 @@ def _layers(tmp_path, monkeypatch, timeout_ms=2000):
         hot = ExpertHotCache(streamer, 3, scratch_rows=TOP_K)
         hot.reassign([0, 1, 2])
         streamer.enable_graph_gather(TOP_K)
-    checks = []
-    manager = type("M", (), {"register_fail_stop_check": lambda self, f: checks.append(f), "add_residency_listener": lambda self, f: f(0, list(hot.slot_to_expert))})()
-    fmt.attach_hot_cache_manager(manager, streamer)
+        checks = []
+        manager = type("M", (), {"register_fail_stop_check": lambda self, f: checks.append(f), "add_residency_listener": lambda self, f: f(0, list(hot.slot_to_expert))})()
+        fmt.attach_hot_cache_manager(manager, streamer)
     return layer, streamer, service_module.Exl3RamMissService.get(), checks
 
 
-def test_ram_misses_inside_a_replay_are_served(tmp_path, monkeypatch):
+def test_ram_misses_inside_a_replay_are_served(tmp_path):
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    layer, streamer, service, checks = _layers(tmp_path, monkeypatch)
+    layer, streamer, service, checks = _layers(tmp_path)
     source = _source_rows(tmp_path)
     try:
         gen = torch.Generator(device="cpu").manual_seed(3)
@@ -135,13 +139,14 @@ def test_ram_misses_inside_a_replay_are_served(tmp_path, monkeypatch):
         service.shutdown()
 
 
-def test_a_forced_timeout_fails_stop_without_hanging(tmp_path, monkeypatch):
+def test_a_forced_timeout_fails_stop_without_hanging(tmp_path):
     import time
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    layer, streamer, service, checks = _layers(tmp_path, monkeypatch, timeout_ms=100)
+    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=100)
     try:
+        assert service.device_side.timeout_ns == 100_000_000  # the override reached attach
         x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
         weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
         ids = torch.tensor([[0, 1, 2, 3, 4, 5]], device="cuda", dtype=torch.int32)

@@ -105,12 +105,17 @@ def test_attach_registers_once_and_pushes_residency(tiers):
     for streamer in streamers.values():
         streamer.format.attach_hot_cache_manager(manager, streamer)
     assert len(checks) == 1 and len(listeners) == 1
-    listeners[0](1, [3, -1])  # expert 3 is hot in layer 1
-    row = service.row_of(1)
-    caches[1].ensure_rows(torch.tensor([0, 1, 2]))
-    caches[1].ensure_rows(torch.tensor([3]))  # capacity 3: evicts 0, loads 3
-    caches[1].ensure_rows(torch.tensor([4]))  # evicts 1, never the hot 3
-    assert service.host.contains(row, 3) and not service.host.contains(row, 1)
+    listeners[0](1, [3, -1])  # expert 3 is hot in layer 1, and in layer 1 only
+    for layer_id in (0, 1):
+        # Capacity 3; 3 is loaded first, so plain LRU would evict it next.
+        caches[layer_id].ensure_rows(torch.tensor([3]))
+        caches[layer_id].ensure_rows(torch.tensor([0, 1]))
+        caches[layer_id].ensure_rows(torch.tensor([2]))
+    hot_row, cold_row = service.row_of(1), service.row_of(0)
+    # The pushed hot map kept 3 in layer 1: the LRU-oldest non-hot row, 0, went instead.
+    assert [service.host.contains(hot_row, e) for e in (3, 0, 1, 2)] == [True, False, True, True]
+    # Layer 0 got no push, so its LRU-oldest row, 3, went.
+    assert [service.host.contains(cold_row, e) for e in (3, 0, 1, 2)] == [False, True, True, True]
 
 
 def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monkeypatch):
@@ -126,6 +131,13 @@ def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monke
     assert order == ["stop", 0, 1]
     service.shutdown()  # idempotent: the fixture calls it again
     assert order == ["stop", 0, 1]
+    # A started service refuses every later use with a clear error, not the C++
+    # "unknown handle" of a closed host; the per-batch check has nothing left to check.
+    with pytest.raises(RuntimeError, match="option C service was shut down"):
+        caches[0].lookup(torch.tensor([1]))
+    with pytest.raises(RuntimeError, match="option C service was shut down"):
+        service.on_residency(0, [1])
+    service.fail_stop_check()
 
 
 def test_graph_steps_are_traced_and_read_back_by_tier_sim(tmp_path):
@@ -179,6 +191,34 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     demand_rows[0] = [1, 1]
     service.fail_stop_check()
     assert lines == [dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3)]
+
+    # discard_graph_capture_routes zeroes the registers: no line, a new baseline.
+    for register in manager._registers["decode"].values():
+        register.zero_()
+    service.fail_stop_check()
+    assert len(lines) == 1
+    manager._graph_counters.copy_(torch.tensor([[6, 1], [6, 0]]))
+    manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
+    demand_rows[0] = [2, 1]
+    service.fail_stop_check()
+    assert lines[1:] == [dict(layer_rows_delta=[1, 0], routed_rows=12, routed_misses=1)]
+
+
+def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    class Gathered(Exception):
+        pass
+
+    def gather(topk_ids):
+        raise Gathered  # stop before the fused MoE: only the routes copy is under test
+
+    backend = SimpleNamespace(routes=torch.full((6,), 7, dtype=torch.int64), keep=torch.ones(1))
+    streamer = SimpleNamespace(row_backend=backend, gather=gather)
+    ids = torch.tensor([[5, 2, 9, 0]], dtype=torch.int32)
+    with pytest.raises(Gathered):
+        Exl3MoEMethod._apply_graph(SimpleNamespace(layer_id=0), streamer, torch.zeros((1, 8)), torch.ones((1, 4)), ids, 10.0)
+    assert backend.routes.tolist() == [5, 2, 9, 0, -1, -1]
 
 
 def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
