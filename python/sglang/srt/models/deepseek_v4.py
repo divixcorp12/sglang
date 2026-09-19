@@ -207,6 +207,18 @@ if _is_npu:
     import torch_npu
 
 
+def _refork_stats_stream(stats_stream, main_stream) -> None:
+    """Fork ``stats_stream`` off ``main_stream`` again under a breakable graph capture.
+
+    The MoE's eager break ends the segment the stats stream was forked into and joins
+    it, so the FFN stats launch on a stream that is no longer part of the capture: their
+    kernels would run once at capture time and the join back would be dropped. A fresh
+    fork puts them in the current segment. The extra wait is conservative (the stats
+    input was produced on ``main_stream``) and adds no work outside a capture."""
+    if stats_stream is not None and is_in_breakable_cuda_graph():
+        stats_stream.wait_stream(main_stream)
+
+
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
     mhc_fused_post_pre: Optional[Callable[..., Any]]
@@ -3248,6 +3260,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
             main_stream = torch.cuda.current_stream()
+            _refork_stats_stream(stats_stream, main_stream)
             if stats_stream is not None:
                 x.record_stream(stats_stream)
             with (
