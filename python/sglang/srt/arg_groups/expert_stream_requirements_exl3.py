@@ -64,10 +64,13 @@ def _check(cfg, budgets) -> None:
             "EXL3 expert caching runs prefill eagerly; pass --cuda-graph-backend-prefill disabled"
         )
     _EAGER.check(_EagerGraphView(cfg), budgets)
-    # Captured into a breakable decode graph, DSV4's alt-stream overlap gives wrong
-    # attention output (the truncated model's tokens diverge at the first decode step;
-    # with the overlap off graph and eager agree bit for bit). Only capture runs the
-    # overlap, so turning it off leaves eager launches unchanged.
+    # DSV4's alt-stream overlap still gives wrong output when captured in the breakable
+    # decode graph, and this gate turns it off. Its mHC stats side stream was one cause
+    # (forked before the MoE break, launched on after it; fixed by _refork_stats_stream:
+    # the NaNs went away). A second defect remains in the first segment: the MQA alt-stream
+    # prepare (MQALayer, capture-only) leaves layer 0's MoE input different from eager's,
+    # cause unknown. The stats stream also runs in eager decode, so eager decode of this
+    # launch loses that overlap too.
     overlap = envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
     if overlap.get():
         if overlap.is_set():

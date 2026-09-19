@@ -130,14 +130,33 @@ def test_breakable_decode_at_batch_size_one_passes(model_dir):
 MULTI_STREAM = "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP"
 
 
-def test_breakable_decode_leaves_the_alt_stream_overlap_alone(model_dir, monkeypatch):
-    # The overlap's stats stream is re-forked after a break (DeepseekV4DecoderLayer._hc_mix_stats),
-    # so the gate neither disables nor refuses it.
+@pytest.fixture
+def multi_stream_unset(monkeypatch):
+    """The env unset for the test; monkeypatch restores whatever the gate sets."""
     monkeypatch.setenv(MULTI_STREAM, "1")
     monkeypatch.delenv(MULTI_STREAM)
+
+
+def test_breakable_decode_turns_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
+    # Captured in a breakable decode graph, DSV4's alt-stream overlap still yields wrong
+    # output after the stats-stream re-fork (graph_parity on the truncated model: the
+    # layer-0 MoE input differs at the first decode step); with it off, graph and eager
+    # agree bit for bit.
+    assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is True
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
+    assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
+
+
+def test_eager_launches_leave_the_alt_stream_overlap_alone(model_dir, multi_stream_unset):
+    _gate(_launch(model_dir))
     assert not envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.is_set()
+
+
+def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(model_dir, monkeypatch):
     monkeypatch.setenv(MULTI_STREAM, "1")
+    with pytest.raises(ValueError, match=MULTI_STREAM):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
+    monkeypatch.setenv(MULTI_STREAM, "0")
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
 
 
