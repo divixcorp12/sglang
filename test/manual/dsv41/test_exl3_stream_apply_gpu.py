@@ -27,7 +27,7 @@ LAYER = 1
         (1, None, [3, 4]),  # one chunk, mixed hits (hot cache + pinned tier)
         (5, None, [3, 4]),
         (5, 2, [3, 4]),  # >= 3 chunks reuse the staging
-        (1, None, [0, 1, 2]),  # every routed expert is hot: rows are hot-cache slots
+        (1, None, [2, 0, 1]),  # all hot, slots [2,0,1]: row_of_source is [1,2,0]
     ],
 )
 def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_experts):
@@ -61,8 +61,8 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
     )
     generator = torch.Generator().manual_seed(tokens)
     x = (torch.randn(tokens, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).cuda()
-    if hot_experts == [0, 1, 2]:
-        topk_ids = torch.tensor([hot_experts] * tokens, dtype=torch.int32).cuda()
+    if sorted(hot_experts) == [0, 1, 2]:
+        topk_ids = torch.tensor([sorted(hot_experts)] * tokens, dtype=torch.int32).cuda()
     elif max_gather_rows is not None:  # all six experts route: three chunks of two
         topk_ids = torch.tensor(
             [[0, 1, 2], [3, 4, 5], [0, 3, 5], [1, 4, 2], [5, 0, 4]][:tokens], dtype=torch.int32
@@ -76,7 +76,18 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
         hidden_states=x,
         topk_output=types.SimpleNamespace(topk_weights=topk_weights, topk_ids=topk_ids),
     )
+    chunks = []
+    iterate = streamer.iter_gather_experts
+
+    def recording(ids, **kwargs):
+        for chunk, row_of_source, rows in iterate(ids, **kwargs):
+            chunks.append(chunk.tolist())
+            yield chunk, row_of_source, rows
+
+    streamer.iter_gather_experts = recording
     got = method.apply(layer, dispatch).hidden_states
+    if max_gather_rows == 2:
+        assert len(chunks) == 3
 
     with open(tmp_path / "model.safetensors.index.json") as f:
         weight_map = json.load(f)["weight_map"]
