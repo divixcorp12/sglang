@@ -181,6 +181,26 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     assert lines == [dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3)]
 
 
+def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
+    # The post kernel reads planned for min(count, 8) lanes and count lives on the
+    # device, so a 6-lane plan (graph_gather_rows = top-6) must not be passed as is.
+    from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS
+
+    calls = []
+    device_side = SimpleNamespace(
+        post=lambda row, planned, count, routes, next_row: calls.append(("post", planned.clone())),
+        wait=lambda row, planned, count, host_rows, keep, ram_miss: calls.append(("wait", planned.clone())),
+    )
+    backend = module.Exl3RamMissRowBackend({0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
+    assert backend.planned.numel() >= MAX_IDS
+    plan = SimpleNamespace(expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]), count=torch.tensor([3], dtype=torch.int32))
+    backend.translate(0, plan)
+    for name, planned in calls:
+        assert planned.numel() >= MAX_IDS, name
+        assert planned.tolist() == [4, 2, 5, 0, 0, 0] + [-1] * (planned.numel() - 6), name
+    assert [name for name, _ in calls] == ["post", "wait"]
+
+
 def test_a_test_fault_spec_parses():
     assert module.parse_fault("") is None
     assert module.parse_fault("40:20") == (40, 20.0)
