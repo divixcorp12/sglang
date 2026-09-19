@@ -177,8 +177,17 @@ def _make_lazy_expert():
             self._keep_dense = keep_dense
             self._dense = self._dequant() if keep_dense else ()
 
+        def bind_disk(self, disk, device: str) -> None:
+            """Read the three tensors from the shard on every call (full-model runs)."""
+            self._disk, self._device = disk, device
+            self._tensors, self._keep_dense, self._dense = None, False, ()
+
         def _dequant(self):
-            w1, w2, w3 = self._tensors
+            if getattr(self, "_disk", None) is not None:
+                t = self._disk.load(self._device)
+                w1, w2, w3 = t["w1"], t["w2"], t["w3"]
+            else:
+                w1, w2, w3 = self._tensors
             # exl3_dense_weight(t) is [in, out]; nn.Linear's convention (and F.linear) wants
             # [out, in], matching ref.Expert's own w1/w2/w3 = Linear(dim, inter_dim)-shaped weights.
             return tuple(exl3_dense_weight(t).t().to(torch.bfloat16) for t in (w1, w2, w3))
@@ -243,7 +252,30 @@ def _exl3_tensors(parts: dict) -> Exl3Tensors:
     )
 
 
-def _load_checkpoint(trunc_dir: str, device: str):
+class DiskExpert:
+    """One routed expert's three EXL3 linears, read from its shard on every `load`.
+
+    Plain safetensors reads, independent of the streaming code under test, so a
+    wrong offset table there shows up as a logit mismatch instead of being shared.
+    """
+
+    def __init__(self, path: str, stems: dict[str, str]) -> None:
+        self.path = path
+        self.stems = stems  # "w1" -> "layers.L.ffn.experts.E.w1", ...
+
+    def load(self, device: str) -> dict[str, Exl3Tensors]:
+        from safetensors import safe_open
+
+        with safe_open(self.path, framework="pt", device="cpu") as f:
+            return {
+                w: _exl3_tensors(
+                    {part: f.get_tensor(f"{stem}.{part}").to(device) for part in ("trellis", "suh", "svh", "mul1")}
+                )
+                for w, stem in self.stems.items()
+            }
+
+
+def _load_checkpoint(trunc_dir: str, device: str, lazy_routed: bool = False):
     """Read every tensor in `trunc_dir`'s (Task 7-filtered) index, split into: a plain `state`
     dict ready for `load_state_dict` (dense/plain tensors, including every dequantized-then-
     concatenated EXL3 stem), plus the routed/shared expert `Exl3Tensors` grouped by (layer,
@@ -262,6 +294,7 @@ def _load_checkpoint(trunc_dir: str, device: str):
         return handles[weight_map[name]].get_tensor(name)
 
     routed_parts: dict[tuple, dict] = {}
+    routed_names: dict[str, dict[str, str]] = {}
     shared_parts: dict[tuple, dict] = {}
     slice_parts: dict[tuple, dict] = {}
     generic_parts: dict[str, dict] = {}
@@ -270,7 +303,10 @@ def _load_checkpoint(trunc_dir: str, device: str):
     for name in weight_map:
         m = _ROUTED_RE.match(name)
         if m:
-            routed_parts.setdefault((m.group(1), m.group(2)), {})[m.group(3)] = get(name)
+            if lazy_routed:
+                routed_names.setdefault(m.group(1), {})[m.group(2)] = weight_map[name]
+            else:
+                routed_parts.setdefault((m.group(1), m.group(2)), {})[m.group(3)] = get(name)
             continue
         m = _SHARED_RE.match(name)
         if m:
@@ -304,6 +340,13 @@ def _load_checkpoint(trunc_dir: str, device: str):
         state[f"{stem}.weight"] = torch.cat(pieces, dim=0)
 
     routed = {}
+    if lazy_routed:
+        for stem, shards in routed_names.items():
+            m = _LAYER_EXPERT_RE.match(stem)
+            (shard,) = set(shards.values())
+            routed[(int(m.group(1)), int(m.group(2)))] = DiskExpert(
+                os.path.join(trunc_dir, shard), {w: f"{stem}.{w}" for w in shards}
+            )
     for (stem, wk), parts in routed_parts.items():
         m = _LAYER_EXPERT_RE.match(stem)
         layer, expert = int(m.group(1)), int(m.group(2))
@@ -318,7 +361,9 @@ def _load_checkpoint(trunc_dir: str, device: str):
     return state, routed, shared
 
 
-def build_model(ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len: int):
+def build_model(
+    ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len: int, lazy_routed: bool = False
+):
     """Build the truncated `ref.Transformer` on `cuda`, load the (Task 7-filtered) checkpoint,
     and bind the routed/shared experts plus the layer-1 Engram table. Needs a GPU."""
     import torch
@@ -341,7 +386,7 @@ def build_model(ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len
     with torch.device("cuda"):
         model = ref.Transformer(ref.ModelArgs(**kwargs), tokenizer=tokenizer)
 
-    state, routed, shared = _load_checkpoint(trunc_dir, device="cuda")
+    state, routed, shared = _load_checkpoint(trunc_dir, device="cuda", lazy_routed=lazy_routed)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if unexpected:
         raise AssertionError(f"unexpected_keys was not empty: {unexpected}")
@@ -353,7 +398,10 @@ def build_model(ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len
     print(f"unexpected_keys: {unexpected}")
 
     for (layer, expert), tensors in routed.items():
-        model.layers[layer].ffn.experts[expert].bind(tensors["w1"], tensors["w2"], tensors["w3"], keep_dense=False)
+        if lazy_routed:
+            model.layers[layer].ffn.experts[expert].bind_disk(tensors, "cuda")
+        else:
+            model.layers[layer].ffn.experts[expert].bind(tensors["w1"], tensors["w2"], tensors["w3"], keep_dense=False)
     for layer, tensors in shared.items():
         model.layers[layer].ffn.shared_experts.bind(tensors["w1"], tensors["w2"], tensors["w3"], keep_dense=True)
 
@@ -524,6 +572,11 @@ def _parse_args():
         "like the reference's fp4, per the layer-2 bisect)",
     )
     parser.add_argument("--sessions", default=_DEFAULT_SESSIONS, help="sessions.jsonl for --router-corpus/--make-prompts")
+    parser.add_argument(
+        "--lazy-experts",
+        action="store_true",
+        help="read each routed expert from its shard per call (full-model runs)",
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--prompts", help="JSONL of {\"tokens\": [...]} to run through the model")
     group.add_argument("--router-corpus", type=int, metavar="N", help="first N sessions -> router-<tag>.json")
@@ -546,7 +599,9 @@ def main() -> int:
     ref, _ = _import_reference(args.snapshot)
     if args.kv_quant.startswith("flashmla"):
         use_flashmla_kv_quant(ref, compressed=args.kv_quant == "flashmla")
-    model = build_model(ref, args.snapshot, args.trunc, args.engram_dir, args.max_seq_len)
+    model = build_model(
+        ref, args.snapshot, args.trunc, args.engram_dir, args.max_seq_len, lazy_routed=args.lazy_experts
+    )
 
     if args.router_corpus is not None:
         _run_router_corpus(ref, model, args.trunc, args.sessions, args.router_corpus, args.tag, args.out_dir)
