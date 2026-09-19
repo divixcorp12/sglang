@@ -118,6 +118,22 @@ def test_attach_registers_once_and_pushes_residency(tiers):
     assert [service.host.contains(cold_row, e) for e in (3, 0, 1, 2)] == [False, True, True, True]
 
 
+def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_hot(tiers):
+    """Minor 1: the hot cache reserves chunk 1's experts before the residency listener
+    pushes them to C++. Chunk 2's admission (its own host use) must still protect them,
+    exactly as ``is_pinned`` does when it sizes the chunk."""
+    service, streamers, caches = tiers
+    cache = caches[0]
+    row = service.row_of(0)
+    cache.ensure_rows(torch.tensor([0]))
+    cache.ensure_rows(torch.tensor([1, 2]))  # full (capacity 3); 0 is the LRU-oldest row
+    # Chunk 1 promoted 0 into VRAM: the hot cache holds it; no listener push has run yet.
+    streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1])
+    assert cache.evictable_rows() == 2  # is_pinned already protects 0
+    cache.ensure_rows(torch.tensor([4]))  # chunk 2's admission
+    assert [service.host.contains(row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
+
+
 @pytest.mark.parametrize("prefetch, advise", [(True, 1), (None, 0)], ids=["env_on", "env_unset"])
 def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, prefetch, advise):
     """The production hop: SGLANG_DSV41_ENABLE_EXPERT_PREFETCH -> prefetch_enabled() -> attach ->
