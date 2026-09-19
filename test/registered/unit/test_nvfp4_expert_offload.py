@@ -1302,5 +1302,39 @@ class HotCacheStartupTests(unittest.TestCase):
         factory.assert_not_called()
 
 
+class ModelOptMixedHotCacheConfigurationTests(HotCacheConfigurationTests):
+    """Every hot-cache gate case again, with the production checkpoint's method named.
+
+    The gate looks up the launch's requirements by quantization method; the
+    ModelOpt methods must get exactly the NVFP4 gate the cases above pin.
+    """
+
+    quantization = "modelopt_mixed"
+
+    def args(self, **changes):
+        changes.setdefault("quantization", self.quantization)
+        return super().args(**changes)
+
+
+class ModelOptFp4HotCacheConfigurationTests(ModelOptMixedHotCacheConfigurationTests):
+    quantization = "modelopt_fp4"
+
+
+class ModelOptAutoHotCacheConfigurationTests(ModelOptMixedHotCacheConfigurationTests):
+    quantization = "ModelOpt"
+
+
+class NvFp4OnlineHotCacheConfigurationTests(ModelOptMixedHotCacheConfigurationTests):
+    """nvfp4_online's MoE method subclasses ModelOptNvFp4FusedMoEMethod and streams too."""
+
+    quantization = "nvfp4_online"
+
+
+class HybridFp8HotCacheConfigurationTests(ModelOptMixedHotCacheConfigurationTests):
+    """fp8 checkpoints with NVFP4 experts load through HybridFp8NvFp4Config and stream too."""
+
+    quantization = "fp8"
+
+
 if __name__ == "__main__":
     unittest.main()
