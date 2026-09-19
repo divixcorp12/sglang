@@ -13,9 +13,11 @@ import math
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Iterable,
     Iterator,
     Literal,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
@@ -107,6 +109,10 @@ class ExpertFormat(Protocol):
     def file_source_bytes_per_expert(
         self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]
     ) -> Optional[int]: ...
+
+    def pinned_tier_options(self, layer: torch.nn.Module) -> Mapping[str, Any]:
+        """Keyword arguments for this layer's ``ExpertPinnedHostCache``, e.g. ``is_pinned``."""
+        ...
 
 
 class DenseLayerFormat:
@@ -211,6 +217,10 @@ class DenseLayerFormat:
         # Exactly the pre-format gate: only the NVFP4 method's verified
         # attribute enables file attribution and the eager pinned tier.
         return getattr(layer, FILE_SOURCE_BYTES_ATTRIBUTE, None)
+
+    def pinned_tier_options(self, layer: torch.nn.Module) -> Mapping[str, Any]:
+        # The dense format builds the pinned tier exactly as before formats existed.
+        return {}
 
 
 def expert_streamer_of(module: torch.nn.Module) -> Optional["ExpertStreamer"]:

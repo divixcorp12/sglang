@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import weakref
 from dataclasses import asdict, dataclass, replace
 from operator import index
 from typing import Dict, Iterable, Tuple
@@ -21,6 +22,12 @@ from sglang.srt.layers.moe.expert_format import (
     ExpertTensorSpec,
     iter_expert_streamers,
     resolve_row_source_kind,
+)
+from sglang.srt.layers.moe.expert_host_tier import (
+    PinnedGatherResult,
+    PinnedSlotLRU,
+    allocate_host_slab,
+    release_host_slabs,
 )
 from sglang.srt.layers.moe.expert_row_source import (
     ExpertRowSource,
@@ -108,9 +115,24 @@ class PinnedHostCacheStats:
 
 
 class ExpertPinnedHostCache:
-    """Bounded, on-demand pinned host rows shared by one expert layer."""
+    """Bounded, on-demand pinned host rows shared by one expert layer.
 
-    def __init__(self, streamer: "ExpertStreamer", capacity: int):
+    Each host tensor gets one page-aligned slab registered with CUDA and sized
+    to exactly ``capacity`` rows; PyTorch's pinned allocator would round each
+    slab up to a power of two. ``device`` holds the slot lookup. It defaults
+    to the layer's CUDA source device, else the current CUDA device; a CPU
+    ``device`` keeps the tier on the host with unregistered slabs, so it runs
+    without a GPU. ``is_pinned(expert_id)`` protects experts from eviction.
+    """
+
+    def __init__(
+        self,
+        streamer: "ExpertStreamer",
+        capacity: int,
+        *,
+        device: torch.device | str | None = None,
+        is_pinned=None,
+    ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
             raise ValueError("pinned host cache capacity must be within expert count")
@@ -125,35 +147,43 @@ class ExpertPinnedHostCache:
             )
         self.bytes_per_expert = streamer.host_bytes_per_expert
         self.residency_bytes = capacity * self.bytes_per_expert
-        devices = {
-            streamer.source(spec.name).device
-            for spec in streamer.specs
-            if spec.residence == "device"
-        }
-        if len(devices) > 1:
-            raise ValueError("pinned host cache CUDA sources must share one device")
-        self.device = next(
-            iter(devices), torch.device("cuda", torch.cuda.current_device())
-        )
-        self.tensors = {
-            name: torch.empty(
-                (capacity,) + streamer.spec(name).row_shape,
-                dtype=streamer.spec(name).dtype,
-                device="cpu",
-                pin_memory=True,
+        if device is None:
+            devices = {
+                streamer.source(spec.name).device
+                for spec in streamer.specs
+                if spec.residence == "device"
+            }
+            if len(devices) > 1:
+                raise ValueError("pinned host cache CUDA sources must share one device")
+            device = next(
+                iter(devices), torch.device("cuda", torch.cuda.current_device())
             )
-            for name in self.cached_names
-        }
+        self.device = torch.device(device)
+        register = self.device.type == "cuda"
+        self.tensors: dict[str, torch.Tensor] = {}
+        registered: list[torch.Tensor] = []
+        try:
+            for name in self.cached_names:
+                spec = streamer.spec(name)
+                slab = allocate_host_slab(
+                    capacity, spec.row_shape, spec.dtype, register=register
+                )
+                self.tensors[name] = slab
+                if register and slab.numel():
+                    registered.append(slab)
+        except BaseException:
+            release_host_slabs(registered)
+            raise
+        # Unregisters the slabs when the cache is collected, at exit, or on close().
+        self._release_slabs = weakref.finalize(self, release_host_slabs, registered)
         row_source = streamer.row_source
         if row_source is not None:
             row_source.register_destinations(self.tensors.values())
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
-        self.slot_to_expert = [-1] * capacity
-        self._expert_to_slot: dict[int, int] = {}
-        self._last_used = [0] * capacity
-        self._clock = 0
+        self.is_pinned = is_pinned
+        self._lru = PinnedSlotLRU(capacity, is_pinned=is_pinned)
         self.stats = PinnedHostCacheStats()
         streamer.pinned_host_cache = self
 
@@ -167,13 +197,34 @@ class ExpertPinnedHostCache:
             return 0
         return min(streamer.num_experts, budget_bytes // streamer.host_bytes_per_expert)
 
+    @property
+    def slot_to_expert(self) -> list[int]:
+        return self._lru.slot_to_expert
+
+    @property
+    def _expert_to_slot(self) -> dict[int, int]:
+        # ExpertHotCache._prepare_promotion reads resident slots through this.
+        return self._lru.expert_to_slot
+
+    def close(self) -> None:
+        """Unregister the slabs; the cache must not be used afterwards."""
+        self._release_slabs()
+
+    def evictable_rows(self) -> int:
+        """Slots a request can use: the capacity minus residents ``is_pinned`` protects."""
+        if self.is_pinned is None:
+            return self.capacity
+        return self.capacity - sum(
+            1 for expert_id in self._lru.expert_to_slot if self.is_pinned(expert_id)
+        )
+
     def _refresh_mapping(self) -> None:
-        mapping = [-1] * self.streamer.num_experts
-        for slot, expert_id in enumerate(self.slot_to_expert):
-            if expert_id >= 0:
-                mapping[expert_id] = slot
         self.expert_to_slot.copy_(
-            torch.tensor(mapping, dtype=torch.long, device=self.device)
+            torch.tensor(
+                self._lru.mapping(self.streamer.num_experts),
+                dtype=torch.long,
+                device=self.device,
+            )
         )
 
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -186,71 +237,59 @@ class ExpertPinnedHostCache:
         hit_mask = slots >= 0
         hit_ids = source_ids[hit_mask].tolist()
         for expert_id in hit_ids:
-            slot = self._expert_to_slot[int(expert_id)]
-            self._clock += 1
-            self._last_used[slot] = self._clock
+            self._lru.touch(int(expert_id))
         self.stats.lookup_hits += len(hit_ids)
         self.stats.lookup_misses += source_ids.numel() - len(hit_ids)
         return slots, hit_mask
 
-    def ensure_rows(self, source_ids: torch.Tensor) -> None:
-        """Read missing source rows into pinned slots, evicting least-recently-used rows."""
+    def ensure_rows(
+        self, source_ids: torch.Tensor, protected: Iterable[int] = ()
+    ) -> None:
+        """Read missing source rows into pinned slots, evicting least-recently-used rows.
+
+        The requested experts, and any others in ``protected`` (a caller's
+        whole chunk), are evicted only when nothing else can be.
+        """
         if not self.cached_names or self.capacity == 0 or source_ids.numel() == 0:
             return
         requested = list(dict.fromkeys(int(value) for value in source_ids.tolist()))
-        missing = [
-            expert_id
-            for expert_id in requested
-            if int(expert_id) not in self._expert_to_slot
-        ]
-        assignments = []
-        for expert_id in missing:
-            free = next(
-                (
-                    slot
-                    for slot, resident in enumerate(self.slot_to_expert)
-                    if resident < 0
-                ),
-                None,
-            )
-            evicted = free is None
-            if free is None:
-                free = min(range(self.capacity), key=self._last_used.__getitem__)
-            if evicted:
-                self.stats.evictions += 1
-                self._expert_to_slot.pop(self.slot_to_expert[free], None)
-            assignments.append((expert_id, free))
-            self.slot_to_expert[free] = expert_id
-            self._expert_to_slot[expert_id] = free
-            self._clock += 1
-            self._last_used[free] = self._clock
-        if not assignments:
+        missing = [expert_id for expert_id in requested if expert_id not in self._lru]
+        if not missing:
             return
-        # More misses than slots reassign a slot within this call. Read only the
-        # slot's final expert: batched file reads complete in any order.
-        final_slots = {slot: expert_id for expert_id, slot in assignments}
-        source_ids_cpu = torch.tensor(list(final_slots.values()), dtype=torch.long)
-        slots_cpu = torch.tensor(list(final_slots), dtype=torch.long)
+        protected = frozenset(requested).union(int(value) for value in protected)
+        assignments = []
+        evictions = 0
+        # Assignment and read are one transaction: on any failure every slot this
+        # call assigned is freed, so no expert stays mapped to a slot never read.
         try:
+            for expert_id in missing:
+                slot, evicted = self._lru.assign(expert_id, protected)
+                evictions += evicted is not None
+                assignments.append((expert_id, slot))
+            # More misses than slots reassign a slot within this call. Read only the
+            # slot's final expert: batched file reads complete in any order.
+            final_slots = {slot: expert_id for expert_id, slot in assignments}
+            source_ids_cpu = torch.tensor(list(final_slots.values()), dtype=torch.long)
+            slots_cpu = torch.tensor(list(final_slots), dtype=torch.long)
             self.streamer.read_host_rows(
                 source_ids_cpu,
                 {name: self.tensors[name] for name in self.cached_names},
                 slots_cpu,
             )
         except BaseException:
-            for slot, expert_id in final_slots.items():
-                self.slot_to_expert[slot] = -1
-                self._expert_to_slot.pop(expert_id, None)
+            for slot in dict.fromkeys(slot for _, slot in assignments):
+                self._lru.release(slot)
             self._refresh_mapping()
             raise
         self._refresh_mapping()
+        self.stats.evictions += evictions
         self.stats.populated_rows += len(final_slots)
         self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
 
     def copy_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> bool:
-        """Gather resident pinned rows directly into CUDA outputs."""
+        """Gather resident pinned rows directly into CUDA (or, on a CPU tier, CPU) outputs."""
         if source_ids.numel() == 0:
             return False
         slots = self.expert_to_slot[source_ids.long()]
@@ -258,7 +297,9 @@ class ExpertPinnedHostCache:
         for name in self.cached_names:
             source = self.tensors[name]
             output = outputs[name]
-            if source.is_contiguous() and output.is_contiguous():
+            if output.device.type == "cpu":
+                torch.index_select(source, 0, slots.cpu(), out=output)
+            elif source.is_contiguous() and output.is_contiguous():
                 row_bytes = source.numel() * source.element_size() // self.capacity
                 _gather_host_rows_kernel[
                     (source_ids.numel(), triton.cdiv(row_bytes, 1024))
@@ -282,6 +323,70 @@ class ExpertPinnedHostCache:
                 torch.index_select(source, 0, slots_cpu, out=host_output)
                 output.copy_(host_output, non_blocking=True)
         return fallback_used
+
+    def gather_rows(
+        self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
+    ) -> PinnedGatherResult:
+        """Copy the rows of ``source_ids`` into the leading rows of ``outputs``, admitting misses.
+
+        Rows are admitted and copied chunk by chunk. Each chunk is sized when
+        it starts, from ``evictable_rows()``: residents that ``is_pinned``
+        protects never make room, and an admitted row may itself become
+        protected (an inclusive hierarchy pins rows the hot cache reserves), so
+        the room shrinks during a call. A chunk holds at most that many
+        distinct experts, all of them protected while it is admitted, and its
+        rows are checked resident before its copy, so no copy reads slot -1.
+        A call that fits in one chunk is the pre-chunking sequence ``lookup``,
+        ``ensure_rows``, ``copy_rows``, plus that host-side check. With no
+        evictable slot, a chunk with misses raises; an all-hit chunk is still
+        copied. Each chunk's hit count (``.item()``) syncs the stream on the
+        host, so the previous chunk's copy has run before its slots can be
+        refilled.
+        """
+        if self.capacity == 0:
+            raise ValueError("pinned host cache has no rows")
+        hit_rows = 0
+        miss_rows = 0
+        populated_before = self.stats.populated_bytes
+        fallback_used = False
+        total = source_ids.numel()
+        start = 0
+        while start < total:
+            evictable = self.evictable_rows()
+            chunk_rows = total - start
+            if (
+                evictable >= 1
+                and chunk_rows > evictable
+                and torch.unique(source_ids[start:]).numel() > evictable
+            ):
+                chunk_rows = evictable
+            chunk = source_ids[start : start + chunk_rows]
+            _, hit_mask = self.lookup(chunk)
+            chunk_hits = int(hit_mask.sum().item())
+            hit_rows += chunk_hits
+            miss_rows += chunk.numel() - chunk_hits
+            chunk_ids = [int(value) for value in chunk.tolist()]
+            if chunk_hits < chunk.numel():
+                if evictable < 1:
+                    raise RuntimeError("every pinned host slot holds a protected expert")
+                self.ensure_rows(chunk[~hit_mask], protected=chunk_ids)
+            lost = sorted({expert_id for expert_id in chunk_ids if expert_id not in self._lru})
+            if lost:
+                raise RuntimeError(
+                    f"pinned host rows of experts {lost} were evicted before their copy"
+                )
+            chunk_outputs = {
+                name: output[start : start + chunk_rows]
+                for name, output in outputs.items()
+            }
+            fallback_used = self.copy_rows(chunk, chunk_outputs) or fallback_used
+            start += chunk_rows
+        return PinnedGatherResult(
+            hit_rows,
+            miss_rows,
+            self.stats.populated_bytes - populated_before,
+            fallback_used,
+        )
 
 
 class ExpertPinnedHostCacheManager:
@@ -325,8 +430,16 @@ class ExpertPinnedHostCacheManager:
         if not any(capacities.values()):
             return None
         manager = cls()
+        # The format supplies tier options such as an is_pinned filter; the dense
+        # format supplies none, so NVFP4 tiers are built exactly as before.
         manager.caches = {
-            layer_id: ExpertPinnedHostCache(streamers[layer_id], capacity)
+            layer_id: ExpertPinnedHostCache(
+                streamers[layer_id],
+                capacity,
+                **streamers[layer_id].format.pinned_tier_options(
+                    streamers[layer_id].layer
+                ),
+            )
             for layer_id, capacity in capacities.items()
             if capacity
         }
@@ -1133,25 +1246,19 @@ class ExpertStreamer:
             and pinned_cache.capacity
             and self.file_source_bytes_per_expert is not None
         ):
-            _, pinned_hit_mask = pinned_cache.lookup(miss_source_ids)
-            pinned_hit_rows = int(pinned_hit_mask.sum().item())
-            pinned_miss_rows = miss_rows - pinned_hit_rows
-            populated_before = pinned_cache.stats.populated_bytes
-            if pinned_miss_rows:
-                pinned_cache.ensure_rows(miss_source_ids[~pinned_hit_mask])
-            pinned_populated_bytes = (
-                pinned_cache.stats.populated_bytes - populated_before
-            )
-            source_bytes = pinned_miss_rows * self.host_bytes_per_expert + miss_rows * (
-                self.bytes_per_expert - self.host_bytes_per_expert
-            )
             pinned_outputs = {
                 name: output
                 for name, output in misses.items()
                 if name in pinned_cache.cached_names
             }
-            gather_fallback_used = pinned_cache.copy_rows(
-                miss_source_ids, pinned_outputs
+            # Chunked so misses beyond the pinned capacity are never copied from slot -1.
+            pinned = pinned_cache.gather_rows(miss_source_ids, pinned_outputs)
+            pinned_hit_rows = pinned.hit_rows
+            pinned_miss_rows = pinned.miss_rows
+            pinned_populated_bytes = pinned.populated_bytes
+            gather_fallback_used = pinned.fallback_used
+            source_bytes = pinned_miss_rows * self.host_bytes_per_expert + miss_rows * (
+                self.bytes_per_expert - self.host_bytes_per_expert
             )
             uncached_outputs = {
                 name: output
@@ -1204,17 +1311,16 @@ class ExpertStreamer:
         """Gather routed rows through the pinned host cache.
 
         Returned tensors follow the leading-dimension rule of ``_gather_cached``.
+        Pinned rows are copied straight into the one staging set of
+        ``max(rows, NO_DEDUP_LIMIT)`` rows by ``gather_rows``, which admits
+        misses in chunks the tier can hold, so a format's ``max_gather_rows``
+        bounds this path's VRAM as it bounds ``_gather_cached``'s.
         """
         cache = self.pinned_host_cache
         assert cache is not None
         row_count = source_ids.numel()
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
-        slots, hit_mask = cache.lookup(source_ids)
-        del slots
-        hit_rows = int(hit_mask.sum().item())
-        miss_rows = row_count - hit_rows
-        copy_engine_bytes = 0
         padded = {
             name: _staging_buffer(
                 name,
@@ -1227,85 +1333,32 @@ class ExpertStreamer:
             for name in self.tensor_names
         }
         gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
-        hit_positions = hit_mask.nonzero().flatten()
-        miss_positions = (~hit_mask).nonzero().flatten()
-        if hit_rows:
-            hit_outputs = {
-                name: _staging_buffer(
-                    ("pinned_host_cache_hits", name),
-                    hit_rows,
-                    capacity,
-                    tuple(output.shape[1:]),
-                    output.dtype,
-                    output.device,
-                )
+        pinned = cache.gather_rows(
+            source_ids,
+            {
+                name: output
                 for name, output in gathered.items()
                 if name in cache.cached_names
-            }
-            cache.copy_rows(source_ids[hit_mask], hit_outputs)
-            for name, output in hit_outputs.items():
-                gathered[name].index_copy_(0, hit_positions, output)
-        if miss_rows:
-            populated_before = cache.stats.populated_bytes
-            cache.ensure_rows(source_ids[~hit_mask])
-            resident_mask = cache.expert_to_slot[source_ids[~hit_mask].long()] >= 0
-            resident_count = int(resident_mask.sum().item())
-            miss_outputs = {
-                name: _staging_buffer(
-                    ("pinned_host_cache_misses", name),
-                    resident_count,
-                    capacity,
-                    tuple(output.shape[1:]),
-                    output.dtype,
-                    output.device,
-                )
-                for name, output in gathered.items()
-                if name in cache.cached_names
-            }
-            if bool(resident_mask.any().item()):
-                cache.copy_rows(source_ids[~hit_mask][resident_mask], miss_outputs)
-                resident_positions = miss_positions[resident_mask]
-                for name, output in miss_outputs.items():
-                    gathered[name].index_copy_(0, resident_positions, output)
-            cold_mask = ~resident_mask
-            if bool(cold_mask.any().item()):
-                cold_ids = source_ids[~hit_mask][cold_mask]
-                cold_positions = miss_positions[cold_mask]
-                cold_outputs = {
-                    name: _staging_buffer(
-                        ("pinned_host_cache_cold", name),
-                        cold_ids.numel(),
-                        capacity,
-                        tuple(output.shape[1:]),
-                        output.dtype,
-                        output.device,
-                    )
-                    for name, output in gathered.items()
-                    if name in cache.cached_names
-                }
-                copy_engine_bytes += self._copy_source_rows(cold_ids, cold_outputs)
-                for name, output in cold_outputs.items():
-                    gathered[name].index_copy_(0, cold_positions, output)
-            populated_bytes = cache.stats.populated_bytes - populated_before
-        else:
-            populated_bytes = 0
+            },
+        )
+        copy_engine_bytes = 0
         uncached = {
             name: output
             for name, output in gathered.items()
             if name not in cache.cached_names
         }
         if uncached:
-            copy_engine_bytes += self._copy_source_rows(source_ids, uncached)
+            copy_engine_bytes = self._copy_source_rows(source_ids, uncached)
         self.last_gather_stats = ExpertGatherStats(
             row_count,
             0,
             row_count,
             0,
             row_count * self.host_bytes_per_expert,
-            miss_rows * self.bytes_per_expert,
-            hit_rows,
-            miss_rows,
-            populated_bytes,
+            pinned.miss_rows * self.bytes_per_expert,
+            pinned.hit_rows,
+            pinned.miss_rows,
+            pinned.populated_bytes,
             copy_engine_bytes=copy_engine_bytes,
             routed_rows=compact_ids.numel(),
             routed_miss_rows=compact_ids.numel(),
