@@ -1,0 +1,72 @@
+"""The corpus driver's session selection and CLI (CPU; the Engine run is Window C's)."""
+
+import json
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts", "dsv41")
+sys.path.insert(0, SCRIPTS)
+
+import trace_corpus  # noqa: E402
+
+
+def test_first_turns_skip_then_take(tmp_path):
+    sessions = tmp_path / "sessions.jsonl"
+    sessions.write_text("\n".join(json.dumps({"turns": [f"s{i}", "later"]}) for i in range(6)) + "\n")
+    assert list(trace_corpus._first_turns(str(sessions), 3)) == ["s0", "s1", "s2"]
+    assert list(trace_corpus._first_turns(str(sessions), 2, skip=3)) == ["s3", "s4"]
+    assert list(trace_corpus._first_turns(str(sessions), 5, skip=4)) == ["s4", "s5"]
+
+
+def test_engine_and_sampling_settings():
+    args = SimpleNamespace(model="/m", mem_fraction_static=0.85, chunked_prefill_size=512, new_tokens=128)
+    kwargs = trace_corpus.engine_kwargs(args)
+    assert kwargs["disable_cuda_graph"] and kwargs["disable_shared_experts_fusion"]
+    assert kwargs["disable_radix_cache"]
+    assert kwargs["expert_distribution_recorder_mode"] == "per_pass"
+    assert kwargs["max_running_requests"] == 4
+    assert trace_corpus.sampling_params(args) == {"max_new_tokens": 128, "temperature": 0, "ignore_eos": True}
+
+
+def test_help_lists_the_options():
+    result = subprocess.run(
+        [sys.executable, os.path.join(SCRIPTS, "trace_corpus.py"), "--help"],
+        capture_output=True, text=True, check=True,
+    )
+    for flag in ("--model", "--sessions", "--skip", "--new-tokens", "--out"):
+        assert flag in result.stdout
+
+
+def test_time_stream_reports_ttft_and_decode_rate():
+    ticks = iter([10.0, 12.0, 14.0])  # start, first chunk, done
+    timing = trace_corpus.time_stream(iter(["a", "b", "c"]), new_tokens=5, clock=lambda: next(ticks))
+    assert timing == {"ttft_s": 2.0, "decode_tok_s": 4 / 2.0}
+
+
+def test_time_stream_zero_decode_time_gives_zero_rate():
+    ticks = iter([0.0, 1.0, 1.0])
+    timing = trace_corpus.time_stream(iter(["a"]), new_tokens=5, clock=lambda: next(ticks))
+    assert timing == {"ttft_s": 1.0, "decode_tok_s": 0.0}
+
+
+def test_time_stream_that_yields_nothing_is_an_error():
+    with pytest.raises(RuntimeError, match="no chunks"):
+        trace_corpus.time_stream(iter([]), new_tokens=5)
+
+
+def test_mean_decode_tok_s():
+    sessions = [{"decode_tok_s": 2.0}, {"decode_tok_s": 4.0}]
+    assert trace_corpus.mean_decode_tok_s(sessions) == 3.0
+
+
+def test_mean_decode_tok_s_with_no_sessions_is_an_error():
+    with pytest.raises(ValueError, match="no sessions"):
+        trace_corpus.mean_decode_tok_s([])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
