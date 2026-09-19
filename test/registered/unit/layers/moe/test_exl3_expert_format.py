@@ -121,6 +121,13 @@ def test_rejects_an_unexpected_row(tmp_path):
         Exl3ExpertFormat(broken, 0)
 
 
+def test_the_exl3_format_serves_graph_gathers_from_its_pinned_tier():
+    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.expert_format import graph_source_kind_of
+
+    assert graph_source_kind_of(Exl3ExpertFormat) == "pinned_tier"
+
+
 if __name__ == "__main__":
     import sys
 

@@ -160,6 +160,19 @@ def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(model_d
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
 
 
+def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    with pytest.raises(ValueError, match="GRAPH_GATHER"):
+        _gate(_launch(model_dir), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    with pytest.raises(ValueError, match="PINNED_HOST_MB"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_PINNED_HOST_MB=0)
+
+
+def test_the_exl3_requirements_read_graph_gathers_from_the_pinned_tier(model_dir):
+    args = _launch(model_dir)
+    assert expert_stream_requirements_for(args, args).graph_gather_host_source == "pinned_tier"
+
+
 if __name__ == "__main__":
     import sys
 
