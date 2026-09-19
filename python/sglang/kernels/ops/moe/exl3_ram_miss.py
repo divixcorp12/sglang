@@ -6,7 +6,11 @@ device kernels (Task 13) and the host simulator (Task 11) speak the same protoco
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable
+import atexit
+import json
+import sys
+import weakref
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
@@ -104,3 +108,194 @@ def read_rows_with_fault(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
     return int(results[0]), int(results[1])
+
+
+PAGE_BYTES = 10304
+RECORD_BYTES = 128
+DEMAND_RING = 64
+DEMAND_RECORDS = 16
+ADVISE_RING = DEMAND_RING + DEMAND_RECORDS * RECORD_BYTES
+ADVISE_RECORDS = 64
+MAX_IDS = 8
+WORDS = {
+    "demand_head": 0,
+    "demand_done": 4,
+    "fatal": 8,
+    "stop": 12,
+    "advise_head": 16,
+    "advise_done": 20,
+    "busy_seq": 24,
+    "heartbeat": 28,
+}
+STATUS = {"pending": 0, "served": 1, "failed": 2}
+COUNTERS = (
+    "served",
+    "touch_only",
+    "rows_read",
+    "read_errors",
+    "evictions",
+    "overruns",
+    "advisories",
+    "advisories_skipped",
+    "advisory_rows",
+    "late_after_fatal",
+    "no_victim",
+    "version",
+    "running",
+    "spin_cpu",
+)
+
+
+def new_page(pin: bool) -> torch.Tensor:
+    """A zeroed request page; pinned (device-readable through UVA) for a real device."""
+    return torch.zeros(PAGE_BYTES, dtype=torch.uint8, pin_memory=pin)
+
+
+def page_word(page: torch.Tensor, name: str) -> int:
+    offset = WORDS[name]
+    return int(page[offset : offset + 4].view(torch.int32)[0]) & 0xFFFFFFFF
+
+
+def sim_post(page, row: int, need, protect, *, advisory: bool = False, after: int = 0) -> int:
+    """Post a record as the device post kernel does; returns its sequence."""
+    return int(_host_module().exl3_ram_miss_sim_post(page, row, _ids(need), _ids(protect), int(advisory), after))
+
+
+def sim_wait(page, seq: int, timeout_s: float) -> int:
+    """Wait as the device wait kernel does: 1 served, 2 failed, 0 timed out, 3 fatal already raised."""
+    return int(_host_module().exl3_ram_miss_sim_wait(page, seq, int(timeout_s * 1e9)))
+
+
+_LIVE: weakref.WeakSet[Exl3RamMissHost] = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_live() -> None:
+    for host in list(_LIVE):
+        host.stop()
+
+
+class Exl3RamMissHost:
+    """The C++-owned pinned-slot bookkeeping of every streamed layer and its request service.
+
+    ``tables``: ``Exl3RamMissTables``; ``page``: a ``new_page`` tensor; ``slot_map``:
+    int32 ``[layers, experts]`` filled with -1 (pinned for a real device). Row ``r`` is
+    streamed layer ``tables.layer_ids[r]``. Without a thread (Task 12) requests are
+    served only by ``pump()``.
+    """
+
+    def __init__(self, tables, *, page: torch.Tensor, slot_map: torch.Tensor, direct: bool) -> None:
+        if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
+            raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
+        if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.reads.shape[:2]):
+            raise ValueError("slot_map must be int32 [layers, experts]")
+        self._module = _host_module()
+        # The C++ service writes through raw addresses of the page, the slot map and the
+        # slabs (``tables.keepalive``): this object holds all three, and the finalizer
+        # below closes the service before they can be released.
+        self.tables = tables
+        self.page = page
+        self.slot_map = slot_map
+        self.layers, self.experts = tables.reads.shape[:2]
+        self.handle = int(
+            self._module.exl3_ram_miss_open(
+                page, slot_map, tables.reads, tables.file_sizes, tables.segments, tables.slabs,
+                tables.row_bytes, tables.capacity, "\n".join(tables.paths), tables.slot_bytes, int(direct),
+            )
+        )
+        if self.handle < 0:
+            raise RuntimeError("exl3 RAM miss service failed to open (files, io_uring or bounce)")
+        self._close = weakref.finalize(self, self._module.exl3_ram_miss_close, self.handle)
+        self._close.atexit = False  # _stop_live closes live hosts at exit, logging counters first
+        _LIVE.add(self)
+
+    def _check(self, row: int, expert: Optional[int] = None, slot: Optional[int] = None) -> None:
+        """The bounds the C++ bookkeeping does not check."""
+        if not 0 <= row < self.layers:
+            raise ValueError(f"streamed row {row} is outside [0, {self.layers})")
+        if expert is not None and not 0 <= expert < self.experts:
+            raise ValueError(f"expert {expert} is outside [0, {self.experts})")
+        capacity = int(self.tables.capacity[row])
+        if slot is not None and not 0 <= slot < capacity:
+            raise ValueError(f"slot {slot} is outside [0, {capacity})")
+
+    def pump(self) -> int:
+        return int(self._module.exl3_ram_miss_pump(self.handle))
+
+    def contains(self, row: int, expert: int) -> bool:
+        self._check(row, expert)
+        return bool(self._module.exl3_ram_miss_contains(self.handle, row, expert))
+
+    def touch(self, row: int, expert: int) -> None:
+        self._check(row, expert)
+        self._module.exl3_ram_miss_touch(self.handle, row, expert)
+
+    def assign(self, row: int, expert: int, protected: Iterable[int] = (), protected_fallback: bool = True) -> tuple[int, Optional[int]]:
+        self._check(row, expert)
+        out = torch.zeros(2, dtype=torch.int64)
+        self._module.exl3_ram_miss_assign(self.handle, row, expert, _ids(protected), int(protected_fallback), out)
+        slot, evicted = int(out[0]), int(out[1])
+        if evicted == -2:
+            raise ValueError(f"expert {expert} already holds a pinned slot")
+        if slot < 0:
+            raise RuntimeError("every pinned host slot holds a protected expert")
+        return slot, (None if evicted < 0 else evicted)
+
+    def release(self, row: int, slot: int) -> None:
+        self._check(row, slot=slot)
+        self._module.exl3_ram_miss_release(self.handle, row, slot)
+
+    def mapping(self, row: int) -> list[int]:
+        self._check(row)
+        out = torch.empty(self.experts, dtype=torch.int64)
+        self._module.exl3_ram_miss_mapping(self.handle, row, out)
+        return out.tolist()
+
+    def slot_to_expert(self, row: int) -> list[int]:
+        self._check(row)
+        out = torch.empty(int(self.tables.capacity[row]), dtype=torch.int64)
+        self._module.exl3_ram_miss_slot_to_expert(self.handle, row, out)
+        return out.tolist()
+
+    def lru_order(self, row: int) -> list[int]:
+        self._check(row)
+        out = torch.empty(int(self.tables.capacity[row]), dtype=torch.int64)
+        count = int(self._module.exl3_ram_miss_lru_order(self.handle, row, out))
+        return out[:count].tolist()
+
+    def set_hot(self, row: int, experts: Iterable[int]) -> None:
+        self._check(row)
+        self._module.exl3_ram_miss_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
+
+    def version(self) -> int:
+        return self.counters()["version"]
+
+    def inject(self, delay_s: float = 0.0, fail_reads: bool = False, delay_after_demands: int = 0) -> None:
+        """Test-only faults (see RamTier::inject)."""
+        self._module.exl3_ram_miss_inject(self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands)
+
+    def counters(self) -> dict[str, int]:
+        out = torch.zeros(len(COUNTERS), dtype=torch.int64)
+        self._module.exl3_ram_miss_counters(self.handle, out)
+        return dict(zip(COUNTERS, out.tolist()))
+
+    def layer_rows(self) -> list[int]:
+        """Rows read for demands, per streamed layer: the RAM misses behind ``f``."""
+        out = torch.zeros(self.layers, dtype=torch.int64)
+        self._module.exl3_ram_miss_layer_rows(self.handle, 0, out)
+        return out.tolist()
+
+    def layer_advisory_rows(self) -> list[int]:
+        out = torch.zeros(self.layers, dtype=torch.int64)
+        self._module.exl3_ram_miss_layer_rows(self.handle, 1, out)
+        return out.tolist()
+
+    def fatal_seq(self) -> int:
+        return page_word(self.page, "fatal")
+
+    def stop(self) -> None:
+        close = getattr(self, "_close", None)
+        if close is not None and close.alive:
+            # One line for the window's records (the corpus arms grep it).
+            sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
+            close()
