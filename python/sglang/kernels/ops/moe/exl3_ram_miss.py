@@ -1,4 +1,4 @@
-"""Option C RAM-miss service for EXL3 streamed experts: the C++ host module's wrappers.
+"""Option C RAM-miss service for EXL3 streamed experts: the C++ host module's and the device kernels' wrappers.
 
 Page layout and memory ordering are the plan's Design decisions D10-D11. The
 device kernels (Task 13) and the host simulator (Task 11) speak the same protocol.
@@ -346,3 +346,71 @@ class Exl3RamMissHost:
                 sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
             finally:
                 close()
+
+
+STATE_WORDS = {
+    "posted": 0,
+    "pending": 1,
+    "timeouts": 2,
+    "failures": 3,
+    "waits": 4,
+    "polls": 5,
+    "sticky": 6,
+    "advised": 7,
+    "unserved_misses": 8,
+}
+
+
+@cache_once
+def _device_module() -> Module:
+    names = ("exl3_ram_miss_post", "exl3_ram_miss_wait")
+    return load_jit(
+        "exl3_ram_miss",
+        cuda_files=["moe/exl3_ram_miss.cuh"],
+        cuda_wrappers=[(name, name) for name in names],
+    )
+
+
+class Exl3RamMissDevice:
+    """The post and wait kernels of option C, capturable in a CUDA graph.
+
+    ``page`` and ``slot_map`` are the host's pinned tensors (device-readable
+    through UVA). ``state`` holds the device words ``STATE_WORDS``;
+    ``last_routes`` int32 ``[layers, MAX_IDS]`` the previous token's routes per
+    layer for advisories (``advise``). ``timeout_ms`` bounds each wait.
+    """
+
+    def __init__(self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool) -> None:
+        if page.numel() != PAGE_BYTES or page.dtype != torch.uint8:
+            raise ValueError("page must be a uint8 tensor of PAGE_BYTES")
+        if slot_map.dtype != torch.int32 or slot_map.dim() != 2 or slot_map.shape[0] != layers:
+            raise ValueError("slot_map must be int32 [layers, experts]")
+        if timeout_ms <= 0:
+            raise ValueError("the RAM-miss wait timeout must be positive")
+        self.page = page
+        self.slot_map = slot_map
+        self.layers = layers
+        self.timeout_ns = int(timeout_ms * 1_000_000)
+        self.advise = int(bool(advise))
+        self.state = torch.zeros(len(STATE_WORDS), dtype=torch.int32, device=device)
+        self.last_routes = torch.full((layers, MAX_IDS), -1, dtype=torch.int32, device=device)
+        self._module = None
+
+    def _kernels(self):
+        if self._module is None:
+            self._module = _device_module()
+        return self._module
+
+    def post(self, row: int, planned, count, routes, next_row: int) -> None:
+        self._kernels().exl3_ram_miss_post(
+            self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row
+        )
+
+    def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:
+        self._kernels().exl3_ram_miss_wait(
+            self.page, self.state, self.slot_map, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns
+        )
+
+    def stats(self) -> dict[str, int]:
+        values = self.state.cpu().tolist()
+        return {name: values[index] for name, index in STATE_WORDS.items()}
