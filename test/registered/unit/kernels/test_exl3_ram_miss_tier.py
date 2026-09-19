@@ -1,12 +1,17 @@
 """The C++ slot LRU and request service, pumped by hand against a host-simulated device (CPU)."""
 
 import faulthandler
+import sys
+import threading
+import time
 
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import exl3_ram_miss
 from sglang.kernels.ops.moe.exl3_ram_miss import (
     DEMAND_RECORDS,
+    PAGE_BYTES,
     Exl3RamMissHost,
     new_page,
     page_word,
@@ -40,6 +45,15 @@ def tier(tmp_path, request):
     host.stop()
 
 
+def _until(predicate, timeout_s=5.0):
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
 def _serve(page, host, row, need, protect):
     seq = sim_post(page, row, need=need, protect=protect)
     assert host.pump() == 1
@@ -66,18 +80,25 @@ def test_protected_experts_missing_from_ram_are_read_too(tier):
     assert host.contains(0, 1) and host.contains(0, 4) and host.layer_rows() == [2, 0]
 
 
-def test_eviction_spares_protected_and_hot_experts_and_unmaps_the_victim_first(tier):
+def test_eviction_takes_the_lru_row_and_spares_hot_experts(tier):
     s, page, slot_map, host = tier
-    assert _serve(page, host, 0, need=[0, 1, 2], protect=[0, 1, 2]) == 1
-    host.set_hot(0, [0])
+    assert _serve(page, host, 0, need=[0, 1, 2], protect=[0, 1, 2]) == 1  # stamps 0 < 1 < 2
+    host.set_hot(0, [0])  # 0 is the oldest row but hot: never a victim
     assert _serve(page, host, 0, need=[], protect=[1]) == 1  # touch-only: 2 becomes the LRU non-hot row
-    assert _serve(page, host, 0, need=[4], protect=[4, 1]) == 1
-    assert slot_map[0, 2].item() == -1
-    assert all(slot_map[0, e].item() >= 0 for e in (0, 1, 4))
+    assert host.counters()["touch_only"] == 1
+    assert _serve(page, host, 0, need=[4], protect=[4]) == 1
+    # The victim is 2, the LRU row; it would be 1 if the touch-only record stamped nothing.
+    assert slot_map[0, 2].item() == -1 and all(slot_map[0, e].item() >= 0 for e in (0, 1, 4))
     slot = int(slot_map[0, 4])
     assert all(same_bytes(s.slabs[0][n][slot], s.reference(0, [4])[n][0]) for n in EXL3_STREAMED_NAMES)
-    assert host.lru_order(0)[-1] == 4 and host.counters()["evictions"] == 1
-    assert host.counters()["touch_only"] == 1
+    # 1 (touched before 4 was read) is now the LRU non-hot row.
+    assert _serve(page, host, 0, need=[5], protect=[5]) == 1
+    assert slot_map[0, 1].item() == -1 and all(slot_map[0, e].item() >= 0 for e in (0, 4, 5))
+    assert host.lru_order(0) == [0, 4, 5] and host.counters()["evictions"] == 2
+    # serve() stamps a request's resident ids before it picks a victim, so the shared
+    # victim rule's protect exclusion shows through assign(): 4 is the LRU row but protected.
+    slot, evicted = host.assign(0, 2, protected=[4], protected_fallback=False)
+    assert evicted == 5 and host.contains(0, 4) and slot_map[0, 2].item() == slot
 
 
 @pytest.mark.parametrize("tier", [2], indirect=True)
@@ -88,8 +109,10 @@ def test_no_evictable_slot_fails_the_request_and_raises_fatal(tier):
     assert host.pump() == 1
     assert sim_wait(page, seq, 1.0) == 2
     assert host.fatal_seq() == seq and host.counters()["no_victim"] == 1
+    assert host.counters()["late_after_fatal"] == 0
     sim_post(page, 0, need=[], protect=[0])
     assert host.pump() == 1
+    assert host.counters()["late_after_fatal"] == 1  # the pump saw the raised fatal word
     assert sim_wait(page, page_word(page, "demand_head"), 1.0) == 3  # sticky
 
 
@@ -150,7 +173,100 @@ def test_injected_delay_starts_after_n_demands_that_read(tier):
     assert time.perf_counter() - started >= 0.3
 
 
-if __name__ == "__main__":
-    import sys
+def test_a_lapped_demand_ring_counts_every_skipped_record(tier):
+    s, page, slot_map, host = tier
+    for _ in range(20):
+        sim_post(page, 0, need=[], protect=[])
+    assert host.pump() == 1
+    # The catch-up serves from head - 14 (seq 6): seqs 1-5 are skipped and each is counted.
+    assert host.counters()["overruns"] == 5 and page_word(page, "demand_done") == 6
 
+
+def test_the_seqlock_reader_never_accepts_a_torn_record():
+    accepted, torn = exl3_ram_miss.seqlock_stress(seconds=1.0)
+    assert accepted > 100 and torn == 0, (accepted, torn)
+
+
+def test_an_empty_need_that_reads_protected_rows_counts_as_served(tier):
+    s, page, slot_map, host = tier
+    # D12's race: the posted need is empty but a protected row is missing and is read.
+    assert _serve(page, host, 0, need=[], protect=[3]) == 1
+    assert host.counters()["served"] == 1 and host.counters()["touch_only"] == 0
+    assert host.layer_rows() == [1, 0]
+
+
+def test_a_repeated_protect_id_takes_one_slot(tier):
+    s, page, slot_map, host = tier
+    assert _serve(page, host, 0, need=[1], protect=[1, 1, 2]) == 1
+    assert host.slot_to_expert(0).count(1) == 1 and host.layer_rows() == [2, 0]
+
+
+@pytest.mark.parametrize(
+    "page_fn, map_fn",
+    [
+        (lambda: new_page(pin=False), lambda: torch.full((6, 2), -1, dtype=torch.int32).t()),
+        (lambda: new_page(pin=False), lambda: torch.zeros((2, 6), dtype=torch.int32)),
+        (lambda: torch.zeros(2 * PAGE_BYTES, dtype=torch.uint8)[::2], lambda: torch.full((2, 6), -1, dtype=torch.int32)),
+    ],
+    ids=["transposed_map", "map_not_empty", "strided_page"],
+)
+def test_the_host_refuses_a_page_or_slot_map_it_cannot_index(tmp_path, page_fn, map_fn):
+    s = ram_miss_setup(tmp_path)
+    with pytest.raises(ValueError):
+        Exl3RamMissHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=False)
+
+
+def test_release_refuses_a_slot_that_is_still_loading(tier):
+    s, page, slot_map, host = tier
+    host.inject(delay_s=0.5)
+    seq = sim_post(page, 0, need=[1], protect=[1])
+    pumper = threading.Thread(target=host.pump)
+    pumper.start()
+    try:
+        assert _until(lambda: 1 in host.slot_to_expert(0))
+        slot = host.slot_to_expert(0).index(1)
+        assert slot_map[0, 1].item() == -1  # LOADING: not published yet
+        with pytest.raises(RuntimeError, match="loading"):
+            host.release(0, slot)
+    finally:
+        pumper.join(timeout=10)
+    assert sim_wait(page, seq, 1.0) == 1 and slot_map[0, 1].item() == slot
+
+
+def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_returns(tier):
+    s, page, slot_map, host = tier
+    host.inject(delay_s=0.5)
+    seq = sim_post(page, 0, need=[1], protect=[1])
+    results = []
+    pumper = threading.Thread(target=lambda: results.append(host.pump()))
+    pumper.start()
+    try:
+        assert _until(lambda: 1 in host.slot_to_expert(0))
+        host.stop()  # closes the handle while the pump is inside a read
+    finally:
+        pumper.join(timeout=10)
+    assert results == [1] and sim_wait(page, seq, 1.0) == 1
+
+
+def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, capsys):
+    hosts = []
+    for i in range(2):
+        s = ram_miss_setup(tmp_path / str(i))
+        hosts.append(
+            Exl3RamMissHost(
+                s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+            )
+        )
+
+    def broken():
+        raise RuntimeError("counters broke")
+
+    monkeypatch.setattr(hosts[0], "counters", broken)
+    monkeypatch.setattr(hosts[1], "counters", broken)
+    exl3_ram_miss._stop_live()
+    assert not hosts[0]._close.alive and not hosts[1]._close.alive
+    assert "counters broke" in capsys.readouterr().err
+
+
+if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
