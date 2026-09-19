@@ -76,9 +76,12 @@ def test_a_ram_miss_inside_a_replay_is_counted_and_drops_the_layer():
     assert streamer.row_backend.ram_miss.item() == 1
     missed = remap.reshape(-1)[1].item()
     assert missed >= hot.capacity  # the miss landed in a scratch row
+    # The clamped lane copied pinned slot 0. The tier is inclusive, so the hot
+    # cache's reassign put experts 0 and 1 there before 6: look the slot up.
+    slot_zero_expert = pinned.expert_to_slot.tolist().index(0)
+    assert slot_zero_expert != 7
     for name in NAMES:
-        # The clamped lane copied pinned slot 0, which holds expert 6.
-        assert torch.equal(tensors[name][missed].cpu(), reference[name][6]), name
+        assert torch.equal(tensors[name][missed].cpu(), reference[name][slot_zero_expert]), name
 
 
 if __name__ == "__main__":
