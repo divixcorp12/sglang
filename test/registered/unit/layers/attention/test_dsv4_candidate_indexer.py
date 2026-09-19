@@ -243,5 +243,21 @@ def test_mask_decode_never_reaches_topk_v2_and_consumers_stay_inside_the_mask(mo
         assert mask[b, picked.long()].all()
 
 
+@pytest.mark.parametrize("topk_v2, expected", [(False, False), (True, True)])
+def test_dense_fp4_prefill_indexer_needs_topk_v2(monkeypatch, topk_v2, expected):
+    # The dense prefill selects with topk_transform_ragged_v2, which sm_120 cannot run
+    # (model_hook turns topk_v2 off there); prefill then takes the torch indexer.
+    monkeypatch.setattr(backend_mod, "_has_dense_fp4_indexer", lambda: True)
+    batch = types.SimpleNamespace(
+        forward_mode=types.SimpleNamespace(is_extend=lambda: True),
+        seq_lens_cpu=[8],
+        extend_seq_lens_cpu=[8],
+    )
+    use = backend_mod.DeepseekV4AttnBackend._use_dense_fp4_prefill_indexer
+    with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False):
+        with envs.SGLANG_OPT_USE_TOPK_V2.override(topk_v2):
+            assert use(batch) is expected
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
