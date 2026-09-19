@@ -339,8 +339,8 @@ class TestGatherExpertsCuda(unittest.TestCase):
         )
         from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
 
-        streamer.residency_policy = ExpertResidencyPolicy(80, 1, device="cuda")
         routes = torch.arange(40, device="cuda", dtype=torch.int32).reshape(10, 4)
+        streamer.residency_policy = ExpertResidencyPolicy(80, 1, device=routes.device)
         with self.assertRaisesRegex(ValueError, "max_gather_rows"):
             streamer.gather(routes)
         # A refused forward records no routes.
