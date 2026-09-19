@@ -361,6 +361,16 @@ def _load_checkpoint(trunc_dir: str, device: str, lazy_routed: bool = False):
     return state, routed, shared
 
 
+def _bind_routed(model, routed: dict, lazy_routed: bool, device: str) -> None:
+    """Bind each routed expert: `DiskExpert`s (per-call reads) when `lazy_routed`, else resident tensors."""
+    for (layer, expert), tensors in routed.items():
+        target = model.layers[layer].ffn.experts[expert]
+        if lazy_routed:
+            target.bind_disk(tensors, device)
+        else:
+            target.bind(tensors["w1"], tensors["w2"], tensors["w3"], keep_dense=False)
+
+
 def build_model(
     ref, snapshot: str, trunc_dir: str, engram_dir: str, max_seq_len: int, lazy_routed: bool = False
 ):
@@ -397,11 +407,7 @@ def build_model(
     print(f"missing_keys: {missing}")
     print(f"unexpected_keys: {unexpected}")
 
-    for (layer, expert), tensors in routed.items():
-        if lazy_routed:
-            model.layers[layer].ffn.experts[expert].bind_disk(tensors, "cuda")
-        else:
-            model.layers[layer].ffn.experts[expert].bind(tensors["w1"], tensors["w2"], tensors["w3"], keep_dense=False)
+    _bind_routed(model, routed, lazy_routed, "cuda")
     for layer, tensors in shared.items():
         model.layers[layer].ffn.shared_experts.bind(tensors["w1"], tensors["w2"], tensors["w3"], keep_dense=True)
 
