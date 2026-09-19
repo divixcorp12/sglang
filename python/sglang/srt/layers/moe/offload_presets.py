@@ -226,12 +226,17 @@ def resolve_offload_env(
     return ResolvedOffloadEnv(effective=effective, filled=filled, overridden=overridden)
 
 
-def needs_overlap_off(values: Mapping[str, str]) -> bool:
-    """Whether these variables require ``--disable-overlap-schedule``."""
+def needs_overlap_off(values: Mapping[str, str], *, nvfp4_hot_cache: bool) -> bool:
+    """Whether these variables require ``--disable-overlap-schedule``.
+
+    ``nvfp4_hot_cache``: the launch's experts are NVFP4 (or their format is not
+    known yet); other formats declare their own hot-cache rules in
+    ``expert_stream_requirements``.
+    """
     if _value(values, "SGLANG_MOE_EXPERT_DOORBELL"):
         return True
-    # memory_hook.handle_offload_compatibility enforces the same rule for the hot cache.
-    return _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0 and not (
+    # The NVFP4 requirements (expert_stream_requirements._check_nvfp4) enforce the same rule.
+    return nvfp4_hot_cache and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0 and not (
         _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER") and _residency_update(values)
     )
 
@@ -247,6 +252,7 @@ def check_offload_config(
     dp_size: int,
     dp_attention: bool,
     allowed_cpus: Collection[int],
+    nvfp4_hot_cache: bool,
 ) -> None:
     """Refuse combinations that would otherwise fail after the weight load, or silently.
 
@@ -255,8 +261,13 @@ def check_offload_config(
     later (numactl wrap, SGLANG_SET_CPU_AFFINITY, numa_bind_to_node). Passing
     this check is necessary, not sufficient: the scheduler can still end up
     unpinned even when the launcher's cpuset includes the configured core.
+    ``nvfp4_hot_cache`` is as in ``needs_overlap_off``.
     """
-    if _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0 and not _value(values, "SGLANG_MOE_EXPERT_STREAM"):
+    if (
+        nvfp4_hot_cache
+        and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0
+        and not _value(values, "SGLANG_MOE_EXPERT_STREAM")
+    ):
         raise ValueError("SGLANG_MOE_HOT_GPU_MB requires SGLANG_MOE_EXPERT_STREAM=1")
     if _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER") and decode_graphs_disabled:
         raise ValueError(

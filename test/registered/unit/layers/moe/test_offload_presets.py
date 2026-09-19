@@ -75,6 +75,7 @@ def check(values, **overrides):
         dp_size=1,
         dp_attention=False,
         allowed_cpus=ALL_CPUS,
+        nvfp4_hot_cache=True,
     )
     context.update(overrides)
     presets.check_offload_config(values, **context)
@@ -149,12 +150,19 @@ class TestResolution(unittest.TestCase):
 
 class TestOverlapRule(unittest.TestCase):
     def test_graph_gather_keeps_overlap_and_doorbell_turns_it_off(self):
-        self.assertFalse(presets.needs_overlap_off(presets.preset_env(presets.GRAPH_GATHER_PRESET)))
-        self.assertTrue(presets.needs_overlap_off(presets.preset_env(presets.DOORBELL_PRESET)))
+        graph = presets.preset_env(presets.GRAPH_GATHER_PRESET)
+        doorbell = presets.preset_env(presets.DOORBELL_PRESET)
+        self.assertFalse(presets.needs_overlap_off(graph, nvfp4_hot_cache=True))
+        self.assertTrue(presets.needs_overlap_off(doorbell, nvfp4_hot_cache=True))
 
     def test_a_hot_cache_without_graph_gather_and_the_residency_update_turns_overlap_off(self):
-        self.assertTrue(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}))
-        self.assertFalse(presets.needs_overlap_off({}))
+        self.assertTrue(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=True))
+        self.assertFalse(presets.needs_overlap_off({}, nvfp4_hot_cache=True))
+
+    def test_the_hot_cache_rule_is_nvfp4s_but_the_doorbell_rule_is_every_formats(self):
+        self.assertFalse(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=False))
+        doorbell = presets.preset_env(presets.DOORBELL_PRESET)
+        self.assertTrue(presets.needs_overlap_off(doorbell, nvfp4_hot_cache=False))
 
 
 class TestValidation(unittest.TestCase):
@@ -178,6 +186,13 @@ class TestValidation(unittest.TestCase):
         for values, context, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 check(values, **context)
+
+    def test_another_format_streams_experts_without_the_nvfp4_stream_variable(self):
+        # DSV4.1's EXL3 experts stream under SGLANG_DSV41_EXPERT_STREAM.
+        check(
+            {"SGLANG_MOE_HOT_GPU_MB": "14336", "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1"},
+            nvfp4_hot_cache=False,
+        )
 
 
 class TestPresetHook(unittest.TestCase):
@@ -233,6 +248,21 @@ class TestPresetHook(unittest.TestCase):
         moe_offload_hook.handle_moe_offload_preset(self.args("off"))
         self.assertEqual(presets.explicit_offload_env(os.environ), {})
         self.assertEqual(self.declared, [])
+
+    def test_an_exl3_hot_cache_keeps_overlap_and_passes_without_the_nvfp4_stream_variable(self):
+        os.environ.update(SGLANG_MOE_HOT_GPU_MB="14336", SGLANG_MOE_EXPERT_GRAPH_GATHER="1")
+        args = self.args("off", quantization="exl3")
+        moe_offload_hook.handle_moe_offload_preset(args)
+        self.assertEqual(self.declared, [])
+        moe_offload_hook.check_moe_offload_config(args)
+
+    def test_a_hot_cache_of_unknown_format_gets_the_nvfp4_rules(self):
+        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "14336"
+        args = self.args("off")
+        moe_offload_hook.handle_moe_offload_preset(args)
+        self.assertEqual(self.declared, [{"disable_overlap_schedule": True}])
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_STREAM=1"):
+            moe_offload_hook.check_moe_offload_config(args)
 
     def test_a_refusal_names_the_preset(self):
         args = self.args("doorbell", speculative_algorithm="NEXTN")
