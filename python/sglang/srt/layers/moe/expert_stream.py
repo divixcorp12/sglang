@@ -860,7 +860,8 @@ class ExpertStreamer:
             sources = dict(self.pinned_host_cache.tensors)
         else:
             sources = {
-                name: _tensor_data(getattr(self.layer, name)) for name in self.tensor_names
+                name: _tensor_data(getattr(self.layer, name))
+                for name in self.tensor_names
             }
         for name, source in sources.items():
             if source.device.type == "cpu" and not is_gpu_readable_host_tensor(source):
