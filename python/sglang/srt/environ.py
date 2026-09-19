@@ -1774,22 +1774,18 @@ class Envs:
     SGLANG_DSV41_ENGRAM_TABLE_DIR = EnvStr("")
 
     # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
-    # checkpoint loader skips them and each MoE layer fetches the experts it
-    # routes to through a host-RAM cache and a VRAM slot cache.
+    # checkpoint loader skips them and each MoE layer gathers the experts it
+    # routes to through the MoE expert streaming framework. Its knobs size the
+    # tiers: SGLANG_MOE_PINNED_HOST_MB (host RAM), SGLANG_MOE_HOT_GPU_MB (VRAM),
+    # SGLANG_MOE_HOT_SEED (startup residency, a {"count": [[...]]} JSON).
     SGLANG_DSV41_EXPERT_STREAM = EnvBool(False)
     # Directory whose EXL3 shards the streamed experts are read from (required
     # when streaming; the experts may live on a different drive than the model).
     SGLANG_DSV41_EXPERT_DIR = EnvStr("")
-    # Host-RAM expert cache size in GiB (inclusive of the VRAM cache).
-    SGLANG_DSV41_EXPERT_RAM_GIB = EnvFloat(70.0)
-    # VRAM expert slot cache size in GiB.
-    SGLANG_DSV41_EXPERT_VRAM_GIB = EnvFloat(16.0)
-    # When set, append one JSON line per MoE layer call (forward, layer, tokens,
-    # experts, VRAM and RAM misses) for offline tier simulation.
+    # When set, append one JSON line per streamed MoE layer call (forward, layer,
+    # tokens, experts and route counts, VRAM and RAM misses, read and split time)
+    # for offline tier simulation (scripts/dsv41/tier_sim.py).
     SGLANG_DSV41_EXPERT_TRACE_PATH = EnvStr("")
-    # When set, a JSON {"counts": [[...]]} of per-layer router counts whose most
-    # used experts are loaded into the caches at startup.
-    SGLANG_DSV41_EXPERT_SEED_PATH = EnvStr("")
     # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
     # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
     # plain np.memmap path.
