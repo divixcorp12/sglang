@@ -283,6 +283,32 @@ class TestCpuPinnedTier(unittest.TestCase):
         self.assertEqual(result.miss_rows, 1)
         self.assertTrue(torch.equal(output, layer.host_rows.data[[5]]))
 
+    def test_gather_rows_raises_when_a_chunk_expert_is_evicted_before_its_copy(self):
+        # ensure_rows protects the whole chunk, so this can only happen if
+        # something outside the call's own bookkeeping evicts a chunk member
+        # mid-admission; force that race by patching _lru.assign.
+        import heapq
+
+        layer = _host_layer()
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertPinnedHostCache(streamer, 2, device="cpu")
+        cache.ensure_rows(torch.tensor([1]))
+        original_assign = cache._lru.assign
+
+        def sneaky_assign(expert_id, protected):
+            slot, evicted = original_assign(expert_id, protected)
+            if expert_id == 9:
+                victim_slot = cache._lru.expert_to_slot.pop(1, None)
+                if victim_slot is not None:
+                    cache._lru.slot_to_expert[victim_slot] = -1
+                    heapq.heappush(cache._lru._free, victim_slot)
+            return slot, evicted
+
+        output = torch.zeros(2, 3, 4, dtype=torch.uint8)
+        with patch.object(cache._lru, "assign", side_effect=sneaky_assign):
+            with self.assertRaisesRegex(RuntimeError, "evicted before their copy"):
+                cache.gather_rows(torch.tensor([1, 9]), {"host_rows": output})
+
     def test_a_failed_read_rolls_back_the_calls_slots(self):
         layer = _host_layer()
         streamer = ExpertStreamer(layer, ("host_rows",))
