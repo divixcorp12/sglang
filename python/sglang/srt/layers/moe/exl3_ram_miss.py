@@ -15,7 +15,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissDevice, Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS, Exl3RamMissDevice, Exl3RamMissHost, new_page
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
@@ -177,6 +177,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
     writes ``host_rows``, ``keep`` and ``ram_miss``), then the segment copy.
     ``host_row_map`` is the pinned tier's device slot map: the wait reads the host
     slot map instead, but the streamer checks that the tier's map never moved.
+    ``planned`` pads the plan's expert ids to at least ``MAX_IDS`` lanes (-1 past
+    the plan): the post kernel reads ``min(count, MAX_IDS)`` lanes, and ``count``
+    lives on the device, so no host check can bound it.
     """
 
     name = "exl3_ram_miss"
@@ -195,10 +198,17 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.row = row
         self.next_row = next_row
         self.routes = torch.full((capacity,), -1, dtype=torch.int64, device=host_row_map.device)
+        self.planned = torch.full((max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device)
+        if self.planned.numel() < MAX_IDS:
+            raise ValueError(f"planned has {self.planned.numel()} lanes; the post kernel reads up to {MAX_IDS}")
 
     def translate(self, tag, plan) -> None:
-        self.device_side.post(self.row, plan.expert_ids, plan.count, self.routes, self.next_row)
-        self.device_side.wait(self.row, plan.expert_ids, plan.count, self.host_rows, self.keep, self.ram_miss)
+        lanes = plan.expert_ids.numel()
+        if lanes > self.planned.numel():
+            raise ValueError(f"a plan of {lanes} lanes does not fit the backend's {self.planned.numel()}")
+        self.planned[:lanes].copy_(plan.expert_ids)  # a device copy: captured, refreshed every replay
+        self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
+        self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
 
 
 def parse_fault(spec: str) -> Optional[tuple[int, float]]:
