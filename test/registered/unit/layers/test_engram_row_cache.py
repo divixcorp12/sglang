@@ -98,6 +98,28 @@ def test_file_table_with_cache_matches_memmap(tmp_path):
     assert cache.hits == 6
 
 
+def test_cached_lookup_reads_into_cpu_rows_under_a_non_cpu_default_device(tmp_path):
+    # The reference oracle runs under torch.set_default_device("cuda"); "meta" is the
+    # CPU-testable stand-in. The fetch buffers must not follow the default device.
+    n, dim = 300, 64
+    path = str(tmp_path / "model-00047-of-00048.safetensors")
+    _engram_shard(path, n, dim)
+    plain = EngramFileTable(path, "layers.1.engram.embed.weight", "layers.1.engram.embed.scale", n, dim)
+    cached = EngramFileTable(
+        path, "layers.1.engram.embed.weight", "layers.1.engram.embed.scale", n, dim,
+        cache=EngramRowCache(capacity_rows=64, row_bytes=dim + dim // 32), cache_tag=1, direct=False,
+    )
+    ids = torch.tensor([[3, 299, 3], [150, 0, 42]])
+    expected = plain.lookup(ids)
+    previous = torch.get_default_device()
+    torch.set_default_device("meta")
+    try:
+        got = cached.lookup(ids)
+    finally:
+        torch.set_default_device(previous)
+    assert torch.equal(got, expected)
+
+
 @pytest.fixture
 def fresh_shared_cache(monkeypatch):
     """The shared cache is process-global; give each test its own."""
