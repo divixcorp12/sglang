@@ -151,10 +151,12 @@ class NativePinnedSlotTable:
 
     def before_host_use(self, cache) -> None:
         """Pause the thread (the service counts nesting), then, at this table's outermost
-        level only, refresh the device slot map if the thread changed the C++ map."""
+        level only, push the layer's hot set to C++ and refresh the device slot map if the
+        thread changed the C++ map."""
         self.service.before_host_use()
         try:
             if self._depth == 0:
+                self._push_hot()
                 version = self.service.host.version()
                 if version != self._seen_version:
                     cache._refresh_mapping()
@@ -167,6 +169,19 @@ class NativePinnedSlotTable:
     def after_host_use(self, cache) -> None:
         self._depth -= 1
         self.service.after_host_use()
+
+    def _push_hot(self) -> None:
+        """Make the C++ victim choice protect what ``is_pinned`` protects right now.
+
+        The hot cache reserves a residency update's experts before the residency
+        listener pushes them, and promotes them in chunks, each in its own host use:
+        without this push, a later chunk's admission could evict an earlier chunk's
+        expert from RAM (a VRAM-hot expert with no pinned copy).
+        """
+        streamer = self.streamer_of()
+        hot = None if streamer is None else getattr(streamer, "hot_cache", None)
+        if hot is not None:
+            self.service.host.set_hot(self._row, hot.slot_to_expert)
 
 
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
