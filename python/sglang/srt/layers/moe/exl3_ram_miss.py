@@ -112,6 +112,8 @@ class NativePinnedSlotTable:
         self.capacity: Optional[int] = None
         self.streamer_of = streamer_of
         self._seen_version = -1
+        self._slots: "OrderedDict[int, int]" = OrderedDict()
+        self._slots_version = -1
         # This table's host-use nesting; the service counts the process-wide pause apart.
         self._depth = 0
         service.register(layer_id, self)
@@ -130,9 +132,19 @@ class NativePinnedSlotTable:
 
     @property
     def expert_to_slot(self) -> "OrderedDict[int, int]":
+        """Resident experts and their slots, rebuilt only when the C++ map's version moves.
+
+        Promotions read this once per promoted row. Every change of membership bumps
+        the version; a touch does not, so the order is the LRU order as of the last
+        change. Callers must not mutate the returned dict.
+        """
         row = self._row
-        mapping = self.service.host.mapping(row)
-        return OrderedDict((expert, mapping[expert]) for expert in self.service.host.lru_order(row))
+        version = self.service.host.version()
+        if self._slots_version != version:
+            mapping = self.service.host.mapping(row)
+            self._slots = OrderedDict((expert, mapping[expert]) for expert in self.service.host.lru_order(row))
+            self._slots_version = version
+        return self._slots
 
     def __contains__(self, expert_id: int) -> bool:
         return self.service.host.contains(self._row, int(expert_id))
