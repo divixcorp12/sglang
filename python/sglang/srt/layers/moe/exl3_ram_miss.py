@@ -253,11 +253,16 @@ class Exl3RamMissService:
     def row_of(self, layer_id: int) -> int:
         return self._rows[layer_id]
 
+    def _refuse_if_shut_down(self) -> None:
+        # shutdown() closes the C++ host but keeps self.host, whose calls would then
+        # fail with an opaque "unknown handle".
+        if self._shut_down:
+            raise RuntimeError("exl3 RAM miss: the option C service was shut down; its pinned tiers are closed")
+
     def ensure_started(self) -> None:
+        self._refuse_if_shut_down()
         if self.host is not None:
             return
-        if self._shut_down:
-            raise RuntimeError("exl3 RAM miss: the service was shut down")
         streamers = {layer_id: table.streamer_of() for layer_id, table in sorted(self.tables.items())}
         missing = [layer_id for layer_id, s in streamers.items() if s is None or s.pinned_host_cache is None]
         if missing:
@@ -333,12 +338,19 @@ class Exl3RamMissService:
         )
 
     def on_residency(self, layer_id: int, slot_to_expert: list[int]) -> None:
+        self._refuse_if_shut_down()
         if layer_id in self._rows:
             self.host.set_hot(self.row_of(layer_id), slot_to_expert)
 
     def fail_stop_check(self) -> None:
-        """Per batch (the scheduler's doorbell hook): raise when a wait timed out or failed."""
-        if self.host is None:
+        """Per batch (the scheduler's doorbell hook): raise when a wait timed out or failed.
+
+        This is also where a warmup or capture timeout surfaces: no check runs between
+        capture and the first batch, so a fatal raised during warmup stops the process
+        at the first batch's check (an eager prefill, so no dropped-layer token is
+        served), not at startup as plan D20 words it.
+        """
+        if self.host is None or self._shut_down:
             return
         fatal = self.host.fatal_seq()
         if fatal:
@@ -351,7 +363,13 @@ class Exl3RamMissService:
     def _graph_rows(self) -> Optional[list[int]]:
         """Routed rows and routed misses of every decode graph gather so far, from the
         manager's registers (the streamers' own graph_counters are zeroed every forward
-        by the forward observer, before this per-batch check runs; plan D23)."""
+        by the forward observer, before this per-batch check runs; plan D23).
+
+        Overlap scheduling stays on with option C (plan D2, D21). ``tolist()`` then
+        orders only after this thread's current stream, not the forward stream that
+        adds to the registers, so a line may pair one step's demand rows with the
+        previous step's routed rows. Sums over a run are exact; single lines are not.
+        """
         registers = getattr(self._manager, "_registers", None) or {}
         decode = registers.get("decode")
         if decode is None:
