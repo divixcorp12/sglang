@@ -49,11 +49,21 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+@eager_on_graph(True)
+def _engram_file_table_lookup(file_table, indices):
+    """The file-table lookup reads its ids on the host, so under a breakable CUDA
+    graph it runs as an eager break; outside a capture the decorator is transparent."""
+    return file_table.lookup(indices)
 
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
@@ -753,7 +763,7 @@ class EngramEmbedding(nn.Module):
         if self.file_table is not None:
             if indices.shape[0] == 0:
                 return self._empty(indices)
-            return self.file_table.lookup(indices)
+            return _engram_file_table_lookup(self.file_table, indices)
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)
