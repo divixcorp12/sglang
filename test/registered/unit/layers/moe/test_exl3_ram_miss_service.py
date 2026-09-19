@@ -134,6 +134,25 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     assert [service.host.contains(row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
 
 
+def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, monkeypatch):
+    """Minor 5: the watchdog's limit follows SGLANG_DSV41_RAM_MISS_TIMEOUT_MS, so a slow drive's
+    demand fails stop through the device wait, not the watchdog's abort."""
+    service, streamers, caches = tiers
+    for timeout_ms in (50, 2000, 14_000, 40_000, 120_000):
+        wait_s = module.watchdog_wait_s(timeout_ms)
+        assert wait_s >= 30.0
+        assert wait_s > 2 * timeout_ms / 1000 + 1.0  # the eager pause bound
+    started = []
+    start = module.Exl3RamMissHost.start_thread
+    monkeypatch.setattr(
+        module.Exl3RamMissHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
+    )
+    with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
+        service.ensure_started()
+    assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000)}]
+    assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
+
+
 @pytest.mark.parametrize("prefetch, advise", [(True, 1), (None, 0)], ids=["env_on", "env_unset"])
 def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, prefetch, advise):
     """The production hop: SGLANG_DSV41_ENABLE_EXPERT_PREFETCH -> prefetch_enabled() -> attach ->
