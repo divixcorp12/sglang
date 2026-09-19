@@ -190,5 +190,103 @@ class TestPinnedTierCuda(unittest.TestCase):
         self.assertEqual(pinned.stats.evictions, 4)
 
 
+def _spec_only_reference(names=None, experts=EXPERTS, seed=5):
+    generator = torch.Generator().manual_seed(seed)
+    shapes = {
+        "w13_trellis": ((2, 8), torch.int16),
+        "w13_suh": ((2, 4), torch.float16),
+        "w13_svh": ((2, 2), torch.float16),
+        "w2_trellis": ((1, 8), torch.int16),
+        "w2_suh": ((1, 2), torch.float16),
+        "w2_svh": ((1, 4), torch.float16),
+    }
+    names = tuple(shapes) if names is None else names
+    return {
+        name: torch.randint(
+            0, 256, (experts,) + shapes[name][0] + (shapes[name][1].itemsize,),
+            dtype=torch.uint8, generator=generator,
+        ).view(shapes[name][1]).reshape((experts,) + shapes[name][0])
+        for name in names
+    }
+
+
+def _spec_only_streamer(reference):
+    from sglang.test.moe_expert_fakes import SpecOnlyFormat
+
+    layer = torch.nn.Module()
+    layer.layer_id = 0
+    return ExpertStreamer(layer, tuple(reference), format=SpecOnlyFormat(reference))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestSpecOnlyCuda(unittest.TestCase):
+    def _assert_rows(self, reference, ids, compact, tensors):
+        for name, tensor in reference.items():
+            self.assertTrue(
+                torch.equal(
+                    tensors[name][compact.long()].cpu().view(torch.uint8),
+                    tensor[ids.long().cpu()].view(torch.uint8),
+                ),
+                name,
+            )
+
+    def test_eager_gather_reads_hot_pinned_and_cold_rows_through_the_row_source(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        reference = _spec_only_reference()
+        streamer = _spec_only_streamer(reference)
+        hot = ExpertHotCache(streamer, 2)
+        hot.reassign([0, 1])
+        pinned = ExpertPinnedHostCache(streamer, 2)
+        pinned.ensure_rows(torch.tensor([2], device="cuda"))
+        ids = torch.tensor([[0, 2, 5], [1, 6, 2]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(ids)
+        self._assert_rows(reference, ids, compact, tensors)
+        stats = streamer.last_gather_stats
+        self.assertEqual(stats.hot_hit_rows, 2)
+        self.assertEqual((stats.pinned_host_hit_rows, stats.pinned_host_miss_rows), (1, 2))
+        self.assertEqual(stats.host_read_rows, 2)
+
+    def test_promotions_go_through_the_pinned_tier_in_chunks(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        reference = _spec_only_reference()
+        streamer = _spec_only_streamer(reference)
+        # Expert 2 is protected, so every promotion chunk holds at most 2 rows.
+        pinned = ExpertPinnedHostCache(streamer, 3, is_pinned=lambda expert: expert == 2)
+        pinned.ensure_rows(torch.tensor([2], device="cuda"))
+        self.assertEqual(pinned.evictable_rows(), 2)
+        hot = ExpertHotCache(streamer, 5)
+        hot.reassign([4, 0, 7, 3, 1])
+        self.assertEqual(sorted(hot.resident_experts()), [0, 1, 3, 4, 7])
+        self.assertIn(2, pinned._expert_to_slot)
+        for slot, expert in enumerate(hot.slot_to_expert):
+            for name, tensor in reference.items():
+                self.assertTrue(
+                    torch.equal(
+                        hot.tensors[name][slot].cpu().view(torch.uint8),
+                        tensor[expert].view(torch.uint8),
+                    ),
+                    (name, expert),
+                )
+        self.assertEqual(pinned.stats.populated_rows, 6)
+
+    def test_non_six_spec_only_promotion_reads_through_the_row_source(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        reference = _spec_only_reference(names=("w13_trellis", "w2_trellis"))
+        streamer = _spec_only_streamer(reference)
+        hot = ExpertHotCache(streamer, 3)
+        hot.reassign([1, 2, 5])
+        for slot, expert in enumerate(hot.slot_to_expert):
+            for name, tensor in reference.items():
+                self.assertTrue(
+                    torch.equal(hot.tensors[name][slot].cpu(), tensor[expert]),
+                    (name, expert),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

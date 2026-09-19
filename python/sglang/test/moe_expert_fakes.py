@@ -6,6 +6,7 @@ from typing import Iterable, Mapping, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.layers.moe.expert_format import ExpertTensorSpec
 from sglang.srt.layers.moe.expert_row_source import (
     HostSlotLayout,
     RowReadStats,
@@ -85,3 +86,42 @@ class CountingRowSource(SynchronousSubmit):
 
     def close(self) -> None:
         self.closed = True
+
+
+class SpecOnlyFormat:
+    """A format with no dense sources: every host row comes from its row source.
+
+    ``reference`` holds the true ``[experts, ...]`` rows for the row source to
+    serve and for tests to compare against; nothing is set on the layer.
+    """
+
+    key = "spec_only_test"
+    supports_graph_gather = False
+    supports_host_arena = False
+    max_gather_rows: Optional[int] = None
+
+    def __init__(self, reference: Mapping[str, torch.Tensor]):
+        self.reference = dict(reference)
+
+    def tensor_specs(self, layer):
+        return tuple(
+            ExpertTensorSpec(name, tuple(tensor.shape[1:]), tensor.dtype, "host")
+            for name, tensor in self.reference.items()
+        )
+
+    def num_experts(self, layer) -> int:
+        return next(iter(self.reference.values())).shape[0]
+
+    def source(self, layer, name):
+        return None
+
+    def default_row_source(self, layer, specs, kind):
+        if kind in ("auto", "files"):
+            return CountingRowSource(self.reference)
+        raise ValueError(f"expert format {self.key!r} has no row source kind {kind!r}")
+
+    def file_source_bytes_per_expert(self, layer, row_source):
+        return None if row_source is None else row_source.file_bytes_per_expert
+
+    def pinned_tier_options(self, layer):
+        return {}
