@@ -63,6 +63,10 @@ def _check_cuda_bindings():
 _current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVar(
     "current_capture", default=None
 )
+# True while a break body runs at capture time (a capture stub or the inner call): a
+# break nested there (--debug-cuda-graph wraps the whole forward as one break) runs
+# inline instead of splitting a segment that is not being captured.
+_in_break_var: ContextVar[bool] = ContextVar("in_break", default=False)
 _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
     "current_stream", default=None
 )
@@ -223,7 +227,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
-            if capture is None:
+            if capture is None or _in_break_var.get():
                 return inner(*args, **kwargs)
 
             # End the segment that captured up to this break point.
@@ -240,10 +244,14 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # addresses recorded. A capture_stub replaces the body during
             # capture (contents are never consumed; warmup and replay run
             # the real inner), letting rank-coupled bodies skip the work.
-            if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
-            else:
-                output = inner(*args, **kwargs)
+            in_break = _in_break_var.set(True)
+            try:
+                if capture_stub is not None:
+                    output = capture_stub(*args, **kwargs)
+                else:
+                    output = inner(*args, **kwargs)
+            finally:
+                _in_break_var.reset(in_break)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
