@@ -5122,6 +5122,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             time.perf_counter() - tic - compile_secs,
         )
 
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        """Streamed EXL3 routed experts stay on disk; their expert streamer reads them."""
+        from sglang.srt.models.deepseek_v4_exl3_weights import is_streamed_expert_weight
+
+        return is_streamed_expert_weight(
+            name,
+            self.quant_config.get_name() if self.quant_config is not None else None,
+            envs.SGLANG_DSV41_EXPERT_STREAM.get(),
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if self.quant_config is not None and self.quant_config.get_name() == "exl3":
             from sglang.srt.models.deepseek_v4_exl3_weights import (

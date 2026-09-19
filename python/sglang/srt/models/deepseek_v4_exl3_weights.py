@@ -16,8 +16,18 @@ import torch
 from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_dense_weight
 
 EXL3_SUFFIXES = ("suh", "svh", "mul1", "trellis")
+ROUTED_EXPERT_WEIGHT_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.\d+\.")
 DEQUANT_PREFIX_RE = re.compile(r"^.+\.attn\.(?:compressor\.(?:wkv|wgate)|indexer\.wk)$")
 WO_A_SLICE_RE = re.compile(r"^(?P<prefix>.+\.attn\.wo_a)\.slice\.(?P<group>\d+)$")
+
+
+def is_streamed_expert_weight(name: str, quant_method: str | None, streaming: bool) -> bool:
+    """True for a routed-expert tensor that EXL3 expert streaming reads from disk itself."""
+    return (
+        streaming
+        and quant_method == "exl3"
+        and ROUTED_EXPERT_WEIGHT_RE.match(name) is not None
+    )
 
 
 def dense_on_device(t: Exl3Tensors) -> torch.Tensor:

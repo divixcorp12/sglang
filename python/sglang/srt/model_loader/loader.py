@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -394,6 +395,10 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        skip_weight: Optional[Callable[[str], bool]] = None
+        """Checkpoint tensor names the model will not load; the iterator skips
+        them before reading their bytes (e.g. streamed routed experts)."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -405,6 +410,7 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                skip_weight=getattr(model, "skip_checkpoint_weight", None),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -657,6 +663,11 @@ class DefaultModelLoader(BaseModelLoader):
                 use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                if source.skip_weight is not None:
+                    raise NotImplementedError(
+                        "fastsafetensors cannot skip checkpoint tensors; "
+                        "drop --load-format fastsafetensors"
+                    )
                 enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
@@ -673,6 +684,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    skip_name=source.skip_weight,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -681,6 +693,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    skip_name=source.skip_weight,
                 )
 
         else:
