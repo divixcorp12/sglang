@@ -875,7 +875,8 @@ measured in eager mode on the full 40-layer model:
   static, 3 layers, prefill), so the envelope's pessimistic rows are not the operating
   point; it sits between §9.4's 108/10% and 108/25% rows. **Caveats that remain:**
   - 8 cold and 4 seeded sessions on one corpus, 256-token prompts and 128 new tokens; the
-    `tier_sim` numbers replay the same 8 sessions the seed came from (in-sample);
+    `tier_sim` numbers replay the same cold-arm trace (sessions 0–7) whose routing they model,
+    so they are fit and evaluated on the same 8 sessions (in-sample);
   - the live hot cache was 1,128 slots, below §4's 1,220–1,770, and the RAM tier 5,644 rows;
   - the model routes on its own EXL3 activations, whose 22-layer logits sit at the oracle
     noise floor (§16.6) and are unchecked at depth 40, so routing at depth 40 rests on
@@ -1020,7 +1021,7 @@ the plan before the expert framework landed; 3a built something different.
   six streamed names (`w13_trellis`, `w13_suh`, `w13_svh`, `w2_trellis`, `w2_suh`, `w2_svh`,
   13,315,584 B per row) as separate tensors, **split from the shards** on each RAM miss
   (or read from a repack, had Task 16 run; it did not).
-- The split costs **~1.45–1.48 ms per row on the model thread** (split share 0.16 of a
+- The split costs **~1.43–1.48 ms per row on the model thread** (split share 0.16 of a
   read + split, §16.4), and **2.14–2.18 ms per decode RAM miss** on the live run (§16.8).
 - The padding site is unchanged from (c): the RAM→VRAM segment copy, with the slot layout
   supplying the aligned destinations.
@@ -1312,8 +1313,10 @@ Phase 3a is EXL3 streaming on the expert framework, checked against the referenc
 and traced for `G` and `f` on the full 40-layer model. Window C ran on divix01's RTX 5090
 (sm_120) on 2026-09-19, production down, under `cc-gpu.lock`. Code state: the smoke (Step
 5) ran at `a0c5a6b81d` and Step 6b at `3eac82a412`, with Step 7's arms right after in the
-same window; the prefill-indexer gate `f80100db71` landed later and does not change those
-runs, because `env.sh` still sets `SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`. Artifacts:
+same window; divix01's `wt-dsv41` stayed at `3eac82a412` from 02:28:14 until after the
+window, so Step 7 ran at `3eac82a412` too. The prefill-indexer gate `f80100db71` was
+authored later (02:35:53) and **never ran on the GPU**; `env.sh` still sets
+`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`, so its absence does not change those runs. Artifacts:
 `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3a/`
 (`ANA` below; `ANA/window-c.log` is the chronological record).
 
@@ -1328,8 +1331,10 @@ gather, and no in-graph RAM tier. That is Phase 3b (§11).
    - `--prompt-tokens 256` (not 512), 128 new tokens;
    - **the seeded static arm was dropped.** So there is **no stall-free tok/s**, and
      promotion stalls cannot be isolated from tok/s (§16.12);
-   - the seed came from the 8 cold sessions, so `tier_sim` is **in-sample** on those 8; the
-     seeded arm ran on **different sessions** (8–11) from the cold arm, so cold-vs-seeded is
+   - `tier_sim` is **in-sample**: it replays the cold-arm trace (sessions 0–7) whose routing
+     it models, so it is fit and evaluated on the same 8 sessions. Its simulated hot cache
+     was not seeded (`seeded: false`); the seed was only emitted from that trace afterwards.
+     The seeded arm ran on **different sessions** (8–11) from the cold arm, so cold-vs-seeded is
      **not a paired comparison**.
 2. **Hot budget:** `SGLANG_MOE_HOT_GPU_MB` 16,384 → **14,336** after the first smoke
    failed KV-pool sizing at load (minimum viable `mem_fraction` 0.8534 > 0.85).
@@ -1367,7 +1372,7 @@ gather, and no in-graph RAM tier. That is Phase 3b (§11).
 
   | Setting | Value |
   |---|---|
-  | Pinned host tier | `SGLANG_MOE_PINNED_HOST_MB=71680` → 5,644 rows (141 per layer × 40, 36.7% of 15,360), requested 75,161,927,680 B, resident 75,153,156,096 B |
+  | Pinned host tier | `SGLANG_MOE_PINNED_HOST_MB=71680` → 5,644 rows (141–142 per layer, 141 × 40 + 4 = 5,644; 36.7% of 15,360), requested 75,161,927,680 B, resident 75,153,156,096 B |
   | Hot cache | `SGLANG_MOE_HOT_GPU_MB=14336` → **1,128 slots**, 15,019,978,752 B (7.3% of 15,360) |
   | Dynamic residency | `HOT_DYNAMIC=1`, update after 256 prefill tokens and every 32 decode forwards, min residence 8 forwards, no async promotions |
   | Off | graph gather, GPU residency update, doorbell, prefetch candidates |
@@ -1404,7 +1409,8 @@ Layer 0, 16 rows, direct reads for the shards, buffered for the repack.
 | 32 | 1 | 7.733 | 9.220 | 1.429 (0.155) | 8.023 | 0.870 |
 | 32 | 8 | 7.556 | 9.089 | 1.443 (0.159) | 7.656 | **0.842** |
 
-Batch 1 is a single repeat; batch 8 is five. The repack keeps the small names
+Batch 1 is a single repeat, and so is the raw read at batch 8 (7.55 ms, the BLOB baseline);
+only the split and repacked rows at batch 8 are five repeats. The repack keeps the small names
 (`w13_svh`, `w2_suh`, `w2_svh`) buffered.
 
 - **Ruling: skip the repack.** The plan's single threshold is 0.8 at batch 8, and both
@@ -1430,7 +1436,12 @@ Smoke (Step 5), attempt 4, `ANA/smoke.log`: a 640-token prefill plus 8 decode to
 - End to end **129.7 s**; peak GPU **30,097 MiB** (`ANA/smoke-gpu-mem.txt`).
 - **Zero** `weights not found` warnings (non-expert or otherwise), zero clamp lines, zero
   tier-setup warnings, zero `DeepGemmCandidateIndexer` mentions. Task 17 Step 5's
-  non-expert-weights check is clean.
+  non-expert-weights check is clean. One related warning does appear: `Some weights are not
+  initialized from checkpoints` lists 306 names in `smoke.log`, namely 259 `vision.*`, 7
+  aligner/`image_*` names (a Qwen-VL wrapper artefact, presumably benign) and 40
+  `model.layers.N.mlp.gate.e_score_correction_bias_vl` entries. The 40 gate-bias entries are
+  the only ones that are not vision or aligner names; their `_vl` suffix suggests a
+  multimodal-path parameter, but that was not checked.
 - Attempts 1–3 failed: 1 on KV-pool sizing at hot 16,384 MiB; 2 and 3 in the candidate
   indexer (§16.7).
 - Step 3's tests ran before the smoke: 21 passed (`ANA/wc-steps35.out`).
@@ -1453,8 +1464,8 @@ Smoke (Step 5), attempt 4, `ANA/smoke.log`: a 640-token prefill plus 8 decode to
 - The noise floor is **one prompt only** (owner scope cut), and its source is the
   `step6b RESULT` line in `ANA/window-c.log`; the reference-vs-oracle-fw comparison is not
   a file in `ANA`. The 4-prompt mean has no floor of its own.
-- **Phase 1 at 4 layers was 0.92 / 0.084** (§15.2). Disagreement grows with depth
-  (22 layers: 0.794 / 0.331); these are different models, so this is a comparison of
+- **Phase 1 at 3 layers (`dsv41-trunc3`) was 0.92 / 0.084** (§15.2). Disagreement grows
+  with depth (22 layers: 0.794 / 0.331); these are different models, so this is a comparison of
   the two runs, not a per-layer measurement.
 - **No bisect ran** in this window, so the disagreement is not attributed to a module.
 - **Open:** the full-depth (40-layer) comparison, because the dense oracle does not fit.
@@ -1519,7 +1530,7 @@ rows: 40 layers × 6), `f` the fraction of those that also miss the RAM tier.
 
 ### 16.9 Admission policy shapes `f`
 
-The framework admits **every prefill miss** into the per-layer RAM tier (141 rows per
+The framework admits **every prefill miss** into the per-layer RAM tier (141–142 rows per
 layer), in ascending expert order. A long prefill can therefore flush the tier before
 decode. `tier_sim` models both cases; `prefill_admits=False` is **simulation only; not a
 framework policy**.
@@ -1548,8 +1559,9 @@ Beside the live `f` **0.1853** (`f_after_warmup` 0.1749).
 
 ### 16.10 `tier_sim` table
 
-`ANA/tier-sim-cold.json`, replaying the cold trace (**in-sample**: the seed came from the
-same 8 sessions), 41,320 calls, `--update-prefill-tokens 256`. `G` and `f` are decode
+`ANA/tier-sim-cold.json`, replaying the cold trace, unseeded (**in-sample**: it replays the
+same 8 sessions, 0–7, whose routing it models; `seed-counts.json` was emitted from this
+trace afterwards for the seeded arm, which ran on sessions 8–11), 41,320 calls, `--update-prefill-tokens 256`. `G` and `f` are decode
 misses per token and RAM-miss fraction; ms/token is §9.4's model (`G` × 1.11 ms + `f` × `G`
 × `t_nvme`, plus decode-boundary promotions amortized per token), link plus NVMe only,
 **compute excluded**. Rows marked ✗ are `prefill_admits=False`: **simulation only; not a
@@ -1610,7 +1622,7 @@ ceiling stays untested on the full model.
 `ANA/corpus-{cold,seeded}.json`. tok/s is the mean of per-session decode tok/s. TTFT is
 the **median over sessions, plus session 0 separately, never the mean**: with the overlap
 schedule a session's TTFT can include one decode step from the previous session's
-overshoot forward. Session 0 is ~40 s slower than the median in both arms (a first-use
+overshoot forward. Session 0 is 35–38 s slower than the median in both arms (a first-use
 cost that was not isolated).
 
 | | Cold dynamic | Seeded dynamic |
