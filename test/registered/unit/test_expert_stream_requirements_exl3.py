@@ -17,6 +17,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+BREAKABLE_BS1 = CudaGraphConfig(
+    decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1),
+    prefill=PhaseConfig(backend="disabled"),
+)
+
 # Plan Task 17's env.sh, less the paths: the dynamic arm.
 WINDOW_C_ENV = {
     "SGLANG_DSV41_EXPERT_STREAM": True,
@@ -107,12 +112,19 @@ def test_window_c_launches_pass(model_dir):
         ({}, {"SGLANG_DSV41_EXPERT_STREAM": False}, "requires SGLANG_DSV41_EXPERT_STREAM=1"),
         ({}, {"SGLANG_MOE_PINNED_HOST_MB": 0, "SGLANG_MOE_EXPERT_HOST_ARENA": True}, "SGLANG_MOE_EXPERT_HOST_ARENA"),
         ({"expert_distribution_recorder_mode": None}, {}, "stat or per_pass"),
-        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable"), prefill=PhaseConfig(backend="disabled"))}, {}, "runs eagerly"),
+        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="full", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {}, "breakable"),
+        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1, 2], max_bs=2), prefill=PhaseConfig(backend="disabled"))}, {}, "max batch size 1"),
+        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="breakable"))}, {}, "prefill"),
     ],
 )
 def test_unsupported_launches_are_refused(model_dir, launch_changes, env_changes, match):
     with pytest.raises(ValueError, match=match):
         _gate(_launch(model_dir, **launch_changes), **env_changes)
+
+
+def test_breakable_decode_at_batch_size_one_passes(model_dir):
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1, disable_overlap_schedule=True))
 
 
 if __name__ == "__main__":
