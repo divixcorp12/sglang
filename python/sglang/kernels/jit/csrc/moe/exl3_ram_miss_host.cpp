@@ -612,8 +612,12 @@ class RamTier {
     } else {
       in_advice_.store(true);
       counters_[kAdvisories].fetch_add(1);
+      // An advisory gives up only between rows, not inside a blocking read: the watchdog's
+      // stuck rule covers it like a demand, or a hung read would block stop()'s join forever.
+      busy_since_.store(now_ns());
       int64_t rows = 0;
       serve(request, true, &rows);
+      busy_since_.store(0);
       in_advice_.store(false);
     }
     store_release(page_ + kAdviseDone, next_advice_);
@@ -1174,8 +1178,8 @@ namespace exl3_ram_miss {
 // acknowledged the pause between two requests. While paused the loop takes no request, so an eager caller owns the
 // slots until resume(). The watchdog (plan D15), on its own thread so a stuck read cannot silence it, aborts the
 // process when the fatal word stays raised for fatal_wait without stop() (the process did not fail stop), or when one
-// demand stays in service for fatal_wait (a hung read). It outlives the service thread's
-// join in stop(), so a stop during a hung read still ends in its abort.
+// demand or advisory stays in service for fatal_wait (a hung read). It outlives the service thread's
+// join in stop(), so a stop during a hung read, demand or advisory, still ends in its abort.
 // pause()/resume() are not reentrant: their one owner is the slot table's depth counter
 // (Task 14), which calls pause at depth 0->1 and resume at 1->0.
 class RamThread {
