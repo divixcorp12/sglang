@@ -11,7 +11,10 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
-from sglang.srt.models.deepseek_v4_exl3_weights import is_streamed_expert_weight
+from sglang.srt.models.deepseek_v4_exl3_weights import (
+    is_streamed_expert_weight,
+    streamed_expert_skip_hook,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -68,6 +71,32 @@ def test_only_streamed_exl3_routed_experts_are_skipped():
     assert not is_streamed_expert_weight(routed, None, True)
     assert not is_streamed_expert_weight("layers.12.ffn.shared_experts.w2.trellis", "exl3", True)
     assert not is_streamed_expert_weight("layers.12.ffn.gate.weight", "exl3", True)
+
+
+def test_hook_exists_only_when_it_can_skip():
+    assert streamed_expert_skip_hook("exl3", False) is None
+    assert streamed_expert_skip_hook("fp8", True) is None
+    assert streamed_expert_skip_hook(None, True) is None
+    assert streamed_expert_skip_hook("exl3", True) is not None
+
+
+def test_non_streaming_model_gives_the_loader_no_skip_hook():
+    # A DeepSeek V4 model sets skip_checkpoint_weight from the hook factory, so a
+    # non-streaming one exposes None and the loader keeps its no-skip path
+    # (fastsafetensors then does not raise).
+    config = SimpleNamespace(model_path="/unused", revision=None)
+    model = SimpleNamespace(skip_checkpoint_weight=streamed_expert_skip_hook("exl3", False))
+    assert DefaultModelLoader.Source.init_new(config, model).skip_weight is None
+
+
+def test_streaming_model_hook_skips_routed_experts():
+    hook = streamed_expert_skip_hook("exl3", True)
+    assert hook("layers.12.ffn.experts.301.w2.trellis")
+    assert not hook("layers.12.ffn.shared_experts.w2.trellis")
+    assert not hook("layers.12.attn.norm.weight")
+    config = SimpleNamespace(model_path="/unused", revision=None)
+    model = SimpleNamespace(skip_checkpoint_weight=hook)
+    assert DefaultModelLoader.Source.init_new(config, model).skip_weight is hook
 
 
 if __name__ == "__main__":
