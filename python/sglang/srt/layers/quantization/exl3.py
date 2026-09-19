@@ -428,11 +428,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         Hits are read in place from the hot cache, misses land in scratch rows from
         the pinned tier (PinnedTierRowBackend), and routes are recorded on the device
         by the planner. A row missing from RAM sets the backend's ``keep`` to 0,
-        which drops this layer's routed output; the host fail-stop check stops the
-        process after the forward.
+        which drops this layer's routed output. Only option C (Task 14) serves such
+        a miss and fail-stops on one it cannot serve, so a plain
+        ``PinnedTierRowBackend`` is refused unless the layer sets the test-only
+        ``_exl3_allow_p3_only``.
         """
+        from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
         from sglang.srt.layers.quantization.exl3_fused_moe import exl3_fused_moe_for
 
+        if type(streamer.row_backend) is PinnedTierRowBackend and not getattr(layer, "_exl3_allow_p3_only", False):
+            # Without option C nothing serves or checks a RAM miss inside a replay.
+            raise RuntimeError(
+                "exl3 in-graph MoE needs option C (Exl3RamMissRowBackend); the pinned "
+                "tier's slot table was not native (SGLANG_MOE_EXPERT_GRAPH_GATHER off at load?)"
+            )
         if swiglu_limit is None:
             raise NotImplementedError("exl3 in-graph MoE: a swiglu_limit is required (DSV4.1 sets 10.0)")
         remap, _ = streamer.gather(topk_ids)

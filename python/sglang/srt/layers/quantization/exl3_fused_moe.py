@@ -118,6 +118,8 @@ class Exl3FusedMoE:
 
     def run(self, x, topk_weights, remap, keep, act_limit: float) -> torch.Tensor:
         """x [1, H] any float dtype; topk_weights [6]; remap int64 [6] slots; keep fp32 [1]."""
+        if x.shape[0] != 1:  # a host-side shape read: capture-safe
+            raise ValueError(f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}")
         self.x16.copy_(x)
         inv_order, weight_sorted, det = route_tables(remap, self.expert_count, self.ones, topk_weights, keep)
         self.out.zero_()
@@ -144,13 +146,23 @@ def exl3_fused_moe_for(layer, streamer) -> Exl3FusedMoE:
     fused = getattr(layer, "_exl3_fused_moe", None)
     if fused is None:
         cache = streamer.hot_cache
+        rows = streamer.graph_gather_rows
+        # The route buffers hold top_k routes of one token, and the pointer tables cover
+        # hot slots plus scratch rows only: a remap outside them would land in the
+        # expert_count sentinel bin and be skipped without an error.
+        if rows != layer.top_k:
+            raise ValueError(f"exl3 in-graph MoE needs graph_gather_rows ({rows}) == top_k ({layer.top_k})")
+        if cache.scratch_rows < rows:
+            raise ValueError(f"exl3 in-graph MoE needs a scratch row per route ({cache.scratch_rows} < {rows})")
+        if cache.reserves_prefetch_pull_row:
+            raise ValueError("exl3 in-graph MoE does not cover a prefetch-pull row (expert prefetch is off for EXL3)")
         slots = cache.capacity + cache.scratch_rows
         fused = Exl3FusedMoE(
             cache.tensors,
             slots,
             hidden=cache.tensors["w13_suh"].shape[-1],
             inter=cache.tensors["w2_suh"].shape[-1],
-            top_k=streamer.graph_gather_rows,
+            top_k=rows,
             device=cache.device,
         )
         layer._exl3_fused_moe = fused
