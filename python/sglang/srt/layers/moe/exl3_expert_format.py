@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
-from sglang.srt.layers.moe.expert_format import ExpertTensorSpec
+from sglang.srt.layers.moe.expert_format import ExpertTensorSpec, expert_streamer_of
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_row_source import ExpertRowSource
 
 EXL3_STREAMED_NAMES = (
     "w13_trellis",
@@ -129,3 +133,68 @@ class Exl3ExpertFormat:
 
     def segment_map(self) -> tuple[RowSegment, ...]:
         return self._segments
+
+    # Inclusive hierarchy (DSV41_REFERENCE §9.1): every expert the layer's hot
+    # cache holds keeps its pinned host row, so a VRAM eviction never costs a
+    # shard read. For a format that sets this, the framework clamps each layer's
+    # hot slots to its pinned rows minus max_gather_rows.
+    inclusive_pinned_tier = True
+
+    def pinned_tier_options(self, layer: torch.nn.Module) -> dict:
+        """Keyword arguments for this layer's pinned host tier: ``is_pinned``.
+
+        An expert is pinned while the layer's hot cache holds it, or is loading
+        it, into a slot. The callable looks the hot cache up at eviction time:
+        the pinned tier is built before the hot cache, and residency changes.
+        """
+
+        def is_pinned(expert_id: int) -> bool:
+            # Called O(pinned rows) times per miss chunk; each call scans the
+            # layer's ~32 hot slots in C. That is a few ms per 40-layer forward,
+            # accepted for eager 3a; a framework-side resident set is a 3b item.
+            streamer = expert_streamer_of(layer)
+            hot = None if streamer is None else streamer.hot_cache
+            return hot is not None and expert_id in hot.slot_to_expert
+
+        return {"is_pinned": is_pinned}
+
+    def default_row_source(
+        self,
+        layer: torch.nn.Module,
+        specs: Sequence[ExpertTensorSpec],
+        kind: str,
+    ) -> Optional["ExpertRowSource"]:
+        """``auto`` and ``shards`` read the original EXL3 shards."""
+        if kind in ("auto", "shards"):
+            # Imported here: the source pulls in sglang.srt.model_loader, whose
+            # package import reaches the quantization methods that import this module.
+            from sglang.srt.layers.moe.exl3_shard_row_source import (
+                Exl3ShardRowSource,
+            )
+
+            return Exl3ShardRowSource.for_layer(
+                self.layout, self.layer_id, self._segments, direct=self._resolve_direct()
+            )
+        raise ValueError(
+            f"expert format {self.key!r} has no row source kind {kind!r}; "
+            "choose from ('auto', 'shards')"
+        )
+
+    def file_source_bytes_per_expert(
+        self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]
+    ) -> Optional[int]:
+        # Non-None turns on the eager pinned host tier and the file counters.
+        return None if row_source is None else row_source.file_bytes_per_expert
+
+    def _resolve_direct(self) -> bool:
+        if self.direct is not None:
+            return self.direct
+        from sglang.srt.model_loader.file_row_reader import validate_file_reader_mode
+
+        mode = validate_file_reader_mode(envs.SGLANG_MOE_EXPERT_FILE_READER.get())
+        if mode == "mmap":
+            raise ValueError(
+                "the exl3 shard row source reads with io_uring; set "
+                "SGLANG_MOE_EXPERT_FILE_READER=uring_direct (or uring for buffered reads)"
+            )
+        return mode == "uring_direct"
