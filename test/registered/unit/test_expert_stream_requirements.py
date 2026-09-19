@@ -77,6 +77,12 @@ class TestQuantMethodResolution(_GateTest):
         args = SimpleNamespace(quantization=None, model_path="/no/such/model")
         self.assertIsNone(expert_quant_method(args, args))
 
+    def test_whitespace_only_quantization_falls_through_to_config_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._model_dir(directory, {"quant_method": "EXL3"})
+            args = SimpleNamespace(quantization="   ", model_path=directory)
+            self.assertEqual(expert_quant_method(args, args), "exl3")
+
     def test_config_json_names_the_method(self):
         with tempfile.TemporaryDirectory() as directory:
             self._model_dir(directory, {"quant_method": "EXL3", "bits": 3})
@@ -243,6 +249,35 @@ class TestEagerFormatRequirements(_GateTest):
         os.environ["SGLANG_MOE_HOT_LOG_INTERVAL"] = "0"
         with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_LOG_INTERVAL"):
             memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
+
+    def test_expert_prefetch_is_refused(self):
+        os.environ["SGLANG_MOE_PREFETCH_MAX_CANDIDATES"] = "1"
+        with self.assertRaisesRegex(
+            ValueError, "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
+        ):
+            memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
+
+    def test_gpu_residency_update_is_refused(self):
+        os.environ["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] = "1"
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"
+        ):
+            memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
+
+    def test_doorbell_is_refused(self):
+        os.environ["SGLANG_MOE_EXPERT_DOORBELL"] = "1"
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_MOE_EXPERT_DOORBELL; set it to 0"
+        ):
+            memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
+
+    def test_it_accepts_a_launch_with_all_three_settings_off(self):
+        os.environ.update(
+            SGLANG_MOE_PREFETCH_MAX_CANDIDATES="0",
+            SGLANG_MOE_GPU_RESIDENCY_UPDATE="0",
+            SGLANG_MOE_EXPERT_DOORBELL="0",
+        )
+        memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
 
 if __name__ == "__main__":

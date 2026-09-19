@@ -104,6 +104,8 @@ def expert_quant_method(server_args: Any, cfg: Any) -> Optional[str]:
     when the model path is a local directory. None when none of them names one.
     """
     explicit = getattr(cfg, "quantization", None)
+    if isinstance(explicit, str):
+        explicit = explicit.strip()
     if explicit:
         return _normalize(explicit)
     from sglang.srt.arg_groups.model_override_base import (
@@ -300,6 +302,21 @@ def eager_expert_stream_requirements(
             raise ValueError(
                 f"{label} expert caching does not support "
                 "SGLANG_MOE_EXPERT_HOST_ARENA; set it to 0"
+            )
+        if envs.SGLANG_MOE_PREFETCH_MAX_CANDIDATES.get() > 0:
+            raise ValueError(
+                f"{label} expert caching does not support expert prefetch; "
+                "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
+            )
+        if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():
+            raise ValueError(
+                f"{label} expert caching does not support "
+                "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"
+            )
+        if envs.SGLANG_MOE_EXPERT_DOORBELL.get():
+            raise ValueError(
+                f"{label} expert caching does not support "
+                "SGLANG_MOE_EXPERT_DOORBELL; set it to 0"
             )
         graph_config = cfg.cuda_graph_config
         if graph_config is not None and (
