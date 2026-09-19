@@ -146,7 +146,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = self._capture_output_rows(shape_key)
-        output_buffer = self._reserve_shared_output_buffer(warmup_out, size)
+        capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
+            warmup_out
+        )
+        output_buffer = self._reserve_shared_output_buffer(
+            warmup_out, size if capacity_rows is None else max(size, capacity_rows)
+        )
         with (
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
@@ -201,6 +206,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         A body that shards or prunes its output along dim 0 returns fewer than
         ``cap`` rows; everything else returns exactly ``cap``.
         """
+        runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
+        if runner_rows is not None:
+            return runner_rows
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
