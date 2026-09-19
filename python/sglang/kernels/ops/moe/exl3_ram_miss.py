@@ -387,12 +387,25 @@ class Exl3RamMissDevice:
             raise ValueError("slot_map must be int32 [layers, experts]")
         if timeout_ms <= 0:
             raise ValueError("the RAM-miss wait timeout must be positive")
+        if page.device.type != "cpu" or slot_map.device.type != "cpu":
+            raise ValueError("page and slot_map must be host tensors")
+        if not page.is_contiguous() or not slot_map.is_contiguous():
+            raise ValueError("page and slot_map must be contiguous")
+        # Checked before any CUDA call: the kernels read both through UVA, and an unpinned
+        # address faults inside the captured graph.
+        if torch.device(device).type == "cuda" and not (page.is_pinned() and slot_map.is_pinned()):
+            raise ValueError("page and slot_map must be pinned for a CUDA device")
         self.page = page
         self.slot_map = slot_map
         self.layers = layers
         self.timeout_ns = int(timeout_ms * 1_000_000)
         self.advise = int(bool(advise))
-        self.state = torch.zeros(len(STATE_WORDS), dtype=torch.int32, device=device)
+        state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
+        # Continue from the page's heads: the thread serves demand_done + 1 next, so a device
+        # restarting at 1 over a used page would never be served.
+        for word, head in (("posted", "demand_head"), ("advised", "advise_head")):
+            state[STATE_WORDS[word]] = page[WORDS[head] : WORDS[head] + 4].view(torch.int32)[0]
+        self.state = state.to(device)
         self.last_routes = torch.full((layers, MAX_IDS), -1, dtype=torch.int32, device=device)
         self._module = None
 
@@ -401,12 +414,36 @@ class Exl3RamMissDevice:
             self._module = _device_module()
         return self._module
 
+    def _check_row(self, name: str, row: int, *, allow_none: bool = False) -> None:
+        low = -1 if allow_none else 0
+        if not low <= row < self.layers:
+            raise ValueError(f"{name} {row} is outside [{low}, {self.layers})")
+
+    def _check_buffers(self, **buffers) -> None:
+        """The kernels cast each buffer's data pointer to one fixed type and read ``[0, lanes)``."""
+        for name, (tensor, dtype) in buffers.items():
+            if tensor.dtype != dtype or tensor.device != self.state.device or not tensor.is_contiguous() or tensor.numel() < 1:
+                raise ValueError(f"{name} must be a non-empty contiguous {dtype} tensor on {self.state.device}")
+
     def post(self, row: int, planned, count, routes, next_row: int) -> None:
+        self._check_row("row", row)
+        self._check_row("next_row", next_row, allow_none=True)
+        self._check_buffers(planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64))
         self._kernels().exl3_ram_miss_post(
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row
         )
 
     def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:
+        self._check_row("row", row)
+        self._check_buffers(
+            planned=(planned, torch.int64),
+            count=(count, torch.int32),
+            host_rows=(host_rows, torch.int64),
+            keep=(keep, torch.float32),
+            ram_miss=(ram_miss, torch.int64),
+        )
+        if planned.numel() < host_rows.numel():
+            raise ValueError(f"planned has {planned.numel()} lanes but host_rows {host_rows.numel()}: the wait reads planned per lane")
         self._kernels().exl3_ram_miss_wait(
             self.page, self.state, self.slot_map, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns
         )

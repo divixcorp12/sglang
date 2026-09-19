@@ -11,7 +11,8 @@
 // wait: one block; thread 0 polls demand_done with ld.acquire.sys and __nanosleep
 // until it reaches the armed sequence or `timeout_ns` of %globaltimer passes, then
 // translates the planned experts to pinned slots from the slot map. A timeout, a
-// failed request, or a planned row still not in RAM raises the page's fatal word
+// failed request, a planned row still not in RAM, or a fatal word already raised on
+// the page raises the page's fatal word
 // (sticky: later posts post nothing and later waits return at once) and sets keep
 // to 0, which drops the layer's routed output for this forward.
 
@@ -206,7 +207,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     int64_t timeout_ns) {
   using namespace exl3_ram_miss_device;
   if (threadIdx.x != 0) return;
-  bool ok = state[kSticky] == 0;
+  // D15: the page's fatal word too, not only this device's sticky flag.
+  bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0;
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
   if (ok && seq != 0) {
     state[kWaits] += 1;

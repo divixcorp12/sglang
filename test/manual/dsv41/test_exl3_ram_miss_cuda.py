@@ -152,7 +152,6 @@ def test_post_and_wait_capture_and_replay(tmp_path):
 def test_a_rewritten_slot_is_read_fresh(tmp_path):
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, expert_row_segments
     from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-    from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 
     layout, fmt, specs, slabs, host, dev = _service(tmp_path, capacity=1)
     try:
