@@ -6230,7 +6230,7 @@ Expected: `1 passed`; the JSON holds `hit_path_us_per_layer` (acceptance 1: per-
 
 - [ ] **Step 4: Capture smoke and R4 arms on the truncated model (~25 min)**
 
-`<GPU> bash -c ". $ANA/env-t3-c.sh && /data/models/slang/.venv/bin/python scripts/dsv41/graph_parity.py --model \$T3 --prompt-file $ANA/prompt-0.txt --prompt-tokens 256 --new-tokens 32 --mem-fraction-static 0.8 --graph-gather --debug-arm --control --out $ANA/parity-t3-c.json > $ANA/parity-t3-c.log 2>&1"`, then
+`<GPU> bash -c ". $ANA/env-t3-c.sh && /data/models/slang/.venv/bin/python scripts/dsv41/graph_parity.py --model \$T3 --prompt-file $ANA/prompt-0.txt --prompt-tokens 256 --new-tokens 32 --graph-gather --debug-arm --control --out $ANA/parity-t3-c.json > $ANA/parity-t3-c.log 2>&1"`, then
 ```bash
 ssh divix01 'ANA=/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b; grep -E "Breakable CUDA graph captured|exl3 RAM miss thread started|Debug mode for CUDA graph|exl3 RAM miss: request" $ANA/parity-t3-c.log'
 ```
