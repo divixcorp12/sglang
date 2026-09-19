@@ -54,11 +54,20 @@ def engine_kwargs(args) -> dict:
         # the stream trace would count as a decode token.
         disable_radix_cache=True,
     )
-    if getattr(args, "graphs", False):
+    dspark_draft = getattr(args, "dspark", None)
+    if getattr(args, "graphs", False) and not dspark_draft:
         # The capture, RAM-miss thread and hot cache startup lines are info logs.
         kwargs.update(GRAPH_KWARGS, log_level="info")
     else:
+        # The EXL3 expert-caching gate refuses speculation under a decode CUDA
+        # graph, so a --dspark run is always eager regardless of --graphs.
         kwargs["disable_cuda_graph"] = True
+    if dspark_draft:
+        kwargs.update(
+            speculative_algorithm="DSPARK",
+            speculative_draft_model_path=dspark_draft,
+            speculative_dspark_block_size=5,
+        )
     return kwargs
 
 
@@ -72,19 +81,33 @@ def time_stream(stream, new_tokens: int, clock=time.perf_counter) -> dict:
 
     The first chunk carries the first token (end of prefill), so the remaining
     new_tokens - 1 tokens are the decode.
+
+    When a chunk is a dict with a "meta_info" field (the Engine's normal output
+    shape), the last chunk's completion_tokens and spec_verify_ct (present once
+    speculative decoding is active) are carried into the result. A later slice
+    divides them to get the accept length; this only captures the raw fields.
     """
     started = clock()
     first = None
-    for _chunk in stream:
+    last_meta_info = None
+    for chunk in stream:
         if first is None:
             first = clock()
+        if isinstance(chunk, dict):
+            last_meta_info = chunk.get("meta_info", last_meta_info)
     if first is None:
         raise RuntimeError("generate stream yielded no chunks; cannot time the session")
     decode_s = clock() - first
-    return {
+    result = {
         "ttft_s": first - started,
         "decode_tok_s": (new_tokens - 1) / decode_s if decode_s > 0 else 0.0,
     }
+    if last_meta_info:
+        if "completion_tokens" in last_meta_info:
+            result["completion_tokens"] = last_meta_info["completion_tokens"]
+        if "spec_verify_ct" in last_meta_info:
+            result["spec_verify_ct"] = last_meta_info["spec_verify_ct"]
+    return result
 
 
 def mean_decode_tok_s(sessions: list) -> float:
@@ -105,6 +128,12 @@ def main() -> None:
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     p.add_argument("--chunked-prefill-size", type=int, default=512)
     p.add_argument("--graphs", action="store_true", help="breakable decode graphs at batch size 1")
+    p.add_argument(
+        "--dspark",
+        metavar="DRAFT_DIR",
+        help="run DSpark speculative decoding with this draft checkpoint dir "
+        "(forces eager decode; the EXL3 gate refuses speculation under a decode graph)",
+    )
     args = p.parse_args()
 
     texts = list(_first_turns(args.sessions, args.n, args.skip))
