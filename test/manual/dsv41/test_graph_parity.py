@@ -84,5 +84,44 @@ def test_decode_sets_the_env_for_the_engine_and_restores_it(monkeypatch):
     assert os.environ["SGLANG_MOE_EXPERT_GRAPH_GATHER"] == "1"
 
 
+def test_the_alt_stream_overlap_is_pinned_per_run():
+    assert graph_parity.overlap_env(True) == {"SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "1"}
+    assert graph_parity.overlap_env(False) == {"SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "0"}
+
+
+def test_decode_pins_the_overlap_for_every_arm_and_restores_everything_it_touched(monkeypatch):
+    import types
+
+    seen = []
+
+    class _Engine:
+        def __init__(self, **kwargs):
+            seen.append(os.environ.get("SGLANG_OPT_USE_MULTI_STREAM_OVERLAP"))
+            # A launch gate may write the environment of the launching process.
+            os.environ["SGLANG_OPT_USE_MULTI_STREAM_OVERLAP"] = "leaked"
+
+        def generate(self, **kwargs):
+            return {"meta_info": {"output_token_logprobs": [(-0.5, 7, None)]}}
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "sglang", types.SimpleNamespace(Engine=_Engine))
+    monkeypatch.delenv("SGLANG_OPT_USE_MULTI_STREAM_OVERLAP", raising=False)
+    for arm in ("eager", "graph", "control"):
+        graph_parity._decode("/m", [1], 1, arm, False, 0.8, overlap=True)
+    graph_parity._decode("/m", [1], 1, "graph", False, 0.8, overlap=False)
+    # Each Engine sees its own pin, not what the previous Engine's launch left behind.
+    assert seen == ["1", "1", "1", "0"]
+    assert "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP" not in os.environ
+
+
+def test_the_kv_pool_is_capped_so_it_does_not_scale_with_free_memory():
+    # The sm120 FlashMLA page-split buffer is sized to the pool (flash_mla_sm120.py,
+    # _split_kv_pages_to_64); an uncapped pool on the truncated model OOMs it at 0.8.
+    assert graph_parity.engine_kwargs("/m", "eager", 0.8)["max_total_tokens"] == 65536
+    assert graph_parity.engine_kwargs("/m", "graph", 0.8, max_total_tokens=1024)["max_total_tokens"] == 1024
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
