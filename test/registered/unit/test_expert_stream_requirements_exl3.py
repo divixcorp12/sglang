@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sglang.srt.arg_groups import memory_hook
+from sglang.srt.arg_groups import memory_hook, pipeline
 from sglang.srt.arg_groups.expert_stream_requirements import (
     expert_stream_requirements_for,
 )
@@ -78,7 +78,8 @@ def _launch(model_dir, **changes):
     return SimpleNamespace(**values)
 
 
-def _gate(args, **env_changes):
+def _under_window_c_env(env_changes, run):
+    """``run()`` under Window C's environment, a ``ValueError`` from it raised after the env is restored."""
     env = {**WINDOW_C_ENV, **env_changes}
     error = None
     with ExitStack() as stack:
@@ -86,13 +87,17 @@ def _gate(args, **env_changes):
             stack.enter_context(getattr(envs, name).override(value))
         stack.enter_context(patch.object(memory_hook, "resolving_view", lambda a: a))
         try:
-            memory_hook.handle_offload_compatibility(args)
+            run()
         except ValueError as caught:
             # EnvField.override restores the environment only on a clean exit, so
             # the error leaves the with-block as a value and is raised after it.
             error = caught
     if error is not None:
         raise error
+
+
+def _gate(args, **env_changes):
+    _under_window_c_env(env_changes, lambda: memory_hook.handle_offload_compatibility(args))
 
 
 def test_the_exl3_method_selects_the_exl3_requirements(model_dir):
@@ -182,6 +187,77 @@ def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model
         SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
         SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True,
     )
+
+
+class _PipelineStopped(Exception):
+    pass
+
+
+def _resolution_pipeline_hooks(args, hook_for=None):
+    """Run ``run_resolution_pipeline`` on ``args`` with every step replaced, and return the step names in order.
+
+    ``hook_for(name)`` supplies a stand-in for a step (called with ``args``); every
+    other step is a no-op. The run stops at the first ``handle_offload_compatibility`` that follows
+    ``handle_cuda_graph_config``, so it never reaches the direct calls that need a real ServerArgs.
+    """
+    names = []
+
+    def record(hook, server_args):
+        name = hook.__name__
+        names.append(name)
+        if hook_for is not None and hook_for(name) is not None:
+            hook_for(name)(server_args)
+        if name == "handle_offload_compatibility" and "handle_cuda_graph_config" in names:
+            raise _PipelineStopped
+
+    with patch.object(pipeline, "run_hook", record):
+        try:
+            pipeline.run_resolution_pipeline(args)
+        except _PipelineStopped:
+            pass
+    return names
+
+
+def test_the_resolution_pipeline_checks_offload_after_the_cuda_graph_config_is_parsed(model_dir):
+    # The gate's graph checks run only once cuda_graph_config is parsed (they are skipped on
+    # the raw CLI value), so they depend on the offload pass that follows handle_cuda_graph_config.
+    # If a merge moved that pass before it, or dropped it, every EXL3 graph rule would go unchecked.
+    names = _resolution_pipeline_hooks(_launch(model_dir))
+    offload = [i for i, name in enumerate(names) if name == "handle_offload_compatibility"]
+    assert names.count("handle_cuda_graph_config") == 1
+    assert len(offload) == 2, names
+    parsed_at = names.index("handle_cuda_graph_config")
+    assert offload[0] < parsed_at < offload[1]
+
+
+def test_a_flag_only_full_decode_graph_launch_passes_pass_one_and_is_refused_after_parsing(model_dir):
+    # Flag-only launch: cuda_graph_config is None until handle_cuda_graph_config parses it. The
+    # first offload pass must accept it; the second, on the parsed decode `full` config, must refuse it.
+    parsed = CudaGraphConfig(
+        decode=PhaseConfig(backend="full", bs=[1], max_bs=1),
+        prefill=PhaseConfig(backend="disabled"),
+    )
+    args = _launch(model_dir, cuda_graph_config=None)
+    seen = []
+
+    def parse(server_args):
+        seen.append("parsed")
+        server_args.cuda_graph_config = parsed
+
+    def offload(server_args):
+        memory_hook.handle_offload_compatibility(server_args)
+        seen.append("offload passed")
+
+    hooks = {"handle_cuda_graph_config": parse, "handle_offload_compatibility": offload}
+    with pytest.raises(ValueError, match="cannot run the Engram"):
+        _under_window_c_env(
+            {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True},
+            lambda: _resolution_pipeline_hooks(args, hooks.get),
+        )
+    assert seen == ["offload passed", "parsed"]  # pass 1 accepted; pass 2 raised inside its own call
+    # The parsed config alone is what refuses it: the same launch with the config already parsed.
+    with pytest.raises(ValueError, match="cannot run the Engram"):
+        _gate(_launch(model_dir, cuda_graph_config=parsed), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
 
 
 def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
