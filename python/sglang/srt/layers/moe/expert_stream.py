@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.expert_format import (
     ExpertFormat,
     ExpertTensorSpec,
     iter_expert_streamers,
+    pinned_tier_options_of,
     require_graph_gather_support,
     resolve_row_source_kind,
 )
@@ -446,8 +447,8 @@ class ExpertPinnedHostCacheManager:
             layer_id: ExpertPinnedHostCache(
                 streamers[layer_id],
                 capacity,
-                **streamers[layer_id].format.pinned_tier_options(
-                    streamers[layer_id].layer
+                **pinned_tier_options_of(
+                    streamers[layer_id].format, streamers[layer_id].layer
                 ),
             )
             for layer_id, capacity in capacities.items()

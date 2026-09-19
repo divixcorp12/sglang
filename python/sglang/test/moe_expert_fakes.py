@@ -100,8 +100,18 @@ class SpecOnlyFormat:
     supports_host_arena = False
     max_gather_rows: Optional[int] = None
 
-    def __init__(self, reference: Mapping[str, torch.Tensor]):
+    def __init__(
+        self,
+        reference: Mapping[str, torch.Tensor],
+        *,
+        tier_options: Optional[Mapping[str, object]] = None,
+        max_gather_rows: Optional[int] = None,
+        inclusive_pinned_tier: bool = False,
+    ):
         self.reference = dict(reference)
+        self._tier_options = dict(tier_options or {})
+        self.max_gather_rows = max_gather_rows
+        self.inclusive_pinned_tier = inclusive_pinned_tier
 
     def tensor_specs(self, layer):
         return tuple(
@@ -124,4 +134,4 @@ class SpecOnlyFormat:
         return None if row_source is None else row_source.file_bytes_per_expert
 
     def pinned_tier_options(self, layer):
-        return {}
+        return dict(self._tier_options)

@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.expert_residency_clock import (
     classify_forward,
 )
 from sglang.srt.layers.moe.expert_format import (
+    inclusive_hot_slot_limit,
     iter_expert_streamers,
     require_graph_gather_support,
 )
@@ -1169,11 +1170,23 @@ class ExpertHotCacheManager:
             for layer_id, rows in gather_rows.items()
         }
         chosen = {layer_id: set() for layer_id in streamers}
+        # A format with an inclusive pinned tier keeps every hot expert in host memory
+        # too, so its layers hold at most `inclusive_hot_slot_limit` slots and the
+        # budget they cannot use goes to other layers. Other formats have no limit.
+        slot_limits = {
+            layer_id: inclusive_hot_slot_limit(streamer)
+            for layer_id, streamer in streamers.items()
+        }
+        clamped = set()
         for floor_pass in (True, False):
             for _, expert_id, layer_id in candidates:
                 if expert_id in chosen[layer_id] or (
                     floor_pass and len(chosen[layer_id]) >= floors[layer_id]
                 ):
+                    continue
+                limit = slot_limits[layer_id]
+                if limit is not None and len(chosen[layer_id]) >= limit:
+                    clamped.add(layer_id)
                     continue
                 slot_bytes = streamers[layer_id].bytes_per_expert
                 pull_row_bytes = (
@@ -1186,6 +1199,16 @@ class ExpertHotCacheManager:
         for _, expert_id, layer_id in candidates:
             if expert_id in chosen[layer_id]:
                 selected[layer_id].append(expert_id)
+        for layer_id in sorted(clamped):
+            streamer = streamers[layer_id]
+            logger.info(
+                "Expert hot cache clamps layer %d to %d slots: its inclusive pinned "
+                "tier holds %d rows and an eager gather stages up to %d more",
+                layer_id,
+                slot_limits[layer_id],
+                streamer.pinned_host_cache.capacity,
+                streamer.format.max_gather_rows or 0,
+            )
         if not any(selected.values()) and not any(gather_rows.values()):
             return None
         manager = cls()

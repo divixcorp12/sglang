@@ -9,6 +9,7 @@ streamer had before formats existed: every tensor is a layer attribute.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import (
@@ -30,6 +31,9 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_row_source import ExpertRowSource
     from sglang.srt.layers.moe.expert_stream import ExpertStreamer
+
+logger = logging.getLogger(__name__)
+_WARNED_WITHOUT_TIER_OPTIONS: set[str] = set()
 
 # The attribute a quantization method sets on a MoE layer to attach its streamer.
 # The name predates other formats; every format uses it so discovery has one home.
@@ -92,6 +96,9 @@ class ExpertFormat(Protocol):
     supports_graph_gather: bool
     supports_host_arena: bool
     max_gather_rows: Optional[int]
+    # True when the format's is_pinned protects its hot-cache experts, so the
+    # pinned tier holds every hot row (see inclusive_hot_slot_limit).
+    inclusive_pinned_tier: bool
 
     def tensor_specs(self, layer: torch.nn.Module) -> tuple[ExpertTensorSpec, ...]: ...
 
@@ -126,6 +133,7 @@ class DenseLayerFormat:
     supports_graph_gather = True
     supports_host_arena = True
     max_gather_rows: Optional[int] = None
+    inclusive_pinned_tier = False
 
     def __init__(self, tensor_names: Iterable[str]):
         self.tensor_names = tuple(tensor_names)
@@ -262,3 +270,41 @@ def require_graph_gather_support(streamers: Iterable["ExpertStreamer"]) -> None:
                 "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER, "
                 "SGLANG_MOE_GPU_RESIDENCY_UPDATE and SGLANG_MOE_EXPERT_DOORBELL"
             )
+
+
+def pinned_tier_options_of(expert_format: Any, layer: torch.nn.Module) -> Mapping[str, Any]:
+    """``expert_format.pinned_tier_options(layer)``, or no options for a format without the hook.
+
+    The protocol requires the hook; a format missing it gets a default pinned
+    tier (no ``is_pinned`` filter) and one warning, instead of failing startup.
+    """
+    hook = getattr(expert_format, "pinned_tier_options", None)
+    if hook is None:
+        key = str(getattr(expert_format, "key", type(expert_format).__name__))
+        if key not in _WARNED_WITHOUT_TIER_OPTIONS:
+            _WARNED_WITHOUT_TIER_OPTIONS.add(key)
+            logger.warning(
+                "expert format %r has no pinned_tier_options; its pinned host tier "
+                "gets default options (no is_pinned filter)",
+                key,
+            )
+        return {}
+    return hook(layer)
+
+
+def inclusive_hot_slot_limit(streamer: "ExpertStreamer") -> Optional[int]:
+    """The most hot-cache slots a layer may hold when its pinned tier is inclusive.
+
+    An inclusive pinned tier keeps every hot expert in host memory too,
+    protected from eviction, and an eager gather needs room for up to
+    ``max_gather_rows`` more rows beside them; so the layer may hold at most
+    ``pinned rows - max_gather_rows`` hot slots (never below 0). None when the
+    format does not set ``inclusive_pinned_tier`` or the layer has no pinned tier.
+    """
+    expert_format = streamer.format
+    if not getattr(expert_format, "inclusive_pinned_tier", False):
+        return None
+    cache = streamer.pinned_host_cache
+    if cache is None or not cache.capacity:
+        return None
+    return max(cache.capacity - (expert_format.max_gather_rows or 0), 0)
