@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import logging
 import math
-import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
