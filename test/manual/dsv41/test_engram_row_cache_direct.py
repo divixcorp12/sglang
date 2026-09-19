@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import struct
+import tempfile
 
 import numpy as np
 import pytest
@@ -47,8 +48,8 @@ def scratch():
     fs = _fs_type(SCRATCH)
     if fs in ("tmpfs", "overlay"):
         pytest.skip(f"{SCRATCH} is on {fs}, which may reject O_DIRECT")
-    directory = os.path.join(SCRATCH, f"run-{os.getpid()}")
-    os.makedirs(directory)
+    # A fresh path per test: the shared reader caches file ids by path.
+    directory = tempfile.mkdtemp(prefix="run-", dir=SCRATCH)
     try:
         yield directory
     finally:

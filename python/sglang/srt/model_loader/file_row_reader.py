@@ -294,6 +294,8 @@ class PagedRowBatch:
         self._reader = sources[0]._reader
         if any(source._reader is not self._reader for source in sources):
             raise ValueError("paged row batch sources must share one reader")
+        if any(source.base_offset != 0 for source in sources):
+            raise ValueError("paged row batch sources must start at byte 0 of their file")
         self.row_bytes = tuple(source.row_bytes for source in sources)
         self._segments = torch.tensor(
             [
