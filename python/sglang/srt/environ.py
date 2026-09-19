@@ -1787,7 +1787,9 @@ class Envs:
     # for offline tier simulation (scripts/dsv41/tier_sim.py).
     SGLANG_DSV41_EXPERT_TRACE_PATH = EnvStr("")
     # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
-    # thread may take per MoE layer, in ms, before the process fails stop.
+    # thread may take per MoE layer, in ms, before the process fails stop. The
+    # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
+    # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level

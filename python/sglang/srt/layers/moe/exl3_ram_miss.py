@@ -236,6 +236,16 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
 
 
+def watchdog_wait_s(timeout_ms: int) -> float:
+    """The C++ watchdog's abort limit for a wait timeout of ``timeout_ms``: max(30 s, 3 x timeout).
+
+    It must outlast the device wait (a slow demand fails stop cleanly at the timeout, not
+    by abort) and the eager pause bound, 2 x timeout + 1 s (``before_host_use``). Three
+    times the timeout exceeds both for any timeout over 1 s; 30 s covers the rest.
+    """
+    return max(30.0, 3.0 * timeout_ms / 1000)
+
+
 def parse_fault(spec: str) -> Optional[tuple[int, float]]:
     """``SGLANG_TEST_DSV41_RAM_MISS_FAULT`` = ``"<demands>:<seconds>"``: delay each demand
     read by ``seconds`` once ``demands`` demands have read rows. Empty: no fault."""
@@ -304,7 +314,7 @@ class Exl3RamMissService:
         slot_map = slot_map.pin_memory() if pin else slot_map
         host = Exl3RamMissHost(tables, page=page, slot_map=slot_map, direct=fmt._resolve_direct())
         try:
-            host.start_thread(fatal_wait_s=30.0)
+            host.start_thread(fatal_wait_s=watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get()))
             fault = parse_fault(envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get())
             if fault is not None:
                 demands, seconds = fault
