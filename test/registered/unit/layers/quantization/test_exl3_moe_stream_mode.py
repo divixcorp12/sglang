@@ -1,0 +1,242 @@
+"""Exl3MoEMethod in streaming mode: no expert parameters, an attached expert
+streamer, and an apply that runs gathered chunks through the eager loop (CPU)."""
+
+import functools
+import json
+import types
+
+import pytest
+import torch
+from safetensors import safe_open
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.exl3_expert_format import (
+    EXL3_STREAMED_NAMES,
+    exl3_expert_layout_for,
+)
+from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
+from sglang.srt.layers.moe.expert_row_source import RowReadStats
+from sglang.srt.layers.quantization import exl3 as exl3_mod
+from sglang.srt.layers.quantization import exl3_ops
+from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod, Exl3RowViews
+from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_fake_exl3 import HIDDEN, INTER, write_fake_exl3
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+CFG = {"quant_method": "exl3", "version": "1.4.2", "bits": 3.02, "head_bits": 6, "codebook": "mul1"}
+NUM_EXPERTS = 6
+
+
+def _fake_linear(x, t, out_dtype=None):
+    """A CPU stand-in for exl3_linear that depends on all three tensors of its expert."""
+    scale = 1.0 + t.trellis.float().mean() / 32768 + t.suh.float().mean()
+    y = x.float().sum(-1, keepdim=True) * t.svh.float() * scale
+    return y.to(out_dtype or x.dtype)
+
+
+def _reference(ckpt, layer):
+    """({name: [experts, parts, ...]}, resident w13, resident w2) read with safetensors."""
+    with open(ckpt / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    def get(expert, w, kind):
+        name = f"layers.{layer}.ffn.experts.{expert}.{w}.{kind}"
+        with safe_open(str(ckpt / weight_map[name]), "pt") as f:
+            return f.get_tensor(name)
+
+    rows = {}
+    for prefix, linears in (("w13", ("w1", "w3")), ("w2", ("w2",))):
+        for kind in ("trellis", "suh", "svh"):
+            rows[f"{prefix}_{kind}"] = torch.stack(
+                [torch.stack([get(e, w, kind) for w in linears]) for e in range(NUM_EXPERTS)]
+            )
+
+    def tensors(e, w):
+        return Exl3Tensors(trellis=get(e, w, "trellis"), suh=get(e, w, "suh"), svh=get(e, w, "svh"), mul1=True)
+
+    w13 = [(tensors(e, "w1"), tensors(e, "w3")) for e in range(NUM_EXPERTS)]
+    w2 = [tensors(e, "w2") for e in range(NUM_EXPERTS)]
+    return rows, w13, w2
+
+
+class FakeStreamer:
+    """The streamer interface Exl3MoEMethod uses, over in-memory reference rows.
+
+    Each chunk's rows sit in reverse order behind three padding rows, so the
+    method must follow ``row_of_source``.
+    """
+
+    def __init__(self, reference, chunk_rows):
+        self.reference = reference
+        self.chunk_rows = chunk_rows
+        self.recorded = []
+        self.chunks = []
+        self.last_gather_stats = None
+        self.background_read_stats = RowReadStats()
+
+    def record_routes(self, topk_ids):
+        self.recorded.append(topk_ids.clone())
+
+    def iter_gather_experts(self, source_ids, chunk_rows=None):
+        ids = source_ids.tolist()
+        for start in range(0, len(ids), self.chunk_rows):
+            chunk = ids[start : start + self.chunk_rows]
+            n = len(chunk)
+            row_of_source = [3 + n - 1 - i for i in range(n)]
+            rows = {
+                name: torch.zeros((3 + n,) + t.shape[1:], dtype=t.dtype)
+                for name, t in self.reference.items()
+            }
+            for expert, row in zip(chunk, row_of_source):
+                for name, t in self.reference.items():
+                    rows[name][row] = t[expert]
+            self.chunks.append(chunk)
+            yield torch.tensor(chunk), torch.tensor(row_of_source), rows
+        self.last_gather_stats = types.SimpleNamespace(
+            miss_rows=len(ids), host_read_rows=len(ids), host_read_ns=0, host_split_ns=0
+        )
+
+
+@pytest.fixture
+def ckpt(tmp_path):
+    write_fake_exl3(str(tmp_path), num_layers=2, num_experts=NUM_EXPERTS, finite=True)
+    exl3_expert_layout_for.cache_clear()
+    return tmp_path
+
+
+def _layer(method, num_experts=NUM_EXPERTS, hidden=HIDDEN, inter=INTER):
+    layer = torch.nn.Module()
+    layer.layer_id = 1
+    method.create_weights(layer, num_experts, hidden, inter, torch.bfloat16)
+    return layer
+
+
+def _streaming_env(ckpt):
+    return (
+        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
+        envs.SGLANG_DSV41_EXPERT_DIR.override(str(ckpt)),
+        envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("auto"),
+        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+    )
+
+
+def test_stream_mode_registers_no_expert_parameters():
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+        layer = _layer(Exl3MoEMethod(Exl3Config.from_config(CFG)))
+    assert list(layer.named_parameters()) == []
+    assert layer.exl3_streamed is True
+
+
+def test_process_attaches_an_exl3_streamer(ckpt):
+    from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
+    from sglang.srt.layers.moe.expert_format import expert_streamer_of
+
+    a, b, c, d = _streaming_env(ckpt)
+    with a, b, c, d:
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        layer = _layer(method)
+        method.process_weights_after_loading(layer)
+    streamer = expert_streamer_of(layer)
+    assert streamer.format.key == "exl3"
+    assert streamer.layer_id == 1 and streamer.num_experts == NUM_EXPERTS
+    assert isinstance(streamer.row_source, Exl3ShardRowSource)
+    assert streamer.row_source.layer_id == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs, env_dir, match",
+    [
+        ({"num_experts": NUM_EXPERTS + 1}, True, "disable_shared_experts_fusion"),
+        ({"hidden": 2 * HIDDEN}, True, "do not match the layer"),
+        ({}, False, "needs SGLANG_DSV41_EXPERT_DIR"),
+    ],
+)
+def test_process_rejects_a_mismatched_layer(ckpt, kwargs, env_dir, match):
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
+        str(ckpt) if env_dir else ""
+    ):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        layer = _layer(method, **kwargs)
+        with pytest.raises(ValueError, match=match):
+            method.process_weights_after_loading(layer)
+
+
+def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
+    from sglang.srt.layers.moe import exl3_expert_format
+
+    monkeypatch.setattr(exl3_expert_format, "_WARNED_WITHOUT_PINNED_TIER", False)
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
+        str(ckpt)
+    ), envs.SGLANG_MOE_PINNED_HOST_MB.override(0):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.exl3_expert_format"):
+            for _ in range(2):
+                layer = _layer(method, hidden=2 * HIDDEN)  # fails after the warning
+                with pytest.raises(ValueError, match="do not match the layer"):
+                    method.process_weights_after_loading(layer)
+    warnings = [r for r in caplog.records if "SGLANG_MOE_PINNED_HOST_MB" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("chunk_rows", [2, 64])
+def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows):
+    reference, w13, w2 = _reference(ckpt, 1)
+    monkeypatch.setattr(
+        exl3_mod, "exl3_moe_accumulate",
+        functools.partial(exl3_ops.exl3_moe_accumulate, linear=_fake_linear),
+    )
+    trace = Exl3StreamTrace()
+    monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        layer = _layer(method)
+    streamer = FakeStreamer(reference, chunk_rows)
+    layer._nvfp4_expert_streamer = streamer
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+    )
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(4, HIDDEN, generator=generator).to(torch.bfloat16)
+    topk_ids = torch.tensor([[5, 0, 3], [3, 1, 5], [0, 4, 1], [5, 3, 4]], dtype=torch.int32)
+    topk_weights = torch.rand(4, 3, generator=generator)
+    topk = types.SimpleNamespace(topk_weights=topk_weights, topk_ids=topk_ids)
+    dispatch = types.SimpleNamespace(hidden_states=x, topk_output=topk)
+
+    got = method.apply(layer, dispatch).hidden_states
+    want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear)
+    assert torch.equal(got, want)
+    assert len(streamer.recorded) == 1 and torch.equal(streamer.recorded[0], topk_ids.reshape(-1))
+    assert [e for chunk in streamer.chunks for e in chunk] == [0, 1, 3, 4, 5]
+    assert all(len(chunk) <= chunk_rows for chunk in streamer.chunks)
+    assert trace.stats()["vram_misses"] == 5
+
+
+def test_row_views_are_cached_per_buffer_and_row():
+    shapes = {
+        "w13_trellis": ((2, 1, 1, 48), torch.int16),
+        "w13_suh": ((2, 16), torch.float16),
+        "w13_svh": ((2, 16), torch.float16),
+        "w2_trellis": ((1, 1, 1, 48), torch.int16),
+        "w2_suh": ((1, 16), torch.float16),
+        "w2_svh": ((1, 16), torch.float16),
+    }
+    rows = {name: torch.zeros((3,) + shape, dtype=dtype) for name, (shape, dtype) in shapes.items()}
+    views = Exl3RowViews(max_buffers=1)
+    w13, w2 = views.select(rows, [7, 2], [2, 0])
+    again, _ = views.select(rows, [2], [0])
+    assert again[2][0] is w13[2][0] and again[2][1] is w13[2][1]
+    assert w13[7][1].trellis.data_ptr() == rows["w13_trellis"][2, 1].data_ptr()
+    assert w2[2].svh.data_ptr() == rows["w2_svh"][0, 0].data_ptr()
+    other = {name: t.clone() for name, t in rows.items()}
+    fresh, _ = views.select(other, [2], [0])
+    assert fresh[2][0] is not w13[2][0]
+    assert tuple(EXL3_STREAMED_NAMES) == tuple(shapes)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
