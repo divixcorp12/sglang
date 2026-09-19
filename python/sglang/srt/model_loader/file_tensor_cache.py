@@ -79,6 +79,8 @@ class FileTensorCacheGroup:
         self._manifest = manifest
         self._lock = lock
         self._closed = False
+        # Set by open_verified: the group maps files another writer owns.
+        self._verify_only = False
 
     @classmethod
     def open(
@@ -153,8 +155,73 @@ class FileTensorCacheGroup:
             )
             raise
 
+    @classmethod
+    def open_verified(
+        cls,
+        directory: str | os.PathLike[str],
+        namespace: str,
+        cache_identity: Mapping[str, Any],
+        specs: Sequence[FileTensorSpec],
+    ) -> "FileTensorCacheGroup":
+        """Map a completed group for reading without creating or replacing any file.
+
+        ``open`` turns any mismatch into a fresh sparse cache miss, which would
+        destroy a group another tool wrote. This open maps only a group whose
+        manifest and member sizes verify. It raises FileNotFoundError for a
+        missing directory and ValueError when no group verifies. The group
+        holds the cache lock until ``close``; ``complete`` and ``abort`` raise.
+        """
+        directory_path = os.path.realpath(os.path.expanduser(os.fspath(directory)))
+        if not os.path.isdir(directory_path):
+            raise FileNotFoundError(
+                f"file tensor cache directory {directory_path} does not exist"
+            )
+        namespace = str(namespace)
+        normalized_specs = tuple(specs)
+        if not namespace:
+            raise ValueError("file tensor cache namespace must not be empty")
+        if not normalized_specs:
+            raise ValueError("file tensor cache group must contain at least one tensor")
+        tags = [spec.tag for spec in normalized_specs]
+        if len(set(tags)) != len(tags):
+            raise ValueError("file tensor cache tags must be unique within a group")
+        manifest, manifest_path, paths, lock = _group_layout(
+            directory_path, namespace, cache_identity, normalized_specs
+        )
+        lock.acquire()
+        try:
+            if not _cache_is_valid(manifest_path, manifest, normalized_specs, paths):
+                raise ValueError(
+                    f"no verified file tensor cache group for namespace {namespace!r} "
+                    f"in {directory_path}"
+                )
+            # A private mapping opens the files read-only: a read-only repack
+            # works, and a stray write never reaches another tool's files.
+            tensors = {
+                spec.tag: _map_tensor(paths[spec.tag], spec, shared=False)
+                for spec in normalized_specs
+            }
+            group = cls(
+                cache_hit=True,
+                directory=directory_path,
+                manifest_path=manifest_path,
+                manifest=manifest,
+                specs=normalized_specs,
+                paths=paths,
+                tensors=tensors,
+                lock=lock,
+            )
+            group._verify_only = True
+        except BaseException:
+            lock.release()
+            raise
+        _log_cache_event(manifest_path, manifest, "verified_hit")
+        return group
+
     def complete(self) -> None:
         """Durably publish every member as one complete cache group."""
+        if self._verify_only:
+            raise RuntimeError("a verify-only file tensor cache group cannot be published")
         if self._closed:
             return
         temporary_path: Optional[str] = None
@@ -194,6 +261,10 @@ class FileTensorCacheGroup:
 
     def abort(self) -> None:
         """Invalidate this group and release its cache lock."""
+        if self._verify_only:
+            raise RuntimeError(
+                "a verify-only file tensor cache group cannot be invalidated; close it"
+            )
         if self._closed:
             return
         try:
@@ -225,6 +296,29 @@ class FileTensorCacheGroup:
             self.close()
         except Exception:
             pass
+
+
+def _group_layout(
+    directory_path: str,
+    namespace: str,
+    cache_identity: Mapping[str, Any],
+    specs: tuple[FileTensorSpec, ...],
+) -> tuple[dict[str, Any], str, dict[str, str], Any]:
+    """The manifest, manifest path, member paths and lock ``open`` uses for a group."""
+    manifest, digest = _build_manifest(namespace, cache_identity, specs)
+    stem = f"file_tensor_cache_{_safe_component(namespace)}_{digest}"
+    manifest_path = os.path.join(directory_path, f"{stem}.manifest.json")
+    paths = {
+        spec.tag: os.path.join(
+            directory_path,
+            f"{stem}_{index:03d}_{_safe_component(spec.tag)}.bin",
+        )
+        for index, spec in enumerate(specs)
+    }
+    lock_digest = hashlib.sha256(
+        os.path.realpath(manifest_path).encode("utf-8")
+    ).hexdigest()
+    return manifest, manifest_path, paths, get_lock(f"file-tensor-cache-{lock_digest}")
 
 
 def _build_manifest(
@@ -338,8 +432,11 @@ def _exact_json_equal(actual: Any, expected: Any) -> bool:
     return bool(actual == expected)
 
 
-def _map_tensor(path: str, spec: FileTensorSpec) -> torch.Tensor:
-    storage = torch.from_file(path, shared=True, size=spec.nbytes, dtype=torch.uint8)
+def _map_tensor(
+    path: str, spec: FileTensorSpec, *, shared: bool = True
+) -> torch.Tensor:
+    # shared=False maps copy-on-write from a read-only descriptor.
+    storage = torch.from_file(path, shared=shared, size=spec.nbytes, dtype=torch.uint8)
     return torch.as_strided(
         storage.view(spec.dtype), size=spec.shape, stride=spec.stride
     )
