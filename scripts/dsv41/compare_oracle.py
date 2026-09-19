@@ -68,6 +68,9 @@ def main():
         # DSV4 reserves its SWA pool from the request cap up front; prompts run one
         # at a time, and the default cap leaves no budget for the full pool.
         max_running_requests=4,
+        # Window C runs with dynamic expert residency, which the EXL3 expert-caching
+        # gate accepts only with a stat or per_pass route recorder.
+        expert_distribution_recorder_mode="per_pass",
     )
     oracle = np.load(args.oracle)
     results = []
