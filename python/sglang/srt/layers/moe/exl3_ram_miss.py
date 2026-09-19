@@ -199,8 +199,6 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.next_row = next_row
         self.routes = torch.full((capacity,), -1, dtype=torch.int64, device=host_row_map.device)
         self.planned = torch.full((max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device)
-        if self.planned.numel() < MAX_IDS:
-            raise ValueError(f"planned has {self.planned.numel()} lanes; the post kernel reads up to {MAX_IDS}")
 
     def translate(self, tag, plan) -> None:
         lanes = plan.expert_ids.numel()
