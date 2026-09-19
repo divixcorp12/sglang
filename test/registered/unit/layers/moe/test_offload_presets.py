@@ -1,9 +1,14 @@
 """MoE offload presets: the preset values, the merge and derivation rules, and validation."""
 
+import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.srt.arg_groups import moe_offload_hook
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import offload_presets as presets
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -155,3 +160,62 @@ class TestValidation(unittest.TestCase):
         for values, context, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 check(values, **context)
+
+
+class TestPresetHook(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for target, replacement in (
+            ("resolving_view", lambda args: args),
+            ("declare_resolution", self.record_declaration),
+        ):
+            patcher = patch.object(moe_offload_hook, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        affinity = patch.object(moe_offload_hook.os, "sched_getaffinity", return_value=set(range(72)))
+        affinity.start()
+        self.addCleanup(affinity.stop)
+        self.declared = []
+
+    def record_declaration(self, server_args, source, **fields):
+        self.declared.append(fields)
+
+    def args(self, preset, **changes):
+        values = dict(
+            moe_offload_preset=preset,
+            disable_overlap_schedule=False,
+            speculative_algorithm=None,
+            tp_size=1,
+            pp_size=1,
+            dp_size=1,
+            enable_dp_attention=False,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend="breakable", max_bs=1),
+                prefill=PhaseConfig(backend="disabled"),
+            ),
+        )
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def test_graph_gather_sets_every_unset_variable_and_keeps_overlap(self):
+        os.environ["SGLANG_MOE_HOT_GPU_MB"] = "12288"
+        moe_offload_hook.handle_moe_offload_preset(self.args("graph-gather", speculative_algorithm="NEXTN"))
+        expected = dict(presets.preset_env(presets.GRAPH_GATHER_PRESET), SGLANG_MOE_HOT_GPU_MB="12288")
+        self.assertEqual(presets.explicit_offload_env(os.environ), expected)
+        self.assertEqual(self.declared, [])
+
+    def test_doorbell_turns_overlap_off(self):
+        moe_offload_hook.handle_moe_offload_preset(self.args("doorbell"))
+        self.assertEqual(self.declared, [{"disable_overlap_schedule": True}])
+        self.assertEqual(envs.SGLANG_MOE_EXPERT_DOORBELL_CPU.get(), 71)
+
+    def test_off_with_no_offload_env_touches_nothing(self):
+        moe_offload_hook.handle_moe_offload_preset(self.args("off"))
+        self.assertEqual(presets.explicit_offload_env(os.environ), {})
+        self.assertEqual(self.declared, [])
+
+    def test_a_refusal_names_the_preset(self):
+        with self.assertRaisesRegex(ValueError, "--moe-offload-preset doorbell: .*speculative"):
+            moe_offload_hook.handle_moe_offload_preset(self.args("doorbell", speculative_algorithm="NEXTN"))

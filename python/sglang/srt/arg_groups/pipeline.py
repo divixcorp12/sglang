@@ -89,6 +89,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_hicache_ratio_default(server_args)
+    from sglang.srt.arg_groups.moe_offload_hook import handle_moe_offload_preset
+
+    # Before the offload checks, which read the variables the preset fills.
+    handle_moe_offload_preset(server_args)
     from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
 
     handle_offload_compatibility(server_args)
