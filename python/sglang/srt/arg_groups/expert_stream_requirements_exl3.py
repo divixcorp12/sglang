@@ -6,7 +6,10 @@ names it). EXL3 experts stream with prefill eager and decode eager or a
 breakable CUDA graph at max batch size 1 (a ``full`` decode graph is refused);
 graph gather only with that breakable decode graph, reading missed rows from the
 pinned host tier (never the host arena); and a ``stat`` or ``per_pass`` recorder
-under dynamic residency. Nothing else is required; ``--max-running-requests`` and the
+under dynamic residency. Speculative decoding (DSpark or otherwise) is refused with
+any decode CUDA graph: it must run with the decode graph disabled, since a spec verify
+step runs more than one token through scratch and RAM-miss posting sized for one.
+Nothing else is required; ``--max-running-requests`` and the
 overlap schedule stay free. This module runs during server-args processing,
 so it imports only the gate module, ``sglang.srt.environ``, the graph-config enum
 and the standard library.
@@ -68,6 +71,16 @@ def _check(cfg, budgets) -> None:
         # while this is still the raw CLI value: the decode backend is not known yet, and
         # the pass after parsing runs every check below.
         return
+    if (
+        getattr(cfg, "speculative_algorithm", None) is not None
+        and graph.decode.backend != Backend.DISABLED
+    ):
+        # Option C's graph-gather scratch and RAM-miss posting are sized for one token per
+        # step; a DSpark verify runs up to block_size + 1 tokens (Phase D2).
+        raise ValueError(
+            "EXL3 expert caching runs DSpark verify eagerly only; pass "
+            "--cuda-graph-backend-decode disabled (or --disable-cuda-graph)"
+        )
     if graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
         return
