@@ -15,6 +15,12 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
+from sglang.srt.layers.moe.expert_format import (
+    DenseLayerFormat,
+    ExpertFormat,
+    ExpertTensorSpec,
+    iter_expert_streamers,
+)
 from sglang.srt.layers.moe.expert_route_plan import NO_DEDUP_LIMIT as _NO_DEDUP_LIMIT
 from sglang.srt.layers.moe.expert_route_plan import (
     plan_graph_routes,
@@ -96,9 +102,7 @@ class ExpertPinnedHostCache:
         self.streamer = streamer
         self.capacity = capacity
         self.cached_names = tuple(
-            name
-            for name in streamer.tensor_names
-            if _tensor_data(getattr(streamer.layer, name)).device.type == "cpu"
+            spec.name for spec in streamer.specs if spec.residence == "host"
         )
         if capacity and not self.cached_names:
             raise ValueError(
@@ -107,9 +111,9 @@ class ExpertPinnedHostCache:
         self.bytes_per_expert = streamer.host_bytes_per_expert
         self.residency_bytes = capacity * self.bytes_per_expert
         devices = {
-            _tensor_data(getattr(streamer.layer, name)).device
-            for name in streamer.tensor_names
-            if _tensor_data(getattr(streamer.layer, name)).device.type == "cuda"
+            streamer.source(spec.name).device
+            for spec in streamer.specs
+            if spec.residence == "device"
         }
         if len(devices) > 1:
             raise ValueError("pinned host cache CUDA sources must share one device")
@@ -118,9 +122,8 @@ class ExpertPinnedHostCache:
         )
         self.tensors = {
             name: torch.empty(
-                (capacity,)
-                + tuple(_tensor_data(getattr(streamer.layer, name)).shape[1:]),
-                dtype=_tensor_data(getattr(streamer.layer, name)).dtype,
+                (capacity,) + streamer.spec(name).row_shape,
+                dtype=streamer.spec(name).dtype,
                 device="cpu",
                 pin_memory=True,
             )
@@ -296,9 +299,8 @@ class ExpertPinnedHostCacheManager:
         if budget_bytes < 0:
             raise ValueError("pinned host cache byte budget cannot be negative")
         streamers = {}
-        for module in model.modules():
-            streamer = getattr(module, "_nvfp4_expert_streamer", None)
-            if streamer is None or streamer.host_bytes_per_expert == 0:
+        for streamer in iter_expert_streamers(model):
+            if streamer.host_bytes_per_expert == 0:
                 continue
             layer_id = index(streamer.layer_id)
             if layer_id < 0 or layer_id in streamers:
@@ -505,6 +507,7 @@ class ExpertStreamer:
         tensor_names: Iterable[str],
         *,
         layer_id: int | None = None,
+        format: ExpertFormat | None = None,
     ):
         self.layer = layer
         self.layer_id = (
@@ -513,13 +516,15 @@ class ExpertStreamer:
         self.tensor_names = tuple(tensor_names)
         if not self.tensor_names:
             raise ValueError("expert streamer requires at least one tensor")
-
+        # The format owns the row schema. Sources stay dynamic lookups because
+        # the host arena rebinds layer tensors after this streamer exists.
+        self.format = (
+            DenseLayerFormat(self.tensor_names) if format is None else format
+        )
         self.num_experts = self._validate_sources()
-        # Imported here: the reader pulls in sglang.srt.model_loader, whose
-        # package import reaches modelopt_quant, which imports this module.
-        from sglang.srt.layers.moe.expert_file_reader import ExpertFileRowReader
-
-        self.file_row_reader = ExpertFileRowReader.from_layer(layer, self.tensor_names)
+        self.file_row_reader = self.format.default_row_source(
+            layer, self.specs, "auto"
+        )
         self.hot_cache = None
         self.expert_copy_backend = "gpu"
         self._dma_backend = ExpertDMABackend()
@@ -537,27 +542,18 @@ class ExpertStreamer:
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
-        self.bytes_per_expert = sum(
-            _tensor_data(getattr(layer, name)).numel()
-            * _tensor_data(getattr(layer, name)).element_size()
-            // self.num_experts
-            for name in self.tensor_names
-        )
+        self.bytes_per_expert = sum(spec.row_bytes for spec in self.specs)
         self.host_bytes_per_expert = sum(
-            _tensor_data(getattr(layer, name)).numel()
-            * _tensor_data(getattr(layer, name)).element_size()
-            // self.num_experts
-            for name in self.tensor_names
-            if _tensor_data(getattr(layer, name)).device.type == "cpu"
+            spec.row_bytes for spec in self.specs if spec.residence == "host"
         )
         signature = tuple(
             (
-                name,
-                tuple(_tensor_data(getattr(layer, name)).shape),
-                str(_tensor_data(getattr(layer, name)).dtype),
-                str(_tensor_data(getattr(layer, name)).device),
+                spec.name,
+                (self.num_experts,) + spec.row_shape,
+                str(spec.dtype),
+                spec.residence,
             )
-            for name in self.tensor_names
+            for spec in self.specs
         )
         if signature not in _LOGGED_SOURCE_SIGNATURES:
             _LOGGED_SOURCE_SIGNATURES.add(signature)
@@ -566,6 +562,25 @@ class ExpertStreamer:
                 self.num_experts,
                 ",".join(self.tensor_names),
             )
+
+    @property
+    def specs(self) -> tuple[ExpertTensorSpec, ...]:
+        """The format's row specs, in ``tensor_names`` order."""
+        return tuple(self._specs.values())
+
+    def spec(self, name: str) -> ExpertTensorSpec:
+        return self._specs[name]
+
+    def source(self, name: str) -> torch.Tensor | None:
+        """The dense ``[experts, ...]`` source of ``name`` now, or None when it has none."""
+        return self.format.source(self.layer, name)
+
+    @property
+    def file_source_bytes_per_expert(self) -> int | None:
+        """File bytes one expert row reads; None keeps eager gathers out of the pinned tier."""
+        return self.format.file_source_bytes_per_expert(
+            self.layer, self.file_row_reader
+        )
 
     def serves_graph_gather(self, topk_output) -> bool:
         """Whether ``topk_output`` fits the sync-free gather enabled at startup."""
@@ -854,30 +869,38 @@ class ExpertStreamer:
             torch.index_select(source, 0, cpu_ids, out=host_output)
 
     def _validate_sources(self) -> int:
-        expert_count = None
-        for name in self.tensor_names:
-            if not hasattr(self.layer, name):
-                raise ValueError(f"expert source tensor {name!r} is missing")
-            tensor = _tensor_data(getattr(self.layer, name))
-            if tensor.ndim == 0:
+        """Check the format's specs against the streamer names and any dense sources."""
+        specs = tuple(self.format.tensor_specs(self.layer))
+        names = tuple(spec.name for spec in specs)
+        if names != self.tensor_names:
+            raise ValueError(
+                f"expert format specs {names} do not match tensor names {self.tensor_names}"
+            )
+        expert_count = index(self.format.num_experts(self.layer))
+        if expert_count < 1:
+            raise ValueError("expert format has no expert rows")
+        for spec in specs:
+            source = self.format.source(self.layer, spec.name)
+            if source is None:
+                if spec.residence != "host":
+                    raise ValueError(
+                        f"expert tensor {spec.name!r} has no dense source, so its "
+                        "rows must be host-resident"
+                    )
+                continue
+            if (
+                tuple(source.shape) != (expert_count,) + spec.row_shape
+                or source.dtype != spec.dtype
+            ):
                 raise ValueError(
-                    f"expert source tensor {name!r} has no expert dimension"
+                    f"expert source tensor {spec.name!r} does not match its spec"
                 )
-            if tensor.shape[0] == 0:
-                raise ValueError(f"expert source tensor {name!r} has no expert rows")
-            if not tensor.is_contiguous():
-                raise ValueError(f"expert source tensor {name!r} must be contiguous")
-            if tensor.device.type not in ("cpu", "cuda"):
+            if (source.device.type == "cpu") != (spec.residence == "host"):
                 raise ValueError(
-                    f"expert source tensor {name!r} uses unsupported device {tensor.device}"
+                    f"expert source tensor {spec.name!r} on {source.device} does not "
+                    f"match its spec's {spec.residence!r} residence"
                 )
-            if expert_count is None:
-                expert_count = tensor.shape[0]
-            elif tensor.shape[0] != expert_count:
-                raise ValueError(
-                    f"expert count mismatch for {name!r}: {tensor.shape[0]} != {expert_count}"
-                )
-        assert expert_count is not None
+        self._specs = {spec.name: spec for spec in specs}
         return expert_count
 
     def _copy_source_rows(
@@ -986,12 +1009,11 @@ class ExpertStreamer:
                 name,
                 kernel_rows,
                 max(capacity, self.num_experts),
-                tuple(source.shape[1:]),
-                source.dtype,
+                self.spec(name).row_shape,
+                self.spec(name).dtype,
                 topk_ids.device,
             )
             for name in self.tensor_names
-            for source in [_tensor_data(getattr(self.layer, name))]
         }
         gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
         miss_source_ids = source_ids[~hit_mask]
@@ -1017,8 +1039,7 @@ class ExpertStreamer:
         if (
             pinned_cache is not None
             and pinned_cache.capacity
-            and getattr(self.layer, "_nvfp4_file_source_bytes_per_expert", None)
-            is not None
+            and self.file_source_bytes_per_expert is not None
         ):
             _, pinned_hit_mask = pinned_cache.lookup(miss_source_ids)
             pinned_hit_rows = int(pinned_hit_mask.sum().item())
@@ -1107,8 +1128,8 @@ class ExpertStreamer:
                 name,
                 kernel_rows,
                 capacity,
-                tuple(_tensor_data(getattr(self.layer, name)).shape[1:]),
-                _tensor_data(getattr(self.layer, name)).dtype,
+                self.spec(name).row_shape,
+                self.spec(name).dtype,
                 topk_ids.device,
             )
             for name in self.tensor_names
@@ -1268,8 +1289,7 @@ class ExpertStreamer:
         if (
             self.pinned_host_cache is not None
             and self.pinned_host_cache.capacity
-            and getattr(self.layer, "_nvfp4_file_source_bytes_per_expert", None)
-            is not None
+            and self.file_source_bytes_per_expert is not None
         ):
             return self._gather_pinned_host(source_ids, compact_ids, topk_ids)
         self.last_gather_stats = ExpertGatherStats(

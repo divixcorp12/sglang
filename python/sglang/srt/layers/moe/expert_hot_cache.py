@@ -36,7 +36,8 @@ from sglang.srt.layers.moe.expert_residency_clock import (
     ResidencyBoundaryClock,
     classify_forward,
 )
-from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
+from sglang.srt.layers.moe.expert_format import iter_expert_streamers
+from sglang.srt.layers.moe.expert_stream import ExpertStreamer
 
 from sglang.srt.layers.moe.expert_transfer import (
     NVFP4_TRANSFER_TENSOR_COUNT,
@@ -133,9 +134,9 @@ class ExpertHotCache:
         )
         self.allocation_bytes = allocation_rows * self.bytes_per_expert
         devices = {
-            _tensor_data(getattr(streamer.layer, name)).device
-            for name in streamer.tensor_names
-            if _tensor_data(getattr(streamer.layer, name)).device.type == "cuda"
+            streamer.source(spec.name).device
+            for spec in streamer.specs
+            if spec.residence == "device"
         }
         if len(devices) > 1:
             raise ValueError("hot cache CUDA sources must share one device")
@@ -143,13 +144,12 @@ class ExpertHotCache:
             iter(devices), torch.device("cuda", torch.cuda.current_device())
         )
         self.tensors = {
-            name: torch.empty(
-                (allocation_rows,) + tuple(source.shape[1:]),
-                dtype=source.dtype,
+            spec.name: torch.empty(
+                (allocation_rows,) + spec.row_shape,
+                dtype=spec.dtype,
                 device=self.device,
             )
-            for name in streamer.tensor_names
-            for source in [_tensor_data(getattr(streamer.layer, name))]
+            for spec in streamer.specs
         }
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
@@ -466,7 +466,7 @@ class ExpertHotCache:
             expert_rows = [ticket.expert_id for ticket in tickets]
             destination_slots = [ticket.slot for ticket in tickets]
             sources = {
-                name: _tensor_data(getattr(self.streamer.layer, name))
+                name: self.streamer.source(name)
                 for name in self.streamer.tensor_names
             }
             secondary_source_rows = None
@@ -977,10 +977,7 @@ class ExpertHotCacheManager:
         streamers = {}
         if copy_backend not in ("gpu", "dma"):
             raise ValueError("expert copy backend must be gpu or dma")
-        for module in model.modules():
-            streamer = getattr(module, "_nvfp4_expert_streamer", None)
-            if streamer is None:
-                continue
+        for streamer in iter_expert_streamers(model):
             layer_id = index(streamer.layer_id)
             if layer_id < 0 or layer_id in streamers:
                 raise ValueError(
@@ -2485,9 +2482,7 @@ class ExpertHotCacheManager:
                 getattr(stats, "gather_fallback_used", False)
             )
             counters.gather_copy_engine_bytes += getattr(stats, "copy_engine_bytes", 0)
-            file_bytes = getattr(
-                streamer.layer, "_nvfp4_file_source_bytes_per_expert", None
-            )
+            file_bytes = streamer.file_source_bytes_per_expert
             if file_bytes is not None:
                 counters.file_source_bytes = (
                     counters.file_source_bytes or 0
