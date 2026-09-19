@@ -1,6 +1,7 @@
 """The C++ slot LRU and request service, pumped by hand against a host-simulated device (CPU)."""
 
 import faulthandler
+import subprocess
 import sys
 import threading
 import time
@@ -233,19 +234,35 @@ def test_release_refuses_a_slot_that_is_still_loading(tier):
     assert sim_wait(page, seq, 1.0) == 1 and slot_map[0, 1].item() == slot
 
 
-def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_returns(tier):
-    s, page, slot_map, host = tier
-    host.inject(delay_s=0.5)
-    seq = sim_post(page, 0, need=[1], protect=[1])
-    results = []
-    pumper = threading.Thread(target=lambda: results.append(host.pump()))
-    pumper.start()
-    try:
-        assert _until(lambda: 1 in host.slot_to_expert(0))
-        host.stop()  # closes the handle while the pump is inside a read
-    finally:
-        pumper.join(timeout=10)
-    assert results == [1] and sim_wait(page, seq, 1.0) == 1
+_CLOSE_DURING_PUMP = """
+import pathlib, sys, threading, time
+from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+import torch
+s = ram_miss_setup(pathlib.Path(sys.argv[1]))
+page = new_page(pin=False)
+host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host.inject(delay_s=0.5)
+seq = sim_post(page, 0, need=[1], protect=[1])
+results = []
+pumper = threading.Thread(target=lambda: results.append(host.pump()))
+pumper.start()
+deadline = time.perf_counter() + 5.0
+while 1 not in host.slot_to_expert(0) and time.perf_counter() < deadline:
+    time.sleep(0.005)
+host.stop()  # closes the handle while the pump is inside a read
+pumper.join(timeout=10)
+assert results == [1] and sim_wait(page, seq, 1.0) == 1, results
+print("ok")
+"""
+
+
+def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_returns(tmp_path):
+    # In a subprocess: a regression is a use-after-free, which would kill this process.
+    result = subprocess.run(
+        [sys.executable, "-c", _CLOSE_DURING_PUMP, str(tmp_path)], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0 and "ok" in result.stdout, (result.returncode, result.stderr[-2000:])
 
 
 def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, capsys):
