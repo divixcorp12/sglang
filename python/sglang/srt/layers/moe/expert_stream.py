@@ -87,6 +87,13 @@ class ExpertGatherStats:
     routed_rows: int = 0
     routed_miss_rows: int = 0
     unique_miss_rows: int = 0
+    # Host rows the row sources read during this gather (summed RowReadStats).
+    # Trailing and defaulted: the stats are constructed positionally.
+    host_read_rows: int = 0
+    host_read_file_bytes: int = 0
+    host_read_split_bytes: int = 0
+    host_read_ns: int = 0
+    host_split_ns: int = 0
 
 
 @dataclass
@@ -558,6 +565,9 @@ class ExpertStreamer:
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
+        # Row-source reads outside eager gathers (promotions, seeding, direct calls).
+        self.background_read_stats = RowReadStats()
+        self._gather_read_stats: RowReadStats | None = None
         self.bytes_per_expert = sum(spec.row_bytes for spec in self.specs)
         self.host_bytes_per_expert = sum(
             spec.row_bytes for spec in self.specs if spec.residence == "host"
@@ -644,7 +654,14 @@ class ExpertStreamer:
             stats = stats + _read_rows(row_source, rows_cpu, covered, destination_rows)
         if stats.rows:
             stats = replace(stats, rows=rows_cpu.numel())
+        self._record_read(stats)
         return stats
+
+    def _record_read(self, stats: RowReadStats) -> None:
+        if self._gather_read_stats is not None:
+            self._gather_read_stats = self._gather_read_stats + stats
+        else:
+            self.background_read_stats = self.background_read_stats + stats
 
     def serves_graph_gather(self, topk_output) -> bool:
         """Whether ``topk_output`` fits the sync-free gather enabled at startup."""
@@ -1358,6 +1375,38 @@ class ExpertStreamer:
         next_layer_prefetch = getattr(self, "next_layer_prefetch", None)
         if next_layer_prefetch is not None:
             next_layer_prefetch(source_ids)
+        return self._gather_eager_rows(source_ids, compact_ids, topk_ids)
+
+    def _gather_eager_rows(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run one eager gather and add the host reads it caused to its stats."""
+        self._gather_read_stats = RowReadStats()
+        try:
+            result = self._dispatch_eager_rows(source_ids, compact_ids, topk_ids)
+            read = self._gather_read_stats
+        finally:
+            self._gather_read_stats = None
+        if read.rows:
+            self.last_gather_stats = replace(
+                self.last_gather_stats,
+                host_read_rows=read.rows,
+                host_read_file_bytes=read.file_bytes,
+                host_read_split_bytes=read.split_bytes,
+                host_read_ns=read.read_ns,
+                host_split_ns=read.split_ns,
+            )
+        return result
+
+    def _dispatch_eager_rows(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.hot_cache is not None and self.hot_cache.capacity:
             return self._gather_cached(source_ids, compact_ids, topk_ids)
         if (

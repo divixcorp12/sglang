@@ -817,6 +817,20 @@ class _OperationalCounters:
     side_pull_covered_routes: int = 0
     side_pull_residual_routes: int = 0
     side_pull_useful_precision: float = 0.0
+    host_read_rows: int = 0
+    host_read_file_bytes: int = 0
+    host_read_split_bytes: int = 0
+    host_read_ns: int = 0
+    host_split_ns: int = 0
+
+
+def _add_host_read_counters(counters: _OperationalCounters, stats: Any) -> None:
+    """Sum one gather's row-source reads into a phase/layer's counters."""
+    counters.host_read_rows += getattr(stats, "host_read_rows", 0)
+    counters.host_read_file_bytes += getattr(stats, "host_read_file_bytes", 0)
+    counters.host_read_split_bytes += getattr(stats, "host_read_split_bytes", 0)
+    counters.host_read_ns += getattr(stats, "host_read_ns", 0)
+    counters.host_split_ns += getattr(stats, "host_split_ns", 0)
 
 
 _PHASES = {
@@ -2482,6 +2496,7 @@ class ExpertHotCacheManager:
                 getattr(stats, "gather_fallback_used", False)
             )
             counters.gather_copy_engine_bytes += getattr(stats, "copy_engine_bytes", 0)
+            _add_host_read_counters(counters, stats)
             file_bytes = streamer.file_source_bytes_per_expert
             if file_bytes is not None:
                 counters.file_source_bytes = (
