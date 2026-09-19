@@ -92,8 +92,10 @@ The design that follows is in §9. Decisions still open are in §12.
 9. **A decode step is half NVMe wait, a third PCIe gather, and 4% compute** (§18.2,
    node-mode trace of option C, 391 ms/step under tracing): 190 ms waiting for NVMe reads
    (10.2 ms per row), 128 ms gathering rows over PCIe (1.06 ms per row), 17 ms of
-   compute, ~41 ms of host gap between steps and ~11 ms in the two Engram breaks, all
-   serialized. Overlapping copies with compute is worth at most ~4%. Prefetch with the
+   compute and ~11 ms in the two Engram breaks, all serialized. The remaining ~41 ms/step
+   in that window is one residency-boundary stall: every 32 decode forwards the hot cache
+   promotes experts synchronously, stalling decode for ~1.2–2.1 s (§18.6).
+   Overlapping copies with compute is worth at most ~4%. Prefetch with the
    next layer's gate catches 48% of NVMe rows at top-6 but wastes 2.5 reads per useful
    one; a confidence-gated set is estimated at ~6% (one layer ahead) to ~10% (two) of the
    step (§18.4). The previous token's routes, the predictor 3b used, catch none.
@@ -2081,7 +2083,7 @@ calls = **50.6 decode steps**. Session decode 2.289 tok/s (traced). Report
 | `exl3_ram_miss_wait_kernel`: the GPU waits for NVMe reads | **190** | 48.6% |
 | `copy_expert_row_segments_gpu_kernel`: pinned RAM to VRAM gather | **128** | 32.7% |
 | all compute (EXL3 GEMVs, `exl3_moe`, attention, mHC, router, …) | **16.8** | 4.3% |
-| gap between steps (host; §18.6) | ~41 | ~10.6% |
+| one residency-boundary stall, averaged over the window (§18.6) | ~41 | ~10.6% |
 | the two Engram breaks (graph → eager → graph) | ~11 | ~2.9% |
 
 - **Everything is serialized.** The union of wait, gather and compute intervals equals
@@ -2098,8 +2100,8 @@ calls = **50.6 decode steps**. Session decode 2.289 tok/s (traced). Report
   **1.055 ms/row**, at the PCIe line rate for a 13.3 MB row. NVMe wait **10.16 ms per
   RAM-miss row** (single-row median 10.55 ms; §17.5 measured 11.40 ms).
 - **Tracing cost.** Node mode charges ~0.77 µs of `cudaGraphLaunch` host time per node
-  (project CLAUDE.md); at ~5,200 kernels per step that is ~4 ms of the between-step gap.
-  GPU kernel durations are unaffected.
+  (project CLAUDE.md), but the same session untraced ran 390 ms/step (py-spy run, §18.6)
+  against 391 traced, so the cost is negligible here. GPU kernel durations are unaffected.
 
 ### 18.3 Upper bounds on overlap without prediction
 
@@ -2189,13 +2191,44 @@ reading code and checkpoints, not by a launch:
   hot cache. §10's rule stands: α must be measured before DSpark ships. **Parked by the
   owner (2026-09-19) in favour of the prefetch measurement.**
 
-### 18.6 Open
+### 18.6 The "host gap" is the residency boundary
 
-- **The between-step host gap, ~41 ms/step** (63 gaps averaging 33 ms between eager
-  kernels, plus the Engram round trips). §17.7's graph-mode trace put residual host work
-  at 27.8–54.2 ms/token. Not attributed yet; `prof-node.nsys-rep` has Python sampling.
-- **Stream 37's off-graph row copies** (390 calls, 0.97 s in 19.8 s): not attributed. If
-  they run during decode, they share the PCIe link with the gather.
+The ~41 ms/step of GPU idle between steps in §18.2 is not a per-step cost.
+
+- **All 40 idle gaps over 20 ms (2,089 ms) fall inside one 2.1 s stretch** of the 19.8 s
+  window (5.46–7.51 s; the post-kernel interval spanning it is 2,105 ms). A second,
+  smaller stretch sits at 15.7 s (`gapclusters.py`).
+- **Inside it:** every gap holds 6 off-graph `copy_expert_rows_gpu_kernel` launches on
+  stream 37 (931 ms of that stream's 967 ms). The scheduler waits for them in
+  `cudaStreamSynchronize` (923 ms). CPU samples on the scheduler thread: 73% spinning in
+  that sync, 17% in a CPU-side ATen elementwise loop (`hostgap*.py`).
+- **py-spy** (`spy-run.sh`: the same option C session without nsys, 30 s = 77 decode
+  steps, 390 ms/step, as traced) attributes, per step averaged:
+  - `graph replay`, 338 ms, mostly blocked in the Engram break's `lookup` waiting on the GPU;
+  - `on_expert_distribution` → `_update_residency`, **45 ms**:
+    - `_prepare_promotion` 19.5 ms, with synchronous NVMe reads of promoted rows under it
+      (io_uring 15.9 ms, shard reads 6.5 ms as leaf frames);
+    - `synchronize` 13.8 ms, waiting on the promotion copies;
+    - `decide_residency_policies` 9.6 ms of CPU;
+  - everything else outside replay (batch scheduling, result processing, sampling): **~3–4 ms**.
+- **Cause.** `_update_residency` runs only at a residency boundary. Phase 3a's `env.sh` sets
+  `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=32` and `SGLANG_MOE_HOT_ASYNC_PROMOTIONS=0`, so
+  every 32nd decode forward promotes experts synchronously, reading from NVMe the rows not
+  in RAM. One boundary costs ~1.2–2.1 s, about 40–65 ms per token over 32 tokens (10–15% of
+  decode). Nothing in the plans records why async promotions are off for DSV4.1.
+- **Measuring it (in flight):** paired Phase 3b `c` arms on sessions 0–3 in
+  `OVL/boundary/`:
+  - `c32`, as now;
+  - `c0`, `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=0`: no decode boundaries, residency still
+    updates at each prefill;
+  - `casync`, `c32` plus `SGLANG_MOE_HOT_ASYNC_PROMOTIONS=1`.
+
+### 18.7 Open
+
+- The boundary arms above: whether decode-time promotions earn back their stall, and
+  whether async promotions work with EXL3 and option C.
+- **Stream 37's copies are the boundary's promotions** (§18.6); they do not run during
+  ordinary steps.
 - A prefetch prototype (confidence-gated L+1 or L+2 lookahead, prefetch reads queued
   behind demand reads) would check §18.4's estimate.
 - Everything in §17.8's open list stands, including the raw-JSON `--cuda-graph-config`
