@@ -323,14 +323,16 @@ def live_summary(calls, warmup: int = 16) -> dict:
             continue
         vram = sum(call["vram_miss"] for call in forward)
         ram = sum(call["ram_miss"] for call in forward)
-        totals["decode_tokens"] += 1
+        # A graph_step line may cover more than one decode step (its "steps").
+        steps = int(forward[0].get("steps", 1))
+        totals["decode_tokens"] += steps
         totals["vram"] += vram
         totals["ram"] += ram
         if since_prefill is None or since_prefill >= warmup:
             totals["late_vram"] += vram
             totals["late_ram"] += ram
         if since_prefill is not None:
-            since_prefill += 1
+            since_prefill += steps
     tokens = totals["decode_tokens"]
     return {
         "decode_tokens": tokens,

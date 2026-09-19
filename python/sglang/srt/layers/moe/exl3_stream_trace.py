@@ -116,7 +116,12 @@ class Exl3StreamTrace:
         return self._file is not None
 
     def record_graph_step(
-        self, layer_rows_delta, routed_rows: int, routed_misses: int, thread: Optional[dict] = None
+        self,
+        layer_rows_delta,
+        routed_rows: int,
+        routed_misses: int,
+        thread: Optional[dict] = None,
+        steps: int = 1,
     ) -> None:
         """One graph decode step: its VRAM misses (G) and the demand rows the RAM-miss
         thread read (f). In-graph MoE layers produce no host gather stats; the option C
@@ -124,10 +129,12 @@ class Exl3StreamTrace:
         like a one-token forward, so tier_sim.live_summary counts it as a decode token.
         ``thread``: the thread's cumulative counters, written as given. An Engine's
         scheduler is SIGKILLed at shutdown, so the last line is where a run reads them.
+        ``steps``: the decode steps the deltas cover (a lagged per-batch read folds one
+        step into the next line); live_summary counts them as decode tokens.
         """
         ram = int(sum(layer_rows_delta))
         self.forwards += 1
-        self.decode_tokens += 1
+        self.decode_tokens += int(steps)
         self.decode_vram_misses += int(routed_misses)
         self.decode_ram_misses += ram
         self.vram_misses += int(routed_misses)
@@ -145,6 +152,7 @@ class Exl3StreamTrace:
                 "ram_miss": ram,
                 "routed_rows": int(routed_rows),
                 "layer_ram_rows": [int(v) for v in layer_rows_delta],
+                "steps": int(steps),
                 "t": round(time.monotonic(), 6),
             }
             if thread is not None:

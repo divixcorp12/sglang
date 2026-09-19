@@ -241,6 +241,8 @@ class Exl3RamMissService:
         self._pause_depth = 0
         self._trace_rows: Optional[list[int]] = None
         self._trace_graph: Optional[list[int]] = None
+        # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
+        self.routed_rows_per_step = 0
         self._shut_down = False
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
@@ -328,6 +330,7 @@ class Exl3RamMissService:
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 advise=prefetch_enabled(),
             )
+        self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         next_row = row + 1 if row + 1 < len(self._rows) else -1
         previous = streamer.row_backend
@@ -387,11 +390,16 @@ class Exl3RamMissService:
         rows = self.host.layer_rows()  # demand rows only: advisory reads are not misses
         # A register reset (discard_graph_capture_routes) moves the totals back: re-baseline.
         if self._trace_graph is not None and graph[0] > self._trace_graph[0]:
+            routed = graph[0] - self._trace_graph[0]
+            # A lagged read (see _graph_rows) leaves one step for the next line: count
+            # the steps a line covers from its routed rows (decode graphs are bs 1).
+            steps = max(1, round(routed / self.routed_rows_per_step)) if self.routed_rows_per_step else 1
             trace.record_graph_step(
                 layer_rows_delta=[a - b for a, b in zip(rows, self._trace_rows)],
-                routed_rows=graph[0] - self._trace_graph[0],
+                routed_rows=routed,
                 routed_misses=graph[1] - self._trace_graph[1],
                 thread=self.host.counters(),
+                steps=steps,
             )
         self._trace_rows, self._trace_graph = rows, graph
 
