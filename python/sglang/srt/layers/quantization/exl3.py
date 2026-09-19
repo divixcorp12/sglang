@@ -26,7 +26,10 @@ from sglang.srt.layers.moe.exl3_expert_format import (
     EXL3_STREAMED_NAMES,
     build_exl3_expert_streamer,
 )
-from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+from sglang.srt.layers.moe.exl3_stream_trace import (
+    capturing_graphs,
+    get_exl3_stream_trace,
+)
 from sglang.srt.layers.moe.expert_format import STREAMER_ATTRIBUTE, expert_streamer_of
 from sglang.srt.layers.quantization.exl3_ops import (
     Exl3Tensors,
@@ -423,7 +426,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         """
         flat = topk_ids.reshape(-1)
         routed = flat[flat >= 0]  # record_routes requires ids in [0, E); -1 marks a dropped route
-        streamer.record_routes(routed)
+        if not capturing_graphs():
+            # Warmup and capture forwards route dummy tokens; they must not move residency.
+            streamer.record_routes(routed)
         source_ids = torch.unique(routed)
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         gathered = False

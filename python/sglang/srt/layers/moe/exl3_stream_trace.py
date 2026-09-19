@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 LOG_EVERY_FORWARDS = 256
 
 
+def capturing_graphs() -> bool:
+    """True during the decode runner's warmup and capture forwards, False at replay.
+
+    ``get_is_capture_mode()`` is also true at every breakable replay, so only the
+    module flag that ``model_capture_mode()`` sets separates capture from serving.
+    """
+    from sglang.srt.model_executor.runner_utils import capture_mode
+
+    return bool(capture_mode.is_capture_mode)
+
+
 class Exl3StreamTrace:
     def __init__(self, path: str = "", log_every: int = LOG_EVERY_FORWARDS) -> None:
         # Line-buffered: the scheduler process may exit without running atexit.
@@ -56,6 +67,8 @@ class Exl3StreamTrace:
         """Count one streamed MoE call; ``stats`` is its gather's stats, or None
         when the call gathered nothing. ``background_read_rows`` is the layer's
         cumulative count of rows read outside gathers (promotions, seeding)."""
+        if capturing_graphs():
+            return
         tokens = int(topk_ids.shape[0])
         if self._last_layer is None or layer_id <= self._last_layer:
             self.forwards += 1
