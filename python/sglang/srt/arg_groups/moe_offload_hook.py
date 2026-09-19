@@ -7,12 +7,22 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.expert_stream_requirements import (
+    NVFP4_QUANT_METHODS,
+    expert_quant_method,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import offload_presets
 from sglang.srt.model_executor.cuda_graph_config import Backend
 
 logger = logging.getLogger(__name__)
+
+
+def _nvfp4_hot_cache(server_args: Any, cfg: Any) -> bool:
+    """Whether NVFP4's hot-cache rules apply; an unknown format counts as NVFP4, as in memory_hook."""
+    method = expert_quant_method(server_args, cfg)
+    return method is None or method in NVFP4_QUANT_METHODS
 
 
 def handle_moe_offload_preset(server_args: Any) -> None:
@@ -40,7 +50,12 @@ def handle_moe_offload_preset(server_args: Any) -> None:
             os.environ[env_name],
             value,
         )
-    if offload_presets.needs_overlap_off(resolved.effective) and not cfg.disable_overlap_schedule:
+    if (
+        offload_presets.needs_overlap_off(
+            resolved.effective, nvfp4_hot_cache=_nvfp4_hot_cache(server_args, cfg)
+        )
+        and not cfg.disable_overlap_schedule
+    ):
         declare_resolution(server_args, "handle_moe_offload_preset", disable_overlap_schedule=True)
         logger.info("MoE offload preset %s turns overlap scheduling off", name)
 
@@ -70,6 +85,7 @@ def check_moe_offload_config(server_args: Any) -> None:
             dp_size=cfg.dp_size,
             dp_attention=cfg.enable_dp_attention,
             allowed_cpus=os.sched_getaffinity(0),
+            nvfp4_hot_cache=_nvfp4_hot_cache(server_args, cfg),
         )
     except ValueError as error:
         raise ValueError(f"--moe-offload-preset {name}: {error}") from error
