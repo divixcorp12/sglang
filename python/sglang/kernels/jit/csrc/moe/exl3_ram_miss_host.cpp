@@ -815,6 +815,8 @@ class RamTier {
       if (!ok) {
         for (int64_t slot : slots)
           release_locked(request.row, slot);
+        // Each slot taken may have evicted a row, and that eviction stays: the map moved.
+        if (!slots.empty()) counters_[kVersion].fetch_add(1);
         slots.clear();
       }
     }
