@@ -7,6 +7,9 @@ memory an exact LRU map over ~19M rows would need (DSV41_REFERENCE §5).
 
 from __future__ import annotations
 
+import atexit
+import json
+import logging
 import threading
 from typing import Callable, Optional
 
@@ -14,12 +17,23 @@ import numpy as np
 
 from sglang.srt.environ import envs
 
+logger = logging.getLogger(__name__)
+
 _GIB = 1 << 30
+# One lookup per Engram layer per forward, so this logs about every 256 forwards.
+LOG_EVERY_LOOKUPS = 512
 
 
 class EngramRowCache:
-    def __init__(self, capacity_rows: int, row_bytes: int, ways: int = 8) -> None:
+    def __init__(
+        self,
+        capacity_rows: int,
+        row_bytes: int,
+        ways: int = 8,
+        log_every: int = LOG_EVERY_LOOKUPS,
+    ) -> None:
         self.ways = ways
+        self.log_every = log_every
         self.n_sets = max(1, capacity_rows // ways)
         self.row_bytes = row_bytes
         self.tags = np.full((self.n_sets, ways), -1, dtype=np.int64)
@@ -55,7 +69,21 @@ class EngramRowCache:
                 self.ages[s, w] = self.clock
                 self.data[s * self.ways + w] = row
         self.hits += int(np.count_nonzero(hit[inverse]))
+        if self.log_every and self.clock % self.log_every == 0:
+            self.log()
         return out[inverse]
+
+    def stats(self) -> dict:
+        return {
+            "lookups": self.clock,
+            "accesses": self.accesses,
+            "hits": self.hits,
+            "hit_rate": self.hits / self.accesses if self.accesses else 0.0,
+        }
+
+    def log(self) -> None:
+        if self.clock:
+            logger.info("engram row cache: %s", json.dumps(self.stats()))
 
 
 _SHARED: Optional[EngramRowCache] = None
@@ -71,6 +99,8 @@ def shared_engram_row_cache(row_bytes: int) -> Optional[EngramRowCache]:
     with _SHARED_LOCK:
         if _SHARED is None:
             _SHARED = EngramRowCache.for_bytes(int(budget * _GIB), row_bytes)
+            # Engine.shutdown() may kill the scheduler first; the periodic line covers that.
+            atexit.register(_SHARED.log)
         elif _SHARED.row_bytes != row_bytes:
             raise ValueError(f"Engram layers disagree on row bytes: {_SHARED.row_bytes} vs {row_bytes}")
         return _SHARED
