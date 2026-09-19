@@ -29,8 +29,9 @@ def assert_not_capturing(module_name: str) -> None:
     """
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            f"{module_name}: EXL3 / Engram file-table paths run eagerly only; "
-            "launch with --disable-cuda-graph"
+            f"{module_name}: EXL3 / Engram file-table paths cannot run inside a CUDA graph capture; "
+            "run them as an eager break (--cuda-graph-backend-decode breakable) "
+            "or launch with --disable-cuda-graph"
         )
 
 

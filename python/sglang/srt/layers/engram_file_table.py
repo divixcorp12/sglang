@@ -2,7 +2,7 @@
 
 The layer-1 table alone is 101.5 GB, more than the host RAM budget, and a batch
 touches 24 rows per token. Rows are gathered on the CPU, copied to the device
-and dequantized there. Eager only. By default rows come from an np.memmap and
+and dequantized there. Eager, or an eager break of a breakable graph. By default rows come from an np.memmap and
 the page cache does the caching; with SGLANG_DSV41_ENGRAM_RAM_GIB set, a bounded
 RAM row cache shared by every Engram layer does, and misses read with O_DIRECT.
 """

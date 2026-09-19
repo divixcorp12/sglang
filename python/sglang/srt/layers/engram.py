@@ -59,7 +59,16 @@ from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 logger = logging.getLogger(__name__)
 
 
-@eager_on_graph(True)
+def _engram_lookup_capture_stub(file_table, indices):
+    """The capture-time call of the break: the hash ids come from a segment that was
+    captured but never executed, so they are garbage. Return zeros of the real output's
+    shape, dtype and device without touching the table; warmup and replay run the lookup."""
+    return torch.zeros(
+        *indices.shape, file_table.dim, dtype=torch.bfloat16, device=indices.device
+    )
+
+
+@eager_on_graph(True, capture_stub=_engram_lookup_capture_stub)
 def _engram_file_table_lookup(file_table, indices):
     """The file-table lookup reads its ids on the host, so under a breakable CUDA
     graph it runs as an eager break; outside a capture the decorator is transparent."""

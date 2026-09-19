@@ -3,9 +3,9 @@
 The MoE expert-caching gate imports this module the first time a launch's
 quantization method resolves to ``exl3`` (the checkpoint's ``config.json``
 names it). EXL3 experts stream with prefill eager and decode eager or a
-breakable CUDA graph at max batch size 1; no host arena,
-and a ``stat`` or ``per_pass`` recorder under dynamic
-residency. Nothing else is required; ``--max-running-requests`` and the
+breakable CUDA graph at max batch size 1 (a ``full`` decode graph is refused);
+no graph gather, no host arena, and a ``stat`` or ``per_pass`` recorder under
+dynamic residency. Nothing else is required; ``--max-running-requests`` and the
 overlap schedule stay free. This module runs during server-args processing,
 so it imports only the gate module, ``sglang.srt.environ`` and the graph-config enum.
 """
