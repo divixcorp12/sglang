@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -469,33 +469,38 @@ class ExpertHotCache:
         tickets = tuple(tickets)
         start = 0
         while start < len(tickets):
-            chunk_rows = pinned_cache.evictable_rows()
-            if chunk_rows < 1:
-                self._cancel_tickets(tickets[start:])
-                raise RuntimeError(
-                    "the pinned host tier has no evictable slots for hot cache promotions"
-                )
-            chunk = tickets[start : start + chunk_rows]
-            promotion = None
-            submitted = False
-            try:
-                promotion = self._prepare_promotion(chunk)
-                current_stream = torch.cuda.current_stream(self.device)
-                ticket = submit_hot_cache_promotions(
-                    [promotion], producer_stream=current_stream
-                )
-                submitted = True
-                self._transfer_executor.wait(ticket, current_stream)
-                current_stream.synchronize()
-                self.complete_promotion(promotion)
-            except BaseException:
-                if promotion is not None and self.promotion_in_flight is promotion:
-                    if not submitted or self._drain_device():
-                        self.abort_promotion(promotion)
-                rest = tickets[start + len(chunk) :]
-                if rest:
-                    self._cancel_tickets(rest)
-                raise
+            # One host use from sizing the chunk to its completed copy: a slot
+            # table with an owner (a native reader thread) must not move the
+            # chunk's pinned rows while the promotion reads them.
+            with pinned_cache.host_use():
+                chunk_rows = pinned_cache.evictable_rows()
+                if chunk_rows < 1:
+                    self._cancel_tickets(tickets[start:])
+                    raise RuntimeError(
+                        "the pinned host tier has no evictable slots for hot cache "
+                        "promotions"
+                    )
+                chunk = tickets[start : start + chunk_rows]
+                promotion = None
+                submitted = False
+                try:
+                    promotion = self._prepare_promotion(chunk)
+                    current_stream = torch.cuda.current_stream(self.device)
+                    ticket = submit_hot_cache_promotions(
+                        [promotion], producer_stream=current_stream
+                    )
+                    submitted = True
+                    self._transfer_executor.wait(ticket, current_stream)
+                    current_stream.synchronize()
+                    self.complete_promotion(promotion)
+                except BaseException:
+                    if promotion is not None and self.promotion_in_flight is promotion:
+                        if not submitted or self._drain_device():
+                            self.abort_promotion(promotion)
+                    rest = tickets[start + len(chunk) :]
+                    if rest:
+                        self._cancel_tickets(rest)
+                    raise
             start += len(chunk)
         self.wait_for_slot_publication()
 
@@ -555,11 +560,16 @@ class ExpertHotCache:
             use_secondary_source_rows = [False] * len(self.streamer.tensor_names)
             pinned_cache = self.streamer.pinned_host_cache
             if pinned_cache is not None and pinned_cache.cached_names:
-                pinned_cache.ensure_rows(torch.tensor(expert_rows, device=self.device))
-                cached_rows = [
-                    pinned_cache._expert_to_slot.get(expert_id, -1)
-                    for expert_id in expert_rows
-                ]
+                # Admission and the slot read share one host use, so the slots
+                # read are the ones ensure_rows filled.
+                with pinned_cache.host_use():
+                    pinned_cache.ensure_rows(
+                        torch.tensor(expert_rows, device=self.device)
+                    )
+                    cached_rows = [
+                        pinned_cache._expert_to_slot.get(expert_id, -1)
+                        for expert_id in expert_rows
+                    ]
                 if all(slot >= 0 for slot in cached_rows):
                     secondary_source_rows = cached_rows
                     for position, name in enumerate(self.streamer.tensor_names):
@@ -1092,7 +1102,10 @@ class ExpertHotCacheManager:
         if not streamers:
             return None
         if index(graph_gather_batch_size) or gpu_residency_update or expert_doorbell:
-            require_graph_gather_support(streamers.values())
+            require_graph_gather_support(
+                streamers.values(),
+                pinned_tier_ok=not (gpu_residency_update or expert_doorbell),
+            )
         seed = None
         if seed_path is not None:
             path = Path(seed_path)
@@ -1189,11 +1202,13 @@ class ExpertHotCacheManager:
                     # This clamp is reachable during the floor pass only if a
                     # layer both has a floor (DIRECT, graph_gather_batch_size > 0)
                     # and an inclusive pinned tier's slot limit. That never
-                    # happens today: a nonzero floor requires every streamer to
-                    # have passed require_graph_gather_support, and no format
-                    # both supports graph gather and sets inclusive_pinned_tier
-                    # (EXL3's inclusive tier is eager-only). Assert this instead
-                    # of relying on it silently, since the clamp would otherwise
+                    # happens today: DIRECT requires gpu_residency_update, under
+                    # which require_graph_gather_support refuses pinned_tier
+                    # formats (pinned_tier_ok=False), and no dense format sets
+                    # inclusive_pinned_tier. A pinned_tier format (EXL3's
+                    # inclusive tier) passes the support check only for the plain
+                    # graph gather, which has no floor. Assert this instead of
+                    # relying on it silently, since the clamp would otherwise
                     # cut into a layer's floor and DIRECT would refuse the budget.
                     assert not floor_pass or floors[layer_id] == 0
                     clamped.add(layer_id)
@@ -1385,6 +1400,7 @@ class ExpertHotCacheManager:
                 sort_keys=True,
             ),
         )
+        manager._attach_formats()
         return manager
 
     def enable_next_layer_prefetch(self, max_candidates: int) -> None:
@@ -1714,6 +1730,60 @@ class ExpertHotCacheManager:
         if getattr(self, "doorbell", None) is not None:
             self.doorbell.stop()
 
+    def register_fail_stop_check(self, check: Callable[[], None]) -> None:
+        """Run ``check`` after every batch result, before the doorbell's own check.
+
+        A check raises to stop the process; it must not synchronize the device.
+        """
+        if not hasattr(self, "fail_stop_checks"):
+            self.fail_stop_checks = []
+        self.fail_stop_checks.append(check)
+
+    def add_residency_listener(
+        self, listener: Callable[[int, list[int]], None]
+    ) -> None:
+        """Call ``listener(layer_id, slot_to_expert)`` after startup and every residency update.
+
+        The update is committed before listeners run. A listener must not raise
+        for a recoverable condition: a raise skips the remaining listeners and
+        layers and propagates out of the forward observer, stopping the process.
+        Listeners are not called by the GPU residency updater, so
+        ``_attach_formats`` refuses them when it is on.
+        """
+        if not hasattr(self, "residency_listeners"):
+            self.residency_listeners = []
+        self.residency_listeners.append(listener)
+
+    def _notify_residency_listeners(self) -> None:
+        """Push every layer's hot slots to each listener; a listener's raise propagates."""
+        for listener in getattr(self, "residency_listeners", ()):
+            for layer_id, cache in self.caches.items():
+                listener(layer_id, list(cache.slot_to_expert))
+
+    def _attach_formats(self) -> None:
+        """Offer the finished manager to each streamed format that asks for it
+        (``attach_hot_cache_manager(manager, streamer)``), then push residency once.
+
+        Runs once per manager; later calls return at once, so hooks never
+        register their checks and listeners twice.
+        """
+        if getattr(self, "_formats_attached", False):
+            return
+        self._formats_attached = True
+        for streamer in self.streamers.values():
+            hook = getattr(streamer.format, "attach_hot_cache_manager", None)
+            if hook is not None:
+                hook(self, streamer)
+        if (
+            getattr(self, "gpu_residency", None) is not None
+            and getattr(self, "residency_listeners", None)
+        ):
+            raise ValueError(
+                "a format registered a residency listener, but the GPU residency "
+                "updater changes residency without notifying listeners"
+            )
+        self._notify_residency_listeners()
+
     def doorbell_fail_stop_check(self, synchronize: bool = False) -> float:
         """Hold until every committed doorbell copy a drain gave up on has landed.
 
@@ -1727,6 +1797,8 @@ class ExpertHotCacheManager:
         host words and returns 0.0 without a device-wide synchronize; see
         ``ExpertDoorbellCopier.fail_stop_check``.
         """
+        for check in getattr(self, "fail_stop_checks", ()):
+            check()
         doorbell = getattr(self, "doorbell", None)
         if doorbell is None:
             return 0.0
@@ -2660,6 +2732,7 @@ class ExpertHotCacheManager:
             )
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
+            self._notify_residency_listeners()
         if clock.forwards % self.log_interval == 0:
             self._schedule_trace(mode)
             self._log_doorbell()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import json
 import os
@@ -20,6 +22,7 @@ from sglang.srt.layers.moe.expert_format import (
     DenseLayerFormat,
     ExpertFormat,
     ExpertTensorSpec,
+    graph_source_kind_of,
     iter_expert_streamers,
     pinned_tier_options_of,
     require_graph_gather_support,
@@ -28,6 +31,7 @@ from sglang.srt.layers.moe.expert_format import (
 from sglang.srt.layers.moe.expert_host_tier import (
     PinnedGatherResult,
     PinnedSlotLRU,
+    PinnedSlotTable,
     allocate_host_slab,
     release_host_slabs,
 )
@@ -47,6 +51,7 @@ from sglang.srt.layers.moe.expert_row_plan import (
     ExpertRowPlan,
     ExpertRowPlanner,
     InGraphRowBackend,
+    PinnedTierRowBackend,
 )
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
@@ -125,6 +130,17 @@ class PinnedHostCacheStats:
     evictions: int = 0
 
 
+def _host_use(method):
+    """Run a pinned-tier method inside ``self.host_use()``."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.host_use():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class ExpertPinnedHostCache:
     """Bounded, on-demand pinned host rows shared by one expert layer.
 
@@ -134,6 +150,10 @@ class ExpertPinnedHostCache:
     to the layer's CUDA source device, else the current CUDA device; a CPU
     ``device`` keeps the tier on the host with unregistered slabs, so it runs
     without a GPU. ``is_pinned(expert_id)`` protects experts from eviction.
+
+    ``slot_table`` replaces the default ``PinnedSlotLRU``. Such a table chooses
+    its own victims: ``is_pinned`` is then used only to size requests
+    (``evictable_rows``), so the table must protect the same experts itself.
     """
 
     def __init__(
@@ -143,6 +163,7 @@ class ExpertPinnedHostCache:
         *,
         device: torch.device | str | None = None,
         is_pinned: Callable[[int], bool] | None = None,
+        slot_table: PinnedSlotTable | None = None,
     ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
@@ -194,7 +215,20 @@ class ExpertPinnedHostCache:
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
         self.is_pinned = is_pinned
-        self._lru = PinnedSlotLRU(capacity, is_pinned=is_pinned)
+        if slot_table is not None and hasattr(slot_table, "bind_capacity"):
+            # A table built before the tier's size was known (a format's
+            # pinned_tier_options) learns it here.
+            slot_table.bind_capacity(capacity)
+        if slot_table is not None and slot_table.capacity != capacity:
+            raise ValueError(
+                f"pinned slot table capacity {slot_table.capacity} does not match "
+                f"the tier's {capacity} rows"
+            )
+        self._lru = (
+            slot_table
+            if slot_table is not None
+            else PinnedSlotLRU(capacity, is_pinned=is_pinned)
+        )
         self.stats = PinnedHostCacheStats()
         streamer.pinned_host_cache = self
 
@@ -217,6 +251,22 @@ class ExpertPinnedHostCache:
         # ExpertHotCache._prepare_promotion reads resident slots through this.
         return self._lru.expert_to_slot
 
+    @contextlib.contextmanager
+    def host_use(self) -> Iterator[None]:
+        """Hold the slot table's host use: ``before_host_use`` now, ``after_host_use`` on exit.
+
+        Every read of the slot map or the slabs from the host, and every copy
+        that reads slots chosen here, belongs inside one. Nested host uses call
+        both hooks again (``lookup``, ``ensure_rows``, ``copy_rows`` and
+        ``gather_rows`` each open one), so a table whose owner must pause
+        counts depth and acts only on the outermost pair.
+        """
+        self._lru.before_host_use(self)
+        try:
+            yield
+        finally:
+            self._lru.after_host_use(self)
+
     def close(self) -> None:
         """Unregister the slabs; the cache must not be used afterwards."""
         self._release_slabs()
@@ -238,6 +288,7 @@ class ExpertPinnedHostCache:
             )
         )
 
+    @_host_use
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return slots and record row-level hit/miss counters."""
         if source_ids.device != self.device:
@@ -253,6 +304,7 @@ class ExpertPinnedHostCache:
         self.stats.lookup_misses += source_ids.numel() - len(hit_ids)
         return slots, hit_mask
 
+    @_host_use
     def ensure_rows(
         self, source_ids: torch.Tensor, protected: Iterable[int] = ()
     ) -> None:
@@ -297,6 +349,7 @@ class ExpertPinnedHostCache:
         self.stats.populated_rows += len(final_slots)
         self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
 
+    @_host_use
     def copy_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> bool:
@@ -335,6 +388,7 @@ class ExpertPinnedHostCache:
                 output.copy_(host_output, non_blocking=True)
         return fallback_used
 
+    @_host_use
     def gather_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> PinnedGatherResult:
@@ -677,6 +731,7 @@ class ExpertStreamer:
         self.row_planner = None
         self.row_plan = None
         self.row_backend = None
+        self._graph_pinned_tier = False
         self.row_tag = 0
         self.before_eager_gather = None
         # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and this
@@ -827,7 +882,8 @@ class ExpertStreamer:
         raise if a layer tensor was rebound after this call; replays cannot
         check, and keep reading the tensors frozen here.
         """
-        require_graph_gather_support((self,))
+        pinned_tier = graph_source_kind_of(self.format) == "pinned_tier"
+        require_graph_gather_support((self,), pinned_tier_ok=True)
         from sglang.kernels.ops.moe.expert_cache_transfer import (
             copy_expert_row_segments_gpu,
             expert_row_segments,
@@ -841,7 +897,7 @@ class ExpertStreamer:
             raise ValueError("graph gather needs a hot cache")
         if scratch_destinations and cache.scratch_rows < max_rows:
             raise ValueError("graph gather needs a hot cache scratch row per route")
-        if self.pinned_host_cache is not None:
+        if self.pinned_host_cache is not None and not pinned_tier:
             raise ValueError(
                 "graph gather cannot admit rows through the pinned host cache"
             )
@@ -850,16 +906,23 @@ class ExpertStreamer:
             or getattr(self, "next_layer_prefetch", None) is not None
         ):
             raise ValueError("graph gather cannot run with expert prefetch")
-        for name in self.tensor_names:
-            source = _tensor_data(getattr(self.layer, name))
+        if pinned_tier:
+            # Missed rows are read from the pinned tier's registered slabs by pinned
+            # slot (PinnedTierRowBackend), never from layer attributes.
+            sources = dict(self.pinned_host_cache.tensors)
+        else:
+            sources = {
+                name: _tensor_data(getattr(self.layer, name))
+                for name in self.tensor_names
+            }
+        for name, source in sources.items():
             if source.device.type == "cpu" and not is_gpu_readable_host_tensor(source):
                 raise ValueError(
                     f"graph gather needs registered host rows; {name!r} is pageable"
                 )
         device = cache.device
-        self._graph_sources = {
-            name: _tensor_data(getattr(self.layer, name)) for name in self.tensor_names
-        }
+        self._graph_sources = sources
+        self._graph_pinned_tier = pinned_tier
         device_pairs = tuple(
             (source, cache.tensors[name])
             for name, source in self._graph_sources.items()
@@ -928,11 +991,18 @@ class ExpertStreamer:
             slots=self._graph_destination_slots,
             count=self._graph_miss_count,
         )
-        self.row_backend = (
-            InGraphRowBackend({self.row_tag: self._graph_row_segments})
-            if self._graph_row_segments is not None
-            else None
-        )
+        if pinned_tier:
+            self.row_backend = PinnedTierRowBackend(
+                {self.row_tag: self._graph_row_segments},
+                self.pinned_host_cache.expert_to_slot,
+                max_rows,
+            )
+        else:
+            self.row_backend = (
+                InGraphRowBackend({self.row_tag: self._graph_row_segments})
+                if self._graph_row_segments is not None
+                else None
+            )
         self._graph_ones = torch.ones(max_rows, dtype=torch.float32, device=device)
         self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
@@ -1075,11 +1145,22 @@ class ExpertStreamer:
     def _check_graph_sources(self) -> None:
         """Raise if a layer tensor was rebound after its graph gather plan froze it."""
         for name, source in self._graph_sources.items():
-            current = _tensor_data(getattr(self.layer, name))
+            current = (
+                self.pinned_host_cache.tensors[name]
+                if self._graph_pinned_tier
+                else _tensor_data(getattr(self.layer, name))
+            )
             if current.data_ptr() != source.data_ptr() or current.device != source.device:
                 raise RuntimeError(
                     f"expert tensor {name!r} moved after graph gather was enabled"
                 )
+        if self._graph_pinned_tier and (
+            self.pinned_host_cache.expert_to_slot.data_ptr()
+            != self.row_backend.host_row_map.data_ptr()
+        ):
+            raise RuntimeError(
+                "the pinned host tier's slot map moved after graph gather was enabled"
+            )
 
     def _read_pageable_rows(
         self,

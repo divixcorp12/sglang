@@ -1,5 +1,6 @@
 """CPU tests for the expert format seam: specs, dense sources and streamer discovery."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -426,6 +427,10 @@ class _FixedRoom:
 
     def evictable_rows(self):
         return self.rows
+
+    def host_use(self):
+        # _load_reserved_in_chunks holds one host use per chunk.
+        return contextlib.nullcontext()
 
 
 class TestSpecOnlyPromotion(unittest.TestCase):

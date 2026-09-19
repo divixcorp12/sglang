@@ -184,6 +184,44 @@ class TestRequirementsLookup(_GateTest):
             )
 
 
+class TestPinnedTierGraphGatherRequirements(_GateTest):
+    """A format whose graph gathers read its pinned host tier, not the host arena."""
+
+    def setUp(self):
+        super().setUp()
+        register_expert_stream_requirements(
+            ("pinned_tier_test",),
+            ExpertStreamRequirements(
+                "PINNED", lambda cfg, budgets: None, graph_gather_host_source="pinned_tier"
+            ),
+        )
+        register_expert_stream_requirements(
+            ("arena_test",), ExpertStreamRequirements("ARENA", lambda cfg, budgets: None)
+        )
+        os.environ.update(
+            SGLANG_MOE_HOT_GPU_MB="1",
+            SGLANG_MOE_PINNED_HOST_MB="1",
+            SGLANG_MOE_EXPERT_GRAPH_GATHER="1",
+        )
+
+    def _args(self, quantization):
+        args = _launch(quantization=quantization)
+        args.cuda_graph_config.decode.backend = "breakable"
+        return args
+
+    def test_graph_gather_runs_without_the_host_arena(self):
+        memory_hook.handle_offload_compatibility(self._args("pinned_tier_test"))
+
+    def test_an_arena_format_still_needs_the_host_arena(self):
+        with self.assertRaisesRegex(ValueError, "requires SGLANG_MOE_EXPERT_HOST_ARENA=1"):
+            memory_hook.handle_offload_compatibility(self._args("arena_test"))
+
+    def test_a_missing_pinned_budget_is_refused_before_model_load(self):
+        os.environ["SGLANG_MOE_PINNED_HOST_MB"] = "0"
+        with self.assertRaisesRegex(ValueError, "requires SGLANG_MOE_PINNED_HOST_MB"):
+            memory_hook.handle_offload_compatibility(self._args("pinned_tier_test"))
+
+
 class TestEagerFormatRequirements(_GateTest):
     """A format registered with ``eager_expert_stream_requirements`` (EXL3's shape)."""
 

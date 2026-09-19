@@ -28,7 +28,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Literal, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -68,6 +68,16 @@ class ExpertStreamRequirements:
 
     label: str
     check: Callable[[Any, ExpertCacheBudgets], None]
+    # Where graph gathers read host rows: "arena" (SGLANG_MOE_EXPERT_HOST_ARENA,
+    # indexed by expert id) or "pinned_tier" (the format's pinned host tier).
+    graph_gather_host_source: Literal["arena", "pinned_tier"] = "arena"
+
+    def __post_init__(self) -> None:
+        if self.graph_gather_host_source not in ("arena", "pinned_tier"):
+            raise ValueError(
+                f"{self.label}: graph_gather_host_source must be 'arena' or "
+                f"'pinned_tier', not {self.graph_gather_host_source!r}"
+            )
 
 
 _REGISTRY: dict[str, ExpertStreamRequirements] = {}

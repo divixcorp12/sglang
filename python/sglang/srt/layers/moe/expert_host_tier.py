@@ -10,7 +10,16 @@ from __future__ import annotations
 import heapq
 import math
 from collections import OrderedDict
-from typing import Callable, Collection, NamedTuple, Optional, Sequence
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 import torch
 
@@ -24,6 +33,43 @@ class PinnedGatherResult(NamedTuple):
     miss_rows: int
     populated_bytes: int
     fallback_used: bool
+
+
+class PinnedSlotTable(Protocol):
+    """The slot bookkeeping ``ExpertPinnedHostCache`` delegates to.
+
+    ``PinnedSlotLRU`` is the default. A format whose slots are also managed by
+    someone else (a native reader thread) supplies its own through
+    ``pinned_tier_options(layer)["slot_table"]``; ``before_host_use(cache)`` runs
+    before every host-side use of the tier, so that owner can pause and the cache
+    can refresh its device slot map. Host uses nest (``ExpertPinnedHostCache.host_use``
+    calls both hooks at every level), so a table that pauses an owner counts depth
+    and pauses on the outermost ``before`` and resumes on the outermost ``after``.
+    """
+
+    capacity: int
+
+    @property
+    def slot_to_expert(self) -> Sequence[int]: ...
+
+    @property
+    def expert_to_slot(self) -> Mapping[int, int]: ...
+
+    def __contains__(self, expert_id: int) -> bool: ...
+
+    def touch(self, expert_id: int) -> None: ...
+
+    def assign(
+        self, expert_id: int, protected: Collection[int] = frozenset()
+    ) -> tuple[int, Optional[int]]: ...
+
+    def release(self, slot: int) -> None: ...
+
+    def mapping(self, num_experts: int) -> list[int]: ...
+
+    def before_host_use(self, cache: Any) -> None: ...
+
+    def after_host_use(self, cache: Any) -> None: ...
 
 
 class PinnedSlotLRU:
@@ -103,6 +149,13 @@ class PinnedSlotLRU:
             if expert_id >= 0:
                 mapping[expert_id] = slot
         return mapping
+
+    def before_host_use(self, cache) -> None:
+        """Nothing else owns these slots."""
+        return None
+
+    def after_host_use(self, cache) -> None:
+        return None
 
 
 def allocate_host_slab(
