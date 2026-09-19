@@ -1068,8 +1068,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        quant_config = getattr(self, "quant_config", None)
-        is_exl3 = quant_config is not None and quant_config.get_name() == "exl3"
+        is_exl3 = self.quant_config is not None and self.quant_config.get_name() == "exl3"
         if is_exl3:
             from sglang.srt.models.deepseek_v4_exl3_weights import (
                 adapt_exl3_weights,
