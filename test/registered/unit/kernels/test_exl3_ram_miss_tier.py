@@ -196,6 +196,26 @@ def test_an_empty_need_that_reads_protected_rows_counts_as_served(tier):
     assert host.layer_rows() == [1, 0]
 
 
+def test_an_unarmed_record_only_touches_and_never_evicts_or_reads(tier):
+    """Minor 2: nobody waits on an unarmed (touch-only) record, so the GPU may already be
+    gathering the next token's rows. Serving it must not evict or read, even when a
+    protected id is missing from RAM; it only refreshes the recency of assigned rows."""
+    s, page, slot_map, host = tier
+    for expert in (0, 1, 2):  # full (capacity 3); 0 is the LRU-oldest row
+        assert _serve(page, host, 0, need=[expert], protect=[expert]) == 1
+    before_map, before_counters = slot_map.clone(), host.counters()
+    sim_post(page, 0, need=[], protect=[1, 5], armed=False)  # 5 is missing
+    assert host.pump() == 1
+    assert torch.equal(slot_map, before_map) and host.layer_rows() == [3, 0]
+    counters = host.counters()
+    assert counters["evictions"] == before_counters["evictions"]
+    assert counters["touch_only"] == before_counters["touch_only"] + 1
+    # The touch still counts: 1 is now the most recent, so 0 goes first, then 2.
+    assert _serve(page, host, 0, need=[3], protect=[3]) == 1
+    assert _serve(page, host, 0, need=[4], protect=[4]) == 1
+    assert [host.contains(0, e) for e in (0, 1, 2)] == [False, True, False]
+
+
 def test_a_repeated_protect_id_takes_one_slot(tier):
     s, page, slot_map, host = tier
     assert _serve(page, host, 0, need=[1], protect=[1, 1, 2]) == 1

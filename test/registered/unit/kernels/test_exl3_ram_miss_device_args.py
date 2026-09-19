@@ -140,7 +140,7 @@ def _constants(path: Path) -> dict[str, int]:
 PAGE_PROTOCOL = (
     "kDemandHead", "kDemandDone", "kFatal", "kAdviseHead", "kRecordBytes", "kDemandRing", "kDemandRecords",
     "kAdviseRing", "kAdviseRecords", "kMaxIds", "kRecSeq", "kRecRow", "kRecNeedCount", "kRecProtectCount",
-    "kRecStatus", "kRecAfter", "kRecNeed", "kRecProtect", "kServed",
+    "kRecStatus", "kRecAfter", "kRecNeed", "kRecProtect", "kRecArmed", "kServed",
 )
 
 
