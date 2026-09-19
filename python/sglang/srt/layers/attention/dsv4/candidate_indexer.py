@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.runtime_context import get_platform
 
@@ -43,9 +44,17 @@ def make_candidate_indexer(
     topk_blocks: int, block_size: int, source_layer_id: int = 0
 ) -> Optional[DeepGemmCandidateIndexer]:
     """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
-    indexer selects through masks inline, and when no layer publishes candidates
-    (``source_layer_id < 0``, e.g. a model truncated below the source layer)."""
-    if topk_blocks <= 0 or source_layer_id < 0 or get_platform().device_sm < 100:
+    indexer selects through masks inline, when no layer publishes candidates
+    (``source_layer_id < 0``, e.g. a model truncated below the source layer), and
+    where topk_v2 is off (sm_120 needs more shared memory than it has): the indexer's
+    publish and select both run topk_v2 kernels, so those decodes select through
+    masks too (``DeepseekV4AttnBackend._low_ratio_index_topk``)."""
+    if (
+        topk_blocks <= 0
+        or source_layer_id < 0
+        or get_platform().device_sm < 100
+        or not envs.SGLANG_OPT_USE_TOPK_V2.get()
+    ):
         return None
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,

@@ -3185,7 +3185,9 @@ class DeepseekV4AttnBackend(
             or forward_batch.forward_mode.is_target_verify()
         )
         if is_decode_or_verify:
-            if _is_sm100_or_newer():
+            if _is_sm100_or_newer() and not self._selects_candidates_through_masks(
+                layer.indexer
+            ):
                 # DeepGEMM pairs verify rows by request id; decode has one row each.
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
@@ -3197,6 +3199,17 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         else:
             self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+
+    def _selects_candidates_through_masks(self, indexer) -> bool:
+        """A candidate layer's decode runs the mask path when no candidate indexer was
+        built (Hopper, or a platform without topk_v2). Graphs where every request
+        fits the candidate budget take the plain top-k, so they stay on the paged
+        path."""
+        return (
+            self.candidate_indexer is None
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+            and not _every_request_fits()
+        )
 
     @staticmethod
     def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
