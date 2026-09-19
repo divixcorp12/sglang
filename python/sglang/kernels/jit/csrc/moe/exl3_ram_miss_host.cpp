@@ -948,17 +948,8 @@ int64_t exl3_ram_miss_open(
   return handle;
 }
 
-void exl3_ram_miss_close(int64_t handle) {
-  using namespace exl3_ram_miss;
-  std::shared_ptr<RamTier> tier;
-  {
-    std::lock_guard<std::mutex> guard(registry_mutex());
-    const auto found = registry().find(handle);
-    if (found == registry().end()) return;
-    tier = std::move(found->second);
-    registry().erase(found);
-  }
-}
+// Defined after RamThread (the service thread block below).
+void exl3_ram_miss_close(int64_t handle);
 
 // 1 served a demand record, 2 an advisory record, 0 nothing posted. Refused while a thread pumps.
 int64_t exl3_ram_miss_pump(int64_t handle) {
@@ -1146,5 +1137,221 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_layer_rows, exl3_ram_miss_layer_rows
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_post, exl3_ram_miss_sim_post);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_wait, exl3_ram_miss_sim_wait);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_seqlock_stress, exl3_ram_miss_seqlock_stress);
+
+namespace exl3_ram_miss {
+
+// Pumps one RamTier on its own thread (plan D19): demands first, then advisories; spins
+// with _mm_pause() for spin_ns after the last request, else sleeps 50 us between polls.
+// pause() is a handshake: it asks every advisory in flight to give up at its next row,
+// skips advisories posted so far (resume() skips those posted during the pause), and returns once the loop has
+// acknowledged the pause between two requests. While paused the loop takes no request, so an eager caller owns the
+// slots until resume(). The watchdog (plan D15), on its own thread so a stuck read cannot silence it, aborts the
+// process when the fatal word stays raised for fatal_wait without stop() (the process did not fail stop), or when one
+// demand stays in service for fatal_wait (a hung read).
+class RamThread {
+ public:
+  RamThread(std::shared_ptr<RamTier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns)
+      : tier_(std::move(tier)),
+        page_(tier_->page()),
+        cpu_core_(cpu_core),
+        fatal_wait_ns_(fatal_wait_ns),
+        spin_ns_(spin_ns) {}
+
+  ~RamThread() {
+    stop();
+  }
+
+  void start() {
+    tier_->set_threaded(true);
+    thread_ = std::thread([this] { run(); });
+    watchdog_ = std::thread([this] { watch(); });
+  }
+
+  void stop() {
+    stop_.store(true);
+    if (thread_.joinable()) thread_.join();
+    if (watchdog_.joinable()) watchdog_.join();
+    tier_->set_threaded(false);
+  }
+
+  bool pause(int64_t timeout_ns) {
+    tier_->request_pause(true);
+    tier_->skip_advice_posted_so_far();
+    pause_requested_.store(true);
+    const int64_t deadline = now_ns() + timeout_ns;
+    while (!paused_.load()) {
+      if (now_ns() > deadline) {
+        resume();
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    return true;
+  }
+
+  // Advisories posted while paused predate the eager use: skip them too.
+  void resume() {
+    tier_->skip_advice_posted_so_far();
+    pause_requested_.store(false);
+    tier_->request_pause(false);
+  }
+
+ private:
+  void run() {
+    if (cpu_core_ >= 0) {
+      cpu_set_t cpus;
+      CPU_ZERO(&cpus);
+      CPU_SET(cpu_core_, &cpus);
+      pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+    }
+    tier_->set_counter(kSpinCpu, sched_getcpu());
+    tier_->set_counter(kRunning, 1);
+    int64_t last_active = now_ns();
+    uint32_t heartbeat = 0;
+    while (!stop_.load(std::memory_order_relaxed)) {
+      store_release(page_ + kHeartbeat, ++heartbeat);
+      if (pause_requested_.load()) {
+        paused_.store(true);
+        while (pause_requested_.load() && !stop_.load())
+          std::this_thread::sleep_for(std::chrono::microseconds(20));
+        paused_.store(false);
+        continue;
+      }
+      if (tier_->pump_demand() || tier_->pump_advice()) {
+        last_active = now_ns();
+        continue;
+      }
+      if (now_ns() - last_active < spin_ns_) {
+        _mm_pause();
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+    }
+    tier_->set_counter(kRunning, 0);
+  }
+
+  void watch() {
+    int64_t fatal_since = 0;
+    bool reported = false;
+    while (!stop_.load()) {
+      const uint32_t fatal = load_acquire(page_ + kFatal);
+      const int64_t now = now_ns();
+      if (fatal != 0) {
+        if (!reported) {
+          reported = true;
+          std::fprintf(stderr, "ERROR exl3 RAM miss: request %u timed out or failed; the process must stop\n", fatal);
+          std::fflush(stderr);
+        }
+        if (fatal_since == 0) fatal_since = now;
+      }
+      const int64_t busy_since = tier_->busy_since();
+      const bool fatal_held = fatal_since != 0 && now - fatal_since > fatal_wait_ns_;
+      const bool stuck = busy_since != 0 && now - busy_since > fatal_wait_ns_;
+      if (fatal_held || stuck) {
+        std::fprintf(
+            stderr,
+            "ERROR exl3 RAM miss: %s for %.1f s (fatal %u, busy %u); aborting instead of hanging decode\n",
+            stuck ? "a request stayed in service" : "the fatal word stayed raised without the process stopping",
+            static_cast<double>(fatal_wait_ns_) / 1e9,
+            fatal,
+            load_acquire(page_ + kBusySeq));
+        std::fflush(stderr);
+        prctl(PR_SET_DUMPABLE, 0);
+        std::abort();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+
+  std::shared_ptr<RamTier> tier_;
+  uint8_t* page_;
+  int cpu_core_;
+  int64_t fatal_wait_ns_;
+  int64_t spin_ns_;
+  std::thread thread_;
+  std::thread watchdog_;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> pause_requested_{false};
+  std::atomic<bool> paused_{false};
+};
+
+// Guarded by registry_mutex(), like the tiers; shared for the same reason as the tiers.
+inline std::unordered_map<int64_t, std::shared_ptr<RamThread>>& thread_registry() {
+  static std::unordered_map<int64_t, std::shared_ptr<RamThread>> threads;
+  return threads;
+}
+
+inline std::shared_ptr<RamThread> find_thread(int64_t handle) {
+  std::lock_guard<std::mutex> guard(registry_mutex());
+  const auto found = thread_registry().find(handle);
+  if (found == thread_registry().end()) throw std::runtime_error("exl3 RAM miss: no service thread");
+  return found->second;
+}
+
+}  // namespace exl3_ram_miss
+
+void exl3_ram_miss_start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
+  using namespace exl3_ram_miss;
+  if (cpu_core >= CPU_SETSIZE) throw std::runtime_error("exl3 RAM miss: cpu_core out of range");
+  std::shared_ptr<RamTier> tier = find(handle);
+  // Checked and registered under one lock, so a concurrent close() either sees the thread
+  // (and joins it) or runs before it and leaves no handle to start it on.
+  std::lock_guard<std::mutex> guard(registry_mutex());
+  if (registry().count(handle) == 0) throw std::runtime_error("exl3 RAM miss: unknown handle");
+  if (thread_registry().count(handle)) throw std::runtime_error("exl3 RAM miss: the service thread already runs");
+  auto thread = std::make_shared<RamThread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns);
+  thread->start();
+  thread_registry()[handle] = std::move(thread);
+}
+
+void exl3_ram_miss_stop_thread(int64_t handle) {
+  using namespace exl3_ram_miss;
+  std::shared_ptr<RamThread> thread;
+  {
+    std::lock_guard<std::mutex> guard(registry_mutex());
+    const auto found = thread_registry().find(handle);
+    if (found == thread_registry().end()) return;
+    thread = std::move(found->second);
+    thread_registry().erase(found);
+  }
+  thread->stop();
+}
+
+int64_t exl3_ram_miss_pause(int64_t handle, int64_t timeout_ns) {
+  return exl3_ram_miss::find_thread(handle)->pause(timeout_ns) ? 1 : 0;
+}
+
+void exl3_ram_miss_resume(int64_t handle) {
+  exl3_ram_miss::find_thread(handle)->resume();
+}
+
+// Takes the tier and its service thread out of the registries under one lock (so no
+// start_thread can slip in between), then joins the thread: it holds a reference to the
+// tier, which writes through raw addresses of Python-owned tensors that the caller
+// releases after this returns.
+void exl3_ram_miss_close(int64_t handle) {
+  using namespace exl3_ram_miss;
+  std::shared_ptr<RamThread> thread;
+  std::shared_ptr<RamTier> tier;
+  {
+    std::lock_guard<std::mutex> guard(registry_mutex());
+    const auto running = thread_registry().find(handle);
+    if (running != thread_registry().end()) {
+      thread = std::move(running->second);
+      thread_registry().erase(running);
+    }
+    const auto found = registry().find(handle);
+    if (found != registry().end()) {
+      tier = std::move(found->second);
+      registry().erase(found);
+    }
+  }
+  if (thread) thread->stop();
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_start_thread, exl3_ram_miss_start_thread);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_stop_thread, exl3_ram_miss_stop_thread);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pause, exl3_ram_miss_pause);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_resume, exl3_ram_miss_resume);
 
 }  // namespace sglang

@@ -190,8 +190,8 @@ class Exl3RamMissHost:
 
     ``tables``: ``Exl3RamMissTables``; ``page``: a ``new_page`` tensor; ``slot_map``:
     int32 ``[layers, experts]`` filled with -1 (pinned for a real device). Row ``r`` is
-    streamed layer ``tables.layer_ids[r]``. Without a thread (Task 12) requests are
-    served only by ``pump()``.
+    streamed layer ``tables.layer_ids[r]``. Requests are served by ``pump()`` until
+    ``start_thread()``, then by the C++ service thread until ``stop()``.
     """
 
     def __init__(self, tables, *, page: torch.Tensor, slot_map: torch.Tensor, direct: bool) -> None:
@@ -205,6 +205,7 @@ class Exl3RamMissHost:
         if not bool((slot_map == -1).all()):
             raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
         self._module = _host_module()
+        self.threaded = False
         # The C++ service writes through raw addresses of the page, the slot map and the
         # slabs (``tables.keepalive``): this object holds all three, and the finalizer
         # below closes the service before they can be released.
@@ -220,6 +221,7 @@ class Exl3RamMissHost:
         )
         if self.handle < 0:
             raise RuntimeError("exl3 RAM miss service failed to open (files, io_uring or bounce)")
+        # exl3_ram_miss_close also stops and joins the service thread, if one runs.
         self._close = weakref.finalize(self, self._module.exl3_ram_miss_close, self.handle)
         self._close.atexit = False  # _stop_live closes live hosts at exit, logging counters first
         _LIVE.add(self)
@@ -233,6 +235,22 @@ class Exl3RamMissHost:
         capacity = int(self.tables.capacity[row])
         if slot is not None and not 0 <= slot < capacity:
             raise ValueError(f"slot {slot} is outside [0, {capacity})")
+
+    def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000) -> None:
+        """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog."""
+        self._module.exl3_ram_miss_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
+        self.threaded = True
+
+    def pause(self, timeout_s: float) -> None:
+        """Hand the slots to the caller: returns once the thread is between requests and idle."""
+        if not self.threaded:
+            return
+        if not self._module.exl3_ram_miss_pause(self.handle, int(timeout_s * 1e9)):
+            raise RuntimeError(f"exl3 RAM miss thread did not pause within {timeout_s} s")
+
+    def resume(self) -> None:
+        if self.threaded:
+            self._module.exl3_ram_miss_resume(self.handle)
 
     def pump(self) -> int:
         return int(self._module.exl3_ram_miss_pump(self.handle))
@@ -312,6 +330,9 @@ class Exl3RamMissHost:
         close = getattr(self, "_close", None)
         if close is not None and close.alive:
             try:
+                if self.threaded:
+                    self._module.exl3_ram_miss_stop_thread(self.handle)
+                    self.threaded = False
                 # One line for the window's records (the corpus arms grep it).
                 sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
             finally:
