@@ -307,6 +307,18 @@ class TestStreamerRowRouting(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "row source holds 5 experts"):
             ExpertStreamer(layer, ("a", "b", "c"), row_source=source)
 
+    def test_reassigning_a_mismatched_row_source_after_construction_is_refused(self):
+        layer = _layer()
+        streamer = ExpertStreamer(layer, ("a", "b", "c"), row_source=None)
+        source = CountingRowSource({"a": torch.zeros(5, 4, dtype=torch.int16)})
+        with self.assertRaisesRegex(ValueError, "row source holds 5 experts"):
+            streamer.row_source = source
+        with self.assertRaisesRegex(ValueError, "row source holds 5 experts"):
+            streamer.file_row_reader = source
+        # None is always accepted, e.g. the host arena dropping the source.
+        streamer.file_row_reader = None
+        self.assertIsNone(streamer.row_source)
+
     def test_a_row_source_serves_a_tensor_without_a_dense_source(self):
         layer = _layer(("a", "b"))
         source = CountingRowSource({"b": layer.b.data})

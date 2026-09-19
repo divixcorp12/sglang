@@ -148,6 +148,45 @@ class TestIterGatherExperts(_ClearStaging):
             list(streamer.iter_gather_experts(torch.tensor([], dtype=torch.long))), []
         )
 
+    def test_a_cap_between_the_default_chunk_and_num_experts_still_chunks(self):
+        # 70 of 80: the default chunk (the format cap, 70) does not divide the
+        # id count evenly, and 70 < num_experts (80), so a second chunk of 10
+        # trailing ids must still be gathered under the same cap.
+        _, streamer = _streamer(experts=80, max_gather_rows=70)
+        ids = torch.arange(70)
+        sizes = [chunk.numel() for chunk, _, _ in streamer.iter_gather_experts(ids)]
+        self.assertEqual(sizes, [70])
+        _, streamer = _streamer(experts=80, max_gather_rows=70)
+        ids = torch.arange(80)
+        sizes = [chunk.numel() for chunk, _, _ in streamer.iter_gather_experts(ids)]
+        self.assertEqual(sizes, [70, 10])
+
+    def test_validation_runs_once_up_front_not_once_per_chunk(self):
+        # iter_gather_experts validates 1-D/range/distinctness once, then
+        # dispatches every chunk through the unvalidated _gather_experts.
+        layer, streamer = _streamer(experts=16)
+        calls = []
+        original = streamer._gather_experts
+
+        def spy(source_ids):
+            calls.append(source_ids.clone())
+            return original(source_ids)
+
+        streamer._gather_experts = spy
+        ids = torch.tensor([3, 9, 1, 14, 6])
+        list(streamer.iter_gather_experts(ids, chunk_rows=2))
+        self.assertEqual(len(calls), 3)
+
+    def test_2d_ids_are_refused(self):
+        _, streamer = _streamer()
+        with self.assertRaisesRegex(ValueError, "1-D"):
+            list(streamer.iter_gather_experts(torch.tensor([[1, 2]])))
+
+    def test_out_of_range_ids_are_refused(self):
+        _, streamer = _streamer(experts=16)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            list(streamer.iter_gather_experts(torch.tensor([16])))
+
 
 class TestSumGatherStats(unittest.TestCase):
     def test_counts_add_and_a_fallback_marks_the_sum(self):

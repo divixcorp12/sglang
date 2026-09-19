@@ -8,7 +8,7 @@ import os
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from operator import index
-from typing import Dict, Iterable, Iterator, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, Sequence, Tuple
 
 import torch
 import triton
@@ -142,7 +142,7 @@ class ExpertPinnedHostCache:
         capacity: int,
         *,
         device: torch.device | str | None = None,
-        is_pinned=None,
+        is_pinned: Callable[[int], bool] | None = None,
     ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
@@ -662,12 +662,8 @@ class ExpertStreamer:
             row_source = self.format.default_row_source(
                 layer, self.specs, resolve_row_source_kind()
             )
-        self.row_source = row_source
-        if row_source is not None and row_source.num_experts != self.num_experts:
-            raise ValueError(
-                f"row source holds {row_source.num_experts} experts, but the layer "
-                f"has {self.num_experts}"
-            )
+        self._row_source: ExpertRowSource | None = None
+        self.row_source = row_source  # validated against num_experts by the setter
         # Dense sources serve every name the row source does not cover.
         self._tensor_rows = TensorRowSource(
             self.source, self.tensor_names, self.num_experts
@@ -729,6 +725,24 @@ class ExpertStreamer:
     def has_spec_only_tensors(self) -> bool:
         """Whether a streamed tensor has no dense source, so only the row source reads it."""
         return any(self.source(name) is None for name in self.tensor_names)
+
+    @property
+    def row_source(self) -> ExpertRowSource | None:
+        return self._row_source
+
+    @row_source.setter
+    def row_source(self, value: ExpertRowSource | None) -> None:
+        """Assign the row source; a non-None value must hold ``num_experts`` rows.
+
+        None is always accepted without a check, so the host arena can drop
+        the source (``file_row_reader = None``) at no extra cost.
+        """
+        if value is not None and value.num_experts != self.num_experts:
+            raise ValueError(
+                f"row source holds {value.num_experts} experts, but the layer "
+                f"has {self.num_experts}"
+            )
+        self._row_source = value
 
     @property
     def file_row_reader(self) -> ExpertRowSource | None:
@@ -1414,9 +1428,19 @@ class ExpertStreamer:
     def record_routes(self, topk_ids: torch.Tensor) -> None:
         """Count every route of a forward in the residency policy; call once per forward.
 
-        Skipped during CUDA stream capture. ``gather`` calls it itself; a
-        consumer of ``gather_experts`` calls it with the forward's full
-        ``topk_ids``.
+        Contract: every id in ``topk_ids`` must be in ``[0, num_experts)``,
+        on the residency policy's device, with the forward's full
+        multiplicity. A caller whose ``topk_ids`` can carry negative or
+        sentinel ids (padding, masked routes) must filter them out itself
+        before calling this; ``record_routes`` does not filter, so that
+        NVFP4 prefill, which never has such ids, pays no extra masked-select.
+        ``ExpertResidencyPolicy.record_routes`` runs ``torch.bincount`` on
+        the ids and raises on a negative id or a device mismatch.
+
+        Skipped during CUDA stream capture. ``gather`` calls it itself with
+        ids it has already range-checked; a consumer of ``gather_experts``
+        calls it separately with the forward's full ``topk_ids``, filtered
+        to satisfy this contract.
         """
         residency_policy = self.residency_policy
         flat_ids = topk_ids.reshape(-1)
@@ -1479,16 +1503,46 @@ class ExpertStreamer:
         Returns ``(row_of_source, rows)``, where ``rows[name][row_of_source[i]]``
         holds expert ``source_ids[i]``. ``rows`` are the hot cache's slot
         tensors when every expert is resident, else staging buffers that the
-        next eager gather of any layer reuses. Routes are not recorded: call
-        ``record_routes`` once with the forward's full ``topk_ids``. At most
-        the format's ``max_gather_rows`` experts per call; see
-        ``iter_gather_experts``.
+        next eager gather of any layer reuses: enqueue any consuming work on
+        the current stream before calling into this streamer again (``next()``
+        on an ``iter_gather_experts`` iterator included), and clone any row
+        you need to keep past that point. An all-hit chunk returns the hot
+        cache's own slot tensors, not a staging copy. Routes are not
+        recorded: call ``record_routes`` once with the forward's full
+        ``topk_ids``. At most the format's ``max_gather_rows`` experts per
+        call; see ``iter_gather_experts``.
+
+        Validates ``source_ids`` itself (1-D, in range, distinct). A caller
+        that already validated a larger id set once, such as
+        ``iter_gather_experts``, should not call this method per chunk;
+        use the unvalidated ``_gather_experts`` instead.
         """
         if source_ids.ndim != 1:
             raise ValueError("gather_experts needs a 1-D tensor of expert IDs")
         count = source_ids.numel()
         if count == 0:
             raise ValueError("gather_experts needs a nonempty tensor of expert IDs")
+        if bool(((source_ids < 0) | (source_ids >= self.num_experts)).any().item()):
+            raise ValueError(
+                f"selected expert ID is outside [0, {self.num_experts - 1}]"
+            )
+        if torch.unique(source_ids).numel() != count:
+            raise ValueError("gather_experts needs distinct expert IDs")
+        return self._gather_experts(source_ids)
+
+    def _gather_experts(
+        self, source_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """The unvalidated core of ``gather_experts``.
+
+        Callers must have already checked that ``source_ids`` is a 1-D,
+        in-range, distinct tensor of expert IDs; ``gather_experts`` and
+        ``iter_gather_experts`` are the only callers, and each validates
+        once before any chunk reaches here. This still enforces the
+        format's ``max_gather_rows`` cap and the prefetch refusal per call,
+        since both can vary by chunk.
+        """
+        count = source_ids.numel()
         cap = self.format.max_gather_rows
         if cap is not None and count > cap:
             raise ValueError(
@@ -1499,12 +1553,6 @@ class ExpertStreamer:
             or getattr(self, "next_layer_prefetch", None) is not None
         ):
             raise ValueError("gather_experts does not drive expert prefetch")
-        if bool(((source_ids < 0) | (source_ids >= self.num_experts)).any().item()):
-            raise ValueError(
-                f"selected expert ID is outside [0, {self.num_experts - 1}]"
-            )
-        if torch.unique(source_ids).numel() != count:
-            raise ValueError("gather_experts needs distinct expert IDs")
         if self.before_eager_gather is not None:
             self.before_eager_gather()
         compact_ids = _cached_arange(count, source_ids.device, source_ids.dtype)
@@ -1518,15 +1566,28 @@ class ExpertStreamer:
     ) -> Iterator[tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]]:
         """Yield ``(chunk_ids, row_of_source, rows)`` over chunks of distinct experts.
 
-        Each chunk is one ``gather_experts`` call of at most ``chunk_rows``
-        experts (default: the format's ``max_gather_rows``, else all at once).
-        A chunk's rows share staging with the next chunk, so consume them
-        before advancing. When the iteration ends, ``last_gather_stats`` holds
-        the sum over its chunks, so observers count the forward once.
+        Each chunk is one gather of at most ``chunk_rows`` experts (default:
+        the format's ``max_gather_rows``, else all at once). A chunk's rows
+        share staging with the next chunk, so consume them (see
+        ``gather_experts``'s docstring for the staging-reuse contract) before
+        advancing to the next chunk. When the iteration ends,
+        ``last_gather_stats`` holds the sum over its chunks, so observers
+        count the forward once.
+
+        Validates ``source_ids`` once, up front (1-D, in range, distinct),
+        then dispatches every chunk through the unvalidated
+        ``_gather_experts`` so a multi-chunk gather does not repeat the
+        range and distinctness syncs per chunk.
         """
+        if source_ids.ndim != 1:
+            raise ValueError("iter_gather_experts needs a 1-D tensor of expert IDs")
         count = source_ids.numel()
         if count == 0:
             return
+        if bool(((source_ids < 0) | (source_ids >= self.num_experts)).any().item()):
+            raise ValueError(
+                f"selected expert ID is outside [0, {self.num_experts - 1}]"
+            )
         if torch.unique(source_ids).numel() != count:
             raise ValueError("iter_gather_experts needs distinct expert IDs")
         cap = self.format.max_gather_rows
@@ -1544,7 +1605,7 @@ class ExpertStreamer:
         try:
             for start in range(0, count, chunk_rows):
                 chunk = source_ids[start : start + chunk_rows]
-                row_of_source, rows = self.gather_experts(chunk)
+                row_of_source, rows = self._gather_experts(chunk)
                 chunk_stats.append(self.last_gather_stats)
                 yield chunk, row_of_source, rows
         finally:
