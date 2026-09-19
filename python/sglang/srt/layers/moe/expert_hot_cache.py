@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -1390,6 +1390,7 @@ class ExpertHotCacheManager:
                 sort_keys=True,
             ),
         )
+        manager._attach_formats()
         return manager
 
     def enable_next_layer_prefetch(self, max_candidates: int) -> None:
@@ -1719,6 +1720,37 @@ class ExpertHotCacheManager:
         if getattr(self, "doorbell", None) is not None:
             self.doorbell.stop()
 
+    def register_fail_stop_check(self, check: Callable[[], None]) -> None:
+        """Run ``check`` after every batch result, before the doorbell's own check.
+
+        A check raises to stop the process; it must not synchronize the device.
+        """
+        if not hasattr(self, "fail_stop_checks"):
+            self.fail_stop_checks = []
+        self.fail_stop_checks.append(check)
+
+    def add_residency_listener(
+        self, listener: Callable[[int, list[int]], None]
+    ) -> None:
+        """Call ``listener(layer_id, slot_to_expert)`` after startup and every residency update."""
+        if not hasattr(self, "residency_listeners"):
+            self.residency_listeners = []
+        self.residency_listeners.append(listener)
+
+    def _notify_residency_listeners(self) -> None:
+        for listener in getattr(self, "residency_listeners", ()):
+            for layer_id, cache in self.caches.items():
+                listener(layer_id, list(cache.slot_to_expert))
+
+    def _attach_formats(self) -> None:
+        """Offer the finished manager to each streamed format that asks for it
+        (``attach_hot_cache_manager(manager, streamer)``), then push residency once."""
+        for streamer in self.streamers.values():
+            hook = getattr(streamer.format, "attach_hot_cache_manager", None)
+            if hook is not None:
+                hook(self, streamer)
+        self._notify_residency_listeners()
+
     def doorbell_fail_stop_check(self, synchronize: bool = False) -> float:
         """Hold until every committed doorbell copy a drain gave up on has landed.
 
@@ -1732,6 +1764,8 @@ class ExpertHotCacheManager:
         host words and returns 0.0 without a device-wide synchronize; see
         ``ExpertDoorbellCopier.fail_stop_check``.
         """
+        for check in getattr(self, "fail_stop_checks", ()):
+            check()
         doorbell = getattr(self, "doorbell", None)
         if doorbell is None:
             return 0.0
@@ -2665,6 +2699,7 @@ class ExpertHotCacheManager:
             )
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
+            self._notify_residency_listeners()
         if clock.forwards % self.log_interval == 0:
             self._schedule_trace(mode)
             self._log_doorbell()

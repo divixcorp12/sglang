@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import json
 import os
@@ -29,6 +30,7 @@ from sglang.srt.layers.moe.expert_format import (
 from sglang.srt.layers.moe.expert_host_tier import (
     PinnedGatherResult,
     PinnedSlotLRU,
+    PinnedSlotTable,
     allocate_host_slab,
     release_host_slabs,
 )
@@ -127,6 +129,20 @@ class PinnedHostCacheStats:
     evictions: int = 0
 
 
+def _host_use(method):
+    """Run a pinned-tier method between its slot table's before/after_host_use."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._lru.before_host_use(self)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._lru.after_host_use(self)
+
+    return wrapper
+
+
 class ExpertPinnedHostCache:
     """Bounded, on-demand pinned host rows shared by one expert layer.
 
@@ -145,6 +161,7 @@ class ExpertPinnedHostCache:
         *,
         device: torch.device | str | None = None,
         is_pinned: Callable[[int], bool] | None = None,
+        slot_table: "PinnedSlotTable | None" = None,
     ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
@@ -196,7 +213,20 @@ class ExpertPinnedHostCache:
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
         self.is_pinned = is_pinned
-        self._lru = PinnedSlotLRU(capacity, is_pinned=is_pinned)
+        if slot_table is not None and hasattr(slot_table, "bind_capacity"):
+            # A table built before the tier's size was known (a format's
+            # pinned_tier_options) learns it here.
+            slot_table.bind_capacity(capacity)
+        if slot_table is not None and slot_table.capacity != capacity:
+            raise ValueError(
+                f"pinned slot table capacity {slot_table.capacity} does not match "
+                f"the tier's {capacity} rows"
+            )
+        self._lru = (
+            slot_table
+            if slot_table is not None
+            else PinnedSlotLRU(capacity, is_pinned=is_pinned)
+        )
         self.stats = PinnedHostCacheStats()
         streamer.pinned_host_cache = self
 
@@ -240,6 +270,7 @@ class ExpertPinnedHostCache:
             )
         )
 
+    @_host_use
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return slots and record row-level hit/miss counters."""
         if source_ids.device != self.device:
@@ -255,6 +286,7 @@ class ExpertPinnedHostCache:
         self.stats.lookup_misses += source_ids.numel() - len(hit_ids)
         return slots, hit_mask
 
+    @_host_use
     def ensure_rows(
         self, source_ids: torch.Tensor, protected: Iterable[int] = ()
     ) -> None:
@@ -299,6 +331,7 @@ class ExpertPinnedHostCache:
         self.stats.populated_rows += len(final_slots)
         self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
 
+    @_host_use
     def copy_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> bool:
@@ -337,6 +370,7 @@ class ExpertPinnedHostCache:
                 output.copy_(host_output, non_blocking=True)
         return fallback_used
 
+    @_host_use
     def gather_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> PinnedGatherResult:
