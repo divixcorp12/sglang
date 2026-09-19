@@ -177,9 +177,15 @@ def test_graph_steps_are_traced_and_read_back_by_tier_sim(tmp_path):
     trace = Exl3StreamTrace(str(path))
     assert trace.enabled and not Exl3StreamTrace().enabled
     trace.record_graph_step(layer_rows_delta=[1, 0, 2], routed_rows=18, routed_misses=5)
-    trace.record_graph_step(layer_rows_delta=[0, 1, 0], routed_rows=18, routed_misses=3)
+    trace.record_graph_step(
+        layer_rows_delta=[0, 1, 0], routed_rows=18, routed_misses=3, thread={"rows_read": 4, "advisory_rows": 1}
+    )
     trace.close()
     assert trace.decode_tokens == 2 and trace.decode_vram_misses == 8 and trace.decode_ram_misses == 4
+    # The thread's cumulative counters ride on the line: an Engine's scheduler is
+    # SIGKILLed at shutdown, so the atexit counters line is never written there.
+    lines = tier_sim.load_trace(str(path))
+    assert "thread" not in lines[0] and lines[1]["thread"] == {"rows_read": 4, "advisory_rows": 1}
     live = tier_sim.live_summary(tier_sim.load_trace(str(path)), warmup=0)
     assert live["decode_tokens"] == 2 and live["G"] == 4.0 and live["f"] == 0.5
 
@@ -205,7 +211,10 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     demand_rows = [[0, 0]]
     service = module.Exl3RamMissService()
     service._manager = manager
-    service.host = SimpleNamespace(fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0])
+    counters = {"rows_read": 0}
+    service.host = SimpleNamespace(
+        fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: dict(counters)
+    )
 
     manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
     service.fail_stop_check()  # baseline: no line yet
@@ -213,8 +222,9 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])  # the observer
     assert int(manager._graph_counters.sum()) == 0
     demand_rows[0] = [1, 1]
+    counters["rows_read"] = 3  # demand plus advisory rows, cumulative
     service.fail_stop_check()
-    assert lines == [dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3)]
+    assert lines == [dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3, thread={"rows_read": 3})]
 
     # discard_graph_capture_routes zeroes the registers: no line, a new baseline.
     for register in manager._registers["decode"].values():
@@ -225,7 +235,7 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
     demand_rows[0] = [2, 1]
     service.fail_stop_check()
-    assert lines[1:] == [dict(layer_rows_delta=[1, 0], routed_rows=12, routed_misses=1)]
+    assert lines[1:] == [dict(layer_rows_delta=[1, 0], routed_rows=12, routed_misses=1, thread={"rows_read": 3})]
 
 
 def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
