@@ -6,9 +6,9 @@ import logging
 import json
 import os
 import weakref
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from operator import index
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Iterator, Sequence, Tuple
 
 import torch
 import triton
@@ -102,6 +102,15 @@ class ExpertGatherStats:
     host_read_split_bytes: int = 0
     host_read_ns: int = 0
     host_split_ns: int = 0
+
+
+def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
+    """Add gather stats field by field; a fallback in any gather marks the sum."""
+    values = {}
+    for field in fields(ExpertGatherStats):
+        items = [getattr(item, field.name) for item in stats]
+        values[field.name] = any(items) if isinstance(items[0], bool) else sum(items)
+    return ExpertGatherStats(**values)
 
 
 @dataclass
@@ -1177,6 +1186,11 @@ class ExpertStreamer:
             self._read_pageable_rows(cpu_ids, pageable_outputs, row_count, capacity)
         return copy_engine_bytes
 
+    def _staging_floor_rows(self) -> int:
+        """Rows every eager staging buffer is allocated with from the first gather."""
+        cap = self.format.max_gather_rows
+        return self.num_experts if cap is None else min(self.num_experts, cap)
+
     def _gather_cached(
         self,
         source_ids: torch.Tensor,
@@ -1215,12 +1229,13 @@ class ExpertStreamer:
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
         # Allocated at a whole layer's experts from the first gather: prefill chunks climb to
         # nearly all of them, and growing one step at a time left every outgrown buffer in
-        # the allocator's cache at the prefill peak.
+        # the allocator's cache at the prefill peak. A format with large rows caps that
+        # floor at its max_gather_rows and gathers in chunks (iter_gather_experts).
         padded = {
             name: _staging_buffer(
                 name,
                 kernel_rows,
-                max(capacity, self.num_experts),
+                max(capacity, self._staging_floor_rows()),
                 self.spec(name).row_shape,
                 self.spec(name).dtype,
                 topk_ids.device,
@@ -1374,7 +1389,7 @@ class ExpertStreamer:
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
 
     def _plan_eager_routes(
-        self, topk_ids: torch.Tensor
+        self, topk_ids: torch.Tensor, record: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the source IDs to gather and each route's index into them.
 
@@ -1391,12 +1406,23 @@ class ExpertStreamer:
             compact_ids = _cached_arange(
                 flat_ids.numel(), flat_ids.device, topk_ids.dtype
             )
+        if record:
+            self.record_routes(topk_ids)
+        return source_ids, compact_ids
+
+    def record_routes(self, topk_ids: torch.Tensor) -> None:
+        """Count every route of a forward in the residency policy; call once per forward.
+
+        Skipped during CUDA stream capture. ``gather`` calls it itself; a
+        consumer of ``gather_experts`` calls it with the forward's full
+        ``topk_ids``.
+        """
         residency_policy = self.residency_policy
+        flat_ids = topk_ids.reshape(-1)
         if residency_policy is not None and not (
             flat_ids.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
             residency_policy.record_routes(flat_ids)
-        return source_ids, compact_ids
 
     def gather(
         self, topk_ids: torch.Tensor
@@ -1427,7 +1453,14 @@ class ExpertStreamer:
                 f"selected expert ID is outside [0, {self.num_experts - 1}]"
             )
 
-        source_ids, compact_ids = self._plan_eager_routes(topk_ids)
+        source_ids, compact_ids = self._plan_eager_routes(topk_ids, record=False)
+        cap = self.format.max_gather_rows
+        if cap is not None and source_ids.numel() > cap:
+            raise ValueError(
+                f"eager gather of {source_ids.numel()} experts exceeds the format's "
+                f"max_gather_rows={cap}; gather in chunks with iter_gather_experts"
+            )
+        self.record_routes(topk_ids)
         if prefetch_coordinator is not None:
             prefetch_coordinator.synchronous_correction(
                 source_ids.tolist(), lambda _: None
@@ -1436,6 +1469,86 @@ class ExpertStreamer:
         if next_layer_prefetch is not None:
             next_layer_prefetch(source_ids)
         return self._gather_eager_rows(source_ids, compact_ids, topk_ids)
+
+    def gather_experts(
+        self, source_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Gather the rows of the distinct experts ``source_ids`` for an eager consumer.
+
+        Returns ``(row_of_source, rows)``, where ``rows[name][row_of_source[i]]``
+        holds expert ``source_ids[i]``. ``rows`` are the hot cache's slot
+        tensors when every expert is resident, else staging buffers that the
+        next eager gather of any layer reuses. Routes are not recorded: call
+        ``record_routes`` once with the forward's full ``topk_ids``. At most
+        the format's ``max_gather_rows`` experts per call; see
+        ``iter_gather_experts``.
+        """
+        if source_ids.ndim != 1:
+            raise ValueError("gather_experts needs a 1-D tensor of expert IDs")
+        count = source_ids.numel()
+        if count == 0:
+            raise ValueError("gather_experts needs a nonempty tensor of expert IDs")
+        cap = self.format.max_gather_rows
+        if cap is not None and count > cap:
+            raise ValueError(
+                f"gather of {count} experts exceeds the format's max_gather_rows={cap}"
+            )
+        if (
+            getattr(self, "prefetch_coordinator", None) is not None
+            or getattr(self, "next_layer_prefetch", None) is not None
+        ):
+            raise ValueError("gather_experts does not drive expert prefetch")
+        if bool(((source_ids < 0) | (source_ids >= self.num_experts)).any().item()):
+            raise ValueError(
+                f"selected expert ID is outside [0, {self.num_experts - 1}]"
+            )
+        if torch.unique(source_ids).numel() != count:
+            raise ValueError("gather_experts needs distinct expert IDs")
+        if self.before_eager_gather is not None:
+            self.before_eager_gather()
+        compact_ids = _cached_arange(count, source_ids.device, source_ids.dtype)
+        row_of_source, rows = self._gather_eager_rows(
+            source_ids, compact_ids, source_ids.reshape(1, -1)
+        )
+        return row_of_source.reshape(-1), rows
+
+    def iter_gather_experts(
+        self, source_ids: torch.Tensor, chunk_rows: int | None = None
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]]:
+        """Yield ``(chunk_ids, row_of_source, rows)`` over chunks of distinct experts.
+
+        Each chunk is one ``gather_experts`` call of at most ``chunk_rows``
+        experts (default: the format's ``max_gather_rows``, else all at once).
+        A chunk's rows share staging with the next chunk, so consume them
+        before advancing. When the iteration ends, ``last_gather_stats`` holds
+        the sum over its chunks, so observers count the forward once.
+        """
+        count = source_ids.numel()
+        if count == 0:
+            return
+        if torch.unique(source_ids).numel() != count:
+            raise ValueError("iter_gather_experts needs distinct expert IDs")
+        cap = self.format.max_gather_rows
+        if chunk_rows is None:
+            chunk_rows = cap if cap is not None else count
+        chunk_rows = index(chunk_rows)
+        if chunk_rows < 1:
+            raise ValueError("gather chunks need at least one row")
+        if cap is not None and chunk_rows > cap:
+            raise ValueError(
+                f"gather chunks of {chunk_rows} rows exceed the format's "
+                f"max_gather_rows={cap}"
+            )
+        chunk_stats = []
+        try:
+            for start in range(0, count, chunk_rows):
+                chunk = source_ids[start : start + chunk_rows]
+                row_of_source, rows = self.gather_experts(chunk)
+                chunk_stats.append(self.last_gather_stats)
+                yield chunk, row_of_source, rows
+        finally:
+            if chunk_stats:
+                self.last_gather_stats = _sum_gather_stats(chunk_stats)
 
     def _gather_eager_rows(
         self,
