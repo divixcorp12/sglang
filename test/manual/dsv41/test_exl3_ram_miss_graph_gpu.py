@@ -1,5 +1,12 @@
 """End to end on the GPU (window): a captured EXL3 in-graph MoE whose RAM misses are
-served by option C, against the eager streamed apply; and a forced timeout fail-stop."""
+served by option C; and a forced timeout fail-stop.
+
+The served replay is checked as Task 9's test_exl3_graph_apply_gpu.py checks P3: every
+slot the gather names holds exactly the bytes a fresh checkpoint read of its expert
+gives, the output meets the probe's bars (D7) against an fp32 reference over those
+rows, and graph vs the eager streamed apply (exl3_moe_loop, the less accurate arm at
+~1.5e-2 on these fake rows) stays within Task 9's 2.5e-2.
+"""
 
 import pytest
 import torch
@@ -7,6 +14,53 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 HIDDEN, INTER, EXPERTS, TOP_K = 1024, 512, 16, 6
+ACT_LIMIT = 10.0
+REL_BOUND = 1.2e-2  # the probe's bar (D7), against the fp32 reference
+LOOSE_BOUND = 2.5e-2  # graph vs loop (Task 9)
+
+
+def _source_rows(tmp_path):
+    """Every expert's streamed rows, read afresh from the checkpoint."""
+    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+    from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
+
+    layout = build_exl3_expert_layout(str(tmp_path))
+    fmt = Exl3ExpertFormat(layout, 0, direct=False)
+    specs = {spec.name: spec for spec in fmt.tensor_specs(None)}
+    source = {name: torch.empty((EXPERTS,) + spec.row_shape, dtype=spec.dtype) for name, spec in specs.items()}
+    Exl3ShardRowSource.for_layer(layout, 0, fmt.segment_map(), direct=False).read(
+        torch.arange(EXPERTS, dtype=torch.long), source
+    )
+    return source
+
+
+def _reference(x, weights, slots, tensors):
+    """fp32 routed output over the hot-cache rows at ``slots`` (the probe's reference)."""
+    import torch.nn.functional as F
+
+    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear_reference
+
+    def view(prefix, slot, part):
+        return Exl3Tensors(
+            trellis=tensors[f"{prefix}_trellis"][slot, part],
+            suh=tensors[f"{prefix}_suh"][slot, part],
+            svh=tensors[f"{prefix}_svh"][slot, part],
+            mul1=True,
+        )
+
+    x16 = x.to(torch.float16)
+    out = torch.zeros((1, x.shape[1]), dtype=torch.float32, device=x.device)
+    for k, slot in enumerate(slots.tolist()):
+        gate = exl3_linear_reference(x16, view("w13", slot, 0)).clamp(max=ACT_LIMIT)
+        up = exl3_linear_reference(x16, view("w13", slot, 1)).clamp(-ACT_LIMIT, ACT_LIMIT)
+        h = F.silu(gate) * up * weights[k].float()
+        out += exl3_linear_reference(h.to(torch.float16), view("w2", slot, 0))
+    return out
+
+
+def _rel(y, ref):
+    return float((y.float() - ref.float()).norm() / ref.float().norm())
 
 
 def _layers(tmp_path, monkeypatch, timeout_ms=2000):
@@ -43,6 +97,7 @@ def test_ram_misses_inside_a_replay_are_served(tmp_path, monkeypatch):
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
     layer, streamer, service, checks = _layers(tmp_path, monkeypatch)
+    source = _source_rows(tmp_path)
     try:
         gen = torch.Generator(device="cpu").manual_seed(3)
         x = (torch.randn((1, HIDDEN), generator=gen) * 0.5).to("cuda", torch.bfloat16)
@@ -57,12 +112,24 @@ def test_ram_misses_inside_a_replay_are_served(tmp_path, monkeypatch):
             graph.replay()
             torch.cuda.synchronize()
             got = out.float().clone()
-            want = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids.long(), 10.0).float()
-            rel = float((got - want).norm() / want.norm())
-            assert rel <= 1.2e-2, (route, rel)
             assert streamer.row_backend.keep.item() == 1.0
+            assert streamer.row_backend.ram_miss.item() == 0
             for check in checks:
                 check()
+            # An eager call of the same routes repeats the replay bit for bit, so its gather
+            # names the replay's slots; they hold the rows option C read, byte for byte.
+            assert torch.equal(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT).float(), got)
+            remap, tensors = streamer.gather(ids)
+            slots = remap.reshape(-1).tolist()
+            for k, expert in enumerate(route):
+                for name, rows in tensors.items():
+                    assert torch.equal(rows[slots[k]].cpu(), source[name][expert]), (route, k, expert, name)
+            ref = _reference(x, weights.reshape(-1), remap.reshape(-1), tensors)
+            loop = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids.long(), ACT_LIMIT)
+            rel, rel_loop, rel_graph_loop = _rel(got, ref), _rel(loop, ref), _rel(got, loop)
+            print(f"route {route}: rel {rel:.3e} rel_loop {rel_loop:.3e} graph_vs_loop {rel_graph_loop:.3e}")
+            assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (route, rel, rel_loop)
+            assert rel_graph_loop <= LOOSE_BOUND, (route, rel_graph_loop)
         assert service.host.counters()["rows_read"] >= 6
     finally:
         service.shutdown()
