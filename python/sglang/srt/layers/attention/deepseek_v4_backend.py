@@ -3215,6 +3215,8 @@ class DeepseekV4AttnBackend(
     def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
         return (
             not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            # the dense prefill selects with topk_transform_ragged_v2 (a topk_v2 kernel)
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and _has_dense_fp4_indexer()
             and forward_batch.forward_mode.is_extend()
             and forward_batch.seq_lens_cpu is not None
