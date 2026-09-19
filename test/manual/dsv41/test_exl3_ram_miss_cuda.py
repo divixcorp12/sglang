@@ -47,6 +47,15 @@ def _service(tmp_path, *, expert_dir=None, layer=0, capacity=8, timeout_ms=2000,
     return layout, fmt, specs, slabs, host, dev
 
 
+def _close(host, slabs):
+    """Stop the thread, then unregister the slabs: a freed but still registered range makes
+    the next test's cudaHostRegister of the reused addresses fail (cudaErrorHostMemoryAlreadyRegistered)."""
+    from sglang.srt.layers.moe.expert_host_tier import release_host_slabs
+
+    host.stop()
+    release_host_slabs([slab for names in slabs.values() for slab in names.values()])
+
+
 def _buffers():
     return dict(
         planned=torch.zeros(TOP_K, dtype=torch.int64, device="cuda"),
@@ -82,7 +91,7 @@ def test_a_miss_is_served_and_translated(tmp_path):
         assert b["keep"].item() == 1.0 and b["ram_miss"].item() == 0
         assert dev.stats()["timeouts"] == 0 and host.fatal_seq() == 0
     finally:
-        host.stop()
+        _close(host, slabs)
 
 
 def test_a_hung_read_times_out_and_everything_after_is_fast(tmp_path):
@@ -107,7 +116,7 @@ def test_a_hung_read_times_out_and_everything_after_is_fast(tmp_path):
         assert dev.stats()["sticky"] == 1 and dev.stats()["timeouts"] == 1
     finally:
         host.inject(delay_s=0.0)
-        host.stop()
+        _close(host, slabs)
 
 
 def test_post_and_wait_capture_and_replay(tmp_path):
@@ -128,7 +137,7 @@ def test_post_and_wait_capture_and_replay(tmp_path):
             assert b["host_rows"][: len(planned)].tolist() == [mapping[e] for e in planned]
             assert b["keep"].item() == 1.0
     finally:
-        host.stop()
+        _close(host, slabs)
 
 
 def test_a_rewritten_slot_is_read_fresh(tmp_path):
@@ -152,7 +161,7 @@ def test_a_rewritten_slot_is_read_fresh(tmp_path):
             for n in EXL3_STREAMED_NAMES:
                 assert torch.equal(dest[n].cpu().view(torch.uint8), want[n].view(torch.uint8)), (expert, n)
     finally:
-        host.stop()
+        _close(host, slabs)
 
 
 def test_overheads(tmp_path):
@@ -184,7 +193,7 @@ def test_overheads(tmp_path):
             _set(b, [], [])
         report["thread"] = host.counters()
     finally:
-        host.stop()
+        _close(host, slabs)
     out = os.environ.get("DSV41_RAM_MISS_OUT")
     if out:
         with open(out, "w") as f:
