@@ -30,9 +30,30 @@ def expert_spec(hidden: int = HIDDEN, inter: int = INTER, bits: int = BITS):
     return spec
 
 
+# The mul1 codebook constant the export stores in every w*.mul1 (Phase 1 fake).
+MUL1 = -2082680531
+
+
 def expert_bytes(layer: int, expert: int, row_bytes: int) -> bytes:
     rng = np.random.default_rng(layer * 100_003 + expert)
     return rng.integers(0, 256, row_bytes, dtype=np.uint8).tobytes()
+
+
+def finite_expert_bytes(layer: int, expert: int, spec) -> bytes:
+    """A row whose tensors decode: any int16 trellis, suh/svh of +-[0.5, 1.5), mul1."""
+    rng = np.random.default_rng(layer * 100_003 + expert)
+    parts = []
+    for _suffix, dtype, shape, nbytes in spec:
+        count = int(np.prod(shape))
+        if dtype == "I16":
+            parts.append(rng.integers(-32768, 32768, count, dtype=np.int16).tobytes())
+        elif dtype == "F16":
+            sign = rng.choice([-1.0, 1.0], count)
+            parts.append((sign * rng.uniform(0.5, 1.5, count)).astype(np.float16).tobytes())
+        else:
+            parts.append(struct.pack("<i", MUL1))
+        assert len(parts[-1]) == nbytes
+    return b"".join(parts)
 
 
 def _write_shard(path: str, tensors: list[tuple[str, str, tuple, bytes]]) -> None:
@@ -56,8 +77,13 @@ def write_fake_exl3(
     experts_per_shard: int = 3,
     hidden: int = HIDDEN,
     inter: int = INTER,
+    finite: bool = False,
 ) -> dict[tuple[int, int], bytes]:
-    """Write shards plus model.safetensors.index.json; return each expert's raw row."""
+    """Write shards plus model.safetensors.index.json; return each expert's raw row.
+
+    ``finite`` writes rows the EXL3 kernels can run (see ``finite_expert_bytes``);
+    otherwise every byte is random.
+    """
     spec = expert_spec(hidden, inter)
     row_bytes = sum(nbytes for *_, nbytes in spec)
     keys = [(layer, expert) for layer in range(num_layers) for expert in range(num_experts)]
@@ -66,7 +92,11 @@ def write_fake_exl3(
         filename = f"model-{shard_index + 1:05d}.safetensors"
         tensors = [(f"layers.{keys[first][0]}.attn.norm{shard_index}.weight", "BF16", (3,), b"\x01" * 6)]
         for layer, expert in keys[first : first + experts_per_shard]:
-            row = expert_bytes(layer, expert, row_bytes)
+            row = (
+                finite_expert_bytes(layer, expert, spec)
+                if finite
+                else expert_bytes(layer, expert, row_bytes)
+            )
             rows[(layer, expert)] = row
             cursor = 0
             for suffix, dtype, shape, nbytes in spec:

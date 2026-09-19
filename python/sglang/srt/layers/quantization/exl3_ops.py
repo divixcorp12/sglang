@@ -8,7 +8,7 @@ had is exllamav3's blockwise 128 Hadamard and W_inner = reconstruct(trellis).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
@@ -129,10 +129,32 @@ def exl3_moe_loop(
     out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
     flat = topk_ids.reshape(-1)
     counts = torch.bincount(flat[flat >= 0], minlength=len(w2)).tolist()
-    for expert, count in enumerate(counts):
-        if count == 0:
-            continue
+    experts = [expert for expert, count in enumerate(counts) if count]
+    exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts, linear)
+    return out.to(x.dtype)
+
+
+def exl3_moe_accumulate(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: Union[Sequence, Mapping[int, tuple[Exl3Tensors, Exl3Tensors]]],
+    w2: Union[Sequence, Mapping[int, Exl3Tensors]],
+    swiglu_limit: Optional[float],
+    experts: Iterable[int],
+    linear: Callable = exl3_linear,
+) -> None:
+    """Add ``experts``' routed outputs into the fp32 ``out`` [tokens, hidden].
+
+    ``w13[e]`` / ``w2[e]`` need to exist only for ``experts``, so a streamed
+    caller can pass one gathered chunk at a time; ascending ``experts`` keep the
+    accumulation order, and so the result, of ``exl3_moe_loop``.
+    """
+    for expert in experts:
         token, slot = torch.where(topk_ids == expert)
+        if token.numel() == 0:
+            continue
         xe = x[token]
         gate = linear(xe, w13[expert][0], torch.float32)
         up = linear(xe, w13[expert][1], torch.float32)
@@ -141,7 +163,6 @@ def exl3_moe_loop(
             gate = gate.clamp(max=swiglu_limit)
         h = F.silu(gate) * up * topk_weights[token, slot].float().unsqueeze(-1)
         out.index_add_(0, token, linear(h.to(x.dtype), w2[expert], torch.float32))
-    return out.to(x.dtype)
 
 
 def random_exl3_tensors(

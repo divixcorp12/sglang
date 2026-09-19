@@ -8,7 +8,7 @@ sign vector, so parts cannot be concatenated into one trellis.
 from __future__ import annotations
 
 import functools
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import threading
 
@@ -21,10 +21,18 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.exl3_expert_format import (
+    EXL3_STREAMED_NAMES,
+    build_exl3_expert_streamer,
+)
+from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+from sglang.srt.layers.moe.expert_format import STREAMER_ATTRIBUTE, expert_streamer_of
 from sglang.srt.layers.quantization.exl3_ops import (
     Exl3Tensors,
     assert_not_capturing,
     exl3_linear,
+    exl3_moe_accumulate,
     exl3_moe_loop,
 )
 from sglang.srt.utils import set_weight_attrs
@@ -209,6 +217,62 @@ def _load_expert(layer, prefix, name, param, loaded_weight, weight_name=None, *,
     layer.exl3_loaded.add((prefix, name, local, slot))
 
 
+class Exl3RowViews:
+    """``Exl3Tensors`` views of gathered rows, built once per buffer row and reused.
+
+    Gathered rows live in a few stable buffers: the shared eager staging rows
+    and each layer's hot-cache slots. Building the dataclasses per call would
+    cost about a thousand constructions per prefill layer, so views are cached
+    by the buffers' addresses and the row. A cached view keeps its buffer
+    alive, so an address is never reused under it. ``max_buffers`` bounds what
+    that can pin: 40 layers' hot slots plus the shared staging set fit in 48,
+    and a buffer that stops being used (a reallocated staging set holds about
+    852 MB of VRAM) is dropped at the next overflow.
+    """
+
+    def __init__(self, max_buffers: int = 48) -> None:
+        self.max_buffers = max_buffers
+        self._buffers: dict[tuple, dict[int, tuple[Exl3Tensors, Exl3Tensors, Exl3Tensors]]] = {}
+
+    def select(
+        self,
+        rows: Mapping[str, torch.Tensor],
+        experts: Sequence[int],
+        row_of_source: Sequence[int],
+    ) -> tuple[dict[int, tuple[Exl3Tensors, Exl3Tensors]], dict[int, Exl3Tensors]]:
+        """``(w13, w2)`` keyed by expert id: expert ``experts[i]`` is row ``row_of_source[i]``."""
+        key = tuple((name, rows[name].data_ptr()) for name in EXL3_STREAMED_NAMES)
+        cached = self._buffers.get(key)
+        if cached is None:
+            if len(self._buffers) >= self.max_buffers:
+                self._buffers.clear()
+            cached = self._buffers[key] = {}
+        w13, w2 = {}, {}
+        for expert, row in zip(experts, row_of_source):
+            views = cached.get(row)
+            if views is None:
+                views = cached[row] = (
+                    self._view(rows, "w13", row, 0),
+                    self._view(rows, "w13", row, 1),
+                    self._view(rows, "w2", row, 0),
+                )
+            w13[expert] = (views[0], views[1])
+            w2[expert] = views[2]
+        return w13, w2
+
+    @staticmethod
+    def _view(rows: Mapping[str, torch.Tensor], prefix: str, row: int, part: int) -> Exl3Tensors:
+        return Exl3Tensors(
+            trellis=rows[f"{prefix}_trellis"][row, part],
+            suh=rows[f"{prefix}_suh"][row, part],
+            svh=rows[f"{prefix}_svh"][row, part],
+            mul1=True,
+        )
+
+
+EXL3_ROW_VIEWS = Exl3RowViews()
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
     def __init__(self, config: Exl3Config):
         self.config = config
@@ -241,6 +305,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden = hidden_size
         layer.exl3_inter = intermediate_size_per_partition
         layer.exl3_loaded = set()
+        layer.exl3_streamed = envs.SGLANG_DSV41_EXPERT_STREAM.get()
+        if layer.exl3_streamed:
+            # Routed experts stay on disk. With no parameters, load_weights skips
+            # them (deepseek_v4.load_weights' skip_unmaterialized_expert_param),
+            # and process_weights_after_loading attaches an expert streamer.
+            return
         # CONTRACT: map a global expert id to this rank's local slot (-1 = not ours),
         # using the same helper FusedMoE.weight_loader uses (identity at TP1/EP1).
         # Evidence: fused_moe_triton/layer.py:993-1000 (_map_global_expert_id_to_local_expert_id)
@@ -260,6 +330,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if getattr(layer, "exl3_streamed", False):
+            setattr(layer, STREAMER_ATTRIBUTE, build_exl3_expert_streamer(layer))
+            return
         for e in range(layer.exl3_num_experts):
             for prefix, slots in (("w13", (0, 1)), ("w2", (0,))):
                 for slot in slots:
@@ -310,21 +383,59 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # By name: StandardTopKOutputPacked (moe_fused_gate) carries a 4th field.
         topk = dispatch_output.topk_output
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
-        out = exl3_moe_loop(
-            dispatch_output.hidden_states,
-            topk_weights,
-            topk_ids,
-            layer.exl3_w13,
-            layer.exl3_w2,
-            # CONTRACT: MoeRunnerConfig.swiglu_limit (moe_runner/base.py:60) is the
-            # DeepSeek V4 swiglu clamp field; deep_gemm._apply_swiglu_limit
-            # (moe_runner/deep_gemm.py:1666-1667) clamps up to +-limit and gate to
-            # <= limit, matching exl3_moe_loop exactly.
-            cfg.swiglu_limit,
-        )
+        streamer = expert_streamer_of(layer)
+        if streamer is not None:
+            out = self._apply_streamed(
+                layer,
+                streamer,
+                dispatch_output.hidden_states,
+                topk_weights,
+                topk_ids,
+                cfg.swiglu_limit,
+            )
+        else:
+            out = exl3_moe_loop(
+                dispatch_output.hidden_states,
+                topk_weights,
+                topk_ids,
+                layer.exl3_w13,
+                layer.exl3_w2,
+                # CONTRACT: MoeRunnerConfig.swiglu_limit (moe_runner/base.py:60) is the
+                # DeepSeek V4 swiglu clamp field; deep_gemm._apply_swiglu_limit
+                # (moe_runner/deep_gemm.py:1666-1667) clamps up to +-limit and gate to
+                # <= limit, matching exl3_moe_loop exactly.
+                cfg.swiglu_limit,
+            )
         # On CUDA, DeepseekV2MoE never scales the routed output itself (its multiply is
         # under `not _is_cuda`): the runner does, unless the factor is already fused into
         # topk_weights -- as the unquantized triton path does (unquant.py:1075).
         if cfg.routed_scaling_factor is not None and not layer.should_fuse_routed_scaling_factor_in_topk:
             out = out * cfg.routed_scaling_factor
         return StandardCombineInput(hidden_states=out)
+
+    @staticmethod
+    def _apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+        """Routed experts gathered in chunks of distinct experts by the streamer.
+
+        Routes are recorded once for the whole call; every chunk's experts run
+        before the next chunk reuses the staging rows. The fp32 accumulation
+        order is ascending expert id, the same as ``exl3_moe_loop``.
+        """
+        flat = topk_ids.reshape(-1)
+        routed = flat[flat >= 0]  # record_routes requires ids in [0, E); -1 marks a dropped route
+        streamer.record_routes(routed)
+        source_ids = torch.unique(routed)
+        out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
+        gathered = False
+        for chunk, row_of_source, rows in streamer.iter_gather_experts(source_ids):
+            gathered = True
+            experts = chunk.tolist()
+            w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source.tolist())
+            exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts)
+        get_exl3_stream_trace().record(
+            layer.layer_id,
+            topk_ids,
+            streamer.last_gather_stats if gathered else None,
+            streamer.background_read_stats.rows,
+        )
+        return out.to(x.dtype)

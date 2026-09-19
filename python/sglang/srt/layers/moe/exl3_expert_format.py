@@ -11,14 +11,20 @@ one superset read into the six per-name rows.
 
 from __future__ import annotations
 
+import functools
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
+from sglang.srt.layers.moe.exl3_expert_layout import (
+    Exl3ExpertLayout,
+    build_exl3_expert_layout,
+)
 from sglang.srt.layers.moe.expert_format import ExpertTensorSpec, expert_streamer_of
 
 if TYPE_CHECKING:
@@ -198,3 +204,52 @@ class Exl3ExpertFormat:
                 "SGLANG_MOE_EXPERT_FILE_READER=uring_direct (or uring for buffered reads)"
             )
         return mode == "uring_direct"
+
+
+logger = logging.getLogger(__name__)
+_WARNED_WITHOUT_PINNED_TIER = False
+
+
+@functools.lru_cache(maxsize=4)
+def exl3_expert_layout_for(expert_dir: str) -> Exl3ExpertLayout:
+    """The checkpoint's expert layout, read once per directory (headers only)."""
+    return build_exl3_expert_layout(expert_dir)
+
+
+def build_exl3_expert_streamer(layer: torch.nn.Module, expert_dir: Optional[str] = None):
+    """An ``ExpertStreamer`` for an EXL3 MoE layer whose routed experts stay on disk.
+
+    ``expert_dir`` defaults to ``SGLANG_DSV41_EXPERT_DIR``. The row source comes
+    from ``SGLANG_MOE_EXPERT_ROW_SOURCE`` (``auto`` means the shards).
+    """
+    # Imported here: expert_stream imports Triton kernels and the model loader.
+    from sglang.srt.layers.moe.expert_stream import ExpertStreamer
+
+    global _WARNED_WITHOUT_PINNED_TIER
+    expert_dir = expert_dir or envs.SGLANG_DSV41_EXPERT_DIR.get()
+    if not expert_dir:
+        raise ValueError("SGLANG_DSV41_EXPERT_STREAM needs SGLANG_DSV41_EXPERT_DIR")
+    if not envs.SGLANG_MOE_PINNED_HOST_MB.get() and not _WARNED_WITHOUT_PINNED_TIER:
+        # SGLANG_DSV41_EXPERT_RAM_GIB is retired; an old launch script setting it
+        # would otherwise run with no RAM tier and no sign of it.
+        _WARNED_WITHOUT_PINNED_TIER = True
+        logger.warning(
+            "EXL3 expert streaming without SGLANG_MOE_PINNED_HOST_MB: there is no "
+            "host RAM tier, so every VRAM miss reads the shards"
+        )
+    layout = exl3_expert_layout_for(os.path.realpath(expert_dir))
+    if layout.num_experts != layer.exl3_num_experts:
+        raise ValueError(
+            f"exl3 streaming: the layer has {layer.exl3_num_experts} experts, the "
+            f"checkpoint {layout.num_experts}; launch with disable_shared_experts_fusion=True"
+        )
+    fmt = Exl3ExpertFormat(layout, layer.layer_id)
+    specs = {spec.name: spec.row_shape for spec in fmt.tensor_specs(layer)}
+    hidden, inter = layer.exl3_hidden // 16, layer.exl3_inter // 16
+    if specs["w13_trellis"][:3] != (2, hidden, inter) or specs["w2_trellis"][:3] != (1, inter, hidden):
+        raise ValueError(
+            f"exl3 streaming: expert trellis rows {specs['w13_trellis']} / "
+            f"{specs['w2_trellis']} do not match the layer "
+            f"({layer.exl3_hidden} -> {layer.exl3_inter})"
+        )
+    return ExpertStreamer(layer, fmt.names, layer_id=layer.layer_id, format=fmt)
