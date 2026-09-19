@@ -118,6 +118,30 @@ def test_attach_registers_once_and_pushes_residency(tiers):
     assert [service.host.contains(cold_row, e) for e in (3, 0, 1, 2)] == [False, True, True, True]
 
 
+@pytest.mark.parametrize("prefetch, advise", [(True, 1), (None, 0)], ids=["env_on", "env_unset"])
+def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, prefetch, advise):
+    """The production hop: SGLANG_DSV41_ENABLE_EXPERT_PREFETCH -> prefetch_enabled() -> attach ->
+    Exl3RamMissDevice(advise=...) -> the row backend's posts. Nothing else sets ``advise``."""
+    service, streamers, caches = tiers
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+    for streamer in streamers.values():
+        # The graph-gather state the pinned-tier format sets up on a real streamer.
+        streamer._graph_pinned_tier = True
+        streamer.hot_cache = SimpleNamespace(device="cpu")
+        streamer.graph_gather_rows = 6
+        streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
+    # The env is read while attaching, so it is overridden around the attach only.
+    var = envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH
+    with var.override(bool(prefetch)):  # restores whatever was there on exit
+        if prefetch is None:
+            var.clear()  # really unset, not set to False
+        for streamer in streamers.values():
+            streamer.format.attach_hot_cache_manager(manager, streamer)
+    assert service.device_side.advise == advise
+    for layer_id, streamer in streamers.items():
+        assert streamer.row_backend.device_side is service.device_side  # one device side, shared by every layer
+
+
 def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monkeypatch):
     service, streamers, caches = tiers
     service.ensure_started()
