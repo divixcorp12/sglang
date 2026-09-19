@@ -222,10 +222,12 @@ def _routed_inputs(topk_ids, seed=0):
     return x, topk_weights, types.SimpleNamespace(hidden_states=x, topk_output=topk)
 
 
-@pytest.mark.parametrize("pinned_rows", [0, 3])
+@pytest.mark.parametrize("pinned_rows", [3, 6])  # evicting, and holding every expert
 def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeypatch, pinned_rows):
-    """Three chunks of at most 2 experts reuse one staging set (and, with a pinned
-    tier, evict and refill it): each chunk's rows must be read through row_of_source."""
+    """Three chunks of at most 2 experts reuse one staging set, and a 3-row pinned
+    tier evicts between them: each chunk's rows must be read through row_of_source.
+    (No uncached case: that path pins host memory, which needs CUDA. The hot cache
+    is CUDA-only, so the all-hit path runs only in the GPU file.)"""
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
 
     _, w13, w2 = _reference(ckpt, 1)
@@ -240,8 +242,7 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
         method.process_weights_after_loading(layer)
     streamer = layer._nvfp4_expert_streamer
     streamer.format.max_gather_rows = 2
-    if pinned_rows:
-        ExpertPinnedHostCache(streamer, pinned_rows, device="cpu", **streamer.format.pinned_tier_options(layer))
+    ExpertPinnedHostCache(streamer, pinned_rows, device="cpu", **streamer.format.pinned_tier_options(layer))
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
         apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
