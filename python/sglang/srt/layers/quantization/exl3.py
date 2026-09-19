@@ -95,7 +95,11 @@ class Exl3Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Exl3LinearMethod(self)
         if isinstance(layer, FusedMoE):
-            return Exl3MoEMethod(self)
+            from sglang.srt.models.deepseek_v4_exl3_weights import (
+                is_streamed_expert_module,
+            )
+
+            return Exl3MoEMethod(self, streamed=is_streamed_expert_module(prefix))
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -277,8 +281,9 @@ EXL3_ROW_VIEWS = Exl3RowViews()
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
-    def __init__(self, config: Exl3Config):
+    def __init__(self, config: Exl3Config, *, streamed: bool):
         self.config = config
+        self.streamed = streamed
         self.moe_runner_config = None
 
     def create_weights(
@@ -308,7 +313,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden = hidden_size
         layer.exl3_inter = intermediate_size_per_partition
         layer.exl3_loaded = set()
-        layer.exl3_streamed = envs.SGLANG_DSV41_EXPERT_STREAM.get()
+        layer.exl3_streamed = self.streamed and envs.SGLANG_DSV41_EXPERT_STREAM.get()
         if layer.exl3_streamed:
             # Routed experts stay on disk. With no parameters, load_weights skips
             # them (deepseek_v4.load_weights' skip_unmaterialized_expert_param),

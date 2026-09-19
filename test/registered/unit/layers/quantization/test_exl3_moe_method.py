@@ -16,7 +16,7 @@ E, HIDDEN, INTER = 4, 256, 128
 def _moe():
     layer = nn.Module()
     layer.num_experts = E
-    method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+    method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False)
     method.create_weights(layer, E, HIDDEN, INTER, torch.bfloat16)
     return layer, method
 
@@ -98,7 +98,7 @@ def test_missing_expert_detected():
 def test_sharded_create_weights_rejected():
     layer = nn.Module()
     layer.num_experts = E
-    method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+    method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False)
     with pytest.raises(NotImplementedError, match="tensor-parallel size 1"):
         method.create_weights(
             layer, E, HIDDEN, INTER, torch.bfloat16, moe_intermediate_size=INTER * 2

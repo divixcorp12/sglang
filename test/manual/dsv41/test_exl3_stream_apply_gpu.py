@@ -45,7 +45,7 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
     ):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = torch.nn.Module()
         layer.layer_id = LAYER
         method.create_weights(layer, NUM_EXPERTS, HIDDEN, INTER, torch.bfloat16)

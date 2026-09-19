@@ -20,6 +20,23 @@ ROUTED_EXPERT_WEIGHT_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.\d+\.")
 DEQUANT_PREFIX_RE = re.compile(r"^.+\.attn\.(?:compressor\.(?:wkv|wgate)|indexer\.wk)$")
 WO_A_SLICE_RE = re.compile(r"^(?P<prefix>.+\.attn\.wo_a)\.slice\.(?P<group>\d+)$")
 
+# Unlike ROUTED_EXPERT_WEIGHT_RE (raw checkpoint tensor names), this matches the
+# sglang *module* prefix Exl3Config.get_quant_method receives for a FusedMoE
+# layer: DeepseekV4ForCausalLM builds it as "model.layers.<L>.mlp.experts"
+# (deepseek_v4.py DeepseekV4Model prefix="model" -> DeepseekV4DecoderLayer
+# mlp=add_prefix("mlp", ...) -> deepseek_v2.DeepseekV2MoE
+# experts=add_prefix("experts", ...)). The DSpark draft's stages are built with
+# an empty root prefix and land under "stages.<S>.mlp.experts" instead
+# (deepseek_v4_dspark.py DeepseekV4ForCausalLMDSpark.stages
+# prefix=add_prefix(f"stages.{stage_id}", prefix)), so they never match and
+# stay resident.
+ROUTED_EXPERT_MODULE_RE = re.compile(r"^model\.layers\.\d+\.mlp\.experts$")
+
+
+def is_streamed_expert_module(prefix: str) -> bool:
+    """True for a target routed-expert FusedMoE (the draft's stages keep theirs resident)."""
+    return ROUTED_EXPERT_MODULE_RE.match(prefix) is not None
+
 
 def is_streamed_expert_weight(name: str, quant_method: str | None, streaming: bool) -> bool:
     """True for a routed-expert tensor that EXL3 expert streaming reads from disk itself."""

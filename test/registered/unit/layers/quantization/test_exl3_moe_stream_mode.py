@@ -127,7 +127,7 @@ def _streaming_env(ckpt):
 
 def test_stream_mode_registers_no_expert_parameters():
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
-        layer = _layer(Exl3MoEMethod(Exl3Config.from_config(CFG)))
+        layer = _layer(Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True))
     assert list(layer.named_parameters()) == []
     assert layer.exl3_streamed is True
 
@@ -138,7 +138,7 @@ def test_process_attaches_an_exl3_streamer(ckpt):
 
     a, b, c, d = _streaming_env(ckpt)
     with a, b, c, d:
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
         method.process_weights_after_loading(layer)
     streamer = expert_streamer_of(layer)
@@ -160,7 +160,7 @@ def test_process_rejects_a_mismatched_layer(ckpt, kwargs, env_dir, match):
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
         str(ckpt) if env_dir else ""
     ):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method, **kwargs)
         with pytest.raises(ValueError, match=match):
             method.process_weights_after_loading(layer)
@@ -173,7 +173,7 @@ def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
         str(ckpt)
     ), envs.SGLANG_MOE_PINNED_HOST_MB.override(0):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.exl3_expert_format"):
             for _ in range(2):
                 layer = _layer(method, hidden=2 * HIDDEN)  # fails after the warning
@@ -193,7 +193,7 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows)
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = FakeStreamer(reference, chunk_rows)
     layer._nvfp4_expert_streamer = streamer
@@ -231,7 +231,7 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
     monkeypatch.setattr(exl3_mod, "assert_not_capturing", refuse)
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = types.SimpleNamespace(serves_graph_gather=lambda topk: topk.topk_ids.numel() <= 6)
     layer._nvfp4_expert_streamer = streamer
@@ -272,7 +272,7 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     )
     a, b, c, d = _streaming_env(ckpt)
     with a, b, c, d:
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
         method.process_weights_after_loading(layer)
     streamer = layer._nvfp4_expert_streamer
