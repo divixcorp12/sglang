@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import json
 import os
-from dataclasses import asdict, dataclass
+import weakref
+from dataclasses import asdict, dataclass, fields, replace
 from operator import index
-from typing import Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Iterator, Sequence, Tuple
 
 import torch
 import triton
@@ -15,6 +16,26 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
+from sglang.srt.layers.moe.expert_format import (
+    DenseLayerFormat,
+    ExpertFormat,
+    ExpertTensorSpec,
+    iter_expert_streamers,
+    pinned_tier_options_of,
+    require_graph_gather_support,
+    resolve_row_source_kind,
+)
+from sglang.srt.layers.moe.expert_host_tier import (
+    PinnedGatherResult,
+    PinnedSlotLRU,
+    allocate_host_slab,
+    release_host_slabs,
+)
+from sglang.srt.layers.moe.expert_row_source import (
+    ExpertRowSource,
+    RowReadStats,
+    TensorRowSource,
+)
 from sglang.srt.layers.moe.expert_route_plan import NO_DEDUP_LIMIT as _NO_DEDUP_LIMIT
 from sglang.srt.layers.moe.expert_route_plan import (
     plan_graph_routes,
@@ -45,6 +66,8 @@ NVFP4_STREAM_TENSORS = (
     "g1_alphas",
     "g2_alphas",
 )
+# ExpertStreamer's row_source default: resolve it from SGLANG_MOE_EXPERT_ROW_SOURCE.
+_DEFAULT_ROW_SOURCE = object()
 
 
 @dataclass(frozen=True)
@@ -73,6 +96,22 @@ class ExpertGatherStats:
     routed_rows: int = 0
     routed_miss_rows: int = 0
     unique_miss_rows: int = 0
+    # Host rows the row sources read during this gather (summed RowReadStats).
+    # Trailing and defaulted: the stats are constructed positionally.
+    host_read_rows: int = 0
+    host_read_file_bytes: int = 0
+    host_read_split_bytes: int = 0
+    host_read_ns: int = 0
+    host_split_ns: int = 0
+
+
+def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
+    """Add gather stats field by field; a fallback in any gather marks the sum."""
+    values = {}
+    for field in fields(ExpertGatherStats):
+        items = [getattr(item, field.name) for item in stats]
+        values[field.name] = any(items) if isinstance(items[0], bool) else sum(items)
+    return ExpertGatherStats(**values)
 
 
 @dataclass
@@ -87,18 +126,31 @@ class PinnedHostCacheStats:
 
 
 class ExpertPinnedHostCache:
-    """Bounded, on-demand pinned host rows shared by one expert layer."""
+    """Bounded, on-demand pinned host rows shared by one expert layer.
 
-    def __init__(self, streamer: "ExpertStreamer", capacity: int):
+    Each host tensor gets one page-aligned slab registered with CUDA and sized
+    to exactly ``capacity`` rows; PyTorch's pinned allocator would round each
+    slab up to a power of two. ``device`` holds the slot lookup. It defaults
+    to the layer's CUDA source device, else the current CUDA device; a CPU
+    ``device`` keeps the tier on the host with unregistered slabs, so it runs
+    without a GPU. ``is_pinned(expert_id)`` protects experts from eviction.
+    """
+
+    def __init__(
+        self,
+        streamer: "ExpertStreamer",
+        capacity: int,
+        *,
+        device: torch.device | str | None = None,
+        is_pinned: Callable[[int], bool] | None = None,
+    ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
             raise ValueError("pinned host cache capacity must be within expert count")
         self.streamer = streamer
         self.capacity = capacity
         self.cached_names = tuple(
-            name
-            for name in streamer.tensor_names
-            if _tensor_data(getattr(streamer.layer, name)).device.type == "cpu"
+            spec.name for spec in streamer.specs if spec.residence == "host"
         )
         if capacity and not self.cached_names:
             raise ValueError(
@@ -106,36 +158,43 @@ class ExpertPinnedHostCache:
             )
         self.bytes_per_expert = streamer.host_bytes_per_expert
         self.residency_bytes = capacity * self.bytes_per_expert
-        devices = {
-            _tensor_data(getattr(streamer.layer, name)).device
-            for name in streamer.tensor_names
-            if _tensor_data(getattr(streamer.layer, name)).device.type == "cuda"
-        }
-        if len(devices) > 1:
-            raise ValueError("pinned host cache CUDA sources must share one device")
-        self.device = next(
-            iter(devices), torch.device("cuda", torch.cuda.current_device())
-        )
-        self.tensors = {
-            name: torch.empty(
-                (capacity,)
-                + tuple(_tensor_data(getattr(streamer.layer, name)).shape[1:]),
-                dtype=_tensor_data(getattr(streamer.layer, name)).dtype,
-                device="cpu",
-                pin_memory=True,
+        if device is None:
+            devices = {
+                streamer.source(spec.name).device
+                for spec in streamer.specs
+                if spec.residence == "device"
+            }
+            if len(devices) > 1:
+                raise ValueError("pinned host cache CUDA sources must share one device")
+            device = next(
+                iter(devices), torch.device("cuda", torch.cuda.current_device())
             )
-            for name in self.cached_names
-        }
-        file_row_reader = getattr(streamer, "file_row_reader", None)
-        if file_row_reader is not None:
-            file_row_reader.register_destinations(self.tensors.values())
+        self.device = torch.device(device)
+        register = self.device.type == "cuda"
+        self.tensors: dict[str, torch.Tensor] = {}
+        registered: list[torch.Tensor] = []
+        try:
+            for name in self.cached_names:
+                spec = streamer.spec(name)
+                slab = allocate_host_slab(
+                    capacity, spec.row_shape, spec.dtype, register=register
+                )
+                self.tensors[name] = slab
+                if register and slab.numel():
+                    registered.append(slab)
+        except BaseException:
+            release_host_slabs(registered)
+            raise
+        # Unregisters the slabs when the cache is collected, at exit, or on close().
+        self._release_slabs = weakref.finalize(self, release_host_slabs, registered)
+        row_source = streamer.row_source
+        if row_source is not None:
+            row_source.register_destinations(self.tensors.values())
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
         )
-        self.slot_to_expert = [-1] * capacity
-        self._expert_to_slot: dict[int, int] = {}
-        self._last_used = [0] * capacity
-        self._clock = 0
+        self.is_pinned = is_pinned
+        self._lru = PinnedSlotLRU(capacity, is_pinned=is_pinned)
         self.stats = PinnedHostCacheStats()
         streamer.pinned_host_cache = self
 
@@ -149,13 +208,34 @@ class ExpertPinnedHostCache:
             return 0
         return min(streamer.num_experts, budget_bytes // streamer.host_bytes_per_expert)
 
+    @property
+    def slot_to_expert(self) -> list[int]:
+        return self._lru.slot_to_expert
+
+    @property
+    def _expert_to_slot(self) -> dict[int, int]:
+        # ExpertHotCache._prepare_promotion reads resident slots through this.
+        return self._lru.expert_to_slot
+
+    def close(self) -> None:
+        """Unregister the slabs; the cache must not be used afterwards."""
+        self._release_slabs()
+
+    def evictable_rows(self) -> int:
+        """Slots a request can use: the capacity minus residents ``is_pinned`` protects."""
+        if self.is_pinned is None:
+            return self.capacity
+        return self.capacity - sum(
+            1 for expert_id in self._lru.expert_to_slot if self.is_pinned(expert_id)
+        )
+
     def _refresh_mapping(self) -> None:
-        mapping = [-1] * self.streamer.num_experts
-        for slot, expert_id in enumerate(self.slot_to_expert):
-            if expert_id >= 0:
-                mapping[expert_id] = slot
         self.expert_to_slot.copy_(
-            torch.tensor(mapping, dtype=torch.long, device=self.device)
+            torch.tensor(
+                self._lru.mapping(self.streamer.num_experts),
+                dtype=torch.long,
+                device=self.device,
+            )
         )
 
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -168,88 +248,59 @@ class ExpertPinnedHostCache:
         hit_mask = slots >= 0
         hit_ids = source_ids[hit_mask].tolist()
         for expert_id in hit_ids:
-            slot = self._expert_to_slot[int(expert_id)]
-            self._clock += 1
-            self._last_used[slot] = self._clock
+            self._lru.touch(int(expert_id))
         self.stats.lookup_hits += len(hit_ids)
         self.stats.lookup_misses += source_ids.numel() - len(hit_ids)
         return slots, hit_mask
 
-    def ensure_rows(self, source_ids: torch.Tensor) -> None:
-        """Read missing source rows into pinned slots, evicting least-recently-used rows."""
+    def ensure_rows(
+        self, source_ids: torch.Tensor, protected: Iterable[int] = ()
+    ) -> None:
+        """Read missing source rows into pinned slots, evicting least-recently-used rows.
+
+        The requested experts, and any others in ``protected`` (a caller's
+        whole chunk), are evicted only when nothing else can be.
+        """
         if not self.cached_names or self.capacity == 0 or source_ids.numel() == 0:
             return
         requested = list(dict.fromkeys(int(value) for value in source_ids.tolist()))
-        missing = [
-            expert_id
-            for expert_id in requested
-            if int(expert_id) not in self._expert_to_slot
-        ]
-        assignments = []
-        for expert_id in missing:
-            free = next(
-                (
-                    slot
-                    for slot, resident in enumerate(self.slot_to_expert)
-                    if resident < 0
-                ),
-                None,
-            )
-            evicted = free is None
-            if free is None:
-                free = min(range(self.capacity), key=self._last_used.__getitem__)
-            if evicted:
-                self.stats.evictions += 1
-                self._expert_to_slot.pop(self.slot_to_expert[free], None)
-            assignments.append((expert_id, free))
-            self.slot_to_expert[free] = expert_id
-            self._expert_to_slot[expert_id] = free
-            self._clock += 1
-            self._last_used[free] = self._clock
-        if not assignments:
+        missing = [expert_id for expert_id in requested if expert_id not in self._lru]
+        if not missing:
             return
-        # More misses than slots reassign a slot within this call. Read only the
-        # slot's final expert: batched file reads complete in any order.
-        final_slots = {slot: expert_id for expert_id, slot in assignments}
-        source_ids_cpu = torch.tensor(list(final_slots.values()), dtype=torch.long)
-        slots_cpu = torch.tensor(list(final_slots), dtype=torch.long)
-        file_row_reader = getattr(self.streamer, "file_row_reader", None)
+        protected = frozenset(requested).union(int(value) for value in protected)
+        assignments = []
+        evictions = 0
+        # Assignment and read are one transaction: on any failure every slot this
+        # call assigned is freed, so no expert stays mapped to a slot never read.
         try:
-            for name in self.cached_names:
-                if file_row_reader is not None and file_row_reader.covers(name):
-                    continue
-                source = _tensor_data(getattr(self.streamer.layer, name))
-                for source_id, slot in zip(source_ids_cpu, slots_cpu):
-                    torch.index_select(
-                        source,
-                        0,
-                        source_id.reshape(1),
-                        out=self.tensors[name][int(slot) : int(slot) + 1],
-                    )
-            if file_row_reader is not None:
-                file_row_reader.read(
-                    source_ids_cpu,
-                    {
-                        name: self.tensors[name]
-                        for name in self.cached_names
-                        if file_row_reader.covers(name)
-                    },
-                    slots_cpu,
-                )
+            for expert_id in missing:
+                slot, evicted = self._lru.assign(expert_id, protected)
+                evictions += evicted is not None
+                assignments.append((expert_id, slot))
+            # More misses than slots reassign a slot within this call. Read only the
+            # slot's final expert: batched file reads complete in any order.
+            final_slots = {slot: expert_id for expert_id, slot in assignments}
+            source_ids_cpu = torch.tensor(list(final_slots.values()), dtype=torch.long)
+            slots_cpu = torch.tensor(list(final_slots), dtype=torch.long)
+            self.streamer.read_host_rows(
+                source_ids_cpu,
+                {name: self.tensors[name] for name in self.cached_names},
+                slots_cpu,
+            )
         except BaseException:
-            for slot, expert_id in final_slots.items():
-                self.slot_to_expert[slot] = -1
-                self._expert_to_slot.pop(expert_id, None)
+            for slot in dict.fromkeys(slot for _, slot in assignments):
+                self._lru.release(slot)
             self._refresh_mapping()
             raise
         self._refresh_mapping()
+        self.stats.evictions += evictions
         self.stats.populated_rows += len(final_slots)
         self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
 
     def copy_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> bool:
-        """Gather resident pinned rows directly into CUDA outputs."""
+        """Gather resident pinned rows directly into CUDA (or, on a CPU tier, CPU) outputs."""
         if source_ids.numel() == 0:
             return False
         slots = self.expert_to_slot[source_ids.long()]
@@ -257,7 +308,9 @@ class ExpertPinnedHostCache:
         for name in self.cached_names:
             source = self.tensors[name]
             output = outputs[name]
-            if source.is_contiguous() and output.is_contiguous():
+            if output.device.type == "cpu":
+                torch.index_select(source, 0, slots.cpu(), out=output)
+            elif source.is_contiguous() and output.is_contiguous():
                 row_bytes = source.numel() * source.element_size() // self.capacity
                 _gather_host_rows_kernel[
                     (source_ids.numel(), triton.cdiv(row_bytes, 1024))
@@ -282,6 +335,70 @@ class ExpertPinnedHostCache:
                 output.copy_(host_output, non_blocking=True)
         return fallback_used
 
+    def gather_rows(
+        self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
+    ) -> PinnedGatherResult:
+        """Copy the rows of ``source_ids`` into the leading rows of ``outputs``, admitting misses.
+
+        Rows are admitted and copied chunk by chunk. Each chunk is sized when
+        it starts, from ``evictable_rows()``: residents that ``is_pinned``
+        protects never make room, and an admitted row may itself become
+        protected (an inclusive hierarchy pins rows the hot cache reserves), so
+        the room shrinks during a call. A chunk holds at most that many
+        distinct experts, all of them protected while it is admitted, and its
+        rows are checked resident before its copy, so no copy reads slot -1.
+        A call that fits in one chunk is the pre-chunking sequence ``lookup``,
+        ``ensure_rows``, ``copy_rows``, plus that host-side check. With no
+        evictable slot, a chunk with misses raises; an all-hit chunk is still
+        copied. Each chunk's hit count (``.item()``) syncs the stream on the
+        host, so the previous chunk's copy has run before its slots can be
+        refilled.
+        """
+        if self.capacity == 0:
+            raise ValueError("pinned host cache has no rows")
+        hit_rows = 0
+        miss_rows = 0
+        populated_before = self.stats.populated_bytes
+        fallback_used = False
+        total = source_ids.numel()
+        start = 0
+        while start < total:
+            evictable = self.evictable_rows()
+            chunk_rows = total - start
+            if (
+                evictable >= 1
+                and chunk_rows > evictable
+                and torch.unique(source_ids[start:]).numel() > evictable
+            ):
+                chunk_rows = evictable
+            chunk = source_ids[start : start + chunk_rows]
+            _, hit_mask = self.lookup(chunk)
+            chunk_hits = int(hit_mask.sum().item())
+            hit_rows += chunk_hits
+            miss_rows += chunk.numel() - chunk_hits
+            chunk_ids = [int(value) for value in chunk.tolist()]
+            if chunk_hits < chunk.numel():
+                if evictable < 1:
+                    raise RuntimeError("every pinned host slot holds a protected expert")
+                self.ensure_rows(chunk[~hit_mask], protected=chunk_ids)
+            lost = sorted({expert_id for expert_id in chunk_ids if expert_id not in self._lru})
+            if lost:
+                raise RuntimeError(
+                    f"pinned host rows of experts {lost} were evicted before their copy"
+                )
+            chunk_outputs = {
+                name: output[start : start + chunk_rows]
+                for name, output in outputs.items()
+            }
+            fallback_used = self.copy_rows(chunk, chunk_outputs) or fallback_used
+            start += chunk_rows
+        return PinnedGatherResult(
+            hit_rows,
+            miss_rows,
+            self.stats.populated_bytes - populated_before,
+            fallback_used,
+        )
+
 
 class ExpertPinnedHostCacheManager:
     """Allocate a global complete-row budget across streamed expert layers."""
@@ -296,9 +413,8 @@ class ExpertPinnedHostCacheManager:
         if budget_bytes < 0:
             raise ValueError("pinned host cache byte budget cannot be negative")
         streamers = {}
-        for module in model.modules():
-            streamer = getattr(module, "_nvfp4_expert_streamer", None)
-            if streamer is None or streamer.host_bytes_per_expert == 0:
+        for streamer in iter_expert_streamers(model):
+            if streamer.host_bytes_per_expert == 0:
                 continue
             layer_id = index(streamer.layer_id)
             if layer_id < 0 or layer_id in streamers:
@@ -325,8 +441,16 @@ class ExpertPinnedHostCacheManager:
         if not any(capacities.values()):
             return None
         manager = cls()
+        # The format supplies tier options such as an is_pinned filter; the dense
+        # format supplies none, so NVFP4 tiers are built exactly as before.
         manager.caches = {
-            layer_id: ExpertPinnedHostCache(streamers[layer_id], capacity)
+            layer_id: ExpertPinnedHostCache(
+                streamers[layer_id],
+                capacity,
+                **pinned_tier_options_of(
+                    streamers[layer_id].format, streamers[layer_id].layer
+                ),
+            )
             for layer_id, capacity in capacities.items()
             if capacity
         }
@@ -492,6 +616,19 @@ def _copy_indices_to_cpu(source_ids: torch.Tensor, capacity: int) -> torch.Tenso
     return indices
 
 
+def _read_rows(
+    source: ExpertRowSource,
+    rows_cpu: torch.Tensor,
+    destinations: dict[str, torch.Tensor],
+    destination_rows: torch.Tensor | None,
+) -> RowReadStats:
+    # Without destination rows, call read with two arguments, as the pageable
+    # gather path always called the file reader.
+    if destination_rows is None:
+        return source.read(rows_cpu, destinations)
+    return source.read(rows_cpu, destinations, destination_rows)
+
+
 class ExpertStreamer:
     """Gather aligned expert rows into compact, reusable CUDA buffers.
 
@@ -505,6 +642,8 @@ class ExpertStreamer:
         tensor_names: Iterable[str],
         *,
         layer_id: int | None = None,
+        format: ExpertFormat | None = None,
+        row_source: ExpertRowSource | None | object = _DEFAULT_ROW_SOURCE,
     ):
         self.layer = layer
         self.layer_id = (
@@ -513,13 +652,22 @@ class ExpertStreamer:
         self.tensor_names = tuple(tensor_names)
         if not self.tensor_names:
             raise ValueError("expert streamer requires at least one tensor")
-
+        # The format owns the row schema. Sources stay dynamic lookups because
+        # the host arena rebinds layer tensors after this streamer exists.
+        self.format = (
+            DenseLayerFormat(self.tensor_names) if format is None else format
+        )
         self.num_experts = self._validate_sources()
-        # Imported here: the reader pulls in sglang.srt.model_loader, whose
-        # package import reaches modelopt_quant, which imports this module.
-        from sglang.srt.layers.moe.expert_file_reader import ExpertFileRowReader
-
-        self.file_row_reader = ExpertFileRowReader.from_layer(layer, self.tensor_names)
+        if row_source is _DEFAULT_ROW_SOURCE:
+            row_source = self.format.default_row_source(
+                layer, self.specs, resolve_row_source_kind()
+            )
+        self._row_source: ExpertRowSource | None = None
+        self.row_source = row_source  # validated against num_experts by the setter
+        # Dense sources serve every name the row source does not cover.
+        self._tensor_rows = TensorRowSource(
+            self.source, self.tensor_names, self.num_experts
+        )
         self.hot_cache = None
         self.expert_copy_backend = "gpu"
         self._dma_backend = ExpertDMABackend()
@@ -537,27 +685,21 @@ class ExpertStreamer:
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
-        self.bytes_per_expert = sum(
-            _tensor_data(getattr(layer, name)).numel()
-            * _tensor_data(getattr(layer, name)).element_size()
-            // self.num_experts
-            for name in self.tensor_names
-        )
+        # Row-source reads outside eager gathers (promotions, seeding, direct calls).
+        self.background_read_stats = RowReadStats()
+        self._gather_read_stats: RowReadStats | None = None
+        self.bytes_per_expert = sum(spec.row_bytes for spec in self.specs)
         self.host_bytes_per_expert = sum(
-            _tensor_data(getattr(layer, name)).numel()
-            * _tensor_data(getattr(layer, name)).element_size()
-            // self.num_experts
-            for name in self.tensor_names
-            if _tensor_data(getattr(layer, name)).device.type == "cpu"
+            spec.row_bytes for spec in self.specs if spec.residence == "host"
         )
         signature = tuple(
             (
-                name,
-                tuple(_tensor_data(getattr(layer, name)).shape),
-                str(_tensor_data(getattr(layer, name)).dtype),
-                str(_tensor_data(getattr(layer, name)).device),
+                spec.name,
+                (self.num_experts,) + spec.row_shape,
+                str(spec.dtype),
+                spec.residence,
             )
-            for name in self.tensor_names
+            for spec in self.specs
         )
         if signature not in _LOGGED_SOURCE_SIGNATURES:
             _LOGGED_SOURCE_SIGNATURES.add(signature)
@@ -566,6 +708,103 @@ class ExpertStreamer:
                 self.num_experts,
                 ",".join(self.tensor_names),
             )
+
+    @property
+    def specs(self) -> tuple[ExpertTensorSpec, ...]:
+        """The format's row specs, in ``tensor_names`` order."""
+        return tuple(self._specs.values())
+
+    def spec(self, name: str) -> ExpertTensorSpec:
+        return self._specs[name]
+
+    def source(self, name: str) -> torch.Tensor | None:
+        """The dense ``[experts, ...]`` source of ``name`` now, or None when it has none."""
+        return self.format.source(self.layer, name)
+
+    @property
+    def has_spec_only_tensors(self) -> bool:
+        """Whether a streamed tensor has no dense source, so only the row source reads it."""
+        return any(self.source(name) is None for name in self.tensor_names)
+
+    @property
+    def row_source(self) -> ExpertRowSource | None:
+        return self._row_source
+
+    @row_source.setter
+    def row_source(self, value: ExpertRowSource | None) -> None:
+        """Assign the row source; a non-None value must hold ``num_experts`` rows.
+
+        None is always accepted without a check, so the host arena can drop
+        the source (``file_row_reader = None``) at no extra cost.
+        """
+        if value is not None and value.num_experts != self.num_experts:
+            raise ValueError(
+                f"row source holds {value.num_experts} experts, but the layer "
+                f"has {self.num_experts}"
+            )
+        self._row_source = value
+
+    @property
+    def file_row_reader(self) -> ExpertRowSource | None:
+        """Alias of ``row_source``; the host arena drops it by assigning None."""
+        return self.row_source
+
+    @file_row_reader.setter
+    def file_row_reader(self, value: ExpertRowSource | None) -> None:
+        self.row_source = value
+
+    @property
+    def file_source_bytes_per_expert(self) -> int | None:
+        """File bytes one expert row reads; None keeps eager gathers out of the pinned tier."""
+        return self.format.file_source_bytes_per_expert(self.layer, self.row_source)
+
+    def read_host_rows(
+        self,
+        rows_cpu: torch.Tensor,
+        destinations: dict[str, torch.Tensor],
+        destination_rows: torch.Tensor | None = None,
+    ) -> RowReadStats:
+        """Fill host ``destinations`` with expert ``rows_cpu``.
+
+        Every name the row source covers is read in one call, so a source that
+        reads a whole on-disk expert row per request pays for it once. The other
+        names are read from their dense sources. Rows land in
+        ``destination_rows`` of each destination, or in its leading rows.
+        """
+        row_source = self.row_source
+        covered = {
+            name: destination
+            for name, destination in destinations.items()
+            if row_source is not None and row_source.covers(name)
+        }
+        uncovered = {
+            name: destination
+            for name, destination in destinations.items()
+            if name not in covered
+        }
+        missing = [name for name in uncovered if not self._tensor_rows.covers(name)]
+        if missing:
+            raise ValueError(
+                f"no row source covers expert tensors {missing} and they have "
+                "no dense source"
+            )
+        stats = RowReadStats()
+        if uncovered:
+            stats = stats + _read_rows(
+                self._tensor_rows, rows_cpu, uncovered, destination_rows
+            )
+        if covered:
+            stats = stats + _read_rows(row_source, rows_cpu, covered, destination_rows)
+        if stats.rows:
+            stats = replace(stats, rows=rows_cpu.numel())
+        self._record_read(stats)
+        return stats
+
+    def _record_read(self, stats: RowReadStats) -> None:
+        if self._gather_read_stats is not None:
+            self._gather_read_stats = self._gather_read_stats + stats
+        else:
+            self.background_read_stats = self.background_read_stats + stats
 
     def serves_graph_gather(self, topk_output) -> bool:
         """Whether ``topk_output`` fits the sync-free gather enabled at startup."""
@@ -588,6 +827,7 @@ class ExpertStreamer:
         raise if a layer tensor was rebound after this call; replays cannot
         check, and keep reading the tensors frozen here.
         """
+        require_graph_gather_support((self,))
         from sglang.kernels.ops.moe.expert_cache_transfer import (
             copy_expert_row_segments_gpu,
             expert_row_segments,
@@ -841,43 +1081,62 @@ class ExpertStreamer:
                     f"expert tensor {name!r} moved after graph gather was enabled"
                 )
 
-    def _read_host_rows(
+    def _read_pageable_rows(
         self,
-        name: str,
-        source: torch.Tensor,
-        cpu_ids: torch.Tensor,
-        host_output: torch.Tensor,
+        cpu_ids: torch.Tensor | None,
+        outputs: dict[str, torch.Tensor],
+        row_count: int,
+        capacity: int,
     ) -> None:
-        if self.file_row_reader is not None and self.file_row_reader.covers(name):
-            self.file_row_reader.read(cpu_ids, {name: host_output})
-        else:
-            torch.index_select(source, 0, cpu_ids, out=host_output)
+        """Read ``outputs``' rows on the host in one batch into pinned staging, then copy them up."""
+        assert cpu_ids is not None
+        host_outputs = {
+            name: _pinned_staging_buffer(
+                name,
+                row_count,
+                capacity,
+                self.spec(name).row_shape,
+                self.spec(name).dtype,
+            )
+            for name in outputs
+        }
+        self.read_host_rows(cpu_ids, host_outputs)
+        for name, output in outputs.items():
+            output.copy_(host_outputs[name], non_blocking=True)
 
     def _validate_sources(self) -> int:
-        expert_count = None
-        for name in self.tensor_names:
-            if not hasattr(self.layer, name):
-                raise ValueError(f"expert source tensor {name!r} is missing")
-            tensor = _tensor_data(getattr(self.layer, name))
-            if tensor.ndim == 0:
+        """Check the format's specs against the streamer names and any dense sources."""
+        specs = tuple(self.format.tensor_specs(self.layer))
+        names = tuple(spec.name for spec in specs)
+        if names != self.tensor_names:
+            raise ValueError(
+                f"expert format specs {names} do not match tensor names {self.tensor_names}"
+            )
+        expert_count = index(self.format.num_experts(self.layer))
+        if expert_count < 1:
+            raise ValueError("expert format has no expert rows")
+        for spec in specs:
+            source = self.format.source(self.layer, spec.name)
+            if source is None:
+                if spec.residence != "host":
+                    raise ValueError(
+                        f"expert tensor {spec.name!r} has no dense source, so its "
+                        "rows must be host-resident"
+                    )
+                continue
+            if (
+                tuple(source.shape) != (expert_count,) + spec.row_shape
+                or source.dtype != spec.dtype
+            ):
                 raise ValueError(
-                    f"expert source tensor {name!r} has no expert dimension"
+                    f"expert source tensor {spec.name!r} does not match its spec"
                 )
-            if tensor.shape[0] == 0:
-                raise ValueError(f"expert source tensor {name!r} has no expert rows")
-            if not tensor.is_contiguous():
-                raise ValueError(f"expert source tensor {name!r} must be contiguous")
-            if tensor.device.type not in ("cpu", "cuda"):
+            if (source.device.type == "cpu") != (spec.residence == "host"):
                 raise ValueError(
-                    f"expert source tensor {name!r} uses unsupported device {tensor.device}"
+                    f"expert source tensor {spec.name!r} on {source.device} does not "
+                    f"match its spec's {spec.residence!r} residence"
                 )
-            if expert_count is None:
-                expert_count = tensor.shape[0]
-            elif tensor.shape[0] != expert_count:
-                raise ValueError(
-                    f"expert count mismatch for {name!r}: {tensor.shape[0]} != {expert_count}"
-                )
-        assert expert_count is not None
+        self._specs = {spec.name: spec for spec in specs}
         return expert_count
 
     def _copy_source_rows(
@@ -887,8 +1146,10 @@ class ExpertStreamer:
 
         With the ``dma`` copy backend, rows of registered or pinned host tensors
         go through the CUDA copy engine, merged into runs of consecutive rows.
-        Graph capture keeps the pull kernel. Returns the bytes the copy engine
-        moved, so a build without it shows up as zero.
+        Graph capture keeps the pull kernel. Rows of pageable host tensors, and
+        of tensors without a dense source, are read by the row sources in one
+        batch into pinned staging. Returns the bytes the copy engine moved, so
+        a build without it shows up as zero.
         """
         row_count = source_ids.numel()
         use_dma = (
@@ -899,23 +1160,24 @@ class ExpertStreamer:
         dma_rows = None
         copy_engine_bytes = 0
         capacity = max(row_count, _NO_DEDUP_LIMIT)
+        sources = {name: self.source(name) for name in self.tensor_names}
         host_sources = {
             name: source
-            for name in self.tensor_names
-            for source in [_tensor_data(getattr(self.layer, name))]
-            if source.device.type == "cpu"
+            for name, source in sources.items()
+            if source is None or source.device.type == "cpu"
         }
         readable = {
-            name: is_gpu_readable_host_tensor(source)
+            name: source is not None and is_gpu_readable_host_tensor(source)
             for name, source in host_sources.items()
         }
         pageable_source = not all(readable.values())
         cpu_ids = (
             _copy_indices_to_cpu(source_ids, capacity) if pageable_source else None
         )
+        pageable_outputs: dict[str, torch.Tensor] = {}
         for name, output in outputs.items():
-            source = _tensor_data(getattr(self.layer, name))
-            if source.device.type == "cuda":
+            source = sources[name]
+            if source is not None and source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
             elif readable[name] and use_dma and source.ndim >= 2:
                 if dma_rows is None:
@@ -934,13 +1196,15 @@ class ExpertStreamer:
                     BLOCK=1024,
                 )
             else:
-                assert cpu_ids is not None
-                host_output = _pinned_staging_buffer(
-                    name, row_count, capacity, tuple(source.shape[1:]), source.dtype
-                )
-                self._read_host_rows(name, source, cpu_ids, host_output)
-                output.copy_(host_output, non_blocking=True)
+                pageable_outputs[name] = output
+        if pageable_outputs:
+            self._read_pageable_rows(cpu_ids, pageable_outputs, row_count, capacity)
         return copy_engine_bytes
+
+    def _staging_floor_rows(self) -> int:
+        """Rows every eager staging buffer is allocated with from the first gather."""
+        cap = self.format.max_gather_rows
+        return self.num_experts if cap is None else min(self.num_experts, cap)
 
     def _gather_cached(
         self,
@@ -978,39 +1242,35 @@ class ExpertStreamer:
             ), cache.tensors
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
+        # Allocated at a whole layer's experts from the first gather: prefill chunks climb to
+        # nearly all of them, and growing one step at a time left every outgrown buffer in
+        # the allocator's cache at the prefill peak. A format with large rows caps that
+        # floor at its max_gather_rows and gathers in chunks (iter_gather_experts).
         padded = {
             name: _staging_buffer(
                 name,
                 kernel_rows,
-                capacity,
-                tuple(source.shape[1:]),
-                source.dtype,
+                max(capacity, self._staging_floor_rows()),
+                self.spec(name).row_shape,
+                self.spec(name).dtype,
                 topk_ids.device,
             )
             for name in self.tensor_names
-            for source in [_tensor_data(getattr(self.layer, name))]
         }
         gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
         miss_source_ids = source_ids[~hit_mask]
-        if hit_rows == 0:
-            misses = gathered
-            assembly_bytes = 0
-        else:
-            hit_positions = hit_mask.nonzero().flatten()
+        # Misses take the first rows so their copies land in place, with no second
+        # staging buffer as large as a layer's experts; hits fill the rows after them.
+        misses = {name: output[:miss_rows] for name, output in gathered.items()}
+        assembly_bytes = hit_rows * self.bytes_per_expert
+        if hit_rows:
             hot_slots = slots[hit_mask]
-            miss_positions = (~hit_mask).nonzero().flatten()
-            misses = {
-                name: _staging_buffer(
-                    ("hot_cache_misses", name),
-                    miss_rows,
-                    capacity,
-                    tuple(output.shape[1:]),
-                    output.dtype,
-                    output.device,
-                )
-                for name, output in gathered.items()
-            }
-            assembly_bytes = row_count * self.bytes_per_expert
+            order = torch.cat(((~hit_mask).nonzero().flatten(), hit_mask.nonzero().flatten()))
+            rows = _cached_arange(row_count, order.device, order.dtype)
+            row_of_source = torch.empty_like(order)
+            row_of_source[order] = rows
+            compact_ids = row_of_source[compact_ids.long()]
+            hit_positions = rows[miss_rows:]
         pinned_hit_rows = 0
         pinned_miss_rows = 0
         pinned_populated_bytes = 0
@@ -1021,28 +1281,21 @@ class ExpertStreamer:
         if (
             pinned_cache is not None
             and pinned_cache.capacity
-            and getattr(self.layer, "_nvfp4_file_source_bytes_per_expert", None)
-            is not None
+            and self.file_source_bytes_per_expert is not None
         ):
-            _, pinned_hit_mask = pinned_cache.lookup(miss_source_ids)
-            pinned_hit_rows = int(pinned_hit_mask.sum().item())
-            pinned_miss_rows = miss_rows - pinned_hit_rows
-            populated_before = pinned_cache.stats.populated_bytes
-            if pinned_miss_rows:
-                pinned_cache.ensure_rows(miss_source_ids[~pinned_hit_mask])
-            pinned_populated_bytes = (
-                pinned_cache.stats.populated_bytes - populated_before
-            )
-            source_bytes = pinned_miss_rows * self.host_bytes_per_expert + miss_rows * (
-                self.bytes_per_expert - self.host_bytes_per_expert
-            )
             pinned_outputs = {
                 name: output
                 for name, output in misses.items()
                 if name in pinned_cache.cached_names
             }
-            gather_fallback_used = pinned_cache.copy_rows(
-                miss_source_ids, pinned_outputs
+            # Chunked so misses beyond the pinned capacity are never copied from slot -1.
+            pinned = pinned_cache.gather_rows(miss_source_ids, pinned_outputs)
+            pinned_hit_rows = pinned.hit_rows
+            pinned_miss_rows = pinned.miss_rows
+            pinned_populated_bytes = pinned.populated_bytes
+            gather_fallback_used = pinned.fallback_used
+            source_bytes = pinned_miss_rows * self.host_bytes_per_expert + miss_rows * (
+                self.bytes_per_expert - self.host_bytes_per_expert
             )
             uncached_outputs = {
                 name: output
@@ -1065,11 +1318,6 @@ class ExpertStreamer:
                     output.view(torch.uint8),
                     row_bytes,
                     BLOCK=1024,
-                )
-                output.view(torch.uint8).reshape(row_count, -1).index_copy_(
-                    0,
-                    miss_positions,
-                    misses[name].view(torch.uint8).reshape(miss_rows, -1),
                 )
         self.last_gather_stats = ExpertGatherStats(
             row_count,
@@ -1100,108 +1348,54 @@ class ExpertStreamer:
         """Gather routed rows through the pinned host cache.
 
         Returned tensors follow the leading-dimension rule of ``_gather_cached``.
+        Pinned rows are copied straight into the one staging set of
+        ``max(rows, NO_DEDUP_LIMIT)`` rows by ``gather_rows``, which admits
+        misses in chunks the tier can hold, so a format's ``max_gather_rows``
+        bounds this path's VRAM as it bounds ``_gather_cached``'s.
         """
         cache = self.pinned_host_cache
         assert cache is not None
         row_count = source_ids.numel()
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
-        slots, hit_mask = cache.lookup(source_ids)
-        del slots
-        hit_rows = int(hit_mask.sum().item())
-        miss_rows = row_count - hit_rows
-        copy_engine_bytes = 0
         padded = {
             name: _staging_buffer(
                 name,
                 kernel_rows,
                 capacity,
-                tuple(_tensor_data(getattr(self.layer, name)).shape[1:]),
-                _tensor_data(getattr(self.layer, name)).dtype,
+                self.spec(name).row_shape,
+                self.spec(name).dtype,
                 topk_ids.device,
             )
             for name in self.tensor_names
         }
         gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
-        hit_positions = hit_mask.nonzero().flatten()
-        miss_positions = (~hit_mask).nonzero().flatten()
-        if hit_rows:
-            hit_outputs = {
-                name: _staging_buffer(
-                    ("pinned_host_cache_hits", name),
-                    hit_rows,
-                    capacity,
-                    tuple(output.shape[1:]),
-                    output.dtype,
-                    output.device,
-                )
+        pinned = cache.gather_rows(
+            source_ids,
+            {
+                name: output
                 for name, output in gathered.items()
                 if name in cache.cached_names
-            }
-            cache.copy_rows(source_ids[hit_mask], hit_outputs)
-            for name, output in hit_outputs.items():
-                gathered[name].index_copy_(0, hit_positions, output)
-        if miss_rows:
-            populated_before = cache.stats.populated_bytes
-            cache.ensure_rows(source_ids[~hit_mask])
-            resident_mask = cache.expert_to_slot[source_ids[~hit_mask].long()] >= 0
-            resident_count = int(resident_mask.sum().item())
-            miss_outputs = {
-                name: _staging_buffer(
-                    ("pinned_host_cache_misses", name),
-                    resident_count,
-                    capacity,
-                    tuple(output.shape[1:]),
-                    output.dtype,
-                    output.device,
-                )
-                for name, output in gathered.items()
-                if name in cache.cached_names
-            }
-            if bool(resident_mask.any().item()):
-                cache.copy_rows(source_ids[~hit_mask][resident_mask], miss_outputs)
-                resident_positions = miss_positions[resident_mask]
-                for name, output in miss_outputs.items():
-                    gathered[name].index_copy_(0, resident_positions, output)
-            cold_mask = ~resident_mask
-            if bool(cold_mask.any().item()):
-                cold_ids = source_ids[~hit_mask][cold_mask]
-                cold_positions = miss_positions[cold_mask]
-                cold_outputs = {
-                    name: _staging_buffer(
-                        ("pinned_host_cache_cold", name),
-                        cold_ids.numel(),
-                        capacity,
-                        tuple(output.shape[1:]),
-                        output.dtype,
-                        output.device,
-                    )
-                    for name, output in gathered.items()
-                    if name in cache.cached_names
-                }
-                copy_engine_bytes += self._copy_source_rows(cold_ids, cold_outputs)
-                for name, output in cold_outputs.items():
-                    gathered[name].index_copy_(0, cold_positions, output)
-            populated_bytes = cache.stats.populated_bytes - populated_before
-        else:
-            populated_bytes = 0
+            },
+        )
+        copy_engine_bytes = 0
         uncached = {
             name: output
             for name, output in gathered.items()
             if name not in cache.cached_names
         }
         if uncached:
-            copy_engine_bytes += self._copy_source_rows(source_ids, uncached)
+            copy_engine_bytes = self._copy_source_rows(source_ids, uncached)
         self.last_gather_stats = ExpertGatherStats(
             row_count,
             0,
             row_count,
             0,
             row_count * self.host_bytes_per_expert,
-            miss_rows * self.bytes_per_expert,
-            hit_rows,
-            miss_rows,
-            populated_bytes,
+            pinned.miss_rows * self.bytes_per_expert,
+            pinned.hit_rows,
+            pinned.miss_rows,
+            pinned.populated_bytes,
             copy_engine_bytes=copy_engine_bytes,
             routed_rows=compact_ids.numel(),
             routed_miss_rows=compact_ids.numel(),
@@ -1210,7 +1404,7 @@ class ExpertStreamer:
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
 
     def _plan_eager_routes(
-        self, topk_ids: torch.Tensor
+        self, topk_ids: torch.Tensor, record: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the source IDs to gather and each route's index into them.
 
@@ -1227,12 +1421,33 @@ class ExpertStreamer:
             compact_ids = _cached_arange(
                 flat_ids.numel(), flat_ids.device, topk_ids.dtype
             )
+        if record:
+            self.record_routes(topk_ids)
+        return source_ids, compact_ids
+
+    def record_routes(self, topk_ids: torch.Tensor) -> None:
+        """Count every route of a forward in the residency policy; call once per forward.
+
+        Contract: every id in ``topk_ids`` must be in ``[0, num_experts)``,
+        on the residency policy's device, with the forward's full
+        multiplicity. A caller whose ``topk_ids`` can carry negative or
+        sentinel ids (padding, masked routes) must filter them out itself
+        before calling this; ``record_routes`` does not filter, so that
+        NVFP4 prefill, which never has such ids, pays no extra masked-select.
+        ``ExpertResidencyPolicy.record_routes`` runs ``torch.bincount`` on
+        the ids and raises on a negative id or a device mismatch.
+
+        Skipped during CUDA stream capture. ``gather`` calls it itself with
+        ids it has already range-checked; a consumer of ``gather_experts``
+        calls it separately with the forward's full ``topk_ids``, filtered
+        to satisfy this contract.
+        """
         residency_policy = self.residency_policy
+        flat_ids = topk_ids.reshape(-1)
         if residency_policy is not None and not (
             flat_ids.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
             residency_policy.record_routes(flat_ids)
-        return source_ids, compact_ids
 
     def gather(
         self, topk_ids: torch.Tensor
@@ -1263,7 +1478,14 @@ class ExpertStreamer:
                 f"selected expert ID is outside [0, {self.num_experts - 1}]"
             )
 
-        source_ids, compact_ids = self._plan_eager_routes(topk_ids)
+        source_ids, compact_ids = self._plan_eager_routes(topk_ids, record=False)
+        cap = self.format.max_gather_rows
+        if cap is not None and source_ids.numel() > cap:
+            raise ValueError(
+                f"eager gather of {source_ids.numel()} experts exceeds the format's "
+                f"max_gather_rows={cap}; gather in chunks with iter_gather_experts"
+            )
+        self.record_routes(topk_ids)
         if prefetch_coordinator is not None:
             prefetch_coordinator.synchronous_correction(
                 source_ids.tolist(), lambda _: None
@@ -1271,16 +1493,176 @@ class ExpertStreamer:
         next_layer_prefetch = getattr(self, "next_layer_prefetch", None)
         if next_layer_prefetch is not None:
             next_layer_prefetch(source_ids)
-        row_count = source_ids.numel()
+        return self._gather_eager_rows(source_ids, compact_ids, topk_ids)
+
+    def gather_experts(
+        self, source_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Gather the rows of the distinct experts ``source_ids`` for an eager consumer.
+
+        Returns ``(row_of_source, rows)``, where ``rows[name][row_of_source[i]]``
+        holds expert ``source_ids[i]``. ``rows`` are the hot cache's slot
+        tensors when every expert is resident, else staging buffers that the
+        next eager gather of any layer reuses: enqueue any consuming work on
+        the current stream before calling into this streamer again (``next()``
+        on an ``iter_gather_experts`` iterator included), and clone any row
+        you need to keep past that point. An all-hit chunk returns the hot
+        cache's own slot tensors, not a staging copy. Routes are not
+        recorded: call ``record_routes`` once with the forward's full
+        ``topk_ids``. At most the format's ``max_gather_rows`` experts per
+        call; see ``iter_gather_experts``.
+
+        Validates ``source_ids`` itself (1-D, in range, distinct). A caller
+        that already validated a larger id set once, such as
+        ``iter_gather_experts``, should not call this method per chunk;
+        use the unvalidated ``_gather_experts`` instead.
+        """
+        if source_ids.ndim != 1:
+            raise ValueError("gather_experts needs a 1-D tensor of expert IDs")
+        count = source_ids.numel()
+        if count == 0:
+            raise ValueError("gather_experts needs a nonempty tensor of expert IDs")
+        if bool(((source_ids < 0) | (source_ids >= self.num_experts)).any().item()):
+            raise ValueError(
+                f"selected expert ID is outside [0, {self.num_experts - 1}]"
+            )
+        if torch.unique(source_ids).numel() != count:
+            raise ValueError("gather_experts needs distinct expert IDs")
+        return self._gather_experts(source_ids)
+
+    def _gather_experts(
+        self, source_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """The unvalidated core of ``gather_experts``.
+
+        Callers must have already checked that ``source_ids`` is a 1-D,
+        in-range, distinct tensor of expert IDs; ``gather_experts`` and
+        ``iter_gather_experts`` are the only callers, and each validates
+        once before any chunk reaches here. This still enforces the
+        format's ``max_gather_rows`` cap and the prefetch refusal per call,
+        since both can vary by chunk.
+        """
+        count = source_ids.numel()
+        cap = self.format.max_gather_rows
+        if cap is not None and count > cap:
+            raise ValueError(
+                f"gather of {count} experts exceeds the format's max_gather_rows={cap}"
+            )
+        if (
+            getattr(self, "prefetch_coordinator", None) is not None
+            or getattr(self, "next_layer_prefetch", None) is not None
+        ):
+            raise ValueError("gather_experts does not drive expert prefetch")
+        if self.before_eager_gather is not None:
+            self.before_eager_gather()
+        compact_ids = _cached_arange(count, source_ids.device, source_ids.dtype)
+        row_of_source, rows = self._gather_eager_rows(
+            source_ids, compact_ids, source_ids.reshape(1, -1)
+        )
+        return row_of_source.reshape(-1), rows
+
+    def iter_gather_experts(
+        self, source_ids: torch.Tensor, chunk_rows: int | None = None
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]]:
+        """Yield ``(chunk_ids, row_of_source, rows)`` over chunks of distinct experts.
+
+        Each chunk is one gather of at most ``chunk_rows`` experts (default:
+        the format's ``max_gather_rows``, else all at once). A chunk's rows
+        share staging with the next chunk, so consume them (see
+        ``gather_experts``'s docstring for the staging-reuse contract) before
+        advancing to the next chunk. When the iteration ends,
+        ``last_gather_stats`` holds the sum over its chunks, so observers
+        count the forward once.
+
+        Validates ``source_ids`` once, up front (1-D, in range, distinct),
+        then dispatches every chunk through the unvalidated
+        ``_gather_experts`` so a multi-chunk gather does not repeat the
+        range and distinctness syncs per chunk.
+        """
+        if source_ids.ndim != 1:
+            raise ValueError("iter_gather_experts needs a 1-D tensor of expert IDs")
+        count = source_ids.numel()
+        if count == 0:
+            return
+        if bool(((source_ids < 0) | (source_ids >= self.num_experts)).any().item()):
+            raise ValueError(
+                f"selected expert ID is outside [0, {self.num_experts - 1}]"
+            )
+        if torch.unique(source_ids).numel() != count:
+            raise ValueError("iter_gather_experts needs distinct expert IDs")
+        cap = self.format.max_gather_rows
+        if chunk_rows is None:
+            chunk_rows = cap if cap is not None else count
+        chunk_rows = index(chunk_rows)
+        if chunk_rows < 1:
+            raise ValueError("gather chunks need at least one row")
+        if cap is not None and chunk_rows > cap:
+            raise ValueError(
+                f"gather chunks of {chunk_rows} rows exceed the format's "
+                f"max_gather_rows={cap}"
+            )
+        chunk_stats = []
+        try:
+            for start in range(0, count, chunk_rows):
+                chunk = source_ids[start : start + chunk_rows]
+                row_of_source, rows = self._gather_experts(chunk)
+                chunk_stats.append(self.last_gather_stats)
+                yield chunk, row_of_source, rows
+        finally:
+            if chunk_stats:
+                self.last_gather_stats = _sum_gather_stats(chunk_stats)
+
+    def _gather_eager_rows(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run one eager gather and add the host reads it caused to its stats."""
+        self._gather_read_stats = RowReadStats()
+        try:
+            result = self._dispatch_eager_rows(source_ids, compact_ids, topk_ids)
+            read = self._gather_read_stats
+        finally:
+            self._gather_read_stats = None
+        if read.rows:
+            self.last_gather_stats = replace(
+                self.last_gather_stats,
+                host_read_rows=read.rows,
+                host_read_file_bytes=read.file_bytes,
+                host_read_split_bytes=read.split_bytes,
+                host_read_ns=read.read_ns,
+                host_split_ns=read.split_ns,
+            )
+        return result
+
+    def _dispatch_eager_rows(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.hot_cache is not None and self.hot_cache.capacity:
             return self._gather_cached(source_ids, compact_ids, topk_ids)
         if (
             self.pinned_host_cache is not None
             and self.pinned_host_cache.capacity
-            and getattr(self.layer, "_nvfp4_file_source_bytes_per_expert", None)
-            is not None
+            and self.file_source_bytes_per_expert is not None
         ):
             return self._gather_pinned_host(source_ids, compact_ids, topk_ids)
+        return self._gather_uncached(source_ids, compact_ids, topk_ids)
+
+    def _gather_uncached(
+        self,
+        source_ids: torch.Tensor,
+        compact_ids: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Gather rows straight from their sources, with no hot or pinned cache.
+
+        Returned tensors follow the leading-dimension rule of ``_gather_cached``.
+        """
+        row_count = source_ids.numel()
         self.last_gather_stats = ExpertGatherStats(
             row_count,
             0,
@@ -1293,30 +1675,33 @@ class ExpertStreamer:
             unique_miss_rows=row_count,
         )
         capacity = max(row_count, _NO_DEDUP_LIMIT)
+        sources = {name: self.source(name) for name in self.tensor_names}
         pageable_source = any(
-            _tensor_data(getattr(self.layer, name)).device.type == "cpu"
-            and not is_gpu_readable_host_tensor(_tensor_data(getattr(self.layer, name)))
-            for name in self.tensor_names
+            source is None
+            or (source.device.type == "cpu" and not is_gpu_readable_host_tensor(source))
+            for source in sources.values()
         )
         cpu_ids = (
             _copy_indices_to_cpu(source_ids, capacity) if pageable_source else None
         )
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
         padded: dict[str, torch.Tensor] = {}
+        pageable_outputs: dict[str, torch.Tensor] = {}
         for name in self.tensor_names:
-            source = _tensor_data(getattr(self.layer, name))
+            source = sources[name]
+            spec = self.spec(name)
             padded[name] = _staging_buffer(
                 name,
                 kernel_rows,
                 capacity,
-                tuple(source.shape[1:]),
-                source.dtype,
+                spec.row_shape,
+                spec.dtype,
                 topk_ids.device,
             )
             output = padded[name][:row_count]
-            if source.device.type == "cuda":
+            if source is not None and source.device.type == "cuda":
                 torch.index_select(source, 0, source_ids, out=output)
-            elif is_gpu_readable_host_tensor(source):
+            elif source is not None and is_gpu_readable_host_tensor(source):
                 source_bytes = source.view(torch.uint8)
                 output_bytes = output.view(torch.uint8)
                 row_bytes = source_bytes.numel() // self.num_experts
@@ -1329,15 +1714,7 @@ class ExpertStreamer:
                     BLOCK=block,
                 )
             else:
-                assert cpu_ids is not None
-                host_output = _pinned_staging_buffer(
-                    name,
-                    row_count,
-                    capacity,
-                    tuple(source.shape[1:]),
-                    source.dtype,
-                )
-                self._read_host_rows(name, source, cpu_ids, host_output)
-                output.copy_(host_output, non_blocking=True)
-
+                pageable_outputs[name] = output
+        if pageable_outputs:
+            self._read_pageable_rows(cpu_ids, pageable_outputs, row_count, capacity)
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded

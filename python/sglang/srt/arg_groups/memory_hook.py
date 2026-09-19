@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import copy
 import logging
-import math
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.expert_stream_requirements import (
+    ExpertCacheBudgets,
+    expert_stream_requirements_for,
+)
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
@@ -215,96 +218,16 @@ def handle_offload_compatibility(server_args: Any) -> None:
         return
     if hot_budget_mb < 0:
         raise ValueError("SGLANG_MOE_HOT_GPU_MB must be nonnegative")
-    if not streaming:
-        raise ValueError("NVFP4 hot caching requires SGLANG_MOE_EXPERT_STREAM=1")
-    if cfg.moe_runner_backend != "flashinfer_cutlass":
-        raise ValueError(
-            "NVFP4 hot caching requires --moe-runner-backend flashinfer_cutlass"
-        )
-    if cfg.tp_size != 1:
-        raise ValueError("NVFP4 hot caching requires TP size 1")
-    if cfg.ep_size != 1:
-        raise ValueError("NVFP4 hot caching requires EP size 1")
-    if cfg.moe_a2a_backend != "none":
-        raise ValueError("NVFP4 hot caching requires --moe-a2a-backend none")
-    if cfg.enable_waterfill:
-        raise ValueError("NVFP4 hot caching does not support Waterfill")
-    # Graph gather with GPU residency keeps route accounting and slot changes on the
-    # forward stream, so result processing may trail the next launch.
-    if not cfg.disable_overlap_schedule and not (
-        graph_gather and envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
-    ):
-        raise ValueError(
-            "NVFP4 hot caching requires --disable-overlap-schedule unless "
-            "SGLANG_MOE_EXPERT_GRAPH_GATHER=1 and SGLANG_MOE_GPU_RESIDENCY_UPDATE=1"
-        )
-    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
-        raise ValueError("NVFP4 hot caching requires both batch overlap modes disabled")
-    if cfg.max_running_requests != 1:
-        raise ValueError("NVFP4 hot caching requires --max-running-requests 1")
-    if any(
-        getattr(cfg, name, None)
-        for name in (
-            "elastic_ep_backend",
-            "elastic_ep_rejoin",
-            "ep_join_mode",
-            "enable_elastic_expert_backup",
-            "elastic_ep_initial_size",
-            "max_ep_size",
-            "ep_join_rank_offset",
-        )
-    ):
-        raise ValueError("NVFP4 hot caching does not support elastic EP")
-    if cfg.enable_eplb:
-        raise ValueError("NVFP4 hot caching does not support EPLB")
-    if hot_budget_mb:
-        recorder = cfg.expert_distribution_recorder_mode
-        if envs.SGLANG_MOE_HOT_DYNAMIC.get() and recorder not in ("stat", "per_pass"):
-            raise ValueError(
-                "Dynamic NVFP4 hot caching requires --expert-distribution-recorder-mode "
-                "stat or per_pass"
-            )
-        if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
-            raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
-        if envs.SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS.get() < 0:
-            raise ValueError("SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS must be nonnegative")
-        if envs.SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS.get() < 0:
-            raise ValueError("SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS must be nonnegative")
-        if envs.SGLANG_MOE_HOT_DECAY_TOKENS.get() < 0:
-            raise ValueError("SGLANG_MOE_HOT_DECAY_TOKENS must be nonnegative")
-        sigmas = envs.SGLANG_MOE_HOT_PROMOTION_SIGMAS.get()
-        if not math.isfinite(sigmas) or sigmas < 0:
-            raise ValueError(
-                "SGLANG_MOE_HOT_PROMOTION_SIGMAS must be finite and nonnegative"
-            )
-        ratio = envs.SGLANG_MOE_HOT_BENEFIT_RATIO.get()
-        if not math.isfinite(ratio) or ratio < 0:
-            raise ValueError("SGLANG_MOE_HOT_BENEFIT_RATIO must be finite and nonnegative")
-        if envs.SGLANG_MOE_HOT_LOG_INTERVAL.get() < 1:
-            raise ValueError("SGLANG_MOE_HOT_LOG_INTERVAL must be positive")
-    graph_config = cfg.cuda_graph_config
-    decode_backends = (
-        (Backend.BREAKABLE, Backend.FULL)
-        if graph_gather
-        else (Backend.DISABLED, Backend.BREAKABLE)
+    # Each expert format declares its own launch requirements; a launch whose
+    # quantization method is not known yet keeps the NVFP4 requirements.
+    expert_stream_requirements_for(server_args, cfg).check(
+        cfg,
+        ExpertCacheBudgets(
+            hot_budget_mb=hot_budget_mb,
+            pinned_budget_mb=pinned_budget_mb,
+            graph_gather=graph_gather,
+        ),
     )
-    if graph_config is not None and (
-        graph_config.decode.backend not in decode_backends
-        or graph_config.prefill.backend != Backend.DISABLED
-    ):
-        raise ValueError(
-            "NVFP4 hot caching requires decode CUDA graph capture to be "
-            f"{' or '.join(decode_backends)}, and prefill CUDA graph capture to be "
-            "disabled"
-        )
-    if pinned_budget_mb and graph_config is not None and (
-        graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
-        or graph_config.prefill.backend != Backend.DISABLED
-    ):
-        raise ValueError(
-            "NVFP4 pinned host caching requires decode CUDA graph capture to be disabled "
-            "or breakable, and prefill CUDA graph capture to be disabled"
-        )
 
 
 def handle_gpu_memory_settings(server_args: Any):

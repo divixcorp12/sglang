@@ -720,10 +720,9 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
                 )
-            streamed = any(
-                getattr(module, "_nvfp4_expert_streamer", None) is not None
-                for module in self.model.modules()
-            )
+            from sglang.srt.layers.moe.expert_format import iter_expert_streamers
+
+            streamed = next(iter_expert_streamers(self.model), None) is not None
             if not streamed:
                 return
             if getattr(self, "expert_host_arena", None) is None:
@@ -748,9 +747,8 @@ class ModelRunner:
                 graph_gather_batch_size *= verify_tokens
                 scratch_cap = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get()
                 request_routes = verify_tokens * max(
-                    getattr(module._nvfp4_expert_streamer.layer, "top_k", 0) or 0
-                    for module in self.model.modules()
-                    if getattr(module, "_nvfp4_expert_streamer", None) is not None
+                    getattr(streamer.layer, "top_k", 0) or 0
+                    for streamer in iter_expert_streamers(self.model)
                 )
                 if 0 < scratch_cap < request_routes:
                     raise ValueError(
@@ -813,11 +811,6 @@ class ModelRunner:
                 raise ValueError(
                     "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with DP attention: "
                     "idle batches replay the decode graph and would count twice"
-                )
-            if self.spec_algorithm.is_speculative():
-                raise ValueError(
-                    "SGLANG_MOE_GPU_RESIDENCY_UPDATE cannot run with speculative "
-                    "decoding: verify commits do not reach the device clock"
                 )
             if (get_exec().graph.cuda_graph_config.decode.max_bs or 0) > 1:
                 raise ValueError(

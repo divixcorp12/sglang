@@ -49,7 +49,7 @@ Important design properties:
 
 ## Baseline results at `57c842ae6e`
 
-Reduced by user direction from the full matrix. Per arm: cold server on 31040, startup mode verified, fixed warm-up, 8 sessions / 29 turns at 768 tokens, fused plan 1, candidates 16, budget 2, hot GPU 10240, calibration 0, not profiled. All arms 29 records, 0 errors. Run directories are listed in the ledger.
+Reduced by user direction from the full matrix. Per arm: cold server on 31040, startup mode verified, fixed warm-up, 8 sessions / 29 turns at 768 tokens, fused plan 1 as *recorded* (false: the launcher printed a literal and never exported the flag, so these arms ran the generic planner; see `MOE_EXPERT_TRANSFER.md`, "Fused route planner arm"), candidates 16, budget 2, hot GPU 10240, calibration 0, not profiled. All arms 29 records, 0 errors. Run directories are listed in the ledger.
 
 | Arm | Median decode tok/s per pass | Mean |
 | --- | --- | ---: |
@@ -201,7 +201,8 @@ Iteration-speed rulings (user, 2026-09-17). Arm cost breaks down as ~26 s proces
 ## Next actions
 
 **Campaign landed 2026-09-18. Shipping config is insert-on-miss stage 2 (DIRECT)
-at 19.360 tok/s, +38.7% over the 13.96 baseline.** Branch
+plus the fused route planner at 20.695 tok/s, +48.2% over the 13.96 baseline**
+(stage 2 alone: 19.360, +38.7%). Branch
 `insert-on-miss-stage-b` @ `797be6f678`, fast-forwarded into
 `codex/nvfp4-expert-stream-main` 2026-09-18, **not pushed** — the repo owner pushes.
 Full results, the winning config and every closed line live in
@@ -223,17 +224,21 @@ authoritative document; this file is history plus what remains.
 4. **Still open, in the order the bandwidth analysis implies:**
    - **12 GiB budget** — never measured. At 12 GiB stage 2 gives ~4,660 slots
      against stage 1's ~4,180. Same +480, and the only untried capacity lever.
-   - **B2** (fold the insert into `plan_graph_routes_fused`). **Re-derive its value
-     against stage 2 as shipped** — its original ~1% was scoped against a model
-     that has since changed twice.
+   - **B2, now backlog #22** (fold stage 2's `gather_destinations` + `_commit_gather`
+     into the fused planner). The decode trace bounds it at ~1.9–2.4 ms/token; the
+     planner itself realized ~70% of its trace bound. Its original ~1% was scoped
+     against stage 1 and is superseded.
    - **#20 offline blockscale re-coding** — +1.6% lossless / +3.2% lossy.
      **DEFERRED: do not start without asking the repo owner.** The lossy variant
      changes model numerics and that trade is theirs.
    - Fused scorer kernel — only if prefetch is ever revived, which the evidence
      says it should not be.
-5. **Prod deployment is still gated** on advancing the `main-port-probe-7bc4eb`
-   worktree (158+ commits behind, no `INSERT_ON_MISS` in its code). Note
-   production on 7867 was observed **down** on 2026-09-18 and was not touched.
+5. **Prod deployment: done in the script, not yet restarted.** The
+   `main-port-probe-7bc4eb` worktree is detached at `797be6f678`, and
+   `run-nvfp4-e16c-public.sh` carries stage 2, decode-forwards 1, overlap on and
+   `SGLANG_MOE_EXPERT_FUSED_PLAN=1` (backups `.bak-pre-stage2-20260918`,
+   `.bak-pre-fusedplan-20260918`). Stage 2 was validated under that script; the
+   fused-planner line has not been started there yet. Prod was left down.
 6. **Read before running any arm:** the `hot_update_decode_forwards` launcher
    warning in `MOE_EXPERT_TRANSFER.md`. Main-tip's `run-shadow-server.sh` tests
    `= 1`, which silently yields 4 under stage 2. That file has no test coverage,

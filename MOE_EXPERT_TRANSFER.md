@@ -2,10 +2,20 @@
 
 State as of `797be6f678` (`insert-on-miss-stage-b`, fast-forwarded into
 `codex/nvfp4-expert-stream-main` 2026-09-18) — all accepted
-optimizations merged, plus insert-on-miss **stage 2 (DIRECT)**, accepted
-2026-09-18 on an acceptance-grade paired serving arm. Suite on that merge:
+optimizations merged, plus insert-on-miss **stage 2 (DIRECT)** and the **fused
+route planner** (`SGLANG_MOE_EXPERT_FUSED_PLAN=1`), both accepted 2026-09-18 on
+acceptance-grade paired serving arms. Suite on that merge:
 1 failed / 860 passed, the single failure being the long-characterised doorbell
 copier flake (four distinct parametrisations, clears in isolation).
+
+**NEXTN speculative decoding now runs on top of all of it** (2026-09-18, after
+lifting the `SGLANG_MOE_GPU_RESIDENCY_UPDATE` speculation guard): **+9.6% over
+the shipped config at production's 12,288 MB, 29/29 paired turns** — but only
+with 3 draft tokens, and at 31.9 of 32 GB. See
+[NEXTN arm](#nextn-speculative-decoding-arm-2026-09-18). Committed, not deployed.
+Four draft tokens now start (per-layer slot floor) but **tie** three; keep 3. Prefill
+staging was cut from 2.6 GB to 1.3 GB (**−1.5 GB peak VRAM**, see
+[Prefill staging and VRAM](#prefill-staging-and-vram-2026-09-18)).
 
 Geometry for scale: 48 layers, 512 experts/layer, top_k 10, one expert row =
 2,764,800 B. About 480 routed rows/token if nothing is cached. The experiments
@@ -24,20 +34,36 @@ scratch + 48 pull rows; **stage 2 needs no scratch, so the same budget gives
 | Baseline (no optimizations) | 13.96 | — |
 | + insert-on-miss (stage 1, SCRATCH) | 15.98 | +14.2% |
 | + overlap scheduling + hc_mix CTA cap | 16.645 | +19.2% |
-| **+ insert-on-miss stage 2 (DIRECT) — SHIP THIS** | **19.360** | **+38.7%** |
-| + prefetch enabled on top | 15.93 | −4.3% ✗ |
+| + insert-on-miss stage 2 (DIRECT) | 19.360 | +38.7% |
+| **+ fused route planner — SHIP THIS** | **20.695** | **+48.2%** |
+| same config at prod's 12,288 MB (NEXTN arm control) | 22.650 | +62.2% ¹ |
+| + NEXTN, 3 draft tokens, 12,288 MB — committed, not deployed | 24.930 | +78.6% ¹ |
+| + prefetch enabled on top (of stage 2's predecessor) | 15.93 | −4.3% ✗ |
 
-**Everything that worked reduces or re-schedules bytes; nothing that worked came
-from prediction.** Prefetch is implemented, measured, and deliberately left off.
+¹ Different matrix and budget from the baseline row; compare the last two rows
+with each other only (paired, same build, same day).
+
+**Nothing that worked came from prediction.** Prefetch is implemented, measured,
+and deliberately left off. (NEXTN is speculation over *tokens*, not experts: it
+moves slightly more bytes per token and wins by running fewer forwards.)
 
 The governing constraint: at ~140 miss rows/token x 0.2239 ms/row, the PCIe path
-is the dominant term. Only changes that reduce bytes/token move the needle —
-**stage 2 wins by moving 388.0 MB/token instead of 430.5.**
+is ~62% of each token — **stage 2 wins by moving 388.0 MB/token instead of
+430.5.** But the link and the compute run **serialized on one stream**, so the
+other ~38% is on the critical path too: the fused planner moves no bytes and
+wins by cutting ~65 bookkeeping kernels per layer (see
+[the decode trace](#nsight-decode-trace-2026-09-18--the-per-row-constant-measured-in-graph)).
 
 Stage 2 accepted 2026-09-18 on an acceptance-grade paired arm: **19.360 vs
 18.541 median, faster on 27 of 29 paired turns (p < 1e-5)**, mechanism confirmed
 by +480 slots → +3.09 points of hit rate → 9.9% fewer miss rows. See
 [Acceptance arm](#acceptance-arm-2026-09-18--the-shipping-decision).
+
+Fused route planner accepted 2026-09-18 on a second acceptance-grade paired arm:
+**20.695 vs 19.442 median, faster on 28 of 29 paired turns (p = 5.6e-8)**,
+2.77 ms/token saved, hit rate unchanged. The shipped-config control reproduced
+the day before's 19.360 within drift. See
+[Fused route planner arm](#fused-route-planner-arm-2026-09-18).
 
 ---
 
@@ -48,6 +74,7 @@ by +480 slots → +3.09 points of hit rate → 9.9% fewer miss rows. See
 | Variable | Default | What it does |
 |---|---|---|
 | `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | `0` (OFF) | **The big one.** `0` OFF, `1` SCRATCH, `2` DIRECT. **Ship `2`.** A miss is paid once instead of every token. SCRATCH (+14.2%) copies the previous forward's misses out of the gather's scratch rows into slots at the boundary. DIRECT lands each miss straight in a victim slot chosen from a shortlist the previous boundary ranked, so the D2D hop disappears **and the 1.33 GB scratch region returns to the cache as +480 slots (+14.1% capacity at no VRAM cost)** — worth a further **+4.4%** over SCRATCH. Requires `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1` and `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`. |
+| `SGLANG_MOE_EXPERT_FUSED_PLAN` | `False` | **Ship `1` (+6.4%).** Replaces the graph gather's generic route planning (~65 small torch ops per layer: sorts, scans, masks, counter adds) with one warp-sized JIT kernel. Pure compute: moves no bytes and leaves residency unchanged. BS1 only — `supports_fused_graph_routes` requires one token row with unique IDs and falls back to the generic planner otherwise. Tested against stage 2 by `test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one`. |
 | `SGLANG_MOE_HOT_INSERT_ON_MISS` | — | **Deprecated alias** for the above, kept because the enum preserves its 0/1 meaning. `1` selects SCRATCH. Prefer the `_STAGE` form. |
 | `SGLANG_MOE_HOT_FUSED_INSERT` | `False` | Runs **stage 1's** boundary insert through a fused masked Triton kernel: one pass instead of two, and idle lanes move no bytes. Cuts that boundary ~45% (5.32 ms/token isolated, 4.28 ms/token in an arm). **Not on the shipping path** — stage 2 has no insert loop to fuse, and this flag is hard-refused on any stage but SCRATCH so an arm cannot report a fused number for an unfused run. Keep off unless you are deliberately running stage 1. |
 | `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY` | `0.98` | Per-token decay on the insertion score that ranks eviction victims. Lower = forgets faster. |
@@ -65,13 +92,15 @@ graph-gather plus GPU residency update.
 
 ### Winning config
 
-This is exactly what produced **19.360 tok/s**
-(`servers/accept-C/run-20260917-211615`, acceptance grade, 29 records, 0 errors).
-Paths are divix01's; change the four at the top for another host.
+This is the config that produced **20.695 tok/s**
+(`servers/fplan-F/run-20260918-032147`, acceptance grade, 29 records, 0 errors),
+except that the arm ran a **10,240 MB** hot cache where this block shows
+production's 12,288. Paths are divix01's; change the four at the top for another host.
 
-> **The one line that changed from the 16.645 config** is
+> **Two lines changed from the 16.645 config:**
 > `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2` in place of
-> `SGLANG_MOE_HOT_INSERT_ON_MISS=1`. Everything else is identical.
+> `SGLANG_MOE_HOT_INSERT_ON_MISS=1` (19.360), then
+> `SGLANG_MOE_EXPERT_FUSED_PLAN=1` (20.695). Everything else is identical.
 > Stage 2 requires `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` and
 > `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1`, both already present.
 >
@@ -119,6 +148,7 @@ taskset -c 0-63 env OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
   SGLANG_MOE_EXPERT_FILE_READER=uring_direct \
   SGLANG_MOE_EXPERT_HOST_ARENA=1 \
   SGLANG_MOE_EXPERT_GRAPH_GATHER=1 \
+  SGLANG_MOE_EXPERT_FUSED_PLAN=1 \
   SGLANG_MOE_EXPERT_COPY_BACKEND=dma \
   SGLANG_MOE_PINNED_HOST_MB=0 \
   \
@@ -198,55 +228,48 @@ The tested wrapper is `scripts/expert_prediction/run-shadow-server.sh`, which ad
 run provenance, the GPU lock and metrics files:
 
 ```bash
-OVERLAP_SCHEDULE=1 HOT_GPU_MB=10240 HOT_INSERT_ON_MISS_STAGE=2 HOT_INSERT_ON_MISS_DECAY=0.98 \
+OVERLAP_SCHEDULE=1 HOT_GPU_MB=10240 HOT_INSERT_ON_MISS_STAGE=2 HOT_INSERT_ON_MISS_DECAY=0.98 FUSED_PLAN=1 \
 PREFETCH_PREDICTOR= PREFETCH_PULL_MODE=off RUN_KIND=timed PREFETCH_RUN_DIR=/path/to/run \
   scripts/expert_prediction/run-shadow-server.sh myserver 31047 off
 ```
 
 ### What production runs today, and the delta
 
-The live production server is launched by
+The production server is launched by
 **`divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh`** (port 7867,
 `0.0.0.0`). That *script* is not in this repo, but the *code* it runs is: the
-worktree `main-port-probe-7bc4eb` is checked out on **this same branch**,
-`codex/nvfp4-expert-stream-main`, at commit `d43c59b58a`.
+worktree `main-port-probe-7bc4eb`, **detached at `797be6f678`** since 2026-09-18
+(it was on `d43c59b58a`, 158 commits behind and without `INSERT_ON_MISS`).
 
-**Prod is 158+ commits behind, and the gap is the whole problem.** `d43c59b58a`
-is an ancestor of the current tip and contains **zero occurrences of
-`INSERT_ON_MISS`** — the flag does not exist in the code prod is running. Setting
-it there changes nothing.
+**As of 2026-09-18 the script carries the full winning config.** Four changes
+against the pre-campaign script, each with a backup alongside:
 
-Therefore the env changes below are step 2, not step 1:
+| Setting | Before | Now | Why | Backup |
+|---|---|---|---|---|
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | unset (off) | **`2`** | +14.2% for stage 1, a further +4.4% for stage 2's +480 slots | `.bak-pre-stage2-20260918` |
+| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a boundary every decode forward. **Stage 2 requires 1 — see the launcher warning above** | same |
+| `--disable-overlap-schedule` | present | **removed** | +4.5% / +2.9%. Its absence *is* the optimization | same |
+| `SGLANG_MOE_EXPERT_FUSED_PLAN` | unset | **`1`** | +6.4% | `.bak-pre-fusedplan-20260918` |
 
-1. **Get the code to prod first.** Fetch and fast-forward the
-   `main-port-probe-7bc4eb` worktree to the tip of
-   `shared/codex/nvfp4-expert-stream-main` (do not pin a SHA from this document
-   — it is written before the commit that contains it). That advances prod by 158
-   commits — far more than our four optimizations — so it needs its own
-   validation pass, not a flag flip. (The worktree's own `git status` reports
-   "behind 13" against a stale remote-tracking ref; fetch first. The 158 figure
-   is computed where both commits are present and is the one to trust.)
-2. **Then change exactly three things:**
-
-| Setting | Prod today | Should be | Why |
-|---|---|---|---|
-| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | unset (off) | **`2`** | +14.2% for stage 1, and a further +4.4% for stage 2's +480 slots. The largest single win |
-| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a residency boundary after every decode forward; it refuses to initialise otherwise. **Stage 2 requires 1 — see the launcher warning above** |
-| `--disable-overlap-schedule` | **present** | **remove the flag** | +4.5% / +2.9%. Its absence *is* the optimization |
-
-The hc_mix CTA cap needs no change once the code is there — `SGLANG_OPT_HC_MIX_MAX_CTAS`
-defaults to 128. Note that removing `--disable-overlap-schedule` also depends on
-code prod does not yet have: the overlap admission path came from
-`host-decode-overhead` @ `90914e33ac`. All three changes are gated on step 1.
+Validated after the stage-2 change: healthy in 201 s, `DIRECT`, 4,660 slots,
+`scratch_bytes: 0`, coherent generation. **The fused-planner line was added after
+that validation and has not been started under the prod script yet** — prod was
+left down after the 2026-09-18 traces.
 
 Keep everything else prod already has, including `--tool-call-parser auto`,
 `SGLANG_QWEN4_PLE_FILE_READER=uring`, `SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY=1`,
 `SGLANG_FILE_CACHE_MODEL_PATH`, `SGLANG_VLM_CACHE_SIZE_MB=0` and the PLE RSS budget
 vars — none are in the benchmark launcher and all are production behaviour.
 
-**Prod runs a 12,288 MB hot cache; every measurement here was at 10,240 MB.** The
-direction should hold (more slots, fewer misses) but the magnitude is unverified
-at that budget.
+**Prod runs a 12,288 MB hot cache; every measurement before the NEXTN arm was at
+10,240 MB.** That arm's control ran the prod config at 12,288 MB: 22.650 median.
+
+**Prod is down, and its script does not start as of 2026-09-18.** It carries
+`--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1
+--speculative-num-draft-tokens 4`, which fails twice over: prod's worktree
+(`797be6f678`) still has the speculation guard, and 4 draft tokens do not fit
+stage 2 at 12,288 MB (see the NEXTN arm). The last working script is
+`run-nvfp4-e16c-public.sh.bak-pre-nextn-20260918`.
 
 ### Flag rationale (questions that come up)
 
@@ -280,13 +303,17 @@ at that budget.
 
 - Measured only at **BS1** (`--max-running-requests 1`, decode graph captured for
   `bs=[1]`). Concurrency changes the memory split between KV and the hot cache.
-- Measured at **10,240 MB** hot cache, not production's 12 GiB. At 12 GiB stage 2
-  would give ~4,660 slots against stage 1's ~4,180 — the same +480, unmeasured.
+- Stage 2 and the fused planner were accepted at **10,240 MB**. At 12,288 MB the
+  shipped config ran 22.650 (NEXTN arm control); stage 2's +480 slots over stage 1
+  are still unmeasured at that budget.
 - `--weight-loader-drop-cache-after-load` is in the benchmark launcher and costs
   129 s of startup re-reading weights. Drop it in production.
 - Suite on the merged build is **1 failed / 860 passed**; the single failure is
   the doorbell copier flake (four parametrisations, clears 10/10 in isolation in
   two separate trees). The six earlier base failures are fixed by main-tip.
+- **The fused planner is BS1-only by construction.** At more than one token row it
+  falls back to the generic planner automatically, so it cannot break a larger
+  batch — but its +6.4% does not carry over either.
 - **Stage 2 has never run on production hardware under production load** — only
   on divix01's benchmark harness at BS1. It is accepted on a paired serving arm,
   which is the strongest evidence this campaign produced, not on production
@@ -308,6 +335,12 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 3 | **hc_mix CTA cap** | `hc-mix-stall` @ `732acac42f` | **D 14.089 → 14.713 (+4.4%)**; B flat (13.836 → 13.962) | `matrix/hcmix-20260917-113135`; microbench `analysis/hc-mix-stall/` |
 | 4 | Top-1 prefetch selector | `scoring-cost` @ `3baf985d33` | C 13.33 → 13.81; D unchanged. Width-16 bank cost 2.37 ms, scorer 1.71 ms | `servers/scoring-*` |
 | — | **Combined (1+2+3+4)** | `combined-iom` @ `f727a001f7` | **combo-B 16.645** | `servers/combo-b-p1/run-20260917-141132` |
+| 14 | **Insert-on-miss stage 2 (DIRECT)** | `insert-on-miss-stage-b` @ `797be6f678` | **18.541 → 19.360 (+4.4%)** over stage 1 + fused insert kernel | `matrix/accept-20260917-205847`; see backlog row 14 |
+| 21 | **Fused route planner** | flag only, on `797be6f678` (planner code predates the campaign) | **19.442 → 20.695 (+6.4%)**, 28/29 paired turns, p = 5.6e-8; 2.77 ms/token; hit rate unchanged | `matrix/fplan-20260918-032147` |
+| 24 | Per-layer slot floor for stage 2 | `e1d227a4bd` | Enabler, no speed of its own: lets 4 draft tokens start at 12,288 MB. **N4 vs N3: tie** (11/29 turns, median −1.5%, p = 0.27 two-sided); keep 3 | `matrix/nextn-20260918-123932` |
+| 25 | **Prefill staging in place, allocated once** | `844bb9d7a5` | **Peak VRAM 32,143 → 30,587 MiB** (37k-token prompt, NEXTN-3, 12,288 MB); prefill time unchanged | `matrix/memprobe-20260918-144144` |
+| 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `codex/nvfp4-expert-stream-main` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
+| 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. Long-prompt peak at 13,312 MB **not probed** | `matrix/cache-20260918-161820` |
 
 ### Rejected / closed
 
@@ -315,7 +348,7 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 |---|---|---|---|
 | 5 | **Prefetch (LLaPor pull)** | combo-D 15.928 vs combo-B 16.645, **−4.3%** | Moves +21 rows/token over the link. Precision is fine (77.7%) but coverage is only 19% of misses, a correct pull saves **zero** bytes (same row, earlier), and wrong pulls are pure waste. Plus it starves insert-on-miss: insertions 159.5 → 133.9/token |
 | 6 | Insert pull-covered experts | Recovers ~9 rows/token, still +11.5 worse than no-pull | Identity: **C − A = posted x (1 − precision)**. Needs ~100% precision to break even |
-| 7 | **Speculative decoding / bigger N** | At α=0.7, N=4 costs **+35%** rows per accepted token | Consecutive tokens share experts (1.68x at N=8) but the shared ones are *already resident*; miss reuse is only 1.28x. Break-even α = 0.84–0.93 |
+| 7 | **Speculative decoding / bigger N** | At α=0.7, N=4 costs **+35%** rows per accepted token | Consecutive tokens share experts (1.68x at N=8) but the shared ones are *already resident*; miss reuse is only 1.28x. Break-even α = 0.84–0.93. **Superseded by #23:** the row arithmetic held (NEXTN-3 moved ~4% more bytes/token) but the model left out the ~20 ms of per-forward non-transfer work, which speculation amortizes over 2.55 tokens |
 | 8 | Task 3 compute-window pull placement | Was −4%, re-tested at **+2.9%** after the hc_mix fix | Rejection was confounded by the stall. Now moot: it relocates *pull* copies and prefetch ships off. Conflicts with `scoring-cost` in `serving/runtime.py` |
 | 9 | Static per-layer pull gating | Est. 0.1–0.5 ms/token, below noise | Timing cancelled; code kept on `pull-layer-gating` @ `fa5b873a34` |
 | 10 | Layer-0 token-id table | Best ~0.85–0.91 ms/token vs 1.41 ceiling | Below the 1 ms gate; no code |
@@ -329,19 +362,29 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 |---|---|---|---|
 | 14 | **Insert-on-miss stage 2 (DIRECT)** | **+4.4% measured** over stage 1 + fused kernel | **ACCEPTED, ship it.** 19.360 vs 18.541 median, faster on 27/29 paired turns (p < 1e-5). +480 slots at no VRAM cost, +3.09 points hit rate, 9.9% fewer miss rows, 42.5 MB/token less over PCIe |
 | 19 | Fused masked insert kernel | ~45% off stage 1's boundary (5.32 ms isolated / 4.28 ms in-arm) | **Kept, default-off, stage-1 only.** Correct and tested, but stage 2 has no insert loop to fuse, so it is on no live path. Retained for a memory-constrained config where the 1.33 GB scratch is affordable but 3883 slots are not |
-| 15 | 12 GiB budget | +741 slots; curve says −6.08 ms/token (independent estimate said −6) | Not started; needs +2 GB VRAM |
+| 15 | 12 GiB budget | +741 slots; curve says −6.08 ms/token (independent estimate said −6) | **Measured incidentally, not as a paired arm:** the NEXTN arm's control (shipped config at 12,288 MB) ran 22.650, vs 20.695 at 10,240 MB in a different matrix — about −4.2 ms/token, below the curve's −6. Prod already runs 12,288 |
 | 16 | Reduce the 2.76 MB row size | Directly attacks bytes/token | **Closed by arithmetic.** Row size is set by the model (NVFP4 4-bit weights + E4M3 blockscales); it is not a tunable. The only mechanism that shrinks it is compression, which is #12 |
 | 17 | Fused scorer kernel | 1.7 ms D scoring cost | Only useful if prefetch is revived |
 | 18 | Fix 8 known test failures | Suite to zero | In flight on `fix-known-test-failures` |
+| 22 | **Fold stage 2's gather bookkeeping into the fused planner** | ≤ ~1.9–2.4 ms/token (trace upper bound, like the planner's 3.8–4.4 that realized 2.77) | Not started. `gather_destinations` (~16–23 kernels/layer) and `_commit_gather` (22) are what remains of the tail after #21. Supersedes the handoff's B2, whose ~1% was scoped against stage 1 |
+| 26 | **Chunked prefill 8192** | Long-prompt prefill **−28% / −36%** (31k / 37k tokens) at +420 MiB peak over 4096, measured *before* pre-sizing | One clean probe on the pre-sized build still owed (the first attempt lost its memory to other GPU jobs mid-load). TTFT only; decode unaffected |
+| 28 | Token embedding to pinned host memory | 1.18 GiB (~+450 slots), lossless; decode reads one 5 KB row per token | Not started. No option exists; copy the PLE offload pattern. The LM head (also 1.18 GiB) cannot move: every token multiplies against all of it |
+| 29 | Prefill MoE in expert groups | Staging ~4x smaller again | Not started; needs the fused-MoE runner to split and re-sum per group. Only after #28 |
 | 20 | **Offline blockscale re-coding** (precomputed codebook) | **+1.6%** lossless (6-bit) / **+3.2%** lossy (4-bit) | **DEFERRED — do not pick this up without asking the repo owner first.** Not blocked on evidence; it is an open decision about accuracy budget, and it is the owner's call to make |
 
 ### The pattern
 
 Two sophisticated ideas failed for the same structural reason. **On a saturated
-link, only reducing bytes helps.** Prefetch *re-times* bytes (−4.3%).
-Speculation *re-groups* bytes (−35% at realistic acceptance). Residency policy
-*reduces* bytes (+14.2%). Use this as the filter for any new proposal: does it
-change bytes/token?
+link, re-timing or re-grouping bytes does not help.** Prefetch *re-times* bytes
+(−4.3%). Speculation *re-groups* bytes (−35% at realistic acceptance). Residency
+policy *reduces* bytes (+14.2%).
+
+The filter has a second branch, found by trace rather than theory: the link and
+the compute run **serialized on one stream** (~62% / ~38% of a token), so
+removing work from the compute side shortens the token as directly as removing
+bytes does. The fused planner moves no bytes and won +6.4%. Ask of any new
+proposal: **does it change bytes/token, or remove work from that one stream?**
+Moving work *around* on it (re-timing) is the pattern that has failed.
 
 ### The link is at line rate, and the host caps it at Gen3
 
@@ -420,13 +463,24 @@ time. 36% of layer calls miss nothing.
 on one stream; summed kernel time 14.67 s vs GPU-busy union 14.49 s. The idle
 window above is structural, not incidental.
 
-**The small-kernel tail is the one new target.** ~6,800 kernels per token on the
-compute stream; 2.54M of the window's kernels ran under 2 µs, 4.3 ms/token of
-execution plus the inter-node gaps. Per-layer counts of `bitwise_and`,
-`bitwise_not`, `where`, `fill`, `sum`, `index_select` at 6–7 each look like
-hot-cache routing bookkeeping — **unverified attribution**. It does not touch
-the link, so it only pays directly on the ~20 ms compute share, and more if the
-idle window is ever filled.
+**The small-kernel tail is hot-cache bookkeeping — verified, and partly
+removed.** Each layer runs the same 137 kernels (146 on the 12 full-attention
+layers); gaps between them average only 0.35 µs. Between the router and the MoE
+GEMM sit **107 bookkeeping kernels, ~130 µs/layer, 6.2 ms/token** — more than
+twice the MoE runner (54 µs) and as much as the rest of the layer (134 µs).
+Split by code order (boundaries +-7 kernels):
+
+| block | kernels/layer | ms/token |
+|---|---:|---:|
+| generic route planning + counters (`if not fused:` branch) | ~62–69 | ~3.8–4.4 |
+| stage 2 `gather_destinations` | ~16–23 | ~1.0–1.5 |
+| stage 2 `_commit_gather` | 22 | ~0.9 |
+
+The first block is what `SGLANG_MOE_EXPERT_FUSED_PLAN` replaces — which production
+was **not** running (see [the arm](#fused-route-planner-arm-2026-09-18)); it
+realized 2.77 ms/token of the 3.8–4.4 upper bound. The other two are backlog #22.
+The ordered sequence for one layer is saved as
+`run-20260918-004721/profiles/layer-kernel-sequence.txt`.
 
 **Open:** 15.35 GB of plain H2D memcpy in the window (670 ops, ~34 MB/token)
 is not the segment kernel and is unattributed — prefill inside the window or
@@ -643,6 +697,29 @@ Under `/data/models/slang/nvfp4-work/cc-e16c-public/` (production-config traces)
 | Graph-mode trace, 120 s (kernel table is prefill-only, see above) | `run-20260918-000659/profiles/report.nsys-rep` |
 | Traced launcher (node mode, `--delay=360 --duration=20`) / graph-mode backup | `../run-nvfp4-e16c-public-TRACED.sh` / `.bak-graphmode` |
 | Trace load driver (health `-m 60`, quits after 3 consecutive failures) | `drive.sh` |
+| One layer's ordered kernel sequence (node-mode trace) | `run-20260918-004721/profiles/layer-kernel-sequence.txt` |
+
+Fused route planner work, under `cc-expert-prediction/`:
+
+| What | Where |
+|---|---|
+| Arm | `matrix/fplan-20260918-032147`, `servers/fplan-{F,C}/run-2026091803*`; the first C attempt is marked `ABORTED` |
+| Arm script / paired analysis | `fplan-arm.sh` / `fplan_paired.py` |
+| Worktree | `wt-fusedplan` @ `797be6f678` + the test and launcher change |
+| CUDA test runner (`ALLOW_SHARED_GPU=1` waives the census check, keeps the lock) | `run-fusedplan-tests.sh`, logs `logs/cuda-tests-fusedplan-*` |
+
+NEXTN work, under `cc-expert-prediction/`:
+
+| What | Where |
+|---|---|
+| Arm | `matrix/nextn-20260918-115808`, `servers/nextn-{N,F}/run-20260918-1{15808,21147}`; `matrix/nextn-20260918-{104943,105436,110139}` are `ABORTED` |
+| Arm script / paired analysis | `nextn-arm.sh` / `nextn_paired.py` (its "C"/"F" labels mean F/N) |
+| Worktree | `wt-nextn` @ `797be6f678` + the guard removal, test and launcher switch (`wt-nextn.patch`) |
+| CUDA test runner | `run-nextn-tests.sh`, logs `logs/cuda-tests-nextn-*` |
+| N4 vs N3 arm / paired | `matrix/nextn-20260918-123932` / `nextn4_paired.py` (its "C"/"F" mean N3/N4) |
+| Memory probe (waits for arms, retries a lost lock) | `mem-probe.sh`; `matrix/memprobe-20260918-{125301,140008,144144}` |
+| Staging test runners (lock-queued) | `run-staging-green.sh`, `run-presize-tests.sh`; logs `logs/cuda-tests-{staging,presize}-*` |
+| Cache-budget arm | `cache-arm.sh`; `matrix/cache-20260918-161820` (`-161749` is `ABORTED`) |
 
 The `_hc_mix` persistent-kernel pattern is recorded as **checked and
 inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
@@ -659,6 +736,183 @@ turns with 3.7% different token totals at temperature 0. The check cannot
 discriminate a code change from the stack's own nondeterminism. Byte-identity
 rests on the unit tests, which control routes and compare every byte of every
 cache tensor including untouched scratch rows.
+
+### Fused route planner arm 2026-09-18
+
+`matrix/fplan-20260918-032147`, script `fplan-arm.sh` (a copy of `accept-arm.sh`),
+build `797be6f678` in `wt-fusedplan`, acceptance grade (8 sessions / 29 turns /
+768 tokens), `OVERLAP_SCHEDULE=1`, 10,240 MB, one cold server per condition,
+env verified from `/proc/<pid>/environ`, empty census before, between and after.
+F ran first.
+
+| | condition | median tok/s | mean | hit rate |
+|---|---|---:|---:|---:|
+| C | stage 2, generic planner (shipped) | 19.442 | 19.649 | 71.07% |
+| **F** | **stage 2 + `SGLANG_MOE_EXPERT_FUSED_PLAN=1`** | **20.695** | **20.834** | 70.73% |
+
+Paired: **F faster on 28/29 turns, one-sided sign test p = 5.6e-8**, median
++1.254 tok/s (ratio 1.060), **2.77 ms/token saved** (mean 2.94). C reproduced the
+previous day's 19.360 within drift.
+
+- **Mechanism is compute, not caching:** F's hit rate is 0.34 points *lower*.
+- **Not a length artifact.** The servers generated different lengths on most
+  turns (F +1.9% tokens) and long generations run faster, but the 5 identical-length
+  turns give the same median, +1.254 (4/5 faster); within 10% length, 12/13.
+- **Correctness:** `test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one`
+  runs twin stage-2 managers (generic vs fused) through 30 captured decode steps
+  and requires identical residency, counters and slot bytes, with the generic
+  planner mocked to fail. It kills a mutant that permutes the planner's
+  rank-to-expert layout at step 0. Related suites: 298 passed, 0 failed.
+
+**Gotcha: every earlier arm that says `fused_plan=1` ran the generic planner.**
+`run-shadow-server.sh` printed `fused_plan=1` as a hard-coded literal in the run
+manifest and startup banner (since `ee9c86f189`) and never exported
+`SGLANG_MOE_EXPERT_FUSED_PLAN`, which defaults to `False`. The planner, reviewed
+and approved in Stage A, was therefore never measured in serving until this arm,
+and the claim "fused plan 1" in the prefetch handoff's baseline arms is false.
+The launcher now takes `FUSED_PLAN=1`, exports the variable only when set, and
+records the real value. Same lesson as the `OVERLAP_SCHEDULE` gotcha: **verify a
+flag in the server's environment, not in what the harness says it did.**
+
+### NEXTN speculative decoding arm 2026-09-18
+
+**Why it was refused, and why the refusal was too broad.** `model_runner.py`
+refused `SGLANG_MOE_GPU_RESIDENCY_UPDATE` with any speculative algorithm:
+"verify commits do not reach the device clock". True, but harmless. The host
+clock's `commit` (`expert_residency_clock.py`, fed by `eagle_worker_v2.py`'s
+`on_verify_complete_cpu`) only corrects `tokens_since_boundary`, i.e. how far a
+boundary decays scores. Boundaries fire on *forward* counts, which the device
+counts identically for DECODE and VERIFY. Without the commit the device decays
+each verify by its drafted positions (N) instead of the committed tokens (~α·N+1),
+and its route counts include those same N positions, so drafted positions are
+arguably the consistent unit. Draft forwards never reach it: `observe_forward`
+returns on DRAFT, and the MTP layer's experts are FP8, so it has no streamers.
+The guard was deleted (the DP-attention and batch-size checks stay).
+
+**The binding constraint is stage 2's slot floor, not the clock.** A verify
+gathers `draft_tokens × top_k` routes per layer (40 at 4 tokens), and DIRECT
+requires every layer to hold **twice** its gather rows (`_init_insert_direct`'s
+capacity guarantee), i.e. 80 slots. The per-layer split follows seed scores, so
+the smallest layer sets the floor:
+
+| Draft tokens | Budget | Outcome |
+|---|---|---|
+| 4 | 12,288 MB | refused at startup: layer 0 has **75** slots for 40 rows |
+| 4 | 13,824 MB | starts (5,242 slots), then **OOM on the first prefill** (348 MiB staging alloc, 252 MiB free) |
+| **3** | **12,288 MB** | **runs**: 30 rows, needs 60, layer 0 has 75; 31.9 of 32 GB in use |
+
+**Arm:** `matrix/nextn-20260918-115808`, script `nextn-arm.sh` (a copy of
+`fplan-arm.sh`), worktree `wt-nextn` = `797be6f678` + this change, acceptance
+grade, `OVERLAP_SCHEDULE=1`, both conditions at 12,288 MB with stage 2 + fused
+planner, speculation verified from `server_args` in each server log. N ran first.
+Two earlier attempts are marked `ABORTED` (the 4-token failures above) and a third
+was stopped for other GPU work after 5 turns.
+
+| | condition | median tok/s | mean | decode-phase hit rate | H2D / token ² |
+|---|---|---:|---:|---:|---:|
+| F | shipped config (no speculation) | 22.650 | 22.640 | 74.44% | 360 MB |
+| **N** | **F + NEXTN, 2 steps, top-k 1, 3 draft tokens** | **24.930** | **24.915** | 69.87% | 375 MB |
+
+² Cumulative counters include warm-up (same for both); N's decode rows are under
+the `speculative` phase key, not `decode`.
+
+Paired: **N faster on 29/29 turns, one-sided sign test p = 1.9e-9**, median
++2.137 tok/s (ratio 1.096, min +0.22, max +4.11), **3.94 ms/token saved** (mean
+4.12). Mean accept length 2.55. Length-matched turns agree: 5/5 identical-length
+and 12/12 within 10% are faster.
+
+- **Mechanism: fewer forwards, not fewer bytes.** N moves ~4% *more* bytes per
+  token at a 4.6-point lower hit rate, as #7 predicted, but each verify pays the
+  ~20 ms of serialized non-transfer work once for ~2.55 tokens.
+- **The fused planner does not run on verify forwards** (one-token rows only); N
+  wins despite losing it.
+- **Correctness:** `test_a_speculative_verify_forward_keeps_direct_exact` replays
+  a 2-token TARGET_VERIFY graph with repeated experts under DIRECT with the fused
+  flag on, commits random accept counts, and checks per step: gathered bytes,
+  every miss lands in a slot no token reads, distinct destinations, no routed
+  resident evicted, byte-exact slots, and device `forwards` equal to the host
+  clock's. Related suites: 299 passed.
+- **Not deployed.** 31.9 of 32 GB with outputs up to 768 tokens; a long prefill
+  (context is 40,000) is untested and the 13,824 MB attempt shows how little
+  headroom there is. Run one ~30k-token request before shipping.
+
+**Test gotcha: `envs.X.override()` has no `try/finally`** (`environ.py`). A test
+that raises inside the `with` leaks the value into every later test in the
+process; a failing draft of the test above left `SGLANG_MOE_EXPERT_FUSED_PLAN=true`
+set and produced four unrelated-looking `test_expert_graph_gather` failures.
+
+### Prefill staging and VRAM 2026-09-18
+
+**Where the 32 GB goes** (NEXTN-3, 12,288 MB, from the server log):
+
+| Item | Size |
+|---|---:|
+| Hot cache | 12.0 GiB |
+| Target non-expert weights | 10.05 GB (linear attention 3.89 GiB, full attention 1.42, embed_tokens 1.18, lm_head 1.18, shared experts 0.44, other ~1.9; vision skipped by `--language-model-only`) |
+| NEXTN draft layer (mostly its FP8 experts) | 2.46 GB |
+| KV (target + draft) / Mamba + spec scratch / CUDA graphs | 1.0 / 0.44 / 0.49 GB |
+| Free after startup | 4.08 GB, consumed at the prefill peak |
+
+**The prefill peak was staging, and it does not scale with the chunk.** The
+eager hot-cache gather stages every routed expert of a layer, and a 2048- or
+4096-token chunk routes to 480–495 of 512. It held them **twice** — misses in a
+`hot_cache_misses` buffer, then stitched into the kernel's buffer by the
+`index_copy` at `expert_stream.py:1033` — and grew both a step at a time
+(13–21 regrowths per prefill), leaving each outgrown buffer in the allocator's
+cache: **2.6 GB of staging**. So chunk 2048 freed nothing (peak 32,145 vs 32,143
+MiB) and prefilled 60% slower.
+
+`844bb9d7a5`: misses take the kernel buffer's first rows so their copies land in
+place (hits after them, routes remapped), and the buffer is allocated at a whole
+layer's experts on first use. Probe: `mem-probe.sh`, NEXTN-3 at 12,288 MB, a
+30,906- then a 37,274-token prompt, `nvidia-smi` sampled every 100 ms:
+
+| Build | chunk | Peak MiB | 31k / 37k prefill | OOM |
+|---|---:|---:|---:|---|
+| before | 4096 | 32,143 | 35.0 / 38.9 s | no |
+| before | 2048 | 32,145 | 56.6 / 61.9 s | no |
+| in place | 4096 | 31,387 | 33.9 / 38.7 s | no |
+| in place | 8192 | 31,807 | **24.3 / 24.7 s** | no |
+| **in place + allocated once** | 4096 | **30,587** | 34.3 / 37.5 s | no |
+
+- **Bigger chunks are faster prefill.** Each expert copied over PCIe serves
+  every token of the chunk that routes to it, and prefill is ~90% transfer
+  (~50 GB per 4096-token chunk at a 23% prefill hit rate). That is also why
+  CUDA graphs for prefill are not worth building: they remove launch overhead
+  from a 4.5 s chunk.
+- **Tests:** `test_eager_hot_cache_gather_stages_a_layer_once` (old: 2.0 layers
+  at peak) and `test_growing_prefill_gathers_do_not_regrow_staging` (old: 1.75
+  layers) both fail on the old code. Device-to-device assembly now counts hit
+  rows only (three test expectations updated). All MoE suites: 726 passed.
+- **Gotcha: a peak-memory test must not index on the device.** Building the
+  routed rows to check correctness (`tensors[name][compact]`) allocated 2x the
+  staging and made the first version of the regrowth test fail identically on
+  old and new code.
+- **Gotcha: 10 test files in `test/registered/unit/layers/moe/` do not import**
+  on divix01's venv (`pyarrow` has no `PyExtensionType`). A plain pytest run of
+  the directory aborts at collection; use `--continue-on-collection-errors`.
+- **Gotcha: another session shares `cc-gpu.lock`** with short back-to-back jobs.
+  Check-then-launch loses the race (the launcher's `flock --nonblock` exits at
+  once); queue with a blocking `flock -w` or retry a launch that leaves no log.
+
+**Cache-budget arm** (`matrix/cache-20260918-161820`, `cache-arm.sh`, acceptance
+grade, same build, NEXTN-3 + stage 2 + fused planner, B first):
+
+| | budget | slots | median tok/s | mean | speculative-phase hit rate | H2D / token |
+|---|---:|---:|---:|---:|---:|---:|
+| N | 12,288 MB | 4,660 | 25.208 | 25.192 | 70.17% | 372 MB |
+| **B** | **13,312 MB** | **5,048** | **27.081** | **26.514** | **72.11%** | **345 MB** |
+
+Paired: **B faster on 24/29 turns, one-sided sign test p = 2.7e-4**, median
++1.615 tok/s (ratio 1.061, min -2.44, max +3.69), 2.16 ms/token saved. Accept
+length 2.55 (N) vs 2.57 (B): the gain is bytes, not speculation.
+
+- **Not yet safe to deploy.** The +1,024 MB comes out of the ~1.5 GB the staging
+  change freed; the 37k-token peak at 13,312 MB is estimated at ~31,600 of
+  32,607 MiB but was not measured. Run `mem-probe.sh` at 13,312 MB first.
+- **Script gotcha:** the requested-bytes check needs `grep -qF` on a precomputed
+  number; an unquoted pattern lost its quotes through `ssh` and the first launch
+  (`-161749`, `ABORTED`) was stopped before it ran.
 
 ### Acceptance arm 2026-09-18 — the shipping decision
 

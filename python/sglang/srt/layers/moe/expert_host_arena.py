@@ -9,6 +9,8 @@ import os
 
 import torch
 
+from sglang.srt.layers.moe.expert_format import iter_expert_streamers
+
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_register,
     _cuda_host_unregister,
@@ -59,14 +61,16 @@ class ExpertHostArena:
     @classmethod
     def from_model(cls, model: torch.nn.Module) -> ExpertHostArena | None:
         """Bind every streamed expert layer of ``model``; None when there are none."""
-        streamers = [
-            streamer
-            for module in model.modules()
-            for streamer in [getattr(module, "_nvfp4_expert_streamer", None)]
-            if streamer is not None
-        ]
+        streamers = list(iter_expert_streamers(model))
         if not streamers:
             return None
+        for streamer in streamers:
+            if not streamer.format.supports_host_arena or streamer.has_spec_only_tensors:
+                raise ValueError(
+                    f"expert format {streamer.format.key!r} of layer "
+                    f"{streamer.layer_id} does not support the host arena; unset "
+                    "SGLANG_MOE_EXPERT_HOST_ARENA"
+                )
         arena = cls()
         try:
             for streamer in streamers:

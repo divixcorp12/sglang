@@ -36,7 +36,12 @@ from sglang.srt.layers.moe.expert_residency_clock import (
     ResidencyBoundaryClock,
     classify_forward,
 )
-from sglang.srt.layers.moe.expert_stream import ExpertStreamer, _tensor_data
+from sglang.srt.layers.moe.expert_format import (
+    inclusive_hot_slot_limit,
+    iter_expert_streamers,
+    require_graph_gather_support,
+)
+from sglang.srt.layers.moe.expert_stream import ExpertStreamer
 
 from sglang.srt.layers.moe.expert_transfer import (
     NVFP4_TRANSFER_TENSOR_COUNT,
@@ -133,9 +138,9 @@ class ExpertHotCache:
         )
         self.allocation_bytes = allocation_rows * self.bytes_per_expert
         devices = {
-            _tensor_data(getattr(streamer.layer, name)).device
-            for name in streamer.tensor_names
-            if _tensor_data(getattr(streamer.layer, name)).device.type == "cuda"
+            streamer.source(spec.name).device
+            for spec in streamer.specs
+            if spec.residence == "device"
         }
         if len(devices) > 1:
             raise ValueError("hot cache CUDA sources must share one device")
@@ -143,13 +148,12 @@ class ExpertHotCache:
             iter(devices), torch.device("cuda", torch.cuda.current_device())
         )
         self.tensors = {
-            name: torch.empty(
-                (allocation_rows,) + tuple(source.shape[1:]),
-                dtype=source.dtype,
+            spec.name: torch.empty(
+                (allocation_rows,) + spec.row_shape,
+                dtype=spec.dtype,
                 device=self.device,
             )
-            for name in streamer.tensor_names
-            for source in [_tensor_data(getattr(streamer.layer, name))]
+            for spec in streamer.specs
         }
         self.expert_to_slot = torch.full(
             (streamer.num_experts,), -1, dtype=torch.long, device=self.device
@@ -403,11 +407,22 @@ class ExpertHotCache:
         return True
 
     def _load_reserved(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
-        """Copy one reserved placement bundle before publishing any slot mapping."""
+        """Copy one reserved placement bundle before publishing any slot mapping.
+
+        Tensors without a dense source are read by the streamer's row source:
+        through the pinned host tier in chunks of its capacity when the layer
+        has six tensors and a pinned tier, else one row at a time into staging.
+        """
         if not tickets:
             return
         assert self._transfer_executor is not None
-        if len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT:
+        spec_only = self.streamer.has_spec_only_tensors
+        six_tensors = len(self.streamer.tensor_names) == NVFP4_TRANSFER_TENSOR_COUNT
+        pinned_cache = self.streamer.pinned_host_cache
+        if spec_only and six_tensors and pinned_cache is not None and pinned_cache.capacity:
+            self._load_reserved_in_chunks(tickets, pinned_cache)
+            return
+        if not six_tensors or spec_only:
             for ticket in tickets:
                 if not self.begin_loading(ticket):
                     raise RuntimeError("hot cache reservation became stale")
@@ -428,6 +443,73 @@ class ExpertHotCache:
         self._transfer_executor.wait(ticket, current_stream)
         self.complete_promotion(promotion)
         self.wait_for_slot_publication()
+
+    def _load_reserved_in_chunks(
+        self, tickets: Sequence[HotCacheSlotTicket], pinned_cache
+    ) -> None:
+        """Promote tickets through the pinned tier, one chunk per transfer.
+
+        Each chunk holds at most ``pinned_cache.evictable_rows()`` tickets,
+        read when the chunk starts: an inclusive ``is_pinned`` protects the
+        rows the hot cache has reserved, so every admitted chunk can shrink the
+        room for the next. Each chunk's rows are admitted to the pinned tier,
+        copied from its slabs, and waited for on the host before the next chunk
+        may evict them. When no slot is evictable, the remaining tickets are
+        cancelled and the call raises.
+
+        If a chunk fails, the tickets after it are cancelled, and so is its own
+        promotion if it is still in flight. A failed ``_prepare_promotion`` or
+        submission has already cancelled its own tickets. Once copies were
+        submitted, their slots are freed only after the device has drained
+        them. If the device cannot drain (a sticky CUDA error), the promotion
+        stays in flight with its slots LOADING. ``stage_reassign`` then refuses
+        further updates, so no later reservation can reuse a slot a copy may
+        still write.
+        """
+        tickets = tuple(tickets)
+        start = 0
+        while start < len(tickets):
+            chunk_rows = pinned_cache.evictable_rows()
+            if chunk_rows < 1:
+                self._cancel_tickets(tickets[start:])
+                raise RuntimeError(
+                    "the pinned host tier has no evictable slots for hot cache promotions"
+                )
+            chunk = tickets[start : start + chunk_rows]
+            promotion = None
+            submitted = False
+            try:
+                promotion = self._prepare_promotion(chunk)
+                current_stream = torch.cuda.current_stream(self.device)
+                ticket = submit_hot_cache_promotions(
+                    [promotion], producer_stream=current_stream
+                )
+                submitted = True
+                self._transfer_executor.wait(ticket, current_stream)
+                current_stream.synchronize()
+                self.complete_promotion(promotion)
+            except BaseException:
+                if promotion is not None and self.promotion_in_flight is promotion:
+                    if not submitted or self._drain_device():
+                        self.abort_promotion(promotion)
+                rest = tickets[start + len(chunk) :]
+                if rest:
+                    self._cancel_tickets(rest)
+                raise
+            start += len(chunk)
+        self.wait_for_slot_publication()
+
+    def _drain_device(self) -> bool:
+        """Wait until every queued copy on the cache's device has run; False if it cannot."""
+        try:
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            logger.warning(
+                "hot cache promotion copies could not be drained; their slots stay "
+                "LOADING and the cache refuses further updates"
+            )
+            return False
+        return True
 
     def _copy_routes_for(
         self, sources: Mapping[str, torch.Tensor], use_secondary: Sequence[bool]
@@ -466,7 +548,7 @@ class ExpertHotCache:
             expert_rows = [ticket.expert_id for ticket in tickets]
             destination_slots = [ticket.slot for ticket in tickets]
             sources = {
-                name: _tensor_data(getattr(self.streamer.layer, name))
+                name: self.streamer.source(name)
                 for name in self.streamer.tensor_names
             }
             secondary_source_rows = None
@@ -484,6 +566,12 @@ class ExpertHotCache:
                         if name in pinned_cache.tensors:
                             sources[name] = pinned_cache.tensors[name]
                             use_secondary_source_rows[position] = True
+            if any(source is None for source in sources.values()):
+                raise RuntimeError(
+                    "hot cache promotion of expert tensors without a dense source "
+                    "needs every row in the pinned host tier; promote at most its "
+                    "capacity at once"
+                )
             self._transfer_plan.set_rows(
                 expert_rows,
                 destination_slots,
@@ -587,7 +675,10 @@ class ExpertHotCache:
                 tickets = self.reserve(
                     tuple(zip(promoted, free_slots)), consumer_complete=True
                 )
-                if len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT:
+                if (
+                    len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT
+                    or self.streamer.has_spec_only_tensors
+                ):
                     self._load_reserved(tickets)
                 elif tickets:
                     promotion = self._prepare_promotion(tickets)
@@ -817,6 +908,20 @@ class _OperationalCounters:
     side_pull_covered_routes: int = 0
     side_pull_residual_routes: int = 0
     side_pull_useful_precision: float = 0.0
+    host_read_rows: int = 0
+    host_read_file_bytes: int = 0
+    host_read_split_bytes: int = 0
+    host_read_ns: int = 0
+    host_split_ns: int = 0
+
+
+def _add_host_read_counters(counters: _OperationalCounters, stats: Any) -> None:
+    """Sum one gather's row-source reads into a phase/layer's counters."""
+    counters.host_read_rows += getattr(stats, "host_read_rows", 0)
+    counters.host_read_file_bytes += getattr(stats, "host_read_file_bytes", 0)
+    counters.host_read_split_bytes += getattr(stats, "host_read_split_bytes", 0)
+    counters.host_read_ns += getattr(stats, "host_read_ns", 0)
+    counters.host_split_ns += getattr(stats, "host_split_ns", 0)
 
 
 _PHASES = {
@@ -977,10 +1082,7 @@ class ExpertHotCacheManager:
         streamers = {}
         if copy_backend not in ("gpu", "dma"):
             raise ValueError("expert copy backend must be gpu or dma")
-        for module in model.modules():
-            streamer = getattr(module, "_nvfp4_expert_streamer", None)
-            if streamer is None:
-                continue
+        for streamer in iter_expert_streamers(model):
             layer_id = index(streamer.layer_id)
             if layer_id < 0 or layer_id in streamers:
                 raise ValueError(
@@ -989,6 +1091,8 @@ class ExpertHotCacheManager:
             streamers[layer_id] = streamer
         if not streamers:
             return None
+        if index(graph_gather_batch_size) or gpu_residency_update or expert_doorbell:
+            require_graph_gather_support(streamers.values())
         seed = None
         if seed_path is not None:
             path = Path(seed_path)
@@ -1056,15 +1160,65 @@ class ExpertHotCacheManager:
             raise ValueError(
                 "expert hot cache budget cannot hold the graph-gather scratch and pull rows"
             )
+        # DIRECT refuses any layer holding fewer than twice its gather rows (see
+        # `_init_insert_direct`), so a seed that scores one layer low would refuse the
+        # whole budget. Give every layer that floor from its own best experts first; the
+        # scores then spend the rest. When every layer clears the floor anyway, the
+        # selection is unchanged: each layer's picks are its top-scored experts either way.
+        floors = {
+            layer_id: min(2 * rows, streamers[layer_id].num_experts) if direct else 0
+            for layer_id, rows in gather_rows.items()
+        }
+        chosen = {layer_id: set() for layer_id in streamers}
+        # A format with an inclusive pinned tier keeps every hot expert in host memory
+        # too, so its layers hold at most `inclusive_hot_slot_limit` slots and the
+        # budget they cannot use goes to other layers. Other formats have no limit.
+        slot_limits = {
+            layer_id: inclusive_hot_slot_limit(streamer)
+            for layer_id, streamer in streamers.items()
+        }
+        clamped = set()
+        for floor_pass in (True, False):
+            for _, expert_id, layer_id in candidates:
+                if expert_id in chosen[layer_id] or (
+                    floor_pass and len(chosen[layer_id]) >= floors[layer_id]
+                ):
+                    continue
+                limit = slot_limits[layer_id]
+                if limit is not None and len(chosen[layer_id]) >= limit:
+                    # This clamp is reachable during the floor pass only if a
+                    # layer both has a floor (DIRECT, graph_gather_batch_size > 0)
+                    # and an inclusive pinned tier's slot limit. That never
+                    # happens today: a nonzero floor requires every streamer to
+                    # have passed require_graph_gather_support, and no format
+                    # both supports graph gather and sets inclusive_pinned_tier
+                    # (EXL3's inclusive tier is eager-only). Assert this instead
+                    # of relying on it silently, since the clamp would otherwise
+                    # cut into a layer's floor and DIRECT would refuse the budget.
+                    assert not floor_pass or floors[layer_id] == 0
+                    clamped.add(layer_id)
+                    continue
+                slot_bytes = streamers[layer_id].bytes_per_expert
+                pull_row_bytes = (
+                    slot_bytes if pull_row_enabled and layer_id not in allocated_layers else 0
+                )
+                if slot_bytes + pull_row_bytes <= remaining:
+                    chosen[layer_id].add(expert_id)
+                    remaining -= slot_bytes + pull_row_bytes
+                    allocated_layers.add(layer_id)
         for _, expert_id, layer_id in candidates:
-            slot_bytes = streamers[layer_id].bytes_per_expert
-            pull_row_bytes = (
-                slot_bytes if pull_row_enabled and layer_id not in allocated_layers else 0
-            )
-            if slot_bytes + pull_row_bytes <= remaining:
+            if expert_id in chosen[layer_id]:
                 selected[layer_id].append(expert_id)
-                remaining -= slot_bytes + pull_row_bytes
-                allocated_layers.add(layer_id)
+        for layer_id in sorted(clamped):
+            streamer = streamers[layer_id]
+            logger.info(
+                "Expert hot cache clamps layer %d to %d slots: its inclusive pinned "
+                "tier holds %d rows and an eager gather stages up to %d more",
+                layer_id,
+                slot_limits[layer_id],
+                streamer.pinned_host_cache.capacity,
+                streamer.format.max_gather_rows or 0,
+            )
         if not any(selected.values()) and not any(gather_rows.values()):
             return None
         manager = cls()
@@ -2467,9 +2621,8 @@ class ExpertHotCacheManager:
                 getattr(stats, "gather_fallback_used", False)
             )
             counters.gather_copy_engine_bytes += getattr(stats, "copy_engine_bytes", 0)
-            file_bytes = getattr(
-                streamer.layer, "_nvfp4_file_source_bytes_per_expert", None
-            )
+            _add_host_read_counters(counters, stats)
+            file_bytes = streamer.file_source_bytes_per_expert
             if file_bytes is not None:
                 counters.file_source_bytes = (
                     counters.file_source_bytes or 0

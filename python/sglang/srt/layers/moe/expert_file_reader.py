@@ -1,13 +1,19 @@
-"""io_uring reads of NVFP4 expert rows from their verified expert files."""
+"""io_uring reads of expert rows from verified expert files."""
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.expert_row_source import (
+    HostSlotLayout,
+    RowReadStats,
+    SynchronousSubmit,
+)
 from sglang.srt.model_loader.file_row_reader import (
     AlignedRowSource,
     read_plans,
@@ -17,19 +23,29 @@ from sglang.srt.model_loader.file_row_reader import (
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.io.uring_file_reader import UringFileReader
+    from sglang.srt.model_loader.file_tensor_cache import FileTensorCacheGroup
 
 logger = logging.getLogger(__name__)
 _LOGGED_MODES: set[str] = set()
 
 
-class ExpertFileRowReader:
+class ExpertFileRowReader(SynchronousSubmit):
     """Read host expert rows from the files behind their mapped tensors.
 
-    Only tensors bound by the NVFP4 expert file cache are covered. Their
-    parameters carry the verified cache group, and row ``e`` of a tensor lives
-    at byte ``e * row_bytes`` of its member file because the runtime view is
-    contiguous from storage offset zero, which :meth:`from_layer` checks.
+    :meth:`from_layer` covers the tensors bound by the NVFP4 expert file
+    cache. Their parameters carry the verified cache group, and row ``e`` of
+    a tensor lives at byte ``e * row_bytes`` of its member file because the
+    runtime view is contiguous from storage offset zero, which it checks.
+    :meth:`from_group` covers members of a group opened directly, such as
+    repacked expert files that are not bound as layer parameters. The reader
+    is an ``ExpertRowSource`` with the per-name host layout.
     """
+
+    host_layouts = frozenset({HostSlotLayout.PER_NAME})
+    # One call is one io_uring batch; the reader pipelines its own queue depth.
+    preferred_batch_rows = 0
+    # O_DIRECT is used when a destination is page-aligned, buffered reads otherwise.
+    requires_page_aligned_destinations = False
 
     def __init__(
         self,
@@ -41,6 +57,13 @@ class ExpertFileRowReader:
         self._sources = dict(sources)
         self.mode = mode
         self.registered_bytes = 0
+        row_counts = {source.row_count for source in self._sources.values()}
+        if len(row_counts) > 1:
+            raise ValueError("expert file rows must share one expert count")
+        self.num_experts = next(iter(row_counts), 0)
+        self.file_bytes_per_expert = sum(
+            source.row_bytes for source in self._sources.values()
+        )
 
     @classmethod
     def from_layer(
@@ -106,6 +129,52 @@ class ExpertFileRowReader:
             )
         return cls(reader, sources, mode)
 
+    @classmethod
+    def from_group(
+        cls,
+        group: FileTensorCacheGroup,
+        names: Optional[Iterable[str]] = None,
+        mode: Optional[str] = None,
+    ) -> ExpertFileRowReader:
+        """Build a reader for members ``names`` (default: all) of an open cache group.
+
+        Each member must be a contiguous ``[experts, ...]`` tensor; the member
+        tag is the streamed tensor name.
+        """
+        mode = validate_file_reader_mode(
+            envs.SGLANG_MOE_EXPERT_FILE_READER.get() if mode is None else mode
+        )
+        if mode == "mmap":
+            raise ValueError(
+                "ExpertFileRowReader.from_group reads through io_uring; with "
+                "SGLANG_MOE_EXPERT_FILE_READER=mmap read the group's mapped "
+                "tensors through a TensorRowSource"
+            )
+        specs = {spec.tag: spec for spec in group.specs}
+        names = tuple(specs) if names is None else tuple(names)
+        if not names:
+            raise ValueError("ExpertFileRowReader.from_group needs at least one member")
+        reader = shared_uring_file_reader()
+        sources: dict[str, AlignedRowSource] = {}
+        for name in names:
+            spec = specs.get(name)
+            if spec is None:
+                raise ValueError(f"file tensor cache group has no member {name!r}")
+            tensor = group.tensors[name]
+            if not spec.shape or spec.shape[0] == 0 or not tensor.is_contiguous():
+                raise ValueError(
+                    f"file tensor cache member {name!r} is not a contiguous "
+                    "[experts, ...] tensor"
+                )
+            sources[name] = AlignedRowSource(
+                reader,
+                group.paths[name],
+                tensor[0].numel() * tensor.element_size(),
+                spec.shape[0],
+                direct=mode == "uring_direct",
+            )
+        return cls(reader, sources, mode)
+
     @property
     def names(self) -> tuple[str, ...]:
         return tuple(self._sources)
@@ -127,11 +196,12 @@ class ExpertFileRowReader:
         rows: torch.Tensor,
         destinations: Mapping[str, torch.Tensor],
         destination_rows: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> RowReadStats:
         """Read expert ``rows`` of every named tensor in one io_uring batch."""
         missing = [name for name in destinations if name not in self._sources]
         if missing:
             raise ValueError(f"expert file reader does not cover {missing}")
+        start = time.perf_counter_ns()
         read_plans(
             self._reader,
             [
@@ -139,3 +209,13 @@ class ExpertFileRowReader:
                 for name, destination in destinations.items()
             ],
         )
+        count = rows.numel()
+        return RowReadStats(
+            rows=count,
+            file_bytes=count
+            * sum(self._sources[name].row_bytes for name in destinations),
+            read_ns=time.perf_counter_ns() - start,
+        )
+
+    def close(self) -> None:
+        """Nothing to release: the io_uring reader belongs to the process."""
