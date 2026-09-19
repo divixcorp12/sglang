@@ -81,6 +81,21 @@ def test_logs_every_n_forwards_and_at_close(caplog):
     assert json.loads(lines[-1].split(": ", 1)[1])["decode_tokens"] == 3
 
 
+def test_capture_forwards_are_not_recorded(monkeypatch):
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+    from sglang.srt.model_executor.runner_utils import capture_mode
+
+    trace = module.Exl3StreamTrace()
+    monkeypatch.setattr(capture_mode, "is_capture_mode", True)
+    assert module.capturing_graphs()
+    trace.record(0, torch.zeros((1, 6), dtype=torch.long), None, 0)
+    assert trace.forwards == 0 and trace.decode_tokens == 0
+    monkeypatch.setattr(capture_mode, "is_capture_mode", False)
+    assert not module.capturing_graphs()
+    trace.record(0, torch.zeros((1, 6), dtype=torch.long), None, 0)
+    assert trace.forwards == 1 and trace.decode_tokens == 1
+
+
 if __name__ == "__main__":
     import sys
 

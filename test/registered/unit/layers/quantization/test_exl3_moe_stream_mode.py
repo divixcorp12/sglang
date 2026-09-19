@@ -287,6 +287,34 @@ def test_row_views_are_cached_per_buffer_and_row():
     assert tuple(EXL3_STREAMED_NAMES) == tuple(shapes)
 
 
+def test_streamed_apply_skips_route_recording_while_capturing(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+    from sglang.srt.model_executor.runner_utils import capture_mode
+
+    recorded = []
+
+    class _Streamer:
+        background_read_stats = type("S", (), {"rows": 0})()
+        last_gather_stats = None
+
+        def record_routes(self, routed):
+            recorded.append(routed.tolist())
+
+        def iter_gather_experts(self, source_ids):
+            return iter(())
+
+    layer = type("L", (), {"layer_id": 0})()
+    x = torch.zeros((1, 8), dtype=torch.float16)
+    weights = torch.ones((1, 2), dtype=torch.float32)
+    ids = torch.tensor([[1, 2]])
+    monkeypatch.setattr(capture_mode, "is_capture_mode", True)
+    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None)
+    assert recorded == []
+    monkeypatch.setattr(capture_mode, "is_capture_mode", False)
+    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None)
+    assert recorded == [[1, 2]]
+
+
 if __name__ == "__main__":
     import sys
 
