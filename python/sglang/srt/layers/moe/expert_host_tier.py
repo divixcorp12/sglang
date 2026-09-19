@@ -42,7 +42,9 @@ class PinnedSlotTable(Protocol):
     someone else (a native reader thread) supplies its own through
     ``pinned_tier_options(layer)["slot_table"]``; ``before_host_use(cache)`` runs
     before every host-side use of the tier, so that owner can pause and the cache
-    can refresh its device slot map.
+    can refresh its device slot map. Host uses nest (``ExpertPinnedHostCache.host_use``
+    calls both hooks at every level), so a table that pauses an owner counts depth
+    and pauses on the outermost ``before`` and resumes on the outermost ``after``.
     """
 
     capacity: int

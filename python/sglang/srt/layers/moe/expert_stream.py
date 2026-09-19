@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import json
@@ -130,15 +131,12 @@ class PinnedHostCacheStats:
 
 
 def _host_use(method):
-    """Run a pinned-tier method between its slot table's before/after_host_use."""
+    """Run a pinned-tier method inside ``self.host_use()``."""
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        self._lru.before_host_use(self)
-        try:
+        with self.host_use():
             return method(self, *args, **kwargs)
-        finally:
-            self._lru.after_host_use(self)
 
     return wrapper
 
@@ -152,6 +150,10 @@ class ExpertPinnedHostCache:
     to the layer's CUDA source device, else the current CUDA device; a CPU
     ``device`` keeps the tier on the host with unregistered slabs, so it runs
     without a GPU. ``is_pinned(expert_id)`` protects experts from eviction.
+
+    ``slot_table`` replaces the default ``PinnedSlotLRU``. Such a table chooses
+    its own victims: ``is_pinned`` is then used only to size requests
+    (``evictable_rows``), so the table must protect the same experts itself.
     """
 
     def __init__(
@@ -161,7 +163,7 @@ class ExpertPinnedHostCache:
         *,
         device: torch.device | str | None = None,
         is_pinned: Callable[[int], bool] | None = None,
-        slot_table: "PinnedSlotTable | None" = None,
+        slot_table: PinnedSlotTable | None = None,
     ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
@@ -248,6 +250,22 @@ class ExpertPinnedHostCache:
     def _expert_to_slot(self) -> dict[int, int]:
         # ExpertHotCache._prepare_promotion reads resident slots through this.
         return self._lru.expert_to_slot
+
+    @contextlib.contextmanager
+    def host_use(self) -> Iterator[None]:
+        """Hold the slot table's host use: ``before_host_use`` now, ``after_host_use`` on exit.
+
+        Every read of the slot map or the slabs from the host, and every copy
+        that reads slots chosen here, belongs inside one. Nested host uses call
+        both hooks again (``lookup``, ``ensure_rows``, ``copy_rows`` and
+        ``gather_rows`` each open one), so a table whose owner must pause
+        counts depth and acts only on the outermost pair.
+        """
+        self._lru.before_host_use(self)
+        try:
+            yield
+        finally:
+            self._lru.after_host_use(self)
 
     def close(self) -> None:
         """Unregister the slabs; the cache must not be used afterwards."""
