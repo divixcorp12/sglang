@@ -151,6 +151,15 @@ def test_a_promotion_admits_a_missing_row_but_never_touches_a_held_one():
     assert (out["vram_misses"], out["ram_misses"]) == (10, 6)
 
 
+def test_a_ram_hit_refreshes_its_lru_position():
+    # RAM holds 3 rows. Call [1, 4] hits 1 (touch: order 2, 3, 1 -> then 4 evicts 2),
+    # so expert 5 evicts 3 and the last call hits 1: 5 RAM misses. Without the hit's
+    # touch, 5 would evict 1 and the last call would miss again (6).
+    calls = [_call(1, 0, [1]), _call(2, 0, [2]), _call(3, 0, [3]), _call(4, 0, [1, 4]), _call(5, 0, [5]), _call(6, 0, [1])]
+    out = simulate(calls, num_layers=1, num_experts=8, vram_slots=0, ram_slots=3)
+    assert (out["vram_misses"], out["ram_misses"]) == (7, 5)
+
+
 def test_prefill_counts_apart_from_decode():
     calls = [_call(1, 0, [5, 6], tokens=4), _call(2, 0, [5])]
     out = simulate(calls, num_layers=1, num_experts=8, vram_slots=0, ram_slots=4)
