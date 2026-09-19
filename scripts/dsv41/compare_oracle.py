@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import os
+import sys
 
 import numpy as np
 
@@ -54,14 +56,14 @@ def main():
     # Prompts past 144 rows run EXL3 linears through a dense reconstruction (the 1.3 GB head
     # among them), which needs headroom outside the static pool.
     p.add_argument("--mem-fraction-static", type=float, default=0.7)
+    p.add_argument("--graphs", action="store_true", help="breakable decode graphs at batch size 1")
     args = p.parse_args()
 
     import sglang
 
-    engine = sglang.Engine(
+    kwargs = dict(
         model_path=args.model,
         tp_size=1,
-        disable_cuda_graph=True,
         disable_shared_experts_fusion=True,
         context_length=4096,
         mem_fraction_static=args.mem_fraction_static,
@@ -72,6 +74,14 @@ def main():
         # gate accepts only with a stat or per_pass route recorder.
         expert_distribution_recorder_mode="per_pass",
     )
+    if args.graphs:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from trace_corpus import GRAPH_KWARGS
+
+        kwargs.update(GRAPH_KWARGS)
+    else:
+        kwargs["disable_cuda_graph"] = True
+    engine = sglang.Engine(**kwargs)
     oracle = np.load(args.oracle)
     results = []
     with open(args.prompts) as f:

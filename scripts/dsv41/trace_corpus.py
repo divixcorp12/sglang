@@ -26,17 +26,26 @@ def _first_turns(path: str, n: int, skip: int = 0):
             yield json.loads(line)["turns"][0]
 
 
+# Decode as a breakable CUDA graph at batch size 1, prefill eager (the EXL3 gate's only
+# graph shape). The MoE runs in-graph once graph gather serves it, else as an eager break.
+GRAPH_KWARGS = dict(
+    cuda_graph_backend_decode="breakable",
+    cuda_graph_backend_prefill="disabled",
+    cuda_graph_bs_decode=[1],
+    cuda_graph_max_bs_decode=1,
+)
+
+
 def engine_kwargs(args) -> dict:
-    """The Engine of every Window C corpus run (it satisfies the EXL3 expert-caching gate)."""
-    return dict(
+    """The Engine of every corpus run (it satisfies the EXL3 expert-caching gate)."""
+    kwargs = dict(
         model_path=args.model,
         tp_size=1,
-        disable_cuda_graph=True,
         disable_shared_experts_fusion=True,
         context_length=4096,
         mem_fraction_static=args.mem_fraction_static,
         chunked_prefill_size=args.chunked_prefill_size,
-        # BS1 decode is what Phase 3a measures; DSV4 reserves SWA slots per request.
+        # BS1 decode is what Phase 3 measures; DSV4 reserves SWA slots per request.
         max_running_requests=4,
         # The hot cache's residency counts routes through the recorder's forward
         # observer; without it dynamic residency never updates (MOE_EXPERT_TRANSFER.md).
@@ -45,6 +54,11 @@ def engine_kwargs(args) -> dict:
         # the stream trace would count as a decode token.
         disable_radix_cache=True,
     )
+    if getattr(args, "graphs", False):
+        kwargs.update(GRAPH_KWARGS)
+    else:
+        kwargs["disable_cuda_graph"] = True
+    return kwargs
 
 
 def sampling_params(args) -> dict:
@@ -89,6 +103,7 @@ def main() -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     p.add_argument("--chunked-prefill-size", type=int, default=512)
+    p.add_argument("--graphs", action="store_true", help="breakable decode graphs at batch size 1")
     args = p.parse_args()
 
     texts = list(_first_turns(args.sessions, args.n, args.skip))
