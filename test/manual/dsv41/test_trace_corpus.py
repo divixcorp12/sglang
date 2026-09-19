@@ -75,6 +75,9 @@ def test_graphs_switch_to_breakable_decode_at_batch_size_one():
     assert kwargs["cuda_graph_backend_decode"] == "breakable"
     assert kwargs["cuda_graph_backend_prefill"] == "disabled"
     assert kwargs["cuda_graph_bs_decode"] == [1] and kwargs["cuda_graph_max_bs_decode"] == 1
+    # A graph run's checks read info logs: the capture line, the RAM-miss thread start,
+    # the hot cache's startup slots (the Engine's default level is error).
+    assert kwargs["log_level"] == "info"
     eager = trace_corpus.engine_kwargs(SimpleNamespace(**{**vars(args), "graphs": False}))
     assert eager["disable_cuda_graph"] is True
 
