@@ -216,6 +216,21 @@ def test_an_unarmed_record_only_touches_and_never_evicts_or_reads(tier):
     assert [host.contains(0, e) for e in (0, 1, 2)] == [False, True, False]
 
 
+def test_a_request_that_evicts_and_then_fails_bumps_the_version(tier):
+    """The version is how Python learns the map moved (the device map refresh, the
+    cached expert_to_slot). A request whose first slot evicted a row and whose second
+    found no victim frees its slots, but the eviction stays: that is a map change."""
+    s, page, slot_map, host = tier
+    for expert in (0, 1, 2):  # full (capacity 3); 0 is the LRU-oldest row
+        assert _serve(page, host, 0, need=[expert], protect=[expert]) == 1
+    version = host.version()
+    # 3 takes 0's slot; 4 finds only protected rows (1, 2) and fails the request.
+    sim_post(page, 0, need=[3, 4], protect=[1, 2, 3, 4])
+    assert host.pump() == 1
+    assert not host.contains(0, 0) and not host.contains(0, 3)
+    assert host.version() > version
+
+
 def test_a_repeated_protect_id_takes_one_slot(tier):
     s, page, slot_map, host = tier
     assert _serve(page, host, 0, need=[1], protect=[1, 1, 2]) == 1
