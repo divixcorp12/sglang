@@ -214,6 +214,56 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows)
     assert trace.stats()["vram_misses"] == 5
 
 
+def _routed_inputs(topk_ids, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    x = torch.randn(topk_ids.shape[0], HIDDEN, generator=generator).to(torch.bfloat16)
+    topk_weights = torch.rand(topk_ids.shape, generator=generator)
+    topk = types.SimpleNamespace(topk_weights=topk_weights, topk_ids=topk_ids)
+    return x, topk_weights, types.SimpleNamespace(hidden_states=x, topk_output=topk)
+
+
+@pytest.mark.parametrize("pinned_rows", [0, 3])
+def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeypatch, pinned_rows):
+    """Three chunks of at most 2 experts reuse one staging set (and, with a pinned
+    tier, evict and refill it): each chunk's rows must be read through row_of_source."""
+    from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+    _, w13, w2 = _reference(ckpt, 1)
+    monkeypatch.setattr(
+        exl3_mod, "exl3_moe_accumulate",
+        functools.partial(exl3_ops.exl3_moe_accumulate, linear=_fake_linear),
+    )
+    a, b, c, d = _streaming_env(ckpt)
+    with a, b, c, d:
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        layer = _layer(method)
+        method.process_weights_after_loading(layer)
+    streamer = layer._nvfp4_expert_streamer
+    streamer.format.max_gather_rows = 2
+    if pinned_rows:
+        ExpertPinnedHostCache(streamer, pinned_rows, device="cpu", **streamer.format.pinned_tier_options(layer))
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+    )
+    topk_ids = torch.tensor([[5, 0, 3], [3, 1, 5], [0, 4, 1], [5, 3, 4]], dtype=torch.int32)
+    x, topk_weights, dispatch = _routed_inputs(topk_ids)
+    chunks = []
+    iterate = streamer.iter_gather_experts
+
+    def recording(ids, **kwargs):
+        for chunk, row_of_source, rows in iterate(ids, **kwargs):
+            chunks.append(chunk.tolist())
+            yield chunk, row_of_source, rows
+
+    streamer.iter_gather_experts = recording
+
+    got = method.apply(layer, dispatch).hidden_states
+    want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear)
+    assert chunks == [[0, 1], [3, 4], [5]]
+    assert torch.equal(got, want)
+
+
 def test_row_views_are_cached_per_buffer_and_row():
     shapes = {
         "w13_trellis": ((2, 1, 1, 48), torch.int16),

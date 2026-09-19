@@ -21,8 +21,16 @@ NUM_EXPERTS = 6
 LAYER = 1
 
 
-@pytest.mark.parametrize("tokens", [1, 5])
-def test_streamed_apply_equals_resident(tmp_path, tokens):
+@pytest.mark.parametrize(
+    "tokens, max_gather_rows, hot_experts",
+    [
+        (1, None, [3, 4]),  # one chunk, mixed hits (hot cache + pinned tier)
+        (5, None, [3, 4]),
+        (5, 2, [3, 4]),  # >= 3 chunks reuse the staging
+        (1, None, [0, 1, 2]),  # every routed expert is hot: rows are hot-cache slots
+    ],
+)
+def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_experts):
     from sglang.srt.layers.moe.exl3_expert_format import exl3_expert_layout_for
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
@@ -43,17 +51,26 @@ def test_streamed_apply_equals_resident(tmp_path, tokens):
         method.create_weights(layer, NUM_EXPERTS, HIDDEN, INTER, torch.bfloat16)
         method.process_weights_after_loading(layer)
     streamer = layer._nvfp4_expert_streamer
-    ExpertHotCache(streamer, 2).reassign([3, 4])
-    ExpertPinnedHostCache(streamer, 2)
+    if max_gather_rows is not None:
+        streamer.format.max_gather_rows = max_gather_rows
+    ExpertHotCache(streamer, len(hot_experts)).reassign(hot_experts)
+    ExpertPinnedHostCache(streamer, max(2, len(hot_experts)))
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
         apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
     )
     generator = torch.Generator().manual_seed(tokens)
     x = (torch.randn(tokens, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).cuda()
-    topk_ids = torch.stack(
-        [torch.randperm(NUM_EXPERTS, generator=generator)[:3] for _ in range(tokens)]
-    ).to(torch.int32).cuda()
+    if hot_experts == [0, 1, 2]:
+        topk_ids = torch.tensor([hot_experts] * tokens, dtype=torch.int32).cuda()
+    elif max_gather_rows is not None:  # all six experts route: three chunks of two
+        topk_ids = torch.tensor(
+            [[0, 1, 2], [3, 4, 5], [0, 3, 5], [1, 4, 2], [5, 0, 4]][:tokens], dtype=torch.int32
+        ).cuda()
+    else:
+        topk_ids = torch.stack(
+            [torch.randperm(NUM_EXPERTS, generator=generator)[:3] for _ in range(tokens)]
+        ).to(torch.int32).cuda()
     topk_weights = torch.rand(tokens, 3, generator=generator).cuda()
     dispatch = types.SimpleNamespace(
         hidden_states=x,
