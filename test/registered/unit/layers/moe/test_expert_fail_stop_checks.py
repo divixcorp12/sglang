@@ -48,18 +48,28 @@ def test_formats_are_offered_the_manager_then_residency_is_pushed():
     class _Format:
         def attach_hot_cache_manager(self, mgr, streamer):
             events.append(("attach", streamer.layer_id))
-            mgr.add_residency_listener(lambda layer_id, experts: events.append(("hot", layer_id, experts)))
+            mgr.add_residency_listener(
+                lambda layer_id, experts: events.append(("hot", layer_id, experts))
+            )
 
-    manager.streamers = {1: SimpleNamespace(format=_Format(), layer_id=1), 2: SimpleNamespace(format=SimpleNamespace(), layer_id=2)}
+    manager.streamers = {
+        1: SimpleNamespace(format=_Format(), layer_id=1),
+        2: SimpleNamespace(format=SimpleNamespace(), layer_id=2),
+    }
     manager._attach_formats()
     assert events == [("attach", 1), ("hot", 1, [4])]
 
 
 def test_residency_listeners_get_every_layers_resident_experts():
     manager = _manager()
-    manager.caches = {2: SimpleNamespace(slot_to_expert=[5, -1]), 7: SimpleNamespace(slot_to_expert=[1])}
+    manager.caches = {
+        2: SimpleNamespace(slot_to_expert=[5, -1]),
+        7: SimpleNamespace(slot_to_expert=[1]),
+    }
     seen = []
-    manager.add_residency_listener(lambda layer_id, experts: seen.append((layer_id, experts)))
+    manager.add_residency_listener(
+        lambda layer_id, experts: seen.append((layer_id, experts))
+    )
     manager._notify_residency_listeners()
     assert sorted(seen) == [(2, [5, -1]), (7, [1])]
 

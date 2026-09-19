@@ -33,7 +33,8 @@ class RecordingTable(PinnedSlotLRU):
 
 def _streamer():
     reference = {
-        name: torch.arange(8 * 4, dtype=torch.int16).reshape(8, 4) + i for i, name in enumerate(NAMES)
+        name: torch.arange(8 * 4, dtype=torch.int16).reshape(8, 4) + i
+        for i, name in enumerate(NAMES)
     }
     layer = torch.nn.Module()
     layer.layer_id = 0
@@ -54,8 +55,16 @@ def test_the_cache_uses_a_supplied_slot_table_and_announces_host_use():
     cache.lookup(torch.tensor([5]))
     assert table.host_uses == before + 1
     assert table.depth == 0  # every use was closed
-    cache.gather_rows(torch.tensor([5]), {n: torch.empty((1,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in reference.items()})
-    assert table.depth == 0 and table.max_depth >= 2  # gather_rows nests lookup/ensure_rows
+    cache.gather_rows(
+        torch.tensor([5]),
+        {
+            n: torch.empty((1,) + tuple(t.shape[1:]), dtype=t.dtype)
+            for n, t in reference.items()
+        },
+    )
+    assert (
+        table.depth == 0 and table.max_depth >= 2
+    )  # gather_rows nests lookup/ensure_rows
 
 
 def test_host_use_is_closed_when_the_call_raises():
