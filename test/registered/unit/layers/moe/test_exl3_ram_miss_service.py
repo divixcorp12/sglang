@@ -124,6 +124,7 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     exactly as ``is_pinned`` does when it sizes the chunk."""
     service, streamers, caches = tiers
     cache = caches[0]
+    service.ensure_started()
     row = service.row_of(0)
     cache.ensure_rows(torch.tensor([0]))
     cache.ensure_rows(torch.tensor([1, 2]))  # full (capacity 3); 0 is the LRU-oldest row
