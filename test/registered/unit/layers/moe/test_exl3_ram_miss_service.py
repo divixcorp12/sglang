@@ -138,6 +138,8 @@ def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, 
         for streamer in streamers.values():
             streamer.format.attach_hot_cache_manager(manager, streamer)
     assert service.device_side.advise == advise
+    # One bs-1 decode step routes graph_gather_rows rows in every in-graph layer.
+    assert service.routed_rows_per_step == 6 * len(streamers)
     for layer_id, streamer in streamers.items():
         assert streamer.row_backend.device_side is service.device_side  # one device side, shared by every layer
 
@@ -180,14 +182,20 @@ def test_graph_steps_are_traced_and_read_back_by_tier_sim(tmp_path):
     trace.record_graph_step(
         layer_rows_delta=[0, 1, 0], routed_rows=18, routed_misses=3, thread={"rows_read": 4, "advisory_rows": 1}
     )
+    # Under overlap scheduling a per-batch read can lag a step: one line then holds two.
+    trace.record_graph_step(layer_rows_delta=[1, 1, 0], routed_rows=36, routed_misses=4, steps=2)
     trace.close()
-    assert trace.decode_tokens == 2 and trace.decode_vram_misses == 8 and trace.decode_ram_misses == 4
+    assert trace.decode_tokens == 4 and trace.decode_vram_misses == 12 and trace.decode_ram_misses == 6
     # The thread's cumulative counters ride on the line: an Engine's scheduler is
     # SIGKILLed at shutdown, so the atexit counters line is never written there.
     lines = tier_sim.load_trace(str(path))
     assert "thread" not in lines[0] and lines[1]["thread"] == {"rows_read": 4, "advisory_rows": 1}
-    live = tier_sim.live_summary(tier_sim.load_trace(str(path)), warmup=0)
-    assert live["decode_tokens"] == 2 and live["G"] == 4.0 and live["f"] == 0.5
+    assert [line["steps"] for line in lines] == [1, 1, 2]
+    live = tier_sim.live_summary(lines, warmup=0)
+    assert live["decode_tokens"] == 4 and live["G"] == 3.0 and live["f"] == 0.5
+    # Warmup counts steps too: only the two-step line is past a 2-token warmup.
+    late = tier_sim.live_summary([{"forward": 0, "layer": 0, "tokens": 256, "vram_miss": 0, "ram_miss": 0}] + lines, warmup=2)
+    assert late["decode_tokens"] == 4 and late["f_after_warmup"] == 2 / 4
 
 
 def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeypatch):
@@ -211,6 +219,7 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     demand_rows = [[0, 0]]
     service = module.Exl3RamMissService()
     service._manager = manager
+    service.routed_rows_per_step = 12  # 6 routed rows in each of the two layers
     counters = {"rows_read": 0}
     service.host = SimpleNamespace(
         fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: dict(counters)
@@ -224,7 +233,7 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     demand_rows[0] = [1, 1]
     counters["rows_read"] = 3  # demand plus advisory rows, cumulative
     service.fail_stop_check()
-    assert lines == [dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3, thread={"rows_read": 3})]
+    assert lines == [dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3, thread={"rows_read": 3}, steps=1)]
 
     # discard_graph_capture_routes zeroes the registers: no line, a new baseline.
     for register in manager._registers["decode"].values():
@@ -235,7 +244,14 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
     demand_rows[0] = [2, 1]
     service.fail_stop_check()
-    assert lines[1:] == [dict(layer_rows_delta=[1, 0], routed_rows=12, routed_misses=1, thread={"rows_read": 3})]
+    assert lines[1:] == [dict(layer_rows_delta=[1, 0], routed_rows=12, routed_misses=1, thread={"rows_read": 3}, steps=1)]
+
+    # Two replays before one check (the read lagged a step): one line, two steps.
+    for _ in range(2):
+        manager._graph_counters.copy_(torch.tensor([[6, 1], [6, 1]]))
+        manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
+    service.fail_stop_check()
+    assert lines[2:] == [dict(layer_rows_delta=[0, 0], routed_rows=24, routed_misses=4, thread={"rows_read": 3}, steps=2)]
 
 
 def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
