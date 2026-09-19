@@ -128,6 +128,11 @@ WORDS = {
     "heartbeat": 28,
 }
 STATUS = {"pending": 0, "served": 1, "failed": 2}
+# Order of the C++ counters. ``rows_read`` counts every row read, demand AND advisory
+# (``advisory_rows`` is the advisory part); it is not the RAM-miss count behind ``f``. Demand
+# rows come only from ``Exl3RamMissHost.layer_rows()``: per streamed layer, demand-only, and
+# read under the host's lock. Do not derive them as ``rows_read - advisory_rows``: the two
+# counters are separate atomics bumped after the rows are published, so a read can tear.
 COUNTERS = (
     "served",
     "touch_only",
@@ -265,6 +270,9 @@ class Exl3RamMissHost:
         return int(self._module.exl3_ram_miss_pump(self.handle))
 
     def contains(self, row: int, expert: int) -> bool:
+        """True once the expert holds a slot in ``row``: from the moment the thread claims the
+        slot, before its read has finished. It does not mean the bytes are in RAM; the read is
+        done when ``layer_rows()`` / ``layer_advisory_rows()`` count the row."""
         self._check(row, expert)
         return bool(self._module.exl3_ram_miss_contains(self.handle, row, expert))
 
@@ -322,7 +330,10 @@ class Exl3RamMissHost:
         return dict(zip(COUNTERS, out.tolist()))
 
     def layer_rows(self) -> list[int]:
-        """Rows read for demands, per streamed layer: the RAM misses behind ``f``."""
+        """Rows read for demands only (not advisories), per streamed layer: the RAM misses behind ``f``.
+
+        ``counters()["rows_read"]`` is demand plus advisory rows.
+        """
         out = torch.zeros(self.layers, dtype=torch.int64)
         self._module.exl3_ram_miss_layer_rows(self.handle, 0, out)
         return out.tolist()
