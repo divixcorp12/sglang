@@ -1555,6 +1555,12 @@ class ExpertHotCacheManager:
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
+        # Warmup and capture forwards replaced each layer's last gather stats and
+        # admitted pinned rows. Start the eager counters from here, so the first
+        # real forward counts only its own.
+        for layer_id, streamer in self.streamers.items():
+            self._last_gather[layer_id] = streamer.last_gather_stats
+            self._last_pinned_cache_stats[layer_id] = self._pinned_cache_stats(streamer)
 
     def _start_doorbell(
         self,
