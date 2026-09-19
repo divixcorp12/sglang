@@ -288,5 +288,64 @@ class TestSpecOnlyCuda(unittest.TestCase):
                 )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestGatherExpertsCuda(unittest.TestCase):
+    def test_chunked_gather_matches_one_gather_through_hot_and_cold_rows(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        layer = _nvfp4_layer(pinned=False)
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        ExpertHotCache(streamer, 2).reassign([1, 4])
+        ids = torch.tensor([6, 1, 3, 4, 0], device="cuda")
+        row_of_source, rows = streamer.gather_experts(ids)
+        whole = {
+            name: rows[name][row_of_source.long()].view(torch.uint8).cpu()
+            for name in NVFP4_STREAM_TENSORS
+        }
+        pieces = {name: [] for name in NVFP4_STREAM_TENSORS}
+        for _, chunk_rows_of_source, chunk_rows in streamer.iter_gather_experts(
+            ids, chunk_rows=2
+        ):
+            for name in NVFP4_STREAM_TENSORS:
+                pieces[name].append(
+                    chunk_rows[name][chunk_rows_of_source.long()].view(torch.uint8).cpu()
+                )
+        for name in NVFP4_STREAM_TENSORS:
+            self.assertTrue(torch.equal(torch.cat(pieces[name]), whole[name]), name)
+            self.assertTrue(torch.equal(whole[name], _source_bytes(layer, name, ids)), name)
+        stats = streamer.last_gather_stats
+        self.assertEqual((stats.requested_rows, stats.hot_hit_rows), (5, 2))
+
+    def test_staging_stays_within_the_cap_and_eager_gathers_above_it_are_refused(self):
+        from sglang.srt.layers.moe import expert_stream
+        from sglang.srt.layers.moe.expert_format import DenseLayerFormat
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        class CappedDenseFormat(DenseLayerFormat):
+            max_gather_rows = 16
+
+        layer = _nvfp4_layer(pinned=False, experts=80)
+        streamer = ExpertStreamer(
+            layer, NVFP4_STREAM_TENSORS, format=CappedDenseFormat(NVFP4_STREAM_TENSORS)
+        )
+        ExpertHotCache(streamer, 1).reassign([0])
+        expert_stream._STAGING.clear()
+        ids = torch.arange(40, device="cuda")
+        for _, row_of_source, rows in streamer.iter_gather_experts(ids):
+            self.assertLessEqual(row_of_source.numel(), 16)
+        self.assertTrue(expert_stream._STAGING)
+        self.assertLessEqual(
+            max(buffer.shape[0] for buffer in expert_stream._STAGING.values()), 64
+        )
+        from sglang.srt.layers.moe.expert_residency import ExpertResidencyPolicy
+
+        streamer.residency_policy = ExpertResidencyPolicy(80, 1, device="cuda")
+        routes = torch.arange(40, device="cuda", dtype=torch.int32).reshape(10, 4)
+        with self.assertRaisesRegex(ValueError, "max_gather_rows"):
+            streamer.gather(routes)
+        # A refused forward records no routes.
+        self.assertEqual(float(streamer.residency_policy.pending_counts.sum()), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
