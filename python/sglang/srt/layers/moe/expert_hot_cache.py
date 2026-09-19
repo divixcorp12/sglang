@@ -1186,6 +1186,16 @@ class ExpertHotCacheManager:
                     continue
                 limit = slot_limits[layer_id]
                 if limit is not None and len(chosen[layer_id]) >= limit:
+                    # This clamp is reachable during the floor pass only if a
+                    # layer both has a floor (DIRECT, graph_gather_batch_size > 0)
+                    # and an inclusive pinned tier's slot limit. That never
+                    # happens today: a nonzero floor requires every streamer to
+                    # have passed require_graph_gather_support, and no format
+                    # both supports graph gather and sets inclusive_pinned_tier
+                    # (EXL3's inclusive tier is eager-only). Assert this instead
+                    # of relying on it silently, since the clamp would otherwise
+                    # cut into a layer's floor and DIRECT would refuse the budget.
+                    assert not floor_pass or floors[layer_id] == 0
                     clamped.add(layer_id)
                     continue
                 slot_bytes = streamers[layer_id].bytes_per_expert
