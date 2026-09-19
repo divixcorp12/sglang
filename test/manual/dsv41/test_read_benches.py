@@ -190,5 +190,129 @@ def test_planned_reads_count_both_copies():
     assert 3.1e9 < 2 * planned < 3.3e9  # queue depths 32 and 128: about 3.2 GB
 
 
+def test_default_run_fits_the_read_cap_and_gates_batch_8_on_full_submissions():
+    bench = bench_split_vs_repack
+    assert bench.GATE_BATCH == 8 and bench.DEFAULT_REPEATS == 5
+    assert bench.DEFAULT_ROWS % bench.GATE_BATCH == 0  # batch 8 is whole 8-row submissions
+    assert bench.GATE_BATCH in bench.DEFAULT_BATCHES
+    planned = bench.planned_read_bytes(
+        13_320_192, 13_315_584, bench.DEFAULT_ROWS, bench.DEFAULT_BATCHES,
+        warmup_rows=1, repeats=bench.DEFAULT_REPEATS,
+    )
+    assert planned <= 3.5e9
+    # Why the default batches are not 1/4/8: five repeats at the gate would not fit.
+    assert bench.planned_read_bytes(
+        13_320_192, 13_315_584, bench.DEFAULT_ROWS, [1, 4, 8], warmup_rows=1, repeats=5
+    ) > 3.5e9
+
+
+def test_repeats_are_counted_at_the_gate_batch_only():
+    base = bench_split_vs_repack.planned_read_bytes(100, 90, 4, [1, 8])
+    five = bench_split_vs_repack.planned_read_bytes(100, 90, 4, [1, 8], repeats=5)
+    assert five - base == 4 * 4 * (100 + 90)  # 4 extra passes of split (buffer) and repacked (streamed)
+    no_gate = bench_split_vs_repack.planned_read_bytes(100, 90, 4, [1, 4], repeats=5)
+    assert no_gate == bench_split_vs_repack.planned_read_bytes(100, 90, 4, [1, 4])
+
+
+def test_the_gate_batch_alternates_split_and_repacked_passes(tmp_path, monkeypatch):
+    bench = bench_split_vs_repack
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    write_fake_exl3(str(ckpt), num_layers=1, num_experts=8)
+    events = []
+    real_read = bench.Exl3ShardRowSource.read
+    real_plans = bench.read_plans
+
+    def read(self, rows, *args, **kwargs):
+        events.append(("S", rows.numel()))
+        return real_read(self, rows, *args, **kwargs)
+
+    def plans(reader, plan_list):
+        events.append(("R", int(plan_list[0].file_ids.numel())))
+        return real_plans(reader, plan_list)
+
+    monkeypatch.setattr(bench.Exl3ShardRowSource, "read", read)
+    monkeypatch.setattr(bench, "read_plans", plans)
+    bench.run(
+        str(ckpt), 0, 4, [2], str(tmp_path / "work"), direct=False, max_read_gb=1.0,
+        require_same_drive=False, repeats=3, gate_batch=2,
+    )
+    # The repack pass's read of the sample, one warm read per arm, then three
+    # (split over 4 rows, repacked as two 2-row submissions) pairs in turn.
+    assert events == [("S", 4), ("S", 1), ("R", 1)] + [("S", 4), ("R", 2), ("R", 2)] * 3
+
+
+def test_the_gate_batch_reports_all_samples_median_min_and_the_ratio(tmp_path):
+    bench = bench_split_vs_repack
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    write_fake_exl3(str(ckpt), num_layers=1, num_experts=8)
+    rows = bench.run(
+        str(ckpt), 0, 4, [1, 2], str(tmp_path / "work"), direct=False, max_read_gb=1.0,
+        require_same_drive=False, repeats=3, gate_batch=2,
+    )
+    by = {(r["mode"], r["batch"]): r for r in rows}
+    for mode in ("superset_split", "repacked_per_name"):
+        gate, other = by[(mode, 2)], by[(mode, 1)]
+        assert gate["repeats"] == 3 and len(gate["samples_ms_per_row"]) == 3
+        assert other["repeats"] == 1 and len(other["samples_ms_per_row"]) == 1
+        samples = sorted(gate["samples_ms_per_row"])
+        assert gate["median_ms_per_row"] == samples[1] and gate["min_ms_per_row"] == samples[0]
+        assert gate["ms_per_row"] == gate["median_ms_per_row"]
+    assert by[("superset_raw", 2)]["repeats"] == 1
+    repacked, split = by[("repacked_per_name", 2)], by[("superset_split", 2)]
+    assert repacked["ratio_median"] == pytest.approx(
+        repacked["median_ms_per_row"] / split["median_ms_per_row"]
+    )
+    assert split["deterministic"] and repacked["verified"]
+
+
+def test_repeats_that_overrun_the_read_budget_fail_fast(tmp_path):
+    write_fake_exl3(str(tmp_path), num_layers=1, num_experts=8)
+    with pytest.raises(SystemExit, match="repeats"):
+        bench_split_vs_repack.run(
+            str(tmp_path), 0, 8, [8], str(tmp_path / "w"), direct=False,
+            max_read_gb=1.0, require_same_drive=False, repeats=10**9,
+        )
+    with pytest.raises(SystemExit, match="repeats"):
+        bench_split_vs_repack.run(
+            str(tmp_path), 0, 4, [1], str(tmp_path / "w"), direct=False,
+            require_same_drive=False, repeats=0,
+        )
+    assert not (tmp_path / "w").exists()
+
+
+def test_the_repacked_copy_is_sparse_at_expert_id_offsets(tmp_path):
+    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+
+    ckpt, work = tmp_path / "ckpt", tmp_path / "work"
+    ckpt.mkdir()
+    work.mkdir()
+    write_fake_exl3(str(ckpt), num_layers=1, num_experts=6)
+    layout = build_exl3_expert_layout(str(ckpt))
+    specs = Exl3ExpertFormat(layout, 0, direct=False).tensor_specs(None)
+    experts = [1, 4]
+    truth = {}
+    for spec in specs:
+        pattern = (torch.arange(2 * spec.row_bytes, dtype=torch.int64) % 251 + 1).to(torch.uint8)
+        truth[spec.name] = pattern.view(spec.dtype).view((2,) + spec.row_shape)
+    paths = bench_split_vs_repack._write_repacked(str(work), 0, specs, truth, experts, layout.num_experts)
+    for spec in specs:
+        with open(paths[spec.name], "rb") as f:
+            data = f.read()
+        assert len(data) == layout.num_experts * spec.row_bytes
+        raw = truth[spec.name].view(torch.uint8).reshape(2, -1)
+        for i, expert in enumerate(experts):
+            at = expert * spec.row_bytes
+            assert data[at : at + spec.row_bytes] == raw[i].numpy().tobytes()
+        holes = b"".join(
+            data[e * spec.row_bytes : (e + 1) * spec.row_bytes]
+            for e in range(layout.num_experts)
+            if e not in experts
+        )
+        assert holes == bytes(len(holes))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
