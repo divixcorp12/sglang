@@ -286,14 +286,13 @@ def test_layer_posts_advise_the_next_layer(tmp_path):
         _step(dev, b, row=0, next_row=1)
         torch.cuda.synchronize()
         deadline = time.perf_counter() + 5.0
-        while time.perf_counter() < deadline and not all(host.contains(1, e) for e in (9, 10, 11)):
-            time.sleep(0.005)
-        assert all(host.contains(1, e) for e in (9, 10, 11))
-        assert dev.last_routes[0, 0].item() == 2  # layer 0 remembered this token's routes
-        # The thread publishes the rows before it bumps its counters: wait for the bump.
+        # contains() is true once the thread has claimed a slot, before the read completes; the
+        # global counter is bumped after the rows are published: wait for it.
         while time.perf_counter() < deadline and host.counters()["advisory_rows"] != 3:
             time.sleep(0.005)
         assert host.counters()["advisory_rows"] == 3
+        assert all(host.contains(1, e) for e in (9, 10, 11))
+        assert dev.last_routes[0, 0].item() == 2  # layer 0 remembered this token's routes
     finally:
         _close(host, slabs)
 
