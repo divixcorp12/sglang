@@ -126,6 +126,54 @@ def test_shared_cache_is_one_object_and_checks_row_bytes(fresh_shared_cache):
             shared_engram_row_cache(130)
 
 
+def test_stats_report_the_hit_rate():
+    table = np.arange(100 * 4, dtype=np.uint8).reshape(100, 4)
+    cache = EngramRowCache(capacity_rows=16, row_bytes=4)
+    assert cache.stats() == {"lookups": 0, "accesses": 0, "hits": 0, "hit_rate": 0.0}
+    cache.lookup(np.array([5, 7, 5]), _fetcher(table, []))
+    cache.lookup(np.array([7, 5]), _fetcher(table, []))
+    assert cache.stats() == {"lookups": 2, "accesses": 5, "hits": 2, "hit_rate": 0.4}
+
+
+def _log_lines(caplog):
+    return [
+        json.loads(r.getMessage().split("engram row cache: ", 1)[1])
+        for r in caplog.records
+        if "engram row cache: " in r.getMessage()
+    ]
+
+
+def test_logs_its_stats_every_log_every_lookups(caplog):
+    table = np.arange(100 * 4, dtype=np.uint8).reshape(100, 4)
+    cache = EngramRowCache(capacity_rows=16, row_bytes=4, log_every=2)
+    with caplog.at_level("INFO", logger="sglang.srt.layers.engram_row_cache"):
+        cache.lookup(np.array([1, 2]), _fetcher(table, []))
+        assert _log_lines(caplog) == []
+        cache.lookup(np.array([1, 2]), _fetcher(table, []))
+        assert _log_lines(caplog) == [cache.stats()]
+        cache.lookup(np.array([3]), _fetcher(table, []))
+        cache.lookup(np.array([3]), _fetcher(table, []))
+    lines = _log_lines(caplog)
+    assert [line["lookups"] for line in lines] == [2, 4]
+    assert lines[-1] == {"lookups": 4, "accesses": 6, "hits": 3, "hit_rate": 0.5}
+
+
+def test_log_is_silent_before_any_lookup(caplog):
+    cache = EngramRowCache(capacity_rows=16, row_bytes=4)
+    with caplog.at_level("INFO", logger="sglang.srt.layers.engram_row_cache"):
+        cache.log()
+    assert _log_lines(caplog) == []
+
+
+def test_shared_cache_logs_at_exit(fresh_shared_cache, monkeypatch):
+    registered = []
+    monkeypatch.setattr(row_cache_module.atexit, "register", lambda fn, *a: registered.append(fn))
+    with envs.SGLANG_DSV41_ENGRAM_RAM_GIB.override(0.001):
+        cache = shared_engram_row_cache(66)
+        assert shared_engram_row_cache(66) is cache
+    assert registered == [cache.log]
+
+
 if __name__ == "__main__":
     import sys
 
