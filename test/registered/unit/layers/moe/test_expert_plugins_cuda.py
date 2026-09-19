@@ -137,5 +137,58 @@ class TestRowSourceRoutingCuda(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestPinnedTierCuda(unittest.TestCase):
+    def test_pinned_slabs_are_registered_page_aligned_and_unrounded(self):
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+        from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
+
+        layer = torch.nn.Module()
+        layer.host_rows = torch.nn.Parameter(
+            torch.zeros(8, 3000, dtype=torch.uint8), requires_grad=False
+        )
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertPinnedHostCache(streamer, 3)
+        slab = cache.tensors["host_rows"]
+        self.assertEqual(slab.data_ptr() % 4096, 0)
+        self.assertTrue(is_gpu_readable_host_tensor(slab))
+        self.assertEqual(slab.untyped_storage().nbytes(), 3 * 3000 + 4096)
+        cache.close()
+        self.assertFalse(is_gpu_readable_host_tensor(slab))
+
+    def test_cached_gather_copies_misses_beyond_the_pinned_capacity(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        experts = 16
+        layer = torch.nn.Module()
+        layer.host_rows = torch.nn.Parameter(
+            torch.randint(0, 256, (experts, 3, 4), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.gpu_rows = torch.nn.Parameter(
+            torch.rand(experts, 5, device="cuda"), requires_grad=False
+        )
+        layer._nvfp4_file_source_bytes_per_expert = 12
+        streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
+        ExpertHotCache(streamer, 1).reassign([3])
+        pinned = ExpertPinnedHostCache(streamer, 2)
+        ids = torch.tensor([[3, 0, 5, 7], [9, 11, 3, 13]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(ids)
+        cpu_ids = ids.long().cpu()
+        self.assertTrue(
+            torch.equal(tensors["host_rows"][compact.long()].cpu(), layer.host_rows.data[cpu_ids])
+        )
+        self.assertTrue(
+            torch.equal(
+                tensors["gpu_rows"][compact.long()].cpu(),
+                layer.gpu_rows.data[cpu_ids.cuda()].cpu(),
+            )
+        )
+        stats = streamer.last_gather_stats
+        self.assertEqual((stats.hot_hit_rows, stats.pinned_host_miss_rows), (1, 6))
+        self.assertEqual(pinned.stats.evictions, 4)
+
+
 if __name__ == "__main__":
     unittest.main()
