@@ -218,6 +218,14 @@ def test_paged_row_batch_matches_per_source_reads_across_files_and_windows(direc
             batch.read_rows(torch.tensor([1]), [1, 0, 0], torch.zeros(100, dtype=torch.uint8))
 
 
+def test_paged_row_batch_rejects_a_source_with_a_base_offset():
+    with tempfile.TemporaryDirectory() as directory:
+        path, _ = _write_rows(directory, "rows.bin", 50, 8, seed=6)
+        source = PagedRowSource(_reader(), path, 8, 40, direct=False, base_offset=64)
+        with pytest.raises(ValueError, match="byte 0"):
+            PagedRowBatch([source], [(0, 40)])
+
+
 def test_aligned_rows_reject_wrong_width_and_mismatched_slots():
     with tempfile.TemporaryDirectory() as directory:
         path, _ = _write_rows(directory, "rows.bin", 3, PAGE, seed=5)

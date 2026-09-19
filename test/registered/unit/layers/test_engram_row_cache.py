@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.engram_file_table import EngramFileTable
-from sglang.srt.layers.engram_row_cache import EngramRowCache
+from sglang.srt.environ import envs
+from sglang.srt.layers import engram_row_cache as row_cache_module
+from sglang.srt.layers.engram_row_cache import EngramRowCache, shared_engram_row_cache
 from sglang.srt.model_loader.file_row_reader import PagedRowSource, shared_uring_file_reader
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -94,6 +96,34 @@ def test_file_table_with_cache_matches_memmap(tmp_path):
     assert torch.equal(cached.lookup(ids), plain.lookup(ids))
     assert torch.equal(cached.lookup(ids), plain.lookup(ids))
     assert cache.hits == 6
+
+
+@pytest.fixture
+def fresh_shared_cache(monkeypatch):
+    """The shared cache is process-global; give each test its own."""
+    monkeypatch.setattr(row_cache_module, "_SHARED", None)
+
+
+def test_empty_lookup_returns_no_rows_and_never_fetches():
+    cache = EngramRowCache(capacity_rows=16, row_bytes=4)
+    calls = []
+    got = cache.lookup(np.array([], dtype=np.int64), _fetcher(np.zeros((4, 4), np.uint8), calls))
+    assert got.shape == (0, 4) and got.dtype == np.uint8
+    assert calls == [] and cache.accesses == 0
+
+
+def test_shared_cache_is_off_at_zero_gib(fresh_shared_cache):
+    with envs.SGLANG_DSV41_ENGRAM_RAM_GIB.override(0.0):
+        assert shared_engram_row_cache(66) is None
+
+
+def test_shared_cache_is_one_object_and_checks_row_bytes(fresh_shared_cache):
+    with envs.SGLANG_DSV41_ENGRAM_RAM_GIB.override(0.001):
+        first = shared_engram_row_cache(66)
+        assert first is not None and first.row_bytes == 66
+        assert shared_engram_row_cache(66) is first
+        with pytest.raises(ValueError, match="disagree on row bytes"):
+            shared_engram_row_cache(130)
 
 
 if __name__ == "__main__":
