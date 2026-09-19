@@ -39,9 +39,10 @@ these could be derived instead of refused.
 ## Surface
 
 `--moe-offload-preset {off,graph-gather,doorbell}`, default `off`, declared
-beside the PLE offload fields in `arg_groups/fields/exec_.py`. `off` is today's
-behaviour exactly: no environment variable is touched and no server argument
-is declared.
+beside the PLE offload fields in `arg_groups/fields/exec_.py`. `off` selects
+no preset values. Auto-derivation still applies to explicitly set variables,
+which only changes configurations that previously refused to start; with no
+offload variable set, `off` touches nothing and declares nothing.
 
 Precedence, highest first:
 
@@ -65,16 +66,22 @@ reconstructed from its log.
   preset leaves that variable alone.
 - A module-level mapping from field name to `Envs` descriptor name. A test
   checks that it is complete.
-- Two constants, `GRAPH_GATHER_PRESET` and `DOORBELL_PRESET`. A docstring on
-  each says when to use it, its measured speed (or "unmeasured") and its hard
-  requirements.
+- Two constants, `GRAPH_GATHER_PRESET` and `DOORBELL_PRESET`, and `PRESETS`
+  mapping each CLI name to one (`off` to `None`). A comment block above each
+  constant says when to use it, its measured speed (or "unmeasured") and its
+  hard requirements.
 - Pure functions, with no reads of process state:
   - `preset_env(preset) -> dict[str, str]`, the variables a preset sets;
-  - `derive_env(values) -> dict[str, str]`, the variables forced by others
-    (see **Auto-derivation**);
-  - `check_offload_config(values, *, speculative, decode_graph_disabled,
-    decode_max_bs, parallel, allowed_cpus) -> None`, which raises `ValueError`
-    for invalid combinations (see **Validation**);
+  - `explicit_offload_env(environ) -> dict[str, str]`, the offload variables
+    already set;
+  - `resolve_offload_env(preset, explicit) -> ResolvedOffloadEnv`, which merges
+    with the precedence below and applies **Auto-derivation**, returning the
+    effective values, the ones to set, and the preset values explicit ones
+    replaced;
+  - `check_offload_config(values, *, speculative, decode_graphs_disabled,
+    decode_max_bs, tp_size, pp_size, dp_size, dp_attention, allowed_cpus) ->
+    None`, which raises `ValueError` for invalid combinations (see
+    **Validation**);
   - `needs_overlap_off(values) -> bool`.
 
 ### `python/sglang/srt/arg_groups/moe_offload_hook.py` (new)
@@ -82,12 +89,13 @@ reconstructed from its log.
 `handle_moe_offload_preset(server_args)` is the only impure part:
 
 1. read the preset and the currently set environment;
-2. merge with the precedence above and apply `derive_env`;
+2. `resolve_offload_env` (merge with the precedence above, then derive);
 3. raise if an explicitly set variable conflicts with a derived value;
 4. `envs.X.set` every filled variable and log it;
 5. `declare_resolution(server_args, "moe_offload_preset",
    disable_overlap_schedule=True)` when `needs_overlap_off` and overlap is on.
-   If the user explicitly asked for overlap in a way that conflicts, raise;
+   `disable_overlap_schedule` is a plain boolean whose default is indistinguishable
+   from an explicit `False`, so this never raises;
 6. run `check_offload_config`.
 
 It is wired into `arg_groups/pipeline.py` immediately before
@@ -151,7 +159,7 @@ Overlap scheduling is turned off. Speculative decoding is refused.
 
 The doorbell preset's compatibility with stage 1 and the fused planner is
 confirmed by a startup smoke test during implementation. A refused combination
-is dropped from the preset, with the reason recorded in its docstring.
+is dropped from the preset, with the reason recorded in its comment block.
 
 ## Auto-derivation
 
@@ -197,7 +205,7 @@ CPU unit tests, in one new file beside the other `arg_groups` tests:
    contradicts a derived one raises.
 3. Each auto-derivation rule fires, and a contradicting explicit value raises.
 4. The doorbell preset declares overlap off and refuses NEXTN.
-5. `off` sets no variable and declares nothing.
+5. `off` with no offload variable set sets nothing and declares nothing.
 6. The field-to-descriptor mapping covers every `MoeOffloadPreset` field, and
    every descriptor exists in `Envs`.
 
