@@ -7,8 +7,11 @@ G = VRAM misses per decode token, f = the share of those that also miss RAM
   evenly over layers, and each layer is a PinnedSlotLRU. It is inclusive, as
   the EXL3 format asks (spec §9.1): its ``is_pinned`` protects every expert the
   layer's hot cache holds. A VRAM miss looks RAM up (hit: touch; miss: shard
-  read and admit). Promotions and the startup residency are admitted the
-  same way.
+  read and admit). Per call, the experts go through it in chunks of
+  ``max_gather_rows`` as ExpertPinnedHostCache.gather_rows does: a chunk's hits
+  are touched first, then its misses are admitted with the chunk protected.
+  Promotions and the startup residency only admit the rows RAM lacks
+  (ensure_rows) and never touch a row it holds.
 - VRAM is the hot cache. Its startup allocation copies
   ExpertHotCacheManager.from_model: global slots go to the (layer, expert)
   pairs with the highest seed count (ties: lower expert, then lower layer),
@@ -147,19 +150,72 @@ def simulate(
         for layer, rows in enumerate(ram_rows)
     }
 
-    def ram_touch(layer: int, expert: int, admit: bool = True) -> bool:
+    def evictable_rows(layer: int) -> int:
+        """ExpertPinnedHostCache.evictable_rows: capacity minus the rows is_pinned protects."""
         tier = ram[layer]
-        if tier is not None and expert in tier:
-            if admit:
+        return tier.capacity - sum(1 for expert in tier.expert_to_slot if expert in resident[layer])
+
+    def ram_gather(layer: int, experts: list[int], admit: bool) -> int:
+        """ExpertPinnedHostCache.gather_rows: RAM misses of one hot-miss set.
+
+        Each chunk is sized from the evictable rows when it starts; its hits are
+        touched first, then its misses are admitted with the whole chunk protected.
+        """
+        tier = ram[layer]
+        if tier is None:
+            return len(experts)
+        if not admit:
+            return sum(1 for expert in experts if expert not in tier)
+        misses = 0
+        start = 0
+        while start < len(experts):
+            room = evictable_rows(layer)
+            rows = len(experts) - start
+            if room >= 1 and rows > room and len(set(experts[start:])) > room:
+                rows = room
+            chunk = experts[start : start + rows]
+            hits = [expert for expert in chunk if expert in tier]
+            for expert in hits:
                 tier.touch(expert)
-            return True
-        if tier is not None and admit:
-            tier.assign(expert)
-        return False
+            missing = [expert for expert in chunk if expert not in tier]
+            if missing:
+                if room < 1:
+                    raise RuntimeError("every pinned host slot holds a protected expert")
+                misses += len(missing)
+                protected = frozenset(chunk)
+                for expert in missing:
+                    tier.assign(expert, protected)
+            start += rows
+        return misses
+
+    def ram_ensure(layer: int, experts) -> int:
+        """ExpertHotCacheManager._load_reserved_in_chunks: admit rows, touching none.
+
+        Chunks hold at most the evictable rows read when they start; each goes
+        through ``ensure_rows``, which assigns only the experts the tier lacks.
+        Returns how many it had to read.
+        """
+        experts = list(experts)
+        tier = ram[layer]
+        if tier is None:
+            return len(experts)
+        misses = 0
+        start = 0
+        while start < len(experts):
+            room = evictable_rows(layer)
+            if room < 1:
+                raise RuntimeError("the pinned host tier has no evictable slots for hot cache promotions")
+            chunk = experts[start : start + room]
+            protected = frozenset(chunk)
+            for expert in chunk:
+                if expert not in tier:
+                    misses += 1
+                    tier.assign(expert, protected)
+            start += len(chunk)
+        return misses
 
     for layer, experts in hot.items():
-        for expert in experts:
-            ram_touch(layer, expert)
+        ram_ensure(layer, experts)
 
     clock = ResidencyBoundaryClock(update_prefill_tokens, update_decode_forwards, enabled=dynamic)
     last_update = {layer: 0 for layer in policies}
@@ -193,12 +249,19 @@ def simulate(
                     call["counts"], dtype=torch.float32
                 )
                 policy.record_counts(counts)
-            for expert in call["experts"]:
-                if expert in resident[layer]:
-                    continue
-                out[f"{phase}vram_misses"] += 1
-                if not ram_touch(layer, expert, admit=decode or prefill_admits):
-                    out[f"{phase}ram_misses"] += 1
+            # iter_gather_experts: chunks of max_gather_rows over the call's distinct
+            # experts; each chunk's hot misses go to the pinned tier together.
+            experts = call["experts"]
+            for start in range(0, len(experts), max_gather_rows):
+                missing = [
+                    expert
+                    for expert in experts[start : start + max_gather_rows]
+                    if expert not in resident[layer]
+                ]
+                out[f"{phase}vram_misses"] += len(missing)
+                out[f"{phase}ram_misses"] += ram_gather(
+                    layer, missing, admit=decode or prefill_admits
+                )
         kind = ForwardKind.DECODE if decode else ForwardKind.PREFILL
         boundary = clock.observe(kind, tokens)
         if boundary is None or not policies:
@@ -221,10 +284,11 @@ def simulate(
             # protected while its promotions are admitted through RAM.
             resident[layer].clear()
             resident[layer].update(decision.desired_experts)
-            for expert in decision.promotions:
-                out[f"{'decode' if decode else 'prefill'}_promotion_rows"] += 1
-                if not ram_touch(layer, expert):
-                    out[f"{'decode' if decode else 'prefill'}_promotion_ram_misses"] += 1
+            boundary_phase = "decode" if decode else "prefill"
+            out[f"{boundary_phase}_promotion_rows"] += len(decision.promotions)
+            out[f"{boundary_phase}_promotion_ram_misses"] += ram_ensure(
+                layer, decision.promotions
+            )
             last_update[layer] = clock.forwards
     tokens = out["decode_tokens"]
     out["G"] = out["vram_misses"] / tokens if tokens else 0.0
@@ -342,7 +406,11 @@ def main() -> None:
         "trace": args.trace,
         "calls": len(calls),
         "seeded": bool(args.seed),
-        "live": live_summary(calls) if calls and "vram_miss" in calls[0] else None,
+        "live": (
+            live_summary(calls)
+            if calls and all("vram_miss" in c and "ram_miss" in c for c in calls)
+            else None
+        ),
         "rows": rows,
     }
     print(json.dumps(report, indent=2))
