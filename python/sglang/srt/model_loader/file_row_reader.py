@@ -177,16 +177,19 @@ class PagedRowSource:
         row_count: int,
         *,
         direct: bool,
+        base_offset: int = 0,
     ) -> None:
         self.path = os.fspath(path)
         self.row_bytes = int(row_bytes)
         self.row_count = int(row_count)
+        # Row 0 starts here (a table inside a safetensors shard).
+        self.base_offset = int(base_offset)
         if not 0 < self.row_bytes <= PAGE_BYTES:
             raise ValueError("paged file rows must be between 1 byte and one page")
         self._reader = reader
         self._buffered_file = reader.open(self.path, direct=False)
         self._file_bytes = reader.file_size(self._buffered_file)
-        if self._file_bytes < self.row_bytes * self.row_count:
+        if self._file_bytes < self.base_offset + self.row_bytes * self.row_count:
             raise ValueError(
                 f"{self.path} holds {self._file_bytes} bytes, fewer than "
                 f"{self.row_count} rows of {self.row_bytes} bytes"
@@ -223,7 +226,7 @@ class PagedRowSource:
             raise ValueError(
                 f"paged row destination must hold {count} rows of {self.row_bytes} bytes"
             )
-        starts = rows * self.row_bytes
+        starts = self.base_offset + rows * self.row_bytes
         first_pages = starts >> _PAGE_SHIFT
         last_pages = (starts + (self.row_bytes - 1)) >> _PAGE_SHIFT
         pages = torch.unique(torch.cat([first_pages, last_pages]), sorted=True)
