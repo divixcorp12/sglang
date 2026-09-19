@@ -239,8 +239,8 @@ _WARNED_WITHOUT_PINNED_TIER = False
 
 
 def prefetch_enabled() -> bool:
-    """Option F advisories (Task 15 adds the env var; off until then)."""
-    return False
+    """Option F advisories (``SGLANG_DSV41_ENABLE_EXPERT_PREFETCH``)."""
+    return envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get()
 
 
 @functools.lru_cache(maxsize=4)

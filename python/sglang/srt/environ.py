@@ -1793,6 +1793,10 @@ class Envs:
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
     SGLANG_TEST_DSV41_RAM_MISS_FAULT = EnvStr("")
+    # Option F on top of option C: during MoE layer L of a graph decode step, post
+    # the previous token's routes for layer L+1 that are not in RAM as advisory
+    # reads for the RAM-miss thread (demands always go first). Off by default.
+    SGLANG_DSV41_ENABLE_EXPERT_PREFETCH = EnvBool(False)
     # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
     # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
     # plain np.memmap path.

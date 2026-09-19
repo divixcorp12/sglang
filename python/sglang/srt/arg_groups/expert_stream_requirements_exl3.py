@@ -49,6 +49,11 @@ def _check(cfg, budgets) -> None:
     ``full`` cannot work: the Engram lookup reads its ids on the host. A breakable decode
     graph also turns DSV4's alt-stream overlap off (below).
     """
+    if envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get() and not budgets.graph_gather:
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH posts advisories from the in-graph MoE; "
+            "it needs SGLANG_MOE_EXPERT_GRAPH_GATHER=1 with breakable decode graphs"
+        )
     graph = cfg.cuda_graph_config
     if graph is None or graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
