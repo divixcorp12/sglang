@@ -12,6 +12,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 NAMES = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
 
 
+@pytest.fixture(params=[False, True], ids=["unfused", "fused"], autouse=True)
+def fused_plan(request, monkeypatch):
+    """Run every test under both planners: the fused kernel writes the plan's expert ids itself."""
+    monkeypatch.setenv("SGLANG_MOE_EXPERT_FUSED_PLAN", "1" if request.param else "0")
+    return request.param
+
+
 def _tiers(pinned_rows=4, hot_slots=2, top_k=2):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
@@ -34,9 +41,10 @@ def _tiers(pinned_rows=4, hot_slots=2, top_k=2):
     return streamer, pinned, hot, reference
 
 
-def test_capture_then_replay_reads_the_pinned_slots():
+def test_capture_then_replay_reads_the_pinned_slots(fused_plan):
     streamer, pinned, hot, reference = _tiers()
     assert streamer._graph_pinned_tier
+    assert streamer._fused_plan_enabled == fused_plan
     pinned.ensure_rows(torch.tensor([6, 3], device="cuda"))  # slots chosen by the LRU
     ids = torch.tensor([[1, 6]], device="cuda", dtype=torch.int32)
     streamer.gather(ids)  # warm up outside capture
@@ -54,15 +62,26 @@ def test_capture_then_replay_reads_the_pinned_slots():
 
 
 def test_a_ram_miss_inside_a_replay_is_counted_and_drops_the_layer():
-    streamer, pinned, hot, _ = _tiers()
+    streamer, pinned, hot, reference = _tiers()
     pinned.ensure_rows(torch.tensor([6], device="cuda"))
     ids = torch.tensor([[1, 6]], device="cuda", dtype=torch.int32)
     streamer.gather(ids)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        streamer.gather(ids)
+        remap, tensors = streamer.gather(ids)
     ids.copy_(torch.tensor([[1, 7]], device="cuda", dtype=torch.int32))  # 7 is not in RAM
     graph.replay()
     torch.cuda.synchronize()
     assert streamer.row_backend.keep.item() == 0.0
     assert streamer.row_backend.ram_miss.item() == 1
+    missed = remap.reshape(-1)[1].item()
+    assert missed >= hot.capacity  # the miss landed in a scratch row
+    for name in NAMES:
+        # The clamped lane copied pinned slot 0, which holds expert 6.
+        assert torch.equal(tensors[name][missed].cpu(), reference[name][6]), name
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
