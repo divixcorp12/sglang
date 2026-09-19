@@ -420,6 +420,8 @@ constexpr int64_t kRecStatus = 10;
 constexpr int64_t kRecAfter = 12;
 constexpr int64_t kRecNeed = 16;
 constexpr int64_t kRecProtect = 48;
+// uint32: nonzero when the device waits on this demand record (need non-empty or advise on).
+constexpr int64_t kRecArmed = 80;
 constexpr uint16_t kServed = 1;
 constexpr uint16_t kFailed = 2;
 
@@ -463,6 +465,7 @@ struct Request {
   uint32_t seq = 0;
   int64_t row = 0;
   uint32_t after = 0;
+  bool armed = true;
   std::vector<int32_t> need;
   std::vector<int32_t> protect;
 };
@@ -476,6 +479,9 @@ inline bool read_record(const uint8_t* record, uint32_t expected, Request* reque
   std::memcpy(&need, record + kRecNeedCount, 2);
   std::memcpy(&protect, record + kRecProtectCount, 2);
   std::memcpy(&request->after, record + kRecAfter, 4);
+  uint32_t armed;
+  std::memcpy(&armed, record + kRecArmed, 4);
+  request->armed = armed != 0;
   request->seq = expected;
   request->row = row;
   const auto* need_ids = reinterpret_cast<const int32_t*>(record + kRecNeed);
@@ -769,8 +775,26 @@ class RamTier {
     return !reached(next_demand_ - 1u, load_acquire(page_ + kDemandHead));
   }
 
-  // Touch the request's assigned rows; read every protected or needed expert that is not
-  // assigned (D12's recompute), evicting only unprotected, non-hot READY rows; publish.
+  // An unarmed demand record: nobody waits on it, so the device may already be gathering
+  // any mapped slot (the next token's rows too, once the thread lags). Only refresh the
+  // recency of its assigned rows: no eviction, no read. False for an invalid record.
+  bool touch_request(const Request& request) {
+    if (request.row < 0 || request.row >= layers_) return false;
+    std::lock_guard<std::mutex> guard(mutex_);
+    Tier& tier = tiers_[request.row];
+    for (const auto* ids : {&request.protect, &request.need}) {
+      for (int32_t expert : *ids) {
+        if (expert < 0 || expert >= experts_) return false;
+        const int32_t slot = tier.expert_slot[expert];
+        if (slot >= 0) tier.stamp[slot] = ++tick_;
+      }
+    }
+    return true;
+  }
+
+  // An armed demand or an advisory: touch the request's assigned rows; read every protected
+  // or needed expert that is not assigned (D12's recompute: the device is waiting on this
+  // record, so no gather is in flight), evicting only unprotected, non-hot READY rows; publish.
   // An advisory protects only its own ids, reads one row at a time and gives up when a
   // demand is posted or a pause is requested (its rows so far are released).
   // *rows: the rows it read (0 when it failed).
@@ -868,7 +892,7 @@ class RamTier {
     store_release(page_ + kBusySeq, request.seq);
     if (load_acquire(page_ + kFatal) != 0) counters_[kLateAfterFatal].fetch_add(1);
     int64_t rows = 0;
-    const bool ok = serve(request, false, &rows);
+    const bool ok = request.armed ? serve(request, false, &rows) : touch_request(request);
     // Classified by what was read: an empty need whose protect ids had to be read is D12's race.
     if (ok) counters_[rows == 0 ? kTouchOnly : kServedRequests].fetch_add(1);
     _mm_sfence();
@@ -1011,7 +1035,7 @@ void exl3_ram_miss_layer_rows(int64_t handle, int64_t advisory, TensorView out) 
 // ---- Host-side simulated device: the post and wait kernels' protocol, for CPU tests ----
 
 int64_t exl3_ram_miss_sim_post(
-    TensorView page, int64_t row, TensorView need, TensorView protect, int64_t advisory, int64_t after) {
+    TensorView page, int64_t row, TensorView need, TensorView protect, int64_t advisory, int64_t after, int64_t armed) {
   using namespace exl3_ram_miss;
   auto* base = static_cast<uint8_t*>(page.data_ptr());
   const int64_t head_word = advisory ? kAdviseHead : kDemandHead;
@@ -1026,6 +1050,7 @@ int64_t exl3_ram_miss_sim_post(
   const uint16_t protect_count = static_cast<uint16_t>(std::min<size_t>(protect_ids.size(), kMaxIds));
   const uint16_t pending = 0;
   const uint32_t after32 = static_cast<uint32_t>(after);
+  const uint32_t armed32 = armed != 0 ? 1u : 0u;
   // Seqlock writer: invalidate seq, fence, payload, fence, seq last (a lapped record
   // still being rewritten can never carry a valid seq).
   store_release(record + kRecSeq, 0u);
@@ -1036,6 +1061,7 @@ int64_t exl3_ram_miss_sim_post(
   std::memcpy(record + kRecProtectCount, &protect_count, 2);
   std::memcpy(record + kRecStatus, &pending, 2);
   std::memcpy(record + kRecAfter, &after32, 4);
+  std::memcpy(record + kRecArmed, &armed32, 4);
   if (need_count) std::memcpy(record + kRecNeed, need_ids.data(), 4 * need_count);  // data() may be null when empty
   if (protect_count) std::memcpy(record + kRecProtect, protect_ids.data(), 4 * protect_count);
   std::atomic_thread_fence(std::memory_order_seq_cst);

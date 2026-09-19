@@ -5,7 +5,8 @@
 // into the page's demand ring with volatile stores, fences system-wide and
 // release-stores demand_head. The record is posted for every MoE layer (the thread
 // uses touch-only records for LRU recency); the wait is armed only when something is
-// needed or advisories are on. With `advise`, it also remembers this token's routes
+// needed or advisories are on, and the record says so (kRecArmed): the thread only
+// touches for an unarmed record, since nothing orders it before the next gathers. With `advise`, it also remembers this token's routes
 // for `row` and posts the previous token's routes of `next_row` that are not in RAM
 // as an advisory record.
 // wait: one block; thread 0 polls demand_done with ld.acquire.sys and __nanosleep
@@ -51,6 +52,7 @@ constexpr int64_t kRecStatus = 10;
 constexpr int64_t kRecAfter = 12;
 constexpr int64_t kRecNeed = 16;
 constexpr int64_t kRecProtect = 48;
+constexpr int64_t kRecArmed = 80;
 constexpr uint16_t kServed = 1;
 
 constexpr int kPosted = 0;
@@ -96,7 +98,7 @@ __device__ __forceinline__ bool listed(const int32_t* ids, int count, int32_t id
 
 __device__ __forceinline__ void write_record(
     uint8_t* record, uint32_t seq, int64_t row, const int32_t* need, int need_count, const int32_t* protect,
-    int protect_count, uint32_t after) {
+    int protect_count, uint32_t after, uint32_t armed) {
   volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(record);
   volatile uint16_t* halves = reinterpret_cast<volatile uint16_t*>(record);
   // Seqlock writer: invalidate seq before touching the payload, so a lapped record that
@@ -108,6 +110,7 @@ __device__ __forceinline__ void write_record(
   halves[kRecProtectCount / 2] = static_cast<uint16_t>(protect_count);
   halves[kRecStatus / 2] = 0;
   words[kRecAfter / 4] = after;
+  words[kRecArmed / 4] = armed;
   volatile int32_t* need_out = reinterpret_cast<volatile int32_t*>(record + kRecNeed);
   volatile int32_t* protect_out = reinterpret_cast<volatile int32_t*>(record + kRecProtect);
   for (int i = 0; i < kMaxIds; ++i) {
@@ -168,10 +171,11 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   if (seq == 0) seq = 1;
   state[kPosted] = static_cast<int32_t>(seq);
   uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
-  write_record(record, seq, row, need, need_count, protect, protect_count, 0);
+  const bool armed = need_count > 0 || advise != 0;
+  write_record(record, seq, row, need, need_count, protect, protect_count, 0, armed ? 1u : 0u);
   __threadfence_system();
   st_release_sys(page + kDemandHead, seq);
-  state[kPending] = (need_count > 0 || advise != 0) ? static_cast<int32_t>(seq) : 0;
+  state[kPending] = armed ? static_cast<int32_t>(seq) : 0;
   if (advise == 0) return;
   for (int i = 0; i < kMaxIds; ++i) last_routes[row * kMaxIds + i] = i < protect_count ? protect[i] : -1;
   if (next_row < 0) return;
@@ -187,7 +191,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   if (advice == 0) advice = 1;
   state[kAdvised] = static_cast<int32_t>(advice);
   uint8_t* advice_record = page + kAdviseRing + static_cast<int64_t>((advice - 1u) % kAdviseRecords) * kRecordBytes;
-  write_record(advice_record, advice, next_row, ahead, ahead_count, ahead, ahead_count, seq);
+  write_record(advice_record, advice, next_row, ahead, ahead_count, ahead, ahead_count, seq, 1u);
   __threadfence_system();
   st_release_sys(page + kAdviseHead, advice);
 }

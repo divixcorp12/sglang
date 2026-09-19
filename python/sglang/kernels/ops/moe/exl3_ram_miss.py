@@ -161,9 +161,15 @@ def page_word(page: torch.Tensor, name: str) -> int:
     return int(page[offset : offset + 4].view(torch.int32)[0]) & 0xFFFFFFFF
 
 
-def sim_post(page, row: int, need, protect, *, advisory: bool = False, after: int = 0) -> int:
-    """Post a record as the device post kernel does; returns its sequence."""
-    return int(_host_module().exl3_ram_miss_sim_post(page, row, _ids(need), _ids(protect), int(advisory), after))
+def sim_post(page, row: int, need, protect, *, advisory: bool = False, after: int = 0, armed: bool = True) -> int:
+    """Post a record as the device post kernel does; returns its sequence.
+
+    ``armed``: a device waits on the record. The post kernel arms a demand record when
+    its need is non-empty or advisories are on; the thread only touches for an unarmed one.
+    """
+    return int(
+        _host_module().exl3_ram_miss_sim_post(page, row, _ids(need), _ids(protect), int(advisory), after, int(armed))
+    )
 
 
 def sim_wait(page, seq: int, timeout_s: float) -> int:
