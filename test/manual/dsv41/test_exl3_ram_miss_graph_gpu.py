@@ -8,6 +8,8 @@ rows, and graph vs the eager streamed apply (exl3_moe_loop, the less accurate ar
 ~1.5e-2 on these fake rows) stays within Task 9's 2.5e-2.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -167,3 +169,7 @@ def test_a_forced_timeout_fails_stop_without_hanging(tmp_path):
     finally:
         service.host.inject(delay_s=0.0)
         service.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

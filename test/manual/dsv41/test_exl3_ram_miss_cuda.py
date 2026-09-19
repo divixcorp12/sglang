@@ -8,6 +8,7 @@ file for the measured numbers.
 
 import json
 import os
+import sys
 import time
 
 import pytest
@@ -333,3 +334,7 @@ def test_overheads(tmp_path):
             json.dump(report, f, indent=2)
     print(json.dumps(report))
     assert report["hit_path_us_per_layer"] < 100.0
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

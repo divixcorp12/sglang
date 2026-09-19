@@ -1,5 +1,6 @@
 """Advisory (next-layer prefetch) records on the RAM-miss thread (CPU, simulated device)."""
 
+import faulthandler
 import sys
 import time
 
@@ -11,6 +12,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def hang_guard():
+    # The service thread and its handshakes run in C++: a broken handshake or join hangs,
+    # so dump every stack and exit instead (pytest-timeout could not interrupt it).
+    faulthandler.dump_traceback_later(120, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
 
 
 def _host(tmp_path):

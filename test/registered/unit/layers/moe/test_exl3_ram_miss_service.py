@@ -1,6 +1,7 @@
 """Option C wiring on the host: the native slot table under the pinned tier, the fail-stop
 check, residency pushes and the per-step graph trace (CPU; the thread runs, no device)."""
 
+import faulthandler
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,15 @@ from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 LAYERS, EXPERTS, CAPACITY = 2, 6, 3
+
+
+@pytest.fixture(autouse=True)
+def hang_guard():
+    # The service thread and its handshakes run in C++: a broken handshake or join hangs,
+    # so dump every stack and exit instead (pytest-timeout could not interrupt it).
+    faulthandler.dump_traceback_later(120, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.fixture
@@ -93,6 +103,8 @@ def test_the_fail_stop_check_raises_once_fatal_is_set(tiers):
     assert sim_wait(service.page, sim_post(service.page, row, need=[1], protect=[1]), 10) == 2
     with pytest.raises(RuntimeError, match="exl3 RAM miss"):
         service.fail_stop_check()
+    # fatal stays raised: stop now, before the watchdog's fatal-held rule can abort pytest.
+    service.shutdown()
 
 
 def test_attach_registers_once_and_pushes_residency(tiers):
