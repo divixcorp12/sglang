@@ -65,6 +65,12 @@ class _RowsPerRequestRunner:
     def capture_output_rows(self, size):
         return size * self.rows_per_request
 
+    def cuda_graph_output_rows(self, output):
+        return None
+
+    def cuda_graph_output_capacity_rows(self, output):
+        return None
+
 
 def test_capture_output_rows_come_from_the_runner_and_default_to_the_key_size():
     backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
@@ -79,6 +85,7 @@ def test_capture_output_rows_come_from_the_runner_and_default_to_the_key_size():
 
 def test_shared_output_buffer_grows_for_a_wider_capture_and_keeps_earlier_slices():
     backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+    backend._cuda_graph_runner = _RowsPerRequestRunner(1)
     backend._shared_output_buffer = None
     backend._shared_output_rows = 0
     narrow = LogitsProcessorOutput(
@@ -109,6 +116,7 @@ def test_shared_output_buffer_grows_for_a_wider_capture_and_keeps_earlier_slices
 
 def test_copy_rejects_a_field_with_fewer_rows_than_the_capture_stores():
     backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+    backend._cuda_graph_runner = _RowsPerRequestRunner(1)
     output = LogitsProcessorOutput(
         next_token_logits=torch.zeros(4, 3), hidden_states=torch.zeros(1, 2)
     )

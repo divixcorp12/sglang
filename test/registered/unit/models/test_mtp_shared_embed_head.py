@@ -29,9 +29,20 @@ def _tensors(module):
     return [t for _, t in chain(module.named_parameters(), module.named_buffers())]
 
 
+_PP_GROUP = SimpleNamespace(
+    is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+)
+
+
 def _parallel():
     return SimpleNamespace(
-        tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1, enable_dp_lm_head=False
+        tp_rank=0,
+        tp_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_dcp_size=1,
+        enable_dp_lm_head=False,
+        pp_group=_PP_GROUP,
     )
 
 
@@ -115,24 +126,18 @@ class BuildWithTargetWeightTests(unittest.TestCase):
 
 
 class RealMtpConstructionTests(unittest.TestCase):
-    pp_group = SimpleNamespace(
-        is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
-    )
-
     def construction_patches(self, stack):
         for owner, name, value in (
             (qwen3_5_mtp, "_mtp_quant_config", lambda q: None),
             (qwen3_5_mtp, "get_parallel", _parallel),
-            (qwen3_5_mtp, "get_pp_group", lambda: self.pp_group),
             (qwen3_5_mtp, "LogitsProcessor", lambda c: nn.Identity()),
-            (qwen3_5, "get_pp_group", lambda: self.pp_group),
+            (qwen3_5, "get_parallel", _parallel),
             (qwen3_5, "make_layers", lambda *a, **k: (nn.ModuleList(), 0, 0)),
             (qwen3_5, "get_stream", lambda name: None),
             (qwen3_5, "is_dp_attention_enabled", lambda: False),
             (qwen4_exp_mtp, "Qwen4ExpModel", lambda *a, **k: nn.Module()),
             (qwen4_exp_mtp, "_mtp_quant_config", lambda q: None),
             (qwen4_exp_mtp, "get_parallel", _parallel),
-            (qwen4_exp_mtp, "get_pp_group", lambda: self.pp_group),
             (qwen4_exp_mtp, "LogitsProcessor", lambda c: nn.Identity()),
             (qwen4_exp_mtp, "maybe_install_mtp_hidden_trace", lambda m: None),
         ):
