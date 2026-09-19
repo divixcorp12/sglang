@@ -246,11 +246,13 @@ The production server is launched by
 **`divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh`** (port 7867,
 `0.0.0.0`). That *script* is not in this repo, but the *code* it runs is. Since
 2026-09-19 it runs the worktree **`prod-presets-20260919`**: `797be6f678` plus
-`prod-presets-20260919.patch` staged, now at the commit that adds the offload
-presets, byte-identical to this branch's code at that commit (everything below
-plus the host token embedding, the stage-2 victim fix, and the presets module).
-The patch is the exact one the fix was verified with. The previous worktree
-`prod-5b91a98` (code at `5b91a9833c`, **has the stage-2 bug**) is untouched.
+`prod-presets-20260919.patch` staged, now at `a3134f39b9`, byte-identical to
+this branch's code at that commit (everything below plus the host token
+embedding, the stage-2 victim fix, and the presets module). The patch is
+`git diff 797be6f678 a3134f39b9` of `python/`, `scripts/` and `test/`; its
+effective offload env was verified identical to the previous script's. The
+previous worktree `prod-5b91a98` (code at `5b91a9833c`, **has the stage-2
+bug**) is untouched.
 
 **As of 2026-09-18 the script carries the full winning config.** Four changes
 against the pre-campaign script, each with a backup alongside:

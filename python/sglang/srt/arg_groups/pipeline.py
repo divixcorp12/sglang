@@ -374,9 +374,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     from sglang.srt.arg_groups.moe_offload_hook import check_moe_offload_config
 
-    # Last: cuda_graph_config, speculative_algorithm, and the parallelism
-    # fields it reads keep changing until here (handle_speculative_decoding,
-    # handle_data_parallelism, handle_dllm_inference, handle_other_validations).
+    # Last: cuda_graph_config and speculative_algorithm keep changing until here
+    # (handle_speculative_decoding, handle_dllm_inference, handle_other_validations);
+    # dp_size/enable_dp_attention are forced by handle_dwdp, earlier, but
+    # handle_data_parallelism still resets enable_dp_attention when dp_size==1.
     check_moe_offload_config(server_args)
 
     server_args._resolution_finished = True

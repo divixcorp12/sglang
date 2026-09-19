@@ -49,11 +49,11 @@ def check_moe_offload_config(server_args: Any) -> None:
     """Refuse invalid offload combinations once the fields it reads are final.
 
     Runs last in the resolution pipeline. cuda_graph_config keeps changing
-    through handle_speculative_decoding, handle_data_parallelism,
-    handle_dllm_inference and handle_other_validations; speculative_algorithm
-    only settles at handle_speculative_decoding; tp/pp/dp_size and
-    enable_dp_attention can still move through handle_data_parallelism and
-    the DeepSeek-family model overrides. By this point every offload
+    through handle_speculative_decoding, handle_dllm_inference and
+    handle_other_validations; speculative_algorithm only settles at
+    handle_speculative_decoding. dp_size/enable_dp_attention are forced by
+    handle_dwdp, earlier, but handle_data_parallelism still resets
+    enable_dp_attention when dp_size==1. By this point every offload
     variable the preset fills is already in os.environ.
     """
     cfg = resolving_view(server_args)

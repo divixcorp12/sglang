@@ -248,7 +248,14 @@ def check_offload_config(
     dp_attention: bool,
     allowed_cpus: Collection[int],
 ) -> None:
-    """Refuse combinations that would otherwise fail after the weight load, or silently."""
+    """Refuse combinations that would otherwise fail after the weight load, or silently.
+
+    ``allowed_cpus`` is the launcher process's cpuset; the doorbell spin thread
+    actually runs in the spawned scheduler, which can narrow its own cpuset
+    later (numactl wrap, SGLANG_SET_CPU_AFFINITY, numa_bind_to_node). Passing
+    this check is necessary, not sufficient: the scheduler can still end up
+    unpinned even when the launcher's cpuset includes the configured core.
+    """
     if _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0 and not _value(values, "SGLANG_MOE_EXPERT_STREAM"):
         raise ValueError("SGLANG_MOE_HOT_GPU_MB requires SGLANG_MOE_EXPERT_STREAM=1")
     if _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER") and decode_graphs_disabled:
@@ -278,7 +285,8 @@ def check_offload_config(
     cpu = _value(values, "SGLANG_MOE_EXPERT_DOORBELL_CPU")
     if cpu not in allowed_cpus:
         raise ValueError(
-            f"SGLANG_MOE_EXPERT_DOORBELL_CPU={cpu} is outside this process's allowed CPUs "
-            f"({min(allowed_cpus)}-{max(allowed_cpus)}), so the spin thread would run "
-            "unpinned; set it to an allowed core"
+            f"SGLANG_MOE_EXPERT_DOORBELL_CPU={cpu} is outside the launcher's allowed CPUs "
+            f"({min(allowed_cpus)}-{max(allowed_cpus)}); set it to an allowed core. This "
+            "does not guarantee the scheduler process keeps that core: it can narrow its "
+            "own cpuset further after this check runs."
         )
