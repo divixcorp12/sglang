@@ -42,7 +42,9 @@ The design that follows is in §9. Decisions still open are in §12.
    - Today's in-graph gather reads host RAM via `ld.global.nc` and has no miss path.
    - Four mechanisms are compared in §9.3. **Option C (CPU io_uring thread + device-side
      wait) was built and measured in Phase 3b (§17):** 2.781 tok/s under breakable CUDA
-     graphs against 1.664 eager on the same four sessions.
+     graphs against 1.664 eager on the same four cold sessions. Caveats: R4 fails against
+     the eager loop (fused-kernel numerics, §17.4), and graph gather's scratch cuts the hot
+     cache to 888 slots against the eager run's 1,128 (§17.6).
    - Each needs a bounded wait and a defined failure path; a stuck NVMe read must not
      wedge the stream.
    - For experts the NVMe read is on the critical path whatever the mechanism (the
@@ -860,7 +862,8 @@ measured in eager mode on the full 40-layer model:
 1. **Go/no-go bar.** What tok/s justifies the downtime and the Phase 2–3 investment?
    The envelope is ~3–8 tok/s before compute, against 19.36 tok/s on Qwen today
    (MOE_EXPERT_TRANSFER).
-2. **Miss mechanism**: A, B (split) or C (§9.3), decided after the prototype.
+2. **Miss mechanism**: A, B (split) or C (§9.3), decided after the prototype (option C
+   built, §17; A and B not built).
 3. **Overlap scheduling.** At DSV4.1 token times it is worth ~1–2%, not Qwen's ~4%.
    Keep it only if the chosen mechanism is compatible.
 4. **Failure policy** for an NVMe read that fails or times out inside a graph: fail-stop,
@@ -892,8 +895,9 @@ measured in eager mode on the full 40-layer model:
     token of it outside RAM-miss I/O (§16.12).
 - nvme1's real throughput under `op-reth` write load (DRAM-less QLC) is unknown. So is
   its sustained write rate for the 205 GB copy.
-- The miss mechanisms are unprototyped. Option B's host-callback serialization and
-  stream-idle behaviour and option C's SM cost while polling are unmeasured.
+- Option C was prototyped in Phase 3b (§17); A and B were not. Option B's host-callback
+  serialization and stream-idle behaviour, and option C's SM cost while polling, remain
+  unmeasured.
 - ~~The EXL3 slot alignment~~: resolved (§14.1) — trellis needs 16 B, `suh`/`svh`
   need 8 B (checked in both the main and coop kernels), and padding happens in the
   RAM→VRAM segment copy, not as a separate admission-copy cost.
@@ -1710,9 +1714,10 @@ here.
   `SGLANG_MOE_EXPERT_GRAPH_GATHER=1`, `SGLANG_DSV41_RAM_MISS_TIMEOUT_MS=2000`,
   `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=0` (`cpf` sets it to 1). `ANA/env-full-p1.sh` sets
   graph gather to 0. The Step 6 setting (`window.log`) was **`MEM_FRACTION=0.80`,
-  `HOT_MB=14336`**, with no ladder rung needed. The `p1` arm ran with
-  `SGLANG_MOE_HOT_GPU_MB=11288` (`ANA/step8-chain.sh`): 14,336 less option C's scratch
-  of 3,048 MiB.
+  `HOT_MB=14336`**, with no ladder rung needed. The `p1` arm ran with a hot budget of
+  **11,288 MiB** = `HOT_MB` − 3,048 (option C's scratch, 3,195,740,160 B). Source:
+  `corpus-p1.log`'s `Expert hot cache startup` line, `requested_bytes` 11,836,325,888 =
+  11,288 MiB.
 - **The DSV4 multi-stream overlap is off** for EXL3 breakable decode (the EXL3 gate,
   Task 5). The root cause of the first defect was found and fixed: `hc_stats_stream` was
   forked before the MoE, the EXL3 MoE break ended the segment, and `ffn_stats` launched
@@ -1798,14 +1803,21 @@ probe rel_fused/rel_loop 1.16e-3/1.15e-2** (`window.log`, Step 5).
   and they agree exactly, so capture introduces no error. The eager control is bitwise,
   which rules out run-to-run nondeterminism. What remains is the fused `exl3_moe` against
   the eager `exl3_moe_loop`.
-- **Observation: the divergence is the eager path's error, not a capture bug.** Against
-  the fp32 reference, the fused path is the more accurate one in every measurement:
+- **Observation:**
+  - Capture is not the cause: `graph_vs_debug` is bitwise.
+  - Per layer, the fused kernel is **~7–10x closer to fp32** than `exl3_moe_loop` in
+    every measurement below.
+  - So the end-to-end mismatch at step 18 is a numeric difference between two kernels.
+    These data do not attribute it to either one.
+  - **No end-to-end fp32 logprob comparison was run on `T3`** (open, §17.8).
+
+  Per-layer MoE error against the fp32 reference:
 
   | Source | Fused / graph vs fp32 | `exl3_moe_loop` vs fp32 |
   |---|---:|---:|
   | Task 1 probe (`probe-exl3-moe.json`, max over 8 route sets) | 1.16e-3 | 1.15e-2 |
-  | Task 9 GPU test, 3 routes (`task-9-report.md`) | 2.13–2.18e-3 (graph replay) | 1.50–1.57e-2 |
-  | Task 14 GPU test, 2 routes with served misses (`task-14-report.md`) | 2.148e-3, 2.292e-3 | 1.752e-2, 1.478e-2 |
+  | Task 9 GPU test, 3 routes, synthetic rows (`task-9-report.md`) | 2.13–2.18e-3 (graph replay) | 1.50–1.57e-2 |
+  | Task 14 GPU test, 2 routes with served misses, synthetic rows (`task-14-report.md`) | 2.148e-3, 2.292e-3 | 1.752e-2, 1.478e-2 |
 
   That is ~10x in the probe and ~7x in the Task 9 and 14 tests. The step-18 divergence
   was not bisected further.
@@ -1867,6 +1879,15 @@ in §16.12. `G` and `f` are as in §16.8; `f` counts **demand rows only**.
   no_victim 0.
 - `decode_tokens`: `p1` 512, `c` 511, `cpf` 511. `c` and `cpf` have 495 `graph_step` lines,
   16 of which hold 2 steps (§17.8 bug 5).
+  - **Why 511, not 512.** Under overlap scheduling the per-batch register read lags a step
+    now and then, and the next check writes the lagged step. After the run's last replay
+    that next check never comes, because `Engine.shutdown` SIGKILLs the scheduler. So the
+    final lagged step is never recorded. Per-session `routed_rows / 240` gives 127 or 128
+    steps, so nothing else was lost (task-16 report, bug 5; Task 16 review M1).
+  - A lagged step at a session boundary is written after the next session's prefill, so it
+    counts as that session's first warmup step.
+  - `p1` (eager MoE break, per-layer lines, no lag) counts all 512.
+  - The effect is one step in 512 (~0.2%) on `G` and `f`.
 
 ### 17.7 Per-token breakdown
 
@@ -1900,8 +1921,18 @@ Which eager buckets moved:
 - **Host work, ~340 ms/token** (Python, torch CPU ops, bookkeeping) plus ~57 ms of launch
   API: launches fell from ~7.1k to 52 per token. The scheduler now spends its time
   blocked inside `cudaGraphLaunch` (203 ms/token) and `cudaMemcpyAsync` (138 ms/token),
-  each waiting for the previous segment, in-graph waits included. The residual host-CPU
-  bucket was **not computed** from the graph trace.
+  each waiting for the previous segment, in-graph waits included.
+  - **Residual host work: ~28–54 ms/token.** This is span, less CUDA runtime time on the
+    scheduler thread, less the part of off-CPU time that falls outside API calls
+    (`prof-graph-analysis.log`):
+    - span 14.798 s;
+    - runtime 12.902 s (`cudaGraphLaunch` 7.105 + `cudaMemcpyAsync` 4.842 +
+      `cudaStreamSynchronize` 0.925 + launches 0.024 + event/capture queries 0.005);
+    - off-CPU 0.924 s.
+  - The split of off-CPU time between inside and outside the API calls was not measured.
+    So the residual lies between 14.798 − 12.902 − 0.924 = 0.972 s and
+    14.798 − 12.902 = 1.896 s, i.e. **27.8–54.2 ms/token** over 35 steps.
+  - Eager: ~340 ms/token plus ~57 ms of launch API.
 - **Syncs, ~220 ms/token** (168 `cudaMemcpyAsync` + 51 `cudaStreamSynchronize`): now 164 ms
   (138 + 26) in ~40 calls instead of ~1,600. The remaining copies are the Engram break's
   syncing copies, and their time is mostly waiting on the GPU.
@@ -1943,9 +1974,13 @@ Which eager buckets moved:
 **Open:**
 - **The MQA alt-stream defect** in segment 0 (§17.1). The DSV4 multi-stream overlap stays
   off for EXL3 breakable decode until it is found; its speed-up is unmeasured.
-- **Raw JSON `--cuda-graph-config` crash** in `memory_hook.py:174-176`: the framework's
-  graph-gather check reads `.decode` off any non-None pre-parse value, so an explicit JSON
-  dict with graph gather would raise `AttributeError` in the pre-parse pass. Flag-only
+- **Raw JSON `--cuda-graph-config` crash** at two framework sites in
+  `arg_groups/memory_hook.py` (`cc/moe-expert-plugins`):
+  - `:174-176`, the graph-gather check, reads `.decode` off any non-None pre-parse value;
+  - `:208-211`, the Qwen4 PLE staging check, reads `.prefill` the same way.
+
+  An explicit JSON dict with either feature enabled would raise `AttributeError` in the
+  pre-parse pass. Flag-only
   launches pass `None` and are unaffected. Not fixed (framework branch, R3 scope).
 - **Trace lines written before `4b906b3d4f` undercount steps under overlap.** For such a
   trace use `routed_rows / routed_rows_per_step` (240 on the full model).
@@ -1953,6 +1988,8 @@ Which eager buckets moved:
   scales with the KV pool: `T3` needs `mem_fraction_static` 0.5, or 0.8 with a
   `max_total_tokens` cap (`graph_parity.py`). The full model at 0.80 was unaffected.
 - **R4** stays FAIL against the eager loop (§17.4).
+- **No end-to-end fp32 reference for R4.** Neither path's `T3` logprobs were compared with
+  an fp32 model, so the step-18 divergence is not attributed to either kernel (§17.4).
 - Parked minors from the ledger that a reader may hit:
   - the RAM-miss thread is not stopped at a clean scheduler shutdown (the exit hook
     covers it; Task 14 M3);
