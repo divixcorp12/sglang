@@ -151,12 +151,17 @@ def handle_offload_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_HOT_GPU_MB"
             )
-        if not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get() and (
-            expert_stream_requirements_for(server_args, cfg).graph_gather_host_source
-            == "arena"
-        ):
+        host_source = expert_stream_requirements_for(
+            server_args, cfg
+        ).graph_gather_host_source
+        if host_source == "arena" and not envs.SGLANG_MOE_EXPERT_HOST_ARENA.get():
             raise ValueError(
                 "SGLANG_MOE_EXPERT_GRAPH_GATHER requires SGLANG_MOE_EXPERT_HOST_ARENA=1"
+            )
+        if host_source == "pinned_tier" and not pinned_budget_mb:
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER over the pinned host tier requires "
+                "SGLANG_MOE_PINNED_HOST_MB"
             )
         if prefetch_candidates:
             raise ValueError(

@@ -1101,6 +1101,13 @@ class ExpertStreamer:
                 raise RuntimeError(
                     f"expert tensor {name!r} moved after graph gather was enabled"
                 )
+        if self._graph_pinned_tier and (
+            self.pinned_host_cache.expert_to_slot.data_ptr()
+            != self.row_backend.host_row_map.data_ptr()
+        ):
+            raise RuntimeError(
+                "the pinned host tier's slot map moved after graph gather was enabled"
+            )
 
     def _read_pageable_rows(
         self,

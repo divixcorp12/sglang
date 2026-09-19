@@ -1192,11 +1192,13 @@ class ExpertHotCacheManager:
                     # This clamp is reachable during the floor pass only if a
                     # layer both has a floor (DIRECT, graph_gather_batch_size > 0)
                     # and an inclusive pinned tier's slot limit. That never
-                    # happens today: a nonzero floor requires every streamer to
-                    # have passed require_graph_gather_support, and no format
-                    # both supports graph gather and sets inclusive_pinned_tier
-                    # (EXL3's inclusive tier is eager-only). Assert this instead
-                    # of relying on it silently, since the clamp would otherwise
+                    # happens today: DIRECT requires gpu_residency_update, under
+                    # which require_graph_gather_support refuses pinned_tier
+                    # formats (pinned_tier_ok=False), and no dense format sets
+                    # inclusive_pinned_tier. A pinned_tier format (EXL3's
+                    # inclusive tier) passes the support check only for the plain
+                    # graph gather, which has no floor. Assert this instead of
+                    # relying on it silently, since the clamp would otherwise
                     # cut into a layer's floor and DIRECT would refuse the budget.
                     assert not floor_pass or floors[layer_id] == 0
                     clamped.add(layer_id)

@@ -259,6 +259,15 @@ def graph_source_kind_of(expert_format: Any) -> str:
     return getattr(expert_format, "graph_source_kind", "dense")
 
 
+def graph_gather_needs_host_arena(model: torch.nn.Module) -> bool:
+    """Whether ``model``'s graph gathers need ``SGLANG_MOE_EXPERT_HOST_ARENA``: true
+    unless every attached streamer's format serves them from its pinned host tier."""
+    return any(
+        graph_source_kind_of(streamer.format) != "pinned_tier"
+        for streamer in iter_expert_streamers(model)
+    )
+
+
 def require_graph_gather_support(
     streamers: Iterable["ExpertStreamer"], *, pinned_tier_ok: bool = False
 ) -> None:
