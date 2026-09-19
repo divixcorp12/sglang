@@ -237,12 +237,21 @@ class Exl3RamMissHost:
             raise ValueError(f"slot {slot} is outside [0, {capacity})")
 
     def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000) -> None:
-        """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog."""
+        """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog.
+
+        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19).
+        """
+        if 64 <= cpu_core <= 71:
+            raise ValueError(f"cpu_core {cpu_core}: cores 64-71 are reserved (71 is production's doorbell core)")
         self._module.exl3_ram_miss_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
         self.threaded = True
 
     def pause(self, timeout_s: float) -> None:
-        """Hand the slots to the caller: returns once the thread is between requests and idle."""
+        """Hand the slots to the caller: returns once the thread is between two requests.
+
+        The caller must have synchronized the device stream, so no demand is pending (D12).
+        Not reentrant: one owner (the slot table's depth counter) pauses and resumes.
+        """
         if not self.threaded:
             return
         if not self._module.exl3_ram_miss_pause(self.handle, int(timeout_s * 1e9)):
