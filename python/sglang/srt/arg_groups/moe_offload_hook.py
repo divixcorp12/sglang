@@ -10,7 +10,7 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import offload_presets
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +40,17 @@ def handle_moe_offload_preset(server_args: Any) -> None:
     if offload_presets.needs_overlap_off(resolved.effective) and not cfg.disable_overlap_schedule:
         declare_resolution(server_args, "handle_moe_offload_preset", disable_overlap_schedule=True)
         logger.info("MoE offload preset %s turns overlap scheduling off", name)
-    graph = cfg.cuda_graph_config
+    # This hook runs before _parse_cuda_graph_config, so cuda_graph_config may
+    # still be the raw CLI dict (or None); normalize it the same way that
+    # resolver does before reading phase settings off it.
+    raw_graph = cfg.cuda_graph_config
+    graph = raw_graph if isinstance(raw_graph, CudaGraphConfig) else CudaGraphConfig.from_dict(raw_graph)
     try:
         offload_presets.check_offload_config(
             resolved.effective,
             speculative=cfg.speculative_algorithm is not None,
-            decode_graphs_disabled=graph is not None and graph.decode.backend == Backend.DISABLED,
-            decode_max_bs=None if graph is None else graph.decode.max_bs,
+            decode_graphs_disabled=graph.decode.backend == Backend.DISABLED,
+            decode_max_bs=graph.decode.max_bs,
             tp_size=cfg.tp_size,
             pp_size=cfg.pp_size,
             dp_size=cfg.dp_size,
