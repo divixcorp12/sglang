@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.expert_format import (
     ExpertFormat,
     ExpertTensorSpec,
     iter_expert_streamers,
+    require_graph_gather_support,
     resolve_row_source_kind,
 )
 from sglang.srt.layers.moe.expert_host_tier import (
@@ -715,6 +716,11 @@ class ExpertStreamer:
         return self.format.source(self.layer, name)
 
     @property
+    def has_spec_only_tensors(self) -> bool:
+        """Whether a streamed tensor has no dense source, so only the row source reads it."""
+        return any(self.source(name) is None for name in self.tensor_names)
+
+    @property
     def file_row_reader(self) -> ExpertRowSource | None:
         """Alias of ``row_source``; the host arena drops it by assigning None."""
         return self.row_source
@@ -797,6 +803,7 @@ class ExpertStreamer:
         raise if a layer tensor was rebound after this call; replays cannot
         check, and keep reading the tensors frozen here.
         """
+        require_graph_gather_support((self,))
         from sglang.kernels.ops.moe.expert_cache_transfer import (
             copy_expert_row_segments_gpu,
             expert_row_segments,

@@ -242,3 +242,23 @@ def resolve_row_source_kind() -> str:
     if not kind:
         raise ValueError("SGLANG_MOE_EXPERT_ROW_SOURCE must name a row source kind")
     return kind
+
+
+def require_graph_gather_support(streamers: Iterable["ExpertStreamer"]) -> None:
+    """Raise unless every streamer's format can serve sync-free graph gathers.
+
+    Graph gather, the GPU residency update and the doorbell all read dense,
+    GPU-readable host sources frozen at startup, which spec-only tensors lack.
+    """
+    for streamer in streamers:
+        expert_format = getattr(streamer, "format", None)
+        unsupported = (
+            expert_format is not None and not expert_format.supports_graph_gather
+        ) or getattr(streamer, "has_spec_only_tensors", False)
+        if unsupported:
+            key = getattr(expert_format, "key", "dense")
+            raise ValueError(
+                f"expert format {key!r} of layer {streamer.layer_id} does not support "
+                "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER, "
+                "SGLANG_MOE_GPU_RESIDENCY_UPDATE and SGLANG_MOE_EXPERT_DOORBELL"
+            )

@@ -64,6 +64,13 @@ class ExpertHostArena:
         streamers = list(iter_expert_streamers(model))
         if not streamers:
             return None
+        for streamer in streamers:
+            if not streamer.format.supports_host_arena or streamer.has_spec_only_tensors:
+                raise ValueError(
+                    f"expert format {streamer.format.key!r} of layer "
+                    f"{streamer.layer_id} does not support the host arena; unset "
+                    "SGLANG_MOE_EXPERT_HOST_ARENA"
+                )
         arena = cls()
         try:
             for streamer in streamers:

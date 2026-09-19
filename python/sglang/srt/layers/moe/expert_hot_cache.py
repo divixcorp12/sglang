@@ -36,7 +36,10 @@ from sglang.srt.layers.moe.expert_residency_clock import (
     ResidencyBoundaryClock,
     classify_forward,
 )
-from sglang.srt.layers.moe.expert_format import iter_expert_streamers
+from sglang.srt.layers.moe.expert_format import (
+    iter_expert_streamers,
+    require_graph_gather_support,
+)
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
 
 from sglang.srt.layers.moe.expert_transfer import (
@@ -403,11 +406,22 @@ class ExpertHotCache:
         return True
 
     def _load_reserved(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
-        """Copy one reserved placement bundle before publishing any slot mapping."""
+        """Copy one reserved placement bundle before publishing any slot mapping.
+
+        Tensors without a dense source are read by the streamer's row source:
+        through the pinned host tier in chunks of its capacity when the layer
+        has six tensors and a pinned tier, else one row at a time into staging.
+        """
         if not tickets:
             return
         assert self._transfer_executor is not None
-        if len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT:
+        spec_only = self.streamer.has_spec_only_tensors
+        six_tensors = len(self.streamer.tensor_names) == NVFP4_TRANSFER_TENSOR_COUNT
+        pinned_cache = self.streamer.pinned_host_cache
+        if spec_only and six_tensors and pinned_cache is not None and pinned_cache.capacity:
+            self._load_reserved_in_chunks(tickets, pinned_cache)
+            return
+        if not six_tensors or spec_only:
             for ticket in tickets:
                 if not self.begin_loading(ticket):
                     raise RuntimeError("hot cache reservation became stale")
@@ -428,6 +442,73 @@ class ExpertHotCache:
         self._transfer_executor.wait(ticket, current_stream)
         self.complete_promotion(promotion)
         self.wait_for_slot_publication()
+
+    def _load_reserved_in_chunks(
+        self, tickets: Sequence[HotCacheSlotTicket], pinned_cache
+    ) -> None:
+        """Promote tickets through the pinned tier, one chunk per transfer.
+
+        Each chunk holds at most ``pinned_cache.evictable_rows()`` tickets,
+        read when the chunk starts: an inclusive ``is_pinned`` protects the
+        rows the hot cache has reserved, so every admitted chunk can shrink the
+        room for the next. Each chunk's rows are admitted to the pinned tier,
+        copied from its slabs, and waited for on the host before the next chunk
+        may evict them. When no slot is evictable, the remaining tickets are
+        cancelled and the call raises.
+
+        If a chunk fails, the tickets after it are cancelled, and so is its own
+        promotion if it is still in flight. A failed ``_prepare_promotion`` or
+        submission has already cancelled its own tickets. Once copies were
+        submitted, their slots are freed only after the device has drained
+        them. If the device cannot drain (a sticky CUDA error), the promotion
+        stays in flight with its slots LOADING. ``stage_reassign`` then refuses
+        further updates, so no later reservation can reuse a slot a copy may
+        still write.
+        """
+        tickets = tuple(tickets)
+        start = 0
+        while start < len(tickets):
+            chunk_rows = pinned_cache.evictable_rows()
+            if chunk_rows < 1:
+                self._cancel_tickets(tickets[start:])
+                raise RuntimeError(
+                    "the pinned host tier has no evictable slots for hot cache promotions"
+                )
+            chunk = tickets[start : start + chunk_rows]
+            promotion = None
+            submitted = False
+            try:
+                promotion = self._prepare_promotion(chunk)
+                current_stream = torch.cuda.current_stream(self.device)
+                ticket = submit_hot_cache_promotions(
+                    [promotion], producer_stream=current_stream
+                )
+                submitted = True
+                self._transfer_executor.wait(ticket, current_stream)
+                current_stream.synchronize()
+                self.complete_promotion(promotion)
+            except BaseException:
+                if promotion is not None and self.promotion_in_flight is promotion:
+                    if not submitted or self._drain_device():
+                        self.abort_promotion(promotion)
+                rest = tickets[start + len(chunk) :]
+                if rest:
+                    self._cancel_tickets(rest)
+                raise
+            start += len(chunk)
+        self.wait_for_slot_publication()
+
+    def _drain_device(self) -> bool:
+        """Wait until every queued copy on the cache's device has run; False if it cannot."""
+        try:
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            logger.warning(
+                "hot cache promotion copies could not be drained; their slots stay "
+                "LOADING and the cache refuses further updates"
+            )
+            return False
+        return True
 
     def _copy_routes_for(
         self, sources: Mapping[str, torch.Tensor], use_secondary: Sequence[bool]
@@ -484,6 +565,12 @@ class ExpertHotCache:
                         if name in pinned_cache.tensors:
                             sources[name] = pinned_cache.tensors[name]
                             use_secondary_source_rows[position] = True
+            if any(source is None for source in sources.values()):
+                raise RuntimeError(
+                    "hot cache promotion of expert tensors without a dense source "
+                    "needs every row in the pinned host tier; promote at most its "
+                    "capacity at once"
+                )
             self._transfer_plan.set_rows(
                 expert_rows,
                 destination_slots,
@@ -587,7 +674,10 @@ class ExpertHotCache:
                 tickets = self.reserve(
                     tuple(zip(promoted, free_slots)), consumer_complete=True
                 )
-                if len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT:
+                if (
+                    len(self.streamer.tensor_names) != NVFP4_TRANSFER_TENSOR_COUNT
+                    or self.streamer.has_spec_only_tensors
+                ):
                     self._load_reserved(tickets)
                 elif tickets:
                     promotion = self._prepare_promotion(tickets)
@@ -1000,6 +1090,8 @@ class ExpertHotCacheManager:
             streamers[layer_id] = streamer
         if not streamers:
             return None
+        if index(graph_gather_batch_size) or gpu_residency_update or expert_doorbell:
+            require_graph_gather_support(streamers.values())
         seed = None
         if seed_path is not None:
             path = Path(seed_path)
