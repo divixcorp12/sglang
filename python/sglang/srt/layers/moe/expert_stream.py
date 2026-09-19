@@ -363,7 +363,7 @@ class ExpertPinnedHostCacheManager:
 
 
 def expert_streaming_enabled() -> bool:
-    return os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
+    return envs.SGLANG_MOE_EXPERT_STREAM.get()
 
 
 @triton.jit

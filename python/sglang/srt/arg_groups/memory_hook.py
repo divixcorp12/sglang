@@ -100,7 +100,7 @@ def handle_offload_compatibility(server_args: Any) -> None:
     """Validate generic, selected-expert, and PLE offload combinations."""
     cfg = resolving_view(server_args)
     validate_moe_route_trace(cfg)
-    streaming = os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
+    streaming = envs.SGLANG_MOE_EXPERT_STREAM.get()
     if cfg.ple_offload_embedding and cfg.offload_group_size > 0:
         raise ValueError(
             "--ple-offload-embedding cannot be combined with "

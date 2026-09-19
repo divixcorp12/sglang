@@ -378,6 +378,8 @@ class Envs:
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    # Stream ModelOpt NVFP4 routed experts from host memory; required for hot caching.
+    SGLANG_MOE_EXPERT_STREAM = EnvBool(False)
     SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
     SGLANG_MOE_PINNED_HOST_MB = EnvInt(0)
     SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
