@@ -65,9 +65,10 @@ The design that follows is in §9. Decisions still open are in §12.
      α=0.7, with break-even at α≈0.84–0.93.
    - **Rule: ship DSpark only if measured α clears the DSV4.1 break-even** (§10, §12).
 7. **Throughput envelope** [estimate]: ~3–8 tok/s, link plus NVMe only, before compute
-   and slot-admission cost (§9.4). It depends on two unmeasured numbers: the VRAM miss
-   rate `G`, and the fraction `f` of those misses that also miss RAM. Nothing in the
-   current phase order measures them before Phase 3; §11 adds earlier proxies.
+   and slot-admission cost (§9.4). It depends on the VRAM miss rate `G` and the fraction `f`
+   of those misses that also miss RAM. **Measured in Phase 3a (§16.8):** `G` ≈ 115 and
+   `f` ≈ 18.5% on the full model in eager mode, which puts the I/O-only model at ~3.6
+   tok/s on nvme2; the measured eager rate is 1.6 tok/s (§16.12).
 8. **Upstream SGLang `dsv4.1` is a V4 extension, not a new model**, and touches none of
    our streaming files. Branch `dsv41` off the mainline and *merge* `dsv4.1` (a squashed
    cherry-pick leaves 29 of 110 files unapplied; the merge conflicts in 12)
@@ -206,7 +207,7 @@ Usable VRAM is taken as 31.8 GiB (32,607 MiB) [measured]. Stage B is assumed, be
 | Embedding | 1.23 | Can move to host (+99 slots) |
 | KV + indexer caches at 40K ctx | ≤0.87 | 584 B/token/layer on the sm_120 `v4` layout (upstream `deepseek_v4_memory_pool.py:132-142`). This is the upper bound if all 40 layers allocate; far less if only the SWA windows + 4 KV-source layers do. Confirm when porting. **Also confirm the pool-configurator interaction**: the pool configurator's request-cap SWA sizing (`pool_configurator.py:807`, present since the pre-squash tip, §6.1) reserves SWA slots from `max_running_requests` before sizing the full pool; our own `compare_oracle.py` needed `max_running_requests=4` to avoid a starved full pool at `mem_fraction_static=0.7` (`bacaf8c63b`) — the EXL3 serving config will need the same check once it exists |
 | Activations, graphs, workspace | ~3 | [estimate] |
-| Dequantized EXL3 modules (`wo_a`, compressor, indexer `wk`) | 2.8 | `wo_a`: 40 × 8,192×4,096 bf16 (8 groups × `o_lora_rank` 1,024; 64 heads × 512 / 8) = 2,684,354,560 B ≈ 2.50 GiB. Compressor (`DeepseekV41Compressor`, `layers/attention/dsv4/dsv41_sparse.py:98`): `wkv` 5,120×512 bf16 = 5.24 MB on the 20 ratio-1 layers, `wkv`+`wgate` = 10.49 MB on the 18 ratio-2 layers (config `compress_ratios`: 2 × 0, 20 × 1, 18 × 2) = 293.6 MB ≈ 0.27 GiB. Indexer `wk` 512×128 bf16 = 131 KB per `index_source_layer_ids` layer, negligible. Total ≈ 2.8 GiB. All come from `deepseek_v4_exl3_weights.adapt_exl3_weights` (`DEQUANT_PREFIX_RE`, `WO_A_SLICE_RE`; `wo_a`'s 8 slices concatenated to `[G·R, D]`), which dequantizes EXL3 trellis to dense bf16 at load and keeps it: a permanent VRAM cost. **Phase 3 must decide whether to keep this row** (dense `wo_a` stays resident) **or remove it** (e.g. by keeping `wo_a` EXL3 and reconstructing per-call like the other attention linears, at a decode-latency cost). Not the same number as §15.2's measured 18.5 GiB truncated-model load memory (3.4 GiB init + 3 × 4.74 GiB routed experts) — that figure is a 3-layer smoke-test load footprint, not a full 40-layer serving budget, and its "3.4 GiB init" already includes some of this row for those 3 layers. |
+| Dequantized EXL3 modules (`wo_a`, compressor, indexer `wk`) | 2.8 | `wo_a`: 40 × 8,192×4,096 bf16 (8 groups × `o_lora_rank` 1,024; 64 heads × 512 / 8) = 2,684,354,560 B ≈ 2.50 GiB. Compressor (`DeepseekV41Compressor`, `layers/attention/dsv4/dsv41_sparse.py:98`): `wkv` 5,120×512 bf16 = 5.24 MB on the 20 ratio-1 layers, `wkv`+`wgate` = 10.49 MB on the 18 ratio-2 layers (config `compress_ratios`: 2 × 0, 20 × 1, 18 × 2) = 293.6 MB ≈ 0.27 GiB. Indexer `wk` 512×128 bf16 = 131 KB per `index_source_layer_ids` layer, negligible. Total ≈ 2.8 GiB. All come from `deepseek_v4_exl3_weights.adapt_exl3_weights` (`DEQUANT_PREFIX_RE`, `WO_A_SLICE_RE`; `wo_a`'s 8 slices concatenated to `[G·R, D]`), which dequantizes EXL3 trellis to dense bf16 at load and keeps it: a permanent VRAM cost. **Phase 3 must decide whether to keep this row** (dense `wo_a` stays resident) **or remove it** (e.g. by keeping `wo_a` EXL3 and reconstructing per-call like the other attention linears, at a decode-latency cost). **3a ruling: kept dense; revisit in 3b.** The 3a smoke loaded with 9.90 GB and peaked at 30,097 MiB with 1,128 hot slots (§16.5), and nothing in 3a measured the decode cost of removing it. Not the same number as §15.2's measured 18.5 GiB truncated-model load memory (3.4 GiB init + 3 × 4.74 GiB routed experts) — that figure is a 3-layer smoke-test load footprint, not a full 40-layer serving budget, and its "3.4 GiB init" already includes some of this row for those 3 layers. |
 | **Hot cache, no DSpark** | **31.8 − 9.86 = ~21.9** | ≈ **1,770 slots** of 15,360 = 11.5% [estimate]. Does not yet subtract the dequantized-EXL3-modules row (2.8 GiB, pending Phase 3's keep/remove decision above); if kept, this drops to ~19.1 GiB ≈ 1,540 slots = 10.0% [estimate] |
 | DSpark draft, fully resident | 6.75 | ≈ 544 slots, **31%** of the above. A draft-expert cache is the alternative (§10) |
 | **Hot cache, DSpark resident** | **~15.2** | ≈ **1,220 slots** = 7.9% [estimate] |
@@ -653,6 +654,26 @@ Engram adds <1 ms.
   ~1.15 s on nvme2. The design rests on routing skew keeping f low.
 - **At f ≥ 25% the system is NVMe-bound, and no software change in this doc fixes that.**
 
+**Measured in Phase 3a (§16.8, eager mode, full 40-layer model, 1,128 hot slots, 5,644 RAM
+rows).** These replace the proxy's `G` ≈ 107 and `f` ≈ 34% above:
+
+| Arm | `G` | `f` | `f_after_warmup` | §9.4 model, nvme2 | x4 |
+|---|---:|---:|---:|---:|---:|
+| Cold dynamic (8 sessions, no seed) | 115.03 | 0.1853 | 0.1749 | 276.9 ms (3.6 tok/s) | 200.1 ms (5.0 tok/s) |
+| Seeded dynamic (4 other sessions) | 111.73 | 0.1844 | 0.1754 | 268.2 ms (3.7 tok/s) | 194.1 ms (5.2 tok/s) |
+
+- `G` and `f` sit between the table's 108/10% and 108/25% rows, so the model's link + NVMe
+  envelope holds (196–309 ms on nvme2). `f` is **well under** the proxy's 34% and under the
+  25% NVMe-bound line.
+- **The model under-counts a miss.** Measured per decode RAM miss: 8.10 ms read + 2.18 ms
+  CPU split = ~10.3 ms, against the model's 7.0 ms (nvme2). Its `t_nvme` has no split term.
+- **The model is not the bottleneck.** Measured eager decode is **1.6 tok/s** (~0.62
+  s/token), against ~0.28 s modelled. About 0.22 s of the 0.60 s median forward is RAM-miss
+  I/O; the other ~0.38 s is not (§16.12, an observation to profile). The x4 column
+  is still unmeasured (nvme1 fio pending, §16.3).
+- The seeded arm ran on different sessions from the cold arm, and no static arm ran, so
+  neither `G`/`f` pair isolates the seed's effect.
+
 ---
 
 ## 10. DSpark (in scope)
@@ -785,15 +806,30 @@ performance work (below) is the only piece deferred.
 - Microbenchmark BS1 decode, including SM contention with a concurrent copy.
 - Vendor the proven exllamav3 subset.
 
-**Phase 3 — three-tier streaming (non-speculative first):**
-- Generalize the streamer.
-- Add the EXL3 shard reader.
-- Turn the arena into a slot-indexed RAM cache: inclusive of VRAM, with VRAM eviction
-  = drop.
-- Pin the shared expert.
-- Build the chosen miss mechanism with its failure path.
-- Add the Engram RAM cache and NVMe reads.
-- **Record `G`, `f` and the hot-cache seed, and check them against the go/no-go bar.**
+**Phase 3a — EXL3 streaming on the expert framework — done, 2026-09-19 (§16).** Landed and
+measured in eager mode on the full 40-layer model:
+- The EXL3 format and shard row-source plugins on the framework (`Exl3ExpertFormat`,
+  `Exl3ShardRowSource`), with the EXL3 server-args gate (§16.2).
+- The per-name, inclusive pinned RAM tier with VRAM eviction = drop, and its hot-slot clamp
+  (§16.2, §14.1). `Exl3RamExpertCache` was deleted.
+- `G`, `f` and the hot-cache seed recorded (§16.8, §16.10), the oracle at 22 layers
+  (§16.6), and split-versus-repack on nvme2 (§16.4).
+- **Not done in 3a:** the full-depth oracle comparison, nvme1 fio, the Engram hit rate on
+  the full model, and the go/no-go check (open, §12.1: the owner decides whether 3b is
+  worth building).
+
+**Phase 3b — graph-mode three-tier streaming (open):**
+- The in-graph RAM tier.
+- The §9.3 miss mechanism and its failure path.
+- CUDA graphs and graph gather for EXL3.
+- A prefill admission policy for the RAM tier, **only if** the simulation-only arm shows a
+  large gap. At 256-token prompts it showed none (admitting prefill misses helped, §16.9);
+  it was not run at 512+ tokens.
+- A BLOB host layout, if the split numbers call for one (§16.4; the nvme2 ruling was to
+  skip the repack).
+- Async reads.
+- Profile the ~0.38 s/token of eager decode that is not RAM-miss I/O (§16.12) before
+  sizing any of the above.
 
 **Phase 4 — DSpark:**
 - Run the measurement gate (§10), then apply the α rule.
@@ -833,14 +869,20 @@ performance work (below) is the only piece deferred.
 
 ## 13. Risks and open questions
 
-- **Routing skew (`G`, `f`) is unknown**, and the entire §9.4 envelope rests on it.
-  **Sharpened, not retired** (§15.2): the truncated model's router proxy gives
-  `G` ≈ 107, `f` ≈ 34% (static cache, 3 layers, prefill only), above §9.4's 25% NVMe-bound
-  line — this pushes §9.4 toward its pessimistic rows (≈243 ms/token idle x4,
-  ≈374 ms/token nvme2). Still only a first, partial signal: three shallow layers (skew
-  rises with depth here, Gini 0.60 → 0.75), prefill rather than decode, and a static
-  rather than dynamic cache (optimistic vs. what a real cache would do). The full-model
-  decode trace in Phase 3 remains the real test.
+- **Routing skew (`G`, `f`): measured** (§16.8), on the full 40-layer model in eager
+  mode. Cold dynamic: `G` 115.0, `f` 18.5% (`f_after_warmup` 17.5%); seeded dynamic:
+  `G` 111.7, `f` 18.4%. That is **better than the §15.2 proxy** (`G` ≈ 107, `f` ≈ 34%,
+  static, 3 layers, prefill), so the envelope's pessimistic rows are not the operating
+  point; it sits between §9.4's 108/10% and 108/25% rows. **Caveats that remain:**
+  - 8 cold and 4 seeded sessions on one corpus, 256-token prompts and 128 new tokens; the
+    `tier_sim` numbers replay the same 8 sessions the seed came from (in-sample);
+  - the live hot cache was 1,128 slots, below §4's 1,220–1,770, and the RAM tier 5,644 rows;
+  - the model routes on its own EXL3 activations, whose 22-layer logits sit at the oracle
+    noise floor (§16.6) and are unchecked at depth 40, so routing at depth 40 rests on
+    unverified quality;
+  - nvme1 is still unmeasured, so the x4 column is arithmetic;
+  - the measured cost is not `G`/`f` alone: eager decode ran at 1.6 tok/s, about 0.38 s per
+    token of it outside RAM-miss I/O (§16.12).
 - nvme1's real throughput under `op-reth` write load (DRAM-less QLC) is unknown. So is
   its sustained write rate for the 205 GB copy.
 - The miss mechanisms are unprototyped. Option B's host-callback serialization and
@@ -853,9 +895,11 @@ performance work (below) is the only piece deferred.
   (§15.2). FlashMLA works via `flash_mla_sm120` plus FlashInfer sparse MLA (64-token
   pages, after splitting the c2 extra KV pool to match); the c2 indexer's DeepGEMM
   logits work via the `lucifer1004/DeepGEMM-sm120` fork; the prefill indexer runs the
-  torch path (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`). **Still open:** the candidate
-  indexer was not exercised — it needs a source layer at or above layer 20
-  (`candidate_source_layer_id`), which the 3-layer truncated model doesn't reach.
+  torch path (`SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`). **Candidate indexer (3a,
+  §16.7):** on the full model it does not run on sm_120. `SGLANG_OPT_USE_TOPK_V2` is
+  forced off there (the kernel needs more than the 99 KB of shared memory), so layers 20
+  and above take the mask decode path (`a0c5a6b81d`). **Still open:** CUDA-graph capture
+  on sm_120 is untested (3a ran eager only).
 - **EXL3 3.0 bpw quality on our workload**: measured on the truncated model (§15.2) —
   SGLang vs. reference oracle top-1 0.921, mean |Δlogprob| 0.084, below the plan's bar
   (≥0.98 / ≤0.05) but **accepted on a noise-floor ruling**: two legitimate oracles that
@@ -864,7 +908,11 @@ performance work (below) is the only piece deferred.
   0.092) that tiny numeric differences flip the argmax, so the absolute bar isn't a
   meaningful gate at this depth. Risk if the ruling is wrong: a sub-1%-per-layer bug
   could hide until the full-model run, where sharper logits would expose it. The
-  card's published scores remain for the unquantized model, not this quantization.
+  card's published scores remain for the unquantized model, not this quantization. **At
+  22 layers (3a, §16.6)** SGLang-vs-oracle is top-1 0.794 / mean |Δlp| 0.331, **rejected**
+  against the bar and **marginally above** the one-prompt noise floor (0.809 / 0.302 vs
+  SGLang's 0.792 / 0.316 on the same prompt). The 40-layer oracle does not fit (dense bf16
+  > 31.4 GiB), so **full-depth quality stays open**.
 - The Engram corpus is narrow (repetitive financial text), so general traffic will
   reuse less than the measured curve in §5.
 - The global-singleton cross-layer KV reuse needs a batched design. Upstream presumably
@@ -965,6 +1013,22 @@ separate NVMe→RAM host memcpy pass.
   781, 789, 798, 916`). `uint2` is 8 bytes, matching the main kernel's `half4`
   requirement exactly — no wider alignment anywhere in the coop path. §13's matching
   risk entry is closed by this finding.
+
+**Phase 3a update: what the RAM tier holds.** (c)'s "raw, unpadded row in the RAM tier" was
+the plan before the expert framework landed; 3a built something different.
+- The RAM tier is the **framework's per-name, inclusive pinned tier** (§16.2). It holds the
+  six streamed names (`w13_trellis`, `w13_suh`, `w13_svh`, `w2_trellis`, `w2_suh`, `w2_svh`,
+  13,315,584 B per row) as separate tensors, **split from the shards** on each RAM miss
+  (or read from a repack, had Task 16 run; it did not).
+- The split costs **~1.45–1.48 ms per row on the model thread** (split share 0.16 of a
+  read + split, §16.4), and **2.14–2.18 ms per decode RAM miss** on the live run (§16.8).
+- The padding site is unchanged from (c): the RAM→VRAM segment copy, with the slot layout
+  supplying the aligned destinations.
+- **`Exl3RamExpertCache`** (the bounded LRU host-RAM tier of raw rows, `e8a17adf6a`) was
+  **deleted**; `git show e8a17adf6a` keeps it.
+- **The split numbers are the input for any future BLOB host layout**: `superset_raw` 7.55 ms/row, split 1.44–1.48 ms/row, repacked 7.66 ms/row at batch
+  8 on nvme2 (§16.4). On nvme2 the repack saves 16% of the read + split time (ratio 0.839), short of
+  the plan's 0.8 threshold, so 3a did not build it.
 
 ### 14.2 Can upstream's `_HostTable` back a partial Engram RAM tier?
 
@@ -1241,6 +1305,355 @@ pure SWA), EXL3 experts, Engram from shard 47, `candidate_source_layer_id=-1`.
   is a first, partial signal: three shallow layers only (skew rises with depth here,
   Gini 0.60 → 0.75), prefill routing rather than decode, and static rather than
   dynamic caching. The full-model decode trace in Phase 3 is the real test.
+
+## 16. Phase 3a findings
+
+Phase 3a is EXL3 streaming on the expert framework, checked against the reference oracle
+and traced for `G` and `f` on the full 40-layer model. Window C ran on divix01's RTX 5090
+(sm_120) on 2026-09-19, production down, under `cc-gpu.lock`. Code state: the smoke (Step
+5) ran at `a0c5a6b81d` and Step 6b at `3eac82a412`, with Step 7's arms right after in the
+same window; the prefill-indexer gate `f80100db71` landed later and does not change those
+runs, because `env.sh` still sets `SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`. Artifacts:
+`divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3a/`
+(`ANA` below; `ANA/window-c.log` is the chronological record).
+
+**Everything below is eager mode** (`disable_cuda_graph=True`): no CUDA graphs, no graph
+gather, and no in-graph RAM tier. That is Phase 3b (§11).
+
+### 16.1 Deviations from the plan
+
+1. **Owner scope cuts** (owner's own message, 2026-09-19 02:00):
+   - full-reference oracle noise floor on **1 prompt** only;
+   - corpus **cold 8 sessions** (not 16), **seeded 4 sessions** (`--skip 8 --n 4`, not 8);
+   - `--prompt-tokens 256` (not 512), 128 new tokens;
+   - **the seeded static arm was dropped.** So there is **no stall-free tok/s**, and
+     promotion stalls cannot be isolated from tok/s (§16.12);
+   - the seed came from the 8 cold sessions, so `tier_sim` is **in-sample** on those 8; the
+     seeded arm ran on **different sessions** (8–11) from the cold arm, so cold-vs-seeded is
+     **not a paired comparison**.
+2. **Hot budget:** `SGLANG_MOE_HOT_GPU_MB` 16,384 → **14,336** after the first smoke
+   failed KV-pool sizing at load (minimum viable `mem_fraction` 0.8534 > 0.85).
+3. **Oracle depth:** the 40-layer dense oracle OOMs at load (dense bf16 > 31.4 GiB;
+   `ANA/oracle-full40-fw-oom.log`), so the comparison ran at **22 layers** (§16.6).
+   Full-depth comparison stays **open**.
+4. **Three sm_120 fixes were found in the window**, each red then green and reviewed
+   (§16.7 for the first):
+   - candidate indexer: `01d1f88c5b` (red) + `a0c5a6b81d`;
+   - Engram `_fetch` allocated without `device="cpu"`: `0efe2df293` + `3eac82a412`;
+   - the dense fp4 prefill indexer now requires `topk_v2`: `9cea40d588` + `f80100db71`, so
+     `SGLANG_DSV41_TORCH_PREFILL_INDEXER` is no longer required on sm_120.
+5. **Engram hit rate: unavailable for the arms** (§16.11).
+6. **nvme1 fio: pending**, so the repack ruling is provisional (§16.4). Task 16 (the repack)
+   did not run, because it is conditional on that ruling.
+
+### 16.2 How 3a streams
+
+- **Framework plugins.** The EXL3 layout plugs into the expert framework as an
+  `Exl3ExpertFormat` (`layers/moe/exl3_expert_format.py`) and an `Exl3ShardRowSource`
+  (`layers/moe/exl3_shard_row_source.py`). Rows are read from the original EXL3 shards with
+  `SGLANG_MOE_EXPERT_ROW_SOURCE=shards` and `SGLANG_MOE_EXPERT_FILE_READER=uring_direct`.
+- **Schema.** Six streamed names: `w13_trellis`, `w13_suh`, `w13_svh`, `w2_trellis`,
+  `w2_suh`, `w2_svh`, **13,315,584 B per row**. §3's raw row is 13,315,596 B; the 12 B
+  difference was not investigated here.
+- **Inclusive pinned tier (§9.1).** `inclusive_pinned_tier = True`. The pinned tier holds
+  every hot-resident row too, and the per-layer hot-slot count is clamped to what the
+  pinned tier can hold inclusively (Task 3). **No layer was clamped** at the budgets that ran (zero
+  `Expert hot cache clamps layer` lines in the smoke log; the arms' logs run below the
+  level that prints them, so the arms carry no such line either way).
+- **Gate.** `arg_groups/expert_stream_requirements_exl3.py` registers the EXL3 server-args
+  gate. On the real full-model directory it resolves to `exl3 EXL3`
+  (`ANA/gate-check.txt`); the host arena is unset.
+- **Budgets that ran** (`ANA/env.sh`):
+
+  | Setting | Value |
+  |---|---|
+  | Pinned host tier | `SGLANG_MOE_PINNED_HOST_MB=71680` → 5,644 rows (141 per layer × 40, 36.7% of 15,360), requested 75,161,927,680 B, resident 75,153,156,096 B |
+  | Hot cache | `SGLANG_MOE_HOT_GPU_MB=14336` → **1,128 slots**, 15,019,978,752 B (7.3% of 15,360) |
+  | Dynamic residency | `HOT_DYNAMIC=1`, update after 256 prefill tokens and every 32 decode forwards, min residence 8 forwards, no async promotions |
+  | Off | graph gather, GPU residency update, doorbell, prefetch candidates |
+  | Engram RAM | `SGLANG_DSV41_ENGRAM_RAM_GIB=5` |
+  | Engine (smoke script) | `disable_cuda_graph=True`, `disable_shared_experts_fusion=True`, `context_length=4096`, `mem_fraction_static=0.85`, `chunked_prefill_size=512`, `max_running_requests=4`. The corpus arms use `trace_corpus`'s own `engine_kwargs` (same eager mode, `mem_fraction_static` default 0.85) |
+
+  The live hot cache (1,128 slots) is **below the smallest simulated size** (1,220,
+  §16.10): the 16,384 MiB first tried failed KV-pool sizing at load (§16.1).
+
+### 16.3 Drive table
+
+nvme2, `ANA/bench-nvme2.jsonl` (256 direct reads, queue depth 128, payload bytes):
+
+| Batch | GB/s | ms per expert |
+|---:|---:|---:|
+| 1 | 1.637 | 8.13 |
+| 4 | 1.749 | 7.61 |
+| 8 | 1.759 | 7.57 |
+| 16 | 1.736 | 7.67 |
+| 32 | 1.766 | 7.54 |
+
+nvme1: **pending**. No fio ran (`ANA/fio-nvme1-pending.txt`: a 20 GiB QLC write was not
+requested). §9.4's 3.4 ms/expert for an idle x4 drive is still an estimate.
+
+### 16.4 Split versus repack (Task 5; **provisional, nvme2 only**)
+
+Layer 0, 16 rows, direct reads for the shards, buffered for the repack.
+`ANA/split-bench-nvme2-qd{32,128}.jsonl`. ms per row, medians:
+
+| QD | Batch | Raw superset read | Read + split | of which split (share) | Repacked | Repacked / split |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 7.864 | 9.311 | 1.453 (0.157) | 8.077 | 0.868 |
+| 128 | 8 | 7.553 | 9.127 | 1.482 (0.163) | 7.662 | **0.839** |
+| 32 | 1 | 7.733 | 9.220 | 1.429 (0.155) | 8.023 | 0.870 |
+| 32 | 8 | 7.556 | 9.089 | 1.443 (0.159) | 7.656 | **0.842** |
+
+Batch 1 is a single repeat; batch 8 is five. The repack keeps the small names
+(`w13_svh`, `w2_suh`, `w2_svh`) buffered.
+
+- **Ruling: skip the repack.** The plan's single threshold is 0.8 at batch 8, and both
+  queue depths read above it (0.839, 0.842). Task 16 did not run, so there is **no repack
+  wall time**.
+- **Provisional.** The ratio is measured on nvme2 (~1.76 GB/s). If nvme1 reads faster and
+  the ~1.5 ms/row CPU split stays fixed, the ratio could fall toward ~0.70 and flip the
+  ruling; that estimate is arithmetic, not a measurement. The nvme1 re-run needs the
+  owner's OK after the copy exists.
+- **Kept as input for a future BLOB host tier:** `superset_raw` (7.55 ms/row) and
+  `split_share` (0.16, ~1.5 ms/row on the model thread).
+
+### 16.5 Load footprint, pinned-tier registration and smoke
+
+Smoke (Step 5), attempt 4, `ANA/smoke.log`: a 640-token prefill plus 8 decode tokens.
+- Load: **9.35 s**, **9.90 GB** (`Load weight end`).
+- Pinned-tier registration for ~70 GiB (75,161,927,680 B): **not logged as a duration.**
+  The log timestamps bound it: `Load weight end` 02:28:26 → `Pinned host expert cache
+  startup` 02:28:52, so **at most 26 s** (that window also holds any other post-load
+  setup).
+- Hot cache startup line at 02:29:04; `cuda_allocated_bytes` 25,543,779,840;
+  `max_total_num_tokens=1,000,704`; `available_gpu_mem=2.62 GB`.
+- End to end **129.7 s**; peak GPU **30,097 MiB** (`ANA/smoke-gpu-mem.txt`).
+- **Zero** `weights not found` warnings (non-expert or otherwise), zero clamp lines, zero
+  tier-setup warnings, zero `DeepGemmCandidateIndexer` mentions. Task 17 Step 5's
+  non-expert-weights check is clean.
+- Attempts 1–3 failed: 1 on KV-pool sizing at hot 16,384 MiB; 2 and 3 in the candidate
+  indexer (§16.7).
+- Step 3's tests ran before the smoke: 21 passed (`ANA/wc-steps35.out`).
+
+### 16.6 Oracle comparison (22 layers)
+
+`ANA/compare-full22-fw.json`, four prompts:
+
+| | top-1 agree | mean overlap | mean \|Δlogprob\| | max \|Δlogprob\| |
+|---|---:|---:|---:|---:|
+| SGLang-streamed vs oracle-fw, mean of 4 prompts | **0.794** | 0.829 | **0.331** | 5.973 |
+| vs the bar | ≥ 0.98 | | ≤ 0.05 | |
+| SGLang prompt 0 | 0.792 | 0.843 | 0.316 | 7.127 |
+| Noise floor, prompt 0: oracle-ref vs oracle-fw | 0.809 | | 0.302 | |
+
+`accept: false`. Per prompt top-1: 0.792, 0.816, 0.753, 0.816.
+- **Against the noise floor,** SGLang's prompt 0 (0.792 / 0.316) sits **marginally above**
+  it (0.809 / 0.302): 1.7 points of top-1 and 0.014 of |Δlp|. §15.2's fallback criterion
+  (SGLang-vs-oracle disagreement ≤ oracle-vs-oracle) is **marginally missed**.
+- The noise floor is **one prompt only** (owner scope cut), and its source is the
+  `step6b RESULT` line in `ANA/window-c.log`; the reference-vs-oracle-fw comparison is not
+  a file in `ANA`. The 4-prompt mean has no floor of its own.
+- **Phase 1 at 4 layers was 0.92 / 0.084** (§15.2). Disagreement grows with depth
+  (22 layers: 0.794 / 0.331); these are different models, so this is a comparison of
+  the two runs, not a per-layer measurement.
+- **No bisect ran** in this window, so the disagreement is not attributed to a module.
+- **Open:** the full-depth (40-layer) comparison, because the dense oracle does not fit.
+  Quality at full depth is therefore unverified.
+
+### 16.7 Candidate indexer on sm_120
+
+**It does not run on sm_120.**
+- `model_hook` forces `SGLANG_OPT_USE_TOPK_V2=False` on sm_120 (the kernel needs more than
+  the 99 KB shared memory that sm_120 has).
+- `make_candidate_indexer` gated only on `sm >= 100`, and `publish_decode` called
+  `topk_transform_paged_v2` with a placeholder CPU `topk_metadata`, which crashed at
+  `topk_v2.cuh:591` in layer 20 decode (`ANA/smoke-diag.log`).
+- **Fix:** `01d1f88c5b` (red) + `a0c5a6b81d`. With `topk_v2` off there is no candidate
+  indexer, and layers 20 and above take the mask decode path (Hopper-style, reviewed
+  against the reference two-level selection; `candidate_block_size` 8).
+- So §13's "candidate indexer not exercised" is closed as **"not applicable on sm_120"**.
+  The mask path ran through both arms' decode (layers 20–39). CUDA-graph capture on
+  sm_120 is **untested** (eager only).
+
+### 16.8 Measured `G` and `f`
+
+From the traces (`ANA/trace-{cold,seeded}.jsonl`; `ANA/boundary-stalls.json`,
+`ANA/tier-sim-cold.json` `live` block). `G` is VRAM misses per decode token (of 240 routed
+rows: 40 layers × 6), `f` the fraction of those that also miss the RAM tier.
+`f_after_warmup` leaves out each session's first 16 decode tokens.
+
+| | Cold dynamic | Seeded dynamic |
+|---|---:|---:|
+| Sessions (decode tokens) | 8 (1,024) | 4 (512), sessions 8–11 |
+| `G` | **115.03** (48% miss) | **111.73** (47%) |
+| `f` | **0.1853** | **0.1844** |
+| `f_after_warmup` | 0.1749 | 0.1754 |
+| RAM misses per decode token (`f`·`G`) | 21.3 | 20.6 |
+| Decode RAM misses (trace) | 21,823 | 10,547 |
+| `decode_read_ms_per_ram_miss` | 8.1005 | 8.1217 |
+| `decode_split_ms_per_ram_miss` | 2.1759 | 2.1353 |
+| `prefill_read_ms_per_ram_miss` | 7.6079 | 7.6014 |
+| `prefill_split_ms_per_ram_miss` | 2.1607 | 2.1356 |
+| Prefill RAM misses (trace) | 39,598 | 20,592 |
+
+- The per-miss pairs are per RAM miss, decode calls only; the `prefill_` pair sits beside
+  them because the periodic log line mixes phases. A decode miss costs **~10.3 ms**
+  (8.10 read + 2.18 split), against §9.4's 7.0 ms for nvme2.
+- **In-sample or not.** The cold arm needs no seed, so its `G` and `f` are plain
+  measurements on 8 sessions. The seeded arm's seed was built from those 8 sessions and
+  the arm ran on 4 other sessions, so it is **out of sample for the seed**, and not
+  paired with the cold arm.
+- **Framework cross-check: available, and it agrees.** The manager counters
+  (`ANA/hot-metrics-{cold,seeded}.jsonl`, final line, decode phase, summed over 40 layers):
+
+  | | Manager | Trace |
+  |---|---:|---:|
+  | Cold decode VRAM misses (`miss_rows`) | 116,875 | 117,794 (`G` × 1,024) |
+  | Cold decode pinned-tier misses | 21,663 | 21,823 |
+  | Cold decode promotions | 2,690 | |
+  | Seeded decode VRAM misses | 56,578 | 57,204 (`G` × 512) |
+  | Seeded decode pinned-tier misses | 10,460 | 10,547 |
+  | Seeded decode promotions | 625 | |
+
+  So dynamic residency ran on DSV4. Counters and trace agree to about 1% (0.7–1.1%).
+
+### 16.9 Admission policy shapes `f`
+
+The framework admits **every prefill miss** into the per-layer RAM tier (141 rows per
+layer), in ascending expert order. A long prefill can therefore flush the tier before
+decode. `tier_sim` models both cases; `prefill_admits=False` is **simulation only; not a
+framework policy**.
+
+Gap between the `prefill_admits` true and false rows (`ANA/tier-sim-cold.json`, RAM 5,644,
+8 cold sessions of 256-token prompts, **in-sample**):
+
+| VRAM slots | Boundary | `f`, admits | `f`, no admit | ms/token (nvme2), admits | no admit |
+|---:|---:|---:|---:|---:|---:|
+| 1,220 | 0 | 0.1699 | 0.1829 | 289.4 | 300.9 |
+| 1,220 | 32 | 0.1897 | 0.2048 | 278.7 | 291.8 |
+| 1,770 | 0 | 0.1921 | 0.2057 | 269.1 | 279.6 |
+| 1,770 | 32 | 0.2198 | 0.2360 | 260.2 | 272.9 |
+
+Beside the live `f` **0.1853** (`f_after_warmup` 0.1749).
+- **At 256-token prompts the gap has the opposite sign to the flush hypothesis.** Not
+  admitting prefill misses makes `f` **worse** by 0.013–0.016 (0.002 at 3,000 RAM rows),
+  and modelled ms/token worse by 10–13 ms. Admitting them helps decode, presumably because
+  a session's decode reuses its own prefill's experts (an observation, not tested).
+- So the simulation gives **no evidence that a prefill admission policy is a lever** at
+  256 tokens. It was **not run at 512 tokens or more**, where the flush is larger; that
+  stays unknown.
+- The live `f_after_warmup` is 0.0103 below `f` (cold; 0.0090 seeded), so the first 16
+  decode tokens of each session carry a slightly higher miss rate. That warm-up effect is
+  small.
+
+### 16.10 `tier_sim` table
+
+`ANA/tier-sim-cold.json`, replaying the cold trace (**in-sample**: the seed came from the
+same 8 sessions), 41,320 calls, `--update-prefill-tokens 256`. `G` and `f` are decode
+misses per token and RAM-miss fraction; ms/token is §9.4's model (`G` × 1.11 ms + `f` × `G`
+× `t_nvme`, plus decode-boundary promotions amortized per token), link plus NVMe only,
+**compute excluded**. Rows marked ✗ are `prefill_admits=False`: **simulation only; not a
+framework policy**.
+
+**RAM 5,644 rows** (the budget that ran). Boundary is decode forwards between residency updates.
+
+| VRAM | Boundary | Prefill admit | `G` | `f` | ms/token nvme2 | ms/token x4 |
+|---:|---:|:---:|---:|---:|---:|---:|
+| 1,220 | 0 | ✓ | 125.87 | 0.1699 | 289.4 | 212.4 |
+| 1,220 | 0 | ✗ | 125.87 | 0.1829 | 300.9 | 218.0 |
+| 1,220 | 32 | ✓ | 112.10 | 0.1897 | 278.7 | 201.0 |
+| 1,220 | 32 | ✗ | 112.10 | 0.2048 | 291.8 | 207.4 |
+| 1,290 | 0 | ✓ | 123.67 | 0.1727 | 286.8 | 209.9 |
+| 1,290 | 0 | ✗ | 123.67 | 0.1857 | 298.1 | 215.4 |
+| 1,290 | 32 | ✓ | 109.65 | 0.1942 | 276.4 | 198.6 |
+| 1,290 | 32 | ✗ | 109.65 | 0.2089 | 289.2 | 204.8 |
+| 1,540 | 0 | ✓ | 116.07 | 0.1826 | 277.2 | 200.9 |
+| 1,540 | 0 | ✗ | 116.07 | 0.1959 | 288.0 | 206.1 |
+| 1,540 | 32 | ✓ | 101.78 | 0.2069 | 267.6 | 190.2 |
+| 1,540 | 32 | ✗ | 101.78 | 0.2230 | 280.9 | 196.6 |
+| 1,770 | 0 | ✓ | 109.64 | 0.1921 | 269.1 | 193.3 |
+| 1,770 | 0 | ✗ | 109.64 | 0.2057 | 279.6 | 198.4 |
+| 1,770 | 32 | ✓ | 95.06 | 0.2198 | 260.2 | 183.0 |
+| 1,770 | 32 | ✗ | 95.06 | 0.2360 | 272.9 | 189.1 |
+
+**RAM 3,000 rows.** All four VRAM sizes give identical rows: the inclusive clamp cuts the
+hot cache to **440 slots with all 40 layers clamped**, so VRAM size stops mattering.
+
+| Boundary | Prefill admit | `G` | `f` | ms/token nvme2 | ms/token x4 |
+|---:|:---:|---:|---:|---:|---:|
+| 0 | ✓ | 162.70 | 0.2682 | 486.1 | 329.0 |
+| 0 | ✗ | 162.70 | 0.2705 | 488.7 | 330.2 |
+| 32 | ✓ | 150.90 | 0.2860 | 471.6 | 315.7 |
+| 32 | ✗ | 150.90 | 0.2885 | 474.2 | 317.0 |
+
+- The live run (1,128 slots, boundary 32, RAM 5,644) measured `G` 115.03, `f` 0.1853. The
+  nearest simulated row (1,220 / 32 / ✓) gives 112.10 / 0.1897, so the simulation brackets
+  the live run.
+- A bigger VRAM cache lowers `G` but raises `f` (the misses left are harder), so modelled
+  ms/token falls only from 278.7 to 260.2 ms over 1,220 → 1,770 slots (nvme2).
+- **The RAM tier size is the sensitive knob:** 3,000 → 5,644 rows takes modelled ms/token
+  from 472–486 to 260–289 ms on nvme2 (prefill admitted).
+- The model is **I/O only**: for the live `G` and `f` it gives **276.9 ms** on nvme2
+  (3.6 tok/s) and **200.1 ms** on an x4 drive (5.0 tok/s). Measured tok/s is in §16.12.
+
+### 16.11 Engram hit rate
+
+**Unavailable for the arms.** The corpus logs carry no `engram row cache:` line
+(`trace_corpus`'s log level suppresses it). The only lines in `ANA` are from the two
+crashed smoke attempts (`smoke-attempt3-noautotune.log`, `smoke-diag.log`): 6 lookups,
+30,768 accesses, **1 hit** (rate 3.3e-5). That is a synthetic 640-token prompt that
+crashed in decode, on a cold table, so it is **not representative**. §5's simulated 71.7%
+ceiling stays untested on the full model.
+
+### 16.12 Measured eager tok/s and TTFT
+
+`ANA/corpus-{cold,seeded}.json`. tok/s is the mean of per-session decode tok/s. TTFT is
+the **median over sessions, plus session 0 separately, never the mean**: with the overlap
+schedule a session's TTFT can include one decode step from the previous session's
+overshoot forward. Session 0 is ~40 s slower than the median in both arms (a first-use
+cost that was not isolated).
+
+| | Cold dynamic | Seeded dynamic |
+|---|---:|---:|
+| Sessions | 8 | 4 (sessions 8–11) |
+| Decode tok/s, mean | **1.604** (per session 1.43–1.95) | **1.628** (1.47–1.84) |
+| ms/token (1000 / mean) | 623 | 614 |
+| TTFT, median | 56.6 s | 59.8 s |
+| TTFT, session 0 | 94.8 s | 94.9 s |
+| Median decode forward | 0.602 s | 0.601 s |
+| Mid-session boundary promotions | 8 forwards | 4 forwards |
+| Promotion stall (lower bound) | 5.38 s | 0.99 s |
+| Post-prefill promotion (part of TTFT) | 7 forwards, 87 background rows | 3 forwards, 37 background rows |
+
+- **Seeded is not measurably faster than cold** (1.628 vs 1.604 tok/s), on different
+  sessions and with per-session tok/s spanning 1.43–1.95, so this is not a result either
+  way.
+- **Stall is a lower bound.** `stall_s` sums each promotion forward's excess over the
+  median plain forward, over mid-session boundaries only (the promotion after a session's
+  prefill is `after_prefill_*`, part of TTFT). A forward counts as promoted only when it
+  read from disk, so promotions served from the inclusive RAM tier (~1.1 ms of H2D per
+  row) are classed as plain forwards. Even so it is 5.3 ms per decode token cold (1.9
+  seeded) against ~620 ms per token.
+- **No stall-free number exists:** the seeded static arm, which the plan used for the clean
+  comparison, was dropped. Both arms include promotion stalls, so **dynamic-versus-static
+  is not measured.**
+- **Against Qwen's 19.36 tok/s** (MOE_EXPERT_TRANSFER) these arms are ~12× slower, at
+  1.6 tok/s and ~0.6 s/token, well below §9.4's ~3–8 tok/s envelope and below the modelled
+  3.6 tok/s (§16.10).
+- **TTFT is ~57 s for a 256-token prompt**, and it is mostly RAM-miss I/O: 39,598 prefill
+  RAM misses over 8 sessions at 9.77 ms (7.61 read + 2.16 split) is ~48 s per session.
+- **Observation (controller's arithmetic, not a profile):** a decode step has ~21 RAM
+  misses × (8.10 read + 2.18 split) ms = **~0.22 s** of I/O, against a median forward of
+  0.60 s. So **~0.38 s per token is not RAM-miss I/O.** This is eager mode with no CUDA
+  graphs, and the model's own compute is not costed. It is the next thing to profile, and
+  it caps what any 3b I/O work can win.
+
+### 16.13 Open
+
+- Owner decision on 3b (§12.1 go/no-go bar).
+- nvme1 fio and the split-versus-repack re-run on nvme1 (§16.4).
+- The full-depth oracle comparison (§16.6), the Engram hit rate on the full model (§16.11),
+  and a static-arm run to isolate stalls (§16.12).
 
 ## Sources
 
