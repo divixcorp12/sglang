@@ -7,7 +7,8 @@ Arms, each a fresh Engine (shut down before the next), with its own environment
   debug   - (--debug-arm) the graph arm with --debug-cuda-graph: the whole forward runs
             as one eager break (graph gather on). Replay runs with capture mode off, so
             capture-only paths (the DSV4 alt-stream overlap's MQA prepare) differ from the
-            graph arm; the bitwise graph-vs-debug gate is sound only with --no-overlap;
+            graph arm; the bitwise graph-vs-debug gate is sound only because every arm
+            pins the overlap off (the EXL3 gate refuses an explicit =1 with decode graphs);
   control - (--control) a second eager run, for run-to-run nondeterminism.
 Reports eager_vs_graph and debug_vs_eager against R4's bar (1e-3), graph_vs_debug
 bitwise (tolerance 0.0: the capture-correctness gate), eager_vs_eager. Exit status 1
@@ -95,7 +96,7 @@ def _decode(
     graph_gather: bool,
     mem_fraction: float,
     *,
-    overlap: bool = True,
+    overlap: bool = False,
     max_total_tokens: int = MAX_TOTAL_TOKENS,
 ) -> dict:
     import sglang
@@ -131,7 +132,6 @@ def main() -> None:
     p.add_argument("--new-tokens", type=int, default=32)
     p.add_argument("--mem-fraction-static", type=float, default=0.8)
     p.add_argument("--max-total-tokens", type=int, default=MAX_TOTAL_TOKENS)
-    p.add_argument("--no-overlap", action="store_true", help="run every arm with the DSV4 alt-stream overlap off")
     p.add_argument("--graph-gather", action="store_true", help="the graph arm serves the MoE in-graph")
     p.add_argument("--debug-arm", action="store_true")
     p.add_argument("--control", action="store_true")
@@ -152,7 +152,6 @@ def main() -> None:
             arm,
             args.graph_gather,
             args.mem_fraction_static,
-            overlap=not args.no_overlap,
             max_total_tokens=args.max_total_tokens,
         )
         for arm in arms
