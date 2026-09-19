@@ -134,6 +134,25 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     assert [service.host.contains(row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
 
 
+def test_expert_to_slot_is_rebuilt_only_when_the_slot_map_changes(tiers, monkeypatch):
+    """Minor 7: promotions read ``_expert_to_slot`` once per promoted row."""
+    service, streamers, caches = tiers
+    cache = caches[0]
+    cache.ensure_rows(torch.tensor([1, 2]))
+    table = cache._lru
+    builds = []
+    mapping = service.host.mapping
+    monkeypatch.setattr(service.host, "mapping", lambda row: (builds.append(row), mapping(row))[1])
+    first = dict(cache._expert_to_slot)
+    for _ in range(5):
+        assert dict(cache._expert_to_slot) == first
+    assert len(builds) == 1
+    cache.ensure_rows(torch.tensor([4]))  # a version change: the next read rebuilds
+    builds.clear()
+    assert set(cache._expert_to_slot) == {1, 2, 4} and len(builds) == 1
+    assert dict(table.expert_to_slot) == {e: s for e, s in enumerate(mapping(service.row_of(0))) if s >= 0}
+
+
 def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, monkeypatch):
     """Minor 5: the watchdog's limit follows SGLANG_DSV41_RAM_MISS_TIMEOUT_MS, so a slow drive's
     demand fails stop through the device wait, not the watchdog's abort."""
