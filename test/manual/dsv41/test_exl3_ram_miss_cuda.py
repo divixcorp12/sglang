@@ -290,6 +290,9 @@ def test_layer_posts_advise_the_next_layer(tmp_path):
             time.sleep(0.005)
         assert all(host.contains(1, e) for e in (9, 10, 11))
         assert dev.last_routes[0, 0].item() == 2  # layer 0 remembered this token's routes
+        # The thread publishes the rows before it bumps its counters: wait for the bump.
+        while time.perf_counter() < deadline and host.counters()["advisory_rows"] != 3:
+            time.sleep(0.005)
         assert host.counters()["advisory_rows"] == 3
     finally:
         _close(host, slabs)

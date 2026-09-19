@@ -36,6 +36,9 @@ def test_an_advisory_loads_rows_before_their_demand(tmp_path):
         sim_post(page, 1, need=[4, 5], protect=[4, 5], advisory=True, after=page_word(page, "demand_head") + 10)
         assert _until(lambda: host.contains(1, 4) and host.contains(1, 5))
         assert host.layer_advisory_rows() == [0, 2] and host.layer_rows() == [0, 0]
+        # The thread publishes the rows before it bumps its counters: wait for the bump so
+        # the baseline below includes the advisory's rows.
+        assert _until(lambda: host.counters()["advisory_rows"] == 2)
         # The demand then finds them in RAM: a touch-only request, no read.
         before = host.counters()["rows_read"]
         assert sim_wait(page, sim_post(page, 1, need=[], protect=[4, 5]), 10) == 1
