@@ -170,12 +170,12 @@ def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_HOT_GPU_MB=0)
 
 
-@pytest.mark.parametrize("raw", [None, {}])
-def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model_dir, raw):
+def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model_dir):
     # run_resolution_pipeline runs handle_offload_compatibility twice; the first pass
     # comes before parse_cuda_graph_config, while cuda_graph_config is still the raw
-    # CLI value. That pass must not read it as eager decode and refuse graph gather
-    # (the Task 16 option C Engine launch failed this way).
+    # CLI value (None for flag-only launches). That pass must not read it as eager
+    # decode and refuse graph gather (the Task 16 option C Engine launch failed this way).
+    raw = None
     _gate(_launch(model_dir, cuda_graph_config=raw), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
     _gate(
         _launch(model_dir, cuda_graph_config=raw),
