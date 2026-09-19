@@ -297,7 +297,7 @@ class TestCpuPinnedTier(unittest.TestCase):
 
         def sneaky_assign(expert_id, protected):
             slot, evicted = original_assign(expert_id, protected)
-            if expert_id == 9:
+            if expert_id == 5:
                 victim_slot = cache._lru.expert_to_slot.pop(1, None)
                 if victim_slot is not None:
                     cache._lru.slot_to_expert[victim_slot] = -1
@@ -307,7 +307,7 @@ class TestCpuPinnedTier(unittest.TestCase):
         output = torch.zeros(2, 3, 4, dtype=torch.uint8)
         with patch.object(cache._lru, "assign", side_effect=sneaky_assign):
             with self.assertRaisesRegex(RuntimeError, "evicted before their copy"):
-                cache.gather_rows(torch.tensor([1, 9]), {"host_rows": output})
+                cache.gather_rows(torch.tensor([1, 5]), {"host_rows": output})
 
     def test_a_failed_read_rolls_back_the_calls_slots(self):
         layer = _host_layer()
