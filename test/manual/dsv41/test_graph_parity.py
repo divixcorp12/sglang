@@ -57,6 +57,8 @@ def test_each_arm_builds_its_engine():
     assert eager["disable_cuda_graph"] and "cuda_graph_backend_decode" not in eager
     assert graph["cuda_graph_backend_decode"] == "breakable" and "debug_cuda_graph" not in graph
     assert debug["debug_cuda_graph"] and debug["cuda_graph_max_bs_decode"] == 1
+    # The capture line ("Breakable CUDA graph captured: ... breaks=N") is an info log.
+    assert graph["log_level"] == "info" and debug["log_level"] == "info"
 
 
 def test_decode_sets_the_env_for_the_engine_and_restores_it(monkeypatch):
