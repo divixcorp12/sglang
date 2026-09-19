@@ -37,6 +37,74 @@ def test_route_tables_sort_routes_by_slot_and_scale_by_keep():
     assert count.tolist() == [0] * 6  # a dropped layer runs no expert at all
 
 
+class _GatherReached(Exception):
+    """The stub streamer's gather ran: _apply_graph got past its setup checks."""
+
+
+def _stub_streamer(backend, graph_gather_rows=6, scratch_rows=6, pull_row=False):
+    from types import SimpleNamespace
+
+    def gather(topk_ids):
+        raise _GatherReached
+
+    cache = SimpleNamespace(capacity=3, scratch_rows=scratch_rows, reserves_prefetch_pull_row=pull_row)
+    return SimpleNamespace(
+        row_backend=backend, gather=gather, hot_cache=cache, graph_gather_rows=graph_gather_rows
+    )
+
+
+def _apply_graph(layer, streamer):
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    return Exl3MoEMethod._apply_graph(
+        layer, streamer, torch.zeros((1, 8)), torch.ones((1, 6)), torch.zeros((1, 6), dtype=torch.long), 10.0
+    )
+
+
+def _plain_pinned_tier_backend():
+    from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
+
+    return PinnedTierRowBackend({0: None}, torch.full((6,), -1, dtype=torch.int64), 6)
+
+
+def test_apply_graph_refuses_a_plain_pinned_tier_backend():
+    # Without option C a RAM miss silently drops the layer and nothing fail-stops.
+    layer = torch.nn.Module()
+    with pytest.raises(RuntimeError, match="option C"):
+        _apply_graph(layer, _stub_streamer(_plain_pinned_tier_backend()))
+    layer._exl3_allow_p3_only = True  # the explicit test-only configuration
+    with pytest.raises(_GatherReached):
+        _apply_graph(layer, _stub_streamer(_plain_pinned_tier_backend()))
+
+
+def test_apply_graph_accepts_an_option_c_backend():
+    from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
+
+    class OptionCBackend(PinnedTierRowBackend):  # stands in for Task 14's Exl3RamMissRowBackend
+        pass
+
+    backend = OptionCBackend({0: None}, torch.full((6,), -1, dtype=torch.int64), 6)
+    with pytest.raises(_GatherReached):
+        _apply_graph(torch.nn.Module(), _stub_streamer(backend))
+
+
+@pytest.mark.parametrize(
+    "streamer_changes, match",
+    [
+        ({"graph_gather_rows": 4}, "top_k"),
+        ({"scratch_rows": 5}, "scratch"),
+        ({"pull_row": True}, "prefetch"),
+    ],
+)
+def test_the_fused_moe_refuses_shapes_its_tables_do_not_cover(streamer_changes, match):
+    from sglang.srt.layers.quantization.exl3_fused_moe import exl3_fused_moe_for
+
+    layer = torch.nn.Module()
+    layer.top_k = 6
+    with pytest.raises(ValueError, match=match):
+        exl3_fused_moe_for(layer, _stub_streamer(None, **streamer_changes))
+
+
 if __name__ == "__main__":
     import sys
 

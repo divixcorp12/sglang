@@ -166,6 +166,14 @@ def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
         _gate(_launch(model_dir), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
     with pytest.raises(ValueError, match="PINNED_HOST_MB"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_PINNED_HOST_MB=0)
+    with pytest.raises(ValueError, match="HOT_GPU_MB"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_HOT_GPU_MB=0)
+
+
+def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
+    # The fused MoE's temp buffers are shared by every layer: sound only on one stream.
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
 def test_the_exl3_requirements_read_graph_gathers_from_the_pinned_tier(model_dir):
