@@ -42,7 +42,8 @@ def _check(cfg, budgets) -> None:
 
     Everything that still needs the host (the eager MoE fallback, the Engram
     file-table lookup) runs as an eager break; prefill stays eager. Decode
-    ``full`` cannot work: the Engram lookup reads its ids on the host.
+    ``full`` cannot work: the Engram lookup reads its ids on the host. A breakable decode
+    graph also turns DSV4's alt-stream overlap off (below).
     """
     graph = cfg.cuda_graph_config
     if graph is None or graph.decode.backend == Backend.DISABLED:
@@ -63,6 +64,18 @@ def _check(cfg, budgets) -> None:
             "EXL3 expert caching runs prefill eagerly; pass --cuda-graph-backend-prefill disabled"
         )
     _EAGER.check(_EagerGraphView(cfg), budgets)
+    # Captured into a breakable decode graph, DSV4's alt-stream overlap gives wrong
+    # attention output (the truncated model's tokens diverge at the first decode step;
+    # with the overlap off graph and eager agree bit for bit). Only capture runs the
+    # overlap, so turning it off leaves eager launches unchanged.
+    overlap = envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
+    if overlap.get():
+        if overlap.is_set():
+            raise ValueError(
+                "EXL3 expert caching's breakable decode graph gives wrong output with "
+                "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1; unset it or set it to 0"
+            )
+        overlap.set(False)
 
 
 exl3_expert_stream_requirements = ExpertStreamRequirements("EXL3", _check)
