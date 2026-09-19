@@ -1709,6 +1709,18 @@ here.
 
   The Nsight capture (§17.7) started at 09:52:03, before the `c`/`cpf` rerun, so it ran at
   `51e3eeb457`. `parity-t3-p1.{json,log}` is from Task 5 (07:12), before the window.
+
+  After the window, the final whole-branch review's fix round hardened the service up to
+  `c1970d371f`. Those commits are not re-measured here:
+  - demand records carry an `armed` flag, and an unarmed record only refreshes recency;
+  - the hot set is pushed to C++ at each outermost host use;
+  - the watchdog covers hung advisories, with limit max(30 s, 3 × the RAM-miss timeout);
+  - the slot-map cache is rebuilt only when the map version bumps;
+  - a failed evicting request now bumps the map version.
+
+  They are correctness fixes on paths the corpus arms rarely or never take. The CPU suite
+  and the option C GPU tests pass at `c1970d371f`
+  (`.superpowers/sdd/2026-09-19-dsv41-phase3b-optionC/final-fix-report.md`).
 - **Budgets.** `ANA/env-full.sh` sources 3a's `env.sh` (§16.2: pinned tier
   `SGLANG_MOE_PINNED_HOST_MB=71680`, 5,644 rows; hot `SGLANG_MOE_HOT_GPU_MB=14336`) and adds
   `SGLANG_MOE_EXPERT_GRAPH_GATHER=1`, `SGLANG_DSV41_RAM_MISS_TIMEOUT_MS=2000`,
