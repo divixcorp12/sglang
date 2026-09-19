@@ -1034,9 +1034,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         last = self.stages[-1]
         x = last.norm(x_post_hc)
-        weight = self.lm_head.weight
-        if self._use_fp32_lm_head and weight.is_floating_point():
-            local_logits = F.linear(x.float(), weight.float())
+        if self._use_fp32_lm_head:
+            if not hasattr(self.lm_head, "weight"):
+                quant_method = getattr(self.lm_head, "quant_method", None)
+                raise ValueError(
+                    "SGLANG_DSPARK_FP32_LM_HEAD requires a dense `lm_head.weight`, "
+                    "but the shared target lm_head is quantized "
+                    f"(quant_method={type(quant_method).__name__}) and exposes no "
+                    "dense weight; unset SGLANG_DSPARK_FP32_LM_HEAD to use the "
+                    "quantized head's own apply path instead."
+                )
+            weight = self.lm_head.weight
+            if weight.is_floating_point():
+                local_logits = F.linear(x.float(), weight.float())
+            else:
+                local_logits = project_through_lm_head(x, self.lm_head)
         else:
             local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:

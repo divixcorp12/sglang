@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -121,6 +122,35 @@ def _configure_target_hidden_projection(
             draft_model.project_target_hidden,
             num_context_features=int(draft_model.num_context_features),
         )
+    )
+
+
+def check_dspark_shared_lm_head_usable(lm_head) -> None:
+    """Validate that a target `lm_head` can be shared with the DSpark draft.
+
+    A head is usable when it exposes a dense `.weight` (the matmul path in
+    `project_through_lm_head`), or when its quant method can apply without
+    one (`should_apply_lm_head_quant_method`, e.g. EXL3's
+    `applies_without_weight = True`). Raises `RuntimeError` naming what is
+    wrong otherwise (missing head, or a quant method that needs a weight it
+    doesn't have).
+    """
+    if lm_head is None:
+        raise RuntimeError(
+            "DSpark requires the target model to expose a usable `lm_head` "
+            "(dense `weight`, or a quant method with applies_without_weight=True); "
+            "the target model has no `lm_head`."
+        )
+    quant_method = getattr(lm_head, "quant_method", None)
+    if hasattr(lm_head, "weight") or should_apply_lm_head_quant_method(
+        lm_head, quant_method
+    ):
+        return
+    raise RuntimeError(
+        "DSpark requires the target model to expose a usable `lm_head` "
+        "(dense `weight`, or a quant method with applies_without_weight=True); "
+        "its `lm_head` has neither a `weight` nor a quant method that applies "
+        f"without one (quant_method={type(quant_method).__name__})."
     )
 
 
@@ -305,10 +335,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         else:
             target_model = self.target_worker.model_runner.model
             lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
-            if lm_head is None or not hasattr(lm_head, "weight"):
-                raise RuntimeError(
-                    "DSpark requires the target model to expose `lm_head` with `weight`."
-                )
+            check_dspark_shared_lm_head_usable(lm_head)
             self.draft_model.attach_shared_modules(
                 embed_tokens=unwrap_lora_layer(
                     self._resolve_target_embed_tokens(target_model)
