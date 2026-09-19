@@ -1255,6 +1255,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+            if skip_name is not None:
+                result = {k: v for k, v in result.items() if not skip_name(k)}
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 result = {
@@ -1262,8 +1264,6 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     for k in f.keys()
                     if skip_name is None or not skip_name(k)
                 }
-        if skip_name is not None:
-            result = {k: v for k, v in result.items() if not skip_name(k)}
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

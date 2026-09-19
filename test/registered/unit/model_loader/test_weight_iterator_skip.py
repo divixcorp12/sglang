@@ -52,6 +52,16 @@ def test_multi_thread_iterator_skips(tmp_path):
     assert sorted(names) == ["layers.0.attn.norm.weight", "layers.0.ffn.shared_experts.w1.trellis"]
 
 
+def test_multi_thread_iterator_skips_without_mmap(tmp_path):
+    names = [
+        n
+        for n, _ in buffered_multi_thread_safetensors_weights_iterator(
+            _shard(tmp_path), max_workers=2, disable_mmap=True, skip_name=_skip
+        )
+    ]
+    assert sorted(names) == ["layers.0.attn.norm.weight", "layers.0.ffn.shared_experts.w1.trellis"]
+
+
 def test_default_skips_nothing(tmp_path):
     assert len(list(safetensors_weights_iterator(_shard(tmp_path)))) == 3
 

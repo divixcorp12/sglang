@@ -4621,6 +4621,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        # None unless streamed EXL3 experts can be skipped; see Source.init_new.
+        self.skip_checkpoint_weight = self._streamed_expert_skip_hook()
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
@@ -5122,12 +5124,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             time.perf_counter() - tic - compile_secs,
         )
 
-    def skip_checkpoint_weight(self, name: str) -> bool:
+    def _streamed_expert_skip_hook(self):
         """Streamed EXL3 routed experts stay on disk; their expert streamer reads them."""
-        from sglang.srt.models.deepseek_v4_exl3_weights import is_streamed_expert_weight
+        from sglang.srt.models.deepseek_v4_exl3_weights import (
+            streamed_expert_skip_hook,
+        )
 
-        return is_streamed_expert_weight(
-            name,
+        return streamed_expert_skip_hook(
             self.quant_config.get_name() if self.quant_config is not None else None,
             envs.SGLANG_DSV41_EXPERT_STREAM.get(),
         )

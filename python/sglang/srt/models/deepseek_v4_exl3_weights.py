@@ -30,6 +30,18 @@ def is_streamed_expert_weight(name: str, quant_method: str | None, streaming: bo
     )
 
 
+def streamed_expert_skip_hook(
+    quant_method: str | None, streaming: bool
+) -> Callable[[str], bool] | None:
+    """The loader's skip predicate, or None when no tensor can be skipped.
+
+    None keeps the loader on its no-skip path (and fastsafetensors usable).
+    """
+    if not (streaming and quant_method == "exl3"):
+        return None
+    return lambda name: is_streamed_expert_weight(name, quant_method, streaming)
+
+
 def dense_on_device(t: Exl3Tensors) -> torch.Tensor:
     cuda = Exl3Tensors(
         trellis=t.trellis.cuda(), suh=t.suh.cuda(), svh=t.svh.cuda(), mul1=t.mul1
