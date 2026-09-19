@@ -65,7 +65,9 @@ def engine_kwargs(model: str, arm: str, mem_fraction: float) -> dict:
         disable_radix_cache=True,
     )
     if arm in ("graph", "debug"):
-        kwargs.update(GRAPH_KWARGS)
+        # Engine's default log level is error; the capture line ("Breakable CUDA graph
+        # captured: ... breaks=N") is an info log and is what a run checks first.
+        kwargs.update(GRAPH_KWARGS, log_level="info")
     else:
         kwargs["disable_cuda_graph"] = True
     if arm == "debug":
@@ -105,7 +107,9 @@ def main() -> None:
     p.add_argument("--prompt-file", required=True, help="a text file; its first --prompt-tokens tokens")
     p.add_argument("--prompt-tokens", type=int, default=256)
     p.add_argument("--new-tokens", type=int, default=32)
-    p.add_argument("--mem-fraction-static", type=float, default=0.8)
+    # 0.8 fails on the truncated model: its KV pool grows to fill the budget and the sm120
+    # FlashMLA page-split buffer (sized to the pool) then asks for another 16.6 GiB.
+    p.add_argument("--mem-fraction-static", type=float, default=0.5)
     p.add_argument("--graph-gather", action="store_true", help="the graph arm serves the MoE in-graph")
     p.add_argument("--debug-arm", action="store_true")
     p.add_argument("--control", action="store_true")
