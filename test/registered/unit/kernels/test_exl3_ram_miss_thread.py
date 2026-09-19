@@ -227,6 +227,28 @@ def test_a_stop_during_a_hung_read_still_ends_in_the_watchdog_abort(tmp_path):
     assert "stayed in service" in result.stderr
 
 
+def test_a_stop_during_a_hung_advisory_still_ends_in_the_watchdog_abort(tmp_path):
+    # Minor 6: an advisory's give-up check runs between rows, not inside a blocking read,
+    # so an advisory hung in io_uring blocks stop()'s join like a hung demand does.
+    result = _run_script(
+        tmp_path,
+        """
+        from sglang.kernels.ops.moe.exl3_ram_miss import page_word
+        host.start_thread(fatal_wait_s=0.5)
+        host.inject(delay_s=8.0)  # advisories sleep before their first read
+        sim_post(page, 1, need=[3], protect=[3], advisory=True, after=page_word(page, "demand_head") + 10)
+        while host.counters()["advisories"] == 0:
+            time.sleep(0.01)
+        host.stop()
+        print("stopped")
+        """,
+        timeout_s=25,
+    )
+    assert result.returncode == -6, (result.returncode, result.stderr[-2000:])
+    assert "stopped" not in result.stdout
+    assert "stayed in service" in result.stderr
+
+
 def test_a_process_that_stops_after_fatal_is_not_aborted(tmp_path):
     result = _run_script(
         tmp_path,
