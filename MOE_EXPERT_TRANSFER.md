@@ -245,11 +245,12 @@ PREFETCH_PREDICTOR= PREFETCH_PULL_MODE=off RUN_KIND=timed PREFETCH_RUN_DIR=/path
 The production server is launched by
 **`divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh`** (port 7867,
 `0.0.0.0`). That *script* is not in this repo, but the *code* it runs is. Since
-2026-09-19 it runs the worktree **`prod-stage2fix-20260919`**: `797be6f678` plus
-`prod-stage2fix-20260919.patch` staged, byte-identical to this branch's code at
-`7b498893cd` (everything below plus the host token embedding and the stage-2
-victim fix). The patch is the exact one the fix was verified with. The previous
-worktree `prod-5b91a98` (code at `5b91a9833c`, **has the stage-2 bug**) is untouched.
+2026-09-19 it runs the worktree **`prod-presets-20260919`**: `797be6f678` plus
+`prod-presets-20260919.patch` staged, now at the commit that adds the offload
+presets, byte-identical to this branch's code at that commit (everything below
+plus the host token embedding, the stage-2 victim fix, and the presets module).
+The patch is the exact one the fix was verified with. The previous worktree
+`prod-5b91a98` (code at `5b91a9833c`, **has the stage-2 bug**) is untouched.
 
 **As of 2026-09-18 the script carries the full winning config.** Four changes
 against the pre-campaign script, each with a backup alongside:
@@ -265,6 +266,16 @@ against the pre-campaign script, each with a backup alongside:
 | `SGLANG_MOE_HOT_GPU_MB` | `12288` | **`15360`** | +6.1% (13,312), +6.65% (14,336), then +6.6% (15,360 with the host embedding); 37k-token peak 31,511 MiB at chunk 4096 | `.bak-pre-stage2fix-20260919` |
 | `SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING` | unset | **`1`** | Frees 1.18 GB at no decode cost; pays for the 15,360 MB cache | `.bak-pre-stage2fix-20260919` |
 | worktree | `main-port-probe-7bc4eb` | **`prod-stage2fix-20260919`** | the rows above need this code, and stage 2 needs `7b498893cd` | same |
+
+**Since 2026-09-19 the script selects these settings with `--moe-offload-preset
+graph-gather`** (`python/sglang/srt/layers/moe/offload_presets.py`) instead of
+setting 22 variables by hand; the table above is that preset's content. An
+explicitly set variable still wins, and the server logs one `MoE offload preset`
+line per value it fills. `--moe-offload-preset doorbell` is the doorbell copier
+on the same base (insert-on-miss stage 1, overlap off, no speculative decoding),
+smoke-tested for startup only: a coherent reply and its spin thread running on
+core 71, not timed; it accepted stage 1 and the fused planner, so nothing was
+dropped. Backup of the explicit script: `.bak-pre-presets-20260919`.
 
 Validated after the stage-2 change: healthy in 201 s, `DIRECT`, 4,660 slots,
 `scratch_bytes: 0`, coherent generation. **The fused-planner line was added after
