@@ -94,6 +94,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_hicache_ratio_default, server_args)
+    from sglang.srt.arg_groups.moe_offload_hook import handle_moe_offload_preset
+
+    # Before the offload checks, which read the variables the preset fills.
+    handle_moe_offload_preset(server_args)
     from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
 
     run_hook(handle_offload_compatibility, server_args)
@@ -377,5 +381,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    from sglang.srt.arg_groups.moe_offload_hook import check_moe_offload_config
+
+    # Last: cuda_graph_config and speculative_algorithm keep changing until here
+    # (handle_speculative_decoding, handle_dllm_inference, handle_other_validations);
+    # dp_size/enable_dp_attention are forced by handle_dwdp, earlier, but
+    # handle_data_parallelism still resets enable_dp_attention when dp_size==1.
+    check_moe_offload_config(server_args)
 
     server_args._resolution_finished = True

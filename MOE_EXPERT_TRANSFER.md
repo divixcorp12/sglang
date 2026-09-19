@@ -43,6 +43,13 @@ scratch + 48 pull rows; **stage 2 needs no scratch, so the same budget gives
 ¹ Different matrix and budget from the baseline row; compare the last two rows
 with each other only (paired, same build, same day).
 
+**Stage 2 corrupted a cache slot until `7b498893cd` (2026-09-19).** After a chunked
+prompt whose last prefill chunk was under 1,024 tokens, the first verify copied
+every miss into slot 0: garbled replies from the second token, and slot 0 kept
+wrong rows afterwards. Every arm before that commit ran with the bug; speeds stand,
+reply quality of those arms was not re-checked. See
+[Stage-2 garbled replies](#stage-2-garbled-replies-2026-09-18--root-cause-and-fix).
+
 **Nothing that worked came from prediction.** Prefetch is implemented, measured,
 and deliberately left off. (NEXTN is speculation over *tokens*, not experts: it
 moves slightly more bytes per token and wins by running fewer forwards.)
@@ -237,9 +244,15 @@ PREFETCH_PREDICTOR= PREFETCH_PULL_MODE=off RUN_KIND=timed PREFETCH_RUN_DIR=/path
 
 The production server is launched by
 **`divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh`** (port 7867,
-`0.0.0.0`). That *script* is not in this repo, but the *code* it runs is: the
-worktree `main-port-probe-7bc4eb`, **detached at `797be6f678`** since 2026-09-18
-(it was on `d43c59b58a`, 158 commits behind and without `INSERT_ON_MISS`).
+`0.0.0.0`). That *script* is not in this repo, but the *code* it runs is. Since
+2026-09-19 it runs the worktree **`prod-presets-20260919`**: `797be6f678` plus
+`prod-presets-20260919.patch` staged, now at `a3134f39b9`, byte-identical to
+this branch's code at that commit (everything below plus the host token
+embedding, the stage-2 victim fix, and the presets module). The patch is
+`git diff 797be6f678 a3134f39b9` of `python/`, `scripts/` and `test/`; its
+effective offload env was verified identical to the previous script's. The
+previous worktree `prod-5b91a98` (code at `5b91a9833c`, **has the stage-2
+bug**) is untouched.
 
 **As of 2026-09-18 the script carries the full winning config.** Four changes
 against the pre-campaign script, each with a backup alongside:
@@ -250,6 +263,21 @@ against the pre-campaign script, each with a backup alongside:
 | `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a boundary every decode forward. **Stage 2 requires 1 — see the launcher warning above** | same |
 | `--disable-overlap-schedule` | present | **removed** | +4.5% / +2.9%. Its absence *is* the optimization | same |
 | `SGLANG_MOE_EXPERT_FUSED_PLAN` | unset | **`1`** | +6.4% | `.bak-pre-fusedplan-20260918` |
+| NEXTN speculation | none | **`--speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3`** | +9.6%; 4 draft tokens tie with 3 | `.bak-pre-nextn-20260918` |
+| `SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT` | unset | **`1`** | Draft 2.46 → 1.45 GB, accept length unchanged | `.bak-pre-nvfp4draft-20260918` |
+| `SGLANG_MOE_HOT_GPU_MB` | `12288` | **`15360`** | +6.1% (13,312), +6.65% (14,336), then +6.6% (15,360 with the host embedding); 37k-token peak 31,511 MiB at chunk 4096 | `.bak-pre-stage2fix-20260919` |
+| `SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING` | unset | **`1`** | Frees 1.18 GB at no decode cost; pays for the 15,360 MB cache | `.bak-pre-stage2fix-20260919` |
+| worktree | `main-port-probe-7bc4eb` | **`prod-stage2fix-20260919`** | the rows above need this code, and stage 2 needs `7b498893cd` | same |
+
+**Since 2026-09-19 the script selects these settings with `--moe-offload-preset
+graph-gather`** (`python/sglang/srt/layers/moe/offload_presets.py`) instead of
+setting 22 variables by hand; the table above is that preset's content. An
+explicitly set variable still wins, and the server logs one `MoE offload preset`
+line per value it fills. `--moe-offload-preset doorbell` is the doorbell copier
+on the same base (insert-on-miss stage 1, overlap off, no speculative decoding),
+smoke-tested for startup only: a coherent reply and its spin thread running on
+core 71, not timed; it accepted stage 1 and the fused planner, so nothing was
+dropped. Backup of the explicit script: `.bak-pre-presets-20260919`.
 
 Validated after the stage-2 change: healthy in 201 s, `DIRECT`, 4,660 slots,
 `scratch_bytes: 0`, coherent generation. **The fused-planner line was added after
@@ -261,15 +289,22 @@ Keep everything else prod already has, including `--tool-call-parser auto`,
 `SGLANG_FILE_CACHE_MODEL_PATH`, `SGLANG_VLM_CACHE_SIZE_MB=0` and the PLE RSS budget
 vars — none are in the benchmark launcher and all are production behaviour.
 
-**Prod runs a 12,288 MB hot cache; every measurement before the NEXTN arm was at
+**Prod ran a 12,288 MB hot cache (14,336 MB from the 2026-09-18 update); every measurement before the NEXTN arm was at
 10,240 MB.** That arm's control ran the prod config at 12,288 MB: 22.650 median.
 
-**Prod is down, and its script does not start as of 2026-09-18.** It carries
-`--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1
---speculative-num-draft-tokens 4`, which fails twice over: prod's worktree
-(`797be6f678`) still has the speculation guard, and 4 draft tokens do not fit
-stage 2 at 12,288 MB (see the NEXTN arm). The last working script is
-`run-nvfp4-e16c-public.sh.bak-pre-nextn-20260918`.
+**Prod is down; the script was updated 2026-09-19 (15,360 MB, host embedding,
+stage-2 fix worktree) and has not been started.**
+Every setting in it was measured in the benchmark launcher, which matches prod
+on all GPU-relevant flags; prod adds `--tool-call-parser auto`,
+`--mamba-radix-cache-strategy extra_buffer_lazy` and `--max-mamba-cache-size 1`
+with `--disable-radix-cache`. Validate the first start with a ~37k-token prompt
+while watching `nvidia-smi` (the benchmark launcher's probe left ~1,096 MiB).
+To go back to 14,336 MB **without** the stage-2 fix:
+`cp run-nvfp4-e16c-public.sh.bak-pre-stage2fix-20260919 run-nvfp4-e16c-public.sh`
+(prefer stage 0 over that). Older:
+`cp run-nvfp4-e16c-public.sh.bak-pre-nvfp4draft-20260918 run-nvfp4-e16c-public.sh`
+(that copy still has the broken 4-token NEXTN lines; `.bak-pre-nextn-20260918`
+is the last pre-speculation script that starts).
 
 ### Flag rationale (questions that come up)
 
@@ -340,7 +375,12 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 24 | Per-layer slot floor for stage 2 | `e1d227a4bd` | Enabler, no speed of its own: lets 4 draft tokens start at 12,288 MB. **N4 vs N3: tie** (11/29 turns, median −1.5%, p = 0.27 two-sided); keep 3 | `matrix/nextn-20260918-123932` |
 | 25 | **Prefill staging in place, allocated once** | `844bb9d7a5` | **Peak VRAM 32,143 → 30,587 MiB** (37k-token prompt, NEXTN-3, 12,288 MB); prefill time unchanged | `matrix/memprobe-20260918-144144` |
 | 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `codex/nvfp4-expert-stream-main` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
-| 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. Long-prompt peak at 13,312 MB **not probed** | `matrix/cache-20260918-161820` |
+| 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. 37k-token peak **31,647 MiB at chunk 4096 (safe); chunk 8192 OOMs** | `matrix/cache-20260918-161820`, `matrix/memprobe-20260918-171612` |
+| 30 | **Draft (MTP) experts requantized FP8 → NVFP4 at load** | `46735b12b4` (`SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT=1`) | **Draft 2.46 → 1.45 GB; free after startup 3.05 → 4.04 GB.** Accept length 2.546 → 2.564, speed tie (26.096 → 26.198, 19/29 turns, p = 0.07), both at 13,312 MB. Enabler for a bigger cache | `matrix/draft-20260918-173157` |
+| 32 | **Spend the draft's freed GB on the hot cache: 14,336 MB** (NVFP4 draft) | flag only, on `46735b12b4` | **26.877 → 28.101 (+6.65% paired median)** vs 13,312 MB, both NVFP4 draft; 27/29 turns, p = 8.1e-7; 2.28 ms/token; 5,048 → 5,437 slots, hit rate 72.67 → 74.20%, 335 → 321 MB/token. 37k-token peak **31,667 MiB at chunk 4096 (safe)** | `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224` |
+| 33 | **Token embedding in pinned host memory**, shared with the draft | `34a80a2dae` (`SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING=1`) | **Free after startup 3.05 → 4.23 GB** at 14,336 MB; speed tie (28.46 → 28.69, 17/29 turns, p = 0.46). The draft binds the target's host table, no second copy. Enabler | `matrix/hostembed-20260918-203429` |
+| 34 | **Spend it on the hot cache: 15,360 MB** (host embedding) | flag only, on `34a80a2dae` | **28.46 → 29.30 (+6.6% paired ratio)** vs 14,336 MB GPU embedding; 24/29 turns, p = 5.5e-4; 2.36 ms/token; 5,825 slots, hit rate 73.98 → 76.13%, 330 → 296 MB/token. 37k-token peak **31,511 MiB at chunk 4096** | `matrix/memprobe-he-20260918-203429`, `matrix/hostembed-20260918-203429` |
+| 35 | **Stage-2 victim shortlist kept full** (correctness) | `7b498893cd` | Fixes garbled replies after a short last prefill chunk and a slot-0 corruption that outlived the request. No speed claim | `matrix/garble-*`, [section](#stage-2-garbled-replies-2026-09-18--root-cause-and-fix) |
 
 ### Rejected / closed
 
@@ -355,6 +395,8 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 11 | Cross-token end-of-step prefetch | 8.7 misses covered at 22% precision with 40 rows | Coverage and precision both too low |
 | 12 | **Lossless NVFP4 compression** | Whole row ~0.95; **subparts differ enormously** (see below) | The compressible part is too small a share, and GPU decode eats the saving |
 | 13 | Batch-prep reduction | ≤1.07 ms/step host work | No change needed once overlap is on |
+| 31 | `--enable-torch-compile` (decode) | Smoke only | **Does not start.** Capture fails in `QSAIndexer`, which has no plain-PyTorch path; the breakable graph backend documents "No torch.compile". Needs a compile-safe indexer path and dynamo-disabled break markers, then an A/B; expected gain 0–3% (decode is PCIe-bound). Deferred. `matrix/tcsmoke-20260918-163830` |
+| 36 | Hot cache past 15,360 MB (host embedding) | 16,384 MB **OOMs** (peak 32,103 MiB); 15,872 MB runs and is **+1.7%** over 15,360 (30.68 vs 29.88, 21/29 turns, p = 0.024) | Peak 32,029 MiB leaves **66 MiB**; not worth a production OOM. `matrix/memprobe-he-16384-20260918-213009`, `matrix/memprobe-he-15872-20260918-213009`, `matrix/hostembed-big-20260918-213009` |
 
 ### Backlog (not started / in flight)
 
@@ -367,8 +409,8 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 17 | Fused scorer kernel | 1.7 ms D scoring cost | Only useful if prefetch is revived |
 | 18 | Fix 8 known test failures | Suite to zero | In flight on `fix-known-test-failures` |
 | 22 | **Fold stage 2's gather bookkeeping into the fused planner** | ≤ ~1.9–2.4 ms/token (trace upper bound, like the planner's 3.8–4.4 that realized 2.77) | Not started. `gather_destinations` (~16–23 kernels/layer) and `_commit_gather` (22) are what remains of the tail after #21. Supersedes the handoff's B2, whose ~1% was scoped against stage 1 |
-| 26 | **Chunked prefill 8192** | Long-prompt prefill **−28% / −36%** (31k / 37k tokens) at +420 MiB peak over 4096, measured *before* pre-sizing | One clean probe on the pre-sized build still owed (the first attempt lost its memory to other GPU jobs mid-load). TTFT only; decode unaffected |
-| 28 | Token embedding to pinned host memory | 1.18 GiB (~+450 slots), lossless; decode reads one 5 KB row per token | Not started. No option exists; copy the PLE offload pattern. The LM head (also 1.18 GiB) cannot move: every token multiplies against all of it |
+| 26 | **Chunked prefill 8192** | Long-prompt prefill **−28% / −36%** (31k / 37k tokens) at +420 MiB peak over 4096, measured *before* pre-sizing | **Does not fit at 13,312 MB**: OOM on the first 31k prompt (160 MiB short in attention). Only viable at 12,288 MB or once more VRAM is freed. TTFT only; decode unaffected |
+| 28 | Token embedding to pinned host memory | 1.18 GiB (~+450 slots), lossless; decode reads one 5 KB row per token | **Done: #33/#34.** The LM head (also 1.18 GiB) cannot move: every token multiplies against all of it |
 | 29 | Prefill MoE in expert groups | Staging ~4x smaller again | Not started; needs the fused-MoE runner to split and re-sum per group. Only after #28 |
 | 20 | **Offline blockscale re-coding** (precomputed codebook) | **+1.6%** lossless (6-bit) / **+3.2%** lossy (4-bit) | **DEFERRED — do not pick this up without asking the repo owner first.** Not blocked on evidence; it is an open decision about accuracy budget, and it is the owner's call to make |
 
@@ -720,6 +762,10 @@ NEXTN work, under `cc-expert-prediction/`:
 | Memory probe (waits for arms, retries a lost lock) | `mem-probe.sh`; `matrix/memprobe-20260918-{125301,140008,144144}` |
 | Staging test runners (lock-queued) | `run-staging-green.sh`, `run-presize-tests.sh`; logs `logs/cuda-tests-{staging,presize}-*` |
 | Cache-budget arm | `cache-arm.sh`; `matrix/cache-20260918-161820` (`-161749` is `ABORTED`) |
+| 13,312 MB memory probe | `mem-probe-hot.sh` (HOT_MB, CHUNKS); `matrix/memprobe-20260918-171612` |
+| torch.compile smoke | `torch-compile-smoke.sh`; `matrix/tcsmoke-20260918-163830` |
+| NVFP4 draft arm | `draft-arm.sh`, worktree `wt-draftfp4` (+ `wt-draftfp4.patch`), `draft_paired.py`, `cache_counters.py`, `run_stubbed.py`; `matrix/draft-20260918-173157` |
+| NVFP4 draft + 14,336 MB | `draftcache-chain.sh` (runs `mem-probe-draft.sh`, then `draftcache-arm.sh` only if the probe survives); `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224`; `draftcache_paired.py` |
 
 The `_hc_mix` persistent-kernel pattern is recorded as **checked and
 inapplicable** in `python/sglang/kernels/ops/moe/expert_insert_rows.py`'s module
@@ -907,9 +953,51 @@ Paired: **B faster on 24/29 turns, one-sided sign test p = 2.7e-4**, median
 +1.615 tok/s (ratio 1.061, min -2.44, max +3.69), 2.16 ms/token saved. Accept
 length 2.55 (N) vs 2.57 (B): the gain is bytes, not speculation.
 
-- **Not yet safe to deploy.** The +1,024 MB comes out of the ~1.5 GB the staging
-  change freed; the 37k-token peak at 13,312 MB is estimated at ~31,600 of
-  32,607 MiB but was not measured. Run `mem-probe.sh` at 13,312 MB first.
+- **Safe at chunk 4096, not at 8192.** `mem-probe-hot.sh` at 13,312 MB
+  (`matrix/memprobe-20260918-171612`): the 37k-token prompt peaks at 31,647 of
+  32,607 MiB (~960 MiB spare, 3.05 GB free after startup). At chunk 8192 the
+  first 31k prompt OOMs in attention with our own process holding 31.17 GiB.
+
+**NVFP4 draft experts** (`matrix/draft-20260918-173157`, `draft-arm.sh`, same
+worktree `wt-draftfp4` for both, 13,312 MB, chunk 4096, D first):
+
+| | draft experts | draft load | free after startup | accept length | median tok/s | hit rate |
+|---|---|---:|---:|---:|---:|---:|
+| B | FP8 128x128 block (as shipped) | 2.46 GB | 3.05 GB | 2.546 | 26.096 | 72.37% |
+| **D** | **NVFP4, requantized at load** | **1.45 GB** | **4.04 GB** | **2.564** | **26.198** | 72.28% |
+
+- **Why the draft was FP8:** the model card says the MTP module was copied
+  byte-for-byte from Qwen's FP8 release; only the main model's routed experts
+  were quantized (with calibrated scales). A normal forward never runs the MTP
+  layer, so it could not be calibrated for W4A4; FP8 block scales need no
+  calibration.
+- **How:** `ModelOptMixedPrecisionConfig.get_quant_method` hands an
+  `FP8_BLOCK_SCALES` MoE built in draft scope to the existing
+  `ModelOptNvFp4OnlineFusedMoEMethod`, which dequantizes each FP8 expert and
+  requantizes it to NVFP4 as it loads. Activation scale is per-tensor 1.0
+  (per-token scales need the TRT-LLM or CuTe DSL MoE backends; we run
+  `flashinfer_cutlass`). Accept length shows 1.0 is good enough.
+- **The draft stays resident:** the offloader matches the quant method's exact
+  class name `ModelOptNvFp4FusedMoEMethod`, so the online subclass is never
+  streamed. `test_requantized_draft_experts_stay_on_the_gpu` guards this.
+- **Output cannot change:** every draft token is verified by the target.
+- **Spent on the cache** (`draftcache-chain.sh`: probe, then arm only if it
+  survives). At 14,336 MB the 37k-token peak is 31,667 MiB at chunk 4096, the
+  same ~940 MiB margin as 13,312 MB with the FP8 draft. The arm (E first):
+
+  | | budget | slots | median tok/s | mean | hit rate | H2D / token | accept length |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | D | 13,312 MB | 5,048 | 26.877 | 26.696 | 72.67% | 335 MB | 2.567 |
+  | **E** | **14,336 MB** | **5,437** | **28.101** | **28.360** | **74.20%** | **321 MB** | 2.604 |
+
+  Paired: **E faster on 27/29 turns, p = 8.1e-7**, median +1.901 tok/s (ratio
+  1.0665), 2.28 ms/token saved. Over the day the stack went 12,288 MB FP8 draft
+  (25.21) → 13,312 MB (27.08) → 14,336 MB with the NVFP4 draft (28.10), each
+  step a paired same-build arm; cross-arm drift is ~2%, so read the chain by
+  its paired steps, not the absolute numbers.
+- **Test gotcha:** `test_modelopt_nvfp4.py` imports `sglang.test.test_utils`,
+  which pulls in `datasets` and dies on divix01's pyarrow; `run_stubbed.py`
+  stubs that one module to run the file there.
 - **Script gotcha:** the requested-bytes check needs `grep -qF` on a precomputed
   number; an unquoted pattern lost its quotes through `ssh` and the first launch
   (`-161749`, `ABORTED`) was stopped before it ran.
@@ -1070,6 +1158,62 @@ Two consequences:
    this card is measuring L2. Size the working set past 128 MB, and sanity-check
    the implied bandwidth against the card's HBM spec — an impossible number
    (3.1 TB/s was the tell here) is the cheapest available detector.
+
+### Stage-2 garbled replies 2026-09-18 — root cause and fix
+
+**Symptom.** With NEXTN on, a reply garbled from its second token ("We", then
+junk) and recovered within a few verifies. The first token came from prefill
+and was right; the draft proposed sensibly; the target's first verify had
+near-zero logit gaps.
+
+**Trigger, pinned by exact-token prompts** (`garble_prompts.py`, chunk 4096):
+a prompt with at least one earlier chunk and a **last chunk under 1,024
+tokens** (1,020 garbled, 1,024 clean). Single-chunk prompts were clean. The
+1,024 is `SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS`: moved to 2,048, the edge moved
+with it (1,124 and 2,043 garbled, 2,048 clean).
+
+**Bisection** (3 garbling prompts + 2 controls per server, all `matrix/garble-*`):
+
+| Change from the prod config | Garbled? |
+|---|---|
+| NEXTN off | no |
+| overlap off | yes |
+| `SGLANG_ENABLE_JIT_DEEPGEMM=0` | yes (the target has no FP8-block linears) |
+| decode graphs off (forces gather, residency update, stage 2 and fused plan off) | no |
+| graphs on, graph gather and residency update off | no |
+| graph gather on, residency update off | no |
+| **stage 0, everything else as prod** | **no** |
+
+**Root cause.** Stage 2 re-ranks each layer's victim shortlist at every graph
+forward and, before the fix, dropped every resident routed since the last
+boundary. A short last chunk takes no boundary but routes ~2,000 routes over
+512 experts, i.e. nearly every resident, so the first verify saw an empty
+shortlist. `gather_destinations` then gave each miss destination 0; the copy
+kernel reads the device miss count, not `live`, so it wrote every miss into
+**slot 0** and the remap pointed every missed route there. A boundary-sized
+last chunk zeroes the route window first, which is why it was clean.
+
+**Evidence.** A throwaway byte-level checker (`debug_residency_check.py`, patched
+into the probe worktree only) compared every resident slot against its host row
+after each forward: 0 bad through both prefill chunks and the prefill
+boundary, then **42-48 of 48 layers with slot 0 holding another expert's rows**
+from the first verify on, persisting across requests.
+
+**Fix (`7b498893cd`).** Routed residents are ranked after unrouted ones instead
+of dropped, so the shortlist is full whenever a layer holds `miss_rows` slots
+(the 2x floor guarantees that). A miss that still finds no victim now counts in
+`insertion_truncated`, which stage 2 never incremented; watch it stay 0. The
+regression test fails on the old code exactly like production (wrong gathered
+rows on the first replay after a short, all-routing prefill).
+
+**Verified.** Stage 2 on: all five prompts clean; the checker stayed at 0 bad
+slots over 72 forwards. 137 unit tests pass.
+
+**Consequence for earlier arms.** Every arm before `7b498893cd` ran with the bug.
+The speed comparisons stand (both sides of each pair had it), but a stale slot
+0 could have read wrong weights for its expert on any later request; reply
+quality of those arms was not re-checked. Stage 1 (SCRATCH) is unaffected: it
+truncates instead of writing slot 0.
 
 ---
 

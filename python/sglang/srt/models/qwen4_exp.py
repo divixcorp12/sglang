@@ -80,6 +80,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 )
 from sglang.srt.models.qwen4_exp_route_trace import maybe_install_moe_route_trace
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.draft_shared_weights import shared_target_embed
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -816,7 +817,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_dir: Optional[str] = None,
         cache_identity: Optional[str] = None,
         cache_tag: Optional[str] = None,
+        host_table: Optional[torch.Tensor] = None,
     ) -> None:
+        """``host_table`` binds an existing pinned table instead of allocating one."""
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
@@ -841,18 +844,34 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_cache_identity = (
             f"{cache_identity}\0{cache_tag}" if cache_identity is not None else None
         )
-        host_table = allocate_ple_host_table(
-            shape=source_weight.shape,
-            dtype=source_weight.dtype,
-            backend=backend,
-            table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
-            cache_identity=table_cache_identity,
-        )
+        if host_table is None:
+            host_table = allocate_ple_host_table(
+                shape=source_weight.shape,
+                dtype=source_weight.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                # Each TP rank holds a different vocabulary shard of the same shape.
+                tag=(
+                    f"rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+                cache_identity=table_cache_identity,
+            )
+        elif (
+            host_table.shape != source_weight.shape
+            or host_table.dtype != source_weight.dtype
+            or not host_table.is_pinned()
+        ):
+            raise ValueError(
+                "bound host table must be pinned with shape "
+                f"{tuple(source_weight.shape)} and dtype {source_weight.dtype}, got "
+                f"{tuple(host_table.shape)} {host_table.dtype} "
+                f"pinned={host_table.is_pinned()}"
+            )
+        else:
+            # A bound target Parameter would otherwise register as a second
+            # parameter of this module.
+            host_table = host_table.detach()
         self._ple_file_cache_table = host_table
         self._ple_file_cache = get_ple_file_cache(host_table)
         self._ple_file_cache_seen_shards: Set[int] = set()
@@ -882,8 +901,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
-        # with the table.
-        self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
+        # with the table. A bf16 token table has none.
+        self.register_buffer(
+            "weight_scale", getattr(embedding, "weight_scale", None), persistent=True
+        )
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
@@ -1804,12 +1825,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
     def _build_embed_tokens(self, config: Qwen4ExpTextConfig) -> nn.Module:
-        return VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-        )
+        def build() -> VocabParallelEmbedding:
+            return VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+            )
+
+        if not envs.SGLANG_ENABLE_QWEN4_HOST_TOKEN_EMBEDDING.get():
+            return build()
+        with torch.device("meta"):
+            embedding = build()
+        # A draft built inside draft_shares_target_embed_and_head binds the
+        # target's host table instead of pinning a second copy.
+        target_table = shared_target_embed()
+        if target_table is not None and target_table.device.type != "cpu":
+            target_table = None
+        return Qwen4ExpPinnedHostEmbedding(embedding, host_table=target_table)
 
     def __init__(
         self,

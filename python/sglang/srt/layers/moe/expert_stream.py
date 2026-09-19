@@ -6,7 +6,6 @@ import contextlib
 import functools
 import logging
 import json
-import os
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from operator import index
@@ -541,7 +540,7 @@ class ExpertPinnedHostCacheManager:
 
 
 def expert_streaming_enabled() -> bool:
-    return os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1"
+    return envs.SGLANG_MOE_EXPERT_STREAM.get()
 
 
 @triton.jit
