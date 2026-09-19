@@ -124,6 +124,46 @@ def _configure_target_hidden_projection(
     )
 
 
+def commit_accepted_to_hot_cache(
+    hot_cache_manager,
+    num_correct_drafts_per_req: list[int],
+) -> None:
+    """Report one real verify step's accepted tokens to the residency clock.
+
+    Mirrors ``EagleWorkerV2.on_verify_complete_cpu``
+    (python/sglang/srt/speculative/eagle_worker_v2.py:1638-1651): accepted
+    tokens are each request's correct drafts plus its bonus token
+    (``GenerationBatchResult.num_non_draft_tokens_per_req``), exactly the
+    quantity ``ResidencyBoundaryClock.commit`` expects
+    (python/sglang/srt/layers/moe/expert_residency_clock.py:113-121 via
+    ``ExpertHotCacheManager.on_speculative_commit``,
+    python/sglang/srt/layers/moe/expert_hot_cache.py:2740-2745).
+
+    ``num_correct_drafts_per_req`` is already on the host (the batch-result
+    processor computes it from ``result.accept_lens.tolist()`` before
+    calling ``on_verify_complete_cpu``), so this never syncs the device.
+
+    No-op when there is no hot cache manager (draft-only runs, or a model
+    that builds no expert streamers).
+
+    Known interaction (see task-5-report.md and task-7-report.md): DSpark's
+    own draft-block forward is misclassified by ``classify_forward``
+    (expert_residency_clock.py:26) as ``ForwardKind.VERIFY``, so the
+    residency clock's provisional queue receives two pushes per real step
+    (the draft-block forward's, then this real verify's) but this call
+    drains only one. Fixing the pairing needs a ``classify_forward``
+    change, out of scope here; this function still reports the correct
+    per-real-verify accepted count, matching EAGLE V2's call cadence.
+    """
+    if hot_cache_manager is None:
+        return
+    hot_cache_manager.on_speculative_commit(
+        sum(num_correct_drafts_per_req)
+        + len(num_correct_drafts_per_req)
+        * GenerationBatchResult.num_non_draft_tokens_per_req
+    )
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -523,6 +563,21 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """Report this step's accepted tokens to the target's hot cache.
+
+        Mirrors ``EagleWorkerV2.on_verify_complete_cpu``
+        (eagle_worker_v2.py:1638); see ``commit_accepted_to_hot_cache`` above
+        for the exact semantics and the known double-VERIFY interaction with
+        DSpark's own draft-block forward.
+        """
+        commit_accepted_to_hot_cache(
+            getattr(self.model_runner, "expert_hot_cache_manager", None),
+            num_correct_drafts_per_req,
+        )
 
     def forward_batch_generation(
         self,
