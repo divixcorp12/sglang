@@ -248,6 +248,16 @@ class TestRowSourceKnob(unittest.TestCase):
         ):
             self.assertIsNone(ExpertStreamer(self._layer(), ("rows",)).row_source)
 
+    def test_auto_with_uring_needs_expert_files(self):
+        # "auto" reaches ExpertFileRowReader.from_layer the same as "files"
+        # when SGLANG_MOE_EXPERT_FILE_READER selects a real reader mode.
+        with (
+            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("auto"),
+            envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+        ):
+            with self.assertRaisesRegex(ValueError, "has no expert file"):
+                ExpertStreamer(self._layer(), ("rows",))
+
     def test_tensor_kind_builds_no_reader(self):
         with (
             envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("tensor"),
@@ -526,6 +536,68 @@ class TestSpecOnlyPromotion(unittest.TestCase):
         self.assertEqual(aborted, [])
         self.assertIs(cache.promotion_in_flight, promotion)
         self.assertEqual(cancelled, [tickets[2:]])
+
+    def test_drain_precedes_abort_and_a_submit_failure_aborts_without_draining(self):
+        # One shared events list pins the order across both failure paths:
+        # once copies are submitted, the device drains before the promotion
+        # is aborted; when submission itself fails, abort runs with no drain.
+        cache = ExpertHotCache.__new__(ExpertHotCache)
+        cache.device = torch.device("cpu")
+        cache.promotion_in_flight = None
+        promotion = SimpleNamespace(name="chunk")
+        events = []
+
+        def prepare(tickets):
+            cache.promotion_in_flight = promotion
+            return promotion
+
+        def abort(staged):
+            events.append(("abort", staged))
+            cache.promotion_in_flight = None
+
+        cache._prepare_promotion = prepare
+        cache.abort_promotion = abort
+        cache._cancel_tickets = lambda tickets: events.append(("cancel", tuple(tickets)))
+        cache._transfer_executor = SimpleNamespace(
+            wait=lambda ticket, stream: (_ for _ in ()).throw(RuntimeError("copy failed"))
+        )
+        tickets = self._tickets((5, 7, 0))
+        with (
+            patch("torch.cuda.current_stream", return_value=None),
+            patch(
+                "torch.cuda.synchronize",
+                side_effect=lambda device: events.append(("drain", device)),
+            ),
+            patch(
+                "sglang.srt.layers.moe.expert_hot_cache.submit_hot_cache_promotions",
+                return_value="ticket",
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                cache._load_reserved_in_chunks(tickets, _FixedRoom(2))
+        self.assertEqual(
+            events,
+            [("drain", cache.device), ("abort", promotion), ("cancel", tickets[2:])],
+        )
+
+        # A submit failure raises before `submitted = True`, so `not submitted`
+        # short-circuits the drain and the promotion aborts unconditionally.
+        cache.promotion_in_flight = None
+        events.clear()
+        with (
+            patch("torch.cuda.current_stream", return_value=None),
+            patch(
+                "torch.cuda.synchronize",
+                side_effect=lambda device: events.append(("drain", device)),
+            ),
+            patch(
+                "sglang.srt.layers.moe.expert_hot_cache.submit_hot_cache_promotions",
+                side_effect=RuntimeError("submit failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "submit failed"):
+                cache._load_reserved_in_chunks(tickets, _FixedRoom(2))
+        self.assertEqual(events, [("abort", promotion), ("cancel", tickets[2:])])
 
     def test_no_evictable_slots_cancel_every_ticket(self):
         cache = ExpertHotCache.__new__(ExpertHotCache)

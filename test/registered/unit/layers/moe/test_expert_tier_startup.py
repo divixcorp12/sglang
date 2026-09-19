@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe import expert_hot_cache, expert_stream
+from sglang.srt.layers.moe import expert_format, expert_hot_cache, expert_stream
 from sglang.srt.layers.moe.expert_format import (
     inclusive_hot_slot_limit,
     pinned_tier_options_of,
@@ -58,6 +58,9 @@ def _model(**format_options):
 
 
 class TestPinnedManagerStartup(unittest.TestCase):
+    def setUp(self):
+        expert_format._WARNED_WITHOUT_TIER_OPTIONS.clear()
+
     def test_the_manager_builds_spec_only_tiers_end_to_end(self):
         model, references = _model(tier_options={"device": "cpu"})
         streamer = model.get_submodule("0")._nvfp4_expert_streamer
@@ -120,9 +123,8 @@ class TestInclusiveHotSlotLimit(unittest.TestCase):
         self.assertEqual(inclusive_hot_slot_limit(streamer), 3)
         streamer.format.max_gather_rows = 7
         self.assertEqual(inclusive_hot_slot_limit(streamer), 0)
-        streamer.format.max_gather_rows = None
-        self.assertEqual(inclusive_hot_slot_limit(streamer), 5)
         streamer.format.inclusive_pinned_tier = False
+        streamer.format.max_gather_rows = None
         self.assertIsNone(inclusive_hot_slot_limit(streamer))
 
     def test_the_dense_format_does_not_opt_in(self):
@@ -131,6 +133,18 @@ class TestInclusiveHotSlotLimit(unittest.TestCase):
         streamer = ExpertStreamer(layer, ("rows",))
         ExpertPinnedHostCache(streamer, 2, device="cpu")
         self.assertIsNone(inclusive_hot_slot_limit(streamer))
+
+    def test_an_inclusive_format_with_no_positive_max_gather_rows_is_refused(self):
+        model, _ = _model(
+            tier_options={"device": "cpu"}, max_gather_rows=None, inclusive_pinned_tier=True
+        )
+        streamer = model.get_submodule("0")._nvfp4_expert_streamer
+        ExpertPinnedHostCache(streamer, 5, device="cpu")
+        with self.assertRaisesRegex(ValueError, "no positive max_gather_rows"):
+            inclusive_hot_slot_limit(streamer)
+        streamer.format.max_gather_rows = 0
+        with self.assertRaisesRegex(ValueError, "no positive max_gather_rows"):
+            inclusive_hot_slot_limit(streamer)
 
 
 class _FakeHotCache:

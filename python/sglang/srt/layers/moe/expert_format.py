@@ -259,12 +259,14 @@ def require_graph_gather_support(streamers: Iterable["ExpertStreamer"]) -> None:
     GPU-readable host sources frozen at startup, which spec-only tensors lack.
     """
     for streamer in streamers:
-        expert_format = getattr(streamer, "format", None)
+        # Every streamer always has a format (DenseLayerFormat by default) and
+        # a has_spec_only_tensors property, so no defensive getattr is needed.
+        expert_format = streamer.format
         unsupported = (
-            expert_format is not None and not expert_format.supports_graph_gather
-        ) or getattr(streamer, "has_spec_only_tensors", False)
+            not expert_format.supports_graph_gather or streamer.has_spec_only_tensors
+        )
         if unsupported:
-            key = getattr(expert_format, "key", "dense")
+            key = expert_format.key
             raise ValueError(
                 f"expert format {key!r} of layer {streamer.layer_id} does not support "
                 "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER, "
@@ -300,11 +302,24 @@ def inclusive_hot_slot_limit(streamer: "ExpertStreamer") -> Optional[int]:
     ``max_gather_rows`` more rows beside them; so the layer may hold at most
     ``pinned rows - max_gather_rows`` hot slots (never below 0). None when the
     format does not set ``inclusive_pinned_tier`` or the layer has no pinned tier.
+
+    Raises if the format sets ``inclusive_pinned_tier`` but has no positive
+    ``max_gather_rows``: without a cap, the hot cache may pin the whole tier,
+    driving ``evictable_rows()`` to 0 and raising "every pinned host slot
+    holds a protected expert" at the first miss instead of at startup.
     """
     expert_format = streamer.format
     if not getattr(expert_format, "inclusive_pinned_tier", False):
         return None
+    max_gather_rows = expert_format.max_gather_rows
+    if not max_gather_rows or max_gather_rows <= 0:
+        key = getattr(expert_format, "key", type(expert_format).__name__)
+        raise ValueError(
+            f"expert format {key!r} sets inclusive_pinned_tier but has no positive "
+            "max_gather_rows; an inclusive pinned tier needs a cap so eager gathers "
+            "always have room beside the pinned rows"
+        )
     cache = streamer.pinned_host_cache
     if cache is None or not cache.capacity:
         return None
-    return max(cache.capacity - (expert_format.max_gather_rows or 0), 0)
+    return max(cache.capacity - max_gather_rows, 0)
