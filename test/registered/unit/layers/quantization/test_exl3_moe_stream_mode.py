@@ -76,6 +76,9 @@ class FakeStreamer:
         self.last_gather_stats = None
         self.background_read_stats = RowReadStats()
 
+    def serves_graph_gather(self, topk_output):
+        return False  # no graph gather: apply takes the eager streamed path
+
     def record_routes(self, topk_ids):
         self.recorded.append(topk_ids.clone())
 
@@ -212,6 +215,38 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows)
     assert [e for chunk in streamer.chunks for e in chunk] == [0, 1, 3, 4, 5]
     assert all(len(chunk) <= chunk_rows for chunk in streamer.chunks)
     assert trace.stats()["vram_misses"] == 5
+
+
+def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
+    """A route set the streamer's graph gather serves goes to _apply_graph, without the capture guard."""
+    calls = []
+
+    def fake_apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+        calls.append((layer, streamer, x, topk_weights, topk_ids, swiglu_limit))
+        return torch.ones_like(x)
+
+    def refuse(name):
+        raise AssertionError(f"{name} guarded against capture on the in-graph path")
+
+    monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
+    monkeypatch.setattr(exl3_mod, "assert_not_capturing", refuse)
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        layer = _layer(method)
+    streamer = types.SimpleNamespace(serves_graph_gather=lambda topk: topk.topk_ids.numel() <= 6)
+    layer._nvfp4_expert_streamer = streamer
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=1.5
+    )
+    topk_ids = torch.tensor([[5, 0, 3, 1, 2, 4]], dtype=torch.int32)
+    x, topk_weights, dispatch = _routed_inputs(topk_ids)
+
+    got = method.apply(layer, dispatch).hidden_states
+    assert len(calls) == 1
+    assert all(got_arg is want for got_arg, want in zip(calls[0], (layer, streamer, x, topk_weights, topk_ids)))
+    assert calls[0][5] == 10.0
+    assert torch.equal(got, torch.full_like(x, 1.5))  # the routed scale still applies
 
 
 def _routed_inputs(topk_ids, seed=0):
