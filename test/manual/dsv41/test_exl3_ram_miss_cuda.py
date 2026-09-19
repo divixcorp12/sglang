@@ -277,6 +277,24 @@ def test_the_wait_honours_a_fatal_raised_on_the_page():
     assert b["keep"].item() == 0.0 and dev.stats()["sticky"] == 1
 
 
+def test_layer_posts_advise_the_next_layer(tmp_path):
+    layout, fmt, specs, slabs, host, dev = _service(tmp_path, advise=True, layers=2)
+    try:
+        b = _buffers()
+        dev.last_routes[1, :3].copy_(torch.tensor([9, 10, 11], dtype=torch.int32))  # the predictor's ids
+        _set(b, [2], [2])
+        _step(dev, b, row=0, next_row=1)
+        torch.cuda.synchronize()
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline and not all(host.contains(1, e) for e in (9, 10, 11)):
+            time.sleep(0.005)
+        assert all(host.contains(1, e) for e in (9, 10, 11))
+        assert dev.last_routes[0, 0].item() == 2  # layer 0 remembered this token's routes
+        assert host.counters()["advisory_rows"] == 3
+    finally:
+        _close(host, slabs)
+
+
 def test_overheads(tmp_path):
     """§9.3 acceptance numbers: hit-path cost per layer, stream idle per forced miss."""
     expert_dir = os.environ.get("DSV41_EXL3_DIR")

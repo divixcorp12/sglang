@@ -176,6 +176,22 @@ def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_u
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
+def test_prefetch_needs_graph_gather_under_breakable_decode(model_dir):
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_EXPERT_PREFETCH"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_EXPERT_PREFETCH"):
+        _gate(_launch(model_dir), SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)  # eager decode: no in-graph MoE to post from
+
+
+def test_prefetch_is_off_unless_the_env_var_is_set():
+    from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
+
+    assert prefetch_enabled() is False
+    with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
+        assert prefetch_enabled() is True
+
+
 def test_the_exl3_requirements_read_graph_gathers_from_the_pinned_tier(model_dir):
     args = _launch(model_dir)
     assert expert_stream_requirements_for(args, args).graph_gather_host_source == "pinned_tier"
