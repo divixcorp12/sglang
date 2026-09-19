@@ -68,5 +68,16 @@ def test_mean_decode_tok_s_with_no_sessions_is_an_error():
         trace_corpus.mean_decode_tok_s([])
 
 
+def test_graphs_switch_to_breakable_decode_at_batch_size_one():
+    args = SimpleNamespace(model="/m", mem_fraction_static=0.8, chunked_prefill_size=512, new_tokens=128, graphs=True)
+    kwargs = trace_corpus.engine_kwargs(args)
+    assert "disable_cuda_graph" not in kwargs
+    assert kwargs["cuda_graph_backend_decode"] == "breakable"
+    assert kwargs["cuda_graph_backend_prefill"] == "disabled"
+    assert kwargs["cuda_graph_bs_decode"] == [1] and kwargs["cuda_graph_max_bs_decode"] == 1
+    eager = trace_corpus.engine_kwargs(SimpleNamespace(**{**vars(args), "graphs": False}))
+    assert eager["disable_cuda_graph"] is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
