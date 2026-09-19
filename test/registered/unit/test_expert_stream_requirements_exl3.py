@@ -69,6 +69,7 @@ def _launch(model_dir, **changes):
         expert_distribution_recorder_mode="per_pass",
         enable_waterfill=False,
         enable_eplb=False,
+        moe_offload_preset="off",
         cuda_graph_config=CudaGraphConfig(
             decode=PhaseConfig(backend="disabled"),
             prefill=PhaseConfig(backend="disabled"),
