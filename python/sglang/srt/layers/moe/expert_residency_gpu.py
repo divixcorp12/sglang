@@ -30,6 +30,8 @@ _PREFILL_PHASE = 1
 _STAGE_OFF = 0
 _STAGE_SCRATCH = 1
 _STAGE_DIRECT = 2
+# Above every residency_rank_keys key of a nonnegative score (sign-bit-0 float32 bits << 16 < 2**47).
+_ROUTED_RANK_OFFSET = 1 << 48
 
 
 class GpuResidencyUpdater:
@@ -285,12 +287,12 @@ class GpuResidencyUpdater:
         so its distinct hits ``H`` and distinct misses ``M`` satisfy
         ``H + M <= miss_rows``. Each hit route disqualifies at most one entry,
         leaving at least ``miss_rows - H >= M`` survivors whenever the shortlist
-        is full. It is full while a layer has ``miss_rows`` eligible candidates,
-        and with a boundary every forward at most ``miss_rows`` residents were
-        routed since the last one, so ``capacity >= 2 * miss_rows`` suffices.
-        Below that a miss could find no slot, and with no scratch row to fall
-        back on its routes would read another expert, so the mode is refused
-        rather than allowed to truncate.
+        is full. It is full whenever a layer holds ``miss_rows`` slots, because
+        :meth:`_rank_victims` ranks routed residents last instead of dropping
+        them; ``capacity >= 2 * miss_rows`` is required on top of that. Without
+        a full shortlist a miss could find no slot, and with no scratch row to
+        fall back on its routes would read another expert, so a smaller layer
+        is refused rather than allowed to truncate.
         """
         width = self.miss_rows
         for layer_id, streamer in zip(self.layer_ids, self.streamers):
@@ -471,9 +473,9 @@ class GpuResidencyUpdater:
         whichever path nobody updated -- and a Stage 2 arm reporting zero
         insertions reads as the feature being off rather than as a bug.
 
-        ``insertion_truncated`` stays a shared tripwire. DIRECT refuses at
-        startup every configuration that could truncate, so its staying zero is
-        the invariant, not an absence of instrumentation.
+        ``insertion_truncated`` stays a shared tripwire. Under DIRECT it counts
+        gathers with a miss that found no victim; those copies land in slot 0,
+        so its staying zero is the invariant, not an absence of instrumentation.
         """
         if not self.insert_on_miss:
             return {}
@@ -659,24 +661,22 @@ class GpuResidencyUpdater:
 
     def _rank_victims(self, routed: torch.Tensor) -> None:
         """Propose each layer's next ``miss_rows`` victim slots: free slots first, then the
-        lowest-scored residents this window did not route.
+        lowest-scored residents, those this window did not route ahead of those it did.
 
         This is only a proposal. It is ranked before the next forward's routing
         is known, so it may name a slot that forward reads; the gather that
-        commits removes those itself (:meth:`gather_destinations`). The
-        ``routed`` filter here is a quality heuristic that keeps warm rows out
-        of the shortlist, never the safety property.
+        commits removes those itself (:meth:`gather_destinations`). Ranking
+        routed residents last keeps warm rows out of the shortlist's front
+        without dropping them: a short prefill routes every resident, and an
+        emptied shortlist sends every miss of the next forward to slot 0.
         """
         slot_dump = self.max_capacity
         width = self.miss_rows
         slot_experts = self.slot_to_expert.clamp(min=0)
         free = (self.slot_state == _FREE) & self.slot_valid
-        evictable = (
-            (self.slot_state == _READY)
-            & self.slot_valid
-            & (self.slot_to_expert >= 0)
-            & ~routed.gather(1, slot_experts)
-        )
+        evictable = (self.slot_state == _READY) & self.slot_valid & (self.slot_to_expert >= 0)
+        rank = residency_rank_keys(self.insert_scores).gather(1, slot_experts)
+        rank = rank + routed.gather(1, slot_experts).to(torch.int64) * _ROUTED_RANK_OFFSET
         never = torch.iinfo(torch.int64).max
         keys = torch.full(
             (self.num_layers, self.victim_columns), never, dtype=torch.int64, device=self.device
@@ -684,7 +684,7 @@ class GpuResidencyUpdater:
         keys[:, : slot_dump + 1] = torch.where(
             free,
             self.slot_ids.unsqueeze(0) - (slot_dump + 1),
-            torch.where(evictable, residency_rank_keys(self.insert_scores).gather(1, slot_experts), never),
+            torch.where(evictable, rank, never),
         )
         ranked = torch.sort(keys, dim=1)
         self.victims.copy_(ranked.indices[:, :width].clamp(max=slot_dump))
@@ -717,7 +717,8 @@ class GpuResidencyUpdater:
         usable_valid = (valid & ~hazard).index_select(0, order)
         live = (self.gather_lanes < streamer._graph_miss_count.long()) & usable_valid
         # Lanes past the miss count are never copied (the copy reads the same count) and
-        # never remapped to, so their destination only has to stay inside the allocation.
+        # never remapped to. A lane inside the count that is not live is still copied to
+        # slot 0; the full shortlist rules that out and _commit_gather counts it if not.
         destinations = torch.where(live, usable, torch.zeros_like(usable))
         streamer._graph_destination_slots.copy_(destinations.to(torch.int32))
         self._pending_commit = (row, streamer, destinations, live)
@@ -763,6 +764,7 @@ class GpuResidencyUpdater:
         self.slot_generations[row, slot_dump : slot_dump + 1].fill_(0)
         self.gather_insertions[row].add_(live.sum())
         self.gather_evictions[row].add_(evicted.sum())
+        self.insertion_truncated[row].add_((streamer._graph_miss_count.long() > live.sum()).long().sum())
 
     def _copy_promotions(self, width: int) -> None:
         """Copy each layer's promoted rows into its destination slots on the current stream."""

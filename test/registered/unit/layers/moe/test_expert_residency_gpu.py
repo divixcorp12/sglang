@@ -1376,8 +1376,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
                         )
 
     def test_the_victim_is_the_lowest_scored_resident_the_forward_does_not_route(self):
-        """Ranking quality is stage 1's rule, unchanged; what is new is that routing the shortlisted
-        slot pushes the miss onto the next entry instead of evicting a row in use."""
+        """Unrouted residents rank lowest score first, as in stage 1; what is new is that routing the
+        shortlisted slot pushes the miss onto the next entry instead of evicting a row in use."""
         manager = _manager(self.model, gpu=True, **DIRECT)
         updater = manager.gpu_residency
         graph, static, outputs = self.capture(manager)
@@ -1524,6 +1524,33 @@ class TestInsertOnMissDirect(unittest.TestCase):
         best = sorted(range(EXPERTS), key=lambda expert: (-((expert * 7) % 5), expert))[:floor]
         resident = {expert for expert, slot in enumerate(manager.caches[0].expert_to_slot.tolist()) if slot >= 0}
         self.assertEqual(resident, set(best))
+
+    def test_misses_after_a_short_prefill_that_routed_every_resident_land_in_their_own_slots(self):
+        """A replay after a boundary-less prefill that routed every resident must still copy each
+        miss into its own slot, never all of them into slot 0."""
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        graph, static, outputs = self.capture(manager)
+
+        def eager_prefill(tokens, experts):
+            routes = [[[experts[(token * TOP_K + k) % len(experts)] for k in range(TOP_K)] for token in range(tokens)]
+                      for _ in range(LAYERS)]
+            for layer, streamer in sorted(manager.streamers.items()):
+                streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
+            manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
+            torch.cuda.synchronize()
+
+        eager_prefill(24, list(range(EXPERTS)))
+        assert_slot_rows(self, manager, self.model, "boundary prefill")
+        eager_prefill(6, list(range(EXPERTS)))
+        for step in range(3):
+            routes = []
+            for _, cache in sorted(manager.caches.items()):
+                absent = [expert for expert, slot in enumerate(cache.expert_to_slot.tolist()) if slot < 0]
+                self.assertGreaterEqual(len(absent), TOP_K, "the cache holds every expert; nothing can miss")
+                routes.append([absent[:TOP_K]])
+            self.step(manager, graph, static, outputs, routes, f"verify {step}")
+            assert_slot_rows(self, manager, self.model, f"verify {step}")
+        self.assertEqual(sum(manager.gpu_residency.snapshot()["insertion_truncated"]), 0)
 
     def test_the_shortlist_is_ranked_before_the_first_replay(self):
         """`reset_after_capture` must leave a usable shortlist: the first replay's gather reads it
