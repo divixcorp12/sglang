@@ -391,6 +391,7 @@ class Exl3RamMissService:
                 layer_rows_delta=[a - b for a, b in zip(rows, self._trace_rows)],
                 routed_rows=graph[0] - self._trace_graph[0],
                 routed_misses=graph[1] - self._trace_graph[1],
+                thread=self.host.counters(),
             )
         self._trace_rows, self._trace_graph = rows, graph
 
