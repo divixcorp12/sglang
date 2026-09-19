@@ -20,7 +20,7 @@ from sglang.srt.arg_groups.expert_stream_requirements import (
     register_expert_stream_requirements,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 
 _EAGER = eager_expert_stream_requirements(
     "EXL3",
@@ -55,7 +55,12 @@ def _check(cfg, budgets) -> None:
             "it needs SGLANG_MOE_EXPERT_GRAPH_GATHER=1 with breakable decode graphs"
         )
     graph = cfg.cuda_graph_config
-    if graph is None or graph.decode.backend == Backend.DISABLED:
+    if not isinstance(graph, CudaGraphConfig):
+        # run_resolution_pipeline's first offload pass runs before parse_cuda_graph_config,
+        # while this is still the raw CLI value: the decode backend is not known yet, and
+        # the pass after parsing runs every check below.
+        return
+    if graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
         return
     if graph.decode.backend != Backend.BREAKABLE:
