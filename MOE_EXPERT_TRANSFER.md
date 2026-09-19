@@ -237,9 +237,11 @@ PREFETCH_PREDICTOR= PREFETCH_PULL_MODE=off RUN_KIND=timed PREFETCH_RUN_DIR=/path
 
 The production server is launched by
 **`divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh`** (port 7867,
-`0.0.0.0`). That *script* is not in this repo, but the *code* it runs is: the
-worktree `main-port-probe-7bc4eb`, **detached at `797be6f678`** since 2026-09-18
-(it was on `d43c59b58a`, 158 commits behind and without `INSERT_ON_MISS`).
+`0.0.0.0`). That *script* is not in this repo, but the *code* it runs is. Since
+2026-09-18 evening it runs the worktree **`prod-5b91a98`**: `797be6f678` plus
+`prod-5b91a98.patch` staged, byte-identical to this branch's code at
+`5b91a9833c` (guard removal, slot floor, in-place staging, NVFP4 draft flag).
+The previous worktree `main-port-probe-7bc4eb` (plain `797be6f678`) is untouched.
 
 **As of 2026-09-18 the script carries the full winning config.** Four changes
 against the pre-campaign script, each with a backup alongside:
@@ -250,6 +252,10 @@ against the pre-campaign script, each with a backup alongside:
 | `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `4` | **`1`** | Insert-on-miss needs a boundary every decode forward. **Stage 2 requires 1 — see the launcher warning above** | same |
 | `--disable-overlap-schedule` | present | **removed** | +4.5% / +2.9%. Its absence *is* the optimization | same |
 | `SGLANG_MOE_EXPERT_FUSED_PLAN` | unset | **`1`** | +6.4% | `.bak-pre-fusedplan-20260918` |
+| NEXTN speculation | none | **`--speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3`** | +9.6%; 4 draft tokens tie with 3 | `.bak-pre-nextn-20260918` |
+| `SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT` | unset | **`1`** | Draft 2.46 → 1.45 GB, accept length unchanged | `.bak-pre-nvfp4draft-20260918` |
+| `SGLANG_MOE_HOT_GPU_MB` | `12288` | **`14336`** | +6.1% (13,312) then +6.65% (14,336); 37k-token peak 31,667 MiB at chunk 4096 | same |
+| worktree | `main-port-probe-7bc4eb` | **`prod-5b91a98`** | the three rows above need this code | same |
 
 Validated after the stage-2 change: healthy in 201 s, `DIRECT`, 4,660 slots,
 `scratch_bytes: 0`, coherent generation. **The fused-planner line was added after
@@ -261,15 +267,18 @@ Keep everything else prod already has, including `--tool-call-parser auto`,
 `SGLANG_FILE_CACHE_MODEL_PATH`, `SGLANG_VLM_CACHE_SIZE_MB=0` and the PLE RSS budget
 vars — none are in the benchmark launcher and all are production behaviour.
 
-**Prod runs a 12,288 MB hot cache; every measurement before the NEXTN arm was at
+**Prod ran a 12,288 MB hot cache (14,336 MB from the 2026-09-18 update); every measurement before the NEXTN arm was at
 10,240 MB.** That arm's control ran the prod config at 12,288 MB: 22.650 median.
 
-**Prod is down, and its script does not start as of 2026-09-18.** It carries
-`--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1
---speculative-num-draft-tokens 4`, which fails twice over: prod's worktree
-(`797be6f678`) still has the speculation guard, and 4 draft tokens do not fit
-stage 2 at 12,288 MB (see the NEXTN arm). The last working script is
-`run-nvfp4-e16c-public.sh.bak-pre-nextn-20260918`.
+**Prod is down; the script was updated 2026-09-18 but has not been started.**
+Every setting in it was measured in the benchmark launcher, which matches prod
+on all GPU-relevant flags; prod adds `--tool-call-parser auto`,
+`--mamba-radix-cache-strategy extra_buffer_lazy` and `--max-mamba-cache-size 1`
+with `--disable-radix-cache`. Validate the first start with a ~37k-token prompt
+while watching `nvidia-smi` (the probe's margin was ~940 MiB). To roll back:
+`cp run-nvfp4-e16c-public.sh.bak-pre-nvfp4draft-20260918 run-nvfp4-e16c-public.sh`
+(that copy still has the broken 4-token NEXTN lines; `.bak-pre-nextn-20260918`
+is the last pre-speculation script that starts).
 
 ### Flag rationale (questions that come up)
 
