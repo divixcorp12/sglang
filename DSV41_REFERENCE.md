@@ -2252,18 +2252,46 @@ run back to back on 2026-09-19.
   1.6 s; p99 804 ms against `c0`'s 811.
 - So the 2.1 s stall of §18.2's window, and py-spy's 45 ms/step average on the same
   `--skip 12` session, are a promotion burst on that session, not the typical cost.
-  Extrapolating it (40–65 ms/token) was wrong. How often bursts happen across sessions is
-  unmeasured.
+  Extrapolating it (40–65 ms/token) was wrong.
 - **Ruling:** keep `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=32`; defer a real async promotion
-  path (under 1% on these sessions) unless bursts prove common.
+  path (under 1% on these sessions). The burst frequency below settles it.
+
+**Burst frequency** (`OVL/burst-run.sh`, `burst_analysis.py`; the `c32` arm again, sessions
+4–19, 16 sessions × 124 graph steps = 1,983 steps, 2.831 tok/s mean — the same as `c32`'s
+2.823 on sessions 0–3). Bursts are rare, and the slow steps are not at boundaries:
+
+| Quantity | Value |
+|---|---|
+| Steps over 1 s | **6 of 1,983 (0.3%)**, worst 1.40 s |
+| Their positions | steps 30, 82, 110, 110, 124, 125 — none with k%32 in (0,1) |
+| Boundary steps | 112, mean 417 ms, against 359 ms for the other 1,855 (**~115 ms excess per boundary, ~3.6 ms/token**) |
+| Step ms | p50 344, p90 540, p99 776, p99.9 1,267, max 1,403 |
+| Promotions per 32-forward window | median 25, max 832 over 48 windows |
+| Windows with ≥200 promotions | 2; mean window 12.6 s against 10.5–12.0 s for the smaller buckets |
+
+- **No boundary stall recurred.** Nothing approached the 2.1 s of the `--skip 12` session
+  in 16 further sessions; the worst step is 1.40 s, in line with `c32`'s 1.6 s on sessions
+  0–3. The six slow steps sit away from the boundaries, so they are NVMe tail latency on
+  RAM misses, not promotions.
+- **Promotion count barely moves the window.** The two ≥200-promotion windows (832 at the
+  top) run 12.6 s against 10.5–12.0 s elsewhere: ~1–2 s spread over 32 forwards, which is
+  the same ~3.6 ms/token the boundary mean shows.
+- The per-boundary excess is higher than sessions 0–3 suggested (~115 ms against 40–80 ms),
+  still **~1% of throughput**.
+- **Ruling (2026-09-19):** no async promotion path, and no cheaper substitute either (a
+  per-boundary promotion cap, or promoting only experts already in RAM). Both target ~1%,
+  and the cap would give back some of the 16% G reduction promotions buy. The tail belongs
+  to NVMe reads on misses, so prediction and prefetch (§18.4) are where the step time is.
 
 ### 18.7 Open
 
-- **How common are promotion bursts?** One session (`--skip 12`) stalled 2.1 s at a boundary;
-  sessions 0–3 never exceeded 1.6 s per step. Tracing more sessions settles whether async
-  promotions are worth building.
+- ~~How common are promotion bursts?~~ **Settled** (§18.6, burst frequency): 6 steps over
+  1 s in 1,983, none at a boundary, ~115 ms per boundary. No async promotion path.
 - **Stream 37's copies are the boundary's promotions** (§18.6); they do not run during
   ordinary steps.
+- **What is the NVMe tail?** The six slow steps are RAM misses whose reads ran long; the
+  per-row 10.16 ms of §18.2 is a mean. Their distribution is unmeasured, and it caps what
+  prefetch can hide.
 - A prefetch prototype (confidence-gated L+1 or L+2 lookahead, prefetch reads queued
   behind demand reads) would check §18.4's estimate.
 - Everything in §17.8's open list stands, including the raw-JSON `--cuda-graph-config`
