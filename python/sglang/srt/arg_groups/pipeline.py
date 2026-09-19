@@ -372,4 +372,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     validate_deepep_v2_speculative_draft(server_args)
     validate_deepep_v2_dispatch_token_budget(server_args)
 
+    from sglang.srt.arg_groups.moe_offload_hook import check_moe_offload_config
+
+    # Last: cuda_graph_config, speculative_algorithm, and the parallelism
+    # fields it reads keep changing until here (handle_speculative_decoding,
+    # handle_data_parallelism, handle_dllm_inference, handle_other_validations).
+    check_moe_offload_config(server_args)
+
     server_args._resolution_finished = True

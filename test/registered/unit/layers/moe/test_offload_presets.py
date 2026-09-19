@@ -1,6 +1,9 @@
 """MoE offload presets: the preset values, the merge and derivation rules, and validation."""
 
+import json
 import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,9 +12,24 @@ from sglang.srt.arg_groups import moe_offload_hook
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import offload_presets as presets
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+# A real config.json, so TestPipelineWiring's resolve_once() runs past the
+# pipeline's dummy-model early return without loading actual weights.
+_MINI_CONFIG = {
+    "architectures": ["LlamaForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "num_hidden_layers": 2,
+    "vocab_size": 128,
+    "max_position_embeddings": 2048,
+}
 
 # The offload variables of divix01:/data/models/slang/nvfp4-work/run-nvfp4-e16c-public.sh as
 # of 2026-09-19, minus site-specific paths. The graph-gather preset must reproduce them.
@@ -217,5 +235,54 @@ class TestPresetHook(unittest.TestCase):
         self.assertEqual(self.declared, [])
 
     def test_a_refusal_names_the_preset(self):
+        args = self.args("doorbell", speculative_algorithm="NEXTN")
+        moe_offload_hook.handle_moe_offload_preset(args)
         with self.assertRaisesRegex(ValueError, "--moe-offload-preset doorbell: .*speculative"):
-            moe_offload_hook.handle_moe_offload_preset(self.args("doorbell", speculative_algorithm="NEXTN"))
+            moe_offload_hook.check_moe_offload_config(args)
+
+
+class TestPipelineWiring(unittest.TestCase):
+    """Runs the real resolution pipeline (past its dummy-model early return,
+    same technique as test_resolution_declarations.py's _resolve) to pin
+    where check_moe_offload_config is wired: after handle_cuda_graph_config
+    has parsed --cuda-graph-max-bs-decode, which handle_moe_offload_preset
+    alone cannot see (that field is still the CLI default there)."""
+
+    def setUp(self):
+        self._environ_snapshot = dict(os.environ)
+        self.addCleanup(self._restore_environ)
+
+    def _restore_environ(self):
+        os.environ.clear()
+        os.environ.update(self._environ_snapshot)
+
+    def _resolve(self, **fields):
+        path = tempfile.mkdtemp(prefix="offload_preset_")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        with open(os.path.join(path, "config.json"), "w") as handle:
+            json.dump(_MINI_CONFIG, handle)
+        server_args = ServerArgs(model_path=path, device="cuda", random_seed=42, **fields)
+        server_args.resolve_once()
+        return server_args
+
+    def test_graph_gather_with_decode_max_bs_2_is_refused(self):
+        # graph-gather also sets SGLANG_QWEN4_PLE_STAGE_BEFORE_REPLAY, which
+        # handle_offload_compatibility (run earlier) requires file-backed PLE
+        # offload for; satisfy it so this refusal is the one under test.
+        with self.assertRaisesRegex(
+            ValueError, "--moe-offload-preset graph-gather: .*cuda-graph-max-bs-decode 1"
+        ):
+            self._resolve(
+                moe_offload_preset="graph-gather",
+                cuda_graph_max_bs_decode=2,
+                ple_offload_backend="file",
+                ple_offload_embedding=True,
+                moe_runner_backend="flashinfer_cutlass",
+                max_running_requests=1,
+                disable_prefill_cuda_graph=True,
+                expert_distribution_recorder_mode="stat",
+            )
+
+    def test_off_with_no_offload_env_resolves_cleanly(self):
+        self._resolve(moe_offload_preset="off")
+        self.assertEqual(presets.explicit_offload_env(os.environ), {})

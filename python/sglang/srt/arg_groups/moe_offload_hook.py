@@ -10,16 +10,19 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import offload_presets
-from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
+from sglang.srt.model_executor.cuda_graph_config import Backend
 
 logger = logging.getLogger(__name__)
 
 
 def handle_moe_offload_preset(server_args: Any) -> None:
-    """Fill unset offload variables from the preset, derive forced ones, refuse invalid setups.
+    """Fill unset offload variables from the preset, derive forced ones.
 
     Runs in the launcher before the scheduler and workers are spawned, so they
-    inherit every variable set here.
+    inherit every variable set here. Validation is separate (see
+    ``check_moe_offload_config``): cuda_graph_config, speculative_algorithm,
+    and the parallelism fields the checks need are not final yet at this
+    point in the pipeline.
     """
     cfg = resolving_view(server_args)
     name = cfg.moe_offload_preset
@@ -40,14 +43,25 @@ def handle_moe_offload_preset(server_args: Any) -> None:
     if offload_presets.needs_overlap_off(resolved.effective) and not cfg.disable_overlap_schedule:
         declare_resolution(server_args, "handle_moe_offload_preset", disable_overlap_schedule=True)
         logger.info("MoE offload preset %s turns overlap scheduling off", name)
-    # This hook runs before _parse_cuda_graph_config, so cuda_graph_config may
-    # still be the raw CLI dict (or None); normalize it the same way that
-    # resolver does before reading phase settings off it.
-    raw_graph = cfg.cuda_graph_config
-    graph = raw_graph if isinstance(raw_graph, CudaGraphConfig) else CudaGraphConfig.from_dict(raw_graph)
+
+
+def check_moe_offload_config(server_args: Any) -> None:
+    """Refuse invalid offload combinations once the fields it reads are final.
+
+    Runs last in the resolution pipeline. cuda_graph_config keeps changing
+    through handle_speculative_decoding, handle_data_parallelism,
+    handle_dllm_inference and handle_other_validations; speculative_algorithm
+    only settles at handle_speculative_decoding; tp/pp/dp_size and
+    enable_dp_attention can still move through handle_data_parallelism and
+    the DeepSeek-family model overrides. By this point every offload
+    variable the preset fills is already in os.environ.
+    """
+    cfg = resolving_view(server_args)
+    name = cfg.moe_offload_preset
+    graph = cfg.cuda_graph_config
     try:
         offload_presets.check_offload_config(
-            resolved.effective,
+            offload_presets.explicit_offload_env(os.environ),
             speculative=cfg.speculative_algorithm is not None,
             decode_graphs_disabled=graph.decode.backend == Backend.DISABLED,
             decode_max_bs=graph.decode.max_bs,
