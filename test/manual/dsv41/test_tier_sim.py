@@ -236,5 +236,16 @@ def test_a_trace_missing_miss_counts_on_a_later_line_reports_no_live_numbers(tmp
     assert json.loads(result.stdout)["live"] is None
 
 
+def test_graph_steps_mix_with_eager_prefill_lines():
+    calls = [
+        {"forward": 1, "layer": 0, "tokens": 256, "vram_miss": 9, "ram_miss": 4, "experts": [1], "counts": [9]},
+        {"forward": 1, "layer": 1, "tokens": 256, "vram_miss": 9, "ram_miss": 4, "experts": [2], "counts": [9]},
+        {"forward": 2, "layer": -1, "tokens": 1, "kind": "graph_step", "vram_miss": 6, "ram_miss": 3, "experts": [], "counts": []},
+        {"forward": 3, "layer": -1, "tokens": 1, "kind": "graph_step", "vram_miss": 4, "ram_miss": 1, "experts": [], "counts": []},
+    ]
+    live = live_summary(calls, warmup=0)
+    assert live["decode_tokens"] == 2 and live["G"] == 5.0 and live["f"] == 0.4
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

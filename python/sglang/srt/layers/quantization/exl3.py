@@ -439,11 +439,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if type(streamer.row_backend) is PinnedTierRowBackend and not getattr(layer, "_exl3_allow_p3_only", False):
             # Without option C nothing serves or checks a RAM miss inside a replay.
             raise RuntimeError(
-                "exl3 in-graph MoE needs option C (Exl3RamMissRowBackend); the pinned "
-                "tier's slot table was not native (SGLANG_MOE_EXPERT_GRAPH_GATHER off at load?)"
+                f"exl3 in-graph MoE, layer {getattr(layer, 'layer_id', '?')}: the graph gather "
+                "reads the pinned tier, but option C is not installed (the row backend is a "
+                "plain PinnedTierRowBackend, not Exl3RamMissRowBackend), so a RAM miss inside a "
+                "replay would be neither served nor fail-stopped. Option C installs when "
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER is on at load and the hot cache manager "
+                "attaches the EXL3 format."
             )
         if swiglu_limit is None:
             raise NotImplementedError("exl3 in-graph MoE: a swiglu_limit is required (DSV4.1 sets 10.0)")
+        routes = getattr(streamer.row_backend, "routes", None)
+        if routes is not None:
+            # The option C post protects every routed expert of this layer. Captured as a
+            # device copy, so every replay refreshes it from the live topk_ids.
+            flat = topk_ids.reshape(-1)
+            routes[: flat.numel()].copy_(flat)
+            routes[flat.numel() :].fill_(-1)
         remap, _ = streamer.gather(topk_ids)
         fused = exl3_fused_moe_for(layer, streamer)
         out = fused.run(

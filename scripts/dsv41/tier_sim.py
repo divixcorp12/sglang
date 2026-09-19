@@ -129,6 +129,8 @@ def simulate(
     max_gather_rows: int = MAX_GATHER_ROWS,
     prefill_admits: bool = True,
 ) -> dict:
+    # Graph decode steps carry no per-layer routes; only live_summary reads them.
+    calls = [call for call in calls if call.get("kind") != "graph_step"]
     ram_rows = ram_rows_per_layer(ram_slots, num_layers, num_experts)
     limits = [max(rows - max_gather_rows, 0) if rows else num_experts for rows in ram_rows]
     hot = select_hot(seed, vram_slots, num_layers, num_experts, limits)

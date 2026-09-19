@@ -165,7 +165,32 @@ class Exl3ExpertFormat:
             hot = None if streamer is None else streamer.hot_cache
             return hot is not None and expert_id in hot.slot_to_expert
 
-        return {"is_pinned": is_pinned}
+        options = {"is_pinned": is_pinned}
+        if envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get():
+            # Option C: the C++ RAM-miss thread owns this tier's slots (plan D12).
+            # ExpertPinnedHostCache binds the tier's capacity into the table.
+            from sglang.srt.layers.moe.exl3_ram_miss import (
+                Exl3RamMissService,
+                NativePinnedSlotTable,
+            )
+
+            options["slot_table"] = NativePinnedSlotTable(
+                Exl3RamMissService.get(), self.layer_id, lambda: expert_streamer_of(layer)
+            )
+        return options
+
+    def attach_hot_cache_manager(self, manager, streamer) -> None:
+        """Option C hooks (fail-stop check, residency pushes, the RAM-miss row backend),
+        for a layer whose pinned tier runs on the native slot table."""
+        from sglang.srt.layers.moe.exl3_ram_miss import (
+            Exl3RamMissService,
+            NativePinnedSlotTable,
+        )
+
+        tier = getattr(streamer, "pinned_host_cache", None)
+        if not isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
+            return
+        Exl3RamMissService.get().attach(manager, streamer)
 
     def default_row_source(
         self,
@@ -211,6 +236,11 @@ class Exl3ExpertFormat:
 
 logger = logging.getLogger(__name__)
 _WARNED_WITHOUT_PINNED_TIER = False
+
+
+def prefetch_enabled() -> bool:
+    """Option F advisories (Task 15 adds the env var; off until then)."""
+    return False
 
 
 @functools.lru_cache(maxsize=4)

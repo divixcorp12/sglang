@@ -1786,6 +1786,13 @@ class Envs:
     # tokens, experts and route counts, VRAM and RAM misses, read and split time)
     # for offline tier simulation (scripts/dsv41/tier_sim.py).
     SGLANG_DSV41_EXPERT_TRACE_PATH = EnvStr("")
+    # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
+    # thread may take per MoE layer, in ms, before the process fails stop.
+    SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
+    # demand read once that many demands have read rows (forces an Engine-level
+    # timeout after capture). Empty: off.
+    SGLANG_TEST_DSV41_RAM_MISS_FAULT = EnvStr("")
     # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
     # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
     # plain np.memmap path.
