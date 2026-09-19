@@ -89,5 +89,53 @@ class TestFormatSeamCuda(unittest.TestCase):
             streamer.gather(ids)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestRowSourceRoutingCuda(unittest.TestCase):
+    def test_uncached_pageable_rows_read_every_name_in_one_call(self):
+        from sglang.test.moe_expert_fakes import CountingRowSource
+
+        layer = _nvfp4_layer(pinned=False)
+        source = CountingRowSource(
+            {name: getattr(layer, name).data for name in NVFP4_STREAM_TENSORS[:4]}
+        )
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS, row_source=source)
+        ids = torch.tensor([[6, 1, 3]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(ids)
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(source.calls[0].names, NVFP4_STREAM_TENSORS[:4])
+        for name in NVFP4_STREAM_TENSORS:
+            self.assertTrue(
+                torch.equal(
+                    tensors[name][compact.long()].view(torch.uint8).cpu(),
+                    _source_bytes(layer, name, ids),
+                ),
+                name,
+            )
+
+    def test_cached_misses_read_every_name_in_one_call(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+        from sglang.test.moe_expert_fakes import CountingRowSource
+
+        layer = _nvfp4_layer(pinned=False)
+        source = CountingRowSource(
+            {name: getattr(layer, name).data for name in NVFP4_STREAM_TENSORS[:4]}
+        )
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS, row_source=source)
+        ExpertHotCache(streamer, 1).reassign([2])
+        before = len(source.calls)
+        ids = torch.tensor([[2, 5, 7]], device="cuda", dtype=torch.int32)
+        compact, tensors = streamer.gather(ids)
+        self.assertEqual(len(source.calls), before + 1)
+        self.assertEqual(sorted(source.calls[-1].rows), [5, 7])
+        for name in NVFP4_STREAM_TENSORS:
+            self.assertTrue(
+                torch.equal(
+                    tensors[name][compact.long()].view(torch.uint8).cpu(),
+                    _source_bytes(layer, name, ids),
+                ),
+                name,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

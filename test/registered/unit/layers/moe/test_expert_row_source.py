@@ -3,9 +3,11 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.moe.expert_format import DenseLayerFormat
 from sglang.srt.layers.moe.expert_row_source import (
     CompletedReadTicket,
     ExpertRowSource,
@@ -14,6 +16,7 @@ from sglang.srt.layers.moe.expert_row_source import (
     RowReadStats,
     TensorRowSource,
 )
+from sglang.srt.layers.moe.expert_stream import ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.moe_expert_fakes import CountingRowSource
 
@@ -216,6 +219,102 @@ class TestExpertFileRowReaderRowSource(unittest.TestCase):
                 self.assertEqual((stats.rows, stats.file_bytes), (1, 80))
             finally:
                 group.close()
+
+
+def _layer(names=("a", "b", "c"), experts=6):
+    layer = torch.nn.Module()
+    for position, name in enumerate(names):
+        values = torch.arange(experts * 4, dtype=torch.int16).reshape(experts, 4)
+        setattr(
+            layer,
+            name,
+            torch.nn.Parameter(values + 100 * position, requires_grad=False),
+        )
+    return layer
+
+
+def _all_miss(ids):
+    return torch.full_like(ids, -1), torch.zeros_like(ids, dtype=torch.bool)
+
+
+class _PartlySpecOnly(DenseLayerFormat):
+    """Dense specs, but ``b`` has no dense source."""
+
+    def source(self, layer, name):
+        return None if name == "b" else super().source(layer, name)
+
+
+class TestStreamerRowRouting(unittest.TestCase):
+    def test_an_explicit_row_source_is_the_file_row_reader(self):
+        layer = _layer()
+        source = CountingRowSource({"a": layer.a.data})
+        streamer = ExpertStreamer(layer, ("a", "b", "c"), row_source=source)
+        self.assertIs(streamer.row_source, source)
+        self.assertIs(streamer.file_row_reader, source)
+        # ExpertHostArena.bind drops the reader like this.
+        streamer.file_row_reader = None
+        self.assertIsNone(streamer.row_source)
+
+    def test_covered_names_share_one_row_source_call(self):
+        names = tuple("abcdef")
+        layer = _layer(names)
+        source = CountingRowSource({name: getattr(layer, name).data for name in names})
+        streamer = ExpertStreamer(layer, names, row_source=source)
+        destinations = {name: torch.zeros(3, 4, dtype=torch.int16) for name in names}
+        stats = streamer.read_host_rows(torch.tensor([4, 1, 5]), destinations)
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(source.calls[0].names, names)
+        self.assertIsNone(source.calls[0].destination_rows)
+        for name in names:
+            self.assertTrue(
+                torch.equal(destinations[name], getattr(layer, name).data[[4, 1, 5]])
+            )
+        self.assertEqual(stats.rows, 3)
+        self.assertEqual(stats.file_bytes, 3 * source.file_bytes_per_expert)
+
+    def test_uncovered_names_read_their_dense_source(self):
+        layer = _layer()
+        source = CountingRowSource({"a": layer.a.data})
+        streamer = ExpertStreamer(layer, ("a", "b", "c"), row_source=source)
+        destinations = {name: torch.zeros(3, 4, dtype=torch.int16) for name in "abc"}
+        stats = streamer.read_host_rows(
+            torch.tensor([5, 3]), destinations, torch.tensor([2, 0])
+        )
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(source.calls[0].names, ("a",))
+        self.assertEqual(source.calls[0].destination_rows, [2, 0])
+        for name in "abc":
+            self.assertTrue(
+                torch.equal(destinations[name][[2, 0]], getattr(layer, name).data[[5, 3]])
+            )
+        self.assertEqual(stats.rows, 2)
+
+    def test_a_tensor_with_neither_source_is_refused(self):
+        layer = _layer(("a", "b"))
+        streamer = ExpertStreamer(
+            layer, ("a", "b"), format=_PartlySpecOnly(("a", "b")), row_source=None
+        )
+        self.assertIsNone(streamer.source("b"))
+        with self.assertRaisesRegex(ValueError, "no row source covers"):
+            streamer.read_host_rows(
+                torch.tensor([0]), {"b": torch.zeros(1, 4, dtype=torch.int16)}
+            )
+
+    def test_a_row_source_must_hold_the_layers_experts(self):
+        layer = _layer()
+        source = CountingRowSource({"a": torch.zeros(5, 4, dtype=torch.int16)})
+        with self.assertRaisesRegex(ValueError, "row source holds 5 experts"):
+            ExpertStreamer(layer, ("a", "b", "c"), row_source=source)
+
+    def test_a_row_source_serves_a_tensor_without_a_dense_source(self):
+        layer = _layer(("a", "b"))
+        source = CountingRowSource({"b": layer.b.data})
+        streamer = ExpertStreamer(
+            layer, ("a", "b"), format=_PartlySpecOnly(("a", "b")), row_source=source
+        )
+        destination = torch.zeros(2, 4, dtype=torch.int16)
+        streamer.read_host_rows(torch.tensor([1, 4]), {"b": destination})
+        self.assertTrue(torch.equal(destination, layer.b.data[[1, 4]]))
 
 
 if __name__ == "__main__":

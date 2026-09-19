@@ -231,5 +231,45 @@ class TestSpecStagingShapes(unittest.TestCase):
             )
 
 
+class TestRowSourceKnob(unittest.TestCase):
+    def _layer(self):
+        layer = torch.nn.Module()
+        layer.rows = torch.zeros(4, 3)
+        return layer
+
+    def test_auto_keeps_the_mmap_default_of_no_reader(self):
+        with (
+            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("auto"),
+            envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"),
+        ):
+            self.assertIsNone(ExpertStreamer(self._layer(), ("rows",)).row_source)
+
+    def test_tensor_kind_builds_no_reader(self):
+        with (
+            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("tensor"),
+            envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+        ):
+            self.assertIsNone(ExpertStreamer(self._layer(), ("rows",)).row_source)
+
+    def test_files_kind_needs_an_io_uring_reader_and_expert_files(self):
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("files"):
+            with envs.SGLANG_MOE_EXPERT_FILE_READER.override("mmap"):
+                with self.assertRaisesRegex(ValueError, "SGLANG_MOE_EXPERT_FILE_READER"):
+                    ExpertStreamer(self._layer(), ("rows",))
+            with envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"):
+                with self.assertRaisesRegex(ValueError, "has no expert file"):
+                    ExpertStreamer(self._layer(), ("rows",))
+
+    def test_unknown_kind_is_refused(self):
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+            with self.assertRaisesRegex(ValueError, "no row source kind 'shards'"):
+                ExpertStreamer(self._layer(), ("rows",))
+
+    def test_an_explicit_row_source_ignores_the_knob(self):
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"):
+            streamer = ExpertStreamer(self._layer(), ("rows",), row_source=None)
+        self.assertIsNone(streamer.row_source)
+
+
 if __name__ == "__main__":
     unittest.main()
