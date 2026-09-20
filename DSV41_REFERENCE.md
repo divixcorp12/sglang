@@ -2369,6 +2369,27 @@ native reader is the prerequisite for any decode benefit; until then
 
 ### Unexplained: eager + mirrors is slower
 
+> **Superseded, 2026-09-20: `e-base` below did not reproduce, and the tier-warming
+> explanation is refuted.** A counterbalanced re-run (B M M B, six arms, ~1.9 TiB,
+> cache counters added for the purpose) reproduced `e-mirror` closely - TTFT
+> 65.3/29.9/29.0/30.1 s against 59.2/29.6/28.9/30.0, decode 2.01-2.03 against
+> 2.0126 - while `e-base` did not: it read 380.9 GiB of session bytes, not 257.96,
+> and held TTFT at ~55 s instead of warming to 5.6 s. Both arms then read the SAME
+> bytes, made identical cache decisions, and mirroring was faster in every session
+> (1.85x steady TTFT, 1.19x decode) with byte-identical greedy output.
+>
+> Neither tier warms: occupancy hits capacity (5644/5644) inside session 0 in both
+> arms and admissions equal evictions thereafter, so the "`e-base`'s tier warms and
+> `e-mirror`'s does not" reading is refuted rather than merely unconfirmed.
+>
+> What is now unexplained is not the mirror arm's extra bytes - there are none -
+> but `e-base`'s MISSING reads and its 5.6 s prefill. Ordering, tracing, the
+> counters and the environment are ruled out by measurement; system state that day
+> and an undiagnosed build difference are not. Re-running the eager base at the
+> §19 commit would decide it; that has not been done. Treat every `e-base` figure
+> below as unconfirmed, and do not cite the 1.54x byte ratio or the 25% regression.
+> Detail: `analysis/dsv41-drive/EAGER_ANOMALY.md`.
+
 `e-mirror` is 25% slower than `e-base` (2.0126 vs 2.6947) while reading 1.54x
 more bytes (397.41 vs 257.96 GiB). Its first two prefills are faster than
 `e-base`'s (59.2 vs 85.4 s, 29.6 vs 55.1 s), as mirroring predicts, but then it
