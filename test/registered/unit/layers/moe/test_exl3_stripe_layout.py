@@ -24,6 +24,37 @@ def test_last_fragment_absorbs_the_remainder():
     g = StripeGeometry(row_bytes=4096 * 10 + 7, weights=(1.0, 1.0))
     assert sum(g.fragment_bytes) == 4096 * 10 + 7
     assert g.fragment_bytes[0] % 4096 == 0
+    # The last fragment's *payload* is generally unaligned (it absorbs the
+    # remainder), but its *slot stride* must still be page-aligned so every
+    # expert past index 0 on the last drive lands on an O_DIRECT boundary.
+    assert g.fragment_bytes[-1] % 4096 != 0
+    assert g.strides[-1] % 4096 == 0
+    assert g.slot_offset(1, 3) % 4096 == 0
+
+
+@pytest.mark.parametrize("row_bytes", [4096 * 10, 4096 * 10 + 7, 4096 * 10 + 4095])
+@pytest.mark.parametrize("weights", [(1.0, 1.0), (3218.0, 3091.0), (1.0,)])
+def test_every_slot_offset_is_page_aligned(row_bytes, weights):
+    g = StripeGeometry(row_bytes=row_bytes, weights=weights)
+    for stripe in range(len(weights)):
+        for expert in range(5):
+            assert g.slot_offset(stripe, expert) % 4096 == 0
+
+
+@pytest.mark.parametrize("row_bytes", [4096 * 10, 4096 * 10 + 7, 4096 * 10 + 4095])
+@pytest.mark.parametrize("weights", [(1.0, 1.0), (3218.0, 3091.0), (1.0,)])
+def test_fragment_bytes_still_sum_to_the_row(row_bytes, weights):
+    g = StripeGeometry(row_bytes=row_bytes, weights=weights)
+    assert sum(g.fragment_bytes) == row_bytes
+
+
+@pytest.mark.parametrize("row_bytes", [4096 * 10, 4096 * 10 + 7, 4096 * 10 + 4095])
+@pytest.mark.parametrize("weights", [(1.0, 1.0), (3218.0, 3091.0), (1.0,)])
+def test_stride_pads_the_payload_by_less_than_a_page(row_bytes, weights):
+    g = StripeGeometry(row_bytes=row_bytes, weights=weights)
+    for stride, payload in zip(g.strides, g.fragment_bytes):
+        assert stride >= payload
+        assert stride - payload < 4096
 
 
 def test_weights_shape_the_split():

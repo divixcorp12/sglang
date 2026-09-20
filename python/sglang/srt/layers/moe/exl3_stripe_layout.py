@@ -32,13 +32,37 @@ class StripeGeometry:
 
     Every fragment but the last is `align4096(ceil(row_bytes * w_i / sum(w)))`;
     the last absorbs the rounding remainder so the fragments sum to exactly
-    `row_bytes`. This keeps the K-1 leading fragments O_DIRECT-aligned while
-    still landing on the row's true byte count.
+    `row_bytes`. This keeps the K-1 leading fragments' *payload* size a
+    multiple of 4096, but the last fragment's payload generally is not (it is
+    whatever bytes are left over), and even an aligned payload does not make
+    every expert's *slot* aligned once slots are packed back to back:
+    `slot_offset(stripe, e) = e * fragment_bytes[stripe]` only stays a
+    multiple of 4096 for every `e` when `fragment_bytes[stripe]` itself is.
+
+    `fragment_bytes` and `strides` are therefore kept separate:
+
+    - `fragment_bytes[i]` is the *payload* written for stripe `i` — the exact
+      row bytes `[starts[i], starts[i] + fragment_bytes[i])`. These always sum
+      to `row_bytes`; this is the invariant reassembly depends on.
+    - `strides[i] = align4096(fragment_bytes[i])` is the *slot pitch* on disk
+      for stripe `i` — `slot_offset(i, n) = n * strides[i]` is therefore a
+      multiple of 4096 for every stripe and every expert `n`, independent of
+      whether `fragment_bytes[i]` itself is aligned. The gap
+      `strides[i] - fragment_bytes[i]` (at most 4095 bytes) is dead padding
+      at the tail of every slot, spent so every slot's *start* offset is
+      O_DIRECT-aligned regardless of `row_bytes`'s residue mod 4096.
+
+    A reader must still issue a page-aligned *length*: read
+    `align4096(fragment_bytes[i])` bytes starting at `slot_offset(i, n)` (into
+    a buffer with that much room) and use only the first `fragment_bytes[i]`
+    of it — the same aligned-offset/aligned-length/logical-start split
+    `Exl3ExpertRecord.aligned_read` already returns for the unstriped layout.
     """
 
     row_bytes: int
     weights: tuple[float, ...]
     fragment_bytes: tuple[int, ...] = field(init=False)
+    strides: tuple[int, ...] = field(init=False)
     starts: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -61,15 +85,25 @@ class StripeGeometry:
                 f"{fragments} leave {last} bytes for the last stripe"
             )
         fragments.append(last)
+        fragments = tuple(fragments)
 
-        object.__setattr__(self, "fragment_bytes", tuple(fragments))
+        object.__setattr__(self, "fragment_bytes", fragments)
+        object.__setattr__(
+            self, "strides", tuple(_align_up(f, PAGE_BYTES) for f in fragments)
+        )
         object.__setattr__(
             self, "starts", tuple(itertools.accumulate(fragments[:-1], initial=0))
         )
 
     def slot_offset(self, stripe: int, expert: int) -> int:
-        """Byte offset of `expert`'s slot inside stripe `stripe`'s per-drive file."""
-        return expert * self.fragment_bytes[stripe]
+        """Byte offset of `expert`'s slot inside stripe `stripe`'s per-drive file.
+
+        Always a multiple of 4096 (`expert * strides[stripe]`), even when
+        `fragment_bytes[stripe]` is not: the slot pitch is the aligned
+        stride, not the raw payload size, so O_DIRECT reads at any expert
+        index land on a page boundary.
+        """
+        return expert * self.strides[stripe]
 
 
 @dataclass(frozen=True)
@@ -87,6 +121,13 @@ class StripeManifest:
     `index` names which stripe directory this manifest describes; every other
     field must be identical across the K manifests of one striped repack
     (`validate_set` enforces this).
+
+    `StripeInfo.fragment_bytes` is the payload size, matching
+    `StripeGeometry.fragment_bytes`; it does not carry the on-disk slot
+    stride. A consumer derives that stride as `align4096(fragment_bytes)`
+    (`StripeGeometry.strides[i]` for the same input), the same computation
+    a writer used to lay out the file, so the manifest does not need a
+    redundant `stride` field to stay unambiguous.
     """
 
     version: int
