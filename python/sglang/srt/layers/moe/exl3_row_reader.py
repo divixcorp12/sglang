@@ -33,35 +33,50 @@ class Exl3RowReader:
         self._reader = reader if reader is not None else shared_uring_file_reader()
         self._direct = direct
         # Open files by (root, path): root is None for the layout's own paths
-        # (`read`) and a mirror root for that root's copy (`read_split`).
+        # (`read`) and a mirror root for that root's copy (`read_split`). The
+        # size kept is always the source file's; a mirror is checked against
+        # it when opened, so a short copy fails there instead of being
+        # clamped into a silently short row.
         self._files: dict[tuple[Optional[str], str], tuple[int, int]] = {}
-        # The directory the layout's paths live under; a mirror root holds the
-        # same tree, so a record's path relative to this picks its file there.
-        self._source_root = source_root
+        # The directory the layout's paths live under. A mirror root holds
+        # the same tree, so a record's path relative to this picks its file
+        # there. `read_split` requires it; it is never inferred.
+        self.source_root = source_root
         self.buffer_bytes = max(
             record.aligned_read(PAGE_BYTES)[1] for record in layout.records.values()
         )
 
     def _file(self, path: str, root: Optional[str] = None) -> tuple[int, int]:
-        """(file id, size) of ``path``, or of ``root``'s copy of it."""
+        """(file id, source size) of ``path``, or of ``root``'s copy of it."""
         entry = self._files.get((root, path))
         if entry is None:
-            target = path if root is None else self._mirror_path(root, path)
-            file_id = self._reader.open(target, direct=self._direct)
-            entry = self._files[(root, path)] = (
-                file_id,
-                self._reader.file_size(file_id),
-            )
+            if root is None:
+                file_id = self._reader.open(path, direct=self._direct)
+                entry = (file_id, self._reader.file_size(file_id))
+            else:
+                mirror = self._mirror_path(root, path)
+                file_id = self._reader.open(mirror, direct=self._direct)
+                mirror_bytes = self._reader.file_size(file_id)
+                source_bytes = self._file(path)[1]
+                if mirror_bytes != source_bytes:
+                    raise RuntimeError(
+                        f"mirror {mirror} has size {mirror_bytes} bytes but its "
+                        f"source {path} has size {source_bytes} bytes; the copy "
+                        "is incomplete or stale"
+                    )
+                entry = (file_id, source_bytes)
+            self._files[(root, path)] = entry
         return entry
 
     def _mirror_path(self, root: str, path: str) -> str:
-        if self._source_root is None:
-            self._source_root = os.path.commonpath(
-                [os.path.dirname(r.path) for r in self.layout.records.values()]
+        if self.source_root is None:
+            raise ValueError(
+                "read_split needs source_root: the directory the layout's paths "
+                "live under, so each mirror root's copy can be found"
             )
-        relative = os.path.relpath(path, self._source_root)
+        relative = os.path.relpath(path, self.source_root)
         if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-            raise ValueError(f"{path} is not under source root {self._source_root}")
+            raise ValueError(f"{path} is not under source root {self.source_root}")
         return os.path.join(root, relative)
 
     def _submit(
@@ -133,6 +148,8 @@ class Exl3RowReader:
             raise ValueError("read_split needs at least one root")
         if not keys:
             return []
+        if self.source_root is None:
+            self._mirror_path(roots[0], "")  # raises the "needs source_root" error
         if any(address % PAGE_BYTES for address in destinations):
             raise ValueError("expert row destinations must be page-aligned")
         file_ids, offsets, dests, lengths, starts = [], [], [], [], []
@@ -159,7 +176,8 @@ class Exl3RowReader:
                 lengths.append(part_bytes)
                 # Only a shard's last row can run past end of file, and within
                 # it only its last non-empty part; clamp each part on its own
-                # offset rather than the row's.
+                # offset rather than the row's. `file_bytes` is the source's
+                # size, which `_file` has checked every mirror against.
                 expected += min(part_bytes, file_bytes - part_offset)
             starts.append(start)
         self._submit(file_ids, offsets, dests, lengths, expected)
