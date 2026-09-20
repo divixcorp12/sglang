@@ -76,6 +76,18 @@ class Exl3RowReader:
             self._files[(root, path)] = entry
         return entry
 
+    @staticmethod
+    def _require_row_in_file(record, file_bytes: int) -> None:
+        """A row's own bytes must lie inside the file. Only the page-aligned tail of its last
+        page may overrun end of file (that is clamped away); a row that needs bytes the file
+        does not have would otherwise read short and be taken for complete."""
+        if record.file_offset + record.nbytes > file_bytes:
+            raise RuntimeError(
+                f"expert row ({record.layer}, {record.expert}) needs bytes "
+                f"[{record.file_offset}, {record.file_offset + record.nbytes}) of "
+                f"{record.path}, which has only {file_bytes} bytes"
+            )
+
     def _mirror_path(self, root: str, path: str) -> str:
         if self.source_root is None:
             raise ValueError(
@@ -121,12 +133,13 @@ class Exl3RowReader:
             record = self.layout.records[key]
             offset, length, start = record.aligned_read(PAGE_BYTES)
             file_id, file_bytes = self._file(record.path)
+            self._require_row_in_file(record, file_bytes)
             file_ids.append(file_id)
             offsets.append(offset)
             lengths.append(length)
             starts.append(start)
             # The superset of a shard's last row may run past end of file.
-            expected += min(length, file_bytes - offset)
+            expected += max(0, min(length, file_bytes - offset))
         self._submit(file_ids, offsets, list(destinations), lengths, expected)
         return starts
 
@@ -174,6 +187,7 @@ class Exl3RowReader:
                 if part_bytes == 0:
                     continue
                 file_id, file_bytes = self._file(record.path, root)
+                self._require_row_in_file(record, file_bytes)
                 part_offset = offset + part_start
                 file_ids.append(file_id)
                 offsets.append(part_offset)
@@ -183,7 +197,7 @@ class Exl3RowReader:
                 # it only its last non-empty part; clamp each part on its own
                 # offset rather than the row's. `file_bytes` is the source's
                 # size, which `_file` has checked every mirror against.
-                expected += min(part_bytes, file_bytes - part_offset)
+                expected += max(0, min(part_bytes, file_bytes - part_offset))
             starts.append(start)
         self._submit(file_ids, offsets, dests, lengths, expected)
         return starts

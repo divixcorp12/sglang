@@ -234,20 +234,22 @@ def test_open_accepts_mirror_copies_of_the_source_size(tmp_path):
     assert read_rows_once(s.tables, 0, [0, 5], [0, 1], direct=False) == 1
 
 
-# ---- End of file: the native reader and Exl3RowReader must agree (handoff 3A) ----
+# ---- End of file (handoff 3A) ----
+#
+# What a reader owes a row is that every byte the expert needs is read correctly. The bytes a
+# page-aligned superset overruns past end of file are undefined and never asserted on.
 
 EOF_PAGE = 4096
 EOF_FILE_BYTES = 5 * EOF_PAGE + 1000  # not a multiple of any logical block size
 EOF_NAME = "shard.bin"
 
 
-def _eof_checkpoint(tmp_path, weights, *, claimed_rows):
-    """One shard whose size is not block-aligned, one copy of it per root, and a layout of
-    ``claimed_rows`` (file offset, nbytes) records, expert e = position, all in layer 0.
+def _eof_checkpoint(tmp_path, weights, *, rows, need_bytes=None):
+    """One shard whose size is not block-aligned, one copy of it per root, and a layout with one
+    (file offset, nbytes) record per entry of ``rows`` (expert = position, all layer 0).
 
-    Returns (layout, segments, slabs, roots, policy_weights, data). A row is read whole: its
-    single segment copies the entire aligned superset (offset and length are page multiples, so
-    the row starts the buffer), which lets the test see the bytes past EOF as well.
+    Every row starts on a page, so it starts its buffer. The single segment copies the first
+    ``need_bytes`` of the row (default: the whole aligned superset of row 0) into the slab.
     """
     from sglang.srt.layers.moe.exl3_expert_format import RowSegment
     from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout, Exl3ExpertRecord
@@ -264,36 +266,35 @@ def _eof_checkpoint(tmp_path, weights, *, claimed_rows):
         roots.append(str(root))
     records = {
         (0, expert): Exl3ExpertRecord(0, expert, str(source / EOF_NAME), offset, nbytes)
-        for expert, (offset, nbytes) in enumerate(claimed_rows)
+        for expert, (offset, nbytes) in enumerate(rows)
     }
-    layout = Exl3ExpertLayout(
-        tensors=(), row_bytes=0, records=records, num_layers=1, num_experts=len(claimed_rows)
-    )
-    superset = records[(0, 0)].aligned_read(EOF_PAGE)[1]
-    segments = [RowSegment("w13_trellis", 0, 0, 0, superset)]
+    layout = Exl3ExpertLayout(tensors=(), row_bytes=0, records=records, num_layers=1, num_experts=len(rows))
+    need = need_bytes or records[(0, 0)].aligned_read(EOF_PAGE)[1]
+    segments = [RowSegment("w13_trellis", 0, 0, 0, need)]
     slabs = {
         0: {
-            name: torch.zeros((len(claimed_rows), superset if name == "w13_trellis" else 0), dtype=torch.uint8)
+            name: torch.zeros((len(rows), need if name == "w13_trellis" else 0), dtype=torch.uint8)
             for name in EXL3_STREAMED_NAMES
         }
     }
     return layout, segments, slabs, roots, data, str(source)
 
 
-# Row 0 is whole and inside the file; row 1 is the shard's last row: it ends exactly at end of
-# file, so its 4-page aligned superset [2, 6) overruns by 3096 B (page 5 holds 1000 valid bytes).
-EOF_ROWS = [(0, 4 * EOF_PAGE), (2 * EOF_PAGE, EOF_FILE_BYTES - 2 * EOF_PAGE)]
-
-
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("weights", [None, (1.0,), (1.0, 1.0), (3.0, 1.0), (1.0, 3.0), (0.0, 1.0)])
-def test_a_row_crossing_end_of_file_reads_the_same_natively_and_eagerly(tmp_path, weights, direct):
+def test_the_last_row_of_a_shard_reads_correctly_natively_and_eagerly(tmp_path, weights, direct):
+    """The production case: a valid row whose minimal aligned superset overruns EOF."""
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
     from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
     from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
 
-    layout, segments, slabs, roots, data, source = _eof_checkpoint(tmp_path, weights, claimed_rows=EOF_ROWS)
+    # The row ends exactly at end of file: its 4-page superset [2, 6) overruns by 3096 B, and page
+    # 5 holds only 1000 valid bytes. Its needed bytes (start 0, all of them) end at EOF.
+    row = (2 * EOF_PAGE, EOF_FILE_BYTES - 2 * EOF_PAGE)
+    layout, segments, slabs, roots, data, source = _eof_checkpoint(
+        tmp_path, weights, rows=[row], need_bytes=row[1]
+    )
     if direct:
         try:
             os.close(os.open(str(tmp_path / "ckpt" / EOF_NAME), os.O_RDONLY | os.O_DIRECT))
@@ -301,50 +302,63 @@ def test_a_row_crossing_end_of_file_reads_the_same_natively_and_eagerly(tmp_path
             pytest.skip(f"{tmp_path} does not support O_DIRECT: {error}")
     mirrors = {} if weights is None else dict(roots=roots, policy=StaticSplitPolicy(weights), source_root=source)
     tables = exl3_ram_miss_tables(layout, segments, slabs, **mirrors)
+    assert tables.extents[0, 0, :, 2].sum().item() == 4 * EOF_PAGE  # the overrunning superset is what is read
 
-    # Native: row 0 then row 1 through one reader, both in bounce slot 0. Row 1's bytes past end
-    # of file are never written, so they are still row 0's.
-    results = ops.read_rows_with_fault(tables, 0, [0], [0], [1], [1], direct=direct)
-    assert results == (1, 1)
-    native = slabs[0]["w13_trellis"]
+    assert read_rows_once(tables, 0, [0], [0], direct=direct) == 1
+    needed = data[2 * EOF_PAGE :]
+    assert bytes(slabs[0]["w13_trellis"][0].numpy()) == needed
 
-    # Eager: the same row into a page-aligned buffer that already holds row 0's bytes.
-    superset = 4 * EOF_PAGE
-    buffer = allocate_host_slab(1, (superset,), torch.uint8, register=False)
-    buffer[0].copy_(native[0])
+    buffer = allocate_host_slab(1, (4 * EOF_PAGE,), torch.uint8, register=False)
     reader = Exl3RowReader(layout, direct=direct, source_root=source)
-    address = buffer[0].data_ptr()
     if weights is None:
-        reader.read([(0, 1)], [address])
+        reader.read([(0, 0)], [buffer[0].data_ptr()])
     else:
-        reader.read_split([(0, 1)], [address], roots=roots, policy=StaticSplitPolicy(weights))
-
-    assert bytes(native[0].numpy()) == data[0:superset]
-    valid = EOF_FILE_BYTES - 2 * EOF_PAGE
-    row_1 = bytes(native[1].numpy())
-    assert row_1[:valid] == data[2 * EOF_PAGE :]  # the row itself
-    assert row_1[valid:] == data[valid:superset]  # past end of file: row 0's bytes, untouched
-    assert row_1 == bytes(buffer[0].numpy())  # and the eager reader left the same bytes
+        reader.read_split([(0, 0)], [buffer[0].data_ptr()], roots=roots, policy=StaticSplitPolicy(weights))
+    assert bytes(buffer[0].numpy())[: len(needed)] == needed
 
 
-def test_a_part_entirely_past_end_of_file_fails_natively_as_it_does_eagerly(tmp_path):
+def test_a_padding_extent_wholly_past_end_of_file_is_clamped_to_nothing(tmp_path):
+    """A synthetic edge case of the clamp arithmetic (no export produces it): an extent wholly past
+    EOF has negative room, expects 0 bytes, and does not fail a row whose needed bytes are all
+    present. This is not the production case above."""
+    from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
+    from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+
+    weights = (1.0, 1.0)
+    row = (3 * EOF_PAGE, 2 * EOF_PAGE)  # wholly inside the file; one page per root
+    layout, segments, slabs, roots, data, source = _eof_checkpoint(
+        tmp_path, weights, rows=[row], need_bytes=EOF_PAGE  # the expert needs only the first page
+    )
+    tables = exl3_ram_miss_tables(
+        layout, segments, slabs, roots=roots, policy=StaticSplitPolicy(weights), source_root=source
+    )
+    file_1 = int(tables.extents[0, 0, 1, 0])
+    tables.extents[0, 0, 1] = torch.tensor([file_1, 7 * EOF_PAGE, EOF_PAGE, EOF_PAGE])  # wholly past EOF
+    assert read_rows_once(tables, 0, [0], [0], direct=False) == 1
+    assert bytes(slabs[0]["w13_trellis"][0].numpy()) == data[3 * EOF_PAGE : 4 * EOF_PAGE]
+
+
+@pytest.mark.parametrize("weights", [None, (1.0, 1.0)])
+def test_a_row_that_needs_bytes_the_file_lacks_fails_in_both_readers(tmp_path, weights):
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
     from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
     from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
 
-    # A record that claims bytes beyond the file (a layout no export produces): with two roots
-    # its second page lies entirely past end of file.
-    rows = [(0, 2 * EOF_PAGE), (5 * EOF_PAGE, 2 * EOF_PAGE)]
-    weights = (1.0, 1.0)
-    layout, segments, slabs, roots, _data, source = _eof_checkpoint(tmp_path, weights, claimed_rows=rows)
-    policy = StaticSplitPolicy(weights)
-    tables = exl3_ram_miss_tables(layout, segments, slabs, roots=roots, policy=policy, source_root=source)
-
+    # Row 1's record claims [5 pages, 7 pages) of a file that ends 1000 B into page 5: the row
+    # itself is not inside the file (not merely its aligned tail).
+    layout, segments, slabs, roots, _data, source = _eof_checkpoint(
+        tmp_path, weights, rows=[(0, 2 * EOF_PAGE), (5 * EOF_PAGE, 2 * EOF_PAGE)]
+    )
+    mirrors = {} if weights is None else dict(roots=roots, policy=StaticSplitPolicy(weights), source_root=source)
+    tables = exl3_ram_miss_tables(layout, segments, slabs, **mirrors)
     buffer = allocate_host_slab(1, (2 * EOF_PAGE,), torch.uint8, register=False)
     eager = Exl3RowReader(layout, direct=False, source_root=source)
-    with pytest.raises(RuntimeError, match="ended early"):
-        eager.read_split([(0, 1)], [buffer[0].data_ptr()], roots=roots, policy=policy)
+    with pytest.raises(RuntimeError, match="needs bytes"):
+        if weights is None:
+            eager.read([(0, 1)], [buffer[0].data_ptr()])
+        else:
+            eager.read_split([(0, 1)], [buffer[0].data_ptr()], roots=roots, policy=StaticSplitPolicy(weights))
     assert read_rows_once(tables, 0, [1], [0], direct=False) == 0
     assert read_rows_once(tables, 0, [0], [0], direct=False) == 1  # the sound row still reads
 

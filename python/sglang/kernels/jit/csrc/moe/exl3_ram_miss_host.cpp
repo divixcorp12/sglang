@@ -127,6 +127,7 @@ struct Tables {
   std::vector<Read> extents;        // [layers][experts][parts]
   std::vector<int64_t> starts;      // [layers][experts]: where the row starts in its aligned superset
   std::vector<Segment> segments;
+  int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
   std::vector<std::vector<uint8_t*>> slabs;
   std::vector<int64_t> row_bytes;
 };
@@ -188,6 +189,7 @@ inline Tables tables_from(
   t.segments.resize(static_cast<size_t>(segments.size(0)));
   for (size_t i = 0; i < t.segments.size(); ++i) {
     t.segments[i] = Segment{segment_data[4 * i], segment_data[4 * i + 1], segment_data[4 * i + 2], segment_data[4 * i + 3]};
+    t.need_end = std::max(t.need_end, t.segments[i].src + t.segments[i].bytes);
   }
   const auto* slab_data = static_cast<const int64_t*>(slabs.data_ptr());
   const int64_t names = slabs.size(1);
@@ -311,18 +313,21 @@ class RowReader {
       std::vector<int> retries(count * parts, 0);
       std::vector<const Read*> reads(count * parts);
       for (size_t i = 0; i < count; ++i) {
-        const size_t base = static_cast<size_t>(row * t_.experts + experts[first + i]) * parts;
+        const size_t row_index = static_cast<size_t>(row * t_.experts + experts[first + i]);
+        const size_t base = row_index * parts;
+        // The bytes the expert needs are [start, start + need_end) of its aligned superset; they
+        // must all lie inside the file. What an extent's page-aligned tail overruns past end of
+        // file is padding no one needs, so it is clamped away below, but a row that needs bytes
+        // the file does not have is corrupt and must fail, not publish the bounce's stale bytes.
+        const Read* head = &t_.extents[base];
+        if (head->offset - head->dest + t_.starts[row_index] + t_.need_end > t_.file_sizes[head->file]) return 0;
         for (size_t p = 0; p < parts; ++p) {
           const Read* extent = &t_.extents[base + p];
           reads[i * parts + p] = extent;
-          // Per extent, against the file that extent reads.
-          expected[i * parts + p] = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
-          // An extent that starts beyond end of file means the row's record is not inside the file
-          // (an aligned read only ever overruns by the padding of a last page that holds row
-          // bytes). Exl3RowReader fails such a read; so does this, before anything is submitted:
-          // clamping it to nothing would publish the bounce's stale bytes as row data. A
-          // zero-length extent reads nothing and may sit anywhere, including past end of file.
-          if (extent->length > 0 && expected[i * parts + p] < 0) return 0;
+          // Per extent, against the file that extent reads; an extent wholly past end of file
+          // (negative room) expects nothing.
+          expected[i * parts + p] =
+              std::max<int64_t>(0, std::min(extent->length, t_.file_sizes[extent->file] - extent->offset));
         }
       }
       // SQEs prepared and not yet reaped (in the SQ ring or in the kernel). At most
