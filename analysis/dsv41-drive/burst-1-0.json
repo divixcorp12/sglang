@@ -1,0 +1,762 @@
+{
+  "when": "2026-09-20T03:22:24+00:00",
+  "argv": [
+    "analysis/dsv41-drive/bench_mirror_rows.py",
+    "--source",
+    "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw",
+    "--roots",
+    "/mnt/nvme0/dsv41_flash",
+    "/mnt/nvme4/dsv41_flash",
+    "--layers",
+    "19",
+    "--reps",
+    "3",
+    "--rows",
+    "32",
+    "--arms",
+    "mirrored",
+    "--weights",
+    "1:0",
+    "--output",
+    "analysis/dsv41-drive/burst-1-0.json"
+  ],
+  "source": "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw",
+  "roots": [
+    "/mnt/nvme0/dsv41_flash",
+    "/mnt/nvme4/dsv41_flash"
+  ],
+  "weights": [
+    1.0,
+    0.0
+  ],
+  "layers": [
+    {
+      "layer": 19,
+      "experts": 384,
+      "shards": [
+        "model-00020-of-00041.safetensors"
+      ]
+    }
+  ],
+  "reps": 3,
+  "rows": 32,
+  "seed": 1234,
+  "direct": true,
+  "arms": [
+    "mirrored 1:0"
+  ],
+  "gate_p50_ms": 4.0,
+  "same_device_roots": false,
+  "results": {
+    "mirrored 1:0": {
+      "n": 95,
+      "first_reads": [
+        {
+          "layer": 19,
+          "shard": "model-00020-of-00041.safetensors",
+          "ms": 37.455205
+        }
+      ],
+      "p50_ms": 5.643658,
+      "p90_ms": 5.7493495999999995,
+      "p99_ms": 9.0018981,
+      "mean_ms": 5.715224536842105,
+      "min_ms": 5.49402,
+      "max_ms": 9.16112,
+      "bytes_per_row": 13319803.957894737,
+      "mb_per_s": 2330.582791985015,
+      "read_ms_mean": 4.1681706,
+      "split_ms_mean": 1.4747486631578948,
+      "rep_p50_ms": [
+        5.655437,
+        5.651856,
+        5.6196275
+      ]
+    }
+  },
+  "cache_suspects": [],
+  "bytes_match": true,
+  "mismatches": [],
+  "p50_ratios": {},
+  "gate": {
+    "rule": "mirrored 1:0 p50 <= 4.0 ms",
+    "p50_ms": 5.643658,
+    "pass": false
+  },
+  "samples_ns": {
+    "mirrored 1:0": [
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 225,
+        "ns": 37455205,
+        "first": true
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 59,
+        "ns": 5799550,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 3,
+        "ns": 5750775,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 46,
+        "ns": 5603409,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 298,
+        "ns": 5583306,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 17,
+        "ns": 5643522,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 343,
+        "ns": 5637264,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 354,
+        "ns": 5666030,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 42,
+        "ns": 5526420,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 50,
+        "ns": 5642270,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 181,
+        "ns": 5594147,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 121,
+        "ns": 5680594,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 8,
+        "ns": 5570652,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 15,
+        "ns": 5784002,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 177,
+        "ns": 5655437,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 331,
+        "ns": 5716314,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 319,
+        "ns": 5640905,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 247,
+        "ns": 5686956,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 315,
+        "ns": 5709188,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 237,
+        "ns": 5704487,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 76,
+        "ns": 5499553,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 93,
+        "ns": 5602140,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 365,
+        "ns": 5772957,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 58,
+        "ns": 5517297,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 7,
+        "ns": 5565491,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 257,
+        "ns": 5698242,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 249,
+        "ns": 5617107,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 127,
+        "ns": 5759490,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 33,
+        "ns": 5643658,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 341,
+        "ns": 5729083,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 277,
+        "ns": 5696771,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 238,
+        "ns": 5715130,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 35,
+        "ns": 9161120,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 307,
+        "ns": 5624529,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 345,
+        "ns": 5620108,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 45,
+        "ns": 5625595,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 263,
+        "ns": 5719335,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 296,
+        "ns": 5711969,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 23,
+        "ns": 5557301,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 138,
+        "ns": 5654986,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 284,
+        "ns": 5749802,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 32,
+        "ns": 5668915,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 330,
+        "ns": 5642546,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 154,
+        "ns": 5643286,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 246,
+        "ns": 5651988,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 181,
+        "ns": 5594996,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 136,
+        "ns": 5631507,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 127,
+        "ns": 5644959,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 335,
+        "ns": 5640247,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 102,
+        "ns": 5708641,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 232,
+        "ns": 5687909,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 271,
+        "ns": 5683280,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 340,
+        "ns": 5708527,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 9,
+        "ns": 5552806,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 260,
+        "ns": 5651353,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 36,
+        "ns": 5651724,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 2,
+        "ns": 5757258,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 170,
+        "ns": 5710917,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 73,
+        "ns": 5569124,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 363,
+        "ns": 5625473,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 242,
+        "ns": 5678617,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 336,
+        "ns": 5659637,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 193,
+        "ns": 5688514,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 85,
+        "ns": 5545252,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 27,
+        "ns": 8991735,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 39,
+        "ns": 5809138,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 300,
+        "ns": 5668297,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 254,
+        "ns": 5748671,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 83,
+        "ns": 5536579,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 38,
+        "ns": 5596626,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 285,
+        "ns": 5607945,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 110,
+        "ns": 5555750,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 73,
+        "ns": 5510161,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 13,
+        "ns": 5661920,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 177,
+        "ns": 5595483,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 56,
+        "ns": 5614857,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 271,
+        "ns": 5593921,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 72,
+        "ns": 5494020,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 343,
+        "ns": 5627351,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 156,
+        "ns": 5582806,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 232,
+        "ns": 5665909,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 20,
+        "ns": 5636534,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 213,
+        "ns": 5684466,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 141,
+        "ns": 5653308,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 339,
+        "ns": 5654365,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 90,
+        "ns": 5520980,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 139,
+        "ns": 5594218,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 79,
+        "ns": 5559420,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 153,
+        "ns": 5607807,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 237,
+        "ns": 5654843,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 21,
+        "ns": 5649225,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 288,
+        "ns": 5634718,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 197,
+        "ns": 5551101,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 178,
+        "ns": 5624398,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 253,
+        "ns": 5659451,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 174,
+        "ns": 5565960,
+        "first": false
+      }
+    ]
+  }
+}
