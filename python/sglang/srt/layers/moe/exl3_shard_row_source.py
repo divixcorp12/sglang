@@ -134,6 +134,13 @@ class Exl3ShardRowSource(SynchronousSubmit):
         # The reader and the bounce ring are shared by every layer's source.
         return None
 
+    def _read_rows(self, experts: Sequence[int], addresses: Sequence[int]) -> list[int]:
+        """One reader call: ``experts`` of this layer into page-aligned
+        ``addresses``; returns where each row starts inside its buffer."""
+        return self.reader.read(
+            [(self.layer_id, expert) for expert in experts], addresses
+        )
+
     def read(
         self,
         rows: torch.Tensor,
@@ -176,9 +183,8 @@ class Exl3ShardRowSource(SynchronousSubmit):
         for start in range(0, len(experts), self.preferred_batch_rows):
             chunk = experts[start : start + self.preferred_batch_rows]
             began = time.perf_counter_ns()
-            starts = self.reader.read(
-                [(self.layer_id, expert) for expert in chunk],
-                [self.bounce[i].data_ptr() for i in range(len(chunk))],
+            starts = self._read_rows(
+                chunk, [self.bounce[i].data_ptr() for i in range(len(chunk))]
             )
             read_done = time.perf_counter_ns()
             for i, (slot, row_start) in enumerate(
