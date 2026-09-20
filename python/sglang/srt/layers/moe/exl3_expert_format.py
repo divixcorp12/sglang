@@ -228,6 +228,21 @@ class Exl3ExpertFormat:
     def _mirror_row_source(
         self, roots: tuple[str, ...], weights: tuple[float, ...]
     ) -> "ExpertRowSource":
+        self._check_mirror_roots(roots)
+        from sglang.srt.layers.moe.exl3_mirror_row_source import Exl3MirrorRowSource
+
+        return Exl3MirrorRowSource.for_mirrored_layer(
+            self.layout,
+            self.layer_id,
+            self._segments,
+            direct=self._resolve_direct(),
+            roots=roots,
+            policy=StaticSplitPolicy(weights),
+            source_root=self.source_root,
+        )
+
+    def _check_mirror_roots(self, roots: tuple[str, ...]) -> None:
+        """What the eager and the native reader both need of the roots, beyond parsing them."""
         if self.source_root is None:
             raise ValueError(
                 "SGLANG_MOE_EXPERT_MIRROR_DIRS needs the format built with "
@@ -240,17 +255,17 @@ class Exl3ExpertFormat:
                     f"{_MIRROR_DIRS}: {root!r} is the checkpoint directory "
                     f"{self.source_root!r} itself, not a mirror of it"
                 )
-        from sglang.srt.layers.moe.exl3_mirror_row_source import Exl3MirrorRowSource
 
-        return Exl3MirrorRowSource.for_mirrored_layer(
-            self.layout,
-            self.layer_id,
-            self._segments,
-            direct=self._resolve_direct(),
-            roots=roots,
-            policy=StaticSplitPolicy(weights),
-            source_root=self.source_root,
-        )
+    def mirror_table_args(self) -> dict:
+        """The mirror keyword arguments of ``exl3_ram_miss_tables`` (the native reader's tables):
+        empty without ``SGLANG_MOE_EXPERT_MIRROR_DIRS``, else the same validated roots and split
+        policy ``default_row_source`` builds its mirror source from."""
+        mirror = exl3_mirror_config()
+        if mirror is None:
+            return {}
+        roots, weights = mirror
+        self._check_mirror_roots(roots)
+        return dict(roots=roots, policy=StaticSplitPolicy(weights), source_root=self.source_root)
 
     def file_source_bytes_per_expert(
         self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]

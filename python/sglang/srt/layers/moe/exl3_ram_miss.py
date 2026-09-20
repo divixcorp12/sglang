@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 class Exl3RamMissTables:
     layer_ids: list[int]
     paths: list[str]
+    source_paths: list[str]  # per file: the source shard it copies (itself with no mirror roots)
     file_sizes: torch.Tensor  # int64 [F]
     # int64 [L, E, P, 4]: file index, aligned offset, aligned length, destination offset in the
     # row's bounce slot. Part p of a row is served by root p; parts sum to the row's aligned length
@@ -107,6 +108,8 @@ def exl3_ram_miss_tables(
         if roots
         else source_paths
     )
+    # What each file is a copy of, for the reader's open-time size check to name.
+    copied = [path for path in source_paths for _ in range(parts)]
     # A mirror is a byte-identical copy, so every part of a shard is bounded by the source's size
     # (as in the eager reader); the open-time check that each copy really has it is the reader's.
     source_sizes = [os.path.getsize(path) for path in source_paths]
@@ -136,6 +139,7 @@ def exl3_ram_miss_tables(
     return Exl3RamMissTables(
         layer_ids=layer_ids,
         paths=paths,
+        source_paths=copied,
         file_sizes=torch.tensor([size for size in source_sizes for _ in range(parts)], dtype=torch.int64),
         extents=extents,
         starts=starts,
@@ -358,8 +362,12 @@ class Exl3RamMissService:
         if missing:
             raise RuntimeError(f"exl3 RAM miss: layers {missing} have no pinned tier yet")
         fmt = next(iter(streamers.values())).format
+        # The mirror roots and weights the eager row source reads with, validated by the same code.
         tables = exl3_ram_miss_tables(
-            fmt.layout, fmt.segment_map(), {layer_id: s.pinned_host_cache.tensors for layer_id, s in streamers.items()}
+            fmt.layout,
+            fmt.segment_map(),
+            {layer_id: s.pinned_host_cache.tensors for layer_id, s in streamers.items()},
+            **fmt.mirror_table_args(),
         )
         pin = torch.cuda.is_available()
         page = new_page(pin=pin)

@@ -62,6 +62,7 @@ def _table_args(tables, direct: bool) -> tuple:
         tables.slabs,
         tables.row_bytes,
         "\n".join(tables.paths),
+        "\n".join(tables.source_paths),
         tables.slot_bytes,
         int(direct),
     )
@@ -314,7 +315,8 @@ class Exl3RamMissHost:
         self.handle = int(
             self._module.exl3_ram_miss_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
-                tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths), tables.slot_bytes, int(direct),
+                tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
+                "\n".join(tables.source_paths), tables.slot_bytes, int(direct),
             )
         )
         if self.handle < 0:

@@ -2,6 +2,8 @@
 check, residency pushes and the per-step graph trace (CPU; the thread runs, no device)."""
 
 import faulthandler
+import os
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
@@ -40,7 +43,7 @@ def tiers(tmp_path, monkeypatch):
         for layer_id in range(LAYERS):
             layer = torch.nn.Module()
             layer.layer_id = layer_id
-            fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
+            fmt = Exl3ExpertFormat(layout, layer_id, direct=False, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
             options = fmt.pinned_tier_options(layer)
@@ -61,6 +64,31 @@ def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
     assert service.host.contains(row, 4) and service.host.contains(row, 2)
     assert cache.expert_to_slot[4].item() == service.host.mapping(row)[4]
     assert service.slot_map[row, 4].item() == cache.expert_to_slot[4].item()
+
+
+def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_path):
+    service, streamers, caches = tiers
+    roots = [tmp_path.parent / f"{tmp_path.name}_mirror{i}" for i in range(2)]
+    for root in roots:
+        shutil.copytree(tmp_path, root)
+    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(os.pathsep.join(map(str, roots))):
+        with envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override("3:1"):
+            caches[1].ensure_rows(torch.tensor([4, 2]))
+    tables = service.host.tables
+    assert tables.parts == 2
+    assert all(path.startswith(str(root)) for path, root in zip(tables.paths, roots * len(tables.paths)))
+    # Every row's parts are what the eager policy plans for 3:1.
+    planned = StaticSplitPolicy((3.0, 1.0)).plan(int(tables.slot_bytes)).part_bytes
+    assert bool((tables.extents[..., 2] == torch.tensor(planned)).all())
+    row = service.row_of(1)
+    assert service.host.contains(row, 4) and service.host.contains(row, 2)
+
+
+def test_the_service_refuses_a_mirror_configuration_the_eager_source_refuses(tiers, tmp_path):
+    service, streamers, caches = tiers
+    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)):  # the checkpoint itself
+        with pytest.raises(ValueError, match="not a mirror of it"):
+            caches[1].ensure_rows(torch.tensor([4]))
 
 
 def test_rows_the_thread_loads_reach_the_eager_map_on_next_host_use(tiers):

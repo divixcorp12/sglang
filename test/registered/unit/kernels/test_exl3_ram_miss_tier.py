@@ -125,6 +125,17 @@ def test_a_failed_read_frees_its_slots_and_reports_failed(tier):
     assert host.counters()["read_errors"] == 1
 
 
+def test_a_file_cut_short_after_open_fails_the_read(tier):
+    s, page, slot_map, host = tier
+    # Open checked the size; a shard truncated afterwards reads short of the bytes the table
+    # expects, and that fails the demand (not a clamped, silently short row).
+    path = s.tables.paths[int(s.tables.extents[0, 0, 0, 0])]
+    with open(path, "r+b") as f:
+        f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)
+    assert _serve(page, host, 0, need=[0], protect=[0]) == 2
+    assert not host.contains(0, 0) and host.counters()["read_errors"] == 1
+
+
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
     s, page, slot_map, host = tier
     seq = sim_post(page, 0, need=[1], protect=[1])

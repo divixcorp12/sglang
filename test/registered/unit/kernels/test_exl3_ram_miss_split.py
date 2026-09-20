@@ -48,12 +48,13 @@ def test_the_last_row_of_a_shard_is_clamped_at_end_of_file(tmp_path):
     assert same_bytes(s.slabs[1]["w2_svh"][0], s.reference(1, [5])["w2_svh"][0])
 
 
-def test_a_short_file_fails_the_read(tmp_path):
+def test_open_refuses_a_source_file_that_is_not_the_size_the_tables_were_built_from(tmp_path):
     s = ram_miss_setup(tmp_path)
     path = s.tables.paths[int(s.tables.extents[0, 0, 0, 0])]
     with open(path, "r+b") as f:
         f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)  # cut inside expert 0's superset
-    assert read_rows_once(s.tables, 0, [0], [0], direct=False) == 0
+    with pytest.raises(RuntimeError, match="has size 100 bytes but its source"):
+        read_rows_once(s.tables, 0, [0], [0], direct=False)
 
 
 def _assert_rows(s, layer, experts, slots):
@@ -205,13 +206,32 @@ def test_a_short_read_resubmits_only_its_own_extent(tmp_path, part, direct):
     _assert_rows(s, 1, [5], [3])
 
 
-def test_a_short_mirror_copy_fails_the_read(tmp_path):
+@pytest.mark.parametrize("delta", [-100, +100, -PAGE])
+def test_open_refuses_a_mirror_copy_of_the_wrong_size_naming_both_files(tmp_path, delta):
     s = ram_miss_setup(tmp_path, mirror_weights=(1.0, 1.0))
-    # The copy is bounded by the SOURCE's size, so truncating it is seen, not clamped away.
-    shard, offset = int(s.tables.extents[0, 0, 1, 0]), int(s.tables.extents[0, 0, 1, 1])
-    with open(s.tables.paths[shard], "r+b") as f:
-        f.truncate(offset + 100)
-    assert read_rows_once(s.tables, 0, [0], [0], direct=False) == 0
+    # File index = shard * parts + part: file 1 is root 1's copy of the first shard.
+    mirror, source = s.tables.paths[1], s.tables.source_paths[1]
+    assert mirror.startswith(s.roots[1]) and source == s.tables.source_paths[0]
+    source_bytes = os.path.getsize(source)
+    with open(mirror, "r+b") as f:
+        f.truncate(source_bytes + delta)
+    for attempt in (
+        lambda: read_rows_once(s.tables, 0, [0], [0], direct=False),
+        lambda: ops.Exl3RamMissHost(
+            s.tables, page=ops.new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+        ),
+    ):
+        with pytest.raises(RuntimeError) as caught:
+            attempt()
+        message = str(caught.value)
+        assert mirror in message and source in message
+        assert f"size {source_bytes + delta} bytes" in message and f"size {source_bytes} bytes" in message
+
+
+def test_open_accepts_mirror_copies_of_the_source_size(tmp_path):
+    s = ram_miss_setup(tmp_path, mirror_weights=(1.0, 1.0, 1.0))
+    assert s.tables.source_paths == [p for p in dict.fromkeys(s.tables.source_paths) for _ in range(3)]
+    assert read_rows_once(s.tables, 0, [0, 5], [0, 1], direct=False) == 1
 
 
 # ---- End of file: the native reader and Exl3RowReader must agree (handoff 3A) ----

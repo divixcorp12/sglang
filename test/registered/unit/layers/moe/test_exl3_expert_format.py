@@ -391,3 +391,67 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+# --- The native (in-graph) reader is configured from the same env, by the same validation ----
+
+
+def _native_args(fmt):
+    return fmt.mirror_table_args()
+
+
+def test_the_native_tables_get_no_mirror_arguments_when_the_env_is_unset(tmp_path):
+    fmt, _ = _mirrored(tmp_path)
+    assert _native_args(fmt) == {}
+
+
+def test_the_native_tables_get_the_same_roots_and_weights_as_the_eager_source(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "3:1"):
+        args = _native_args(fmt)
+        eager = _row_source(fmt)
+    assert args["roots"] == eager.roots == tuple(roots)
+    assert args["source_root"] == fmt.source_root
+    assert args["policy"].plan(4 * PAGE_BYTES).part_bytes == eager.policy.plan(4 * PAGE_BYTES).part_bytes
+    with _mirror_env(os.pathsep.join(roots)):
+        assert _native_args(fmt)["policy"].plan(4 * PAGE_BYTES).part_bytes == (2 * PAGE_BYTES,) * 2
+
+
+def test_a_zero_weight_reaches_the_native_policy(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "1:0"):
+        assert _native_args(fmt)["policy"].plan(4 * PAGE_BYTES).part_bytes == (4 * PAGE_BYTES, 0)
+
+
+def _bad_mirror_configs(roots, source, tmp_path):
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")
+    join = os.pathsep.join
+    return [
+        (join(roots), "1:1:1"),  # more weights than roots
+        (join(roots), "1"),  # fewer
+        (join(roots), "1:x"),
+        (join(roots), "0:0"),
+        (join(roots), "-1:2"),
+        ("", "1:1"),  # weights without roots
+        (join([roots[0], str(tmp_path / "no_such_drive")]), ""),
+        (join([str(a_file), roots[1]]), ""),
+        (join([roots[0], ""]), ""),  # an empty entry
+        (join([roots[0], "relative/drive"]), ""),
+        (join([roots[0], roots[0]]), ""),  # the same drive twice
+        (join([roots[0], source]), ""),  # the checkpoint itself
+    ]
+
+
+def test_the_native_tables_refuse_every_configuration_the_eager_source_refuses(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    bare = Exl3ExpertFormat(fmt.layout, 1, direct=False)  # no source_root
+    cases = [(fmt, dirs, weights) for dirs, weights in _bad_mirror_configs(roots, fmt.source_root, tmp_path)]
+    cases.append((bare, os.pathsep.join(roots), ""))
+    for used, dirs, weights in cases:
+        with _mirror_env(dirs, weights):
+            with pytest.raises(ValueError) as eager:
+                _row_source(used)
+            with pytest.raises(ValueError) as native:
+                _native_args(used)
+        assert str(native.value) == str(eager.value), (dirs, weights)

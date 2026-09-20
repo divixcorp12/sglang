@@ -122,6 +122,7 @@ struct Tables {
   int64_t parts = 1;
   int64_t slot_bytes = 0;
   std::vector<std::string> paths;
+  std::vector<std::string> source_paths;  // paths[f]'s source shard: a mirror is a copy of it
   std::vector<int64_t> file_sizes;  // the SOURCE size of every file, mirrors included
   std::vector<Read> extents;        // [layers][experts][parts]
   std::vector<int64_t> starts;      // [layers][experts]: where the row starts in its aligned superset
@@ -143,18 +144,28 @@ inline Tables tables_from(
     TensorView slabs,
     TensorView row_bytes,
     const std::string& paths,
+    const std::string& source_paths,
     int64_t slot_bytes) {
   Tables t;
   t.layers = extents.size(0);
   t.experts = extents.size(1);
   t.parts = extents.size(2);
   t.slot_bytes = slot_bytes;
-  size_t start = 0;
-  while (true) {
-    const size_t end = paths.find('\n', start);
-    t.paths.push_back(paths.substr(start, end == std::string::npos ? std::string::npos : end - start));
-    if (end == std::string::npos) break;
-    start = end + 1;
+  const auto split_lines = [](const std::string& text) {
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (true) {
+      const size_t end = text.find('\n', start);
+      lines.push_back(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
+      if (end == std::string::npos) break;
+      start = end + 1;
+    }
+    return lines;
+  };
+  t.paths = split_lines(paths);
+  t.source_paths = split_lines(source_paths);
+  if (t.source_paths.size() != t.paths.size() || static_cast<size_t>(file_sizes.size(0)) != t.paths.size()) {
+    throw std::runtime_error("exl3 RAM miss: every file needs a size and the path of the source shard it copies");
   }
   const auto* sizes = static_cast<const int64_t*>(file_sizes.data_ptr());
   t.file_sizes.assign(sizes, sizes + file_sizes.size(0));
@@ -238,7 +249,19 @@ class RowReader {
       }
       fds_.push_back(fd);
       struct stat st;
-      const int64_t dev = fstat(fd, &st) == 0 ? static_cast<int64_t>(st.st_dev) : -1;
+      const bool statted = fstat(fd, &st) == 0;
+      const size_t file = fds_.size() - 1;
+      // The table clamps every read at end of file against the SOURCE size (file_sizes), so a
+      // copy of another size would otherwise be clamped, or over-read, into a short or stale row
+      // that looks complete. Fail here, naming both files: with dozens of shards a bare
+      // "size mismatch" does not say which copy is bad.
+      if (statted && static_cast<int64_t>(st.st_size) != t_.file_sizes[file]) {
+        throw std::runtime_error(
+            "exl3 RAM miss: " + path + " has size " + std::to_string(st.st_size) + " bytes but its source " +
+            t_.source_paths[file] + " has size " + std::to_string(t_.file_sizes[file]) +
+            " bytes; the copy is incomplete or stale");
+      }
+      const int64_t dev = statted ? static_cast<int64_t>(st.st_dev) : -1;
       size_t drive = 0;
       while (drive < devs_.size() && devs_[drive] != dev) ++drive;
       if (drive == devs_.size()) devs_.push_back(dev);
@@ -512,6 +535,7 @@ int64_t exl3_ram_miss_read_rows(
     TensorView slabs,
     TensorView row_bytes,
     std::string paths,
+    std::string source_paths,
     int64_t slot_bytes,
     int64_t direct,
     int64_t row,
@@ -519,7 +543,7 @@ int64_t exl3_ram_miss_read_rows(
     TensorView slots,
     int64_t step) {
   using namespace exl3_ram_miss;
-  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; });
 }
@@ -537,6 +561,7 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView slabs,
     TensorView row_bytes,
     std::string paths,
+    std::string source_paths,
     int64_t slot_bytes,
     int64_t direct,
     int64_t row,
@@ -546,7 +571,7 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView fault,
     TensorView record) {
   using namespace exl3_ram_miss;
-  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   reader.set_fault(ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4]});
@@ -572,6 +597,7 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView slabs,
     TensorView row_bytes,
     std::string paths,
+    std::string source_paths,
     int64_t slot_bytes,
     int64_t direct,
     int64_t row,
@@ -583,7 +609,7 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView results) {
   using namespace exl3_ram_miss;
   auto* out = static_cast<int64_t*>(results.data_ptr());
-  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) {
     out[0] = out[1] = out[2] = out[3] = 0;
     return;
@@ -1279,6 +1305,7 @@ int64_t exl3_ram_miss_open(
     TensorView row_bytes,
     TensorView capacity,
     std::string paths,
+    std::string source_paths,
     int64_t slot_bytes,
     int64_t direct) {
   using namespace exl3_ram_miss;
@@ -1286,7 +1313,7 @@ int64_t exl3_ram_miss_open(
   auto tier = std::make_shared<RamTier>(
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(slot_map.data_ptr()),
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes),
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0);
   if (!tier->open()) return -1;
