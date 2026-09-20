@@ -90,7 +90,13 @@ over striping. The measurement says otherwise:
 
 The plan gates Task 7 on this measurement: "If the burst barely moves mirrored
 p99, keep the static policy and stop." The burst moved mirrored p99 by
--0.021 ms. An adaptive policy's whole purpose is to shift weight away from a
+-0.021 ms.
+
+Caveat on strength of evidence: the 1:1 and 1:0 burst arms are separate runs,
+not a paired controlled comparison, so the 0.5 ms p50 gap between them is
+suggestive rather than established. The p99 evidence above is the load-bearing
+part of this ruling; the 1:1-beats-1:0 ordering corroborates it but should not
+be quoted alone. An adaptive policy's whole purpose is to shift weight away from a
 busy root, and here that shift is measurably **harmful**. Building it would add
 an EWMA, per-root feedback plumbing and a reader change to expose per-extent
 completion times — all to automate a decision the data says to avoid.

@@ -2297,6 +2297,97 @@ run back to back on 2026-09-19.
 - Everything in §17.8's open list stands, including the raw-JSON `--cuda-graph-config`
   crash in `memory_hook.py`.
 
+## 19. Expert-row mirroring: end-to-end arms (2026-09-19)
+
+Two 205 GB byte-identical copies of the EXL3 expert checkpoint, on
+`/mnt/nvme0/dsv41_flash` and `/mnt/nvme4/dsv41_flash`, selected with
+`SGLANG_MOE_EXPERT_MIRROR_DIRS`. Four arms, sessions 0-3, 256-token prompts,
+128 new tokens, `c32` settings. Each arm's per-drive read volume comes from
+`/proc/diskstats` sectors-read deltas across the whole arm, which is what makes
+the routing question answerable rather than inferred.
+Script `analysis/dsv41-drive/run-mirror-arms.sh`; raw output in
+`analysis/dsv41-drive/e2e/`.
+
+| arm | graphs | GRAPH_GATHER | mirrors | mean decode tok/s |
+|---|---|---|---|---|
+| g-base | yes | 1 | none | 2.8286 |
+| g-mirror | yes | 1 | nvme0+nvme4 | 2.8277 |
+| e-base | no | 0 | none | 2.6947 |
+| e-mirror | no | 0 | nvme0+nvme4 | 2.0126 |
+
+`g-base` reproduces the recorded c32 baseline (2.823 tok/s) to 0.2%, so the
+harness is measuring the same thing as before.
+
+### Decode is untouched by mirroring; prefill is 1.84x faster
+
+Per session, graph arms:
+
+| session | g-base tok/s | g-mirror tok/s | g-base TTFT s | g-mirror TTFT s |
+|---|---|---|---|---|
+| 0 | 2.2540 | 2.2528 | 121.11 | 78.32 |
+| 1 | 3.2269 | 3.2320 | 55.26 | 30.13 |
+| 2 | 2.2923 | 2.2904 | 53.56 | 29.15 |
+| 3 | 3.5411 | 3.5357 | 56.41 | 30.58 |
+
+Decode throughput pairs to within 0.2% on every session: mirroring changes it
+by -0.03% overall, which is nothing. TTFT falls by **1.84x** in steady state
+(sessions 1-3).
+
+### Where the bytes went, which is the whole explanation
+
+| arm | nvme0 | nvme2 (source) | nvme4 | total |
+|---|---:|---:|---:|---:|
+| g-base | 0.00 | 401.30 | 0.10 | 401.40 |
+| g-mirror | 137.59 | 127.21 | 137.89 | 402.69 |
+| e-base | 0.00 | 257.93 | 0.03 | 257.96 |
+| e-mirror | 198.52 | 0.38 | 198.51 | 397.41 |
+
+All figures GiB.
+
+In `g-mirror` the mirrors carry 275.48 GiB and nvme2 still carries 127.21 GiB.
+Subtracting that residual from `g-base`'s single-drive total gives
+401.30 - 127.21 = 274.09 GiB, within 0.5% of the mirrored 275.48. The two
+arms move the same bytes; mirroring is byte-neutral end to end, which
+independently confirms the split is correct at scale. nvme0 and nvme4 differ
+by 0.2% (137.59 vs 137.89), so the static 1:1 policy holds across 275 GiB of
+real traffic.
+
+That residual 127 GiB is the finding. **`exl3_ram_miss_tables` builds its path
+table from `layout.records[(layer, expert)].path` - the source checkpoint - and
+never consults the row source** (`exl3_ram_miss.py:52-63`). When
+`SGLANG_MOE_EXPERT_GRAPH_GATHER` is set, `pinned_tier_options` installs the
+native `Exl3RamMissService` to own the tier's slots
+(`exl3_expert_format.py:176-186`), and every in-graph decode miss is served by
+the C++ reader from nvme2 alone. Only the eager row-source path - prefill -
+reaches the mirror source.
+
+So the 2.31x per-row gain measured in
+`analysis/dsv41-drive/MIRROR_ROWS.md` lands entirely on prefill and **does
+not reach graph decode at all**. Wiring a mirror-aware extent plan into the
+native reader is the prerequisite for any decode benefit; until then
+`SGLANG_MOE_EXPERT_MIRROR_DIRS` is a TTFT optimisation.
+
+### Unexplained: eager + mirrors is slower
+
+`e-mirror` is 25% slower than `e-base` (2.0126 vs 2.6947) while reading 1.54x
+more bytes (397.41 vs 257.96 GiB). Its first two prefills are faster than
+`e-base`'s (59.2 vs 85.4 s, 29.6 vs 55.1 s), as mirroring predicts, but then it
+plateaus at ~30 s while `e-base` warms to 24.8 and 5.6 s. `e-base`'s pinned
+host tier is warming across sessions and `e-mirror`'s is not.
+
+Byte-neutrality is established by the graph arms above, so this is not each
+root reading a full row. The remaining candidates are a tier-population
+difference tied to the row source, or queue-depth behaviour: production reads
+many rows per call, and mirroring doubles the extents per batch, whereas the
+per-row bench measured one row per call. nvme4's fio QD6 result was
+catastrophic (p50 255 ms) on an untrimmed file; that measurement was withdrawn
+at QD1 on fresh data but **was never repeated at QD6 on fresh data**.
+
+Recorded as an open anomaly. Not explained, and no conclusion about eager
+mirroring should be drawn from this arm until miss counts are collected with
+`SGLANG_DSV41_EXPERT_TRACE_PATH` and the arms are repeated interleaved to rule
+out ordering.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
