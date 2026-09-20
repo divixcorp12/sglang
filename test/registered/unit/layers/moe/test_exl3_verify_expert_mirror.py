@@ -8,6 +8,7 @@ import shutil
 import sys
 
 import pytest
+import torch
 
 sys.path.insert(
     0,
@@ -20,6 +21,7 @@ import verify_expert_mirror as vem  # noqa: E402
 
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat  # noqa: E402
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout  # noqa: E402
+from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3  # noqa: E402
 
@@ -230,6 +232,8 @@ def test_a_read_that_writes_nothing_is_not_mistaken_for_a_match(tmp_path, monkey
     real = vem.Exl3MirrorRowSource.for_mirrored_layer
 
     class _Silent:
+        bounce = torch.zeros(1, dtype=torch.uint8)
+
         def read(self, rows, destinations, destination_rows=None):
             return None
 
@@ -245,6 +249,104 @@ def test_a_read_that_writes_nothing_is_not_mistaken_for_a_match(tmp_path, monkey
     assert result.root_reports[0].ok
     (first, *_) = result.root_reports[1].mismatches
     assert (first.layer, first.expert) == (0, 0) and first.mirror_row_all_zero
+
+
+def test_a_reader_that_does_no_io_cannot_pass_on_stale_bounce_bytes(
+    tmp_path, monkeypatch
+):
+    """The real row sources, with the mirror reader patched to do no I/O. The source
+    read leaves its rows in the shared bounce ring; unless the ring is cleared the
+    mirror source copies those out and the (fully sparse) copy passes."""
+    fx = _Fixture(tmp_path)
+    for path in {
+        fx.mirror_file(1, layer, e) for layer in range(LAYERS) for e in range(EXPERTS)
+    }:
+        size = os.path.getsize(path)
+        with open(path, "wb") as f:
+            f.truncate(size)  # a hole: right length, all zeros
+
+    def no_io(self, keys, destinations, *, roots, policy):
+        return [self.layout.records[key].aligned_read(4096)[2] for key in keys]
+
+    monkeypatch.setattr(Exl3RowReader, "read_split", no_io)
+    result = fx.verify()
+    assert not result.ok
+    assert result.root_reports[0].mismatches  # nothing was read for it either
+    (first, *_) = result.root_reports[1].mismatches
+    assert (first.layer, first.expert) == (0, 0) and first.mirror_row_all_zero
+
+
+def test_batches_smaller_than_a_layer_count_rows_and_find_the_first_bad_one(tmp_path):
+    fx = _Fixture(tmp_path)
+    fx.flip(1, 1, 3, 40)  # in the second batch of two rows
+    fx.flip(1, 1, 4, 40)
+    stopped = fx.verify(batch_rows=2).root_reports[1]
+    (first,) = stopped.mismatches
+    assert (first.layer, first.expert) == (1, 3)
+    assert stopped.rows_checked == EXPERTS + 3 + 1  # layer 0, (1,0..2), then (1,3)
+    every = fx.verify(batch_rows=2, keep_going=True).root_reports[1]
+    assert [(m.layer, m.expert) for m in every.mismatches] == [(1, 3), (1, 4)]
+    assert every.rows_checked == LAYERS * EXPERTS
+    clean = fx.verify(batch_rows=1, layers=[0, 2])
+    assert clean.ok and clean.root_reports[0].rows_checked == 2 * EXPERTS
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens any file")
+def test_an_unopenable_copy_is_a_read_failure_not_a_pass(tmp_path):
+    fx = _Fixture(tmp_path)
+    victim = fx.mirror_file(1, 1, 1)
+    os.chmod(victim, 0)
+    try:
+        result = fx.verify()
+    finally:
+        os.chmod(victim, 0o644)
+    assert not result.ok and result.root_reports[0].ok
+    (failure, *_) = result.root_reports[1].read_failures
+    assert failure.root == fx.roots[1] and failure.layer == 1
+    text = vem.render(result)
+    assert "READ FAILED at layer 1" in text and "FAIL" in text
+    assert result.exit_code == 2
+
+
+def test_a_read_that_raises_is_reported_and_the_other_roots_still_run(
+    tmp_path, monkeypatch
+):
+    fx = _Fixture(tmp_path)
+    real = vem.Exl3MirrorRowSource.for_mirrored_layer
+
+    class _Broken:
+        bounce = torch.zeros(1, dtype=torch.uint8)
+
+        def read(self, *args, **kwargs):
+            raise RuntimeError("io_uring read ended early: 10 of 20 bytes")
+
+    def build(*args, roots, **kwargs):
+        if roots[0] == fx.roots[0] and args[1] == 2:
+            return _Broken()
+        return real(*args, roots=roots, **kwargs)
+
+    monkeypatch.setattr(
+        vem.Exl3MirrorRowSource, "for_mirrored_layer", staticmethod(build)
+    )
+    result = fx.verify()
+    broken, fine = result.root_reports
+    assert not result.ok and fine.ok
+    assert fine.rows_checked == LAYERS * EXPERTS
+    (failure,) = broken.read_failures
+    assert (failure.root, failure.layer) == (fx.roots[0], 2)
+    assert "ended early" in failure.message and broken.stopped_early
+    assert broken.rows_checked == 2 * EXPERTS
+    assert "READ FAILED at layer 2: io_uring read ended early" in vem.render(result)
+
+    def cannot_open(*args, roots, **kwargs):
+        raise OSError("mirror root: cannot stat")
+
+    monkeypatch.setattr(
+        vem.Exl3MirrorRowSource, "for_mirrored_layer", staticmethod(cannot_open)
+    )
+    result = fx.verify()
+    assert not result.ok
+    assert all(r.read_failures and r.rows_checked == 0 for r in result.root_reports)
 
 
 # --- Sizes ---------------------------------------------------------------------
@@ -483,6 +585,69 @@ def test_roots_default_to_the_environment_knob(tmp_path, capsys):
     assert all(root in out for root in fx.roots)
     assert vem.main(["--source", str(fx.source), "--buffered"]) == 1
     assert "no mirror roots" in capsys.readouterr().err
+
+
+def test_every_line_of_a_buffered_report_agrees_with_the_exit_code(tmp_path):
+    fx = _Fixture(tmp_path)
+    result = fx.verify()
+    text = vem.render(result)
+    assert result.exit_code == 3
+    assert "MODE: FULL, BUFFERED (not a drive verification)" in text
+    assert text.count("PASS (buffered)") == 2
+    assert "VERIFIED" not in text and "PASSED, BUT THE READS WERE BUFFERED" in text
+
+
+def test_partial_and_buffered_passes_are_qualified_on_every_root(tmp_path):
+    fx = _Fixture(tmp_path)
+    text = vem.render(fx.verify(layers=[0]))
+    assert "MODE: PARTIAL, BUFFERED (not a drive verification)" in text
+    assert text.count("PASS (partial, buffered)") == 2
+    assert "ROOT" in text and "\nROOT " + fx.roots[0] + ": PASS\n" not in text
+    assert "also BUFFERED" in text
+
+
+def test_a_failed_verdict_carries_its_scope(tmp_path):
+    fx = _Fixture(tmp_path)
+    fx.flip(0, 0, 0, 5)
+    text = vem.render(fx.verify(layers=[0]))
+    assert "VERDICT: FAILED [PARTIAL, BUFFERED (not a drive verification)]" in text
+
+
+def test_the_verified_verdict_states_what_it_covers_and_what_it_does_not():
+    """Built from a hand-made complete result: O_DIRECT cannot be assumed here."""
+    fx_result = vem.VerifyResult(
+        source="/s",
+        num_layers=1,
+        num_experts=1,
+        layers=(0,),
+        sampled={0: (0,)},
+        sample_experts=None,
+        seed=0,
+        direct=True,
+        keep_going=False,
+        files_checked=1,
+        streamed_row_bytes=10,
+        root_reports=[vem.RootReport("/r", rows_checked=1, bytes_compared=10)],
+        elapsed_seconds=1.5,
+    )
+    assert fx_result.complete and fx_result.exit_code == 0
+    text = vem.render(fx_result)
+    verdict = text[text.index("VERDICT") :]
+    assert "every byte the runtime reads matches" in verdict
+    assert "does NOT mean the files are identical" in verdict
+    for excluded in ("mul1", "headers", "padding", "index", "outside the layout"):
+        assert excluded in verdict
+    assert "SGLANG_DSV41_EXPERT_DIR is ever pointed at a mirror" in verdict
+    assert "PASS\n" in text and "elapsed: 1.5 s" in text
+
+
+def test_the_header_prints_once_and_the_read_time_is_reported(tmp_path, capsys):
+    fx = _Fixture(tmp_path)
+    vem.main(_argv(fx, "--buffered"))
+    out = capsys.readouterr().out
+    assert out.count("MODE: FULL") == 1 and out.count("source: ") == 1
+    assert out.count("compared: sizes of all") == 1
+    assert out.count(", read ") == 2 and "elapsed: " in out
 
 
 if __name__ == "__main__":

@@ -311,6 +311,82 @@ def test_mirror_roots_are_checked_against_the_source_at_selection(tmp_path):
     assert roots[1] in str(caught.value)
 
 
+def test_a_zero_weight_drops_a_root_from_the_split(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "1:0"):
+        source = _row_source(fmt)
+    assert source.policy.plan(8 * PAGE_BYTES).part_bytes == (8 * PAGE_BYTES, 0)
+    assert source.roots == tuple(roots)
+
+
+def test_a_relative_root_is_refused(tmp_path, monkeypatch):
+    fmt, roots = _mirrored(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    relative = os.path.relpath(roots[1], tmp_path)
+    with _mirror_env(os.pathsep.join([roots[0], relative])):
+        with pytest.raises(ValueError, match="relative path") as caught:
+            _row_source(fmt)
+    assert relative in str(caught.value)
+
+
+def test_the_same_drive_twice_is_refused(tmp_path):
+    """Two entries for one directory look like a two-drive mirror and read one drive."""
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join([roots[0], roots[0]])):
+        with pytest.raises(ValueError, match="same directory"):
+            _row_source(fmt)
+    alias = tmp_path / "alias"
+    os.symlink(roots[0], alias)
+    with _mirror_env(os.pathsep.join([roots[0], str(alias)])):
+        with pytest.raises(ValueError, match="same directory") as caught:
+            _row_source(fmt)
+    assert str(alias) in str(caught.value) and roots[0] in str(caught.value)
+
+
+def test_a_root_that_is_the_checkpoint_itself_is_refused(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join([roots[0], fmt.source_root])):
+        with pytest.raises(ValueError, match="checkpoint directory") as caught:
+            _row_source(fmt)
+    assert fmt.source_root in str(caught.value)
+
+
+def test_the_streamer_builder_hands_the_format_the_real_source_root(
+    tmp_path, monkeypatch
+):
+    """A wrong source_root gives wrong mirror paths, so the builder's value is pinned:
+    the realpath of the directory the layout is built from, through a symlink too."""
+    import types
+
+    from sglang.srt.layers.moe import expert_stream
+    from sglang.srt.layers.moe.exl3_expert_format import build_exl3_expert_streamer
+
+    fmt, roots = _mirrored(tmp_path)
+    link = tmp_path / "ckpt_link"
+    os.symlink(fmt.source_root, link)
+    captured = {}
+
+    class _Streamer:
+        def __init__(self, layer, names, *, layer_id, format):
+            captured["format"] = format
+
+    monkeypatch.setattr(expert_stream, "ExpertStreamer", _Streamer)
+    layer = types.SimpleNamespace(
+        layer_id=1, exl3_num_experts=4, exl3_hidden=128, exl3_inter=128
+    )
+    build_exl3_expert_streamer(layer, str(link))
+    built = captured["format"]
+    assert built.source_root == os.path.realpath(fmt.source_root)
+    assert built.source_root != str(link)
+    with (
+        _mirror_env(os.pathsep.join(roots)),
+        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+    ):
+        source = built.default_row_source(None, built.tensor_specs(None), "auto")
+    assert isinstance(source, Exl3MirrorRowSource)
+    assert source.reader.source_root == os.path.realpath(fmt.source_root)
+
+
 if __name__ == "__main__":
     import sys
 

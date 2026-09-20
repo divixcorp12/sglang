@@ -22,6 +22,12 @@ What is compared, for every root separately:
   serving and so are not compared, and files outside the layout (attention
   shards, the index) are not looked at.
 
+"Verified" therefore means every byte the runtime reads matches, not that the
+files are identical. That is safe while the layout (offsets, headers, the
+index) is built from the source directory. If ``SGLANG_DSV41_EXPERT_DIR`` is
+ever pointed at a mirror, the layout would be built from headers and an index
+this tool never compared: verify with a whole-file comparison first.
+
 The default is a FULL verification: every expert row of every layer, with
 O_DIRECT reads, so the bytes come from the drives and not the page cache.
 ``--layers`` and ``--sample-experts`` bound the work for a fast pre-check; the
@@ -142,6 +148,7 @@ class VerifyResult:
     files_checked: int
     streamed_row_bytes: int
     root_reports: list[RootReport]
+    elapsed_seconds: float = 0.0
 
     @property
     def full(self) -> bool:
@@ -304,9 +311,11 @@ class _Comparer:
     @staticmethod
     def _read(row_source, buffers, experts: Sequence[int]) -> float:
         # Zero first: a read that silently skipped bytes must not leave the
-        # previous batch's (or root's) correct bytes behind.
+        # previous batch's (or root's) correct bytes behind. That includes the
+        # bounce ring, which the source read and every mirror read share.
         for buffer in buffers.values():
             buffer.zero_()
+        row_source.bounce.zero_()
         began = time.perf_counter()
         row_source.read(torch.tensor(list(experts), dtype=torch.int64), buffers)
         return time.perf_counter() - began
@@ -406,6 +415,7 @@ def verify_mirror(
     unless ``keep_going``. Other roots are always still compared.
     """
     log = log or (lambda _line: None)
+    started = time.perf_counter()
     roots = list(roots)
     if not roots:
         raise ValueError(
@@ -560,6 +570,7 @@ def verify_mirror(
             log(f"layer {layer:>3} {root}: {rows} rows compared, {state}")
 
     result.root_reports.extend(reports[root] for root in roots)
+    result.elapsed_seconds = time.perf_counter() - started
     return result
 
 
@@ -570,12 +581,27 @@ def _gb(nbytes: int) -> str:
     return f"{nbytes / 1e9:.3f} GB"
 
 
+def _reads_tag(result: VerifyResult) -> str:
+    return "" if result.direct else ", BUFFERED (not a drive verification)"
+
+
+def _pass_label(result: VerifyResult) -> str:
+    """PASS, qualified when what ran was not a full direct-read verification."""
+    qualifiers = ([] if result.full else ["partial"]) + (
+        [] if result.direct else ["buffered"]
+    )
+    return "PASS" + (f" ({', '.join(qualifiers)})" if qualifiers else "")
+
+
 def _mode_line(result: VerifyResult) -> str:
     rows = sum(len(experts) for experts in result.sampled.values())
     total = result.num_layers * result.num_experts
     per_root = f"{rows} of {total} expert rows ({_gb(rows * result.streamed_row_bytes)}) per root"
     if result.full:
-        return f"MODE: FULL: every expert row of every layer, {per_root}"
+        return (
+            f"MODE: FULL{_reads_tag(result)}: every expert row of every layer, "
+            f"{per_root}"
+        )
     layers = (
         f"all {result.num_layers} layers"
         if len(result.layers) == result.num_layers
@@ -588,7 +614,7 @@ def _mode_line(result: VerifyResult) -> str:
         f"(seed {result.seed})"
     )
     return (
-        f"MODE: PARTIAL: {layers}; {experts}; {per_root}. "
+        f"MODE: PARTIAL{_reads_tag(result)}: {layers}; {experts}; {per_root}. "
         "This is NOT a full verification."
     )
 
@@ -651,11 +677,14 @@ def render_header(result: VerifyResult) -> str:
     )
 
 
-def render(result: VerifyResult) -> str:
-    """The whole report as text: the header, one section per root, a verdict."""
-    out = [render_header(result), ""]
+def render(result: VerifyResult, header: bool = True) -> str:
+    """The report as text: the header (unless the caller already printed it),
+    one section per root, a verdict."""
+    out = [render_header(result), ""] if header else []
     for report in result.root_reports:
-        out.append(f"ROOT {report.root}: {'PASS' if report.ok else 'FAIL'}")
+        out.append(
+            f"ROOT {report.root}: {_pass_label(result) if report.ok else 'FAIL'}"
+        )
         if report.size_problems:
             out.append(
                 f"  sizes: {len(report.size_problems)} of {result.files_checked} files wrong:"
@@ -666,7 +695,8 @@ def render(result: VerifyResult) -> str:
         out.append(
             f"  content: {report.rows_checked} rows compared "
             f"({_gb(report.bytes_compared)}), "
-            f"{len(report.mismatches)} mismatching"
+            f"{len(report.mismatches)} mismatching, "
+            f"read {report.read_seconds:.1f} s"
             + (
                 "; STOPPED at the first mismatch, the rows after it were not compared"
                 if report.stopped_early and report.mismatches
@@ -696,29 +726,43 @@ def render(result: VerifyResult) -> str:
                     f"  ... and {len(report.mismatches) - 21} more mismatching rows"
                 )
         out.append("")
+    scope = _mode_line(result).split(":")[1].strip()
     if not result.ok:
         bad = [r.root for r in result.root_reports if not r.ok]
         out.append(
-            f"VERDICT: FAILED: {len(bad)} of {len(result.root_reports)} roots do not match "
-            f"the source: {', '.join(bad)}"
+            f"VERDICT: FAILED [{scope}]: {len(bad)} of {len(result.root_reports)} "
+            f"roots do not match the source: {', '.join(bad)}"
         )
     elif result.complete:
         out.append(
-            f"VERDICT: VERIFIED: every expert row of every layer matches the source on "
-            f"all {len(result.root_reports)} roots, with O_DIRECT reads, and every file "
-            "size matches"
+            f"VERDICT: VERIFIED, meaning every byte the runtime reads matches the "
+            f"source: the six streamed tensors of every expert row of every layer, on "
+            f"all {len(result.root_reports)} roots, read with O_DIRECT, and every "
+            "layout file's size.\n"
+            "  It does NOT mean the files are identical: the mul1 scalars, safetensors "
+            "headers, alignment padding, the index and files outside the layout were "
+            "not compared.\n"
+            "  If SGLANG_DSV41_EXPERT_DIR is ever pointed at a mirror, the layout would "
+            "be built from headers and an index this tool never checked."
         )
     elif not result.full:
         out.append(
             "VERDICT: PASSED A PARTIAL CHECK. This is NOT a full verification: the rows "
             "and layers not chosen were not compared. Do not trust these copies on this "
             "evidence alone."
+            + (
+                ""
+                if result.direct
+                else " The reads were also BUFFERED, so even the rows compared say "
+                "nothing about the drives."
+            )
         )
     else:
         out.append(
             "VERDICT: PASSED, BUT THE READS WERE BUFFERED. The page cache, not the drives, "
             "may have served these bytes; rerun without --buffered before trusting the copies."
         )
+    out.append(f"elapsed: {result.elapsed_seconds:.1f} s")
     return "\n".join(out)
 
 
@@ -798,7 +842,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_USAGE
     print()
-    print(render(result), flush=True)
+    print(render(result, header=False), flush=True)
     return result.exit_code
 
 

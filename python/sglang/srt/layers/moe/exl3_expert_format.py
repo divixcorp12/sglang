@@ -234,6 +234,12 @@ class Exl3ExpertFormat:
                 "source_root, the checkpoint directory the layout was read from "
                 "(SGLANG_DSV41_EXPERT_DIR), to find each root's copy of a shard"
             )
+        for root in roots:
+            if os.path.realpath(root) == os.path.realpath(self.source_root):
+                raise ValueError(
+                    f"{_MIRROR_DIRS}: {root!r} is the checkpoint directory "
+                    f"{self.source_root!r} itself, not a mirror of it"
+                )
         from sglang.srt.layers.moe.exl3_mirror_row_source import Exl3MirrorRowSource
 
         return Exl3MirrorRowSource.for_mirrored_layer(
@@ -284,8 +290,21 @@ def parse_mirror_roots(value: str) -> tuple[str, ...]:
             f"{os.pathsep!r} and no others"
         )
     for root in entries:
+        if not os.path.isabs(root):
+            raise ValueError(
+                f"{_MIRROR_DIRS}: {root!r} is a relative path, which would mean "
+                "a different directory in every working directory; give an absolute one"
+            )
         if not (os.path.isdir(root) and os.access(root, os.R_OK | os.X_OK)):
             raise ValueError(f"{_MIRROR_DIRS}: {root!r} is not a readable directory")
+    real = [os.path.realpath(root) for root in entries]
+    for i, path in enumerate(real):
+        if path in real[:i]:
+            raise ValueError(
+                f"{_MIRROR_DIRS}: {entries[i]!r} is the same directory as "
+                f"{entries[real.index(path)]!r}; two entries for one drive would "
+                "look like a two-drive mirror and read from one"
+            )
     return tuple(entries)
 
 
