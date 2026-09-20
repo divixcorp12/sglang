@@ -58,20 +58,24 @@ struct Segment {
   int64_t bytes;
 };
 
+// One part of a row's aligned read: `length` bytes of `file` at `offset`, into the row's bounce
+// slot at `dest`. A row is `parts` extents (one per mirror root); a zero-length one reads nothing.
 struct Read {
   int64_t file;
   int64_t offset;
   int64_t length;
-  int64_t start;
+  int64_t dest;
 };
 
 struct Tables {
   int64_t layers = 0;
   int64_t experts = 0;
+  int64_t parts = 1;
   int64_t slot_bytes = 0;
   std::vector<std::string> paths;
-  std::vector<int64_t> file_sizes;
-  std::vector<Read> reads;
+  std::vector<int64_t> file_sizes;  // the SOURCE size of every file, mirrors included
+  std::vector<Read> extents;        // [layers][experts][parts]
+  std::vector<int64_t> starts;      // [layers][experts]: where the row starts in its aligned superset
   std::vector<Segment> segments;
   std::vector<std::vector<uint8_t*>> slabs;
   std::vector<int64_t> row_bytes;
@@ -83,7 +87,8 @@ inline std::vector<int32_t> ids_of(TensorView tensor) {
 }
 
 inline Tables tables_from(
-    TensorView reads,
+    TensorView extents,
+    TensorView starts,
     TensorView file_sizes,
     TensorView segments,
     TensorView slabs,
@@ -91,8 +96,9 @@ inline Tables tables_from(
     const std::string& paths,
     int64_t slot_bytes) {
   Tables t;
-  t.layers = reads.size(0);
-  t.experts = reads.size(1);
+  t.layers = extents.size(0);
+  t.experts = extents.size(1);
+  t.parts = extents.size(2);
   t.slot_bytes = slot_bytes;
   size_t start = 0;
   while (true) {
@@ -103,11 +109,21 @@ inline Tables tables_from(
   }
   const auto* sizes = static_cast<const int64_t*>(file_sizes.data_ptr());
   t.file_sizes.assign(sizes, sizes + file_sizes.size(0));
-  const auto* read_data = static_cast<const int64_t*>(reads.data_ptr());
-  t.reads.resize(static_cast<size_t>(t.layers * t.experts));
-  for (size_t i = 0; i < t.reads.size(); ++i) {
-    t.reads[i] = Read{read_data[4 * i], read_data[4 * i + 1], read_data[4 * i + 2], read_data[4 * i + 3]};
+  const auto* extent_data = static_cast<const int64_t*>(extents.data_ptr());
+  t.extents.resize(static_cast<size_t>(t.layers * t.experts * t.parts));
+  for (size_t i = 0; i < t.extents.size(); ++i) {
+    t.extents[i] = Read{extent_data[4 * i], extent_data[4 * i + 1], extent_data[4 * i + 2], extent_data[4 * i + 3]};
+    // The reader writes each extent into its row's bounce slot and reads its file without
+    // checking again, so a table that would write outside the slot or name no file is refused here.
+    const Read& e = t.extents[i];
+    if (e.file < 0 || e.file >= static_cast<int64_t>(t.paths.size()) ||
+        e.file >= static_cast<int64_t>(t.file_sizes.size()) || e.offset < 0 || e.length < 0 || e.dest < 0 ||
+        e.dest + e.length > slot_bytes) {
+      throw std::runtime_error("exl3 RAM miss: an extent names no file or falls outside its bounce slot");
+    }
   }
+  const auto* start_data = static_cast<const int64_t*>(starts.data_ptr());
+  t.starts.assign(start_data, start_data + t.layers * t.experts);
   const auto* segment_data = static_cast<const int64_t*>(segments.data_ptr());
   t.segments.resize(static_cast<size_t>(segments.size(0)));
   for (size_t i = 0; i < t.segments.size(); ++i) {
@@ -133,6 +149,11 @@ struct ReadFault {
   bool submit_first = false;  // submit the prepared SQEs before failing (reads are in flight)
   int cqe_error = 0;          // errno that replaces the `cqe_call`-th completion's result
   int64_t cqe_call = 0;       // 1-based count of reaped completions over the reader's life
+  // Per-extent faults, keyed by the extent's part index (-1: none). They hit the FIRST completion
+  // of a part-`part` extent, whichever row it is in and however the kernel orders completions.
+  int64_t part = -1;
+  int part_error = 0;         // errno that replaces that completion's result
+  int64_t part_short = 0;     // >0: that completion reports at most this many bytes (block multiple)
 };
 
 // io_uring superset reads of whole expert rows into a page-aligned bounce, then the
@@ -151,7 +172,13 @@ class RowReader {
 
   const Tables& tables() const { return t_; }
 
-  void set_fault(const ReadFault& fault) { fault_ = fault; }
+  void set_fault(const ReadFault& fault) {
+    fault_ = fault;
+    part_fired_ = false;
+  }
+
+  // Completions reaped over the reader's life (tests: a zero-length extent must add none).
+  int64_t cqes() const { return cqes_; }
 
   bool open() {
     for (const auto& path : t_.paths) {
@@ -166,7 +193,7 @@ class RowReader {
       bounce_ = nullptr;
       return false;
     }
-    if (io_uring_queue_init(kQueueDepth, &ring_, 0) != 0) return false;
+    if (io_uring_queue_init(queue_depth(), &ring_, 0) != 0) return false;
     ring_ready_ = true;
     return true;
   }
@@ -190,27 +217,37 @@ class RowReader {
     for (size_t first = 0; first < experts.size(); first += step) {
       if (abandon()) return -1;
       const size_t count = std::min<size_t>(step, experts.size() - first);
-      std::vector<int64_t> done(count, 0);
-      std::vector<int64_t> expected(count, 0);
-      std::vector<int> retries(count, 0);
-      std::vector<const Read*> reads(count);
+      // One entry per extent, j = i * parts + p for part p of row i of this batch.
+      const size_t parts = static_cast<size_t>(t_.parts);
+      std::vector<int64_t> done(count * parts, 0);
+      std::vector<int64_t> expected(count * parts, 0);
+      std::vector<int> retries(count * parts, 0);
+      std::vector<const Read*> reads(count * parts);
       for (size_t i = 0; i < count; ++i) {
-        reads[i] = &t_.reads[static_cast<size_t>(row * t_.experts + experts[first + i])];
-        expected[i] = std::min(reads[i]->length, t_.file_sizes[reads[i]->file] - reads[i]->offset);
+        const size_t base = static_cast<size_t>(row * t_.experts + experts[first + i]) * parts;
+        for (size_t p = 0; p < parts; ++p) {
+          const Read* extent = &t_.extents[base + p];
+          reads[i * parts + p] = extent;
+          // Per extent, against the file that extent reads.
+          expected[i * parts + p] = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
+        }
       }
       // SQEs prepared and not yet reaped (in the SQ ring or in the kernel). At most
-      // kBounceRows < kQueueDepth, so io_uring_get_sqe never runs out.
+      // kBounceRows * parts, and the ring holds kQueueDepth * parts, so io_uring_get_sqe never runs out.
       unsigned pending = 0;
-      auto submit = [&](size_t i) {
+      auto submit = [&](size_t j) {
         io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-        const int64_t remaining = reads[i]->length - done[i];
+        const int64_t remaining = reads[j]->length - done[j];
         io_uring_prep_read(
-            sqe, fds_[reads[i]->file], bounce_ + i * t_.slot_bytes + done[i], static_cast<unsigned>(remaining),
-            static_cast<uint64_t>(reads[i]->offset + done[i]));
-        io_uring_sqe_set_data64(sqe, i);
+            sqe, fds_[reads[j]->file], bounce_ + (j / parts) * t_.slot_bytes + reads[j]->dest + done[j],
+            static_cast<unsigned>(remaining), static_cast<uint64_t>(reads[j]->offset + done[j]));
+        io_uring_sqe_set_data64(sqe, j);
         ++pending;
       };
-      for (size_t i = 0; i < count; ++i) submit(i);
+      // A zero-length extent is a root that serves none of this row: no read, not pending.
+      for (size_t j = 0; j < count * parts; ++j) {
+        if (reads[j]->length > 0) submit(j);
+      }
       bool failed = false;
       int soft_errors = 0;
       while (pending > 0) {
@@ -229,42 +266,55 @@ class RowReader {
         io_uring_cqe* cqe;
         unsigned head;
         unsigned seen = 0;
-        std::vector<size_t> again;
+        std::vector<size_t> again;  // extents to resubmit
         io_uring_for_each_cqe(&ring_, head, cqe) {
           ++seen;
           --pending;
-          const size_t i = static_cast<size_t>(io_uring_cqe_get_data64(cqe));
+          // The extent, not the row: two parts of one row complete independently.
+          const size_t j = static_cast<size_t>(io_uring_cqe_get_data64(cqe));
           int res = cqe->res;
           ++cqes_;
           if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
+          if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(j % parts) == fault_.part) {
+            if (fault_.part_error != 0) {
+              part_fired_ = true;
+              res = -fault_.part_error;
+            } else if (fault_.part_short > 0 && res > fault_.part_short) {
+              part_fired_ = true;
+              res = static_cast<int>(fault_.part_short);
+            }
+          }
           if (res == -EINTR || res == -EAGAIN) {
-            if (++retries[i] > kMaxRetries) {
+            if (++retries[j] > kMaxRetries) {
               failed = true;
             } else {
-              again.push_back(i);  // resubmit the same range (M3)
+              again.push_back(j);  // resubmit the same range (M3)
             }
             continue;
           }
-          if (res < 0 || (res == 0 && done[i] < expected[i])) {
+          if (res < 0 || (res == 0 && done[j] < expected[j])) {
             failed = true;
             continue;
           }
-          done[i] += res;
+          done[j] += res;
           // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
-          // offset + done, bounce + done and length - done stay block-aligned and the
-          // resubmit is a legal direct read. At EOF, done == expected: no resubmit.
-          if (done[i] < expected[i]) again.push_back(i);
+          // offset + done, bounce + dest + done and length - done stay block-aligned (an
+          // extent's offset, dest and length are whole pages) and the resubmit is a legal
+          // direct read of just this extent. At EOF, done == expected: no resubmit.
+          if (done[j] < expected[j]) again.push_back(j);
         }
         io_uring_cq_advance(&ring_, seen);
         if (failed) break;
-        for (size_t i : again) submit(i);
+        for (size_t j : again) submit(j);
       }
       if (failed) {
         drain(pending);
         return 0;
       }
       for (size_t i = 0; i < count; ++i) {
-        const uint8_t* base = bounce_ + i * t_.slot_bytes + reads[i]->start;
+        // The row's parts landed contiguously, so its segments split from one base.
+        const uint8_t* base =
+            bounce_ + i * t_.slot_bytes + t_.starts[static_cast<size_t>(row * t_.experts + experts[first + i])];
         const int64_t slot = slots[first + i];
         for (const Segment& segment : t_.segments) {
           std::memcpy(
@@ -279,6 +329,9 @@ class RowReader {
  private:
   static constexpr int kMaxSoftErrors = 1000;
   static constexpr int kMaxRetries = 8;
+
+  // Room for every extent of a full batch: kBounceRows rows of `parts` extents.
+  unsigned queue_depth() const { return kQueueDepth * static_cast<unsigned>(t_.parts); }
 
   int submit_and_wait() {
     ++submits_;
@@ -308,7 +361,7 @@ class RowReader {
     }
     if (unsubmitted > 0) {
       io_uring_queue_exit(&ring_);
-      ring_ready_ = io_uring_queue_init(kQueueDepth, &ring_, 0) == 0;
+      ring_ready_ = io_uring_queue_init(queue_depth(), &ring_, 0) == 0;
       if (!ring_ready_) std::fprintf(stderr, "ERROR exl3 RAM miss: io_uring ring reset failed\n");
     }
   }
@@ -322,6 +375,7 @@ class RowReader {
   ReadFault fault_{};
   int64_t submits_ = 0;
   int64_t cqes_ = 0;
+  bool part_fired_ = false;
 };
 
 }  // namespace exl3_ram_miss
@@ -340,7 +394,8 @@ std::vector<int64_t> slots_of(TensorView slots) {
 // Read `experts` of streamed row `row` into `slots` once, synchronously (tests, tools).
 // Arguments are validated by the Python wrapper (read_rows_once).
 int64_t exl3_ram_miss_read_rows(
-    TensorView reads,
+    TensorView extents,
+    TensorView starts,
     TensorView file_sizes,
     TensorView segments,
     TensorView slabs,
@@ -353,7 +408,7 @@ int64_t exl3_ram_miss_read_rows(
     TensorView slots,
     int64_t step) {
   using namespace exl3_ram_miss;
-  RowReader reader(tables_from(reads, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; });
 }
@@ -361,10 +416,12 @@ int64_t exl3_ram_miss_read_rows(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows, exl3_ram_miss_read_rows);
 
 // Test only: one reader reads `experts` into `slots` with `fault` injected
-// ([submit_error, submit_call, submit_first, cqe_error, cqe_call]), then reads
-// `then_experts` into `then_slots` with no fault. Results go to `results[0..1]`.
+// ([submit_error, submit_call, submit_first, cqe_error, cqe_call, part, part_error, part_short]),
+// then reads `then_experts` into `then_slots` with no fault. Results go to `results[0..3]`: the two
+// reads' results, then the completions the reader had reaped after each.
 void exl3_ram_miss_read_rows_faulted(
-    TensorView reads,
+    TensorView extents,
+    TensorView starts,
     TensorView file_sizes,
     TensorView segments,
     TensorView slabs,
@@ -381,17 +438,20 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView results) {
   using namespace exl3_ram_miss;
   auto* out = static_cast<int64_t*>(results.data_ptr());
-  RowReader reader(tables_from(reads, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
   if (!reader.open()) {
-    out[0] = out[1] = 0;
+    out[0] = out[1] = out[2] = out[3] = 0;
     return;
   }
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-  reader.set_fault(ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4]});
+  reader.set_fault(
+      ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4], f[5], static_cast<int>(f[6]), f[7]});
   const auto never = [] { return false; };
   out[0] = reader.read(row, ids_of(experts), slots_of(slots), kBounceRows, never);
+  out[2] = reader.cqes();
   reader.set_fault(ReadFault{});
   out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, never);
+  out[3] = reader.cqes();
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_faulted, exl3_ram_miss_read_rows_faulted);
@@ -952,7 +1012,8 @@ inline std::shared_ptr<RamTier> find(int64_t handle) {
 int64_t exl3_ram_miss_open(
     TensorView page,
     TensorView slot_map,
-    TensorView reads,
+    TensorView extents,
+    TensorView starts,
     TensorView file_sizes,
     TensorView segments,
     TensorView slabs,
@@ -966,7 +1027,7 @@ int64_t exl3_ram_miss_open(
   auto tier = std::make_shared<RamTier>(
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(slot_map.data_ptr()),
-      tables_from(reads, file_sizes, segments, slabs, row_bytes, paths, slot_bytes),
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0);
   if (!tier->open()) return -1;

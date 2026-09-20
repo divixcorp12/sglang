@@ -44,7 +44,7 @@ def _checked_rows(tables, row: int, experts, slots) -> tuple[torch.Tensor, torch
         raise ValueError(f"{expert_ids.numel()} experts but {slot_ids.numel()} slots")
     if not 0 <= row < len(tables.layer_ids):
         raise ValueError(f"streamed row {row} is outside [0, {len(tables.layer_ids)})")
-    num_experts = int(tables.reads.shape[1])
+    num_experts = int(tables.starts.shape[1])
     if expert_ids.numel() and not (0 <= int(expert_ids.min()) and int(expert_ids.max()) < num_experts):
         raise ValueError(f"expert ids {expert_ids.tolist()} are outside [0, {num_experts})")
     capacity = int(tables.capacity[row])
@@ -55,7 +55,8 @@ def _checked_rows(tables, row: int, experts, slots) -> tuple[torch.Tensor, torch
 
 def _table_args(tables, direct: bool) -> tuple:
     return (
-        tables.reads,
+        tables.extents,
+        tables.starts,
         tables.file_sizes,
         tables.segments,
         tables.slabs,
@@ -93,20 +94,32 @@ def read_rows_with_fault(
     submit_first: bool = False,
     cqe_error: int = 0,
     cqe_call: int = 0,
+    part: int = -1,
+    part_error: int = 0,
+    part_short: int = 0,
+    cqes: Optional[list[int]] = None,
 ) -> tuple[int, int]:
     """Test only: on one C++ reader, read with an injected io_uring fault, then read cleanly.
 
     ``submit_error`` (an errno) replaces the result of the ``submit_call``-th submit-and-wait
     (after submitting the prepared reads when ``submit_first``); ``cqe_error`` replaces the
-    ``cqe_call``-th completion's result. Returns both reads' results (1 ok, 0 failed).
+    ``cqe_call``-th completion's result. ``part`` (a part index) targets the first completion of a
+    part-``part`` extent: ``part_error`` (an errno) replaces its result, ``part_short`` (a block
+    multiple) caps the bytes it reports, so only that extent is resubmitted. Returns both reads'
+    results (1 ok, 0 failed); ``cqes``, if given, receives the completions reaped after each read.
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
-    fault = torch.tensor([submit_error, submit_call, int(submit_first), cqe_error, cqe_call], dtype=torch.int64)
-    results = torch.zeros(2, dtype=torch.int64)
+    fault = torch.tensor(
+        [submit_error, submit_call, int(submit_first), cqe_error, cqe_call, part, part_error, part_short],
+        dtype=torch.int64,
+    )
+    results = torch.zeros(4, dtype=torch.int64)
     _host_module().exl3_ram_miss_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
+    if cqes is not None:
+        cqes[:] = [int(results[2]), int(results[3])]
     return int(results[0]), int(results[1])
 
 
@@ -208,7 +221,7 @@ class Exl3RamMissHost:
     def __init__(self, tables, *, page: torch.Tensor, slot_map: torch.Tensor, direct: bool) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
-        if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.reads.shape[:2]):
+        if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.starts.shape):
             raise ValueError("slot_map must be int32 [layers, experts]")
         # C++ indexes both through raw addresses and starts with every slot FREE.
         if not page.is_contiguous() or not slot_map.is_contiguous() or slot_map.device.type != "cpu":
@@ -223,11 +236,11 @@ class Exl3RamMissHost:
         self.tables = tables
         self.page = page
         self.slot_map = slot_map
-        self.layers, self.experts = tables.reads.shape[:2]
+        self.layers, self.experts = tables.starts.shape
         self.handle = int(
             self._module.exl3_ram_miss_open(
-                page, slot_map, tables.reads, tables.file_sizes, tables.segments, tables.slabs,
-                tables.row_bytes, tables.capacity, "\n".join(tables.paths), tables.slot_bytes, int(direct),
+                page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
+                tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths), tables.slot_bytes, int(direct),
             )
         )
         if self.handle < 0:

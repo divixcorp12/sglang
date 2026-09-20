@@ -4,6 +4,7 @@ import errno
 import os
 
 import pytest
+import torch
 
 from sglang.kernels.ops.moe import exl3_ram_miss as ops
 from sglang.kernels.ops.moe.exl3_ram_miss import read_rows_once
@@ -16,7 +17,9 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 def test_tables_describe_every_row(tmp_path):
     s = ram_miss_setup(tmp_path)
-    assert s.tables.reads.shape == (2, 6, 4)
+    assert s.tables.extents.shape == (2, 6, 1, 4)
+    assert s.tables.starts.shape == (2, 6)
+    assert s.tables.parts == 1
     assert s.tables.capacity.tolist() == [3, 3]
     assert s.tables.slabs[1, 0].item() == s.slabs[1]["w13_trellis"].data_ptr()
     assert s.tables.slot_bytes % 4096 == 0
@@ -45,9 +48,9 @@ def test_the_last_row_of_a_shard_is_clamped_at_end_of_file(tmp_path):
 
 def test_a_short_file_fails_the_read(tmp_path):
     s = ram_miss_setup(tmp_path)
-    path = s.tables.paths[int(s.tables.reads[0, 0, 0])]
+    path = s.tables.paths[int(s.tables.extents[0, 0, 0, 0])]
     with open(path, "r+b") as f:
-        f.truncate(int(s.tables.reads[0, 0, 1]) + 100)  # cut inside expert 0's superset
+        f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)  # cut inside expert 0's superset
     assert read_rows_once(s.tables, 0, [0], [0], direct=False) == 0
 
 
@@ -117,6 +120,96 @@ def test_a_fault_leaves_the_ring_clean(tmp_path, fault, first_result):
     if first_result == 1:
         _assert_rows(s, 1, first, [0, 1, 2])
     _assert_rows(s, 1, then, [3, 4, 5])
+
+
+# ---- Mirrored rows: one extent per root, each with its own completion ----
+
+EIO = errno.EIO
+PAGE = 4096
+WEIGHTS = [(1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (3.0, 1.0, 2.0)]
+
+
+def _sentinel(s, layer, slot):
+    for name in EXL3_STREAMED_NAMES:
+        s.slabs[layer][name][slot].view(torch.uint8).fill_(0xAB)
+
+
+def _untouched(s, layer, slot):
+    return all(
+        bool((s.slabs[layer][name][slot].view(torch.uint8) == 0xAB).all()) for name in EXL3_STREAMED_NAMES
+    )
+
+
+@pytest.mark.parametrize("weights", WEIGHTS)
+def test_mirrored_rows_are_split_like_the_python_row_source(tmp_path, weights):
+    s = ram_miss_setup(tmp_path, mirror_weights=weights)
+    assert s.tables.parts == len(weights)
+    assert read_rows_once(s.tables, 1, [5, 2, 3], [0, 1, 2], direct=False) == 1
+    _assert_rows(s, 1, [5, 2, 3], [0, 1, 2])
+
+
+def test_a_full_batch_of_three_part_rows_fits_the_ring(tmp_path):
+    # 8 rows x 3 parts = 24 extents in one batch, more than the 16 entries a one-part ring holds.
+    s = ram_miss_setup(tmp_path, capacity=8, experts=8, mirror_weights=(1.0, 1.0, 1.0))
+    experts, slots = list(range(8)), list(range(8))[::-1]
+    assert read_rows_once(s.tables, 1, experts, slots, direct=False) == 1
+    _assert_rows(s, 1, experts, slots)
+
+
+@pytest.mark.parametrize("weights, extents_per_row", [((1.0, 1.0), 2), ((1.0, 0.0), 1), ((0.0, 1.0), 1)])
+def test_a_zero_length_part_issues_no_read(tmp_path, weights, extents_per_row):
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=weights)
+    cqes = []
+    first, then = [0, 1, 2], [5, 4]
+    assert ops.read_rows_with_fault(
+        s.tables, 1, first, [0, 1, 2], then, [3, 4], direct=False, cqes=cqes
+    ) == (1, 1)
+    # One completion per non-empty extent, so an empty part neither reads nor is waited for.
+    assert cqes == [3 * extents_per_row, 3 * extents_per_row + 2 * extents_per_row]
+    _assert_rows(s, 1, first, [0, 1, 2])
+    _assert_rows(s, 1, then, [3, 4])
+
+
+@pytest.mark.parametrize("part", [0, 1])
+def test_a_failed_part_fails_the_row_and_publishes_nothing(tmp_path, part):
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    for slot in (0, 1, 2):
+        _sentinel(s, 1, slot)
+    then = [5, 4, 3]
+    results = ops.read_rows_with_fault(
+        s.tables, 1, [0, 1, 2], [0, 1, 2], then, [3, 4, 5], direct=False, part=part, part_error=EIO
+    )
+    assert results == (0, 1)  # the batch fails, the reader stays usable
+    assert all(_untouched(s, 1, slot) for slot in (0, 1, 2))  # not one row of it was published
+    _assert_rows(s, 1, then, [3, 4, 5])
+
+
+@pytest.mark.parametrize("part", [0, 1])
+@pytest.mark.parametrize("direct", [False, True])
+def test_a_short_read_resubmits_only_its_own_extent(tmp_path, part, direct):
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    if direct:
+        try:
+            os.close(os.open(s.tables.paths[0], os.O_RDONLY | os.O_DIRECT))
+        except OSError as error:
+            pytest.skip(f"{tmp_path} does not support O_DIRECT: {error}")
+    cqes = []
+    assert ops.read_rows_with_fault(
+        s.tables, 1, [0, 1, 2], [0, 1, 2], [5], [3], direct=direct, part=part, part_short=PAGE, cqes=cqes
+    ) == (1, 1)
+    # 6 extents, one of them completing twice: the resubmit read the rest of that extent, no other.
+    assert cqes[0] == 7
+    _assert_rows(s, 1, [0, 1, 2], [0, 1, 2])
+    _assert_rows(s, 1, [5], [3])
+
+
+def test_a_short_mirror_copy_fails_the_read(tmp_path):
+    s = ram_miss_setup(tmp_path, mirror_weights=(1.0, 1.0))
+    # The copy is bounded by the SOURCE's size, so truncating it is seen, not clamped away.
+    shard, offset = int(s.tables.extents[0, 0, 1, 0]), int(s.tables.extents[0, 0, 1, 1])
+    with open(s.tables.paths[shard], "r+b") as f:
+        f.truncate(offset + 100)
+    assert read_rows_once(s.tables, 0, [0], [0], direct=False) == 0
 
 
 def test_tables_keep_their_slabs_alive(tmp_path):
