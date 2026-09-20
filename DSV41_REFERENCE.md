@@ -2396,16 +2396,25 @@ native reader is the prerequisite for any decode benefit; until then
 > and are retired, not merely unconfirmed: do not cite them, nor the 1.54x byte ratio
 > or the 25% regression derived from them.
 >
-> By elimination the cause was machine state that day. The candidate that cannot be
-> excluded is page-cache state left by the `g-mirror` arm that ran immediately before
-> `e-base` and read 127 GiB from the same drive, against the 123 GiB by which `e-base`
-> undershoots today - close enough to be worth naming and too weak to assert, since
-> §19 kept no per-row counters and set no trace path. Inference, not measurement.
+> By elimination the cause was machine state that day, and the cause is unknown.
 >
-> **Method note for future e2e arms.** Two arms run back to back on one drive are not
-> independent unless the reader is genuinely O_DIRECT or the cache is dropped between
-> them. §19 recorded neither, which is why its numbers cannot be rescued. Record the
-> reader mode and the drive-idle check per arm, as `EAGER_ANOMALY.md` does.
+> **The page-cache candidate is excluded.** It was attractive - the `g-mirror` arm ran
+> immediately before `e-base` and read 127 GiB from the same drive, against the 123 GiB
+> by which `e-base` undershoots today - but the reads were O_DIRECT in both runs, so the
+> page cache could not have served them. `dsv41-phase3a/env.sh:14` sets
+> `SGLANG_MOE_EXPERT_FILE_READER=uring_direct`; its mtime precedes the §19 run and
+> neither `run-mirror-arms.sh` nor `eager-cache-arms.sh` overrides it or drops caches.
+> The fd is opened `O_RDONLY | O_DIRECT` unconditionally when direct is set
+> (`io/uring_file_reader.cpp:115`), and an unaligned destination is served through a
+> page-aligned bounce the reader owns rather than by falling back to buffered reads
+> (`:249-252`). The comment at `expert_file_reader.py:47`, "O_DIRECT is used when a
+> destination is page-aligned, buffered reads otherwise", describes that bounce and
+> reads as if there were a fallback; there is not.
+>
+> So §19's arm genuinely requested ~123 GiB fewer bytes, which means it read fewer ROWS,
+> which means its pinned tier was hitting where today's misses. Why is not recoverable:
+> §19 set no trace path and had no per-row counters, and those counters exist only
+> because this investigation added them.
 >
 > Detail and full per-session tables: `analysis/dsv41-drive/EAGER_ANOMALY.md`,
 > commit `cd14545797`.
