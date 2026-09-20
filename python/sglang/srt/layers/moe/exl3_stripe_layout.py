@@ -52,8 +52,8 @@ class StripeGeometry:
       at the tail of every slot, spent so every slot's *start* offset is
       O_DIRECT-aligned regardless of `row_bytes`'s residue mod 4096.
 
-    A reader must still issue a page-aligned *length*: read
-    `align4096(fragment_bytes[i])` bytes starting at `slot_offset(i, n)` (into
+    A reader must still issue a page-aligned *length*: read `strides[i]`
+    bytes (that is what the aligned length is) starting at `slot_offset(i, n)` (into
     a buffer with that much room) and use only the first `fragment_bytes[i]`
     of it — the same aligned-offset/aligned-length/logical-start split
     `Exl3ExpertRecord.aligned_read` already returns for the unstriped layout.
