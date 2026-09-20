@@ -142,6 +142,41 @@ Ruled out by measurement:
   0.03 GiB from the others.
 - Environment (*inferred from mtimes*): `env.sh` and `env-full.sh` predate the §19 run.
 
+## Reader mode and the page cache
+
+The one unexcluded candidate after the §19-commit arm was a buffered read in §19 against
+direct reads now. From the recorded artifacts, no GPU:
+
+- §19 ran `uring_direct`. `run-mirror-arms.sh` sources `env-full.sh` -> `env.sh`
+  (`SGLANG_MOE_EXPERT_FILE_READER=uring_direct`) and its `run_arm` passes only thread counts,
+  `GRAPH_GATHER` and the mirror dirs, so nothing overrides the reader. The recorded logs carry
+  no reader line and `e-base.log` no env dump, so this rests on the script and on `env.sh`
+  (mtime Sep 19 02:08, before the run). There is no separate direct/buffered flag:
+  `_resolve_direct()` reads only this variable.
+- Neither `run-mirror-arms.sh` nor `eager-cache-arms.sh` (nor `run-native-mirror-arm.sh`) drops
+  caches, calls `fadvise`/`vmtouch`, or syncs. Arms run back to back with whatever the previous
+  one left, and in §19 `g-mirror` ran immediately before `e-base`.
+- Today's reads are direct (measured). After ~2.3 TiB of arms, `fincore` shows 15.6 GiB of
+  the 204.1 GiB source expert files resident, which is startup-scale (each engine start reads
+  ~18-24 GiB of non-expert tensors), not the hundreds of GiB buffered reads would leave. That
+  is not evidence about §19's process, only that the same config is direct today.
+- The "123 GiB missing vs 127 GiB from `g-mirror`" coincidence mixes bases: 381 is session
+  bytes today and 258 is §19's whole-arm total with ~24 GiB startup. Whole-arm to whole-arm the
+  gap is ~147 GiB. A 127 GiB warm set would also not fit beside the 70 GiB pinned tier in
+  188 GiB of RAM, and a cache story predicts `e-mirror` benefits too, which it did not
+  (*inferred*).
+- The decode pattern says the divergence starts before session 2. Today's base decodes
+  1.43 / 1.80 / 1.52 / 1.98 tok/s (graph arms: 2.25 / 3.23 / 2.29 / 3.54), so sessions 1 and 3
+  are fast per prompt. §19's `e-base` decoded 1.46 / 2.16 / 3.19 / 3.96: session 1 already 20%
+  faster at an identical 55 s TTFT, then session 2 rises instead of dipping. Whatever changed
+  cut decode-phase cost from session 1 on; a pure "cache warms in session 2" does not fit.
+
+Conclusion: reader mode was the same, the scripts do not manage the cache, and the config
+does not explain §19's arm. Page-cache warming is weakened, not excluded: nothing recorded
+in §19 shows the reads were direct except the config. For future e2e arms: back-to-back arms
+on one drive are independent only if the reader is genuinely O_DIRECT (checked here with
+`fincore` after the arms) or the cache is dropped between them.
+
 ## Limits of the counters
 
 - Snapshots are written at most every 0.5 s, so a session's edges blur by up to that much
