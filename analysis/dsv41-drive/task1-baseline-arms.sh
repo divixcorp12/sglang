@@ -20,7 +20,7 @@ CC=/data/models/slang/nvfp4-work/cc-expert-prediction
 . $CC/analysis/dsv41-phase3b/env-full.sh   # defines $PY $FULL $ANA; it cd's into wt-dsv41, overridden below
 
 WT_OLD=$CC/wt-task1-old;  HEAD_OLD=099eadba33879b705b860dad9439f2f01bdd6d06
-WT_NEW=$CC/wt-task1-new;  HEAD_NEW=b57beac710b46a49b0092a5b652905d7c23e458d
+WT_NEW=$CC/wt-task1-new;  HEAD_NEW=${EXPECT_NEW:?set EXPECT_NEW to the full sha wt-task1-new must be at}  # a commit cannot name itself
 SESSIONS=/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl
 MIRRORS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash
 EXPERT_SHARD_DIRS=(/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw /mnt/nvme0/dsv41_flash /mnt/nvme4/dsv41_flash)

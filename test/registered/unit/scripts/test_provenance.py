@@ -60,6 +60,25 @@ def test_process_env_reports_only_steering_variables_and_redacts_secrets(monkeyp
     assert "hunter2" not in json.dumps(env)
 
 
+def test_redaction_hits_secrets_and_spares_knobs_whose_names_only_contain_token():
+    """Bug: a substring match on TOKEN redacted SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS from the
+    first Task 1 arm's json, so a steering value in force was unrecoverable from the record."""
+    for name in ("SGLANG_API_TOKEN", "HF_TOKEN", "EXA_API_KEY", "SGLANG_SECRET_KEY", "DB_PASSWORD", "GITHUB_ACCESS_TOKEN"):
+        assert prov._redact(name, "v") == prov.REDACTED, name
+    for name in (
+        "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS", "SGLANG_USE_AITER_FP8_PER_TOKEN",
+        "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", "SGLANG_MAX_NEW_TOKENS_LIMIT", "SGLANG_MM_AVOID_RETOKENIZE",
+    ):
+        assert prov._redact(name, "256") == "256", name
+
+
+def test_resolved_env_redacts_only_secret_named_knobs():
+    resolved = prov.resolved_env()
+    redacted = {k for k, v in resolved.items() if v == prov.REDACTED}
+    assert redacted == {k for k in resolved if prov._SECRET_NAME.search(k)}
+    assert resolved["SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS"] != prov.REDACTED
+
+
 def test_exec_env_parses_nul_separated_environ(tmp_path):
     f = tmp_path / "environ"
     f.write_bytes(b"SGLANG_A=1\0PATH=/bin\0SGLANG_B=x=y\0SGLANG_SECRET_KEY=s\0")
