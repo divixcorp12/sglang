@@ -1052,6 +1052,8 @@ class RowReader {
     // GETEVENTS for a completion no in-kernel SQE can produce (the state submit_short_call imitates).
     // Guarding it costs a second syscall on every batch of the decode path, and the service watchdog
     // already aborts a read that stays in service, so this is left to the watchdog deliberately.
+    // If it ever does surface, the signature is busy_since_ non-zero with pending > 0 and an empty
+    // completion queue; the guard would be to pass wait_nr = 0 whenever io_uring_sq_ready() > 0.
     return wait_nr != 0 ? io_uring_submit_and_wait(&ring_, wait_nr) : io_uring_submit(&ring_);
   }
 
