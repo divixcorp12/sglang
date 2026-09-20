@@ -2486,6 +2486,27 @@ base's own sessions span 2.23-3.54 tok/s, a 1.59x spread wider than the effect
 being measured, so a single session proves nothing and only the paired result
 carries the claim.
 
+> **What code these numbers measure, and one place they are misattributed.**
+> The arms above ran at `099eadba33`, the commit that made the native reader
+> build a per-extent table and reach the mirrors. That is what they establish,
+> and the section is scoped to it correctly.
+>
+> They do **not** measure the two-bank pipeline. `ddcb0d55ff`, which introduced
+> two-bank, quotes these same figures in its commit message as "Measured: mean
+> decode 2.8198 to 3.8016 tok/s, 1.3482x". That attribution is wrong: the
+> figures already existed in this file at `ddcb0d55ff`'s parent. The commit
+> message cannot be amended, so the correction lives here. **No post-two-bank
+> end-to-end tok/s result exists in this record.**
+>
+> Both arms are also n=1 per cell and carry no provenance. Against a base spread
+> of 1.59x across sessions, wider than the 1.35x effect, the paired per-session
+> result is what carries the claim and the mean does not. Treat these as the
+> bypass fix landing, not as a baseline: Task 1's matched baselines are being
+> collected separately, repeated and interleaved, with
+> `scripts/dsv41/provenance.py` recording the resolved environment, the imported
+> tree's HEAD and dirtiness, the reader mode actually in force, and a drive-idle
+> check.
+
 #### The gate: service-attributed expert bytes
 
 Per-drive bytes come from the RAM-miss service's own accounting, carried on each
