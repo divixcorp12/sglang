@@ -142,6 +142,38 @@ Claude-Session: https://claude.ai/code/session_01N985sZUTxTE9P7MP2rtJaF
 
 ---
 
+### Task 2b: Unify EOF behaviour between the two readers, with a test
+
+Handoff §3A: "the general reader's short-positive-read retry loop and the
+native reader's expected-existing-bytes termination differ. Add a focused
+O_DIRECT test for an aligned request crossing non-block-aligned EOF before
+reusing either behavior." The page-aligned superset of a shard's LAST row
+overruns EOF by construction, so this is a real case on every shard, not a
+hypothetical. The eager path already clamps against the source size; the native
+path clamps against `file_sizes`. They must agree.
+
+**Files:**
+- Test: `test/registered/unit/kernels/test_exl3_ram_miss_split.py`
+- Modify only if the test shows they disagree:
+  `python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp`
+
+- [ ] **Step 1: Write the test.** A real temp file whose size is NOT a multiple
+  of the logical block size, an O_DIRECT aligned request whose offset+length
+  crosses its EOF, read through the native reader and through
+  `Exl3RowReader`/`read_split`. Assert both return the same bytes, the same
+  completion status, and that the bytes past EOF are left untouched in the
+  destination. Split the request across two roots as well, so the clamp is
+  exercised on a part that lies entirely past EOF (length becomes 0 after
+  clamping) and on a part that straddles it.
+- [ ] **Step 2: Run.** If they already agree, record that as the finding and
+  commit the test as a regression guard — do NOT change behaviour to match a
+  preference. If they disagree, the native reader moves to the eager path's
+  semantics, because that one is what the mirror verifier already validated
+  205 GB of data against.
+- [ ] **Step 3: Commit.**
+
+---
+
 ### Task 3: Size-check every root at open, and wire the env through
 
 **Files:**
@@ -172,17 +204,104 @@ Claude-Session: https://claude.ai/code/session_01N985sZUTxTE9P7MP2rtJaF
 - [ ] **Step 4:** Record in `DSV41_REFERENCE.md` §19 as a follow-up subsection,
   and commit.
 
+## What this plan takes from the handoff, and what it leaves
+
+### §2 (the copy and dependency path) — used as design input, not as tasks
+
+§2 is descriptive, and three of its observations shaped the design above rather
+than becoming work items. Recording them so the reasoning is auditable:
+
+- "The mirror subclass overrides only the read hook: its parts land directly in
+  their final positions within the same bounce row. There is no extra
+  mirror-assembly copy and no duplicated whole-row read." This is why Task 1's
+  extent table carries a `dest_offset` into the row's existing bounce slot
+  instead of introducing per-part buffers. The native path copies the eager
+  path's shape deliberately.
+- "One application-level reader call can still require multiple io_uring kernel
+  submissions for queue limits, short reads, or retries." This is why Task 2
+  keeps the existing resubmit loop rather than assuming one SQE per extent.
+- "The inherited bounce-to-tensor scatter is the CPU copy to optimize." Agreed,
+  and independently measured: a fixed 1.58 ms/row, ~8.4 GB/s, 38% of mirrored
+  per-row time (`analysis/dsv41-drive/MIRROR_ROWS.md`). That is handoff §3C and
+  is NOT in this plan; see below.
+
+### §3A — this plan, with three named omissions
+
+Covered: the native-consumable extent plan (Task 1), both paths consuming the
+same validated policy (Task 1 reuses `SplitPolicy`), per-extent CQE accounting
+that does not collapse parts into one row completion (Task 2), first-open size
+validation on the descriptors native I/O actually uses (Task 3), unified EOF
+handling with its own O_DIRECT test (Task 2b), and the acceptance evidence from
+the handoff's own table row 1 (Task 4).
+
+Deliberately omitted from §3A, each with a reason:
+
+- **Generation in the CQE identity.** §3A asks for "request, row, part, and
+  generation". This plan carries request+row+part but not generation, because
+  `RowReader::read` returns with the ring empty (invariant I1) and publishes per
+  batch, so no completion can outlive its request and be mistaken for a later
+  one. Generation becomes load-bearing the moment Task 2's successor overlaps
+  batches — handoff §3B — and must be added there, not retrofitted after a
+  concurrency bug. Recorded as a precondition on §3B.
+- **Content identity beyond size.** §3A: "Size equality detects truncation, not
+  different same-size contents." Task 3 checks sizes only. The existing offline
+  checker (`scripts/dsv41/verify_expert_mirror.py`) does byte comparison and
+  passed 205 GB per root, so today's mirrors are known good; what is missing is
+  a cheap *runtime* identity, e.g. a manifest of per-shard digests written at
+  copy time and checked at open. Worth doing before mirrors are ever refreshed
+  in place. Not blocking, so not in this plan.
+- **Alternate-root retry on I/O error.** §3A notes it "would require
+  completion-safe destination ownership". Out of scope: a mirror error still
+  fails the batch, exactly as today.
+
+### §3B, §3C, §3D, §3E — not in this plan, and why
+
+- **§3B (bounded completion-driven pipeline).** The next structural step, and
+  the natural successor to Task 2. Needs generations first (above). Deferred
+  because it changes the concurrency model, and doing it on top of an unproven
+  extent path would confuse two sources of risk.
+- **§3C (remove the full-row CPU copy / raw-row pinned cache).** The largest
+  single remaining per-row cost by our own measurement (1.58 ms fixed). Also the
+  most invasive: it changes the segment copier's source addressing, and §3C
+  itself warns that moving packing to the GPU can worsen load alignment because
+  packed EXL3 data is not uniformly 16-byte aligned. Needs §3's stage timing
+  first to confirm the scatter is on the critical path end to end, not just in
+  the per-row bench.
+- **§3D (drive scheduling: whole-row assignment vs within-row splitting).**
+  **This one is directly relevant to an open anomaly and should be the next
+  measurement, ahead of §3B and §3C.** §19 records that eager + mirrors ran 25%
+  slower than eager alone while reading 1.54x more bytes. §3D predicts exactly
+  this shape: "Whole-row assignment avoids waiting for two drives for every row
+  and can improve tail latency; splitting can improve single-row latency.
+  Neither is a universal winner." Our per-row bench measured one row per call
+  (QD1), where splitting wins; production issues many rows per call, where every
+  row waiting on its slowest of two drives may lose. Follow-up, not in this
+  plan: measure whole-row assignment against within-row splitting at active
+  counts 1/2/4/6/8, which is also what settles the §19 anomaly.
+- **§3E (registered buffers, SQPOLL/IOPOLL, NUMA).** Secondary by the handoff's
+  own ordering. One correction worth carrying into Task 2: the general reader
+  already implements registered buffers and READ_FIXED and attempts
+  SINGLE_ISSUER/DEFER_TASKRUN, while the native reader implements neither, so
+  any future work here reuses proven code rather than starting fresh. The NUMA
+  locality check it asks for is cheap and independent; worth doing alongside the
+  §3D measurement.
+
+### Ordering note
+
+The handoff's own implementation order puts stage timing (its item 2) second,
+before everything structural. This plan is its item 1. Item 2 does not block
+Task 1-3 and is independent, but it should land before §3B or §3C are committed
+to, because both are justified only by where the time actually goes.
+
 ## Self-review notes
 
-- Spec coverage: handoff item 1's "native-consumable extent plan" is Task 1,
-  "both paths consume the same validated policy" is Task 1 reusing
-  `SplitPolicy`, "two parts per row need independent CQE accounting ... do not
-  map both parts to an indistinguishable row completion" is Task 2, "extend the
-  same first-open size validation to descriptors actually used by native I/O"
-  is Task 3, and the acceptance evidence in its table row 1 ("Both native graph
-  demand and advisory reads use the intended drives; byte parity") is Task 4.
-- Deliberately NOT in this plan: the handoff's items 3-7 (overlapped packing,
-  raw-row pinned cache, leases, DMA, lookahead). Item 2, stage timing, is worth
-  doing before those, but it is independent of this change and does not block it.
 - The advisory/prefetch path shares `RowReader::read`, so it inherits mirroring
   for free. That is intended; Task 4 Step 1 will see its bytes too.
+- Tasks 1-3 are testable without a GPU. Task 4 is the only one that needs the
+  lock, and its gate is falsifiable: nvme2 falls to roughly zero read volume, or
+  the change did not work.
+- Risk not yet retired: this plan assumes the native reader is the ONLY decode
+  miss path. §19's byte accounting supports that (nvme2 carried 127 GiB with
+  mirrors set, and the arithmetic closes against the baseline), but if some
+  third path reads the source, Task 4 Step 1 will show nvme2 above zero and the
+  cause must be found before the gate is called met.
