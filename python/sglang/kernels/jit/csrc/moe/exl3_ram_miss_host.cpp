@@ -35,6 +35,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sglang {
@@ -44,12 +45,6 @@ using tvm::ffi::TensorView;
 
 constexpr int kBounceRows = 8;
 constexpr unsigned kQueueDepth = 16;
-// A batch prepares at most kBounceRows * parts SQEs and the ring holds
-// kQueueDepth * parts, so io_uring_get_sqe cannot run out. Enforced here rather
-// than by comment: raising kBounceRows past kQueueDepth would otherwise surface
-// as a null-SQE dereference in submit(), at production depth, not at build time.
-static_assert(kBounceRows <= static_cast<int>(kQueueDepth),
-              "a full batch must fit the ring: kBounceRows <= kQueueDepth");
 constexpr int64_t kPage = 4096;
 
 inline int64_t now_ns() {
@@ -222,6 +217,14 @@ struct ReadFault {
   int64_t part = -1;
   int part_error = 0;         // errno that replaces that completion's result
   int64_t part_short = 0;     // >0: that completion reports at most this many bytes (block multiple)
+  // Process each reaped batch of completions back to front. Nothing in the reader may
+  // depend on delivery order, and the kernel gives no ordering guarantee across drives,
+  // so this makes that requirement testable rather than assumed.
+  bool reverse_cqes = false;
+  // >0: cap outstanding reads to this many, below the ring's own depth. Production
+  // constants keep a batch (kBounceRows rows) inside the ring, so credit never binds
+  // there; this makes the refill path reachable from a test without resizing the ring.
+  int64_t max_outstanding = 0;
 };
 
 // io_uring superset reads of whole expert rows into a page-aligned bounce, then the
@@ -336,35 +339,50 @@ class RowReader {
               std::max<int64_t>(0, std::min(extent->length, t_.file_sizes[extent->file] - extent->offset));
         }
       }
-      // SQEs prepared and not yet reaped (in the SQ ring or in the kernel). At most
-      // kBounceRows * parts, and the ring holds kQueueDepth * parts, so io_uring_get_sqe never runs out.
+      // Credit-based preparation. A batch can need more SQEs than the ring holds, so
+      // extents wait in `queue` until a completion frees credit; `pending` counts SQEs
+      // prepared and not yet reaped (in the SQ ring or in the kernel) and never exceeds
+      // `capacity`. Credits are counted by nonempty extents, not by rows, because rows
+      // do not all issue the same number of reads: a root serving none of a row issues
+      // nothing. This is what decouples batch depth (kBounceRows) from ring size.
+      const unsigned capacity =
+          fault_.max_outstanding > 0
+              ? std::min<unsigned>(queue_depth(), static_cast<unsigned>(fault_.max_outstanding))
+              : queue_depth();
       unsigned pending = 0;
-      auto submit = [&](size_t j) -> bool {
-        io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-        // Unreachable while the static_assert above holds. Checked so that a constant
-        // change which breaks that invariant fails the batch cleanly - the caller
-        // drains and returns 0 - instead of writing through a null SQE.
-        if (sqe == nullptr) return false;
-        const int64_t remaining = reads[j]->length - done[j];
-        io_uring_prep_read(
-            sqe, fds_[reads[j]->file], bounce_ + (j / parts) * t_.slot_bytes + reads[j]->dest + done[j],
-            static_cast<unsigned>(remaining), static_cast<uint64_t>(reads[j]->offset + done[j]));
-        io_uring_sqe_set_data64(sqe, j);
-        ++pending;
-        return true;
-      };
-      bool failed = false;
-      // A zero-length extent is a root that serves none of this row: no read, not pending.
+      std::vector<size_t> queue;
+      queue.reserve(count * parts);
+      // A zero-length extent is a root that serves none of this row: no read, not queued.
       for (size_t j = 0; j < count * parts; ++j) {
-        if (reads[j]->length > 0 && !submit(j)) {
-          failed = true;
-          break;
-        }
+        if (reads[j]->length > 0) queue.push_back(j);
       }
+      size_t qhead = 0;
+      bool failed = false;
+      // Prepare as many queued extents as credit and SQ room allow. A null SQE means the
+      // SQ filled before credit ran out: submit what is prepared and come back after the
+      // reap. Retries re-enter through `queue`, so they take credit like any other read.
+      auto refill = [&]() {
+        while (qhead < queue.size() && pending < capacity) {
+          io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+          if (sqe == nullptr) break;
+          const size_t j = queue[qhead++];
+          const int64_t remaining = reads[j]->length - done[j];
+          io_uring_prep_read(
+              sqe, fds_[reads[j]->file], bounce_ + (j / parts) * t_.slot_bytes + reads[j]->dest + done[j],
+              static_cast<unsigned>(remaining), static_cast<uint64_t>(reads[j]->offset + done[j]));
+          io_uring_sqe_set_data64(sqe, j);
+          ++pending;
+        }
+      };
       const bool first_batch = trace != nullptr && trace->batches == 0;
       if (trace) ++trace->batches;
       int64_t submitted = 0, first_seen = 0, last_seen = 0;
       int soft_errors = 0;
+      // Reaped completions, drained before they are processed so the CQ frees early and
+      // a fault can reorder them. Hoisted out of the loop to keep its buffer.
+      std::vector<std::pair<size_t, int>> completions;
+      completions.reserve(count * parts);
+      refill();
       while (!failed && pending > 0) {
         if (trace && submitted == 0) submitted = now_ns();
         const int rc = submit_and_wait();
@@ -384,12 +402,18 @@ class RowReader {
         unsigned head;
         unsigned seen = 0;
         std::vector<size_t> again;  // extents to resubmit
+        completions.clear();
         io_uring_for_each_cqe(&ring_, head, cqe) {
           ++seen;
-          --pending;
+          completions.emplace_back(static_cast<size_t>(io_uring_cqe_get_data64(cqe)), cqe->res);
+        }
+        io_uring_cq_advance(&ring_, seen);
+        pending -= seen;
+        if (fault_.reverse_cqes) std::reverse(completions.begin(), completions.end());
+        for (const auto& completion : completions) {
           // The extent, not the row: two parts of one row complete independently.
-          const size_t j = static_cast<size_t>(io_uring_cqe_get_data64(cqe));
-          int res = cqe->res;
+          const size_t j = completion.first;
+          int res = completion.second;
           ++cqes_;
           if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
           if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(j % parts) == fault_.part) {
@@ -420,18 +444,13 @@ class RowReader {
           // direct read of just this extent. At EOF, done == expected: no resubmit.
           if (done[j] < expected[j]) again.push_back(j);
         }
-        io_uring_cq_advance(&ring_, seen);
         if (trace && seen > 0) {
           if (first_seen == 0) first_seen = returned;
           last_seen = returned;
         }
         if (failed) break;
-        for (size_t j : again) {
-          if (!submit(j)) {
-            failed = true;
-            break;
-          }
-        }
+        for (size_t j : again) queue.push_back(j);
+        refill();
       }
       if (trace) {
         // Bytes the reads returned, also for a batch that failed part way. A zero-length extent
@@ -485,7 +504,10 @@ class RowReader {
   static constexpr int kMaxSoftErrors = 1000;
   static constexpr int kMaxRetries = 8;
 
-  // Room for every extent of a full batch: kBounceRows rows of `parts` extents.
+  // How many reads may be outstanding at once. Credit-based preparation in read() means
+  // this bounds concurrency, not batch size: a batch larger than the ring waits for credit
+  // rather than overrunning it. Scaled by parts so splitting a row across roots does not
+  // halve the number of rows in flight.
   unsigned queue_depth() const { return kQueueDepth * static_cast<unsigned>(t_.parts); }
 
   int submit_and_wait() {
@@ -610,7 +632,8 @@ int64_t exl3_ram_miss_read_rows_traced(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_traced, exl3_ram_miss_read_rows_traced);
 
 // Test only: one reader reads `experts` into `slots` with `fault` injected
-// ([submit_error, submit_call, submit_first, cqe_error, cqe_call, part, part_error, part_short]),
+// ([submit_error, submit_call, submit_first, cqe_error, cqe_call, part, part_error, part_short,
+// reverse_cqes, max_outstanding]),
 // then reads `then_experts` into `then_slots` with no fault. Results go to `results[0..3]`: the two
 // reads' results, then the completions the reader had reaped after each.
 void exl3_ram_miss_read_rows_faulted(
@@ -640,7 +663,8 @@ void exl3_ram_miss_read_rows_faulted(
   }
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   reader.set_fault(
-      ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4], f[5], static_cast<int>(f[6]), f[7]});
+      ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4], f[5], static_cast<int>(f[6]), f[7],
+                f[8] != 0, f[9]});
   const auto never = [] { return false; };
   out[0] = reader.read(row, ids_of(experts), slots_of(slots), kBounceRows, never);
   out[2] = reader.cqes();

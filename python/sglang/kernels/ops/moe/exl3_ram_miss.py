@@ -126,6 +126,8 @@ def read_rows_with_fault(
     part: int = -1,
     part_error: int = 0,
     part_short: int = 0,
+    reverse_cqes: bool = False,
+    max_outstanding: int = 0,
     cqes: Optional[list[int]] = None,
 ) -> tuple[int, int]:
     """Test only: on one C++ reader, read with an injected io_uring fault, then read cleanly.
@@ -134,13 +136,30 @@ def read_rows_with_fault(
     (after submitting the prepared reads when ``submit_first``); ``cqe_error`` replaces the
     ``cqe_call``-th completion's result. ``part`` (a part index) targets the first completion of a
     part-``part`` extent: ``part_error`` (an errno) replaces its result, ``part_short`` (a block
-    multiple) caps the bytes it reports, so only that extent is resubmitted. Returns both reads'
-    results (1 ok, 0 failed); ``cqes``, if given, receives the completions reaped after each read.
+    multiple) caps the bytes it reports, so only that extent is resubmitted. ``reverse_cqes``
+    processes each reaped batch of completions back to front, which must not change any result:
+    the reader keys every extent by its own ``user_data`` and the kernel orders nothing.
+    ``max_outstanding`` caps outstanding reads below the ring's depth, so a batch needs several
+    refill rounds; production constants keep a batch inside the ring, so credit never binds
+    there. Returns
+    both reads' results (1 ok, 0 failed); ``cqes``, if given, receives the completions reaped
+    after each read.
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = torch.tensor(
-        [submit_error, submit_call, int(submit_first), cqe_error, cqe_call, part, part_error, part_short],
+        [
+            submit_error,
+            submit_call,
+            int(submit_first),
+            cqe_error,
+            cqe_call,
+            part,
+            part_error,
+            part_short,
+            int(reverse_cqes),
+            max_outstanding,
+        ],
         dtype=torch.int64,
     )
     results = torch.zeros(4, dtype=torch.int64)

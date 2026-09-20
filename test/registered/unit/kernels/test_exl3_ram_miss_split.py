@@ -159,6 +159,60 @@ def test_a_full_batch_of_three_part_rows_fits_the_ring(tmp_path):
     _assert_rows(s, 1, experts, slots)
 
 
+@pytest.mark.parametrize("credit", [1, 3, 5])
+def test_a_batch_needing_more_reads_than_its_credit_completes_through_refill(tmp_path, credit):
+    # 8 rows x 2 parts = 16 extents, prepared a few at a time. Production constants keep a
+    # batch inside the ring (kBounceRows rows against a kQueueDepth * parts ring), so credit
+    # never binds there; capping it is the only way to reach the refill path. A credit of 1
+    # serialises the batch completely.
+    # Slots 8 and 9 hold the clean follow-up read: it must not overwrite what is asserted.
+    s = ram_miss_setup(tmp_path, capacity=10, experts=8, mirror_weights=(1.0, 1.0))
+    cqes = []
+    first, then = list(range(8)), [5, 4]
+    assert ops.read_rows_with_fault(
+        s.tables, 1, first, list(range(8)), then, [8, 9], direct=False,
+        max_outstanding=credit, cqes=cqes,
+    ) == (1, 1)
+    # Every extent still reads exactly once, however few were in flight at a time.
+    assert cqes[0] == 16
+    _assert_rows(s, 1, first, list(range(8)))
+    _assert_rows(s, 1, then, [8, 9])
+
+
+@pytest.mark.parametrize("credit", [0, 3])
+def test_completions_processed_back_to_front_land_the_same_bytes(tmp_path, credit):
+    # Nothing in the reader may depend on the order completions arrive: each extent is keyed
+    # by its own user_data and carries its own done/expected/retries. The kernel gives no
+    # ordering guarantee across drives, so reversing each reaped batch must change nothing.
+    # This cannot force a reap to return more than one completion, so it is a necessary
+    # check rather than a proof that reordering was exercised on every run.
+    s = ram_miss_setup(tmp_path, capacity=10, experts=8, mirror_weights=(1.0, 1.0))
+    cqes = []
+    first, then = list(range(8)), [5, 4]
+    assert ops.read_rows_with_fault(
+        s.tables, 1, first, list(range(8)), then, [8, 9], direct=False,
+        reverse_cqes=True, max_outstanding=credit, cqes=cqes,
+    ) == (1, 1)
+    assert cqes[0] == 16
+    _assert_rows(s, 1, first, list(range(8)))
+    _assert_rows(s, 1, then, [8, 9])
+
+
+@pytest.mark.parametrize("part", [0, 1])
+def test_a_short_read_resubmits_its_own_extent_under_reversed_completions(tmp_path, part):
+    # A retry re-enters through the credit queue, so it takes credit like any other read.
+    # Reversing delivery must not misattribute the short completion to another extent.
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    cqes = []
+    assert ops.read_rows_with_fault(
+        s.tables, 1, [0, 1, 2], [0, 1, 2], [5], [3], direct=False,
+        part=part, part_short=PAGE, reverse_cqes=True, max_outstanding=2, cqes=cqes,
+    ) == (1, 1)
+    assert cqes[0] == 7  # 6 extents, one completing twice
+    _assert_rows(s, 1, [0, 1, 2], [0, 1, 2])
+    _assert_rows(s, 1, [5], [3])
+
+
 @pytest.mark.parametrize("weights, extents_per_row", [((1.0, 1.0), 2), ((1.0, 0.0), 1), ((0.0, 1.0), 1)])
 def test_a_zero_length_part_issues_no_read(tmp_path, weights, extents_per_row):
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=weights)
