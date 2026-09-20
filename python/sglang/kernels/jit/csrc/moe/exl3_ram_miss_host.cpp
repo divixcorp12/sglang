@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -50,6 +51,54 @@ inline int64_t now_ns() {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
+
+constexpr int kMaxDrives = 4;
+
+// One request's stage record, written only when the stage trace is on. Fixed size and int64
+// words only, so it is copied out to Python as a row of a torch int64 tensor: keep
+// STAGE_FIELDS in ops/moe/exl3_ram_miss.py in step. Every time is now_ns(), CLOCK_MONOTONIC on
+// the host; a stage the request never reached stays 0. Nothing here is a GPU timestamp.
+//
+// The stamps below submit..last_cqe and pack_start are the FIRST io_uring batch's (a request
+// spans several only past kBounceRows rows, or one row at a time for an advisory); pack_end is
+// the LAST batch's. So observed <= reserved <= submit <= first_cqe <= last_cqe <= pack_start <=
+// pack_end <= mapped <= done, and the *_ns sums cover every batch: they are what a decomposition
+// of observed..done adds up.
+struct StageRecord {
+  int64_t seq = 0;
+  int64_t kind = 0;  // kStageDemand, kStageAdvisory, kStageTouch
+  int64_t row = 0;   // streamed row (index into the layer ids), not the layer id
+  int64_t ok = 0;
+  int64_t rows = 0;     // rows read
+  int64_t batches = 0;  // io_uring batches the read used
+  int64_t backlog = 0;  // records already posted behind this one when the service saw it
+  int64_t prev_done = 0;  // `done` of the request served just before this one (0: the first)
+  int64_t observed = 0;   // the service saw the record posted (first poll that found it)
+  int64_t reserved = 0;   // slots reserved under the tier mutex
+  int64_t submit = 0;     // just before the first io_uring submit-and-wait
+  int64_t first_cqe = 0;  // the wait that returned the first completion, returned
+  int64_t last_cqe = 0;   // the wait that returned the last completion, returned
+  int64_t pack_start = 0;
+  int64_t pack_end = 0;
+  int64_t mapped = 0;  // slots marked READY and slot-map entries published
+  int64_t done = 0;    // completion word stored: the device's wait can release
+  int64_t submit_to_first_cqe_ns = 0;  // summed over batches
+  int64_t first_to_last_cqe_ns = 0;
+  int64_t pack_ns = 0;
+  int64_t bytes = 0;    // bytes the reads returned, summed over drives
+  int64_t extents = 0;  // reads issued: one per row and root with a non-empty part
+  int64_t drive_dev[kMaxDrives] = {};  // st_dev of the drive's filesystem; -1 folds several drives
+  int64_t drive_bytes[kMaxDrives] = {};
+  int64_t drive_extents[kMaxDrives] = {};
+};
+static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
+// A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
+inline int64_t stage_words() {
+  return sizeof(StageRecord) / sizeof(int64_t);
+}
+constexpr int64_t kStageDemand = 0;
+constexpr int64_t kStageAdvisory = 1;
+constexpr int64_t kStageTouch = 2;
 
 struct Segment {
   int64_t name;
@@ -188,6 +237,16 @@ class RowReader {
         return false;
       }
       fds_.push_back(fd);
+      struct stat st;
+      const int64_t dev = fstat(fd, &st) == 0 ? static_cast<int64_t>(st.st_dev) : -1;
+      size_t drive = 0;
+      while (drive < devs_.size() && devs_[drive] != dev) ++drive;
+      if (drive == devs_.size()) devs_.push_back(dev);
+      file_drive_.push_back(static_cast<uint8_t>(std::min<size_t>(drive, kMaxDrives - 1)));
+    }
+    for (size_t drive = 0; drive < devs_.size(); ++drive) {
+      const size_t slot = std::min<size_t>(drive, kMaxDrives - 1);
+      drive_dev_[slot] = drive < kMaxDrives ? devs_[drive] : -1;
     }
     if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceRows * t_.slot_bytes)) != 0) {
       bounce_ = nullptr;
@@ -203,6 +262,10 @@ class RowReader {
   // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned.
   // Every return leaves the ring empty: nothing in flight, nothing prepared (I1).
   //
+  // `trace`, when not null, receives this read's stage stamps and per-drive bytes (StageRecord).
+  // Null costs a branch per batch and no clock read; the stamps only read the clock and add to
+  // `trace`, so they cannot change what is submitted, reaped, drained or copied.
+  //
   // This is the hot path and checks nothing: `row`, `experts` and `slots` must be in
   // range and `experts.size() == slots.size()`. The service (Task 11) and
   // read_rows_once (Python) validate at their boundaries.
@@ -211,7 +274,8 @@ class RowReader {
       const std::vector<int32_t>& experts,
       const std::vector<int64_t>& slots,
       size_t step,
-      const std::function<bool()>& abandon) {
+      const std::function<bool()>& abandon,
+      StageRecord* trace = nullptr) {
     if (!ring_ready_) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     for (size_t first = 0; first < experts.size(); first += step) {
@@ -248,9 +312,13 @@ class RowReader {
       for (size_t j = 0; j < count * parts; ++j) {
         if (reads[j]->length > 0) submit(j);
       }
+      const bool first_batch = trace != nullptr && trace->batches == 0;
+      if (trace) ++trace->batches;
+      int64_t submitted = 0, first_seen = 0, last_seen = 0;
       bool failed = false;
       int soft_errors = 0;
       while (pending > 0) {
+        if (trace && submitted == 0) submitted = now_ns();
         const int rc = submit_and_wait();
         if (rc < 0) {
           // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
@@ -263,6 +331,7 @@ class RowReader {
         } else {
           soft_errors = 0;
         }
+        const int64_t returned = trace ? now_ns() : 0;
         io_uring_cqe* cqe;
         unsigned head;
         unsigned seen = 0;
@@ -304,13 +373,40 @@ class RowReader {
           if (done[j] < expected[j]) again.push_back(j);
         }
         io_uring_cq_advance(&ring_, seen);
+        if (trace && seen > 0) {
+          if (first_seen == 0) first_seen = returned;
+          last_seen = returned;
+        }
         if (failed) break;
         for (size_t j : again) submit(j);
+      }
+      if (trace) {
+        // Bytes the reads returned, also for a batch that failed part way. A zero-length extent
+        // issued no read: it is not an extent here and lands on no drive.
+        for (size_t j = 0; j < count * parts; ++j) {
+          if (reads[j]->length == 0) continue;
+          const size_t drive = file_drive_[reads[j]->file];
+          trace->drive_dev[drive] = drive_dev_[drive];
+          trace->drive_bytes[drive] += done[j];
+          trace->drive_extents[drive] += 1;
+          trace->bytes += done[j];
+          trace->extents += 1;
+        }
+        if (first_batch) {
+          trace->submit = submitted;
+          trace->first_cqe = first_seen;
+          trace->last_cqe = last_seen;
+        }
+        if (first_seen != 0) {
+          trace->submit_to_first_cqe_ns += first_seen - submitted;
+          trace->first_to_last_cqe_ns += last_seen - first_seen;
+        }
       }
       if (failed) {
         drain(pending);
         return 0;
       }
+      const int64_t pack_start = trace ? now_ns() : 0;
       for (size_t i = 0; i < count; ++i) {
         // The row's parts landed contiguously, so its segments split from one base.
         const uint8_t* base =
@@ -321,6 +417,12 @@ class RowReader {
               t_.slabs[row][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
               static_cast<size_t>(segment.bytes));
         }
+      }
+      if (trace) {
+        const int64_t pack_end = now_ns();
+        if (first_batch) trace->pack_start = pack_start;
+        trace->pack_end = pack_end;
+        trace->pack_ns += pack_end - pack_start;
       }
     }
     return 1;
@@ -372,6 +474,9 @@ class RowReader {
   uint8_t* bounce_ = nullptr;
   io_uring ring_{};
   bool ring_ready_ = false;
+  std::vector<int64_t> devs_;       // st_dev of each distinct filesystem, in first-opened order
+  std::vector<uint8_t> file_drive_;  // per file: its drive slot in a StageRecord
+  int64_t drive_dev_[kMaxDrives] = {};
   ReadFault fault_{};
   int64_t submits_ = 0;
   int64_t cqes_ = 0;
@@ -414,6 +519,40 @@ int64_t exl3_ram_miss_read_rows(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows, exl3_ram_miss_read_rows);
+
+// Test only: exl3_ram_miss_read_rows with the reader's StageRecord copied to `record`
+// (stage_words() int64), with `ok` set from the result. `fault` is the faulted call's tensor; a
+// zero tensor injects nothing.
+int64_t exl3_ram_miss_read_rows_traced(
+    TensorView extents,
+    TensorView starts,
+    TensorView file_sizes,
+    TensorView segments,
+    TensorView slabs,
+    TensorView row_bytes,
+    std::string paths,
+    int64_t slot_bytes,
+    int64_t direct,
+    int64_t row,
+    TensorView experts,
+    TensorView slots,
+    int64_t step,
+    TensorView fault,
+    TensorView record) {
+  using namespace exl3_ram_miss;
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, slot_bytes), direct != 0);
+  if (!reader.open()) return 0;
+  const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+  reader.set_fault(ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4]});
+  StageRecord stage;
+  const int result =
+      reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; }, &stage);
+  stage.ok = result == 1 ? 1 : 0;
+  std::memcpy(record.data_ptr(), &stage, sizeof(stage));
+  return result;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_traced, exl3_ram_miss_read_rows_traced);
 
 // Test only: one reader reads `experts` into `slots` with `fault` injected
 // ([submit_error, submit_call, submit_first, cqe_error, cqe_call, part, part_error, part_short]),
@@ -560,6 +699,44 @@ inline bool listed(const std::vector<int32_t>& ids, int32_t id) {
   return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
+// Fixed-capacity single-producer single-consumer queue of stage records: the service thread
+// pushes and drops (counted) when full, one Python caller at a time drains. Allocated once, when
+// the trace is enabled; a push copies a record into a preallocated slot and allocates nothing.
+class StageRing {
+ public:
+  explicit StageRing(size_t capacity) : slots_(capacity) {}
+
+  void push(const StageRecord& record) {
+    const uint64_t head = head_.load(std::memory_order_relaxed);
+    if (head - tail_.load(std::memory_order_acquire) >= slots_.size()) {
+      dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    slots_[head % slots_.size()] = record;
+    head_.store(head + 1, std::memory_order_release);
+  }
+
+  int64_t drain(StageRecord* out, int64_t max) {
+    const uint64_t head = head_.load(std::memory_order_acquire);
+    uint64_t tail = tail_.load(std::memory_order_relaxed);
+    int64_t count = 0;
+    while (tail < head && count < max)
+      out[count++] = slots_[tail++ % slots_.size()];
+    tail_.store(tail, std::memory_order_release);
+    return count;
+  }
+
+  int64_t dropped() const {
+    return dropped_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::vector<StageRecord> slots_;
+  std::atomic<uint64_t> head_{0};
+  std::atomic<uint64_t> tail_{0};
+  std::atomic<int64_t> dropped_{0};
+};
+
 struct Tier {
   int64_t capacity = 0;
   std::vector<int32_t> slot_to_expert;
@@ -634,6 +811,7 @@ class RamTier {
   bool pump_demand() {
     const uint32_t head = load_acquire(page_ + kDemandHead);
     if (head == 0 || !reached(head, next_demand_)) return false;
+    begin_stage(kStageDemand, next_demand_, head - next_demand_);
     if (head - next_demand_ >= kDemandRecords) {
       // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq.
       counters_[kOverruns].fetch_add(head - next_demand_ - (kDemandRecords - 2));
@@ -648,6 +826,7 @@ class RamTier {
     }
     _mm_sfence();
     store_release(page_ + kDemandDone, next_demand_);
+    end_stage();
     next_demand_ += 1u;
     return true;
   }
@@ -656,6 +835,7 @@ class RamTier {
   bool pump_advice() {
     const uint32_t head = load_acquire(page_ + kAdviseHead);
     if (head == 0 || !reached(head, next_advice_)) return false;
+    begin_stage(kStageAdvisory, next_advice_, head - next_advice_);
     if (head - next_advice_ >= kAdviseRecords) {
       counters_[kAdvisoriesSkipped].fetch_add(head - next_advice_ - (kAdviseRecords - 2));
       next_advice_ = head - kAdviseRecords + 2u;
@@ -668,6 +848,7 @@ class RamTier {
                        reached(load_acquire(page_ + kDemandHead), request.after + 1u) ||
                        load_acquire(page_ + kFatal) != 0 || pause_requested_.load();
     if (stale) {
+      cur_ = nullptr;  // a skipped advisory is no service: no stage record
       counters_[kAdvisoriesSkipped].fetch_add(1);
     } else {
       in_advice_.store(true);
@@ -681,8 +862,32 @@ class RamTier {
       in_advice_.store(false);
     }
     store_release(page_ + kAdviseDone, next_advice_);
+    end_stage();
     next_advice_ += 1u;
     return true;
+  }
+
+  // ---- Stage trace: one StageRecord per served request, drained by Python ----
+
+  // Allocates the ring, then turns the trace on. Before the service thread starts, so the flag
+  // never flips under a request being served.
+  void enable_trace(size_t capacity) {
+    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: enable the stage trace before the service thread starts");
+    std::lock_guard<std::mutex> guard(trace_mutex_);
+    ring_ = std::make_unique<StageRing>(capacity);
+    trace_on_.store(true, std::memory_order_release);
+  }
+
+  // Up to `max` records into `out` (stage_words() int64 each); returns how many. The count of records
+  // dropped for a full ring is `trace_dropped()`.
+  int64_t drain_trace(StageRecord* out, int64_t max) {
+    std::lock_guard<std::mutex> guard(trace_mutex_);
+    return ring_ ? ring_->drain(out, max) : 0;
+  }
+
+  int64_t trace_dropped() {
+    std::lock_guard<std::mutex> guard(trace_mutex_);
+    return ring_ ? ring_->dropped() : 0;
   }
 
   // ---- Python-facing bookkeeping; eager callers pause the thread first (Task 12) ----
@@ -787,6 +992,31 @@ class RamTier {
   }
 
  private:
+  // Called the moment a posted record is found. With the trace off this is one relaxed load and
+  // no clock read; requests are served one at a time, so one member record serves them all.
+  void begin_stage(int64_t kind, uint32_t seq, uint32_t backlog) {
+    if (!trace_on_.load(std::memory_order_relaxed)) {
+      cur_ = nullptr;
+      return;
+    }
+    const int64_t observed = now_ns();
+    stage_ = StageRecord{};
+    stage_.observed = observed;
+    stage_.kind = kind;
+    stage_.seq = seq;
+    stage_.backlog = backlog;
+    stage_.prev_done = last_done_;
+    cur_ = &stage_;
+  }
+
+  void end_stage() {
+    if (cur_ == nullptr) return;
+    cur_->done = now_ns();
+    last_done_ = cur_->done;
+    ring_->push(*cur_);
+    cur_ = nullptr;
+  }
+
   void publish_map(int64_t row, int64_t expert, int32_t slot) {
     __atomic_store_n(map_ + row * experts_ + expert, slot, __ATOMIC_RELEASE);
   }
@@ -908,6 +1138,7 @@ class RamTier {
         slots.clear();
       }
     }
+    if (cur_) cur_->reserved = now_ns();
     if (ok && !missing.empty()) {
       const int64_t delay = delay_ns_.load();
       if (delay > 0 && (advisory || demands_read_ >= delay_after_.load())) {
@@ -917,9 +1148,13 @@ class RamTier {
         counters_[kReadErrors].fetch_add(1);
         ok = false;
       } else {
-        const int result = reader_.read(request.row, missing, slots, advisory ? 1 : kBounceRows, [&] {
-          return advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load());
-        });
+        const int result = reader_.read(
+            request.row,
+            missing,
+            slots,
+            advisory ? 1 : kBounceRows,
+            [&] { return advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load()); },
+            cur_);
         if (result == 0) counters_[kReadErrors].fetch_add(1);
         ok = result == 1;
       }
@@ -943,6 +1178,12 @@ class RamTier {
         counters_[kVersion].fetch_add(1);
       }
     }
+    if (cur_) {
+      cur_->mapped = now_ns();
+      cur_->row = request.row;
+      cur_->ok = ok ? 1 : 0;
+      cur_->rows = ok ? static_cast<int64_t>(slots.size()) : 0;
+    }
     if (ok) {
       *rows = static_cast<int64_t>(slots.size());
       counters_[kRowsRead].fetch_add(*rows);
@@ -957,6 +1198,11 @@ class RamTier {
     if (load_acquire(page_ + kFatal) != 0) counters_[kLateAfterFatal].fetch_add(1);
     int64_t rows = 0;
     const bool ok = request.armed ? serve(request, false, &rows) : touch_request(request);
+    if (cur_ && !request.armed) {
+      cur_->kind = kStageTouch;
+      cur_->row = request.row;
+      cur_->ok = ok ? 1 : 0;
+    }
     // Classified by what was read: an empty need whose protect ids had to be read is D12's race.
     if (ok) counters_[rows == 0 ? kTouchOnly : kServedRequests].fetch_add(1);
     _mm_sfence();
@@ -986,6 +1232,13 @@ class RamTier {
   std::atomic<int64_t> delay_after_{0};
   std::atomic<bool> fail_reads_{false};
   std::atomic<int64_t> counters_[kCounterCount];
+  // Stage trace. cur_ points at stage_ while a traced request is in service, else null.
+  std::atomic<bool> trace_on_{false};
+  std::mutex trace_mutex_;  // guards ring_ against a drain racing enable_trace
+  std::unique_ptr<StageRing> ring_;
+  StageRecord stage_{};
+  StageRecord* cur_ = nullptr;
+  int64_t last_done_ = 0;
 };
 
 inline std::mutex& registry_mutex() {
@@ -1095,6 +1348,25 @@ void exl3_ram_miss_counters(int64_t handle, TensorView out) {
 
 void exl3_ram_miss_layer_rows(int64_t handle, int64_t advisory, TensorView out) {
   exl3_ram_miss::find(handle)->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
+}
+
+int64_t exl3_ram_miss_trace_words() {
+  return exl3_ram_miss::stage_words();
+}
+
+void exl3_ram_miss_trace_enable(int64_t handle, int64_t capacity) {
+  if (capacity <= 0) throw std::runtime_error("exl3 RAM miss: the stage trace needs a positive capacity");
+  exl3_ram_miss::find(handle)->enable_trace(static_cast<size_t>(capacity));
+}
+
+// Fills up to out.size(0) records, stage_words() int64 each; returns the count.
+int64_t exl3_ram_miss_trace_drain(int64_t handle, TensorView out) {
+  return exl3_ram_miss::find(handle)->drain_trace(
+      static_cast<exl3_ram_miss::StageRecord*>(out.data_ptr()), out.size(0));
+}
+
+int64_t exl3_ram_miss_trace_dropped(int64_t handle) {
+  return exl3_ram_miss::find(handle)->trace_dropped();
 }
 
 // ---- Host-side simulated device: the post and wait kernels' protocol, for CPU tests ----
@@ -1226,6 +1498,10 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_hot, exl3_ram_miss_set_hot);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject, exl3_ram_miss_inject);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_counters, exl3_ram_miss_counters);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_layer_rows, exl3_ram_miss_layer_rows);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_words, exl3_ram_miss_trace_words);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_enable, exl3_ram_miss_trace_enable);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_drain, exl3_ram_miss_trace_drain);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_dropped, exl3_ram_miss_trace_dropped);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_post, exl3_ram_miss_sim_post);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_wait, exl3_ram_miss_sim_wait);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_seqlock_stress, exl3_ram_miss_seqlock_stress);

@@ -2,12 +2,14 @@
 
 import errno
 import os
+import shutil
+import tempfile
 
 import pytest
 import torch
 
 from sglang.kernels.ops.moe import exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import read_rows_once
+from sglang.kernels.ops.moe.exl3_ram_miss import STAGE_ORDER, read_rows_once, read_rows_traced
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -216,6 +218,114 @@ def test_tables_keep_their_slabs_alive(tmp_path):
     s = ram_miss_setup(tmp_path)
     kept = {id(t) for t in s.tables.keepalive}
     assert all(id(s.slabs[layer][name]) in kept for layer in s.slabs for name in EXL3_STREAMED_NAMES)
+
+
+def _bytes_read(s, layer, experts):
+    """What the reader must read for ``experts``: each row's aligned length, cut at its file's end."""
+    total = 0
+    for expert in experts:
+        for part in range(s.tables.parts):
+            file, offset, length, _ = (int(v) for v in s.tables.extents[layer, expert, part])
+            if length:  # an empty part reads nothing, wherever its offset points
+                total += min(length, int(s.tables.file_sizes[file]) - offset)
+    return total
+
+
+def _assert_stages_ordered(record, reached=STAGE_ORDER[2:7]):
+    stamps = [record[name] for name in reached]
+    assert all(stamp > 0 for stamp in stamps), record
+    assert stamps == sorted(stamps), record
+
+
+def test_a_read_records_its_stages_and_bytes(tmp_path):
+    s = ram_miss_setup(tmp_path)
+    experts, slots = [5, 0, 2], [1, 2, 0]
+    result, record = read_rows_traced(s.tables, 1, experts, slots, direct=False)
+    assert result == 1 and record["ok"] == 1
+    _assert_stages_ordered(record)
+    assert record["batches"] == 1 and record["extents"] == 3
+    expected = _bytes_read(s, 1, experts)
+    assert record["bytes"] == expected
+    assert sum(drive["bytes"] for drive in record["drives"]) == expected
+    assert sum(drive["extents"] for drive in record["drives"]) == 3
+    # One filesystem holds the whole fake checkpoint: one drive, named by its st_dev.
+    assert [drive["dev"] for drive in record["drives"]] == [os.stat(s.tables.paths[0]).st_dev]
+    assert record["submit_to_first_cqe_ns"] >= 0 and record["first_to_last_cqe_ns"] >= 0 and record["pack_ns"] > 0
+    assert record["pack_end"] - record["pack_start"] == record["pack_ns"]  # one batch
+
+
+def test_a_read_over_several_batches_sums_them(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=12, experts=12)
+    experts = list(range(11))[::-1]
+    result, record = read_rows_traced(s.tables, 1, experts, list(range(11)), direct=False)
+    assert result == 1 and record["batches"] == 2 and record["extents"] == 11
+    _assert_stages_ordered(record)  # the first batch's stamps, pack_end the last batch's
+    assert record["bytes"] == _bytes_read(s, 1, experts)
+    assert sum(drive["bytes"] for drive in record["drives"]) == record["bytes"]
+    # pack_ns adds both batches' packing, which the first-to-last span of the stamps includes.
+    assert 0 < record["pack_ns"] <= record["pack_end"] - record["pack_start"]
+
+
+def test_a_traced_read_moves_the_same_bytes_as_an_untraced_one(tmp_path):
+    s = ram_miss_setup(tmp_path)
+    assert read_rows_traced(s.tables, 1, [5, 0, 2], [1, 2, 0], direct=False)[0] == 1
+    _assert_rows(s, 1, [5, 0, 2], [1, 2, 0])
+
+
+def test_mirrored_reads_are_accounted_per_drive(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    # Move root 1's copy onto another filesystem (tmpfs /dev/shm), so the two parts are two drives.
+    shm = tempfile.mkdtemp(dir="/dev/shm")
+    try:
+        for index, path in enumerate(s.tables.paths):
+            if index % s.tables.parts == 1:
+                moved = os.path.join(shm, f"{index}_{os.path.basename(path)}")
+                shutil.copy(path, moved)
+                s.tables.paths[index] = moved
+        if len({os.stat(path).st_dev for path in s.tables.paths}) < 2:
+            pytest.skip("/dev/shm is on the same filesystem as the checkpoint")
+        experts = [0, 1, 2]
+        result, record = read_rows_traced(s.tables, 1, experts, [0, 1, 2], direct=False)
+        assert result == 1
+        assert record["extents"] == 6 and len(record["drives"]) == 2
+        assert {d["dev"] for d in record["drives"]} == {os.stat(p).st_dev for p in s.tables.paths}
+        assert [d["extents"] for d in record["drives"]] == [3, 3]
+        assert sum(d["bytes"] for d in record["drives"]) == record["bytes"] == _bytes_read(s, 1, experts)
+        assert all(d["bytes"] > 0 for d in record["drives"])
+    finally:
+        shutil.rmtree(shm, ignore_errors=True)
+
+
+def test_an_empty_part_is_not_an_extent_and_reads_no_drive(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 0.0))
+    result, record = read_rows_traced(s.tables, 1, [0, 1, 2], [0, 1, 2], direct=False)
+    assert result == 1 and record["extents"] == 3
+    assert sum(d["bytes"] for d in record["drives"]) == record["bytes"] == _bytes_read(s, 1, [0, 1, 2])
+
+
+# A retried or resubmitted read must count each byte once; a hard error leaves a partial, consistent record.
+@pytest.mark.parametrize(
+    "fault, result",
+    [
+        (dict(cqe_error=errno.EAGAIN, cqe_call=2), 1),
+        (dict(cqe_error=errno.EINTR, cqe_call=1), 1),
+        (dict(submit_error=errno.EINTR, submit_call=1, submit_first=True), 1),
+        (dict(cqe_error=errno.EIO, cqe_call=1), 0),
+        (dict(submit_error=errno.EIO, submit_call=1, submit_first=True), 0),
+    ],
+)
+def test_a_fault_leaves_a_consistent_record(tmp_path, fault, result):
+    s = ram_miss_setup(tmp_path)
+    experts = [0, 1, 2]
+    got, record = read_rows_traced(s.tables, 1, experts, [0, 1, 2], direct=False, **fault)
+    assert got == result and record["ok"] == result
+    assert record["bytes"] == sum(drive["bytes"] for drive in record["drives"])
+    if result == 1:
+        assert record["bytes"] == _bytes_read(s, 1, experts)
+        _assert_stages_ordered(record)
+    else:
+        assert record["bytes"] <= _bytes_read(s, 1, experts)
+        assert record["pack_start"] == 0 and record["pack_end"] == 0  # nothing was packed
 
 
 if __name__ == "__main__":

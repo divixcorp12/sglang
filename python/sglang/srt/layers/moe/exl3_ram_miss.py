@@ -329,6 +329,8 @@ class Exl3RamMissService:
         self._pause_depth = 0
         self._trace_rows: Optional[list[int]] = None
         self._trace_graph: Optional[list[int]] = None
+        self._stages_traced = False  # the host records a stage line per request (trace runs only)
+        self._stages_dropped = 0
         # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
         self.routed_rows_per_step = 0
         self._shut_down = False
@@ -365,6 +367,11 @@ class Exl3RamMissService:
         slot_map = slot_map.pin_memory() if pin else slot_map
         host = Exl3RamMissHost(tables, page=page, slot_map=slot_map, direct=fmt._resolve_direct())
         try:
+            from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+            if get_exl3_stream_trace().enabled:
+                host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
+                self._stages_traced = True
             host.start_thread(fatal_wait_s=watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get()))
             fault = parse_fault(envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get())
             if fault is not None:
@@ -448,6 +455,21 @@ class Exl3RamMissService:
                 f"(thread {self.host.counters()}); fail-stop"
             )
         self._trace_step()
+        self._trace_stages()
+
+    def _trace_stages(self) -> None:
+        """The stage records the service produced since the last check, into the stream trace."""
+        if not self._stages_traced:
+            return
+        from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+        get_exl3_stream_trace().record_ram_miss_requests(
+            self.host.drain_trace(), sorted(self._rows, key=self._rows.__getitem__)
+        )
+        dropped = self.host.trace_dropped()
+        if dropped > self._stages_dropped:
+            logger.warning("exl3 RAM miss: %d stage records dropped (ring full)", dropped - self._stages_dropped)
+            self._stages_dropped = dropped
 
     def _graph_rows(self) -> Optional[list[int]]:
         """Routed rows and routed misses of every decode graph gather so far, from the

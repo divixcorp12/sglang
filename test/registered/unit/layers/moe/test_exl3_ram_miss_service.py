@@ -378,3 +378,22 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    sent = []
+    trace = SimpleNamespace(enabled=True, record_ram_miss_requests=lambda records, layer_ids: sent.append((records, layer_ids)))
+    monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
+    drained = []
+    service = module.Exl3RamMissService()
+    service._rows = {7: 0, 3: 1}  # layer id -> row
+    service.host = SimpleNamespace(
+        drain_trace=lambda: drained.append(1) or [{"row": 1}], trace_dropped=lambda: 0
+    )
+    service._trace_stages()  # not enabled on the host: it must not even drain
+    assert drained == [] and sent == []
+    service._stages_traced = True
+    service._trace_stages()
+    assert sent == [([{"row": 1}], [7, 3])]

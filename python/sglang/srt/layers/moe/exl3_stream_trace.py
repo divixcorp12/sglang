@@ -159,6 +159,47 @@ class Exl3StreamTrace:
                 line["thread"] = thread
             self._file.write(json.dumps(line) + "\n")
 
+    def record_ram_miss_requests(self, records: list[dict], layer_ids: list[int]) -> None:
+        """One line per RAM-miss request the native service served, from ``Exl3RamMissHost.drain_trace``.
+
+        ``layer_ids[row]`` names each record's streamed row. The line is not a forward call: it has
+        no ``tokens``, and ``kind`` is ``ram_miss_request`` (tier_sim.load_trace skips it). Every
+        ``stages_ns`` value and ``prev_done_ns`` is the host's CLOCK_MONOTONIC in ns, which is what
+        ``t`` (``time.monotonic()``) reads too; 0 is a stage the request never reached. Nothing here
+        compares a GPU clock with the host's. The stamps below ``submit`` are the first io_uring
+        batch's and ``pack_end`` the last's; ``spans_ns`` sums every batch (see StageRecord).
+        """
+        if self._file is None or not records:
+            return
+        from sglang.kernels.ops.moe.exl3_ram_miss import STAGE_ORDER
+
+        for record in records:
+            line = {
+                "forward": self.forwards,
+                "layer": layer_ids[record["row"]],
+                "kind": "ram_miss_request",
+                "request": {
+                    "seq": record["seq"],
+                    "type": record["kind"],
+                    "ok": record["ok"],
+                    "rows": record["rows"],
+                    "batches": record["batches"],
+                    "backlog": record["backlog"],
+                },
+                "stages_ns": {name: record[name] for name in STAGE_ORDER},
+                "prev_done_ns": record["prev_done"],
+                "spans_ns": {
+                    "submit_to_first_cqe": record["submit_to_first_cqe_ns"],
+                    "first_to_last_cqe": record["first_to_last_cqe_ns"],
+                    "pack": record["pack_ns"],
+                },
+                "bytes": record["bytes"],
+                "extents": record["extents"],
+                "drives": record["drives"],
+                "t": round(time.monotonic(), 6),
+            }
+            self._file.write(json.dumps(line) + "\n")
+
     def stats(self) -> dict:
         return {
             "forwards": self.forwards,

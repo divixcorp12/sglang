@@ -80,6 +80,34 @@ def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int 
     )
 
 
+def read_rows_traced(
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    direct: bool,
+    step: int = BOUNCE_ROWS,
+    submit_error: int = 0,
+    submit_call: int = 0,
+    submit_first: bool = False,
+    cqe_error: int = 0,
+    cqe_call: int = 0,
+) -> tuple[int, dict]:
+    """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
+    returns the reader's stage record, decoded by ``stage_records``. The reader-side stages only:
+    the request-side ones (observed, reserved, mapped, done) are the tier's and stay 0."""
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    fault = torch.tensor([submit_error, submit_call, int(submit_first), cqe_error, cqe_call], dtype=torch.int64)
+    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    result = int(
+        _host_module().exl3_ram_miss_read_rows_traced(
+            *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record
+        )
+    )
+    return result, stage_records(record.unsqueeze(0))[0]
+
+
 def read_rows_with_fault(
     tables,
     row: int,
@@ -121,6 +149,52 @@ def read_rows_with_fault(
     if cqes is not None:
         cqes[:] = [int(results[2]), int(results[3])]
     return int(results[0]), int(results[1])
+
+
+# One request's stage record: the C++ StageRecord's int64 words, in order. Every time is the host's
+# CLOCK_MONOTONIC in ns (time.monotonic() reads the same clock); a stage never reached is 0.
+# submit..pack_start are the first io_uring batch's, pack_end the last's (see StageRecord).
+STAGE_DRIVES = 4
+STAGE_FIELDS = (
+    "seq", "kind", "row", "ok", "rows", "batches", "backlog", "prev_done",
+    "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
+    "submit_to_first_cqe_ns", "first_to_last_cqe_ns", "pack_ns", "bytes", "extents",
+    *(f"drive_dev_{d}" for d in range(STAGE_DRIVES)),
+    *(f"drive_bytes_{d}" for d in range(STAGE_DRIVES)),
+    *(f"drive_extents_{d}" for d in range(STAGE_DRIVES)),
+)
+STAGE_KINDS = ("demand", "advisory", "touch")
+# The order of the time stamps within a request: the non-zero ones never decrease along it.
+STAGE_ORDER = (
+    "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
+)
+
+
+def _stage_words() -> int:
+    words = int(_host_module().exl3_ram_miss_trace_words())
+    if words != len(STAGE_FIELDS):
+        raise RuntimeError(f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}")
+    return words
+
+
+def stage_records(words: torch.Tensor) -> list[dict]:
+    """Decode int64 ``[n, len(STAGE_FIELDS)]`` rows into dicts, with a ``drives`` list of the
+    drives that served an extent: ``{"dev", "bytes", "extents"}`` (``dev`` -1: several folded)."""
+    out = []
+    for row in words.tolist():
+        record = dict(zip(STAGE_FIELDS, row))
+        record["kind"] = STAGE_KINDS[record["kind"]]
+        record["drives"] = [
+            {
+                "dev": record.pop(f"drive_dev_{d}"),
+                "bytes": record.pop(f"drive_bytes_{d}"),
+                "extents": record.pop(f"drive_extents_{d}"),
+            }
+            for d in range(STAGE_DRIVES)
+        ]
+        record["drives"] = [drive for drive in record["drives"] if drive["extents"]]
+        out.append(record)
+    return out
 
 
 PAGE_BYTES = 10304
@@ -342,6 +416,25 @@ class Exl3RamMissHost:
     def inject(self, delay_s: float = 0.0, fail_reads: bool = False, delay_after_demands: int = 0) -> None:
         """Test-only faults (see RamTier::inject)."""
         self._module.exl3_ram_miss_inject(self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands)
+
+    def enable_trace(self, capacity: int = 8192) -> None:
+        """Record one stage record per served request, up to ``capacity`` undrained (more are dropped
+        and counted). Before ``start_thread``; with it off the service takes no timestamps."""
+        _stage_words()
+        self._module.exl3_ram_miss_trace_enable(self.handle, int(capacity))
+
+    def drain_trace(self, limit: int = 4096) -> list[dict]:
+        """The stage records not yet drained, oldest first, as ``stage_records`` decodes them."""
+        out = []
+        while True:
+            words = torch.empty((limit, len(STAGE_FIELDS)), dtype=torch.int64)
+            count = int(self._module.exl3_ram_miss_trace_drain(self.handle, words))
+            out.extend(stage_records(words[:count]))
+            if count < limit:
+                return out
+
+    def trace_dropped(self) -> int:
+        return int(self._module.exl3_ram_miss_trace_dropped(self.handle))
 
     def counters(self) -> dict[str, int]:
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)
