@@ -44,6 +44,12 @@ using tvm::ffi::TensorView;
 
 constexpr int kBounceRows = 8;
 constexpr unsigned kQueueDepth = 16;
+// A batch prepares at most kBounceRows * parts SQEs and the ring holds
+// kQueueDepth * parts, so io_uring_get_sqe cannot run out. Enforced here rather
+// than by comment: raising kBounceRows past kQueueDepth would otherwise surface
+// as a null-SQE dereference in submit(), at production depth, not at build time.
+static_assert(kBounceRows <= static_cast<int>(kQueueDepth),
+              "a full batch must fit the ring: kBounceRows <= kQueueDepth");
 constexpr int64_t kPage = 4096;
 
 inline int64_t now_ns() {
@@ -333,25 +339,33 @@ class RowReader {
       // SQEs prepared and not yet reaped (in the SQ ring or in the kernel). At most
       // kBounceRows * parts, and the ring holds kQueueDepth * parts, so io_uring_get_sqe never runs out.
       unsigned pending = 0;
-      auto submit = [&](size_t j) {
+      auto submit = [&](size_t j) -> bool {
         io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        // Unreachable while the static_assert above holds. Checked so that a constant
+        // change which breaks that invariant fails the batch cleanly - the caller
+        // drains and returns 0 - instead of writing through a null SQE.
+        if (sqe == nullptr) return false;
         const int64_t remaining = reads[j]->length - done[j];
         io_uring_prep_read(
             sqe, fds_[reads[j]->file], bounce_ + (j / parts) * t_.slot_bytes + reads[j]->dest + done[j],
             static_cast<unsigned>(remaining), static_cast<uint64_t>(reads[j]->offset + done[j]));
         io_uring_sqe_set_data64(sqe, j);
         ++pending;
+        return true;
       };
+      bool failed = false;
       // A zero-length extent is a root that serves none of this row: no read, not pending.
       for (size_t j = 0; j < count * parts; ++j) {
-        if (reads[j]->length > 0) submit(j);
+        if (reads[j]->length > 0 && !submit(j)) {
+          failed = true;
+          break;
+        }
       }
       const bool first_batch = trace != nullptr && trace->batches == 0;
       if (trace) ++trace->batches;
       int64_t submitted = 0, first_seen = 0, last_seen = 0;
-      bool failed = false;
       int soft_errors = 0;
-      while (pending > 0) {
+      while (!failed && pending > 0) {
         if (trace && submitted == 0) submitted = now_ns();
         const int rc = submit_and_wait();
         if (rc < 0) {
@@ -412,7 +426,12 @@ class RowReader {
           last_seen = returned;
         }
         if (failed) break;
-        for (size_t j : again) submit(j);
+        for (size_t j : again) {
+          if (!submit(j)) {
+            failed = true;
+            break;
+          }
+        }
       }
       if (trace) {
         // Bytes the reads returned, also for a batch that failed part way. A zero-length extent
