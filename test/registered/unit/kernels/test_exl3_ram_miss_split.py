@@ -214,6 +214,121 @@ def test_a_short_mirror_copy_fails_the_read(tmp_path):
     assert read_rows_once(s.tables, 0, [0], [0], direct=False) == 0
 
 
+# ---- End of file: the native reader and Exl3RowReader must agree (handoff 3A) ----
+
+EOF_PAGE = 4096
+EOF_FILE_BYTES = 5 * EOF_PAGE + 1000  # not a multiple of any logical block size
+EOF_NAME = "shard.bin"
+
+
+def _eof_checkpoint(tmp_path, weights, *, claimed_rows):
+    """One shard whose size is not block-aligned, one copy of it per root, and a layout of
+    ``claimed_rows`` (file offset, nbytes) records, expert e = position, all in layer 0.
+
+    Returns (layout, segments, slabs, roots, policy_weights, data). A row is read whole: its
+    single segment copies the entire aligned superset (offset and length are page multiples, so
+    the row starts the buffer), which lets the test see the bytes past EOF as well.
+    """
+    from sglang.srt.layers.moe.exl3_expert_format import RowSegment
+    from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout, Exl3ExpertRecord
+
+    source = tmp_path / "ckpt"
+    source.mkdir()
+    data = bytes((i * 7 + 13) % 251 for i in range(EOF_FILE_BYTES))
+    (source / EOF_NAME).write_bytes(data)
+    roots = []
+    for i in range(len(weights or ())):
+        root = tmp_path / f"drive_{i}"
+        root.mkdir()
+        (root / EOF_NAME).write_bytes(data)
+        roots.append(str(root))
+    records = {
+        (0, expert): Exl3ExpertRecord(0, expert, str(source / EOF_NAME), offset, nbytes)
+        for expert, (offset, nbytes) in enumerate(claimed_rows)
+    }
+    layout = Exl3ExpertLayout(
+        tensors=(), row_bytes=0, records=records, num_layers=1, num_experts=len(claimed_rows)
+    )
+    superset = records[(0, 0)].aligned_read(EOF_PAGE)[1]
+    segments = [RowSegment("w13_trellis", 0, 0, 0, superset)]
+    slabs = {
+        0: {
+            name: torch.zeros((len(claimed_rows), superset if name == "w13_trellis" else 0), dtype=torch.uint8)
+            for name in EXL3_STREAMED_NAMES
+        }
+    }
+    return layout, segments, slabs, roots, data, str(source)
+
+
+# Row 0 is whole and inside the file; row 1 is the shard's last row: it ends exactly at end of
+# file, so its 4-page aligned superset [2, 6) overruns by 3096 B (page 5 holds 1000 valid bytes).
+EOF_ROWS = [(0, 4 * EOF_PAGE), (2 * EOF_PAGE, EOF_FILE_BYTES - 2 * EOF_PAGE)]
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("weights", [None, (1.0,), (1.0, 1.0), (3.0, 1.0), (1.0, 3.0), (0.0, 1.0)])
+def test_a_row_crossing_end_of_file_reads_the_same_natively_and_eagerly(tmp_path, weights, direct):
+    from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
+    from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+    from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
+    from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
+
+    layout, segments, slabs, roots, data, source = _eof_checkpoint(tmp_path, weights, claimed_rows=EOF_ROWS)
+    if direct:
+        try:
+            os.close(os.open(str(tmp_path / "ckpt" / EOF_NAME), os.O_RDONLY | os.O_DIRECT))
+        except OSError as error:
+            pytest.skip(f"{tmp_path} does not support O_DIRECT: {error}")
+    mirrors = {} if weights is None else dict(roots=roots, policy=StaticSplitPolicy(weights), source_root=source)
+    tables = exl3_ram_miss_tables(layout, segments, slabs, **mirrors)
+
+    # Native: row 0 then row 1 through one reader, both in bounce slot 0. Row 1's bytes past end
+    # of file are never written, so they are still row 0's.
+    results = ops.read_rows_with_fault(tables, 0, [0], [0], [1], [1], direct=direct)
+    assert results == (1, 1)
+    native = slabs[0]["w13_trellis"]
+
+    # Eager: the same row into a page-aligned buffer that already holds row 0's bytes.
+    superset = 4 * EOF_PAGE
+    buffer = allocate_host_slab(1, (superset,), torch.uint8, register=False)
+    buffer[0].copy_(native[0])
+    reader = Exl3RowReader(layout, direct=direct, source_root=source)
+    address = buffer[0].data_ptr()
+    if weights is None:
+        reader.read([(0, 1)], [address])
+    else:
+        reader.read_split([(0, 1)], [address], roots=roots, policy=StaticSplitPolicy(weights))
+
+    assert bytes(native[0].numpy()) == data[0:superset]
+    valid = EOF_FILE_BYTES - 2 * EOF_PAGE
+    row_1 = bytes(native[1].numpy())
+    assert row_1[:valid] == data[2 * EOF_PAGE :]  # the row itself
+    assert row_1[valid:] == data[valid:superset]  # past end of file: row 0's bytes, untouched
+    assert row_1 == bytes(buffer[0].numpy())  # and the eager reader left the same bytes
+
+
+def test_a_part_entirely_past_end_of_file_fails_natively_as_it_does_eagerly(tmp_path):
+    from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
+    from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+    from sglang.srt.layers.moe.exl3_row_reader import Exl3RowReader
+    from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
+
+    # A record that claims bytes beyond the file (a layout no export produces): with two roots
+    # its second page lies entirely past end of file.
+    rows = [(0, 2 * EOF_PAGE), (5 * EOF_PAGE, 2 * EOF_PAGE)]
+    weights = (1.0, 1.0)
+    layout, segments, slabs, roots, _data, source = _eof_checkpoint(tmp_path, weights, claimed_rows=rows)
+    policy = StaticSplitPolicy(weights)
+    tables = exl3_ram_miss_tables(layout, segments, slabs, roots=roots, policy=policy, source_root=source)
+
+    buffer = allocate_host_slab(1, (2 * EOF_PAGE,), torch.uint8, register=False)
+    eager = Exl3RowReader(layout, direct=False, source_root=source)
+    with pytest.raises(RuntimeError, match="ended early"):
+        eager.read_split([(0, 1)], [buffer[0].data_ptr()], roots=roots, policy=policy)
+    assert read_rows_once(tables, 0, [1], [0], direct=False) == 0
+    assert read_rows_once(tables, 0, [0], [0], direct=False) == 1  # the sound row still reads
+
+
 def test_tables_keep_their_slabs_alive(tmp_path):
     s = ram_miss_setup(tmp_path)
     kept = {id(t) for t in s.tables.keepalive}

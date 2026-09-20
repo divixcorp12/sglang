@@ -294,6 +294,12 @@ class RowReader {
           reads[i * parts + p] = extent;
           // Per extent, against the file that extent reads.
           expected[i * parts + p] = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
+          // An extent that starts beyond end of file means the row's record is not inside the file
+          // (an aligned read only ever overruns by the padding of a last page that holds row
+          // bytes). Exl3RowReader fails such a read; so does this, before anything is submitted:
+          // clamping it to nothing would publish the bounce's stale bytes as row data. A
+          // zero-length extent reads nothing and may sit anywhere, including past end of file.
+          if (extent->length > 0 && expected[i * parts + p] < 0) return 0;
         }
       }
       // SQEs prepared and not yet reaped (in the SQ ring or in the kernel). At most
