@@ -1,5 +1,6 @@
 """EXL3 expert rows read from K byte-identical mirror copies of a checkpoint."""
 
+import errno
 import os
 import shutil
 
@@ -334,6 +335,9 @@ def test_an_unreadable_root_is_not_reported_as_missing(tmp_path):
         os.chmod(directory, 0o755)
     message = str(caught.value)
     assert m.roots[1] in message and "does not exist" not in message
+    # The structured fields survive the added context.
+    assert caught.value.errno == errno.EACCES
+    assert caught.value.filename == os.path.join(m.roots[1], relative)
 
 
 def test_a_mirror_truncated_after_construction_still_fails_at_the_read(tmp_path):
@@ -376,10 +380,33 @@ def test_for_mirrored_layer_shares_the_reader_and_the_bounce_ring(tmp_path):
     make = Exl3MirrorRowSource.for_mirrored_layer
     a = make(m.layout, 0, m.fmt.segment_map(), **kwargs)
     b = make(m.layout, 1, m.fmt.segment_map(), bounce_rows=3, **kwargs)
-    assert a.reader is b.reader
+    c = make(m.layout, 0, m.fmt.segment_map(), bounce_rows=3, **kwargs)
+    assert a.reader is b.reader is c.reader
     assert a.reader is shared_row_reader(m.layout, False, source_root=str(m.source))
     assert a.reader.source_root == str(m.source)
-    assert b.preferred_batch_rows == 3 and a.preferred_batch_rows != 3
+    assert b.preferred_batch_rows == c.preferred_batch_rows == 3
+    assert a.preferred_batch_rows != 3
+    # Every source with the same ring size reads into one bounce ring...
+    assert b.bounce.data_ptr() == c.bounce.data_ptr()
+    # ...and a different ring size is a different buffer.
+    assert a.bounce.shape != b.bounce.shape
+    assert a.bounce.data_ptr() != b.bounce.data_ptr()
+
+
+def test_sources_built_directly_share_a_ring_of_the_same_size(tmp_path):
+    m = _Mirrored(tmp_path)
+    assert m.mirror().bounce.data_ptr() == m.mirror().bounce.data_ptr()
+    assert m.mirror().bounce.data_ptr() == m.single(bounce_rows=2).bounce.data_ptr()
+
+
+def test_the_inherited_for_layer_cannot_build_a_mirror_source(tmp_path):
+    # for_layer is not overridden; it must fail loudly rather than build a
+    # source that has no roots or policy.
+    m = _Mirrored(tmp_path)
+    with pytest.raises(TypeError, match="roots"):
+        Exl3MirrorRowSource.for_layer(
+            m.layout, LAYER, m.fmt.segment_map(), direct=False
+        )
 
 
 if __name__ == "__main__":

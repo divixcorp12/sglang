@@ -81,9 +81,13 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
                         "does not exist"
                     ) from error
                 except OSError as error:
-                    raise type(error)(
-                        f"mirror root {root}: cannot stat its copy {mirror} of "
-                        f"{path}: {error}"
+                    # OSError(errno, ...) picks the matching subclass and keeps
+                    # errno and filename, so callers can still tell EACCES from EIO.
+                    raise OSError(
+                        error.errno,
+                        f"mirror root {root}: cannot stat its copy of {path}: "
+                        f"{error.strerror}",
+                        error.filename,
                     ) from error
                 if mirror_bytes != source_bytes:
                     raise RuntimeError(
