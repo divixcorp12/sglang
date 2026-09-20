@@ -2385,10 +2385,30 @@ native reader is the prerequisite for any decode benefit; until then
 > What is now unexplained is not the mirror arm's extra bytes - there are none -
 > but `e-base`'s MISSING reads and its 5.6 s prefill. Ordering, tracing, the
 > counters and the environment are ruled out by measurement; system state that day
-> and an undiagnosed build difference are not. Re-running the eager base at the
-> §19 commit would decide it; that has not been done. Treat every `e-base` figure
-> below as unconfirmed, and do not cite the 1.54x byte ratio or the 25% regression.
-> Detail: `analysis/dsv41-drive/EAGER_ANOMALY.md`.
+> and an undiagnosed build difference are not.
+>
+> **Retired, same day: the code is exonerated.** The eager base arm was re-run at
+> §19's own commit `1525e43ab9` and reads 380.7 GiB with TTFT 95.4/54.9/53.6/55.4 -
+> indistinguishable from HEAD - with greedy output sha1s identical to HEAD's for all
+> four sessions. The old code reads the same rows and computes the same answer, so
+> nothing between `1525e43ab9` and HEAD caused it and there is nothing to bisect.
+> `e-base`'s 257.96 GiB and 5.6 s prefill are not reproducible from their own commit
+> and are retired, not merely unconfirmed: do not cite them, nor the 1.54x byte ratio
+> or the 25% regression derived from them.
+>
+> By elimination the cause was machine state that day. The candidate that cannot be
+> excluded is page-cache state left by the `g-mirror` arm that ran immediately before
+> `e-base` and read 127 GiB from the same drive, against the 123 GiB by which `e-base`
+> undershoots today - close enough to be worth naming and too weak to assert, since
+> §19 kept no per-row counters and set no trace path. Inference, not measurement.
+>
+> **Method note for future e2e arms.** Two arms run back to back on one drive are not
+> independent unless the reader is genuinely O_DIRECT or the cache is dropped between
+> them. §19 recorded neither, which is why its numbers cannot be rescued. Record the
+> reader mode and the drive-idle check per arm, as `EAGER_ANOMALY.md` does.
+>
+> Detail and full per-session tables: `analysis/dsv41-drive/EAGER_ANOMALY.md`,
+> commit `cd14545797`.
 
 `e-mirror` is 25% slower than `e-base` (2.0126 vs 2.6947) while reading 1.54x
 more bytes (397.41 vs 257.96 GiB). Its first two prefills are faster than
