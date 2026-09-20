@@ -137,7 +137,13 @@ def test_static_policy_plans_the_same_split_every_time():
 
 Read `.claude/skills/env-var-conventions/SKILL.md` first.
 
-- New: `SGLANG_MOE_EXPERT_MIRROR_DIRS` (str, default `""`) — os.pathsep-separated mirror roots. Non-empty selects the mirror row source; one entry is legal and means "read everything from this root" (useful for the nvme0-only arm in Task 6).
+- New: `SGLANG_MOE_EXPERT_MIRROR_DIRS` (str, default `""`) — os.pathsep-separated mirror roots. Non-empty selects the mirror row source; one entry is legal and means "read everything from this root" (useful for the nvme0-only arm in Task 6). The value this deployment uses, verbatim:
+
+  ```
+  SGLANG_MOE_EXPERT_MIRROR_DIRS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash
+  ```
+
+  and for the single-root arms, `/mnt/nvme0/dsv41_flash` or `/mnt/nvme4/dsv41_flash` alone. `SGLANG_DSV41_EXPERT_DIR` keeps pointing at the source checkpoint on nvme2 unless the owner retires it; the mirror roots override where rows are *read*, not what the layout is built from.
 - Optional: `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` (str, default `""`) — colon-separated floats for `StaticSplitPolicy`; empty means equal weights.
 
 - [ ] **Step 1: Failing tests.** Mirror dirs set → mirror row source with a `StaticSplitPolicy` of the parsed weights; unset → the shard source, unchanged; a weights list whose length differs from the dirs list is refused, naming both counts; a root that is not a readable directory is refused, naming it.
@@ -161,7 +167,9 @@ nvme4 has never been measured and its bandwidth sets the default weights.
 - [ ] **Step 3: Verify** with `verify_expert_mirror.py`: all files' sizes on both roots, plus every expert of layers 0, 19 and 39 byte for byte against nvme2. A mirror that differs anywhere is not usable.
 - [ ] **Step 4: Per-row latency**, reusing `analysis/dsv41-drive/bench_drive_rows.py`, over four configurations: nvme2 (baseline), nvme0 only, nvme4 only, and both mirrored 50/50 (or the Task 5 weights). 3 × 48 rows each, alternating. Report p50/p90/p99. **Gate: mirrored p50 ≤ 4.0 ms.**
 - [ ] **Step 5: The contention test, which is the point of mirroring.** Repeat the mirrored and single-root measurements while a deliberate write burst runs on ONE root (`fio --rw=randwrite --bs=128k --numjobs=2 --runtime=60` against a scratch file on that drive — confirm the path with the owner, never into production data). Report p50/p99 for: mirrored 50/50 under burst, and mirrored with the bursting root weighted to 0. **The second must be close to the quiet drive's solo number** — that is the escape route striping lacked, and it is what Task 7 automates.
-- [ ] **Step 6: End-to-end arm.** `trace_corpus.py --graphs`, sessions 0–3, 256-token prompts, 128 new tokens, standard `c32` settings, with `SGLANG_MOE_EXPERT_MIRROR_DIRS` set to both roots. Compare against the recorded `c32` baseline (2.823 tok/s) and a same-day nvme0-only arm, so the mirroring gain is separated from the drive-move gain.
+- [ ] **Step 6: End-to-end arm.** `trace_corpus.py --graphs`, sessions 0–3, 256-token prompts, 128 new tokens, standard `c32` settings, with
+  `SGLANG_MOE_EXPERT_MIRROR_DIRS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash`.
+  Compare against the recorded `c32` baseline (2.823 tok/s) and a same-day nvme0-only arm (`SGLANG_MOE_EXPERT_MIRROR_DIRS=/mnt/nvme0/dsv41_flash`), so the mirroring gain is separated from the drive-move gain.
 - [ ] **Step 7: Record** the arms, the per-row table and the ruling in `DSV41_REFERENCE.md` (new §19), and commit.
 
 ### Task 7: Adaptive split (only if Task 6 Step 5 justifies it)
