@@ -16,7 +16,8 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 
-# Rows per io_uring batch: the C++ bounce holds kBounceRows = 8 rows.
+# Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
+# row slots each. A bank is reused only after every row read into it has packed.
 BOUNCE_ROWS = 8
 
 if TYPE_CHECKING:
@@ -81,14 +82,9 @@ def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int 
     )
 
 
-def read_rows_traced(
-    tables,
-    row: int,
-    experts,
-    slots,
+# The C++ fault tensor (kFaultWords int64): keep in step with fault_from() in exl3_ram_miss_host.cpp.
+def _fault_tensor(
     *,
-    direct: bool,
-    step: int = BOUNCE_ROWS,
     submit_error: int = 0,
     submit_call: int = 0,
     submit_first: bool = False,
@@ -99,12 +95,17 @@ def read_rows_traced(
     part_short: int = 0,
     reverse_cqes: bool = False,
     max_outstanding: int = 0,
-) -> tuple[int, dict]:
-    """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
-    returns the reader's stage record, decoded by ``stage_records``. The reader-side stages only:
-    the request-side ones (observed, reserved, mapped, done) are the tier's and stay 0."""
-    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
-    fault = torch.tensor(
+    pack_delay_ns: int = 0,
+    poison: bool = False,
+    stale_cqe_call: int = 0,
+    generation_start: int = 0,
+    submit_short_call: int = 0,
+    ordinal: int = -1,
+    hold_ordinal: int = -1,
+    abandon_after: int = 0,
+    step: int = 0,
+) -> torch.Tensor:
+    return torch.tensor(
         [
             submit_error,
             submit_call,
@@ -116,9 +117,38 @@ def read_rows_traced(
             part_short,
             int(reverse_cqes),
             max_outstanding,
+            pack_delay_ns,
+            int(poison),
+            stale_cqe_call,
+            generation_start,
+            submit_short_call,
+            ordinal,
+            hold_ordinal,
+            abandon_after,
+            step,
         ],
         dtype=torch.int64,
     )
+
+
+def read_rows_traced(
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    direct: bool,
+    step: int = BOUNCE_ROWS,
+    **faults,
+) -> tuple[int, dict]:
+    """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
+    returns the reader's stage record, decoded by ``stage_records``. The reader-side stages only:
+    the request-side ones (observed, reserved, mapped, done) are the tier's and stay 0.
+
+    The result is 1 (every row landed), 0 (failed) or -1 (abandoned: ``abandon_after`` batches were
+    admitted, the rows admitted were still read and packed, the rest never read)."""
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(), dtype=torch.int64)
     result = int(
         _host_module().exl3_ram_miss_read_rows_traced(
@@ -137,62 +167,54 @@ def read_rows_with_fault(
     then_slots,
     *,
     direct: bool,
-    submit_error: int = 0,
-    submit_call: int = 0,
-    submit_first: bool = False,
-    cqe_error: int = 0,
-    cqe_call: int = 0,
-    part: int = -1,
-    part_error: int = 0,
-    part_short: int = 0,
-    reverse_cqes: bool = False,
-    max_outstanding: int = 0,
     cqes: Optional[list[int]] = None,
+    stats: Optional[dict] = None,
+    **faults,
 ) -> tuple[int, int]:
-    """Test only: on one C++ reader, read with an injected io_uring fault, then read cleanly.
+    """Test only: on one C++ reader, read with an injected fault, then read cleanly.
 
-    ``submit_error`` (an errno) replaces the result of the ``submit_call``-th submit-and-wait
+    ``submit_error`` (an errno) replaces the result of the ``submit_call``-th submit
     (after submitting the prepared reads when ``submit_first``); ``cqe_error`` replaces the
     ``cqe_call``-th completion's result. ``part`` (a part index) targets the first completion of a
-    part-``part`` extent: ``part_error`` (an errno) replaces its result, ``part_short`` (a block
-    multiple) caps the bytes it reports, so only that extent is resubmitted. ``reverse_cqes``
-    processes each reaped batch of completions back to front, which must not change any result:
-    the reader keys every extent by its own ``user_data`` and the kernel orders nothing.
-    ``max_outstanding`` caps outstanding reads below the ring's depth, so a batch needs several
-    refill rounds; production constants keep a batch inside the ring, so credit never binds
-    there. Returns
-    both reads' results (1 ok, 0 failed); ``cqes``, if given, receives the completions reaped
-    after each read.
+    part-``part`` extent (of row ``ordinal`` of the request, when given): ``part_error`` (an errno)
+    replaces its result, ``part_short`` (a block multiple) caps the bytes it reports, so only that
+    extent is resubmitted. ``reverse_cqes`` processes each reaped batch of completions back to front,
+    which must not change any result: the reader keys every extent by its own descriptor and
+    generation and the kernel orders nothing. ``max_outstanding`` caps outstanding reads below the
+    ring's depth, so a batch needs several refill rounds; production constants keep a batch inside the
+    ring, so credit never binds there.
+
+    Pipeline faults: ``pack_delay_ns`` sleeps inside every row's packing; ``poison`` fills bounce slots
+    and scribbles retired descriptors; ``stale_cqe_call`` redelivers the k-th retired extent's
+    completion after its descriptor is recycled (the read must fail and publish nothing);
+    ``generation_start`` seeds the generation counter (near 2**32 it wraps); ``hold_ordinal`` withholds
+    the completions of that row of the request from the reader until every other row is done (a slow
+    drive: buffered reads of cached data complete inside submit, so nothing else can hold an extent
+    outstanding while other rows pack); ``submit_short_call``
+    makes that submit consume nothing and report success; ``abandon_after`` stops admitting batches
+    after that many; ``step`` is the faulted read's rows per batch (default ``BOUNCE_ROWS``).
+
+    Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
+    completions reaped after each read, ``stats`` the reader's ``stale_cqes`` and ``generation_wraps``.
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
-    fault = torch.tensor(
-        [
-            submit_error,
-            submit_call,
-            int(submit_first),
-            cqe_error,
-            cqe_call,
-            part,
-            part_error,
-            part_short,
-            int(reverse_cqes),
-            max_outstanding,
-        ],
-        dtype=torch.int64,
-    )
-    results = torch.zeros(4, dtype=torch.int64)
+    fault = _fault_tensor(**faults)
+    results = torch.zeros(6, dtype=torch.int64)
     _host_module().exl3_ram_miss_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
     if cqes is not None:
         cqes[:] = [int(results[2]), int(results[3])]
+    if stats is not None:
+        stats.update(stale_cqes=int(results[4]), generation_wraps=int(results[5]))
     return int(results[0]), int(results[1])
 
 
 # One request's stage record: the C++ StageRecord's int64 words, in order. Every time is the host's
 # CLOCK_MONOTONIC in ns (time.monotonic() reads the same clock); a stage never reached is 0.
-# submit..pack_start are the first io_uring batch's, pack_end the last's (see StageRecord).
+# submit/first_cqe/last_cqe span the whole read and pack_start..pack_end run from the first row's packing
+# to the last row's, which overlaps the reads (see StageRecord).
 # The byte split, terminal status, per-row packing and per-extent CQE stamps are defined at StageRecord.
 # STAGE_TRACE_ROWS / STAGE_TRACE_EXTENTS are its kTraceRows / kTraceExtents.
 STAGE_DRIVES = 4
@@ -206,7 +228,7 @@ STAGE_FIELDS = (
     *(f"drive_bytes_{d}" for d in range(STAGE_DRIVES)),
     *(f"drive_extents_{d}" for d in range(STAGE_DRIVES)),
     "status", "rows_asked", "useful_bytes", "submitted_bytes", "retried_bytes", "cancelled_bytes",
-    "rows_untraced", "extents_untraced",
+    "rows_untraced", "extents_untraced", "rows_reading_max", "pending_max", "bank_stalls",
     *(f"row_pack_start_{k}" for k in range(STAGE_TRACE_ROWS)),
     *(f"row_pack_end_{k}" for k in range(STAGE_TRACE_ROWS)),
     *(f"extent_id_{k}" for k in range(STAGE_TRACE_EXTENTS)),
@@ -215,7 +237,10 @@ STAGE_FIELDS = (
 STAGE_KINDS = ("demand", "advisory", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
 STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
-# The order of the time stamps within a request: the non-zero ones never decrease along it.
+# The order of the time stamps within a request. The non-zero ones never decrease along it EXCEPT
+# last_cqe against pack_start: a row packs as soon as its own extents landed, so packing starts before the
+# last completion when reads and packing overlap. What holds instead: first_cqe <= pack_start, last_cqe <=
+# pack_end (see StageRecord).
 STAGE_ORDER = (
     "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
 )
@@ -494,9 +519,18 @@ class Exl3RamMissHost:
     def version(self) -> int:
         return self.counters()["version"]
 
-    def inject(self, delay_s: float = 0.0, fail_reads: bool = False, delay_after_demands: int = 0) -> None:
-        """Test-only faults (see RamTier::inject)."""
-        self._module.exl3_ram_miss_inject(self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands)
+    def inject(
+        self,
+        delay_s: float = 0.0,
+        fail_reads: bool = False,
+        delay_after_demands: int = 0,
+        abandon_after_batches: int = 0,
+    ) -> None:
+        """Test-only faults (see RamTier::inject). ``abandon_after_batches``: an advisory gives up once
+        that many of its rows (batches) were admitted; the rows admitted still complete and publish."""
+        self._module.exl3_ram_miss_inject(
+            self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands, abandon_after_batches
+        )
 
     def enable_trace(self, capacity: int = 8192) -> None:
         """Record one stage record per served request, up to ``capacity`` undrained (more are dropped

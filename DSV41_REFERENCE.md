@@ -2460,6 +2460,50 @@ acts as a control: it says the gain is I/O and not measurement drift between
 arms. The `n` on first-to-last cqe rising to 7,211 is simply every request now
 spanning more than one extent.
 
+**These two spans are measured on the pre-Task-4 reader and do not carry
+forward.** There, each io_uring batch had its own submit-to-first and
+first-to-last span and the record summed them over batches, so packing never
+fell inside first-to-last. Task 4 makes each span cover the whole read, and
+first-to-last can then include the packing of early rows whenever completions
+return in more than one reap - which is the overlap itself, not a regression.
+The two definitions coincide only for a single-batch read whose completions all
+return in one reap. So this table may be compared with other pre-Task-4 runs and
+with nothing after it. How far the definitions diverge on this workload is
+unknown, because the split of these 1,888 and 7,211 requests between advisory,
+single-batch and multi-batch was not recorded.
+
+The per-extent `extent_cqe` stamps did not change meaning, so a comparison
+across that boundary should be built from those, or from a fresh baseline taken
+on the new reader.
+
+#### What the gain is measured against
+
+The mirrors-off arm reads from `/mnt/nvme2`, which is **Gen3 x2** (about 1.9 GB/s;
+see the drive table in section 2), while both mirrors are on Gen3 x4 drives. So
+the comparison is one half-width link against two full-width ones: roughly 4x the
+aggregate ceiling, not the 2x that "two drives instead of one" suggests.
+
+That is the right control, because nvme2 is what the system actually read from
+before mirroring, so 1.348x is the real gain from enabling it. But the mechanism
+should not be misattributed, and the per-row bench already separates it.
+`MIRROR_ROWS.md` records mirrored at **2.31x the nvme2 baseline and 1.42x nvme0
+alone**, so nvme0 alone was 2.31 / 1.42 = **1.63x** the source. At the per-row
+level, most of the gain came from leaving the half-width link, not from using
+two drives: 1.63x from the link and 1.42x from the split.
+
+That decomposition is per-row, not end to end; the decode arm's 1.348x has not
+been split the same way and one x4 mirror has never been run end to end. The
+practical reading is that a single x4 mirror would likely retain most of the
+benefit if a drive ever has to be freed. It does not qualify the measured
+result.
+
+Link state confirmed from PCI sysfs on 2026-09-20 (`lspci -vv` shows no LnkSta
+without root): 0000:88:00.0 (nvme2) `current_link_width` 2 against
+`max_link_width` 4, the other three at 4; its root port 0000:85:02.0 likewise
+negotiated x2 of 4. AER correctable counters 0. One snapshot, so a transient
+downtrain is not excluded. The 1.9 GB/s figure is the Gen3 x2 spec ceiling;
+nvme2's throughput was not measured here.
+
 #### Three defects found on the way
 
 The extent work surfaced bugs that the previous arms could not have exposed:

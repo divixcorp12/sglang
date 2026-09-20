@@ -93,6 +93,19 @@ def summarize(name, path, names):
             f"{per_drive_extents[dev]} extents"
         )
 
+    # Schema 1 spans are the FIRST io_uring batch's and exclude packing; schema 2 spans cover the
+    # whole read and first_to_last_cqe can contain the packing of earlier rows. Printing a mean over
+    # a mix, or comparing one arm against the other across the boundary, compares two quantities.
+    schemas = {r.get("schema", 1) for r in reqs}
+    if len(schemas) > 1:
+        print(f"    WARNING mixed trace schemas {sorted(schemas)}: the spans below are not one quantity")
+    else:
+        only = next(iter(schemas))
+        if only == 1:
+            print("    trace schema 1: spans are the first batch's, packing excluded")
+        else:
+            print(f"    trace schema {only}: spans cover the whole read, packing can fall inside first->last")
+
     waits = [r["spans_ns"]["submit_to_first_cqe"] for r in reqs if r["spans_ns"]["submit_to_first_cqe"]]
     spans = [r["spans_ns"]["first_to_last_cqe"] for r in reqs if r["spans_ns"]["first_to_last_cqe"]]
     packs = [r["spans_ns"]["pack"] for r in reqs if r["spans_ns"]["pack"]]
@@ -102,7 +115,12 @@ def summarize(name, path, names):
                 f"    {label:<18} n={len(vals):5d} mean={st.mean(vals)/1e6:7.3f} ms "
                 f"p50={st.median(vals)/1e6:7.3f} ms"
             )
-    return {"bytes": total_bytes, "per_drive": dict(per_drive_bytes), "names": names}
+    return {
+        "bytes": total_bytes,
+        "per_drive": dict(per_drive_bytes),
+        "names": names,
+        "schemas": schemas,
+    }
 
 
 def main():
@@ -134,6 +152,13 @@ def main():
     m = summarize("mirror", m_tr, names)
 
     if b and m:
+        if b["schemas"] != m["schemas"]:
+            print()
+            print(
+                f"WARNING: base trace schema {sorted(b['schemas'])} against mirror "
+                f"{sorted(m['schemas'])} -- the latency spans above are NOT comparable between "
+                "these arms. Byte totals and per-drive shares are unaffected."
+            )
         print()
         src = next((d for d, n in names.items() if n == "nvme2"), None)
         src_bytes = m["per_drive"].get(src, 0)

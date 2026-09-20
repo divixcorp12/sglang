@@ -40,6 +40,12 @@ def capturing_graphs() -> bool:
     return bool(capture_mode.is_capture_mode)
 
 
+# Bumped whenever a ram_miss_request field changes meaning rather than merely appearing. 2: stage
+# stamps and spans cover the whole read, not the first io_uring batch, and packing can fall inside
+# first_to_last_cqe. A consumer that mixes schemas silently compares different quantities.
+RAM_MISS_TRACE_SCHEMA = 2
+
+
 class Exl3StreamTrace:
     def __init__(self, path: str = "", log_every: int = LOG_EVERY_FORWARDS) -> None:
         # Line-buffered: the scheduler process may exit without running atexit.
@@ -166,8 +172,15 @@ class Exl3StreamTrace:
         no ``tokens``, and ``kind`` is ``ram_miss_request`` (tier_sim.load_trace skips it). Every
         ``stages_ns`` value and ``prev_done_ns`` is the host's CLOCK_MONOTONIC in ns, which is what
         ``t`` (``time.monotonic()``) reads too; 0 is a stage the request never reached. Nothing here
-        compares a GPU clock with the host's. The stamps below ``submit`` are the first io_uring
-        batch's and ``pack_end`` the last's; ``spans_ns`` sums every batch (see StageRecord).
+        compares a GPU clock with the host's.
+
+        ``schema`` is 2. In schema 1 the stamps below ``submit`` were the FIRST io_uring batch's,
+        ``pack_end`` the last's, and ``spans_ns`` summed the per-batch spans, so packing never fell
+        inside ``first_to_last_cqe``. From schema 2 every stamp spans the whole read and a row packs
+        as soon as its own extents land, so ``first_to_last_cqe`` can contain the packing of earlier
+        rows and is no longer pure drive latency. **The two are not comparable**; compare across the
+        boundary with ``extent_cqe_ns``, whose meaning is unchanged, or re-baseline.
+
         ``bytes`` is the completed total; ``byte_split`` names the rest. ``row_pack_ns`` and
         ``extent_cqe_ns`` are per-row and per-extent stamps, bounded (``untraced`` counts the rest).
         """
@@ -180,6 +193,7 @@ class Exl3StreamTrace:
                 "forward": self.forwards,
                 "layer": layer_ids[record["row"]],
                 "kind": "ram_miss_request",
+                "schema": RAM_MISS_TRACE_SCHEMA,
                 "request": {
                     "seq": record["seq"],
                     "type": record["kind"],

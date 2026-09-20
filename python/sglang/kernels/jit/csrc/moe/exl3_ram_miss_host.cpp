@@ -43,7 +43,12 @@ namespace exl3_ram_miss {
 
 using tvm::ffi::TensorView;
 
+// A bounce bank holds kBounceRows row slots and there are kBanks banks (kBounceSlots slots): a bank is
+// the unit that is reused only once every I/O and packing reference to it has retired. Ring credit
+// (kQueueDepth) is unrelated to both.
 constexpr int kBounceRows = 8;
+constexpr int kBanks = 2;
+constexpr int kBounceSlots = kBanks * kBounceRows;
 constexpr unsigned kQueueDepth = 16;
 constexpr int64_t kPage = 4096;
 
@@ -93,20 +98,28 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // useful_bytes <= bytes <= submitted_bytes holds for a read that succeeds.
 //
 // Per-row packing: row_pack_start/end[k] bound the memcpy of row k of the request (k indexes the
-// request's missing rows in read order, the same order as its slots). Rows pack back to back, so row
-// k starts where row k-1 ended. 0/0 is a row that never packed (its batch failed or was cancelled).
-// rows_asked is the number of rows the read was asked for, so a missing row is a k below it with 0/0.
-// pack_start/pack_end/pack_ns keep the whole-read aggregate.
+// request's missing rows in read order, the same order as its slots). A row packs as soon as ITS
+// extents have completed, whatever the others are doing, so rows pack in completion order, not
+// necessarily in request order, and may pack while other rows are still being read: that overlap is
+// what row_pack_start < another row's last extent_cqe shows. 0/0 is a row that never packed (the read
+// failed or was cancelled before it). rows_asked is the number of rows the read was asked for, so a
+// missing row is a k below it with 0/0. pack_start is the first row's start, pack_end the last row's
+// end, pack_ns the sum of the rows' spans (the gaps between rows are waiting, not packing).
 //
 // Per-extent CQE: extent_id[k] = (row ordinal << 16) | part and extent_cqe[k] is the time the wait
 // that reaped that extent's last completion returned; 0 is an extent that never completed. Slots fill in
 // issue order (batch by batch), the first min(extents, kTraceExtents) are valid.
 //
-// The stamps below submit..last_cqe and pack_start are the FIRST io_uring batch's (a request
-// spans several only past kBounceRows rows, or one row at a time for an advisory); pack_end is
-// the LAST batch's. So observed <= reserved <= submit <= first_cqe <= last_cqe <= pack_start <=
-// pack_end <= mapped <= done, and the *_ns sums cover every batch: they are what a decomposition
-// of observed..done adds up.
+// The stamps submit, first_cqe and last_cqe cover the whole read: the first submit, the first completion
+// returned and the last one returned; submit_to_first_cqe_ns and first_to_last_cqe_ns are those spans.
+// Packing overlaps reading, so pack_start may precede last_cqe (that is the overlap, per row above);
+// the order that holds is observed <= reserved <= submit <= first_cqe <= pack_start and
+// last_cqe <= pack_end (the last completion belongs to a row that packs after it) and
+// pack_end <= mapped <= done.
+//
+// Pipeline high-water marks: rows_reading_max is the most rows with I/O outstanding at once,
+// pending_max the most SQEs prepared and not yet reaped (never above the ring credit), bank_stalls the
+// number of times admitting the next batch had to wait for its bank's rows to pack.
 struct StageRecord {
   int64_t seq = 0;
   int64_t kind = 0;  // kStageDemand, kStageAdvisory, kStageTouch
@@ -118,16 +131,16 @@ struct StageRecord {
   int64_t prev_done = 0;  // `done` of the request served just before this one (0: the first)
   int64_t observed = 0;   // the service saw the record posted (first poll that found it)
   int64_t reserved = 0;   // slots reserved under the tier mutex
-  int64_t submit = 0;     // just before the first io_uring submit-and-wait
-  int64_t first_cqe = 0;  // the wait that returned the first completion, returned
-  int64_t last_cqe = 0;   // the wait that returned the last completion, returned
-  int64_t pack_start = 0;
-  int64_t pack_end = 0;
+  int64_t submit = 0;     // just before the first io_uring submit
+  int64_t first_cqe = 0;  // the call that returned the first completion, returned
+  int64_t last_cqe = 0;   // the call that returned the last completion, returned
+  int64_t pack_start = 0;  // the first row's packing started
+  int64_t pack_end = 0;    // the last row's packing ended
   int64_t mapped = 0;  // slots marked READY and slot-map entries published
   int64_t done = 0;    // completion word stored: the device's wait can release
-  int64_t submit_to_first_cqe_ns = 0;  // summed over batches
+  int64_t submit_to_first_cqe_ns = 0;
   int64_t first_to_last_cqe_ns = 0;
-  int64_t pack_ns = 0;
+  int64_t pack_ns = 0;  // the sum of the rows' packing spans
   int64_t bytes = 0;    // completed bytes, summed over drives (see the byte split)
   int64_t extents = 0;  // reads issued: one per row and root with a non-empty part
   int64_t drive_dev[kMaxDrives] = {};  // st_dev of the drive's filesystem; -1 folds several drives
@@ -141,6 +154,9 @@ struct StageRecord {
   int64_t cancelled_bytes = 0;
   int64_t rows_untraced = 0;     // rows past kTraceRows: packed but not stamped
   int64_t extents_untraced = 0;  // extents past kTraceExtents: read but not stamped
+  int64_t rows_reading_max = 0;
+  int64_t pending_max = 0;
+  int64_t bank_stalls = 0;
   int64_t row_pack_start[kTraceRows] = {};
   int64_t row_pack_end[kTraceRows] = {};
   int64_t extent_id[kTraceExtents] = {};
@@ -238,6 +254,33 @@ inline Tables tables_from(
       throw std::runtime_error("exl3 RAM miss: an extent names no file or falls outside its bounce slot");
     }
   }
+  // The EOF guard (RowReader::admit_batch) decides a whole row from ONE of its parts: it reads that
+  // part's `offset - dest` as the row's aligned base and its file size as the row's file size. Both are
+  // true by construction of today's builder - exl3_ram_miss.py repeats one source size across all the
+  // parts of a shard, and the mirror layout puts two files under a row only as two copies of the SAME
+  // shard - but nothing in this file pinned either, and a builder that ever gave a row parts from
+  // genuinely different files would arm the guard to clear a row against the wrong size. Checked here,
+  // once per table, rather than per read.
+  for (size_t base = 0; base + static_cast<size_t>(t.parts) <= t.extents.size();
+       base += static_cast<size_t>(t.parts)) {
+    const Read* head = nullptr;
+    for (int64_t p = 0; p < t.parts && head == nullptr; ++p) {
+      if (t.extents[base + static_cast<size_t>(p)].length > 0) head = &t.extents[base + static_cast<size_t>(p)];
+    }
+    if (head == nullptr) continue;  // a row nothing reads never reaches the guard
+    for (int64_t p = 0; p < t.parts; ++p) {
+      const Read& e = t.extents[base + static_cast<size_t>(p)];
+      // Only the reading parts: a zero-length part is never submitted and its fields are unused, so
+      // requiring anything of them would over-constrain the builder for no gain.
+      if (e.length <= 0) continue;
+      if (t.file_sizes[e.file] != t.file_sizes[head->file] ||
+          e.offset - e.dest != head->offset - head->dest) {
+        throw std::runtime_error(
+            "exl3 RAM miss: a row's parts disagree on their aligned base or their file size, so the "
+            "EOF guard cannot decide the row from part 0");
+      }
+    }
+  }
   const auto* start_data = static_cast<const int64_t*>(starts.data_ptr());
   t.starts.assign(start_data, start_data + t.layers * t.experts);
   const auto* segment_data = static_cast<const int64_t*>(segments.data_ptr());
@@ -279,10 +322,85 @@ struct ReadFault {
   // constants keep a batch (kBounceRows rows) inside the ring, so credit never binds
   // there; this makes the refill path reachable from a test without resizing the ring.
   int64_t max_outstanding = 0;
+  // Pipeline faults. pack_delay_ns sleeps inside every row's packing (a slow copy: the other bank's
+  // completions pile up meanwhile). poison fills a bounce slot with a pattern when a row takes it and
+  // with another when the row has packed, and scribbles every retired descriptor, so a row packed
+  // before its reads landed, a bank reused early or a retired descriptor used again shows in the bytes
+  // or crashes. stale_cqe_call: the k-th extent to retire (1-based) has its completion delivered AGAIN
+  // once its descriptor is recycled for another extent. generation_start seeds the generation counter
+  // (near 2^32 the counter wraps within a test). submit_short_call: that submit consumes nothing and
+  // reports success. ordinal narrows the per-part faults to the row with that index in the request (-1: any).
+  int64_t pack_delay_ns = 0;
+  bool poison = false;
+  int64_t stale_cqe_call = 0;
+  int64_t generation_start = 0;
+  int64_t submit_short_call = 0;
+  int64_t ordinal = -1;
+  // A slow drive, simulated: the completions of the row with this index in the request are withheld
+  // from the reader (they were reaped from the CQ, so the kernel is done with them) until nothing else
+  // is in flight or waiting to pack, then delivered. Cached buffered reads complete inside submit, so
+  // without this no test can hold an extent outstanding while other rows pack (-1: none).
+  int64_t hold_ordinal = -1;
 };
 
-// io_uring superset reads of whole expert rows into a page-aligned bounce, then the
+// The fault tensor of the test entry points: 19 int64 words. The last two are not reader faults:
+// abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
+// (0: never), and step (0: kBounceRows) is the faulted call's rows per batch. Keep the layout in step
+// with _fault_tensor in ops/moe/exl3_ram_miss.py.
+constexpr int64_t kFaultWords = 19;
+
+inline ReadFault fault_from(const int64_t* f) {
+  ReadFault fault;
+  fault.submit_error = static_cast<int>(f[0]);
+  fault.submit_call = f[1];
+  fault.submit_first = f[2] != 0;
+  fault.cqe_error = static_cast<int>(f[3]);
+  fault.cqe_call = f[4];
+  fault.part = f[5];
+  fault.part_error = static_cast<int>(f[6]);
+  fault.part_short = f[7];
+  fault.reverse_cqes = f[8] != 0;
+  fault.max_outstanding = f[9];
+  fault.pack_delay_ns = f[10];
+  fault.poison = f[11] != 0;
+  fault.stale_cqe_call = f[12];
+  fault.generation_start = f[13];
+  fault.submit_short_call = f[14];
+  fault.ordinal = f[15];
+  fault.hold_ordinal = f[16];
+  return fault;
+}
+
+inline void check_fault_words(TensorView fault) {
+  if (fault.size(0) != kFaultWords) throw std::runtime_error("exl3 RAM miss: the fault tensor has the wrong length");
+}
+
+// Entry points' abandon callback: stop once `after` batches were admitted (0: never).
+inline std::function<bool(size_t)> abandon_after(int64_t after) {
+  return [after](size_t admitted) { return after > 0 && admitted >= static_cast<size_t>(after); };
+}
+
+// io_uring superset reads of whole expert rows into page-aligned bounce banks, then the
 // per-name split into the pinned slabs (Exl3ShardRowSource.read's copies).
+//
+// Pipeline (plan Task 4). A read() call is split into batches of `step` rows; batch b fills bank
+// b % kBanks. Every bounce slot is one row's aligned superset, and every extent has its own
+// preallocated descriptor: descriptor (slot, part) is the SQE's user_data together with a generation,
+// so a completion can only be attributed to the extent that is live in that descriptor NOW. The three
+// resources are independent of each other:
+//   * ring credit    `pending <= capacity` (queue_depth()): how many SQEs may be prepared and not yet
+//                    reaped. It knows nothing about banks; a bank can hold more extents than the ring.
+//   * banks          memory: kBanks * kBounceRows slots. A bank is handed to a new batch only once
+//                    every row of its previous batch has PACKED (and so every extent has completed and
+//                    retired): I/O and packing are the two references a bank holds, and both must be
+//                    gone before the kernel may write into it again.
+//   * reading rows   at most `max_reading_rows` rows with I/O outstanding (an advisory reads one).
+// A row is packed as soon as ITS extents have completed, while other rows are still in flight, and
+// every completed row is packed before the call returns. read() itself publishes nothing: the caller
+// keeps the slots LOADING until read() returns 1, so no row is visible before the whole request is.
+// Packing writes only into the caller's not-yet-published slots and only from a slot whose extents
+// have all completed, so a failure leaves at most fully packed rows in unpublished slots, never a
+// half-packed one, and the caller releases them.
 class RowReader {
  public:
   RowReader(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {}
@@ -300,10 +418,17 @@ class RowReader {
   void set_fault(const ReadFault& fault) {
     fault_ = fault;
     part_fired_ = false;
+    retired_ = 0;
+    stale_armed_ = false;
+    stale_waiting_ = false;
+    if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
   }
 
   // Completions reaped over the reader's life (tests: a zero-length extent must add none).
   int64_t cqes() const { return cqes_; }
+  // Completions that named no live descriptor, and generation counter wraps (tests).
+  int64_t stale_cqes() const { return stale_cqes_; }
+  int64_t generation_wraps() const { return generation_wraps_; }
 
   bool open() {
     for (const auto& path : t_.paths) {
@@ -336,268 +461,598 @@ class RowReader {
       const size_t slot = std::min<size_t>(drive, kMaxDrives - 1);
       drive_dev_[slot] = drive < kMaxDrives ? devs_[drive] : -1;
     }
-    if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceRows * t_.slot_bytes)) != 0) {
+    if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) != 0) {
       bounce_ = nullptr;
       return false;
     }
+    // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part), a queue
+    // that can hold each descriptor once (an extent waits in it at most once at a time), and completion
+    // and resubmission lists bounded by the same count.
+    const size_t extents = static_cast<size_t>(kBounceSlots) * static_cast<size_t>(t_.parts);
+    // A completion carries its descriptor index in the low 32 bits of user_data and its generation in
+    // the high 32 (see prepare() and process()). process() rejects an index past descs_.size(), but a
+    // count that does not fit in 32 bits would truncate on the way OUT, so a completion would name a
+    // different live descriptor and pass that check: bytes would be credited to the wrong extent.
+    if (extents > 0xFFFFFFFFull) return false;
+    descs_.assign(extents, ExtentDesc{});
+    queue_.assign(extents, 0);
+    completions_.reserve(extents + 1);
+    held_.reserve(extents);
+    again_.reserve(extents);
     if (io_uring_queue_init(queue_depth(), &ring_, 0) != 0) return false;
     ring_ready_ = true;
     return true;
   }
 
-  // Read `experts` of streamed row `row` into `slots`, `step` rows per io_uring batch
-  // (at most kBounceRows). `abandon()` runs before each batch; true stops the read.
-  // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned.
+  // Read `experts` of streamed row `layer` into `slots`, `step` rows per io_uring batch (at most
+  // kBounceRows, one bank). `abandon(batches admitted so far)` runs before each batch is admitted and
+  // whenever the loop comes back to it; true stops admitting new batches. Rows already admitted are
+  // reaped and packed, so nothing is in flight when read() returns.
+  // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned before every
+  // batch was admitted. `packed`, when not null, is set to 1 for every row that was packed (with -1 those
+  // rows are complete and the caller may keep them; with 0 the caller releases everything).
+  // `max_reading_rows` caps the rows with I/O outstanding (an advisory reads one row at a time).
   // Every return leaves the ring empty: nothing in flight, nothing prepared (I1).
   //
   // `trace`, when not null, receives this read's stage stamps and per-drive bytes (StageRecord).
-  // Null costs a branch per batch and no clock read; the stamps only read the clock and add to
+  // Null costs a branch per event and no clock read; the stamps only read the clock and add to
   // `trace`, so they cannot change what is submitted, reaped, drained or copied.
   //
-  // This is the hot path and checks nothing: `row`, `experts` and `slots` must be in
+  // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in
   // range and `experts.size() == slots.size()`. The service (Task 11) and
   // read_rows_once (Python) validate at their boundaries.
   int read(
-      int64_t row,
+      int64_t layer,
       const std::vector<int32_t>& experts,
       const std::vector<int64_t>& slots,
       size_t step,
-      const std::function<bool()>& abandon,
-      StageRecord* trace = nullptr) {
+      const std::function<bool(size_t)>& abandon,
+      StageRecord* trace = nullptr,
+      std::vector<uint8_t>* packed = nullptr,
+      size_t max_reading_rows = SIZE_MAX) {
     if (!ring_ready_) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
-    if (trace) trace->rows_asked = static_cast<int64_t>(experts.size());
-    for (size_t first = 0; first < experts.size(); first += step) {
-      if (abandon()) return -1;
-      const size_t count = std::min<size_t>(step, experts.size() - first);
-      // One entry per extent, j = i * parts + p for part p of row i of this batch.
-      const size_t parts = static_cast<size_t>(t_.parts);
-      std::vector<int64_t> done(count * parts, 0);
-      std::vector<int64_t> expected(count * parts, 0);
-      std::vector<int> retries(count * parts, 0);
-      std::vector<const Read*> reads(count * parts);
-      for (size_t i = 0; i < count; ++i) {
-        const size_t row_index = static_cast<size_t>(row * t_.experts + experts[first + i]);
-        const size_t base = row_index * parts;
-        // The bytes the expert needs are [start, start + need_end) of its aligned superset; they
-        // must all lie inside the file. What an extent's page-aligned tail overruns past end of
-        // file is padding no one needs, so it is clamped away below, but a row that needs bytes
-        // the file does not have is corrupt and must fail, not publish the bounce's stale bytes.
-        const Read* head = &t_.extents[base];
-        if (head->offset - head->dest + t_.starts[row_index] + t_.need_end > t_.file_sizes[head->file]) return 0;
-        for (size_t p = 0; p < parts; ++p) {
-          const Read* extent = &t_.extents[base + p];
-          reads[i * parts + p] = extent;
-          // Per extent, against the file that extent reads; an extent wholly past end of file
-          // (negative room) expects nothing.
-          expected[i * parts + p] =
-              std::max<int64_t>(0, std::min(extent->length, t_.file_sizes[extent->file] - extent->offset));
-        }
-      }
-      // Credit-based preparation. A batch can need more SQEs than the ring holds, so
-      // extents wait in `queue` until a completion frees credit; `pending` counts SQEs
-      // prepared and not yet reaped (in the SQ ring or in the kernel) and never exceeds
-      // `capacity`. Credits are counted by nonempty extents, not by rows, because rows
-      // do not all issue the same number of reads: a root serving none of a row issues
-      // nothing. This is what decouples batch depth (kBounceRows) from ring size.
-      const unsigned capacity =
-          fault_.max_outstanding > 0
-              ? std::min<unsigned>(queue_depth(), static_cast<unsigned>(fault_.max_outstanding))
-              : queue_depth();
-      unsigned pending = 0;
-      std::vector<size_t> queue;
-      queue.reserve(count * parts);
-      // A zero-length extent is a root that serves none of this row: no read, not queued.
-      for (size_t j = 0; j < count * parts; ++j) {
-        if (reads[j]->length > 0) queue.push_back(j);
-      }
-      size_t qhead = 0;
-      bool failed = false;
-      // Prepare as many queued extents as credit and SQ room allow. A null SQE means the
-      // SQ filled before credit ran out: submit what is prepared and come back after the
-      // reap. Retries re-enter through `queue`, so they take credit like any other read.
-      auto refill = [&]() {
-        while (qhead < queue.size() && pending < capacity) {
-          io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-          if (sqe == nullptr) break;
-          const size_t j = queue[qhead++];
-          const int64_t remaining = reads[j]->length - done[j];
-          io_uring_prep_read(
-              sqe, fds_[reads[j]->file], bounce_ + (j / parts) * t_.slot_bytes + reads[j]->dest + done[j],
-              static_cast<unsigned>(remaining), static_cast<uint64_t>(reads[j]->offset + done[j]));
-          io_uring_sqe_set_data64(sqe, j);
-          ++pending;
-          if (trace) {
-            trace->submitted_bytes += remaining;
-            if (done[j] > 0 || retries[j] > 0) trace->retried_bytes += remaining;
-          }
-        }
-      };
-      const bool first_batch = trace != nullptr && trace->batches == 0;
-      if (trace) ++trace->batches;
-      int64_t submitted = 0, first_seen = 0, last_seen = 0;
-      int soft_errors = 0;
-      // Reaped completions, drained before they are processed so the CQ frees early and
-      // a fault can reorder them. Hoisted out of the loop to keep its buffer.
-      std::vector<std::pair<size_t, int>> completions;
-      completions.reserve(count * parts);
-      std::vector<int64_t> cqe_at;  // per extent: when its last completion was returned (traced only)
-      if (trace) cqe_at.assign(count * parts, 0);
-      refill();
-      while (!failed && pending > 0) {
-        if (trace && submitted == 0) submitted = now_ns();
-        const int rc = submit_and_wait();
-        if (rc < 0) {
-          // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
-          // (uring_file_reader.cpp). Anything else, or a soft error that never clears, fails.
-          const bool soft = rc == -EINTR || rc == -EAGAIN || rc == -EBUSY;
-          if (!soft || ++soft_errors > kMaxSoftErrors) {
-            failed = true;
-            break;
-          }
-        } else {
-          soft_errors = 0;
-        }
-        const int64_t returned = trace ? now_ns() : 0;
-        io_uring_cqe* cqe;
-        unsigned head;
-        unsigned seen = 0;
-        std::vector<size_t> again;  // extents to resubmit
-        completions.clear();
-        io_uring_for_each_cqe(&ring_, head, cqe) {
-          ++seen;
-          completions.emplace_back(static_cast<size_t>(io_uring_cqe_get_data64(cqe)), cqe->res);
-        }
-        io_uring_cq_advance(&ring_, seen);
-        pending -= seen;
-        if (fault_.reverse_cqes) std::reverse(completions.begin(), completions.end());
-        for (const auto& completion : completions) {
-          // The extent, not the row: two parts of one row complete independently.
-          const size_t j = completion.first;
-          int res = completion.second;
-          ++cqes_;
-          if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
-          if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(j % parts) == fault_.part) {
-            if (fault_.part_error != 0) {
-              part_fired_ = true;
-              res = -fault_.part_error;
-            } else if (fault_.part_short > 0 && res > fault_.part_short) {
-              part_fired_ = true;
-              res = static_cast<int>(fault_.part_short);
-            }
-          }
-          if (res == -EINTR || res == -EAGAIN) {
-            if (++retries[j] > kMaxRetries) {
-              failed = true;
-            } else {
-              again.push_back(j);  // resubmit the same range (M3)
-            }
-            continue;
-          }
-          if (res < 0 || (res == 0 && done[j] < expected[j])) {
-            failed = true;
-            continue;
-          }
-          done[j] += res;
-          if (trace && done[j] >= expected[j]) cqe_at[j] = returned;
-          // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
-          // offset + done, bounce + dest + done and length - done stay block-aligned (an
-          // extent's offset, dest and length are whole pages) and the resubmit is a legal
-          // direct read of just this extent. At EOF, done == expected: no resubmit.
-          if (done[j] < expected[j]) again.push_back(j);
-        }
-        if (trace && seen > 0) {
-          if (first_seen == 0) first_seen = returned;
-          last_seen = returned;
-        }
-        if (failed) break;
-        for (size_t j : again) queue.push_back(j);
-        refill();
-      }
-      if (trace) {
-        // Bytes the reads returned, also for a batch that failed part way. A zero-length extent
-        // issued no read: it is not an extent here and lands on no drive.
-        for (size_t j = 0; j < count * parts; ++j) {
-          if (reads[j]->length == 0) continue;
-          const size_t drive = file_drive_[reads[j]->file];
-          trace->drive_dev[drive] = drive_dev_[drive];
-          trace->drive_bytes[drive] += done[j];
-          trace->drive_extents[drive] += 1;
-          trace->bytes += done[j];
-          if (failed) trace->cancelled_bytes += std::max<int64_t>(0, expected[j] - done[j]);
-          const int64_t slot = trace->extents++;
-          if (slot < kTraceExtents) {
-            trace->extent_id[slot] = (static_cast<int64_t>(first + j / parts) << 16) | static_cast<int64_t>(j % parts);
-            trace->extent_cqe[slot] = cqe_at[j];
-          } else {
-            ++trace->extents_untraced;
-          }
-        }
-        if (first_batch) {
-          trace->submit = submitted;
-          trace->first_cqe = first_seen;
-          trace->last_cqe = last_seen;
-        }
-        if (first_seen != 0) {
-          trace->submit_to_first_cqe_ns += first_seen - submitted;
-          trace->first_to_last_cqe_ns += last_seen - first_seen;
-        }
-      }
-      if (failed) {
-        drain(pending);
-        return 0;
-      }
-      const int64_t pack_start = trace ? now_ns() : 0;
-      int64_t row_start = pack_start;
-      for (size_t i = 0; i < count; ++i) {
-        // The row's parts landed contiguously, so its segments split from one base.
-        const uint8_t* base =
-            bounce_ + i * t_.slot_bytes + t_.starts[static_cast<size_t>(row * t_.experts + experts[first + i])];
-        const int64_t slot = slots[first + i];
-        for (const Segment& segment : t_.segments) {
-          std::memcpy(
-              t_.slabs[row][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
-              static_cast<size_t>(segment.bytes));
-        }
-        if (trace) {
-          const int64_t row_end = now_ns();
-          const size_t ordinal = first + i;
-          if (ordinal < static_cast<size_t>(kTraceRows)) {
-            trace->row_pack_start[ordinal] = row_start;
-            trace->row_pack_end[ordinal] = row_end;
-          } else {
-            ++trace->rows_untraced;
-          }
-          for (const Segment& segment : t_.segments) trace->useful_bytes += segment.bytes;
-          row_start = row_end;
-        }
-      }
-      if (trace) {
-        if (first_batch) trace->pack_start = pack_start;
-        trace->pack_end = row_start;
-        trace->pack_ns += row_start - pack_start;
-      }
+    Call& c = c_;
+    c = Call{};
+    c.layer = layer;
+    c.experts = &experts;
+    c.slots = &slots;
+    c.step = step;
+    c.total = experts.size();
+    c.batches = (c.total + step - 1) / step;
+    c.max_reading = std::max<size_t>(1, max_reading_rows);
+    // Credit is the ring's alone: banks and rows in flight do not enter it.
+    c.capacity = fault_.max_outstanding > 0
+                     ? std::min<unsigned>(queue_depth(), static_cast<unsigned>(fault_.max_outstanding))
+                     : queue_depth();
+    c.trace = trace;
+    c.packed = packed;
+    if (packed) packed->assign(c.total, 0);
+    if (trace) trace->rows_asked = static_cast<int64_t>(c.total);
+    reset_pipeline();
+    held_.clear();
+    while (true) {
+      if (!c.failed) admit(abandon);
+      if (!c.failed) refill();
+      if (c.failed) break;
+      const bool ready = has_ready();
+      if (c.pending == 0 && !ready && held_.empty()) break;
+      // Submit what was prepared before packing, so storage stays busy while the CPU copies; only
+      // block for a completion when there is no complete row to pack.
+      if (c.pending > 0 || (!ready && !held_.empty())) reap(ready);
+      if (c.failed) break;
+      pack_one();
     }
-    return 1;
+    // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
+    // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
+    // row that was never read.
+    if (!c.failed) {
+      bool clean = c.reading_rows == 0 && c.queue_count == 0;
+      for (int b = 0; b < kBanks; ++b) clean = clean && rows_busy_[b] == 0 && bank_live_[b] == 0;
+      if (!clean || (!c.abandoned && c.next_batch < c.batches)) c.failed = true;
+    }
+    if (trace && c.first_seen != 0) {
+      trace->submit = c.submitted;
+      trace->first_cqe = c.first_seen;
+      trace->last_cqe = c.last_seen;
+      trace->submit_to_first_cqe_ns = c.first_seen - c.submitted;
+      trace->first_to_last_cqe_ns = c.last_seen - c.first_seen;
+    } else if (trace) {
+      trace->submit = c.submitted;
+    }
+    if (c.failed) {
+      account_unfinished();
+      drain(c.pending);
+      return 0;
+    }
+    return c.abandoned && c.next_batch < c.batches ? -1 : 1;
   }
 
  private:
   static constexpr int kMaxSoftErrors = 1000;
   static constexpr int kMaxRetries = 8;
+  static constexpr uint8_t kPoisonFill = 0xA5;
+  static constexpr int32_t kPoisonSlot = 0x7EADBEEF;
 
-  // How many reads may be outstanding at once. Credit-based preparation in read() means
+  enum class RowState : uint8_t { Free, Reading, Ready };
+
+  // One extent's read, live from admission until its last completion retires it (generation != 0).
+  struct ExtentDesc {
+    const Read* read = nullptr;
+    int64_t done = 0;
+    int64_t expected = 0;
+    uint32_t generation = 0;  // 0: retired, no completion may name it
+    int32_t retries = 0;
+    int32_t slot = -1;        // bounce slot: bank * kBounceRows + row within the bank
+    int32_t trace_slot = -1;  // index into the record's extent arrays, -1 when not stamped
+  };
+
+  struct BounceRow {
+    RowState state = RowState::Free;
+    size_t ordinal = 0;      // the row's index in the request
+    unsigned extents_left = 0;
+    // Coverage, checked before the row is packed. `needed` is the last byte of the slot the segments
+    // can read; `filled` is what the drives actually delivered into it. See pack_one().
+    int64_t needed = 0;
+    int64_t filled = 0;
+  };
+
+  struct Completion {
+    uint64_t data;
+    int res;
+  };
+
+  // One read() call's state. Everything the pipeline mutates lives here or in the members below, all
+  // sized at open(); read() allocates nothing.
+  struct Call {
+    int64_t layer = 0;
+    const std::vector<int32_t>* experts = nullptr;
+    const std::vector<int64_t>* slots = nullptr;
+    size_t step = 1;
+    size_t total = 0;
+    size_t batches = 0;
+    size_t next_batch = 0;
+    size_t max_reading = SIZE_MAX;
+    size_t reading_rows = 0;  // rows with I/O outstanding
+    unsigned capacity = 0;
+    unsigned pending = 0;  // SQEs prepared and not yet reaped
+    size_t queue_head = 0;
+    size_t queue_count = 0;
+    StageRecord* trace = nullptr;
+    std::vector<uint8_t>* packed = nullptr;
+    bool failed = false;
+    bool abandoned = false;
+    bool stalled = false;  // a batch is waiting for its bank to retire
+    int soft_errors = 0;
+    int64_t submitted = 0, first_seen = 0, last_seen = 0;
+  };
+
+  // How many reads may be outstanding at once. Credit-based preparation in refill() means
   // this bounds concurrency, not batch size: a batch larger than the ring waits for credit
   // rather than overrunning it. Scaled by parts so splitting a row across roots does not
   // halve the number of rows in flight.
   unsigned queue_depth() const { return kQueueDepth * static_cast<unsigned>(t_.parts); }
 
-  int submit_and_wait() {
+  uint32_t next_generation() {
+    if (++generation_ == 0) {  // 0 means retired: skip it when the counter wraps
+      ++generation_;
+      ++generation_wraps_;
+    }
+    return generation_;
+  }
+
+  uint8_t* bounce_slot(size_t slot) const { return bounce_ + slot * static_cast<size_t>(t_.slot_bytes); }
+
+  // A new read() starts with every descriptor retired and every bank free. This is also what makes a
+  // failed call safe to follow: drain() has already retired the kernel's side of everything.
+  void reset_pipeline() {
+    for (auto& d : descs_) d = ExtentDesc{};
+    for (auto& r : rows_) r = BounceRow{};
+    for (int b = 0; b < kBanks; ++b) rows_busy_[b] = bank_live_[b] = 0;
+  }
+
+  bool has_ready() const {
+    for (const auto& r : rows_) {
+      if (r.state == RowState::Ready) return true;
+    }
+    return false;
+  }
+
+  void queue_push(uint32_t index) {
+    Call& c = c_;
+    // queue_ holds each descriptor at most once, so queue_count + pending <= descs_.size() == queue_.size():
+    // a descriptor leaves the queue before it is prepared and only re-enters (through again_) after its
+    // completion was reaped. If that ever broke, the modulo below would overwrite the queue's head and
+    // silently drop an extent's read while its row still packed and published - the old native-bypass
+    // bug's signature. Cheap enough to check on every push, and there is no safe way to continue.
+    if (c.queue_count >= queue_.size()) {
+      throw std::runtime_error("exl3 RAM miss: the extent queue overflowed its descriptor count");
+    }
+    queue_[(c.queue_head + c.queue_count) % queue_.size()] = index;
+    ++c.queue_count;
+  }
+
+  // Admit batches while a bank is free. The abandon check comes first: once it says stop, no further
+  // work is submitted, but what was already submitted is reaped by the loop.
+  void admit(const std::function<bool(size_t)>& abandon) {
+    Call& c = c_;
+    while (!c.failed && !c.abandoned && c.next_batch < c.batches) {
+      if (abandon(c.next_batch)) {
+        c.abandoned = true;
+        return;
+      }
+      const size_t first = c.next_batch * c.step;
+      const size_t count = std::min(c.step, c.total - first);
+      const size_t bank = c.next_batch % static_cast<size_t>(kBanks);
+      if (rows_busy_[bank] != 0) {
+        // The bank still holds rows that have not packed: the kernel must not write it again.
+        if (!c.stalled && c.trace) ++c.trace->bank_stalls;
+        c.stalled = true;
+        return;
+      }
+      // The latch clears only once this turn really admits: returning below for the reading-rows cap
+      // leaves the same busy bank to re-arm the edge next turn and count the SAME wait again. With the
+      // advisory configuration (step 1, max_reading 1) that interleaving is the normal case, so one
+      // wait spanning three turns would be reported as three stalls.
+      if (c.reading_rows != 0 && c.reading_rows + count > c.max_reading) return;
+      c.stalled = false;
+      if (!admit_batch(bank, first, count)) {
+        c.failed = true;
+        return;
+      }
+      ++c.next_batch;
+    }
+  }
+
+  bool admit_batch(size_t bank, size_t first, size_t count) {
+    Call& c = c_;
+    const size_t parts = static_cast<size_t>(t_.parts);
+    if (bank_live_[bank] != 0) return false;  // an extent still names this bank: never reuse it
+    // Validate the whole batch before touching any state, so a bad row leaves nothing to undo.
+    for (size_t i = 0; i < count; ++i) {
+      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[first + i]);
+      const size_t base = row_index * parts;
+      // The bytes the expert needs are [start, start + need_end) of its aligned superset; they
+      // must all lie inside the file. What an extent's page-aligned tail overruns past end of
+      // file is padding no one needs, so the expectation below is shortened for it, but a row that
+      // needs bytes the file does not have is corrupt and must fail, not publish the bounce's stale
+      // bytes.
+      // The head is the row's FIRST READING part, not part 0. A root whose split weight is 0 gives a
+      // zero-length part 0 (SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=0:1 is a supported setting), and reading
+      // the base and the file size out of an extent that is never submitted makes the guard depend on
+      // fields nothing else uses: the eager reader already skips zero-length parts before computing
+      // offsets (exl3_row_reader.py), so a builder that borrowed that idiom would leave them zeroed and
+      // silently aim this check at the wrong file. Every part the head can be is one the reader submits.
+      const Read* head = nullptr;
+      for (size_t p = 0; p < parts && head == nullptr; ++p) {
+        if (t_.extents[base + p].length > 0) head = &t_.extents[base + p];
+      }
+      // A row with no extent reads nothing, so packing it would publish the bounce's stale bytes.
+      if (head == nullptr) return false;
+      if (head->offset - head->dest + t_.starts[row_index] + t_.need_end > t_.file_sizes[head->file]) return false;
+      // Every reading part must have at least one byte in its own file. This cannot happen with a
+      // builder table - a part spans whole pages, a superset overruns end of file by less than one
+      // page, so a reading part always starts strictly inside the file - which is exactly why it must
+      // fail loudly here instead of being clamped to an expectation of zero below. An extent that
+      // expects nothing retires having read nothing while its row still packs and publishes, which is
+      // the corruption mode this reader exists to prevent.
+      for (size_t p = 0; p < parts; ++p) {
+        const Read& e = t_.extents[base + p];
+        if (e.length > 0 && t_.file_sizes[e.file] - e.offset <= 0) return false;
+      }
+    }
+    if (c.trace) ++c.trace->batches;
+    for (size_t i = 0; i < count; ++i) {
+      const size_t ordinal = first + i;
+      const size_t slot = bank * kBounceRows + i;
+      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal]);
+      const size_t base = row_index * parts;
+      rows_[slot] = BounceRow{RowState::Reading, ordinal, 0};
+      rows_[slot].needed = t_.starts[row_index] + t_.need_end;
+      ++rows_busy_[bank];
+      ++c.reading_rows;
+      if (fault_.poison) std::memset(bounce_slot(slot), kPoisonFill, static_cast<size_t>(t_.slot_bytes));
+      for (size_t p = 0; p < parts; ++p) {
+        // A zero-length extent is a root that serves none of this row: no read, not queued.
+        const Read* extent = &t_.extents[base + p];
+        if (extent->length <= 0) continue;
+        const uint32_t index = static_cast<uint32_t>(slot * parts + p);
+        ExtentDesc& d = descs_[index];
+        d = ExtentDesc{};
+        d.read = extent;
+        // Per extent, against the file that extent reads: a page-aligned tail overrunning end of file
+        // is padding no one needs, so this expectation is shorter than the extent. At least 1 byte -
+        // the validation loop above refused the batch if any reading extent started at or past EOF.
+        d.expected = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
+        d.generation = next_generation();
+        d.slot = static_cast<int32_t>(slot);
+        if (stale_waiting_ && index == stale_index_) stale_armed_ = true;  // the fault's descriptor was just recycled
+        ++rows_[slot].extents_left;
+        ++bank_live_[bank];
+        queue_push(index);
+        if (c.trace) {
+          const size_t drive = file_drive_[extent->file];
+          c.trace->drive_dev[drive] = drive_dev_[drive];
+          c.trace->drive_extents[drive] += 1;
+          const int64_t trace_slot = c.trace->extents++;
+          if (trace_slot < kTraceExtents) {
+            c.trace->extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | static_cast<int64_t>(p);
+            d.trace_slot = static_cast<int32_t>(trace_slot);
+          } else {
+            ++c.trace->extents_untraced;
+          }
+        }
+      }
+    }
+    if (c.trace) c.trace->rows_reading_max = std::max<int64_t>(c.trace->rows_reading_max, static_cast<int64_t>(c.reading_rows));
+    return true;
+  }
+
+  // Prepare as many queued extents as credit and SQ room allow. `pending` counts SQEs prepared and not
+  // yet reaped (in the SQ ring or in the kernel) and never exceeds `capacity`. Credits are counted by
+  // nonempty extents, not by rows, because rows do not all issue the same number of reads: a root
+  // serving none of a row issues nothing. A null SQE means the SQ filled before credit ran out: the
+  // next submit sends what is prepared and refill runs again after the reap. Retries re-enter through
+  // the queue, so they take credit like any other read.
+  void refill() {
+    Call& c = c_;
+    while (c.queue_count > 0 && c.pending < c.capacity) {
+      io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+      if (sqe == nullptr) break;
+      const uint32_t index = queue_[c.queue_head];
+      c.queue_head = (c.queue_head + 1) % queue_.size();
+      --c.queue_count;
+      ExtentDesc& d = descs_[index];
+      const int64_t remaining = d.read->length - d.done;
+      io_uring_prep_read(
+          sqe, fds_[d.read->file], bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
+          static_cast<unsigned>(remaining), static_cast<uint64_t>(d.read->offset + d.done));
+      io_uring_sqe_set_data64(sqe, (static_cast<uint64_t>(d.generation) << 32) | index);
+      ++c.pending;
+      if (c.trace) {
+        c.trace->submitted_bytes += remaining;
+        if (d.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
+        c.trace->pending_max = std::max<int64_t>(c.trace->pending_max, static_cast<int64_t>(c.pending));
+      }
+    }
+  }
+
+  // Submit, wait for a completion only when `ready` is false, then drain the CQ before processing
+  // it so the CQ frees early and a fault can reorder the completions.
+  void reap(bool ready) {
+    Call& c = c_;
+    if (!ready && c.pending == 0 && !held_.empty()) {
+      // Fault: every other row is done, so the withheld completions arrive now.
+      completions_.assign(held_.begin(), held_.end());
+      held_.clear();
+      again_.clear();
+      const int64_t released = c.trace ? now_ns() : 0;
+      for (size_t k = 0; k < completions_.size(); ++k) process(completions_[k], released);
+      if (c.trace) {
+        if (c.first_seen == 0) c.first_seen = released;
+        c.last_seen = released;
+      }
+      if (!c.failed) {
+        for (uint32_t index : again_) queue_push(index);
+      }
+      return;
+    }
+    if (c.trace && c.submitted == 0) c.submitted = now_ns();
+    const int rc = submit(ready ? 0u : 1u);
+    if (rc < 0) {
+      // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
+      // (uring_file_reader.cpp). Anything else, or a soft error that never clears, fails.
+      const bool soft = rc == -EINTR || rc == -EAGAIN || rc == -EBUSY;
+      if (!soft || ++c.soft_errors > kMaxSoftErrors) {
+        c.failed = true;
+        return;
+      }
+    } else {
+      c.soft_errors = 0;
+    }
+    const int64_t returned = c.trace ? now_ns() : 0;
+    io_uring_cqe* cqe;
+    unsigned head;
+    unsigned seen = 0;
+    completions_.clear();
+    again_.clear();
+    io_uring_for_each_cqe(&ring_, head, cqe) {
+      ++seen;
+      completions_.push_back(Completion{io_uring_cqe_get_data64(cqe), cqe->res});
+    }
+    io_uring_cq_advance(&ring_, seen);
+    c.pending -= seen;
+    if (fault_.reverse_cqes) std::reverse(completions_.begin(), completions_.end());
+    if (fault_.hold_ordinal >= 0) {
+      size_t kept = 0;
+      for (size_t k = 0; k < completions_.size(); ++k) {
+        const uint32_t index = static_cast<uint32_t>(completions_[k].data & 0xFFFFFFFFu);
+        const bool live = index < descs_.size() && descs_[index].generation != 0 &&
+                          descs_[index].generation == static_cast<uint32_t>(completions_[k].data >> 32);
+        if (live && static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) {
+          held_.push_back(completions_[k]);
+        } else {
+          completions_[kept++] = completions_[k];
+        }
+      }
+      completions_.resize(kept);
+    }
+    // Fault: a completion of an extent that retired earlier arrives after its descriptor was recycled.
+    // It names a dead generation, so it must fail the read and touch nothing; without the generation
+    // it would complete whichever extent now lives in that descriptor, publishing bytes never read.
+    if (stale_armed_) {
+      completions_.push_back(stale_);
+      stale_armed_ = stale_waiting_ = false;
+    }
+    for (size_t k = 0; k < completions_.size(); ++k) process(completions_[k], returned);
+    if (c.trace && seen > 0) {
+      if (c.first_seen == 0) c.first_seen = returned;
+      c.last_seen = returned;
+    }
+    if (c.failed) return;
+    for (uint32_t index : again_) queue_push(index);
+  }
+
+  void process(const Completion& completion, int64_t returned) {
+    Call& c = c_;
+    const uint32_t index = static_cast<uint32_t>(completion.data & 0xFFFFFFFFu);
+    const uint32_t generation = static_cast<uint32_t>(completion.data >> 32);
+    if (index >= descs_.size() || generation == 0 || descs_[index].generation != generation) {
+      ++stale_cqes_;
+      c.failed = true;
+      return;
+    }
+    ExtentDesc& d = descs_[index];
+    const size_t part = index % static_cast<size_t>(t_.parts);
+    int res = completion.res;
+    ++cqes_;
+    if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
+    if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(part) == fault_.part &&
+        (fault_.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault_.ordinal)) {
+      if (fault_.part_error != 0) {
+        part_fired_ = true;
+        res = -fault_.part_error;
+      } else if (fault_.part_short > 0 && res > fault_.part_short) {
+        part_fired_ = true;
+        res = static_cast<int>(fault_.part_short);
+      }
+    }
+    // The extent, not the row: two parts of one row complete independently.
+    if (res == -EINTR || res == -EAGAIN) {
+      if (++d.retries > kMaxRetries) {
+        c.failed = true;
+      } else {
+        again_.push_back(index);  // resubmit the same range (M3)
+      }
+      return;
+    }
+    if (res < 0 || (res == 0 && d.done < d.expected)) {
+      c.failed = true;
+      return;
+    }
+    d.done += res;
+    // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
+    // offset + done, bounce + dest + done and length - done stay block-aligned (an
+    // extent's offset, dest and length are whole pages) and the resubmit is a legal
+    // direct read of just this extent. At EOF, done == expected: no resubmit.
+    if (d.done < d.expected) {
+      again_.push_back(index);
+      return;
+    }
+    retire(index, completion, returned);
+  }
+
+  // The extent's last completion: account it, retire the descriptor, and when it was its row's last
+  // extent mark the row ready to pack. Nothing reads the descriptor afterwards.
+  void retire(uint32_t index, const Completion& completion, int64_t returned) {
+    Call& c = c_;
+    ExtentDesc& d = descs_[index];
+    if (c.trace) {
+      const size_t drive = file_drive_[d.read->file];
+      c.trace->drive_bytes[drive] += d.done;
+      c.trace->bytes += d.done;
+      if (d.trace_slot >= 0) c.trace->extent_cqe[d.trace_slot] = returned;
+    }
+    const size_t slot = static_cast<size_t>(d.slot);
+    rows_[slot].filled += d.done;
+    --bank_live_[slot / kBounceRows];
+    if (fault_.stale_cqe_call > 0 && ++retired_ == fault_.stale_cqe_call) {
+      stale_ = completion;
+      stale_index_ = index;
+      stale_waiting_ = true;
+    }
+    d = ExtentDesc{};
+    if (fault_.poison) d.slot = kPoisonSlot;
+    if (--rows_[slot].extents_left == 0) {
+      rows_[slot].state = RowState::Ready;
+      --c.reading_rows;
+    }
+  }
+
+  // Pack ONE complete row, the earliest in request order among those ready. One row per loop turn
+  // keeps packing bounded: the loop refills and reaps between rows.
+  bool pack_one() {
+    Call& c = c_;
+    size_t best = kBounceSlots;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      if (rows_[s].state != RowState::Ready) continue;
+      if (best == static_cast<size_t>(kBounceSlots) || rows_[s].ordinal < rows_[best].ordinal) best = s;
+    }
+    if (best == static_cast<size_t>(kBounceSlots)) return false;
+    // Defence in depth for the one failure this reader must never have: packing bytes no drive
+    // delivered. admit_batch's EOF guard already refuses a row the file cannot satisfy, but it decides
+    // the row from part 0's file size alone, so it is only as good as the table's row consistency
+    // (checked in tables_from). This compares what the drives actually returned for THIS row against
+    // what its segments will read, costs one compare per row, and unlike the byte-split counters it is
+    // not behind the trace flag. Extents fill the slot contiguously from dest 0 and only a tail extent
+    // can stop short without being resubmitted (a short read retries; only the EOF clamp shortens an
+    // expectation), so a total at least `needed` means the needed prefix is whole.
+    if (rows_[best].filled < rows_[best].needed) {
+      c.failed = true;
+      return false;
+    }
+    const size_t ordinal = rows_[best].ordinal;
+    const int64_t start = c.trace ? now_ns() : 0;
+    if (fault_.pack_delay_ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.pack_delay_ns));
+    // The row's parts landed contiguously, so its segments split from one base.
+    const uint8_t* base =
+        bounce_slot(best) + t_.starts[static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal])];
+    const int64_t slot = (*c.slots)[ordinal];
+    for (const Segment& segment : t_.segments) {
+      std::memcpy(
+          t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
+          static_cast<size_t>(segment.bytes));
+    }
+    if (c.trace) {
+      const int64_t end = now_ns();
+      if (ordinal < static_cast<size_t>(kTraceRows)) {
+        c.trace->row_pack_start[ordinal] = start;
+        c.trace->row_pack_end[ordinal] = end;
+      } else {
+        ++c.trace->rows_untraced;
+      }
+      for (const Segment& segment : t_.segments) c.trace->useful_bytes += segment.bytes;
+      if (c.trace->pack_start == 0) c.trace->pack_start = start;
+      c.trace->pack_end = std::max(c.trace->pack_end, end);
+      c.trace->pack_ns += end - start;
+    }
+    if (c.packed) (*c.packed)[ordinal] = 1;
+    // Packing is the last reference the bank held on this slot: only now may it be reused.
+    if (fault_.poison) std::memset(bounce_slot(best), kPoisonFill ^ 0xFF, static_cast<size_t>(t_.slot_bytes));
+    rows_[best] = BounceRow{};
+    --rows_busy_[best / kBounceRows];
+    return true;
+  }
+
+  // A failed call: what every extent still live was owed but never returned is cancelled. Extents that
+  // retired were accounted when they did.
+  void account_unfinished() {
+    Call& c = c_;
+    if (!c.trace) return;
+    for (const ExtentDesc& d : descs_) {
+      if (d.generation == 0) continue;
+      const size_t drive = file_drive_[d.read->file];
+      c.trace->drive_bytes[drive] += d.done;
+      c.trace->bytes += d.done;
+      c.trace->cancelled_bytes += std::max<int64_t>(0, d.expected - d.done);
+    }
+  }
+
+  // Submit the prepared SQEs, waiting for `wait_nr` completions (0: do not block).
+  int submit(unsigned wait_nr) {
     ++submits_;
     if (fault_.submit_error != 0 && submits_ == fault_.submit_call) {
       if (fault_.submit_first) io_uring_submit(&ring_);
       return -fault_.submit_error;
     }
-    return io_uring_submit_and_wait(&ring_, 1);
+    // Fault: the kernel consumed none of the prepared SQEs and reported success. They stay prepared and
+    // are counted in `pending`, so the next submit must send them; nothing may wait on them meanwhile.
+    if (fault_.submit_short_call != 0 && submits_ == fault_.submit_short_call) return 0;
+    // A submit that consumes nothing while nothing is in flight would make the wait below block in
+    // GETEVENTS for a completion no in-kernel SQE can produce (the state submit_short_call imitates).
+    // Guarding it costs a second syscall on every batch of the decode path, and the service watchdog
+    // already aborts a read that stays in service, so this is left to the watchdog deliberately.
+    return wait_nr != 0 ? io_uring_submit_and_wait(&ring_, wait_nr) : io_uring_submit(&ring_);
   }
 
   // After a failure, empty the ring before the bounce is reused or freed: reap every
@@ -637,6 +1092,24 @@ class RowReader {
   int64_t submits_ = 0;
   int64_t cqes_ = 0;
   bool part_fired_ = false;
+  // Pipeline state (see the class comment).
+  Call c_;
+  std::vector<ExtentDesc> descs_;
+  std::vector<uint32_t> queue_;  // ring of descriptors waiting for credit; each appears at most once
+  std::vector<Completion> completions_;
+  std::vector<Completion> held_;  // fault: completions withheld from the reader (hold_ordinal)
+  std::vector<uint32_t> again_;
+  BounceRow rows_[kBounceSlots];
+  size_t rows_busy_[kBanks] = {};   // rows not yet packed, per bank: the packing references
+  size_t bank_live_[kBanks] = {};   // extents not yet retired, per bank: the I/O references
+  uint32_t generation_ = 0;
+  int64_t generation_wraps_ = 0;
+  int64_t stale_cqes_ = 0;
+  int64_t retired_ = 0;
+  Completion stale_{0, 0};
+  uint32_t stale_index_ = 0;
+  bool stale_waiting_ = false;  // a retired completion is held until its descriptor is recycled
+  bool stale_armed_ = false;    // ... and has been: deliver it with the next reap
 };
 
 }  // namespace exl3_ram_miss
@@ -672,14 +1145,15 @@ int64_t exl3_ram_miss_read_rows(
   using namespace exl3_ram_miss;
   RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
-  return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; });
+  return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows, exl3_ram_miss_read_rows);
 
 // Test only: exl3_ram_miss_read_rows with the reader's StageRecord copied to `record`
 // (stage_words() int64), with `ok` and `status` set from the result. `fault` is the faulted call's
-// tensor, laid out as exl3_ram_miss_read_rows_faulted's (10 words); a zero tensor injects nothing.
+// tensor, laid out as exl3_ram_miss_read_rows_faulted's (kFaultWords words); an all-zero tensor injects nothing
+// except that ordinal 0 selects row 0: the Python wrapper sends -1.
 int64_t exl3_ram_miss_read_rows_traced(
     TensorView extents,
     TensorView starts,
@@ -700,15 +1174,14 @@ int64_t exl3_ram_miss_read_rows_traced(
   using namespace exl3_ram_miss;
   RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
+  check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-  reader.set_fault(
-      ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4], f[5], static_cast<int>(f[6]), f[7],
-                f[8] != 0, f[9]});
+  reader.set_fault(fault_from(f));
   StageRecord stage;
-  const int result =
-      reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; }, &stage);
+  const int result = reader.read(
+      row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
   stage.ok = result == 1 ? 1 : 0;
-  stage.status = result == 1 ? kStatusServed : kStatusFailed;
+  stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
   std::memcpy(record.data_ptr(), &stage, sizeof(stage));
   return result;
 }
@@ -716,10 +1189,9 @@ int64_t exl3_ram_miss_read_rows_traced(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_traced, exl3_ram_miss_read_rows_traced);
 
 // Test only: one reader reads `experts` into `slots` with `fault` injected
-// ([submit_error, submit_call, submit_first, cqe_error, cqe_call, part, part_error, part_short,
-// reverse_cqes, max_outstanding]),
-// then reads `then_experts` into `then_slots` with no fault. Results go to `results[0..3]`: the two
-// reads' results, then the completions the reader had reaped after each.
+// (see ReadFault and fault_from), then reads `then_experts` into `then_slots` with no fault. Results go to
+// `results[0..5]`: the two reads' results, the completions the reader had reaped after each, then its
+// stale completions and generation wraps.
 void exl3_ram_miss_read_rows_faulted(
     TensorView extents,
     TensorView starts,
@@ -742,18 +1214,19 @@ void exl3_ram_miss_read_rows_faulted(
   auto* out = static_cast<int64_t*>(results.data_ptr());
   RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) {
-    out[0] = out[1] = out[2] = out[3] = 0;
+    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = 0;
     return;
   }
+  check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-  reader.set_fault(
-      ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4], f[5], static_cast<int>(f[6]), f[7],
-                f[8] != 0, f[9]});
-  const auto never = [] { return false; };
-  out[0] = reader.read(row, ids_of(experts), slots_of(slots), kBounceRows, never);
+  reader.set_fault(fault_from(f));
+  const size_t step = f[18] > 0 ? static_cast<size_t>(f[18]) : static_cast<size_t>(kBounceRows);
+  out[0] = reader.read(row, ids_of(experts), slots_of(slots), step, abandon_after(f[17]));
   out[2] = reader.cqes();
+  out[4] = reader.stale_cqes();
+  out[5] = reader.generation_wraps();
   reader.set_fault(ReadFault{});
-  out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, never);
+  out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, abandon_after(0));
   out[3] = reader.cqes();
 }
 
@@ -1143,11 +1616,13 @@ class RamTier {
   }
 
   // Test-only faults: sleep `delay_ns` before each advisory read and before each demand
-  // read once `after_demands` demands have read rows; report reads as failed.
-  void inject(int64_t delay_ns, bool fail_reads, int64_t after_demands) {
+  // read once `after_demands` demands have read rows; report reads as failed; make an advisory
+  // give up once `abandon_after_batches` of its batches (rows) were admitted (0: never).
+  void inject(int64_t delay_ns, bool fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
     delay_ns_.store(delay_ns);
     fail_reads_.store(fail_reads);
     delay_after_.store(after_demands);
+    abandon_after_.store(abandon_after_batches);
   }
 
   void counters(int64_t* out) const {
@@ -1253,9 +1728,11 @@ class RamTier {
   // An armed demand or an advisory: touch the request's assigned rows; read every protected
   // or needed expert that is not assigned (D12's recompute: the device is waiting on this
   // record, so no gather is in flight), evicting only unprotected, non-hot READY rows; publish.
-  // An advisory protects only its own ids, reads one row at a time and gives up when a
-  // demand is posted or a pause is requested (its rows so far are released).
-  // *rows: the rows it read (0 when it failed).
+  // An advisory protects only its own ids, has at most one row's I/O outstanding, and stops
+  // submitting more when a demand is posted, a pause or a stop is requested. It reaps what it
+  // already submitted, publishes the rows that completed and packed (each is a whole, valid row and
+  // enters the tier as any READY row: evictable under the usual protection rules) and releases the rest.
+  // A demand publishes nothing unless every row landed. *rows: the rows it read (0 when it failed).
   bool serve(const Request& request, bool advisory, int64_t* rows) {
     *rows = 0;
     std::vector<int32_t> wanted;
@@ -1304,6 +1781,15 @@ class RamTier {
     }
     if (cur_) cur_->reserved = now_ns();
     int64_t status = kStatusNoRead;
+    // Per slot: the row was packed whole (read() sets it). A member, not a local, so that the buffer
+    // the pipeline writes into is allocated once rather than per served demand on the service thread
+    // - read()'s assign() below only grows it, and it never shrinks.
+    std::vector<uint8_t>& packed = packed_;
+    // Cleared, not merely reused: the publish gate below reads packed[i] whenever the vector is long
+    // enough, and read() only rewrites it when it actually runs. Carrying the PREVIOUS request's flags
+    // into a request that never read would publish a row on the strength of an older row's packing.
+    packed.clear();
+    bool cancelled = false;
     if (ok && !missing.empty()) {
       const int64_t delay = delay_ns_.load();
       if (delay > 0 && (advisory || demands_read_ >= delay_after_.load())) {
@@ -1314,34 +1800,45 @@ class RamTier {
         ok = false;
         status = kStatusFailed;
       } else {
+        const int64_t abandon_after = abandon_after_.load();
         const int result = reader_.read(
             request.row,
             missing,
             slots,
             advisory ? 1 : kBounceRows,
-            [&] { return advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load()); },
-            cur_);
+            [&](size_t admitted) {
+              return advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load() ||
+                                  (abandon_after > 0 && admitted >= static_cast<size_t>(abandon_after)));
+            },
+            cur_,
+            &packed,
+            advisory ? 1 : SIZE_MAX);
         if (result == 0) counters_[kReadErrors].fetch_add(1);
         ok = result == 1;
+        cancelled = result == -1;
         status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
       }
       if (!advisory) ++demands_read_;
       _mm_sfence();  // the split's memcpy stores land before the map publishes them (D11)
     }
+    // A row is published only when it was packed whole: every row of a request that succeeded, and, for
+    // a cancelled advisory, the rows that completed before it stopped. A failed request publishes none.
+    int64_t published = 0;
     {
       std::lock_guard<std::mutex> guard(mutex_);
       if (!slots.empty()) {
         Tier& tier = tiers_[request.row];
         for (size_t i = 0; i < slots.size(); ++i) {
-          if (ok) {
+          if (ok || (cancelled && i < packed.size() && packed[i] != 0)) {
             tier.state[slots[i]] = kReady;
             tier.stamp[slots[i]] = ++tick_;
             publish_map(request.row, missing[i], static_cast<int32_t>(slots[i]));
+            ++published;
           } else {
             release_locked(request.row, slots[i]);
           }
         }
-        if (ok) (advisory ? tier.rows_advisory : tier.rows_demand) += static_cast<int64_t>(slots.size());
+        (advisory ? tier.rows_advisory : tier.rows_demand) += published;
         counters_[kVersion].fetch_add(1);
       }
     }
@@ -1350,13 +1847,13 @@ class RamTier {
       cur_->row = request.row;
       cur_->ok = ok ? 1 : 0;
       cur_->status = ok || status != kStatusNoRead ? status : kStatusFailed;
-      cur_->rows = ok ? static_cast<int64_t>(slots.size()) : 0;
+      cur_->rows = published;
     }
-    if (ok) {
-      *rows = static_cast<int64_t>(slots.size());
-      counters_[kRowsRead].fetch_add(*rows);
-      if (advisory) counters_[kAdvisoryRows].fetch_add(*rows);
+    if (published > 0) {
+      counters_[kRowsRead].fetch_add(published);
+      if (advisory) counters_[kAdvisoryRows].fetch_add(published);
     }
+    if (ok) *rows = published;
     return ok;
   }
 
@@ -1385,6 +1882,7 @@ class RamTier {
   int64_t layers_;
   int64_t experts_;
   RowReader reader_;
+  std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, sized by read(), reused every request
   std::vector<Tier> tiers_;
   std::mutex mutex_;
   uint64_t tick_ = 0;
@@ -1399,6 +1897,7 @@ class RamTier {
   std::atomic<int64_t> busy_since_{0};
   std::atomic<int64_t> delay_ns_{0};
   std::atomic<int64_t> delay_after_{0};
+  std::atomic<int64_t> abandon_after_{0};
   std::atomic<bool> fail_reads_{false};
   std::atomic<int64_t> counters_[kCounterCount];
   // Stage trace. cur_ points at stage_ while a traced request is in service, else null.
@@ -1508,8 +2007,9 @@ void exl3_ram_miss_set_hot(int64_t handle, int64_t row, TensorView experts) {
   exl3_ram_miss::find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
 }
 
-void exl3_ram_miss_inject(int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands) {
-  exl3_ram_miss::find(handle)->inject(delay_ns, fail_reads != 0, after_demands);
+void exl3_ram_miss_inject(
+    int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
+  exl3_ram_miss::find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
 }
 
 void exl3_ram_miss_counters(int64_t handle, TensorView out) {

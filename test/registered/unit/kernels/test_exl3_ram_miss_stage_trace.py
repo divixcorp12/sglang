@@ -45,8 +45,23 @@ def _serve(page, host, row, need, protect):
 
 
 def _assert_ordered(record):
-    stamps = [record[name] for name in STAGE_ORDER if record[name]]
-    assert stamps == sorted(stamps), record
+    """The documented contract (ops/moe/exl3_ram_miss.py): non-zero stamps never decrease along
+    STAGE_ORDER EXCEPT last_cqe against pack_start, because a row packs as soon as ITS OWN extents
+    land. What holds instead is first_cqe <= pack_start and last_cqe <= pack_end.
+
+    Asserting the whole chain sorted, as this did, passes only while every extent of a request
+    retires in one reap - which is what cached buffered reads do, since they complete inside
+    io_uring_submit. It would therefore stay green in CI and break on real drive latency.
+    """
+    for earlier, later in zip(STAGE_ORDER, STAGE_ORDER[1:]):
+        if earlier == "last_cqe" and later == "pack_start":
+            continue  # the overlap itself
+        if record[earlier] and record[later]:
+            assert record[earlier] <= record[later], (earlier, later, record)
+    if record["first_cqe"] and record["pack_start"]:
+        assert record["first_cqe"] <= record["pack_start"], record
+    if record["last_cqe"] and record["pack_end"]:
+        assert record["last_cqe"] <= record["pack_end"], record
 
 
 def _until(predicate, timeout_s=5.0):
@@ -183,8 +198,11 @@ def test_a_served_request_has_per_row_stamps_in_causal_order(tier):
     for row in record["row_pack"]:
         # Only this row's own completion must precede its packing; other rows' are not compared.
         assert record["submit"] <= cqe_by_row[row["row"]] <= row["start"] <= row["end"] <= record["mapped"], row
-    assert record["pack_start"] == record["row_pack"][0]["start"]
-    assert record["pack_end"] == record["row_pack"][-1]["end"]
+    # pack_one picks the lowest-ordinal row among those currently READY, so packing follows
+    # completion order, not request order: the aggregate brackets the rows, it does not track
+    # ordinal 0 and ordinal -1.
+    assert record["pack_start"] == min(r["start"] for r in record["row_pack"])
+    assert record["pack_end"] == max(r["end"] for r in record["row_pack"])
     assert 0 < record["useful_bytes"] <= record["bytes"] <= record["submitted_bytes"]
     assert record["retried_bytes"] == 0 and record["cancelled_bytes"] == 0
 
