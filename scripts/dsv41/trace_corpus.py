@@ -73,7 +73,13 @@ def engine_kwargs(args) -> dict:
 
 def sampling_params(args) -> dict:
     # Every session decodes exactly new_tokens tokens, so tok/s is not inflated by EOS.
-    return {"max_new_tokens": args.new_tokens, "temperature": 0, "ignore_eos": True}
+    # --stop-at-eos turns that off for an acceptance-rate run, where tokens past
+    # EOS would bias the accept length in either direction.
+    return {
+        "max_new_tokens": args.new_tokens,
+        "temperature": 0,
+        "ignore_eos": not getattr(args, "stop_at_eos", False),
+    }
 
 
 def time_stream(stream, new_tokens: int, clock=time.perf_counter) -> dict:
@@ -90,18 +96,30 @@ def time_stream(stream, new_tokens: int, clock=time.perf_counter) -> dict:
     started = clock()
     first = None
     last_meta_info = None
+    last_text = None
     for chunk in stream:
         if first is None:
             first = clock()
         if isinstance(chunk, dict):
             last_meta_info = chunk.get("meta_info", last_meta_info)
+            # The Engine streams cumulative text, so the last chunk carries the
+            # whole completion. Greedy parity compares these across arms.
+            if chunk.get("text") is not None:
+                last_text = chunk["text"]
     if first is None:
         raise RuntimeError("generate stream yielded no chunks; cannot time the session")
     decode_s = clock() - first
+    # With EOS honoured the session can stop early, so the decoded count is the
+    # server's completion_tokens when it reports one, not the requested ceiling.
+    decoded = new_tokens
+    if last_meta_info and last_meta_info.get("completion_tokens"):
+        decoded = int(last_meta_info["completion_tokens"])
     result = {
         "ttft_s": first - started,
-        "decode_tok_s": (new_tokens - 1) / decode_s if decode_s > 0 else 0.0,
+        "decode_tok_s": (decoded - 1) / decode_s if decode_s > 0 and decoded > 1 else 0.0,
     }
+    if last_text is not None:
+        result["output_text"] = last_text
     if last_meta_info:
         if "completion_tokens" in last_meta_info:
             result["completion_tokens"] = last_meta_info["completion_tokens"]
@@ -133,6 +151,12 @@ def main() -> None:
         metavar="DRAFT_DIR",
         help="run DSpark speculative decoding with this draft checkpoint dir "
         "(forces eager decode; the EXL3 gate refuses speculation under a decode graph)",
+    )
+    p.add_argument(
+        "--stop-at-eos",
+        action="store_true",
+        help="honour EOS instead of decoding exactly --new-tokens; use for an "
+        "acceptance-rate run, where tokens past EOS would bias the accept length",
     )
     args = p.parse_args()
 
