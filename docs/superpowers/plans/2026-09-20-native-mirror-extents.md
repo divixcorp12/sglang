@@ -95,7 +95,8 @@ Claude-Session: https://claude.ai/code/session_01N985sZUTxTE9P7MP2rtJaF
   the existing tests. With two roots and equal weights, for every (layer,
   expert): the two parts' lengths sum to the row's aligned length, both are
   multiples of 4096, `dest_offset` of part 0 is 0 and of part 1 is part 0's
-  length, offsets are `record.offset + dest_offset`, and the file indices are
+  length, offsets are `record.aligned_read(PAGE_BYTES)[0] + dest_offset` (the ALIGNED
+  offset, not `record.offset`), and the file indices are
   `s * 2` and `s * 2 + 1`. Add a weights `(1, 0)` case: part 1 has length 0 and
   part 0 covers the whole row.
 - [ ] **Step 2: Run, confirm failure.**
@@ -160,16 +161,28 @@ path clamps against `file_sizes`. They must agree.
 - [ ] **Step 1: Write the test.** A real temp file whose size is NOT a multiple
   of the logical block size, an O_DIRECT aligned request whose offset+length
   crosses its EOF, read through the native reader and through
-  `Exl3RowReader`/`read_split`. Assert both return the same bytes, the same
-  completion status, and that the bytes past EOF are left untouched in the
-  destination. Split the request across two roots as well, so the clamp is
-  exercised on a part that lies entirely past EOF (length becomes 0 after
-  clamping) and on a part that straddles it.
+  `Exl3RowReader`/`read_split`. Assert that every byte the expert actually
+  requires is read correctly on both paths and that completion status agrees.
+  Do NOT assert anything about bytes past EOF: they are undefined, and pinning
+  them would test an implementation accident. Split the request across two roots
+  as well, so the clamp is exercised on a part entirely past EOF and on a part
+  that straddles it.
+
+  The clamp is `max(0, min(length, file_size - offset))`. The `max(0, ...)` is
+  load-bearing: an extent wholly past EOF gives a negative `file_size - offset`.
+
+  Distinguish two cases and test both; the first must not stand in for the
+  second. (a) A synthetic extent constructed entirely past EOF, exercising the
+  clamp arithmetic. (b) A valid expert's minimal aligned superset whose last
+  page overruns EOF, which is the real production case on every shard's last
+  row.
 - [ ] **Step 2: Run.** If they already agree, record that as the finding and
   commit the test as a regression guard — do NOT change behaviour to match a
-  preference. If they disagree, the native reader moves to the eager path's
-  semantics, because that one is what the mirror verifier already validated
-  205 GB of data against.
+  preference. If they disagree, resolve it from **valid completed bytes** — the
+  bytes an expert requires must be present and correct on both paths — not by
+  declaring either reader authoritative. (An earlier revision said the eager
+  reader wins because the offline verifier validated it. That is provenance,
+  not a correctness argument, and it was wrong.)
 - [ ] **Step 3: Commit.**
 
 ---
