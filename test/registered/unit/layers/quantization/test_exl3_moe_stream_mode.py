@@ -249,6 +249,64 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     assert torch.equal(got, torch.full_like(x, 1.5))  # the routed scale still applies
 
 
+def _select(x, logits, cfg):
+    from sglang.srt.layers.moe.topk import select_experts
+
+    return select_experts(hidden_states=x, router_logits=logits, topk_config=cfg, layer_id=1)
+
+
+@pytest.mark.parametrize("kind", ["standard", "packed", "bypassed"])
+def test_apply_routes_every_topk_format_alike(monkeypatch, kind):
+    """The draft path hands over a BypassedTopKOutput (hidden_states/router_logits/topk_config, no
+    topk_ids); apply must materialize it once, and pass the same routing to the streamer check and
+    the kernel as it does for the equivalent standard output."""
+    from sglang.srt.layers.moe.topk import (
+        BypassedTopKOutput,
+        StandardTopKOutputPacked,
+        TopKConfig,
+    )
+
+    calls, inspected = [], []
+
+    def fake_apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+        calls.append((topk_weights, topk_ids))
+        return torch.ones_like(x)
+
+    monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
+        layer = _layer(method)
+
+    def serves_graph_gather(topk):
+        inspected.append(topk)
+        return isinstance(getattr(topk, "topk_ids", None), torch.Tensor)  # a bypassed output has no ids
+
+    layer._nvfp4_expert_streamer = types.SimpleNamespace(serves_graph_gather=serves_graph_gather)
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+    )
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(1, HIDDEN, generator=generator).to(torch.bfloat16)
+    logits = torch.randn(1, NUM_EXPERTS, generator=generator)
+    cfg = TopKConfig(top_k=3, renormalize=True, torch_native=True)  # the fused router needs CUDA
+    want = _select(x, logits, cfg)
+    if kind == "bypassed":
+        topk = BypassedTopKOutput(hidden_states=x, router_logits=logits, topk_config=cfg)
+    elif kind == "packed":
+        topk = StandardTopKOutputPacked(*want, want.topk_ids)
+    else:
+        topk = want
+
+    method.apply(layer, types.SimpleNamespace(hidden_states=x, topk_output=topk))
+
+    assert len(calls) == 1, "a bypassed output must reach the in-graph path, not fail before it"
+    assert torch.equal(calls[0][0], want.topk_weights) and torch.equal(calls[0][1], want.topk_ids)
+    assert len(inspected) == 1 and hasattr(inspected[0], "topk_ids")  # the converted value, once
+    if kind != "bypassed":
+        assert inspected[0] is topk  # standard formats are passed through untouched
+
+
 def _routed_inputs(topk_ids, seed=0):
     generator = torch.Generator().manual_seed(seed)
     x = torch.randn(topk_ids.shape[0], HIDDEN, generator=generator).to(torch.bfloat16)

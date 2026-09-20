@@ -378,6 +378,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def apply(self, layer: nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         cfg = self.moe_runner_config
         # CONTRACT: exl3_moe_loop applies the route weight before w2 and does not
@@ -389,6 +390,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise NotImplementedError("exl3 MoE: apply_router_weight_on_input")
         # By name: StandardTopKOutputPacked (moe_fused_gate) carries a 4th field.
         topk = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_bypassed(topk):
+            # The draft path supplies routing lazily (hidden_states / router_logits); the
+            # exl3 loop needs explicit ids and weights, so materialize them once here.
+            topk = topk.to_standard(layer_id=layer.layer_id)
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         streamer = expert_streamer_of(layer)
         if streamer is not None and streamer.serves_graph_gather(topk):
