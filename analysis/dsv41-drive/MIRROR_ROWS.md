@@ -113,8 +113,21 @@ against production; scaling the mirrored result by the same factor:
   10.16 x (4.164 / 9.623) = **4.40 ms per RAM-miss row, mirrored**
 
 Applied to §18.2's step: NVMe 190 ms -> 190 x (4.164/9.623) = **82 ms**, so the
-391 ms step becomes ~283 ms, and 2.82 tok/s projects to **~3.53 tok/s** — about
-+25% before any DSpark contribution. To be confirmed by the end-to-end arm.
+391 ms step becomes ~283 ms. That is a **1.38x step speedup**.
+
+Corrected 2026-09-20: an earlier version of this paragraph read "2.82 tok/s
+projects to ~3.53 tok/s". That mixed two bases. 3.53 is 1000/283, i.e. the
+tok/s implied by the *trace's* own step, whose before-value is 1000/391 =
+2.56 tok/s — not the 2.823 tok/s c32 baseline. Stated consistently:
+
+- trace step: 2.56 -> 3.53 tok/s
+- c32 baseline scaled by the same 1.38x: 2.823 -> **3.90 tok/s**
+
+Either way the load-bearing quantity is the **1.38x ratio**, and it is an upper
+bound that assumes the whole NVMe portion scales with the per-row ratio and
+nothing else changes. To be confirmed by an end-to-end arm — and note that the
+arm in DSV41_REFERENCE §19 could not test it, because the native decode path
+does not read the mirrors at all.
 
 This also moves DSpark's break-even in its favour: DSpark buys fewer steps at
 the cost of a larger expert union per step, so halving the per-row cost makes

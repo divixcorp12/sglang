@@ -199,10 +199,48 @@ path clamps against `file_sizes`. They must agree.
   each carry about half the total.
 - [ ] **Step 2:** Compare mean decode tok/s against §19's 2.8277 and against the
   2.8286 baseline. Record the number whatever it is, including no change.
+  **Predicted before measuring, so the result can falsify it:** the ceiling is
+  1.38x (~3.90 tok/s), derived above from §18.2's 190 ms NVMe share and the
+  measured per-row ratio. Anything from 1.0x to 1.38x is plausible; below ~1.1x
+  means the NVMe portion is not what §18.2's attribution says it is, or
+  within-row splitting is losing at production queue depth (§3D).
 - [ ] **Step 3:** Byte-parity check: total bytes read must match §19's `g-base`
   total to within a percent, as it did for prefill.
 - [ ] **Step 4:** Record in `DSV41_REFERENCE.md` §19 as a follow-up subsection,
   and commit.
+
+## The handoff's six main conclusions (§1), one by one
+
+| # | Conclusion | Where it lands |
+|---|---|---|
+| 1 | Wire mirrors into the native graph reader first | **This plan, Tasks 1-4.** Independently confirmed by §19's byte accounting before planning. |
+| 2 | The pipeline is still serial at important boundaries | Not here. Handoff §3B; needs generations (see below) first. |
+| 3 | Biggest structural wins are earlier requests, incremental completion, overlap; queue flags follow measurement | Not here, and the ordering clause is honoured: stage timing before any of it. |
+| 4 | A cold exact-demand dependency cannot be made latency-free | **Not a task — a bound on this plan.** See "What this plan cannot achieve" below. |
+| 5 | Generic async controls are not sufficient for EXL3 | Not a task; a standing warning. Already borne out in this repo: `f5e5b33bfd` made EXL3 refuse the inert `SGLANG_MOE_HOT_ASYNC_PROMOTIONS` flag rather than appear to support it. Nothing in this plan enables a generic flag and calls it async EXL3 promotion. |
+| 6 | Slot leases and completion generations before increasing concurrency | Half addressed: generations are recorded as a precondition on §3B rather than retrofitted later. Leases are not in scope, and belong with §3B/§4C. |
+
+### What this plan cannot achieve (conclusion 4)
+
+Conclusion 4 is the one that bounds the whole effort, so it is worth stating the
+ceiling before Task 4 measures anything.
+
+From §18.2's step: NVMe 190 ms of a 391 ms step. Scaling the NVMe portion by the
+measured per-row ratio (4.164/9.623) gives 82 ms, a 283 ms step, i.e. a **1.38x
+step speedup**. Applied to the 2.823 tok/s c32 baseline that is **~3.90 tok/s**.
+
+That is an upper bound, and a generous one: it assumes the entire NVMe portion
+scales with a QD1 per-row ratio, that nothing else changes, and that the native
+path realises the same ratio the eager path did. **If Task 4 lands well short of
+1.38x, that is information about the pipeline, not a failure of the extent
+table** — and §3D's whole-row-versus-split question, plus the §19 eager anomaly,
+are the first places to look.
+
+Beyond that ceiling, conclusion 4 says the remaining cold-miss latency cannot be
+removed by faster reads at all: until routing is known the right expert cannot
+be fetched, so the next lever is prediction, independent requests, or computing
+hit experts while cold ones load — handoff §4B and §4D. This plan deliberately
+buys the 1.38x and stops.
 
 ## What this plan takes from the handoff, and what it leaves
 
