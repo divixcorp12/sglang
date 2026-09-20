@@ -16,8 +16,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
+# Must equal provenance._SECRET_NAME (a unit test pins that): an over-matching filter hides values.
+SECRET_NAME = re.compile(r"(API_?KEY|SECRET(_?KEY)?|PASSWORD|CREDENTIALS?|(AUTH|ACCESS|API|HF|BEARER)_TOKEN)$", re.I)
+REDACTED = "<redacted>"
 MAX_EXPERT_CACHE_GROWTH_BYTES = 1 << 30
 READER = "SGLANG_MOE_EXPERT_FILE_READER"
 MIRRORS_ENV = "SGLANG_MOE_EXPERT_MIRROR_DIRS"
@@ -47,6 +51,10 @@ def check_arm(report: dict, *, root: str, head: str, mirror: bool, traced: bool,
         problems.append(f"provenance fields unavailable: {sorted(prov['unavailable'])}")
 
     resolved = prov.get("sglang_env_resolved") or {}
+    for table in ("sglang_env", "sglang_env_at_exec", "sglang_env_resolved"):
+        wrongly = sorted(k for k, v in (prov.get(table) or {}).items() if v == REDACTED and not SECRET_NAME.search(k))
+        if wrongly:
+            problems.append(f"{table} redacted knobs that are not secrets, so their values are lost: {wrongly}")
     if resolved.get(READER) != "uring_direct":
         problems.append(f"{READER} resolved to {resolved.get(READER)!r}, not 'uring_direct': reads may fill the page cache")
     env = prov.get("sglang_env") or {}

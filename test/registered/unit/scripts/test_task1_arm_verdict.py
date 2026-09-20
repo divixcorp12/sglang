@@ -80,6 +80,27 @@ def test_each_way_an_arm_can_be_unattributable_is_named(mutation, needle):
     assert any(needle in p for p in problems), problems
 
 
+def test_a_filter_that_over_redacts_fails_the_arm():
+    """Bug: the first Task 1 arm lost 35 knob values to a substring TOKEN filter and still passed."""
+    r = _report()
+    r["provenance"]["sglang_env_resolved"]["SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS"] = verdict.REDACTED
+    r["provenance"]["sglang_env_resolved"]["EXA_API_KEY"] = verdict.REDACTED  # a real secret is fine
+    problems, _ = _check(r)
+    assert any("PREFILL_TOKENS" in p and "not secrets" in p for p in problems)
+    assert not any("EXA_API_KEY" in p for p in problems)
+
+
+def test_the_verdict_and_provenance_agree_on_what_a_secret_is():
+    prov_spec = importlib.util.spec_from_file_location(
+        "provenance", os.path.join(os.path.dirname(_PATH), "..", "..", "scripts", "dsv41", "provenance.py")
+    )
+    prov = importlib.util.module_from_spec(prov_spec)
+    prov_spec.loader.exec_module(prov)
+    assert verdict.SECRET_NAME.pattern == prov._SECRET_NAME.pattern
+    assert verdict.SECRET_NAME.flags == prov._SECRET_NAME.flags
+    assert verdict.REDACTED == prov.REDACTED
+
+
 def test_a_result_without_provenance_is_refused():
     problems, _ = _check({"per_session": []})
     assert problems and "no provenance" in problems[0]

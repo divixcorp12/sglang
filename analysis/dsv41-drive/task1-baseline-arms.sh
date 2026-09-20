@@ -65,8 +65,9 @@ preflight() {  # refuse to start unless the GPU, the port and the worktree are w
   fi
 }
 
+specs=("$@")
 idx=0
-for spec in "$@"; do
+for spec in "${specs[@]}"; do
   IFS=: read -r code mirror trace <<<"$spec"
   case "$code" in old) wt=$WT_OLD; want=$HEAD_OLD ;; new) wt=$WT_NEW; want=$HEAD_NEW ;; *) echo "bad code in $spec"; exit 2 ;; esac
   case "$mirror" in on|off) ;; *) echo "bad mirror in $spec"; exit 2 ;; esac
@@ -109,6 +110,17 @@ for spec in "$@"; do
   } > "$OUTDIR/$name.cache.json"
   echo "rc=$rc wall=${wall}s"
   "$PY" "$VERDICT" "$OUTDIR/$name.json" --root "$wt" --head "$want" --mirror "$mirror" --trace "$trace" \
-    --cache "$OUTDIR/$name.cache.json" | tee "$OUTDIR/$name.verdict.txt"
+    --cache "$OUTDIR/$name.cache.json" > "$OUTDIR/$name.verdict.txt"
+  vrc=$?
+  cat "$OUTDIR/$name.verdict.txt"
+  # Fail fast: an arm that cannot be a baseline poisons nothing yet, but every arm after it that
+  # shares its cause would burn ~400 GiB of reads. Completed arms and this one's files stay in place.
+  if [ "$rc" -ne 0 ] || [ "$vrc" -ne 0 ]; then
+    echo "ABORT: arm $name failed (run rc=$rc, verdict exit=$vrc). Reasons:"
+    grep -E '^(PROBLEM|UNREADABLE|INVALID)' "$OUTDIR/$name.verdict.txt" | sed 's/^/    /'
+    echo "  earlier arms of this run are kept in $OUTDIR: $(ls "$OUTDIR"/"$LABEL"-*.verdict.txt 2>/dev/null | grep -v "/$name.verdict.txt" | xargs -r -n1 basename | tr '\n' ' ')"
+    echo "  NOT RUN: ${specs[*]:idx}"
+    exit 4
+  fi
 done
 echo "ALL ARMS DONE"
