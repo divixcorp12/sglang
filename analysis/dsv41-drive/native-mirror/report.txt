@@ -1,0 +1,37 @@
+================ SERVICE-ATTRIBUTED EXPERT BYTES ================
+device map (st_dev -> mount): {66309: 'nvme0', 66312: 'nvme2', 66307: 'nvme4'}
+
+==================================================================
+DECODE THROUGHPUT (graphs on, GRAPH_GATHER=1)
+==================================================================
+base   mean decode tok/s = 2.8198
+mirror mean decode tok/s = 3.8016
+ratio  = 1.3482x
+predicted ceiling was 1.38x (~3.90 tok/s from 2.823); recorded before measuring.
+
+==================================================================
+SERVICE-ATTRIBUTED EXPERT BYTES (the gate)
+==================================================================
+--- base: 20800 RAM-miss requests
+    request types: {'touch': 13589, 'demand': 7211}   failed: 0
+    total expert bytes: 119.77 GiB in 9655 extents
+      nvme2        119.77 GiB  100.0%  9655 extents
+    submit->first cqe  n= 7211 mean=  7.887 ms p50=  7.741 ms
+    first->last cqe    n= 1888 mean=  9.664 ms p50=  7.461 ms
+    pack               n= 7211 mean=  3.656 ms p50=  2.743 ms
+
+--- mirror: 20800 RAM-miss requests
+    request types: {'touch': 13589, 'demand': 7211}   failed: 0
+    total expert bytes: 119.77 GiB in 19310 extents
+      nvme0         59.89 GiB   50.0%  9655 extents
+      nvme4         59.88 GiB   50.0%  9655 extents
+    submit->first cqe  n= 7211 mean=  2.192 ms p50=  2.085 ms
+    first->last cqe    n= 7211 mean=  1.170 ms p50=  0.433 ms
+    pack               n= 7211 mean=  3.669 ms p50=  2.745 ms
+
+GATE: nvme2 served 0.00 GiB of the mirror arm's expert bytes (0.00%)
+      PASS if approximately zero. The layout is still built from nvme2,
+      so a small residual is expected; a large one means a path still
+      reads the source.
+BYTE PARITY: mirror 119.77 GiB vs base 119.77 GiB (100.0%) -- want ~100%, as prefill showed in 19.
+NATIVE MIRROR ARM DONE

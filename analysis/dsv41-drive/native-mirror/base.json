@@ -1,0 +1,37 @@
+{
+  "per_session": [
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 108.31752811104525,
+      "decode_tok_s": 2.228564826516481,
+      "output_text": " , financial position or cash flows that either excludes or includes amounts that are not normally excluded or included in the most directly comparable measure calculated and presented in accordance with accounting principles generally accepted in the united states ( gaap ) .\nwe define non-gaap net income as net income adjusted for the impact of the items described above .\nwe believe that providing this non-gaap measure helps investors better understand our operating performance and trends , and provides greater transparency with respect to how management analyzes our business .\nthis non-gaap measure should be considered in addition to , and not as a substitute for or superior to , net income or other measures of financial",
+      "completion_tokens": 128
+    },
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 55.1164150290424,
+      "decode_tok_s": 3.224491888112768,
+      "output_text": " investing activities decreased $ 3.6 million in 2003 primarily due to decreased distribution and customer service spending .\nnet cash used in investing activities decreased $ 0.2 million in 2002 primarily due to decreased distribution and customer service spending .\nfinancing activities net cash used in financing activities increased $ 0.2 million in 2004 primarily due to increased payments on long-term debt .\nnet cash used in financing activities decreased $ 0.1 million in 2003 primarily due to decreased payments on long-term debt .\nnet cash used in financing activities decreased $ 0.1 million in 2002 primarily due to decreased",
+      "completion_tokens": 128
+    },
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 53.63965141901281,
+      "decode_tok_s": 2.290574800807362,
+      "output_text": " new york distribution facility is leased . ( b ) the hagerstown , maryland distribution facility is owned . ( c ) the seguin , texas and longview , texas distribution facilities are leased . what is the total approximate square footage of the distribution facility locations that are leased?\n\nTo find the total approximate square footage of the distribution facility locations that are leased, I need to identify the leased facilities from the table and sum their square footage.\n\nFrom the table:\n- Hagerstown, Maryland (b): 309,000 sq ft, leased\n- Lakewood, Washington: 64,000 sq ft, leased",
+      "completion_tokens": 128
+    },
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 56.21910682308953,
+      "decode_tok_s": 3.5354300350023777,
+      "output_text": " the short term .\nwhat is the long term economics of the lng industry as positive given our outlook for supply and demand ? supply and demand .\nwhat is the long term economics of the lng industry as positive given our outlook for supply and demand ? supply and demand .\nwhat is the long term economics of the lng industry as positive given our outlook for supply and demand ? supply and demand .\nwhat is the long term economics of the lng industry as positive given our outlook for supply and demand ? supply and demand .\nwhat is the long term economics of the lng industry as positive given our outlook for supply and demand ? supply and demand",
+      "completion_tokens": 128
+    }
+  ],
+  "mean_decode_tok_s": 2.8197653876097473
+}

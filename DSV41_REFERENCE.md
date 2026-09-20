@@ -2388,6 +2388,91 @@ mirroring should be drawn from this arm until miss counts are collected with
 `SGLANG_DSV41_EXPERT_TRACE_PATH` and the arms are repeated interleaved to rule
 out ordering.
 
+### Follow-up: the native reader now reaches the mirrors (2026-09-20)
+
+The bypass above is fixed. `exl3_ram_miss_tables` now builds a per-(row, expert,
+part) extent table `[file, offset, length, dest_offset]` from the row source, and
+the C++ reader submits one SQE per extent, so in-graph decode misses are served
+from the mirrors. Arms re-run with graphs on and `GRAPH_GATHER=1`, same corpus
+and settings as the table above. Script
+`analysis/dsv41-drive/run-native-mirror-arm.sh`, report
+`analysis/dsv41-drive/native_mirror_report.py`, raw output in
+`analysis/dsv41-drive/native-mirror/`.
+
+| arm | mean decode tok/s |
+|---|---|
+| base (mirrors off) | 2.8198 |
+| mirror (nvme0+nvme4) | 3.8016 |
+
+**1.3482x on graph decode**, against a ceiling of 1.38x recorded in the script
+before the run so it could be falsified. Coming in just under a ceiling is the
+expected shape; a result above it would have indicated a broken measurement.
+
+Per session, paired:
+
+| session | base tok/s | mirror tok/s | ratio | base TTFT s | mirror TTFT s |
+|---|---|---|---|---|---|
+| 0 | 2.2286 | 3.0651 | 1.3753 | 108.32 | 69.08 |
+| 1 | 3.2245 | 4.2881 | 1.3298 | 55.12 | 30.07 |
+| 2 | 2.2906 | 3.1942 | 1.3945 | 53.64 | 29.05 |
+| 3 | 3.5354 | 4.6589 | 1.3178 | 56.22 | 30.58 |
+
+Every session improves, in a 1.32-1.39x band. This matters more than the mean:
+base's own sessions span 2.23-3.54 tok/s, a 1.59x spread wider than the effect
+being measured, so a single session proves nothing and only the paired result
+carries the claim.
+
+#### The gate: service-attributed expert bytes
+
+Per-drive bytes come from the RAM-miss service's own accounting, carried on each
+`ram_miss_request` trace line as `drives: [{dev, bytes, extents}]`. This
+attributes expert bytes from inside the service; aggregate `/proc/diskstats`
+cannot, because it sees every read on the device whoever caused it. Device ids
+are `st_dev` resolved against the mount points, not assumed.
+
+| arm | nvme0 | nvme2 (source) | nvme4 | total | extents |
+|---|---:|---:|---:|---:|---:|
+| base | 0.00 | 119.77 | 0.00 | 119.77 | 9,655 |
+| mirror | 59.89 | 0.00 | 59.88 | 119.77 | 19,310 |
+
+All figures GiB, 20,800 requests per arm (13,589 touch, 7,211 demand), zero
+failed.
+
+nvme2 serves **0.00 GiB, 0.00%** of the mirror arm's expert bytes. A small
+residual was allowed for, since the layout is still built from nvme2; there is
+none. Byte parity is exact at 100.0%, the mirrors split 50.0/50.0, and the
+extent count doubles 9,655 -> 19,310 exactly as within-row splitting predicts.
+Diskstats agrees independently: nvme2 402.60 -> 7.66 GiB, mirrors 0 -> 197.48
+and 198.19 GiB. The 7.66 GiB residual is layout and metadata outside the
+service, which is why the service-attributed figure is the gate and diskstats
+is only corroboration.
+
+#### Where the time went
+
+| span | base | mirror |
+|---|---:|---:|
+| submit -> first cqe | 7.887 ms | 2.192 ms |
+| first -> last cqe | 9.664 ms (n=1,888) | 1.170 ms (n=7,211) |
+| pack | 3.656 ms | 3.669 ms |
+
+Queue wait falls 3.6x. `pack` is CPU work and is unchanged at 3.66 ms, which
+acts as a control: it says the gain is I/O and not measurement drift between
+arms. The `n` on first-to-last cqe rising to 7,211 is simply every request now
+spanning more than one extent.
+
+#### Three defects found on the way
+
+The extent work surfaced bugs that the previous arms could not have exposed:
+
+1. **`ensure_started` built its tables with no roots**, so the env never reached
+   in-graph reads and the feature was inert. Task 4 would have measured nothing
+   for a second time.
+2. **A latent io_uring crash** at three or more roots: a fixed ring of 16 SQEs
+   against 3 roots x 8 rows returned a null `get_sqe`. The original plan
+   asserted this could not happen.
+3. **A past-EOF extent clamped to nothing returned SUCCESS** while publishing
+   stale bounce-buffer bytes. The `max(0, ...)` in the clamp is load-bearing.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
