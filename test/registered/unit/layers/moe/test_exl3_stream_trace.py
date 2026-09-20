@@ -108,6 +108,10 @@ def _stage_record(**over):
         observed=100, reserved=110, submit=120, first_cqe=200, last_cqe=210, pack_start=220,
         pack_end=260, mapped=270, done=280, submit_to_first_cqe_ns=80, first_to_last_cqe_ns=10,
         pack_ns=40, bytes=45380, extents=2, drives=[{"dev": 49, "bytes": 45380, "extents": 2}],
+        status="served", rows_asked=2, missing_stages=[], useful_bytes=45000, submitted_bytes=45380,
+        retried_bytes=0, cancelled_bytes=0, rows_untraced=0, extents_untraced=0,
+        row_pack=[{"row": 0, "start": 220, "end": 240}, {"row": 1, "start": 240, "end": 260}],
+        extent_cqe=[{"row": 0, "part": 0, "cqe": 200}, {"row": 1, "part": 0, "cqe": 210}],
     )
     record.update(over)
     return record
@@ -136,6 +140,13 @@ def test_ram_miss_requests_are_traced_and_skipped_by_tier_sim(tmp_path):
     ]
     assert first["prev_done_ns"] == 90 and first["spans_ns"]["pack"] == 40
     assert first["drives"] == [{"dev": 49, "bytes": 45380, "extents": 2}] and "tokens" not in first
+    assert (first["status"], first["missing_stages"], first["rows_asked"]) == ("served", [], 2)
+    assert first["byte_split"] == {
+        "useful": 45000, "submitted": 45380, "completed": 45380, "retried": 0, "cancelled": 0
+    } and first["bytes"] == 45380
+    assert first["row_pack_ns"][1] == {"row": 1, "start": 240, "end": 260}
+    assert first["extent_cqe_ns"][0] == {"row": 0, "part": 0, "cqe": 200}
+    assert first["untraced"] == {"rows": 0, "extents": 0}
     # tier_sim reads the same file: the stage lines are not forward calls, so G and f are unchanged.
     calls = tier_sim.load_trace(str(path))
     assert [call["kind"] for call in calls] == ["graph_step"]

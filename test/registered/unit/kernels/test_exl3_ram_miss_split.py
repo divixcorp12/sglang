@@ -531,6 +531,201 @@ def test_a_fault_leaves_a_consistent_record(tmp_path, fault, result):
         assert record["pack_start"] == 0 and record["pack_end"] == 0  # nothing was packed
 
 
+# ---- Byte split, per-row packing and per-extent CQE stamps (see StageRecord) ----
+
+
+def _lengths(s, layer, experts):
+    """The first attempts' total: every extent's length, as submitted (not clamped at end of file)."""
+    return sum(int(s.tables.extents[layer, e, p, 2]) for e in experts for p in range(s.tables.parts))
+
+
+def _segment_bytes(s):
+    return int(s.tables.segments[:, 3].sum())
+
+
+def test_the_byte_split_of_a_clean_read(tmp_path):
+    s = ram_miss_setup(tmp_path)
+    experts = [5, 0, 2]  # expert 5 is the last row of its shard: its aligned tail passes end of file
+    result, record = read_rows_traced(s.tables, 1, experts, [1, 2, 0], direct=False)
+    assert result == 1
+    assert record["submitted_bytes"] == _lengths(s, 1, experts)
+    assert record["bytes"] == _bytes_read(s, 1, experts)
+    assert record["useful_bytes"] == len(experts) * _segment_bytes(s)
+    assert record["retried_bytes"] == 0 and record["cancelled_bytes"] == 0
+    assert 0 < record["useful_bytes"] <= record["bytes"] <= record["submitted_bytes"]
+
+
+@pytest.mark.parametrize("part", [0, 1])
+def test_a_short_read_is_retried_bytes_and_adds_nothing_to_useful(tmp_path, part):
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    result, record = read_rows_traced(
+        s.tables, 1, [0], [0], direct=False, part=part, part_short=PAGE, reverse_cqes=True
+    )
+    length = int(s.tables.extents[1, 0, part, 2])
+    assert result == 1
+    assert record["retried_bytes"] == length - PAGE  # the resubmit asked for the rest of that extent only
+    assert record["submitted_bytes"] == _lengths(s, 1, [0]) + record["retried_bytes"]
+    assert record["bytes"] == _bytes_read(s, 1, [0])  # every byte completed once
+    assert record["useful_bytes"] == _segment_bytes(s) and record["cancelled_bytes"] == 0
+    assert record["extents"] == 2  # a resubmission is not a new extent
+    _assert_rows(s, 1, [0], [0])
+
+
+def test_an_interrupted_read_is_resubmitted_whole_and_counted_as_retried(tmp_path):
+    s = ram_miss_setup(tmp_path)
+    result, record = read_rows_traced(s.tables, 1, [0], [0], direct=False, cqe_error=errno.EINTR, cqe_call=1)
+    length = int(s.tables.extents[1, 0, 0, 2])
+    assert result == 1 and record["retried_bytes"] == length
+    assert record["submitted_bytes"] == 2 * length and record["bytes"] == _bytes_read(s, 1, [0])
+
+
+# A failed read: the bytes its extents were still owed are cancelled, so completed + cancelled is the
+# whole expected total, and nothing was packed.
+@pytest.mark.parametrize(
+    "fault",
+    [
+        dict(cqe_error=EIO, cqe_call=1),
+        dict(submit_error=EIO, submit_call=1, submit_first=False),  # prepared, never submitted
+        dict(submit_error=EIO, submit_call=1, submit_first=True),  # in flight at the error
+    ],
+)
+def test_a_failed_read_cancels_the_bytes_it_never_received(tmp_path, fault):
+    s = ram_miss_setup(tmp_path)
+    experts = [0, 1, 2]
+    result, record = read_rows_traced(s.tables, 1, experts, [0, 1, 2], direct=False, **fault)
+    assert result == 0 and record["ok"] == 0
+    assert record["bytes"] + record["cancelled_bytes"] == _bytes_read(s, 1, experts)
+    assert record["cancelled_bytes"] > 0 and record["useful_bytes"] == 0
+    assert record["bytes"] <= record["submitted_bytes"]
+    # No row packed: each row asked for is listed with 0/0, and an extent that never completed has no stamp.
+    assert record["rows_asked"] == 3
+    assert record["row_pack"] == [{"row": k, "start": 0, "end": 0} for k in range(3)]
+    assert record["pack_start"] == 0 and record["pack_end"] == 0
+    assert any(extent["cqe"] == 0 for extent in record["extent_cqe"])
+
+
+def test_a_batch_that_fails_after_a_success_cancels_only_its_own_bytes(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=12, experts=12)
+    experts = list(range(9))  # batch 1: 8 rows, batch 2: 1 row
+    # Completion 9 is the second batch's only read.
+    result, record = read_rows_traced(
+        s.tables, 1, experts, list(range(9)), direct=False, cqe_error=EIO, cqe_call=9
+    )
+    assert result == 0 and record["batches"] == 2
+    assert record["useful_bytes"] == 8 * _segment_bytes(s)  # the first batch packed and counted
+    assert record["cancelled_bytes"] == _bytes_read(s, 1, [8])
+    assert record["bytes"] + record["cancelled_bytes"] == _bytes_read(s, 1, experts)
+    packed = [row for row in record["row_pack"] if row["end"]]
+    assert [row["row"] for row in packed] == list(range(8))  # the failed batch's row never packed
+    assert record["row_pack"][8] == {"row": 8, "start": 0, "end": 0}
+
+
+def _assert_row_causality(record, tables_parts):
+    """Per row only. Another row's extents may complete after this row packs (Task 4 overlaps them),
+    so no ordering across rows is asserted, and the stamps as a whole are not required to be sorted."""
+    by_row = {}
+    for extent in record["extent_cqe"]:
+        by_row.setdefault(extent["row"], []).append(extent)
+    for row in record["row_pack"]:
+        extents = by_row[row["row"]]
+        assert len(extents) == tables_parts
+        assert all(record["submit"] > 0 and extent["cqe"] > 0 for extent in extents), record
+        assert row["start"] > 0 and row["end"] >= row["start"], row
+        # A row's packing starts after all of ITS extents completed.
+        assert max(extent["cqe"] for extent in extents) <= row["start"], (row, extents)
+    for extent in record["extent_cqe"]:
+        assert record["submit"] <= record["first_cqe"] <= extent["cqe"], extent
+        # first_cqe/last_cqe are the FIRST batch's, so only its extents are bounded above by last_cqe.
+        if extent["row"] < ops.BOUNCE_ROWS:
+            assert extent["cqe"] <= record["last_cqe"], extent
+
+
+@pytest.mark.parametrize(
+    "weights, fault",
+    [
+        (None, {}),
+        ((1.0, 1.0), {}),
+        ((1.0, 1.0), dict(reverse_cqes=True, max_outstanding=2)),
+        ((1.0, 1.0), dict(part=1, part_short=PAGE, reverse_cqes=True, max_outstanding=3)),
+    ],
+)
+def test_each_rows_stamps_are_causally_ordered_over_several_batches(tmp_path, weights, fault):
+    s = ram_miss_setup(tmp_path, capacity=12, experts=12, mirror_weights=weights)
+    experts = list(range(11))[::-1]  # a batch of 8 rows, then 3
+    result, record = read_rows_traced(s.tables, 1, experts, list(range(11)), direct=False, **fault)
+    assert result == 1 and record["batches"] == 2
+    assert len(record["row_pack"]) == 11 and len(record["extent_cqe"]) == 11 * s.tables.parts
+    _assert_row_causality(record, s.tables.parts)
+    # The aggregate is the rows': it starts with row 0, ends with the last row, and adds their spans.
+    rows = record["row_pack"]
+    assert record["pack_start"] == rows[0]["start"] and record["pack_end"] == max(r["end"] for r in rows)
+    assert record["pack_ns"] == sum(r["end"] - r["start"] for r in rows)
+    _assert_rows(s, 1, experts, list(range(11)))
+
+
+def test_the_second_batch_packs_after_the_first_batchs_rows(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=12, experts=12)
+    _, record = read_rows_traced(s.tables, 1, list(range(11)), list(range(11)), direct=False)
+    rows = record["row_pack"]
+    # Within one reader the batches are serial, so this holds here; it is not a claim about pipelining.
+    assert all(rows[k]["end"] <= rows[k + 1]["start"] for k in range(10))
+
+
+def test_per_row_and_per_extent_stamps_are_bounded_and_the_overflow_counted(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=18, experts=18, mirror_weights=(1.0, 1.0))
+    experts = list(range(18))
+    result, record = read_rows_traced(s.tables, 1, experts, list(range(18)), direct=False)
+    assert result == 1
+    assert len(record["row_pack"]) == ops.STAGE_TRACE_ROWS and record["rows_untraced"] == 2
+    assert record["extents"] == 36 and len(record["extent_cqe"]) == ops.STAGE_TRACE_EXTENTS
+    assert record["extents_untraced"] == 4
+    assert record["useful_bytes"] == 18 * _segment_bytes(s)  # the totals still cover every row
+    assert record["submitted_bytes"] == _lengths(s, 1, experts)
+    _assert_rows(s, 1, experts, list(range(18)))
+
+
+def _wipe(s):
+    for layer in s.slabs.values():
+        for slab in layer.values():
+            slab.view(torch.uint8).fill_(0xAB)
+
+
+def _slabs(s, slots):
+    return [s.slabs[1][name][slots].clone() for name in EXL3_STREAMED_NAMES]
+
+
+@pytest.mark.parametrize(
+    "weights, fault",
+    [
+        (None, {}),
+        ((1.0, 1.0), {}),
+        ((1.0, 1.0), dict(part=0, part_short=PAGE, reverse_cqes=True, max_outstanding=2)),
+        ((1.0, 1.0), dict(cqe_error=errno.EINTR, cqe_call=3)),
+    ],
+)
+def test_a_traced_read_is_byte_identical_to_an_untraced_one(tmp_path, weights, fault):
+    """The trace only reads the clock and adds to its record, so an untraced read (the record pointer
+    null: no clock read, no vector, no stamp) must leave exactly the bytes a traced one does. Both
+    paths run the same faults, so retries and reordering are covered too."""
+    s = ram_miss_setup(tmp_path, capacity=12, experts=12, mirror_weights=weights)
+    experts = list(range(11))[::-1]
+    slots = list(range(11))
+    _wipe(s)
+    if fault:
+        # The untraced fault harness; its clean follow-up read lands in slot 11, outside the compared slots.
+        assert ops.read_rows_with_fault(
+            s.tables, 1, experts, slots, [5], [11], direct=False, **fault
+        ) == (1, 1)
+    else:
+        assert read_rows_once(s.tables, 1, experts, slots, direct=False) == 1
+    untraced = _slabs(s, slots)
+    _wipe(s)
+    result, record = read_rows_traced(s.tables, 1, experts, slots, direct=False, **fault)
+    assert result == 1 and record["ok"] == 1
+    assert all(same_bytes(a, b) for a, b in zip(untraced, _slabs(s, slots)))
+    _assert_rows(s, 1, experts, slots)
+
+
 if __name__ == "__main__":
     import sys
 

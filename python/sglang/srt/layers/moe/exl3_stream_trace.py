@@ -168,6 +168,8 @@ class Exl3StreamTrace:
         ``t`` (``time.monotonic()``) reads too; 0 is a stage the request never reached. Nothing here
         compares a GPU clock with the host's. The stamps below ``submit`` are the first io_uring
         batch's and ``pack_end`` the last's; ``spans_ns`` sums every batch (see StageRecord).
+        ``bytes`` is the completed total; ``byte_split`` names the rest. ``row_pack_ns`` and
+        ``extent_cqe_ns`` are per-row and per-extent stamps, bounded (``untraced`` counts the rest).
         """
         if self._file is None or not records:
             return
@@ -186,7 +188,10 @@ class Exl3StreamTrace:
                     "batches": record["batches"],
                     "backlog": record["backlog"],
                 },
+                "status": record["status"],
+                "rows_asked": record["rows_asked"],
                 "stages_ns": {name: record[name] for name in STAGE_ORDER},
+                "missing_stages": record["missing_stages"],
                 "prev_done_ns": record["prev_done"],
                 "spans_ns": {
                     "submit_to_first_cqe": record["submit_to_first_cqe_ns"],
@@ -194,6 +199,16 @@ class Exl3StreamTrace:
                     "pack": record["pack_ns"],
                 },
                 "bytes": record["bytes"],
+                "byte_split": {
+                    "useful": record["useful_bytes"],
+                    "submitted": record["submitted_bytes"],
+                    "completed": record["bytes"],
+                    "retried": record["retried_bytes"],
+                    "cancelled": record["cancelled_bytes"],
+                },
+                "row_pack_ns": record["row_pack"],
+                "extent_cqe_ns": record["extent_cqe"],
+                "untraced": {"rows": record["rows_untraced"], "extents": record["extents_untraced"]},
                 "extents": record["extents"],
                 "drives": record["drives"],
                 "t": round(time.monotonic(), 6),

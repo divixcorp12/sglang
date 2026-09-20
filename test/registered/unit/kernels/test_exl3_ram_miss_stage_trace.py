@@ -16,7 +16,7 @@ from sglang.kernels.ops.moe.exl3_ram_miss import (
     sim_wait,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -158,6 +158,132 @@ def test_a_served_advisory_is_recorded_and_a_skipped_one_is_not(tmp_path):
         assert [r["kind"] for r in host.drain_trace()] == []
     finally:
         host.stop()
+
+
+READ_STAGES = ["submit", "first_cqe", "last_cqe", "pack_start", "pack_end"]
+
+
+def _assert_terminal(record, status, missing):
+    """Every record carries a terminal status and names the stages it never reached."""
+    assert record["status"] == status, record
+    assert record["missing_stages"] == missing, record
+    assert all(record[name] == 0 for name in missing)
+    assert all(record[name] > 0 for name in STAGE_ORDER if name not in missing)
+
+
+def test_a_served_request_has_per_row_stamps_in_causal_order(tier):
+    s, page, host = tier
+    host.enable_trace()
+    _serve(page, host, 1, need=[2, 5, 4], protect=[2, 5, 4])
+    (record,) = host.drain_trace()
+    _assert_terminal(record, "served", [])
+    assert record["rows"] == record["rows_asked"] == 3 and record["extents"] == 3
+    assert len(record["row_pack"]) == 3 and len(record["extent_cqe"]) == 3
+    cqe_by_row = {extent["row"]: extent["cqe"] for extent in record["extent_cqe"]}
+    for row in record["row_pack"]:
+        # Only this row's own completion must precede its packing; other rows' are not compared.
+        assert record["submit"] <= cqe_by_row[row["row"]] <= row["start"] <= row["end"] <= record["mapped"], row
+    assert record["pack_start"] == record["row_pack"][0]["start"]
+    assert record["pack_end"] == record["row_pack"][-1]["end"]
+    assert 0 < record["useful_bytes"] <= record["bytes"] <= record["submitted_bytes"]
+    assert record["retried_bytes"] == 0 and record["cancelled_bytes"] == 0
+
+
+def test_a_zero_miss_request_marks_the_read_stages_missing(tier):
+    s, page, host = tier
+    host.enable_trace()
+    _serve(page, host, 1, need=[2], protect=[2])
+    _serve(page, host, 1, need=[], protect=[2])  # resident: nothing to read
+    _, empty = host.drain_trace()
+    _assert_terminal(empty, "no_read", READ_STAGES)
+    assert empty["rows"] == empty["rows_asked"] == 0 and empty["batches"] == 0
+    assert empty["row_pack"] == [] and empty["extent_cqe"] == []
+    assert [empty[k] for k in ("useful_bytes", "submitted_bytes", "bytes", "retried_bytes", "cancelled_bytes")] == [0] * 5
+
+
+def test_a_touch_is_terminal_and_reads_nothing(tier):
+    s, page, host = tier
+    host.enable_trace()
+    _serve(page, host, 0, need=[1], protect=[1])
+    sim_post(page, 0, need=[1], protect=[1], armed=False)
+    assert host.pump() == 1
+    _, touch = host.drain_trace()
+    _assert_terminal(touch, "touch", ["reserved", *READ_STAGES, "mapped"])
+
+
+def test_an_error_request_marks_the_unreached_stages_and_is_terminal(tier):
+    s, page, host = tier
+    host.enable_trace()
+    host.inject(fail_reads=True)
+    failed = sim_post(page, 0, need=[4], protect=[4])
+    assert host.pump() == 1 and sim_wait(page, failed, 1.0) == 2
+    (record,) = host.drain_trace()
+    _assert_terminal(record, "failed", READ_STAGES)
+    assert record["ok"] == 0 and record["rows"] == 0 and record["done"] >= record["mapped"] > 0
+    assert record["useful_bytes"] == 0 and record["extent_cqe"] == []
+
+
+def test_an_invalid_request_is_failed_not_a_silent_no_read(tier):
+    s, page, host = tier
+    host.enable_trace()
+    bad = sim_post(page, 0, need=[6], protect=[6])  # expert 6 does not exist (6 per layer)
+    assert host.pump() == 1 and sim_wait(page, bad, 1.0) == 2
+    (record,) = host.drain_trace()
+    _assert_terminal(record, "failed", READ_STAGES)
+
+
+def test_a_cancelled_advisory_is_terminal_and_names_its_missing_stages(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=6)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host.enable_trace()
+    host.inject(delay_s=0.6, delay_after_demands=10**6)  # only the advisory sleeps, before its first batch
+    host.start_thread(fatal_wait_s=5.0)
+    try:
+        sim_post(page, 1, need=[4, 5], protect=[4, 5], advisory=True, after=page_word(page, "demand_head") + 10)
+        time.sleep(0.2)  # the advisory is asleep in its read
+        seq = sim_post(page, 0, need=[], protect=[0])  # a demand posted behind it: the advisory gives up
+        assert sim_wait(page, seq, 10) == 1
+        records = []
+        assert _until(lambda: records.extend(host.drain_trace()) or len(records) >= 2)
+        advisory, demand = records
+        assert (advisory["kind"], demand["kind"]) == ("advisory", "demand")
+        _assert_terminal(advisory, "cancelled", READ_STAGES)
+        assert advisory["ok"] == 0 and advisory["rows"] == 0 and advisory["rows_asked"] == 2
+        assert advisory["row_pack"] == [{"row": 0, "start": 0, "end": 0}, {"row": 1, "start": 0, "end": 0}]
+        assert advisory["extent_cqe"] == [] and advisory["cancelled_bytes"] == 0  # nothing was in flight
+        _assert_terminal(demand, "served", [])  # its protected expert 0 was not resident: one row read
+        assert host.counters()["advisory_rows"] == 0  # the abandoned advisory's rows were released
+    finally:
+        host.stop()
+
+
+def test_disabled_tracing_serves_the_same_bytes_and_state_as_enabled(tmp_path):
+    def run(name, trace):
+        root = tmp_path / name
+        root.mkdir()
+        s = ram_miss_setup(root, capacity=6)
+        page = new_page(pin=False)
+        slot_map = torch.full((2, 6), -1, dtype=torch.int32)
+        host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+        if trace:
+            host.enable_trace()
+        try:
+            for row, need, protect in [(1, [2, 5, 4], [2, 5, 4]), (1, [0], [0, 2]), (0, [1, 3], [1, 3])]:
+                _serve(page, host, row, need=need, protect=protect)
+            return s, slot_map, host.counters(), len(host.drain_trace())
+        finally:
+            host.stop()
+
+    off, on = run("off", False), run("on", True)
+    assert off[3] == 0 and on[3] == 3  # the switch is what differs
+    assert torch.equal(off[1], on[1]) and off[2] == on[2]
+    slot_map = off[1]
+    assert int((slot_map >= 0).sum()) == 6  # experts 0, 2, 4, 5 of layer 1 and 1, 3 of layer 0
+    for layer in (0, 1):
+        for slot in slot_map[layer][slot_map[layer] >= 0].tolist():  # the other slots were never written
+            for name in off[0].slabs[layer]:
+                assert same_bytes(off[0].slabs[layer][name][slot], on[0].slabs[layer][name][slot]), (layer, slot, name)
 
 
 def test_the_service_thread_records_every_demand(tier):

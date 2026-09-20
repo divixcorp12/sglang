@@ -94,12 +94,31 @@ def read_rows_traced(
     submit_first: bool = False,
     cqe_error: int = 0,
     cqe_call: int = 0,
+    part: int = -1,
+    part_error: int = 0,
+    part_short: int = 0,
+    reverse_cqes: bool = False,
+    max_outstanding: int = 0,
 ) -> tuple[int, dict]:
     """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
     returns the reader's stage record, decoded by ``stage_records``. The reader-side stages only:
     the request-side ones (observed, reserved, mapped, done) are the tier's and stay 0."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
-    fault = torch.tensor([submit_error, submit_call, int(submit_first), cqe_error, cqe_call], dtype=torch.int64)
+    fault = torch.tensor(
+        [
+            submit_error,
+            submit_call,
+            int(submit_first),
+            cqe_error,
+            cqe_call,
+            part,
+            part_error,
+            part_short,
+            int(reverse_cqes),
+            max_outstanding,
+        ],
+        dtype=torch.int64,
+    )
     record = torch.zeros(_stage_words(), dtype=torch.int64)
     result = int(
         _host_module().exl3_ram_miss_read_rows_traced(
@@ -174,7 +193,11 @@ def read_rows_with_fault(
 # One request's stage record: the C++ StageRecord's int64 words, in order. Every time is the host's
 # CLOCK_MONOTONIC in ns (time.monotonic() reads the same clock); a stage never reached is 0.
 # submit..pack_start are the first io_uring batch's, pack_end the last's (see StageRecord).
+# The byte split, terminal status, per-row packing and per-extent CQE stamps are defined at StageRecord.
+# STAGE_TRACE_ROWS / STAGE_TRACE_EXTENTS are its kTraceRows / kTraceExtents.
 STAGE_DRIVES = 4
+STAGE_TRACE_ROWS = 16
+STAGE_TRACE_EXTENTS = 32
 STAGE_FIELDS = (
     "seq", "kind", "row", "ok", "rows", "batches", "backlog", "prev_done",
     "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
@@ -182,8 +205,16 @@ STAGE_FIELDS = (
     *(f"drive_dev_{d}" for d in range(STAGE_DRIVES)),
     *(f"drive_bytes_{d}" for d in range(STAGE_DRIVES)),
     *(f"drive_extents_{d}" for d in range(STAGE_DRIVES)),
+    "status", "rows_asked", "useful_bytes", "submitted_bytes", "retried_bytes", "cancelled_bytes",
+    "rows_untraced", "extents_untraced",
+    *(f"row_pack_start_{k}" for k in range(STAGE_TRACE_ROWS)),
+    *(f"row_pack_end_{k}" for k in range(STAGE_TRACE_ROWS)),
+    *(f"extent_id_{k}" for k in range(STAGE_TRACE_EXTENTS)),
+    *(f"extent_cqe_{k}" for k in range(STAGE_TRACE_EXTENTS)),
 )
 STAGE_KINDS = ("demand", "advisory", "touch")
+# Index 0 is a record that never finished: the service never pushes one.
+STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
 # The order of the time stamps within a request: the non-zero ones never decrease along it.
 STAGE_ORDER = (
     "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
@@ -199,11 +230,40 @@ def _stage_words() -> int:
 
 def stage_records(words: torch.Tensor) -> list[dict]:
     """Decode int64 ``[n, len(STAGE_FIELDS)]`` rows into dicts, with a ``drives`` list of the
-    drives that served an extent: ``{"dev", "bytes", "extents"}`` (``dev`` -1: several folded)."""
+    drives that served an extent: ``{"dev", "bytes", "extents"}`` (``dev`` -1: several folded).
+
+    ``status`` names how the request ended and ``missing_stages`` the STAGE_ORDER stamps it never
+    reached. ``row_pack`` has one ``{"row", "start", "end"}`` per row asked for (first
+    ``STAGE_TRACE_ROWS``), 0/0 for a row that never packed; ``extent_cqe`` one ``{"row", "part",
+    "cqe"}`` per extent issued (first ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed.
+    ``bytes`` is the completed total; the rest of the split is ``useful/submitted/retried/cancelled_bytes``.
+    """
     out = []
     for row in words.tolist():
         record = dict(zip(STAGE_FIELDS, row))
         record["kind"] = STAGE_KINDS[record["kind"]]
+        record["status"] = STAGE_STATUSES[record["status"]]
+        record["missing_stages"] = [name for name in STAGE_ORDER if not record[name]]
+        record["row_pack"] = [
+            {
+                "row": k,
+                "start": record[f"row_pack_start_{k}"],
+                "end": record[f"row_pack_end_{k}"],
+            }
+            for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+        ]
+        record["extent_cqe"] = [
+            {
+                "row": record[f"extent_id_{k}"] >> 16,
+                "part": record[f"extent_id_{k}"] & 0xFFFF,
+                "cqe": record[f"extent_cqe_{k}"],
+            }
+            for k in range(min(record["extents"], STAGE_TRACE_EXTENTS))
+        ]
+        for k in range(STAGE_TRACE_ROWS):
+            del record[f"row_pack_start_{k}"], record[f"row_pack_end_{k}"]
+        for k in range(STAGE_TRACE_EXTENTS):
+            del record[f"extent_id_{k}"], record[f"extent_cqe_{k}"]
         record["drives"] = [
             {
                 "dev": record.pop(f"drive_dev_{d}"),

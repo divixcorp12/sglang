@@ -54,11 +54,53 @@ inline int64_t now_ns() {
 }
 
 constexpr int kMaxDrives = 4;
+// Per-row and per-extent stamps live in fixed arrays: the record is copied out as one fixed-width row
+// of int64 and pushed into a preallocated ring, so nothing on the completion path allocates. A
+// request reads at most 2 * kMaxIds = 16 distinct experts (need and protect ids, 8 each) and a row
+// issues at most two extents (one per mirror root in use), so 16 rows and 32 extents hold every
+// request the wire format can carry. Anything past them is counted in rows_untraced /
+// extents_untraced, never stamped and never allowed to grow the record.
+constexpr int kTraceRows = 16;
+constexpr int kTraceExtents = 32;
 
 // One request's stage record, written only when the stage trace is on. Fixed size and int64
 // words only, so it is copied out to Python as a row of a torch int64 tensor: keep
 // STAGE_FIELDS in ops/moe/exl3_ram_miss.py in step. Every time is now_ns(), CLOCK_MONOTONIC on
 // the host; a stage the request never reached stays 0. Nothing here is a GPU timestamp.
+//
+// Terminal status: how the request ended. kStatusNone (0) is never stored in a pushed record.
+constexpr int64_t kStatusServed = 1;     // every missing row was read, packed and published
+constexpr int64_t kStatusNoRead = 2;     // served with nothing to read: every needed row was resident
+constexpr int64_t kStatusFailed = 3;     // an I/O error, a short file, an invalid request or no victim
+constexpr int64_t kStatusCancelled = 4;  // an advisory gave up (demand posted, pause or stop)
+constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed, no read possible
+
+// Byte split (all in bytes, per request, summed over its io_uring batches):
+//   useful_bytes     bytes copied into the slabs: sum of segment.bytes over every row packed. Each
+//                    byte is counted once, so a retry never adds to it. 0 for rows not packed.
+//   submitted_bytes  the length of every SQE prepared, first attempts and resubmissions. A submit
+//                    that fails may leave some prepared SQEs the kernel never saw.
+//   bytes            COMPLETED: the positive results of every completion reaped, including those of
+//                    a batch that later failed. Never above submitted_bytes; below it by the
+//                    aligned tail an extent asked for past end of file.
+//   retried_bytes    the part of submitted_bytes that was a resubmission after -EINTR/-EAGAIN or a
+//                    short read. submitted_bytes - retried_bytes is the first attempts' total.
+//   cancelled_bytes  when a batch fails: the bytes its extents were expected to return (clamped at
+//                    end of file) that never arrived, whether the extent was in flight, queued or
+//                    errored. 0 for a batch that succeeds and for an advisory abandoned between
+//                    batches (nothing is in flight then). On a failed batch, completed + cancelled
+//                    is that batch's expected total.
+// useful_bytes <= bytes <= submitted_bytes holds for a read that succeeds.
+//
+// Per-row packing: row_pack_start/end[k] bound the memcpy of row k of the request (k indexes the
+// request's missing rows in read order, the same order as its slots). Rows pack back to back, so row
+// k starts where row k-1 ended. 0/0 is a row that never packed (its batch failed or was cancelled).
+// rows_asked is the number of rows the read was asked for, so a missing row is a k below it with 0/0.
+// pack_start/pack_end/pack_ns keep the whole-read aggregate.
+//
+// Per-extent CQE: extent_id[k] = (row ordinal << 16) | part and extent_cqe[k] is the time the wait
+// that reaped that extent's last completion returned; 0 is an extent that never completed. Slots fill in
+// issue order (batch by batch), the first min(extents, kTraceExtents) are valid.
 //
 // The stamps below submit..last_cqe and pack_start are the FIRST io_uring batch's (a request
 // spans several only past kBounceRows rows, or one row at a time for an advisory); pack_end is
@@ -86,11 +128,23 @@ struct StageRecord {
   int64_t submit_to_first_cqe_ns = 0;  // summed over batches
   int64_t first_to_last_cqe_ns = 0;
   int64_t pack_ns = 0;
-  int64_t bytes = 0;    // bytes the reads returned, summed over drives
+  int64_t bytes = 0;    // completed bytes, summed over drives (see the byte split)
   int64_t extents = 0;  // reads issued: one per row and root with a non-empty part
   int64_t drive_dev[kMaxDrives] = {};  // st_dev of the drive's filesystem; -1 folds several drives
   int64_t drive_bytes[kMaxDrives] = {};
   int64_t drive_extents[kMaxDrives] = {};
+  int64_t status = 0;  // kStatus*
+  int64_t rows_asked = 0;
+  int64_t useful_bytes = 0;
+  int64_t submitted_bytes = 0;
+  int64_t retried_bytes = 0;
+  int64_t cancelled_bytes = 0;
+  int64_t rows_untraced = 0;     // rows past kTraceRows: packed but not stamped
+  int64_t extents_untraced = 0;  // extents past kTraceExtents: read but not stamped
+  int64_t row_pack_start[kTraceRows] = {};
+  int64_t row_pack_end[kTraceRows] = {};
+  int64_t extent_id[kTraceExtents] = {};
+  int64_t extent_cqe[kTraceExtents] = {};
 };
 static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
 // A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
@@ -312,6 +366,7 @@ class RowReader {
       StageRecord* trace = nullptr) {
     if (!ring_ready_) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
+    if (trace) trace->rows_asked = static_cast<int64_t>(experts.size());
     for (size_t first = 0; first < experts.size(); first += step) {
       if (abandon()) return -1;
       const size_t count = std::min<size_t>(step, experts.size() - first);
@@ -372,6 +427,10 @@ class RowReader {
               static_cast<unsigned>(remaining), static_cast<uint64_t>(reads[j]->offset + done[j]));
           io_uring_sqe_set_data64(sqe, j);
           ++pending;
+          if (trace) {
+            trace->submitted_bytes += remaining;
+            if (done[j] > 0 || retries[j] > 0) trace->retried_bytes += remaining;
+          }
         }
       };
       const bool first_batch = trace != nullptr && trace->batches == 0;
@@ -382,6 +441,8 @@ class RowReader {
       // a fault can reorder them. Hoisted out of the loop to keep its buffer.
       std::vector<std::pair<size_t, int>> completions;
       completions.reserve(count * parts);
+      std::vector<int64_t> cqe_at;  // per extent: when its last completion was returned (traced only)
+      if (trace) cqe_at.assign(count * parts, 0);
       refill();
       while (!failed && pending > 0) {
         if (trace && submitted == 0) submitted = now_ns();
@@ -438,6 +499,7 @@ class RowReader {
             continue;
           }
           done[j] += res;
+          if (trace && done[j] >= expected[j]) cqe_at[j] = returned;
           // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
           // offset + done, bounce + dest + done and length - done stay block-aligned (an
           // extent's offset, dest and length are whole pages) and the resubmit is a legal
@@ -462,7 +524,14 @@ class RowReader {
           trace->drive_bytes[drive] += done[j];
           trace->drive_extents[drive] += 1;
           trace->bytes += done[j];
-          trace->extents += 1;
+          if (failed) trace->cancelled_bytes += std::max<int64_t>(0, expected[j] - done[j]);
+          const int64_t slot = trace->extents++;
+          if (slot < kTraceExtents) {
+            trace->extent_id[slot] = (static_cast<int64_t>(first + j / parts) << 16) | static_cast<int64_t>(j % parts);
+            trace->extent_cqe[slot] = cqe_at[j];
+          } else {
+            ++trace->extents_untraced;
+          }
         }
         if (first_batch) {
           trace->submit = submitted;
@@ -479,6 +548,7 @@ class RowReader {
         return 0;
       }
       const int64_t pack_start = trace ? now_ns() : 0;
+      int64_t row_start = pack_start;
       for (size_t i = 0; i < count; ++i) {
         // The row's parts landed contiguously, so its segments split from one base.
         const uint8_t* base =
@@ -489,12 +559,23 @@ class RowReader {
               t_.slabs[row][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
               static_cast<size_t>(segment.bytes));
         }
+        if (trace) {
+          const int64_t row_end = now_ns();
+          const size_t ordinal = first + i;
+          if (ordinal < static_cast<size_t>(kTraceRows)) {
+            trace->row_pack_start[ordinal] = row_start;
+            trace->row_pack_end[ordinal] = row_end;
+          } else {
+            ++trace->rows_untraced;
+          }
+          for (const Segment& segment : t_.segments) trace->useful_bytes += segment.bytes;
+          row_start = row_end;
+        }
       }
       if (trace) {
-        const int64_t pack_end = now_ns();
         if (first_batch) trace->pack_start = pack_start;
-        trace->pack_end = pack_end;
-        trace->pack_ns += pack_end - pack_start;
+        trace->pack_end = row_start;
+        trace->pack_ns += row_start - pack_start;
       }
     }
     return 1;
@@ -597,8 +678,8 @@ int64_t exl3_ram_miss_read_rows(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows, exl3_ram_miss_read_rows);
 
 // Test only: exl3_ram_miss_read_rows with the reader's StageRecord copied to `record`
-// (stage_words() int64), with `ok` set from the result. `fault` is the faulted call's tensor; a
-// zero tensor injects nothing.
+// (stage_words() int64), with `ok` and `status` set from the result. `fault` is the faulted call's
+// tensor, laid out as exl3_ram_miss_read_rows_faulted's (10 words); a zero tensor injects nothing.
 int64_t exl3_ram_miss_read_rows_traced(
     TensorView extents,
     TensorView starts,
@@ -620,11 +701,14 @@ int64_t exl3_ram_miss_read_rows_traced(
   RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
   if (!reader.open()) return 0;
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-  reader.set_fault(ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4]});
+  reader.set_fault(
+      ReadFault{static_cast<int>(f[0]), f[1], f[2] != 0, static_cast<int>(f[3]), f[4], f[5], static_cast<int>(f[6]), f[7],
+                f[8] != 0, f[9]});
   StageRecord stage;
   const int result =
       reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [] { return false; }, &stage);
   stage.ok = result == 1 ? 1 : 0;
+  stage.status = result == 1 ? kStatusServed : kStatusFailed;
   std::memcpy(record.data_ptr(), &stage, sizeof(stage));
   return result;
 }
@@ -1219,6 +1303,7 @@ class RamTier {
       }
     }
     if (cur_) cur_->reserved = now_ns();
+    int64_t status = kStatusNoRead;
     if (ok && !missing.empty()) {
       const int64_t delay = delay_ns_.load();
       if (delay > 0 && (advisory || demands_read_ >= delay_after_.load())) {
@@ -1227,6 +1312,7 @@ class RamTier {
       if (fail_reads_.load()) {
         counters_[kReadErrors].fetch_add(1);
         ok = false;
+        status = kStatusFailed;
       } else {
         const int result = reader_.read(
             request.row,
@@ -1237,6 +1323,7 @@ class RamTier {
             cur_);
         if (result == 0) counters_[kReadErrors].fetch_add(1);
         ok = result == 1;
+        status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
       }
       if (!advisory) ++demands_read_;
       _mm_sfence();  // the split's memcpy stores land before the map publishes them (D11)
@@ -1262,6 +1349,7 @@ class RamTier {
       cur_->mapped = now_ns();
       cur_->row = request.row;
       cur_->ok = ok ? 1 : 0;
+      cur_->status = ok || status != kStatusNoRead ? status : kStatusFailed;
       cur_->rows = ok ? static_cast<int64_t>(slots.size()) : 0;
     }
     if (ok) {
@@ -1282,6 +1370,7 @@ class RamTier {
       cur_->kind = kStageTouch;
       cur_->row = request.row;
       cur_->ok = ok ? 1 : 0;
+      cur_->status = ok ? kStatusTouch : kStatusFailed;
     }
     // Classified by what was read: an empty need whose protect ids had to be read is D12's race.
     if (ok) counters_[rows == 0 ? kTouchOnly : kServedRequests].fetch_add(1);
