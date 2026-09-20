@@ -503,6 +503,16 @@ class Envs:
     # expert format defines. auto keeps each format's default (dense NVFP4 layers:
     # their expert files through io_uring, unless SGLANG_MOE_EXPERT_FILE_READER=mmap).
     SGLANG_MOE_EXPERT_ROW_SOURCE = EnvStr("auto")
+    # Mirror roots for EXL3 expert rows, os.pathsep-separated: each holds a
+    # byte-identical copy of the checkpoint (one per drive). Non-empty selects the
+    # mirror row source, which reads every row from all roots at once; one entry
+    # reads everything from that root. Rows are read from the roots, while the
+    # layout is still built from SGLANG_DSV41_EXPERT_DIR. Check the copies with
+    # scripts/dsv41/verify_expert_mirror.py before trusting them.
+    SGLANG_MOE_EXPERT_MIRROR_DIRS = EnvStr("")
+    # Colon-separated relative read shares, one per root of
+    # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
+    SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
     # Copy all host expert rows into registered memory (replaces the pinned LRU).
     SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
