@@ -176,12 +176,57 @@ def test_capture_never_omits_a_key_when_a_source_is_unavailable(monkeypatch):
         assert "OSError: no such thing" in out["unavailable"][field]
 
 
+def _log(times, tokens):
+    return list(zip(times, tokens))
+
+
+def test_step_latency_is_exact_when_every_chunk_is_one_token():
+    # The first chunk (end of prefill, at t=10) starts the clock: 127 decode steps of 0.5 s, one a 2.0 s stall.
+    times = [10.0 + 0.5 * i for i in range(128)]
+    times[-1] += 1.5
+    out = prov.step_latency(_log(times, range(1, 129)))
+    assert out["steps"] == 127 and out["multi_token_chunks"] == 0
+    assert out["step_s_p50"] == pytest.approx(0.5)
+    assert out["step_s_p99"] == pytest.approx(0.5) and out["step_s_max"] == pytest.approx(2.0)
+    assert len(out["step_s"]) == 127
+
+
+def test_step_latency_flags_chunks_that_carry_several_tokens():
+    """A chunk of 3 tokens must not be read as one slow step: it is divided and counted."""
+    out = prov.step_latency(_log([0.0, 1.0, 4.0], [1, 2, 5]))
+    assert out["multi_token_chunks"] == 1
+    assert out["step_s"] == pytest.approx([1.0, 1.0])
+
+
+def test_step_latency_refuses_to_guess_without_token_counts():
+    out = prov.step_latency(_log([0.0, 1.0, 2.0], [1, None, 3]))
+    assert "unavailable" in out and "step_s_p50" not in out
+    assert "unavailable" in prov.step_latency(_log([0.0, 1.0, 2.0], [1, 3, 3]))  # a chunk with no new token
+    assert "unavailable" in prov.step_latency(_log([0.0], [1]))
+
+
+def test_timed_chunks_passes_the_stream_through_and_logs_cumulative_tokens():
+    ticks = iter([1.0, 2.0, 3.0])
+    log = []
+    chunks = [{"meta_info": {"completion_tokens": 1}}, {"meta_info": {"completion_tokens": 2}}, "bare"]
+    assert list(prov.timed_chunks(iter(chunks), log, clock=lambda: next(ticks))) == chunks
+    assert log == [(1.0, 1), (2.0, 2), (3.0, None)]
+
+
+def test_process_tree_cpu_s_counts_this_process():
+    before = prov.process_tree_cpu_s()
+    sum(i * i for i in range(2_000_000))
+    assert prov.process_tree_cpu_s() > before
+
+
 def test_arm_harnesses_embed_provenance_in_the_result_json():
     for parts in (("analysis", "dsv41-drive", "eager_arm_driver.py"), ("scripts", "dsv41", "trace_corpus.py")):
         with open(os.path.join(_ROOT, *parts)) as f:
             source = f.read()
         assert '"provenance": prov' in source, parts
         assert "provenance.capture(" in source and "drive_idle_check()" in source, parts
+        assert "provenance.timed_chunks(" in source and "provenance.step_latency(" in source, parts
+        assert "provenance.process_tree_cpu_s()" in source, parts
 
 
 if __name__ == "__main__":

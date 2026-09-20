@@ -183,11 +183,25 @@ def main() -> None:
     sessions = []
     for text in texts:
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
+        chunk_log = []
+        cpu_before = provenance.process_tree_cpu_s()
         timing = time_stream(
-            engine.generate(input_ids=ids, sampling_params=sampling_params(args), stream=True),
+            provenance.timed_chunks(
+                engine.generate(input_ids=ids, sampling_params=sampling_params(args), stream=True),
+                chunk_log,
+            ),
             args.new_tokens,
         )
-        sessions.append({"prompt_tokens": len(ids), "new_tokens": args.new_tokens, **timing})
+        cpu_after = provenance.process_tree_cpu_s()
+        sessions.append(
+            {
+                "prompt_tokens": len(ids),
+                "new_tokens": args.new_tokens,
+                "cpu_s": None if None in (cpu_before, cpu_after) else cpu_after - cpu_before,
+                "step_latency": provenance.step_latency(chunk_log),
+                **timing,
+            }
+        )
         print(json.dumps(sessions[-1]), flush=True)
     engine.shutdown()
     report = {"provenance": prov, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}

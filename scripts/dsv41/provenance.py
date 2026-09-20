@@ -205,3 +205,71 @@ def capture(harness_files: dict | None = None) -> dict:
         unavailable["sglang_env_resolved"] = "sglang did not import"
     out["unavailable"] = unavailable
     return out
+
+
+def timed_chunks(stream, log: list, clock=None):
+    """Pass a generate stream through, appending ``(time, completion_tokens)`` per chunk to ``log``.
+
+    ``completion_tokens`` is the cumulative count from the chunk's meta_info, or None when the
+    chunk carries none. It is what lets ``step_latency`` count tokens instead of assuming one
+    chunk is one token."""
+    import time
+
+    clock = clock or time.perf_counter
+    for chunk in stream:
+        meta = chunk.get("meta_info") if isinstance(chunk, dict) else None
+        log.append((clock(), meta.get("completion_tokens") if meta else None))
+        yield chunk
+
+
+def _percentile(sorted_values: list, q: float) -> float:
+    # Nearest-rank: with 127 samples p99 is a real observation, not an interpolation.
+    return sorted_values[min(len(sorted_values) - 1, max(0, -(-len(sorted_values) * q // 100) - 1))]
+
+
+def step_latency(log: list) -> dict:
+    """Decode step latency from a ``timed_chunks`` log, from the first chunk (end of prefill) onward.
+
+    Each later chunk's wall time is divided by the tokens it delivered. It is exact only where a
+    chunk delivered one token; ``multi_token_chunks`` counts the rest, and if it is not 0 the
+    percentiles are smoothed over those chunks and must be read that way. If any chunk lacks a
+    token count the percentiles are None with the reason."""
+    if len(log) < 2:
+        return {"steps": 0, "unavailable": "fewer than two chunks"}
+    if any(tokens is None for _, tokens in log):
+        return {"steps": len(log) - 1, "unavailable": "a chunk carried no completion_tokens"}
+    per_token, multi = [], 0
+    for (t0, n0), (t1, n1) in zip(log, log[1:]):
+        if n1 <= n0:
+            return {"steps": len(log) - 1, "unavailable": f"completion_tokens went {n0} -> {n1}"}
+        multi += n1 - n0 > 1
+        per_token.append((t1 - t0) / (n1 - n0))
+    ordered = sorted(per_token)
+    return {
+        "steps": len(per_token),
+        "multi_token_chunks": multi,
+        "step_s_p50": _percentile(ordered, 50),
+        "step_s_p95": _percentile(ordered, 95),
+        "step_s_p99": _percentile(ordered, 99),
+        "step_s_max": ordered[-1],
+        "step_s": per_token,
+    }
+
+
+def process_tree_cpu_s() -> float | None:
+    """User+system CPU seconds so far of this process and every live descendant (the scheduler and
+    its workers). Whole-process totals, not per thread: a spinning doorbell thread counts in full."""
+    try:
+        import psutil
+
+        me = psutil.Process()
+        total = 0.0
+        for p in [me, *me.children(recursive=True)]:
+            try:
+                t = p.cpu_times()
+                total += t.user + t.system
+            except psutil.NoSuchProcess:
+                pass
+        return total
+    except Exception:
+        return None

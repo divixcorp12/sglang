@@ -73,18 +73,23 @@ def main() -> None:
     for index, text in enumerate(texts):
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
         before = read_sectors()
+        cpu_before = provenance.process_tree_cpu_s()
         start_t = time.monotonic()
-        box = {}
+        box, chunk_log = {}, []
         timing = trace_corpus.time_stream(
             capture_text(
-                engine.generate(
-                    input_ids=ids, sampling_params=trace_corpus.sampling_params(args), stream=True
+                provenance.timed_chunks(
+                    engine.generate(
+                        input_ids=ids, sampling_params=trace_corpus.sampling_params(args), stream=True
+                    ),
+                    chunk_log,
                 ),
                 box,
             ),
             args.new_tokens,
         )
         end_t = time.monotonic()
+        cpu_after = provenance.process_tree_cpu_s()
         after = read_sectors()
         output_text = timing.pop("output_text", box.get("text", ""))
         row = {
@@ -94,6 +99,8 @@ def main() -> None:
             "end_t": end_t,
             "disk_bytes": {k: (after[k] - before[k]) * SECTOR_BYTES for k in DRIVES},
             "output_sha1": hashlib.sha1(output_text.encode()).hexdigest(),
+            "cpu_s": None if None in (cpu_before, cpu_after) else cpu_after - cpu_before,
+            "step_latency": provenance.step_latency(chunk_log),
             **timing,
         }
         sessions.append(row)
