@@ -44,7 +44,10 @@ class ExpertFileRowReader(SynchronousSubmit):
     host_layouts = frozenset({HostSlotLayout.PER_NAME})
     # One call is one io_uring batch; the reader pipelines its own queue depth.
     preferred_batch_rows = 0
-    # O_DIRECT is used when a destination is page-aligned, buffered reads otherwise.
+    # False because the READER handles misalignment, not because the reads become buffered.
+    # In direct mode the file is opened O_RDONLY | O_DIRECT unconditionally and an unaligned
+    # destination is served through a reader-owned page-aligned bounce, so no read here ever
+    # goes through the page cache. Anything reasoning about cache residency depends on that.
     requires_page_aligned_destinations = False
 
     def __init__(
