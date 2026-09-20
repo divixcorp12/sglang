@@ -61,25 +61,39 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
         super().__init__(reader, layer_id, segments, bounce_rows=bounce_rows)
         self.roots = roots
         self.policy = policy
-        # Fail here, naming the root and the file, rather than on some later
-        # read. Whether a copy is complete is the reader's size check, on the
-        # first read of each file.
+        # Fail here, naming the root and the file, rather than mid-serve. A copy
+        # of the wrong size is a half-finished or stale one. This is checked
+        # again by the reader when it first opens each file.
         layer_paths = {
             record.path
             for (layer, _expert), record in reader.layout.records.items()
             if layer == layer_id
         }
         for path in sorted(layer_paths):
+            source_bytes = os.path.getsize(path)
             for root in roots:
                 mirror = reader._mirror_path(root, path)
-                if not os.path.isfile(mirror):
+                try:
+                    mirror_bytes = os.path.getsize(mirror)
+                except FileNotFoundError as error:
                     raise FileNotFoundError(
                         f"mirror root {root} has no copy of {path}: {mirror} "
                         "does not exist"
+                    ) from error
+                except OSError as error:
+                    raise type(error)(
+                        f"mirror root {root}: cannot stat its copy {mirror} of "
+                        f"{path}: {error}"
+                    ) from error
+                if mirror_bytes != source_bytes:
+                    raise RuntimeError(
+                        f"mirror root {root}: {mirror} has size {mirror_bytes} "
+                        f"bytes but its source {path} has size {source_bytes} "
+                        "bytes; the copy is incomplete or stale"
                     )
 
     @classmethod
-    def for_layer(
+    def for_mirrored_layer(
         cls,
         layout: Exl3ExpertLayout,
         layer_id: int,
@@ -89,13 +103,18 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
         roots: Sequence[str],
         policy: SplitPolicy,
         source_root: str,
+        bounce_rows: int = BOUNCE_ROWS,
     ) -> "Exl3MirrorRowSource":
+        """The mirror counterpart of ``Exl3ShardRowSource.for_layer``, named
+        apart because it needs arguments that one does not take (so it does
+        not override it: the inherited ``for_layer`` cannot build this class)."""
         return cls(
             shared_row_reader(layout, direct, source_root),
             layer_id,
             segments,
             roots=roots,
             policy=policy,
+            bounce_rows=bounce_rows,
         )
 
     def _read_rows(self, experts: Sequence[int], addresses: Sequence[int]) -> list[int]:
