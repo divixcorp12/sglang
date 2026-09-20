@@ -20,23 +20,9 @@ from types import SimpleNamespace
 # The harness lives in the worktree; run from its root (env.sh does) or from a copy of this file.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts", "dsv41"))
 sys.path.insert(0, os.path.join(os.getcwd(), "scripts", "dsv41"))
+import provenance  # noqa: E402
 import trace_corpus  # noqa: E402
-
-# mount point -> block device, as in run-mirror-arms.sh
-DRIVES = {"nvme0": "nvme0n1", "nvme2": "nvme2n1", "nvme4": "nvme3n1"}
-SECTOR_BYTES = 512
-
-
-def read_sectors() -> dict:
-    """Cumulative sectors read per drive (/proc/diskstats field 6)."""
-    wanted = {device: name for name, device in DRIVES.items()}
-    out = {}
-    with open("/proc/diskstats") as f:
-        for line in f:
-            fields = line.split()
-            if fields[2] in wanted:
-                out[wanted[fields[2]]] = int(fields[5])
-    return out
+from provenance import DRIVES, SECTOR_BYTES, read_sectors  # noqa: E402
 
 
 def capture_text(stream, box):
@@ -74,11 +60,15 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    prov = provenance.capture({"driver": os.path.abspath(__file__), "trace_corpus": trace_corpus.__file__})
+    prov["drive_idle_check"] = provenance.drive_idle_check()
     boot_sectors = read_sectors()
     boot_t = time.monotonic()
     engine = sglang.Engine(**trace_corpus.engine_kwargs(args))
     ready_t = time.monotonic()
     ready_sectors = read_sectors()
+    # Engine launch may edit os.environ before it spawns the scheduler; record what it changed.
+    prov["sglang_env_drift_at_engine_ready"] = provenance.env_drift(prov["sglang_env"], provenance.process_env())
     sessions = []
     for index, text in enumerate(texts):
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
@@ -111,6 +101,7 @@ def main() -> None:
     engine.shutdown()
     report = {
         "arm": args.arm,
+        "provenance": prov,
         "mirror_dirs": os.environ.get("SGLANG_MOE_EXPERT_MIRROR_DIRS", ""),
         "boot_t": boot_t,
         "ready_t": ready_t,

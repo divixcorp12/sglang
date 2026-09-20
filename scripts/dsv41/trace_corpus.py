@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 
 
@@ -170,8 +172,14 @@ def main() -> None:
     import sglang
     from transformers import AutoTokenizer
 
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import provenance
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    prov = provenance.capture({"trace_corpus": os.path.abspath(__file__)})
+    prov["drive_idle_check"] = provenance.drive_idle_check()
     engine = sglang.Engine(**engine_kwargs(args))
+    prov["sglang_env_drift_at_engine_ready"] = provenance.env_drift(prov["sglang_env"], provenance.process_env())
     sessions = []
     for text in texts:
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
@@ -182,7 +190,7 @@ def main() -> None:
         sessions.append({"prompt_tokens": len(ids), "new_tokens": args.new_tokens, **timing})
         print(json.dumps(sessions[-1]), flush=True)
     engine.shutdown()
-    report = {"per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
+    report = {"provenance": prov, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
 
