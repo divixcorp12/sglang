@@ -151,10 +151,47 @@ def test_shared_cache_is_one_object_and_checks_row_bytes(fresh_shared_cache):
 def test_stats_report_the_hit_rate():
     table = np.arange(100 * 4, dtype=np.uint8).reshape(100, 4)
     cache = EngramRowCache(capacity_rows=16, row_bytes=4)
-    assert cache.stats() == {"lookups": 0, "accesses": 0, "hits": 0, "hit_rate": 0.0}
+    empty = {
+        "lookups": 0, "accesses": 0, "hits": 0, "hit_rate": 0.0,
+        "misses": 0, "evictions": 0, "filled_rows": 0, "capacity_rows": 16,
+    }
+    assert cache.stats() == empty
     cache.lookup(np.array([5, 7, 5]), _fetcher(table, []))
     cache.lookup(np.array([7, 5]), _fetcher(table, []))
-    assert cache.stats() == {"lookups": 2, "accesses": 5, "hits": 2, "hit_rate": 0.4}
+    assert cache.stats() == {**empty, "lookups": 2, "accesses": 5, "hits": 2, "hit_rate": 0.4, "misses": 2, "filled_rows": 2}
+
+
+def test_evictions_and_fill_are_counted_and_change_no_result():
+    table = np.arange(64 * 2, dtype=np.uint8).reshape(64, 2)
+    cache = EngramRowCache(capacity_rows=2, row_bytes=2, ways=2)  # one set, two ways
+    for key in (1, 2, 1, 3, 4, 1):
+        got = cache.lookup(np.array([key]), _fetcher(table, []))
+        assert np.array_equal(got, table[[key]])
+    stats = cache.stats()
+    # Fetched: 1, 2, 3 (evicts 2), 4 (evicts 1), 1 (evicts 3). Key 1's second lookup hit.
+    assert (stats["misses"], stats["evictions"], stats["filled_rows"]) == (5, 3, 2)
+    assert stats["capacity_rows"] == 2
+    assert stats["misses"] + stats["hits"] == stats["accesses"]
+
+
+def test_stats_sink_records_cumulative_engram_counters(tmp_path):
+    trace = str(tmp_path / "trace.jsonl")
+    table = np.arange(100 * 4, dtype=np.uint8).reshape(100, 4)
+    saved = (row_cache_module._SINK, row_cache_module._SINK_PATH)
+    row_cache_module._SINK, row_cache_module._SINK_PATH = None, ""
+    try:
+        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(trace):
+            cache = EngramRowCache(capacity_rows=16, row_bytes=4)
+            cache._sink._interval_s = 0.0
+            cache.lookup(np.array([1, 2]), _fetcher(table, []))
+            cache.lookup(np.array([1, 3]), _fetcher(table, []))
+    finally:
+        row_cache_module._SINK, row_cache_module._SINK_PATH = saved
+    with open(trace + ".cache-stats") as f:
+        lines = [json.loads(line) for line in f]
+    assert [line["kind"] for line in lines] == ["engram", "engram"]
+    assert (lines[-1]["hits"], lines[-1]["misses"], lines[-1]["filled_rows"]) == (1, 3, 3)
+    assert lines[0]["t"] <= lines[1]["t"]
 
 
 def _log_lines(caplog):
@@ -177,7 +214,8 @@ def test_logs_its_stats_every_log_every_lookups(caplog):
         cache.lookup(np.array([3]), _fetcher(table, []))
     lines = _log_lines(caplog)
     assert [line["lookups"] for line in lines] == [2, 4]
-    assert lines[-1] == {"lookups": 4, "accesses": 6, "hits": 3, "hit_rate": 0.5}
+    assert lines[-1] == cache.stats()
+    assert (lines[-1]["accesses"], lines[-1]["hits"], lines[-1]["hit_rate"]) == (6, 3, 0.5)
 
 
 def test_log_is_silent_before_any_lookup(caplog):

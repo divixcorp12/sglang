@@ -1,0 +1,74 @@
+{
+  "arm": "r1-mirror",
+  "mirror_dirs": "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash",
+  "boot_t": 710466.916905489,
+  "ready_t": 710541.597088162,
+  "startup_disk_bytes": {
+    "nvme0": 8991129600,
+    "nvme2": 7756328960,
+    "nvme4": 8991326208
+  },
+  "per_session": [
+    {
+      "session": 0,
+      "prompt_tokens": 256,
+      "start_t": 710541.617085009,
+      "end_t": 710659.275103557,
+      "disk_bytes": {
+        "nvme0": 68585668608,
+        "nvme2": 134868992,
+        "nvme4": 68581687296
+      },
+      "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+      "ttft_s": 46.809339470928535,
+      "decode_tok_s": 1.7925558279855711,
+      "completion_tokens": 128
+    },
+    {
+      "session": 1,
+      "prompt_tokens": 256,
+      "start_t": 710659.27890244,
+      "end_t": 710749.678831534,
+      "disk_bytes": {
+        "nvme0": 44436160512,
+        "nvme2": 89501696,
+        "nvme4": 44433457152
+      },
+      "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+      "ttft_s": 29.834164409083314,
+      "decode_tok_s": 2.096895961925412,
+      "completion_tokens": 128
+    },
+    {
+      "session": 2,
+      "prompt_tokens": 256,
+      "start_t": 710749.682068508,
+      "end_t": 710847.272148624,
+      "disk_bytes": {
+        "nvme0": 49677656064,
+        "nvme2": 98377728,
+        "nvme4": 49674719232
+      },
+      "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+      "ttft_s": 29.281562338001095,
+      "decode_tok_s": 1.8592129290647295,
+      "completion_tokens": 128
+    },
+    {
+      "session": 3,
+      "prompt_tokens": 256,
+      "start_t": 710847.277108642,
+      "end_t": 710933.617165441,
+      "disk_bytes": {
+        "nvme0": 41465757696,
+        "nvme2": 89600000,
+        "nvme4": 41463365632
+      },
+      "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+      "ttft_s": 30.113970455015078,
+      "decode_tok_s": 2.2587397879449855,
+      "completion_tokens": 128
+    }
+  ],
+  "mean_decode_tok_s": 2.0018511267301746
+}

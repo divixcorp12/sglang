@@ -8,7 +8,9 @@ are testable on a CPU-only host.
 from __future__ import annotations
 
 import heapq
+import itertools
 import math
+import weakref
 from collections import OrderedDict
 from typing import (
     Any,
@@ -23,7 +25,11 @@ from typing import (
 
 import torch
 
+from sglang.srt.layers.engram_row_cache import cache_stats_sink
+
 PAGE_BYTES = 4096
+_LRU_INDEX = itertools.count()
+_LIVE_LRUS: "weakref.WeakSet[PinnedSlotLRU]" = weakref.WeakSet()
 
 
 class PinnedGatherResult(NamedTuple):
@@ -81,6 +87,12 @@ class PinnedSlotLRU:
     oldest of them does: that is an over-capacity call reassigning its own
     slots. ``touch`` and ``assign`` are O(1); only covered experts are
     skipped when choosing a victim.
+
+    The counters (``stats()``) only count: none is read by a decision. ``hits``
+    counts ``touch`` calls, which the tier makes once per resident route (a
+    repeated expert counts each time); ``admissions`` counts ``assign`` calls,
+    each a distinct missing expert. The two are therefore not one unit, so a
+    miss rate needs the tier's route-level ``lookup_misses`` (``tier_snapshot``).
     """
 
     def __init__(
@@ -93,12 +105,37 @@ class PinnedSlotLRU:
         self.expert_to_slot: "OrderedDict[int, int]" = OrderedDict()
         self._free = list(range(self.capacity))
         heapq.heapify(self._free)
+        self.hits = 0
+        self.admissions = 0
+        self.evictions = 0
+        # Evictions that took an expert of the caller's own request.
+        self.protected_evictions = 0
+        self.releases = 0
+        # The tier's route-level counters, bound when it first uses this table.
+        self._tier_stats = None
+        self._index = next(_LRU_INDEX)
+        _LIVE_LRUS.add(self)
+        self._sink = cache_stats_sink()
+
+    def stats(self) -> dict:
+        return {
+            "capacity": self.capacity,
+            "occupancy": len(self.expert_to_slot),
+            "hits": self.hits,
+            "admissions": self.admissions,
+            "evictions": self.evictions,
+            "protected_evictions": self.protected_evictions,
+            "releases": self.releases,
+        }
 
     def __contains__(self, expert_id: int) -> bool:
         return expert_id in self.expert_to_slot
 
     def touch(self, expert_id: int) -> None:
         self.expert_to_slot.move_to_end(expert_id)
+        self.hits += 1
+        if self._sink is not None:
+            self._sink.maybe_write("pinned_tier", tier_snapshot)
 
     def assign(
         self, expert_id: int, protected: Collection[int] = frozenset()
@@ -116,8 +153,13 @@ class PinnedSlotLRU:
         else:
             evicted = self._victim(protected)
             slot = self.expert_to_slot.pop(evicted)
+            self.evictions += 1
+            self.protected_evictions += evicted in protected
         self.slot_to_expert[slot] = expert_id
         self.expert_to_slot[expert_id] = slot
+        self.admissions += 1
+        if self._sink is not None:
+            self._sink.maybe_write("pinned_tier", tier_snapshot)
         return slot, evicted
 
     def _victim(self, protected: Collection[int]) -> int:
@@ -141,6 +183,7 @@ class PinnedSlotLRU:
         self.expert_to_slot.pop(expert_id, None)
         self.slot_to_expert[slot] = -1
         heapq.heappush(self._free, slot)
+        self.releases += 1
 
     def mapping(self, num_experts: int) -> list[int]:
         """Each expert's slot, or -1."""
@@ -151,11 +194,34 @@ class PinnedSlotLRU:
         return mapping
 
     def before_host_use(self, cache) -> None:
-        """Nothing else owns these slots."""
-        return None
+        """Nothing else owns these slots; remember the tier's counters."""
+        if self._tier_stats is None:
+            self._tier_stats = getattr(cache, "stats", None)
 
     def after_host_use(self, cache) -> None:
         return None
+
+
+def tier_snapshot() -> dict:
+    """Cumulative counters of every live ``PinnedSlotLRU``, in construction order.
+
+    The scalars sum over the layers; ``layers`` holds each table's own counters.
+    ``lookup_*`` and ``populated_bytes`` are the tier's route-level counters
+    (``PinnedHostCacheStats``), present once a tier has used its table.
+    """
+    tables = sorted(_LIVE_LRUS, key=lambda table: table._index)
+    layers = [table.stats() for table in tables]
+    snapshot = {
+        key: sum(layer[key] for layer in layers)
+        for key in ("capacity", "occupancy", "hits", "admissions", "evictions", "protected_evictions", "releases")
+    }
+    tier = [table._tier_stats for table in tables if table._tier_stats is not None]
+    for key in ("lookup_hits", "lookup_misses", "populated_rows", "populated_bytes"):
+        snapshot[key] = sum(getattr(stats, key) for stats in tier)
+    snapshot["layers"] = {
+        key: [layer[key] for layer in layers] for key in ("occupancy", "hits", "admissions", "evictions")
+    }
+    return snapshot
 
 
 def allocate_host_slab(
