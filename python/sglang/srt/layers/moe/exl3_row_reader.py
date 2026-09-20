@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.io.uring_file_reader import UringFileReader
 
 
+def mirror_path(source_root: str, root: str, path: str) -> str:
+    """``root``'s copy of ``path``, a file under ``source_root``."""
+    relative = os.path.relpath(path, source_root)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        raise ValueError(f"{path} is not under source root {source_root}")
+    return os.path.join(root, relative)
+
+
 class Exl3RowReader:
     def __init__(
         self,
@@ -74,10 +82,7 @@ class Exl3RowReader:
                 "read_split needs source_root: the directory the layout's paths "
                 "live under, so each mirror root's copy can be found"
             )
-        relative = os.path.relpath(path, self.source_root)
-        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-            raise ValueError(f"{path} is not under source root {self.source_root}")
-        return os.path.join(root, relative)
+        return mirror_path(self.source_root, root, path)
 
     def _submit(
         self,
