@@ -2398,10 +2398,23 @@ native reader is the prerequisite for any decode benefit; until then
 >
 > By elimination the cause was machine state that day, and the cause is unknown.
 >
-> **The page-cache candidate is excluded.** It was attractive - the `g-mirror` arm ran
-> immediately before `e-base` and read 127 GiB from the same drive, against the 123 GiB
-> by which `e-base` undershoots today - but the reads were O_DIRECT in both runs, so the
-> page cache could not have served them. `dsv41-phase3a/env.sh:14` sets
+> **The page-cache candidate is strongly weakened, and excluded for today's arms only.**
+> It was attractive - the `g-mirror` arm ran immediately before `e-base` and read 127 GiB
+> from the same drive, against the 123 GiB by which `e-base` undershoots today - but that
+> coincidence is a mixed-basis artefact: 381 GiB is today's SESSION bytes and 258 GiB is
+> §19's WHOLE-ARM total including ~24 GiB of startup. Whole-arm to whole-arm the gap is
+> ~147 GiB against `g-mirror`'s 127.2 GiB, and they do not match. Three further facts cut
+> against it: 127 GiB of cached rows would not fit beside the 70 GiB pinned tier in 188 GiB
+> of RAM; `e-mirror` ran right after `g-mirror` had read ~137 GiB from each mirror and did
+> NOT benefit, reading its full 397 GiB with TTFTs within 1-3% of today's; and §19's decode
+> had already diverged in session 1 (2.16 vs 1.80 tok/s at an identical 55 s TTFT), which
+> no "the cache warms from session 2" story fits.
+>
+> For TODAY's arms it is excluded by measurement: after ~2.3 TiB of reads, `fincore` shows
+> 15.6 GiB of the 204.1 GiB source expert files resident, which is startup-scale. For §19
+> itself there is no process-level evidence - that run wrote no env dump and its logs carry
+> no reader line - so "it ran direct" rests on the config alone:
+> `dsv41-phase3a/env.sh:14` sets
 > `SGLANG_MOE_EXPERT_FILE_READER=uring_direct`; its mtime precedes the §19 run and
 > neither `run-mirror-arms.sh` nor `eager-cache-arms.sh` overrides it or drops caches.
 > The fd is opened `O_RDONLY | O_DIRECT` unconditionally when direct is set
@@ -2409,9 +2422,10 @@ native reader is the prerequisite for any decode benefit; until then
 > page-aligned bounce the reader owns rather than by falling back to buffered reads
 > (`:249-252`). The comment at `expert_file_reader.py:47`, "O_DIRECT is used when a
 > destination is page-aligned, buffered reads otherwise", describes that bounce and
-> reads as if there were a fallback; there is not.
+> reads as if there were a fallback; there is not. So the only way §19 could have read
+> buffered is if that env var was not in force in its process, which nothing records.
 >
-> So §19's arm genuinely requested ~123 GiB fewer bytes, which means it read fewer ROWS,
+> So §19's arm most likely requested ~147 GiB fewer bytes, which means it read fewer ROWS,
 > which means its pinned tier was hitting where today's misses. Why is not recoverable:
 > §19 set no trace path and had no per-row counters, and those counters exist only
 > because this investigation added them.
