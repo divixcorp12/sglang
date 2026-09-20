@@ -1,26 +1,16 @@
 """Splitting an already page-aligned read length across mirror roots.
 
-`Exl3ExpertRecord.aligned_read` already rounds a row's read up to a
-page-aligned `(offset, length, row_start)` before any of this runs, so by the
-time a length reaches `ReadSplit` it is a multiple of 4096. That is the
-difference from the retired striping design: there, a *row's own byte count*
-was the thing being split, which is essentially never a multiple of 4096
-itself, so the split needed a padded "stride" distinct from the real payload
-("fragment") size, and reconstructing a row meant stripping that per-part
-padding back out. Here `length` is already a whole number of pages, so a
-split of it into per-part page counts has no remainder fragment and no
-padded stride to strip -- every part, including the last, is directly a
-number of whole O_DIRECT-aligned pages, and they sum to `length` exactly.
-That hazard is what mirroring removes, not something this module works
-around.
+For mirroring, every root holds a byte-identical copy of the checkpoint, so
+the only thing to plan for one read is which root serves which of its bytes.
+`ReadSplit` divides an already page-aligned `length` (the aligned length
+`Exl3ExpertRecord.aligned_read` produces) into `len(weights)` parts, one per
+root: every part, including the last, is a multiple of `PAGE_BYTES`, and the
+parts sum exactly to `length`. A part of 0 is a legal outcome, not a
+degenerate one -- it is how a slow or unhealthy root is dropped from a read
+without dropping the root from the configuration.
 
-`ReadSplit` is deliberately about *bytes for one read*, not row geometry: for
-mirroring, every root holds a byte-identical copy of the checkpoint, so
-"which root serves which bytes of this one read" is the only thing left to
-plan, and it can change per read (a `SplitPolicy` may adapt to per-root
-throughput; Task 7). A part of 0 is a legal outcome, not a degenerate one --
-it is how a slow or unhealthy root is dropped from a read without dropping
-the root from the configuration.
+`SplitPolicy` is the interface a reader plans against; `StaticSplitPolicy`
+is the fixed-weights implementation.
 
 This module has no file I/O and does not import torch, because it is
 imported during layout construction alongside code that must stay usable
@@ -30,6 +20,7 @@ before torch is available.
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -61,14 +52,25 @@ class ReadSplit:
     starts: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
+        if isinstance(self.length, bool) or not isinstance(self.length, int):
+            raise ValueError(f"length must be an int, got {type(self.length).__name__}")
         if self.length < 0:
             raise ValueError(f"length must be non-negative, got {self.length}")
         if self.length % PAGE_BYTES != 0:
-            raise ValueError(f"length must be a multiple of {PAGE_BYTES}, got {self.length}")
+            raise ValueError(
+                f"length must be a multiple of {PAGE_BYTES}, got {self.length}"
+            )
 
         weights = tuple(self.weights)
         if not weights:
             raise ValueError("weights must be non-empty")
+        for w in weights:
+            if (
+                isinstance(w, bool)
+                or not isinstance(w, (int, float))
+                or not math.isfinite(w)
+            ):
+                raise ValueError(f"weights must be finite numbers, got {weights}")
         if any(w < 0 for w in weights):
             raise ValueError(f"weights must be non-negative, got {weights}")
         total_weight = sum(weights)
@@ -76,14 +78,25 @@ class ReadSplit:
             raise ValueError(f"weights must not be all zero, got {weights}")
         object.__setattr__(self, "weights", weights)
 
+        # Floor division (rather than true division followed by `int()`)
+        # keeps the apportionment integer by construction: the sum of the
+        # floors can never exceed `total_pages`, so `remainder` below can
+        # never go negative -- the asserts turn that guarantee into a loud
+        # failure if a future edit breaks it, instead of a silently
+        # misaligned O_DIRECT read.
         total_pages = self.length // PAGE_BYTES
-        pages = [int(total_pages * w / total_weight) for w in weights]
+        pages = [int(total_pages * w // total_weight) for w in weights]
         remainder = total_pages - sum(pages)
+        assert remainder >= 0, f"apportionment overshot total_pages: pages={pages}"
         if remainder:
             largest = weights.index(max(weights))
             pages[largest] += remainder
 
         part_bytes = tuple(p * PAGE_BYTES for p in pages)
+        assert all(p >= 0 for p in part_bytes), f"negative part in {part_bytes}"
+        assert sum(part_bytes) == self.length, (
+            f"parts {part_bytes} do not sum to {self.length}"
+        )
         object.__setattr__(self, "part_bytes", part_bytes)
         object.__setattr__(
             self, "starts", tuple(itertools.accumulate(part_bytes[:-1], initial=0))
@@ -93,9 +106,9 @@ class ReadSplit:
 class SplitPolicy:
     """How to divide one read's bytes across mirror roots.
 
-    A policy may be static (fixed weights) or adaptive (Task 7: weights
-    derived from observed per-root throughput). Either way, `plan` is the
-    only thing a caller needs: it never sees the weights directly.
+    A policy may be static (fixed weights) or adaptive (weights derived from
+    observed per-root throughput). Either way, `plan` is the only thing a
+    caller needs: it never sees the weights directly.
     """
 
     def plan(self, length: int) -> ReadSplit:
