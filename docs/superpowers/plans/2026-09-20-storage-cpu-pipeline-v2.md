@@ -153,7 +153,7 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 >
 > **Mirrors-on moves the bottleneck onto the packer**, which is the finding that matters for what comes next. The read window shrinks from 15.3 ms to 6.0 ms at p50 while packing stays at 5.6-5.7 ms per request, so packing covers 18% of the read window with mirrors off and **49-54% with mirrors on**; rows that waited on the packer go from **0 of 4332 to 104-112 of 4332**. Note that 74% of served requests are single-row and cannot overlap within a request at all, which is a property of the blocking-per-request design rather than a defect.
 >
-> **Two independent analyses converge on this number, in the mirrors-on regime only.** Task 6's precheck, working from the same corpus for a different purpose, found that miss-row completion spread is 2.77 ms with mirrors on -- the same quantity as the exposed tail here, and the basis for calling that spread serial packing. **With mirrors off the spread is 7.4 ms and drive-bound**, so the convergence is a property of the mirrors-on regime, not a general fact about where row spread comes from. Earlier text in this plan, and the commit message that introduced these figures, stated it without that qualifier; the commit cannot be amended, so this correction lives here and in `analysis/dsv41-drive/STORAGE_V2_REPORT.md`. So the packing tail IS the row spread that Task 6 was designed to exploit, and **parallelising packing would shrink Task 4's exposed tail and Task 6's remaining benefit at the same time**. That makes the unchecked packing-worker item below the highest-value remaining work in this task.
+> **Two analyses of the same stamps agree on this number, in the mirrors-on regime only.** (An earlier revision said "two independent analyses converge". They are not independent: both read the same `row_pack_ns` stamps of the same corpus, so n_eff = 1. It is one computation done twice, which checks the arithmetic and not the measurement. The same caveat applies to "seven schema-2 traces, which agree within noise" above.) Task 6's precheck, working from the same corpus for a different purpose, found that miss-row completion spread is 2.77 ms with mirrors on -- the same quantity as the exposed tail here, and the basis for calling that spread serial packing. **With mirrors off the spread is 7.4 ms and drive-bound**, so the convergence is a property of the mirrors-on regime, not a general fact about where row spread comes from. Earlier text in this plan, and the commit message that introduced these figures, stated it without that qualifier; the commit cannot be amended, so this correction lives here and in `analysis/dsv41-drive/STORAGE_V2_REPORT.md`. So the packing tail IS the row spread that Task 6 was designed to exploit, and **parallelising packing would shrink Task 4's exposed tail and the *per-row* increment at the same time**. **That is not adverse to the chosen mechanism.** Two-phase's 35.74 ms is 88% hit-lane hiding and does not depend on miss-row spread at all; only per-row's +4.93 ms best-order increment does. An earlier revision said "Task 6's remaining benefit", which reads as though improving Task 4 undercuts the mechanism Task 6 will build. It undercuts the variant Task 6 expects to reject. That makes the unchecked packing-worker item below the highest-value remaining work in this task, with no tension against Task 6.
 
 ## Task 5: Implement and test source leases and device acknowledgements
 
@@ -218,7 +218,9 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > **Constraint this places on Task 6:** any kernel that polls **host** memory
 > must use `ld.acquire.sys`, never `.nc`. The existing wait kernel already does.
-> **Task 6's per-lane readiness poll must too** -- that is a hard requirement on
+> **Task 6's readiness poll must too** -- per-phase under the chosen two-phase
+> mechanism, per-lane only under V2; the requirement is on any poll of host
+> memory, whatever its granularity -- and that is a hard requirement on
 > the mechanism, not a tuning choice.
 >
 > Conditions: PCIe **Gen3 x16** throughout (the link is Gen1 when idle), 1,403
@@ -297,8 +299,10 @@ Include expert identity in the immutable row result and validate it against the 
 >    (schema 4, `dad59f1b48`). Every figure remains conditional on (3), on
 >    c = 1.055, on the 1.0 ms launch cost, and on one workload.
 > 6. **A cheaper, non-Task-5-compliant V1 exists** (V1b, `kBusySeq`-gated): the
->    88% share with no service change, safe only under today's invariants. It is
->    excluded, and item 4 says why.
+>    88% share with no service change, safe only under today's invariants. **It
+>    is excluded by the Gate**, clause 2 -- the borrowed exclusion expires when
+>    the service stops serving one request at a time. (An earlier revision
+>    pointed at item 4, which is about Task 5 (b) and is not the reason.)
 > 7. **The hit-phase saving is capped by link idle inside read waits**
 >    (`PER_ROW_TRANSFER_REVIEW.md` G1). `c` is the Gen3 link's time per row
 >    (13.3 MB in 1.055 ms is about 12.6 GB/s against a measured 12.02), so
@@ -338,6 +342,12 @@ Include expert identity in the immutable row result and validate it against the 
 > | per-row over two-phase, **best** order | **+4.93** | +1.9% | **no** -- it is Sigma(m-1)c |
 > | per-row over two-phase, **random** order | **-15.67** | -6.2% | yes |
 > | hit lanes per step in layers that read | **33.9** | -- | this **is** the measurement |
+>
+> **The two-phase row is a ceiling by construction, and the table should not be
+> read as a prediction.** 33.9 hit lanes x c = 1.055 gives 35.77, which is the
+> 35.74 figure to rounding: it is simply *every hit copy perfectly hidden*. The
+> only inputs beyond the measured lane count are `c` and A2. Nothing in it models
+> a hit copy that fails to hide.
 >
 > **The fourth row is the one to read carefully.** Three rows of savings move
 > when `k` moves, and the best-order increment does not: it is Sigma(m-1)c and is
@@ -474,6 +484,18 @@ Include expert identity in the immutable row result and validate it against the 
 > the 0.5% tolerance; the residual **-222 lanes are unexplained** (register lag at
 > session start is the candidate and was not shown). **The per-line sum does not
 > hold** -- it matches on only 16 of 495 lines -- so only run sums are usable.
+> **Both residuals are now closed or localised** (`daef1deaf1`). The -222 lanes
+> were an artefact of the "has a `graph_step` line" filter, not of the trace:
+> grouped by session, `sum(lanes)` equals `sum(vram_miss)` **exactly** (0
+> difference) in sessions 2, 3 and 4, and session 1's difference is entirely
+> under forward 2, the first pass, which is not a graph decode step. -222 = 142 +
+> 80 exactly. **The check is exact per session**, which is a stronger statement
+> than the 0.5% tolerance it was first reported against -- though still not exact
+> per line. The 508-versus-511 gap is **localised, not explained**: sessions hold
+> 127, 128, 128, 128 graph steps against 127 client steps each, the extras
+> sitting at the boundaries where the no-line stubs are. A tail step split across
+> the boundary is the candidate and the mechanism is not shown.
+>
 > The lane counts are joined onto `task1-2-new-on-T`'s stage stamps, because the
 > durations are timing-derived and `task1f` ran under accepted CPU contention; the
 > request streams are identical, and running the model on `task1f`'s own stamps
@@ -702,7 +724,14 @@ This permits CPU I/O for later rows to overlap the earlier row's SM transfer. It
 - [ ] Gate each copy on valid lane readiness and an acquired source lease. Failed, timed-out, inactive, or canceled lanes read no source bytes; setting the fused MoE's `keep` to zero alone does not protect an earlier gather. A final request-success check suppresses compute even when some earlier lanes already copied successfully.
 - [ ] Compare batched SM transfer with per-row SM transfer at real miss counts; report kernel overhead, link throughput, SM contention, step latency, and token rate. Sweep launch geometry only as a separate measured variant.
 
-**Gate:** Both demonstrated I/O/H2D overlap and untraced end-to-end benefit at unchanged cache capacity. If launch/head-of-line cost cancels the benefit, retain Task 4 and record Task 6 as rejected; evaluate a readiness-aware gather or native DMA in Task 9 instead of claiming success.
+**Gate.** All of the following. Items 2 and 3 are refusals: a mechanism that fails them is rejected however well it measures, and they are written here because a prohibition stated only in prose is not an acceptance test. (Added after review found the plan asserted "the Gate below refuses" a mechanism the Gate as written would have accepted.)
+
+1. **Measured:** demonstrated I/O/H2D overlap and untraced end-to-end benefit at unchanged cache capacity, against the **Task 5 lease-mode batched** baseline rather than today's unleased path, and run with **promotions off** (they share the Gen3 link and subtract from the hiding).
+2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose correctness holds only because the service serves one request at a time is rejected. The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** (An earlier revision justified the exclusion by saying no document states the borrowed invariants as load-bearing. That reason cancelled itself, since this plan and `PER_ROW_TRANSFER.md` §3.3 now do state them.)
+3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. Stated precisely: today's only producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect`, so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one. (An earlier revision called this item "false"; the 3-slot demonstration constructs a producer that does not exist, so "not guaranteed for a future producer" is what the evidence supports.)
+4. **Required measurement:** the per-stage cost `g`. The per-row-versus-two-phase verdict turns on it at best order, where the net margin is 0.1-0.4 points, and no measurement of it exists.
+
+**A rejected variant is not a rejected task.** Two-phase is the chosen mechanism and is judged on its own; if launch or head-of-line cost cancels the benefit for *per-row*, that rejects per-row. Record which variant was rejected. If early transfer as a whole fails, retain Task 4 and evaluate native DMA or a readiness-aware gather under Task 9's **"Native DMA vs SM gather"** row, which now names the readiness-aware gather explicitly.
 
 ## Task 7: Optional raw-row pinned-cache experiment
 
@@ -734,7 +763,7 @@ This is explicitly separate from demand delivery, but must be implemented before
 
 | Follow-up | Required design/measurement before implementation | Success evidence |
 |---|---|---|
-| Native DMA vs SM gather | Device-selected destinations, source leases, copy-completion generations, independent worker and CUDA-visible dependencies; no CUDA calls from host callbacks | Transfer/compute overlap and token-latency gain, not isolated bandwidth only |
+| Native DMA vs SM gather, **and readiness-aware gather** | Device-selected destinations, source leases, copy-completion generations, independent worker and CUDA-visible dependencies; no CUDA calls from host callbacks. The readiness-aware gather arrives here if Task 6 rejects early transfer as a whole; Task 6's gate referenced a Task 9 row that did not exist until this edit | Transfer/compute overlap and token-latency gain, not isolated bandwidth only |
 | Better RAM/GPU lookahead | Real EXL3 pinned-slot resolution, dedicated GPU destinations, pointer-table coverage, exact demand fallback, bounded speculative bytes | Useful-on-time recall, retained reuse, wasted/canceled bytes, demand tails, net throughput |
 | Hit/miss or multi-request compute overlap | Per-inflight fused temps/output/scratch and deterministic reduction; separate graph control state | Numerical parity plus gain after lost fusion and extra memory |
 | Stream memory waits | Device/driver/graph support, scheduler-visible dependencies, visibility and timeout proof | Better measured cost than the current small wait kernel without deadlock |
@@ -893,7 +922,10 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > **But the causal claim attached to this must not be repeated.** It was first
 > reported, and I restated it, as though the INVALID arm was what moved the
 > number. Checked against the verdict files: **removing `task1-6` alone moves the
-> mean the other way** (it is 254.1 ms against a 3-arm registered mean of 257.5).
+> mean the other way** -- dropping it alone gives **259.3 ms** against a 3-arm
+> registered mean of 257.5. (An earlier revision wrote 254.1 here. That is
+> `task1-6`'s *own* step time, not the mean after dropping it; corrected by
+> `t3-topology` on the verdict files.)
 > The shift comes from `task1c-3`, whose verdict file reads **VALID** with a
 > boot-warm regime note -- no "disturbed" mark exists; that label was the
 > reviewer's. And the replacement denominator, 254.4 ms, is **not** "clean
