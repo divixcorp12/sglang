@@ -2246,3 +2246,43 @@ read (established by reading, not demonstrated).
 
 **R1's subprocess.** `subprocess.run(..., capture_output=True, timeout=60)` reads both pipes to the end, so a full
 pipe cannot block the child, and the timeout bounds a hang. Neither was tested by making the child chatty.
+
+### 20.2i PROPOSAL (not implemented): placement of the orderly shutdown call in `Scheduler.release_host_resources()`
+
+Read first: `.claude/skills/large-class-style/SKILL.md`. Its frozen list is `model_runner.py` only; `scheduler.py` is
+covered for `__init__` (section 2), and this change is not in `__init__`. Section 1.3's test is still the right one
+for the shape: the added statements must construct, wire, delegate or order, and never compute.
+
+**Where.** `Scheduler.release_host_resources()` (`scheduler.py:1865`, called only under `if scheduler.gracefully_exit`
+from `run_scheduler_process`'s `finally`, `scheduler.py:6099`). There is already a block for the same kind of
+collaborator: `expert_hot_cache_manager.stop_doorbell()` inside a `try/except Exception` that logs and goes on.
+Proposed: a second block of the same form **immediately after it and before** `hisparse_coordinator.destroy()` and
+`tree_cache.release_host_resources()`, delegating to one function in `exl3_ram_miss.py`:
+`shutdown_exl3_ram_miss_service()`, which does nothing unless `Exl3RamMissService._instance` exists (it must not
+construct the singleton at shutdown) and otherwise calls `shutdown()`. All logic stays in that module; the
+scheduler gets one delegating `try` block, no computation.
+
+**Why that order.**
+1. After `stop_doorbell()`: the doorbell copier is joined before the RAM-miss service closes admission and
+   synchronizes the device, so no host-side producer is left running against slabs about to be freed.
+2. Before the other host releases and `destroy_global_*`: the barrier needs a working CUDA context, and the docstring
+   there already says the graceful path exists because the exception path may have a wedged GPU.
+3. Before `abort_distributed_environment()` (the last step of the `finally`): nothing in `shutdown()` uses a communicator.
+4. The exit hook stays registered and becomes a no-op after an orderly shutdown (`_shut_down` is set), so the two
+   paths cannot both free.
+
+**Import.** `exl3_ram_miss.py` pulls in the MoE stack; a top-level import in `scheduler.py` would load it for every
+run. Proposed: import inside the `try` block. Its cost was not measured; a run without EXL3 would pay the import at
+shutdown only, which is the trade being made.
+
+**What would show it works, and what does not exist.** A unit test with a stub scheduler object (the four test
+files that mention `release_host_resources` show the pattern) that records call order: the RAM-miss shutdown is
+called once, after the doorbell stop and before the tree-cache release, and an exception in it does not stop the
+remaining releases. Mutations to run: the block is omitted; it is placed before the doorbell stop; it is placed
+after the tree-cache release; the `except` is removed. What no CPU test can show: that the real device barrier
+orders GPU work (the tests fake `_synchronize`), and that every teardown path reaches `gracefully_exit` (OPEN 18's
+residue: a SIGTERM or an engine shutdown that never sets it still ends in the quarantine at exit, not the orderly
+path). A GPU run needs crypto-c9's scheduling.
+
+**Not decided here.** Whether `scheduler.py` review wants the block behind a config gate; the function is a no-op
+without a live service, so this proposal has none.
