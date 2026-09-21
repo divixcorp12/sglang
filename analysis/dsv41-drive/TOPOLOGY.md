@@ -1,7 +1,54 @@
-# Topology, registration limits and the io_uring feature audit — 2026-09-20
+# Topology, registration limits and the io_uring feature audit — 2026-09-20, revision 2 2026-09-21
 
 Plan: `docs/superpowers/plans/2026-09-20-storage-cpu-pipeline-v2.md`, Task 3, the
-part that needs no GPU. Worktree HEAD `099eadba33` (`dsv41`).
+part that needs no GPU. Revision 1 was written at worktree HEAD `099eadba33` (`dsv41`); Revision 2 audits `0752c0c0e6` (§0).
+
+## Headline: `taskset -c 0-63` does not keep interrupts off cores 64-71
+
+The standing rule on this machine is that CPU jobs run under `taskset -c 0-63` so cores 64-71, and
+above all core 71 (production's doorbell spin core), stay free. That rule constrains **our threads**. It
+does not constrain **NVMe completion interrupts**, and on this machine the kernel's queue and interrupt maps send some of them to
+cores 64-71 for I/O that a thread inside 0-63 submits. (That is read from the maps; I did not trace an interrupt to its submitter.)
+
+**How it was found** (Appendix F is the script; both inputs are world-readable, no privilege) [S2]:
+
+- `/sys/block/nvme<N>n1/mq/<hctx>/cpu_list` says which CPUs submit into hardware queue `<hctx>`;
+- `/proc/interrupts` names the queue's vector `nvme<N>q<hctx+1>`, and
+  `/proc/irq/<irq>/effective_affinity_list` says which CPU takes that vector's hard interrupt.
+
+Joining them tells you, for a thread pinned to core *c*, which core services its completions:
+
+| drive (mount) | hardware queues | submitter cores in 0-63 whose completion interrupt lands on a core in 64-71 |
+|---|---|---|
+| `nvme0n1` (`/mnt/nvme0`, mirror A) | 16 | **34, 35, 56, 59, 62** |
+| `nvme2n1` (`/mnt/nvme2`, source) | 16 | 27, 28, 29, 30, 31, 32, 33, 34, 35, 63 |
+| `nvme3n1` (**`/mnt/nvme4`**, mirror B) | 31 | 28, 29, 30, 31, 32, 33, 34, 35, 63 |
+
+**Practical consequence.** A service or reader thread that the scheduler places on one of those
+node-1 cores (18-35 and 54-63 are node 1) reads from a drive whose completion interrupt is then
+handled on a reserved core. The specific hazard: **`nvme0` hardware queue 6 serves CPUs 34, 35, 70, 71
+and its interrupt is on core 71; `nvme3` hardware queue 11 serves CPUs 35 and 71 and its interrupt is on
+core 71.** A mirror read from core 34 or 35 therefore interrupts production's doorbell core. Because
+`start_thread` is called without `cpu_core` (`srt/layers/moe/exl3_ram_miss.py:383`), the service thread is
+free to run on any of cores 0-63, including those. Every node-0 submitter core (0-17, 36-53) takes its
+interrupts on node 0 for all three drives, so **pinning the service thread to a node-0 core removes the
+hazard**; `taskset -c 0-63` alone does not.
+
+**This is a snapshot, not a setting.** `irqbalance` is **active** on this machine (`systemctl
+is-active irqbalance`, pid 3369), and `default_smp_affinity` is all 72 CPUs, so the kernel or the daemon can
+move a vector at any time. The map was identical in two reads about 25 minutes apart, which shows it is
+stable over that span and shows nothing more. **Do not pin or plan against this table as if it were
+configuration: re-run Appendix F before and after every arm that cares, and record the result with the
+arm.** Changing the affinity (or stopping `irqbalance`) is a privileged change I did not make.
+
+**What is not shown.** NVMe vectors have serviced 20-26 M interrupts on each of cores 66-71 since
+boot (`/proc/interrupts`; core 71: 20.3 M, of which `nvme3q12` alone 20.1 M). Core 71 is itself in its own
+hardware queue's CPU list, so anything running on it produces such interrupts; the count does not say
+that threads in 0-63 caused them. It says the vectors exist and are used. A single `ps` at 06:13 UTC also
+showed an unrelated Ray log monitor on core 71 (`ps -eo pid,psr,pcpu,cmd`): nothing but convention keeps
+non-production processes off 64-71 either.
+
+Details, counts and the per-drive maps are in §7.3.
 
 **Every claim carries one tag.**
 
@@ -50,6 +97,27 @@ command, **[S2]** read from sysfs/procfs/a tool on 2026-09-21, **[C2]** read in 
 | `uring_file_reader.cpp` citations | **Unchanged and still correct**: the file's last commit is `9ae02e21e9`, older than Revision 1's HEAD; blob `5e2f3744cd2af0c73ac7d1f7e93ff2d25609cf4d` | `git log -1 -- <path>`; `git rev-parse HEAD:<path>` [C2] |
 | §5 "no serving process exists now" | Still true at 05:56 UTC (no `sglang` in `ps`, GPU 63 MiB); the live pinned-tier placement therefore remains undetermined | `ps -eo ... --sort=-pcpu`; `nvidia-smi` [S2] |
 | Plan Task 3 "existing READ_FIXED and SINGLE_ISSUER/DEFER_TASKRUN support" | Adds one measured constraint Revision 1 missed: **a `DEFER_TASKRUN` ring shows no completion after `io_uring_submit()`, `submit_and_wait(0)` or `peek_cqe`, only after `io_uring_get_events()`, `submit_and_wait(1)` or with `IORING_SETUP_TASKRUN_FLAG`** (§8.3) | Appendix E [M2] |
+
+### 0.2 What Revision 2 verified, and what it only inherits
+
+"Verified" means I re-read or re-measured it on 2026-09-21 and it matched, or I re-derived it from the blobs named in §0.1
+(`git show HEAD:<path>` at `0752c0c0e6`; the `csrc` and `ops` sources are byte-identical at `152383fa7e`, `git diff 152383fa7e HEAD -- csrc ops`
+is empty). **"Inherited" means Revision 1's statement stands unchecked, at `099eadba33`, and is only as good as Revision 1's own tag.** I have
+not renumbered any citation I did not verify.
+
+| Revision 1 item | status in Revision 2 |
+|---|---|
+| §1.1 kernel, liburing, NVIDIA driver, `io_uring_disabled`, THP `enabled`/`defrag`, `zone_reclaim_mode` | **verified** (`uname -r`, `pkg-config`, `nvidia-smi`, `/proc/sys`, `/sys/kernel/mm`): identical. `nvme` `poll_queues` (= 0) also **verified**. PyTorch/CUDA versions and `khugepaged/defrag`: **inherited**, not re-read |
+| §1.2 CPU lists and node sizes | CPU lists **verified** (`lscpu`); memory figures **superseded** (§7.2) |
+| §1.3 negotiated links, root-port capability | **verified** (sysfs). 3.56 GB/s single-drive ceiling: **inherited**, not re-run |
+| §1.4 filesystems | mount options, xfs geometry, block size **verified**; partition start, `statx` DIO alignment, ext4 stripe: **inherited** |
+| §1.5 first touch, `memcpy` by node, THP by node, DMA-node indifference | **inherited, not re-run** (needs CPU/drive time I did not spend). "No code sets a NUMA policy": **verified** by grep at HEAD |
+| §1.6 recorded-run budget (71,680 MB, 5,644 rows, 75,153,156,096 B) | **inherited** from `DSV41_REFERENCE.md`, not re-read; the native bounce line is **superseded** |
+| §1.7 `RLIMIT_MEMLOCK` unlimited | **verified** for a login shell (`ulimit -l`); enforcement, table size and 1 GiB iovec limits: **inherited** |
+| §2 general-reader citations | **verified**, unchanged file. Native-service citations: **remapped and verified** against the blob. Flag matrix, cross-thread and `R_DISABLED` results, CPU-benefit table: **inherited**, not re-run. The deferral behaviour: **re-measured, extended** (§8.3) |
+| §3 read-loop CPU table, wall-time claim | **inherited**. Registration cost: 104 MiB row **reproduced** (§7.7), 256 MiB row **added**. Fallback argument: **re-derived** at HEAD (§8.4a) |
+| §4 placement | **partly revised** (§7.8) |
+| §5, §6, Appendices A-D | unchanged; the probes still compile from the appendices (`uring_probe.c` rebuilt for the registration-cost run) |
 
 Citation remap for `exl3_ram_miss_host.cpp` (Revision 1 line -> `0752c0c0e6` line):
 
@@ -574,6 +642,15 @@ buffered access to mirror B (a `cat`, a mmap, a Python `safetensors` open that m
 files and the drive for the rest. A benchmark that reports "cold-file" numbers for mirror B has to
 record this table before and after, which `task1-baseline-arms.sh` does per directory (`expert_resident_by_dir_*`).
 
+**Residency on the mirrors is time-varying, so sample it, do not assume it.** A second `fincore` at 06:13 UTC (`date -u` on divix01), taken 10-16 minutes after the first (which was made between 05:57 and 06:03 UTC and not stamped), gave: mirror A **33,030,144 B** (was 106,430,464), mirror B
+**10,859,188,224 B, 10.1 GiB** (was 15,335,759,872 B), source 6,722,400,256 B (was 7,722,295,296). Mirror B shrank by
+4.5 GB in that interval while, as far as I know, nothing of ours was reading it. The team lead told me the same mirror held about
+30.00 GiB earlier the same day; I did not measure that and have no file behind it, so it is hearsay here. **These are
+observations with timestamps, not evidence for any explanation of why the residency falls.** I gathered them for another
+purpose (whether the mirror is cold), so they cannot test a hypothesis formed beforehand, and no cause has been
+established; the box is running other workloads (below), any of which can evict cache. Consequence for measurement: any cold
+or warm comparison on mirror B must `fincore` the files it reads immediately before and after each arm.
+
 Node memory at the same time [S2] (`/sys/devices/system/node/node{0,1}/meminfo`, `free -b`):
 
 | | MemTotal | MemFree | FilePages | Unevictable | Mlocked |
@@ -589,6 +666,8 @@ by reclaiming node-0 cache; a default first-touch tier spills to node 1 as Revis
 (62.9 % / 37.1 % for 1 GiB touched from a node-1 core). Where the live tier landed is **[U]** (§7.9).
 
 ### 7.3 NVMe queues, interrupts, and the reserved cores
+
+(The finding and its caveats lead the document; this section carries the detail.)
 
 **Queue-to-CPU maps.** `/sys/block/nvmeXn1/mq/*/cpu_list` (which CPUs submit into a hardware queue) and
 `/proc/irq/<n>/effective_affinity_list` (the CPU that takes that queue's interrupt), joined through
@@ -734,6 +813,47 @@ Revision 1's recommendation stands. The added evidence and the one added require
 - Why `88:00.0` is x2, ext4 stripe of `/mnt/nvme4`, `dmesg` for AER (root-only).
 - Stability of the IRQ map under `irqbalance` (one snapshot).
 
+## 7A. The two mirrors are not symmetric hardware
+
+Everything upstream treats the two mirror roots as interchangeable and splits the bytes 50/50: the service-attributed split was
+50.0 / 50.0 and diskstats measured 197.48 and 198.19 GiB (`DSV41_REFERENCE.md:2611-2616`; the team lead quoted 197.80 for the second figure and I
+could not find that number). By bytes the split is near perfect. By **block requests**, by **file layout**
+and by **queueing** it is not. Sources are the sysfs reads of 2026-09-21 [S2] unless stated.
+
+| | mirror A: `/mnt/nvme0` | mirror B: `/mnt/nvme4` |
+|---|---|---|
+| block device | `nvme0n1` | **`nvme3n1`** (§7.1) |
+| model / firmware (`/sys/class/nvme/*/model`, `firmware_rev`) | Samsung SSD 990 EVO Plus 2TB / `2B2QKXG7` | SPCC M.2 PCIe SSD / `PM060B18` |
+| device link capability (Revision 1 table) | Gen5 x4 (32 GT/s), trained Gen3 x4 | Gen4 x4 (16 GT/s), trained Gen3 x4 |
+| filesystem | xfs | ext4 |
+| **`max_hw_sectors_kb` = `max_sectors_kb`** | **512** | **256** |
+| `max_segments` (`virt_boundary_mask` 4095: one segment per 4 KiB page) | 128 | 65 |
+| hardware queues / interrupt vectors | 16 | 31 |
+| **block requests for one 6.5 MiB (6,815,744 B) extent** | **13.0** (6,815,744 / 524,288) | **26.0** (6,815,744 / 262,144) |
+| extents per mirror, 41 shards (§7.4) | 66 | 3,112 |
+| median physical extent | 4,096 MiB | 16 MiB |
+| page cache, first sample (~06:00 UTC, unstamped) / 06:13 UTC (§7.2) | 0.10 / 0.03 GB | 15.3 / 10.9 GB |
+
+- **The block-request ceiling is the device's, not a default.** `max_hw_sectors_kb` (256 on mirror B) is the hardware limit the driver
+  reports, and `max_sectors_kb` cannot be tuned above it. So a read of the same bytes reaches mirror B as at least **twice as many
+  requests** as it reaches mirror A, and each of those requests carries its own submission, completion and interrupt. The
+  13 and 26 are arithmetic on the sysfs limits for an aligned extent (a 4 KiB-aligned but not 512 KiB-aligned start gives one more), not an
+  observation of the request stream, which needs `blktrace` (root) or the counters below.
+- **Requests also split at physical discontinuities.** Mirror B's ext4 files are scattered (16 MiB median extent, 3,112 extents), so a 6.5 MiB read
+  often spans two physical runs; mirror A's xfs files are one to three runs each. That adds requests on B and none on A.
+- **Consequence for interpretation.** Any per-drive asymmetry seen so far (throughput, tail latency, CPU per byte, interrupt load) has
+  been read against the filesystem difference (xfs against ext4). The request-count difference is a **candidate explanation that
+  has not been separated from it**: the drive model, the 256 KiB cap, the queue count, the extent layout and the filesystem all differ at once, and nothing recorded so far varies one of them.
+  I claim the asymmetry exists and is large by construction; I do **not** claim it explains any recorded difference.
+- **A cheap test the existing arms can carry.** `/proc/diskstats` has, per device, both reads completed (field 4) and sectors read
+  (field 6). Their delta ratio is the **mean bytes per completed request** for exactly the workload run. Recording field 4 next to field 6 (the arm scripts record
+  only sectors today) turns the 13-versus-26 arithmetic into a measurement, per arm, at no extra I/O. The whole-boot totals cannot answer
+  it (mixed workloads; `nvme0n1` 15.4 M reads for 9.84 G sectors, `nvme3n1` 331 M reads for 13.69 G sectors, `/proc/diskstats` at 05:5x UTC), and I
+  do not interpret them. A cleaner separation, if it matters, is a **same-filesystem** control: read the same shard set from a
+  scratch copy of mirror A's layout on mirror B's drive, which is a deliberate contention-free experiment on reserved scratch storage, not something to run casually.
+- **Two things that follow for §9.** The storage-alone arms must be run **per mirror as well as jointly** (§9.A), and the
+  recorded per-drive numbers must state the drive by device name and model, not "mirror".
+
 ## 8. Reader audit at `0752c0c0e6`: `READ_FIXED`, `SINGLE_ISSUER`, `DEFER_TASKRUN`
 
 Two rings, as Revision 1 §2 says. Citations are `git show HEAD:<path>` line numbers (blobs in §0.1).
@@ -808,6 +928,26 @@ ready row and blocks in `submit_and_wait(1)`. While rows pack, each packing pass
 Flags 0 has no such stall today. `DEFER_TASKRUN` therefore needs one of: `IORING_SETUP_TASKRUN_FLAG` at
 setup, or an explicit `io_uring_get_events()` before each `for_each_cqe`.
 
+### 8.4a Recommendation, stated as measured results
+
+- **Measured negative: do not adopt `SINGLE_ISSUER|DEFER_TASKRUN` in the native service without also
+  arranging a `GETEVENTS` entry on every progress step.** Not a preference: §8.3 shows that on this kernel and liburing, plain
+  `SI|DTR` returns no completion from `submit()`, `submit_and_wait(0)` or `peek_cqe`, and the native `reap(ready)`
+  reaches `io_uring_submit` (`N:841`, `N:1057`) whenever a packed row is waiting, which is exactly when storage credit has to be
+  returned. Separately, Revision 1 measured no wall or CPU benefit from the flags on large drive-bound reads (§2.3), so the change buys
+  nothing measured and costs a demonstrated stall plus an ownership refactor (§8.2). `IOPOLL` cannot be exercised on this box
+  (`poll_queues=0`) and `SQPOLL` was not tried; the plan calls both optional experiments, and neither is assumed to help.
+- **`READ_FIXED` is cheap to implement here and has no fallback objection, and it is still not recommended for Task 4.** The native
+  bounce is **one `posix_memalign` allocation** (`N:464`) and construction rejects any extent that does not lie inside one slot
+  (`N:253`), so **a single registered iovec over `[bounce_, bounce_ + 16 * slot_bytes)` covers 100 % of extents: the fallback rate is
+  zero by construction**, the registration is one call after `N:482` and one after `N:1079`, and the table entry and MEMLOCK budget
+  are negligible (§7.7). What is missing is a measured benefit: wall time was identical in every arm because the drives set the pace, and the CPU
+  saving exists only when the bounce is 4 KiB-backed (§3.1). "Registration is not mandatory merely because it exists" is the plan's
+  wording; defer until Task 4's timeline shows the owner thread saturated (§9.D).
+- **Rerunning the probe:** the source and full output are Appendix E, and the same two files are in the tree as
+  `analysis/dsv41-drive/defer_probe.c` and `analysis/dsv41-drive/nvme_irq_map.py` (build line in the file header; CPU-only, `taskset -c` a
+  core in 0-63).
+
 ### 8.4 What Task 4/5 must preserve if it adopts either flag (checklist; nothing adopted)
 
 The recommendation from Revision 1 §2.3 stands: **do not adopt `SINGLE_ISSUER`/`DEFER_TASKRUN` or
@@ -843,6 +983,12 @@ a number valid, so the run can be scheduled without further design.
 
 ### 9.0 Preconditions common to every arm
 
+- **The box must be quiet, and a contended box invalidates a run exactly as a busy GPU does.** divix01 is not quiet now: at 06:13 UTC the load
+  average was 5.48 with `nimbus_beacon_node` at 93 % of a core, `op-reth` at 53 % and `reth-binary` at 33 % (`uptime`, `ps -eo pid,psr,pcpu,cmd --sort=-pcpu`), on cores 52, 3 and 47. Those
+  are inside the range our threads use and their memory traffic and interrupts share the sockets with the arm. The slot for §9.B and §9.C needs **both the GPU lock and a
+  quiet box**, agreed with the machine's owner in advance. Record `uptime` and the per-core busy list before and after every arm; a run with a foreign process above 10 % of any core we use, or
+  on either node's memory bandwidth in ways we cannot see, is labelled contended and is not compared with a quiet one. Deliberate contention is a separate labelled experiment, per the plan.
+
 - Schedule GPU time with the owner of the machine and take `cc-gpu.lock` through `$ANA/gpu-run.sh`. **Verify the
   wrapper and `$ANA` exist first**; the plan's own constraint. Do not start or stop production. The storage-only arm (§9.A) needs neither and is
   a heavy-I/O run: it needs the drives to be otherwise idle.
@@ -873,7 +1019,7 @@ a number valid, so the run can be scheduled without further design.
   one discarded, offsets random over the whole 41-file set (204 GiB, so no drive-side reuse), same seed in every arm.
   Use the existing harnesses (`bench_row_scheduling.py`, `uring_probe read`) rather than a new tool; extend `uring_probe`
   to take two files if needed. Bounce sized as production, 213 MB (16 slots), on node 0, then on node 1.
-- **Record:** wall, GB/s, thread CPU (`getrusage(RUSAGE_THREAD)`), diskstats delta by device, IRQ map, and for each
+- **Record:** wall, GB/s, thread CPU (`getrusage(RUSAGE_THREAD)`), diskstats delta by device **including reads completed (field 4) so bytes per request per drive is measured (§7A)**, IRQ map, and for each
   arm the submitter's core and node. Expected footprint: 0.87 GB per pass, about 13 GB per arm at 15 passes,
   well under 200 GB for the whole matrix, minutes of wall time.
 - **Decision it feeds:** the Task 4 resource budget (bytes/s the storage side can supply) and whether mirror B's
@@ -1339,8 +1485,8 @@ int main(int c, char** v) { for (int i = 1; i < c; ++i) { struct statx sx; if (s
 <details><summary>Appendix E: defer_probe.c and its output (2026-09-21)</summary>
 
 ```c
-// CPU-only: which calls on a DEFER_TASKRUN ring make a deferred completion visible? No drive, no GPU.
-//   gcc -O2 -pthread defer_probe.c -o defer_probe -luring
+// CPU-only: which calls on a DEFER_TASKRUN ring make a deferred completion visible? No drive, no GPU. TOPOLOGY.md Appendix E.
+//   gcc -O2 -pthread defer_probe.c -o defer_probe -luring ; taskset -c 2 ./defer_probe
 #define _GNU_SOURCE
 #include <liburing.h>
 #include <pthread.h>
