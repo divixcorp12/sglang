@@ -511,6 +511,7 @@ class Service:
             tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
+            self.slot_map = slot_map
             self.host = Exl3RamMissHost(tables, page=self.page, slot_map=slot_map, direct=False)
             self.host.enable_lease_mode()
             self.host.start_thread(fatal_wait_s=60.0)
@@ -548,12 +549,18 @@ class Service:
 
     def step(self, row=0, next_row=-1):
         """post, wait, the real copy kernel (count = go_count), acknowledgement: one layer, one stream."""
+        self.step_with(self.dev, row=row, next_row=next_row)
+
+    def step_with(self, dev, row=0, next_row=-1):
+        """The same chain driven by ``dev``. ``go_count`` and ``lane_ctx`` belong to the device object, so a second
+        device -- built after the first has posted, continuing the demand sequence from the page's head -- runs whole
+        requests of its own while the first device's acknowledgement is still withheld."""
         from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 
-        self.dev.post(row, self.planned, self.count, self.routes, next_row)
-        self.dev.wait(row, self.planned, self.count, self.host_rows, self.keep, self.ram_miss)
-        copy_expert_row_segments_gpu(self.segments, self.host_rows, self.dest_slots, self.dev.go_count)
-        self.dev.ack(self.keep)
+        dev.post(row, self.planned, self.count, self.routes, next_row)
+        dev.wait(row, self.planned, self.count, self.host_rows, self.keep, self.ram_miss)
+        copy_expert_row_segments_gpu(self.segments, self.host_rows, self.dest_slots, dev.go_count)
+        dev.ack(self.keep)
 
     def expected(self, experts):
         from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
@@ -717,6 +724,98 @@ class TestServiceEndToEnd:
         assert s.keep.item() == 0.0 and s.host.fatal_seq() == 1
         assert s.block.ack_word(0, 0) == _tagged(lease.CONSUMED, 1) and s.block.ack_word(0, 1) == _tagged(lease.VIOLATED, 1)
         assert s.until(lambda: s.host.counters()["leases_acked"] == 2), "a VIOLATED word still retires the lease"
+
+
+def _resident(s, row=0):
+    """expert -> slot for every kReady slot of ``row``."""
+    return {expert: slot for slot, (state, expert, _leases, _gen) in enumerate(s.host.slot_info(row)) if state == 2}
+
+
+class TestDelayedConsumption:
+    """Task 5 step 3: delayed GPU consumption under RAM admission pressure, with the real acknowledgement kernel as
+    the consumer rather than a CPU stand-in written from the same specification.
+
+    The first device posts, waits and copies, and then does not acknowledge. Its leases stay outstanding for as long
+    as this test likes. A second device -- its own ``go_count`` and ``lane_ctx``, continuing the demand sequence from
+    the page's head -- then runs six whole requests that fill the tier and force evictions out of it. The held
+    experts carry the oldest ``stamp`` values in the tier, so ``take_slot_locked`` would choose them first; the only
+    thing standing between them and the victim search is the ``leased_locked`` skip.
+    """
+
+    def test_a_leased_source_survives_admission_pressure_until_the_gpu_acknowledges(self, service):
+        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+        s = service
+        held = [3, 4, 5]
+        s.plan(held)
+        s.dev.post(0, s.planned, s.count, s.routes, -1)
+        s.dev.wait(0, s.planned, s.count, s.host_rows, s.keep, s.ram_miss)
+        copy_expert_row_segments_gpu(s.segments, s.host_rows, s.dest_slots, s.dev.go_count)
+        _cuda_ready()
+        # Read, published, leased and copied -- and deliberately not acknowledged.
+        assert s.dev.go_count.item() == len(held) and s.keep.item() == 1.0
+        _delivered(s, held)
+        slots = {expert: _resident(s)[expert] for expert in held}
+        before = {expert: {n: s.slabs[0][n][slot].clone() for n in s.names} for expert, slot in slots.items()}
+        assert all(s.leases()[slot] > 0 for slot in slots.values()), s.leases()
+        assert s.host.counters()["leases_acked"] == 0, s.host.counters()
+
+        newer = Exl3RamMissDevice(
+            s.page, s.slot_map, device="cuda", layers=LAYERS, timeout_ms=2000, advise=False,
+            lease_block=s.host.lease_block, lease_layout=s.host.lease_layout,
+        )
+
+        def press(experts):
+            """A whole newer request on the second device: posted, served, copied and acknowledged."""
+            s.plan(experts)
+            s.step_with(newer)
+            _cuda_ready()
+            assert s.keep.item() == 1.0 and newer.go_count.item() == len(experts), experts
+            assert s.until(lambda: all(s.host.contains(0, e) for e in experts)), (experts, _resident(s))
+
+        # CAPACITY is 8 and the lease holds 3: the first two rounds fill the tier, the last two can only be served
+        # by evicting, and every eviction has to walk past the three leased slots to find its victim.
+        press([6, 7, 8])
+        press([9, 10])
+        assert len(_resident(s)) == CAPACITY, _resident(s)
+        evicted_before = s.host.counters()["evictions"]
+        press([11, 12, 13])
+        press([14, 15, 0])
+        counters = s.host.counters()
+        assert counters["evictions"] - evicted_before == 6, counters
+        assert counters["no_victim"] == 0, counters
+
+        # The property: the leased sources are untouched -- same slot, still leased, byte for byte the same rows.
+        resident = _resident(s)
+        for expert, slot in slots.items():
+            assert resident.get(expert) == slot, (expert, slot, resident)
+            assert s.leases()[slot] > 0, (expert, slot, s.leases())
+            for n in s.names:
+                assert torch.equal(
+                    s.slabs[0][n][slot].view(torch.uint8), before[expert][n].view(torch.uint8)
+                ), (expert, n)
+        assert s.host.counters()["leases_acked"] == sum(len(e) for e in ([6, 7, 8], [9, 10], [11, 12, 13], [14, 15, 0]))
+
+        # The device's own verdict on the same question: every lane's slot generation is still the one it leased,
+        # so the acknowledgement is CONSUMED and keep survives. A recycled source would have made this VIOLATED.
+        keep_held = torch.ones(1, dtype=torch.float32, device="cuda")
+        s.dev.ack(keep_held)
+        _cuda_ready()
+        assert keep_held.item() == 1.0 and s.host.fatal_seq() == 0
+        for lane in range(len(held)):
+            assert s.block.ack_word(0, lane) == _tagged(lease.CONSUMED, 1), lane
+        assert s.until(lambda: all(s.leases()[slot] == 0 for slot in slots.values())), s.host.counters()
+        counters = s.host.counters()
+        assert counters["leases_voided"] == 0 and counters["lease_double_signal"] == 0, counters
+
+        # The control, and the reason the assertions above are not vacuous: the same pressure, with the same slots
+        # now retired, takes them first. Their stamps are the oldest in the tier, so two evictions are experts 3
+        # and 4 in that order -- which is precisely the choice the lease was suppressing.
+        evicted_before = s.host.counters()["evictions"]
+        press([1, 2])
+        assert s.host.counters()["evictions"] - evicted_before == 2, s.host.counters()
+        gone = [expert for expert in held if not s.host.contains(0, expert)]
+        assert gone == [3, 4], (gone, _resident(s))
 
 
 if __name__ == "__main__":
