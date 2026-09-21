@@ -863,6 +863,31 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > the test coverage of code Task 6 intends to modify**, which nothing in this
 > plan anticipated.
 >
+> **THE WHOLE CI SUITE CANNOT COLLECT ON THIS BRANCH, AND A REGISTERED FILE WITH
+> NO `__main__` BLOCK RUNS ZERO TESTS AND EXITS 0** (`1e210f524a`). `test/run_suite.py`
+> globs every file under `test/registered` and calls `collect_tests(..., sanity_check=True)`,
+> which raises on the **first** file that has no CI registry, or is registered but
+> lacks an `if __name__ == "__main__":` block. Over all 2,122 files: **30 with no
+> registry, 27 registered with no `__main__`**, and it raises at
+> `test/registered/unit/test_file_row_reader.py`. **So no registered test runs
+> through `run_suite` at all**, and the offenders concentrate in `layers/moe` (27)
+> and `kernels` (15) -- this plan's own area.
+>
+> The second half is the more dangerous one and was **demonstrated**, not
+> inferred: a registered file with its `__main__` block removed, run the way CI
+> runs it, **exits 0 having executed no test**. That is an entire file that cannot
+> fail. Every "N passed" figure in this plan comes from pytest and is unaffected,
+> but **no claim here may rest on CI having run anything.**
+>
+> Two things worth recording about how it happened. **Eight of the offending files
+> were written during this plan's own work**, by an author who copied the shape of
+> a neighbouring file that itself lacked the block -- so the defect propagated by
+> imitation, which is the mechanism most likely to keep propagating. And the
+> runner-divergence audit that found it came back **clean** on its own question:
+> across 48 files in the three dsv41 test directories run both ways, there is no
+> remaining pytest-versus-CI divergence. The commissioned result was negative; the
+> incidental one was this.
+>
 > **RULE for the remainder of this plan: write the mutant first.** Before a test
 > is accepted as evidence for any gate here, name the specific change to
 > production code it must fail against, and show it failing. A test whose
