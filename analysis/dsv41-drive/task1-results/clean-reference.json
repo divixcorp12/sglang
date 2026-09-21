@@ -1,0 +1,23 @@
+{
+ "new:off": [
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-0-new-off-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-1-new-off-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-4-new-off-U.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-5-new-off-U.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1c-2-new-off-T.json"
+ ],
+ "new:on": [
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-2-new-on-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-3-new-on-U.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1b-0-new-on-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1c-0-new-on-T.json"
+ ],
+ "old:on": [
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1c-1-old-on-U.json"
+ ],
+ "generations": {
+  "921bc132c0479bd932e85fa700b9ab4aa39ccbb7": "gen0 = python/ of 099eadba33 (old barriers, pre two-bank)",
+  "815cb723309886975d75e1cc582d45de39d535a5": "gen1 = python/ identical to f6608901a3",
+  "ee70296428321097df189c7fa5cadbb2d4300fa6": "gen2 = python/ of 87417376f5 (stage-trace schema 3: row_admit, extent_submit, extent_attempts, trace_clock_reads; exl3_ram_miss_host.cpp changed vs gen1)"
+ }
+}
