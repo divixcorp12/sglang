@@ -181,6 +181,19 @@ the *lapped-record* case, where a real waiter exists, not this one. The model
 (section 18.3) agrees: with a service that does not skip 0 it finds a phantom sequence
 and no safety violation.
 
+**The lap-skip resume can also land on zero.** Found by execution by the instrumentation
+agent, not by me: `next = head - kDemandRecords + 2u` evaluates to 0 when `head - next` equals
+the ring size (seed 0xFFFFFFFD, post 16 demand or 64 advisory records), and it failed before
+the fix. The fix that landed (`85cdbf9382`) is a `skip_zero()` helper at four sites: both
+increments and both lap-skip resumes. My model reproduces this shape independently: in a
+world with three unarmed records posted across the wrap, only a service whose *increment*
+skips 0 still finds a phantom through the lap resume (`skip0_lap=False`), and the fixed service
+is clean. It is the same pattern as the epoch hole the model found in this document's own
+draft (11.3): a lap skip crossing the wrap without passing through the value being skipped,
+once in today's code and once in the proposed protocol, found by different methods. (The
+model had missed the fresh-page signature until it was made to flag *any* handling of seq 0,
+not only a failed record read; the same lesson as the test that asserted on `overruns` alone.)
+
 It is still a defect: the two sides disagree on one value, and any code that keys
 something by `next_demand_` inherits the disagreement. This document's own design avoids
 that dependency (section 11.3). The test that drives both rings through the wrap, on both
@@ -1432,7 +1445,7 @@ GPU (under the lock; not run here):
 ### 18.3 The model check (done, bounded)
 
 `analysis/dsv41-drive/lease_model.py` is a self-contained explicit-state model of this
-protocol; `test_lease_model.py` (31 tests, about four minutes, pure Python) pins what it
+protocol; `test_lease_model.py` (32 tests, about four minutes, pure Python) pins what it
 finds. It has two threads (the device's post, wait, copy, acknowledge, consume; the service's
 observe, reserve, load, grant and publish, retire), pinned slots that an advisory may evict
 and reload whenever the service is idle, injectable timeouts and read failures, an optional
@@ -1457,7 +1470,7 @@ Results, all exhaustive over the bounds (up to about 2.4 million states each, co
 | Today's protocol, no faults, temporal exclusion | no violation (the model does not cry wolf) |
 | Today's protocol, one timeout | I1 violated (D1); wrong bytes not accepted, because `keep = 0` contains it |
 | Today's protocol without the exclusion | wrong bytes accepted (D2) |
-| Service that does not skip 0 (D6) | a phantom sequence, nothing else |
+| Service that does not skip 0 (D6), on the increment or only on the lap resume | a phantom sequence, nothing else; the fixed service is clean, including with three unarmed records posted across the wrap so that the lap resume lands on 0 |
 | **Task 8 extension.** Designed protocol plus a promoter (host lease, copy, release) and an eager caller (pause, assign, resume); 2 requests; with and without timeouts and read failures | no violation, no deadlock, no leak; the eager pause was granted **while a host lease was held**, and a demand was deferred for want of an unleased victim (both reached) |
 | Mutant: the service evicts a host-leased slot; the eager assign takes a host-leased slot | each is I1 violated (the two paths are checked separately: R5 covers `take_slot_locked`, `assign` and `release`) |
 | Mutant: the eager pause also waits for host leases (R2 broken) | `PauseBlockedByHostLease`: the pause is refused with graph leases at zero and only a promotion's lease in the way |

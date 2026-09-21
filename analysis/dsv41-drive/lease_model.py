@@ -81,6 +81,7 @@ class Config:
     ack_after_copy: bool = True  # False: the acknowledgement is published at commit
     gen64: bool = True  # False: acknowledgements and readiness are keyed by the 32-bit sequence only
     skip0: bool = True  # the service skips sequence 0 on wrap as the device does
+    skip0_lap: bool = True  # ... and also when a lap resume lands on it (head - ring + 2 can be 0)
     echo_gen: bool = True  # the service takes the request generation from the device's lane request; False: it counts epochs itself
     defer_reuse: bool = True  # a request slot is served only when its previous lease row is retired
     detector: bool = True  # the acknowledgement re-checks the slot generation
@@ -582,14 +583,19 @@ class Model:
         if (head - nd) % c.modulus() >= c.ring:
             n["overruns"] = min(2, st["overruns"] + 1)
             nd = (head - (c.ring - 2)) % c.modulus()
+            if nd == 0 and c.skip0 and c.skip0_lap:
+                nd = 1
+                n["sep"] = st["sep"] + 1
             n["nd"] = nd
             yield ("service resumes after a lap", self.emit(n))
             return
         idx = ring_index(c, nd)
         rec = st["rec"][idx]
+        if nd == 0:
+            # The device never posts sequence 0. On a used page the read below fails, on a fresh page the empty
+            # record of slot (0 - 1) % ring reads as a request: either way the service is handling nothing.
+            self.flag(n, "PhantomSequence")
         if rec[0] != nd:
-            if nd == 0:
-                self.flag(n, "PhantomSequence")
             n["overruns"] = min(2, st["overruns"] + 1)
             n["done"] = nd
             n["nd"], n["sep"] = next_seq_service(c, nd, st["sep"])

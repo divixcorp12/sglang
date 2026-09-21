@@ -209,6 +209,18 @@ def test_a_service_that_does_not_skip_zero_is_noise_not_a_safety_failure():
     assert set(result.seen_violations) == {"PhantomSequence"}
 
 
+def test_a_lap_resume_that_lands_on_sequence_zero_is_skipped_like_an_increment():
+    """`next = head - ring + 2` is 0 when `head - next` equals the ring: three unarmed records posted across the
+    wrap while the service lags. The model finds the phantom when only the increment skips 0, and is clean when
+    the lap resume skips it too (the fix: skip_zero at both increments and both lap resumes)."""
+    world = dict(requests=3, ring=3, seq_space=8, start=6, menu=((), (0,), (0, 1), (2,)), **CLEAN)
+    assert run(lm.Config(**world)).violation is None
+    cfg = lm.Config(**world, skip0_lap=False)
+    result = run(cfg)
+    assert result.violation == "PhantomSequence"
+    assert "service resumes after a lap" in result.trace
+
+
 # ---- the protocol as it is today ----
 
 
