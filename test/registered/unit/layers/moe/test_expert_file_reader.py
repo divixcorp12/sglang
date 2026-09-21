@@ -119,3 +119,11 @@ def test_tensor_not_at_file_offset_zero_is_rejected():
                 ExpertFileRowReader.from_layer(layer, names, mode="uring")
         finally:
             group.close()
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

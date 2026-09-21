@@ -181,3 +181,11 @@ def test_read_split_property_random_lengths_and_weights():
             assert part % PAGE_BYTES == 0
             assert 0 <= part <= length
         assert sum(s.part_bytes) == length
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

@@ -1395,3 +1395,7 @@ class TestExpertGraphGatherPrefetchSkip(unittest.TestCase):
                 )
                 if capacity:
                     self.assertEqual(compact.reshape(-1)[0].item(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

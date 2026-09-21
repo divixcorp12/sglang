@@ -171,3 +171,11 @@ def test_a_source_root_that_does_not_contain_the_layout_is_refused(tmp_path):
             policy=StaticSplitPolicy((1.0, 1.0)),
             source_root=str(tmp_path / "elsewhere"),
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))
