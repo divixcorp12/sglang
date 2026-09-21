@@ -534,3 +534,11 @@ def test_gate_refuses_multi_token_calls_even_when_shape_would_otherwise_qualify(
 
     assert supports_fused_graph_routes(single_token, expert_to_slot, scratch_rows=8)
     assert not supports_fused_graph_routes(multi_token, expert_to_slot, scratch_rows=8)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))
