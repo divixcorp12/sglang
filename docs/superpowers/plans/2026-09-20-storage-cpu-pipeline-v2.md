@@ -231,7 +231,18 @@ This is explicitly separate from demand delivery, but must be implemented before
 | GDS | Proven native platform support, fallback detection, inclusive RAM-cache policy | End-to-end gain and acceptable cache behavior |
 | Alternate-root failover/content refresh | Completion-safe retry buffers; immutable manifest/identity validation for refreshed mirrors | Fault recovery without mixed/stale checkpoint bytes |
 
+| Task 3 placement measurements (storage alone, SM transfer alone, simultaneous) | Designed in `TOPOLOGY.md` 9.A-9.C. Needs the GPU lock **and** a quiet box; a contended box invalidates them as surely as a busy GPU | Deferred: this task's gate was to choose placement for Task 4, which is already implemented, so the measurement is retrospective |
+| Registered bounce (`READ_FIXED`) in the native service | One iovec covers 100% of extents because the bounce is a single allocation, so the fallback rate is zero by construction; registration measured at 59.9 ms (THP) / 106.6 ms (4 KiB) for 256 MiB | Deferred until a Task 4 timeline shows the owner thread saturated. Registration is not mandatory merely because it exists |
+| `SINGLE_ISSUER` / `DEFER_TASKRUN` in the native service | **Measured negative, already recorded.** A probe shows a `DEFER_TASKRUN` ring reveals a deferred completion only through `io_uring_get_events()`, `submit_and_wait(1)` or `TASKRUN_FLAG` — never `submit(0)`, which is the path `reap()` takes whenever a packed row is ready | Rejected for now: adopting it would starve storage credit while rows pack. `IOPOLL` is unexercisable (`poll_queues=0`); `SQPOLL` untried |
+
 These experiments are not requirements for accepting Task 4. Their deferred status must remain visible in the final implementation report.
+
+> **A claim in this plan that is not substantiated.** Task 5's gate says
+> "concurrent graph execution remains unsupported and guarded". Reading the
+> source found **no such guard** (`LEASE_PROTOCOL.md` OPEN 9), and the post
+> kernel updates `state[kPosted]` with a non-atomic read-modify-write. Every
+> design that rests on that guard existing — Tasks 5, 6 and 8 — must treat it as
+> a requirement to build, not a property to rely on.
 
 ## Verification procedure and final acceptance
 
