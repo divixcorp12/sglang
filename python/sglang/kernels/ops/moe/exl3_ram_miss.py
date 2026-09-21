@@ -233,6 +233,10 @@ STAGE_FIELDS = (
     *(f"row_pack_end_{k}" for k in range(STAGE_TRACE_ROWS)),
     *(f"extent_id_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     *(f"extent_cqe_{k}" for k in range(STAGE_TRACE_EXTENTS)),
+    "dropped_before",
+    *(f"row_admit_{k}" for k in range(STAGE_TRACE_ROWS)),
+    *(f"extent_submit_{k}" for k in range(STAGE_TRACE_EXTENTS)),
+    *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
 )
 STAGE_KINDS = ("demand", "advisory", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
@@ -258,9 +262,12 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     drives that served an extent: ``{"dev", "bytes", "extents"}`` (``dev`` -1: several folded).
 
     ``status`` names how the request ended and ``missing_stages`` the STAGE_ORDER stamps it never
-    reached. ``row_pack`` has one ``{"row", "start", "end"}`` per row asked for (first
-    ``STAGE_TRACE_ROWS``), 0/0 for a row that never packed; ``extent_cqe`` one ``{"row", "part",
-    "cqe"}`` per extent issued (first ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed.
+    reached. ``row_pack`` has one ``{"row", "admit", "start", "end"}`` per row asked for (first
+    ``STAGE_TRACE_ROWS``), 0/0 for a row that never packed and ``admit`` 0 for one never admitted;
+    ``extent_cqe`` one ``{"row", "part", "submit", "attempts", "cqe"}`` per extent issued (first
+    ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed, ``attempts`` its resubmissions.
+    ``cqe`` is when the wait that reaped the extent returned: io_uring gives no per-completion time.
+    ``dropped_before`` counts the records the ring dropped just before this one.
     ``bytes`` is the completed total; the rest of the split is ``useful/submitted/retried/cancelled_bytes``.
     """
     out = []
@@ -272,6 +279,7 @@ def stage_records(words: torch.Tensor) -> list[dict]:
         record["row_pack"] = [
             {
                 "row": k,
+                "admit": record[f"row_admit_{k}"],
                 "start": record[f"row_pack_start_{k}"],
                 "end": record[f"row_pack_end_{k}"],
             }
@@ -281,14 +289,17 @@ def stage_records(words: torch.Tensor) -> list[dict]:
             {
                 "row": record[f"extent_id_{k}"] >> 16,
                 "part": record[f"extent_id_{k}"] & 0xFFFF,
+                "submit": record[f"extent_submit_{k}"],
+                "attempts": record[f"extent_attempts_{k}"],
                 "cqe": record[f"extent_cqe_{k}"],
             }
             for k in range(min(record["extents"], STAGE_TRACE_EXTENTS))
         ]
         for k in range(STAGE_TRACE_ROWS):
-            del record[f"row_pack_start_{k}"], record[f"row_pack_end_{k}"]
+            del record[f"row_pack_start_{k}"], record[f"row_pack_end_{k}"], record[f"row_admit_{k}"]
         for k in range(STAGE_TRACE_EXTENTS):
             del record[f"extent_id_{k}"], record[f"extent_cqe_{k}"]
+            del record[f"extent_submit_{k}"], record[f"extent_attempts_{k}"]
         record["drives"] = [
             {
                 "dev": record.pop(f"drive_dev_{d}"),
@@ -550,6 +561,11 @@ class Exl3RamMissHost:
 
     def trace_dropped(self) -> int:
         return int(self._module.exl3_ram_miss_trace_dropped(self.handle))
+
+    def trace_clock_reads(self) -> int:
+        """Clock reads taken for trace records, process-wide and cumulative: zero growth while the
+        trace is off is what shows a disabled trace does no timing work."""
+        return int(self._module.exl3_ram_miss_trace_clock_reads())
 
     def counters(self) -> dict[str, int]:
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)

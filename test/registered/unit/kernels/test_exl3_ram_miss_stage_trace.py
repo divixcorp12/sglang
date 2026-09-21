@@ -268,7 +268,10 @@ def test_a_cancelled_advisory_is_terminal_and_names_its_missing_stages(tmp_path)
         assert (advisory["kind"], demand["kind"]) == ("advisory", "demand")
         _assert_terminal(advisory, "cancelled", READ_STAGES)
         assert advisory["ok"] == 0 and advisory["rows"] == 0 and advisory["rows_asked"] == 2
-        assert advisory["row_pack"] == [{"row": 0, "start": 0, "end": 0}, {"row": 1, "start": 0, "end": 0}]
+        assert advisory["row_pack"] == [
+            {"row": 0, "admit": 0, "start": 0, "end": 0},
+            {"row": 1, "admit": 0, "start": 0, "end": 0},
+        ]
         assert advisory["extent_cqe"] == [] and advisory["cancelled_bytes"] == 0  # nothing was in flight
         _assert_terminal(demand, "served", [])  # its protected expert 0 was not resident: one row read
         assert host.counters()["advisory_rows"] == 0  # the abandoned advisory's rows were released

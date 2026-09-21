@@ -40,10 +40,13 @@ def capturing_graphs() -> bool:
     return bool(capture_mode.is_capture_mode)
 
 
-# Bumped whenever a ram_miss_request field changes meaning rather than merely appearing. 2: stage
-# stamps and spans cover the whole read, not the first io_uring batch, and packing can fall inside
-# first_to_last_cqe. A consumer that mixes schemas silently compares different quantities.
-RAM_MISS_TRACE_SCHEMA = 2
+# Bumped whenever a ram_miss_request field changes meaning OR the record layout changes (a field
+# added or removed): a JSONL file has no field check like the native record's, so this integer is the
+# only mechanical answer to which fields a file has and which quantities it compares.
+# 2: stage stamps and spans cover the whole read, not the first io_uring batch, and packing can fall
+# inside first_to_last_cqe. 3: adds row_pack[].admit, extent_cqe[].submit/attempts and dropped_before;
+# no schema-2 field changed meaning.
+RAM_MISS_TRACE_SCHEMA = 3
 
 
 class Exl3StreamTrace:
@@ -174,7 +177,7 @@ class Exl3StreamTrace:
         ``t`` (``time.monotonic()``) reads too; 0 is a stage the request never reached. Nothing here
         compares a GPU clock with the host's.
 
-        ``schema`` is 2. In schema 1 the stamps below ``submit`` were the FIRST io_uring batch's,
+        ``schema`` is RAM_MISS_TRACE_SCHEMA. In schema 1 the stamps below ``submit`` were the FIRST io_uring batch's,
         ``pack_end`` the last's, and ``spans_ns`` summed the per-batch spans, so packing never fell
         inside ``first_to_last_cqe``. From schema 2 every stamp spans the whole read and a row packs
         as soon as its own extents land, so ``first_to_last_cqe`` can contain the packing of earlier
@@ -183,6 +186,11 @@ class Exl3StreamTrace:
 
         ``bytes`` is the completed total; ``byte_split`` names the rest. ``row_pack_ns`` and
         ``extent_cqe_ns`` are per-row and per-extent stamps, bounded (``untraced`` counts the rest).
+        ``schema`` 3 adds ``row_pack_ns[].admit``, ``extent_cqe_ns[].submit`` and ``.attempts``. A
+        row's stamps are compared with its own extents', never as one sorted list: rows overlap.
+        ``extent_cqe_ns[].cqe`` is when the wait that reaped the extent returned, not a per-completion time.
+        ``dropped_before`` is how many records the native trace ring dropped, for being full, just
+        before this line's record: nonzero means lines are missing at this point of the file.
         """
         if self._file is None or not records:
             return
@@ -223,6 +231,7 @@ class Exl3StreamTrace:
                 "row_pack_ns": record["row_pack"],
                 "extent_cqe_ns": record["extent_cqe"],
                 "untraced": {"rows": record["rows_untraced"], "extents": record["extents_untraced"]},
+                "dropped_before": record["dropped_before"],
                 "extents": record["extents"],
                 "drives": record["drives"],
                 "t": round(time.monotonic(), 6),

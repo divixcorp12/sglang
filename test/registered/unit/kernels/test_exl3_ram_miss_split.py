@@ -626,7 +626,8 @@ def test_a_failed_read_cancels_the_bytes_it_never_received(tmp_path, fault):
     assert record["bytes"] <= record["submitted_bytes"]
     # No row packed: each row asked for is listed with 0/0, and an extent that never completed has no stamp.
     assert record["rows_asked"] == 3
-    assert record["row_pack"] == [{"row": k, "start": 0, "end": 0} for k in range(3)]
+    assert [(row["row"], row["start"], row["end"]) for row in record["row_pack"]] == [(k, 0, 0) for k in range(3)]
+    assert all(row["admit"] > 0 for row in record["row_pack"])  # admitted, read, never packed
     assert record["pack_start"] == 0 and record["pack_end"] == 0
     assert any(extent["cqe"] == 0 for extent in record["extent_cqe"])
 
@@ -646,7 +647,8 @@ def test_a_batch_that_fails_after_a_success_cancels_only_its_own_bytes(tmp_path)
     assert record["bytes"] + record["cancelled_bytes"] == _bytes_read(s, 1, experts)
     packed = [row for row in record["row_pack"] if row["end"]]
     assert [row["row"] for row in packed] == list(range(8))  # the failed batch's row never packed
-    assert record["row_pack"][8] == {"row": 8, "start": 0, "end": 0}
+    failed_row = record["row_pack"][8]
+    assert (failed_row["row"], failed_row["start"], failed_row["end"]) == (8, 0, 0) and failed_row["admit"] > 0
 
 
 def _assert_row_causality(record, tables_parts):

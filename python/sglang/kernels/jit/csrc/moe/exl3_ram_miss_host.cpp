@@ -58,6 +58,22 @@ inline int64_t now_ns() {
   return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
+struct StageRecord;
+
+// Clock reads taken for a trace record, so a test can show a disabled trace takes none. Written
+// only when a record exists: with the trace off nothing here runs beyond the null check.
+inline std::atomic<int64_t>& traced_clock_reads() {
+  static std::atomic<int64_t> reads{0};
+  return reads;
+}
+
+// The only way a trace stamp reads the clock; null (trace off) is a branch, never a clock read.
+inline int64_t stamp(const StageRecord* trace) {
+  if (trace == nullptr) return 0;
+  traced_clock_reads().fetch_add(1, std::memory_order_relaxed);
+  return now_ns();
+}
+
 constexpr int kMaxDrives = 4;
 // Per-row and per-extent stamps live in fixed arrays: the record is copied out as one fixed-width row
 // of int64 and pushed into a preallocated ring, so nothing on the completion path allocates. A
@@ -107,8 +123,23 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // end, pack_ns the sum of the rows' spans (the gaps between rows are waiting, not packing).
 //
 // Per-extent CQE: extent_id[k] = (row ordinal << 16) | part and extent_cqe[k] is the time the wait
-// that reaped that extent's last completion returned; 0 is an extent that never completed. Slots fill in
-// issue order (batch by batch), the first min(extents, kTraceExtents) are valid.
+// that reaped that extent's last completion returned; 0 is an extent that never completed. io_uring
+// gives no per-completion time, so this is the reaping wait's return and not when the drive finished:
+// CQEs reaped together share it. Slots fill in issue order (batch by batch), the first
+// min(extents, kTraceExtents) are valid.
+//
+// Per-row admission and per-extent submit (schema 3), indexed like the two above:
+//   row_admit[k]        the batch holding row k took a bounce bank and queued its extents; one clock
+//                       read per batch, so the rows of a batch share it. 0: never admitted.
+//   extent_submit[k]    when the extent's FIRST read was prepared as an SQE. The kernel sees it at the
+//                       submit() of the same loop turn, before any wait: the handover to within one
+//                       syscall, not a clock read around the submit itself.
+//   extent_attempts[k]  resubmissions after the first (-EINTR/-EAGAIN or a short read).
+// These are not in STAGE_ORDER on purpose: rows overlap, so no single order of stamps holds across
+// rows. Compare a row's own stamps: row_admit <= its extents' submit <= their cqe <= its pack_start.
+//
+// dropped_before: records the trace ring dropped, for being full, immediately before this one was
+// pushed. A gap in `seq` cannot locate a loss on its own (a skipped advisory has no record either).
 //
 // The stamps submit, first_cqe and last_cqe cover the whole read: the first submit, the first completion
 // returned and the last one returned; submit_to_first_cqe_ns and first_to_last_cqe_ns are those spans.
@@ -161,6 +192,10 @@ struct StageRecord {
   int64_t row_pack_end[kTraceRows] = {};
   int64_t extent_id[kTraceExtents] = {};
   int64_t extent_cqe[kTraceExtents] = {};
+  int64_t dropped_before = 0;
+  int64_t row_admit[kTraceRows] = {};
+  int64_t extent_submit[kTraceExtents] = {};
+  int64_t extent_attempts[kTraceExtents] = {};
 };
 static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
 // A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
@@ -741,9 +776,11 @@ class RowReader {
         if (e.length > 0 && t_.file_sizes[e.file] - e.offset <= 0) return false;
       }
     }
+    const int64_t admitted = stamp(c.trace);
     if (c.trace) ++c.trace->batches;
     for (size_t i = 0; i < count; ++i) {
       const size_t ordinal = first + i;
+      if (c.trace && ordinal < static_cast<size_t>(kTraceRows)) c.trace->row_admit[ordinal] = admitted;
       const size_t slot = bank * kBounceRows + i;
       const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal]);
       const size_t base = row_index * parts;
@@ -796,6 +833,7 @@ class RowReader {
   // the queue, so they take credit like any other read.
   void refill() {
     Call& c = c_;
+    int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
     while (c.queue_count > 0 && c.pending < c.capacity) {
       io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
       if (sqe == nullptr) break;
@@ -813,6 +851,14 @@ class RowReader {
         c.trace->submitted_bytes += remaining;
         if (d.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
         c.trace->pending_max = std::max<int64_t>(c.trace->pending_max, static_cast<int64_t>(c.pending));
+        if (d.trace_slot >= 0) {
+          if (c.trace->extent_submit[d.trace_slot] == 0) {
+            if (prepared == 0) prepared = stamp(c.trace);
+            c.trace->extent_submit[d.trace_slot] = prepared;
+          } else {
+            ++c.trace->extent_attempts[d.trace_slot];
+          }
+        }
       }
     }
   }
@@ -826,7 +872,7 @@ class RowReader {
       completions_.assign(held_.begin(), held_.end());
       held_.clear();
       again_.clear();
-      const int64_t released = c.trace ? now_ns() : 0;
+      const int64_t released = stamp(c.trace);
       for (size_t k = 0; k < completions_.size(); ++k) process(completions_[k], released);
       if (c.trace) {
         if (c.first_seen == 0) c.first_seen = released;
@@ -837,7 +883,7 @@ class RowReader {
       }
       return;
     }
-    if (c.trace && c.submitted == 0) c.submitted = now_ns();
+    if (c.trace && c.submitted == 0) c.submitted = stamp(c.trace);
     const int rc = submit(ready ? 0u : 1u);
     if (rc < 0) {
       // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
@@ -850,7 +896,7 @@ class RowReader {
     } else {
       c.soft_errors = 0;
     }
-    const int64_t returned = c.trace ? now_ns() : 0;
+    const int64_t returned = stamp(c.trace);
     io_uring_cqe* cqe;
     unsigned head;
     unsigned seen = 0;
@@ -992,7 +1038,7 @@ class RowReader {
       return false;
     }
     const size_t ordinal = rows_[best].ordinal;
-    const int64_t start = c.trace ? now_ns() : 0;
+    const int64_t start = stamp(c.trace);
     if (fault_.pack_delay_ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.pack_delay_ns));
     // The row's parts landed contiguously, so its segments split from one base.
     const uint8_t* base =
@@ -1004,7 +1050,7 @@ class RowReader {
           static_cast<size_t>(segment.bytes));
     }
     if (c.trace) {
-      const int64_t end = now_ns();
+      const int64_t end = stamp(c.trace);
       if (ordinal < static_cast<size_t>(kTraceRows)) {
         c.trace->row_pack_start[ordinal] = start;
         c.trace->row_pack_end[ordinal] = end;
@@ -1349,9 +1395,13 @@ class StageRing {
     const uint64_t head = head_.load(std::memory_order_relaxed);
     if (head - tail_.load(std::memory_order_acquire) >= slots_.size()) {
       dropped_.fetch_add(1, std::memory_order_relaxed);
+      ++unreported_;
       return;
     }
-    slots_[head % slots_.size()] = record;
+    StageRecord& slot = slots_[head % slots_.size()];
+    slot = record;
+    slot.dropped_before = unreported_;
+    unreported_ = 0;
     head_.store(head + 1, std::memory_order_release);
   }
 
@@ -1374,6 +1424,7 @@ class StageRing {
   std::atomic<uint64_t> head_{0};
   std::atomic<uint64_t> tail_{0};
   std::atomic<int64_t> dropped_{0};
+  int64_t unreported_ = 0;  // producer only: drops since the last record that got in
 };
 
 struct Tier {
@@ -1640,7 +1691,7 @@ class RamTier {
       cur_ = nullptr;
       return;
     }
-    const int64_t observed = now_ns();
+    const int64_t observed = stamp(&stage_);  // before the reset below: the record is found, not built
     stage_ = StageRecord{};
     stage_.observed = observed;
     stage_.kind = kind;
@@ -1652,7 +1703,7 @@ class RamTier {
 
   void end_stage() {
     if (cur_ == nullptr) return;
-    cur_->done = now_ns();
+    cur_->done = stamp(cur_);
     last_done_ = cur_->done;
     ring_->push(*cur_);
     cur_ = nullptr;
@@ -1781,7 +1832,7 @@ class RamTier {
         slots.clear();
       }
     }
-    if (cur_) cur_->reserved = now_ns();
+    if (cur_) cur_->reserved = stamp(cur_);
     int64_t status = kStatusNoRead;
     // Per slot: the row was packed whole (read() sets it). A member, not a local, so that the buffer
     // the pipeline writes into is allocated once rather than per served demand on the service thread
@@ -1845,7 +1896,7 @@ class RamTier {
       }
     }
     if (cur_) {
-      cur_->mapped = now_ns();
+      cur_->mapped = stamp(cur_);
       cur_->row = request.row;
       cur_->ok = ok ? 1 : 0;
       cur_->status = ok || status != kStatusNoRead ? status : kStatusFailed;
@@ -2037,6 +2088,10 @@ int64_t exl3_ram_miss_trace_drain(int64_t handle, TensorView out) {
       static_cast<exl3_ram_miss::StageRecord*>(out.data_ptr()), out.size(0));
 }
 
+int64_t exl3_ram_miss_trace_clock_reads() {
+  return exl3_ram_miss::traced_clock_reads().load(std::memory_order_relaxed);
+}
+
 int64_t exl3_ram_miss_trace_dropped(int64_t handle) {
   return exl3_ram_miss::find(handle)->trace_dropped();
 }
@@ -2174,6 +2229,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_words, exl3_ram_miss_trace_wor
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_enable, exl3_ram_miss_trace_enable);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_drain, exl3_ram_miss_trace_drain);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_dropped, exl3_ram_miss_trace_dropped);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_clock_reads, exl3_ram_miss_trace_clock_reads);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_post, exl3_ram_miss_sim_post);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_wait, exl3_ram_miss_sim_wait);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_seqlock_stress, exl3_ram_miss_seqlock_stress);
