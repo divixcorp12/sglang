@@ -2185,3 +2185,28 @@ acknowledge normally; recorded because a version without the witness would have 
 Baseline 16 of 16 collected and passed before the run. Not established: the sentinel check covers the CPU
 service's slab writes, not the device kernels' reads (item 5 and 12 stay GPU-only); a slot leased by two lanes was
 not the subject here.
+
+### 20.2g R1 (a long deferral does not trip the watchdog): test and mutation ledger
+
+`test_a_long_deferral_does_not_trip_the_watchdog_and_the_demand_is_served_after_the_lease_retires` in
+`test_exl3_ram_miss_lease_thread.py`. A subprocess (the watchdog's abort kills the interpreter), thread mode with
+the real watchdog and `fatal_wait_s = 0.3`. Row 0 is full of host leases, a two-expert demand is deferred, and the
+script samples every 10 ms for 5 x `fatal_wait` on its own clock: `busy_since_ns()`, the `busy_seq` word and the
+`fatal` word, and that `demand_done` has not moved and `deferred` is still 1. It then retires the leases and
+requires the demand to be served and the process alive.
+
+Path witness, asserted by the parent from what the script printed: the deferral was observed for at least
+5 x `fatal_wait` with at least 20 samples (a shorter or unobserved deferral proves nothing about an abort).
+Property: `busy_since_ns`, `busy_seq` and `fatal` were 0 at every sample, return code 0, `SERVED`, `alive`, and
+no `ERROR exl3` on stderr. The hung-read abort itself is still tested by the existing thread-file tests.
+
+| Mutant | Result | How it died |
+|---|---|---|
+| C1 the deferral marks itself busy at its first observation | KILLED 1 of 6 | the process aborted (-6): "a request stayed in service for 0.3 s" |
+| C2 the same, on every poll | KILLED 1 of 6 | same abort. Not distinct from C1: a polled deferral returns before the marking line once observed, so a mutant placed there runs once |
+| C3 the deferral publishes the busy word | KILLED 1 of 6 | the property: `busy_seq` was 1 |
+| C4 the deferral raises the fatal word | KILLED 3 of 6 | R1 and both R2 tests (an advisory is skipped while the fatal word is up) |
+
+Baseline 6 of 6 collected and passed; every run executed all 6. Not established: the test does not vary
+`fatal_wait` against the deferral (5x is a fixed ratio, on a 0.3 s watchdog); a deferral of a request-slot reuse
+(`kDeferredReuse`) rather than a victim shortage was not run through the watchdog.

@@ -7,6 +7,10 @@ service's own leases are all graph lanes. Each test names the mutation of the se
 """
 
 import faulthandler
+import re
+import subprocess
+import sys
+import textwrap
 import time
 
 import pytest
@@ -164,6 +168,73 @@ def test_an_advisory_for_the_deferred_demands_own_row_takes_no_leased_slot(runni
     assert now["deferred"] == 1, "an advisory that cannot be served gives up; only a demand is deferred"
     assert host.slot_info(0) == row0 and host.mapped_slot_generations(0) == gens
     assert page_word(page, "demand_done") != seq
+
+
+_DEFERRAL_SCRIPT = """
+import pathlib, sys, time
+import torch
+from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word
+from sglang.test.dsv41_lease_sim import LeaseSim
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+
+FATAL_WAIT = 0.3
+s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=2)
+page = new_page(pin=False)
+host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host.enable_lease_mode()
+sim = LeaseSim(host, page, s.slabs)
+host.start_thread(fatal_wait_s=FATAL_WAIT, spin_us=200)
+host.assign(0, 3, protected=[3])
+host.assign(0, 4, protected=[4])
+for slot in (0, 1):
+    host.inject_lease(0, slot, +1)
+req = sim.post(0, [1, 2])
+deadline = time.perf_counter() + 5
+while host.counters()["deferred"] != 1:
+    assert time.perf_counter() < deadline, "the demand was never deferred"
+    time.sleep(0.002)
+start = time.perf_counter()
+busy_max = seq_max = fatal_max = samples = 0
+while time.perf_counter() - start < 5 * FATAL_WAIT:
+    busy_max = max(busy_max, host.busy_since_ns())
+    seq_max = max(seq_max, page_word(page, "busy_seq"))
+    fatal_max = max(fatal_max, page_word(page, "fatal"))
+    assert page_word(page, "demand_done") != req.seq and host.counters()["deferred"] == 1
+    samples += 1
+    time.sleep(0.01)
+age = time.perf_counter() - start
+print(f"WITNESS age={age:.2f} fatal_wait={FATAL_WAIT} samples={samples} busy_max={busy_max} busy_seq_max={seq_max} fatal_max={fatal_max}", flush=True)
+for slot in (0, 1):
+    host.inject_lease(0, slot, -1)
+waited = sim.wait(req, timeout_s=5.0)
+print("SERVED" if waited.status == 1 else f"NOT SERVED {waited.status}", flush=True)
+host.stop()
+print("alive", flush=True)
+"""
+
+
+def test_a_long_deferral_does_not_trip_the_watchdog_and_the_demand_is_served_after_the_lease_retires(tmp_path):
+    """R1. A subprocess, because the watchdog's abort kills the interpreter. The deferral is observed to be older
+    than five times ``fatal_wait`` on the script's own clock (else nothing could have aborted), the busy word and
+    ``busy_since`` are sampled throughout, and the process must be alive at the end with the demand served.
+    Mutations: the deferral marks itself busy at its first observation (abort), or on every poll (``busy_since``
+    nonzero); it publishes ``busy_seq``; it raises the fatal word (the fatal-held rule aborts)."""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_DEFERRAL_SCRIPT), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (result.returncode, result.stderr[-2000:], result.stdout[-500:])
+    witness = re.search(
+        r"WITNESS age=([\d.]+) fatal_wait=([\d.]+) samples=(\d+) busy_max=(\d+) busy_seq_max=(\d+) fatal_max=(\d+)", result.stdout
+    )
+    assert witness, result.stdout
+    age, fatal_wait, samples, busy, busy_seq, fatal = (float(g) for g in witness.groups())
+    assert age >= 5 * fatal_wait and samples >= 20, "the conditions were present: a deferral far older than fatal_wait"
+    assert (busy, busy_seq, fatal) == (0, 0, 0), "a deferral is not in service: no busy time, no busy word, no fatal"
+    assert "SERVED" in result.stdout and "alive" in result.stdout
+    assert "ERROR exl3" not in result.stderr
 
 
 if __name__ == "__main__":
