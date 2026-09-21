@@ -2489,3 +2489,72 @@ The patch is kept at `analysis/dsv41-drive/held/R3_retire_in_read.diff` (applies
 raises `KeyboardInterrupt` in the calling thread, so it bypasses the real helper-thread `join`. It is accepted because a real
 interrupt during the join lands in the same `except BaseException`, but the `join` itself is not exercised by it. The
 post-landing review of `bcfe378f0d` found nothing to fix forward.
+
+### 20.2l The device kernels (7.3, 7.4) landed as `70847da92f`: verification ledger, and what it does not establish
+
+**Independently verified by the lead**, on a fresh detached worktree built at the branch tip, not the implementer's
+tree, so none of it depends on that environment. GPU work ran under `cc-gpu.lock` through the wrapper, on cores
+0-63, production not started.
+
+| Check | Result |
+|---|---|
+| `test/manual/dsv41/test_exl3_lease_kernels_cuda.py` (RTX 5090) | **31 of 31 pass**, 42 s |
+| Full `exl3` CPU suite (`test/registered/unit/kernels/ -k exl3`) | **694 passed, 0 failed**, 424 deselected |
+| Layout sync (`test_exl3_lease_block.py`, `test_exl3_ram_miss_device_args.py`) | **26 pass** |
+| Pushed to `origin` | no; `shared` only |
+
+**The lease-off path.** `armed` became `need_count > 0 || advise != 0 || (lease != nullptr && planned_count > 0)`,
+which reduces to the old expression exactly when the lease pointer is null. A hazard worth recording because it was
+handled rather than hit: `state[kPendingEpoch] = state[kEpoch]` is written **unconditionally**, including on the
+lease-off path, into two state words that did not exist before, so any caller still sizing that array at the old
+length would have taken an out-of-bounds write in code unrelated to leases. `STATE_WORDS` carries `epoch: 9` and
+`pending_epoch: 10`, the allocation uses `len(STATE_WORDS)`, and no hardcoded size survives.
+
+**Mutation ledger: 14 applied one at a time to `exl3_ram_miss.cuh`, all 14 KILLED.** Run with `pytest -x`, so the
+named test is the *first* failure only; others may also kill a given mutant and that was not checked.
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M1 | ack kernel drops the `lane < n` guard (acks all 8 lanes) | `..._acknowledges_exactly_the_committed_lanes` |
+| M2 | ack kernel uses `lane <= n` | same as M1 |
+| M3 | ack kernel sets `consumed = true`, never VIOLATED | `..._a_slot_generation_that_moved_is_acknowledged_violated...` |
+| M4 | wait kernel removes `go_count[0] = 0` at entry | `..._go_count_is_zero_on_entry_even_when_the_previous_request_committed` |
+| M5 | wait kernel fails **open** (`go_count = planned_count` on the failure path) | `..._a_plan_of_more_than_eight_lanes_is_clamped_and_the_wait_refuses_it` |
+| M6 | wait kernel never publishes `Terminal` | same as M5 |
+| M7 | wait kernel drops `host_slot < capacity` | `..._refuses_the_whole_request_and_publishes_a_terminal[slot_past_capacity]` |
+| M8 | wait kernel drops `expert == planned[i]` | same test, `[wrong_expert]` |
+| M9 | ack kernel: VIOLATED raises fatal but no longer sets `keep = 0` | same as M3 |
+| M10 | post kernel does not arm a request with lanes in lease mode | `..._post_writes_the_lane_request_and_arms_a_request_with_lanes_only_in_lease_mode` |
+| M11 | wait kernel does not abort on the fatal word or `Header.shutdown` while polling | `..._shutdown_ends_the_wait_promptly_without_a_fatal_word` |
+| M12 | ack kernel reads `SlotGen` at `4*slot`, ignoring the row's `slot_gen_base` | `..._the_slot_generation_is_read_from_the_lanes_own_row` |
+| M13 | wait kernel drops the request-generation comparison on `ready` | same as M7, `[stale_generation]` |
+| M14 | post kernel does not bump the epoch when the sequence wraps | `..._the_epoch_advances_when_the_sequence_wraps_and_names_the_generation` |
+
+**Every killing test is in `TestHandDriven`. The end-to-end class killed nothing.** Those end-to-end cases (graph
+capture and replay, the real C++ service thread with the real copy kernel) are evidence that the pieces compose, and
+they are not evidence that the tests would notice a broken handshake. All the mutation strength rests on the
+hand-driven cases, and a reader quoting these numbers should know that.
+
+**Not established, listed so nobody mistakes this ledger for more than it is.**
+1. **7.4's central "by construction" property is the one thing no mutant probed.** M1 and M2 are killed by the
+   exact-lane-set test, not by `..._a_refused_request_emits_no_acknowledgement_even_with_a_stale_lane_context`, so
+   that test's power to kill an "ack ignores `go_count == 0`" mutant is **unproven**. It matters because the host
+   makes it consequential: in `retire_leases` the `acknowledged` branch is tested **before** `voided`, so on a
+   refused request (whose `Terminal` marks the lanes skipped) a spurious ack would win the if-chain, retire the lane
+   as `kLeasesAcked`, record that the GPU consumed a source it never read, and hide the refusal from the counters.
+   That mutant is outstanding.
+2. **Ordering is not covered and mostly cannot be.** No mutant touches the 11.4 re-read of `ready`, and none swaps
+   the `Terminal` and fatal stores (F2). Memory-ordering defects are not deterministically observable in a single
+   run; they need stress or a formal argument. **The ordering guarantee rests on section 6.4's argument, not on any
+   test**, and that is a stated limit rather than a gap left unfilled. Chasing it with mutants would produce passes
+   for the wrong reason.
+3. `keep` left unset on a refused wait, the `count > 8` reason value, and the unarmed-with-lanes branch that clears
+   `pending` are untested. None is a safety property.
+4. **"Passes now" is demonstrated; "unchanged from before" was not demonstrated by the implementer**, who did not run
+   a parent-commit baseline. The lead's 694-test run is the evidence for that claim, not the implementer's runs.
+5. Nothing here is a LeaseSim result: **no LeaseSim tests were written.** Per 20.2b and the repeated ruling in this
+   document, a LeaseSim pass would not have been GPU evidence anyway.
+
+**No plan checkbox is ticked, and none should be on this evidence.** Task 5's remaining boxes name service-side
+behaviours (the shutdown drain, the terminal cancellation handshake, admission pressure under a delayed GPU
+consumer) that these two kernels now make *possible* and do not themselves demonstrate.
