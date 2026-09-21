@@ -228,14 +228,51 @@ def test_the_lease_block_layout_is_written_once_in_python_and_in_the_device_sour
     assert python["kLeaseRing"] == device["kDemandRecords"] and python["kLeaseLanes"] == device["kMaxIds"]
 
 
-def test_the_host_source_agrees_with_the_lease_layout_wherever_it_defines_it():
-    """The host source gets its lease constants in a later step; from then on they must equal the Python ones."""
-    host = _constants(CSRC / "exl3_ram_miss_host.cpp")
+# Words that mean the host source has started to implement leases. Step 2 must name its constants kLease*; if it
+# adds the concepts under other names the guard below fails instead of leaving the agreement check matching nothing.
+_LEASE_CONCEPTS = re.compile(r"\b(?:LaneRequest|SlotGen|slot_generation|Outstanding|retire_leases|lease_block|leases)\b")
+
+
+def _check_host_lease_layout(host_source: str, host_constants: dict[str, int], python: dict[str, int]) -> str:
+    """"agreed", or "skip" while the host source has no lease code; raises when it has and does not agree."""
+    defined = {name: value for name, value in host_constants.items() if name.startswith("kLease")}
+    if not defined:
+        if _LEASE_CONCEPTS.search(host_source):
+            raise AssertionError(
+                "the host source mentions leases but defines no kLease* layout constants: the agreement check "
+                "would match nothing. Define the layout as kLease* constants (mirroring exl3_lease_block.py)."
+            )
+        return "skip"
+    for name, value in defined.items():
+        assert name in python, f"{name} is defined in the host source but not mirrored in Python"
+        assert value == python[name], (name, value, python[name])
+    missing = sorted(set(python) - set(defined))
+    assert not missing, f"the host source defines some lease constants but not {missing}"
+    return "agreed"
+
+
+def test_the_host_source_agrees_with_the_lease_layout_once_it_defines_it():
+    """Skips while the host source has no lease code (step 2 of LEASE_PROTOCOL.md section 20 adds it); from then on
+    it is a hard failure if the constants are missing, partial or different."""
+    path = CSRC / "exl3_ram_miss_host.cpp"
+    outcome = _check_host_lease_layout(path.read_text(), _constants(path), _lease_python_constants())
+    if outcome == "skip":
+        pytest.skip("the host source has no lease code yet; this check activates when it does")
+
+
+def test_the_host_lease_guard_can_fail():
+    """The guard is itself a check that must be able to fail: each way the host source can go wrong is refused."""
     python = _lease_python_constants()
-    for name, value in host.items():
-        if name.startswith("kLease"):
-            assert name in python, f"{name} is defined in the host source but not mirrored in Python"
-            assert value == python[name], (name, value, python[name])
+    assert _check_host_lease_layout("// nothing about them", {}, python) == "skip"
+    assert _check_host_lease_layout("x", dict(python), python) == "agreed"
+    with pytest.raises(AssertionError, match="defines no kLease"):
+        _check_host_lease_layout("struct Outstanding {};", {}, python)  # lease code under other names
+    with pytest.raises(AssertionError, match="but not"):
+        _check_host_lease_layout("x", {"kLeaseRing": python["kLeaseRing"]}, python)  # partial
+    with pytest.raises(AssertionError):
+        _check_host_lease_layout("x", {**python, "kLeaseSlotGen": python["kLeaseSlotGen"] + 4}, python)  # drifted
+    with pytest.raises(AssertionError, match="not mirrored"):
+        _check_host_lease_layout("x", {**python, "kLeaseInvented": 1}, python)
 
 
 if __name__ == "__main__":

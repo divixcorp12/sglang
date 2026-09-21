@@ -271,3 +271,17 @@ Everything in section 5 stands, and the run adds:
 - One host store shape each for `regular` and `nt`; the service's real `memcpy` may differ.
 - The 200,000-iteration count is finite: zero is "not observed".
 - It says nothing about the model, or about the lease protocol's other steps.
+
+## Facts for the next benchmark author
+
+- **The RTX 5090's L2 is 96 MiB** (`l2CacheSize` = 100,663,296 bytes, read from the device
+  properties by this run), not the "about 128 MB" in this file's pre-registration or in the
+  project's `CLAUDE.md` microbenchmark guidance. The guidance stays correct in effect, because a
+  working set sized past 128 MB also clears 96 MiB, but the number is wrong and should not be
+  derived from.
+- The GPU here sits on a **Gen3 x16** link (driver-reported maximum 3; Gen1 while idle): the ceiling
+  for host-to-device work is 15.75 GB/s theoretical, 12.3-13.8 GB/s measured. A benchmark that
+  reports more than that over PCIe is not measuring PCIe.
+- `nvcc` 13.4.46 is at `/usr/local/cuda/bin/nvcc` on divix01 and is not on `PATH`. A standalone
+  program built for `sm_120` there in 4.5 s of CPU time. Whether the project's `load_jit` finds it
+  from a non-interactive environment has not been checked; do not assume it.

@@ -1429,6 +1429,88 @@ budget; A4 above; and the launch-count cost. The `LaneRequest` mechanism already
 the service the lane list before the request is served, which per-lane early publication
 needs.
 
+**Hard requirement on Task 6's readiness poll (from the `ld.global.nc` experiment,
+`NC_VISIBILITY.md`):** a `.nc` load of host memory is stale for the life of the kernel, so the
+per-lane readiness poll must use `ld.acquire.sys` (or `cv`), never `.nc`, however natural `.nc`
+looks by symmetry with the copy path, which keeps it.
+
+### 17.3 The executor-stream release callback: ownership, lifetime and close (OPEN 16)
+
+Requirement (17.1 R1a): a host lease is released by a host function enqueued on the executor
+stream after the copy, not by the scheduler thread. This section designs the mechanism far enough
+that no step of it can be a use-after-free, because the failure it prevents would present as a rare
+crash in unrelated code. Nothing here is implemented, and **step 7 must not get ahead of it.**
+
+**Design rule: a callback dereferences nothing that can be freed.** It carries a handle and a lease
+id, never a pointer to the tier, its mutex or its counters, and it reaches the tier only through a
+process-lifetime registry. Everything below follows from that.
+
+1. **What crosses the module boundary is one plain C function, once.** `host.cpp` exports
+   `extern "C" int exl3_ram_miss_release_by_handle(int64_t handle, int64_t lease_id)` and an
+   `exl3_ram_miss_release_abi()` returning a version integer. The device module (which already has
+   CUDA, and enqueues with `cudaLaunchHostFunc`) receives the function's address as an integer,
+   together with the ABI version it was built against, and refuses to enqueue when the versions differ.
+   A shared header declares the signature as a `typedef`, and both modules `static_assert` it, so a
+   change to one side breaks the build of the other rather than the process.
+2. **Who owns the address, and when it is valid.** The address is the entry point of code in the host
+   module. It becomes valid when that module is loaded and stays valid for the life of the process,
+   because `_host_module()` is a `cache_once` `load_jit` and nothing in this tree drops the reference.
+   That claim is the one this design rests on and I have **not** verified that `tvm_ffi` never unloads
+   a JIT module: **[OPEN 17]**. It must be checked, and a test must assert `_host_module()` returns the
+   same object throughout a process. If the host module were torn down first, the device module's
+   stored address would dangle; the design makes that impossible by never tearing the host module
+   down, not by detecting it.
+3. **The ticket.** The enqueuer heap-allocates `{fn, handle, lease_id, cookie}`, passes it as the
+   host function's user data, and the callback frees it; a failed enqueue frees it on the enqueuer's
+   side. The cookie is checked in the callback so a stray pointer is refused, not followed.
+4. **The registry is a leaked singleton.** `handle -> shared_ptr<RamTier>` is created once with
+   `new` and never destroyed, so the static-destruction order at process exit cannot free it while a
+   callback runs on a driver thread. (The existing `registry()` and `thread_registry()` in `host.cpp`
+   are function-local statics, destroyed at exit; the release path must not use them as they are.)
+5. **The callback body.** It takes a shared lock on the registry, copies the `shared_ptr`, drops the
+   lock, calls `release_host_lease` (a `mutex_` section and a decrement; no CUDA call, no Python), and
+   drops the `shared_ptr`. It is `noexcept`: every exception is caught and counted, because an
+   exception leaving a driver thread terminates the process.
+6. **A callback racing with, or after, tier close.** Close erases the registry entry. A callback
+   either finds the entry and holds the tier alive for its own duration (the destructor then runs on
+   the last `shared_ptr` drop, possibly on the driver thread, and must not call CUDA or Python; today's
+   `~RowReader` does neither) or finds nothing and counts `releases_after_close` and returns. **No
+   ordering has to be won for memory safety**: there is no pointer to dangle. "Draining first" is
+   therefore not what makes it safe, and it does not need to be proven complete for that purpose.
+7. **What the drain establishes, and how: the slabs, not the tier object.** The shutdown sequence's
+   S3 (14.3) is a device-wide `torch.cuda.synchronize`. CUDA orders a host function after the stream
+   work enqueued before it, and a device-wide synchronize does not return until every stream's work,
+   host functions included, has completed. So when S3 succeeds, **no host function is queued or
+   running on any stream**, and freeing the slabs is safe. Admission closing (S1) is what stops new
+   enqueues: `enqueue_release` checks a `closing` flag under the registry lock and refuses, so nothing
+   can be enqueued between S3 and the free. If S3 cannot succeed (a CUDA error, a timeout), the slabs
+   are quarantined (14.2) and any callback that later fires only touches the registry, which is
+   safe by rule 6.
+8. **A failed enqueue leaves an uncertain lease.** If `cudaLaunchHostFunc` returns an error (a sticky
+   CUDA error, say), the release will never run. The lease is not released by anything else (R1a: the
+   poll must not double-release), so the tier is marked `poisoned`, the counter
+   `release_enqueue_failures` is bumped, and the shutdown treats a poisoned tier as "completion cannot
+   be established": it quarantines rather than frees. This is the same rule as any CUDA error in S3.
+9. **No blocking under `mutex_`.** The callback takes the tier's `mutex_`; the service holds it only
+   in short sections and never across I/O or while waiting for anything (it must stay so: state it as
+   an invariant of `RamTier`). A callback that waited for `mutex_` would stall the executor stream's
+   later copies, so the critical sections it contends with are bounded and short.
+10. **Stream lifetime.** The executor stream that carries the callbacks belongs to the promotion
+    executor and lives for the process (Task 8's design); a callback is not enqueued on a stream that
+    may be destroyed first.
+
+Tests this design requires before step 7 lands: a released lease through the callback path; a
+callback after `close` is a counted no-op and touches nothing; a stress test in which a thread fires
+callbacks at random times while the tier is closed and re-opened (must not crash under a sanitizer
+build, and must never decrement a different tier's lease: the handle must not be reused while
+callbacks are outstanding, so handles are never recycled); an enqueue after `closing` is refused; a
+failed enqueue poisons the tier and shutdown quarantines; the callback survives an exception thrown
+by `release_host_lease`. The `_host_module()` identity assertion covers rule 2.
+
+If any of this proves awkward, the fallback of 17.1 (poll in `before_host_use` with
+`stream.query()`) removes the callback and the whole cross-module question, at the cost of the
+weaker guarantee stated there.
+
 ---
 
 ## 18. What has to exist before this can be accepted
@@ -1660,9 +1742,10 @@ side is transcribed faithfully.
 - **[OPEN 11]** The per-layer cost of arming every `count > 0` record when advise is off.
 - **[OPEN 12]** Whether planned experts are always a subset of the routed experts in the
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
-- **[OPEN 16]** The mechanics of the executor-stream release callback (17.1 R1a): the enqueue
-  lives in the device module, the release function in the host module, the address crosses as an
-  integer, and a callback still queued at tier close is not designed.
+- **[OPEN 16]** (designed in 17.3; the design's own assumption is OPEN 17) The mechanics of the
+  executor-stream release callback (17.1 R1a).
+- **[OPEN 17]** That `tvm_ffi` never unloads a JIT module, so the function address the device module
+  holds stays valid for the process. Unchecked; 17.3 rule 2 rests on it.
 - **[OPEN 15]** How a deferral interacts with the stage record's `observed`, `prev_done` and
   `backlog` fields (7.1).
 - **[OPEN 14]** Epoch seeding for a second device incarnation over one lease block. The
@@ -1766,6 +1849,49 @@ independent review) that lease mode defaults off.
 - Step 5 must not enable lease mode by default, and must not remove the un-armed touch-only
   path for `count == 0` records.
 - Step 6 must not free anything on any path where completion was not established.
+
+### 20.2a Deviations from this order, recorded as they happen
+
+- **Step 1 deviated.** The order above put the block constants and allocator in `ops.py` and
+  `host.cpp`. They were built instead as a **new module** (`ops/moe/exl3_lease_block.py`), the
+  constants in `exl3_ram_miss.cuh`, and new tests, because `host.cpp`, `ops.py` and
+  `srt/layers/moe/exl3_ram_miss.py` were carrying another change's uncommitted diff (the Task 4
+  packing-worker pool) and editing them in step 1 would have collided with it. The host-side
+  constants therefore move to step 2, and the agreement test for them (see below) is a guarded
+  skip until then. Nothing else in the order changes.
+- **The host-source agreement test is guarded so it cannot silently match nothing.** It skips
+  with a reason while `host.cpp` has no lease code, and fails hard if `host.cpp` mentions lease
+  concepts (`LaneRequest`, `SlotGen`, `Outstanding`, `retire_leases`, `leases`...) without
+  defining the `kLease*` constants, or defines only some of them, or defines them with other
+  values. The guard has its own test that each of those failure modes is refused, because a
+  check that cannot fail is the failure this project keeps finding.
+- **Step 6 was started early** for its part that touches no contested file:
+  `ExpertPinnedHostCache.quarantine()` and `quarantine_host_slabs()`. The `shutdown` wiring that
+  calls it is still to do.
+
+### 20.2b Step 3's CPU simulated device: what the scaffolding must provide
+
+The simulated device of step 3 extends `exl3_ram_miss_sim_post` / `_sim_wait`. To be faithful to
+the model rather than decorative it must:
+
+- write a `LaneRequest` with the request, and take the lease block, so a test can post lanes;
+- run the wait kernel's decisions (row-result validation, `go_count`, terminal) and a copy that
+  reads the leased slot's bytes into a test buffer and compares them with the expected expert,
+  so a test observes the shipped-bug shape (wrong bytes accepted), not just a counter;
+- run the acknowledgement kernel, including the `SlotGen` re-check and its `VIOLATED` outcome;
+- hold the device's stores to `LaneAck` and `Terminal` in an outbox and let the test deliver them
+  in any order across words (same word in order), as the model does;
+- be able to withhold acknowledgements entirely (the "never retires" and lease-pressure tests) and
+  to time out (`go_count = 0`, terminal published).
+
+**Model traces are replayed at the scenario level, not step for step.** The model's service steps
+(reserve, load, grant, status, done) are finer than the real `serve()`, which is one call per
+request; so a counterexample becomes a scenario whose *outcome* is asserted (for example: an
+advisory pressure applied while a lease is held leaves the slot's bytes and generation unchanged;
+a request whose device gave up leaves no lease after the terminal is delivered; a deferred demand
+is served once the acknowledgement is delivered and its stage ring holds one record, not one per
+poll), not a sequence of internal calls. Say which model trace each test corresponds to in its
+docstring.
 
 ### 20.3 Dependencies
 
