@@ -2014,11 +2014,18 @@ independent review) that lease mode defaults off.
 - **The device kernels (7.3, 7.4) landed with three post-kernel additions the spec did not spell out, and they
   are decisions, not readings of the text.** (1) The post kernel had none of its [P] half: it wrote no `LaneRequest`,
   kept no `kEpoch`/`kPendingEpoch` (11.3), so the wait kernel had no `G56` to name. Both are now written, in lease
-  mode only (`lease_address != 0`; zero leaves the post byte-for-byte as before). (2) **Arming.** 7.1 step 3 says a
-  request with `count == 0` takes no lease, and says nothing about `count > 0` with every planned expert already in
-  RAM, which today's post leaves unarmed. The service reads a request's lanes only when the record is armed, so such a
-  request would be copied from slots nobody leased. In lease mode the post now arms every request with planned lanes.
-  Cost: a wait per streamed layer that today would have been skipped. Unmeasured. (3) **Where the wait kernel refuses
+  mode only (`lease_address != 0`; zero leaves the post byte-for-byte as before). (2) **Arming — and this one is NOT a decision; correcting the
+  sentence above for this item.** 7.1 step 3 indeed says nothing about `count > 0` with every planned expert already
+  in RAM, which today's post leaves unarmed, and the service reads a request's lanes only when the record is armed, so
+  such a request would be copied from slots nobody leased. But **section 15 settles it and mandates exactly what was
+  implemented**: "The all-hit handshake ... kept, and now mandatory whenever `count > 0`, with or without advise: the
+  handshake is where the lease is granted", and "lease mode arms every record with `count > 0`, exactly as Option F
+  already does when advise is on", with `count == 0` staying unarmed and touch-only. So the post arming every request
+  with planned lanes is the registered rule, not an implementer's choice, and **it is not open to being optimised away
+  here**: section 15 records that removing the handshake needs an equivalent protection (a device-side lease by mapped
+  atomic) whose Dekker-style argument in both directions and model check are an explicit Task 5 non-goal. Cost: a wait
+  per streamed layer that today would have been skipped, which is section 15's already-registered **OPEN 11**, still
+  unmeasured. The implementation matching the spec is a stronger result than a defensible choice would have been. (3) **Where the wait kernel refuses
   with no generation to name** (sticky at entry, or lanes with nothing armed) it publishes no `Terminal`: nothing was
   posted, so nothing was leased. Terminal `reason` values (`timeout 1, aborted 2, failed 3, identity 4, count 5`) are
   mine; the service does not interpret them. The wait also refuses a `host_slot` at or above the row's capacity
