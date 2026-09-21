@@ -11,6 +11,8 @@ reconstructed from the lead's messages and marked "approx.".
 | 4 | approx. 05:04-05:06 | proposed amendment 6 code | GO (0% / 0%), foreign 20.6 cores, load 25; `pgrep` for pytest found 0 **at its end** | **UNVERIFIED, NOT TO BE RELIED ON.** It began after the 05:02 kill on the lead's timeline but I did not record a `pgrep` at its start. |
 | 5 | 05:15:11-05:16:37 | in force | NO-GO 85% / 92%; foreign 30.3 cores; load 32.0 | **CONTAMINATED, DISCARDED.** `pgrep` for `orderplug|pytest` found **18 processes at the start and 14 at the end**: `sweep3.sh` / `xargs -P 3` (`t1-ordersweep`, `test_zaya_cca.py`), `taskset -c 0-63`, relaunched a fifth time. |
 
+| 6 | 05:20:54-05:22:20 | amendment 6 v2 (used cores + SMT siblings + reserved-neighbour exclusion) | **NO-GO**: 40% / 40% of 80 windows above 10% (harness mask [46, 50], reader mask [18, 23, 26]); load 27.9-30.5, foreign 21.1 cores; physical cores with both siblings under 10%: harness 0, reader 0 | **CLEAN**: `pgrep orderplug|pytest|sweep3` = 0 at the start and 0 at the end. |
+
 Run 5 output as printed:
 
 ```text
@@ -33,4 +35,4 @@ NO-GO (at most 5% of rehearsal windows above the gate on either mask, NVMe idle)
 then: gpu-run.sh taskset -c 42,44 <python> c_harness.py ... --reader-cpus 24,28,29
 ```
 
-**Consequence.** The evidence that the proposed amendment 6 passes the gate rests only on runs 3 and 4, and neither is usable. The proposal has **no clean rehearsal yet**; run 1 (valid) is the only clean result and it is a NO-GO against the in-force code. Nothing here is a statement about the box in isolation.
+**Consequence.** The only clean rehearsals are run 1 (in-force code, NO-GO) and run 6 (SMT-corrected code, NO-GO). The GO-shaped runs 3 and 4 are contaminated or unverified and are not evidence; they are kept to show that the un-corrected rule certified physical cores whose SMT siblings were busy (the hole the lead measured).

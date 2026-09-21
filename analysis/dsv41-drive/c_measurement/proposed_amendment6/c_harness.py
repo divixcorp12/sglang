@@ -118,6 +118,15 @@ def node_cpus(node):
 
 # ------------------------------------------------------------------------------------------------- box conditions
 
+_SIB_CACHE = {}
+def thread_siblings(cpu):
+    """The logical CPUs sharing a physical core with `cpu` (including itself), from /sys/devices/system/cpu/cpuN/topology/thread_siblings_list.
+    SMT is active on this box (2 threads per core): a logical CPU is half a physical core, so 'the cores the run uses' are physical cores."""
+    if cpu not in _SIB_CACHE:
+        try: _SIB_CACHE[cpu] = tuple(_parse_cpus(Path("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list" % cpu).read_text().strip()))
+        except OSError: _SIB_CACHE[cpu] = (cpu,)
+    return _SIB_CACHE[cpu]
+
 class ForeignLoad:
     """Foreign CPU use on the cores WE use, over one window, from /proc/stat (cheap, so it can run around every visit).
 
@@ -131,8 +140,8 @@ class ForeignLoad:
     (system time), so it is an upper bound on foreign load, which makes the box-drift gate conservative."""
     MIN_TICKS = 3
     USED_FRACTION = 0.10          # a core counts as USED by us if our own threads ran on it for at least this fraction of the window
-    def __init__(self, own_pids, cores):
-        self.own = set(own_pids); self.cores = set(cores); self.hz = os.sysconf("SC_CLK_TCK")
+    def __init__(self, own_pids, cores, siblings=thread_siblings):
+        self.own = set(own_pids); self.cores = set(cores); self.hz = os.sysconf("SC_CLK_TCK"); self.siblings = siblings
     def add_own(self, pid): self.own.add(pid)
     last = {}
     def _cpu(self):
@@ -166,12 +175,14 @@ class ForeignLoad:
         # which we did nothing cannot contend with us for CPU. With no own presence at all (a plain survey) every core of the set counts.
         used = {c for c in self.cores if own_c.get(c, 0.0) >= self.USED_FRACTION * self.hz * dt}
         if not used and own_c: used = {c for c in own_c if c in self.cores}
-        mine = {c: foreign[c] for c in (used or self.cores) if c in foreign}
-        self.last["used_cores"] = sorted(used)
+        # SMT: a used logical CPU is half of a physical core, so the foreign CPU on its thread sibling counts against the same gate (summed over the pair)
+        def phys(c): return sum(foreign.get(x, 0.0) for x in self.siblings(c) if x in foreign)
+        mine = {c: phys(c) for c in (used or self.cores) if c in foreign}
+        self.last["used_cores"] = sorted(used); self.last["sibling_foreign_ticks"] = {c: round(phys(c) - foreign.get(c, 0.0), 1) for c in mine}
         if not mine: return (0.0, "")
         c = max(mine, key=mine.get); ticks = mine[c]; pct = 100.0 * ticks / self.hz / dt
         if ticks < self.MIN_TICKS: pct = min(pct, 9.9)
-        return (pct, "cpu%d: %.1f foreign ticks in %.2f s" % (c, ticks, dt))
+        return (pct, "cpu%d+siblings%s: %.1f foreign ticks in %.2f s" % (c, list(self.siblings(c)), ticks, dt))
 
 class TopScan:
     """Once per pass, a full thread scan (0.25 s at load 30): who the biggest foreign processes are, by process name and CPU, with their command lines.

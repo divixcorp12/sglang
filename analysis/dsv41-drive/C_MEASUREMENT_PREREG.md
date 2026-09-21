@@ -292,9 +292,9 @@ The harness mask is the two quietest harness candidates and the reader's the thr
 
 **4. The record.** The list of standing services in `meta.json` (`steady_state_by_pass`, from the per-pass thread scan) will include, besides `java` (QuestDB, measured flat at about 14.4 cores in three samples: 1444%, 1448%, 1430%), `aggregate-runner`, `nimbus_beacon_node`, `op-reth` and `reth-binary`, a **Ray `log_monitor.py`** (about 14% of a core, on core 70, which is inside the 64-71 band we never touch and outside our masks). The flat QuestDB figure also lowers the risk of the box-drift gate: there is no ingest burst to swing it.
 
-## 17. PROPOSED amendment 6, made after the first rehearsal and before any measurement: which cores and which drives the gates judge (2026-09-21)
+## 17. Amendment 6, made after the first rehearsal and before any measurement: which cores and which drives the gates judge, with the SMT correction (2026-09-21)
 
-**Status: PROPOSED, not in force.** The harness in force is still `35dcf8215ae5c2c9…` (section 9). The proposal is in `c_measurement/proposed_amendment6/` (files not overwriting the in-force ones); it takes effect only when the lead accepts it and section 9 is updated in a separate commit. If it is refused, the in-force harness stands and the rehearsal below says NO-GO, so the window does not open.
+**Status: ACCEPTED by the lead in principle, with one mandatory correction (item 5); NOT used today** (today's window did not open; see item 6). The files are in `c_measurement/proposed_amendment6/` and become the harness in force, with section 9 flipped in a separate commit, only when a run is next attempted; until then the harness in force is still `35dcf8215ae5c2c9…` (section 9).
 
 **What happened, in the order it happened.**
 1. **The first rehearsal (the in-force code, run 04:58 on divix01, `--rehearse 40`) said NO-GO: 72% of 80 windows above 10% on the harness mask [36, 38] and 66% on the reader mask [25, 27, 30].** No lane of ours was running (a `pgrep` for pytest found none), so this is not a false negative caused by us; against the in-force gate as implemented, the box fails.
@@ -308,10 +308,19 @@ The harness mask is the two quietest harness candidates and the reader's the thr
 
 **What the proposal does not change.** `c_analysis.py` (`4657702c…`) and every frozen gate value; the per-visit retry rule; the box-drift gate; the ungated memory-bandwidth failure mode (section 12), which the used-cores rule does not touch and does not weaken any more than the mask restriction already did.
 
-**Proposed files and hashes** (in `c_measurement/proposed_amendment6/`; 19 CPU tests pass on them; not in force):
+**5. The lead's SMT correction (required after the proposal, and it cuts against my result).** SMT is active on this box (2 threads per core, 18 cores per socket, 2 sockets; e.g. `thread_siblings_list` of cpu42 is 6,42; cpu44 is 8,44; cpu36 is 0,36). A logical CPU is half a physical core, so "the cores the run uses" are **physical cores**: my used-core rule was too wide on spare CPUs of the mask **and too narrow on the SMT siblings outside it**.
+The lead measured foreign CPU on the siblings of my proposed masks at 29.7%, 44.9%, 13.9%, 31.9%, 7.7% and 100% while my rehearsal reported 0% of windows above 10%; both were true, which is the hole. My diagnosis (foreign ticks on the occupied CPU are 0) was correct about why spare-core counting was wrong and incomplete about where the contention went: **the scheduler moves foreign threads off a CPU we spin on, but not off its idle sibling.**
+Implemented (v2 of the files below): foreign CPU is summed over each used logical CPU **and its thread sibling(s)** (from `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`) against the same 10% gate; `quiet_check.py` scores candidates by **physical core, worst sibling**, prints both members of each pair, and needs both siblings quiet; and **any CPU whose sibling lies in the reserved 64-71 band is excluded permanently in `candidates()`** (reader cpus 28-31 pair with 64-67, cpu35 with cpu71 itself, the doorbell spin core; the reader set is 10 CPUs, not 14).
+Conditions the lead set: report all three rehearsals; keep the ordering disclosure and add that this correction was required after the proposal; no further amendment after a result without coming back to the lead first; `c_analysis.py` stays `4657702c…`.
+
+**6. The three rehearsals (full list in `c_measurement/rehearsal_log.md`).** (1) in-force code, clean box: **NO-GO** 72%/66%. (2) the proposal, before the SMT correction: GO-shaped, **but the runs that produced it are contaminated (a relaunched order sweep) or unverified, so this GO is not evidence**; it is reported here because it shows how the un-corrected rule behaved (it certified physical cores whose siblings were 30-100% foreign-busy).
+(3) **the SMT-corrected code, 05:20:54-05:22:20, `pgrep` for `orderplug|pytest|sweep3` = 0 at the start and 0 at the end, load 27.9-30.5, foreign 21.1 cores: NO-GO, 40% of 80 windows above 10% on the harness mask [46, 50] and 40% on the reader mask [18, 23, 26]; physical cores with both siblings under 10%: harness 0 (need 2), reader 0 (need 3); the best pair's worst side was 12% (harness) and 21% (reader).**
+On the box as it is, **the frozen gate cannot be met today.** Whether that makes the measurement NOT MEASURED or lets it proceed on a declared sibling load turns on whether a steady sibling load biases `c_m` absolutely; that question and its proposed pilot are in the lead thread, not decided here.
+
+**Files and hashes (v2, SMT-corrected; 21 CPU tests pass on them):** 
 
 | file | sha256 |
 |---|---|
-| `proposed_amendment6/c_harness.py` | `58390047dd58e2164ee53b2cae16e9462446c55e1f5d45ee88a379d60b3d4999` |
-| `proposed_amendment6/quiet_check.py` | `3cf2834218759ab87bf6cea9b251d670e1c456c70a59b820153aa3d0dd5861ed` |
-| `proposed_amendment6/test_c_harness.py` | `7ff90d81cfe4041a3960b38301af2946300fe7b00588054e2a9c7969ebecac9a` |
+| `proposed_amendment6/c_harness.py` | `4aed80a181e8ea66d6f58c126ac0e688b2e0282ab69862455bcb1fe762a046f0` |
+| `proposed_amendment6/quiet_check.py` | `84f28a0b01d4a1d7221583268f8f393012249e9d69115fa2fb7a603ea36c9f28` |
+| `proposed_amendment6/test_c_harness.py` | `99a047970b820bbfe92ac08c746b68f646b2c2caf591c6d66508b0b82977fde9` |

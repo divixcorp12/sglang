@@ -15,12 +15,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import c_harness as h
 REHEARSAL_MAX_BAD = 0.05     # a visit gets 3 attempts, so a per-window failure rate p costs p**3 per visit; 5% over ~470 visits is about 0.06 lost visits
 
-def candidates(node0_cpus, node1_cpus):
-    """Harness = node 0 AND within 32-63 (gpu-run.sh's mask); reader = node 1, outside 32-63, never 64-71. Membership comes from the cpulists of
-    /sys/devices/system/node/node*/, which on this box are INTERLEAVED (node0 0-17,36-53; node1 18-35,54-71), never from a split point."""
-    harness = [c for c in node0_cpus if 32 <= c <= 63]
-    reader = [c for c in node1_cpus if c < 32 and not 64 <= c <= 71]
+RESERVED = range(64, 72)     # production's band (core 71 is the doorbell spin core): never used, and neither is any physical core that has a thread there
+
+def reserved_neighbours(siblings=h.thread_siblings, cpus=range(0, 72)):
+    """Logical CPUs whose SMT sibling lies in the reserved band: occupying them occupies the physical core the reserved thread lives on."""
+    return sorted(c for c in cpus if c not in RESERVED and any(x in RESERVED for x in siblings(c)))
+
+def candidates(node0_cpus, node1_cpus, siblings=h.thread_siblings):
+    """Harness = node 0 AND within 32-63 (gpu-run.sh's mask); reader = node 1, outside 32-63, never 64-71 and never a CPU whose SMT sibling is in 64-71.
+    Membership comes from the cpulists of /sys/devices/system/node/node*/, which on this box are INTERLEAVED (node0 0-17,36-53; node1 18-35,54-71),
+    never from a split point. Returns (harness, reader)."""
+    bad = set(reserved_neighbours(siblings))
+    harness = [c for c in node0_cpus if 32 <= c <= 63 and c not in bad]
+    reader = [c for c in node1_cpus if c < 32 and c not in RESERVED and c not in bad]
     return harness, reader
+
+def pairs(cpus, busy, siblings=h.thread_siblings):
+    """[(cpu, sibling(s), worst busy of the physical core)] for candidate CPUs, both members shown; sorted quietest first."""
+    out = []
+    for c in cpus:
+        sib = [x for x in siblings(c) if x != c]; worst = max([busy.get(c, 0.0)] + [busy.get(x, 0.0) for x in sib])
+        out.append((c, sib, worst))
+    return sorted(out, key=lambda t: t[2])
 
 def rehearse(mask, spin_cores, seconds, window=0.5):
     """CPU-only dress rehearsal of the frozen gate: our own load is present on `spin_cores` (a spinner stands in for the launching thread and
@@ -55,7 +71,13 @@ def main():
     busy = {c: 100.0 * (d1[c][0] - d0[c][0]) / max(1, d1[c][1] - d0[c][1]) for c in d1}
     node0, node1 = candidates(h.node_cpus(0), h.node_cpus(1))
     print("candidates from /sys: harness (node 0 within 32-63) %s ; reader (node 1 outside 32-63, not 64-71) %s" % (node0, node1))
-    harness = sorted(sorted(node0, key=lambda c: busy[c])[:4]); reader = sorted(sorted(node1, key=lambda c: busy[c])[:4])
+    ph, pr = pairs(node0, busy), pairs(node1, busy)
+    print("harness candidates as physical cores (cpu / sibling / worst busy%%): " + "; ".join("%d/%s/%.0f" % (c, "+".join(map(str, sb)) or "-", w) for c, sb, w in ph[:8]))
+    print("reader candidates as physical cores (cpu / sibling / worst busy%%):  " + "; ".join("%d/%s/%.0f" % (c, "+".join(map(str, sb)) or "-", w) for c, sb, w in pr[:8]))
+    print("excluded as neighbours of the reserved 64-71 band: %s" % reserved_neighbours())
+    harness = sorted(c for c, sb, w in ph[:4]); reader = sorted(c for c, sb, w in pr[:4])
+    quiet_h = [t for t in ph if t[2] < 10.0]; quiet_r = [t for t in pr if t[2] < 10.0]
+    print("physical cores with BOTH siblings under 10%%: harness %d (need 2), reader %d (need 3)" % (len(quiet_h), len(quiet_r)))
     watched = h.watched_nvme(h.DRIVE_PATHS)
     rd = sum(s1[k][0] - s0.get(k, (0, 0))[0] for k in s1 if k in watched) / 1e9 / dt; wr = sum(s1[k][1] - s0.get(k, (0, 0))[1] for k in s1 if k in watched) / 1e9 / dt
     rd_all = sum(s1[k][0] - s0.get(k, (0, 0))[0] for k in s1) / 1e9 / dt; wr_all = sum(s1[k][1] - s0.get(k, (0, 0))[1] for k in s1) / 1e9 / dt
@@ -66,10 +88,10 @@ def main():
     print("cores busy % (0-63): " + " ".join("%d:%.0f" % (c, busy[c]) for c in sorted(busy) if c < 64))
     print("harness cores (node 0, within 32-63), quietest 4: %s -> busy %s" % (harness, [round(busy[c]) for c in harness]))
     print("reader cores (node 1, outside 32-63 and 64-71), quietest 4: %s -> busy %s" % (reader, [round(busy[c]) for c in reader]))
-    ok = all(busy[c] < 5.0 for c in harness) and all(busy[c] < 5.0 for c in reader) and (rd + wr) < h.IDLE_DRIVE_MAX_GBS
+    ok = all(max([busy[c]] + [busy[x] for x in h.thread_siblings(c)]) < 5.0 for c in harness + reader) and (rd + wr) < h.IDLE_DRIVE_MAX_GBS
     print("IDLE-CORE CHECK (informational, my own margin): %s (every picked core under 5%% busy and the NVMe drives under %.2f GB/s)" % ("GO" if ok else "NO-GO", h.IDLE_DRIVE_MAX_GBS))
     if a.rehearse > 0:
-        hm, rm = harness[:2], reader[:3]
+        hm, rm = harness[:2], reader[:3]      # each rehearsal window sums foreign CPU over the used CPU AND its SMT sibling, exactly as the harness does
         res_h = rehearse(hm, hm[:1], a.rehearse); res_r = rehearse(rm, rm[:1], a.rehearse)
         bad_h = sum(1 for x in res_h if x[0] > h.ENV_FOREIGN_PCT) / max(1, len(res_h)); bad_r = sum(1 for x in res_r if x[0] > h.ENV_FOREIGN_PCT) / max(1, len(res_r))
         print("REHEARSAL (the frozen gate as the harness measures it, our own load present): harness mask %s: %.0f%% of %d windows above %.0f%%; reader mask %s: %.0f%% of %d windows"
