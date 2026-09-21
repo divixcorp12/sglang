@@ -229,6 +229,36 @@ Include expert identity in the immutable row result and validate it against the 
 > correction in the result section. **Note the same "~128 MB" figure appears in
 > the project's `CLAUDE.md` microbenchmark guidance.**
 
+> **CROSS-TASK STRUCTURAL FINDING: three independent safety arguments rest on
+> the same unstated premise, and Task 8 is what removes it.** Found separately,
+> by three agents, on three different mechanisms:
+> 1. **The unarmed-record path** is benign only because advise is off, so nothing
+>    evicts between post and wait -- the temporal exclusion of `LEASE_PROTOCOL`
+>    §1.1 rule 5 (Task 6 blockquote).
+> 2. **The `kBusySeq`-gated hit phase** is safe only while the service serves one
+>    request at a time, with no advisory in flight once a request is taken.
+> 3. **DECIDE 3 (lease at publication)** is safe only while **the service is the
+>    only evictor** -- hit slots are protected solely by this request's own
+>    `wanted` list (`828ab911e2` §20.2c).
+>
+> All three are the same premise wearing different clothes: **one thread evicts,
+> and it is the one serving this request.** Task 8's promotion admission calls
+> `take_slot_locked` from the scheduler thread while the service is mid-read, so
+> a READY hit slot has no protection between reservation and grant. **Task 8
+> therefore invalidates three safety arguments simultaneously, none of which
+> names it as a dependency.**
+>
+> Consequence for sequencing: `DECIDE 3` must be **reopened when Task 5 step 7
+> lands**, and step 2's eviction predicate should be written so a
+> reservation-time hold for hit and loaded lanes is a one-line addition rather
+> than a restructure.
+>
+> A second §20.2c finding worth surfacing here: **`take_slot_locked` unmaps its
+> victim as it goes**, one call per missing expert, so a deferral that ran the
+> reservation loop and backed out would **evict a row on every retry -- data loss
+> driven by a poll**. Any deferral needs a dry run that counts free, evictable
+> and lease-blocked slots for the whole request *before* committing any take.
+
 ## Task 6: Start per-row GPU transfers before all reads finish
 
 **Files:** Files from Task 5; `python/sglang/srt/layers/moe/expert_row_plan.py`; `python/sglang/kernels/ops/moe/expert_cache_transfer.py`; `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`; graph wrapper/backend tests; `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`.
