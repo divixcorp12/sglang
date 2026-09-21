@@ -16,6 +16,7 @@ import time
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import exl3_lease_block as lease
 from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
@@ -126,6 +127,41 @@ def test_a_terminal_retires_its_lanes_while_the_worker_serves_and_another_acknow
     deadline = time.perf_counter() + 5.0
     while time.perf_counter() < deadline and host.counters()["leases_acked"] < 1:
         time.sleep(0.002)
+    assert host.counters()["leases_acked"] == 1
+
+
+@pytest.fixture
+def world(tmp_path):
+    """The service driven by hand (no thread): every retirement pass is a ``pump``."""
+    s = ram_miss_setup(tmp_path, capacity=3)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host.enable_lease_mode()
+    yield s, page, host, LeaseSim(host, page, s.slabs)
+    host.stop()
+
+
+def test_a_terminal_of_another_generation_with_the_same_low_bits_voids_no_lease(world):
+    """The terminal is what the device publishes when it gives up, and what the service voids a lane on. A terminal left
+    in a request slot by an EARLIER lap has the slot's low 32 bits but not its generation: acting on it would release
+    a lease the GPU may still be reading through. Mutation: the service checks a terminal's tag and not its generation."""
+    s, page, host, sim = world
+    req = sim.post(0, [3])
+    assert host.pump() == 1
+    waited = sim.wait(req)
+    assert waited.go == 1
+    stale = req.gen ^ (1 << 32)
+    assert stale & 0xFFFFFFFF == req.gen & 0xFFFFFFFF and stale != req.gen
+    offset = sim.terminal_offset(req)
+    sim._i32(offset, 2)[:] = torch.tensor([0b1, 1], dtype=torch.int32)
+    sim.write_u64(offset + lease.TERMINAL_FIELDS["gen"], lease.tagged(lease.TERMINAL_TAG, stale))
+    host.pump()
+    counters = host.counters()
+    assert counters["leases_voided"] == 0 and counters["leases_acked"] == 0, counters
+    assert host.slot_info(0)[[i for i, info in enumerate(host.slot_info(0)) if info[1] == 3][0]][2] == 1, "still leased"
+    sim.ack(req, waited)
+    sim.deliver()
+    host.pump()
     assert host.counters()["leases_acked"] == 1
 
 
