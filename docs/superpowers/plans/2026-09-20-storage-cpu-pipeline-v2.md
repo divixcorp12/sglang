@@ -239,6 +239,27 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > The change Task 5 must absorb is **when** the `RowResult` words are published
 > (at reservation, for hit lanes), not which words exist.
+>
+> **Cost, split by owner** (`c5c572bd92`). The information the signal must carry
+> already exists at the right moment and in the right thread: `RamTier::serve`
+> resolves hit lanes authoritatively under `mutex_`, before any read is
+> submitted (`tier.expert_slot[expert] >= 0`). It is host-side only, in
+> C++-private `Tier` state. So:
+> - **(a) small, Task 6's own:** in `serve()`, publish each hit lane's
+>   `RowResult` inside the reservation critical section rather than after
+>   `read()`. That is the whole of V1's protocol delta.
+> - **(b) large, Task 5's:** the words themselves, lease counters and
+>   retirement, the eviction predicate, and generations. **None of this
+>   exists.**
+>
+> **Sequencing consequence: Task 6 cannot be accepted before Task 5 (b) lands.**
+> Not merely "should follow" -- (b) is what makes (a) safe, per the ownership
+> argument above. This orders the remaining plan work regardless of which
+> mechanism is chosen.
+>
+> Separately, the device's post kernel classifies `need` from `slot_map` at post
+> time. That is a racy hint carrying no ownership, benign only for as long as
+> the host re-resolves authoritatively before acting on it.
 
 **Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step (2.0%), or 2.55 ms at random lane order, against a gate that resolves about 1.5% -- while costing 160 extra stage triples per step across all 40 layers. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
 
