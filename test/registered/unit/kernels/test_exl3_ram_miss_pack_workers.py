@@ -328,6 +328,104 @@ def test_credit_and_rows_in_flight_do_not_depend_on_where_the_copy_runs(tmp_path
         assert workers[field] == inline[field], field
 
 
+# ---- The record says which mode wrote it (schema 5) ----
+
+
+@pytest.mark.parametrize("workers, chunks, split", [(0, 0, 0), (1, 0, 1), (3, 0, 3), (3, 1, 1), (3, 3, 3), (2, 5, 5)])
+def test_a_stage_record_carries_the_packing_mode_that_produced_it(tmp_path, workers, chunks, split):
+    """Inline is pack_workers 0. Without the two fields a worker-mode record is indistinguishable from an inline
+    one, and the analysis reads the workers' wake-up delay as a busy packer. ``split`` is what the reader
+    keeps: one chunk per worker unless told otherwise."""
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    result, record = read_rows_traced(
+        s.tables, 1, [3, 0, 5], [0, 1, 2], direct=False, pack_workers=workers, pack_split=chunks
+    )
+    assert result == 1
+    assert (record["pack_workers"], record["pack_split"]) == (workers, split)
+
+
+def _served_records(tmp_path, workers, rows=(2,)):
+    """A demand that reads ``rows``, one that finds them resident (no_read) and an unarmed one (touch), through a
+    host built with ``workers``: the three shapes of record a request can end in."""
+    s = ram_miss_setup(tmp_path, capacity=6)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(
+        s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=workers
+    )
+    host.enable_trace()
+    try:
+        for _ in range(2):
+            seq = ops.sim_post(page, 1, need=list(rows), protect=list(rows))
+            assert host.pump() == 1 and ops.sim_wait(page, seq, timeout_s=1.0) == 1
+        ops.sim_post(page, 1, need=[], protect=list(rows), armed=False)
+        assert host.pump() == 1
+        return host.drain_trace()
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_every_record_a_host_pushes_carries_its_mode_including_the_ones_that_read_nothing(tmp_path, workers):
+    """The mode is the reader's, not the request's: a no_read or touch record has no packing of its own and
+    still says how the run was configured, so a file's mode is the same whichever record is looked at."""
+    records = _served_records(tmp_path, workers)
+    assert [r["status"] for r in records] == ["served", "no_read", "touch"]
+    assert [r["pack_workers"] for r in records] == [workers] * 3
+    assert [r["pack_split"] for r in records] == [workers] * 3  # split defaults to one chunk per worker
+
+
+def test_the_mode_reaches_the_jsonl_a_trace_writes(tmp_path):
+    """The analysis reads the file, not the record: the fields must survive the export."""
+    import json
+
+    from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
+
+    lines = {}
+    for workers in (0, 2):
+        (tmp_path / f"w{workers}").mkdir()
+        records = _served_records(tmp_path / f"w{workers}", workers)
+        path = tmp_path / f"trace-w{workers}.jsonl"
+        trace = Exl3StreamTrace(str(path))
+        try:
+            trace.record_ram_miss_requests(records, [10, 11])
+        finally:
+            trace.close()
+        lines[workers] = [json.loads(line) for line in path.read_text().splitlines()]
+    for workers, written in lines.items():
+        assert len(written) == 3
+        assert {(l["request"]["pack_workers"], l["request"]["pack_split"]) for l in written} == {(workers, workers)}
+
+
+def test_the_analysis_refuses_the_metrics_of_a_trace_a_worker_host_wrote_and_keeps_those_of_an_inline_one(tmp_path):
+    """The whole path: a real host's records, through the exporter, into overlap_timeline. Two rows read per
+    demand, so the request is multi-row and would otherwise be judged."""
+    import sys
+    from pathlib import Path
+
+    from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "analysis" / "dsv41-drive"))
+    import overlap_timeline as ot
+
+    results = {}
+    for workers in (0, 2):
+        (tmp_path / f"w{workers}").mkdir()
+        records = _served_records(tmp_path / f"w{workers}", workers, rows=(2, 5, 4))
+        path = tmp_path / f"trace-w{workers}.jsonl"
+        trace = Exl3StreamTrace(str(path))
+        try:
+            trace.record_ram_miss_requests(records, [10, 11])
+        finally:
+            trace.close()
+        results[workers] = ot.analyse_file(str(path))
+    assert results[0]["judged_requests"] == results[2]["judged_requests"] == 1
+    assert results[0]["pack_mode"] == {"inline": 3} and "refused" not in results[0]
+    assert "rows_queued_behind_the_packer" in results[0] and "hidden_fraction_of_pack" in results[0]
+    assert results[2]["pack_mode"] == {"workers": 3} and "rows_queued_behind_the_packer" not in results[2]
+    assert results[2]["refused"]["metrics"] == list(ot.WORKER_MODE_REFUSED)
+    assert results[2]["coverage_of_window_by_pack"]["n"] == 1 and results[2]["exposed_tail_us"]["n"] == 1
+
+
 if __name__ == "__main__":
     import sys
 

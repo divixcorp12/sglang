@@ -47,7 +47,11 @@ def capturing_graphs() -> bool:
 # inside first_to_last_cqe. 3: adds row_pack[].admit, extent_cqe[].submit/attempts and dropped_before;
 # no schema-2 field changed meaning. 4: adds request.lanes, the planned lane count the device posted;
 # every schema-3 field keeps its meaning, so spans, byte totals and per-drive shares compare across 3 and 4.
-RAM_MISS_TRACE_SCHEMA = 4
+# 5: adds request.pack_workers and request.pack_split, the packing mode the reader ran in. No earlier field
+# changed meaning, but a worker-mode record's pack stamps mean something else than an inline one's (a row's
+# pack_start is after the worker woke, its spans overlap). A file written before schema 5 does not say which
+# mode wrote it; it is ASSUMED inline, because the workers were barred from any run that writes a stage trace.
+RAM_MISS_TRACE_SCHEMA = 5
 
 
 class Exl3StreamTrace:
@@ -194,6 +198,10 @@ class Exl3StreamTrace:
         before this line's record: nonzero means lines are missing at this point of the file.
         ``schema`` 4 adds ``request.lanes``: the layer's planned lane count for that request (RAM hits and
         misses; ``rows_asked`` counts only the misses read), which with the line's ``layer`` gives lanes per layer.
+        ``schema`` 5 adds ``request.pack_workers`` and ``request.pack_split``: the packing mode. ``pack_workers``
+        0 is the inline reader; above 0 the rows are packed by workers, and ``row_pack_ns`` starts, ``spans_ns.pack``
+        and anything derived from the gap between an extent's reap and its row's pack start are then not
+        comparable with an inline trace's (analysis/dsv41-drive/overlap_timeline.py refuses them).
         """
         if self._file is None or not records:
             return
@@ -213,6 +221,8 @@ class Exl3StreamTrace:
                     "batches": record["batches"],
                     "backlog": record["backlog"],
                     "lanes": record["lanes"],
+                    "pack_workers": record["pack_workers"],
+                    "pack_split": record["pack_split"],
                 },
                 "status": record["status"],
                 "rows_asked": record["rows_asked"],

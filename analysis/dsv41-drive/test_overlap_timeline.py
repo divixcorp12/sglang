@@ -10,8 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import overlap_timeline as ot  # noqa: E402
 
 
-def _record(rows, extents, *, submit=1000, status="served", schema=2, **extra):
-    """rows: [(start, end)] and, optionally, admit; extents: [(row, cqe)] or (row, cqe, submit)."""
+def _record(rows, extents, *, submit=1000, status="served", schema=2, workers=None, **extra):
+    """rows: [(start, end)] and, optionally, admit; extents: [(row, cqe)] or (row, cqe, submit).
+    ``workers``: the schema-5 ``request.pack_workers``, absent when None (what a schema-2..4 line looks like)."""
     row_pack = [
         {"row": k, "start": r[0], "end": r[1], **({"admit": r[2]} if len(r) > 2 else {})} for k, r in enumerate(rows)
     ]
@@ -26,7 +27,7 @@ def _record(rows, extents, *, submit=1000, status="served", schema=2, **extra):
         "schema": schema,
         "status": status,
         "layer": 3,
-        "request": {"seq": 1},
+        "request": {"seq": 1, **({} if workers is None else {"pack_workers": workers, "pack_split": workers})},
         "stages_ns": {"submit": submit},
         "row_pack_ns": row_pack,
         "extent_cqe_ns": extent_cqe,
@@ -127,3 +128,102 @@ def test_the_timeline_marks_reads_and_packing_per_row():
     row0, row1 = lines[1].split("|")[1], lines[2].split("|")[1]
     assert row0.index("#") < row1.index("#")  # row 0 packs first
     assert row1.index(".") == 0 and row1.rstrip().endswith("#")  # row 1's read is outstanding from the submit
+
+
+# ---- Packing mode (schema 5): a worker-mode trace must not be read as an inline one ----
+
+INVALID_FOR_WORKERS = (
+    "ready_to_pack_us",
+    "rows_queued_behind_the_packer",
+    "saved_fraction_of_serial",
+    "saved_us_vs_pack_after_last_cqe",
+    "hidden_fraction_of_pack",
+)
+# Two rows reaped together at 2000; row 0 starts packing 200 us later. Inline that lag is a busy packer (row 1
+# waits behind row 0); with workers it is only how long the workers took to wake.
+WAKE_LAG = ([(202_000, 203_000), (202_000, 203_000)], [(0, 2000), (1, 2000)])
+
+
+def _trace(tmp_path, *records, name="t.trace"):
+    path = tmp_path / name
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return str(path)
+
+
+def test_the_mode_is_read_from_the_record_and_an_absent_field_is_inline_by_assumption():
+    assert ot.pack_mode(_record(*WAKE_LAG, schema=5, workers=0)) == ("inline", False)
+    assert ot.pack_mode(_record(*WAKE_LAG, schema=5, workers=3)) == ("workers", False)
+    assert ot.pack_mode(_record(*WAKE_LAG, schema=4)) == ("inline", True)  # no field: assumed, and says so
+
+
+def test_a_schema_5_line_without_the_field_is_refused_not_assumed_inline(tmp_path):
+    with pytest.raises(ot.UnsupportedSchema, match="packing mode unknown"):
+        ot.pack_mode(_record(*WAKE_LAG, schema=5))
+    with pytest.raises(ot.UnsupportedSchema, match="packing mode unknown"):
+        ot.analyse_file(_trace(tmp_path, _record(*WAKE_LAG, schema=5)))
+
+
+def test_identical_stamps_read_differently_inline_and_with_workers():
+    inline = ot.analyse_request(_record(*WAKE_LAG, schema=5, workers=0))
+    workers = ot.analyse_request(_record(*WAKE_LAG, schema=5, workers=3))
+    assert inline["ready_to_pack_ns"] == [200_000, 200_000] and "refused" not in inline
+    for key in ("ready_to_pack_ns", "hidden_fraction_of_pack", "saved_ns", "saved_fraction"):
+        assert key not in workers, key  # absent: asking is a KeyError, never a wrong number
+    assert "refused" in workers
+    # The interval-only numbers are the same: they do not depend on who packed.
+    for key in ("coverage", "exposed_tail_ns", "tail_share", "window_ns", "hidden_ns", "overlapped_rows"):
+        assert workers[key] == inline[key], key
+
+
+def test_a_worker_mode_file_refuses_the_invalid_metrics_and_still_emits_coverage_and_tail(tmp_path):
+    good = _record([(2000, 3000), (4000, 5000)], [(0, 2000), (1, 4000)], schema=5, workers=3)
+    path = _trace(tmp_path, good, _record(*WAKE_LAG, schema=5, workers=3))
+    result = ot.analyse_file(path)
+    assert result["pack_mode"] == {"workers": 2}
+    assert result["refused"]["metrics"] == list(INVALID_FOR_WORKERS)
+    for key in INVALID_FOR_WORKERS:
+        assert key not in result, key
+    for bucket in result["by_rows_per_request"].values():
+        assert "hidden_fraction_of_pack" not in bucket and "saved_us" not in bucket
+    assert result["coverage_of_window_by_pack"]["n"] == 2 and result["exposed_tail_us"]["n"] == 2
+    report = ot.format_report(result)
+    assert "REFUSED" in report and "ready_to_pack_us" in report
+    assert "window covered by packing" in report and "exposed tail" in report
+    assert "rows that waited for the packer" not in report and "pack hidden inside" not in report
+
+
+def test_the_same_file_written_inline_keeps_every_metric(tmp_path):
+    result = ot.analyse_file(_trace(tmp_path, _record(*WAKE_LAG, schema=5, workers=0)))
+    assert "refused" not in result and result["pack_mode"] == {"inline": 1}
+    assert result["rows_queued_behind_the_packer"] == 2  # the lag that is a wake-up under workers is real here
+    assert result["ready_to_pack_us"]["p50"] == 200.0
+    for key in INVALID_FOR_WORKERS:
+        assert key in result, key
+    assert "rows that waited for the packer" in ot.format_report(result)
+
+
+def test_one_worker_request_in_a_file_refuses_the_file_wide_metrics(tmp_path):
+    result = ot.analyse_file(
+        _trace(tmp_path, _record(*WAKE_LAG, schema=5, workers=0), _record(*WAKE_LAG, schema=5, workers=2))
+    )
+    assert result["pack_mode"] == {"inline": 1, "workers": 1}
+    assert "rows_queued_behind_the_packer" not in result and result["refused"]["metrics"] == list(INVALID_FOR_WORKERS)
+    assert "1 of 2 requests" in result["refused"]["reason"]
+
+
+def test_a_schema_4_file_is_read_as_inline_and_says_it_assumed_so(tmp_path):
+    result = ot.analyse_file(_trace(tmp_path, _record(*WAKE_LAG, schema=4)))
+    assert result["pack_mode"] == {"inline (assumed: schema < 5)": 1}
+    assert "refused" not in result and result["rows_queued_behind_the_packer"] == 2
+    assert "inline (assumed: schema < 5)" in ot.format_report(result)
+
+
+def test_main_exits_2_when_it_refused_metrics_and_0_when_it_did_not(tmp_path, capsys):
+    workers = _trace(tmp_path, _record(*WAKE_LAG, schema=5, workers=3), name="w.trace")
+    inline = _trace(tmp_path, _record(*WAKE_LAG, schema=5, workers=0), name="i.trace")
+    assert ot.main([inline]) == 0
+    capsys.readouterr()
+    assert ot.main([workers]) == 2
+    printed = capsys.readouterr().out
+    assert "REFUSED" in printed and "coverage" in printed
+    assert ot.main([inline, workers]) == 2

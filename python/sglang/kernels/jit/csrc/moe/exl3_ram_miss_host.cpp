@@ -145,6 +145,17 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // is only what was missing. Not clamped to kMaxIds, so a plan wider than the lanes the service is asked
 // for shows here.
 //
+// pack_workers, pack_split (schema 5): the packing mode the reader ran this request in, the reader's own
+// pack_workers_ / pack_split_ (SGLANG_DSV41_RAM_MISS_PACK_WORKERS). pack_workers 0 is the inline reader:
+// the owner thread packs each row itself, so a row's pack_start follows the extent's reap by however long the
+// owner was busy, and pack_ns is a sum of spans that never overlap. pack_workers > 0 hands each row to a
+// worker: pack_start is then when the worker had woken and taken a chunk, not when the packer was free, and
+// the rows' spans overlap, so pack_ns can exceed pack_end - pack_start. A record does not say which of
+// the two produced it without these, and a consumer that reads a worker record as an inline one reports
+// wake-up latency as a busy packer and counts overlapping spans twice. pack_split is the chunks each row is
+// cut into and means something only when pack_workers > 0. Every record carries the mode, including the ones
+// no row was read for (no_read, touch): it is a property of the reader, not of the request.
+//
 // dropped_before: records the trace ring dropped, for being full, immediately before this one was
 // pushed. A gap in `seq` cannot locate a loss on its own (a skipped advisory has no record either).
 //
@@ -206,6 +217,8 @@ struct StageRecord {
   int64_t extent_submit[kTraceExtents] = {};
   int64_t extent_attempts[kTraceExtents] = {};
   int64_t lanes = 0;
+  int64_t pack_workers = 0;
+  int64_t pack_split = 0;
 };
 static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
 // A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
@@ -482,6 +495,7 @@ class RowReader {
     pack_split_ = split > 0 ? static_cast<unsigned>(split) : pack_workers_;
   }
   unsigned pack_workers() const { return pack_workers_; }
+  unsigned pack_split() const { return pack_split_; }
   // Copies a worker still holds. read() leaves none: this is what a test checks after it returns.
   int64_t unfinished_jobs() const {
     int64_t open_jobs = 0;
@@ -612,7 +626,11 @@ class RowReader {
     c.trace = trace;
     c.packed = packed;
     if (packed) packed->assign(c.total, 0);
-    if (trace) trace->rows_asked = static_cast<int64_t>(c.total);
+    if (trace) {
+      trace->rows_asked = static_cast<int64_t>(c.total);
+      trace->pack_workers = pack_workers_;
+      trace->pack_split = pack_split_;
+    }
     reset_pipeline();
     held_.clear();
     // Whatever way this call ends, no packing worker may still be copying when it does: the caller
@@ -2240,6 +2258,21 @@ class RamTier {
     abandon_after_.store(abandon_after_batches);
   }
 
+  // Test only: carry a whole ReadFault down to this tier's reader, where inject() reaches it only as a
+  // delay, a blanket failure or an abandon point. `words` is the reader tests' fault tensor (kFaultWords
+  // int64; see fault_from). Unlike fail_reads the fault does NOT short-circuit ahead of the reader: the read
+  // runs, so the fault's part errors, pack delay and the rest act on rows that have already packed. The
+  // service thread applies it just before its next read (the reader is that thread's alone), and it then
+  // stays until replaced; an all-default tensor clears it. Words 17-20 (abandon_after, step, pack_workers,
+  // pack_split) are not faults and are ignored: use inject() for the abandon point, and the tier's own
+  // constructor for the packing pool. The reader's counters (submit and completion calls) run over the
+  // reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to a fresh tier.
+  void inject_fault(const int64_t* words) {
+    std::lock_guard<std::mutex> guard(fault_mutex_);
+    pending_fault_ = fault_from(words);
+    fault_pending_.store(true, std::memory_order_release);
+  }
+
   void counters(int64_t* out) const {
     for (int i = 0; i < kCounterCount; ++i)
       out[i] = counters_[i].load();
@@ -2260,7 +2293,21 @@ class RamTier {
     stage_.seq = seq;
     stage_.backlog = backlog;
     stage_.prev_done = last_done_;
+    stage_.pack_workers = reader_.pack_workers();
+    stage_.pack_split = reader_.pack_split();
     cur_ = &stage_;
+  }
+
+  // Service thread, before a read: install the fault inject_fault() left, on the reader only this thread drives.
+  void apply_pending_fault() {
+    if (!fault_pending_.load(std::memory_order_acquire)) return;
+    ReadFault fault;
+    {
+      std::lock_guard<std::mutex> guard(fault_mutex_);
+      fault = pending_fault_;
+      fault_pending_.store(false, std::memory_order_relaxed);
+    }
+    reader_.set_fault(fault);
   }
 
   void end_stage() {
@@ -2508,6 +2555,7 @@ class RamTier {
     packed.clear();
     bool cancelled = false;
     if (ok && !missing.empty()) {
+      apply_pending_fault();
       const int64_t delay = delay_ns_.load();
       if (delay > 0 && (advisory || demands_read_ >= delay_after_.load())) {
         std::this_thread::sleep_for(std::chrono::nanoseconds(delay));
@@ -2638,6 +2686,9 @@ class RamTier {
   std::atomic<int64_t> delay_after_{0};
   std::atomic<int64_t> abandon_after_{0};
   std::atomic<bool> fail_reads_{false};
+  std::mutex fault_mutex_;  // guards pending_fault_ between inject_fault() and the service thread
+  ReadFault pending_fault_{};
+  std::atomic<bool> fault_pending_{false};
   std::atomic<int64_t> counters_[kCounterCount];
   // Stage trace. cur_ points at stage_ while a traced request is in service, else null.
   std::atomic<bool> trace_on_{false};
@@ -2787,6 +2838,12 @@ void exl3_ram_miss_set_hot(int64_t handle, int64_t row, TensorView experts) {
 void exl3_ram_miss_inject(
     int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
   exl3_ram_miss::find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
+}
+
+// Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
+void exl3_ram_miss_inject_fault(int64_t handle, TensorView fault) {
+  exl3_ram_miss::check_fault_words(fault);
+  exl3_ram_miss::find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
 }
 
 void exl3_ram_miss_counters(int64_t handle, TensorView out) {
@@ -2963,6 +3020,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_to_expert, exl3_ram_miss_slot_t
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_lru_order, exl3_ram_miss_lru_order);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_hot, exl3_ram_miss_set_hot);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject, exl3_ram_miss_inject);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_fault, exl3_ram_miss_inject_fault);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_counters, exl3_ram_miss_counters);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_layer_rows, exl3_ram_miss_layer_rows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_trace_words, exl3_ram_miss_trace_words);

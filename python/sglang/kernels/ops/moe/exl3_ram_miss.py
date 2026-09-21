@@ -253,6 +253,7 @@ STAGE_FIELDS = (
     *(f"extent_submit_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     "lanes",
+    "pack_workers", "pack_split",
 )
 STAGE_KINDS = ("demand", "advisory", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
@@ -284,7 +285,9 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed, ``attempts`` its resubmissions.
     ``cqe`` is when the wait that reaped the extent returned: io_uring gives no per-completion time.
     ``dropped_before`` counts the records the ring dropped just before this one. ``lanes`` is the planned
-    lane count the device posted with the request (schema 4).
+    lane count the device posted with the request (schema 4). ``pack_workers`` / ``pack_split`` are the
+    packing mode the reader ran the request in (schema 5): 0 workers is the inline reader, and a worker-mode
+    record's pack stamps are not comparable with an inline one's (see StageRecord).
     ``bytes`` is the completed total; the rest of the split is ``useful/submitted/retried/cancelled_bytes``.
     """
     out = []
@@ -648,6 +651,15 @@ class Exl3RamMissHost:
         self._module.exl3_ram_miss_inject(
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands, abandon_after_batches
         )
+
+    def inject_fault(self, **faults) -> None:
+        """Test only: hand the tier's reader a whole ``ReadFault`` (the keywords of ``_fault_tensor``, the same
+        vocabulary ``read_rows_faulted`` takes). Unlike ``inject(fail_reads=True)`` the read still runs, so
+        the fault acts on rows that already packed. It is installed before the next read, stays until
+        replaced, and ``inject_fault()`` with no keywords clears it. ``abandon_after``, ``step``,
+        ``pack_workers`` and ``pack_split`` are not faults and are ignored (``inject`` takes the abandon
+        point). Call-numbered faults (``submit_call``, ``cqe_call``) count from the reader's creation."""
+        self._module.exl3_ram_miss_inject_fault(self.handle, _fault_tensor(**faults))
 
     def enable_trace(self, capacity: int = 8192) -> None:
         """Record one stage record per served request, up to ``capacity`` undrained (more are dropped
