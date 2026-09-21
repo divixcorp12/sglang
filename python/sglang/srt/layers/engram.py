@@ -33,7 +33,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids_and_commit,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
-from sglang.srt.dsv41_config import Dsv41Config
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -703,15 +703,14 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self.file_table: Optional[EngramFileTable] = None
-        cfg = Dsv41Config.from_envs()
-        table_dir = cfg.engram_table_dir
+        table_dir = envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get()
         if table_dir:
             if self.tp_size != 1:
                 raise NotImplementedError("the file-backed Engram table is TP1 only")
             self.file_table = EngramFileTable.open(table_dir, layer_id, num_embeddings, dim)
             return
-        if cfg.engram_host_table:
-            self._init_host_table(num_embeddings, dim, layer_id, cfg.engram_host_table_layout)
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+            self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
@@ -726,7 +725,8 @@ class EngramEmbedding(nn.Module):
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
-    def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int, layout: str):
+    def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
+        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
