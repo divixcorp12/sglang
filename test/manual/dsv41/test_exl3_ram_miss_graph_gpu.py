@@ -9,6 +9,7 @@ rows, and graph vs the eager streamed apply (exl3_moe_loop, the less accurate ar
 """
 
 import sys
+import time
 
 import pytest
 import torch
@@ -65,7 +66,7 @@ def _rel(y, ref):
     return float((y.float() - ref.float()).norm() / ref.float().norm())
 
 
-def _layers(tmp_path, timeout_ms=2000):
+def _layers(tmp_path, timeout_ms=2000, lease=False):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -82,6 +83,8 @@ def _layers(tmp_path, timeout_ms=2000):
         envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
         # Read when attach builds the device side, so attach runs inside this block.
         envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
+        # Read once, when the service starts (ensure_started, inside attach): the switch under test.
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(lease),
     ):
         layer = torch.nn.Module()
         layer.layer_id = 0
@@ -96,13 +99,19 @@ def _layers(tmp_path, timeout_ms=2000):
         checks = []
         manager = type("M", (), {"register_fail_stop_check": lambda self, f: checks.append(f), "add_residency_listener": lambda self, f: f(0, list(hot.slot_to_expert))})()
         fmt.attach_hot_cache_manager(manager, streamer)
-    return layer, streamer, service_module.Exl3RamMissService.get(), checks
+    service = service_module.Exl3RamMissService.get()
+    assert service.lease_mode is lease and (service.device_side.lease_block is not None) is lease
+    return layer, streamer, service, checks
 
 
-def test_ram_misses_inside_a_replay_are_served(tmp_path):
+LEASES = pytest.mark.parametrize("lease", [False, True], ids=["leases_off", "leases_on"])
+
+
+@LEASES
+def test_ram_misses_inside_a_replay_are_served(tmp_path, lease):
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    layer, streamer, service, checks = _layers(tmp_path)
+    layer, streamer, service, checks = _layers(tmp_path, lease=lease)
     source = _source_rows(tmp_path)
     try:
         gen = torch.Generator(device="cpu").manual_seed(3)
@@ -137,16 +146,31 @@ def test_ram_misses_inside_a_replay_are_served(tmp_path):
             assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (route, rel, rel_loop)
             assert rel_graph_loop <= LOOSE_BOUND, (route, rel_graph_loop)
         assert service.host.counters()["rows_read"] >= 6
+        if lease:
+            # The replays' copies were leased and acknowledged, none violated, and the service retired every one.
+            def retired():
+                c = service.host.counters()
+                return c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]
+
+            deadline = time.perf_counter() + 10.0
+            while time.perf_counter() < deadline and not retired():
+                time.sleep(0.005)
+            counters = service.host.counters()
+            assert retired(), counters
+            assert counters["leases_voided"] == 0 and counters["lease_double_signal"] == 0, counters
+            assert service.host.fatal_seq() == 0
+            assert all(info[2] == 0 for info in service.host.slot_info(0)), "no slot is left leased"
+        else:
+            assert service.host.counters()["leases_granted"] == 0
     finally:
         service.shutdown()
 
 
-def test_a_forced_timeout_fails_stop_without_hanging(tmp_path):
-    import time
-
+@LEASES
+def test_a_forced_timeout_fails_stop_without_hanging(tmp_path, lease):
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=100)
+    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=100, lease=lease)
     try:
         assert service.device_side.timeout_ns == 100_000_000  # the override reached attach
         x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
@@ -163,12 +187,65 @@ def test_a_forced_timeout_fails_stop_without_hanging(tmp_path):
         torch.cuda.synchronize()
         assert time.perf_counter() - started < 2.0
         assert streamer.row_backend.keep.item() == 0.0
+        if lease:
+            # A refused request commits nothing: the copy read nothing and no acknowledgement was emitted.
+            assert service.device_side.go_count.item() == 0
         with pytest.raises(RuntimeError, match="exl3 RAM miss"):
             for check in checks:
                 check()
     finally:
         service.host.inject(delay_s=0.0)
         service.shutdown()
+
+
+def _replayed_outputs(tmp_path, lease, routes):
+    """Warm up, capture, replay each route; the output bytes of every replay, and the service's ack count."""
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    layer, streamer, service, checks = _layers(tmp_path, lease=lease)
+    try:
+        gen = torch.Generator(device="cpu").manual_seed(11)
+        x = (torch.randn((1, HIDDEN), generator=gen) * 0.5).to("cuda", torch.bfloat16)
+        weights = torch.softmax(torch.randn((1, TOP_K), generator=gen), -1).cuda()
+        ids = torch.tensor([routes[0]], device="cuda", dtype=torch.int32)
+        Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+        outputs = []
+        for route in routes:
+            ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert streamer.row_backend.keep.item() == 1.0
+            for check in checks:
+                check()
+            outputs.append(out.clone())
+        counters = service.host.counters()
+        return outputs, counters
+    finally:
+        service.shutdown()
+        service_module = sys.modules["sglang.srt.layers.moe.exl3_ram_miss"]
+        service_module.Exl3RamMissService._instance = None
+
+
+def test_lease_mode_output_is_byte_exact_against_off(tmp_path):
+    """Same weights, same routes (misses, hits, repeats): the leased chain returns the very same bytes."""
+    routes = [
+        [9, 10, 11, 0, 1, 12],
+        [13, 14, 15, 2, 9, 4],
+        [13, 14, 15, 2, 9, 4],  # every row now resident: the all-hit handshake
+        [0, 1, 2, 9, 10, 11],
+        [3, 5, 7, 6, 8, 12],
+    ]
+    (tmp_path / "off").mkdir()
+    (tmp_path / "on").mkdir()
+    off, off_counters = _replayed_outputs(tmp_path / "off", False, routes)
+    on, on_counters = _replayed_outputs(tmp_path / "on", True, routes)
+    for n, (a, b) in enumerate(zip(off, on)):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"replay {n} differs"
+    assert off_counters["leases_granted"] == 0
+    assert on_counters["leases_granted"] > 0 and on_counters["leases_voided"] == 0, on_counters
 
 
 if __name__ == "__main__":
