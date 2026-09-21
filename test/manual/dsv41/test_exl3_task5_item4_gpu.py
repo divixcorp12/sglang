@@ -18,6 +18,7 @@ SGLANG_EXL3_BUILD_DIR set for the graph tests (they build the exllamav3 extensio
 
 import errno
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -102,6 +103,36 @@ class TestSkippedCopyEmitsNoAcknowledgement:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Timeout before copy: the wait gives up at its timeout, and not before it.
+# ---------------------------------------------------------------------------------------------------------------
+class TestTheTimeoutIsBoundedBothWays:
+    TIMEOUT_MS = 600
+
+    def test_a_request_served_before_the_timeout_commits_and_one_never_served_times_out_at_it(self):
+        # Served at 0.2 s, well inside the 0.6 s timeout: the wait must still be waiting, and commit.
+        rig = Rig(timeout_ms=self.TIMEOUT_MS)
+        rig.plan([2, 6])
+        seq = rig.post()
+        rig.write_lane(seq, 0, 2, 0, 1)
+        rig.write_lane(seq, 1, 6, 1, 1)
+        for slot in (0, 1):
+            rig.block.set_u32(rig.block.slot_gen_offset(0, slot), 1)
+        threading.Timer(0.2, lambda: rig.finish(seq)).start()
+        rig.wait()
+        assert rig.go() == 2 and rig.keep.item() == 1.0 and page_word(rig.page, "fatal") == 0
+        assert rig.dev.stats()["timeouts"] == 0
+        # Never served: it gives up at the timeout, neither long before it nor long after.
+        rig = Rig(timeout_ms=self.TIMEOUT_MS)
+        rig.plan([2, 6])
+        rig.post()
+        start = time.perf_counter()
+        rig.wait()
+        elapsed = time.perf_counter() - start
+        assert 0.9 * self.TIMEOUT_MS / 1000 <= elapsed < 2.0, elapsed
+        assert rig.go() == 0 and rig.keep.item() == 0.0 and rig.dev.stats()["timeouts"] == 1
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Failure after a subset packed, timeout before copy: the real service, the real copy kernel.
 # ---------------------------------------------------------------------------------------------------------------
 class TestRealServiceFailures:
@@ -137,6 +168,29 @@ class TestRealServiceFailures:
             assert not any(s.host.contains(0, e) for e in experts)
         finally:
             s.host.inject_fault()
+            s.close()
+
+    def test_a_read_that_fails_before_it_starts_copies_nothing_and_acknowledges_nothing(self, tmp_path):
+        """Failure before readiness: fail_reads returns ahead of the reader, so no row packs at all."""
+        s = Service(tmp_path)
+        try:
+            experts = [3, 5, 7]
+            want = s.expected(experts)
+            s.host.inject(fail_reads=True)
+            s.plan(experts)
+            s.step()
+            _cuda_ready()
+            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            counters = s.host.counters()
+            assert not any(_slab_holds(s, e, want) for e in experts), "no row packed"
+            assert counters["read_errors"] == 1 and counters["rows_read"] == 0, counters
+            assert s.keep.item() == 0.0 and s.dev.go_count.item() == 0 and s.host.fatal_seq() != 0
+            assert _dest_untouched(s)
+            assert s.block.terminal(0)["reason"] == REASON["failed"] and s.block.terminal(0)["mask"] == 0b111
+            assert s.block.ack_area() == NO_ACKS
+            assert counters["leases_granted"] == 0 and s.leases() == [0] * len(s.leases())
+        finally:
+            s.host.inject(fail_reads=False)
             s.close()
 
     def test_the_control_without_the_fault_the_same_request_copies_and_is_acknowledged(self, tmp_path):
