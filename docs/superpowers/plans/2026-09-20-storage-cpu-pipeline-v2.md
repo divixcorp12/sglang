@@ -277,9 +277,33 @@ Include expert identity in the immutable row result and validate it against the 
 > argument above. This orders the remaining plan work regardless of which
 > mechanism is chosen.
 >
-> Separately, the device's post kernel classifies `need` from `slot_map` at post
-> time. That is a racy hint carrying no ownership, benign only for as long as
-> the host re-resolves authoritatively before acting on it.
+> **The post kernel's `slot_map` hint: benign today, and *why* is the point.**
+> It classifies `need` from `slot_map` at post time with no ownership. Checked
+> against the source, it cannot silently suppress a demand -- but the two paths
+> are safe for different reasons, and only one of them survives this task:
+> - **Armed record:** the host re-resolves. `serve()` builds `wanted = protect +
+>   need`, and `protect` comes from the layer's routed experts (`topk_ids` via
+>   `_apply_graph`), *not* from `need`. Any `wanted` expert with
+>   `tier.expert_slot[expert] < 0` at serve time is re-read. This reason is
+>   independent of Task 6 and survives it.
+> - **Unarmed record (advise off):** the host does **not** re-derive. It is safe
+>   only because with advise off no advisories exist, so nothing evicts between
+>   post and wait -- **the temporal exclusion of `LEASE_PROTOCOL` §1.1 rule 5,
+>   which is precisely the premise this task removes.** Were it to fail today the
+>   failure is loud (`unserved_misses` -> `raise_fatal`, fail-stop), not wrong
+>   bytes.
+>
+> So this task does not merely need a lease for the hit lanes it copies early;
+> it **invalidates the standing justification for an existing benign race**.
+> Any Task 6 work must re-establish safety for the unarmed path rather than
+> inherit it. The same argument makes V1's order array `ord` benign -- a wrong
+> hint only changes *when* a lane is copied, because correctness comes from the
+> per-lane `RowResult`.
+>
+> Latent and not closed: a planned expert absent from `protect` (a
+> `plan_candidates` producer) is suppressed by the hint and never re-derived,
+> failing loudly. No production caller exists outside `expert_row_plan.py`
+> (`LEASE_PROTOCOL` OPEN 12, seen from the hint side).
 
 **Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step, **2.0% gross**, falling to about 1% net of launch cost -- against a gate that resolves about 1.5%, so it sits **at** the resolution limit, not below it -- while costing 160 extra stage triples per step across all 40 layers. The strongest argument for the redirect is a different one, currently unregistered: the plan's *original* fixed-order per-row is about **14 ms/step worse than V1** (38.6 - 5.06 - 19.2), because random lane order forfeits roughly half the ideal saving. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
 
