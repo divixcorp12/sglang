@@ -897,7 +897,13 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 >
 > Separately and not merged into the count: **22 files / 279 tests have no
 > `register_*_ci` call and 17 files / 171 tests are registered with no
-> `__main__` entry.** `collect_tests` raises loudly on both, so this is not a
+> `__main__` entry** -- **within the five slices this sweep read, NOT the whole
+> corpus.** Do not compare these to the repository-wide figures below; the
+> current whole-corpus measurement is **30 / 19 / 1 over 2,126 files**, in the
+> re-measurement table further down, and the intermediate "30 / 27" quoted there
+> is itself superseded. Three different count-pairs appear in this document at
+> three different scopes and dates, and each is correct only with its scope
+> attached. `collect_tests` raises loudly on both, so this is not a
 > silent green -- those files run only under a manual pytest invocation. It is a
 > coverage-plumbing problem, a different defect from a test that passes for the
 > wrong reason.
