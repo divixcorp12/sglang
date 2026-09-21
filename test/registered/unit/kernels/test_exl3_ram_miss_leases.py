@@ -228,7 +228,11 @@ def test_the_census_counts_free_evictable_and_leased_slots_without_taking_any(tm
 
 def test_a_demand_the_tier_could_serve_only_after_a_lease_retires_evicts_nothing(tier):
     """Mutation: no dry run. The take loop then evicts the unleased victim (expert 3) before failing on the leased
-    one, and a poll that retried the request would evict a row every time."""
+    one, and a poll that retried the request would evict a row every time.
+
+    INTERIM BEHAVIOUR: the refused demand FAILS (status 2) only because step 3 of LEASE_PROTOCOL.md section 20 has
+    not added the deferral yet. Step 3 replaces that assertion with "not served, not failed, served after the lease
+    retires". Keep the no-eviction assertions; do not change the deferral to keep the status-2 line green."""
     s, page, host = tier
     assert _serve(page, host, 0, need=[3, 4], protect=[3, 4]) == 1
     _, leased_slot = _slot_of(host, 0, 3), _slot_of(host, 0, 4)
@@ -237,7 +241,7 @@ def test_a_demand_the_tier_could_serve_only_after_a_lease_retires_evicts_nothing
     before = (host.counters()["evictions"], host.counters()["version"], host.slot_info(0), host.mapping(0))
     seq = sim_post(page, 0, need=[1, 2], protect=[1, 2])
     assert host.pump() == 1
-    assert sim_wait(page, seq, 1.0) == 2, "step 2 has no retry yet: the refused demand fails, without evicting"
+    assert sim_wait(page, seq, 1.0) == 2, "INTERIM (step 3 replaces this with a deferral): failed, without evicting"
     after = (host.counters()["evictions"], host.counters()["version"], host.slot_info(0), host.mapping(0))
     assert after == before
     assert host.counters()["deferred"] == 1 and host.counters()["no_victim"] == 0
