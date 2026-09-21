@@ -1076,6 +1076,28 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > new check reported `INVALID (not every collected test ran)`, the mutant was
 > repaired (`pass` in place of the deleted line) and re-ran as a genuine kill.
 >
+> **A FIFTH MECHANISM, AND THE SHARPEST: THE MUTANT HUNG.** The
+> release-at-dispatch mutant was re-run against the *original*
+> `test_a_bank_is_not_reused_until_every_row_in_it_has_packed` -- the test whose
+> "kill" had already been retracted once, when its author found their `-k`
+> selector had never matched it. It did not fail the test. **It deadlocked the
+> reader**, and the run ended only via the test's own 120 s hang guard: exit 1,
+> **no pytest output at all**. A driver keying on a nonzero exit would record
+> that as a kill; one keying on a `FAILED` line would record a survivor.
+>
+> **So the same mutant produced three different verdicts under three checks** --
+> "caught" (wrong, the test never ran), "survived" (wrong, the absence was a
+> hang), and finally a real kill -- **and only the third came from the code
+> actually being exercised.**
+>
+> **It also found a genuine defect.** The hang was not an artefact of the mutant:
+> `admit_batch` could fill a bank slot whose row was not `Free`. The fix refuses
+> that admission (`b009cc8574`); it never fires in correct code. After it, the
+> mutant fails all 15 worker parametrisations of the original test with
+> `assert (0 == 1)`. **A mutation campaign that had scored this mutant "caught"
+> would have shipped the missing invariant**, which is the concrete cost of the
+> whole class.
+>
 > **A malformed mutant is the case nobody designs for**, and it produces exactly
 > the absence the old check read as evidence. Note also what it says about
 > mutation testing generally: **a mutant that fails to compile or parse is
