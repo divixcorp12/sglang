@@ -290,7 +290,7 @@ Include expert identity in the immutable row result and validate it against the 
 >    capacity, and promotion copies on the same link subtract from it. V1's
 >    ceiling is a ceiling by construction.
 >
-> **CURRENT FIGURES.** Per **511** decode steps, shares of 257.5 ms. These
+> **CURRENT FIGURES.** Per **511** decode steps, shares of **254.4 ms**. These
 > supersede every figure in the audit trail below, which records how they moved
 > and **must not be quoted**.
 >
@@ -305,22 +305,31 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > | source of `k` | BEST | RANDOM | two-phase | hit lanes, read layers |
 > |---|---:|---:|---:|---:|
-> | **measured `k`** (`dad59f1b48`) | **40.67** (15.8%) | **20.07** (7.8%) | **35.74** (13.9%) | **33.9** (measured) |
+> | **measured `k`** (`dad59f1b48`) | **40.67** (16.0%) | **20.07** (7.9%) | **35.74** (14.0%) | **33.9** (measured) |
 > | estimated `k` (A1), R6-corrected | 35.80 | 17.79 | 30.88 | 29.3 |
 > | estimated `k` (A1), as registered | 38.61 | 19.17 | 33.53 | 31.9 |
 >
 > Per-row over two-phase: **+4.93 ms** at best order (this increment is
 > Sigma(m-1)c and does not depend on the lane count), **-15.67 ms** at random
-> order. (RANDOM - 1 ms)/T = **7.4%** against the 3% bar. two-phase/BEST =
+> order, i.e. **+1.9%** and **-6.2%**. (RANDOM - 1 ms)/T = **7.5%** against the
+> 3% bar. two-phase/BEST =
 > **87.9%**, so the split quoted elsewhere as 87/13 is 88/12. A1's estimate
 > undercounted hit lanes in read layers by about **14%**: per read request its
 > `k` was exact for only 36%, low for 42% and high for 22%.
 >
-> The 257.5 ms denominator includes the INVALID `task1-6` arm and the disturbed
-> `task1c-3`; the clean step time is **254.4 ms**, which `PER_ROW_TRANSFER.md`
-> already uses. Every share above is therefore about 1.2% relative low. No
-> verdict turns on it, but the plan and the design quote different step times for
-> the same shares and should be reconciled.
+> **Denominator: 254.4 ms, decided here so the plan and the design agree.** It
+> is the mean of the `new:on` arms `clean-reference.json` accepts. The 257.5 ms
+> set used previously was named before its verdicts were read and includes the
+> INVALID `task1-6`. The two differ by 1.2% and cross no bar, so nothing turns on
+> the choice -- but the same shares were being quoted against two step times in
+> two documents, which is how a 1.2% discrepancy becomes an argument later.
+> **Neither figure is purely untraced:** 254.4 is a mean of four arms, three of
+> them traced, and the only clean untraced on-arm alone gives 254.7 ms (n = 1),
+> so traced stretching is not excluded from either. An earlier revision of this
+> paragraph called `task1c-3` "disturbed"; **that label is withdrawn** -- its
+> verdict file reads VALID with a boot-warm regime note and no disturbance mark
+> exists. See the correction later in this plan, which this paragraph
+> contradicted.
 >
 > ---
 >
