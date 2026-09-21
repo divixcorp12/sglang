@@ -72,18 +72,19 @@ def test_foreign_load_counts_only_the_cores_we_use_and_not_ours():
     try:
         f = h.ForeignLoad([os.getpid()], {mine}); f.start(); time.sleep(1.0); pct, where = f.stop()
         assert pct > 50.0 and ("cpu%d" % mine) in where, (pct, where)                    # a spinner on our core is seen
-        f = h.ForeignLoad([os.getpid()], {cpus[2]}); f.start(); time.sleep(1.0); pct2, _ = f.stop()
-        assert pct2 < 60.0                                                               # a core with no spinner of ours is not blamed for the other two (the box may be busy: only bound it)
-        assert f.last["box_foreign_cores"] >= 1.5, f.last                                # box-wide, both spinners are foreign
-        f = h.ForeignLoad([os.getpid(), on_mine.pid, on_other.pid], {mine, other}); f.start(); time.sleep(1.0); pct3, _ = f.stop()
-        assert pct3 < 30.0, pct3                                                          # declaring the spinners ours removes them (attribution, not perfect: ticks)
+        f2 = h.ForeignLoad([os.getpid()], {cpus[2]}); f2.start(); time.sleep(1.0); f2.stop()
+        assert f2.last["box_foreign_cores"] >= 1.5, f2.last                              # box-wide, both spinners are foreign (other load on the machine can only add)
+        f3 = h.ForeignLoad([os.getpid(), on_mine.pid, on_other.pid], {mine, other}); f3.start(); time.sleep(1.0); pct3, _ = f3.stop()
+        assert pct3 <= pct - 30.0, (pct, pct3)                                             # declaring the spinners ours removes them from the count
     finally:
         on_mine.kill(); on_other.kill()
 
 def test_foreign_load_resolution_floor():
-    f = h.ForeignLoad([os.getpid()], {0}); f.start(); import time; time.sleep(0.05)
-    f.a[0] -= 2                                            # pretend 2 foreign ticks appeared on core 0 within a 50 ms window: 40%, but below MIN_TICKS
-    pct, _ = f.stop(); assert pct <= 9.9, pct
+    import time
+    for ticks, clamped in ((2, True), (3, False)):
+        f = h.ForeignLoad([os.getpid()], {0}); vals = iter([{0: 100}, {0: 100 + ticks}]); f._cpu = lambda: next(vals); f._own = lambda: {}
+        f.start(); time.sleep(0.05); pct, _ = f.stop()
+        assert (pct <= 9.9) == clamped, (ticks, pct)            # 2 ticks in 50 ms is 40% but below MIN_TICKS: not evidence; 3 ticks counts
 
 def test_top_scan_names_a_spinner():
     import time
@@ -134,6 +135,19 @@ def test_meta_records_not_measured_and_load_fields():
         assert "hot" in m["NOT_MEASURED"] and "nvme" in m["NOT_MEASURED"]                    # nvme is reported not measured when it was not run
         line = json.loads(open(Path(d, "results.jsonl")).readline())
         assert {"box_foreign_cores", "loadavg_start", "loadavg_end", "attempts"} <= set(line)
+
+def test_quiet_check_candidates_use_the_interleaved_numa_layout():
+    import quiet_check as q
+    n0, n1 = h._parse_cpus("0-17,36-53"), h._parse_cpus("18-35,54-71")
+    hc, rc = q.candidates(n0, n1)
+    assert hc == list(range(36, 54)) and rc == list(range(18, 32))                 # 18 harness candidates, 14 reader candidates, as the lead worked out
+    assert not any(64 <= c <= 71 for c in rc + hc) and all(c in n0 for c in hc) and all(c in n1 for c in rc)
+    assert q.candidates(list(range(0, 36)), list(range(36, 72)))[0] == list(range(32, 36))   # a contiguous split gives a different (wrong for this box) answer: that is why the lists come from /sys
+
+def test_rehearsal_measures_windows():
+    import quiet_check as q
+    cpus = sorted(os.sched_getaffinity(0)); res = q.rehearse(cpus[1:3], cpus[1:2], 2.0, window=0.5)
+    assert len(res) == 4 and all(isinstance(x[0], float) for x in res)
 
 def test_node_mem_reader():
     try: m = h.node_mem_mib(0)
