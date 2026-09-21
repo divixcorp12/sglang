@@ -102,7 +102,7 @@ on_expert_distribution
       reserve promoted experts into the SAME slot indices
       _load_reserved  (EXL3: no dense source -> has_spec_only_tensors)
         _load_reserved_in_chunks                           chunk = evictable_rows() tickets
-          pinned_cache.host_use()                          -> Exl3RamMissTable.before_host_use
+          pinned_cache.host_use()                          -> NativePinnedSlotTable.before_host_use
             current_stream().synchronize()                 BLOCKING host sync
             Exl3RamMissHost.pause(2*timeout+1 s)           BLOCKING, all layers, waits for the
                                                            thread to finish its current request
@@ -306,7 +306,18 @@ Say this plainly, because a design that rebuilt these would be worse than the co
   `set_rows` ("cannot rewrite a transfer plan while it is in flight").
 - **Generation-qualified slot tickets** with FREE / RESERVED / LOADING / READY:
   `HotCacheSlotTicket`, `_ticket_matches`, `reserve`, `begin_loading`, `publish_ready`,
-  `cancel`, `retire` (which requires `consumer_complete`).
+  `cancel`, `retire`. **Correction (review finding F1): `retire`'s `consumer_complete`
+  parameter is a caller assertion, not a check.** `retire` returns False unless the caller
+  passes `consumer_complete=True`, but every production caller passes `True`
+  unconditionally (`_reserve`'s victim retire, `stage_reassign` twice, `assign_prefetch`),
+  and nothing anywhere computes whether a consumer has finished. What actually protects a
+  recycled slot today is **temporal exclusion**: `before_host_use` synchronizes the stream
+  and pauses the service before any promotion runs, and the synchronous path waits for its
+  copies. The generation-qualified tickets protect against *stale tickets* (a host-side
+  bookkeeping error), not against a *live reader*. So the lifecycle has no notion of "the
+  last consumer has retired"; DRAINING with a real `retire_event` (sections 2.1 and 7.4) is
+  the first place that value would be computed. This strengthens the case for leases: the
+  parameter's name promises an ownership check the code does not perform.
 - **`stage_reassign` refuses to run while a promotion is in flight**
   (`promotion_in_flight`), and `_update_residency` counts such layers in
   `deferred_residency_updates`.
@@ -339,31 +350,47 @@ Say this plainly, because a design that rebuilt these would be worse than the co
   later reservation can reuse a slot a copy may still write."
 
   **This is the precedent for what Task 5 must do in C++.** Never recycle storage whose
-  last reader cannot be shown to have finished; quarantine it, refuse new work, keep
-  serving what does not depend on it. `LEASE_PROTOCOL.md` section 14 states the same rule
-  for the native side. The codebase already knows the pattern; this design reuses it as
-  the failure semantics for every state in section 5.
+  last reader cannot be shown to have finished; quarantine it and refuse new work.
+  `LEASE_PROTOCOL.md` section 14 states the same rule for the native side. The codebase
+  already knows the pattern; this design reuses it as the failure semantics for every state
+  in section 5. **Limit of the precedent (review finding F7):** it covers "refuse further
+  updates" (`stage_reassign` raises while `promotion_in_flight` is set), not "keep serving".
+  Today a failed promotion raises uncaught out of `_update_residency` into the forward-pass
+  epilogue. Layer-local isolation, where one layer's failure leaves the others promoting, is
+  new behaviour: the poll step needs its own catch and its own per-layer quarantine flag.
 
 ### 4.1 Where the existing code falls short of its own rule
 
 Two places, both by reading, neither run:
 
-- **A partial enqueue frees slots that may still be written (D2).** In
-  `_submit_operations`, the six copy operations are issued in a loop; if the third raises,
-  the first two kernels are already queued on the executor stream, no completion event is
-  recorded, and the `except` releases the plan claims and re-raises.
-  `submit_hot_cache_promotions` then calls `abort_promotion`, which cancels the tickets
-  and frees the destination slots. A later reservation can then reuse a slot a queued
-  kernel will still write. `_load_reserved_in_chunks` covers this only when `submitted`
-  is True. The rule to adopt: once any copy may have been enqueued, record an event in a
-  `finally` and treat the destinations as quarantined until it completes. A launch
-  failure is rare; that is why this is a hazard and not a bug report.
+- **A partial enqueue is not followed by an event (D2), hygiene rather than a live bug.**
+  The promotion path submits **one** callback: `submit_hot_cache_promotions` ->
+  `submit_expert_row_copy_batch` -> `executor.submit_batch(plans, copy_all)`, where
+  `copy_all` issues the six copies through `ExpertRowCopyRoutes.copy_rows`. If a launch
+  raises partway, earlier kernels are queued, no completion event is recorded, and
+  `_submit_operations` releases the plan claims and re-raises. `submit_hot_cache_promotions`
+  has its own `except BaseException` that calls `abort_promotion` for every promotion, so
+  by the time `_load_reserved_in_chunks` sees the exception `promotion_in_flight` is already
+  `None` and its `submitted` logic never acts: the abort has happened without a drain.
+  **The consequence is weak today** (review finding F2): the destinations are LOADING and
+  never mapped, a later write into them goes through the same single executor stream and so
+  runs after the stale kernels, and what can raise between launches on the GPU route is a
+  launch-time CUDA error, after which the context is poisoned and the exception propagates
+  uncaught anyway. I do not claim reachable slot-reuse corruption in today's code. The rule
+  is still worth adopting for the new `try_submit`, where destinations and leases outlive the
+  call: record an event in a `finally` and quarantine the wave until it completes. A related
+  variant: `FixedRowTransferPlan.set_rows` uploads the plan on the *current* stream with no
+  ordering against stale kernels already on the executor stream, so a stale kernel could read
+  a half-updated plan; the window is microseconds and needs the same failure. Section 7.2's
+  plan upload on the executor stream removes it as a side effect.
 - **A full ring raises (D3).** `_acquire_slot` raises `RuntimeError("expert transfer
   ticket ring is full")` after scanning all 8 slots. For a synchronous caller that is a
   can't-happen. For an asynchronous submitter a full ring is *normal backpressure* and
   must become a deferral (section 6.3), not an exception. Note also that `for_device`
   returns one executor shared by everything on the device, so ring pressure is not
-  private to promotions [OPEN 4 covers who else submits].
+  private to promotions [OPEN 4]. On today's EXL3 path it is unreachable: every ticket is
+  waited before the next submit. It is a requirement on the asynchronous design, not a
+  present defect.
 
 ### 4.2 The timeout hole, as it bears on promotions
 
@@ -459,7 +486,7 @@ Rules that make the machine safe (each is tested, section 11):
 |---|---|---|
 | VRAM destination slot | `reserve()` of a FREE slot: RESERVED -> LOADING | at PUBLISHED it becomes READY; at CANCELLED it returns FREE |
 | Pinned RAM source row | a lease on `(row, host_slot, slot_generation)`, taken atomically with the row becoming READY (M2), or `acquire_host_lease` on a resident row (M1) | at COPIED |
-| Transfer ring entry | one executor ticket per layer-wave; the manager already batches a whole update behind one ticket (`submit_batch`) | at COPIED (`release_plans`) |
+| Transfer ring entry | one executor ticket per layer-wave; one executor ticket per layer-wave. (Correction, review F6: the manager batches a whole update behind one ticket only for dense formats, where `stage_reassign` returns a promotion. EXL3 submits one ticket per layer per chunk today, so one ticket per layer-wave is new behaviour for EXL3, not existing.) | at COPIED (`release_plans`) |
 | Plan buffer | the layer's `FixedRowTransferPlan`, claimed while in flight | at COPIED |
 | In-flight byte budget | section 8.3 | at COPIED |
 
@@ -497,10 +524,21 @@ What K costs, in numbers I can derive and numbers I cannot:
   (section 17.6).
 - Derived: the model has 40 streamed layers of 384 experts (15,360 rows;
   1,128 / 15,360 = 7.3% as the reference states).
-- **Not determined [OPEN 6]:** whether the slots are split uniformly across layers. If
-  uniform, that is 22 to 28 live slots per layer and `K = 2` takes 7% to 9% of the cache.
-  That is not small, which is why the default `K` should be the smallest that keeps the
-  deferral rate acceptable, chosen from the per-layer promotion distribution.
+- **1,128 is the eager run's slot count; the measured async configuration has 888.** The
+  Task 1 arms' startup log reads `slots: 888`, `allocation_bytes` 15,019,978,752,
+  `scratch_bytes` 3,195,740,160 (240 rows = 40 layers x 6 gather rows) and
+  `residency_bytes` 11,824,238,592 (review F9). K must be costed against 888.
+- **Per-layer split (answers OPEN 6 for the unseeded case).** By reading the manager
+  construction, candidates are sorted by `(-score x bytes, expert_id, layer_id)` and taken
+  greedily until the budget is spent. With no seed (`SGLANG_MOE_HOT_SEED` resolved to `''`
+  in those arms) every score is equal, so the order is expert 0 of every layer, then expert 1,
+  and so on: **22 or 23 slots per layer** (888 = 22 x 40 + 8), uniform. With a seed the
+  split follows the seed and is **not** uniform. Read from code and consistent with the
+  logged total; the per-layer counts themselves were not logged.
+- **What K costs there:** `K = 1` per layer takes 40 slots, about 4.5% of 888; `K = 2` takes
+  80, about 9.0%. That is not small, which is why the default `K` should be the smallest that
+  keeps the deferral rate acceptable, chosen from the per-layer promotion distribution. Against
+  a seeded configuration the fraction per layer differs and must be recomputed.
 - **Not determined [OPEN 7]:** that distribution. The reference gives whole-model
   promotions per 32-forward window (median 25, max 832 over 48 windows), not per layer.
   The per-layer counters exist (`_counters[phase][layer_id].promotions`); the analysis has
@@ -714,8 +752,12 @@ the pause protects, and whether the promotion path needs it [E, by reading `host
 | A second reader on the same io_uring rings / slabs: the eager Python `Exl3ShardRowSource` versus the service's `RowReader` | Avoided: from M2 promotions never use the Python reader. | promotions read only through the service |
 
 The last row is an open question in its own right: whether the Python eager reader may
-run concurrently with the native reader I could not determine [OPEN 2]. Today they never
-overlap, because the pause serializes them, and `ExpertRowSource.register_destinations`
+run concurrently with the native reader [OPEN 2, now answered in part]. Review F10: they are
+**separate io_uring instances** sharing only the drives (each reader object owns its own ring;
+the EXL3 eager path registers no buffers). Today they also never overlap in time, because the
+pause serializes them. One constraint follows: the general reader enforces creator-thread
+ownership (`check_owner_` in `uring_file_reader.cpp`), so nothing may move its calls off the
+scheduler thread. Section 7.1 does not propose that. And `ExpertRowSource.register_destinations`
 "must run on the reader's owner thread" (`expert_row_source.py`). **What must be true**
 for M2 to be safe: promotion admissions are performed only by the service thread; the
 Python eager reader is used only inside an eager `host_use` (which still pauses); and no
@@ -760,7 +802,7 @@ Three caps, all [P], env-configurable (section 13), all initial values to be tun
   (`SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`). The 1.1 ms figure is from one measurement; the
   copy rate under concurrent forward traffic is unmeasured [OPEN 5].
 - **`max_admit_rows`**: rows in ADMITTING / LEASED, which bounds the RAM tier's leased
-  fraction (5,644 rows total; 141 per layer if uniform [OPEN 6]).
+  fraction (5,644 rows total; about 141 per layer if uniform [OPEN 6]; not derived).
 - **`max_waves_per_boundary`** and one publication batch per poll (P5), so a burst
   (832 promotions in the worst measured window) is spread over boundaries instead of
   landing on one forward.
@@ -846,11 +888,18 @@ milestone is not implementable as written.
 - **R7. Counters** `host_leases_outstanding`, lease hold time (histogram or
   p50/p95/p99), `pauses`, `pause_wait_ns`, `defer_reason` counts. Section 11's "no
   service-wide pause in promotion submission" test reads `pauses`.
-- **R8. Non-interference with `kVersion` consumers.** `Exl3RamMissTable.expert_to_slot`
+- **R8. Non-interference with `kVersion` consumers.** `NativePinnedSlotTable.expert_to_slot`
   rebuilds an `OrderedDict` when `host.version()` moves. The lease API must not bump
   `kVersion` (it changes no mapping), or the promotion path pays B9 for every lease.
 
-### 9.2 A deadlock the current copy ordering would create
+### 9.2 A deadlock the current copy ordering would create (for this proposal only)
+
+**Scope: this cycle cannot form on today's code**, because no source lease exists yet
+(confirmed by the review, F4). It is a property of *this design if it kept today's copy
+ordering*. The mechanism itself is real: `_submit_operations` does
+`stream.wait_stream(producer_stream)`, and the observer runs in the `finally` of
+`with_forward_pass`, after the forward's replay has been enqueued, so an armed wait kernel can
+already be in the producer's queue when a promotion enqueues.
 
 `LEASE_PROTOCOL.md` A3 forbids a non-graph holder's release from depending on a demand.
 Today's copy path has that dependence, hidden. `_submit_operations` does
@@ -891,7 +940,7 @@ resource cannot be shown to have finished, keep the resource and stop using the 
 | Cancel in COPYING | ABANDONED: keep destination LOADING and the lease; when the event completes, release both and discard; never publish. |
 | Cancel in COPIED (before publication) | release destination -> FREE; lease already released. The victim is untouched (still mapped). |
 | Cancel after PUBLISHED | not a cancel; the promotion happened. A later boundary may evict. |
-| Event query raises / `synchronize` raises (sticky CUDA error) | QUARANTINED: destinations stay LOADING, leases stay held, the layer takes no further tickets; other layers continue; log once. The process continues serving what it can; a sticky CUDA error will also break demand, which is the existing fail-stop. |
+| Event query raises / `synchronize` raises (sticky CUDA error) | QUARANTINED: destinations stay LOADING, leases stay held, the layer takes no further tickets; other layers continue; log once. **Layer-local isolation is new behaviour** (review F7): today a failed promotion raises uncaught out of `_update_residency`, so the poll step needs its own catch and a per-layer quarantine flag. A sticky CUDA error will also break demand, which is the existing fail-stop. |
 | Enqueue fails after a partial launch | as above: record an event in a `finally` (D2); quarantine until it completes; if the event cannot be recorded, quarantine permanently. |
 | Ring full / plan busy / cap | DEFERRED with a reason; no exception. |
 | Service admit failure (row unreadable) | that row ADMITTING -> CANCELLED; the wave proceeds with the rows it has, or defers if none. Counter + log. |
@@ -1207,24 +1256,30 @@ arm's capacity can be verified from its log instead of trusted.
   stream. Test: at attach, record the replay stream and the observer's `current_stream()`;
   refuse the async mode if they differ; log both.
 - **[OPEN 2] Whether the Python eager reader can run concurrently with the service's io_uring
-  reader.** Today the pause serializes them. I did not determine whether they share rings,
-  registered buffers or O_DIRECT alignment state. **What must be true:** none, for this
-  design, because promotions never use the Python reader from M2 and eager use still pauses.
-  Determining it would allow relaxing the eager pause later.
+  reader.** Answered in part by the review (F10): they are separate io_uring instances sharing
+  only the drives, so there is no shared ring or registered-buffer state; O_DIRECT alignment
+  state and drive contention were not checked, and the pause still serializes them today.
+  **What must be true:** nothing new for this design, because promotions never use the Python
+  reader from M2 and eager use still pauses. The Python reader's creator-thread ownership
+  forbids moving its calls off the scheduler thread.
 - **[OPEN 3] Whether `hot` protects a row across a cancel/retire in every path.** `set_hot`
   is keyed by expert and overwritten by the next push; I argued it is not a lease (R3) but
   did not enumerate every push site. Test: cancel a ticket while its copy is in flight, push
   `set_hot` without it, apply eviction pressure; the leased slot must survive.
 - **[OPEN 4] Who else submits to the shared per-device executor.** `AsyncExpertTransferExecutor.for_device`
-  is a singleton; `expert_prefetch.py` builds its own with `max_inflight=1` (line ~107-112)
-  but other users of `for_device` were not enumerated. Ring pressure and the `try_submit`
-  behaviour depend on it.
+  is a singleton. Correction (review F3): `expert_prefetch.py` uses that **shared** singleton by
+  default; its private `max_inflight=1` executor is the exception (taken only when a
+  `copy_stream` or `ready_event` is supplied). Other `for_device` users were not enumerated.
+  `for_device` raises `ValueError` when asked for a ring size different from the registered
+  one, so an async design **cannot simply request a larger ring**; it must share the 8 slots or
+  own a separate executor object. Ring pressure and the `try_submit` behaviour depend on it.
 - **[OPEN 5] The copy rate under concurrent forward traffic.** 1.1 ms per row is one
   idle-conditions figure. The SM-gather copy competes with the graph for SMs and the link;
   lease hold time and the byte cap's meaning depend on it.
-- **[OPEN 6] Whether hot slots are split uniformly across layers, and the per-layer RAM row
-  counts.** Determines what `K` costs as a fraction of a layer and how many leased rows a
-  cap allows.
+- **[OPEN 6] Per-layer slot split under a seed, and the per-layer RAM row counts.**
+  Unseeded it is uniform, 22 or 23 per layer (section 6.2, review F9); a seeded run follows the
+  seed. Per-layer RAM row counts (5,644 rows total) were not derived. Determines what `K` costs
+  per layer and how many leased rows a cap allows.
 - **[OPEN 7] The per-layer promotions-per-boundary distribution.** Determines the smallest
   useful `K`. The counters exist; the analysis has not been done.
 - **[OPEN 8] Whether CUDA stream priority reaches the kernel nodes of a captured graph
