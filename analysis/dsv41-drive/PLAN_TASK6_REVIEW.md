@@ -173,3 +173,114 @@ The R1 to R6 recomputation against the raw traces; `kBusySeq` window figures and
 "promotion admission cancelled at the next row" matches the eventual C++ (it is a design); Task 5's own text about "asynchronous `progress()`" (I cited it as
 wording the plan should reference, from the plan's Task 5 section, not re-read in full); the plan outside Task 6 (the coverage table's Task 6 row, Task 9's readiness-aware
 gather row); anything the `task1f` arm will produce. Nothing was run.
+
+---
+
+# Second audit: the rewrite (`7990275c98`, `1556a30a56`), 2026-09-21
+
+Same terms and limits as above: read-only, no traces re-read, nothing run. The plan's Task 6 section is now lines 262 to 652 (390 lines, of which
+about 300 are one blockquote). Line references are to the plan at `1556a30a56`; quoted text is the locator.
+
+## Verdict
+
+The rewrite fixed what the first audit named and introduced three new problems of the same families. **The most important is that the rule written
+for the V1b exclusion is not enforced by the Gate it points at (F1, HIGH).** The audit trail is not history in the sense its label promises (F3).
+Fidelity of the new figures to `t3-topology`'s table is good.
+
+## Findings
+
+### F1. HIGH: "The Gate below refuses a mechanism whose correctness rests on either" is false; the Gate is unchanged
+
+The sequencing paragraph ends: "**V1b is nonetheless excluded**, and as a rule rather than a preference ... The Gate below refuses a mechanism whose
+correctness rests on either." The Gate (line 652) reads, in full: "Both demonstrated I/O/H2D overlap and untraced end-to-end benefit at unchanged cache
+capacity. If launch/head-of-line cost cancels the benefit, retain Task 4 and record Task 6 as rejected; evaluate a readiness-aware gather or native DMA in
+Task 9 instead of claiming success." It says nothing about borrowed invariants or a `planned subset of protect` assertion. **A V1b that shows overlap and a
+benefit passes it.** The checklist above the Gate (V2's) has no line for either. So the plan states a prohibition that its acceptance test does not
+implement, which is what you asked me to check for, and it is worse than the preference the first audit found because it reads as enforced.
+
+The reasons for the rule are also weaker than a rule needs:
+
+- **Reason 1 cancels itself.** "Its safety is borrowed from invariants no document predating this task states as load-bearing." By the plan's own text the
+  invariants are now stated as load-bearing (by this plan, `PER_ROW_TRANSFER.md` 3.3 and my review section A). The absence being cited has been remedied
+  by this task, so under the criterion as written V1b is no longer excluded on this ground. The real ground is durability: the borrowed exclusion expires
+  when the service stops serving one request at a time, and Task 5's wording contemplates an asynchronous `progress()`. The plan states that ground elsewhere
+  and should use it.
+- **Reason 2 overstates.** "A device-side `planned subset of protect` assertion that **no producer guarantees**." The plan's own hint analysis says that for the
+  router-miss producer `protect` is filled from the routed experts by `_apply_graph` and every planned lane is inside it. What is absent is a device-side
+  *assertion* of it and a guarantee for a *future* producer. The demonstration (a request protecting only expert 4 while lane 0 is planned) constructs a
+  producer that does not exist.
+- **The summary cross-reference is wrong.** Item 6 says V1b "is excluded, and item 4 says why". Item 4 is about Task 5 (b). Item 3 mentions the device-side
+  invariant; nothing in the summary states an exclusion rule.
+
+**What would make it true:** a sentence in the Gate itself (for example "a mechanism is refused if its safety depends on a gate that is not a lease, or if it does
+not assert `planned subset of protect` on the device") and, in the checklist, the assertion as a checkbox with a mutation control (a producer whose planned lane is
+outside `protect`; the test must show it is caught).
+
+### F2. MEDIUM: "the second [unverified item] *false*" is stronger than its basis
+
+"Two things unverified: ... whether every planned lane is in `protect` for every producer. **Both are answered below** -- the first NOT guaranteed but fail-safe,
+the second *false*, and false in a way that yields silent wrong bytes." The demonstration shows that *if* a planned lane is outside `protect`, an early copy can
+read a slot the request then evicts, silently. It does not show that any producer puts a planned lane outside `protect`; the plan says elsewhere that no
+production producer other than `expert_row_plan.py`'s does. The accurate answer is "true for the only production producer; not guaranteed by construction for a future
+one; the failure, if it occurred, would be silent under early read." "*False*" is the wrong label and it feeds F1's reason 2.
+
+### F3. MEDIUM: the "audit trail ... must not be quoted" is not history; it holds the live specification, and it mixes updated and stale figures
+
+The CURRENT FIGURES block says the trail below "records how [the figures] moved and **must not be quoted**". Checked against what is actually below it:
+
+- **The trail contains the only statement of several live things.** V1b is defined there and only there (summary item 6 points at it); the `kBusySeq` facts a
+  consumer must honour (clears before `demand_done`; advisories never set it; poll both words); the safety invariants (a) and (b); the `planned subset of protect`
+  demonstration; the V2 cleanup landmine; the same-`mutex_`-section correction; the hint analysis; the unarmed-record analysis. None is history. A reader who obeys
+  "do not quote" loses them; a reader who ignores it quotes obsolete numbers.
+- **Some trail paragraphs were updated to current figures, some carry "(pre-measurement)" parentheticals, some are marked history, some were left.** The paragraph
+  after the first `---` uses 20.07, 7.4%, 4.93, 1.9% (current) but says "88% ... and only **13%**" in one sentence (88 + 13 is not 100; the table says 88/12) and "about 1%
+  only net of launch cost" (the "Chosen first mechanism" paragraph says 1.1-1.5% and records that "about 1%" was the earlier revision). BLOCKING DEPENDENCY opens with
+  "The 7.5-15% saving, and the 87% share" (old) and, three lines later, "V1's advantage is the 88% hit-lane share" (new). "Two corrections from the first independent review"
+  carries "33.5 ms, not 38.6" with "(Both are pre-measurement; the current pair is 35.74 against 40.67.)". So which figure in the trail is live cannot be told from position.
+- **A stale sentence in an updated paragraph.** "The caveat that carries the result is that hit lanes are assumed to spread evenly over layers; the traces do not record lanes
+  per layer ... a schema-4 trace can replace the bounds below with a measurement." The measurement has landed; the summary says "A1 no longer has to be assumed"; A1's layer-level premise
+  held and its per-request count did not. This sentence still describes the state before the trace.
+- **Embedded history in live text.** "An earlier revision of this sentence said ...", "An earlier revision quoted 'about 1%'", "As first written this bullet said ..." appear inside
+  the paragraphs a reader will quote. They are useful once and noise afterwards.
+
+**Answer to your question 2: yes, the section would be more honest shorter, and I would delete the history rather than mark it.** A marked chronology is a weaker device than
+deletion for exactly the reason above: "must not be quoted" is a request, and the reader cannot tell live paragraphs from history by looking. The plan is not the place for the record of
+how each number moved; that record exists (`PER_ROW_TRANSFER.md`, `PER_ROW_TRANSFER_REVIEW.md`, `PER_ROW_PRECHECK_REVIEW.md`, this file, and the commit messages, several of which
+already say what each correction was). A structure that survives future edits: (i) a short standing block (the summary, the table, the two rules); (ii) live technical notes, each written
+once in current-state form, with no "an earlier revision" clauses (V1b and its invariants, the `kBusySeq` facts, the hint analysis, the V2 landmine, the cost split); (iii) a single
+sentence pointing to the documents that hold the history. That is about a third of the current length and every sentence in it is quotable. The evidence that the current shape
+decays is in this section: the rewrite that introduced the table also introduced two of the mixed paragraphs above.
+
+### F4. MEDIUM-LOW: the new table's "two-phase" row is the ceiling by construction, and the table does not say so
+
+Measured hit lanes are 33.9 per step; 33.9 x 1.055 ms = 35.77 ms, which is the two-phase figure (35.74) to within 0.1%. So two-phase is not a model output with an independent
+spread of assumptions; it is "every hit lane's copy hides completely", i.e. hit lanes x c, and it can only be lower if some read waits are shorter than `h*c`. Summary item 7
+says "V1's ceiling is a ceiling by construction" and the block says the savings are modelled; a one-line note in the table ("two-phase = 33.9 x 1.055, every hit copy hidden") would make the
+reader see that the only inputs beyond the measured `k` are `c` and A2, which is the honest state and reduces the chance the 13.9% is read as a prediction.
+
+### F5. LOW: smaller items
+
+- **The 257.5 ms denominator is recorded, not reconciled.** The block says the plan and the design "quote different step times for the same shares and should be reconciled" and keeps
+  257.5. Whether that is the reconciliation the lead described or a note that one is owed, a reader takes the shares as stated; at 254.4 they are 1.2% higher (7.5% rather than 7.4%).
+  Immaterial; say which one governs.
+- **"A1 was first bounded, then measured, and the prediction held."** The bounds held. The A1 *estimate* (29.3 / 31.9) undercounted by about 14% and its per-request `k` was exact for
+  36% of requests. "The prediction held" is true of the bounds and reads as true of A1. Say "the bounds held".
+- **The "3.0x the registered SUPPORT floor"**: the floor was 11.7 (37% of 31.9) in the first document and 10.8 rescaled; 33.9 / 11.7 = 2.9 and 33.9 / 10.8 = 3.1. "About 3x" is right; "3.0x" implies a
+  precision the floor does not have.
+- **The 88/12 shares:** the trail still writes 87/13 in two places (BLOCKING DEPENDENCY, the paragraph after the first `---`).
+
+## Your four questions
+
+1. **New stale paragraphs / history relied on as live:** yes to both: F3 (a stale A1 sentence in an updated paragraph; live specification held in the "history"), F2, and the mixed 87/88 and 13/12 figures.
+2. **Is "must not be quoted" enforceable?** No. Delete the history and keep a current-state section (F3).
+3. **Does the Gate enforce the V1b exclusion?** No (F1, HIGH).
+4. **A8 (no V1 checklist): deferring is the right call for the implementation checklist and the wrong call for two smaller things.** The checklist should be written against the mechanism that will be built,
+   after Task 5 (b) fixes what the words are, and writing it twice is waste. But (a) the **Gate** must be written now, because it is what a reviewer will apply and it currently accepts V2, V1b and V1
+   alike (F1); and (b) the heading and the checklist header should say plainly that the checklist below specifies **V2 only** and V1's is to follow, because at present a reader who takes the plan at its
+   word ("Chosen first mechanism: two-phase") and follows the only checklist builds the variant the plan expects to reject. A two-line note above the checklist and a Gate paragraph cost nothing and remove
+   the risk that the largest open item is also the least visible.
+
+## What I did not check
+
+The measured lane counts (`dad59f1b48`, 33.9, 64,635 against 64,857, the 36/42/22 split) and the join onto `task1-2-new-on-T`'s stamps: I checked the table's internal arithmetic (shares, 87.9%, +4.93, -15.67,
+7.4%, 33.9 x c) and not the trace. `t3-topology` is sweeping the rest of the plan for stale figures; I read only Task 6. The 3-slot demonstration and the `kBusySeq` windows remain uncommitted (the plan now says so).
