@@ -142,13 +142,13 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 
 | file | sha256 |
 |---|---|
-| `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `b93ebf7c776314d1a1b0a09d2493b7c9d385e912a5487a6087f478a30a1e34d4` (**IN FORCE: amendment 9, section 21**; supersedes `4657702c...`, the constant cited elsewhere in this document) |
-| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `9e7d8e4e0f1df596e9a5037facd810c071f9187852b35329a63717490845faed` (**IN FORCE: amendment 9, section 21**) |
+| `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `21afc941c29f95be50613187ccd91072a58b2e8372c69661e7f07c74cea26e92` (**IN FORCE: amendment 10, section 22.1**; supersedes `b93ebf7c...` (amendment 9) and `4657702c...`, the constant cited elsewhere in this document) |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `b2e71474c01ea589e2c1868642a8c2fb7142bc25f8a16d8fd5085bedb415ff76` (**IN FORCE: amendment 10, section 22.1**; supersedes `9e7d8e4e...` (amendment 9)) |
 | `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
 | `c_measurement/quiet_check.py` (the pre-flight: candidate cores from /sys, the idle-core check, and the CPU-only `--rehearse` of the frozen gate) | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` (**IN FORCE: amendment 6, section 17**) |
 | `c_measurement/verify_hashes.py` (checks the files against this table; run it immediately before the window) | `26bb113eb3699d6d48440f795656e5fe077e51d617dd3c75535efe931141f542` |
 | `c_measurement/prebuild_jit.py` (compiles the gather kernel's JIT module with no GPU) | `015215022edf78dd69f98002e1c1d7bbc982fa2662cd5cca09ab7091d4fbb782` |
-| `c_measurement/test_c_harness.py` (the harness-to-analysis hand-off, plus the two guard tests of section 17a) | `b6815a802c84e9bf8ec831dcb1ec3f23c855cb9e315108fc7a023860910b27a3` (**IN FORCE: amendment 6, section 17**; 25 CPU tests) |
+| `c_measurement/test_c_harness.py` (the harness-to-analysis hand-off, plus the two guard tests of section 17a) | `5dabd036a204e71ba9dacea51914dd212df70ea5c115138be963d64a43c7fcc1` (**IN FORCE: amendment 10, section 22.1**; 26 CPU tests; supersedes `b6815a80...`) |
 
 **Superseded hashes: none of these is the registered harness.** `c_harness.py` `171302f871ee45d2…` (first version, commit `8313506f25`) was superseded by amendment 1 (section 12, `c2eddc482b`); `6b7313b05132798c…` (amendment 1) by amendment 2 (section 13, `cb436aec3b`);
 `d39270e19a7fcd90…` (amendment 2) by amendment 3 (section 14, `bc02ab9ddf`); `adcd041f5660ef77…` (amendment 3) by amendment 4 (section 15). Earlier `test_c_harness.py` hashes (`3fe04030…`, `94082c54…`, `e71c672a…`, `a8f96f0f…`) and `quiet_check.py` `0190708b…`, `e50bd7ab…` are superseded the same way.
