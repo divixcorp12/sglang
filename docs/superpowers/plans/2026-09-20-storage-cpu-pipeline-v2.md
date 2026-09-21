@@ -177,8 +177,26 @@ Include expert identity in the immutable row result and validate it against the 
 
 **Files:** Files from Task 5; `python/sglang/srt/layers/moe/expert_row_plan.py`; `python/sglang/kernels/ops/moe/expert_cache_transfer.py`; `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`; graph wrapper/backend tests; `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`.
 
-> **The chosen mechanism below is not justified by the benefit it was designed
-> to exploit.** A pre-registered analysis of the existing graph-decode traces
+> **SUMMARY OF THIS TASK'S STANDING** (the detail below is the audit trail; read
+> this first):
+> 1. The mechanism this plan originally specified -- fixed-order per-row -- is
+>    **expected-REJECTED by arithmetic**, and is about 14 ms/step *worse* than
+>    the two-phase alternative.
+> 2. **Two-phase (hits, then the rest) is the chosen mechanism.** It is
+>    justified; per-row is retained below only as the variant that must beat it.
+> 3. **Neither mechanism's saving exists today.** Both need an early,
+>    device-visible readiness signal that does not exist, confirmed at the
+>    source. That signal is also a *safety* requirement, not only a performance
+>    one.
+> 4. **Task 6 cannot be accepted before Task 5's lease words land**, and it
+>    invalidates the standing justification for a race that is benign today.
+> 5. Every figure below is conditional on (3) and on assumption A1, which the
+>    traces cannot check.
+>
+> ---
+>
+> **The mechanism this plan originally specified is not justified by the benefit
+> it was designed to exploit.** A pre-registered analysis of the existing graph-decode traces
 > (`analysis/dsv41-drive/PER_ROW_PRECHECK_PREREG.txt`, hashed before it ran)
 > finds the modelled saving is real -- 19.2 ms/step at random lane order, about
 > 7.1% after launch cost -- but that **87% of it is RAM-HIT lanes gathered while
