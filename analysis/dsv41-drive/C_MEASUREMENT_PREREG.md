@@ -143,11 +143,11 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 | file | sha256 |
 |---|---|
 | `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c` |
-| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `d39270e19a7fcd90ce4ddf44af61496bd3785990729f8a65f5cdece3a138a2f2` (**supersedes `6b7313b0…` and `171302f8…`: sections 12 and 13**) |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `adcd041f5660ef77d95bad4b8769d472a53fcb1e31b51d64b5b7164c18b6b8eb` (**supersedes every earlier hash: sections 12, 13, 14**) |
 | `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
-| `c_measurement/quiet_check.py` (the pre-flight: is the box quiet, on which cores; reads /proc only) | `0190708bf9ab4bf37a573f80a8a088b193e7d82d252d6af72143dffd310df6f4` |
+| `c_measurement/quiet_check.py` (the pre-flight: is the box quiet, on which cores; reads /proc only) | `e50bd7abae727220e2d98971e19b0cb602d75b7c9a9df4958d093524dd0435a3` |
 | `c_measurement/prebuild_jit.py` (compiles the gather kernel's JIT module with no GPU) | `015215022edf78dd69f98002e1c1d7bbc982fa2662cd5cca09ab7091d4fbb782` |
-| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `e71c672a14adb5057ee7ea924a8305de09e27fd164b9c461bcdbdaaf0f50f645` (12 CPU tests; supersedes `94082c54…`) |
+| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `a8f96f0f87833719ad09061c10f734b72e625ee19f9ea0ddeacad65d5bff5874` (13 CPU tests) |
 
 Self-test, 2026-09-21 on divix01, CPU: `c = 1.00` gives STANDS (`g*_H` 6.22), `c = 1.055` gives INTERMEDIATE (`g*_X` 7.01, `g*_H` 8.06, gross 4.92: the earlier model's 6.98 / 8.03 / 4.93 within `f`), `c = 1.15` INTERMEDIATE, `c = 1.40` WITHDRAWN, and an
 impossible bandwidth, an idle link, row reuse, foreign load and a wrong row size are INVALID. **That tests the logic and the arithmetic reproduction, not the GPU.**
@@ -188,6 +188,8 @@ python3 <dir>/c_measurement/c_analysis.py <outdir>/results.jsonl        # the fr
 `TOPOLOGY.md` 9.B is **retired**, superseded by this document; 9.C's GPU side is carried by the `nvme` arm (its remote-bounce placement matrix stays open and unscheduled); **9.A (storage alone, no GPU) stays as an independent item.** The status lines in `TOPOLOGY.md` say so.
 
 ## 12. Amendment before any data: what "quiet" means, the idle baseline for `rho`, and how contention is handled (2026-09-21)
+
+**Partly superseded by section 14: the 0.02 GB/s idle-drive criterion (item 2's GO condition and item 3(a)) and the idea that the box should be quiesced are withdrawn; the drift rules replace them. Read section 14 first.**
 
 Prompted by the lead's note that the box carried a load average of 27.8 (36 when I looked: every core from 0 to 63 was between 20% and 100% busy) while the GPU itself was free. **Nothing has been run; this
 changes the registered design only by making three things explicit, all before a launch, and the harness hash in section 9 is the one that includes them.**
@@ -231,3 +233,20 @@ never as "no effect".** The floor is stated with its numbers (the recorded forei
 defended, the run goes without `--with-nvme` and `nvme` is **reported NOT MEASURED** (`meta.json` `NOT_MEASURED`), for a genuinely quiet box; the other arms are unaffected. Cores 64-71 are never used.
 
 **Order of the report** (as required): the `--check-only` result first, and if it finds a problem I stop and tell the lead before proceeding; then the verdict word; and if `c_m` is within about 2% of 1.055 I say so plainly and report the label as unchanged.
+
+## 14. Correction before any data, third: the box's permanent load is the CONDITION, not contamination (2026-09-21, lead's correction)
+
+`nimbus_beacon_node` (Ethereum mainnet consensus), `op-reth` (Optimism full node) and `aggregate-runner` (`aggregate-runner.service`, a feed scraper) are the user's own permanent infrastructure, and production normally runs beside them. **They are not stopped and nobody is asked to stop them.**
+Measuring `c` with them running is measuring the environment V1 would ship into; the run is quoted as **"`c` measured under the box's steady-state load"** and `meta.json` records that load rather than assuming it away. This **supersedes** what sections 12 and 13 said about quiet, in three places:
+
+1. **No absolute idle-drive limit.** Section 12's rule that an idle cell reading above 0.02 GB/s makes the run INVALID is **withdrawn**: the services do real drive I/O. In its place the refusal is on **drift**: within a pass, foreign NVMe traffic (reads plus writes over every whole NVMe device, the reader's own bytes removed from the load cells) may differ between the idle cells and the load cells by at most **0.10 GB/s**,
+   and box-wide foreign CPU by at most **1.0 core** (section 13, kept). Either drift writes `results.INVALID` for the `nvme` ratio (exit 3). **A steady load cancels in `rho`; a drifting one invalidates it.** Both services burst (sync, peer churn), so drift is a live possibility, not a formality.
+2. **Their I/O is sampled per cell, not only their CPU.** Per visit: read and write bytes of `nimbus_beacon_n`, `op-reth`, `reth-binary`, `aggregate-runner` and any process among the top CPU users, from `/proc/<pid>/io` (**readable only for our own uid; a process it cannot read is recorded as "unreadable", never as zero**), and the per-device NVMe read/write deltas. On 2026-09-21 only `nimbus` was readable
+   (0.06 MB/s written); `op-reth` and `reth-binary` were not, so their share is bounded only through the per-device totals. `meta.json` also records the command lines of the top foreign processes at the end.
+3. **The `nvme` arm is not deferred because the box is busy.** It is deferred (reported NOT MEASURED) only if `quiet_check.py` cannot find reader cores under 5% busy, or a drift gate fires and the run is not repeated. "The box is not quiet" alone is no longer a reason.
+
+**What the steady state looks like (observed 2026-09-21, `quiet_check.py`, 8 s).** Foreign CPU was **21 cores** (kernel I/O threads excluded), not the roughly 4 that `ps` suggested: `java` (QuestDB, `questdb.jar`, about 14 cores of `ilpwriter` threads), `aggregate-runner` (about 3), one pytest lane of ours, `nimbus_beacon_node` and `op-reth`. NVMe traffic across all devices was
+0.018 GB/s read and 0.008 GB/s written, so drive I/O was small at that moment. Load average 23.5-35.9 through the afternoon.
+
+**A tension I cannot resolve by design and am recording before the run.** The frozen per-core gate (`foreign_max_core_pct` at most 10% on the cores we use) is not a drift rule; with a 21-core foreign floor a service thread landing on one of our cores for 100 ms of a 1-second visit fails it. Cores are chosen as the quietest by `quiet_check.py` (four harness cores on node 0, four reader cores on node 1) to minimise that.
+**If the run is INVALID and the only failing gate is `foreign_max_core_pct`, and the recorded `foreign_where` names a steady service on one of our cores, I ask for one re-run on freshly picked cores, with both runs reported.** I will not loosen the gate or drop cells to get a VALID run. That request is not a permission I take; it needs the lead's yes after seeing the failure.

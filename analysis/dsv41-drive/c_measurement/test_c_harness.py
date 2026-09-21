@@ -119,6 +119,17 @@ def test_meta_records_not_measured_and_load_fields():
         line = json.loads(open(Path(d, "results.jsonl")).readline())
         assert {"box_foreign_cores", "foreign_top", "loadavg_start", "loadavg_end"} <= set(line)
 
+def test_proc_io_sees_a_writer_and_marks_the_unreadable():
+    import subprocess, time, tempfile
+    with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as d:          # /tmp is RAM-backed on some hosts: write_bytes counts disk writes only
+        code = "import os,time\nf=open(%r,'wb')\nt=time.time()\nwhile time.time()-t<2:\n    f.write(b'x'*(4<<20)); f.flush(); os.fsync(f.fileno())" % os.path.join(d, "w")
+        w = subprocess.Popen([sys.executable, "-c", code]); time.sleep(0.3)
+        pio = h.ProcIO([os.getpid()]); pio.start(extra=(os.path.basename(sys.executable), "python3", "python")); time.sleep(1.0); out = pio.stop(); w.kill()
+        mine = [v for k, v in out.items() if isinstance(v, dict) and v["write_MB_s"] > 5.0]
+        assert mine, out
+        pio.pids[1] = "init"; pio.a = pio._read(); pio.t = time.monotonic()                     # pid 1 is another uid: recorded as unreadable, never as zero
+        if os.getuid() != 0: assert pio.stop().get("init[1]") == "unreadable"
+
 def test_node_mem_reader():
     try: m = h.node_mem_mib(0)
     except OSError: return
