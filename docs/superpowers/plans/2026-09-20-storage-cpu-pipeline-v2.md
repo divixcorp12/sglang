@@ -848,6 +848,15 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > count, and the count must not be quoted without it -- "21 checks cannot fail"
 > invites the false inference that the suite is worthless, and it is not.
 >
+> **The count is 21 or 20 depending on a definition, and the definition must
+> travel with it.** 21 is the sweep's raw sum. The sweep author's own report says
+> **about 20**, because one reviewer counted the unregistered
+> `test_expert_transfer.py` as a finding, and that report puts it in the
+> **separate registration class** below rather than in the cannot-fail class.
+> Both numbers are correct under their own definition; neither is correct
+> unlabelled. Quote it as "21 including one registration-class item, or 20
+> excluding it".
+>
 > Separately and not merged into the count: **22 files / 279 tests have no
 > `register_*_ci` call and 17 files / 171 tests are registered with no
 > `__main__` entry.** `collect_tests` raises loudly on both, so this is not a
@@ -857,8 +866,23 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 >
 > **No mutant in that sweep was run**; findings are marked `[re-verified]` or
 > `[reviewer-established]` at the source, with a ranked list of the mutations
-> worth actually running (`host.cpp:2054`, `expert_hot_cache.py:292`,
+> worth actually running (the **publish gate**, `expert_hot_cache.py:292`,
 > `verify_expert_mirror.py:519`/`:534` separately, `exl3_expert_layout.py:64`).
+>
+> **The publish gate is anchored by its text, not by a line number, and earlier
+> revisions of this plan got that wrong.** The gate is
+> `if (ok || (cancelled && i < packed.size() && packed[i] != 0)) {`. It sits at
+> `exl3_ram_miss_host.cpp:1904` at `a01f9347d6` and at `:2347` at `bc02ab9ddf`.
+> This plan previously cited `host.cpp:2054`, a number quoted from a working
+> tree a reviewer happened to be reading; `host.cpp` has since moved under three
+> lanes (busy-seq, trace schema 4, and Task 5 steps 2-3c), and **2054 is blank at
+> `a01f9347d6` and an unrelated `stamp()` call at `bc02ab9ddf`** -- wrong at
+> every base anyone can check out, in a document whose point is precision.
+> **Rule for this plan: cite C++ call sites by their text, and pair any line
+> number that must remain with the base sha it is true at.** The same defect
+> affected the sweep's other `host.cpp` citations (first-submit stamp, drive
+> attribution, the failed-start `set_threaded(false)`); they are corrected at
+> their source in `e16c5ce504`.
 >
 > **Two further survivors from the same sweep, both live risks rather than test
 > hygiene.** **H15:** a resubmitted extent overwriting its first submit stamp
