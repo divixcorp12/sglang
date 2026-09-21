@@ -64,24 +64,33 @@ second of its pair.
 
 ## What is measured
 
-- **Statistic: per-token decode latency**, the time between consecutive streamed chunks. One request of 896 tokens is
-  ~900 samples, so p50/p95/p99 cost seconds, not requests. Per-request percentiles are not computed: with two
-  requests they would be meaningless (e2e and TTFT appear as means only).
+- **Statistic: per-token decode latency**, the time between consecutive streamed chunks. Per-request percentiles are
+  not computed (4 requests); e2e and TTFT appear as means only.
 - **Warmup discarded, and recorded**: one warmup request (`--warmup-requests 1`, 64 tokens) before the window, then
   the first `--discard-steps` (30) steps of every measured request are dropped. The count is in
   `summary.discarded_steps_per_request`.
-- **Default window**: 2 requests x 896 tokens, 256-token prompts, greedy, `ignore_eos`: 2 x (896 - 1 - 30) = 1730
-  per-token samples per arm, ~2 min at 67 ms. Both arms see the same prompts in the same order.
+- **Default window: 4 requests x 512 tokens**, four different corpus prompts of 256 tokens, greedy, `ignore_eos`:
+  4 x (512 - 1 - 30) = 1924 per-token samples per arm, ~2 min at 67 ms. Both arms see the same prompts in the same
+  order. Decode batch size is pinned at 1 by the EXL3 gate, so requests cannot overlap and each one's TTFT (prefill,
+  possibly tens of seconds of cold RAM misses) is pure overhead that adds no decode samples. Hence few requests with
+  many tokens each; 4 rather than 2 so the window spans four routes, not one pathological one. Nothing about the
+  count is sacred: `--requests 2 --output-tokens 1024` gives 2000 samples for two TTFTs, `--requests 8
+  --output-tokens 256` for eight.
+- **Projected wall clock**: right after warmup the process prints `[projection] ...` from the warmup request's own TTFT
+  and decode rate: the measured window and this process's total. The project's figures disagree (~67 ms/token in-graph
+  vs 300-450 ms in the Sept 19 corpus runs), so read the projection in the first minutes and abort (Ctrl-C) if it is far
+  off; `--max-projected-s N` makes the process abort itself if the projected window exceeds N seconds. The warmup is
+  the coldest request, so the projection leans slow.
 - Reported: min, p50, p95, p99 and mean of step latency; tokens/s over the whole window (prefill included).
 - **Within-arm spread**: the samples are cut into `--blocks` (5) consecutive slices; `p50s`/`mins` of each slice and
   their relative range are recorded. Consecutive, so a drift within the window shows up as spread.
 - **Concurrency stays 1**: the EXL3 gate allows decode graphs at batch size 1 only, so a batch of two runs eagerly and
   skips the lease path. `--concurrency 2` is refused unless `--allow-eager-batches`.
 
-## The effect to resolve, and why 1730 tokens
+## The effect to resolve, and why ~1900 tokens
 
 The lease cost is ~0.68 ms per 40-layer step on ~66.8 ms: about 1%. The standard error of a p50 over n samples is
-about 1.25 x sd / sqrt(n), so 1730 samples resolve 0.67 ms if the per-step sd is below roughly 8 ms; a run whose
+about 1.25 x sd / sqrt(n), so 1924 samples resolve 0.67 ms if the per-step sd is below roughly 8 ms; a run whose
 steps stall on RAM misses (sd of tens of ms) will not, and the block spread will say so. The main threat is
 cross-process variance (two processes, two loads), which is why `min` is reported beside p50: on the OPEN 11 re-take
 min-to-min and p50 agreed to 0.4 us on a quiet card and disagreed six-fold on a busy one. A p50 delta whose min-to-min
@@ -95,7 +104,7 @@ Run the pair once. Then read the last lines of `comparison.md` (also `compare.py
   `decision: RESOLVED`. Two loads were enough.
 - **Otherwise** run one more pair with the order flipped, into the same directory:
   `run_ab.py --rep-start 1 --out-dir <same dir>` (odd reps put `lease_on` first, so the order effect cancels), or a
-  longer window (`--output-tokens 1800`, context allows ~3800) if the block spread itself is large. Then decide again.
+  longer window (`--output-tokens 1024 --requests 4`; the context length allows 256 + 3800) if the block spread itself is large. Then decide again.
 - **Invalid** whatever the deltas, if the lease check failed (below). An identical number from both arms is the
   symptom of a lease path that never ran, not a result.
 

@@ -45,6 +45,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--rep", type=int, default=0, help="repetition index, recorded in the result"
     )
     p.add_argument(
+        "--max-projected-s",
+        type=float,
+        default=0.0,
+        help="abort after warmup if the projected measured window exceeds this many seconds (0 = never)",
+    )
+    p.add_argument(
         "--position",
         type=int,
         default=0,
@@ -59,13 +65,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     w.add_argument("--warmup-requests", type=int, default=1)
     w.add_argument("--warmup-output-tokens", type=int, default=64)
-    w.add_argument("--requests", type=int, default=2, help="measured requests")
+    w.add_argument(
+        "--requests",
+        type=int,
+        default=4,
+        help="measured requests, each a different prompt",
+    )
     w.add_argument("--input-tokens", type=int, default=256)
     w.add_argument(
         "--output-tokens",
         type=int,
-        default=896,
-        help="per measured request; 2 x (896 - 1 - discard) ~ 1730 per-token samples",
+        default=512,
+        help="per measured request; 4 x (512 - 1 - discard) = 1924 per-token samples",
     )
     w.add_argument(
         "--discard-steps",
@@ -300,7 +311,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
     os.environ.update(env)
 
     from counters import TraceCursor, mix, verify_lease, window
-    from metrics import aggregate
+    from metrics import aggregate, project
     from transformers import AutoTokenizer
     from workload import run_closed_loop, sampling_params, select_prompts
 
@@ -359,10 +370,36 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
                 concurrency=args.concurrency,
             )
         )
+        warm_started = time.monotonic()
         warm_records, _ = run(warm, warm_params) if warm else ([], 0.0)
+        warm_wall_s = time.monotonic() - warm_started
         result["warmup"] = [
             {k: v for k, v in r.items() if k != "step_s"} for r in warm_records
         ]
+        if warm_records:
+            result["projection"] = project(
+                warm=warm_records[-1],
+                requests=args.requests,
+                output_tokens=args.output_tokens,
+                startup_s=result["startup_s"],
+                warm_wall_s=warm_wall_s,
+            )
+            print(
+                "[projection] warmup TTFT {warmup_ttft_s:.1f} s, decode {warmup_decode_tok_s:.2f} tok/s "
+                "({warmup_ms_per_token:.0f} ms/token): measured window ~{measured_window_s:.0f} s, "
+                "this process ~{process_total_s:.0f} s in all".format(
+                    **result["projection"]
+                ),
+                flush=True,
+            )
+            if (
+                args.max_projected_s
+                and result["projection"]["measured_window_s"] > args.max_projected_s
+            ):
+                raise RuntimeError(
+                    f"projected measured window {result['projection']['measured_window_s']:.0f} s exceeds "
+                    f"--max-projected-s {args.max_projected_s}"
+                )
         marks["start"] = cursor.mark() if cursor else None
         records, wall_s = run(measured, params)
         time.sleep(2.0)

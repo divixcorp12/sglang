@@ -120,3 +120,31 @@ def aggregate(
         "multi_token_chunks": sum(r["multi_token_chunks"] or 0 for r in requests),
         "steps_unavailable": sum(1 for r in requests if r["step_unavailable"]),
     }
+
+
+def project(
+    *,
+    warm: dict,
+    requests: int,
+    output_tokens: int,
+    startup_s: float,
+    warm_wall_s: float,
+) -> dict:
+    """Wall clock of the rest of the run, from the warmup request's own TTFT and decode rate.
+
+    The warmup is the coldest request the process serves, so this leans slow; it is for deciding in the first
+    minutes whether to abort, not a forecast.
+    """
+    rate = warm["decode_tok_s"]
+    if rate <= 0:
+        raise ValueError("warmup request reported no decode rate")
+    per_request = warm["ttft_s"] + (output_tokens - 1) / rate
+    measured = requests * per_request
+    return {
+        "warmup_ttft_s": warm["ttft_s"],
+        "warmup_decode_tok_s": rate,
+        "warmup_ms_per_token": 1e3 / rate,
+        "per_request_s": per_request,
+        "measured_window_s": measured,
+        "process_total_s": startup_s + warm_wall_s + measured,
+    }

@@ -298,3 +298,24 @@ def test_compare_flags_an_unverified_lease_run():
     assert "INVALID" in compare.render([good, bad]) and not compare.problems(
         [good, {**bad, "lease_check": {"ok": True, "reasons": []}}]
     )
+
+
+def test_the_projection_uses_the_warmup_request_own_rate():
+    warm = {"ttft_s": 50.0, "decode_tok_s": 4.0}
+    got = metrics.project(
+        warm=warm, requests=4, output_tokens=401, startup_s=100.0, warm_wall_s=160.0
+    )
+    assert (
+        got["per_request_s"] == 150.0
+        and got["measured_window_s"] == 600.0
+        and got["process_total_s"] == 860.0
+    )
+    assert got["warmup_ms_per_token"] == 250.0
+    with pytest.raises(ValueError, match="no decode rate"):
+        metrics.project(
+            warm={"ttft_s": 1.0, "decode_tok_s": 0.0},
+            requests=1,
+            output_tokens=10,
+            startup_s=0,
+            warm_wall_s=0,
+        )
