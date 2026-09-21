@@ -287,11 +287,11 @@ def _backend_calls(monkeypatch, *, lease):
         wait=lambda *a: calls.append("wait"),
         ack=lambda keep: calls.append(("ack", keep)),
     )
-    monkeypatch.setattr(
-        module,
-        "copy_expert_row_segments_gpu",
-        lambda segments, host_rows, slots, count: calls.append(("copy", count)),
-    )
+    from sglang.srt.layers.moe import expert_row_plan
+
+    record = lambda segments, host_rows, slots, count: calls.append(("copy", count))  # noqa: E731
+    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", record)  # the lease post
+    monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", record)  # the inherited post
     backend = module.Exl3RamMissRowBackend({0: "SEG"}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
     plan = SimpleNamespace(
         expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]),
