@@ -1547,42 +1547,77 @@ not by me):
 
 ### 18.2 Tests required (each maps to a Task 5 item or a defect)
 
-CPU-only (simulated device), most of them:
+**Audited against five ways a check can be unable to fail** (`#audit` below, 2026-09-21): a fault
+injected where it short-circuits before the code under test; an assertion over a scan or
+collection that can be empty; a test whose only failure on old code is a missing name; a stub
+whose default makes the interesting state unreachable; and a test of a model or simulator where
+the claim is about the service or the kernel. The first version of this list had all of them.
+Each test below therefore states its **class** (what it actually exercises), its **precondition**
+(what must be asserted first so that it is not vacuous) and the **mutation it must fail under**
+(named, and to be demonstrated by applying it, not assumed).
 
-1. Lease-pressure: hold a lease (no ack) and force admission pressure on the same row;
-   assert the leased slot is never chosen as a victim, the demand defers rather than
-   fails, and it proceeds after the ack. Include a RAM *hit* lane.
-2. Delayed acknowledgement with a newer request present: the leased source stays
-   byte-identical (poison the slot on any illegal rewrite, as the existing poisoned-recycle
-   tests do).
-3. Duplicate lanes: two lanes, one expert, two leases, one ack releases one.
-4. F1, F2, F3-shaped (Task 6 later), F12, F13: each row of section 12 has a test naming its
-   row.
-5. Skipped copy emits no ack: with `go_count == 0` no `LaneAck` word is written (assert the
-   words stay zero).
-6. Terminal mask retires exactly its lanes; an ack and a mask never both retire a lane
-   (double-retire is an internal error).
-7. Generation wrap: seed the page head and the device near `0xFFFFFFF0`, drive through the
-   wrap; no `kOverruns`, leases retire across the wrap, the `LaneAck` aliasing case (a
-   stale word from `G - 2^32`) is rejected, and a lap that crosses the wrap (unarmed
-   records posted past it while the service lags) still serves the armed request that
-   follows. The first part is written (`test_exl3_ram_miss_wrap.py`, both rings) and should
-   fail on today's `pump_demand` (D6); the rest needs the lease code.
-8. Request-slot reuse: retire-before-reuse, deferral without lapping (OPEN 8's test).
-9. Pause with a leaked lease is refused (F10); shutdown ordering including the
-   helper-thread timeout path selecting quarantine; a fake CUDA error selecting
-   quarantine and asserting no `unregister` and no free call.
-10. Worker never waits: a fault-injected reader with 100% of acks withheld still submits,
-    reaps, honours `pause`, `stop` and cancellation (a watchdog in the test, as the thread
-    tests already do for hangs).
+Classes: **[service]** the real C++ service driven through the CPU simulated device; **[sim]** the
+simulated device only, which is code written from the same spec and is *not* evidence about the
+CUDA kernels; **[python]** the Python shutdown/quarantine wiring; **[kernel]** the CUDA kernels on
+a GPU. A [sim] test is a consistency check of the scaffolding, never a claim about the kernel.
 
-GPU (under the lock; not run here):
+Every [service] test needs test-only introspection (`slot_leases(row, slot)`, `slot_generation`,
+and counters `deferred`, `deferred_reuse`, `lease_double_signal`, `late_after_terminal`). **On
+today's code each of them fails with a missing name, which is not evidence of anything**: the
+evidence is the mutation column, applied to the finished service.
 
-11. The `ld.global.nc` visibility experiment of section 6.6.
-12. Graph-parity: byte-exact output with leases on versus off; `go_count` zero on an
-    injected timeout and no source bytes read (compare against a poisoned slab).
-13. Cost of the added `LaneRequest` fences and the ack kernel per layer, and of arming every
-    `count > 0` record without advise (OPEN 5, OPEN 11).
+| # | Test | Class | Precondition to assert first | Must fail under |
+|---|---|---|---|---|
+| 1 | **Lease pressure.** A lease held with its ack withheld, on a tier whose capacity is exhausted so that the leased slot is the *only* possible victim of the next request; the request must defer (not fail), then be served after the ack is delivered. Include a RAM *hit* lane. | service | `deferred > 0` and `demand_done` has not advanced while the ack is withheld; `slot_leases == 1` for the hit slot and for the loaded slot | `take_slot_locked` ignores `leases` (with spare capacity the pressure takes another victim and a test without the exhausted-capacity setup passes on this mutant); a demand fails instead of deferring |
+| 2 | **Delayed ack, newer request present.** A sentinel is written into the leased slot's slab bytes *after* publication; a newer request or advisory that reserves and reads runs; the sentinel and `slot_generation` are unchanged. Use the existing `_sentinel` and `_exact_or_untouched` helpers of `test_exl3_ram_miss_split.py`, requiring *untouched* (the helper also accepts a whole exact row, which is wrong for a leased slot). | service | the newer request's reservation ran (an eviction or `advisories` counter moved for another slot) | eviction that reloads the *same* expert into the leased slot with identical bytes (a byte comparison cannot see it; the sentinel and the generation can). The original wording cited the existing poisoned-recycle tests as the technique; they poison reader-owned descriptors and slots the reader is about to write (`test_poisoned_descriptors_and_slots_are_recycled...`), and detect nothing about a rewrite of a slot nobody is reading |
+| 3 | **Duplicate lanes.** Two lanes, one expert. | service | `slot_leases == 2` **before any ack**; after one ack `slot_leases == 1` and the slot is still not a victim (repeat item 1's pressure); after the second, 0 | leases deduplicated per expert (a test that only checks the end state passes); an ack that releases every lease on its slot |
+| 4 | **The rows of section 12.** One test per row *that is observable*, naming its row. **Service-observable:** F1 (a read fault injected *after* reservation, so it is not short-circuited; assert `slot_leases == 0` and no `RowResult`); F2 in *both* orders (terminal delivered before the service serves: `late_after_terminal`, no lease; terminal delivered after grant: retired by the mask); F8 (a lapped request); F10 (item 9); F11 (item 3). **Not observable on the CPU:** F5 (CUDA error), F6 (device hang), F7 (service hang, existing watchdog), and the *device halves* of F1, F2, F12, F13, which are behaviours of the kernels ([kernel], items 12, 5b). F13 exists only if a protocol bug exists; an injected recycle tests the simulator's ack, so it is [sim]. | service / sim / kernel | per row as stated | F1: leases granted at reservation and not voided on failure; F2: a lease granted after a terminal that nothing retires |
+| 5 | **Skipped copy emits no ack.** With `go_count == 0` no `LaneAck` word is written. | **sim only** here; **[kernel] on the GPU** | assert the words are all zero *and* that the simulated wait did run its abort path | On the CPU this checks the simulator against the same author's spec. A kernel that acknowledges `[0, count)` instead of `[0, go_count)` passes every CPU test; only a GPU test that runs `exl3_ram_miss_ack_kernel` catches it. Do not cite the CPU version as evidence for the kernel |
+| 6 | **Terminal mask retires exactly its lanes; a lane signalled by both an ack and a mask is counted, not decremented twice.** | service | inject both signals for one lane and deliver both *before* `retire_leases()` runs (pump once after both are visible), else the first retirement empties the lane and the second is a trivial no-op; a partial mask to exercise the per-lane state machine (the real device publishes only full masks until Task 6) | retirement decrements per signal instead of per lane state. **The old wording, "double-retire is an internal error", disagrees with the model and the design, where the second signal is ignored by the lane state machine; specify the counter `lease_double_signal` and assert exact `leases`** |
+| 7 | **Generation wrap.** (a) the demand/advisory wrap, written (`test_exl3_ram_miss_wrap.py`), fails on the old `pump_demand`/`pump_advice` and passes on the fix; (b) leases retire across the wrap; (c) the stale-acknowledgement case; (d) a lap that crosses the wrap. | (a) service; (b)-(d) service + sim | (c) the stale word must have the **same low 32 bits and a different epoch** as the awaited generation, else it is rejected for the wrong reason and the test passes with a 32-bit compare; assert the lease is *still held* while the stale word is present, and released by the real ack. (d) assert a lap occurred (`overruns`/resume counter) with the service held back by `pump()` stepping, and that the armed request after it is served | (c) a service that compares only the low 32 bits of the generation; (d) a service that counts epochs itself (the model's counterexample) |
+| 8 | **Request-slot reuse.** A request slot is reused only after its lease row retired, and a deferral does not flood the stage ring. | service | acknowledgements withheld so request `G + 16` actually arrives with `G` unretired: `deferred_reuse > 0`; with instant acks it never defers. Assert the stage ring gained **one** record for the deferred request, not one per poll | `defer_reuse=False` (a request slot overwritten with a granted lane unretired: leaked lease); a deferral that re-enters `begin_stage` every poll |
+| 9 | **Pause and shutdown.** (a) a *graph-lane* lease outstanding: the pause is refused; (b) a *host* lease outstanding: the pause is **granted** (R2; the first version tested only the refusal, which passes for an implementation that refuses whenever any lease exists); (c) a fake CUDA error and a fake `synchronize` that outlasts its deadline each select quarantine. | (a),(b) service; (c) python | (c) patch `release_host_slabs` **before** the cache is built (the finalizer binds the function at creation, which the first version of `TestQuarantine` had to work around); assert the fake `synchronize` was actually called; release the blocked helper thread at the end; assert the slab is alive via a weak reference and no unregister was recorded | (a)/(b): a pause that counts host leases; (c): a shutdown that frees when the sync did not complete |
+| 10 | **The worker never waits.** With every acknowledgement withheld the service still serves *another row's* request, and `pause`, `stop` and cancellation complete within a bound. | service | a demand is **deferred** (`deferred > 0`) when `pause`/`stop` is issued, otherwise an idle worker passes; a watchdog as the thread tests already have | a `serve()` that spins on the acknowledgement (hangs `pause`/`stop`; the watchdog fires) |
+| 11 | The `ld.global.nc` experiment of section 6.6. | kernel | done: `NC_VISIBILITY.md` | see there |
+| 12 | **Graph parity and fail-closed.** Byte-exact output with leases on versus off; on an injected timeout `go_count` is 0 and the copy reads nothing. | kernel | the timeout must be injected **after the post and before the demand is served** (service paused), else there is nothing to copy and the test cannot fail; the destination is pre-filled with a sentinel and must be unchanged; a poisoned source slab | a copy that runs after a failed wait (D1); an ack kernel that acknowledges `[0, count)`; an ack published before the copy completes |
+| 13 | Cost of the added fences, the ack kernel, and arming every `count > 0` record (OPEN 5, OPEN 11). | kernel | a measurement, not a test | n/a |
+| 14 | **The stage ring is not flooded by a deferral** (7.1). | service | as item 8 | a per-poll `begin_stage` |
+| 15 | **Stale or repeated `LeaseRef` is a counted error, not a second decrement** (R1); **the lease API does not bump `kVersion`** (R8). | service | assert the counter value and `version()` unchanged around a lease | a release that decrements twice; a lease that bumps the version |
+| 16 | **The release-callback tests of 17.3** (a callback after close is a counted no-op; a callback racing with close and re-open never crashes and never touches another tier). | service | the callback must be fired **from another thread while the tier closes**, not called inline (an inline call cannot race) | a callback that dereferences the tier by pointer |
+| 17 | **The model's mutants replayed on the service.** | service | see the ledger below | see the ledger below |
+
+**Mutation ledger** (section 20.0 says each model mutant becomes a regression test on the real
+code; this says which can and which cannot). Applied to the finished service and shown to fail:
+
+| Model mutant | Service test | Note |
+|---|---|---|
+| `leases=False` | items 1, 2, 3 | with the exhausted-capacity precondition |
+| `defer_reuse=False` | item 8 | needs withheld acks |
+| `gen64=False` + stale ack | item 7(c) | same low 32 bits, different epoch |
+| `echo_gen=False` | item 7(d) | a lap that crosses the wrap |
+| `defer_leased=False` | item 1 (defers rather than fails) | |
+| `retire=False` | item 10 | |
+| `free_needs_sync=False`, `free_waits_executor=False`, `host_admission_closed=False` | item 9(c), the shutdown tests | python |
+| `host_guard=False`, `eager_host_guard=False`, `pause_counts_host` | item 9(a)/(b), step 7 tests | |
+| **`ack_after_copy=False`, `fail_closed=False` (fail-open), `detector=False`** | **none on the CPU** | **kernel properties: only items 5(kernel) and 12 can catch them.** The simulator would only re-implement the rule under test |
+| `copy_waits_on_serving` | none | a property of the Task 8 copy path, not of the service |
+
+#### Audit
+
+Findings against the first version of this list, each shown at the source or by a named
+mutation the test would miss: (A1) item 2 cited a technique that does not detect a rewrite of an
+unread slot (`test_exl3_ram_miss_split.py`, `test_poisoned_descriptors_and_slots...`); (A2) items 1
+and 2 pass on the mutant "eviction ignores leases" without the exhausted-capacity setup; (A3) item
+3 passes on lease deduplication if only the end state is asserted; (A4) item 4 was an instruction,
+not a test, and covered rows that cannot be observed on a CPU; (A5) item 5 tested the simulator
+against the same author's spec and could not fail on the kernel; (A6) item 6 asserted "internal
+error" where the design ignores the second signal, and needed both signals visible before
+retirement; (A7) item 7's stale-word case passes with a 32-bit compare unless the low 32 bits
+match; (A8) item 8 never defers with instant acknowledgements, and the stage-ring flood test was
+absent; (A9) item 9 tested only the refusal, which an "always refuse" pause passes; (A10) item 10
+passes on an idle worker; (A11) item 12's timeout must fire after the post; (A12) every service
+test fails today with a missing name, which is not evidence, so the mutation column is the
+acceptance criterion; (A13) three model mutants have no CPU analogue.
 
 ### 18.3 The model check (done, bounded)
 
@@ -1817,10 +1852,10 @@ this order may change).
 |---|---|---|---|---|
 | 1 | **Constants and block allocator, no behaviour.** `ops.py`: lease-block constants (`LEASE_RING`, `LEASE_LANES`, offsets of area H/S/D from 4.3) and `new_lease_block(rows, capacities, pin)`, allocating `bytes + 4096` and slicing to a 4096-aligned view (there is no alignment check today; add it). Mirror the same names in `host.cpp` and `device.cuh`. | Extend `test_exl3_ram_miss_device_args` so the lease constants join the existing three-way agreement test; a test that an unaligned or unpinned block is refused. | The `_constants` parser accepts only `constexpr <type> kName = <expr>;` with integers, `+ - *` and known names, and fails on a duplicate name. No `<<`, `|`, `/`, `sizeof` in a `k` constexpr; the tag encoding stays in code. | no |
 | 2 | **Slot generations and the eviction predicate.** `host.cpp`: `Tier` gains `leases` and `slot_generation`; `SlotGen[]` mapped writes with the `_mm_sfence()` of 6.5; `take_slot_locked` returns the tri-state {slot, deferred, none} with the cause (graph or host); `assign`/`release` refuse a leased slot; new counters. `exl3_ram_miss_open` takes the block tensor and writes the immutable header and `RowTable` (the service is the only writer); `ops.py` `Exl3RamMissHost.__init__` creates the block itself when none is passed, so no test call site changes. Nothing grants a lease yet. | All existing `test_exl3_ram_miss_tier` / `_split` / `_thread` / `_advisory` unchanged and green; new CPU tests for the tri-state, for `SlotGen` bumping before the first byte store, for `release` of a leased slot throwing. | Append the new counters at the end of `enum Counter` before `kCounterCount` **and** the same position in `COUNTERS` (`ops.py`), which is index-aligned by convention. `kVersion` must not move on a lease change (R8). | no |
-| 3 | **Admission, grant, publish, retire, terminal; the CPU device.** `host.cpp`: read `LaneRequest` with the seqlock re-check; take `G` from it (11.3); `Outstanding` ring; in `serve()` grant and publish per lane (6.1 order, RAII undo); `retire_leases()` called from the top of `RamThread::run` and from the give-up lambda of `RowReader::read`; the pause acknowledgement's graph-lane `outstanding == 0`; the terminal check and `late_after_terminal`; deferral. Extend `exl3_ram_miss_sim_post` / `_sim_wait` and add `sim_ack`, `sim_terminal` so the whole protocol runs with no GPU. | Section 18.2 tests 1-6, 8 and 10, plus one test per model mutant and per model counterexample (each is a trace to replay against the C++ through the sim). The wrap tests (`test_exl3_ram_miss_wrap.py`) still pass. | **A deferral must return before `begin_stage`, or push nothing**, and retry only when `retire_leases()` changed something or a `Terminal` appeared, or the 8192-slot stage ring floods per poll (7.1, OPEN 15). Weak ordering between ack and terminal words: the sim must be able to deliver them in either order, as the model does. | no |
+| 3 | **Admission, grant, publish, retire, terminal; the CPU device.** `host.cpp`: read `LaneRequest` with the seqlock re-check; take `G` from it (11.3); `Outstanding` ring; in `serve()` grant and publish per lane (6.1 order, RAII undo); `retire_leases()` called from the top of `RamThread::run` and from the give-up lambda of `RowReader::read`; the pause acknowledgement's graph-lane `outstanding == 0`; the terminal check and `late_after_terminal`; deferral. Extend `exl3_ram_miss_sim_post` / `_sim_wait` and add `sim_ack`, `sim_terminal` so the whole protocol runs with no GPU. | Section 18.2 items 1-4, 6, 7(b)-(d), 8, 10, 14 and 15, each with its precondition asserted and its mutation demonstrated (the ledger in 18.2; item 5 is sim-only on the CPU and is not evidence for the kernel), plus the model counterexamples that have a service analogue, replayed at scenario level (20.2b). The wrap tests (`test_exl3_ram_miss_wrap.py`) still pass. | **A deferral must return before `begin_stage`, or push nothing**, and retry only when `retire_leases()` changed something or a `Terminal` appeared, or the 8192-slot stage ring floods per poll (7.1, OPEN 15). Weak ordering between ack and terminal words: the sim must be able to deliver them in either order, as the model does. | no |
 | 4 | **The device kernels.** `device.cuh`: `LaneRequest` in the post kernel; the wait kernel with `go_count`, the `RowResult` validate (generation, tag, expert), the terminal, the `fatal`/`Header.shutdown` poll inside the loop (D4), and 64-bit `ld.acquire.sys` / `st.release.sys`; new `exl3_ram_miss_ack_kernel`. `ops.py`: `Exl3RamMissDevice.post/wait/ack`, `lane_ctx`, `go_count`; append `epoch` and `pending_epoch` to `STATE_WORDS`. | CPU: argument validation in `test_exl3_ram_miss_device_args`; the state-word agreement test. GPU (manual, under the lock, after crypto-c9 schedules): a wait kernel timeout leaves `go_count == 0` and a poisoned slab is not read; an acknowledgement is emitted only for copied lanes; the `ld.global.nc` experiment (6.6), independent of this step. | **`STATE_WORDS` is a triple edit**: the device-state enum in `device.cuh`, `STATE_WORDS` in `ops.py`, and the hard-coded dict in the device-args test, all together or the existing test fails. **`go_count` must be an int32 CUDA tensor of shape `[1]`** (`_validate_plan`), not a scalar, not int64. Constexprs as in step 1. | yes |
 | 5 | **The backend and the arming rule.** `srt_ram_miss.py`: `Exl3RamMissRowBackend` overrides `post` (today only `translate` is overridden and `post` is inherited from `PinnedTierRowBackend`) to pass `go_count` to `copy_expert_row_segments_gpu` and to launch the acknowledgement kernel after it; `Exl3RamMissService.ensure_started` / `attach` allocate the block and hand it to the host and the device; lease mode arms every record with `count > 0` (15). The new environment switch is read here. | Existing service tests green with the switch off; with it on, the GPU graph parity test (`test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`): byte-exact output versus off, an injected timeout, and the arming cost measurement (OPEN 11) reported, not assumed. | The switch defaults off. `advise` and the arming rule must agree between the device (`armed = need_count > 0 || advise != 0`) and the service's `touch_request` path, or a record is waited on that the service treats as touch-only. | yes |
-| 6 | **Shutdown and quarantine.** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 test 9 (a fake CUDA error and a fake sync timeout select quarantine; no unregister, no free); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
+| 6 | **Shutdown and quarantine.** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 item 9(c) (a fake CUDA error and a fake sync timeout select quarantine; `release_host_slabs` patched before the cache is built, the fake sync asserted to have been called, no unregister, the slab alive by weak reference); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
 | 7 | **The host-lease API for Task 8.** `host.cpp` and the export table: `acquire_host_lease`, `lease_on_ready`, `release_host_lease` (17.1, R1-R8), never bumping `kVersion`, releasable by an executor-stream host callback (R1a, OPEN 16) and not only by the scheduler thread's poll, a stale or repeated `LeaseRef` counted as an error; the pause counts graph-lane leases only; **a host lease is released by an executor-stream host callback, not the scheduler thread's poll (R1a, OPEN 16)**. | R1-R8 tests; the model's Task 8 mutants replayed against the real API through the sim. | R8 (`kVersion`), R2 (the pause split), R3 (`lease_on_ready`), and A3 for whoever calls it. | no |
 | 8 | **Enable and gate.** Flip nothing by default. Record the cost of the added fences and of arming every `count > 0` record (OPEN 5, OPEN 11); run the `ld.global.nc` experiment if not already done (OPEN 6); state the result of the wrap tests against the real code (OPEN 1). | The plan's Task 5 gate: lease-pressure and fault tests prove no reuse before consumption; concurrent graph execution stays guarded (OPEN 9). | Do not report skipped hardware tests as passed. | yes |
 
