@@ -1,6 +1,7 @@
 """Analysis for the task1e series (see task1e-PREDICTIONS.txt and task1e-AMENDMENT.txt).
 
-Revision 2 adds the RELAXED sets of the amendment, written after arm 0's verdict and before arm 1's.
+Revision 3 adds the leave-one-out CROSS-ARM of task1e-ADDENDUM.txt; revisions 1 and 2 are unchanged in every number
+they printed. Revision 2 adds the RELAXED sets of the amendment, written after arm 0's verdict and before arm 1's.
 Revision 1 (sha256 ca0f20e2db5ee40f1859ee4ab9515d07876a384d8f367f77998ad1540a769e9a, commit 450f86d17a) is the
 one the original pre-registration hashed; its STRICT and S1 numbers are unchanged in revision 2.
 
@@ -122,19 +123,47 @@ def load_arm(json_path, code):
     }
 
 
-def inconclusive_reasons(a, ignore_cross=False, ignore_contended=False):
+def inconclusive_reasons(a, ignore_cross=False, ignore_contended=False, loo=False):
     r = []
     if not a["valid"]:
         r.append("not VALID")
     if a["outliers"]:
         r.append("OUTLIER note")
-    if a["cross"] and not ignore_cross:
-        r.append("CROSS-ARM flag")
+    if a["cross"] and not ignore_cross and not loo:
+        r.append("CROSS-ARM flag (historical reference)")
+    if loo and not ignore_cross and a.get("loo"):
+        r.append("CROSS-ARM flag (leave-one-out, this series)")
     if a["contended"] != "not" and not ignore_contended:
         r.append(f"CONTENDED {a['contended']}")
     if not a["gen_ok"]:
         r.append(f"generation {a['gen'][:40]!r}")
     return r
+
+
+CROSS_ARM_SLOWER = 0.08   # the verdict's own threshold, unchanged
+
+
+def _median(v):
+    v = sorted(v)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def loo_cross_flags(arms):
+    """Leave-one-out CROSS-ARM within this series (addendum): each arm's sessions against the median of the OTHER
+    VALID arms of the same cell in this series, same 8% rule as the verdict: decode tok/s any session, TTFT sessions
+    1..n. Sets a["loo"] to the list of flags ("not judged" if no other valid arm exists in the cell)."""
+    for a in arms:
+        others = [b for b in arms if b is not a and b["code"] == a["code"] and b["valid"]]
+        a["loo"] = None if not others else []
+        a["loo_refs"] = len(others)
+        for i, (tps, ttft) in enumerate(zip(a["sessions"], a["ttft"])):
+            ref = [b["sessions"][i] for b in others if i < len(b["sessions"])]
+            if ref and tps < (1 - CROSS_ARM_SLOWER) * _median(ref):
+                a["loo"].append(f"LOO session_{i}: decode {tps:.3f} tok/s is {100 * (1 - tps / _median(ref)):.0f}% below the {len(ref)}-arm same-series median {_median(ref):.3f}")
+            ref = [b["ttft"][i] for b in others if i < len(b["ttft"])]
+            if i >= 1 and ref and ttft > (1 + CROSS_ARM_SLOWER) * _median(ref):
+                a["loo"].append(f"LOO session_{i}: ttft {ttft:.1f} s is {100 * (ttft / _median(ref) - 1):.0f}% above the {len(ref)}-arm same-series median {_median(ref):.1f} s")
 
 
 def welch(new, old):
@@ -247,19 +276,27 @@ def main():
         print(f"    -> {'CLEAN' if not why else 'INCONCLUSIVE: ' + '; '.join(why)}" + (f"  sightings {x['sightings']}" if x["sightings"] else ""))
         for n in x["outliers"] + x["cross"]:
             print(f"       {n[:200]}")
+    loo_cross_flags(arms)
+    print("\nLEAVE-ONE-OUT CROSS-ARM (this series; primary for disqualification under the addendum):")
+    for x in arms:
+        print(f"   {x['name']}: " + ("not judged (no other valid arm of its cell)" if x["loo"] is None else (f"{len(x['loo'])} flag(s) vs {x['loo_refs']} other arm(s)" if x["loo"] else f"no flag vs {x['loo_refs']} other arm(s)")))
+        for n in x["loo"] or []:
+            print(f"       {n}")
     non_stat, why = stationarity(arms)
     print(f"\nSTATIONARITY over all {len(arms)} arms run: {'NON-STATIONARY' if non_stat else 'stationary'}")
     for r in why:
         print("   ", r)
     strict = [x for x in arms if not inconclusive_reasons(x)]
     sens1 = [x for x in arms if not inconclusive_reasons(x, ignore_cross=True)]
-    relaxed = [x for x in arms if not inconclusive_reasons(x, ignore_contended=True)]
+    relaxed = [x for x in arms if not inconclusive_reasons(x, ignore_contended=True, loo=True)]
+    relaxed_hist = [x for x in arms if not inconclusive_reasons(x, ignore_contended=True)]
     sens1r = [x for x in arms if not inconclusive_reasons(x, ignore_cross=True, ignore_contended=True)]
     sens2 = [x for x in arms if x["valid"] and x["gen_ok"]]
     print(f"\nARMS DROPPED of {len(arms)}: STRICT (original rules) {len(arms) - len(strict)}, S1 (strict, CROSS-ARM ignored) {len(arms) - len(sens1)}, "
-          f"RELAXED (amended: CONTENDED alone does not disqualify) {len(arms) - len(relaxed)}, S1r (relaxed, CROSS-ARM ignored) {len(arms) - len(sens1r)}, "
+          f"RELAXED-LOO (amended + addendum: primary) {len(arms) - len(relaxed)}, RELAXED-HIST (historical CROSS-ARM) {len(arms) - len(relaxed_hist)}, S1r (relaxed, CROSS-ARM ignored) {len(arms) - len(sens1r)}, "
           f"S2 (all VALID, right generation) {len(arms) - len(sens2)}")
-    for title, s in (("RELAXED = AMENDED PRIMARY (OUTLIER and CROSS-ARM still disqualify)", relaxed),
+    for title, s in (("RELAXED-LOO = PRIMARY (CONTENDED ignored; OUTLIER and leave-one-out CROSS-ARM disqualify)", relaxed),
+                     ("RELAXED-HIST (CONTENDED ignored; OUTLIER and historical-reference CROSS-ARM disqualify)", relaxed_hist),
                      ("STRICT (original task1e-PREDICTIONS rules)", strict),
                      ("S1r sensitivity: relaxed with CROSS-ARM ignored (VALID, OUTLIER-free, right generation)", sens1r),
                      ("S1 sensitivity, original definition: strict with CROSS-ARM ignored", sens1),
@@ -268,7 +305,7 @@ def main():
         fit = position_fit([(x, pos[x["name"]]) for x in s])
         print("   position fit:", (f"cell(new-old) {fit['cell_new_minus_old']:+.4f} tok/s at fixed position, slope {fit['slope_per_slot']:+.4f} tok/s per slot" if fit else "not computable"))
     print("\nPRE-REGISTERED VERDICTS (both are reported; the original is not erased):")
-    for label, s in (("STRICT (original rules)", strict), ("RELAXED (amended primary)", relaxed)):
+    for label, s in (("STRICT (original rules)", strict), ("RELAXED-HIST (amendment, historical CROSS-ARM)", relaxed_hist), ("RELAXED-LOO (amendment + addendum: PRIMARY)", relaxed)):
         n_new = sum(1 for x in s if x["code"] == "new")
         n_old = sum(1 for x in s if x["code"] == "old")
         if n_new < 3 or n_old < 3:
