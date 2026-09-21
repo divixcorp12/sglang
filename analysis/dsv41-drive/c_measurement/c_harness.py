@@ -54,6 +54,10 @@ IDLE_DRIVE_MAX_GBS = 0.02          # an idle-arm cell during which the NVMe devi
 LOAD_FOREIGN_IO_MAX = 0.10         # in a load cell, drive bytes beyond the reader's own may not exceed 10% of the reader's bytes
 SEED = 20260921
 
+KERNEL_IO_THREADS = ("kworker", "ksoftirqd", "irq/", "nvme", "iou-", "migration", "rcu_", "cpuhp")
+DRY_BOX_SHIFT = 0.0                # tests only: the synthetic device reports this much extra foreign CPU (cores) in load cells
+BOX_FOREIGN_MAX_DELTA = 1.0        # cores: idle-arm and load-arm cells of a pass may differ by at most this in non-own CPU, or the nvme ratio is invalid
+
 Cell = collections.namedtuple("Cell", "engine state node load launch n")
 
 # ---------------------------------------------------------------------------------------------------- pure helpers
@@ -117,6 +121,7 @@ class ForeignLoad:
     def __init__(self, own_pids, cores):
         self.own = set(own_pids); self.cores = set(cores); self.hz = os.sysconf("SC_CLK_TCK")
     def add_own(self, pid): self.own.add(pid)
+    last = {}
     def _snap(self):
         out = {}
         for d in os.listdir("/proc"):
@@ -134,17 +139,23 @@ class ForeignLoad:
         self.a = self._snap(); self.t = time.monotonic()
     def stop(self):
         b = self._snap(); dt = time.monotonic() - self.t; per_core = collections.defaultdict(float); top = {}
+        box = 0.0; by_proc = collections.defaultdict(float); names = {}
         for key, (j, cpu, name) in b.items():
             if key not in self.a: continue
             j0, cpu0, _ = self.a[key]; pct = 100.0 * (j - j0) / self.hz / dt
+            if pct > 0 and not name.startswith(KERNEL_IO_THREADS):     # kernel threads that carry OUR I/O (softirq, kworker, nvme) are not foreign load
+                box += pct; by_proc[key[0]] += pct; names[key[0]] = name
             for c in {cpu, cpu0}:
                 if c in self.cores and pct > 0:
                     per_core[c] += pct
                     if pct > top.get(c, (0.0, ""))[0]: top[c] = (pct, "%s[%d/%d]" % (name, key[0], key[1]))
+        self.last = {"box_foreign_cores": box / 100.0, "top": [(names[p_], p_, round(v, 1)) for p_, v in sorted(by_proc.items(), key=lambda kv: -kv[1])[:5]],
+                     "loadavg": Path("/proc/loadavg").read_text().split()[:3]}
         if not per_core: return (0.0, "")
         c = max(per_core, key=per_core.get); return (per_core[c], "cpu%d: %s" % (c, top[c][1]))
 
 class _NoForeign:
+    last = {"box_foreign_cores": 0.0, "top": [], "loadavg": ["0", "0", "0"]}
     def start(self): pass
     def stop(self): return (0.0, "")
 
@@ -208,6 +219,15 @@ def pages_on_node(ptr, nbytes, node, sample=512):
     if r != 0: raise OSError(ctypes.get_errno(), "move_pages")
     return sum(1 for s in status if s == node) / len(idx)
 
+def node_mem_mib(node):
+    """MemFree, FilePages (the page cache) and Active(file)+Inactive(file) of a NUMA node, MiB."""
+    out = {}
+    for line in Path("/sys/devices/system/node/node%d/meminfo" % node).read_text().splitlines():
+        f = line.split()
+        for key in ("MemFree", "FilePages", "Active(file)", "Inactive(file)"):
+            if f[2] == key + ":": out[key] = int(f[3]) // 1024
+    return out
+
 def node_free_mib(node):
     for line in Path("/sys/devices/system/node/node%d/meminfo" % node).read_text().splitlines():
         if "MemFree" in line: return int(line.split()[-2]) // 1024
@@ -226,7 +246,7 @@ class DryDevice:
         c = self.c * (1.04 if cell.node == 1 else 1.0) * (1.08 if cell.load == "nvme" else 1.0)
         base = (self.f + c * cell.n) * (0.93 if cell.engine == "ce" else 1.0)
         T = [base * (1 + abs(self.rng.gauss(0, 0.004))) for _ in range(launches)]
-        return T, {"cpu": 0, "node_verified_frac": 1.0}
+        return T, {"cpu": 0, "dry_box": DRY_BOX_SHIFT if cell.load == "nvme" else 0.0}
     def close(self): pass
 
 class RealDevice:
@@ -247,7 +267,7 @@ class RealDevice:
         self.src, self.seg, self.ring, self.consumed, meta = {}, {}, {}, {}, {"nodes": {}}
         self.global_seq = {0: [], 1: []}
         for node in (0, 1):
-            free_before = node_free_mib(node)
+            free_before = node_free_mib(node); mem_before = node_mem_mib(node)
             set_mempolicy(node)
             try:
                 slabs = [allocate_host_slab(ROWS_PER_NODE, (b,), torch.uint8, register=False) for _, b in SEGMENTS]
@@ -260,7 +280,7 @@ class RealDevice:
             for s, (_, b) in zip(slabs, SEGMENTS): _cuda_host_register(s, registration_granularity_bytes=b)
             self.src[node] = slabs; self.seg[node] = expert_row_segments(list(zip(slabs, self.dest)))
             self.ring[node] = ring_ids(ROWS_PER_NODE, SEED + node); self.consumed[node] = 0
-            meta["nodes"][node] = {"page_fraction_on_node": fracs, "free_mib_before": free_before, "free_mib_after": node_free_mib(node)}
+            meta["nodes"][node] = {"page_fraction_on_node": fracs, "free_mib_before": free_before, "free_mib_after": node_free_mib(node), "mem_mib_before": mem_before, "mem_mib_after": node_mem_mib(node)}
         # each row's first 8 bytes carry its id, so a launch can be checked to have moved the intended rows
         for node in (0, 1):
             for s in self.src[node]:
@@ -396,13 +416,16 @@ def run(args):
     skip = set(args.skip_arms)
     cells = [c for c in cell_list() if c.state not in skip and c.engine not in skip and c.launch not in skip]
     load_cells = load_cell_list() if args.with_nvme else []
-    meta["skipped_arms"] = sorted(skip)      # a skipped arm is a declared deviation from the registered design and must be named in the report
-    order_log = []; load_windows = []; idle_dirty = []; load_drive = []
+    meta["skipped_arms"] = sorted(skip); meta["NOT_MEASURED"] = sorted(skip) + ([] if args.with_nvme else ["nvme"])      # a skipped arm is a declared deviation from the registered design and must be named in the report
+    order_log = []; load_windows = []; idle_dirty = []; load_drive = []; box_idle = []; box_load = []; box_shift = []
     def visit(cell, sink):
+        la0 = Path("/proc/loadavg").read_text().split()[:3]
         foreign.start(); ds0 = None if dry else nvme_sectors_read(); t0 = time.monotonic()
         T, extra = dev.run_visit(cell, LAUNCHES_PER_CELL // 2, args)
         t1 = time.monotonic(); fp = foreign.stop(); ds1 = None if dry else nvme_sectors_read()
-        extra = dict(extra); extra["drive_bytes"] = None if dry else sum(ds1[k] - ds0.get(k, 0) for k in ds1) * 512
+        extra = dict(extra); extra["foreign"] = dict(foreign.last); extra["loadavg_start"] = la0
+        if dry: extra["foreign"]["box_foreign_cores"] = extra.get("dry_box", 0.0)
+        extra["drive_bytes"] = None if dry else sum(ds1[k] - ds0.get(k, 0) for k in ds1) * 512
         sink.append((T, extra, t0, t1, fp))
     for p in range(PASSES):
         acc = collections.defaultdict(list)
@@ -421,8 +444,11 @@ def run(args):
             if cond is None: raise SystemExit("no nvidia-smi samples for cell %s: refusing to write a cell without conditions" % (cell,))
             worst = max((v[4] for v in visits), key=lambda x: x[0])
             dur = sum(v[3] - v[2] for v in visits); db = None if dry else sum(v[1]["drive_bytes"] for v in visits)
-            extra = {"cpu": visits[0][1].get("cpu"), "pass": p, "visits": len(visits), "drive_bytes": db, "drive_gb_per_s": None if dry else db / 1e9 / max(dur, 1e-9), "foreign_where": worst[1]}
+            extra = {"cpu": visits[0][1].get("cpu"), "pass": p, "visits": len(visits), "drive_bytes": db, "drive_gb_per_s": None if dry else db / 1e9 / max(dur, 1e-9), "foreign_where": worst[1],
+                     "box_foreign_cores": max(v[1]["foreign"]["box_foreign_cores"] for v in visits), "foreign_top": [v[1]["foreign"]["top"] for v in visits],
+                     "loadavg_start": visits[0][1]["loadavg_start"], "loadavg_end": visits[-1][1]["foreign"]["loadavg"]}
             if cell.load == "idle" and not dry and extra["drive_gb_per_s"] > IDLE_DRIVE_MAX_GBS: idle_dirty.append((list(cell), p, extra["drive_gb_per_s"]))
+            (box_load if cell.load == "nvme" else box_idle).append((p, extra["box_foreign_cores"]))
             lines.write(json.dumps(record(cell, p, T, dev.reuse_distance(cell.node) if cell.state != "repeat" else 10 ** 9, cond, worst, extra)) + "\n"); lines.flush()
         print("pass %d done" % p, flush=True)
     rc = 0
@@ -442,6 +468,12 @@ def run(args):
             (out / "results.INVALID").write_text("drive traffic in a load window differs from the reader's own bytes by more than %.0f%%: another lane used the drives; the nvme arm's rho is not to be quoted\n" % (100 * LOAD_FOREIGN_IO_MAX)); rc = 3
         if any(g["reader_gb_per_s"] < args.min_reader_gbs for g in gbs) and not dry:
             (out / "results.INVALID").write_text("the nvme load arm did not load the drives at >= %.1f GB/s in every window: no load-arm number is to be quoted\n" % args.min_reader_gbs); rc = 3
+    for p_ in range(PASSES):
+        i_ = [x for q, x in box_idle if q == p_]; l_ = [x for q, x in box_load if q == p_]
+        if i_ and l_ and abs(S.mean(l_) - S.mean(i_)) > BOX_FOREIGN_MAX_DELTA: box_shift.append((p_, round(S.mean(i_), 2), round(S.mean(l_), 2)))
+    meta["box_foreign_cores_idle_vs_load_by_pass"] = [(p_, round(S.mean([x for q, x in box_idle if q == p_] or [0]), 2), round(S.mean([x for q, x in box_load if q == p_] or [0]), 2)) for p_ in range(PASSES)]
+    if box_shift:
+        (out / "results.INVALID").write_text("foreign CPU (non-own, kernel I/O threads excluded) changed by more than %.1f cores between the idle and load arms in pass(es) %s: the nvme ratio is invalid\n" % (BOX_FOREIGN_MAX_DELTA, box_shift)); rc = 3
     if idle_dirty:
         (out / "results.INVALID").write_text("an idle-arm cell saw NVMe reads above %.2f GB/s (rho's baseline is contaminated): %s\n" % (IDLE_DRIVE_MAX_GBS, idle_dirty[:5])); rc = 3
     meta["idle_dirty"] = idle_dirty

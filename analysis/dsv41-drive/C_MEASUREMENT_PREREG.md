@@ -143,11 +143,11 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 | file | sha256 |
 |---|---|
 | `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c` |
-| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `6b7313b05132798cdae4ca77401280eaa010b8961a3f6c8fd8249264c3519b8b` (**supersedes `171302f8…` after the amendment in section 12**) |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `d39270e19a7fcd90ce4ddf44af61496bd3785990729f8a65f5cdece3a138a2f2` (**supersedes `6b7313b0…` and `171302f8…`: sections 12 and 13**) |
 | `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
 | `c_measurement/quiet_check.py` (the pre-flight: is the box quiet, on which cores; reads /proc only) | `0190708bf9ab4bf37a573f80a8a088b193e7d82d252d6af72143dffd310df6f4` |
 | `c_measurement/prebuild_jit.py` (compiles the gather kernel's JIT module with no GPU) | `015215022edf78dd69f98002e1c1d7bbc982fa2662cd5cca09ab7091d4fbb782` |
-| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `94082c546ec5a9e777f0466bde2d1e6ac0fdf5a00e9b727abfca4bbf213c84ad` (9 CPU tests; supersedes `3fe04030…`) |
+| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `e71c672a14adb5057ee7ea924a8305de09e27fd164b9c461bcdbdaaf0f50f645` (12 CPU tests; supersedes `94082c54…`) |
 
 Self-test, 2026-09-21 on divix01, CPU: `c = 1.00` gives STANDS (`g*_H` 6.22), `c = 1.055` gives INTERMEDIATE (`g*_X` 7.01, `g*_H` 8.06, gross 4.92: the earlier model's 6.98 / 8.03 / 4.93 within `f`), `c = 1.15` INTERMEDIATE, `c = 1.40` WITHDRAWN, and an
 impossible bandwidth, an idle link, row reuse, foreign load and a wrong row size are INVALID. **That tests the logic and the arithmetic reproduction, not the GPU.**
@@ -210,3 +210,24 @@ This establishes the idle baseline by measurement in the same window, not by ass
 
 **4. What contention would still get through.** Memory-bandwidth pressure from cores outside our set, and the drives' queues seen by a lane that reads a different device set: (a) sees all whole NVMe devices, so the second is covered; the first is not gated, which is why the request to suspend box-wide jobs is for the window and not only for our cores. The per-cell
 `p99 / p50` gate and the recorded foreign-thread name (`foreign_where`) are how a contaminated cell would show.
+
+## 13. Amendment before any data, second: the P-state fallback, a persistent foreign process, and how `rho` is worded (2026-09-21)
+
+**P-state fallback (authorised by the lead, three conditions).** The run is made as registered first. If gate 4.1 fails on `hot` cells only, the failure is **observed and recorded first**: the INVALID result of the full run is kept in its own output directory
+(`results.jsonl`, `meta.json`, the analysis output) **before** any re-run. A re-run in the same window may then use `--skip-arms hot`. `meta.json` of that run records the deviation (`skipped_arms`, and `NOT_MEASURED` lists `hot`), and **`hot` is reported NOT MEASURED, not absent and not
+"not applicable"**. Wherever `c` is quoted afterwards (the report, `PER_ROW_TRANSFER.md`, the plan) the limitation travels with it: **a `c` measured without `hot` is a `c` for the cold path; anything that depends on host-cache state is outside it.** A `hot` cell that sits below P0 because the GPU
+idles while the CPU packs describes that arm's duty cycle, not only the instrument; it would still not be comparable with the other cells, which is why the gate refuses it. No pre-emptive skip is permitted.
+
+**A persistent foreign process.** `aggregate-runner`, running as root at about 246% of a CPU, owned by nobody on the team, is a floor under everything: **a truly idle baseline is not available today.** It does not block the run, and it is handled by recording and by a gate, not by assumption:
+- **Recorded per cell** (`results.jsonl`): the box-wide foreign CPU in cores (`box_foreign_cores`: every non-own thread, with the kernel threads that carry *our* I/O, `kworker`, `ksoftirqd`, `irq/`, `nvme`, `iou-`, excluded so the load arm's own I/O is not counted against it), the five biggest foreign
+  processes by name and CPU for each visit (`foreign_top`, where `aggregate-runner` will appear), and the load average at the start and end of the cell.
+- **Recorded per node in `meta.json`:** MemFree, FilePages and Active/Inactive(file) before and after the slab allocation, so a later cold/warm measurement can tell whether it inherited this run's eviction.
+- **A new harness-level gate, INVALID and no number:** if, within a pass, the mean box-wide foreign CPU of the load cells differs from that of the idle cells by **more than 1.0 core**, the `nvme` ratio is invalid (`results.INVALID`, exit 3; the per-pass means are in `meta.json`).
+
+**How `rho` is worded.** The idle baseline is measured on a box that is not idle, so `T_idle` is inflated and `rho = T_load / T_idle` is biased **low, in the direction that flatters V1** (it is harder to trip 1.05 and 1.20). Therefore: **a `rho` just below 1.05 is reported as "no effect detectable above a floor we did not control",
+never as "no effect".** The floor is stated with its numbers (the recorded foreign cores in the idle cells and the process names).
+
+**When the `nvme` arm is deferred instead of run.** Once the lanes are quiesced the lead reports the residual load at that moment; it is recorded as the actual starting condition. If `quiet_check.py` does not print GO for the reader's cores or the drives, or the residual floor is high enough that I judge a ratio cannot be
+defended, the run goes without `--with-nvme` and `nvme` is **reported NOT MEASURED** (`meta.json` `NOT_MEASURED`), for a genuinely quiet box; the other arms are unaffected. Cores 64-71 are never used.
+
+**Order of the report** (as required): the `--check-only` result first, and if it finds a problem I stop and tell the lead before proceeding; then the verdict word; and if `c_m` is within about 2% of 1.055 I say so plainly and report the label as unchanged.

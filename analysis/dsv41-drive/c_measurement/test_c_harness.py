@@ -93,6 +93,37 @@ def test_drive_accounting_helpers():
 def test_cpu_list_parser():
     assert h._parse_cpus("18-20,54") == [18, 19, 20, 54] and h._parse_cpus("") == []
 
+def test_box_foreign_gate_and_measure():
+    import subprocess, time
+    # 1. the meter: a one-core spinner shows up as about 1 box-wide foreign core and is named
+    sp = _spin_on(sorted(os.sched_getaffinity(0))[0]); time.sleep(0.3)
+    try:
+        f = h.ForeignLoad([os.getpid()], set(os.sched_getaffinity(0))); f.start(); time.sleep(1.0); f.stop()
+        assert f.last["box_foreign_cores"] >= 0.8 and any(t[0] in ("python3", "python") and t[2] > 50 for t in f.last["top"]), f.last["top"]
+        assert len(f.last["loadavg"]) == 3
+    finally: sp.kill()
+    # 2. the gate: foreign CPU that differs between the idle and the load arms by more than a core writes results.INVALID (exit 3)
+    for shift, want_rc in ((0.0, 0), (2.5, 3)):
+        h.DRY_BOX_SHIFT = shift
+        with tempfile.TemporaryDirectory() as d:
+            rc = h.main(["--out", d, "--dry-run", "--with-nvme", "--reader-cpus", "0"])
+            assert rc == want_rc and (Path(d, "results.INVALID").exists() == (want_rc == 3)), (shift, rc)
+            assert "box_foreign_cores_idle_vs_load_by_pass" in json.loads(Path(d, "meta.json").read_text())
+    h.DRY_BOX_SHIFT = 0.0
+
+def test_meta_records_not_measured_and_load_fields():
+    with tempfile.TemporaryDirectory() as d:
+        assert h.main(["--out", d, "--dry-run", "--skip-arms", "hot"]) == 0
+        m = json.loads(Path(d, "meta.json").read_text())
+        assert "hot" in m["NOT_MEASURED"] and "nvme" in m["NOT_MEASURED"]                    # nvme is reported not measured when it was not run
+        line = json.loads(open(Path(d, "results.jsonl")).readline())
+        assert {"box_foreign_cores", "foreign_top", "loadavg_start", "loadavg_end"} <= set(line)
+
+def test_node_mem_reader():
+    try: m = h.node_mem_mib(0)
+    except OSError: return
+    assert "MemFree" in m and "FilePages" in m
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests: t(); print("ok", t.__name__)
