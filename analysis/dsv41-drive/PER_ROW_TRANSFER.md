@@ -245,6 +245,34 @@ publication of the hit lanes, and per-row gets the remaining 13% for per-row pub
 gap in mechanism narrows; the gap in yield does not (the 13% is below what the gate can resolve). Task 5 as designed publishes
 every lane after all rows land (whole-request scope), so *when* the words are published is the Task 6 change, not the words.
 
+### 3.2 The post kernel's `need` is a hint; why that is benign today, and which reason Task 6 removes
+
+The post kernel decides `need` from `slot_map` at post time (`ld_volatile`): a racy read with no ownership. If a row it
+judged resident is evicted before the request is served, two things can happen, by record type.
+
+- **Armed record: benign because `serve()` re-resolves.** `wanted = protect + need`, and `protect` is filled from the
+  layer's routed experts (first 8), copied in by `Exl3MoEMethod._apply_graph`, not derived from `need`. Any `wanted` expert
+  with `tier.expert_slot < 0` at serve time joins `missing` and is read (the "D12 recompute"). This reason is structural and
+  does not depend on Task 6.
+- **Unarmed record (`need` empty, `advise == 0`): the host does not re-derive** (`handle_demand` calls `touch_request`,
+  `7526d4cdc3`), and this is safe **only because advise is off, so no advisory exists and nothing evicts in that tier between
+  post and wait** (`LEASE_PROTOCOL` 1.1, fifth rule). **That is the temporal exclusion early copying removes.** Task 6 therefore
+  does not merely need a lease for the hit lanes it copies early: it invalidates the standing justification for a race that is
+  benign today, and safety on the unarmed path must be re-established (in lease mode every `count > 0` record is armed,
+  `LEASE_PROTOCOL` 15, which is how it is re-established), not inherited.
+- **The failure, if the unarmed premise ever broke, is loud.** After any wait the wait kernel re-reads the map, counts a planned
+  expert with `slot < 0`, and sets `unserved_misses`, `raise_fatal(page, 0xFFFFFFFF)`, `ok = false`, `keep = 0`: a fail-stop,
+  not wrong bytes.
+- **Not covered:** a planned expert outside `protect` (a `plan_candidates` producer) would be suppressed and never
+  re-derived, failing loudly; I found no production caller outside `expert_row_plan.py`, so it is latent (`LEASE_PROTOCOL`
+  OPEN 12 seen from the hint side). An advisory can start in the few microseconds between the post's map read and its record
+  write; the armed path re-reads it.
+
+**Consequence for V1's order array `ord` (section 4.2).** It is a hint of exactly this kind, and it is benign by the same
+argument: a wrong hint changes only *when* a lane is copied, while correctness lives in the per-lane `RowResult` (generation,
+expert identity, slot range, and the lease taken before it is published). This is why V1's mechanism is sound with an
+unsound hint.
+
 **Stale or wrong claims in nearby documents, found by reading (each also recorded for its owner):**
 
 - `LEASE_PROTOCOL` D7 ("no `<= kMaxIds` check at attach") is **stale**: `Exl3RamMissService.attach` refuses
