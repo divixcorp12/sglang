@@ -2011,6 +2011,22 @@ independent review) that lease mode defaults off.
   tests failed because a raw `sim_post` writes no lane request, so the service saw an overrun; the test was wrong,
   not the service.
 
+- **The device kernels (7.3, 7.4) landed with three post-kernel additions the spec did not spell out, and they
+  are decisions, not readings of the text.** (1) The post kernel had none of its [P] half: it wrote no `LaneRequest`,
+  kept no `kEpoch`/`kPendingEpoch` (11.3), so the wait kernel had no `G56` to name. Both are now written, in lease
+  mode only (`lease_address != 0`; zero leaves the post byte-for-byte as before). (2) **Arming.** 7.1 step 3 says a
+  request with `count == 0` takes no lease, and says nothing about `count > 0` with every planned expert already in
+  RAM, which today's post leaves unarmed. The service reads a request's lanes only when the record is armed, so such a
+  request would be copied from slots nobody leased. In lease mode the post now arms every request with planned lanes.
+  Cost: a wait per streamed layer that today would have been skipped. Unmeasured. (3) **Where the wait kernel refuses
+  with no generation to name** (sticky at entry, or lanes with nothing armed) it publishes no `Terminal`: nothing was
+  posted, so nothing was leased. Terminal `reason` values (`timeout 1, aborted 2, failed 3, identity 4, count 5`) are
+  mine; the service does not interpret them. The wait also refuses a `host_slot` at or above the row's capacity
+  (read from the immutable `RowTable`), which bounds the ack kernel's `SlotGen` read; 7.3's "range" comment did not
+  say against what. An abort on the fatal word or `Header.shutdown` raises no fatal word of its own. `ram_miss` counts
+  every planned lane of a refused request (OPEN 7 remains open). The legacy `exl3_ram_miss_wait` is kept for lease
+  mode off; `exl3_ram_miss_lease_wait` is a separate kernel, so nothing of today's path moved.
+
 ### 20.2b Step 3's CPU simulated device: what the scaffolding must provide
 
 The simulated device of step 3 extends `exl3_ram_miss_sim_post` / `_sim_wait`. To be faithful to

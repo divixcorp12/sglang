@@ -1561,6 +1561,7 @@ constexpr int64_t kLeaseTerminalBytes = 16;
 constexpr int64_t kLeaseTermSkippedMask = 0;
 constexpr int64_t kLeaseTermReason = 4;
 constexpr int64_t kLeaseTermGen = 8;
+constexpr int64_t kLeaseRowTableBytes = 8;
 
 enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2 };
 

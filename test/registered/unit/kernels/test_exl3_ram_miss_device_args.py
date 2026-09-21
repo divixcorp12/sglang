@@ -179,6 +179,8 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kSticky": "sticky",
         "kAdvised": "advised",
         "kUnservedMisses": "unserved_misses",
+        "kEpoch": "epoch",
+        "kPendingEpoch": "pending_epoch",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
 
@@ -215,6 +217,25 @@ def _lease_python_constants():
         "kLeaseTermSkippedMask": lease.TERMINAL_FIELDS["skipped_mask"],
         "kLeaseTermReason": lease.TERMINAL_FIELDS["reason"],
         "kLeaseTermGen": lease.TERMINAL_FIELDS["gen"],
+        "kLeaseRowTableBytes": lease.ROW_TABLE_ENTRY_BYTES,
+    }
+
+
+def _lease_device_only_constants():
+    """Words only the device kernels write or name: the tags and the Terminal reasons (the host never interprets them)."""
+    from sglang.kernels.ops.moe import exl3_lease_block as lease
+
+    return {
+        "kLeaseTagDemand": lease.DEMAND_TAG,
+        "kLeaseTagReady": lease.READY,
+        "kLeaseTagConsumed": lease.CONSUMED,
+        "kLeaseTagViolated": lease.VIOLATED,
+        "kLeaseTagTerminal": lease.TERMINAL_TAG,
+        "kLeaseReasonTimeout": lease.TERMINAL_REASONS["timeout"],
+        "kLeaseReasonAborted": lease.TERMINAL_REASONS["aborted"],
+        "kLeaseReasonFailed": lease.TERMINAL_REASONS["failed"],
+        "kLeaseReasonIdentity": lease.TERMINAL_REASONS["identity"],
+        "kLeaseReasonCount": lease.TERMINAL_REASONS["count"],
     }
 
 
@@ -226,6 +247,8 @@ def test_the_lease_block_layout_is_written_once_in_python_and_in_the_device_sour
         assert name in device, name
         assert device[name] == value, (name, device[name], value)
     assert python["kLeaseRing"] == device["kDemandRecords"] and python["kLeaseLanes"] == device["kMaxIds"]
+    for name, value in _lease_device_only_constants().items():
+        assert device[name] == value, (name, device[name], value)
 
 
 # Words that mean the host source has started to implement leases. Step 2 must name its constants kLease*; if it

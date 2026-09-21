@@ -59,6 +59,10 @@ AREA_D_BYTES = TERMINAL + RING * TERMINAL_BYTES
 # Tags of the 8-bit field above the 56-bit generation.
 READY, FAILED = 1, 2  # RowResult.ready
 CONSUMED, VIOLATED = 1, 2  # LaneAck
+DEMAND_TAG = 1  # LaneRequest.gen, written by the post kernel
+TERMINAL_TAG = 1  # Terminal.gen, written by the wait kernel
+# Terminal.reason, written by the wait kernel (the service does not interpret it; it is for the trace and the tests).
+TERMINAL_REASONS = {"timeout": 1, "aborted": 2, "failed": 3, "identity": 4, "count": 5}
 TAG_SHIFT = 56
 GENERATION_MASK = (1 << TAG_SHIFT) - 1
 

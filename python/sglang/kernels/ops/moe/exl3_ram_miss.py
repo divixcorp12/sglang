@@ -730,12 +730,14 @@ STATE_WORDS = {
     "sticky": 6,
     "advised": 7,
     "unserved_misses": 8,
+    "epoch": 9,
+    "pending_epoch": 10,
 }
 
 
 @cache_once
 def _device_module() -> Module:
-    names = ("exl3_ram_miss_post", "exl3_ram_miss_wait")
+    names = ("exl3_ram_miss_post", "exl3_ram_miss_wait", "exl3_ram_miss_lease_wait", "exl3_ram_miss_lease_ack")
     return load_jit(
         "exl3_ram_miss",
         cuda_files=["moe/exl3_ram_miss.cuh"],
@@ -750,9 +752,17 @@ class Exl3RamMissDevice:
     through UVA). ``state`` holds the device words ``STATE_WORDS``;
     ``last_routes`` int32 ``[layers, MAX_IDS]`` the previous token's routes per
     layer for advisories (``advise``). ``timeout_ms`` bounds each wait.
+
+    With ``lease_block`` and its ``lease_layout`` (the host's ``lease_block`` and ``lease_layout``) the device speaks
+    the lease protocol (LEASE_PROTOCOL.md 6.3, 7.3, 7.4): ``post`` also writes the request's LaneRequest and arms
+    every request with lanes, ``wait`` validates each lane's row result and commits ``go_count`` (or fails closed
+    with ``go_count == 0``), and ``ack`` is launched after the copy kernel, in the same stream. The copy kernel takes
+    ``go_count`` where it takes the plan's count today. Without them, nothing here changes.
     """
 
-    def __init__(self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool) -> None:
+    def __init__(
+        self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None
+    ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8:
             raise ValueError("page must be a uint8 tensor of PAGE_BYTES")
         if slot_map.dtype != torch.int32 or slot_map.dim() != 2 or slot_map.shape[0] != layers:
@@ -780,6 +790,25 @@ class Exl3RamMissDevice:
         self.state = state.to(device)
         self.last_routes = torch.full((layers, MAX_IDS), -1, dtype=torch.int32, device=device)
         self._module = None
+        if (lease_block is None) != (lease_layout is None):
+            raise ValueError("lease_block and lease_layout go together")
+        self.lease_block = lease_block
+        self._lease_address = 0
+        self._lease_d = 0
+        self.go_count = None
+        self.lane_ctx = None
+        if lease_block is not None:
+            if lease_layout.rows != layers:
+                raise ValueError(f"the lease layout has {lease_layout.rows} rows for {layers} layers")
+            exl3_lease_block.check_lease_block(
+                lease_block, lease_layout, need_pinned=torch.device(device).type == "cuda"
+            )
+            self._lease_address = int(lease_block.data_ptr())
+            self._lease_d = int(lease_layout.d_offset)
+            # The committed copy count (the one word that gates both the copy and the acknowledgement) and, per
+            # lane, {request generation, slot generation, row, host slot}. Stable addresses: a graph captures them.
+            self.go_count = torch.zeros(1, dtype=torch.int32, device=device)
+            self.lane_ctx = torch.zeros((exl3_lease_block.LANES, 4), dtype=torch.int64, device=device)
 
     def _kernels(self):
         if self._module is None:
@@ -802,7 +831,8 @@ class Exl3RamMissDevice:
         self._check_row("next_row", next_row, allow_none=True)
         self._check_buffers(planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64))
         self._kernels().exl3_ram_miss_post(
-            self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row
+            self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
+            self._lease_address, self._lease_d,
         )
 
     def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:
@@ -816,8 +846,27 @@ class Exl3RamMissDevice:
         )
         if planned.numel() < host_rows.numel():
             raise ValueError(f"planned has {planned.numel()} lanes but host_rows {host_rows.numel()}: the wait reads planned per lane")
+        if self.lease_block is not None:
+            self._kernels().exl3_ram_miss_lease_wait(
+                self.page, self.state, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns,
+                self._lease_address, self._lease_d, self.go_count, self.lane_ctx,
+            )
+            return
         self._kernels().exl3_ram_miss_wait(
             self.page, self.state, self.slot_map, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns
+        )
+
+    def ack(self, keep) -> None:
+        """Launch the acknowledgement kernel: after the copy kernel, in the same stream (LEASE_PROTOCOL.md 6.4, 7.4).
+
+        Emits one LaneAck word per lane below ``go_count`` and nothing when ``go_count`` is zero. A lane whose slot
+        generation moved since the lease was granted is acknowledged VIOLATED, and ``keep`` is set to 0.
+        """
+        if self.lease_block is None:
+            raise RuntimeError("this device was built without a lease block")
+        self._check_buffers(keep=(keep, torch.float32))
+        self._kernels().exl3_ram_miss_lease_ack(
+            self.page, self.state, self._lease_address, self._lease_d, self.go_count, self.lane_ctx, keep
         )
 
     def stats(self) -> dict[str, int]:
