@@ -7,8 +7,11 @@ int64 tensors, so the C++ thread reads and splits rows without Python.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import threading
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
@@ -21,10 +24,18 @@ from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSeg
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
 from sglang.srt.layers.moe.exl3_row_reader import mirror_path
+from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
 
 logger = logging.getLogger(__name__)
+
+
+def _quarantine_service_at_exit(service: "weakref.ref[Exl3RamMissService]") -> None:
+    """Exit hook: no device barrier is attempted in an exit handler, so the tiers are quarantined, never freed."""
+    live = service()
+    if live is not None:
+        live.shutdown(at_exit=True)
 
 
 @dataclass(frozen=True)
@@ -338,6 +349,7 @@ class Exl3RamMissService:
         # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
         self.routed_rows_per_step = 0
         self._shut_down = False
+        self._quarantined = False
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -392,6 +404,11 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host = page, slot_map, host
+        # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
+        # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
+        # later is refused by register()), makes this run before that hook, so the slabs are quarantined and their
+        # finalizers detached before they could unregister them. Move this earlier and the quarantine is silently undone.
+        atexit.register(_quarantine_service_at_exit, weakref.ref(self))
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms",
@@ -528,21 +545,96 @@ class Exl3RamMissService:
             )
         self._trace_rows, self._trace_graph = rows, graph
 
-    def shutdown(self) -> None:
-        """Join the thread, then unregister every pinned tier's slabs; idempotent.
+    def _cuda_active(self) -> bool:
+        return torch.cuda.is_available() and torch.cuda.is_initialized()
 
-        The thread writes into the slabs through raw addresses, so it stops first.
-        The tiers must not be used afterwards.
+    def _synchronize(self) -> None:
+        torch.cuda.synchronize()
+
+    def _completion_deadline_s(self) -> float:
+        # A wait kernel is bounded by the wait timeout (and, once admission is closed, by the header word).
+        return envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 5.0
+
+    def _establish_gpu_completion(self) -> Optional[str]:
+        """None when every GPU reader is known to have finished, else why that could not be established.
+
+        The device-wide synchronize runs on a helper thread with a deadline: it is not interruptible, so a hung
+        kernel would otherwise hang shutdown with no way to say "uncertain".
+        """
+        if not self._cuda_active():
+            return None
+        outcome: dict = {}
+
+        def run() -> None:
+            try:
+                self._synchronize()
+                outcome["done"] = True
+            except BaseException as error:  # noqa: BLE001 - any CUDA error means completion is not established
+                outcome["error"] = error
+
+        deadline = self._completion_deadline_s()
+        helper = threading.Thread(target=run, daemon=True, name="exl3-shutdown-sync")
+        helper.start()
+        helper.join(deadline)
+        if helper.is_alive():
+            return f"the device synchronize did not return within {deadline:.1f} s"
+        if "error" in outcome:
+            return f"the device synchronize failed: {outcome['error']!r}"
+        return None
+
+    def shutdown(self, *, at_exit: bool = False) -> None:
+        """Stop admission, establish that no GPU reader runs, then free; else quarantine (LEASE_PROTOCOL.md 14.3).
+
+        Idempotent. The tiers must not be used afterwards. ``at_exit``: no device barrier is attempted in an exit
+        handler, so the tiers are quarantined unconditionally. Today this is called by tests and by the exit hook;
+        a production caller of the orderly path does not exist yet (LEASE_PROTOCOL.md 14.6).
         """
         if self._shut_down:
             return
         self._shut_down = True
+        uncertain: Optional[str] = None
         try:
             if self.host is not None:
-                self.host.stop()
+                self.host.close_admission()
+                uncertain = "process exit: no device barrier is attempted" if at_exit else self._establish_gpu_completion()
+        except BaseException as error:  # noqa: BLE001 - a failure to even close admission is an uncertain state
+            uncertain = f"closing admission failed: {error!r}"
         finally:
-            for layer_id in sorted(self.tables):
-                streamer = self.tables[layer_id].streamer_of()
-                tier = getattr(streamer, "pinned_host_cache", None)
-                if tier is not None:
-                    tier.close()
+            try:
+                # The service thread writes into the slabs through raw addresses, so it stops before anything is freed.
+                if self.host is not None:
+                    self.host.stop()
+            finally:
+                if uncertain is None:
+                    for layer_id in sorted(self.tables):
+                        streamer = self.tables[layer_id].streamer_of()
+                        tier = getattr(streamer, "pinned_host_cache", None)
+                        if tier is not None:
+                            tier.close()
+                else:
+                    self._quarantine(uncertain)
+
+    def _quarantine(self, reason: str) -> None:
+        """Keep everything a GPU kernel may still read or write alive until the process ends; free nothing."""
+        logger.error(
+            "exl3 RAM miss: shutdown could not establish that no GPU reader is running (%s); the pinned slabs, the "
+            "request page, the slot map, the lease block and the device buffers are quarantined until process exit",
+            reason,
+        )
+        owned: list[torch.Tensor] = []
+        if self.host is not None:
+            owned += [self.host.page, self.host.slot_map, self.host.lease_block]
+        if self.device_side is not None:
+            owned += [self.device_side.state, self.device_side.last_routes]
+        for layer_id in sorted(self.tables):
+            streamer = self.tables[layer_id].streamer_of()
+            tier = getattr(streamer, "pinned_host_cache", None)
+            if tier is not None:
+                tier.quarantine()
+            backend = getattr(streamer, "row_backend", None)
+            for name in ("host_rows", "ram_miss", "keep", "routes", "planned"):
+                tensor = getattr(backend, name, None)
+                if isinstance(tensor, torch.Tensor):
+                    owned.append(tensor)
+        quarantine_host_slabs(owned)
+        self._quarantined = True

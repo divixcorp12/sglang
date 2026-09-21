@@ -555,6 +555,10 @@ class Exl3RamMissHost:
         self._module.exl3_ram_miss_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
 
+    def close_admission(self) -> None:
+        """Shutdown, first step: the service serves nothing new and the header's shutdown word is set."""
+        self._module.exl3_ram_miss_close_admission(self.handle)
+
     def busy_since_ns(self) -> int:
         """When the request now in service began (0 when none): what the watchdog's stuck rule reads."""
         return int(self._module.exl3_ram_miss_busy_since(self.handle))

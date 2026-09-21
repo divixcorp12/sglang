@@ -275,6 +275,23 @@ def test_the_leases_exist_before_the_device_can_see_demand_done(tmp_path):
         host.stop()
 
 
+def test_closing_admission_sets_the_header_word_stops_new_service_and_keeps_retiring(world):
+    """Shutdown, step one. Mutation: the header word is not set, a request posted after the close is served, or
+    retirement stops with admission (an acknowledgement of work already in flight would then never land)."""
+    s, page, host, sim = world
+    first, first_wait = _serve(host, sim, 0, [3])
+    assert host.lease_header()["shutdown"] == 0
+    host.close_admission()
+    assert host.lease_header()["shutdown"] == 1
+    late = sim.post(0, [4])
+    assert host.pump() == 0 and page_word(page, "demand_done") == first.seq, "nothing new is served"
+    sim.ack(first, first_wait)
+    sim.deliver()
+    host.pump()
+    assert _leases(host, 0) == [0, 0, 0] and host.counters()["leases_acked"] == 1, "retirement goes on"
+    assert late.seq != first.seq
+
+
 if __name__ == "__main__":
     import sys
 

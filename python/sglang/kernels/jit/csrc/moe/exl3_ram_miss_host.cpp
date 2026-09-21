@@ -1614,6 +1614,7 @@ class RamTier {
   // Serve the next posted demand record, if any. True when it handled one.
   bool pump_demand() {
     retire_leases();  // first, so that an idle pump still retires what the device has acknowledged
+    if (admission_closed_.load()) return false;
     const uint32_t head = load_acquire(page_ + kDemandHead);
     if (head == 0 || !reached(head, next_demand_)) return false;
     // A deferred demand is not looked at again until a lease retires: no stage record, no clock read per poll.
@@ -1666,6 +1667,7 @@ class RamTier {
 
   // Serve (or skip) the next posted advisory record, if any. True when it handled one.
   bool pump_advice() {
+    if (admission_closed_.load()) return false;
     const uint32_t head = load_acquire(page_ + kAdviseHead);
     if (head == 0 || !reached(head, next_advice_)) return false;
     begin_stage(kStageAdvisory, next_advice_, head - next_advice_);
@@ -1777,6 +1779,13 @@ class RamTier {
     if (lease_ == nullptr) throw std::runtime_error("exl3 RAM miss: lease mode needs a lease block");
     if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set lease mode before the service thread starts");
     lease_mode_ = on;
+  }
+
+  // Shutdown, first step (LEASE_PROTOCOL.md 14.3 S1): the header word tells the device to stop waiting on the service,
+  // and the service serves nothing new. Retirement goes on, so acknowledgements of work already in flight still land.
+  void close_admission() {
+    admission_closed_.store(true);
+    if (lease_ != nullptr) store_release(lease_ + kLeaseHeaderShutdown, 1u);
   }
 
   void inject_done_stall(int64_t ns) {
@@ -2407,6 +2416,7 @@ class RamTier {
   bool lease_mode_ = false;             // set before the service thread starts; off is today's protocol
   Outstanding outstanding_[kDemandRecords];  // by request slot; guarded by mutex_
   std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
+  std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
   std::atomic<int64_t> done_stall_ns_{0};      // test only: sleep between serving a demand and storing demand_done
   std::atomic<uint64_t> lease_changes_{0};     // bumped whenever a lease is released: what wakes a deferred demand
   // The demand held back, if any (service thread only): its sequence, the changes seen when it was last refused,
@@ -2549,6 +2559,10 @@ void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted,
 
 int64_t exl3_ram_miss_busy_since(int64_t handle) {
   return exl3_ram_miss::find(handle)->busy_since();
+}
+
+void exl3_ram_miss_close_admission(int64_t handle) {
+  exl3_ram_miss::find(handle)->close_admission();
 }
 
 void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
@@ -2746,6 +2760,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_census);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_busy_since, exl3_ram_miss_busy_since);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close_admission, exl3_ram_miss_close_admission);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);
