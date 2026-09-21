@@ -216,6 +216,50 @@ file, not a measurement). It reproduced 38.61 / 19.17 / 33.53 ms per step, +5.09
 read layers (the A1 credit), and it printed a sum-check mismatch on the synthetic data (68,832 lanes against 64,857 `vram_miss`), so the check can fail. On the real
 schema-3 trace it exits with "not a schema-4 trace". It says nothing about the real placement.
 
+### Result: `task1f-0-new-on-T` (schema 4, gen4, mirrors on, 495 graph_step lines = 511 decode steps)
+
+Reported in the order the lead asked for. Everything below divides by `sum(steps)` (511). `task1f` ran under accepted CPU contention (`task1f-PURPOSE.txt`), so it answers
+a placement question and **no timing from it is quoted**; see the note on timing at the end.
+
+**1. The measured placement is inside the bounds, and not near an edge.** Hit lanes per decode step in layers that read: **33.9**. The bounds from R2 were 10.8 to 63.6
+computed per 495 lines; scaled to 511 they are about 10.5 to 61.6 (scaled, not recomputed, so I have not moved an edge by recomputation, but 33.9 is 46% of the way across and
+no edge is within 20 lanes of it). The prediction that the placement lies in the data-forced range held. It also lies well above the registered SUPPORT floor (37% of the A1
+credit, 11.3 per step at 511) at **3.0x** that floor, and above A1's own credit (31.9 per 495 lines, 30.9 per 511 steps, 29.3 with `k` from `vram_miss` per step).
+Hit lanes in layers that read nothing: 73.9 per step; total 107.9 (R2 estimated 108.4 at 511). So 31% of hit lanes sit in read layers, against the 29% A1 credited. A1's "spread
+evenly over layers" is good at the layer level: lanes per layer per step range 2.4 to 4.1 (mean 3.16), first ten layers 3.07 against last ten 3.17.
+
+**2. Checks.**
+- The trace is schema 4: all 20,800 request lines carry `schema` 4 and `request.lanes`; `dropped_before` is 0 on every line.
+- `sum(lanes)` over decode requests (those whose `forward` has a `graph_step`) is **64,635** against `sum(vram_miss)` **64,857**: -0.34%, inside the 0.5% tolerance and the same order as the
+  schema-3 `rows_asked` against `ram_miss` gap (9,514 against 9,462, identical here). Over all 20,800 requests it is 66,875 (+3.1%): the 2,240 lanes filed under forwards 2, 126, 251, 376
+  belong to steps with no `graph_step` line, so **the filter matters**. I did not explain the remaining -222 lanes (0.34%); a lag at the four session starts is the candidate, not shown.
+- `lanes >= rows_asked` on every read request (0 violations); max `lanes` is 6, so the model's cap of 6 was never binding and exact permutation averaging is valid.
+- **Line by line the sum does not hold**: `sum(lanes)` per `forward` equals that line's `vram_miss` in 16 of 495 lines (sd of the difference 10.6; merged lines average -16.6). Per-step grouping through
+  `forward` is unreliable, as `_trace_step` says; only run sums are used here.
+- Same stream as `task1-2-new-on-T`: `(layer, type, rows_asked, status)` identical for all 20,800 requests in order; 16 requests differ only in `forward` label and 4 `graph_step` lines shift a few
+  RAM misses between adjacent steps (the register lag), with equal sums. That is what allows the next item.
+
+**3. Recomputed figures with measured `k`** (`schema4_join.py`: measured lanes from `task1f` joined request by request onto the stage timings of `task1-2-new-on-T`; ms per decode step, shares of 257.5 ms):
+
+| k | BEST | RANDOM | two-phase | hit lanes in read layers | per-row over two-phase, best / random order |
+|---|---:|---:|---:|---:|---:|
+| A1 as registered (per 495 lines, for reference) | 38.61 (15.0%) | 19.17 (7.4%) | 33.53 (13.0%) | 31.9 | +5.09 / -14.35 |
+| A1 with the 511-step denominator (R6, denominator only) | 37.40 (14.5%) | 18.57 (7.2%) | 32.48 (12.6%) | 30.9 | +4.93 / -13.90 |
+| A1 corrected (R6, both) | 35.80 (13.9%) | 17.79 (6.9%) | 30.88 (12.0%) | 29.3 | +4.93 / -13.08 |
+| **measured** | **40.67 (15.8%)** | **20.07 (7.8%)** | **35.74 (13.9%)** | **33.9** | **+4.93 / -15.67** |
+
+The measurement is 13-16% above the A1-corrected figures and 5-7% above the registered ones (R6's overstatement and A1's understatement happen to nearly cancel against the original numbers, which
+is luck, not agreement). Verdicts: SUPPORT holds with more margin ((RANDOM - 1 ms launch) / T = 7.4%); two-phase 13.9%; per-row over two-phase is +4.93 ms (1.9%) at best order and **-15.67 ms at random
+order**, so R1 gets stronger; the 87/13 split becomes 87.9% (two-phase / best = 35.74 / 40.67), essentially unchanged. The per-row-over-two-phase best-order increment does not depend on `k` at all (it
+is `Sigma(m-1)*c` over steps, 4.93), which is why it is the same in every row.
+
+Where A1 was wrong: not in the layer spread but per request. Against measured `k` on 7,139 read requests, A1's `k` (with `vram_miss` per step) is exact for 36%, too low for 42%, too high for 22%; mean absolute error 0.88 lanes.
+A1 assigns every layer in a step the step's average, while the real lane count varies by layer and request (range 1 to 6); the errors mostly cancel in the sum but not to zero, and the net is a 14% undercount of hit lanes in read layers.
+
+**Timing.** `k` is content (a lane count) and does not depend on step duration. The BEST / RANDOM / two-phase figures are timing-derived, because they use the stage stamps (`observed`, `reserved`, `done`, row pack ends). I therefore took
+those stamps from `task1-2-new-on-T` and only the lanes from `task1f`. As a check on contamination the same model on `task1f`'s own stamps gives 40.73 / 20.13 / 35.79: within 0.06 ms of the joined figures, so the contended stamps
+do not change the model here; I still quote the joined ones. The figures inherit everything else the precheck assumes: A2 (an early readiness signal that does not exist), `c = 1.055`, the 1.0 ms launch cost, one workload (n_eff = 1).
+
 ## Appendix: scripts (`per_row_recompute/`)
 
 Run from divix01 with the directory copied over; each prints the numbers above. `D` in `core.py` is the hard-coded results
@@ -229,6 +273,7 @@ directory on divix01.
 - `spread_hide_tstep.py`: spread p50, hide_ok, read-wait, T_step variants.
 - `reap_ties.py`: same-reap tie counts (mirrors-on and mirrors-off).
 - `merged_steps.py`: R6, the merged `graph_step` lines and the recomputation with `steps` (four arms).
+- `schema4_join.py`: the schema-4 result (measured lanes joined onto `task1-2` stamps; k error; lanes per layer). Run after `schema4_lanes.py`.
 - `schema4_lanes.py`: the measured-`k` version for a schema-4 trace (see the Schema 4 section; plumbing-tested on a synthetic file only).
 
 The core function, for reference:
