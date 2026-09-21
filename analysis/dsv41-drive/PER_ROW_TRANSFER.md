@@ -131,6 +131,12 @@ Shares are of **254.4 ms** (denominator note below).
 | per-row over two-phase, random order | **-15.67** | **-6.2%** | yes |
 | hit lanes per step in read layers | 33.9 | | (is the `k` measurement) |
 
+**No saving in this table has been measured end to end.** What the trace measured is the lane count `k` (last column of the
+history, and the 33.9 above). BEST, RANDOM and two-phase are model outputs that consume `k`, and they still rest on inputs that
+were not measured for this path: `c = 1.055 ms` (an 18.2 figure), **A2** (the early readiness signal that does not exist),
+the assumed 1.0 ms launch cost, one workload, and stage stamps taken from a traced run and joined onto the measured lane counts. A
+better `k` does not turn a model into a measurement; this table is the artefact most likely to be quoted as if it were one.
+
 Also current: two-phase / BEST = **87.9%** (so the saving is about 88% hit-lane hiding and 12% miss-row spread);
 `(RANDOM - 1 ms launch) / T = 7.5%` against the 3% SUPPORT bar (7.4% on the registered 257.5 ms denominator). **Which numbers
 move with `k`:** BEST, two-phase, RANDOM and the random-order increment. **The best-order increment does not:** it is
@@ -211,6 +217,22 @@ attributed. The model's `c` and lane count are not contradicted by the step budg
   carry, not to resolve: **the per-line lane sum does not hold** (`sum(lanes)` equals a line's `vram_miss` in only 16 of 495
   lines, so only run sums are usable); and there is an **unexplained residual of -222 lanes (-0.34%)**, inside the 0.5% tolerance,
   which the recomputation did not account for.
+- **`c` is the link's time per row, and that bounds both mechanisms** (`PER_ROW_TRANSFER_REVIEW.md` G1). 13,315,584 B in 1.055 ms is
+  12.62 GB/s, against the 12.02 GB/s the reference measures for the Gen3 host link (`DSV41_REFERENCE.md`, "Link time / miss row at
+  12.02 GB/s", 1.11 ms): within about 5% of that ceiling, so `c` is not a kernel latency that an earlier or smaller launch could
+  shorten. Consequences: (1) **early copying cannot make a row cheaper**; it moves link busy time into read waits, where the link
+  would otherwise idle, and total link time per step is unchanged (about `126.9 * 1.055 = 134 ms` of the 254.4 ms step). (2) **The
+  hit-phase saving is capped request by request by `min(read_wait, h * c)`**, and summed over requests the cap is `sum h*c`:
+  33.9 hit lanes per step x 1.055 ms = 35.8 ms, which is V1's 35.74 ms. **That equality is not a coincidence: the model assumes every
+  hit copy hides completely (94% of requests wait at least `h*c`, registered, A1's `k`), so V1's figure is a ceiling by
+  construction, not an estimate.** A realised saving below it comes from requests whose read wait is shorter than `h*c`, or from
+  anything else using the link during the read wait. (3) **Anything else on the link during a read wait subtracts directly**: Task
+  8's promotion copies, the prefetch puller and the eager gather share the same Gen3 link, so a promotion in flight during a read
+  wait divides about 12 GB/s between it and the hit phase and the modelled hiding fails for that layer. Section 5.6 makes
+  "promotions off" a precondition of the arms. (4) **The traced read wait is not the untraced one** (the 94% is from traced runs;
+  a shorter untraced wait shrinks the window the hit copies must fit into; `exl3_stage_trace_overhead.py` exists and I did not read
+  its result). (5) Whether the copy kernel at `count = 1` runs at link rate is unmeasured (OPEN 1); the link arithmetic above is what
+  makes "it does not" unlikely, not a measurement.
 - `c = 1.055` is 18.2's number, from a node-mode trace of an older tree; it was not measured for this path in isolation.
 - Tracing was on in every trace used, which stretches request durations, and the 254.4 ms denominator includes three traced
   arms (section 1.2), so stretching is not fully excluded from the shares.
@@ -637,8 +659,23 @@ earlier gather": `keep` protects the *compute*; the per-stage `go` protects each
   67% that read nothing, pays a service round trip (`LEASE_PROTOCOL` 15, OPEN 11). That is Task 5's gate, but Task 6's
   benefit has to be reported net of it, and it is unmeasured.
 
+**Precondition of every arm, not a caveat on the result: promotions, the prefetch puller and eager gathers are OFF, and each arm's
+record says so.** They share the Gen3 link with the hit phase (section 1.4, G1); one in flight inside a read wait divides the link
+and the arm then measures link contention, not the mechanism, and it does so in the direction that flatters a null result (the
+saving looks absent), which is the kind of defect that survives review because the number is unsurprising. A later arm that
+combines Task 6 with Task 8 is a separate, labelled experiment.
+
 **Arms** (interleaved, untraced, n >= 3 clean per cell, unchanged cache capacity, mirrors on, the `task1e` harness and its
 stationarity and inconclusive-arm rules): A0 today; A1 V0' (Task 5 batched); A2 V1; A3 V2; and, as the earliest possible experiment, **A2b V1b** (section 3.3), which needs neither Task 5 nor a service change.
+
+**What the report must compare** (`PER_ROW_TRANSFER_REVIEW.md` G2). Lease mode arms every `count > 0` record, so all 40 layers pay
+a service round trip that today's path does not, and its cost X is unmeasured (`LEASE_PROTOCOL` OPEN 11). Then **V1 against A0
+(today) is the ceiling minus X**, and the difference has two parts: A1 against A0 is Task 5's cost or gain, A2 against A1 is Task
+6's overlap. **The report states all three differences, each with an interval** (A1 v A0, A2 v A1, A2 v A0), and must not present
+A2 against A0 alone as "the Task 6 result": that flatters Task 6 by exactly the cost it inherits, and quoting A2 against A1 without
+A1 against A0 hides a possible loss from Task 5. **V1b (A2b) needs no lease mode, so its baseline is A0 directly**, and its gain is not
+comparable with V1's without saying which baseline each used. A confirmed second half of the trap, beyond the baseline statement
+above: the comparison to make after the run, not only the arms to run.
 
 **Metrics.** Mean decode tok/s (headline; interval on the ratio); step-latency p50/p95/p99 (boundary stalls dominate the
 mean: 18.6's 2.1 s outlier); **graph node count** and `cudaGraphLaunch` host time per step for each arm (untraced, or
@@ -795,7 +832,10 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
 
 **Open (could not determine)**
 
-- **[OPEN 1]** Whether the 12 GB/s gather is link-limited or limited by the 8-SM kernel's own load latency.
+- **[OPEN 1]** Whether the 12 GB/s gather is link-limited or limited by the 8-SM kernel's own load latency. Narrowed but not closed:
+  `c` is 12.62 GB/s against a measured 12.02 GB/s link ceiling (section 1.4), which makes a latency limit unlikely at the batched
+  size; what is unmeasured is a one-row (`count = 1`) launch. If it is latency-limited there, a per-row copy is slower per row than
+  the batched one and the per-row-specific 12% shrinks further. The link-throughput microbenchmark of section 5.6 settles it.
 - **[OPEN 2]** The per-layer round trip of lease mode (`LEASE_PROTOCOL` OPEN 11) on the layers that read nothing.
 - **[OPEN 3]** Whether the traced request durations overstate the untraced ones, and by how much; `exl3_stage_trace_overhead.py`
   exists but I did not run or read its result.
