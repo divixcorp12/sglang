@@ -1291,8 +1291,29 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > first.** Both the original `test_a_bank_is_not_reused_until_every_row_in_it_has_packed`
 > (15 of 15 worker parametrisations) and the dedicated
 > `test_no_extent_reuses_a_bank...` fail on `assert (0 == 1)` from the refusal
-> -- **neither fails on its own ordering assertion any more.** Before the guard
-> existed, the dedicated test *did* fail on that assertion.
+> -- **neither fails on its own ordering assertion.**
+>
+> **THE CHECK FOUND SOMETHING WORSE THAN MASKING, AND RETRACTS THIS ENTRY'S
+> ORIGINAL CLAIM.** An earlier revision said the dedicated test *did* fail on
+> that assertion before the guard existed. **Its author retracted that**: the
+> run in question already carried a second guard -- a re-arm `RuntimeError`
+> added the same day -- so it was that throw all along. Re-run with the
+> `admit_batch` guard removed, the dedicated test fails on the **re-arm throw**;
+> with **both** guards removed it **hangs** (2-minute timeout, stuck in
+> `read_rows_traced`, no test result at all).
+>
+> **So the ordering assertion has never been observed to fire, and cannot fire
+> under this mutant.** It sits *after* `read_rows_traced` returns, and the
+> mutant corrupts slot state so the reader never returns -- no record is ever
+> produced for the assertion to judge. The requirement is protected by two
+> guards **plus** an assertion, and **only the guards have been seen to work.**
+>
+> **The remedy is to test the assertion directly, since no mutant can reach
+> it:** extract it as a pure helper and feed it crafted records -- an ordered
+> one passing, an extent submitted before the copy's end and one at the same
+> instant each raising, rows outside the reusing batch ignored. That shows the
+> assertion is correct *on a record*, which is all that is showable here, and it
+> must be stated with that limit rather than as an end-to-end demonstration.
 >
 > So the suite still detects the defect, and **nothing in it has been observed
 > failing on the rule the requirement names.** If the guard is later changed or
