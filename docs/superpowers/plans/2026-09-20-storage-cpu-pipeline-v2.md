@@ -220,8 +220,25 @@ Include expert identity in the immutable row result and validate it against the 
 >   resolved at plan time and merely kept host-side; that is under independent
 >   check and is not yet established.
 >
-> An independent code-level confirmation of the above is in progress. Until it
-> lands, treat the dependency as identified but not verified.
+> **CONFIRMED against the source** (`53bc8c7229`). `kDemandDone` is stored in
+> exactly one place, `RamTier::pump_demand`, *after* `handle_demand` returns --
+> i.e. after `serve()` has finished `RowReader::read()` and published every row.
+> `exl3_ram_miss_wait_kernel` polls only that word and has no per-lane or
+> per-phase input. `slot_map` does not substitute: `publish_map` for new rows
+> also runs after `read()`.
+>
+> **The early signal is a safety requirement, not only a performance one.** For
+> a RAM hit the `slot_map` entry already exists, so it is tempting to gather
+> hits from it during the read. That would be a correctness bug. The entry
+> carries **no ownership**, and today's safety rests on temporal exclusion that
+> early copying is precisely what removes -- an in-progress advisory on the same
+> tier evicts unprotected rows. The same early publication that lets the GPU
+> start is what grants the lease keeping the slot immutable. Any implementation
+> that treats this as a performance-only change, and reads `slot_map` early
+> without taking a lease, is reading memory that may be evicted under it.
+>
+> The change Task 5 must absorb is **when** the `RowResult` words are published
+> (at reservation, for hit lanes), not which words exist.
 
 **Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step (2.0%), or 2.55 ms at random lane order, against a gate that resolves about 1.5% -- while costing 160 extra stage triples per step across all 40 layers. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
 
