@@ -544,6 +544,31 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > before any code existed -- so this is a defect in how tests are designed, not
 > in how they are written.
 >
+> **UPDATE, same day: the count is 21, not 8.** An audit of `LEASE_PROTOCOL`
+> §18.2's test list -- run by its own author, against the standard above --
+> returned **13 more** (`8d38d593f6`, recorded as A1-A13), every one proven at
+> the source or carrying the named mutation it would miss. The shapes recur:
+> vacuous preconditions (a test that never reaches the interesting state unless
+> the tier is exhausted, or acks are withheld, or a timeout fires in the right
+> window); one-directional tests (a leaked lease refusing a pause -- passed by an
+> "always refuse" implementation, with the converse untested); a technique that
+> does not detect the thing it is aimed at (poisoned-recycle tests cannot see a
+> rewrite of a slot nobody is reading; only a sentinel plus slot generation
+> catches an eviction reloading the same expert with identical bytes); and
+> model-not-service shapes, where a simulated device is tested against the same
+> author's spec and a kernel acknowledging `[0, count)` instead of
+> `[0, go_count)` passes every CPU test.
+>
+> **The sharpest of the 13 is A12, and it generalises to this whole plan:** every
+> new service test "fails on today's code with a missing name, which is not
+> evidence." A test that fails because a symbol does not exist yet has not been
+> shown to catch anything. **A red test is evidence only when it goes red for the
+> behaviour it names**, under a mutation applied to the *finished* code.
+>
+> Related: §20.0 claimed every model mutant becomes a regression test on the real
+> code. That is false for three kernel-only mutants (`ack_after_copy=False`,
+> fail-open, detector-off), which have no CPU analogue at all.
+>
 > **RULE for the remainder of this plan: write the mutant first.** Before a test
 > is accepted as evidence for any gate here, name the specific change to
 > production code it must fail against, and show it failing. A test whose
