@@ -44,8 +44,7 @@ Do not run this to measure lease-mode arming cost. It cannot resolve it.
 What was verified without loading the model: `--dry-run` on divix01, the import-path assertion, all paths, and
 `test_harness.py`. Nothing here has ever been run against the model.
 
-The rest of this file describes the harness as built. Its figures of ~67 ms per token and a ~1% effect
-(Cost model, Launch, and the effect section below) come from the wrong denominator; read them with the note above.
+The rest of this file describes the harness as built, with DSV4.1 figures (~360 ms in-graph step, ~0.19% effect).
 
 ## The GRAPH_GATHER trap
 
@@ -71,9 +70,11 @@ Do not read "both arms gave the same number" as a finding. Read `lease_check` in
 
 ## Cost model: two loads, nothing more
 
-The model load (~70 GiB pinned host cache) dominates; decode tokens are cheap (67 ms each was assumed; the measured DSV4.1 in-graph figure is ~360 ms, see the shelving note). The switch is read once at
-service start, so two process launches is the floor, and it is the default: one `lease_off`, one `lease_on`, one
-repetition. Nothing is pre-planned beyond that. `--reps` (default 1) counts pairs.
+The switch is read once at service start, so two process launches is the floor, and it is the default: one
+`lease_off`, one `lease_on`, one repetition. Nothing is pre-planned beyond that. `--reps` (default 1) counts pairs.
+Each process pays a model load (~70 GiB pinned host cache, ~80 s to engine ready in the Sept 19 runs) and then a window
+that is not cheap: a DSV4.1 in-graph decode step is ~360 ms and a cold 256-token prefill ~55 s, so the default window
+below is ~12 min of decode plus ~4 min of TTFT per arm.
 
 ## Launch
 
@@ -108,33 +109,34 @@ second of its pair.
   the first `--discard-steps` (30) steps of every measured request are dropped. The count is in
   `summary.discarded_steps_per_request`.
 - **Default window: 4 requests x 512 tokens**, four different corpus prompts of 256 tokens, greedy, `ignore_eos`:
-  4 x (512 - 1 - 30) = 1924 per-token samples per arm, ~2 min at 67 ms. Both arms see the same prompts in the same
+  4 x (512 - 1 - 30) = 1924 per-token samples per arm, ~12 min at ~360 ms per step. Both arms see the same prompts in the same
   order. Decode batch size is pinned at 1 by the EXL3 gate, so requests cannot overlap and each one's TTFT (prefill,
   possibly tens of seconds of cold RAM misses) is pure overhead that adds no decode samples. Hence few requests with
   many tokens each; 4 rather than 2 so the window spans four routes, not one pathological one. Nothing about the
   count is sacred: `--requests 2 --output-tokens 1024` gives 2000 samples for two TTFTs, `--requests 8
   --output-tokens 256` for eight.
 - **Projected wall clock**: right after warmup the process prints `[projection] ...` from the warmup request's own TTFT
-  and decode rate: the measured window and this process's total. The project's figures disagree (~67 ms/token in-graph
-  vs 300-450 ms in the Sept 19 corpus runs), so read the projection in the first minutes and abort (Ctrl-C) if it is far
-  off; `--max-projected-s N` makes the process abort itself if the projected window exceeds N seconds. The warmup is
-  the coldest request, so the projection leans slow.
+  and decode rate: the measured window and this process's total. Expect ~360 ms per token in-graph (the shelving
+  note's table); if the printed rate is far from that, the configuration is not the one this README describes. The
+  warmup is the coldest request, so the projection leans slow. `--max-projected-s N` makes the process abort itself
+  if the projected window exceeds N seconds.
 - Reported: min, p50, p95, p99 and mean of step latency; tokens/s over the whole window (prefill included).
 - **Within-arm spread**: the samples are cut into `--blocks` (5) consecutive slices; `p50s`/`mins` of each slice and
   their relative range are recorded. Consecutive, so a drift within the window shows up as spread.
 - **Concurrency stays 1**: the EXL3 gate allows decode graphs at batch size 1 only, so a batch of two runs eagerly and
   skips the lease path. `--concurrency 2` is refused unless `--allow-eager-batches`.
 
-## The effect to resolve, and why ~1900 tokens
+## The effect to resolve, and what a window resolves
 
-The lease cost is ~0.68 ms per 40-layer step. On the ~66.8 ms this section was written against that is about 1%; on the real ~360 ms DSV4.1 step it is ~0.19% (see the shelving note). The standard error of a p50 over n samples is
-about 1.25 x sd / sqrt(n), so 1924 samples resolve 0.67 ms if the per-step sd is below roughly 8 ms; a run whose
-steps stall on RAM misses (sd of tens of ms) will not, and the block spread will say so. **This is the condition under which the exercise fails**: if the per-step sd is above ~8 ms (RAM-miss stalls, box
-contention) the 1% is unresolvable from one pair, and a `NOT RESOLVED` verdict says that, not that there is no effect.
-The main threat is
-cross-process variance (two processes, two loads), which is why `min` is reported beside p50: on the OPEN 11 re-take
-min-to-min and p50 agreed to 0.4 us on a quiet card and disagreed six-fold on a busy one. A p50 delta whose min-to-min
-delta disagrees in sign is box noise.
+The lease cost is ~0.68 ms per 40-layer step: ~0.19% of a ~360 ms DSV4.1 in-graph step. The standard error of a p50
+over n samples is about 1.25 x sd / sqrt(n); the smallest p50 difference between two arms this window calls resolved is
+3 x 1.25 x sd x sqrt(2 / n) (`compare.detectable_delta_s`). With n = 1924 that is 0.12 x sd, so 0.68 ms needs a
+per-step sd below ~5.6 ms. RAM-miss stalls give a per-step sd of tens of ms (base sessions span 2.2-3.5 tok/s), so
+the window resolves roughly 7-12 ms (2-3%) and this harness returns `UNRESOLVED` for this effect; reaching 0.68 ms at
+sd 60 ms would take ~2 x 10^5 samples per arm (~20 h of decode). A `NOT RESOLVED` or `UNRESOLVED` verdict says the
+window could not see the effect, not that there is none. Cross-process variance (two processes, two loads) is the
+other threat, which is why `min` is reported beside p50: on the OPEN 11 re-take min-to-min and p50 agreed to 0.4 us
+on a quiet card and disagreed six-fold on a busy one. A p50 delta whose min-to-min delta disagrees in sign is box noise.
 
 ## Decision rule: do not reflexively run three of everything
 
@@ -144,8 +146,8 @@ Run the pair once. Then read the last lines of `comparison.md` (also `compare.py
   `decision: RESOLVED`. Two loads were enough.
 - **`UNRESOLVED` is a result**: "any effect of lease mode on the p50 decode step is below X%", where X is what this
   window could resolve (the larger of 2x the block spread and 3 standard errors of the p50 difference from the
-  per-token sd). At a 400 ms step that bound is a few percent and the 0.68 ms effect is under 0.2%, so expect this
-  verdict there; it is an upper bound, not a null.
+  per-token sd). At the ~360 ms step and a 60-100 ms sd that bound is 2-3% against a 0.19% effect, so
+  expect this verdict for lease-mode arming; it is an upper bound, not a null.
 - **Watch the first two minutes**: after warmup each process prints `[projection]` and `[resolvability]` (per-token sd of
   the warmup request, what the planned window resolves, versus `--expected-effect-ms`, default 0.68). If it says
   `UNLIKELY TO RESOLVE`, abort before the second arm. Warmup is the coldest request, so this leans pessimistic.
@@ -184,7 +186,7 @@ recorded: the trace snapshots per batch, not per step boundary, so a nonzero fin
 weaker than in `open11`.
 
 **The trace may also inflate the variance**, not just the step time, and variance is what decides resolvability
-(the sd < ~8 ms condition above). Its per-step overhead is not measured: measuring it needs an untraced arm, which
+(the sd < ~5.6 ms condition above). Its per-step overhead is not measured: measuring it needs an untraced arm, which
 costs a third load. Every result therefore carries `trace_overhead = {"measured": false, "trace_enabled": true}` and
 `compare.py` prints it, so a number is never read as if the tree were untraced. To measure it, run one extra
 `lease_off` process with `--no-trace` and compare its step statistics to the traced `lease_off` (its lease check will
@@ -192,7 +194,7 @@ be reported as unverified by design).
 
 **The trace is on in both arms**, so the service also takes stage timestamps and the scheduler writes a JSON line per
 decode step. That is symmetric between the arms so it cancels in the delta, but its cost per step is unmeasured, and it adds
-to the step time the 1% is taken against. `--no-trace` removes it and
+to the step time the 0.19% is taken against. `--no-trace` removes it and
 the verification with it.
 
 ## Fixed choices, and where they come from

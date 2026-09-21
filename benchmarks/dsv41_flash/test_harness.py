@@ -265,18 +265,18 @@ def _run(arm, p50, mn, spread, ok=True):
 @pytest.mark.parametrize(
     "on_p50, on_min, spread, verdict",
     [
-        (0.0675, 0.0605, 0.002, "RESOLVED"),  # +1% p50 and min, spread 0.2%
+        (0.3636, 0.3330, 0.002, "RESOLVED"),  # +1% p50 and min, spread 0.2%
         (
-            0.0675,
-            0.0605,
+            0.3636,
+            0.3330,
             0.02,
             "UNRESOLVED. Any effect of lease mode",
         ),  # same delta buried in 2% spread
-        (0.0675, 0.0590, 0.002, "disagree in sign"),  # p50 up, min down: box noise
+        (0.3636, 0.3200, 0.002, "disagree in sign"),  # p50 up, min down: box noise
     ],
 )
 def test_the_second_pair_decision_rule(on_p50, on_min, spread, verdict):
-    off = _run("lease_off", 0.0668, 0.0600, spread)
+    off = _run("lease_off", 0.3600, 0.3300, spread)
     on = _run("lease_on", on_p50, on_min, spread)
     text = "\n".join(compare.decision({"lease_off": [off], "lease_on": [on]}))
     assert verdict in text
