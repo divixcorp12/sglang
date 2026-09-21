@@ -310,13 +310,15 @@ Include expert identity in the immutable row result and validate it against the 
 >    mutant and confirm a pause-refusal test kills it; the reviewer did not check
 >    that such a test exists.
 >
-> **ONE QUALIFICATION to "no consumer today", from the same review:** that is
-> true of the **demand** path, which is one batch. **On the advisory path the
-> call actually repeats** -- and the reviewer records it as **not covered by
-> tests**. So the held package has a case where its call site fires more than
-> once, on the one path nobody exercised. Whether a repeated retire has a
-> consumer *there* is a separate question and is also unanswered. Test the
-> advisory path before landing, whenever that is.
+> **THE ADVISORY QUALIFICATION, now resolved.** An earlier revision recorded
+> that the call repeats on the **advisory** path -- the reviewer's point -- and
+> left open whether a repeated retire has a consumer there. It does not:
+> **advisories grant no leases**, so the repeated call has nothing to retire.
+> The author also reports that advisory-path retirement between rows is
+> **unreachable from the service**, so it cannot be tested from there either.
+> So the finding is stronger than first written: **neither path has a consumer
+> today** -- demands because the callback fires once before any I/O, advisories
+> because there is never a lease to release.
 >
 > **Box 5 does not move either way** -- "keeps reaping during a long read" has a
 > call site in the held package and no multi-batch demonstration anywhere.
