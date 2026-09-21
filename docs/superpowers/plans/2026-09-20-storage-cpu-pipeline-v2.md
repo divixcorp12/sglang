@@ -277,7 +277,19 @@ Include expert identity in the immutable row result and validate it against the 
 > out the usual way a sentinel check goes vacuous -- test slabs that do not alias
 > the memory the service writes.
 >
-> **It stays open on its first clause, not its last.** "Inject delayed GPU
+> **CORRECTION to this note's own first draft:** it said the box stays open "on its
+> first clause, not its last". That was too clean. Clause 4, "while a newer request
+> exists", is demonstrated for newer requests that are *served* -- a demand and an
+> advisory each reserve, read and evict while the older lease is outstanding -- but the
+> `world` fixture drives the service with a manual `host.pump()`, so those requests are
+> serial, not concurrent. A newer request that is merely pending or deferred is covered
+> only by the defer tests, which assert eviction counts and not bytes. So clause 4 is
+> demonstrated in the sense the box most plausibly means and unproven in the stronger
+> concurrent sense. The pump-mode fixture is not a vacuity risk here the way it was for
+> E1 -- this property does not route through `pause()` -- and the four mutant kills
+> settle that empirically.
+>
+> **It stays open on its first clause.** "Inject delayed GPU
 > consumption" is satisfied by `LeaseSim`, a CPU stand-in written from this same
 > specification, and `exl3_ram_miss.cuh` carries only the layout constants for
 > `LaneAck` (:83-85) -- **no acknowledgement kernel exists**. `LEASE_PROTOCOL`
