@@ -380,7 +380,20 @@ Include expert identity in the immutable row result and validate it against the 
 > - **The two-phase row is a ceiling by construction.** 33.9 x 1.055 = 35.77,
 >   which *is* the 35.74 figure: it is every hit copy perfectly hidden. Nothing in
 >   it models a hit copy that fails to hide. `c` is the Gen3 link's time per row
->   (13.3 MB in 1.055 ms is 12.62 GB/s against a measured 12.02), so copying early
+>   -- but **the arithmetic offered for that is wrong and is withdrawn**
+>   (`05c5510392`). An earlier revision of this plan said "13.3 MB in 1.055 ms is
+>   12.62 GB/s against a measured 12.02". The 12.02 GB/s is not a DSV4.1 link
+>   measurement: it is `2,764,800 B / 0.23 ms` for the **older 2.76 MB NVFP4 row**
+>   (`MOE_EXPERT_TRANSFER.md` line 433). And 12.62 is **above** 12.02, so even
+>   taken at face value it did not support the claim it was cited for. **What
+>   `c` = 1.055 actually is:** the gather kernel's traced total of 128 ms/step
+>   divided by G = 121.2 rows/step, from one node-mode `nsys` arm on an older
+>   tree with mirrors off -- a batched in-situ average, not a link figure. The
+>   only direct measurement of this kernel is 12.34 GB/s past L2
+>   (`NC_VISIBILITY.md`), giving **c = 1.079**; `cudaMemcpyAsync` gives 0.966.
+>   **The existing evidence bounds `c` to roughly 0.97-1.08 ms and does not choose
+>   within it.** The qualitative point stands -- the copy is link work, so copying
+>   early moves link time into the read wait
 >   **moves** link time into the read wait rather than creating capacity, and
 >   promotion copies, the prefetch puller and the eager gather share that link.
 >
