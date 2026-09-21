@@ -143,7 +143,45 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 | file | sha256 |
 |---|---|
 | `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c` |
-| the harness | *to be appended before the lock is taken* |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `171302f871ee45d2c14d9743d6f9c92ec02edc64c3bcee11a9d6fb553b6f7992` |
+| `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
+| `c_measurement/prebuild_jit.py` (compiles the gather kernel's JIT module with no GPU) | `015215022edf78dd69f98002e1c1d7bbc982fa2662cd5cca09ab7091d4fbb782` |
+| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `3fe0403056a2947299bbf2a5ad9943d018a7d7ff03ca91fba5e55d2f876a1750` |
 
 Self-test, 2026-09-21 on divix01, CPU: `c = 1.00` gives STANDS (`g*_H` 6.22), `c = 1.055` gives INTERMEDIATE (`g*_X` 7.01, `g*_H` 8.06, gross 4.92: the earlier model's 6.98 / 8.03 / 4.93 within `f`), `c = 1.15` INTERMEDIATE, `c = 1.40` WITHDRAWN, and an
 impossible bandwidth, an idle link, row reuse, foreign load and a wrong row size are INVALID. **That tests the logic and the arithmetic reproduction, not the GPU.**
+
+## 10. The harness as built (added when it was written; the registered design above is unchanged)
+
+**Disclosed implementation choices** (also in the harness docstring): the "idle stream" is realised as a 600 us spin kernel before every timed launch so the host is always ahead of the GPU and its launch latency stays outside `T`;
+the plan tensors are updated by device-to-device copies outside the timed window, for eager and graph alike; each cell's 200 launches are two visits of 100 (ABBA), after 20 discarded warm-up launches per visit; the six segment sizes
+are derived from the dimensions (hidden 5120, intermediate 2304) and checked against the measured 13,315,584 B, not read from a loaded layout; `hot` packs with a one-thread torch copy on the launching thread, not the service thread; the `ce` arm's `T`
+includes host enqueue of 6 x n copies, so it is a lower bound on the copy engine's speed, not its peak (its role is only the yardstick for the gate, which uses the registered 13.79 GB/s).
+**Reuse distance is measured, not assumed:** each cell records the minimum reuse distance of the time-ordered rows read from that node's slabs (a permutation ring, so 150), and gate 4.1 reads it.
+**Harness-level refusals, additional to the frozen gates:** a node's slabs must be at least 99% on the requested node by `move_pages`; each node's first launch is checked to have moved the intended rows (row ids are stamped in the first 8 bytes); the `nvme` arm writes
+`results.INVALID` (exit 3) if the reader did not average 1.0 GB/s in every load window. `--skip-arms hot|repeat|ce|graph` exists as a **declared deviation** recorded in `meta.json`; the frozen analysis still requires the primary arms.
+
+**What was tested, on CPU (2026-09-21):** 7 tests pass (segment sum; ring and reuse distance; ABBA coverage; the arm list; a dry run feeds `c_analysis.py` and it recovers the synthetic `c = 1.08`, `f = 0.006` and the load arm's 8% ratio; each of six gates fires on
+bad harness output; the foreign-load meter sees a spinning process). On divix01: the harness's imports resolve against `wt-task1-new` with the engine's `/data/models/slang/.venv` Python; **the gather kernel's JIT module was built with no GPU** by `prebuild_jit.py` (6.2 s, cached under `~/.cache/sglang/jit/sm120f`), so the window has no compile; the NUMA helpers
+bound 24 MiB slabs to node 0 and node 1 and `move_pages` confirmed 1.00 and 0.99. **Not tested, because it needs the GPU or the drives:** the real device path end to end (CUDA context, registration, the copy check, event timing, the graph capture, the copy-engine arm), and the reader's real I/O (its imports resolve).
+
+**Known risks for the window.**
+1. **P-state.** Gate 4.1 requires P0 at the start of every cell. The `hot` arm syncs after every launch and the GPU is idle while the CPU packs, so it may sit below P0. If `hot` cells alone fail the gate the whole run is INVALID by the registered rule; the fallback is `--skip-arms hot` with the deviation named in the report. I would look at the first pass's states before deciding.
+2. **Page cache.** Node 1 had 734 MiB free (node 0: 6.3 GiB) on 2026-09-21. Binding 2 GiB there evicts about 1.3 GiB of page cache; that is a side effect on any later arm's cold/warm state (`PIPELINE_BASELINE.md`'s regime notes). Run this window **after** any pending timed arm, or re-warm.
+3. **Threads.** `gpu-run.sh` pins the harness to cores 32-63, which span both nodes, so the launching thread may run on either; `cpu` is recorded per cell.
+
+**Command (for whoever holds the lock).** Copy `c_measurement/` (with `bench_mirror_rows.py`, `bench_row_scheduling.py`, `drive_conditions.py` beside its parent) to a scratch directory on divix01 keeping the relative layout, then:
+
+```text
+CC=/data/models/slang/nvfp4-work/cc-expert-prediction
+env CUDA_HOME=/usr/local/cuda-13.2 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$CC/wt-task1-new/python \
+  $CC/analysis/dsv41-phase3b/gpu-run.sh /data/models/slang/.venv/bin/python <dir>/c_measurement/c_harness.py \
+  --out <outdir> --repo $CC/wt-task1-new --with-nvme --reader-cpus 18-25
+python3 <dir>/c_measurement/c_analysis.py <outdir>/results.jsonl        # the frozen verdict
+```
+
+`--reader-cpus 18-25` is node 1 outside cores 32-63 and 64-71. First minute: the same command with `--check-only` (no `--with-nvme`) does the allocation, registration and copy check and exits.
+
+## 11. Retirement of the earlier design
+
+`TOPOLOGY.md` 9.B is **retired**, superseded by this document; 9.C's GPU side is carried by the `nvme` arm (its remote-bounce placement matrix stays open and unscheduled); **9.A (storage alone, no GPU) stays as an independent item.** The status lines in `TOPOLOGY.md` say so.

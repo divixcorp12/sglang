@@ -1030,7 +1030,7 @@ a number valid, so the run can be scheduled without further design.
 
 ### 9.A Storage alone (heavy drive I/O; no GPU)
 
-**Status: designed, not run; an option.** Needs no GPU. It would need the drives otherwise idle and a quiet box.
+**Status: designed, not run; an option; independent of the `c` measurement and NOT retired** (2026-09-21: it needs no GPU and can share a quiet hour with the `c` window, but it answers a storage question and stays its own item). Needs no GPU. It would need the drives otherwise idle and a quiet box.
 
 - **Question.** What does each mirror deliver alone and both together with the production read geometry, and what
   does the submitting thread spend? Revision 1 has nvme0 alone (3.56 GB/s, 90 % of the Gen3 x4 ceiling) and
@@ -1049,7 +1049,7 @@ a number valid, so the run can be scheduled without further design.
 
 ### 9.B Current SM transfer alone (GPU)
 
-**Status: deferred, not queued.** Moved to Task 9's tracking table. Reason: the Task 3 gate is "choose placement and a resource budget for Task 4", and Task 4 is already implemented and committed, so this measurement is retrospective; the placement recommendation (§7.8) and the negative results (§8.4a) stand without it. It needs the GPU lock and a quiet box if it is ever run.
+**Status: RETIRED 2026-09-21, superseded by `C_MEASUREMENT_PREREG.md`** (the same question, asked with the real six-segment layout, counts 1-6 and rows drawn without replacement, and a decision rule; the design below is kept as the record of the earlier version and is not to be run). Earlier status: deferred, not queued. Moved to Task 9's tracking table. Reason: the Task 3 gate is "choose placement and a resource budget for Task 4", and Task 4 is already implemented and committed, so this measurement is retrospective; the placement recommendation (§7.8) and the negative results (§8.4a) stand without it. It needs the GPU lock and a quiet box if it is ever run.
 
 - **Question.** What does the production SM (GPU-pull) gather deliver from host to device, at an honest working
   set, on this box's Gen3 link and NUMA layout, and what does the copy engine deliver as a separately labelled comparison?
@@ -1075,7 +1075,7 @@ a number valid, so the run can be scheduled without further design.
 
 ### 9.C Storage and SM transfer simultaneously (GPU + heavy drive I/O)
 
-**Status: deferred, not queued.** Moved to Task 9's tracking table, for the reason given in §9.B; the two-drive-into-remote-bounce question it would answer stays **[U]**.
+**Status: RETIRED 2026-09-21, as far as the GPU side goes: the `nvme` load arm of `C_MEASUREMENT_PREREG.md` measures the SM gather under concurrent drive-to-host DMA** (one drive-local bounce node, both slab nodes). What it does **not** carry over is the two-drive-into-a-*remote*-bounce placement matrix, which stays **[U]** and is not scheduled. Earlier status: deferred, not queued. Moved to Task 9's tracking table, for the reason given in §9.B.
 
 - **Question.** Do the two add, or do they contend? Contention is possible in the drive-to-host DMA writes into
   memory, the socket interconnect (drives and the GPU are on different nodes, §1.2), the memory controllers of
