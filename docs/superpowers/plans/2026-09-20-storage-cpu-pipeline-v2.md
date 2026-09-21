@@ -174,7 +174,30 @@ Include expert identity in the immutable row result and validate it against the 
 > kernel rows need step 4 and a GPU. **The wrap tests are the only
 > service-level mutation evidence in the entire lease test list today.**
 
-- [ ] Document aligned fields, single-writer ownership, system release/acquire operations, wrap handling, and request-slot reuse before coding. Use a coherently validated protocol; ordinary Python stores are not its implementation.
+- [x] Document aligned fields, single-writer ownership, system release/acquire operations, wrap handling, and request-slot reuse before coding. Use a coherently validated protocol; ordinary Python stores are not its implementation.
+  - **Artefacts:** `LEASE_PROTOCOL.md` (`cc30fe34f4`) covering aligned fields §4, single-writer ownership §5, release/acquire §6, wrap §11, request-slot reuse §11.4; the explicit-state model `lease_model.py` (`3d11d02265`); the independent transcription review `LEASE_MODEL_REVIEW.md` (`2cbe9b4b92`).
+  - **"Before coding" is checked, not asserted:** the document lands 01:16, the model 01:45, and the first lease code is step 1 (`1b22ea4626`, 02:44). `git log -S kLease -- python` returns only steps 1 and 2. The doc precedes the first line of lease code by about 88 minutes.
+  - **Seen to fail:** documentation cannot, but the model's mutants do -- 19 protocol mutants plus the review's additions each fail with the named violation, and the model found a hole in the document's own draft, which is why the epoch design changed.
+  - **RESIDUAL, named not hidden:** "coherently validated" is satisfied by a sequentially consistent model, the `.nc` experiment and an independent review. It is **not** validated against the kernels, which do not exist yet.
+> **What steps 1-2 delivered, and why it closes no box below.** Landed: the lease
+> block layout and allocator (step 1, `1b22ea4626`), and slot generations, the
+> lease block header and row table, a lease-aware eviction predicate and a
+> mandatory dry run (step 2, `6ea3b6a4f9`; 269 passing against a base of 226 + 1
+> skipped, 19 mutants with one survivor found and fixed). Also the slab half of
+> shutdown, `ExpertPinnedHostCache.quarantine()`, 4 tests, 2 mutations caught and
+> one test fixed after it proved unable to fail.
+>
+> **None of that closes a box, because every box below asks for a demonstration
+> and these are mechanisms.** No lease is granted by the service; `inject_lease`
+> is a test hook standing in for a GPU reader. An eviction predicate that respects
+> an injected lease is not the same claim as "a leased source stays immutable
+> while a newer request exists". **Step 3 is what makes box 3 closable.**
+>
+> Box 7 deserves its own note: nothing has touched Option F's arming or
+> acknowledgement ordering and its suites pass unchanged, but **"I did not change
+> it" is not a demonstration that it holds under leases.** That can only be shown
+> once lease mode exists and its handshake is exercised, at step 5/8.
+
 - [ ] Initially exercise the acknowledgements after the existing whole-request copy, without changing its scheduling. Include RAM hits as well as newly read rows in source ownership.
 - [ ] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
 > **The all-or-nothing guarantee is unpinned in BOTH directions** (second
