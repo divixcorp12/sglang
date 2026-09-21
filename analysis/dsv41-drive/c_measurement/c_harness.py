@@ -474,8 +474,14 @@ class RealDevice:
                 if hot: ends[i].synchronize()
         self.stream.synchronize()
         T = [s.elapsed_time(e) for s, e in zip(starts, ends)][WARMUP_LAUNCHES:]
-        self.consumed[node] += launches * n
-        if cell.state != "repeat": self.global_seq[node].extend(ids)     # time-ordered rows read from this node's slabs (warm-up launches included)
+        # amendment 9: a `repeat` cell reads list(range(n)) and never draws from the ring, so it must not advance the
+        # ring cursor either. It used to, while contributing nothing to global_seq, which tore the sequence that
+        # reuse_distance measures: for n=6, 220*6 = 1320 and 1320 % 150 = 120, so the next node-0 cell resumed 120
+        # rows into a 150-row ring and the global minimum reuse distance read 30 instead of 150. `repeat` runs on
+        # node 0 only, so every node-0 SM cell failed the L2 gate and node 1 failed none.
+        if cell.state != "repeat":
+            self.consumed[node] += launches * n
+            self.global_seq[node].extend(ids)                            # time-ordered rows read from this node's slabs (warm-up launches included)
         return T, {"cpu": _syscalls().sched_getcpu()}                # (v6: os.sched_getcpu does not exist; found on the first real visit)
     def close(self):
         pass

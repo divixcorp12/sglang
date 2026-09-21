@@ -180,6 +180,19 @@ if __name__ == "__main__":
     r = analyse(lines, *(tr or [None, None]))
     print("VERDICT:", r["verdict"])
     for g in r["gates"]: print("  gate:", g)
+    # amendment 9. A marker beside the input is printed here, after the verdict word and before anything else, so its
+    # SCOPE is always in view: section 12 item 3(b) voids the `nvme` arm's rho, not the run, and an unconditional
+    # refusal would permanently block a run whose only fault is rho.
+    marker = os.path.join(os.path.dirname(os.path.abspath(args[0])), "results.INVALID")
+    if os.path.exists(marker):
+        print("  marker:", open(marker).read().strip())
+    # amendment 9. On an INVALID verdict no fit, flag or model line is printed, whatever the caller does with the
+    # output. Run 1 of `c` was collected with `tail`, which showed the fits before line 1 had been read, so fitted
+    # values for a voided run were seen; the answer to "I saw something I should not have" is to make seeing it
+    # impossible. This can only withhold numbers, never admit them.
+    if r["verdict"] == "INVALID":
+        print("  (INVALID: no fit, flag or model line is printed)")
+        sys.exit(3)
     for k, f in r["fits"].items(): print("  fit %s: f %.4f ms, c_marginal %.4f ms, T(1) off-line %.3f, GB/s by n %s" % (k, f[0], f[1], f[2], ["%.2f" % x for x in f[3]]))
     for fl in r.get("flags", []): print("  flag:", fl)
     for k, m in r.get("model", {}).items(): print("  model", k, {a: (round(b, 3) if isinstance(b, float) else b) for a, b in m.items()})
