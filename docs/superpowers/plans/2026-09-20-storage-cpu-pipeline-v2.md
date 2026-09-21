@@ -151,7 +151,7 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 
 ## Task 5: Implement and test source leases and device acknowledgements
 
-**Files:** Native service/pipeline header; `python/sglang/kernels/jit/csrc/moe/exl3_ram_miss.cuh`; `python/sglang/kernels/ops/moe/exl3_ram_miss.py`; `python/sglang/srt/layers/moe/exl3_ram_miss.py`; thread and GPU graph tests.
+**Files:** Native service/pipeline header; `python/sglang/kernels/jit/csrc/moe/exl3_ram_miss.cuh`; `python/sglang/kernels/ops/moe/exl3_ram_miss.py`; `python/sglang/srt/layers/moe/exl3_ram_miss.py`; thread and GPU graph tests. **Plus, found during design and missing from this list:** `python/sglang/srt/layers/moe/expert_stream.py` and `python/sglang/srt/layers/moe/expert_host_tier.py`. `ExpertPinnedHostCache.__init__` registers a `weakref.finalize(..., release_host_slabs)` with the default `atexit=True`, so the slabs are unregistered at every ordinary process exit with no device barrier. **A quarantine that leaves that finalizer attached is silently undone at exit**, so §14's shutdown ordering cannot be implemented without touching these two files.
 
 **Proposed control contract:** For each fixed request lane, publish `{request_generation, slot_generation, host_slot, status}` into stable mapped control storage. Publish readiness last with the existing validated system-scope ordering. The service grants a GPU-reader lease before publication. A matching GPU acknowledgement after that lane's copy releases exactly one lease. Keep record reuse behind acknowledgement retirement.
 
