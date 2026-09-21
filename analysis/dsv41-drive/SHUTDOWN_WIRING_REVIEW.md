@@ -265,3 +265,41 @@ with the block present. Add: **a hung `stop()` ends the graceful shutdown with `
 ## Recommendation
 
 Land after S1 to S3 (all small, all tests). S4 and S5 are notes. The GPU barrier test stays queued behind this. No box moves.
+
+---
+
+## Rulings requested by `t5-leases` on the second pass (2026-09-21)
+
+### R1. A hung `host.stop()` in front of `abort_distributed_environment()`: ACCEPT as a recorded risk; do not bound `stop()` now
+
+**What the source shows (read, not run).** `RamThread::stop` sets the stop flag, joins the service thread, and only then stops the watchdog, so the watchdog is live
+during the join. `watch()` aborts the process (`prctl(PR_SET_DUMPABLE, 0); std::abort()`) when `busy_since != 0` for longer than `fatal_wait_ns_`. `busy_since_` is set by **both**
+request kinds: `handle_demand` (line ~2583) and the advisory path (line ~1886), so a hung read of either kind is covered. `fatal_wait_ns_` is `watchdog_wait_s(timeout)`,
+`max(30 s, 3 x SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)`. So the worst case of a hung read is a `SIGABRT` after **at most 30 s at the default**, not an unbounded hang.
+
+**Why not bound it.** Bounding a blocking native `stop()` means running it on a helper thread with a deadline, as the barrier is. On a miss the shutdown quarantines and carries on, but
+the first `stop()` is then still blocked, and the exit hook (`_stop_live` in the ops module, and `shutdown(at_exit=True)`) calls `Exl3RamMissHost.stop()` again on the main thread while
+`close.alive` is still true. Two threads joining the same `std::thread` is undefined behaviour, and `close()` would destroy the native handle under the blocked join. Making that safe needs a
+"stop in progress" state that the exit hook honours: new machinery, on a path no test can exercise (a hung join cannot be simulated on CPU), to remove an exposure that is
+bounded by an abort the design already provides. That trade is worse than the risk.
+
+**On "withheld from the other ranks, who cannot tell it from a dead peer".** It is a dead peer within 30 s, by design, and `abort_distributed_environment()` is a local teardown each
+rank runs itself, so a lagging rank does not prevent the others from running theirs (I have not run a multi-rank teardown; that is the one part of this that is reasoning). For this
+deployment, one GPU and one rank, there is no peer.
+
+**What is accepted, exactly, so it can be checked later.** (a) A graceful shutdown with a service thread hung in a read ends in `SIGABRT` after up to `max(30 s, 3 x timeout)`, before
+`abort_distributed_environment()` runs, where today the same abort would come from the exit hook after it. (b) A hang **outside** a request (`busy_since == 0`, for example a mutex
+deadlock in the thread) is not covered by the watchdog and would hang the join with no bound. This pre-exists at the exit hook. (c) Not bounded and not tested; revisit if a stop hang is
+ever observed. **Record all three in the message and in 20.2j.** One cheap addition: log a line before `host.stop()` naming the abort deadline, so an abort in the log is attributable.
+
+### R2. The scheduler reads `sys.modules` itself: the departure is correct, and my F4 suggestion could not have worked
+
+My F4 fix said to put the `sys.modules` guard "in the delegating function". That function lives in the RAM-miss module, so reaching it already requires importing that module, which is the
+cost F4 was about. The guard has to be in the caller. Their departure meets F4's purpose and mine did not.
+
+Weighing the cost of the decision living in `scheduler.py`: it adds a module-path string and a function name to the scheduler, and a wrong or drifted string makes the block a silent no-op
+(`sys.modules.get` returns `None`). The tests cover that: the order test patches `module.shutdown_exl3_ram_miss_service` (a missing attribute raises), and asserts `CHEAP + ["ram_miss"]`, so a
+changed string fails on that `==`. The block is a conditional and a call, which satisfies "construct, wire, delegate or order, and never compute" in `large-class-style` (it is not in `__init__`).
+A registry the RAM-miss module registers a shutdown callback with would remove the string, but it is new surface for one caller; not now. **Accepted.** Their note that the surviving
+`except Exception: return` mutant is equivalent only because the block is last is right; put a one-line comment at the block saying it must stay last and why, so a later edit that adds a
+release after it also revisits that `except`.
