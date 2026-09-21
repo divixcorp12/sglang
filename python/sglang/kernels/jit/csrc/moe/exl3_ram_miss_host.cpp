@@ -1021,16 +1021,16 @@ class RowReader {
     }
   }
 
-  // Pack ONE complete row, the earliest in request order among those ready. One row per loop turn
-  // keeps packing bounded: the loop refills and reaps between rows.
-  bool pack_one() {
+  // The earliest row in request order among those ready, vetted for packing; kBounceSlots when there is
+  // none or the vetting failed the call. Runs before any copy.
+  size_t take_ready_row() {
     Call& c = c_;
     size_t best = kBounceSlots;
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
       if (rows_[s].state != RowState::Ready) continue;
       if (best == static_cast<size_t>(kBounceSlots) || rows_[s].ordinal < rows_[best].ordinal) best = s;
     }
-    if (best == static_cast<size_t>(kBounceSlots)) return false;
+    if (best == static_cast<size_t>(kBounceSlots)) return best;
     // Defence in depth for the one failure this reader must never have: packing bytes no drive
     // delivered. admit_batch's EOF guard already refuses a row the file cannot satisfy, but it decides
     // the row from part 0's file size alone, so it is only as good as the table's row consistency
@@ -1041,8 +1041,17 @@ class RowReader {
     // expectation), so a total at least `needed` means the needed prefix is whole.
     if (rows_[best].filled < rows_[best].needed) {
       c.failed = true;
-      return false;
+      return static_cast<size_t>(kBounceSlots);
     }
+    return best;
+  }
+
+  // Pack ONE complete row, the earliest in request order among those ready. One row per loop turn
+  // keeps packing bounded: the loop refills and reaps between rows.
+  bool pack_one() {
+    const size_t best = take_ready_row();
+    if (best == static_cast<size_t>(kBounceSlots)) return false;
+    Call& c = c_;
     const size_t ordinal = rows_[best].ordinal;
     const int64_t start = stamp(c.trace);
     if (fault_.pack_delay_ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.pack_delay_ns));
@@ -1055,8 +1064,16 @@ class RowReader {
           t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
           static_cast<size_t>(segment.bytes));
     }
+    finish_row(best, start, stamp(c.trace));
+    return true;
+  }
+
+  // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank
+  // held on this slot: only now may it be reused.
+  void finish_row(size_t best, int64_t start, int64_t end) {
+    Call& c = c_;
+    const size_t ordinal = rows_[best].ordinal;
     if (c.trace) {
-      const int64_t end = stamp(c.trace);
       if (ordinal < static_cast<size_t>(kTraceRows)) {
         c.trace->row_pack_start[ordinal] = start;
         c.trace->row_pack_end[ordinal] = end;
@@ -1069,11 +1086,9 @@ class RowReader {
       c.trace->pack_ns += end - start;
     }
     if (c.packed) (*c.packed)[ordinal] = 1;
-    // Packing is the last reference the bank held on this slot: only now may it be reused.
     if (fault_.poison) std::memset(bounce_slot(best), kPoisonFill ^ 0xFF, static_cast<size_t>(t_.slot_bytes));
     rows_[best] = BounceRow{};
     --rows_busy_[best / kBounceRows];
-    return true;
   }
 
   // A failed call: what every extent still live was owed but never returned is cancelled. Extents that
