@@ -1,0 +1,37 @@
+{
+ "script": "g_harness.py",
+ "process": 1,
+ "started": "2026-09-21T18:29:23-0500",
+ "repo": "/data/models/slang/nvfp4-work/cc-microbench",
+ "repo_head": "d22cf9fd88f5ef139ff8ccee9fee7756fa4a5b84",
+ "g_harness_sha256": "76d7d22c16d48a1371f346b53806d593f0c5bf8bde8f0cd24aa191588a949368",
+ "g_kernels_sha256": "8ac5a52c34eb55cbedb89d13928fbadcc6618db40a477bc48de824cb7b32c068",
+ "torch": "2.13.0+cu130",
+ "cuda": "13.0",
+ "device": "NVIDIA GeForce RTX 5090",
+ "sglang_file": "/data/models/slang/nvfp4-work/cc-microbench/python/sglang/__init__.py",
+ "R": 50,
+ "batches": 20,
+ "keepalive": false,
+ "page_numa_note": "pinned by torch (cudaHostAlloc); NUMA node not bound, see numa_maps below",
+ "box_start": {
+  "loadavg": [
+   "5.34",
+   "6.43",
+   "6.66"
+  ]
+ },
+ "driver": "610.57.04",
+ "apps_start": [
+  "972731, 680 MiB"
+ ],
+ "self_check": "active_p4 N=3: 9 nodes, go=1, 3 acks written; empty N=3: 9 nodes, go=0, no ack",
+ "box_end": {
+  "loadavg": [
+   "5.41",
+   "6.24",
+   "6.58"
+  ]
+ },
+ "finished": "2026-09-21T18:31:38-0500"
+}

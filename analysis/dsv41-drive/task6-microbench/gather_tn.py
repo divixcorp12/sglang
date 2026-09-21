@@ -176,6 +176,10 @@ def analyse(recs, boots=400):
             lines.append("  delta (%s) = T(1) - (f + c_m) = %+.1f us  ->  x %.2f reads/step = %+.3f ms/step   (G* = %.3f ms)" % (kind, dm, READS_PER_STEP, dm * READS_PER_STEP / 1e3, G_STAR_MS))
             for k, v in d["delta_share_us"].items():
                 lines.append("      vs batched share T(%d)/%d: delta = %+.1f us -> %+.3f ms/step" % (k, k, v, v * READS_PER_STEP / 1e3))
+        t1 = S.median(Tn[1])
+        lines.append("  batching saves n*T(1) - T(n) (p50), us, versus n separate count-1 launches back to back: " + ", ".join(
+            "n=%d %+.1f" % (n, (n * t1 - S.median(Tn[n])) * 1e3) for n in NS if n > 1))
+        lines.append("  marginal step T(n) - T(n-1) (p50), ms: " + ", ".join("%d: %.4f" % (n, S.median(Tn[n]) - S.median(Tn[n - 1])) for n in NS if n > 1))
         # bootstrap 95% interval over launches, p50 statistic, for the marginal delta and the delta against T(6)/6
         bm, b6 = [], []
         for _ in range(boots):

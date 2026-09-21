@@ -109,10 +109,30 @@ python3 analysis/dsv41-drive/g_measurement/g_analysis.py $O/results.jsonl   # th
 python3 analysis/dsv41-drive/task6-microbench/g_harness.py summary $O/results.jsonl   # slopes and G even when INVALID: preliminary only
 ```
 
+Two additions beyond the registered design, both reported separately and neither seen by the frozen analysis:
+
+* **Poll-latency probe** (every process from `925354fff4` on, printed and stored in `meta_process*.json`): mean latency of serial `ld.acquire.sys`
+  loads of the pinned request page versus a device word. It shows whether the stand-in `W_s` poll really leaves the GPU (a PCIe
+  round trip) or is served from L2 (which would understate `g_a`).
+* **`--ext`** (unregistered variants, written to `results_ext.jsonl`): empty and `active_p4` triples on top of 1000, 2000, 4000
+  and 8000 filler nodes, N = 0, 160, 640. It answers whether the per-triple cost depends on the size of the graph it sits in (the
+  plan's decode graph has ~8,000 nodes); the registered `empty_base8k` variant only covers the empty triple at 8,000.
+
 `--keepalive` (off by default, recorded) sends tiny H2D copies during cells; use it only if the link idles to Gen1 during the
 empty cells and the frozen link gate then refuses (see results.md for what was seen).
 
-## 3. The traps, and how each is handled
+## 3. Layout of this directory
+
+```text
+README.md        this file
+results.md       preliminary readings from 2026-09-21, their card conditions, and what is stale in the brief
+gather_tn.py     T(n) and delta                 g_harness.py, g_kernels.cu     the stage-triple harness
+data/tn_prelim/  raw T(n) samples (.gz), meta, and the analysis text
+data/g_prelim/   raw g cells (.gz) for 3 processes (results and results_ext), meta per process
+data/probe/      the poll-latency probe's own meta
+```
+
+## 4. The traps, and how each is handled
 
 * **L2, not HBM.** `T(n)`: ring of 150 rows = 2.0 GB per node, minimum reuse distance recorded per cell, `repeat` control at
   every n, implied GB/s checked against 15.75 GB/s and against the copy engine. `g` moves no data (4 KiB or nothing), so L2
@@ -131,7 +151,7 @@ empty cells and the frozen link gate then refuses (see results.md for what was s
 * **CPU jobs on divix01** run under `taskset -c 0-63` with `OMP_NUM_THREADS=1`; `gpu-run.sh` pins to 32-63. Cores 64-71 stay
   free (71 is production's doorbell spin core).
 
-## 4. What these do not settle
+## 5. What these do not settle
 
 * **`g` with stand-ins.** `W_s` and `A_s` are written to the contract of `PER_ROW_TRANSFER.md` 5.5, not the production kernels of
   a per-stage protocol (none exists: that is Task 6's work). The stand-ins bound `g`. Ready-at-launch is the best case for polling:
