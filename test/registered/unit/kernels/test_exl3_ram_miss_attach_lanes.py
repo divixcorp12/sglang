@@ -73,3 +73,9 @@ def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers
     assert service.device_side is None  # no device words were allocated for it
     assert service.routed_rows_per_step == 0
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

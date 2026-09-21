@@ -239,3 +239,9 @@ def test_no_clock_read_bypasses_the_trace_gate():
     assert reads == NON_TRACE_CLOCK_READS, {
         line: count for line, count in (reads - collections.Counter(NON_TRACE_CLOCK_READS)).items()
     }
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

@@ -59,3 +59,11 @@ def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path
     (extent,) = first["extent_cqe_ns"]
     assert set(extent) == {"row", "part", "submit", "attempts", "cqe"}
     assert row["admit"] <= extent["submit"] <= extent["cqe"] <= row["start"]
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

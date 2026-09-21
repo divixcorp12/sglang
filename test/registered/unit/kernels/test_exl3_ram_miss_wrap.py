@@ -170,3 +170,9 @@ def test_the_service_thread_serves_a_real_waiter_for_every_sequence_through_the_
         assert counters["served"] == 4 and counters["touch_only"] == 0 and counters["overruns"] == 0
     finally:
         host.stop()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

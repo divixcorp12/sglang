@@ -318,3 +318,9 @@ def test_the_service_thread_records_every_demand(tier):
     assert [r["seq"] for r in records] == seqs
     for record in records:
         _assert_ordered(record)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
