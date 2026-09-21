@@ -1,5 +1,147 @@
 # Eager + mirrors "is slower": does not reproduce (2026-09-20)
 
+## Read this first: the 1.54x is one base arm reading 147 GiB LESS, not the mirror arm reading more (2026-09-21)
+
+Nobody should look for extra reads in the mirror arm. There are none.
+
+**What the 1.54x compares.** 397.41 / 257.96 GiB = 1.54: the whole-arm `/proc/diskstats`
+deltas (three drives summed, startup included) of two single runs of `run-mirror-arms.sh`
+on 2026-09-19, `e-mirror` over `e-base`. No cache counters, no environment dump, no git
+revision in either log. The numerator is normal: `e-mirror`'s 397.41 is the ~381 GiB every
+eager arm reads in its four sessions, plus 17-24 GiB of startup. The denominator is the
+outlier. Against today's eager base arm (380.9 GiB of sessions + ~24.3 GiB of startup =
+~405 GiB whole-arm) `e-base` read 405 - 258 = **~147 GiB less**. (Whole-arm to whole-arm; the
+"~123 GiB" that once made a cache story look attractive mixed session bytes with whole-arm
+bytes.) `e-base` also ran fast: TTFT 85.4 / 55.1 / 24.8 / 5.6 s and decode 3.96 tok/s in
+session 3, faster than the graph arms. Its startup (20.2-24.5 GiB in today's base arms)
+leaves 233-238 GiB for sessions, and sessions 0+1 alone read 210.8 GiB today, so sessions 2
+and 3 together read about 23-27 GiB: almost nothing.
+
+This is the gate's question, reworded: not "why does mirroring read more" but "why did one
+base arm read ~147 GiB fewer bytes than seven others, none of which differ from it in code,
+corpus, or (as far as anything recorded) configuration". The plan's bar, "resolved only with
+evidence explaining the additional reads", cannot be met for the original arm, and there are
+no additional reads to explain.
+
+### The determinism argument: why machine state is the least likely class
+
+Per-session bytes are the same to 0.1% in every arm we have, and so are the greedy outputs:
+
+| arm (2026-09-20) | code | order | mirrors | trace | session GiB (s0 / s1 / s2 / s3) | output sha1 (s0-s3, first 8) |
+|---|---|---|---|---|---|---|
+| r1-mirror (trace lost) | HEAD | 1st | on | on | 127.87 / 82.85 / 92.62 / 77.32 | ad32424c de3bc746 91530418 5142f271 |
+| r1-0-base | HEAD | 1 | off | on | 128.03 / 82.89 / 92.67 / 77.33 | same |
+| r1-1-mirror | HEAD | 2 | on | on | 128.02 / 82.90 / 92.65 / 77.33 | same |
+| r1-2-mirror | HEAD | 3 | on | on | 128.04 / 82.88 / 92.65 / 77.33 | same |
+| r1-3-base | HEAD | 4 | off | on | 128.01 / 82.89 / 92.65 / 77.39 | same |
+| r2-0-base | HEAD | later | off | **off** | 127.99 / 82.87 / 92.65 / 77.33 | same |
+| s19-0-base | `1525e43ab9` | separate | off | **off** | 127.94 / 82.88 / 92.63 / 77.26 | same |
+
+Across the four traced arms the RAM-miss row counts agree to 3 in 30,367, and MiB per read
+row is 12.72-12.73 in all 16 traced arm-sessions. What changes between arms is *timing* (TTFT
+55 s against 30 s with mirrors) and startup bytes (18.3-24.5 GiB for identical code, so
+startup has a cache-dependent buffered component and sessions do not).
+
+**The argument.** Which rows a session reads is a deterministic function of the computation:
+weights, config, prompt, numerics and the tier and hot-set policy. Page-cache warmth, drive
+state, predecessors, ordering, the mirror choice and tracing change how fast those rows
+arrive, not which rows are asked for. They did not change the byte count here across two
+commits, both orders, both trace settings and mirrors on or off. So a machine-state
+explanation would have to produce a 147 GiB change in *which rows were read* out of
+something that has never moved that number by more than 0.1%. It can, but it is the least
+likely class. What can change the number is one of two things:
+
+1. **A different computation ran**, so different rows were requested: uncommitted code,
+   a different environment (a knob such as `SGLANG_MOE_HOT_SEED`, the hot-tier dynamics or
+   the tier sizes), different numerics or prompts. Counters would show fewer rows read.
+2. **The rows were requested but did not reach the device**: read through something that
+   caches (buffered I/O, or a cache in front of the drive). Counters would show the same rows
+   read; diskstats would show fewer bytes.
+
+These are told apart by one observable pair, which is the standing protocol below.
+
+### What the record already excludes, and what it does not
+
+| candidate | status | evidence |
+|---|---|---|
+| mirroring changes the bytes | excluded | per-row counters, 4 traced arms: identical bytes and decisions |
+| tier warming differs between arms | excluded | occupancy 5644/5644 in session 0 in both; admissions equal evictions after |
+| ordering (base before / after mirror) | excluded for eager-after-eager | B M M B |
+| tracing or counters | excluded | untraced base (r2-0, s19-0) matches |
+| committed code | excluded | 1525e43ab9 re-run; and see the reflog below |
+| corpus, session count, source drive | excluded | `sessions.jsonl` mtime 09-15; wall time; 0.03 GiB on other drives |
+| predecessor was a *graph* arm (`g-mirror`) | **not tested**; mechanism weak | every eager arm today follows an eager arm; under O_DIRECT a predecessor has no channel to change host-issued reads |
+| uncommitted edits in `wt-dsv41` at 23:02 | **not excluded** | see below: nothing shows them, nothing rules them out |
+| environment exported in a shell | **not excluded** | `env.sh` mtime shows the file was old, not that the process used it; no env dump exists |
+| driver | not tested for base | 09-19 used `trace_corpus.py`; today's arms use `eager_arm_driver.py`; `e-mirror` reproduced under the new one |
+| non-direct reads somewhere | unsupported either way | config and code say O_DIRECT (`uring_file_reader.cpp:115`), no process-level record from 09-19 |
+
+### Attempt to recover the state of 2026-09-19 (no runs)
+
+- **wt-dsv41 reflog** (`.git/worktrees/wt-dsv41/logs/HEAD`, read with `cat`; no git command
+  was run in that worktree): HEAD was `efcef725fc` from 22:35:54 and did not move again until
+  23:36:29 (an `am` of the docs commit). The four arms ran 22:45-23:18 (`g-base` ended
+  22:54:44, `g-mirror` 23:02:11, `e-base` 23:10:21, `e-mirror` 23:18:23; `e-base` started at
+  23:02:12). **No checkout, reset, rebase or commit** falls in that window, and
+  `efcef725fc..1525e43ab9` is docs and scripts only. So the *committed* code that ran is the
+  code the re-run used. A reflog says nothing about uncommitted edits.
+- **Claude session transcripts** (local `~/.claude/projects`, 22:30-23:30 CDT on 09-19): two
+  local sessions were active. The one that launched the arms (22:45) made 55 tool calls
+  between 22:34 and 23:19: a commit and a fetch at 22:35, a DSpark smoke run on the box that
+  ended before the arms began, the arm launch, and reads of results. **None edited python
+  under `wt-dsv41`.** The other session edited `exl3.py` at ~23:30 in the laptop worktree,
+  after `e-mirror` had finished. Sessions on other machines, and edits made in an editor,
+  are not visible here.
+- **`~/.bash_history` on divix01**: last written 2026-09-11; non-interactive ssh commands do
+  not enter it, so an exported variable would not appear.
+
+Result: nothing shows an uncommitted edit or an unusual environment, and nothing can rule
+either out. The residual is exactly "uncommitted tree, environment, unrecorded state".
+
+**Status: retired as non-reproducible; cause unknown; residual = uncommitted tree,
+environment, unrecorded state; determinism argues against machine state.** The 257.96 GiB /
+1.54x pair must not be cited. Re-running the 09-19 sequence would not change this: it would
+most likely read 381 GiB again, which leaves the anomaly unreproducible with one fewer
+untested factor, not resolved. It is not worth 35 minutes of GPU.
+
+### Standing protocol: how the next low arm is diagnosed instead of debated
+
+The reason 09-19 is unrecoverable is that nothing recorded what ran. That has changed:
+`scripts/dsv41/provenance.py` records, from inside the arm's own process, git HEAD and
+dirtiness with a tracked-diff hash and untracked files, the live and exec-time environment,
+every `SGLANG_*` knob with its default resolved, `sglang.__file__`, a drive-idle check and
+env drift at engine ready. `trace_corpus.py` adds fincore residency and a
+meminfo/load/drive sample at every session boundary, and `eager_arm_driver.py` records
+per-session diskstats bytes and the output sha1. The task1 arms already do this
+(`task1-results/` holds their pre-registration files and the clean-reference manifest; raw
+arm outputs stay on divix01).
+
+For any eager arm whose session bytes differ from the table above, or whose TTFT falls
+faster than ~55 s, compute per session with the trace and cache counters on:
+
+    implied = (RAM miss rows + bg rows) x 12.72 MiB      # eager_cache_report.py: "MiB/read row"
+    actual  = diskstats bytes over the session, all three drives
+
+| what moved | class | check next |
+|---|---|---|
+| actual and implied both fall; MiB/read row stays 12.72-12.73 | fewer rows were read: a different computation | `provenance` env and git (dirty files, diff hash, `sglang.__file__`); output sha1 against the table; VRAM/RAM miss counts and tier occupancy per session; the arm's `SGLANG_MOE_*` knobs against `env-full.sh` |
+| actual falls, implied does not; MiB/read row falls below ~12.7 | the rows were read but not from the device | per-session fincore of the source and mirror shards; the reader mode in the process environment; a buffered code path |
+| neither falls | not this anomaly | it is a timing effect |
+
+The threshold is descriptive: 12.72-12.73 is what all 16 traced arm-sessions measured; it is
+not a tuned limit.
+
+**What the eager path still needs added, so the protocol is complete** (no code changed here):
+`eager_arm_driver.py` does not record what `trace_corpus.py` does, namely fincore residency
+of the expert directories at each session boundary and the meminfo/load sample. Without
+per-session residency the second row of the table can only be answered after the fact, by a
+single end-of-run fincore, which is what this investigation had to do. The counters need the
+trace path set: an arm run with `NO_TRACE=1` cannot be diagnosed this way (base with and
+without the trace matches, so nothing is lost by leaving it on).
+
+---
+
+
 DSV41_REFERENCE §19 recorded `e-mirror` 25% slower than `e-base` (2.0126 vs 2.6947 tok/s)
 while reading 1.54x more bytes (397.41 vs 257.96 GiB), and named one candidate: the base
 arm's pinned host tier warms across sessions, the mirror arm's does not.
