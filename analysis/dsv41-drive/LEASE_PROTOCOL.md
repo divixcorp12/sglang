@@ -1246,6 +1246,12 @@ Inherited unchanged: the block layout, single-writer ownership, generations and 
 `RowResult`/`LaneAck`/`Terminal`, the eviction predicate, the terminal mask semantics,
 deferral, the quarantine rules.
 
+Task 6 also inherits OPEN 11. Lease mode arms every record with `count > 0`, so each layer
+pays a service round trip even when nothing is read, and that cost lands on exactly the
+path Task 6 is trying to shorten. Task 6's benefit has to be measured net of it, and the
+"removing the all-hit handshake" optimization of section 15 is the thing that would give it
+back.
+
 Task 6 must add, and I have not designed: per-lane wait/copy/ack kernels with a lane
 predicate that reads the lane's own readiness (the wait becomes per lane); a finalize
 kernel that publishes the terminal mask after all lane kernels; a single request timeout
