@@ -1173,6 +1173,21 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > defect is about a check failing to check itself, check the fix the same
 > way.**
 >
+> **IT IS A REVIEW-TIME LESSON TOO, and the reviewer supplied the instance.**
+> A fix whose production branch has no test yields a *"the test recorded the
+> argument"* result **that looks like coverage**. The check, in the reviewer's
+> words: **ask which branch the real configuration takes first, and whether any
+> test takes it.**
+>
+> And the same defect reached the *review*: the reviewer's own F4 suggestion --
+> a guard inside the delegating function -- **could not have achieved its
+> purpose, because reaching that function already requires the import the guard
+> was meant to avoid.** It went unchallenged for a round **because it sounded
+> right**, and was caught only when the author departed from it and said so.
+> **A recommendation is an untested claim in the same way a fix is**, and it is
+> harder to doubt because it arrives as the correction rather than as the thing
+> being corrected.
+>
 > **(f) A CONTROL ARM THAT THE ACT OF MEASURING DESTROYS.** The sibling pilot's
 > A arm requires one CPU's SMT sibling to stay idle. Measured: with a spinner on
 > the sibling, foreign busy stayed **under 2.1%**; with it left idle, foreign
