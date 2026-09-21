@@ -613,6 +613,21 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > code. That is false for three kernel-only mutants (`ack_after_copy=False`,
 > fail-open, detector-off), which have no CPU analogue at all.
 >
+> **THE RULE CAUGHT A VIOLATION THAT REASONING MISSED, IN A TEST WRITTEN AFTER
+> THE RULE WAS ADOPTED** (`55bcd3eb20`). Its author wrote four quarantine tests,
+> flagged honestly that they were written-and-unrun, then ran both mutants
+> against them. Mutant A (drop the finalizer `detach()`) was caught. **Mutant B
+> (delete the `Py_IncRef`) was not: 4 passed.**
+> `test_quarantined_slabs_outlive_the_cache_and_the_module_list` did
+> `kept = list(_QUARANTINED)` before clearing the list, and *that local reference*
+> kept every slab alive -- so the test passed with the extra reference removed,
+> proving nothing about the mechanism it named. Fixed by dropping the local.
+>
+> The lesson is narrower and harder than "write better tests": **the author had
+> already adopted this rule, reasoned about the test, and still could not see it
+> by inspection.** Only executing the mutant found it. So "name the mutation" is
+> necessary but not sufficient -- the mutation must be *run*.
+>
 > **RULE for the remainder of this plan: write the mutant first.** Before a test
 > is accepted as evidence for any gate here, name the specific change to
 > production code it must fail against, and show it failing. A test whose
