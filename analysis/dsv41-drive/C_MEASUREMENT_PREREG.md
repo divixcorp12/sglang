@@ -356,7 +356,7 @@ INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling
 
 | file | sha256 |
 |---|---|
-| `sibling_pilot/sibling_pilot.py` (the runner (GPU; needs the lock)) | `4b9219521077bb8e3ccd251b8047dd895bba2d278222f4dacba88ff5e2afdff0` |
+| `sibling_pilot/sibling_pilot.py` (the runner (GPU; needs the lock)) | `d313a6d1394beddb886bbf7f93b998e3218af172bd37745400e8bcb358553304` |
 | `sibling_pilot/sibling_pilot_analysis.py` (the frozen rule and verdict (CPU; `--selftest` passes all ten cases)) | `5d85f67c946e55445598421ff79765be0e40fb748a131e55988fd8d9b24b3bc5` |
 | `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `8709257809e254459a7079743b79525250d702a2934cc1c12142527edcf4f076` |
 | `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
@@ -388,3 +388,8 @@ Also recorded: link Gen3 throughout, P1 (busy), SM clock 2760-2970 MHz, no other
 ### 18.3 Ray writes to a watched drive (from the lead)
 
 `/mnt/nvme4/ray_tmp` is on `/dev/nvme3n1p1`, and `nvme3n1` is in the watched set (mirror roots plus source). Ray's `log_monitor` and `dashboard` write session logs there with `--logging-rotate-bytes=536870912`, so its traffic is bursty by construction; measured quiet at 0.0000 GB/s over 10 s today. **A Ray rotation can trip the idle-cell rule or break the load-cell match for a reason that is neither us nor a lane**; the per-cell per-device bytes (`drive_by_dev`) are recorded, and **Ray is a known writer to a watched drive**, to be named in `meta.json` for the `c` run. If rotations prove frequent enough to make the `nvme` arm unreliable, the remedy is to move the source checkpoint off `nvme3n1`, not to loosen the rule. (`nvme1n1` read a steady 0.0266 GB/s with our lanes stopped; it is not watched and its reader is unidentified.)
+
+### 18.4 The re-run's parameters (proposed to the lead; nothing runs until the lead says yes)
+
+**`--reps` is now a command-line parameter of the runner (registered default 20, unchanged); the re-run would use `--reps 40`**, so that at run 1's valid-rep rate (7 of 20, about a third) about 14 valid reps are expected per `n` against the unchanged minimum of 8. **What does not change:** the rule, the `n` values (3, 6), the +-0.5% criterion, the t-interval, every validity condition, the minimum of 8 valid reps, `c_analysis.py`, and the visit structure. The value used is recorded in `meta.json`.
+This is a change of a registered parameter after an INVALID and is made only with the lead's explicit yes; if the lead prefers, the re-run uses the registered 20 and accepts that it may again be INVALID for the same A-arm reason (run 1 had 7 valid of 20 per `n`, so about one chance in two of reaching 8).

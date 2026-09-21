@@ -16,7 +16,7 @@ sys.path.insert(0, str(HERE.parent / "proposed_amendment6"))
 import c_harness as h
 import quiet_check as q
 
-REPS = 20; NS = (3, 6); VISIT_LAUNCHES = 100; WARM_SPIN_S = 0.3
+REPS = 20; REPS_RUN = 20; NS = (3, 6); VISIT_LAUNCHES = 100; WARM_SPIN_S = 0.3
 
 class Ticks:
     """Per-CPU busy ticks (user+nice+system) and per-process ticks from /proc, over a window."""
@@ -47,7 +47,9 @@ def measure(launch, sib, spinner_pid, run):
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", required=True); ap.add_argument("--repo", required=True); ap.add_argument("--launch-cpu", type=int, required=True)
-    ap.add_argument("--dry-run", action="store_true", help="no GPU: synthetic T with no sibling effect; tests the plumbing"); a = ap.parse_args()
+    ap.add_argument("--dry-run", action="store_true", help="no GPU: synthetic T with no sibling effect; tests the plumbing")
+    ap.add_argument("--reps", type=int, default=REPS, help="reps per n (registered default 20; the re-run after run 1 uses 40 with the lead's approval, recorded in meta.json)"); a = ap.parse_args()
+    global REPS_RUN; REPS_RUN = a.reps
     lanes = [] if a.dry_run else q.lane_processes()          # (a dry run on a dev machine would match unrelated command lines)
     if lanes: print("ABORT: lanes of ours are running at the START: %s" % lanes[:3]); return 2
     L = a.launch_cpu; sibs = [c for c in h.thread_siblings(L) if c != L]
@@ -57,7 +59,7 @@ def main():
     if os.sched_getaffinity(0) != {L}: print("ABORT: this process must be pinned to exactly cpu %d (taskset -c %d)" % (L, L)); return 2
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     spinner = subprocess.Popen(["taskset", "-c", str(Sb), sys.executable, "-c", "while True: pass"]); time.sleep(0.3); os.kill(spinner.pid, signal.SIGSTOP)
-    smi = None; meta = {"launch_cpu": L, "sibling_cpu": Sb, "reps": REPS, "ns": NS, "visit_launches": VISIT_LAUNCHES, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "dry_run": a.dry_run}
+    smi = None; meta = {"launch_cpu": L, "sibling_cpu": Sb, "reps": REPS_RUN, "ns": NS, "visit_launches": VISIT_LAUNCHES, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "dry_run": a.dry_run}
     try:
         if a.dry_run:
             import random; rnd = random.Random(2)
@@ -73,7 +75,7 @@ def main():
             for _ in range(3): dev.run_visit(h.Cell("sm", "cold", 0, "idle", "eager", 6), 40, ns_args)      # untimed: link and clocks up
         w0 = time.monotonic(); rows = []
         import random; rng = random.Random(20260921)
-        for rep in range(REPS):
+        for rep in range(REPS_RUN):
             for n in NS:
                 cell = h.Cell("sm", "cold", 0, "idle", "eager", n)
                 for arm in "ABBA":
