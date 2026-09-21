@@ -392,3 +392,58 @@ Whether any producer other than the router-miss path can put a planned lane outs
 `kBusySeq` visibility timing on the device; analysis scripts that read `rows` for failed requests; manual GPU tests; whether the wait
 kernel could be split without changing capture stability; `RowReader::admit_batch`/`refill`; every claim in the first pass's "not
 checked" list that is not repeated above. Nothing was run.
+
+---
+
+## G. Two constraints for whoever writes or judges the Task 6 report (added after the second pass)
+
+### G1. The link bounds both mechanisms: early copies move link time into the read wait, they do not remove it
+
+`c` = 1.055 ms per row is the H2D time of a 13.3 MB row, about 12.6 GB/s (13,315,584 B / 1.055 ms). The reference states the whole
+host is Gen3 and measures the link at 12.02 GB/s (`DSV41_REFERENCE.md` "Link time / miss row at 12.02 GB/s", 1.11 ms; and 18.2: "at the
+PCIe line rate"). So `c` is the link's time per row, within about 5% of its measured ceiling; it is not a kernel latency that a
+smaller or earlier launch could shorten. Consequences, none of which the plan or the design states:
+
+1. **Early copying cannot make a row cheaper.** It re-schedules link busy time into intervals in which the link would otherwise be idle:
+   the read waits. The total link time per step is unchanged (about 131 lanes x 1.055 ms = 138 ms of the 257.5 ms step).
+2. **The saving is capped by link idle time inside read waits, request by request:** `saving_r <= min(read_wait_r, h_r * c)` for the hit
+   phase. Summed, the cap is `sum_r h_r * c` (every hit copy fully hidden) or the total read-wait, whichever is smaller. From the
+   post-hoc figures (unregistered): 14.4 read requests per step at a mean 2.21 hit lanes gives about 31.8 hit lanes per step in read
+   layers, times 1.055 ms = **about 33.5 ms**, against a traced read-wait of about 93 ms per step. The hit-phase ceiling is the
+   *first* term, and it equals the document's V1 figure (BEST 38.6 minus the 5.06 ms miss-row part). That is not a coincidence: the
+   model assumes every hit copy hides completely (94% of requests wait at least `h*c`), so V1's 33.5 ms is a ceiling by construction,
+   not an estimate. A realised saving below it must come from requests whose read wait is shorter than `h*c`, or from anything else that
+   uses the link during the read wait.
+3. **Anything else on the link during read waits directly subtracts.** The promotion copies of Task 8, the prefetch puller and the
+   eager gather share the same Gen3 link. If a promotion copy is in flight during a read wait, the hit phase and the promotion divide
+   12 GB/s between them, and the modelled hiding fails for that layer. This is the unmeasured interaction between the two designs; the
+   Task 6 arms should be run with promotions off, and any later combined arm labelled.
+4. **The traced read-wait is not the untraced one.** All seven traces are traced; stage stamps stretch request durations by an amount
+   the precheck cannot bound (`exl3_stage_trace_overhead.py` exists; its result was not read). A shorter untraced read wait shrinks the
+   window into which the hit copies must fit. The 94% "read wait covers all hit copies" figure is from traced runs.
+5. **Whether the copy kernel at `count = 1` runs at link rate is still unmeasured** (the document's OPEN 1). If the 8-SM kernel is latency
+   limited at `count = 1`, a per-row copy is slower per row than the batched one and the per-row-specific 13% shrinks further; the link
+   arithmetic above is what makes that unlikely, not a measurement.
+
+### G2. Report-time trap: the ceiling predicts V1 against Task 5 in lease mode, not against today
+
+The precheck's ceiling is computed against a batched copy after `demand_done`. Task 5's lease mode arms **every** `count > 0` record, so
+all 40 layers pay a service round trip that today's path does not (67% of layer calls wait on nothing, 18.2; unmeasured, LEASE_PROTOCOL OPEN 11).
+V1's predicted gain is therefore against **V0' (Task 5 batched)**: both pay that cost, and the overlap saving is what differs. **V1 against
+today's unleased path is the ceiling minus the lease-mode cost X on all 40 layers, and X is unmeasured.** A report that quotes arm A2 (V1)
+against arm A0 (today) and attributes the whole difference to Task 6 flatters it by exactly the cost it inherits from Task 5; one that quotes
+A2 against A1 and omits A1 against A0 hides a possible loss from Task 5. The arms in section 5.6 of the design (A0 today, A1 V0', A2 V1, A3 V2)
+are the right set; the report must state all three differences, with intervals, and must not present A2 against A0 alone as "the Task 6 result".
+The same applies to a `kBusySeq`-gated V1: its baseline is today's path (it needs no lease mode), so it is compared with A0 directly, and its
+gain is not comparable with the lease-mode V1's without saying which baseline each used.
+
+### G3. One clause in the plan's `kBusySeq` correction to tighten
+
+The plan says a `kBusySeq`-gated hit phase "expires the moment the service becomes asynchronous", and elsewhere that Task 8 exists to make it
+so. Checked against `PROMOTION_ASYNC.md`: the invariants the gate borrows (one service thread; `take_slot_locked` never evicting `wanted`; eager
+paused) **survive Task 8 as designed.** Promotion admission (M2) is a request class served by the same thread strictly below demand and
+advisory, cancelled at the next row when a demand is posted, so no admit is in progress once `handle_demand` has taken a request; and a
+promotion's source lease only adds protection. What does break the gate: a service that overlaps the reading of one request with serving another
+(the plan's "asynchronous `progress()`" wording in Task 5, and any pipelining across requests), a producer whose planned lanes are not in `protect`,
+or a change that lets an eviction run inside a demand's read. So the accurate statement is "expires when the service stops serving one request
+at a time", which Task 8 does not do and Task 5's asynchronous-service wording might.
