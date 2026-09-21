@@ -110,6 +110,16 @@ is no schema-3 graph-decode trace. The row-ready stamp used, `row_pack_ns[].end`
 request stream (20,800 requests, 7,211 demands in each) replayed with different timing**, so their agreement is
 agreement of the run and the drives, not seven workloads.
 
+**Are they independent runs or copies of one run? Independent runs (checked, `per_row_independence_result.txt`).** All eight trace
+files in `task1-results/` (seven used here plus `task1f`) have different sha256; every pair has **0 of 20,800 requests with the
+same `observed` stamp and 0 with the same extent-completion tuple** (the only coincidences are one `pack_ns` value in two pairs);
+they carry different boot-clock stamps, different total spans (445-459 s mirrors off, 288-289 s and 319 s mirrors on) and different
+host pids in the arm JSON, with file mtimes from 2026-09-20 13:04 to 2026-09-21 03:05. What is identical is exactly the
+non-timing content: `(layer, type, rows_asked)` for all 20,800 requests in every pair, which is what a deterministic harness
+produces. So "three mirrors-on arms" are three independent timing samples of **one** request stream: their agreement (the FIFO
+result, the 2.77 ms spread, the 254.4 ms mean) is agreement of the drives and the box across runs, not of the workload, which is
+what the sentence above already said. Nothing else here changes.
+
 Model: per request that reads `m >= 1` rows, `k` lanes (the registered run used `k = round(vram_miss/40)` for its graph step, capped at 6 **[A1]**; **the current figures in 1.2 replace it with the measured per-request lane count**),
 `h = k - m` RAM-hit lanes ready at the service's `reserved` stamp **[A2: this assumes an early readiness signal that does not exist today; section 3.1]**, miss row `j` ready at its `row_pack_ns[j].end`,
 lane copy time `c = 1.055 ms` (DSV41_REFERENCE 18.2's measured gather per row). Batched time `T_b = done + k*c`; per-row

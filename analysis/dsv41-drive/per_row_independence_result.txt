@@ -1,0 +1,5 @@
+# per_row_independence_check.py output, 2026-09-21, divix01 (taskset -c 0-63, nice, 1 thread, read-only) over task1-results/*.trace
+# sha256 (first 16 hex) of each trace:
+96f2bb448db158e0 t1-0-new-off-T; 99e06b916434fe67 task1-0-new-off-T; 3fd9051aeb24ff10 task1-1-new-off-T; cc341a9aac06b410 task1-2-new-on-T; 3d71296dc16e8c76 task1b-0-new-on-T; fe537a4438d7cae9 task1c-0-new-on-T; 68c892d61815eed6 task1c-2-new-off-T; ae6967a357117649 task1f-0-new-on-T
+# arm json provenance: distinct host pids 2091741 2127373 2149129 2443655 2164497 2403431 2422887 2785482; trace mtimes 2026-09-20 13:04 .. 2026-09-21 03:05
+# (pairwise output was captured in the session; rerun: ssh divix01 ... python3 - <names> < per_row_independence_check.py)
