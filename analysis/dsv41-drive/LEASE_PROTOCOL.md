@@ -143,12 +143,12 @@ quarantine.**
   An independent review answered the ordering: `weakref.finalize`'s atexit hook is
   registered before `_stop_live`, and `atexit` is last-in first-out, so `_stop_live` runs
   **first** and the slab-unregister finalizers run **second**, with no device barrier between
-  them. Which exit path production actually takes is a separate question: the docstring of
-  `record_graph_step` in `exl3_stream_trace.py` says the scheduler "is SIGKILLed at
-  shutdown", in which case none of these hooks run. I have not confirmed that from the
-  launcher, so I state the hazard's scope as: **a normal-exit and test-teardown hazard;
-  under SIGKILL it does not occur, and nothing in this design should be read as fixing a
-  production defect that SIGKILL already hides.**
+  them. Which exit path production takes: corrected by reading the launcher (see the finding at the top of section
+  14). The scheduler is **not** unconditionally SIGKILLed: on a graceful shutdown (`ShutdownReq` sets
+  `gracefully_exit`) `run_scheduler_process`'s `finally` runs `Scheduler.release_host_resources()`, and only the
+  exception path can SIGKILL. An earlier version of this bullet cited a docstring in `exl3_stream_trace.py` for the
+  opposite and is withdrawn. So the exit-time unregister is a live hazard on a normal exit, and whether every production
+  teardown reaches the graceful path (`Engine.shutdown()` kills its children's tree) is untraced (OPEN 18).
 - Design consequence: this document designs for the `_stop_live` path. If the
   design needs a production caller of an orderly shutdown to exist, that is a
   **requirement** (section 14.6), not an assumption.
