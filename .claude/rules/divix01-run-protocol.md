@@ -69,3 +69,23 @@ Every CPU job runs under `taskset -c 0-63` with threads capped
 (`OMP_NUM_THREADS`). Cores 64-71 stay free: core 71 is production's doorbell
 spin core. GPU work goes through `gpu-run.sh` (takes `cc-gpu.lock`, pins cores
 32-63), never a bare command.
+
+## The launch gate can validate the wrong format and pass
+
+`expert_stream_requirements_for` (`python/sglang/srt/arg_groups/expert_stream_requirements.py:160`) asks
+`expert_quant_method` for the launch's format. That returns `None` when `model_path` is not a local directory
+(`:134-136`), and `None` falls back to `NVFP4_EXPERT_STREAM_REQUIREMENTS` **silently** (`:164-166`). So a gate run
+against a mistyped or nonexistent model directory checks the NVFP4 rules, reports that it accepted the launch, and
+never applies any EXL3 rule -- not the breakable decode graph, not batch size 1, not the refusals of
+`SGLANG_OPT_USE_MULTI_STREAM_OVERLAP` and `SGLANG_MOE_HOT_ASYNC_PROMOTIONS`.
+
+Note the asymmetry that makes it easy to miss: an *unsupported* method raises a clear `ValueError` naming the
+supported methods (`:171-177`), so the one branch that is silent is the one that looks like success.
+
+**This is not a bug to fix in the gate.** Returning `None` for a non-directory is deliberate: `model_path` may be a
+remote HuggingFace repo id, and raising there would refuse legitimate launches. The defect is that "could not
+determine the format" and "there is genuinely no expert format" are the same value.
+
+**What a caller must do instead:** after running the gate, assert the resolved requirements are the format you meant
+to test. A harness that merely checks the gate did not raise has proved nothing about an EXL3 launch. Found by the
+`benchmarks/dsv41_flash` work, which now asserts exactly this; `check_gate` there is the worked example.
