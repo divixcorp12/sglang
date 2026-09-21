@@ -596,8 +596,8 @@ under `.nc` and checks the second read. The existing byte-parity results on deco
 slots are evicted and reloaded constantly in those runs. They are not a test of this
 claim. I am not asserting the read is safe or unsafe.
 
-**The experiment that would settle it (needs the GPU; not run; not runnable in this
-phase).** On the RTX 5090, under the GPU lock and with crypto-c9's scheduling:
+**The experiment that would settle it. It was run afterwards (NC_VISIBILITY.md, see the note
+below this list); the plan as written here is kept for the record.** On the RTX 5090, under the GPU lock and with crypto-c9's scheduling:
 
 1. Allocate a registered host slab larger than L2 (size past ~128 MiB per the project's
    microbenchmark rule) and fill row `r` with pattern A.
@@ -613,6 +613,21 @@ mode uses the non-`nc` load (a compile-time variant of `copy_expert_host_unit16`
 lease protocol itself is unchanged. If it never fails, record the count and the
 GPU/driver versions, and say "not observed", not "safe". The intra-kernel variant (host
 writes during K2) is **not** a supported use and must not be tested as if it were.
+
+**Result (run afterwards; full write-up and its pre-registration in `NC_VISIBILITY.md`).** The
+experiment above was pre-registered, then run on divix01 (RTX 5090, PCIe Gen3 x16, driver
+610.57.04). By the pre-registered rule the verdict is **keep `ld.global.nc`**: stale or mixed
+words were **not observed** in 1.3e10 words per cell across the eight `nc` cells (host store
+regular or non-temporal; boundary, graph, L2-thrashed and GPU-busy shapes), and the non-`nc`
+`cv` load was equally clean. The harness can tell the variants apart: in a control, a `.nc`
+load of a host-written flag inside a kernel never saw it in 20 ms (0 of 100) while `cv` saw it in
+8.6 us (100 of 100), and a device-memory control returned the old value 100,000 of 100,000 times
+under `.nc`. Two consequences for the design. (1) Step 4 keeps `.nc` for the copy; the `cv`
+variant stays a compile-time switch, at no measured bandwidth cost (12.34 GB/s both, against
+13.79 for `cudaMemcpyAsync`, Gen3 ceiling 15.75). (2) **A `.nc` load of host memory is stale for
+the life of the kernel, so any kernel that polls host memory (the wait kernel, and Task 6's
+per-lane readiness poll) must use `ld.acquire.sys`, never `.nc`.** This is "not observed", not
+"safe", for one GPU, driver and host; OPEN 6 is narrowed, not closed.
 
 ---
 
@@ -1630,7 +1645,7 @@ side is transcribed faithfully.
   Allocate with slack and slice if not guaranteed.
 - **[OPEN 4]** Production tier capacities, so the size of `SlotGen[]`.
 - **[OPEN 5]** Cost of two extra `__threadfence_system()` per post and of the ack kernel.
-- **[OPEN 6]** The exact PTX ISA wording for `ld.global.nc` on the deployed toolkit, and
+- **[OPEN 6]** (narrowed by the run in 6.6: cross-kernel `.nc` staleness not observed; PTX wording still unverified) The exact PTX ISA wording for `ld.global.nc` on the deployed toolkit, and
   whether L2 keeps system-memory lines across kernel launches. Section 6.6 gives the
   experiment.
 - **[OPEN 7]** Every consumer of `ram_miss` and `unserved_misses`, and whether their

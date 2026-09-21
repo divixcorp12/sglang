@@ -1,0 +1,4 @@
+Cuda compilation tools, release 13.4, V13.4.46
+Build cuda_13.4.r13.4/compiler.38501229_0
+7c0bb78ba776e0fab4b1f9eff6519f043adca6e819e8dd6f614f0daa46acafab  /home/dnikolaidis/nc-visibility/nc_visibility
+db5c53b9c81fa5ffefca86f8620b1f496230307a5f8fab0141f81e57b6de856f  /home/dnikolaidis/nc-visibility/nc_visibility.cu
