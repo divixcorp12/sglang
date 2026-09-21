@@ -351,6 +351,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
             for p in prompts
         ],
         "error": None,
+        "trace_overhead": {"measured": False, "trace_enabled": trace_path is not None},
     }
     cursor = TraceCursor(trace_path) if trace_path else None
     started = time.monotonic()

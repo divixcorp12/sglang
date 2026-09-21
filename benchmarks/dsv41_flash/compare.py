@@ -241,6 +241,16 @@ def render(runs: list[dict]) -> str:
     lines.append("")
     if all(by_arm.values()):
         lines += decision(by_arm) + mix_lines(by_arm)
+    traced = sorted(
+        {
+            str(r["trace_overhead"]["trace_enabled"])
+            for r in runs
+            if r.get("trace_overhead")
+        }
+    )
+    lines.append(
+        f"stream trace enabled (its per-step overhead and variance cost are NOT measured): {', '.join(traced) or 'n/a'}"
+    )
     lines.append(f"greedy output parity across arms: {parity(runs)}")
     lease = [
         r["counters_final"]

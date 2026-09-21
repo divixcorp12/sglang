@@ -91,7 +91,9 @@ second of its pair.
 
 The lease cost is ~0.68 ms per 40-layer step on ~66.8 ms: about 1%. The standard error of a p50 over n samples is
 about 1.25 x sd / sqrt(n), so 1924 samples resolve 0.67 ms if the per-step sd is below roughly 8 ms; a run whose
-steps stall on RAM misses (sd of tens of ms) will not, and the block spread will say so. The main threat is
+steps stall on RAM misses (sd of tens of ms) will not, and the block spread will say so. **This is the condition under which the exercise fails**: if the per-step sd is above ~8 ms (RAM-miss stalls, box
+contention) the 1% is unresolvable from one pair, and a `NOT RESOLVED` verdict says that, not that there is no effect.
+The main threat is
 cross-process variance (two processes, two loads), which is why `min` is reported beside p50: on the OPEN 11 re-take
 min-to-min and p50 agreed to 0.4 us on a quiet card and disagreed six-fold on a busy one. A p50 delta whose min-to-min
 delta disagrees in sign is box noise.
@@ -135,6 +137,13 @@ A failed check sets `lease_check.ok = false`, exits 3 and puts `INVALID` at the 
 recorded: the trace snapshots per batch, not per step boundary, so a nonzero final gap is expected to be in flight.
 `fatal_seq` itself is a request-page word not present in the snapshot; this is where the brief's `fatal == 0` is
 weaker than in `open11`.
+
+**The trace may also inflate the variance**, not just the step time, and variance is what decides resolvability
+(the sd < ~8 ms condition above). Its per-step overhead is not measured: measuring it needs an untraced arm, which
+costs a third load. Every result therefore carries `trace_overhead = {"measured": false, "trace_enabled": true}` and
+`compare.py` prints it, so a number is never read as if the tree were untraced. To measure it, run one extra
+`lease_off` process with `--no-trace` and compare its step statistics to the traced `lease_off` (its lease check will
+be reported as unverified by design).
 
 **The trace is on in both arms**, so the service also takes stage timestamps and the scheduler writes a JSON line per
 decode step. That is symmetric between the arms so it cancels in the delta, but its cost per step is unmeasured, and it adds
