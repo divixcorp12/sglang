@@ -1,4 +1,8 @@
-"""Analysis for the task1e series, fixed before the series ran (see task1e-PREDICTIONS.txt).
+"""Analysis for the task1e series (see task1e-PREDICTIONS.txt and task1e-AMENDMENT.txt).
+
+Revision 2 adds the RELAXED sets of the amendment, written after arm 0's verdict and before arm 1's.
+Revision 1 (sha256 ca0f20e2db5ee40f1859ee4ab9515d07876a384d8f367f77998ad1540a769e9a, commit 450f86d17a) is the
+one the original pre-registration hashed; its STRICT and S1 numbers are unchanged in revision 2.
 
     task1e_analyze.py <task1-results dir> <label-prefix>... [--manifest clean-reference.json]
 
@@ -118,7 +122,7 @@ def load_arm(json_path, code):
     }
 
 
-def inconclusive_reasons(a, ignore_cross=False):
+def inconclusive_reasons(a, ignore_cross=False, ignore_contended=False):
     r = []
     if not a["valid"]:
         r.append("not VALID")
@@ -126,7 +130,7 @@ def inconclusive_reasons(a, ignore_cross=False):
         r.append("OUTLIER note")
     if a["cross"] and not ignore_cross:
         r.append("CROSS-ARM flag")
-    if a["contended"] != "not":
+    if a["contended"] != "not" and not ignore_contended:
         r.append(f"CONTENDED {a['contended']}")
     if not a["gen_ok"]:
         r.append(f"generation {a['gen'][:40]!r}")
@@ -184,7 +188,8 @@ def stationarity(arms):
             reasons.append(f"{key}: missing samples")
             continue
         spread = max(vals) - min(vals)
-        gap = mean([a[key] for a in arms if a["code"] == "new"]) - mean([a[key] for a in arms if a["code"] == "old"])
+        gn, go = [a[key] for a in arms if a["code"] == "new"], [a[key] for a in arms if a["code"] == "old"]
+        gap = mean(gn) - mean(go) if gn and go else 0.0
         slope, _ = ols(list(range(len(vals))), vals)
         trend = slope * (len(vals) - 1)
         name = {"L": "load1", "F": "foreign CPU% on cores 32-63"}[key]
@@ -246,27 +251,32 @@ def main():
     print(f"\nSTATIONARITY over all {len(arms)} arms run: {'NON-STATIONARY' if non_stat else 'stationary'}")
     for r in why:
         print("   ", r)
-    primary = [x for x in arms if not inconclusive_reasons(x)]
+    strict = [x for x in arms if not inconclusive_reasons(x)]
     sens1 = [x for x in arms if not inconclusive_reasons(x, ignore_cross=True)]
+    relaxed = [x for x in arms if not inconclusive_reasons(x, ignore_contended=True)]
+    sens1r = [x for x in arms if not inconclusive_reasons(x, ignore_cross=True, ignore_contended=True)]
     sens2 = [x for x in arms if x["valid"] and x["gen_ok"]]
-    print(f"\nARMS DROPPED: primary {len(arms) - len(primary)}, S1 (CROSS-ARM ignored) {len(arms) - len(sens1)}, S2 (all VALID, right generation) {len(arms) - len(sens2)}")
-    w = None
-    for title, s in (("PRIMARY (inherited INCONCLUSIVE rules)", primary), ("S1 sensitivity: VALID, OUTLIER-free, not contended, CROSS-ARM ignored", sens1),
+    print(f"\nARMS DROPPED of {len(arms)}: STRICT (original rules) {len(arms) - len(strict)}, S1 (strict, CROSS-ARM ignored) {len(arms) - len(sens1)}, "
+          f"RELAXED (amended: CONTENDED alone does not disqualify) {len(arms) - len(relaxed)}, S1r (relaxed, CROSS-ARM ignored) {len(arms) - len(sens1r)}, "
+          f"S2 (all VALID, right generation) {len(arms) - len(sens2)}")
+    for title, s in (("RELAXED = AMENDED PRIMARY (OUTLIER and CROSS-ARM still disqualify)", relaxed),
+                     ("STRICT (original task1e-PREDICTIONS rules)", strict),
+                     ("S1r sensitivity: relaxed with CROSS-ARM ignored (VALID, OUTLIER-free, right generation)", sens1r),
+                     ("S1 sensitivity, original definition: strict with CROSS-ARM ignored", sens1),
                      ("S2 descriptive: every VALID right-generation arm", sens2)):
-        r = report_set(title, s)
-        if title.startswith("PRIMARY"):
-            w = r
+        report_set(title, s)
         fit = position_fit([(x, pos[x["name"]]) for x in s])
         print("   position fit:", (f"cell(new-old) {fit['cell_new_minus_old']:+.4f} tok/s at fixed position, slope {fit['slope_per_slot']:+.4f} tok/s per slot" if fit else "not computable"))
-    n_new = sum(1 for x in primary if x["code"] == "new")
-    n_old = sum(1 for x in primary if x["code"] == "old")
-    print("\nPRE-REGISTERED VERDICT:")
-    if n_new < 3 or n_old < 3:
-        print(f"   UNRESOLVED: {n_old} clean old, {n_new} clean new; fewer than 3 in a cell.")
-    elif non_stat:
-        print("   UNRESOLVED: contention was non-stationary across the series; no ratio is reported as a result.")
-    else:
-        print("   Ratio and interval above are the result (contended absolute levels).")
+    print("\nPRE-REGISTERED VERDICTS (both are reported; the original is not erased):")
+    for label, s in (("STRICT (original rules)", strict), ("RELAXED (amended primary)", relaxed)):
+        n_new = sum(1 for x in s if x["code"] == "new")
+        n_old = sum(1 for x in s if x["code"] == "old")
+        if n_new < 3 or n_old < 3:
+            print(f"   {label}: UNRESOLVED: {n_old} clean old, {n_new} clean new; fewer than 3 in a cell.")
+        elif non_stat:
+            print(f"   {label}: UNRESOLVED: contention was non-stationary across the series; the ratio is not a result.")
+        else:
+            print(f"   {label}: the ratio and interval above are the result (contended absolute levels).")
 
 
 if __name__ == "__main__":
