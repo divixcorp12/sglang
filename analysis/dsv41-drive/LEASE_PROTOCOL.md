@@ -1107,6 +1107,16 @@ completion of all GPU readers before freeing their memory. If a CUDA error preve
 establishing completion, retain/quarantine allocations until process teardown; never
 recycle uncertain storage." Today (D5) the code frees first and never checks.
 
+**FINDING, before anything else in this section: `Exl3RamMissService.shutdown()` has no production caller.** Its
+only callers are tests and the exit hook the wiring adds. So the orderly sequence below (S0-S5) is correct, tested
+and mutation-checked as a *wiring*, and changes nothing about what a production teardown does. What is reachable in
+production today is **only the exit-hook quarantine, and only on a normal interpreter exit**: the docstring of
+`record_graph_step` in `exl3_stream_trace.py` says the scheduler is SIGKILLed at shutdown (not confirmed from the
+launcher), in which case **no part of step 6 runs in production at all**, and neither did the unregister finalizers
+this section replaces (D5's hazard is then a normal-exit and test-teardown hazard only). Do not read any test or
+mutation result on this step as protection of a production path. No Task 5 box that mentions shutdown is to be ticked
+on step 6's strength without this paragraph attached. Whether a production caller belongs in Task 5 is stated in 14.6.
+
 ### 14.1 What is quarantined, precisely
 
 Everything a still-running or possibly-running GPU kernel may read *or write*:
@@ -1247,6 +1257,16 @@ check, and it is Task 5's non-goal.
 ---
 
 ## 16. The worker never waits for an acknowledgement, and why it cannot deadlock
+
+
+**Status of that requirement (asked directly: deliberate, out of scope, or blocked?).** It is **out of Task 5's scope,
+not deliberate and not technically blocked**, and it is **unowned**. It was recorded as a requirement when the design was
+written (this section) precisely so it would not be assumed, but no task assigns it: the natural caller is scheduler
+teardown, which is not in Task 5's file list, and if the scheduler is SIGKILLed at shutdown there is no orderly
+teardown to hook, so a caller may need a launcher change instead. I could not determine who owns that, or whether the
+launcher SIGKILLs (**[OPEN 18]**). Consequence for Task 6: its "stop during SM transfer" case (a shutdown while lane
+copies are in flight) can only be exercised by tests that call `shutdown()` directly, and nothing in production will
+ever run that path until someone owns the caller.
 
 ### 16.1 The rule
 
@@ -1833,6 +1853,8 @@ side is transcribed faithfully.
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
 - **[OPEN 16]** (designed in 17.3; the design's own assumption is OPEN 17) The mechanics of the
   executor-stream release callback (17.1 R1a).
+- **[OPEN 18]** Who owns a production caller of `Exl3RamMissService.shutdown()`, and whether the scheduler is
+  SIGKILLed at shutdown (so that no orderly teardown exists to hook). Unowned and undetermined (14, 14.6).
 - **[OPEN 17]** That `tvm_ffi` never unloads a JIT module, so the function address the device module
   holds stays valid for the process. Unchecked; 17.3 rule 2 rests on it.
 - **[OPEN 15]** How a deferral interacts with the stage record's `observed`, `prev_done` and
@@ -1909,7 +1931,7 @@ this order may change).
 | 3 | **Admission, grant, publish, retire, terminal; the CPU device.** `host.cpp`: read `LaneRequest` with the seqlock re-check; take `G` from it (11.3); `Outstanding` ring; in `serve()` grant and publish per lane (6.1 order, RAII undo); `retire_leases()` called from the top of `RamThread::run` and from the give-up lambda of `RowReader::read`; the pause acknowledgement's graph-lane `outstanding == 0`; the terminal check and `late_after_terminal`; deferral. Extend `exl3_ram_miss_sim_post` / `_sim_wait` and add `sim_ack`, `sim_terminal` so the whole protocol runs with no GPU. | Section 18.2 items 1-4, 6, 7(b)-(d), 8, 10, 14 and 15, each with its precondition asserted and its mutation demonstrated (the ledger in 18.2; item 5 is sim-only on the CPU and is not evidence for the kernel), plus the model counterexamples that have a service analogue, replayed at scenario level (20.2b). The wrap tests (`test_exl3_ram_miss_wrap.py`) still pass. | **A deferral must return before `begin_stage`, or push nothing**, and retry only when `retire_leases()` changed something or a `Terminal` appeared, or the 8192-slot stage ring floods per poll (7.1, OPEN 15). Weak ordering between ack and terminal words: the sim must be able to deliver them in either order, as the model does. | no |
 | 4 | **The device kernels.** `device.cuh`: `LaneRequest` in the post kernel; the wait kernel with `go_count`, the `RowResult` validate (generation, tag, expert), the terminal, the `fatal`/`Header.shutdown` poll inside the loop (D4), and 64-bit `ld.acquire.sys` / `st.release.sys`; new `exl3_ram_miss_ack_kernel`. `ops.py`: `Exl3RamMissDevice.post/wait/ack`, `lane_ctx`, `go_count`; append `epoch` and `pending_epoch` to `STATE_WORDS`. | CPU: argument validation in `test_exl3_ram_miss_device_args`; the state-word agreement test. GPU (manual, under the lock, after crypto-c9 schedules): a wait kernel timeout leaves `go_count == 0` and a poisoned slab is not read; an acknowledgement is emitted only for copied lanes; the `ld.global.nc` experiment (6.6), independent of this step. | **`STATE_WORDS` is a triple edit**: the device-state enum in `device.cuh`, `STATE_WORDS` in `ops.py`, and the hard-coded dict in the device-args test, all together or the existing test fails. **`go_count` must be an int32 CUDA tensor of shape `[1]`** (`_validate_plan`), not a scalar, not int64. Constexprs as in step 1. | yes |
 | 5 | **The backend and the arming rule.** `srt_ram_miss.py`: `Exl3RamMissRowBackend` overrides `post` (today only `translate` is overridden and `post` is inherited from `PinnedTierRowBackend`) to pass `go_count` to `copy_expert_row_segments_gpu` and to launch the acknowledgement kernel after it; `Exl3RamMissService.ensure_started` / `attach` allocate the block and hand it to the host and the device; lease mode arms every record with `count > 0` (15). The new environment switch is read here. | Existing service tests green with the switch off; with it on, the GPU graph parity test (`test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`): byte-exact output versus off, an injected timeout, and the arming cost measurement (OPEN 11) reported, not assumed. | The switch defaults off. `advise` and the arming rule must agree between the device (`armed = need_count > 0 || advise != 0`) and the service's `touch_request` path, or a record is waited on that the service treats as touch-only. | yes |
-| 6 | **Shutdown and quarantine.** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 item 9(c) (a fake CUDA error and a fake sync timeout select quarantine; `release_host_slabs` patched before the cache is built, the fake sync asserted to have been called, no unregister, the slab alive by weak reference); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
+| 6 | **Shutdown and quarantine. (Production reachability: only the exit-hook quarantine, only on normal exit; `shutdown()` has no production caller. See the finding at the top of section 14.)** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 item 9(c) (a fake CUDA error and a fake sync timeout select quarantine; `release_host_slabs` patched before the cache is built, the fake sync asserted to have been called, no unregister, the slab alive by weak reference); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
 | 7 | **The host-lease API for Task 8.** `host.cpp` and the export table: `acquire_host_lease`, `lease_on_ready`, `release_host_lease` (17.1, R1-R8), never bumping `kVersion`, releasable by an executor-stream host callback (R1a, OPEN 16) and not only by the scheduler thread's poll, a stale or repeated `LeaseRef` counted as an error; the pause counts graph-lane leases only; **a host lease is released by an executor-stream host callback, not the scheduler thread's poll (R1a, OPEN 16)**. | R1-R8 tests; the model's Task 8 mutants replayed against the real API through the sim. | R8 (`kVersion`), R2 (the pause split), R3 (`lease_on_ready`), and A3 for whoever calls it. | no |
 | 8 | **Enable and gate.** Flip nothing by default. Record the cost of the added fences and of arming every `count > 0` record (OPEN 5, OPEN 11); run the `ld.global.nc` experiment if not already done (OPEN 6); state the result of the wrap tests against the real code (OPEN 1). | The plan's Task 5 gate: lease-pressure and fault tests prove no reuse before consumption; concurrent graph execution stays guarded (OPEN 9). | Do not report skipped hardware tests as passed. | yes |
 
