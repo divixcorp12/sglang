@@ -41,6 +41,11 @@ one is ever wanted, is conditioned. None is planned.
 
 ## The two mirrors are not symmetric hardware
 
+**Device resolution trap:** the `/proc/diskstats` row is the *partition*
+(`nvme0n1p1`, `nvme3n1p1`) while the queue limits live on the *parent disk*
+(`nvme0n1`, `nvme3n1`); a script keyed on a device name reads the wrong thing or
+nothing. The harness resolves both.
+
 Resolved at run time from `/proc/self/mountinfo`, `/proc/diskstats` and
 `/sys/dev/block/<major>:<minor>` by `os.stat().st_dev`, never by name (there is no
 `nvme4` block device; `/mnt/nvme4` is `nvme3n1`, and diskstats keys the partition):
@@ -55,13 +60,43 @@ nvme0 and 26 on nvme3. A 50/50 byte split is a 1:2 request split.
 
 ### Request-count model applied to run 1 and run 2 (no drive I/O)
 
-`bench_row_scheduling.py --model-requests --weights 0.96:1` (and `0.97:1` for run 2)
-re-plans the recorded replay (digest `ad92c28366896b0d`, 100 batches, 304 rows per
-rep) through the same planners, resetting stateful planners per batch-size group
-exactly as the run did, and predicts requests as `ceil(extent / max_sectors_kb)` per
-extent. It read only the checkpoint headers. Its per-arm per-drive bytes reproduce the
-recorded ones (1.89/1.89 GiB within-row and whole-row, 3.77/0 one-root, 1.85/1.92 and
-1.86/1.91 weighted). Predicted requests per batch, nvme0 / nvme3:
+**Status: an unvalidated prediction, not a measurement.** Its three limits:
+(1) it has not been checked against real block counts, because the existing runs
+recorded no `reads_completed`; (2) it counts only the `max_sectors_kb` size cap and
+ignores segment merging and how xfs and ext4 build bios, either of which can move the
+real count; (3) run 1 and run 2 lack per-arm conditions (previous section) and stand
+only for the identical-requested-bytes verdict. A small validation run (below, under
+Reproduce; about 0.12 GB) is approved for a time when the drives are free and is not
+required to close the scheduling items.
+
+**Finding 1, measured: request count does not bind at 3.3-3.5 GB/s.** The drive with
+twice the requests per byte was the faster one solo. The calibration read nvme0 (13
+requests per extent) at 3329 MB/s in run 1 and 3293 in run 2, and nvme4 (26 per extent)
+at 3456 and 3412, so nvme4 was 3-4% faster; per-row solo p50 in `MIRROR_ROWS.md` was
+5.916 ms (nvme0) against 6.007 ms (nvme4), a parity. This is a measured fact and does
+not depend on the model, though the 13 and 26 that label it do.
+
+**Finding 2, modelled: the request asymmetry is real but arm-invariant.** A
+byte-balanced split is a 1:2 request split, and both arms whose verdict matters carry
+the same one (busiest over quietest 2.00 for within-row, 1.96 for whole-row). It is a
+property of the drive pair at a given byte split, not of the scheduling policy, so it
+cannot explain whole-row's 1-2% gain at 4 or more rows or its 1.8x loss at one row
+(one extent on one drive, a byte effect). A real effect that cannot tell the
+alternatives apart is a negative result for the decision here: "1:2 request imbalance"
+should not be read as a reason to change the policy.
+
+The one arm this cannot rule out is a request-balanced split (about 2:1 bytes toward
+nvme0). Finding 1 gives no reason to expect it to win, since nvme3 is not the slower
+drive.
+
+**How the model was built and why it is credible.** `bench_row_scheduling.py
+--model-requests --weights 0.96:1` (and `0.97:1` for run 2) re-plans the recorded
+replay (digest `ad92c28366896b0d`, 100 batches, 304 rows per rep) through the same
+planners, resetting stateful planners per batch-size group exactly as the run did, and
+predicts requests as `ceil(extent / max_sectors_kb)` per extent. It read only the
+checkpoint headers. Its per-arm per-drive bytes reproduce the recorded ones (1.89/1.89
+GiB within-row and whole-row, 3.77/0 one-root, 1.85/1.92 and 1.86/1.91 weighted), so
+the plan is the one that ran. Predicted requests per batch, nvme0 / nvme3:
 
 | rows | within-row 1:1 | whole-row | weighted 0.96:1 |
 |---|---|---|---|
@@ -73,28 +108,9 @@ recorded ones (1.89/1.89 GiB within-row and whole-row, 3.77/0 one-root, 1.85/1.9
 | 32 | 416 / 832 | 416 / 816 | 416 / 832 |
 
 Request share nvme0 / nvme3 is 0.33 / 0.67 for within-row and weighted and 0.34 / 0.66
-for whole-row (busiest over quietest 2.00 against 1.96). One-root nvme0 puts all
-requests (26 per row) on nvme0.
-
-**What this says.** The request asymmetry is a property of the two drives at a given
-byte split, not of the policy: the two arms that are compared (within-row and
-whole-row) carry the same 1:2 request split, so it cannot explain whole-row's 1-2%
-gain at 4 or more rows or its 1.8x loss at one row (one extent on one drive, a byte
-effect). The one place the existing data touch the question is solo throughput: the
-calibration read nvme0 (13 requests per extent) at 3329 and 3293 MB/s and nvme4 (26
-per extent) at 3456 and 3412 MB/s in run 1 and run 2, and the per-row solo p50 was
-5.916 ms against 6.007 ms in `MIRROR_ROWS.md`. The drive with twice the requests per
-byte was not slower, so nothing here shows request count binding at 3.3-3.5 GB/s. The
-one arm this cannot rule out is a request-balanced split (about 2:1 bytes toward
-nvme0), which the calibration gives no reason to expect to win because nvme3 is not
-the slower drive.
-
-**What it does not say.** The model counts only the size cap; segment merging and the
-way xfs and ext4 build bios can move the real count. It has not been checked against
-`reads_completed`, since the existing runs recorded none. Treat 13 and 26 as a
-prediction until a conditioned run compares them; the harness prints predicted and
-measured side by side and marks a block `?` when they differ by more than 25%
-(arbitrary threshold).
+for whole-row. One-root nvme0 puts all requests (26 per row) on nvme0. The harness
+prints predicted and measured requests side by side in a conditioned run and marks a
+block `?` when they differ by more than 25% (arbitrary threshold).
 
 ## What was measured (runs 1 and 2)
 
