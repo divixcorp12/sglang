@@ -248,7 +248,10 @@ Include expert identity in the immutable row result and validate it against the 
 > the NVMe read runs, and only 13% needs miss rows to finish at different
 > times**. Per-row transfer's own contribution over a simple **hits-then-rest
 > two-phase copy** is at most 5.06 ms/step, about **2.0% gross** -- which is
-> *above* the ~1.5% this plan's arms resolve (`task1e-PREDICTIONS.txt` line 10).
+> *above* the ~1.5% this plan's arms resolve (`task1e-PREDICTIONS.txt` line 10)
+> -- and **that 1.5% is itself optimistic**, since it derives from task1e's
+> quiet-box standard deviation and that series is UNRESOLVED. The true
+> resolution is worse, which widens rather than narrows the gap.
 > It falls to about 1% only **net of launch cost**, i.e. **at** the design's
 > resolution rather than clearly below it. (An earlier revision of this
 > blockquote cited 2.55 ms / 1.0% as the gross figure and called it below
@@ -263,13 +266,32 @@ Include expert identity in the immutable row result and validate it against the 
 > ms per row of packing), not drive completion order, so this task's premise was
 > partly a misattribution of a Task 4 artefact -- and parallelising packing would
 > shrink the 13% further, making per-row *less* attractive as Task 4 improves.
+> **Correction:** the perfect pack-order result (1,888 of 1,888) was attributed
+> in earlier revisions of this plan -- by me -- to `pack_one`'s lowest-ordinal
+> tie-break. **That is refuted.** Row completion stamps show **0 inversions** in
+> 1,842 m>=2 requests on each of three on-arms and the off-arm, and **0 of 4,750
+> consecutive-row pairs on one drive part** completed out of order, with
+> same-reap ties only 3.7% of adjacent pairs (0% mirrors-off). The ordering comes
+> from **per-drive FIFO completion**, not from the packer. The design must list
+> FIFO completion per drive part as an explicit assumption; `MIRROR_ROWS`' tail
+> means bunching, not reordering.
 > **With mirrors off the spread is 7.4 ms and is drive-bound**, so the
 > misattribution claim holds only in the regime this system actually runs in, and
 > must not be restated as a general one. The precheck's modelled saving is the
 > same either way. The caveat that carries the result is that hit
 > lanes are assumed to spread evenly over layers; the traces do not record lanes
 > per layer, so an instrumentation item is requested to record the planned lane
-> count per request.
+> count per request (**landed**: schema 4, `4e63616666`, records `lanes` per
+> request; a schema-4 trace can replace the bounds below with a measurement).
+>
+> **A1 no longer has to be assumed, and this strengthens the redirect**
+> (independent recompute, `f1cda7ba72`). The trace *bounds* hit-lane placement
+> without assuming it: of 111.9 hit lanes/step, the data force **at least 10.8
+> and at most 63.6** into read layers (A1 credits 31.9). **At the worst
+> placement two-phase still yields about 4%, clearing the 3% bar**, while
+> random-order per-row falls to about **2.8%, just under it**. So A1 does not
+> prop up two-phase -- it decides the per-row column only. Two-phase floors
+> (unregistered): >=3% at f = 0.26, >=1.5% at f = 0.145.
 >
 > **BLOCKING DEPENDENCY.** The 7.5-15% saving, and the 87% share attributed to
 > hit lanes, both assume the hit-lane gather can start while the NVMe read is
@@ -321,8 +343,20 @@ Include expert identity in the immutable row result and validate it against the 
 > It is safe only under today's invariants -- one service thread, so no advisory
 > can run once the request is taken; `take_slot_locked` never evicts `wanted`;
 > eager paused -- and it is **not Task 5 compliant**. It buys the 87% by
-> *borrowing* the temporal exclusion rather than replacing it, so it expires the
-> moment the service becomes asynchronous. Two things unverified: whether the
+> *borrowing* the temporal exclusion rather than replacing it.
+>
+> **Correction to the expiry condition** (`98b4146ead`, G3): I first wrote that
+> it expires when the service becomes asynchronous, "which Task 8 exists to make
+> it". That is wrong. Checked against `PROMOTION_ASYNC.md`, the borrowed
+> invariants **survive Task 8 as designed** -- M2 promotion admission is a
+> request class on the same thread, strictly below demand and advisory, cancelled
+> at the next row when a demand is posted; and a promotion's source lease only
+> adds protection, so `wanted` is still never evicted. The correct condition is
+> that it **expires when the service stops serving one request at a time**. Task
+> 8 does not do that; Task 5's "asynchronous `progress()`" wording might. What
+> actually breaks it: overlapping the read of one request with serving another, a
+> producer whose planned lanes are not in `protect`, or any change letting an
+> eviction run inside a demand's read. Two things unverified: whether the
 > device reliably observes `kBusySeq` before it clears, and whether every planned
 > lane is in `protect` for every producer.
 >
