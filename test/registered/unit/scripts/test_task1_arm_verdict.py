@@ -386,3 +386,20 @@ def test_generation_is_derived_from_the_python_tree_of_the_imported_head(tmp_pat
 def test_generation_is_unknown_when_the_head_cannot_be_resolved(tmp_path):
     assert verdict.generation({}, str(tmp_path), {})[0].startswith("unknown")
     assert verdict.generation(_arm_at("0" * 40), str(tmp_path), {})[0].startswith("unknown")
+
+
+def test_the_harness_that_drove_an_arm_is_named_or_its_absence_is():
+    old = verdict.harness_note(_report())
+    assert old.startswith("HARNESS not recorded") and "predates" in old
+    report = _report()
+    report["provenance"]["harness_loaded"] = {
+        "top": "/wt/harness",
+        "git": {"head": "c" * 40, "dirty": True, "dirty_file_count": 2},
+        "files": {"scripts/dsv41/trace_corpus.py": "a" * 64, "analysis/dsv41-drive/drive_conditions.py": "b" * 64},
+    }
+    note = verdict.harness_note(report)
+    assert "/wt/harness" in note and "c" * 40 in note and "dirty=True" in note and "2 tracked changes" in note
+    assert '"scripts/dsv41/trace_corpus.py": "aaaaaaaaaaaa"' in note
+    report["provenance"]["harness_loaded"]["git"] = None
+    report["provenance"]["harness_loaded"]["git_unavailable"] = "CalledProcessError"
+    assert "worktree state unavailable (CalledProcessError)" in verdict.harness_note(report)

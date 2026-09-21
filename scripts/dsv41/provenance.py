@@ -134,6 +134,7 @@ def _drive_conditions():
     )
     spec = importlib.util.spec_from_file_location("drive_conditions", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # so harness_loaded() sees it, as it would an import
     spec.loader.exec_module(module)
     return module
 
@@ -195,6 +196,38 @@ def drive_idle_check(
     }
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def harness_loaded(top: str | None = None, modules=None, main_file: str | None = None) -> dict:
+    """The harness files this process actually loaded, with their sha256, and the state of the worktree they came from.
+
+    Taken from the loader (``sys.modules`` plus ``__main__``), not from a list, so a module the harness starts to import
+    is recorded without anyone editing this function. ``top`` is the harness worktree (default: the one this file is in);
+    only files under its ``scripts/`` and ``analysis/`` count. ``python/`` is left to git_state(): it is the code under
+    test, and for an old arm it lives in another worktree than the harness."""
+    top = os.path.realpath(top or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    roots = tuple(os.path.join(top, d) + os.sep for d in ("scripts", "analysis"))
+    modules = sys.modules if modules is None else modules
+    paths = {os.path.realpath(getattr(m, "__file__", None) or "") for m in list(modules.values())}
+    paths.add(os.path.realpath(__file__))  # this file is loaded by definition, however it was imported
+    main_file = main_file if main_file is not None else getattr(modules.get("__main__"), "__file__", None)
+    if main_file:
+        paths.add(os.path.realpath(main_file))
+    files = {os.path.relpath(p, top): _sha256_file(p) for p in sorted(paths) if p.startswith(roots) and os.path.isfile(p)}
+    out = {"top": top, "files": files, "git": None}
+    try:
+        out["git"] = git_state(os.path.join(top, "scripts", "dsv41"))
+    except Exception as e:
+        out["git_unavailable"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def capture(harness_files: dict | None = None) -> dict:
     """Snapshot the running process. ``harness_files`` maps a label to a module ``__file__``,
     so a stale copy of the driver or of trace_corpus is visible afterwards."""
@@ -216,6 +249,11 @@ def capture(harness_files: dict | None = None) -> dict:
         out["sglang_env_at_exec"] = None
         unavailable["sglang_env_at_exec"] = f"{type(e).__name__}: {e}"
 
+    out["harness_loaded"] = None
+    try:
+        out["harness_loaded"] = harness_loaded()
+    except Exception as e:
+        unavailable["harness_loaded"] = f"{type(e).__name__}: {e}"
     out["sglang_file"] = None
     out["sglang_env_resolved"] = None
     out["git"] = None

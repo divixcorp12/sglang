@@ -26,7 +26,7 @@ prov = _load("provenance", "scripts", "dsv41", "provenance.py")
 
 REQUIRED_KEYS = {
     "schema", "host", "utc", "pid", "argv", "cwd", "python", "harness_files", "sglang_env",
-    "sglang_env_at_exec", "sglang_file", "sglang_env_resolved", "git", "unavailable",
+    "sglang_env_at_exec", "sglang_file", "sglang_env_resolved", "git", "harness_loaded", "unavailable",
 }
 
 
@@ -235,6 +235,62 @@ def test_capture_never_omits_a_key_when_a_source_is_unavailable(monkeypatch):
     for field in ("sglang_env_at_exec", "git", "sglang_env_resolved"):
         assert out[field] is None
         assert "OSError: no such thing" in out["unavailable"][field]
+
+
+def _module(path):
+    import types
+
+    return types.SimpleNamespace(__file__=str(path))
+
+
+def test_harness_loaded_hashes_the_files_the_loader_saw_not_a_list(tmp_path):
+    import hashlib
+
+    (tmp_path / "scripts" / "dsv41").mkdir(parents=True)
+    (tmp_path / "analysis" / "dsv41-drive").mkdir(parents=True)
+    (tmp_path / "python").mkdir()
+    main, dep, unrelated, package = (
+        tmp_path / "scripts" / "dsv41" / "trace.py",
+        tmp_path / "analysis" / "dsv41-drive" / "dep.py",
+        tmp_path / "analysis" / "dsv41-drive" / "never_imported.py",
+        tmp_path / "python" / "code.py",
+    )
+    for f, text in ((main, "m"), (dep, "d"), (unrelated, "u"), (package, "p")):
+        f.write_text(text)
+    outside = tmp_path.parent / "elsewhere.py"
+    outside.write_text("o")
+    modules = {"dep": _module(dep), "code": _module(package), "elsewhere": _module(outside), "builtin": _module("")}
+    out = prov.harness_loaded(top=str(tmp_path), modules=modules, main_file=str(main))
+    sha = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    assert out["files"]["scripts/dsv41/trace.py"] == sha("m")
+    assert out["files"]["analysis/dsv41-drive/dep.py"] == sha("d")
+    assert "analysis/dsv41-drive/never_imported.py" not in out["files"]  # present on disk, never loaded
+    assert not any(k.startswith("python/") or "elsewhere" in k for k in out["files"])  # code under test and strangers are not harness
+    assert out["git"] is None and "git_unavailable" in out  # tmp_path is no worktree: said, not omitted
+    json.dumps(out)
+
+
+def test_harness_loaded_names_the_worktree_it_came_from(repo):
+    (repo / "scripts" / "dsv41").mkdir(parents=True)
+    (repo / "scripts" / "dsv41" / "x.py").write_text("1\n")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "add", "scripts/dsv41/x.py")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "harness")
+    out = prov.harness_loaded(top=str(repo), modules={}, main_file=str(repo / "scripts" / "dsv41" / "x.py"))
+    assert len(out["git"]["head"]) == 40 and out["git"]["dirty"] is False
+    (repo / "scripts" / "dsv41" / "x.py").write_text("2\n")
+    assert prov.harness_loaded(top=str(repo), modules={}, main_file=str(repo / "scripts" / "dsv41" / "x.py"))["git"]["dirty"] is True
+
+
+def test_the_by_path_drive_resolver_is_recorded_as_harness():
+    import hashlib
+
+    module = prov._drive_conditions()
+    out = prov.harness_loaded()
+    rel = "analysis/dsv41-drive/drive_conditions.py"
+    assert rel in out["files"], sorted(out["files"])
+    with open(module.__file__, "rb") as f:
+        assert out["files"][rel] == hashlib.sha256(f.read()).hexdigest()
+    assert "scripts/dsv41/provenance.py" in out["files"]  # this file names itself
 
 
 def _log(times, tokens):

@@ -6,6 +6,7 @@
 #
 # Usage: [DRY=1] EXPECT_NEW=<sha> REFERENCE=<clean-reference.json> task1-baseline-arms.sh <label> <run-dir> <code>:<mirror>:<trace>...
 # REFERENCE is REQUIRED and every arm's python/ tree must be in its "generations" (see generation_gate); else exit 5 before any arm.
+# Exit 6 before any arm if wt-task1-new is not clean at EXPECT_NEW or the runtime copies of this script and the verdict differ from their blobs there (harness_gate).
 #   code   old | new     old = wt-task1-old (pre two-bank reader), new = wt-task1-new
 #   mirror on | off      SGLANG_MOE_EXPERT_MIRROR_DIRS set / unset
 #   trace  T | U         SGLANG_DSV41_EXPERT_TRACE_PATH set (traced) / unset (untraced)
@@ -16,6 +17,7 @@
 # Nothing here reads wt-dsv41, which holds another job's uncommitted work. Never touches 7867.
 # Every arm goes through gpu-run.sh (cc-gpu.lock). DRY=1 prints what would run and takes no lock.
 set -uo pipefail
+SELF=$(readlink -f "$0")   # before env-full.sh cd's: a relative $0 stops resolving after it (task1e's header printed a blank script sha)
 
 CC=/data/models/slang/nvfp4-work/cc-expert-prediction
 . $CC/analysis/dsv41-phase3b/env-full.sh   # defines $PY $FULL $ANA; it cd's into wt-dsv41, overridden below
@@ -39,7 +41,11 @@ SENTINEL="$OUTDIR/$LABEL.sentinel"
 rm -f "$SENTINEL"
 trap 'rc_exit=$?; { echo "status=$([ $rc_exit -eq 0 ] && echo DONE || echo ABORTED) exit=$rc_exit finished=$(date --iso-8601=seconds)"; echo "arms_started=$idx of ${#specs[@]}"; } > "$SENTINEL"' EXIT
 trap 'exit 130' INT TERM
-echo "script: $(sha1sum "$0" | cut -c1-12)  verdict: $(sha1sum "$VERDICT" | cut -c1-12)  host: $(hostname)"
+sha256_of() { sha256sum "$1" 2>/dev/null | cut -c1-64; }
+ENVFILE=$CC/analysis/dsv41-phase3b/env-full.sh; GPURUN=$ANA/gpu-run.sh   # in no repo: the hashes below are the only record of them
+RUNTIME_SHA256=$(printf '{"arm_script": "%s", "verdict": "%s", "env_full_sh": "%s", "gpu_run_sh": "%s"}' \
+  "$(sha256_of "$SELF")" "$(sha256_of "$VERDICT")" "$(sha256_of "$ENVFILE")" "$(sha256_of "$GPURUN")")
+echo "script sha256:$(sha256_of "$SELF" | cut -c1-16)  verdict sha256:$(sha256_of "$VERDICT" | cut -c1-16)  env-full.sh sha256:$(sha256_of "$ENVFILE" | cut -c1-16)  gpu-run.sh sha256:$(sha256_of "$GPURUN" | cut -c1-16)  host: $(hostname)"
 
 sectors() { awk -v d="$1" '$3==d {print $6}' /proc/diskstats; }
 
@@ -83,6 +89,26 @@ preflight() {  # refuse to start unless the GPU, the port and the worktree are w
 # "generations", or no arm runs. Checked for the whole list before the first arm so a bad tail cannot cost GPU time, and with DRY=1
 # too. Not overridable: an unregistered tree is a new code generation that would be compared as if it were an old one.
 # (Before this gate the manifest was advisory: an unknown tree printed "GENERATION unknown" and the arm was still VALID.)
+# Harness gate. The harness (trace_corpus.py, provenance.py, drive_conditions.py) always runs from $WT_NEW, for old arms too, so $WT_NEW must be
+# at EXPECT_NEW and clean whatever the arm's code is, and the hand-copied runtime files (this script, the verdict) must equal their blobs at
+# EXPECT_NEW. Before this, an old arm's harness commit and cleanliness were neither recorded nor checked (PIPELINE_BASELINE.md section 7.4).
+# Exit 6. Also under DRY=1. Not overridable.
+harness_gate() {
+  local head dirty pair f rel
+  head=$(git -C "$WT_NEW" rev-parse HEAD 2>/dev/null)
+  [ "$head" = "$HEAD_NEW" ] || { echo "REFUSE: harness worktree $WT_NEW is at ${head:-<unreadable>}, expected EXPECT_NEW=$HEAD_NEW (the harness runs from it for old arms too)"; return 1; }
+  dirty=$(git -C "$WT_NEW" status --porcelain --untracked-files=no | wc -l)
+  [ "$dirty" = 0 ] || { echo "REFUSE: harness worktree $WT_NEW has $dirty tracked changes"; return 1; }
+  for pair in "$SELF:analysis/dsv41-drive/task1-baseline-arms.sh" "$VERDICT:analysis/dsv41-drive/task1_arm_verdict.py"; do
+    f=${pair%%:*}; rel=${pair#*:}
+    git -C "$WT_NEW" cat-file -e "$HEAD_NEW:$rel" 2>/dev/null || { echo "REFUSE: $rel does not exist at $HEAD_NEW, so the runtime copy $f cannot be checked"; return 1; }
+    [ "$(sha256_of "$f")" = "$(git -C "$WT_NEW" show "$HEAD_NEW:$rel" | sha256sum | cut -c1-64)" ] \
+      || { echo "REFUSE: runtime copy $f differs from $rel at $HEAD_NEW (a stale or edited hand copy); copy the blob from that commit"; return 1; }
+  done
+  echo "harness ok: $WT_NEW at $HEAD_NEW, clean; arm script and verdict equal their blobs there"
+}
+harness_gate || { echo "NO ARM RUN (harness gate)"; exit 6; }
+
 generation_gate() {  # <worktree> <sha>
   local wt="$1" want="$2" tree label
   if [ -z "${REFERENCE:-}" ] || [ ! -r "$REFERENCE" ]; then
@@ -142,7 +168,7 @@ for spec in "${specs[@]}"; do
     sep=""; for k in nvme0 nvme2 nvme4; do
       printf '%s"%s": %s' "$sep" "$k" $(( ($(sectors "${DEV[$k]}") - ${before[$k]}) * 512 )); sep=", "
     done
-    printf '}}\n'
+    printf '}, "runtime_sha256": %s}\n' "$RUNTIME_SHA256"
   } > "$OUTDIR/$name.cache.json"
   echo "rc=$rc wall=${wall}s"
   "$PY" "$VERDICT" "$OUTDIR/$name.json" --root "$wt" --head "$want" --mirror "$mirror" --trace "$trace" \

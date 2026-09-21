@@ -1,7 +1,7 @@
 gen2 (87417376f5, python tree ee70296428321097df189c7fa5cadbb2d4300fa6) -> gen3 (HEAD a23480d2f2, python tree 8d3312fdf0a7ecc38dfe70e04d1badfd0ca91cf6): 58 commits
-  behavioural (touch python/): 2; harness: 2; no effect on an arm: 54
+  behavioural (touch python/): 2; harness: 3; no effect on an arm: 53
 
-5203f9ffc7 | none (documentation, tests, analysis or results only) | feat(dsv41): per-drive request model and per-block conditions for the row-scheduling harness
+5203f9ffc7 | HARNESS (adds analysis/dsv41-drive/drive_conditions.py, which provenance.py loads by path since c87b8dc181; not python/) | feat(dsv41): per-drive request model and per-block conditions for the row-scheduling harness
 1fac4133e0 | none (documentation, tests, analysis or results only) | docs(dsv41): mark what Task 2 has left after the scheduling verdict
 2db60d128c | none (documentation, tests, analysis or results only) | docs(dsv41): lead the request-count section with the measured solo result; mark the model unvalidate
 450f86d17a | none (documentation, tests, analysis or results only) | docs(dsv41): pre-register task1e (gen2 two-bank, 3 vs 3) with its replacement budget; add the gen2 m

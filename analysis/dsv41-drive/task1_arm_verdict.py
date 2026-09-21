@@ -323,6 +323,20 @@ def cross_arm_outliers(report: dict, arm_path: str, references: list):
     return notes
 
 
+def harness_note(report: dict) -> str:
+    """What the arm recorded about the harness that drove it. A NOTE, never a gate: it makes "same harness?" a
+    comparison of two arm jsons. Arms before this record say so instead of implying a pinned harness."""
+    h = (report.get("provenance") or {}).get("harness_loaded")
+    if not isinstance(h, dict):
+        return ("HARNESS not recorded: this arm predates harness recording, so which harness commit drove it, and whether "
+                "that worktree was clean, is unknown (for an old arm the harness is not the worktree named in provenance.git)")
+    git = h.get("git") or {}
+    files = {k: v[:12] for k, v in sorted((h.get("files") or {}).items())}
+    state = (f"head {git.get('head')} dirty={git.get('dirty')} ({git.get('dirty_file_count')} tracked changes)"
+             if git else f"worktree state unavailable ({h.get('git_unavailable')})")
+    return f"HARNESS {h.get('top')} {state} files(sha256[:12]) {json.dumps(files)}"
+
+
 def boundary_notes(report: dict) -> list:
     """Load and busy foreign processes seen at any boundary, so a disturbance can be explained."""
     notes = []
@@ -407,6 +421,7 @@ def main() -> int:
         "contended": "means a foreign process using >= 50% CPU last ran on an arm core at a sampled boundary",
     }[contended]
     notes.insert(2, f"CONTENDED {contended} {json.dumps(why)} -- {meaning}")
+    notes.insert(3, harness_note(report))
     notes += boundary_notes(report)
     if args.summary_json:
         timed = None if phases is None else {d: phases["last"][d] - phases["ready"][d] for d in phases["ready"]
