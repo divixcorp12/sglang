@@ -84,6 +84,19 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 
 ## Task 1: Instrument causal stages and build matched baselines
 
+> **Measured-path boundary.** The stage-trace instrumentation (trace schema 3)
+> landed inside `5e92db22dc`, a commit whose message describes a documentation
+> change. It went there because a concurrent `git commit` without a pathspec
+> took another session's staged files out of the shared index; nothing was
+> amended, and `0f6bb50ead` carries the message the change should have had.
+> The consequence for anyone comparing arms: **`python/` changed at
+> `5e92db22dc`**, so arms measured at `f6608901a3` are not directly comparable
+> to later ones even with tracing off, because the record grew and the branch
+> structure changed. A gap across that boundary is a code-generation change,
+> not a regression. Arm results carry a GENERATION label derived from
+> `git rev-parse <HEAD>:python` for this reason.
+
+
 **Files:** Native host service; CUDA RAM-miss kernels and wrapper for optional device timing; `python/sglang/srt/layers/moe/exl3_stream_trace.py`; proposed `analysis/dsv41-drive/PIPELINE_BASELINE.md`; native timing tests.
 
 **Interface:** Bounded trace records keyed by request, row/lane, extent, attempt, root, and generation. Host timestamps use one monotonic clock. GPU intervals use one device clock or profiler domain. A GPU post is not silently labeled with the later host-observation timestamp.
