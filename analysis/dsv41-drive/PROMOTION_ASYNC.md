@@ -796,6 +796,31 @@ its steps. The team lead's decision (2026-09-21): **the lease is not released by
 conditioning the design on overlap scheduling was rejected, because a safety property should not
 depend on a scheduler mode the arm harnesses do not record.
 
+**The rule, stated in its strong form so nobody later "simplifies" it back: the lease release must not
+depend on the scheduler thread at all.** Not on the poll step, and not on "some other point on the
+scheduler thread" either. The scheduler thread is the one that runs `before_host_use`, which blocks in
+`torch.cuda.current_stream().synchronize()` and then `Exl3RamMissHost.pause`
+(`Exl3RamMissService.before_host_use`), so any release placed anywhere on that thread only moves the
+stall. **This was confirmed independently from a second direction**
+(`analysis/dsv41-drive/LEASE_MODEL_REVIEW.md`, finding F1): the lease model treated the promoter and the
+eager caller as independent actors, while in this design both are the scheduler thread, so the blocking
+synchronize was never a state and the cycle was unreachable by construction. Coupling the two with one
+subclass and nothing else turned the clean Task 8 world into a `Deadlock` in 4,802 states with an
+11-step trace: an armed demand deferred behind a promotion-leased victim, the copy finished, the
+scheduler thread inside `before_host_use` and unable to poll, the lease never released. With timeouts
+on it ends as a fatal after 2 s. Two reviewers, on different documents, by different methods, reached
+the same structural weakness. The device-flag-read-by-the-service mechanism below satisfies the strong
+rule (the releasing actor is the service thread, which `before_host_use` does not block), so the
+mechanism is unchanged; only its justification is stated more strongly.
+
+**Recorded alternatives.** (1) *Fallback, weaker:* make `before_host_use` poll with `stream.query()`
+(releasing completed leases) instead of a blocking `synchronize()`. That fixes the liveness cycle above
+but leaves the release on the scheduler thread, so it is weaker and does not satisfy the strong rule;
+keep it only if the device flag proves awkward. (2) *A CUDA host callback* that only decrements the lease
+(no CUDA call in it) would also run off the scheduler thread; not adopted, because it adds a per-ticket
+host function on the executor stream and a native entry point called from a driver thread, where the
+device flag reuses Task 5's acknowledgement shape.
+
 How likely the cycle is, so the finding is neither over- nor under-read: it needs *every*
 candidate victim in the layer's RAM tier to be leased or `hot`, against about 141 rows per layer
 with a few leased (an estimate; OPEN 6). It is improbable and it is a liveness dependence on the
@@ -840,9 +865,10 @@ Consequences:
 This is `LEASE_PROTOCOL.md`'s device-acknowledgement idea (there for graph lanes) applied to the
 executor stream. The lease owner should own the word layout; this document only requires that a
 non-graph device acknowledgement exist and that its release be by the service. The lease model
-(`lease_model.py`) needs a further scenario: a promoter whose release is the host poll, run with
-a host that is blocked, expected to find a Deadlock. The current model does not cover it (it does
-not model the poll or hold time).
+(`lease_model.py`) does not see the host-poll release as written: it has no thread identity and no
+poll (`LEASE_MODEL_REVIEW.md` F1, whose probe 6 finds the cycle only after coupling the promoter and the
+eager caller into one thread). The model needs that coupling built in, and a scenario in which the
+release is the service's ack, expected clean, beside the host-release variant, expected `Deadlock`.
 
 ### 7.3 Publication: the safe graph boundary
 
@@ -1129,9 +1155,11 @@ milestone is not implementable as written.
     could omit); it is what makes a re-validation failure rare, so admitted rows are not re-read from
     NVMe. Safety is the re-validated lease at enqueue: a row that has gone is dropped, never copied.
 - **R4. Promotion leases never cause a demand failure, and their release never depends on the
-  host or on a demand.** With `LEASE_PROTOCOL.md` A3, a promotion's release must not depend on a
-  demand being served. It also must not depend on the scheduler thread's progress (second review
-  A1): the normal-path release is the **service's own**, on the device acknowledgement (7.2.1).
+  scheduler thread or on a demand.** With `LEASE_PROTOCOL.md` A3, a promotion's release must not depend on a
+  demand being served. It also must not depend on the scheduler thread at all (second review A1,
+  confirmed by `LEASE_MODEL_REVIEW.md` F1: `before_host_use` blocks that thread, so a release "at
+  another point" on it only moves the stall): the normal-path release is the **service's own**, on
+  the device acknowledgement (7.2.1).
   The hold time is enqueue to ack, bounded by a capped copy (section 8.3) plus the service loop's
   latency. If a demand is deferred for lack of a victim *only because of promotion leases*, it is
   served when the ack arrives; there is no host-side "release LEASED leases" step (there are no
@@ -1147,7 +1175,12 @@ milestone is not implementable as written.
 - **R5. The eviction predicate covers every path.** `take_slot_locked`, `assign` and
   `release` (the Python-facing eager calls) all refuse a slot with `leases > 0`; `release`
   of a leased slot throws exactly as it does for `kLoading` today (LEASE_PROTOCOL section 8).
-- **R6. Shutdown covers host leases.** Outstanding host leases at teardown are part of the
+- **R6. Shutdown covers host leases.** **Unchecked by any model or test today** (a gap in the
+  evidence, not in the design): `LEASE_MODEL_REVIEW.md` F2 reports that a probe reaches "python frees
+  memory" followed by "promoter leases slot 0" and its copy with zero violations flagged, because the
+  promoter neither stops at shutdown nor is checked after the free. Until the model closes admission at
+  shutdown and flags a lease acquired after the free, R6 rests on argument, and 11.3's R6 test is its
+  only check. Outstanding host leases at teardown are part of the
   quarantine set of `LEASE_PROTOCOL.md` section 14: never recycle a pinned slab while a
   promotion copy may still read it. Note this design adds one more GPU reader class to
   D5: the executor stream, and `ExpertPinnedHostCache._release_slabs` is a
@@ -1491,13 +1524,15 @@ copy:
   deadlock" test passes if the harness polls from its own thread, which production does not. Run it
   where the host cannot poll while the GPU is stalled: the test's main thread enqueues an armed wait
   kernel for a demand whose only candidate victim is a leased slot, **then blocks in
-  `Stream.synchronize()` on the serving stream** (it does not call the poll step). The promotion's copy
+  `Stream.synchronize()` on the serving stream** (it does not call the poll step), exactly what `before_host_use` does on the scheduler thread; it does not call the poll step or any other scheduler-thread release). The promotion's copy
   and ack kernel run on the executor stream; the service thread, not the test thread, must observe the ack
   and release the lease so the demand is served. Assert the demand is served in far less than the 2 s
   timeout and no fatal is raised. **Mutation controls, both required:** (i) disable the service's ack scan
   so the release falls back to the host poll: the test must end in the timeout and a fatal (the A1
   cycle); (ii) `producer_stream` set to the serving stream: it must also fail (the stream cycle of
-  9.2).
+  9.2). (iii) move the release to a *different point* on the test's main thread (for example after the
+  `synchronize()` returns): it must fail the same way, because the strong rule (7.2.1) is that no
+  scheduler-thread release is acceptable.
 - **Ring reuse under a slow publication** (A2): hold publication for more than 8 further submits; assert
   it neither raises "stale" nor waits on another wave's copy. Mutation control: use the ring event.
 - **Copy failure on a device**: inject a launch failure (an invalid destination pointer in one of the six
@@ -1747,8 +1782,9 @@ arm's capacity can be verified from its log instead of trusted.
 - **[DECIDE 7]** DRAINING is recycled by host-polled `retire_event`, not by a device-side
   wait, so the copy stream never depends on the serving stream (9.2).
 - **[DECIDE 8]** *(revised after the second review)* The lease starts at enqueue and is released by
-  the **service on the device acknowledgement**, never by the host poll (team lead's decision,
-  2026-09-21). Before enqueue the row is protected by `hot`; after the ack, by `hot` again.
+  the **service on the device acknowledgement**. The rule is that the release must not depend on the
+  scheduler thread at all (team lead's decision, 2026-09-21, strengthened after `LEASE_MODEL_REVIEW.md`
+  F1); the host poll is one instance of that, `before_host_use` polling is another that is weaker. Before enqueue the row is protected by `hot`; after the ack, by `hot` again.
   Alternatives rejected: releasing at COPIED by the host poll (A1 cycle); conditioning on overlap
   scheduling (unrecorded mode); a CUDA host callback releasing the lease from a driver thread (also
   independent of the scheduler thread, but a per-ticket host function on the executor stream and a new
