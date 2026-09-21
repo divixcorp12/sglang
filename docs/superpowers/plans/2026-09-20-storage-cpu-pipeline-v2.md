@@ -287,6 +287,29 @@ Include expert identity in the immutable row result and validate it against the 
 > case cannot currently be constructed at all. Build that before building the
 > test, or the test will again pass for a reason unrelated to the requirement.
 >
+> **THREE CORRECTIONS from the reviewer's third pass, two of which land on
+> claims this plan and its lead had already propagated:**
+>
+> 1. **The callback is UNREACHABLE on packing turns for demands** -- not merely
+>    "not established", as both the author and the lead recorded it. `admit()`
+>    runs every loop turn, but it evaluates the callback **only inside
+>    `while (next_batch < batches)`**; once the last batch is admitted -- batch 0
+>    for a demand -- it is never evaluated again. **So the "evaluated on more
+>    turns in worker mode" claim, which the lead passed on as a binding
+>    idempotence constraint, is false for demands.** It is true only of
+>    advisories, which is the untested path.
+> 2. **The new idempotence test adds nothing for D4.** D4 is already killed by
+>    five earlier tests, and the new test's rationale does not apply: it drives
+>    `pump()`, exercising the **existing top-of-function retire**, not the new
+>    call site. A test written to close a gap, which passes without touching the
+>    code the gap is in.
+> 3. **No mutant attacks `lanes_outstanding_` itself** -- the counter whose
+>    relaxed load makes the fast path cheap and whose correctness makes the early
+>    return sound. If it were not decremented on release, the fast path would
+>    never be taken and **an eager pause would be refused forever**. Add that
+>    mutant and confirm a pause-refusal test kills it; the reviewer did not check
+>    that such a test exists.
+>
 > **ONE QUALIFICATION to "no consumer today", from the same review:** that is
 > true of the **demand** path, which is one batch. **On the advisory path the
 > call actually repeats** -- and the reviewer records it as **not covered by
