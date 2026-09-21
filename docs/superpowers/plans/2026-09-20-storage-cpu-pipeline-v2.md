@@ -173,6 +173,34 @@ Include expert identity in the immutable row result and validate it against the 
 
 **Gate:** Lease-pressure and fault tests prove no reuse before consumption. Concurrent graph execution remains unsupported and guarded. Audit repeated mutable-slot reads through `ld.global.nc` on the deployed GPU; treat this as a visibility test, not a presumption of corruption.
 
+> **The `ld.global.nc` audit is DONE** (`6629148b2d`, pre-registered at
+> `afba4dbc2e` before the program was written). Verdict by the mechanical rule:
+> **KEEP `nc`** -- "not observed in 1.31e10 words per cell across the eight nc
+> cells". The wording is *not observed*, as pre-registered; it is **not** "safe"
+> and **not** "coherent".
+>
+> The result is load-bearing only because the controls show the harness can see
+> staleness: within a kernel, `nc` saw a host-written flag **0 of 100** times
+> while `cv` saw it 100 of 100 (median 8.6 us); and a second `nc` read of a
+> just-overwritten device word returned the stale value **100,000 of 100,000**
+> times, where `cv` returned it 0. So `.nc` is cached per SM and the rig detects
+> it -- it is across *kernels* that the cache was never seen to serve stale
+> bytes. `cv` stays a compile-time switch at no measured bandwidth cost (12.34
+> GB/s both ways, against 13.79 for `cudaMemcpyAsync`).
+>
+> **Constraint this places on Task 6:** any kernel that polls **host** memory
+> must use `ld.acquire.sys`, never `.nc`. The existing wait kernel already does.
+> **Task 6's per-lane readiness poll must too** -- that is a hard requirement on
+> the mechanism, not a tuning choice.
+>
+> Conditions: PCIe **Gen3 x16** throughout (the link is Gen1 when idle), 1,403
+> samples, load1 3.15 rising to 6.68 with substantial foreign load. The
+> pre-registration said L2 was "about 128 MB"; it is **96 MiB**. That changes
+> nothing here (the visibility region is 512 KiB and the bandwidth region 1 GiB,
+> ~10.7x L2), and the pre-registered text was left as written with the
+> correction in the result section. **Note the same "~128 MB" figure appears in
+> the project's `CLAUDE.md` microbenchmark guidance.**
+
 ## Task 6: Start per-row GPU transfers before all reads finish
 
 **Files:** Files from Task 5; `python/sglang/srt/layers/moe/expert_row_plan.py`; `python/sglang/kernels/ops/moe/expert_cache_transfer.py`; `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`; graph wrapper/backend tests; `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`.
