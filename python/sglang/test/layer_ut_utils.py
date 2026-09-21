@@ -4,15 +4,31 @@ Hand-written quantization references (oracle side) live in quant_ref_utils.
 """
 
 import os
+import socket
+from typing import Optional
 
 import torch
 
 
-def init_single_process_dist(master_port: int = 29632, backend: str = "gloo"):
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def init_single_process_dist(master_port: Optional[int] = None, backend: str = "gloo"):
     """world=1 dist + model-parallel groups; srt layers require them even
-    at tp=1."""
+    at tp=1.
+
+    MASTER_PORT: an environment value that is already set wins, then ``master_port`` if given, otherwise a free
+    port. The old fixed default (29632) made two jobs on one host collide with EADDRINUSE. Picking a free port
+    narrows that race rather than removing it: the probe socket is closed before the store binds the port, so
+    another process can still take it in between; a rare EADDRINUSE here is that window, not a fixed-port clash.
+    """
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(master_port))
+    os.environ.setdefault(
+        "MASTER_PORT", str(_free_port() if master_port is None else master_port)
+    )
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
