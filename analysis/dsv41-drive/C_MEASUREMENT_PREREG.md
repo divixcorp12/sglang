@@ -68,7 +68,7 @@ Order randomised within each of **5 interleaved passes** (A B B A); every repeti
 ### 4.1 Gates (any failure: INVALID, no number quoted)
 
 Row bytes equal 13,315,584; **no row re-read within 100 rows** (1.33 GB = 13.9 x L2) in any non-`repeat` SM cell; link Gen3 and P0 at the start and end of every cell; no other GPU process; no foreign process above 10% of a core; `p99 / p50 <= 1.25` per cell;
-**no implied bandwidth above 15.75 GB/s (spec) or above 1.03 x the measured copy-engine figure** (the impossible-number detector; L2 residency would trip it); SM bandwidth at `n >= 2` at least 8 GB/s (else the harness or the box is broken);
+**no implied bandwidth above 15.75 GB/s (spec) or above 1.03 x 13.79 GB/s** (13.79 is the copy-engine figure measured in `NC_VISIBILITY.md`, a registered constant; the run's own `ce` arm is reported beside it and a `ce` figure more than 5% off 13.79 is noted as a change of box state) (the impossible-number detector; L2 residency would trip it); SM bandwidth at `n >= 2` at least 8 GB/s (else the harness or the box is broken);
 graph within 3% of eager at `n = 3`; both nodes present with 5 passes and every `n`.
 
 ### 4.2 The label (computed by the frozen script, per node, then together)
