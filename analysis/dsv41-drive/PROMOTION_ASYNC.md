@@ -146,7 +146,7 @@ Every site the promotion path can block. "Normal path" means a boundary with no 
 | B7 | `ExpertHotCache._publish_slots`: `_slot_upload_event.synchronize()` | previous slot upload not yet run | scheduler thread | not isolated |
 | B8 | `wait_for_slot_publication` (end of `_load_reserved_in_chunks`, `reassign`) | event synchronize | scheduler thread | not isolated |
 | B9 | `ExpertPinnedHostCache.evictable_rows`, `expert_to_slot` property | O(residents) Python per chunk; rebuilds an `OrderedDict` from `host.mapping` and `host.lru_order` when the C++ version moved | scheduler thread | not isolated |
-| B10 | `_refresh_mapping` | `torch.tensor(list, device=cuda)`: a pageable H2D that synchronizes | scheduler thread | not isolated |
+| B10 | `_refresh_mapping` (end of `ensure_rows`; and from `before_host_use` when the native version moved) | `torch.tensor(list, device=cuda)`: a pageable H2D that synchronizes | scheduler thread | not isolated. **No milestone edits it; it leaves the promotion path when the promotion stops calling `ensure_rows` and `host_use`** (M1 for RAM-resident rows, M2 for admitted rows), and stays on the eager path (section 9.3). M0 does not remove it (review F8). |
 
 Only B4 and B5 have measured cost; the rest are enumerated from reading, not timed.
 
@@ -1332,14 +1332,14 @@ performance claim.
 **M1: spare slots, draining, async copy and publication, RAM-resident rows.** Requires the
 host-lease API (R1, R2, R5, R6, R7, R8). Files: `expert_hot_cache.py` (states, ticket, poll,
 publication), `expert_transfer.py` (`try_submit`, plan upload on the executor stream, D2, D3),
-`exl3_reqs.py`, `srt_ram_miss.py` (lease calls), tests. Gate: all of 11.2 and 11.4's
+`exl3_reqs.py`, `srt_ram_miss.py` (lease calls), tests. The poll step has its own exception handling and a per-layer quarantine flag (review F7). Gate: all of 11.2 and 11.4's
 consumer, atomicity, lease and deadlock tests pass; 11.1's static and API-trace proofs hold
 for RAM-resident rows; no throughput claim; the synchronous path is unchanged with the mode
 off.
 
 **M2: asynchronous RAM admission through the service.** Requires R3, R4. Files: `host.cpp`
 (promotion class, `submit_admit`, `poll_admits`, `lease_on_ready`, counters),
-`ops_ram_miss.py`, `srt_ram_miss.py`, tests. Gate: 11.3 passes; NVMe reads are off the
+`ops_ram_miss.py`, `srt_ram_miss.py`, tests. Gate: 11.3 passes; `_refresh_mapping` and `ensure_rows` are no longer on the promotion path (B10); NVMe reads are off the
 scheduler thread (API/CPU trace: no io_uring submit from the scheduler thread in a
 boundary); `pauses` unchanged across promotions; demand latency during promotion admission
 within the one-row bound. This is the milestone after which `SGLANG_DSV41_PROMOTION_MODE`
