@@ -1063,6 +1063,26 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > ran. A suite can satisfy (a) perfectly and still be worthless if nobody
 > checked (c).
 >
+> **THE DEFENCE CAUGHT A FOURTH INSTANCE ON ITS FIRST USE, HOURS AFTER BEING
+> WRITTEN, IN A CASE NOT AMONG THE THREE IT WAS DERIVED FROM.** A lane
+> implemented the rule in its mutation driver -- a kill requires
+> `passed + failed == collected`, no collection error, no `Interrupted`, **and**
+> a named test failing, with the baseline asserted clean first. On its first
+> run, shutdown mutant **S8** ("quarantine keeps no host tensors") had been
+> written by deleting a line, which left an **empty `if` body**: an
+> `IndentationError`, so the run produced **0 passed, 0 failed of 20
+> collected**. The old `FAILED`-regex driver would have seen no failure line and
+> recorded **survived** -- or, with an equally broken baseline, **killed**. The
+> new check reported `INVALID (not every collected test ran)`, the mutant was
+> repaired (`pass` in place of the deleted line) and re-ran as a genuine kill.
+>
+> **A malformed mutant is the case nobody designs for**, and it produces exactly
+> the absence the old check read as evidence. Note also what it says about
+> mutation testing generally: **a mutant that fails to compile or parse is
+> indistinguishable, by output alone, from a mutant the suite caught.** Any
+> mutation campaign without this check has an unknown number of its "kills" in
+> that category.
+>
 > **(d) ORDER-DEPENDENT RESULTS -- a test whose verdict depends on what ran
 > before it.** Every other class here concerns a test that passes for the wrong
 > reason; this is a test whose result is not a property of the test at all.
