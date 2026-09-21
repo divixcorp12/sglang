@@ -219,11 +219,94 @@ def session_outliers(report: dict) -> list:
     return notes
 
 
+ARM_CORES = range(32, 64)      # gpu-run.sh pins every arm here
+CONTENDED_CPU_PCT = 50
+CROSS_ARM_SLOWER = 0.08        # flag a session this much slower than the clean arms of its cell
+
+
+def _core_set(spec):
+    """"30-32,40" -> {30, 31, 32, 40}; None if unrecorded."""
+    if not spec:
+        return None
+    out = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        out |= set(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def contention(report: dict):
+    """(verdict, reasons). "contended" if a foreign process using >= 50% CPU last ran on an arm core at some
+    boundary; "unknown" if the samples predate core/affinity recording; else "not contended". One 0.2 s snapshot
+    per boundary, so "not contended" means none was seen, not that none occurred."""
+    samples = report.get("boundary_samples") or []
+    if not samples:
+        return "unknown", ["no boundary samples"]
+    reasons, recorded = [], False
+    for b in samples:
+        for p in b.get("top_other_cpu") or []:
+            if p.get("cpu_pct", 0) < CONTENDED_CPU_PCT:
+                continue
+            if "cpu_num" not in p and "affinity" not in p:
+                continue
+            recorded = True
+            if p.get("cpu_num") in ARM_CORES:
+                reasons.append(f"{p['name']}({p['cpu_pct']:.0f}%) on core {p['cpu_num']} at {b['label']}")
+    if reasons:
+        return "contended", reasons
+    if not recorded and any(p.get("cpu_pct", 0) >= CONTENDED_CPU_PCT for b in samples for p in b.get("top_other_cpu") or []):
+        return "unknown", ["busy foreign processes recorded without core or affinity"]
+    return "not contended", []
+
+
+def _median(values):
+    v = sorted(values)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def cross_arm_outliers(report: dict, arm_path: str, references: list):
+    """NOTES, never failures: sessions of this arm >= 8% slower than the median of the other clean arms of its
+    cell, per session index (leave-one-out: the arm is never its own reference). tok/s: every session. TTFT:
+    sessions 1..n only (session-0 TTFT is unexplained-noisy even in quiet arms). Returns None if fewer than one
+    other reference arm exists. Catches what the arm-internal rule cannot: uniform, session-0 and decode-only
+    slowdowns. It is only as good as the reference set, and it cannot see an arm as slow as its references."""
+    me = os.path.realpath(arm_path)
+    refs = []
+    for path in references:
+        if os.path.realpath(path) == me:
+            continue
+        with open(path) as f:
+            refs.append(json.load(f).get("per_session") or [])
+    if not refs:
+        return None
+    rows = report.get("per_session") or []
+    notes = []
+    for i, row in enumerate(rows):
+        ref_tps = [r[i]["decode_tok_s"] for r in refs if i < len(r) and r[i].get("decode_tok_s")]
+        if ref_tps and row.get("decode_tok_s") is not None:
+            ref = _median(ref_tps)
+            if row["decode_tok_s"] < (1 - CROSS_ARM_SLOWER) * ref:
+                notes.append(f"CROSS-ARM session_{i}: decode {row['decode_tok_s']:.3f} tok/s is {100 * (1 - row['decode_tok_s'] / ref):.0f}% below "
+                             f"the {len(ref_tps)}-arm clean median {ref:.3f}")
+        ref_ttft = [r[i]["ttft_s"] for r in refs if i < len(r) and r[i].get("ttft_s")]
+        if i >= 1 and ref_ttft and row.get("ttft_s") is not None:
+            ref = _median(ref_ttft)
+            if row["ttft_s"] > (1 + CROSS_ARM_SLOWER) * ref:
+                notes.append(f"CROSS-ARM session_{i}: ttft {row['ttft_s']:.1f} s is {100 * (row['ttft_s'] / ref - 1):.0f}% above "
+                             f"the {len(ref_ttft)}-arm clean median {ref:.1f} s")
+    return notes
+
+
 def boundary_notes(report: dict) -> list:
     """Load and busy foreign processes seen at any boundary, so a disturbance can be explained."""
     notes = []
     for b in report.get("boundary_samples") or []:
-        busy = [f"{p['name']}({p['cpu_pct']:.0f}%)" for p in (b.get("top_other_cpu") or []) if p["cpu_pct"] >= 20]
+        busy = [
+            f"{p['name']}({p['cpu_pct']:.0f}%, core {p.get('cpu_num', '?')}, affinity {p.get('affinity', '?')})"
+            for p in (b.get("top_other_cpu") or [])
+            if p["cpu_pct"] >= 20
+        ]
         load = (b.get("loadavg") or [None])[0]
         if busy or (load is not None and load >= 4):
             notes.append(f"at {b['label']}: load1 {load}, busy other processes: {', '.join(busy) or 'none >=20%'}")
@@ -238,6 +321,8 @@ def main() -> int:
     p.add_argument("--mirror", choices=("on", "off"), required=True)
     p.add_argument("--trace", choices=("T", "U"), required=True)
     p.add_argument("--cache")
+    p.add_argument("--reference", help="json {\"<code>:<mirror>\": [clean arm json paths]} for the cross-arm check")
+    p.add_argument("--code", choices=("old", "new"), help="which code this arm ran; selects its reference cell")
     p.add_argument("--summary-json", help="write regime, boot-phase growth and timed-phase growth here")
     args = p.parse_args()
     try:
@@ -268,13 +353,22 @@ def main() -> int:
     notes.insert(1, f"BOOT_PHASE {json.dumps(phase)}")
     notes.append(p5_note(growth, phase))
     notes += session_outliers(report)
+    cross = None
+    if args.reference and args.code:
+        with open(args.reference) as f:
+            refs = json.load(f).get(f"{args.code}:{args.mirror}", [])
+        cross = cross_arm_outliers(report, args.arm_json, refs)
+        notes += cross if cross is not None else [f"CROSS-ARM not judged: no other clean arm in cell {args.code}:{args.mirror}"]
+    contended, why = contention(report)
+    notes.insert(2, f"CONTENDED {contended} {json.dumps(why)}")
     notes += boundary_notes(report)
     if args.summary_json:
         timed = None if phases is None else {d: phases["last"][d] - phases["ready"][d] for d in phases["ready"]
                                               if phases["last"][d] is not None and phases["ready"][d] is not None}
         with open(args.summary_json, "w") as f:
             json.dump({"regime": kind, "boot_growth_bytes": growth, "timed_growth_bytes": timed, "boot_phase": phase,
-                       "outlier_sessions": [n for n in notes if n.startswith("OUTLIER")], "valid": not problems}, f, indent=2)
+                       "outlier_sessions": [n for n in notes if n.startswith("OUTLIER")], "contended": contended,
+                       "cross_arm_flags": cross, "valid": not problems}, f, indent=2)
     for n in notes:
         print("NOTE", n)
     for x in problems:

@@ -302,6 +302,27 @@ def resident_bytes(dirs: list, chunk: int = 200) -> dict:
 MEMINFO_FIELDS = ("MemFree", "MemAvailable", "Cached")
 
 
+def _try(fn):
+    """The value of fn(), or None if the process vanished or the kernel refuses (no reason recorded)."""
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def cpu_ranges(cpus) -> str:
+    """[30, 31, 32, 40] -> "30-32,40": what taskset prints, so the record reads like the command."""
+    cpus = sorted(set(cpus))
+    out, i = [], 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(str(cpus[i]) if i == j else f"{cpus[i]}-{cpus[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
 def _meminfo_kb(path: str = "/proc/meminfo") -> dict:
     out = {}
     with open(path) as f:
@@ -353,7 +374,8 @@ def system_sample(cpu_interval: float = 0.2, top: int = 5) -> dict:
             except psutil.Error:
                 continue
             if pct >= 1.0:
-                busy.append({"pid": p.info["pid"], "name": p.info["name"], "cpu_pct": pct})
+                busy.append({"pid": p.info["pid"], "name": p.info["name"], "cpu_pct": pct,
+                             "cpu_num": _try(p.cpu_num), "affinity": _try(lambda: cpu_ranges(p.cpu_affinity()))})
         out["top_other_cpu"] = sorted(busy, key=lambda b: -b["cpu_pct"])[:top]
     except Exception:
         out["top_other_cpu"] = None

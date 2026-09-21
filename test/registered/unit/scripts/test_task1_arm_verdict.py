@@ -271,4 +271,55 @@ def test_boundary_notes_name_busy_foreign_processes_and_high_load():
     report = {"boundary_samples": [_sample("session_2", {}, 1, load=3.9, busy=[("rsync", 80)]),
                                    _sample("session_3", {}, 1, load=5.2), _sample("engine_ready", {}, 1)]}
     notes = verdict.boundary_notes(report)
-    assert len(notes) == 2 and "rsync(80%)" in notes[0] and "load1 5.2" in notes[1]
+    assert len(notes) == 2 and "rsync(80%" in notes[0] and "load1 5.2" in notes[1]
+
+
+# --- contention and the cross-arm check ------------------------------------------------------------
+
+
+def _busy(name, pct, core=None, aff=None):
+    p = {"pid": 1, "name": name, "cpu_pct": pct}
+    if core is not None:
+        p.update(cpu_num=core, affinity=aff)
+    return p
+
+
+def _with_busy(*procs):
+    return {"boundary_samples": [{"label": "session_1", "top_other_cpu": list(procs), "loadavg": [1, 0, 0]}]}
+
+
+def test_contended_only_when_a_heavy_foreign_process_last_ran_on_an_arm_core():
+    assert verdict.contention(_with_busy(_busy("reth", 60, 47, "30-50")))[0] == "contended"
+    assert verdict.contention(_with_busy(_busy("reth", 60, 11, "0-71")))[0] == "not contended"
+    assert verdict.contention(_with_busy(_busy("reth", 30, 47, "30-50")))[0] == "not contended"   # under 50%
+    assert verdict.contention(_with_busy(_busy("nimbus", 100)))[0] == "unknown"                   # predates core recording
+    assert verdict.contention({})[0] == "unknown"
+    assert verdict.contention(_with_busy())[0] == "not contended"
+
+
+def _arm_file(tmp_path, name, tps, ttfts):
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps({"per_session": [{"decode_tok_s": a, "ttft_s": b} for a, b in zip(tps, ttfts)]}))
+    return str(path)
+
+
+def test_cross_arm_flags_uniform_session0_and_decode_only_slowdowns_the_internal_rule_cannot_see(tmp_path):
+    """Bug: task1d-0 had session 0 at -31% (exempt) and session 3 at -29% decode with a normal TTFT; the
+    arm-internal rule flagged nothing. A cross-arm reference sees both."""
+    refs = [_arm_file(tmp_path, f"r{i}", [3.17, 4.40, 3.33, 4.75], [60, 30, 29, 30]) for i in range(3)]
+    slow = {"per_session": [{"decode_tok_s": t, "ttft_s": f} for t, f in zip([2.12, 4.30, 3.19, 3.33], [72, 29.9, 28.9, 30.2])]}
+    notes = verdict.cross_arm_outliers(slow, str(tmp_path / "me.json"), refs)
+    assert [n.split(":")[0] for n in notes] == ["CROSS-ARM session_0", "CROSS-ARM session_3"]
+    assert verdict.session_outliers(slow) == []          # the internal rule really does miss it
+    ok = {"per_session": [{"decode_tok_s": t, "ttft_s": f} for t, f in zip([3.2, 4.4, 3.3, 4.7], [50, 30, 29.5, 30.5])]}
+    assert verdict.cross_arm_outliers(ok, str(tmp_path / "me.json"), refs) == []   # session-0 TTFT is not compared
+    late = {"per_session": [{"decode_tok_s": 4.4, "ttft_s": 30}, {"decode_tok_s": 4.4, "ttft_s": 41}]}
+    assert "ttft" in verdict.cross_arm_outliers(late, str(tmp_path / "me.json"), refs)[0]
+
+
+def test_cross_arm_is_leave_one_out_and_not_judged_without_another_reference(tmp_path):
+    only = _arm_file(tmp_path, "only", [3.0, 4.0], [50, 30])
+    report = json.load(open(only))
+    assert verdict.cross_arm_outliers(report, only, [only]) is None      # the arm is never its own reference
+    other = _arm_file(tmp_path, "other", [3.0, 4.0], [50, 30])
+    assert verdict.cross_arm_outliers(report, only, [only, other]) == []

@@ -263,6 +263,11 @@ def test_system_sample_has_every_field_and_is_json_serialisable():
     assert out["meminfo_kb"] is None or set(out["meminfo_kb"]) == set(prov.MEMINFO_FIELDS)
 
 
+def test_cpu_ranges_reads_like_taskset():
+    assert prov.cpu_ranges([32, 30, 31, 40, 30]) == "30-32,40"
+    assert prov.cpu_ranges(range(72)) == "0-71" and prov.cpu_ranges([]) == "" and prov.cpu_ranges([5]) == "5"
+
+
 def test_arm_harnesses_embed_provenance_in_the_result_json():
     for parts in (("analysis", "dsv41-drive", "eager_arm_driver.py"), ("scripts", "dsv41", "trace_corpus.py")):
         with open(os.path.join(_ROOT, *parts)) as f:
