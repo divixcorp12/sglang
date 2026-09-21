@@ -49,3 +49,48 @@ service round trip that an unarmed one skipped.
   not a test"). A serving-path number must be taken again when step 5 lands.
 * **Box conditions:** load 3-4.5 with QuestDB, nimbus and reth running; the service thread spins
   (`spin_us=5000`), so the round trip is a spin handoff. A different spin setting would move the ~11 us.
+
+---
+
+# Re-taken through the real backend (2026-09-21, step 5 of section 20.1)
+
+Script `open11_serving_path.py`; raw output `serving_path/run{1,2,3}_lease{0,1}.json.gz`. Code at the commit that
+carries this file. Same box conditions as above (divix01, RTX 5090, `gpu-run.sh`, `taskset -c 0-63`,
+`OMP_NUM_THREADS=1`, production stopped), but **load average 8-11** this time, so the eager view is noisier.
+`Exl3RamMissService` and `Exl3RamMissRowBackend` are driven by the real switch `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES`,
+one process per switch value, three alternating runs each. Route `[3, 5, 7, 4, 0, 1]`: four RAM lanes plus two
+VRAM-hot experts (which are not lanes); all four are resident before timing and `rows_read` during timing is **0** in
+every timed run. `leases_granted == leases_acked` at exit, `leases_voided == 0`, `fatal == 0`.
+
+| view | what is timed | delta per layer, p50, runs 1/2/3 |
+|---|---|---|
+| **eager** | `backend.post`, then a synchronize, wall clock: the method of the 8 us figure above | -2.6 / +10.5 / +9.5 us (noisy) |
+| **layer** | one whole `Exl3MoEMethod._apply_graph` per CUDA graph replay | +15.5 / +17.6 / +16.6 us |
+| **chain** | 40 `backend.post` in one graph, 1.5 ms GPU spin between them | +17.9 / +16.3 / +17.1 us |
+| **packed** | the same 40 back to back, no spin | +17.1 / +17.0 / +16.7 us |
+
+**In a CUDA graph the added cost is about 17 us per all-hit layer, about 0.67-0.69 ms per 40-layer step. That is
+roughly twice the ~8 us / ~0.32 ms of the kernel-and-service measurement above, and it is not reconciled here.**
+The three graph views agree with each other to within ~1 us and across runs; the eager view through the real backend
+lands near the old 8 us but its three runs span -2.6 to +10.5 us, so it neither confirms nor contradicts it.
+
+What this does and does not say:
+
+* **The old figure was an eager figure.** It was taken with a synchronize per step, where the CPU launch cost of
+  the kernels sits in front of the GPU work. Serving replays a graph, and in a graph the GPU-side service round trip
+  and the acknowledgement kernel run back to back on the GPU with nothing hiding them. That is a hypothesis for the
+  gap, **not tested**: nothing here isolates the ack kernel from the wait in graph mode. The gap could also be the
+  4-lane versus 3-lane plan, or the real backend's extra work (the `planned` copy), which the eager old harness did
+  not do.
+* **The 1.5 ms spacing changes nothing** (chain +17 us versus packed +17 us), so the cost is not being paid for a
+  ring slot waiting on an unretired acknowledgement: `deferred` and `deferred_reuse` are 0 in the run counters. The
+  cost is the per-layer wait itself.
+* **Against absolute step latency:** ~0.68 ms is ~1.0% of a ~66.8 ms/token step. **Against Task 6's `G*` of
+  1.114 ms it is about 60%**, not the 28-30% the kernel-level number gave. Section 17.2's requirement that Task 6's
+  benefit be measured net of this cost now has a number twice as large as the one written there.
+* **Still not production geometry.** One layer's row, four lanes, a fake 8-row checkpoint; "40 layers" is 40 posts
+  to one row in one graph (chain, packed) or 40 times the single-layer delta. A real 40-layer decode has different
+  rows, different lane counts, real MoE compute between layers and `advise` possibly on. The all-hit case is the
+  upper bound: a layer with a miss was armed before lease mode.
+* **Not measured:** a full serving run (`bench_serving`/the real model), lease mode with `advise` on in a graph,
+  and any cost when the RAM tier is under eviction pressure.

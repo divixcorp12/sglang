@@ -1266,7 +1266,8 @@ skip the handshake, because the GPU may only read a source it holds a lease on a
 the service grants leases. So lease mode arms every record with `count > 0`, exactly as
 Option F already does when advise is on. That is a per-layer round trip added for the
 no-advise configuration; **measured 2026-09-21 at about 8 us per all-hit layer, ~0.32 ms per step at 40 layers
-(OPEN 11, `open11/results.md`)**. The plan anticipates this:
+(OPEN 11, `open11/results.md`, kernel-and-service level, eager). Re-taken through the real backend in a CUDA graph the
+same day: about 17 us per all-hit layer, ~0.68 ms per step, and the two are not reconciled (section 20.2m).** The plan anticipates this:
 "Removing its all-hit handshake is a separate optimization after equivalent protection is
 proven." What an equivalent protection would be, and why I did not design it here: a
 device-side lease taken by an atomic on a mapped per-slot counter would have to be
@@ -2583,3 +2584,37 @@ outcome too; it simply fails on the acknowledgement-area assertion first.
 **No plan checkbox is ticked, and none should be on this evidence.** Task 5's remaining boxes name service-side
 behaviours (the shutdown drain, the terminal cancellation handshake, admission pressure under a delayed GPU
 consumer) that these two kernels now make *possible* and do not themselves demonstrate.
+
+### 20.2m Step 5 (the backend and the switch) landed: what was wired, and what was and was not verified
+
+Wired (`exl3_ram_miss.py`, `environ.py`; the file 20.1 row 5 calls `srt_ram_miss.py` is `srt/layers/moe/exl3_ram_miss.py`):
+
+- `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES = EnvBool(False)`, under the option C / option F block of `Envs`, read **once**
+  in `Exl3RamMissService.ensure_started` into `service.lease_mode`. That one field enables the host
+  (`enable_lease_mode()`, before `start_thread`) and, in `attach`, hands the device the host's own `lease_block` and
+  `lease_layout`. There is no second read and no second notion of arming: the device's `armed` is written into the
+  record and the service reads it back, so the hazard row 5 names (a record the device waits on that the service
+  treats as touch-only) cannot arise from this wiring.
+- `Exl3RamMissRowBackend.post`: without a lease block on the device it is the inherited `post`; with one it is
+  translate, copy with `device_side.go_count` in place of `plan.count`, then `device_side.ack(keep)`, in that stream.
+- The quarantine also keeps the device's `go_count` and `lane_ctx` alive.
+- Nothing allocates a block in the service: `Exl3RamMissHost` already allocates one (step 1); row 5's "allocate the
+  block" is satisfied by passing that one on.
+
+Verification, by kind (none of it ticks a plan box):
+
+- **GPU (RTX 5090, divix01, under `gpu-run.sh`):** `test_exl3_ram_miss_graph_gpu.py`, five tests, all passing: the
+  served-replay and forced-timeout tests with the switch off and on, and a new test that replays five routes (misses,
+  an all-hit repeat) with the switch off and on and requires the output bytes to be identical. The timeout case with
+  leases on also requires `go_count == 0` and the scratch rows byte-for-byte untouched. `test_exl3_lease_kernels_cuda.py`
+  32 of 32, including a new case with advise and leases both on. Three backend mutants (no ack; copy with `plan.count`;
+  host lease mode never enabled) were each killed. The OPEN 11 serving-path figure above.
+- **CPU only:** the full `exl3` suite `test/registered/unit/kernels/ -k exl3`, **694 passed, 0 failed**, the same as
+  before the change; and `layers/moe` exl3 tests. New CPU tests (switch default, host-before-thread order, one read,
+  the backend's call order against a fake device) prove the wiring's shape and nothing about the device.
+  `test_exl3_stream_trace.py::test_ram_miss_requests_are_traced_and_skipped_by_tier_sim` fails with a `KeyError:
+  'pack_workers'` **at the parent commit as well**, unrelated to this change.
+- **Not verified:** a real serving run with the switch on; lease mode in a graph with `advise` on (only the
+  kernel-and-service level case above covers that combination); a model with more than one streamed layer through the
+  graph path; eviction pressure with leases on through the backend; and everything section 20.2l lists as not
+  established (the ordering argument of 6.4).

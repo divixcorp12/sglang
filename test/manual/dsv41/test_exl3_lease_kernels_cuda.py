@@ -490,7 +490,7 @@ def _close(host, slabs):
 
 
 class Service:
-    def __init__(self, tmp_path, *, timeout_ms=2000):
+    def __init__(self, tmp_path, *, timeout_ms=2000, advise=False):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
         from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
@@ -515,7 +515,7 @@ class Service:
             self.host.enable_lease_mode()
             self.host.start_thread(fatal_wait_s=60.0)
             self.dev = Exl3RamMissDevice(
-                self.page, slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=False,
+                self.page, slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=advise,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
             )
         except BaseException:
@@ -546,11 +546,11 @@ class Service:
         self.routes.fill_(-1)
         self.routes[: len(experts)] = torch.tensor(experts, dtype=torch.int64)
 
-    def step(self, row=0):
+    def step(self, row=0, next_row=-1):
         """post, wait, the real copy kernel (count = go_count), acknowledgement: one layer, one stream."""
         from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 
-        self.dev.post(row, self.planned, self.count, self.routes, -1)
+        self.dev.post(row, self.planned, self.count, self.routes, next_row)
         self.dev.wait(row, self.planned, self.count, self.host_rows, self.keep, self.ram_miss)
         copy_expert_row_segments_gpu(self.segments, self.host_rows, self.dest_slots, self.dev.go_count)
         self.dev.ack(self.keep)
@@ -667,6 +667,36 @@ class TestServiceEndToEnd:
             assert counters["leases_granted"] == counters["leases_voided"], counters
         finally:
             s.host.inject(delay_s=0.0)
+            s.close()
+
+    def test_advisories_and_leases_coexist(self, tmp_path):
+        """Advise on and lease on together (LEASE_PROTOCOL.md 15, and the arming rule the device and the service must
+        agree on): an advisory for the next layer is read but never leased, every demand's lanes are leased and
+        retired, and nothing is waited on that the service treats as touch-only."""
+        s = Service(tmp_path, advise=True)
+        try:
+            s.plan([9, 10])
+            s.step(row=1)  # last_routes[1] = [9, 10]; both are read into row 1's RAM
+            _cuda_ready()
+            assert s.until(lambda: s.host.counters()["leases_acked"] == 2), s.host.counters()
+            for slot, (state, expert, leases, _gen) in enumerate(s.host.slot_info(1)):
+                if expert in (9, 10) and state == 2:
+                    s.host.release(1, slot)  # out of RAM again, so the next post advises them
+            assert not s.host.contains(1, 9) and not s.host.contains(1, 10)
+            rows_before = s.host.counters()["rows_read"]
+            s.plan([3, 5])
+            s.step(row=0, next_row=1)  # demand for row 0, and an advisory for row 1's [9, 10]
+            _cuda_ready()
+            assert s.keep.item() == 1.0 and s.dev.go_count.item() == 2
+            _delivered(s, [3, 5])
+            assert s.until(lambda: s.host.counters()["advisories"] >= 1 and s.host.contains(1, 9) and s.host.contains(1, 10))
+            assert s.until(lambda: s.host.counters()["leases_acked"] == 4), s.host.counters()
+            counters = s.host.counters()
+            assert counters["advisory_rows"] == 2 and counters["leases_granted"] == 4, counters  # the advisory took no lease
+            assert counters["leases_voided"] == 0 and counters["lease_double_signal"] == 0, counters
+            assert s.host.fatal_seq() == 0 and s.leases(0) == [0] * CAPACITY and s.leases(1) == [0] * CAPACITY
+            assert counters["rows_read"] - rows_before == 2 + 2  # demand 3, 5 (row 0) and advisory 9, 10 (row 1)
+        finally:
             s.close()
 
     def test_a_slot_rewritten_under_a_committed_copy_is_acknowledged_violated(self, service):
