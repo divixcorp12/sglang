@@ -1948,6 +1948,52 @@ is served once the acknowledgement is delivered and its stage ring holds one rec
 poll), not a sequence of internal calls. Say which model trace each test corresponds to in its
 docstring.
 
+### 20.2c Notes for whoever lands step 2, from reading `host.cpp` at `48da151fb0`
+
+Written while the details were fresh, by reading (not by running anything), so treat each as a
+claim to check against the file as it stands when step 2 starts. Only things that bear on the
+lease design are listed.
+
+1. **`take_slot_locked` mutates as it chooses, so a deferral cannot be built on it alone.** The
+   reservation loop in `serve()` calls it once per missing expert, and each call unmaps its victim
+   and marks the slot free before the next. The failure path even says so: "each slot taken may
+   have evicted a row, and that eviction stays". A *deferral* that ran the loop and then backed
+   out would evict a row on every retry, which is data loss driven by a poll. The design's
+   "tri-state {slot, deferred, none}" (section 8) is not enough for an all-or-nothing request:
+   step 2 needs a **dry-run** that counts free, evictable and lease-blocked slots for the whole
+   request first, and only then either commits the takes or defers with no state change. This
+   corrects the sketch in section 8.
+2. **`pump_demand`'s structure fights an early return.** After `begin_stage` it reads the record,
+   calls `handle_demand`, then unconditionally does `_mm_sfence()`, `store_release(demand_done)`
+   and `next_demand_ = skip_zero(next_demand_ + 1u)`. A deferral must return **between**
+   `read_record` and `handle_demand` without running that tail, and must clear `cur_` without
+   pushing (7.1). It must also not reach `busy_since_` or `kBusySeq`: `handle_demand` sets them at
+   entry, and the watchdog's "stuck" rule (`max(30 s, 3 x timeout)`) would count a long deferral
+   as a hung read and abort the process.
+3. **Lease at publication (DECIDE 3) is safe only while the service is the only actor that can
+   evict.** In `serve()` the residency check and reservation happen in one `mutex_` section, the
+   read happens outside it, and the publication happens in a third. Today nothing else evicts in
+   between: the hit slots are protected only by this request's own `wanted` list, and other
+   actors (Python's `assign`, `touch`) run only while the thread is paused. **Task 8 breaks that**:
+   a promotion admission on the scheduler thread will call `take_slot_locked` on the same row
+   while the service is mid-read. A READY hit slot then has no protection from reservation to
+   grant. So when step 7 lands, hit and loaded lanes need a reservation-time hold (a per-request
+   reserved count checked by the eviction predicate, or the lease itself taken at reservation),
+   and DECIDE 3 has to be reopened. Step 2's predicate should be written so that this is a
+   one-line addition, not a rewrite.
+4. **Eager `assign()` publishes before the bytes exist.** It marks the slot `kReady` and publishes
+   the map entry immediately; Python fills the bytes afterwards, with the device idle and the
+   thread paused. The `SlotGen` bump therefore belongs at `assign` time (before Python writes),
+   not at "slot becomes ready", or the detector of 6.5 would compare against a generation taken
+   after the bytes changed. Serving reads bump at the move to `kLoading`.
+5. **`Request` carries `need` and `protect` only.** The lane list arrives in a separate
+   `LaneRequest` with its own seqlock, so `serve()`'s `wanted` must be built from
+   protect, need **and** the lane experts (7.1 step 4), and `Request` grows a `lanes` field.
+6. **`counters_` is index-aligned with Python `COUNTERS`.** New lease counters go at the end of
+   `enum Counter` and the same position in `ops.py`; `exl3_ram_miss_open` gains a block argument
+   and the many test call sites are spared by the constructor allocating one when none is given
+   (step 2 as written above).
+
 ### 20.3 Dependencies
 
 `1 -> 2 -> 3`, `3 -> 4`, `4 -> 5`, `2 -> 6`, `3 -> 7`, `5 + 6 -> 8`. Steps 1-3, 6 and 7 are
