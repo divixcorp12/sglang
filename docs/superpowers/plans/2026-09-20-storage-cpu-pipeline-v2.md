@@ -712,6 +712,30 @@ This permits CPU I/O for later rows to overlap the earlier row's SM transfer. It
    **Report all three differences with intervals: A1 v A0, A2 v A1, and A2 v A0** (A0 = today's unleased path, A1 = Task 5 lease-mode batched, A2 = the Task 6 mechanism). **A2 against A0 alone must not be presented as "the Task 6 result"** -- it credits Task 6 with the cost it inherits from Task 5. A2 against A1 alone is also not enough: quoting it without A1 against A0 hides a possible loss from Task 5. V1b, needing no lease mode, is measured against A0 directly. (`PER_ROW_TRANSFER_REVIEW.md` G2, a report-time trap that a correct baseline statement does not cover.)
 2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose **source-read safety** holds only because the service serves one request at a time, i.e. one that relies on invariants (a) or (b) in SAFETY rather than on an ownership grant, is rejected. (It is refused before measurement; clause 1 does not apply to it.) The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** The ground is *not* that the borrowed invariants go unstated -- this plan and `PER_ROW_TRANSFER.md` §3.3 state them -- so do not reinstate that reasoning.
 3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. **The control must be matched to the claim, not to the mechanism** -- see SAFETY, where the obvious control for this property turned out to leave the property's own test green. Stated precisely: today's only **production** producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect` (`plan_candidates` lives in the same file with no production caller found), so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one.
+**SCHEDULING CONSEQUENCE OF 2026-09-21, raised because nobody has drawn it.**
+This Gate now contains **two required GPU measurements** -- clause 1's three
+intervals and clause 4's `g` -- and the mechanism choice additionally turns on
+`c`, which was **NOT MEASURED** that day because no physical core on divix01 had
+both SMT siblings under the frozen 10% foreign-CPU gate while the user's
+services run. **Whether clauses 1 and 4 face the same blocker is NOT
+established**, and should be settled before either is scheduled rather than
+discovered in a window:
+- `c` is a microbenchmark resolving a per-row copy cost, so per-core contention
+  enters it directly.
+- Clause 1 is an **end-to-end decode** comparison, which may tolerate a noisier
+  box -- but its verdict turns on a **net margin of 0.1-0.4 points**, and a
+  margin that small is not obviously safer than a microbenchmark just because
+  the measurement is longer.
+- Clause 4's `g` has a crossing at **6.98-8.03 us**, which is microbenchmark
+  territory again.
+
+The cheap way to settle it is the pre-registered sibling pilot already staged
+(`--reps 40`, runner and frozen analysis hashed): it answers whether SMT-sibling
+load enters the measured interval **for this instrument**, and a "not in T"
+verdict would bear on clauses 1 and 4 as well. **Two aborted attempts, both from
+lane-coordination errors rather than from the instrument**, so the pilot is a
+few minutes on a genuinely quiet box rather than new work.
+
 4. **Required measurement:** the per-stage cost `g`. The per-row-versus-two-phase verdict turns on it at best order, where the net margin is 0.1-0.4 points, and no measurement of it exists.
 
 **A rejected variant is not a rejected task.** Two-phase is the chosen mechanism and is judged on its own; if launch or head-of-line cost cancels the benefit for *per-row*, that rejects per-row. Record which variant was rejected. If early transfer as a whole fails, retain Task 4 and evaluate native DMA or a readiness-aware gather under Task 9's **"Native DMA vs SM gather"** row, which now names the readiness-aware gather explicitly.
