@@ -206,6 +206,55 @@ precision (about 5 of 6 where checkable), not a new count. Two sweep findings co
 `_ticket_matches` generation gate and the insert-on-miss victim; both need a GPU) and remain source
 arguments.
 
+## Rerun plan and predictions, registered BEFORE any base-2 or base-3 result exists (2026-09-21)
+
+Three bases, checked by ancestry in git, not assumed:
+
+| base | commit | what it contains | host.cpp md5 |
+|---|---|---|---|
+| 1 | `a01f9347d6` | before Task 5 (run; results above) | `8d7ca119...` |
+| 2 | `457e44e036` | Task 5 step 2 (`6ea3b6a4f9`) only: lease-aware victim predicate, generation fields, dry-run in `serve()`'s reservation; no lease mode | `99cca091...` |
+| 3 | current HEAD at launch (`bc02ab9ddf` when this was written) | steps 3a (lease mode, off by default), 3b (deferral branch in `pump_demand`), 3c (`pause` returns 1/0/2) | recorded at launch |
+
+`9e9b9cd204` (3a), `e28f2126da` (3b) and `928e375bd0` (3c) are not ancestors of `457e44e036`. Both step 2 and
+step 3a touched `serve` and `pump_demand`, so base 2 is what separates "step 2 changed the publish gate's
+coverage" from "3a did". Runs: base 3 full (baseline, 22 mutants, H19 and H20); base 2 gate family only
+(baseline, H01, H02, H19, H20); base 1 H19 and H20 only.
+
+**H14 was re-authored for base 3 because the code moved; it is not the same mutant, so both texts are kept.**
+- **Original (base 1 and 2)**, `pump_demand`'s tail for an unreadable record: an early return after the
+  overrun count, before the done-store:
+  `counters_[kOverruns].fetch_add(1);  // status stays pending...` then `}` then `_mm_sfence();
+  store_release(page_ + kDemandDone, next_demand_);` becomes the same `else` branch followed by
+  `end_stage(); next_demand_ = skip_zero(next_demand_ + 1u); return true;` before the done-store.
+- **Base 3**, where the tail is now `deferred_seq_ = 0;` then an optional test stall, `_mm_sfence()` and the
+  done-store, and the `else` branch is the last arm of an `if` chain with the lease deferral arms above it:
+  the `else { counters_[kOverruns].fetch_add(1);  // status stays pending: a waiting layer fails stop }`
+  branch gains `end_stage(); next_demand_ = skip_zero(next_demand_ + 1u); return true;`, so an unreadable
+  record still skips the `deferred_seq_ = 0` reset, the stall, the fence and the done-store. The intent is
+  the same (Done never advances for an unreadable record) and the edit is one branch, but the surrounding
+  path is different, so if H14 survives on base 3 and died on base 1 the first question is whether this text
+  is as sharp; the two texts are here to answer it.
+
+**Predictions (written before the runs):**
+1. **H01 survives on base 2 and on base 3**, as on base 1. Reason: lease mode is off by default and no lease is
+   injected in these tests, and the lease author states existing tests pass unchanged with the switch off. A
+   confirmed prediction is a small piece of independent evidence that the lease code is inert when disabled.
+   **If H01 is killed on base 2 or 3, that is the more interesting result**: it would mean disabled lease
+   code changes what the tests observe of the publish path.
+2. **H19 (`if (true)`) is killed on all three bases**, by `test_a_failed_read_publishes_none...` among others.
+3. **H20 (`if (ok || cancelled)`) is killed on all three bases**, by the cancelled-advisory tests.
+4. **H14 is killed on base 3** by the same test that killed it on base 1.
+5. **The four `skip_zero` mutants (H04-H07) stay killed on base 3**, and the lap-resume ones still by exactly
+   one test each.
+6. The baseline on base 3 passes with no more skips than base 2 (the `kLease*` agreement test has run since
+   base 2: its baseline was 298 passed, 0 skipped, from a run that itself was double-launched, so that
+   count is provisional until the clean baseline).
+
+**For base 3 the result table will flag any kill that depends only on a counter advancing** (the failing
+assertion reads a counter and nothing else), since those are the kills most likely to be accidents, and base
+3 is the code Task 6 will change.
+
 ## What went wrong, and what is not established
 
 - **Double launch, base 2.** I started the base-2 queue twice (a shell quoting error in the first launch
