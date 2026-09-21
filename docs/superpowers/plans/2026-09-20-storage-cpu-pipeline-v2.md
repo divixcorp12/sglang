@@ -996,6 +996,28 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > the record it switched on would have shown `row_pack` empty, which is exactly
 > why the test was vacuous. The witness was one unused call away.
 >
+> **THE RULE IS NOW DEMONSTRATED, NOT ARGUED (`e6382ce07e`).** The
+> advisory-during-deferral test was the worked example above: it asserted
+> `advise_done` advanced, which an advisory **dropped as stale** also produces.
+> Its author rewrote it with a path witness and then **ran the old version
+> against the mutants the new one kills.** The old check **SURVIVED** two of
+> them -- A1 (advisory dropped as stale while a demand is pending) and A4
+> (advisory ignores leases) -- **3 of 3 collected passing, 0 failed.** The
+> replacement kills A1 with 2 of 5, and A2 through A5 each with 1 or 2.
+>
+> So the claim "an outcome a shortcut also produces is not evidence" is no
+> longer an inference from reading: **the shortcut was built and the old
+> assertion passed it.** Running a superseded test against the mutants its
+> replacement catches is cheap, and it is the only way to show a test was
+> vacuous rather than merely argue it.
+>
+> **Two details of that run worth copying.** The A5 kill comes from a **timeout
+> on a positive assertion** ("the advisory was consumed") rather than from an
+> absence -- the author distinguished the two, which is the distinction this
+> whole section exists for. And the mutant wall times of 37-48 s against a 17 s
+> baseline are **the C++ rebuild of the mutated file, not test time**; saying so
+> stops a later reader inferring contention or a hang from the spread.
+>
 > **(b) A test for "X does not happen" is vacuous by default.** Unless something
 > proves the conditions for X were present, it passes for free. Found when a
 > requirement was recorded backwards -- "aborts after a long deferral" when the
