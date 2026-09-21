@@ -94,3 +94,44 @@ What this does and does not say:
   upper bound: a layer with a miss was armed before lease mode.
 * **Not measured:** a full serving run (`bench_serving`/the real model), lease mode with `advise` on in a graph,
   and any cost when the RAM tier is under eviction pressure.
+
+---
+
+# Re-taken on an exclusively held card (2026-09-21)
+
+The two sections above were measured while the box was shared: the first at load 3-4.5, the second at load
+8-11. That second run's percentiles were not trustworthy, and chasing the discrepancy cost real time -- a p50
+delta of +90.5 us against a min-to-min delta of +14.8 us for the same measurement. Percentile numbers need an
+exclusively held card, so this re-take waited for one.
+
+Conditions: divix01, RTX 5090, **no other process on the GPU** (63 MiB used, no compute apps), load average
+4.2-4.5 and steady across all six runs, `gpu-run.sh` holding `cc-gpu.lock`, `OMP_NUM_THREADS=1`, `PYTHONPATH`
+at the tree under test. Script `open11_serving_path.py --reps 300`, three runs per arm, raw output in
+`serving_path_exclusive/run{1,2,3}_lease{0,1}.json.gz`. `rows_read` during timing is **0** in every run and
+`leases_granted == leases_acked == 36264` in every lease-on run, with no fatal.
+
+| view | lease OFF p50 (ms) | lease ON p50 (ms) | delta per post (us) | min-to-min (us) |
+|---|---|---|---|---|
+| layer (one in-graph MoE layer) | 0.3501 | 0.3672 | **+17.10** | +17.19 |
+| chain (40 posts, 1.5 ms spacing) | 68.28 | 68.96 | **+17.09** | +16.98 |
+| packed (40 posts, no spacing) | 8.466 | 9.144 | **+16.79** | +16.84 |
+| eager (one post, synchronize) | 0.2514 | 0.2612 | +9.74 | +10.15 |
+
+**The three graph views agree at 16.8-17.1 us per armed layer, and p50 now agrees with min to within 0.4 us.**
+Run-to-run spread is 0.0002 ms. That agreement is the point of the re-take: under contention the p50 and the
+min disagreed by a factor of six, and neither could be quoted.
+
+## Two corrections to what is recorded above
+
+* **The cost is ~17 us per armed layer, not ~8 us.** The 8 us figure came from `open11_arming_cost.py`, which
+  drives a hand-written step. Through `Exl3RamMissRowBackend` and the real switch it is about twice that. The
+  backend path, not the measurement noise, is the difference.
+* **The x40 figure is now measured rather than extrapolated, and it is ~0.68 ms/step, not ~0.32 ms.** `chain`
+  and `packed` each run 40 posts in one graph: +0.684 ms and +0.672 ms respectively. The earlier 0.32 ms was
+  8 us linearly extrapolated, and the caveat recorded against it ("assumes per-layer costs are additive")
+  turns out to have been the smaller error.
+
+**Consequence for Task 6: OPEN 11 is about 61% of the 1.114 ms `G*`, not 28-30%.** Section 17.2's requirement
+that Task 6's benefit be reported net of OPEN 11 now bites roughly twice as hard as recorded. Still an upper
+bound -- it is attained only when every layer is all-hit, and a layer with a miss was already armed -- and
+still ~1% of a ~66.8 ms/token decode step in absolute terms.

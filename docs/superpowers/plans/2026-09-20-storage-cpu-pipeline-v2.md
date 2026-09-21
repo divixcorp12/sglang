@@ -246,13 +246,24 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 > lease `post` override and **there is no environment switch**, so lease mode cannot be enabled in the serving path at
 > all. Until it lands, every lease number is a kernel-and-service number, never an end-to-end one.~~
 >
-> **OPEN 11 is now measured** (`analysis/dsv41-drive/open11/`, three runs agreeing to 6%): arming every `count > 0`
+> **OPEN 11 RE-TAKEN 2026-09-21 on an exclusively held card, and both headline numbers roughly double.** The
+> paragraph below is superseded. On a card with no other process on it (load steady at 4.2-4.5, three runs per arm,
+> `analysis/dsv41-drive/open11/serving_path_exclusive/`), arming costs **~17 us per all-hit layer, not ~8**, and
+> **~0.68 ms per 40-layer step, not ~0.32** -- and the x40 is now *measured* in one graph by two independent
+> geometries (`chain` +0.684 ms, `packed` +0.672 ms) rather than linearly extrapolated. The three graph views agree
+> to 0.3 us and p50 now agrees with min to 0.4 us, which is what the exclusive card bought: under contention the same
+> measurement gave +90.5 us at p50 against +14.8 us min-to-min, and neither could be quoted. The ~8 us came from
+> `open11_arming_cost.py`'s hand-written step; the real backend path costs about twice that.
+> **So OPEN 11 is ~61% of the 1.114 ms `G*`, not 28-30%**, and section 17.2's net-of-OPEN-11 requirement on Task 6
+> bites twice as hard as recorded. Still an upper bound, still ~1% of a ~66.8 ms/token step.
+>
+> ~~**OPEN 11 is now measured** (`analysis/dsv41-drive/open11/`, three runs agreeing to 6%): arming every `count > 0`
 > record costs **about 8 us per all-hit layer, ~0.32 ms per step at 40 layers**. The exposed cost is the wait alone
 > (+11 us); the acknowledgement kernel costs ~14 us measured in isolation but is largely hidden in the stream, and the
 > copy is unchanged. **That is about 28-30% of the 1.114 ms `G*` Task 6 is trying to win**, so Task 6's benefit must be
 > reported net of it -- material, not fatal. It is an **upper bound**, attained only when every layer is all-hit, since
 > a layer with a miss was already armed and pays nothing. It is not a serving-path figure and must be retaken when
-> step 5 lands.
+> step 5 lands.~~
 
 **Files:** Native service/pipeline header; `python/sglang/kernels/jit/csrc/moe/exl3_ram_miss.cuh`; `python/sglang/kernels/ops/moe/exl3_ram_miss.py`; `python/sglang/srt/layers/moe/exl3_ram_miss.py`; thread and GPU graph tests. **Plus, found during design and missing from this list:** `python/sglang/srt/layers/moe/expert_stream.py` and `python/sglang/srt/layers/moe/expert_host_tier.py`. `ExpertPinnedHostCache.__init__` registers a `weakref.finalize(..., release_host_slabs)` with the default `atexit=True`, so the slabs are unregistered at every ordinary process exit with no device barrier. **A quarantine that leaves that finalizer attached is silently undone at exit**, so §14's shutdown ordering cannot be implemented without touching these two files.
 
