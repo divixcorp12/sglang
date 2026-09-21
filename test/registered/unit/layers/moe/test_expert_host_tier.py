@@ -15,7 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import engram_row_cache
-from sglang.srt.layers.moe import expert_stream
+from sglang.srt.layers.moe import expert_host_tier, expert_stream
 from sglang.srt.layers.moe.expert_format import DenseLayerFormat
 from sglang.srt.layers.moe.expert_host_tier import (
     PAGE_BYTES,
@@ -366,6 +366,12 @@ class TestCacheStatsSink(unittest.TestCase):
         self.addCleanup(setattr, engram_row_cache, "_SINK_PATH", engram_row_cache._SINK_PATH)
         engram_row_cache._SINK = None
         engram_row_cache._SINK_PATH = ""
+        # tier_snapshot sums every table in the registry. An earlier test's streamer and cache reference
+        # each other, so its table stays listed until a collection happens to run, and pytest's file
+        # order (TestTierSnapshot first) then adds its admissions to this test's counts. A registry of
+        # its own makes the counts depend on this test alone.
+        self.addCleanup(setattr, expert_host_tier, "_LIVE_LRUS", expert_host_tier._LIVE_LRUS)
+        expert_host_tier._LIVE_LRUS = weakref.WeakSet()
 
     def lines(self):
         with open(self.trace + ".cache-stats") as f:
