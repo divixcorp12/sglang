@@ -2495,8 +2495,9 @@ carries the claim.
 > two-bank, quotes these same figures in its commit message as "Measured: mean
 > decode 2.8198 to 3.8016 tok/s, 1.3482x". That attribution is wrong: the
 > figures already existed in this file at `ddcb0d55ff`'s parent. The commit
-> message cannot be amended, so the correction lives here. **No post-two-bank
-> end-to-end tok/s result exists in this record.**
+> message cannot be amended, so the correction lives here. The two-bank
+> pipeline's own effect is measured separately below, and it is **about +3%,
+> not 1.35x**.
 >
 > Both arms are also n=1 per cell and carry no provenance. Against a base spread
 > of 1.59x across sessions, wider than the 1.35x effect, the paired per-session
@@ -2506,6 +2507,77 @@ carries the claim.
 > `scripts/dsv41/provenance.py` recording the resolved environment, the imported
 > tree's HEAD and dirtiness, the reader mode actually in force, and a drive-idle
 > check.
+
+
+#### Task 1 matched baselines, and what two-bank is actually worth (2026-09-21)
+
+The arms above were single shots without provenance. These are their replacement:
+repeated, interleaved, each arm refusing to start unless its worktree is clean at
+an expected sha, and each result carrying `scripts/dsv41/provenance.py`'s record
+of the resolved environment, the imported tree, the reader mode in force and a
+drive-idle check. Scripts `analysis/dsv41-drive/task1-baseline-arms.sh` and
+`task1_arm_verdict.py`; raw output in `analysis/dsv41-drive/task1-results/`.
+
+Graph decode, `GRAPH_GATHER=1`, 4 sessions, 256 prompt / 128 new, 70 GiB pinned
+tier. `multi_token_chunks` was 0 in every arm of the series, so the step-latency
+percentiles are exact rather than smoothed.
+
+| arm | code | mirrors | mean decode tok/s | n |
+|---|---|---|---:|---:|
+| new, mirrors off | `f6608901a3` | off | 2.903, 2.905, 2.907, 2.917, 2.919 | 5 |
+| new, mirrors on | `f6608901a3` | on | 3.905, 3.927, 3.933 | 3 |
+| old, mirrors on | `099eadba33` | on | 3.798 | 1 |
+
+**The mirror effect is 1.347x** (3.92 / 2.91), reproducing the single-shot
+1.3482x above with repeats and provenance. Run-to-run spread within a cell is
+0.5-0.6%, far below the effect, and the four off arms span 2.903-2.919.
+
+**Two-bank is worth about +3.2%** (3.92 clean new / 3.798 clean old), and the
+sign is consistent across all four sessions individually (+3-5%, +3%, +4-5%,
++2%). This is the number `ddcb0d55ff`'s commit message should have carried.
+It is not the 1.35x, which belongs to the mirrors.
+
+**The old arm's n is 1.** Two old arms ran; one had disturbed sessions (below)
+and is excluded, leaving a single clean measurement at 3.798 against three clean
+new arms. Every other cell has n=3 or more. More old arms are being collected,
+and until they exist the +3.2% should be read as "about 3%, sign-consistent
+across sessions, old-arm n=1", not as a precise figure.
+
+Corroboration worth noting: that clean old arm reads 3.798 against this
+section's single-shot 3.8016, measured on the same reader four days earlier.
+The old number was right; only the label attached to it was wrong.
+
+##### What these arms do not settle
+
+- **Session-0 TTFT varies from 49.8 to 60.3 s across mirrors-on arms**, with no
+  explanation. A pre-registered prediction (`task1c-PREDICTIONS.txt`, sha256
+  recorded before the run) that this tracked boot-phase page-cache growth was
+  **falsified**: a boot-warm arm came in at 50.8 s, inside the stated
+  falsification condition. Sessions 1-3 are stable at 29-30 s (on) and 53-56 s
+  (off) in every clean arm, so whatever this is, it is confined to the first
+  session. Do not pool session-0 TTFT across arms without saying so.
+- **Two arms had a disturbed session** that the verdict could not see, because it
+  checks start state only: one session's prefill ran 13 s and 30 s slow while
+  bytes read, residency and start-state idleness were all normal. Those arms are
+  recorded VALID-but-disturbed and are excluded from the means above. Box load
+  average was 2.5-2.9 at the time against 0.7 earlier, which is a hint and not a
+  cause.
+- **Page-cache independence rests on O_DIRECT, not on dropped caches**, because
+  no one here can drop them. It is supported rather than assumed: across six
+  arms reading ~400 GiB each, expert-shard residency moved by less than 0.09
+  GiB, and a direct test (`dd iflag=direct` against a cold shard on each mount,
+  with a buffered control) showed O_DIRECT populating **zero** bytes of page
+  cache on both xfs and ext4 while the control populated 70 MiB. Note that the
+  two mirrors are on different filesystems: `/mnt/nvme0` is xfs, `/mnt/nvme4` is
+  ext4 and is physically `nvme3n1`.
+- **Boot-phase page-cache behaviour is not understood.** Residency of the source
+  directory changes during engine startup by anywhere from -3.4 to +5.1 GiB, and
+  these changes do not track device reads. An explanation in terms of eviction
+  and re-reading was proposed and **withdrawn** when diskstats contradicted it.
+  A second hypothesis, that the 70 GiB pinned allocation reclaims page cache
+  concurrently with the buffered weight load, is pre-registered and **untested**.
+- **Spans are not compared across schema 1 and 2** (see the schema note above),
+  so the old-versus-new comparison here is on tok/s and bytes only.
 
 #### The gate: service-attributed expert bytes
 
