@@ -1368,12 +1368,13 @@ enum Counter : int {
   kVersion,
   kRunning,
   kSpinCpu,
-  kDeferred,  // demands the tier could serve only if leases retired; none evicted (step 2: counted, then failed)
+  kDeferred,  // demands held back because their only victims are leased: one per deferral, none evicted
   kLeasesGranted,     // one per lane of a served request in lease mode
   kLeasesAcked,       // released by the device's acknowledgement
   kLeasesVoided,      // released by a terminal record that named the lane
   kLeaseDoubleSignal, // a lane signalled by both, or twice: released once, counted here
   kLateAfterTerminal, // a request the device had already given up on: dropped without a lease
+  kDeferredReuse,     // a demand held back because its request slot still holds an unretired lease row
   kCounterCount,
 };
 
@@ -1615,6 +1616,8 @@ class RamTier {
     retire_leases();  // first, so that an idle pump still retires what the device has acknowledged
     const uint32_t head = load_acquire(page_ + kDemandHead);
     if (head == 0 || !reached(head, next_demand_)) return false;
+    // A deferred demand is not looked at again until a lease retires: no stage record, no clock read per poll.
+    if (deferred_seq_ == next_demand_ && !deferral_may_retry()) return false;
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
     if (head - next_demand_ >= kDemandRecords) {
       // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq.
@@ -1628,12 +1631,29 @@ class RamTier {
         counters_[kOverruns].fetch_add(1);  // a later request overwrote the lane request: a lapped record
       } else if (lease_mode_ && request.armed && terminal_seen(request)) {
         counters_[kLateAfterTerminal].fetch_add(1);  // the device gave up on it: serve nothing, lease nothing
+      } else if (const Defer reason = request.armed ? defers(request) : Defer::kNone; reason != Defer::kNone) {
+        // Held back, not failed and not served: return before handle_demand (so busy_since_ and kBusySeq stay
+        // untouched, or the watchdog would count the wait as a hung read) and before the tail (no demand_done, no
+        // advance). No stage record is pushed; the first observation time is kept for the one written when it is served.
+        if (deferred_seq_ != next_demand_) {
+          deferred_seq_ = next_demand_;
+          deferred_observed_ns_ = cur_ != nullptr ? cur_->observed : 0;
+          counters_[reason == Defer::kRequestSlot ? kDeferredReuse : kDeferred].fetch_add(1);
+        }
+        deferred_stamp_ = lease_changes_.load();
+        deferred_gen_ = request.gen;
+        cur_ = nullptr;
+        return false;
       } else {
+        if (cur_ != nullptr && deferred_seq_ == next_demand_ && deferred_observed_ns_ != 0) {
+          cur_->observed = deferred_observed_ns_;
+        }
         handle_demand(request, record);
       }
     } else {
       counters_[kOverruns].fetch_add(1);  // status stays pending: a waiting layer fails stop
     }
+    deferred_seq_ = 0;
     if (const int64_t stall = done_stall_ns_.load(); stall > 0) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(stall));  // test only: see inject_done_stall
     }
@@ -1784,9 +1804,52 @@ class RamTier {
 
   // The device has published a terminal for this request: it will never read a source for the lanes it names.
   bool terminal_seen(const Request& request) const {
-    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    return terminal_seen_for(request.seq, request.gen);
+  }
+
+  bool terminal_seen_for(uint32_t seq, uint64_t gen) const {
+    const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
     const uint8_t* base = lease_ + lease_d_ + kLeaseTerminal + idx * kLeaseTerminalBytes;
-    return generation_of(load_acquire64(base + kLeaseTermGen)) == request.gen && tag_of(load_acquire64(base + kLeaseTermGen)) != 0;
+    const uint64_t word = load_acquire64(base + kLeaseTermGen);
+    return generation_of(word) == gen && tag_of(word) != 0;
+  }
+
+  enum class Defer { kNone, kVictims, kRequestSlot };
+
+  // Would this armed demand have to wait for a lease to retire? Counts, changes nothing. The request slot rule (lease
+  // mode only): the slot's previous lease row must be fully retired before it is reused. The victim rule: the tier
+  // could serve the request only if leased slots were victims (LEASE_PROTOCOL.md section 8, and 20.2c: a dry run,
+  // because the take loop evicts a victim per call and keeps that eviction when the request then fails).
+  Defer defers(const Request& request) {
+    if (request.row < 0 || request.row >= layers_) return Defer::kNone;
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (lease_mode_ && !request.lane_experts.empty() &&
+        outstanding_[static_cast<int64_t>((request.seq - 1u) % kDemandRecords)].active) {
+      return Defer::kRequestSlot;
+    }
+    std::vector<int32_t> wanted;
+    for (const auto* ids : {&request.protect, &request.need, &request.lane_experts}) {
+      for (int32_t expert : *ids) {
+        if (expert >= 0 && expert < experts_ && !listed(wanted, expert)) wanted.push_back(expert);
+      }
+    }
+    const Tier& tier = tiers_[request.row];
+    int64_t missing = 0;
+    for (int32_t expert : wanted) {
+      if (tier.expert_slot[expert] < 0) ++missing;
+    }
+    if (missing == 0) return Defer::kNone;
+    const VictimCensus census = census_locked(request.row, wanted);
+    if (census.free + census.evictable < missing && census.free + census.evictable + census.leased >= missing) {
+      return Defer::kVictims;
+    }
+    return Defer::kNone;
+  }
+
+  // A deferred demand is retried only when a lease was released since it was last refused, or the device gave up on it.
+  bool deferral_may_retry() const {
+    if (lease_changes_.load() != deferred_stamp_) return true;
+    return lease_mode_ && terminal_seen_for(deferred_seq_, deferred_gen_);
   }
 
   // Lease every lane's source slot and publish its row result, in one critical section, after the rows are ready
@@ -1884,6 +1947,7 @@ class RamTier {
     held.state = counter == kLeasesAcked ? 2 : 3;
     lanes_outstanding_.fetch_sub(1);
     counters_[counter].fetch_add(1);
+    lease_changes_.fetch_add(1);
   }
 
   // Test hooks and introspection. slot_info: [state, expert, leases, generation] per slot.
@@ -1906,6 +1970,7 @@ class RamTier {
       throw std::runtime_error("exl3 RAM miss: lease underflow on slot " + std::to_string(slot));
     }
     tier.leases[slot] = static_cast<uint32_t>(static_cast<int64_t>(tier.leases[slot]) + delta);
+    if (delta < 0) lease_changes_.fetch_add(1);
   }
 
   VictimCensus victim_census(int64_t row, const std::vector<int32_t>& wanted) {
@@ -2337,6 +2402,13 @@ class RamTier {
   Outstanding outstanding_[kDemandRecords];  // by request slot; guarded by mutex_
   std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
   std::atomic<int64_t> done_stall_ns_{0};      // test only: sleep between serving a demand and storing demand_done
+  std::atomic<uint64_t> lease_changes_{0};     // bumped whenever a lease is released: what wakes a deferred demand
+  // The demand held back, if any (service thread only): its sequence, the changes seen when it was last refused,
+  // its generation (a terminal for it also wakes it) and when it was first observed (for the stage record).
+  uint32_t deferred_seq_ = 0;
+  uint64_t deferred_stamp_ = 0;
+  uint64_t deferred_gen_ = 0;
+  int64_t deferred_observed_ns_ = 0;
   int64_t layers_;
   int64_t experts_;
   RowReader reader_;
@@ -2467,6 +2539,10 @@ void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted,
   result[0] = census.free;
   result[1] = census.evictable;
   result[2] = census.leased;
+}
+
+int64_t exl3_ram_miss_busy_since(int64_t handle) {
+  return exl3_ram_miss::find(handle)->busy_since();
 }
 
 void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
@@ -2663,6 +2739,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_release, exl3_ram_miss_release);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_census);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_busy_since, exl3_ram_miss_busy_since);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);

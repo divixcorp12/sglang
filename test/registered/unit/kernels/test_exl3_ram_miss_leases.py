@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post, sim_wait
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -228,11 +228,8 @@ def test_the_census_counts_free_evictable_and_leased_slots_without_taking_any(tm
 
 def test_a_demand_the_tier_could_serve_only_after_a_lease_retires_evicts_nothing(tier):
     """Mutation: no dry run. The take loop then evicts the unleased victim (expert 3) before failing on the leased
-    one, and a poll that retried the request would evict a row every time.
-
-    INTERIM BEHAVIOUR: the refused demand FAILS (status 2) only because step 3 of LEASE_PROTOCOL.md section 20 has
-    not added the deferral yet. Step 3 replaces that assertion with "not served, not failed, served after the lease
-    retires". Keep the no-eviction assertions; do not change the deferral to keep the status-2 line green."""
+    one, and a poll that retried the request would evict a row every time. (The demand's deferral itself, and its
+    service once the lease retires, are tested in test_exl3_ram_miss_lease_defer.py.)"""
     s, page, host = tier
     assert _serve(page, host, 0, need=[3, 4], protect=[3, 4]) == 1
     _, leased_slot = _slot_of(host, 0, 3), _slot_of(host, 0, 4)
@@ -240,8 +237,8 @@ def test_a_demand_the_tier_could_serve_only_after_a_lease_retires_evicts_nothing
     assert host.victim_census(0, wanted=[1, 2]) == (0, 1, 1), "precondition: one victim short, one lease away"
     before = (host.counters()["evictions"], host.counters()["version"], host.slot_info(0), host.mapping(0))
     seq = sim_post(page, 0, need=[1, 2], protect=[1, 2])
-    assert host.pump() == 1
-    assert sim_wait(page, seq, 1.0) == 2, "INTERIM (step 3 replaces this with a deferral): failed, without evicting"
+    assert host.pump() == 0, "deferred: the demand is neither served nor failed"
+    assert page_word(page, "demand_done") != seq
     after = (host.counters()["evictions"], host.counters()["version"], host.slot_info(0), host.mapping(0))
     assert after == before
     assert host.counters()["deferred"] == 1 and host.counters()["no_victim"] == 0
@@ -268,3 +265,9 @@ def test_an_advisory_blocked_only_by_leases_gives_up_without_evicting_or_countin
     assert host.pump() == 2
     assert (host.counters()["evictions"], host.slot_info(0)) == before
     assert host.counters()["deferred"] == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

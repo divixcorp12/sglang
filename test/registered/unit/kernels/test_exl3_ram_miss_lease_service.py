@@ -273,3 +273,9 @@ def test_the_leases_exist_before_the_device_can_see_demand_done(tmp_path):
         assert sim.wait(req, timeout_s=10.0).go == 2
     finally:
         host.stop()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

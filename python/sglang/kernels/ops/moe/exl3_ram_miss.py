@@ -360,6 +360,7 @@ COUNTERS = (
     "leases_voided",
     "lease_double_signal",
     "late_after_terminal",
+    "deferred_reuse",
 )
 
 
@@ -550,6 +551,10 @@ class Exl3RamMissHost:
         out = torch.empty(3, dtype=torch.int64)
         self._module.exl3_ram_miss_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
+
+    def busy_since_ns(self) -> int:
+        """When the request now in service began (0 when none): what the watchdog's stuck rule reads."""
+        return int(self._module.exl3_ram_miss_busy_since(self.handle))
 
     def enable_lease_mode(self) -> None:
         """Lease every armed request's lanes and publish their row results (LEASE_PROTOCOL.md 7); before the thread starts."""

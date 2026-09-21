@@ -87,3 +87,9 @@ def test_generation_zero_and_generations_past_56_bits_are_refused():
         lease.tagged(lease.READY, 0)
     with pytest.raises(ValueError):
         lease.tagged(lease.READY, 1 << 56)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
