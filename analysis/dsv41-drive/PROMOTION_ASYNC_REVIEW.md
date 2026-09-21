@@ -128,7 +128,7 @@ not propose that; it is worth stating.
 
 - **B1-B9** each match the source: `decide_residency_policies` (`expert_residency.py:450-471`, `.cpu()` on the stacked scores);
   `advance_residency_policies` (three `torch._foreach_*` launches); `before_host_use` (`exl3_ram_miss.py:401-408`, synchronise at
-  `_pause_depth == 0`, then `pause(2 x timeout + 1 s)`); `set_rows` (`expert_transfer.py:127`) and `_publish_slots` (`:235`) event
+  `_pause_depth == 0`, then `pause(2 x timeout + 1 s)`); `set_rows` (`expert_transfer.py:125`) and `_publish_slots` (`expert_hot_cache.py:235`) event
   synchronisation; `wait_for_slot_publication` (`:253`).
 - **Why `SGLANG_MOE_HOT_ASYNC_PROMOTIONS` is inert for EXL3:** `stage_reassign` routes spec-only formats to `_load_reserved` and
   returns no promotion; `exl3_reqs._check` refuses the flag (`:55`).
