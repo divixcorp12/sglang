@@ -2238,7 +2238,7 @@ uniquely detecting B1-B3 in its file). The box's first clause is "inject delayed
 GPU consumer: the delay is injected into `LeaseSim`, a stand-in written from the same specification. R4 does not
 change that.
 
-**Class order.** Nine of my ten new or changed test files have no test classes, so the class-order divergence between
+**Class order.** Eight of the nine test files I added or changed (lease_block, device_args, leases, lease_service, lease_defer, lease_thread, lease_wrap and shutdown) have no test classes, so the class-order divergence between
 `unittest` and pytest cannot apply to them (closed by construction, not swept). The exception is `TestQuarantine`
 in `test_expert_host_tier.py`, a 12-class file that is not mine. Not established for any of them: isolation between
 functions (a reverse-order run was not done) and that no production path writes an environment variable the tests
