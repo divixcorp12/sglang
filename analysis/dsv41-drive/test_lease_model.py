@@ -3,7 +3,7 @@ enough to find each thing that is known to be wrong.
 
 A model that cannot find a known bug is too weak to say "nothing" about the design, so half of this file is
 mutants: one protocol rule removed each, with the violation it must produce. Pure Python, no GPU, no torch;
-the whole file takes about four minutes and under 1 GiB.
+the whole file takes about five minutes and under 1 GiB.
 
     OMP_NUM_THREADS=1 python -m pytest analysis/dsv41-drive/test_lease_model.py -p no:cacheprovider
 """
@@ -127,6 +127,39 @@ def test_an_eager_pause_is_granted_while_a_promotion_holds_a_lease_and_nothing_d
     assert result.coverage.get("pause granted while a host lease is held", 0) > 0
     assert result.coverage.get("host lease taken", 0) > 0
     assert result.coverage.get("deferred: victims are leased", 0) > 0
+
+
+def test_a_blocking_eager_caller_is_clean_when_promotion_leases_are_released_by_a_callback():
+    """F1 (LEASE_MODEL_REVIEW.md): the eager caller is the scheduler thread and blocks in synchronize() before it
+    pauses. With the lease released off the scheduler thread (a callback that only decrements it) nothing waits on
+    the blocked thread."""
+    assert run(lm.Config(**TASK8, **CLEAN, blocking_eager=True)).violation is None
+
+
+def test_the_scheduler_thread_release_cycle_is_found():
+    """F1: the poll step that releases a promotion lease runs on the thread that is blocked in synchronize()
+    waiting for a replay that waits for the service that defers behind that lease."""
+    cfg = lm.Config(**TASK8, **CLEAN, blocking_eager=True, poll_release=True)
+    result = run(cfg)
+    assert result.violation == "Deadlock"
+    assert "scheduler enters before_host_use and blocks in synchronize" in result.trace
+
+
+def test_shutdown_with_host_leases_closes_admission_and_waits_for_the_executor():
+    """R6: no new host lease after shutdown, and Python frees only once the promotion copy and lease are done."""
+    world = dict(requests=1, menu=EVICTING, promotions=1, shutdown=True, **CLEAN)
+    assert run(lm.Config(**world)).violation is None
+    assert run(lm.Config(**world, host_admission_closed=False)).violation == "HostLeaseAfterFree"
+    assert run(lm.Config(**world, free_waits_executor=False)).violation == "FreedWhileReading"
+
+
+def test_failing_open_after_an_abort_is_found_even_though_the_terminal_is_published():
+    """F4: the D1 fix (a failed wait sets the copy count to 0) as a mutant. With the protocol on, the terminal
+    retires the lease, an advisory evicts, and the copy that was allowed to run reads the recycled slot."""
+    cfg = lm.Config(requests=3, menu=MENU, fail_closed=False)
+    result = run(cfg)
+    assert result.violation == "RecycledUnderReader"
+    assert "device aborts: wait times out" in result.trace and any("by terminal" in step for step in result.trace)
 
 
 # ---- mutants: each removed rule must be found ----

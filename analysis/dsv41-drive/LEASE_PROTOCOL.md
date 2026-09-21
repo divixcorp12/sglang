@@ -1334,6 +1334,36 @@ Requirements filed on this contract by Task 8 (`analysis/dsv41-drive/PROMOTION_A
 - **R1** The host-lease calls take only `RamTier::mutex_`, are callable from the scheduler
   thread, and never pause the service. A stale or repeated `LeaseRef` (slot generation or
   `lease_id` mismatch) is a **counted error**, not a silent no-op and not a second decrement.
+- **R1a (added by review finding F1, `LEASE_MODEL_REVIEW.md`): a host lease must be releasable
+  from a context that is not the scheduler thread, and this is a requirement, not a permission.**
+  In the Task 8 design the promoter and the eager caller are the *same* thread: the poll step
+  that releases a promotion lease runs on the scheduler thread, and eager `before_host_use`
+  blocks that same thread in `torch.cuda.current_stream().synchronize()`. The cycle: a decode
+  replay is in flight and its armed demand is deferred because the only victim carries a
+  promotion lease; the copy has finished but the lease is released only by the poll step; the
+  scheduler thread has entered `before_host_use` and is blocked waiting for that replay; the
+  replay waits for the service; the service defers behind the lease. The model shows it (the
+  Task 8 world with `blocking_eager` and `poll_release` is a Deadlock in 4,802 states, an 11-step
+  trace) and shows it gone when the release is not on the scheduler thread. It is stronger than
+  A3: not merely "not the host poll", but **not the scheduler thread at all**, because
+  `before_host_use` blocks it.
+  **Chosen mechanism: a host callback enqueued on the executor stream right after the copy**
+  (`cudaLaunchHostFunc`), whose only action is `release_host_lease` (a `mutex_` section and a
+  counter decrement, no CUDA call, no Python). Why this and not the alternative of making
+  `before_host_use` poll with `stream.query()` and release completed leases: the callback removes
+  the dependency for every path, whereas polling fixes only the one blocking call we know of and
+  leaves the next `synchronize()` anyone adds as the same hazard; and it makes the release happen
+  at copy completion rather than at the next poll, which is what the lease's hold time (R4)
+  should be measured against. Its costs, stated: one callback per copy; a stalled or
+  unscheduled driver thread delays the release (the deferral is then bounded by the device
+  timeout as for any other lease); the callback takes `mutex_`, which the service holds only in
+  short sections and never across I/O; and the poll step must then **not** also release (a
+  double release is a counted error, R1), only reclaim bookkeeping. **[OPEN 16]**: `host.cpp`
+  makes no CUDA calls today, so the enqueue belongs in the device module (`exl3_ram_miss.cuh`,
+  which already has CUDA) and reaches the release function of the host module by an address
+  exported as an integer; that cross-module call and its lifetime at shutdown (a callback still
+  queued when the tier closes) are not designed here. If they prove awkward, the fallback is
+  `before_host_use` polling, accepting its weaker guarantee.
 - **R2 (the F10 split)** The pause acknowledgement's `outstanding == 0` counts **graph-lane
   leases only**. Host leases must not block an eager pause: otherwise one in-flight
   promotion makes every eager `before_host_use` fail for the copy's duration, and
@@ -1460,7 +1490,7 @@ GPU (under the lock; not run here):
 ### 18.3 The model check (done, bounded)
 
 `analysis/dsv41-drive/lease_model.py` is a self-contained explicit-state model of this
-protocol; `test_lease_model.py` (32 tests, about four minutes, pure Python) pins what it
+protocol; `test_lease_model.py` (36 tests, about five minutes, pure Python) pins what it
 finds. It has two threads (the device's post, wait, copy, acknowledge, consume; the service's
 observe, reserve, load, grant and publish, retire), pinned slots that an advisory may evict
 and reload whenever the service is idle, injectable timeouts and read failures, an optional
@@ -1505,9 +1535,9 @@ What this does **not** establish, stated so a pass is not over-read:
   (about 1e-5 at these sizes).
 - It models one stream and serialized replays (assumption 1 of 1.1). Concurrent graphs are
   outside it.
-- It did not cover the `pause`/eager path (F10) or its graph-lane/host split, host leases
-  at all (Task 8), the lease-mode arming cost, or the watchdog beyond "fatal is followed by
-  abort".
+- It does not model the lease-mode arming cost, or the watchdog beyond "fatal is followed by
+  abort". The Task 8 side (host leases, the eager pause and its graph-lane/host split) *is*
+  modelled, coarsely, as the next bullets say.
 - **The Task 8 extension is thinner than the graph side.** One promotion, one eager cycle,
   2 requests and four request shapes (against 3 requests for the graph-only runs), so its
   world is smaller by one request. It models the *contract* (lease, copy, release; pause and
@@ -1526,6 +1556,60 @@ What this does **not** establish, stated so a pass is not over-read:
   a demand is deferred (section 8); that is a different tier and cannot take the deferred
   demand's victims, so I do not expect it to change the result, but the model does not show
   it.
+
+**Independent review, and what changed after it.** `LEASE_MODEL_REVIEW.md` reviewed the
+model at `845a54994e` and found the transcription faithful where it can be checked, with no
+headline result contradicted. Its findings are recorded here so they are not lost:
+
+- **F1 (real design hazard the model could not see).** The promoter and the eager caller were
+  independent actors; in the design they are one thread. Now modelled (`blocking_eager`,
+  `poll_release`): the cycle is a Deadlock, and it is gone with a callback release. Applied to
+  17.1 as R1a.
+- **F2.** R6 (shutdown with host leases) was unmodelled and 18.3 contradicted itself about it.
+  Now modelled: `host_admission_closed` and `free_waits_executor`, each with a mutant
+  (`HostLeaseAfterFree`, `FreedWhileReading`). The contradiction is removed.
+- **F3.** Terminal retirement cannot be shown *necessary* by the search: after a fatal the model
+  lets the process die and a leak after a fatal is invisible, so the "retired by terminal"
+  counter shows the step is reachable, not that the design needs it. E2(b), E4 and section 13
+  for that step rest on the argument. (In the real system the watchdog also aborts the process
+  after a fatal, so the rule matters for runs that continue past a failed wait, such as a
+  shutdown in progress.) Not changed.
+- **F4.** The D1 fix (fail closed, `go_count = 0`) had no mutant because an `assert` forbade
+  one. Removed: the fail-open mutant finds `RecycledUnderReader` in 41,047 states and is a test.
+- **F5.** Four mutants (`leases`, `host_guard`, `eager_host_guard`, `pause_counts_host`) fire on
+  the removed rule at the first byte store or on reachability, before any reader has begun, so
+  their tests show the rule matters, not the harm. Only the `leases=False` detector test shows
+  harm.
+- **F6.** The stream-dependency model is sound for **presence** and optimistic for **absence**.
+  The modelled copy is released as soon as the device posts the next request, but a real
+  `wait_stream(producer)` orders after everything already enqueued, several requests of a
+  replay. So the deadlock found is real (the real dependency contains the modelled one), and
+  "A3 is necessary" stands, but a cycle at request k + 1 is invisible: **a clean run with
+  `copy_waits_on_serving=True` would not show a weaker dependency safe.**
+- **F7.** `Config.map_read` was a dead knob (the device resolves through the map exactly when
+  `protocol=False`). Removed. "Today" is `protocol=False`, and the D2 result is "today without
+  the exclusion", not a separate map-read configuration.
+- **F8.** Ring 2 or 3 against 16, and a sequence range of 8-11 against 2^32. At ring 2 the wrap
+  makes seq 7 and seq 1 share request slot 0, where the real ring goes from index 14 to 0: harsher
+  than reality, so it shows the reuse rule matters at ring 2 but does not establish it at ring
+  16 (OPEN 8). Slot generations and content versions are modulo 4 (four reassignments inside one
+  lease window would be needed to alias, which the lease forbids; only mutants reach it).
+- **F9. Blind spots the limits above did not name:** (1) thread identity (F1, now partly
+  modelled for the eager caller only); (2) post-fatal behaviour: the model stops the device after
+  the first fault, whereas the real wait and copy kernels of the rest of the replay still run
+  (host_rows from the map, copy executed, `keep = 0`) until the watchdog, so D1 is wider in
+  reality than in the model; (3) multi-word atomicity: the record and the lane request are single
+  atomic writes and are read in one step, so a torn read between them (the real seqlock writes
+  seq 0, a fence, payload, a fence, seq) is not representable; (4) copy concurrency: lanes are
+  copied one at a time in the model and together in the kernel, which cannot hide an I1 hole
+  (the ack follows all lanes) but cannot show an intra-kernel one; (5) shutdown with Task 8
+  (now modelled, F2); (6) no hot set, and `wanted` is the lane list, whereas the real `protect` is
+  routes plus need, so the victim pool is a superset (conservative for the designed protocol,
+  optimistic for "today": if planned experts are not a subset of routed ones, OPEN 12, today can
+  fail stop where the model cannot); (7) one tier and one row, with no cross-row ordering;
+  (8) a CUDA error only during copy or acknowledgement.
+- **Changes made after the review (mine, so not covered by it):** the F1/F2/F4 additions above
+  and the removal of `map_read`. The reviewed version is `845a54994e`.
 
 The model's own faithfulness is the thing to review first: `lease_model.py` restates the
 service and device steps by hand from this document and the code, so a step I mis-transcribed
@@ -1561,6 +1645,9 @@ side is transcribed faithfully.
 - **[OPEN 11]** The per-layer cost of arming every `count > 0` record when advise is off.
 - **[OPEN 12]** Whether planned experts are always a subset of the routed experts in the
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
+- **[OPEN 16]** The mechanics of the executor-stream release callback (17.1 R1a): the enqueue
+  lives in the device module, the release function in the host module, the address crosses as an
+  integer, and a callback still queued at tier close is not designed.
 - **[OPEN 15]** How a deferral interacts with the stage record's `observed`, `prev_done` and
   `backlog` fields (7.1).
 - **[OPEN 14]** Epoch seeding for a second device incarnation over one lease block. The
@@ -1636,8 +1723,21 @@ this order may change).
 | 4 | **The device kernels.** `device.cuh`: `LaneRequest` in the post kernel; the wait kernel with `go_count`, the `RowResult` validate (generation, tag, expert), the terminal, the `fatal`/`Header.shutdown` poll inside the loop (D4), and 64-bit `ld.acquire.sys` / `st.release.sys`; new `exl3_ram_miss_ack_kernel`. `ops.py`: `Exl3RamMissDevice.post/wait/ack`, `lane_ctx`, `go_count`; append `epoch` and `pending_epoch` to `STATE_WORDS`. | CPU: argument validation in `test_exl3_ram_miss_device_args`; the state-word agreement test. GPU (manual, under the lock, after crypto-c9 schedules): a wait kernel timeout leaves `go_count == 0` and a poisoned slab is not read; an acknowledgement is emitted only for copied lanes; the `ld.global.nc` experiment (6.6), independent of this step. | **`STATE_WORDS` is a triple edit**: the device-state enum in `device.cuh`, `STATE_WORDS` in `ops.py`, and the hard-coded dict in the device-args test, all together or the existing test fails. **`go_count` must be an int32 CUDA tensor of shape `[1]`** (`_validate_plan`), not a scalar, not int64. Constexprs as in step 1. | yes |
 | 5 | **The backend and the arming rule.** `srt_ram_miss.py`: `Exl3RamMissRowBackend` overrides `post` (today only `translate` is overridden and `post` is inherited from `PinnedTierRowBackend`) to pass `go_count` to `copy_expert_row_segments_gpu` and to launch the acknowledgement kernel after it; `Exl3RamMissService.ensure_started` / `attach` allocate the block and hand it to the host and the device; lease mode arms every record with `count > 0` (15). The new environment switch is read here. | Existing service tests green with the switch off; with it on, the GPU graph parity test (`test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`): byte-exact output versus off, an injected timeout, and the arming cost measurement (OPEN 11) reported, not assumed. | The switch defaults off. `advise` and the arming rule must agree between the device (`armed = need_count > 0 || advise != 0`) and the service's `touch_request` path, or a record is waited on that the service treats as touch-only. | yes |
 | 6 | **Shutdown and quarantine.** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 test 9 (a fake CUDA error and a fake sync timeout select quarantine; no unregister, no free); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
-| 7 | **The host-lease API for Task 8.** `host.cpp` and the export table: `acquire_host_lease`, `lease_on_ready`, `release_host_lease` (17.1, R1-R8), never bumping `kVersion`, a stale or repeated `LeaseRef` counted as an error; the pause counts graph-lane leases only. | R1-R8 tests; the model's Task 8 mutants replayed against the real API through the sim. | R8 (`kVersion`), R2 (the pause split), R3 (`lease_on_ready`), and A3 for whoever calls it. | no |
+| 7 | **The host-lease API for Task 8.** `host.cpp` and the export table: `acquire_host_lease`, `lease_on_ready`, `release_host_lease` (17.1, R1-R8), never bumping `kVersion`, releasable by an executor-stream host callback (R1a, OPEN 16) and not only by the scheduler thread's poll, a stale or repeated `LeaseRef` counted as an error; the pause counts graph-lane leases only; **a host lease is released by an executor-stream host callback, not the scheduler thread's poll (R1a, OPEN 16)**. | R1-R8 tests; the model's Task 8 mutants replayed against the real API through the sim. | R8 (`kVersion`), R2 (the pause split), R3 (`lease_on_ready`), and A3 for whoever calls it. | no |
 | 8 | **Enable and gate.** Flip nothing by default. Record the cost of the added fences and of arming every `count > 0` record (OPEN 5, OPEN 11); run the `ld.global.nc` experiment if not already done (OPEN 6); state the result of the wrap tests against the real code (OPEN 1). | The plan's Task 5 gate: lease-pressure and fault tests prove no reuse before consumption; concurrent graph execution stays guarded (OPEN 9). | Do not report skipped hardware tests as passed. | yes |
+
+### 20.1a What "GPU-free" means for step 4
+
+`nvcc` 13.4 is installed on divix01 at `/usr/local/cuda/bin/nvcc` (not on `PATH`); a
+standalone CUDA program compiled for `sm_120` there in 4.5 s of CPU time with no GPU touched
+(`nc_visibility.cu`). So the kernels of step 4 can be **written and compile-checked** without
+the GPU, and the argument-validation and state-word agreement tests are CPU-only. Whether the
+project's JIT path (`load_jit`) finds that `nvcc` from a non-interactive environment is not
+checked; do not assume it. What only a GPU can verify is that a timed-out wait leaves
+`go_count == 0`, that acknowledgements are emitted only for copied lanes, and that the 64-bit
+acquire/release words behave as designed. **Until step 4's GPU test has run, the model's
+device-side steps are transcribed but unexecuted**, which is a second reason (beside the
+independent review) that lease mode defaults off.
 
 ### 20.2 What each step must not do
 

@@ -44,7 +44,7 @@ CONSUMED, VIOLATED = 1, 2
 TORN = -1
 # Promoter program counters, and the eager caller's.
 H_IDLE, H_COPY_B, H_COPY_E, H_REL = range(4)
-E_IDLE, E_TAKE, E_WB, E_WE, E_RESUME = range(5)
+E_IDLE, E_TAKE, E_WB, E_WE, E_RESUME, E_SYNC = range(6)
 
 
 @dataclass(frozen=True)
@@ -71,12 +71,15 @@ class Config:
     pause_counts_host: bool = False  # True: the pause also waits for host leases (R2 says it must not)
     copy_waits_on_serving: bool = False  # True: the promotion copy waits on the serving stream (A3 says it must not)
     host_release: bool = True  # False: the promoter never releases its lease
+    blocking_eager: bool = False  # the eager caller is the scheduler thread and blocks in synchronize() before pausing
+    poll_release: bool = False  # host leases are acquired and released by the scheduler thread's poll step, not a callback
+    host_admission_closed: bool = True  # after shutdown no new host lease is taken
+    free_waits_executor: bool = True  # Python frees only once the promotion copies and leases are done
     stale_ack: Optional[tuple] = None  # (idx, lane, gen): an acknowledgement left by an idle lane a full sequence cycle ago
     menu: Optional[tuple] = None  # the lane lists a request may take (default: every list of up to ``lanes`` experts)
 
     # Protocol rules. Each False (or True for the mutants) is one rule removed.
     leases: bool = True  # eviction requires leases == 0
-    map_read: bool = False  # the device resolves slots through the mutable map (today)
     fail_closed: bool = True  # a failed wait sets the copy count to 0
     ack_after_copy: bool = True  # False: the acknowledgement is published at commit
     gen64: bool = True  # False: acknowledgements and readiness are keyed by the 32-bit sequence only
@@ -98,7 +101,7 @@ class Config:
 def today(**kw) -> Config:
     """The service and kernels as they are before Task 5: no leases, the device reads the map, the copy runs
     whatever the wait returned, and the only protection is the implicit temporal exclusion."""
-    base = dict(protocol=False, leases=False, map_read=True, fail_closed=False, exclusion=True, detector=False)
+    base = dict(protocol=False, leases=False, fail_closed=False, exclusion=True, detector=False)
     base.update(kw)
     return Config(**base)
 
@@ -277,11 +280,14 @@ class Model:
             yield ("shutdown: admission closed", self.emit(n))
         if c.shutdown and st["shut"] and not st["freed"] and not st["quar"]:
             finished = st["dpc"] in (HALT,) or (st["dpc"] == IDLE and st["dk"] >= c.requests)
-            if finished or not c.free_needs_sync:
+            executor_done = st["hpc"] == H_IDLE and not any(st["hl"])
+            if (finished and (executor_done or not c.free_waits_executor)) or not c.free_needs_sync:
                 n = dict(st)
                 n["freed"] = 1
                 if any(h >= 0 for h in st["dhold"]) or st["dpc"] in (COPY_B, COPY_E, ACK):
                     self.flag(n, "FreedWhileReading")
+                if not executor_done:
+                    self.flag(n, "FreedWhileReading")  # a promotion copy or lease is still outstanding
                 yield ("python frees memory", self.emit(n))
             if st["dpc"] == ERR:
                 n = dict(st)
@@ -432,7 +438,6 @@ class Model:
     def abort(self, st: dict, why: str):
         """The wait kernel gives up. Designed: zero the copy count, publish the terminal record, raise fatal."""
         c = self.c
-        assert c.fail_closed or not c.protocol, "the copy-anyway abort is only meaningful for today's protocol"
         idx, gen, seq, count, experts, armed = st["dreq"]
         n = dict(st)
         n["dok"] = False
@@ -446,7 +451,8 @@ class Model:
             n["dhold"] = tuple(-1 for _ in range(c.lanes))
             n["dpc"] = MOE
         else:
-            # Today: the translate loop and the copy still run, and keep = 0 is the only consequence.
+            # Today (and the fail-open mutant): the translate loop and the copy still run, and keep = 0 is the only
+            # consequence. With the protocol on, the terminal above is published and the copy runs anyway.
             n["dpc"], n["di"] = (RD if count > 0 else COMMIT), 0
         yield (f"device aborts: {why}", self.emit(n))
 
@@ -725,12 +731,18 @@ class Model:
         if pc == H_IDLE:
             if st["hleft"] <= 0:
                 return
+            if st["shut"] and c.host_admission_closed:
+                return  # shutdown closed admission: no new lease
+            if c.poll_release and st["epc"] == E_SYNC:
+                return  # the scheduler thread is blocked in synchronize() and cannot run the poll step
             for slot in range(c.slots):
                 if st["sst"][slot] != READY:
                     continue
                 n = dict(st)
                 n["hl"] = put(st["hl"], slot, st["hl"][slot] + 1)
                 n["hslot"], n["hexp"], n["hleft"] = slot, st["sexp"][slot], st["hleft"] - 1
+                if st["freed"]:
+                    self.flag(n, "HostLeaseAfterFree")
                 in_flight = st["dpc"] not in (IDLE, HALT, ERR)
                 # A3 violated: the copy is ordered after the serving stream's queued work (wait_stream).
                 n["hneed"] = st["dk"] if (c.copy_waits_on_serving and in_flight) else -1
@@ -757,6 +769,8 @@ class Model:
             n["hpc"] = H_REL
             yield (f"promotion copy ends on slot {slot}", self.emit(n))
         elif pc == H_REL:
+            if c.poll_release and st["epc"] == E_SYNC:
+                return  # the release is the scheduler thread's poll step, which is blocked
             slot = st["hslot"]
             n = dict(st)
             if c.host_release:
@@ -770,6 +784,31 @@ class Model:
     def eager(self, st: dict):
         c = self.c
         pc = st["epc"]
+        if pc == E_IDLE and c.blocking_eager:
+            if st["eleft"] <= 0 or st["paused"] or st["fatal"]:
+                return
+            n = dict(st)
+            n["epc"] = E_SYNC
+            yield ("scheduler enters before_host_use and blocks in synchronize", self.emit(n))
+            return
+        if pc == E_SYNC:
+            base = (
+                st["dpc"] in (IDLE, HALT) and not st["pend"] and all(o is None for o in st["out"])
+                and st["spc"] == S_IDLE and not st["fatal"]
+            )
+            if not base:
+                return
+            if any(x > 0 for x in st["hl"]) and c.pause_counts_host:
+                n = dict(st)
+                self.flag(n, "PauseBlockedByHostLease")
+                yield ("the eager pause is refused only because a promotion holds a lease", self.emit(n))
+                return
+            n = dict(st)
+            n["paused"], n["epc"] = 1, E_TAKE
+            if any(x > 0 for x in st["hl"]):
+                self.note("pause granted while a host lease is held")
+            yield ("eager caller pauses the service", self.emit(n))
+            return
         if pc == E_IDLE:
             if st["eleft"] <= 0 or st["paused"] or st["spc"] != S_IDLE:
                 return
@@ -851,6 +890,7 @@ class Model:
 VIOLATION_KINDS = (
     "RecycledUnderReader", "WrongBytesRead", "WrongBytesAccepted", "BytesChangedUnderCopy", "FreedWhileReading",
     "LeaseUnderflow", "InternalIdentity", "PhantomSequence", "ArmedRequestLapped", "SpuriousFatal", "LeakedLease", "Deadlock",
+    "PauseBlockedByHostLease", "HostLeaseAfterFree",
 )
 
 
