@@ -1938,6 +1938,12 @@ class RamTier {
     }
   }
 
+  // Lanes leased by the device and not yet retired. An eager pause is refused while this is non-zero; a lease held by
+  // anything else (a promotion, in Task 8) is not counted, because it protects its own slot (LEASE_PROTOCOL.md 17.1 R2).
+  int64_t graph_leases_outstanding() const {
+    return lanes_outstanding_.load();
+  }
+
   // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless.
   void release_lease_locked(Tier& tier, LaneLease& held, int counter) {
     if (tier.leases[held.slot] == 0) {
@@ -2813,7 +2819,9 @@ class RamThread {
     tier_->set_threaded(false);
   }
 
-  bool pause(int64_t timeout_ns) {
+  // 1 paused, 0 timed out, 2 refused: a graph lane still holds a lease after one retirement pass (the caller must
+  // have synchronized the stream, so the device's acknowledgements are visible), and the slots are not the caller's.
+  int pause(int64_t timeout_ns) {
     tier_->request_pause(true);
     tier_->skip_advice_posted_so_far();
     pause_requested_.store(true);
@@ -2821,11 +2829,16 @@ class RamThread {
     while (!paused_.load()) {
       if (now_ns() > deadline) {
         resume();
-        return false;
+        return 0;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
-    return true;
+    tier_->retire_leases();
+    if (tier_->graph_leases_outstanding() > 0) {
+      resume();
+      return 2;
+    }
+    return 1;
   }
 
   // Advisories posted while paused predate the eager use: skip them too.
@@ -2985,7 +2998,7 @@ void exl3_ram_miss_stop_thread(int64_t handle) {
 }
 
 int64_t exl3_ram_miss_pause(int64_t handle, int64_t timeout_ns) {
-  return exl3_ram_miss::find_thread(handle)->pause(timeout_ns) ? 1 : 0;
+  return exl3_ram_miss::find_thread(handle)->pause(timeout_ns);
 }
 
 void exl3_ram_miss_resume(int64_t handle) {

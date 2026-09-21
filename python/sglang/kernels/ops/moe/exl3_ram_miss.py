@@ -496,7 +496,10 @@ class Exl3RamMissHost:
         """
         if not self.threaded:
             return
-        if not self._module.exl3_ram_miss_pause(self.handle, int(timeout_s * 1e9)):
+        outcome = int(self._module.exl3_ram_miss_pause(self.handle, int(timeout_s * 1e9)))
+        if outcome == 2:
+            raise RuntimeError("exl3 RAM miss: not paused, a GPU reader still holds a graph-lane lease")
+        if outcome != 1:
             raise RuntimeError(f"exl3 RAM miss thread did not pause within {timeout_s} s")
 
     def resume(self) -> None:
