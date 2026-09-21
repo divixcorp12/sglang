@@ -182,6 +182,14 @@ def test_sibling_foreign_cpu_is_counted_against_a_used_core():
     finally:
         mine.kill(); other.kill()
 
+def test_lane_guard_sees_a_decoy_lane_and_ignores_itself():
+    import quiet_check as q, subprocess, time
+    decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)", "pytest", "-p", "orderplug"]); time.sleep(0.3)
+    try:
+        assert any(p == decoy.pid for p, _ in q.lane_processes())                        # a lane of ours is seen
+        assert not any(p == os.getpid() for p, _ in q.lane_processes())                   # and this process is not counted
+    finally: decoy.kill()
+
 def test_rehearsal_measures_windows():
     import quiet_check as q
     cpus = sorted(os.sched_getaffinity(0)); res = q.rehearse(cpus[1:3], cpus[1:2], 2.0, window=0.5)

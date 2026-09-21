@@ -15,6 +15,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import c_harness as h
 REHEARSAL_MAX_BAD = 0.05     # a visit gets 3 attempts, so a per-window failure rate p costs p**3 per visit; 5% over ~470 visits is about 0.06 lost visits
 
+LANE_PATTERN = ("pytest", "orderplug", "sweep", "mutate", "xargs -P")     # command-line fragments of the team's own lanes (t1 order sweep, mutation chains, pytest loops)
+
+def lane_processes(own=None):
+    """The team's own lanes running on the box right now: [(pid, cmdline)]. Excludes this process, its parents (the ssh/bash that launched it) and pgrep-like probes.
+    A pre-flight that cannot see contamination at its own start is the defect this replaces: it aborts on any hit and records the count again at the end."""
+    own = set(own or ()) | {os.getpid(), os.getppid()}
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) in own: continue
+        try: cmd = Path("/proc/%s/cmdline" % d).read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError: continue
+        if not cmd or "quiet_check.py" in cmd or "sweep_guard" in cmd or cmd.startswith(("pgrep", "grep", "ps ")) or " grep " in cmd: continue     # sweep_guard is the lead's watchdog, not a lane
+        if any(pat in cmd for pat in LANE_PATTERN): out.append((int(d), cmd[:160]))
+    return out
+
 RESERVED = range(64, 72)     # production's band (core 71 is the doorbell spin core): never used, and neither is any physical core that has a thread there
 
 def reserved_neighbours(siblings=h.thread_siblings, cpus=range(0, 72)):
@@ -60,6 +75,10 @@ def cpu_times():
     return out
 
 def main():
+    start_lanes = lane_processes()
+    if start_lanes:
+        print("ABORT: %d lane process(es) of ours are running at the START; a rehearsal now would measure us, not the box. First: %s" % (len(start_lanes), start_lanes[:3]))
+        return 2
     p = argparse.ArgumentParser(); p.add_argument("--seconds", type=float, default=10.0)
     p.add_argument("--rehearse", type=float, default=0.0, help="seconds of CPU-only dress rehearsal of the frozen foreign-CPU gate on the picked cores, with a spinner as our own load")
     a = p.parse_args()
@@ -81,6 +100,7 @@ def main():
     watched = h.watched_nvme(h.DRIVE_PATHS)
     rd = sum(s1[k][0] - s0.get(k, (0, 0))[0] for k in s1 if k in watched) / 1e9 / dt; wr = sum(s1[k][1] - s0.get(k, (0, 0))[1] for k in s1 if k in watched) / 1e9 / dt
     rd_all = sum(s1[k][0] - s0.get(k, (0, 0))[0] for k in s1) / 1e9 / dt; wr_all = sum(s1[k][1] - s0.get(k, (0, 0))[1] for k in s1) / 1e9 / dt
+    print("lane processes of ours: 0 at the start; %d at the end of the survey" % len(lane_processes()))
     print("loadavg %s over %.0f s" % (" ".join(load0), dt))
     print("foreign CPU box-wide: %.2f cores (an upper bound: kernel worker time is included). The user's permanent services are the condition, not a NO-GO reason." % fl.last["box_foreign_cores"])
     for t in top: print("  %-16s %6.1f%%  pid %d  %s" % (t["comm"], t["cpu_pct"], t["pid"], t["cmdline"][:110]))
@@ -97,7 +117,10 @@ def main():
         print("REHEARSAL (the frozen gate as the harness measures it, our own load present): harness mask %s: %.0f%% of %d windows above %.0f%%; reader mask %s: %.0f%% of %d windows"
               % (hm, 100 * bad_h, len(res_h), h.ENV_FOREIGN_PCT, rm, 100 * bad_r, len(res_r)))
         ok = bad_h <= REHEARSAL_MAX_BAD and bad_r <= REHEARSAL_MAX_BAD and (rd + wr) < h.IDLE_DRIVE_MAX_GBS
-        print("GO" if ok else "NO-GO", "(at most %.0f%% of rehearsal windows above the gate on either mask, NVMe idle)" % (100 * REHEARSAL_MAX_BAD))
+        end_lanes = lane_processes()
+        print("lane processes of ours at the END of the rehearsal: %d %s" % (len(end_lanes), end_lanes[:2]))
+        if end_lanes: ok = False; print("CONTAMINATED DURING: a lane of ours arrived mid-rehearsal; this result is void whatever it says")
+        print("GO" if ok else "NO-GO", "(at most %.0f%% of rehearsal windows above the gate on either mask, NVMe idle, no lane of ours at the start or the end)" % (100 * REHEARSAL_MAX_BAD))
     else:
         print("no rehearsal requested: the idle-core check above is not the registered GO; run with --rehearse 40")
     print("then: gpu-run.sh taskset -c %s <python> c_harness.py ... --reader-cpus %s" % (",".join(map(str, harness[:2])), ",".join(map(str, reader[:3]))))
