@@ -134,19 +134,32 @@ quarantine.**
   design needs a production caller of an orderly shutdown to exist, that is a
   **requirement** (section 14.6), not an assumption.
 
-**D6. Candidate defect, not verified by running anything: the demand sequence wrap.**
-The post kernel and `sim_post` skip sequence 0 on wrap (`if (seq == 0) seq = 1`).
-`RamTier::pump_demand` advances with `next_demand_ += 1u` and no skip. By reading, at
-the wrap the service expects seq 0 after 0xFFFFFFFF, the device posts seq 1, the service
-finds `head` reached, reads the record slot `(0-1) % 16 = 15`, fails the seqlock read,
-counts one `kOverruns` and stores `demand_done = 0` (a backwards step), then continues
-with seq 1. I expect this to be benign for correctness (no armed waiter can be pending
-across it) but it is one spurious overrun per wrap and it will corrupt any generation
-scheme layered on `next_demand_`. A grep of the unit tests for `wrap` found tests for the
-reader descriptor generation and for seeding the device from page heads
-(`test_the_device_sequences_continue_from_the_page_heads`), but no test that drives the
-demand path through the 32-bit wrap. **[OPEN 1]**: verify with a synthetic wrap test; the
-protocol below needs the fix either way (section 11).
+**D6. The demand and advisory sequence wraps are handled differently by the two sides.**
+The post kernel and `sim_post` skip sequence 0 on wrap (`if (seq == 0) seq = 1`), and
+`RamTier::open` skips it when it seeds `next_demand_`. But `pump_demand` and `pump_advice`
+advance with a bare `next_demand_ += 1u` / `next_advice_ += 1u`. At the wrap the service
+expects seq 0 after 0xFFFFFFFF, the device posts seq 1, the service finds `head` reached,
+reads the record slot `(0-1) % 16 = 15`, fails the seqlock read, counts one `kOverruns`
+(or, on the advisory ring, one `kAdvisoriesSkipped`), begins a stage record, and stores
+`demand_done = 0` (or `advise_done = 0`). It then carries on with seq 1.
+
+Severity, by reading: **a spurious counter and a spurious trace record once per 2^32
+requests, not a failed request.** Nothing can be waiting on sequence 0, because the device
+never posts it, and I found no consumer of `kOverruns` outside the counter list in
+`ops.py` and tests (a grep over `python/`, `test/`, `analysis/` and `scripts/`). The
+comment in `pump_demand` that a pending status "makes a waiting layer fail stop" describes
+the *lapped-record* case, where a real waiter exists, not this one. The model
+(section 18.3) agrees: with a service that does not skip 0 it finds a phantom sequence
+and no safety violation.
+
+It is still a defect: the two sides disagree on one value, and any code that keys
+something by `next_demand_` inherits the disagreement. This document's own design avoids
+that dependency (section 11.3). A test that drives both rings through the wrap is
+`test/registered/unit/kernels/test_exl3_ram_miss_wrap.py`; it was written to fail on
+today's `pump_demand`, and I could not run it (the laptop's interpreter has no
+`transformers`; the project interpreter is on divix01, where I was told not to touch the
+worktrees). **[OPEN 1]**: run that test against today's code and confirm it fails, and
+against the one-line fix and confirm it passes.
 
 **D7. Lane capacity is silently 8.** The post kernel reads `min(count, kMaxIds)` lanes
 with `kMaxIds = 8`; the wait kernel translates up to `host_rows.numel()` lanes. A plan
@@ -282,14 +295,14 @@ Offsets are from the block base; each area starts on a 4096-byte boundary.
 | 0x0C | u32 | `lanes = 8` (`L`) | service, at open, immutable |
 | 0x10 | u32 | `rows` (streamed layers) | service, at open, immutable |
 | 0x14 | u32 | `shutdown` (0 running, 1 closed to admission) | service, release-store, sticky |
-| 0x18 | u32 | `demand_epoch` (epoch of `next_demand_`) | service, release-store, mutable |
+| 0x18 | u32 | reserved, zero (an earlier draft held a service-maintained epoch here; see 11.3) | |
 | 0x1C | u32 | reserved, zero | |
 | 0x20 | u32 | `slot_gen_offset` (bytes from base to the first slot-generation word) | service, immutable |
 | 0x24..0x7F | | reserved, zero | |
 | 0x80 | `rows * 8` B | `RowTable[rows]`: `{u32 slot_gen_base; u32 capacity}` | service, immutable |
 
 Immutable words are written before the device is constructed, so the device may read
-them without ordering. The two mutable words are `shutdown` and `demand_epoch`.
+them without ordering. The one mutable word is `shutdown`.
 
 **Area S: service-written, offset `0x1000`**
 
@@ -356,7 +369,6 @@ makes the word visible, and nothing else.
 |---|---|---|---|---|
 | Header immutable fields | service | before device construction | device, Python checks | constant for the block's life |
 | `Header.shutdown` | service | once, at stop | device wait/post kernels | after seeing 1, the service issues no new leases and will not publish further `RowResult`s |
-| `Header.demand_epoch` | service | on every 32-bit wrap of `next_demand_` | device at construction only | epoch consistent with `demand_head`'s seq at that instant; used only to seed a new device |
 | `RowResult[idx][lane]` payload | service | after the previous generation of that request slot retired, before `ready` | device | nothing, until it has acquired `ready` with the expected generation |
 | `RowResult[idx][lane].ready` | service | last store of the record | device (wait kernel) | if `gen == G` and tag == READY: payload is complete, the lease exists, and the slot's bytes are final and immutable until this lane's retirement |
 | `SlotGen[row, slot]` | service | before the first byte store that changes the slot | device (ack kernel) | a value different from the leased generation means the slot's bytes were, or are being, rewritten |
@@ -579,8 +591,12 @@ Before `serve()` grants anything, in the order:
    serve it as a demand (no lease is granted); advance and count `late_after_terminal`.
    This check has no ordering requirement: if it races with a terminal published just
    after, the terminal retires whatever was granted (section 13).
-3. Read `LaneRequest[idx]` with the seqlock re-check. Its `count`/`expert[i]` define the
-   lanes. `count == 0` means no lanes, no leases (the record is touch-only or an Option F
+3. Read `LaneRequest[idx]` with the seqlock re-check. Its low 32 bits must equal `seq`;
+   its full `gen` is the request's `G` for everything that follows (11.3). Its
+   `count`/`expert[i]` define the lanes. A mismatch means a later request has already
+   overwritten the slot (a lap): count an overrun and skip. For an *armed* record that
+   must not happen (the device is blocked in its wait and cannot post the next request into
+   this slot; 11.4), so it is a protocol error there. `count == 0` means no lanes, no leases (the record is touch-only or an Option F
    all-GPU-hit handshake).
 4. Add every `expert[i]` to the request's `wanted` set (protect, need, and now the lane
    experts), so that a lane's own expert can never be chosen as a victim by the same
@@ -848,22 +864,38 @@ assumed 1200 posts per second (about 60 streamed layers at 20 tokens per second;
 layer count and rate are my assumption, not a measurement) `2^32` requests is 41 days.
 Production runs longer than that. So the word carries the epoch.
 
-### 11.3 Who owns the epoch
+### 11.3 Who owns the epoch: the device, and the service only echoes it
 
-- Device: new device-state words `kEpoch` and `kPendingEpoch`, appended to `STATE_WORDS`
-  (index 9 and 10; appended, not reordered, so existing indices keep their meaning). The
-  post kernel increments `kEpoch` when `seq32` wraps past 0xFFFFFFFF to 1. The wait
-  kernel reads the pending epoch stored by its own post.
-- A device constructed over a used page (already supported: it seeds `posted` from the
-  page's `demand_head`) also seeds `kEpoch` from `Header.demand_epoch`.
-- Service: `epoch_` increments when `next_demand_` wraps. This **requires fixing D6**:
-  `pump_demand` must skip 0 the way the post kernel does
-  (`if (++next_demand_ == 0) { next_demand_ = 1; ++epoch_; }`), otherwise the service's
-  generation for the request after the wrap is off by one and every lease of that request
-  is keyed wrong. A synthetic wrap test (page head seeded near 0xFFFFFFF0, both sides
-  driven through the wrap, checking that no overrun is counted and that leases at and
-  after the wrap retire) is part of the required tests. `epoch` is stored to
-  `Header.demand_epoch` with release before the head that follows the wrap is served.
+- **Device owns it.** New device-state words `kEpoch` and `kPendingEpoch`, appended to
+  `STATE_WORDS` (indices 9 and 10; appended, not reordered, so existing indices keep their
+  meaning). The post kernel increments `kEpoch` when `seq32` wraps past 0xFFFFFFFF to 1 and
+  writes the full `G56` into `LaneRequest.gen`. The wait and acknowledgement kernels use the
+  pending epoch stored by the request's own post.
+- **The service does not count epochs.** It takes `G` from `LaneRequest[idx].gen`, after
+  checking that the low 32 bits equal the sequence it is serving. Every lease, `RowResult`
+  and terminal check for that request is keyed by that echoed `G`.
+- A device built over a used block starts at epoch 0; the block is created fresh with the
+  device (one device incarnation per block, **[OPEN 14]**).
+
+Why the service must not count epochs itself, which is what an earlier draft of this
+section said (a service-side `epoch_` incremented whenever `next_demand_` wraps): the
+explicit-state model (section 18.3, `lease_model.py`, mutant `echo_gen=False`) found a
+counterexample. The service can move `next_demand_` across the wrap **without stepping
+through it**: `pump_demand` resumes after a lap at `head - 14` (`next_demand_ = head -
+kDemandRecords + 2u`). If the device has posted unarmed touch-only records across the wrap
+while the service lagged, the service resumes on the far side of the wrap, its counted epoch
+is one behind the device's, the armed request that follows is keyed with the wrong epoch, its
+`LaneRequest` looks stale, and the request is dropped as lapped while the device waits for
+it: a healthy system fails stop. In the model's ring of 2 the trace is nine device steps
+and two service steps. With the real ring of 16 it needs the service to lag the device by
+16 or more records across the wrap, which unarmed records make possible (the device posts
+them without waiting) whenever the service is inside a long read. That is rare (once per
+2^32 requests, times the lag), but it is a healthy-system fail-stop, which is why it is
+worth removing by construction. Echoing the device's `G` removes the service's epoch state
+and with it the whole class.
+
+Consequences: `Header.demand_epoch` is gone (4.3); fixing D6 is no longer a prerequisite of
+this protocol, though it should still be fixed (section 1.2).
 
 The 24-bit epoch overflows after `2^24` wraps, `7.2e16` requests, about 1.9e6 years at
 1200/s. Treated as never; **not** handled.
@@ -889,9 +921,12 @@ Why this is safe and cannot deadlock or lap:
   posts nothing further; the only posts that do not wait are unarmed touch-only records
   with `count == 0`, which take no lease and so cannot exhaust the ring of *lease*
   entries. Lapping of the demand ring by `head - next_demand_ >= 16` is therefore not
-  reachable through a deferred armed request. **[OPEN 8]**: I have argued this, not
-  tested it; the interplay of the existing lap-skip logic (`pump_demand`) with deferral
-  needs a targeted test (post 16 unarmed records behind a deferred armed one).
+  reachable through a deferred armed request. **[OPEN 8]**: I argued this and the model
+  supports it within its bounds (unarmed records piling past the ring in a ring of 2 and of
+  3, across the wrap, with deferral reached: no armed request was ever lapped once the
+  epoch is echoed). Not tested at ring 16 or against the real lap-skip code; the interplay
+  of `pump_demand`'s lap skip with deferral needs a targeted test (post 16 unarmed records
+  behind a deferred armed one).
 - If G's acknowledgements never arrive (CUDA error, dead stream) `G + 16` is never
   posted either; nothing is ever served into a reused slot. The failure is a hang of a
   dead stream, which the device timeouts and watchdog already bound.
@@ -1229,7 +1264,7 @@ checklist. None has been done.
 
 | File | Symbol | Change |
 |---|---|---|
-| `host.cpp` | `Tier`, `take_slot_locked`, `assign`, `release`, `serve`, `pump_demand`, `RamThread::run`, the `RowReader::read` give-up lambda | leases and slot generations; tri-state slot choice; `retire_leases()`; skip-0 and epoch in `pump_demand` (D6); `Header.shutdown` |
+| `host.cpp` | `Tier`, `take_slot_locked`, `assign`, `release`, `serve`, `pump_demand`, `RamThread::run`, the `RowReader::read` give-up lambda | leases and slot generations; tri-state slot choice; `retire_leases()`; skip-0 in `pump_demand` and `pump_advice` (D6; not required by this protocol); `Header.shutdown` |
 | `host.cpp` | `exl3_ram_miss_sim_post`, `_sim_wait` | extend the host-side simulated device with `sim_ack`, `sim_terminal` and the lane request, so the whole protocol is testable on CPU with no GPU |
 | `device.cuh` | `exl3_ram_miss_post_kernel`, `exl3_ram_miss_wait_kernel` | `LaneRequest`; row-result acquire/validate; `go_count`; terminal; poll on fatal/shutdown (D4); 64-bit acquire/release |
 | `device.cuh` | new `exl3_ram_miss_ack_kernel` | section 7.4 |
@@ -1257,8 +1292,10 @@ CPU-only (simulated device), most of them:
    (double-retire is an internal error).
 7. Generation wrap: seed the page head and the device near `0xFFFFFFF0`, drive through the
    wrap; no `kOverruns`, leases retire across the wrap, the `LaneAck` aliasing case (a
-   stale word from `G - 2^32`) is rejected. This test **fails on today's `pump_demand`**
-   (D6); that failure is the evidence D6 is real.
+   stale word from `G - 2^32`) is rejected, and a lap that crosses the wrap (unarmed
+   records posted past it while the service lags) still serves the armed request that
+   follows. The first part is written (`test_exl3_ram_miss_wrap.py`, both rings) and should
+   fail on today's `pump_demand` (D6); the rest needs the lease code.
 8. Request-slot reuse: retire-before-reuse, deferral without lapping (OPEN 8's test).
 9. Pause with a leaked lease is refused (F10); shutdown ordering including the
    helper-thread timeout path selecting quarantine; a fake CUDA error selecting
@@ -1275,12 +1312,57 @@ GPU (under the lock; not run here):
 13. Cost of the added `LaneRequest` fences and the ack kernel per layer, and of arming every
     `count > 0` record without advise (OPEN 5, OPEN 11).
 
-### 18.3 A design-level check I have not done
+### 18.3 The model check (done, bounded)
 
-Before coding, the protocol (service steps, device steps, eviction pressure, terminal,
-wrap; 2 lanes, 2 slots, 2 request slots) should be model-checked exhaustively. It is small
-enough for a Python explicit-state search or TLA+. I did not do it; a reviewer who wants
-to find a hole should start by asking for it.
+`analysis/dsv41-drive/lease_model.py` is a self-contained explicit-state model of this
+protocol; `test_lease_model.py` (23 tests, about two minutes, pure Python) pins what it
+finds. It has two threads (the device's post, wait, copy, acknowledge, consume; the service's
+observe, reserve, load, grant and publish, retire), pinned slots that an advisory may evict
+and reload whenever the service is idle, injectable timeouts and read failures, an optional
+shutdown with a CUDA error, and a 32-bit sequence shrunk to a handful of values that starts
+next to its wrap. Device stores to acknowledgement and terminal words reach the service in
+any order across different words. It checks I1 directly (ghost state: which slot each device
+lane holds), the shipped-bug shape (a request accepted with bytes that are not the
+requested experts'), lease underflow and leak, deadlock, and "a run with no injected fault
+must not fail stop".
+
+Results, all exhaustive over the bounds (up to about 2.4 million states each, complete):
+
+| World | Result |
+|---|---|
+| Designed protocol; 3 requests; timeouts and read failures on; ring 2 | no violation |
+| Same, no timeouts or faults (liveness) | no violation, no deadlock, no leak, no spurious fatal |
+| Same with a victim-forcing request mix | no violation; the deferral on leased victims and on an unretired request slot were both reached |
+| All request shapes, 2 requests; ring 3 across the wrap; shutdown with a CUDA error | no violation |
+| **Design as an earlier draft had it** (service counts epochs) | **counterexample**, section 11.3; fixed by echoing the device's `G` |
+| Mutants: eviction ignores leases; ack published at commit; 32-bit generations with a stale ack; request slot reused before retirement; a demand fails instead of deferring; the service never retires; Python frees without a sync | each found, with the violation named in the test |
+| Mutant: leases removed, detector kept vs removed | the mechanism fails either way; only without the detector are wrong bytes **accepted** (E6 does what section 6.5 says) |
+| Today's protocol, no faults, temporal exclusion | no violation (the model does not cry wolf) |
+| Today's protocol, one timeout | I1 violated (D1); wrong bytes not accepted, because `keep = 0` contains it |
+| Today's protocol without the exclusion | wrong bytes accepted (D2) |
+| Service that does not skip 0 (D6) | a phantom sequence, nothing else |
+
+What this does **not** establish, stated so a pass is not over-read:
+
+- It is sequentially consistent apart from the one relaxation above. A missing fence, the
+  `ld.global.nc` question (6.6), or PCIe reordering of the *service's* stores are outside it.
+- It is Task 5's whole-request protocol only. Per-lane copy, the finalize kernel and the
+  terminal mask with a partly copied request (Task 6) are not modelled, so the
+  "terminal names lanes" argument of section 13 is exercised only with all lanes named.
+- The bounds are small: 2 lanes, 2 slots, 3 experts, at most 3 requests, one advisory, and
+  request shapes restricted in the 3-request runs. A hole that needs more of any of them is
+  not excluded. Visited states are kept as 64-bit hashes; a collision could hide a state
+  (about 1e-5 at these sizes).
+- It models one stream and serialized replays (assumption 1 of 1.1). Concurrent graphs are
+  outside it.
+- It did not cover the `pause`/eager path (F10), the lease-mode arming cost, or the
+  watchdog, beyond "fatal is followed by abort".
+
+The model's own faithfulness is the thing to review first: `lease_model.py` restates the
+service and device steps by hand from this document and the code, so a step I mis-transcribed
+would make a pass meaningless. The mutants and the "today" runs are the guard against that
+(they reproduce D1, D2 and D6 from the code as read), but they cannot prove the designed
+side is transcribed faithfully.
 
 ---
 
@@ -1312,6 +1394,9 @@ to find a hole should start by asking for it.
 - **[OPEN 11]** The per-layer cost of arming every `count > 0` record when advise is off.
 - **[OPEN 12]** Whether planned experts are always a subset of the routed experts in the
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
+- **[OPEN 14]** Epoch seeding for a second device incarnation over one lease block. The
+  design is one incarnation per block (11.3); a device re-created over a used block would
+  restart at epoch 0 while old acknowledgement words still carry epoch 0 generations.
 - **[OPEN 13]** The order of the exit-time callbacks: `_stop_live` (`ops.py`), the
   `ExpertPinnedHostCache._release_slabs` finalizer (`expert_stream.py`), and the
   `Exl3RamMissHost._close` finalizer (`atexit = False`). If the slab finalizer runs while a
@@ -1332,3 +1417,15 @@ to find a hole should start by asking for it.
   want reservation-time leases; nothing here prevents it.
 - **[DECIDE 4]** The acknowledgement is a separate kernel, not fused into the copy tail
   (6.4).
+- **[DECIDE 5]** The service echoes the request generation from the device's `LaneRequest`
+  instead of counting epochs (11.3). Forced by the model's counterexample, not a preference.
+
+### Plan correction
+
+The plan's Task 5 file list is Native service/pipeline header, `exl3_ram_miss.cuh`,
+`ops/moe/exl3_ram_miss.py`, `srt/layers/moe/exl3_ram_miss.py` and the thread/GPU-graph tests.
+The shutdown requirement cannot be met inside those files: `ExpertPinnedHostCache.__init__`
+in `srt/layers/moe/expert_stream.py` creates the `weakref.finalize(... release_host_slabs ...)`
+that unregisters the slabs at every process exit, and a quarantine that leaves it attached is
+silently undone at exit. `expert_stream.py` (and `expert_host_tier.py`, where
+`release_host_slabs` lives) belong in Task 5's file list, and the plan should be amended.
