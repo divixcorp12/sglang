@@ -274,16 +274,30 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > 1. **Two-phase (hit lanes, then the rest) is the chosen mechanism.** It is
 >    supported by a modelled ceiling as an upper bound. It is **not measured**.
-> 2. **Fixed-order per-row (V2) is expected-REJECTED**, decisively at random lane
->    order (-15.67 ms/step) and **only marginally at best order**, where the net
->    increment is +2.7 to +3.6 ms, or 1.1-1.4% against a 1.5% resolution. That
->    margin is 0.1-0.4 points, is `k`-free, and turns on a per-stage cost `g` of
->    8-14 us that **has never been measured**; at `g` around 5 us or below,
->    best-order per-row clears the bar. The label currently survives because the
->    real resolution is *worse* than 1.5% (the series is UNRESOLVED on the
->    contended box) -- i.e. on the weakness of the instrument, not the strength of
->    the result. **Measuring `g` is the cheapest open item that could overturn a
->    standing verdict in this plan.**
+> 2. **Per-row is expected-REJECTED -- but "per-row" names two different
+>    mechanisms and they are rejected for different reasons.** Keep them apart:
+>    - **Fixed lane order, no `ord` array.** This is what the checklist and
+>      pseudo-code below actually specify. It is **-15.67 ms/step worse than
+>      two-phase**, and the rejection is decisive. An implementer who follows the
+>      checklist builds *this* one.
+>    - **Best order, using the `ord` array** (design §4.2; **absent from the
+>      checklist below**). Gross +4.93 ms, net of 160 extra stage triples
+>      +2.7 to +3.6 ms, i.e. **1.1-1.4% against a 1.5% resolution** -- a margin of
+>      0.1 to 0.4 points. This is the variant the marginal verdict is about.
+>
+>    That margin is `k`-free, so **no lane measurement can settle it**, and it
+>    turns on a per-stage cost `g` of 8-14 us that **has never been measured**.
+>    By this section's own arithmetic the crossing is at **`g` = 6.96 us**
+>    (net = 4.93 - 160g against a bar of 0.015 x 254.4 = 3.82 ms) -- **less than
+>    1 us below the assumed range**, not the "around 5 us" an earlier revision
+>    carried from `PER_ROW_TRANSFER.md` §5.6. So the verdict rests on an
+>    unmeasured parameter whose crossing sits immediately next to the assumed
+>    value. The label further survives only because the real resolution is
+>    *worse* than 1.5% (the series is UNRESOLVED on the contended box) -- i.e. on
+>    the weakness of the instrument, not the strength of the result.
+>    **Measuring `g` is the cheapest open item that could overturn a standing
+>    verdict in this plan**, and the §5.6 derivation of "about 5 us" should be
+>    re-checked when it is.
 > 3. **Neither mechanism's saving exists today.** Both need an early,
 >    device-visible readiness signal. None exists: `kDemandDone` is stored in
 >    exactly one place, `RamTier::pump_demand`, *after* `handle_demand` returns,
@@ -291,11 +305,16 @@ Include expert identity in the immutable row result and validate it against the 
 >    substitute -- `publish_map` for new rows also runs after `read()`.
 > 4. **No Task-5-compliant Task 6 can be accepted before Task 5 (b) lands.** The
 >    one mechanism that escapes this (V1b) is refused by the Gate; see SAFETY.
-> 5. **Early transfer as a whole is not in doubt.** The pre-registered GENEROUS
->    reject test gives every reading request `k` = 6, so no lane estimate enters
->    it; at 73.0 ms/step it is 28.7% of the step against a 1.5% (3.8 ms) reject
->    threshold, about 19x margin. It did not reject. **Only the choice of
->    mechanism is open.**
+> 5. **Early transfer as a whole cannot be rejected on arithmetic -- and is not
+>    demonstrated either.** The pre-registered GENEROUS test gives every reading
+>    request `k` = 6, so no lane estimate enters it; at 73.0 ms/step it is 28.7%
+>    of the step against a 1.5% (3.8 ms) reject threshold, and **it did not
+>    reject**. Read that for exactly what it is: **an upper bound sitting above a
+>    reject threshold**. A test constructed to be generous failing to reject
+>    cannot establish that a benefit is real, and "19x" is a ceiling over a
+>    threshold, not an effect over noise. It is consistent with item 1 and with
+>    the FIGURES note -- nothing here has been measured end to end. What it
+>    licenses is proceeding; what it does not license is confidence.
 >
 > ---
 >
@@ -337,7 +356,10 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > **Measurement provenance** (schema 4, `4e63616666`, on `task1f-0-new-on-T`,
 > `dad59f1b48`). 33.9 hit lanes/step in layers that read, inside the 10.8-63.6
-> bounds predicted before the arm ran, 46% across and 3.0x the SUPPORT floor.
+> bounds predicted before the arm ran -- **43.8% across them**, nowhere near an
+> edge, and about 3x the SUPPORT floor. (An earlier revision said 46%; that is the
+> position against the bounds rescaled to 511 steps, 10.5-61.6, which this section
+> no longer carries. The rescaling was never recomputed, only scaled.)
 > All 20,800 records carry `lanes`; `dropped_before` is 0; `lanes >= rows_asked`
 > on every read request; max `lanes` is 6, so the model's cap never bound.
 > Grouped by session, `sum(lanes)` equals `sum(vram_miss)` **exactly** in sessions
@@ -379,9 +401,20 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > ---
 >
-> **SAFETY.** Today's correctness rests on **temporal exclusion** -- one service
-> thread, so no advisory runs once a request is taken; `take_slot_locked` never
-> evicts `wanted`; eager paused. **Early copying is precisely what removes it.**
+> **SAFETY.** Today's correctness rests on **temporal exclusion**, and on two
+> invariants that a gated early copy borrows rather than replaces. State both,
+> because **the gate's safety does not come from the word** -- it comes from
+> these:
+> - **(a) No actor evicts in that tier between the request finishing and the
+>   device's next post.** This is the interval *after* the request, and it is the
+>   one that matters where the word is least observable: an all-hit request is
+>   over in 0.6-1.8 us while its hit copy lasts milliseconds, so the copy runs
+>   almost entirely after the request has finished, protected by (a) alone.
+> - **(b) `wanted` is never a victim.** `take_slot_locked` never evicts it.
+>
+> Supporting these today: one service thread, so no advisory runs once a request
+> is taken; eager paused. **Early copying is precisely what removes the
+> exclusion.**
 > A `slot_map` entry carries no ownership, so gathering hits from it during the
 > read is a correctness bug, not a performance shortcut. The same early
 > publication that lets the GPU start is what grants the lease keeping the slot
@@ -398,7 +431,9 @@ Include expert identity in the immutable row result and validate it against the 
 > watchdog. So a cheaper V1 exists -- gate the hit phase on `kBusySeq == seq`,
 > then read `slot_map` and copy lanes `>= 0` -- costing a wait-kernel change and a
 > stage kernel with **no service change at all**, and reaching the 88% share
-> without `[REQ 1]`. It is refused on **durability**: the borrowed exclusion
+> without `[REQ 1]`. **It is not Task 5 compliant**: it buys the 88% by
+> *borrowing* the temporal exclusion rather than replacing it, and it is refused
+> on **durability**: the borrowed exclusion
 > expires when the service stops serving one request at a time, which Task 5's
 > asynchronous `progress()` wording contemplates. (It survives Task 8 as designed
 > -- M2 promotion admission is a request class on the same thread, below demand,
@@ -495,9 +530,11 @@ Include expert identity in the immutable row result and validate it against the 
 >   means bunching, not reordering.
 > - `[REQ 1]`'s cost is booked to Task 5 and appears in no Task 6 estimate.
 
-**Chosen mechanism: two-phase.** Per-row costs 160 extra stage triples per step across all 40 layers to buy an increment that is 1.1-1.4% net at best order and negative at random order (STANDING item 2). `PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. **The checklist and pseudo-code below specify V2 (per-row) only**, and are retained as the specification of the variant that must beat two-phase; V1's checklist is deferred until Task 5 (b) is real, so that it is written once against the mechanism actually being built. A reader implementing this task from the checklist alone would build the variant the plan expects to reject -- read the Gate first.
+**Chosen mechanism: two-phase.** Per-row costs 160 extra stage triples per step across all 40 layers to buy an increment that is 1.1-1.4% net **at best order**, and that is **-6.2% at fixed lane order** (STANDING item 2). `PER_ROW_TRANSFER.md` §6.2 lists what would overturn that.
 
-**Baseline correction:** the fair comparison is Task 5 **lease-mode batched**, not today's unleased path. Lease mode arms every `count > 0` record, so all 40 layers pay a service round trip (OPEN 11, unmeasured). That cost must be netted out or any Task 6 arm flatters itself.
+**What the checklist and pseudo-code below actually specify, which is not what the verdict above is about.** They describe **V2 at fixed lane order**: there is no `ord` array in either, so the mechanism they build is the **-15.67 ms/step** one, not the +4.93 ms best-order variant the marginal verdict discusses (the `ord` array is in `PER_ROW_TRANSFER.md` §4.2 only). They are retained as the specification of the variant that must beat two-phase. **V1's checklist is deliberately absent** and is deferred until Task 5 (b) is real, so that it is written once against the mechanism actually being built. **A reader implementing this task from the checklist alone builds the worst of the three mechanisms on the table -- read the Gate first.**
+
+**Baseline:** Task 5 **lease-mode batched**, not today's unleased path -- lease mode arms every `count > 0` record, so all 40 layers pay a service round trip (OPEN 11, unmeasured), and that cost must be netted out or any Task 6 arm flatters itself. Gate 1 states the reporting requirement that follows from it.
 
 **Per-row variant (V2):** Retain the existing SM-driven host gather and one graph stream. Capture a fixed number of lane operations determined by plan capacity. Each active lane waits for its own generation-qualified readiness, copies only that row to its reserved GPU destination, then acknowledges source consumption. Inactive lanes are no-ops. All lane copies precede one fused MoE invocation.
 
@@ -522,11 +559,11 @@ This permits CPU I/O for later rows to overlap the earlier row's SM transfer. It
 
 **Gate.** All of the following. Items 2 and 3 are **refusals**: a mechanism that fails them is rejected however well it measures. They are stated here, in the acceptance test, because a prohibition that lives only in prose is not one.
 
-1. **Measured:** demonstrated I/O/H2D overlap and untraced end-to-end benefit at unchanged cache capacity, against the **Task 5 lease-mode batched** baseline rather than today's unleased path. Preconditions on every arm: **promotions, the prefetch puller and eager gathers off**, and each arm's record must say so -- they share the Gen3 link, and contention on it subtracts from the hiding in the direction that flatters a null result. A combined Task 6 + Task 8 arm is a separate, labelled experiment.
+1. **Measured:** demonstrated I/O/H2D overlap and untraced end-to-end benefit at unchanged cache capacity, against the **Task 5 lease-mode batched** baseline rather than today's unleased path. Preconditions on every arm: **promotions, the prefetch puller and the eager (speculative) gather off** -- not prefill's gather, which is not on this path -- and each arm's record must say so -- they share the Gen3 link, and contention on it subtracts from the hiding in the direction that flatters a null result. A combined Task 6 + Task 8 arm is a separate, labelled experiment.
 
    **Report all three differences with intervals: A1 v A0, A2 v A1, and A2 v A0** (A0 = today's unleased path, A1 = Task 5 lease-mode batched, A2 = the Task 6 mechanism). **A2 against A0 alone must not be presented as "the Task 6 result"** -- it credits Task 6 with the cost it inherits from Task 5. A2 against A1 alone is also not enough: quoting it without A1 against A0 hides a possible loss from Task 5. V1b, needing no lease mode, is measured against A0 directly. (`PER_ROW_TRANSFER_REVIEW.md` G2, a report-time trap that a correct baseline statement does not cover.)
-2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose correctness holds only because the service serves one request at a time is rejected. The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** The ground is *not* that the borrowed invariants go unstated -- this plan and `PER_ROW_TRANSFER.md` §3.3 state them -- so do not reinstate that reasoning.
-3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. Stated precisely: today's only producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect`, so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one.
+2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose **source-read safety** holds only because the service serves one request at a time, i.e. one that relies on invariants (a) or (b) in SAFETY rather than on an ownership grant, is rejected. (It is refused before measurement; clause 1 does not apply to it.) The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** The ground is *not* that the borrowed invariants go unstated -- this plan and `PER_ROW_TRANSFER.md` §3.3 state them -- so do not reinstate that reasoning.
+3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. Stated precisely: today's only **production** producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect` (`plan_candidates` lives in the same file with no production caller found), so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one.
 4. **Required measurement:** the per-stage cost `g`. The per-row-versus-two-phase verdict turns on it at best order, where the net margin is 0.1-0.4 points, and no measurement of it exists.
 
 **A rejected variant is not a rejected task.** Two-phase is the chosen mechanism and is judged on its own; if launch or head-of-line cost cancels the benefit for *per-row*, that rejects per-row. Record which variant was rejected. If early transfer as a whole fails, retain Task 4 and evaluate native DMA or a readiness-aware gather under Task 9's **"Native DMA vs SM gather"** row, which now names the readiness-aware gather explicitly.
@@ -561,7 +598,7 @@ This is explicitly separate from demand delivery, but must be implemented before
 
 | Follow-up | Required design/measurement before implementation | Success evidence |
 |---|---|---|
-| Native DMA vs SM gather, **and readiness-aware gather** | Device-selected destinations, source leases, copy-completion generations, independent worker and CUDA-visible dependencies; no CUDA calls from host callbacks. The readiness-aware gather arrives here if Task 6 rejects early transfer as a whole; Task 6's gate referenced a Task 9 row that did not exist until this edit | Transfer/compute overlap and token-latency gain, not isolated bandwidth only |
+| Native DMA vs SM gather, **and readiness-aware gather** | Device-selected destinations, source leases, copy-completion generations, independent worker and CUDA-visible dependencies; no CUDA calls from host callbacks. The readiness-aware gather arrives here if Task 6 rejects early transfer as a whole | Transfer/compute overlap and token-latency gain, not isolated bandwidth only |
 | Better RAM/GPU lookahead | Real EXL3 pinned-slot resolution, dedicated GPU destinations, pointer-table coverage, exact demand fallback, bounded speculative bytes | Useful-on-time recall, retained reuse, wasted/canceled bytes, demand tails, net throughput |
 | Hit/miss or multi-request compute overlap | Per-inflight fused temps/output/scratch and deterministic reduction; separate graph control state | Numerical parity plus gain after lost fusion and extra memory |
 | Stream memory waits | Device/driver/graph support, scheduler-visible dependencies, visibility and timeout proof | Better measured cost than the current small wait kernel without deadlock |
