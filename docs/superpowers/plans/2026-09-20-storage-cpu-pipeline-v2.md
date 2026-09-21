@@ -287,6 +287,26 @@ Include expert identity in the immutable row result and validate it against the 
 > case cannot currently be constructed at all. Build that before building the
 > test, or the test will again pass for a reason unrelated to the requirement.
 >
+> **THE HELD DIFF HAS SINCE GONE STALE, and the staleness is narrow, not rot**
+> (measured 2026-09-21 at `05996e5208`, `git apply --check` on a clean tree --
+> the laptop worktree was dirty with other lanes' work, so this was checked on a
+> fresh checkout of HEAD, which is the only place the answer is meaningful).
+> `analysis/dsv41-drive/held/R3_retire_in_read.diff` is recorded as applying on
+> `bcfe378f0d`; it no longer applies on HEAD. Per file:
+>
+> | file | on HEAD |
+> |---|---|
+> | `exl3_ram_miss_host.cpp` | applies clean |
+> | `test_exl3_ram_miss_lease_thread.py` | applies clean |
+> | `test_exl3_ram_miss_lease_service.py` | **fails at :341** |
+>
+> **The production change is intact; one test file conflicts**, because
+> `cc52bf85b0` landed the E1 test in that same file. So whoever picks R3 up
+> rebases one test hunk, not the diff. Recording it because a held patch that
+> silently stops applying is how held work turns into lost work: the next reader
+> finds a conflict, assumes the patch has rotted, and rewrites what was already
+> reviewed.
+>
 > **THREE CORRECTIONS from the reviewer's third pass, two of which land on
 > claims this plan and its lead had already propagated:**
 >
