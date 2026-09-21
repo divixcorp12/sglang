@@ -105,10 +105,11 @@ def run(a):
         with torch.cuda.stream(stream):
             chain(variant, min(N, 2))                           # eager warm-up: JIT, first-touch, context
         stream.synchronize()
-        g = torch.cuda.CUDAGraph()
+        g = torch.cuda.CUDAGraph(keep_graph=True)              # keep_graph: the raw graph is needed to count nodes
         with torch.cuda.graph(g, stream=stream):
             chain(variant, N)
-        return g, node_count(g)
+        nodes = node_count(g); g.instantiate()
+        return g, nodes
 
     meta = {"script": "g_harness.py", "process": a.process, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "repo": str(repo),
             "repo_head": subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip(),
@@ -197,10 +198,11 @@ def run(a):
 
 def capture_empty(torch, stream):
     """N = 0: a graph with no nodes (what replay costs by itself)."""
-    g = torch.cuda.CUDAGraph()
+    g = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(g, stream=stream):
         pass
-    return g, node_count(g)
+    nodes = node_count(g); g.instantiate()
+    return g, nodes
 
 
 def summary(path):
