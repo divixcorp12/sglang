@@ -56,7 +56,11 @@ assumptions hold together:
 
 A fifth rule closes the remaining gap: an *unarmed* record is touch-only
 (`touch_request`); it never evicts, because "the device may already be gathering any
-mapped slot".
+mapped slot". That rule is sufficient only because of a premise that is stated nowhere
+near it: advisories exist only when `advise != 0`, and `advise != 0` arms *every* record
+(`armed = need_count > 0 || advise != 0`, `device.cuh`). So unarmed records occur only
+with advisories off, and then nothing else evicts on a row the device is gathering
+(section 15).
 
 I could not construct a non-fault interleaving in today's code that violates this
 exclusion. It is real. But it is implicit, it is nowhere stated as an invariant, and
@@ -84,8 +88,13 @@ zero alone does not protect an earlier gather."
 `slot_map` with `ld_volatile` into device `host_rows`, and the copy then indexes the
 slabs by `host_rows`. The map is written by the service (`publish_map`) at any time. What
 breaks is specified in section 10; in one line, an entry that changes between the
-wait's read and the gather's use makes the copy read another expert's bytes, and every
-counter (`keep`, `ram_miss`, status) still reports success.
+wait's read and the gather's use makes the copy read another expert's bytes.
+**Severity today: latent, not live.** Today the map cannot change in that window without a
+fault (the temporal exclusion above), and after a timeout `ok` is false and `keep` is 0, so
+the counters do not report success. D2 becomes a live defect when Task 6 lets the service
+evict while an earlier lane's copy runs, or when a non-graph reader (Task 8) shares the
+slabs. The model (section 18.3) shows the same: without the exclusion, wrong bytes are
+accepted.
 
 **D3. No GPU-to-CPU acknowledgement exists.** The service cannot learn that a gather
 has finished. The only "acknowledgement" in the code base is `demand_done` for an armed
@@ -96,8 +105,9 @@ record, which is CPU-to-GPU. (The handoff calls it Option F's acknowledgement,
 fatal word is checked once, on entry; the poll loop checks only `demand_done` and the
 clock. After a fatal is raised elsewhere, or after a shutdown, a spinning wait holds its
 stream until `timeout_ns`, which defaults to 2000 ms
-(`SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`, `environ.py`). Prompt shutdown is impossible by
-construction.
+(`SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`, `environ.py`). Shutdown, or a fatal raised elsewhere, is
+therefore bounded by the wait timeout rather than prompt; the design's `Header.shutdown`
+poll (section 7.3) makes it one poll interval.
 
 **D5. Shutdown does not establish that GPU readers are done, and does the opposite of
 quarantine.**
@@ -130,6 +140,15 @@ quarantine.**
   the first finalizer is created, `_stop_live` when `ops.py` is imported; I did not
   determine which is first). Any quarantine has to *detach this finalizer*; otherwise it
   still fires.
+  An independent review answered the ordering: `weakref.finalize`'s atexit hook is
+  registered before `_stop_live`, and `atexit` is last-in first-out, so `_stop_live` runs
+  **first** and the slab-unregister finalizers run **second**, with no device barrier between
+  them. Which exit path production actually takes is a separate question: the docstring of
+  `record_graph_step` in `exl3_stream_trace.py` says the scheduler "is SIGKILLed at
+  shutdown", in which case none of these hooks run. I have not confirmed that from the
+  launcher, so I state the hazard's scope as: **a normal-exit and test-teardown hazard;
+  under SIGKILL it does not occur, and nothing in this design should be read as fixing a
+  production defect that SIGKILL already hides.**
 - Design consequence: this document designs for the `_stop_live` path. If the
   design needs a production caller of an orderly shutdown to exist, that is a
   **requirement** (section 14.6), not an assumption.
@@ -143,6 +162,16 @@ reads the record slot `(0-1) % 16 = 15`, fails the seqlock read, counts one `kOv
 (or, on the advisory ring, one `kAdvisoriesSkipped`), begins a stage record, and stores
 `demand_done = 0` (or `advise_done = 0`). It then carries on with seq 1.
 
+Confirmed by execution by the independent reviewer (heads seeded at 0xFFFFFFFD, requests
+posted through the existing `sim_post` and pump: one phantom iteration at expected seq 0,
+`demand_done` stepping 0xFFFFFFFF, 0, 1). The signature depends on the page: on a used page
+the phantom read fails and `overruns` is 1, as above; on a never-used page record slot 15
+holds seq 0, so the phantom read *succeeds* as an empty touch record and `overruns` stays 0.
+Same phantom iteration, different signature, so a test must assert on the number of requests
+handled, not only on `overruns` (the wrap test does both). The device's
+`reached(0, 0xFFFFFFFF)` is true under the signed compare, which is why waiters are
+unaffected.
+
 Severity, by reading: **a spurious counter and a spurious trace record once per 2^32
 requests, not a failed request.** Nothing can be waiting on sequence 0, because the device
 never posts it, and I found no consumer of `kOverruns` outside the counter list in
@@ -154,20 +183,24 @@ and no safety violation.
 
 It is still a defect: the two sides disagree on one value, and any code that keys
 something by `next_demand_` inherits the disagreement. This document's own design avoids
-that dependency (section 11.3). A test that drives both rings through the wrap is
-`test/registered/unit/kernels/test_exl3_ram_miss_wrap.py`; it was written to fail on
-today's `pump_demand`, and I could not run it (the laptop's interpreter has no
-`transformers`; the project interpreter is on divix01, where I was told not to touch the
-worktrees). **[OPEN 1]**: run that test against today's code and confirm it fails, and
-against the one-line fix and confirm it passes.
+that dependency (section 11.3). The test that drives both rings through the wrap, on both
+a used and a fresh page, is `test/registered/unit/kernels/test_exl3_ram_miss_wrap.py`. That
+file is the reviewer's rewrite of my first draft (which asserted only on `overruns` and so
+would have passed on a fresh page for the advisory ring); I could not run either version
+myself (the laptop's interpreter has no `transformers`, and the project interpreter is on
+divix01, where I was told not to touch the worktrees). **[OPEN 1]** (now narrowed: the
+phantom itself is confirmed by execution): confirm that the committed test fails on today's
+`pump_demand`/`pump_advice` and passes with the one-line fix.
 
 **D7. Lane capacity is silently 8.** The post kernel reads `min(count, kMaxIds)` lanes
 with `kMaxIds = 8`; the wait kernel translates up to `host_rows.numel()` lanes. A plan
 with more than 8 lanes has lanes that are never requested from the service, and the wait
-kernel then finds them missing and raises a fatal via `unserved_misses`. Today
-`exl3_fused_moe.py` requires `graph_gather_rows == top_k`, so this is unreachable at
-bs 1 with a top-k of 8 or less **[OPEN 2]: I did not verify DSV4.1's top-k; the design
-needs `lanes <= 8` enforced at attach, not assumed.**
+kernel then finds them missing and raises a fatal via `unserved_misses`. DSV4.1 is top-6
+(per the independent review), so bs 1 gives at most 6 lanes and today's decode is safe. But
+`graph_gather_rows` is `tokens * top_k`, and `Exl3RamMissService.attach` passes it to
+`Exl3RamMissRowBackend` as the capacity with **no `<= kMaxIds` check**, so any multi-token
+graph exceeds 8. **Required change (not an open question): enforce `graph_gather_rows <=
+kMaxIds` (the lease block's `lanes`) at attach and refuse otherwise.**
 
 ### 1.3 The shape of the failure this design exists to prevent
 
@@ -255,9 +288,11 @@ few guards against silent ABI drift across the language boundary, and this desig
 not put it at risk to save an allocation. The new block's constants join the **same**
 test (section 18), so agreement checking scales instead of forking.
 
-Allocation: pinned, zero-filled, base address 4096-aligned. The constructor refuses a
-block whose `data_ptr() % 4096 != 0` or that is not pinned for a CUDA device, mirroring
-the existing checks in `Exl3RamMissDevice.__init__`. **[OPEN 3]**: `torch.zeros(...,
+Allocation: pinned, zero-filled, base address 4096-aligned. The constructor **adds** a
+check that refuses a block whose `data_ptr() % 4096 != 0`; there is no alignment check today
+(`Exl3RamMissDevice.__init__` checks numel, dtype, host, contiguous and pinned, and nothing
+about alignment), so an implementer must not assume one exists. It also refuses a block that
+is not pinned for a CUDA device, as `__init__` does for the page. **[OPEN 3]**: `torch.zeros(...,
 pin_memory=True)` (what `new_page` uses) does not obviously guarantee 4096 alignment. If
 not guaranteed, allocate `bytes + 4096` and slice, as `allocate_host_slab` does for its
 slabs.
@@ -582,6 +617,17 @@ fused MoE (keep)                                                     leases--, i
 
 ### 7.1 Service: admission of a request
 
+**A deferral must not touch the stage trace.** `pump_demand` calls `begin_stage` before it
+decides anything, and its stage ring holds 8192 records. A deferral that returns without
+advancing `next_demand_` and re-enters on every loop turn would push a stage record per
+poll and flood the ring within milliseconds. So: a deferral pushes nothing (it resets
+`cur_` without `ring_->push`), and a deferred request is re-attempted only when
+`retire_leases()` changed something or a `Terminal` appeared, not on every poll. The stage
+record eventually written for that request should carry the request's *first* observation
+time, so that the time spent deferred shows up in the trace instead of vanishing.
+How that interacts with `prev_done` and the backlog field is left to the code task
+**[OPEN 15]**.
+
 Before `serve()` grants anything, in the order:
 
 1. `idx = (seq - 1) % 16`. If the `Outstanding` entry for `idx` holds an earlier
@@ -747,10 +793,18 @@ When no victim exists *only because* of leases (there is a candidate that would 
 if leases were zero), a **demand** is deferred, not failed (section 16). When no
 candidate exists even ignoring leases, it is the existing `kNoVictim` failure. The
 distinction must be computed, not guessed: `take_slot_locked` returns a tri-state
-{slot, deferred, none}. While a demand is deferred it still counts as `demand_pending()`
-(the head has reached `next_demand_`), so no advisory starts and a running one gives up at
-its next row: an advisory must not take slots that the deferred demand is waiting to
-reuse.
+{slot, deferred, none}, and it must report *whose* leases caused a deferral (graph-lane or
+host), because Task 8 needs to act on the second kind (`PROMOTION_ASYNC.md` R4).
+
+An advisory can run while a demand is deferred. `pump_advice` starts one whenever it is not
+stale, and `demand_pending()` is consulted only in the give-up lambda *after* reservation,
+so it does **not** stop an advisory from reserving. An advisory posted *before* the deferred
+demand is stale by the `after` rule (the head has reached `after + 1`); one posted by the
+same post kernel *after* the demand, for the next row, is not stale (its `after` is the
+demand's own seq) and may start. It takes slots in the *next* row's tier, not the deferred
+demand's, and gives up after one row because `demand_pending()` is then true, so it delays
+the retry by at most one row's read. An implementer must not rely on `demand_pending()` to
+keep advisories off a deferred demand's row.
 
 Slot generation lifecycle: bumped by the service under `mutex_` when a slot is assigned
 to a new expert, before its first byte write. Hits do not bump.
@@ -961,7 +1015,7 @@ them; "Slots" is what happens to the pinned slots; "GPU" is what the GPU reads.
 | F7 | **Service thread hang or death** | wait times out (F2) | existing watchdog aborts on stuck `busy_since` or held fatal | irrelevant, process ends | irrelevant | existing behaviour [E] `RamThread::watch` |
 | F8 | **Request lapped by the device** | existing: status stays pending, `kOverruns` counted, device wait times out | existing lap skip | none granted for a skipped generation | no | section 11.4 shows a deferred armed request cannot be lapped |
 | F9 | **Shutdown / process exit** | pollers exit promptly on `Header.shutdown`; committed copies finish and ack | stop admission, drain, then Python establishes completion (section 14) | see section 14 | no new reads | |
-| F10 | **Eager pinned-tier use** (`before_host_use`) | none | the caller synchronizes the current stream (existing `before_host_use`), then pause; the pause acknowledgement runs `retire_leases()` and requires `outstanding == 0`, otherwise the pause fails and eager use is refused | expected 0; nonzero means a leaked lease and is reported loudly | no | today's eager path calls `current_stream().synchronize()` then `host.pause(...)`; a leak here is exactly a protocol anomaly |
+| F10 | **Eager pinned-tier use** (`before_host_use`) | none | the caller synchronizes the current stream (existing `before_host_use`), then pause; the pause acknowledgement runs `retire_leases()` and requires `outstanding == 0` **counting graph-lane leases only** (host leases do not block it; 17.1 R2), otherwise the pause fails and eager use is refused | expected 0; nonzero means a leaked lease and is reported loudly | no | today's eager path calls `current_stream().synchronize()` then `host.pause(...)`; a leak here is exactly a protocol anomaly |
 | F11 | **Duplicate lanes** (two lanes, one expert) | two acks | two leases on one slot | `leases == 2`, each retired once | yes, each lane | section 9 |
 | F12 | **Identity mismatch or stale/foreign row result** | wait compares expert/generation/tag; fails closed as F1 with reason `identity` | counter `identity_errors` from the service's own pre-publish check | none or VOID by mask | no | should be unreachable; it is the alarm, not a path |
 | F13 | **Recycle detected after copy** (E6) | ack outcome VIOLATED, `keep = 0`, fatal | counts `lease_violations`, decrements (the reader is done) | ACKED | yes, and detected | a protocol bug, not an expected path |
@@ -1201,8 +1255,16 @@ Assumptions this argument needs, all of them explicit:
   acknowledgements of *this* request, which are gated on this request's readiness: a real
   cycle. All-or-nothing reservation is what removes it.
 - **A3**: every non-graph acquirer (Task 8) releases its lease without waiting on a
-  demand. A promotion whose release is gated on a request the service has not served
-  would close a cycle through the service. Section 17.
+  demand, and **once a lease is held, the acquirer's copy stream must not depend on the
+  serving stream** (no `wait_stream(producer_stream)` after acquisition; a dependency the
+  copy needs must be satisfied *before* the lease is taken, or the copy must not have one).
+  The cycle it forbids is concrete: a promotion holds a source lease on slot `S` and its
+  copy waits on the serving stream; the serving stream is inside an armed wait whose only
+  victim is `S`; the service defers the demand for lack of a victim; the lease is released
+  only when the copy completes; the copy waits for the serving stream. Nothing breaks it
+  but the 2 s device timeout, as a fatal (`PROMOTION_ASYNC.md` 9.2, found by Task 8's
+  design; today's `_submit_operations` does `self.stream.wait_stream(producer_stream)`).
+  Section 17.
 - **A4**: for Task 6, lanes are consumed in a fixed order and lane `j`'s acknowledgement
   is issued before the GPU waits for lane `j + 1`'s readiness. Lane `j + 1`'s readiness
   then never waits on an ack of lane `>= j + 1`. Task 6 must re-establish this; I have
@@ -1229,11 +1291,46 @@ thing that differs by acquirer:
   optional<LeaseRef> acquire_host_lease(row, expert)   // service mutex; slot must be kReady;
                                                        // leases++; LeaseRef = {row, slot,
                                                        // slot_generation, lease_id}
+  LeaseRef lease_on_ready(row, slot)                   // service-initiated admission: the lease
+                                                       // is taken in the SAME mutex_ section
+                                                       // that moves kLoading to kReady
   void release_host_lease(LeaseRef)                    // exactly once; leases--; any thread
   ```
 
   The holder decides when its consumer (for example a `cudaMemcpyAsync` and its event) is
   complete and calls `release_host_lease` itself. The service never infers it.
+
+Requirements filed on this contract by Task 8 (`analysis/dsv41-drive/PROMOTION_ASYNC.md`
+9.1, R1-R8), accepted here as requirements of the lease owner:
+
+- **R1** The host-lease calls take only `RamTier::mutex_`, are callable from the scheduler
+  thread, and never pause the service. A stale or repeated `LeaseRef` (slot generation or
+  `lease_id` mismatch) is a **counted error**, not a silent no-op and not a second decrement.
+- **R2 (the F10 split)** The pause acknowledgement's `outstanding == 0` counts **graph-lane
+  leases only**. Host leases must not block an eager pause: otherwise one in-flight
+  promotion makes every eager `before_host_use` fail for the copy's duration, and
+  `before_host_use` cannot wait for it (it synchronizes the current stream only, not the
+  executor stream). The split is safe because a host-leased slot is excluded from eviction
+  and from `assign`/`release` (below), so the lease, not the absence of the thread, protects
+  its bytes. Table row F10 in section 12 is read with this split.
+- **R3 `lease_on_ready`** Section 17.1's original `acquire_host_lease` requires the slot to
+  be `kReady` first, which leaves a window between `kReady` and the lease in which a demand
+  or advisory eviction could take the row unless it is `hot`. `hot` is a boolean the next
+  `set_hot` overwrites, so it is not a substitute. Service-initiated admission therefore
+  takes its lease inside the section that publishes the row.
+- **R4** A promotion lease never causes a demand failure. A deferral caused *only* by host
+  leases must be reported as such (section 8's tri-state) so the poll step can act on it;
+  the hold time is bounded by the capped copy's enqueue-to-completion.
+- **R5** The eviction predicate covers `take_slot_locked`, `assign` and `release`; `release`
+  of a leased slot throws exactly as it does for `kLoading` today (section 8).
+- **R6** Outstanding host leases are part of the shutdown quarantine set (section 14). The
+  executor stream is one more GPU reader class: the device-wide synchronization in S3 covers
+  it only if S3 is `torch.cuda.synchronize(device)` and not a single-stream synchronize, so
+  S3 must be the device-wide form.
+- **R7** Counters: `host_leases_outstanding`, lease hold time, `pauses`, `pause_wait_ns`,
+  `defer_reason`.
+- **R8** The lease API must **not** bump `kVersion` (it changes no mapping); otherwise every
+  lease pays an `expert_to_slot` rebuild in `NativePinnedSlotTable`.
 
 Both channels decrement the same `leases` counter and are subject to the same eviction
 predicate. **I do not specify the promotion protocol** (that is Task 8's own design), only
@@ -1277,7 +1374,21 @@ checklist. None has been done.
 | `ops.py` | `PAGE_BYTES`-style constants for the block; `STATE_WORDS`; `new_lease_block`; `Exl3RamMissDevice` | append `epoch`, `pending_epoch`; allocate/validate the block; ack wrapper |
 | `srt_ram_miss.py` | `Exl3RamMissRowBackend.translate` and its copy | pass `go_count` to the copy; launch the ack kernel after the copy |
 | `srt_ram_miss.py`, `ops.py`, `host_tier.py`, `expert_stream.py` | `Exl3RamMissService.shutdown`, `_stop_live`, `release_host_slabs`, `ExpertPinnedHostCache._release_slabs` | sections 14.2-14.4 (`expert_stream.py` is outside the four files the plan lists for Task 5; flagging it) |
-| `test_exl3_ram_miss_device_args.py` | the layout agreement test | extend to the lease block constants (three-way agreement stays one test) |
+| `test_exl3_ram_miss_device_args.py` | the layout agreement test | extend to the lease block constants (three-way agreement stays one test); see the constraints below |
+| `host.cpp` / `attach` | `Exl3RamMissService.attach` | enforce `graph_gather_rows <= kMaxIds` (D7); today there is no such check |
+
+Constraints from the existing tests that the implementation must respect (found by review,
+not by me):
+
+- `test_exl3_ram_miss_device_args._constants` parses **every** `constexpr <type> kName = <expr>;`
+  line in `host.cpp` and `device.cuh`; expressions may use only integers, `+`, `-`, `*` and
+  already known names, and a duplicate name in one file breaks it. So the block's
+  `constexpr`s must stay `+ - *`, and the tag encoding (`tag << 56 | G56`) must live **in
+  code, not in a `k` constexpr** (no `<<`, `|`, `/` or `sizeof` in a constexpr line).
+- The device-state check compares `STATE_WORDS` to a hard-coded dict exactly. Appending
+  `epoch` and `pending_epoch` means editing `device.cuh`, `STATE_WORDS` and that dict together.
+- The copy kernel's count argument must be an int32 CUDA tensor of shape `[1]`
+  (`_validate_plan`), so `go_count` is that, not a scalar or an int64.
 
 ### 18.2 Tests required (each maps to a Task 5 item or a defect)
 
@@ -1361,8 +1472,14 @@ What this does **not** establish, stated so a pass is not over-read:
   (about 1e-5 at these sizes).
 - It models one stream and serialized replays (assumption 1 of 1.1). Concurrent graphs are
   outside it.
-- It did not cover the `pause`/eager path (F10), the lease-mode arming cost, or the
-  watchdog, beyond "fatal is followed by abort".
+- It did not cover the `pause`/eager path (F10) or its graph-lane/host split, host leases
+  at all (Task 8), the lease-mode arming cost, or the watchdog beyond "fatal is followed by
+  abort".
+- Its advisory pressure is applied only while no demand is visible to the service, and to
+  the single modelled row. In the real service an advisory for the *next* row can start while
+  a demand is deferred (section 8); that is a different tier and cannot take the deferred
+  demand's victims, so I do not expect it to change the result, but the model does not show
+  it.
 
 The model's own faithfulness is the thing to review first: `lease_model.py` restates the
 service and device steps by hand from this document and the code, so a step I mis-transcribed
@@ -1378,9 +1495,7 @@ side is transcribed faithfully.
 
 - **[OPEN 1]** D6: does the demand sequence wrap really produce the phantom seq-0
   iteration? By reading, yes; not run. Settled by test 7.
-- **[OPEN 2]** DSV4.1's top-k against `lanes <= 8`. The fused-MoE path requires
-  `graph_gather_rows == top_k`; I did not check the value. Enforce `lanes <= 8` at attach
-  regardless.
+- **[OPEN 2]** (resolved: required change, D7) `lanes <= 8` must be enforced at attach.
 - **[OPEN 3]** Whether `torch.zeros(..., pin_memory=True)` gives 4096-byte alignment.
   Allocate with slack and slice if not guaranteed.
 - **[OPEN 4]** Production tier capacities, so the size of `SlotGen[]`.
@@ -1400,10 +1515,12 @@ side is transcribed faithfully.
 - **[OPEN 11]** The per-layer cost of arming every `count > 0` record when advise is off.
 - **[OPEN 12]** Whether planned experts are always a subset of the routed experts in the
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
+- **[OPEN 15]** How a deferral interacts with the stage record's `observed`, `prev_done` and
+  `backlog` fields (7.1).
 - **[OPEN 14]** Epoch seeding for a second device incarnation over one lease block. The
   design is one incarnation per block (11.3); a device re-created over a used block would
   restart at epoch 0 while old acknowledgement words still carry epoch 0 generations.
-- **[OPEN 13]** The order of the exit-time callbacks: `_stop_live` (`ops.py`), the
+- **[OPEN 13]** (ordering answered by review, production path still open: see D5) The order of the exit-time callbacks: `_stop_live` (`ops.py`), the
   `ExpertPinnedHostCache._release_slabs` finalizer (`expert_stream.py`), and the
   `Exl3RamMissHost._close` finalizer (`atexit = False`). If the slab finalizer runs while a
   GPU kernel can still read, the D5 hazard occurs in every normal exit today. Determine the
