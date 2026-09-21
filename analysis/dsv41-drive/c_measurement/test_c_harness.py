@@ -38,7 +38,8 @@ def test_dry_run_feeds_the_analysis():
     with tempfile.TemporaryDirectory() as d:
         _dry(d, True)
         lines = [json.loads(l) for l in open(Path(d) / "results.jsonl")]
-        keys = {"process", "engine", "state", "node", "load", "launch", "n", "row_bytes", "T_ms", "distinct_rows", "min_reuse_distance_rows", "link_gen_start", "link_gen_end", "pstate_start", "other_gpu_procs", "foreign_max_core_pct"}
+        keys = {"process", "engine", "state", "node", "load", "launch", "n", "row_bytes", "T_ms", "distinct_rows", "min_reuse_distance_rows", "link_gen_start", "link_gen_end", "pstate_start", "other_gpu_procs", "foreign_max_core_pct",
+                "sm_mhz_min", "sm_mhz_start", "sm_mhz_end", "sm_mhz_mean", "sm_mhz_limit"}
         assert all(keys <= set(x) for x in lines)
         assert {x["process"] for x in lines} == set(range(h.PASSES)) and all(len(x["T_ms"]) == h.LAUNCHES_PER_CELL for x in lines)
         a.simulate = lambda T, *_: (36.0, 4.9, 0.0)                     # the trace model needs the divix01 traces; the gates and fits do not
@@ -57,9 +58,32 @@ def test_each_analysis_gate_fires_on_bad_harness_output():
     a.simulate = lambda T, *_: (36.0, 4.9, 0.0)
     for name, edit in (("row bytes", lambda x: x.update(row_bytes=2_764_808)), ("reuse", lambda x: x.update(min_reuse_distance_rows=3)),
                        ("link", lambda x: x.update(link_gen_start=1)), ("foreign", lambda x: x.update(foreign_max_core_pct=50.0)),
-                       ("other gpu", lambda x: x.update(other_gpu_procs=1)), ("tail", lambda x: x.update(T_ms=x["T_ms"][:190] + [x["T_ms"][0] * 3] * 10))):
+                       ("other gpu", lambda x: x.update(other_gpu_procs=1)), ("tail", lambda x: x.update(T_ms=x["T_ms"][:190] + [x["T_ms"][0] * 3] * 10)),
+                       # amendment 10: the three SM-clock conditions, and a record in the pre-amendment format
+                       ("clock floor (a)", lambda x: x.update(sm_mhz_min=int(0.79 * x["sm_mhz_limit"]))),
+                       ("clock drift within a cell (b)", lambda x: x.update(sm_mhz_end=int(x["sm_mhz_start"] * 1.06))),
+                       ("no clock fields", lambda x: [x.pop(k) for k in ("sm_mhz_min", "sm_mhz_start", "sm_mhz_end", "sm_mhz_mean", "sm_mhz_limit")])):
         bad = json.loads(json.dumps(good)); edit(bad[0]); assert a.analyse(bad)["verdict"] == "INVALID", name
     assert a.analyse(good)["verdict"] != "INVALID"
+    # (c): the mean clock of one arm's n = 6 cells 4% above its n = 1 cells (each cell individually within the floor and (b))
+    bad = json.loads(json.dumps(good))
+    for x in bad:
+        if x["n"] == 6: x["sm_mhz_mean"] *= 1.04
+    assert a.analyse(bad)["verdict"] == "INVALID" and any(g.startswith("(c)") for g in a.analyse(bad)["gates"])
+    # the P-state label is recorded and no longer gates
+    p1 = json.loads(json.dumps(good))
+    for x in p1: x["pstate_start"] = 1
+    assert a.analyse(p1)["verdict"] != "INVALID"
+
+def test_analysis_refuses_beside_a_marker_and_prints_no_number():
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        _dry(d, False)
+        (Path(d) / "results.INVALID").write_text("a marker of any scope\n")
+        r = subprocess.run([sys.executable, str(HERE / "c_analysis.py"), str(Path(d) / "results.jsonl")], capture_output=True, text=True)
+        lines = r.stdout.strip().splitlines()
+        assert r.returncode == 3 and lines[0].startswith("VERDICT: REFUSED"), r.stdout
+        assert not any("fit " in l or "c_marginal" in l or "model" in l for l in lines), r.stdout
 
 def _spin_on(cpu):
     import subprocess

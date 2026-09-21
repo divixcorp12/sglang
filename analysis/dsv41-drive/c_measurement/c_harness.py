@@ -224,7 +224,7 @@ class SmiSampler:
     def __init__(self, own_pid):
         self.own = own_pid; self.gen = []; self.apps = []; self._procs = []
     def start(self):
-        for args, sink, kind in ((["--query-gpu=pcie.link.gen.current,pstate,clocks.sm", "--format=csv,noheader,nounits", "-lms", "250"], self.gen, "gpu"),
+        for args, sink, kind in ((["--query-gpu=pcie.link.gen.current,pstate,clocks.sm,clocks.max.sm", "--format=csv,noheader,nounits", "-lms", "250"], self.gen, "gpu"),
                                  (["--query-compute-apps=pid", "--format=csv,noheader", "-lms", "250"], self.apps, "apps")):
             p = subprocess.Popen(["nvidia-smi"] + args, stdout=subprocess.PIPE, text=True, bufsize=1)
             self._procs.append(p); threading.Thread(target=self._read, args=(p, sink, kind), daemon=True).start()
@@ -233,7 +233,7 @@ class SmiSampler:
             t = time.monotonic(); line = line.strip()
             if kind == "gpu":
                 try:
-                    g, ps, clk = [x.strip() for x in line.split(",")]; sink.append((t, int(g), int(ps.lstrip("P")), int(clk)))
+                    g, ps, clk, lim = [x.strip() for x in line.split(",")]; sink.append((t, int(g), int(ps.lstrip("P")), int(clk), int(lim)))
                 except ValueError: pass
             else:
                 sink.append((t, [int(x) for x in line.split() if x.isdigit() and int(x) != self.own]))
@@ -241,8 +241,12 @@ class SmiSampler:
         g = [x for x in self.gen if t0 - 0.6 <= x[0] <= t1 + 0.6]
         a = [x for x in self.apps if t0 - 0.6 <= x[0] <= t1 + 0.6]
         if not g: return None
+        # amendment 10 (C_MEASUREMENT_PREREG.md section 22): the clock fields the three SM-clock conditions read. `sm_mhz_start` and
+        # `sm_mhz_end` are the first and last samples of the cell's window, `sm_mhz_mean` the mean over it, `sm_mhz_limit` the card's
+        # clocks.max.sm. The P-state stays recorded (`pstate_start`) and no longer gates.
         return {"link_gen_start": g[0][1], "link_gen_end": g[-1][1], "pstate_start": g[0][2], "sm_mhz_min": min(x[3] for x in g),
-                "sm_mhz_max": max(x[3] for x in g), "other_gpu_procs": max((len(x[1]) for x in a), default=0)}
+                "sm_mhz_max": max(x[3] for x in g), "sm_mhz_start": g[0][3], "sm_mhz_end": g[-1][3], "sm_mhz_mean": sum(x[3] for x in g) / len(g),
+                "sm_mhz_limit": max(x[4] for x in g), "other_gpu_procs": max((len(x[1]) for x in a), default=0)}
     def stop(self):
         for p in self._procs: p.terminate()
 
@@ -494,7 +498,8 @@ def record(cell, pass_idx, T, reuse, cond, foreign, extra):
             "min_reuse_distance_rows": reuse,
             "link_gen_start": cond["link_gen_start"], "link_gen_end": cond["link_gen_end"], "pstate_start": cond["pstate_start"],
             "other_gpu_procs": cond["other_gpu_procs"], "foreign_max_core_pct": foreign[0], "foreign_max_proc": foreign[1],
-            "sm_mhz_min": cond["sm_mhz_min"], "sm_mhz_max": cond["sm_mhz_max"], **extra}
+            "sm_mhz_min": cond["sm_mhz_min"], "sm_mhz_max": cond["sm_mhz_max"], "sm_mhz_start": cond["sm_mhz_start"], "sm_mhz_end": cond["sm_mhz_end"],
+            "sm_mhz_mean": cond["sm_mhz_mean"], "sm_mhz_limit": cond["sm_mhz_limit"], **extra}
 
 def run(args):
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -587,7 +592,8 @@ def run(args):
         for cell, visits in list(acc.items()) + list(load_acc.items()):
             T = [x for v in visits for x in v[0]]
             t0 = min(v[2] for v in visits); t1 = max(v[3] for v in visits)
-            cond = smi.window(t0, t1) if smi else {"link_gen_start": 3, "link_gen_end": 3, "pstate_start": 0, "other_gpu_procs": 0, "sm_mhz_min": 2900, "sm_mhz_max": 2900}
+            cond = smi.window(t0, t1) if smi else {"link_gen_start": 3, "link_gen_end": 3, "pstate_start": 0, "other_gpu_procs": 0, "sm_mhz_min": 2900, "sm_mhz_max": 2900,
+                                                                     "sm_mhz_start": 2900, "sm_mhz_end": 2900, "sm_mhz_mean": 2900.0, "sm_mhz_limit": 3135}
             if cond is None: raise SystemExit("no nvidia-smi samples for cell %s: refusing to write a cell without conditions" % (cell,))
             worst = max((v[4] for v in visits), key=lambda x: x[0])
             dur = sum(v[3] - v[2] for v in visits); db = None if dry else sum(v[1]["drive_bytes"] for v in visits)
