@@ -1137,6 +1137,18 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > and `Interrupted` rather than trusting an exit status or the absence of a
 > keyword. An exit status lies under every one of these defects.
 >
+> **A KILL COUNT IS NOT A COVERAGE COUNT, and the gap is larger than it looks.**
+> Step 6's ledger reports **13 mutants killed** -- resting on **5 distinct tests
+> out of 20**: S6+S7 share one killer, S4+S8+S9 share one, S13+S14 share one.
+> Two other campaigns reported the same shape: a mutant whose numbering implied
+> a fourth kill was **functionally identical to the first** (a polled deferral
+> returns before the marking line, so the mutant runs once), and another was
+> recorded as not distinct rather than counted. **The evidence is the set of
+> tests that fired, not the number of mutants that died**, and the two differ by
+> a factor of two and a half in the one case where both were reported. Record
+> the killing test per row; a tally without it cannot be deflated by a later
+> reader.
+>
 > This is the same rule as (a) applied one level up: (a) demands a witness that
 > the intended *code path* ran; (c) demands a witness that the intended *test*
 > ran. A suite can satisfy (a) perfectly and still be worthless if nobody
