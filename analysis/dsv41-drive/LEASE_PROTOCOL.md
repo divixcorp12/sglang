@@ -2301,3 +2301,14 @@ release. Mutations, each to be run and its killing test read: block omitted; bef
 tree-cache release; `except` removed; the function constructs the singleton when none exists (a run without EXL3
 would then create a service at shutdown). The fake barrier is still a fake: the second test shows the wiring, not
 that the real barrier orders GPU work.
+
+**20.2i revision after the independent review (`SHUTDOWN_WIRING_REVIEW.md`): the placement above is superseded.**
+The block goes **last** in `Scheduler.release_host_resources()`, after hisparse, the tree cache, the decode-offload
+manager, both capturers and `rank_consensus_checker` (review F3, decided). Reason 2 above ("the barrier needs a
+working CUDA context, so run first") was not a reason: nothing before it frees a context. Cost of a failing barrier:
+up to `RAM_MISS_TIMEOUT + 5 s`, plus an unbounded `host.stop()` (a hung service thread is ended by the watchdog's
+abort after `fatal_wait`, as at the exit hook today); `abort_distributed_environment()` in the caller waits behind it.
+The block reads `sys.modules` rather than importing (F4). The claim "the worst case is what the exit hook does today"
+was false until `shutdown()` treated a failed `stop()` as uncertain (F1), chose the barrier's device on the calling
+thread (F2) and recorded completion separately from start (F5). The code and its ledger are in a patch awaiting the
+reviewer's second pass; nothing is landed. The mutation ledger goes with the code (20.2j).
