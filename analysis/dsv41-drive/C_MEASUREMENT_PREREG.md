@@ -291,3 +291,27 @@ The idle-core figure stays in the pre-flight as an **informational** line. **The
 The harness mask is the two quietest harness candidates and the reader's the three quietest reader candidates (`taskset -c` inside `gpu-run.sh`'s 32-63; the harness needs one core for the launching thread and one spare). If no pair or triple meets it, the answer is that this box cannot host the measurement today and the window does not open. The rehearsal runs a few seconds of spinners on three cores; it needs the lead's yes to be run on divix01.
 
 **4. The record.** The list of standing services in `meta.json` (`steady_state_by_pass`, from the per-pass thread scan) will include, besides `java` (QuestDB, measured flat at about 14.4 cores in three samples: 1444%, 1448%, 1430%), `aggregate-runner`, `nimbus_beacon_node`, `op-reth` and `reth-binary`, a **Ray `log_monitor.py`** (about 14% of a core, on core 70, which is inside the 64-71 band we never touch and outside our masks). The flat QuestDB figure also lowers the risk of the box-drift gate: there is no ingest burst to swing it.
+
+## 17. PROPOSED amendment 6, made after the first rehearsal and before any measurement: which cores and which drives the gates judge (2026-09-21)
+
+**Status: PROPOSED, not in force.** The harness in force is still `35dcf8215ae5c2c9…` (section 9). The proposal is in `c_measurement/proposed_amendment6/` (files not overwriting the in-force ones); it takes effect only when the lead accepts it and section 9 is updated in a separate commit. If it is refused, the in-force harness stands and the rehearsal below says NO-GO, so the window does not open.
+
+**What happened, in the order it happened.**
+1. **The first rehearsal (the in-force code, run 04:58 on divix01, `--rehearse 40`) said NO-GO: 72% of 80 windows above 10% on the harness mask [36, 38] and 66% on the reader mask [25, 27, 30].** No lane of ours was running (a `pgrep` for pytest found none), so this is not a false negative caused by us; against the in-force gate as implemented, the box fails.
+2. **A diagnostic** (CPU-only, 20 windows of 0.5 s on each of cores 36 and 46 with a spinner on the core, foreign CPU by the harness's own code): **foreign ticks on the core we occupy were 0 in 19 of 20 windows and 1 tick in the twentieth (core 36), and 0 in all 20 (core 46).** The NO-GO came from the *spare* core of the mask (core 38, 14-20% busy from the services), on which our thread was not running.
+3. **The implementation had counted every core of the allowed mask.** Section 12 says the gate counts "the cores the run uses". A spare core on which our threads did nothing cannot contend with us for CPU. The proposed code counts the cores **where our own threads accrued at least 10% of the window** (all cores of the set when we have no presence at all, so a plain survey stays conservative), which is the text of section 12 and not a new gate.
+4. **A second defect, found in the same rehearsal:** its NVMe criterion summed **all** whole NVMe devices, and `nvme1n1` (0.019 GB/s read, 0.005 written, not read by this harness, not one of ours by the lead's measurement) alone exceeded 0.02 GB/s. The rules exist to protect `rho`'s baseline on the drives the reader reads; the proposal judges the devices holding the mirror roots and the source checkpoint (`nvme0n1`, `nvme3n1`, `nvme2n1`, resolved through `st_dev` and `/sys/dev/block`, never by mount label) and **records every device**.
+
+**Disclosure of the ordering.** Both changes were made after seeing a rehearsal result. They are made before any measurement of `c`, they follow from the text already registered in section 12 (cores "the run uses") and from the stated purpose of the drive rule, and the rehearsal that motivated them is reported here in full, including that the in-force code said NO-GO. That is still a decision made with a result in view, and the lead should weigh it as such.
+
+**The rehearsal under the proposed code** (two runs, both with no lane of ours running, load 25-32, foreign CPU 20.6-29.9 cores box-wide, QuestDB and the other services present): harness mask **0% of 80 windows above 10%**, reader mask **0% of 80**; NVMe on the watched drives **0.0000 GB/s** read and written (all devices: 0.017 read, 0.008 written). The first of the two runs printed NO-GO only because of the all-devices NVMe criterion of item 4; the second, with the watched-drive rule, prints **GO**.
+
+**What the proposal does not change.** `c_analysis.py` (`4657702c…`) and every frozen gate value; the per-visit retry rule; the box-drift gate; the ungated memory-bandwidth failure mode (section 12), which the used-cores rule does not touch and does not weaken any more than the mask restriction already did.
+
+**Proposed files and hashes** (in `c_measurement/proposed_amendment6/`; 19 CPU tests pass on them; not in force):
+
+| file | sha256 |
+|---|---|
+| `proposed_amendment6/c_harness.py` | `58390047dd58e2164ee53b2cae16e9462446c55e1f5d45ee88a379d60b3d4999` |
+| `proposed_amendment6/quiet_check.py` | `3cf2834218759ab87bf6cea9b251d670e1c456c70a59b820153aa3d0dd5861ed` |
+| `proposed_amendment6/test_c_harness.py` | `7ff90d81cfe4041a3960b38301af2946300fe7b00588054e2a9c7969ebecac9a` |
