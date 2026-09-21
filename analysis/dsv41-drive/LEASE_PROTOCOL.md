@@ -194,6 +194,21 @@ once in today's code and once in the proposed protocol, found by different metho
 model had missed the fresh-page signature until it was made to flag *any* handling of seq 0,
 not only a failed record read; the same lesson as the test that asserted on `overruns` alone.)
 
+The four signatures are now observed, not argued (by the instrumentation agent, running the
+merged wrap test against the code before the fix): demand ring on a used page, `overruns = 1`;
+demand ring on a fresh page, `touch_only = 1` with `overruns = 0`; advisory ring on a used
+page, `advisories_skipped = 1`; advisory ring on a fresh page, `advisories = 5` with
+`advisories_skipped = 0`. The last is why a test that asserts on the skip or overrun counter
+alone passes on a fresh page: my own first draft did exactly that, which is why the merged
+test asserts on the done word and on what was served instead.
+
+The transferable lesson, stated once: **a ring with a reserved value must skip that value at
+every place the counter can move, and a resume-after-lap is such a place.** The increment
+was fixed on one side; the lap resume jumped over the increment and could still land on the
+reserved value. This document's own draft had the same shape with epochs (11.3): a lap skip
+crossing the wrap without passing through the value being tracked. Anyone writing a ring
+with a sentinel should add "every jump, not just every step" to their checklist.
+
 It is still a defect: the two sides disagree on one value, and any code that keys
 something by `next_demand_` inherits the disagreement. This document's own design avoids
 that dependency (section 11.3). The test that drives both rings through the wrap, on both
@@ -1583,3 +1598,62 @@ in `srt/layers/moe/expert_stream.py` creates the `weakref.finalize(... release_h
 that unregisters the slabs at every process exit, and a quarantine that leaves it attached is
 silently undone at exit. `expert_stream.py` (and `expert_host_tier.py`, where
 `release_host_slabs` lives) belong in Task 5's file list, and the plan should be amended.
+
+---
+
+## 20. Implementation order (Task 5)
+
+Design only, as everywhere in this document: this section says what to change in what order,
+and none of it has been executed. It is a plan for the person who implements after the model's
+transcription has been reviewed independently (if that review finds a mis-transcribed step,
+this order may change).
+
+### 20.0 Ground rules
+
+- **Lease mode is a switch that defaults off, and off is today's protocol bit for bit.** Every
+  step below leaves the tree passing all existing tests with the switch off. The switch is a
+  new `SGLANG_*` environment variable, so it needs the env-var conventions
+  (`python/sglang/srt/environ.py`; read `.claude/skills/env-var-conventions` first).
+- **Every model counterexample and mutant becomes a regression test on the real code**, run
+  through the CPU simulated device (`sim_post`, `sim_wait`, extended in step 3). The model's
+  traces are the test scenarios; do not invent new ones and lose the ones already found.
+- **Each structural milestone gets an independent review before the next starts** (plan:
+  "no approval based solely on checklist completion"). Steps 3, 4 and 6 are the milestones.
+- **The native service is shared.** Steps 2 and 3 edit `exl3_ram_miss_host.cpp`, which other
+  work is editing; check `git status` and the freeze state before starting, and do not begin
+  while a GPU arm series depends on the code.
+- Already landed and to be **built on, not redone**: `skip_zero` at all four sites
+  (`85cdbf9382`) and the refusal to attach a layer whose gather is wider than the service's
+  lanes (`8c78749b35`, D7).
+
+### 20.1 The ordered steps
+
+| # | Change (symbol, file) | Test that covers it | Constraint that bites | Needs GPU |
+|---|---|---|---|---|
+| 1 | **Constants and block allocator, no behaviour.** `ops.py`: lease-block constants (`LEASE_RING`, `LEASE_LANES`, offsets of area H/S/D from 4.3) and `new_lease_block(rows, capacities, pin)`, allocating `bytes + 4096` and slicing to a 4096-aligned view (there is no alignment check today; add it). Mirror the same names in `host.cpp` and `device.cuh`. | Extend `test_exl3_ram_miss_device_args` so the lease constants join the existing three-way agreement test; a test that an unaligned or unpinned block is refused. | The `_constants` parser accepts only `constexpr <type> kName = <expr>;` with integers, `+ - *` and known names, and fails on a duplicate name. No `<<`, `|`, `/`, `sizeof` in a `k` constexpr; the tag encoding stays in code. | no |
+| 2 | **Slot generations and the eviction predicate.** `host.cpp`: `Tier` gains `leases` and `slot_generation`; `SlotGen[]` mapped writes with the `_mm_sfence()` of 6.5; `take_slot_locked` returns the tri-state {slot, deferred, none} with the cause (graph or host); `assign`/`release` refuse a leased slot; new counters. `exl3_ram_miss_open` takes the block tensor and writes the immutable header and `RowTable` (the service is the only writer); `ops.py` `Exl3RamMissHost.__init__` creates the block itself when none is passed, so no test call site changes. Nothing grants a lease yet. | All existing `test_exl3_ram_miss_tier` / `_split` / `_thread` / `_advisory` unchanged and green; new CPU tests for the tri-state, for `SlotGen` bumping before the first byte store, for `release` of a leased slot throwing. | Append the new counters at the end of `enum Counter` before `kCounterCount` **and** the same position in `COUNTERS` (`ops.py`), which is index-aligned by convention. `kVersion` must not move on a lease change (R8). | no |
+| 3 | **Admission, grant, publish, retire, terminal; the CPU device.** `host.cpp`: read `LaneRequest` with the seqlock re-check; take `G` from it (11.3); `Outstanding` ring; in `serve()` grant and publish per lane (6.1 order, RAII undo); `retire_leases()` called from the top of `RamThread::run` and from the give-up lambda of `RowReader::read`; the pause acknowledgement's graph-lane `outstanding == 0`; the terminal check and `late_after_terminal`; deferral. Extend `exl3_ram_miss_sim_post` / `_sim_wait` and add `sim_ack`, `sim_terminal` so the whole protocol runs with no GPU. | Section 18.2 tests 1-6, 8 and 10, plus one test per model mutant and per model counterexample (each is a trace to replay against the C++ through the sim). The wrap tests (`test_exl3_ram_miss_wrap.py`) still pass. | **A deferral must return before `begin_stage`, or push nothing**, and retry only when `retire_leases()` changed something or a `Terminal` appeared, or the 8192-slot stage ring floods per poll (7.1, OPEN 15). Weak ordering between ack and terminal words: the sim must be able to deliver them in either order, as the model does. | no |
+| 4 | **The device kernels.** `device.cuh`: `LaneRequest` in the post kernel; the wait kernel with `go_count`, the `RowResult` validate (generation, tag, expert), the terminal, the `fatal`/`Header.shutdown` poll inside the loop (D4), and 64-bit `ld.acquire.sys` / `st.release.sys`; new `exl3_ram_miss_ack_kernel`. `ops.py`: `Exl3RamMissDevice.post/wait/ack`, `lane_ctx`, `go_count`; append `epoch` and `pending_epoch` to `STATE_WORDS`. | CPU: argument validation in `test_exl3_ram_miss_device_args`; the state-word agreement test. GPU (manual, under the lock, after crypto-c9 schedules): a wait kernel timeout leaves `go_count == 0` and a poisoned slab is not read; an acknowledgement is emitted only for copied lanes; the `ld.global.nc` experiment (6.6), independent of this step. | **`STATE_WORDS` is a triple edit**: the device-state enum in `device.cuh`, `STATE_WORDS` in `ops.py`, and the hard-coded dict in the device-args test, all together or the existing test fails. **`go_count` must be an int32 CUDA tensor of shape `[1]`** (`_validate_plan`), not a scalar, not int64. Constexprs as in step 1. | yes |
+| 5 | **The backend and the arming rule.** `srt_ram_miss.py`: `Exl3RamMissRowBackend` overrides `post` (today only `translate` is overridden and `post` is inherited from `PinnedTierRowBackend`) to pass `go_count` to `copy_expert_row_segments_gpu` and to launch the acknowledgement kernel after it; `Exl3RamMissService.ensure_started` / `attach` allocate the block and hand it to the host and the device; lease mode arms every record with `count > 0` (15). The new environment switch is read here. | Existing service tests green with the switch off; with it on, the GPU graph parity test (`test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`): byte-exact output versus off, an injected timeout, and the arming cost measurement (OPEN 11) reported, not assumed. | The switch defaults off. `advise` and the arming rule must agree between the device (`armed = need_count > 0 || advise != 0`) and the service's `touch_request` path, or a record is waited on that the service treats as touch-only. | yes |
+| 6 | **Shutdown and quarantine.** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 test 9 (a fake CUDA error and a fake sync timeout select quarantine; no unregister, no free); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
+| 7 | **The host-lease API for Task 8.** `host.cpp` and the export table: `acquire_host_lease`, `lease_on_ready`, `release_host_lease` (17.1, R1-R8), never bumping `kVersion`, a stale or repeated `LeaseRef` counted as an error; the pause counts graph-lane leases only. | R1-R8 tests; the model's Task 8 mutants replayed against the real API through the sim. | R8 (`kVersion`), R2 (the pause split), R3 (`lease_on_ready`), and A3 for whoever calls it. | no |
+| 8 | **Enable and gate.** Flip nothing by default. Record the cost of the added fences and of arming every `count > 0` record (OPEN 5, OPEN 11); run the `ld.global.nc` experiment if not already done (OPEN 6); state the result of the wrap tests against the real code (OPEN 1). | The plan's Task 5 gate: lease-pressure and fault tests prove no reuse before consumption; concurrent graph execution stays guarded (OPEN 9). | Do not report skipped hardware tests as passed. | yes |
+
+### 20.2 What each step must not do
+
+- Step 2 must not grant a lease or change a request's outcome; if any existing test changes
+  its result, the step is wrong.
+- Step 3 must not touch `device.cuh` or the request page's layout; the page ABI is untouched
+  by the whole task (DECIDE 1).
+- Step 4 must not change `copy_expert_row_segments_gpu`'s kernel; the copy kernel already
+  takes the active count as a tensor, and a zero `go_count` is the whole fail-closed
+  mechanism.
+- Step 5 must not enable lease mode by default, and must not remove the un-armed touch-only
+  path for `count == 0` records.
+- Step 6 must not free anything on any path where completion was not established.
+
+### 20.3 Dependencies
+
+`1 -> 2 -> 3`, `3 -> 4`, `4 -> 5`, `2 -> 6`, `3 -> 7`, `5 + 6 -> 8`. Steps 1-3, 6 and 7 are
+GPU-free, so they can run while the GPU is scheduled elsewhere; 4, 5 and 8 need the
+scheduled GPU time.
