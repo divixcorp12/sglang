@@ -27,6 +27,22 @@ def test_dry_run_plumbing():
         assert max(x["spinner_ticks"] for x in rows if x["arm"] == "A") == 0
         assert json.loads(Path(d, "meta.json").read_text())["sibling_cpu"] != L
 
+
+def test_stdlib_attributes_used_by_the_scripts_exist():
+    """The class of defect the first real launch found (os.sched_getcpu does not exist): every `module.attr` the scripts use on an imported stdlib module must exist. Catches typos and platform-only names on a CPU box."""
+    import ast, importlib, sys as _s
+    for path in [HERE / "sibling_pilot.py", HERE / "sibling_pilot_analysis.py"]:
+        tree = ast.parse(Path(path).read_text()); mods = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name.split(".")[0] in _s.stdlib_module_names: mods[(a.asname or a.name).split(".")[0]] = a.name
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in mods:
+                m = importlib.import_module(mods[n.value.id])
+                assert hasattr(m, n.attr), "%s: %s.%s does not exist" % (path, n.value.id, n.attr)
+
+
 if __name__ == "__main__":
     for t in [v for k, v in sorted(globals().items()) if k.startswith("test_")]: t(); print("ok", t.__name__)
     print("ALL PASSED")

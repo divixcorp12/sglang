@@ -327,7 +327,7 @@ A mid-run arrival during the measurement itself is visible afterwards in `meta.j
 | file | sha256 |
 |---|---|
 | `proposed_amendment6/c_harness.py` | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
-| `proposed_amendment6/quiet_check.py` | `c9017bb8c3e4fe85e2c1781764511c1b157a48c627b923ee25324f03a8b45e99` |
+| `proposed_amendment6/quiet_check.py` | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` |
 | `proposed_amendment6/test_c_harness.py` | `b735ca4723768fdcb45f87360a31f538a24bb08d8f0ed35a55ac1561f4a32904` |
 
 ## 18. The SMT-sibling pilot: pre-registration (2026-09-21; approved by the lead; nothing has been run)
@@ -358,9 +358,9 @@ INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling
 |---|---|
 | `sibling_pilot/sibling_pilot.py` (the runner (GPU; needs the lock)) | `4b9219521077bb8e3ccd251b8047dd895bba2d278222f4dacba88ff5e2afdff0` |
 | `sibling_pilot/sibling_pilot_analysis.py` (the frozen rule and verdict (CPU; `--selftest` passes all ten cases)) | `5d85f67c946e55445598421ff79765be0e40fb748a131e55988fd8d9b24b3bc5` |
-| `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `0f7de46f249bb782a35547ddd4221538d8ba61e2e99ef92a4f157411e741c9f8` |
+| `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `8709257809e254459a7079743b79525250d702a2934cc1c12142527edcf4f076` |
 | `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
-| `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `c9017bb8c3e4fe85e2c1781764511c1b157a48c627b923ee25324f03a8b45e99` |
+| `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` |
 
 ### 18.1 Run 1 of the pilot: INVALID, twice over; no verdict is quoted (2026-09-21, 05:37:55-05:40:26, raw output on divix01 in `c_measurement_run/pilot_out_053754/`, `meta.json` in `sibling_pilot/run1_meta.json`)
 
@@ -374,3 +374,17 @@ Also recorded: link Gen3 throughout, P1 (busy), SM clock 2760-2970 MHz, no other
 
 **What this does and does not say.** It says nothing about whether a busy sibling moves `T`. It says something about the box that the pilot's design depends on: **on divix01 the idle SMT sibling of a CPU we occupy is foreign-busy above 10% in roughly a third of 0.5-0.9 s windows even on the quietest physical core the survey found**, so a clean A arm is available only about a third of the time.
 **Options, none taken without the lead:** re-run with more reps (about 40, so that about 14 valid are expected against the minimum of 8: a change of a registered parameter after an INVALID, so it needs the lead's yes and a new hash), and either stop the sweep lane's `test -f` pollers or exclude pure `test -f` probes from the lane pattern (a guard change; it would be made before, not after, looking at any shift).
+| `proposed_amendment6/test_c_harness.py` (25 CPU tests, incl. the stdlib-attribute existence check, the `_plan`/launch-CPU test and the guard-narrowing test) | `b6815a802c84e9bf8ec831dcb1ec3f23c855cb9e315108fc7a023860910b27a3` |
+
+### 18.2 What the first real launch showed about the instrument, and the guard change (2026-09-21)
+
+**The `c` run would have crashed on its first execution.** `RealDevice._plan` used an undefined `torch` and `run_visit` called `os.sched_getcpu`, which does not exist; both are in the **in-force** harness `35dcf8215ae5c2c9…`, the one gated, hashed and amended five times today, and the real path had never run on a GPU. So **had the box passed the gate the `c` run would have failed at `--check-only`**: today's NOT MEASURED was over-determined, by the box (the gate is unsatisfiable) **and** by an instrument that could not have completed. The natural reading of the day, "divix01 was too busy", is incomplete.
+**No measurement existed when either fix was made** (both crashed before any timed launch was recorded), so repairing them is not amending a gate in response to data; the new hash is recorded above and the in-force harness is noted as carrying both bugs.
+**Why 19-22 CPU tests passed while the real path was broken:** they exercised everything except the thing the harness exists to do. They asserted outcomes (a dry run producing a `results.jsonl`, gates firing on synthetic input) that a non-functional GPU path also produces, and nothing witnessed that the real launch path ran at all. Both defects are of the kind a smoke test on the real path catches in one second: an import-scope error and an environment-dependent name. **Two tests now stand in the list before the next attempt** (both need no GPU): `test_stdlib_attributes_used_by_the_scripts_exist` (every `module.attr` used on an imported stdlib module must exist; it would have caught `os.sched_getcpu`) and `test_plan_and_launch_cpu_construct_without_a_gpu` (constructs the plan and reads the launch CPU; it would have caught both). This is a worked example, from our own tooling, of the two-part rule of the cannot-fail taxonomy (`ac5af3223b`): a test that asserts something a broken path also satisfies, with no witness that the path under test ran.
+
+**The guard change, made before any re-run.** Run 1's INVALID reason 2 was a false positive: `bash -c test -f /data/models/slang/nvfp4-work/t1-ordersweep/sweep.done` (pids 3274284 and 3274313), a file-existence poll that matched the `sweep` substring of a path. The guard now judges **what is executed, not which words appear**: a process whose command (or `bash -c` body) begins with `test`, `[`, `ls`, `cat`, `grep`, `tail`, `head`, `sleep`, `pgrep`, `stat`, `wc`, `echo`, `sed`, `awk`, `ssh`, `systemctl`, `date`, `readlink`, `find` or `ps` is not a lane, while a launcher (`bash -c cd … && systemd-run … sweep_py.py`), `python -m pytest`, and `xargs -P` still are. The lead's remark that a command-line regex is a proxy for "is a process consuming CPU that could contend with us" stands; a CPU-time-based check remains the better guard if this proves fiddly again.
+**Run 1 stays as it is:** its directory is kept, the INVALID marker stands, no shift was computed. **Disclosure:** before the instruction not to analyse `visits.jsonl` arrived I had read its validity statistics (spinner achieved fraction, foreign busy fractions, valid-rep counts) to decide whether a re-run was feasible; I read no `T` value and computed no shift.
+
+### 18.3 Ray writes to a watched drive (from the lead)
+
+`/mnt/nvme4/ray_tmp` is on `/dev/nvme3n1p1`, and `nvme3n1` is in the watched set (mirror roots plus source). Ray's `log_monitor` and `dashboard` write session logs there with `--logging-rotate-bytes=536870912`, so its traffic is bursty by construction; measured quiet at 0.0000 GB/s over 10 s today. **A Ray rotation can trip the idle-cell rule or break the load-cell match for a reason that is neither us nor a lane**; the per-cell per-device bytes (`drive_by_dev`) are recorded, and **Ray is a known writer to a watched drive**, to be named in `meta.json` for the `c` run. If rotations prove frequent enough to make the `nvme` arm unreliable, the remedy is to move the source checkpoint off `nvme3n1`, not to loosen the rule. (`nvme1n1` read a steady 0.0266 GB/s with our lanes stopped; it is not watched and its reader is unidentified.)

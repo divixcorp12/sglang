@@ -27,8 +27,21 @@ def lane_processes(own=None):
         try: cmd = Path("/proc/%s/cmdline" % d).read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
         except OSError: continue
         if not cmd or "quiet_check.py" in cmd or "sweep_guard" in cmd or cmd.startswith(("pgrep", "grep", "ps ")) or " grep " in cmd: continue     # sweep_guard is the lead's watchdog, not a lane
-        if any(pat in cmd for pat in LANE_PATTERN): out.append((int(d), cmd[:160]))
+        if not any(pat in cmd for pat in LANE_PATTERN): continue
+        if _harmless(cmd): continue
+        out.append((int(d), cmd[:160]))
     return out
+
+HARMLESS = ("test", "[", "ls", "cat", "grep", "egrep", "tail", "head", "sleep", "pgrep", "stat", "wc", "echo", "sed", "awk", "ssh", "systemctl", "date", "true", "readlink", "find", "ps")
+
+def _harmless(cmd):
+    """A process that only MENTIONS a lane's name (a `test -f .../sweep.done` poll, an `ls`, a `cat` of a log, a `sleep`) cannot contend for CPU: judged by what is
+    executed, not by which words appear. `bash -c <body>` is judged by the first word of its body. A launcher (`bash -c cd ... && systemd-run ...`) is NOT harmless."""
+    toks = cmd.split()
+    if not toks: return True
+    first = os.path.basename(toks[0])
+    if first in ("bash", "sh", "dash") and len(toks) > 2 and toks[1] == "-c": first = os.path.basename(toks[2])
+    return first in HARMLESS
 
 RESERVED = range(64, 72)     # production's band (core 71 is the doorbell spin core): never used, and neither is any physical core that has a thread there
 

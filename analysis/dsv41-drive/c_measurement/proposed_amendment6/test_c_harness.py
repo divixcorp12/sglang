@@ -1,7 +1,8 @@
 """CPU tests for c_harness.py and its hand-off to c_analysis.py. No CUDA. Run: python3 test_c_harness.py"""
 import json, sys, tempfile, importlib, os, itertools
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 import c_harness as h, c_analysis as a
 
 def test_segments():
@@ -199,6 +200,35 @@ def test_watched_nvme_resolves_through_st_dev_and_skips_the_unresolvable():
     assert h.watched_nvme(["/definitely/not/a/path"]) == set()
     got = h.watched_nvme(["/", "/tmp", os.path.expanduser("~")])
     assert all(n.startswith("nvme") and "p" not in n[4:] for n in got)               # whole devices only, never a partition or a mapper name
+
+
+def test_stdlib_attributes_used_by_the_scripts_exist():
+    """The class of defect the first real launch found (os.sched_getcpu does not exist): every `module.attr` the scripts use on an imported stdlib module must exist. Catches typos and platform-only names on a CPU box."""
+    import ast, importlib, sys as _s
+    for path in [HERE / "c_harness.py", HERE / "quiet_check.py"]:
+        tree = ast.parse(Path(path).read_text()); mods = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name.split(".")[0] in _s.stdlib_module_names: mods[(a.asname or a.name).split(".")[0]] = a.name
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in mods:
+                m = importlib.import_module(mods[n.value.id])
+                assert hasattr(m, n.attr), "%s: %s.%s does not exist" % (path, n.value.id, n.attr)
+
+def test_plan_and_launch_cpu_construct_without_a_gpu():
+    """The two defects of the first real launch, reproduced on CPU: `_plan` built its tensors from a bare `torch`; the launch CPU came from a nonexistent os function."""
+    import torch
+    stub = type("S", (), {"torch": torch})()
+    r, s_ = h.RealDevice._plan(stub, 0, 2, [7, 9], [3, 4])
+    assert r.tolist()[:2] == [7, 9] and s_.tolist()[:2] == [3, 4] and r.dtype == torch.int64 and s_.dtype == torch.int32
+    assert h._syscalls().sched_getcpu() >= 0
+
+def test_lane_guard_ignores_processes_that_only_mention_a_lane():
+    import quiet_check as q
+    assert q._harmless("bash -c test -f /data/x/t1-ordersweep/sweep.done") and q._harmless("/bin/bash -c cat /x/sweep3.log") and q._harmless("sleep 600") and q._harmless("ls /x/orderplug")
+    assert not q._harmless("/bin/bash -c cd /x && systemd-run --user --unit=t1py python sweep_py.py")       # a launcher counts
+    assert not q._harmless("python -m pytest -p orderplug test/x.py") and not q._harmless("xargs -P 3 -I{} bash -c one {}")
 
 def test_node_mem_reader():
     try: m = h.node_mem_mib(0)
