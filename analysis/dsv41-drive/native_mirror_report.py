@@ -20,6 +20,18 @@ MOUNTS = {"nvme0": "/mnt/nvme0", "nvme2": "/mnt/nvme2", "nvme4": "/mnt/nvme4"}
 GIB = 1073741824
 
 
+def span_kind(schema):
+    """What the latency spans of a trace schema measure. Schema 1's are the FIRST io_uring batch's and
+    exclude packing; from schema 2 they cover the whole read and first->last can contain the packing of
+    earlier rows. Schemas 3 and 4 only add fields (admit, extent submit, dropped_before, lanes), so their
+    spans are schema 2's quantity: a mix within one kind is comparable, a mix across kinds is not."""
+    return "first-batch" if schema == 1 else "whole-read"
+
+
+def span_kinds(schemas):
+    return {span_kind(s) for s in schemas}
+
+
 def dev_names():
     out = {}
     for name, path in MOUNTS.items():
@@ -93,12 +105,13 @@ def summarize(name, path, names):
             f"{per_drive_extents[dev]} extents"
         )
 
-    # Schema 1 spans are the FIRST io_uring batch's and exclude packing; schema 2 spans cover the
-    # whole read and first_to_last_cqe can contain the packing of earlier rows. Printing a mean over
-    # a mix, or comparing one arm against the other across the boundary, compares two quantities.
+    # Printing a mean over spans of two kinds, or comparing one arm against the other across the
+    # boundary, compares two quantities (see span_kind).
     schemas = {r.get("schema", 1) for r in reqs}
-    if len(schemas) > 1:
+    if len(span_kinds(schemas)) > 1:
         print(f"    WARNING mixed trace schemas {sorted(schemas)}: the spans below are not one quantity")
+    elif len(schemas) > 1:
+        print(f"    trace schemas {sorted(schemas)}: spans cover the whole read (the schemas differ only in added fields)")
     else:
         only = next(iter(schemas))
         if only == 1:
@@ -152,7 +165,7 @@ def main():
     m = summarize("mirror", m_tr, names)
 
     if b and m:
-        if b["schemas"] != m["schemas"]:
+        if span_kinds(b["schemas"]) != span_kinds(m["schemas"]):
             print()
             print(
                 f"WARNING: base trace schema {sorted(b['schemas'])} against mirror "
