@@ -2,7 +2,9 @@
 
 import copy
 import importlib.util
+import json
 import os
+import sys
 
 import pytest
 
@@ -152,3 +154,75 @@ def test_residency_notes_name_the_session_where_a_directory_changed():
     notes = verdict.residency_notes(report)
     assert notes == ["residency of /m4 changed +1400.0 MiB at session_1"]
     assert verdict.residency_notes({}) == []
+
+
+# --- the timed-phase gate: what the independence claim is about ---------------------------------
+
+GiB = 1 << 30
+SRC, M0, M4 = "/src", "/m0", "/m4"
+
+
+def _phased(before, ready, per_session):
+    report = _report()
+    report["expert_residency"] = {"before_engine": before, "after_engine_ready": ready}
+    report["per_session"] = [
+        dict(row, expert_resident_bytes=per_session[min(i, len(per_session) - 1)])
+        for i, row in enumerate(report["per_session"])
+    ]
+    return report
+
+
+def _run_main(monkeypatch, capsys, tmp_path, report, cache=None):
+    arm = tmp_path / "arm.json"
+    arm.write_text(json.dumps(report))
+    argv = ["v", str(arm), "--root", ROOT, "--head", HEAD, "--mirror", "on", "--trace", "T",
+            "--summary-json", str(tmp_path / "regime.json")]
+    if cache is not None:
+        (tmp_path / "cache.json").write_text(json.dumps(cache))
+        argv += ["--cache", str(tmp_path / "cache.json")]
+    monkeypatch.setattr(sys, "argv", argv)
+    code = verdict.main()
+    return code, capsys.readouterr().out, json.loads((tmp_path / "regime.json").read_text())
+
+
+def test_boot_growth_is_a_note_and_the_regime_not_a_failure(monkeypatch, capsys, tmp_path):
+    """Boot-time weight loading grew the source dir 5 GiB; the sessions only shrank it. The independence
+    claim concerns the timed sessions, so this arm is valid and says which regime it was in."""
+    before = {SRC: 16 * GiB, M4: 30 * GiB}
+    ready = {SRC: 21 * GiB, M4: 30 * GiB}
+    report = _phased(before, ready, [{SRC: 21 * GiB - (600 << 20), M4: 30 * GiB}])
+    code, out, summary = _run_main(monkeypatch, capsys, tmp_path, report)
+    assert code == 0 and out.rstrip().endswith("VALID")
+    assert "REGIME boot-populated" in out and "residency of /src changed +5120.0 MiB at engine_ready" in out
+    assert summary["regime"] == "boot-populated" and summary["boot_growth_bytes"][SRC] == 5 * GiB
+    assert summary["timed_growth_bytes"][SRC] < 0 and summary["valid"] is True
+
+
+def test_a_quiet_boot_still_reports_its_regime_and_boot_growth(monkeypatch, capsys, tmp_path):
+    """A field that appears only on exception cannot be used to compute a baseline."""
+    flat = {SRC: 16 * GiB, M4: 30 * GiB}
+    code, out, summary = _run_main(monkeypatch, capsys, tmp_path, _phased(flat, flat, [flat]))
+    assert code == 0 and "REGIME boot-warm" in out
+    assert summary["regime"] == "boot-warm" and summary["boot_growth_bytes"] == {SRC: 0, M4: 0}
+
+
+def test_timed_phase_growth_fails_the_arm_and_names_the_directory(monkeypatch, capsys, tmp_path):
+    flat = {SRC: 16 * GiB, M4: 30 * GiB}
+    leaked = {SRC: 16 * GiB, M4: 31 * GiB + (1 << 29)}
+    code, out, summary = _run_main(monkeypatch, capsys, tmp_path, _phased(flat, flat, [flat, leaked]))
+    assert code == 1 and "1.50 GiB during the timed sessions in /m4" in out
+    assert summary["valid"] is False
+
+
+def test_an_arm_without_per_session_residency_is_gated_on_the_whole_arm_and_regime_unknown(monkeypatch, capsys, tmp_path):
+    """Arm 6 has no per-session samples: it must not be judged under the phase gate."""
+    cache = _cache({SRC: 16 * GiB, M4: 30 * GiB}, {SRC: 17 * GiB + (1 << 29), M4: 30 * GiB})
+    code, out, summary = _run_main(monkeypatch, capsys, tmp_path, _report(), cache)
+    assert code == 1 and "grew 1.50 GiB across the arm in /src" in out
+    assert summary["regime"].startswith("unknown") and summary["timed_growth_bytes"] is None
+
+
+def test_unmeasured_timed_residency_is_a_problem(monkeypatch, capsys, tmp_path):
+    ok = {SRC: 16 * GiB}
+    code, out, _ = _run_main(monkeypatch, capsys, tmp_path, _phased(ok, ok, [{SRC: None}]))
+    assert code == 1 and "could not be measured" in out

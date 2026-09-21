@@ -120,7 +120,7 @@ for spec in "${specs[@]}"; do
   } > "$OUTDIR/$name.cache.json"
   echo "rc=$rc wall=${wall}s"
   "$PY" "$VERDICT" "$OUTDIR/$name.json" --root "$wt" --head "$want" --mirror "$mirror" --trace "$trace" \
-    --cache "$OUTDIR/$name.cache.json" > "$OUTDIR/$name.verdict.txt"
+    --cache "$OUTDIR/$name.cache.json" --summary-json "$OUTDIR/$name.regime.json" > "$OUTDIR/$name.verdict.txt"
   vrc=$?
   cat "$OUTDIR/$name.verdict.txt"
   # Fail fast: an arm that cannot be a baseline poisons nothing yet, but every arm after it that

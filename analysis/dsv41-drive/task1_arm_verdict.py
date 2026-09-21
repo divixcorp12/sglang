@@ -102,6 +102,54 @@ def check_cache(cache: dict) -> list:
     return problems
 
 
+def phase_residency(report: dict):
+    """Per-directory residency at the phase boundaries, or None if the driver did not record them.
+
+    boot  = before_engine -> engine_ready   (weight loading, not expert reads)
+    timed = engine_ready  -> end of the last session (the phase the independence claim is about)"""
+    res = report.get("expert_residency") or {}
+    rows = report.get("per_session") or []
+    before, ready = res.get("before_engine"), res.get("after_engine_ready")
+    last = rows[-1].get("expert_resident_bytes") if rows else None
+    if not all(isinstance(x, dict) and x for x in (before, ready, last)):
+        return None
+    if not (set(before) == set(ready) == set(last)):
+        return None
+    return {"before": before, "ready": ready, "last": last}
+
+
+def check_timed_phase(phases: dict) -> list:
+    """The independence gate: no directory's residency may grow more than the limit while timed."""
+    problems = []
+    for d in sorted(phases["ready"]):
+        a, b = phases["ready"][d], phases["last"][d]
+        if a is None or b is None:
+            problems.append(f"residency of {d} could not be measured in the timed phase")
+        elif b - a > MAX_EXPERT_CACHE_GROWTH_BYTES:
+            problems.append(
+                f"expert shard page-cache residency grew {(b - a) / (1 << 30):.2f} GiB during the timed sessions in {d}"
+            )
+    return problems
+
+
+def boot_growth(phases: dict) -> dict:
+    """{dir: bytes grown between before_engine and engine_ready}; None where unmeasured."""
+    return {
+        d: None if phases["before"][d] is None or phases["ready"][d] is None else phases["ready"][d] - phases["before"][d]
+        for d in sorted(phases["ready"])
+    }
+
+
+def regime(phases) -> str:
+    """Which regime the boot put the arm in, derived from its own recorded boot-phase growth."""
+    if phases is None:
+        return "unknown: no per-session residency recorded"
+    growth = [g for g in boot_growth(phases).values()]
+    if any(g is None for g in growth):
+        return "unknown: boot-phase residency unmeasured"
+    return "boot-populated" if max(growth) > MAX_EXPERT_CACHE_GROWTH_BYTES else "boot-warm"
+
+
 def residency_notes(report: dict) -> list:
     """Where in the run each directory's residency changed, from the driver's own samples."""
     res = report.get("expert_residency") or {}
@@ -126,6 +174,7 @@ def main() -> int:
     p.add_argument("--mirror", choices=("on", "off"), required=True)
     p.add_argument("--trace", choices=("T", "U"), required=True)
     p.add_argument("--cache")
+    p.add_argument("--summary-json", help="write regime, boot-phase growth and timed-phase growth here")
     args = p.parse_args()
     try:
         with open(args.arm_json) as f:
@@ -137,9 +186,25 @@ def main() -> int:
     problems, notes = check_arm(
         report, root=args.root, head=args.head, mirror=args.mirror == "on", traced=args.trace == "T"
     )
-    if cache is not None:
+    phases = phase_residency(report)
+    if phases is not None:
+        # The whole-arm figure is a note: it mixes boot weight loading with the timed sessions.
+        problems += check_timed_phase(phases)
+    elif cache is not None:
         problems += check_cache(cache)
+        notes.append("no per-session residency: gated on the whole-arm before/after instead")
+    if cache is not None and isinstance(cache.get("expert_resident_by_dir_before"), dict):
+        b, a = cache["expert_resident_by_dir_before"], cache.get("expert_resident_by_dir_after") or {}
+        notes += [f"whole-arm residency of {d} {(a.get(d, 0) - b[d]) / (1 << 20):+.1f} MiB" for d in sorted(b)]
     notes += residency_notes(report)
+    kind = regime(phases)
+    growth = boot_growth(phases) if phases is not None else None
+    notes.insert(0, f"REGIME {kind} boot_growth_bytes={json.dumps(growth)}")
+    if args.summary_json:
+        timed = None if phases is None else {d: phases["last"][d] - phases["ready"][d] for d in phases["ready"]
+                                              if phases["last"][d] is not None and phases["ready"][d] is not None}
+        with open(args.summary_json, "w") as f:
+            json.dump({"regime": kind, "boot_growth_bytes": growth, "timed_growth_bytes": timed, "valid": not problems}, f, indent=2)
     for n in notes:
         print("NOTE", n)
     for x in problems:
