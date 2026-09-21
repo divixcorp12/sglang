@@ -84,7 +84,8 @@ def run(a):
 
     lib = ctypes.CDLL(str(build_lib(a.build_dir)))
     for name, argt in (("launch_w", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]),
-                       ("launch_a", [ctypes.c_void_p] * 3), ("launch_nop", [ctypes.c_void_p])):
+                       ("launch_a", [ctypes.c_void_p] * 3), ("launch_nop", [ctypes.c_void_p]),
+                       ("launch_probe", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p])):
         getattr(lib, name).argtypes = argt; getattr(lib, name).restype = ctypes.c_int
 
     torch.cuda.init(); dev = torch.device("cuda", torch.cuda.current_device()); torch.cuda.set_device(dev)
@@ -158,6 +159,16 @@ def run(a):
     meta["self_check"] = "active_p4 N=3: 9 nodes, go=1, 3 acks written; empty N=3: 9 nodes, go=0, no ack"
     del gtest, gtest2
 
+    # fidelity probe: is an acquire.sys load of the pinned page really a PCIe round trip? (host vs device word, serial loads)
+    pout = torch.zeros(2, dtype=torch.float64, device=dev); dword = torch.ones(16, dtype=torch.int32, device=dev)
+    probe = {}
+    for name, ptr in (("host_pinned_page", page.data_ptr()), ("device_word", dword.data_ptr())):
+        vals = []
+        for _ in range(5):
+            with torch.cuda.stream(stream): lib.launch_probe(stream.cuda_stream, ptr, 2000, pout.data_ptr())
+            stream.synchronize(); vals.append(float(pout[0].item()))
+        probe[name + "_ns_per_load"] = sorted(vals)
+    meta["poll_latency_probe"] = probe; print("poll latency probe (ns per serial ld.acquire.sys, 5 repeats sorted):", json.dumps(probe), flush=True)
     smi = H.SmiSampler(os.getpid()); smi.start(); time.sleep(2.0)
     stop = threading.Event()
     if a.keepalive:                                             # optional: small H2D copies keep the link out of Gen1 during empty cells

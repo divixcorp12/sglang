@@ -58,6 +58,20 @@ __global__ void a_kernel(const uint32_t* go, uint32_t* ack_line) {
 
 __global__ void nop_kernel() {}
 
+// Fidelity probe (not part of any triple): mean latency of `iters` serial ld.acquire.sys loads of one word, in ns, from a
+// pinned host word (a PCIe round trip if the load really leaves the GPU) and from a device word (an L2 hit). If the two
+// agree, the stand-in W_s polls are being served from cache and g_a is understated.
+__global__ void probe_kernel(const uint32_t* addr, int iters, double* out_ns) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  uint32_t acc = 0;
+  for (int i = 0; i < 64; ++i) acc += ld_acquire_sys(addr);  // warm
+  const uint64_t t0 = globaltimer_ns();
+  for (int i = 0; i < iters; ++i) acc += ld_acquire_sys(addr);
+  const uint64_t t1 = globaltimer_ns();
+  out_ns[0] = (double)(t1 - t0) / iters;
+  out_ns[1] = (double)acc;  // keep the loads live
+}
+
 extern "C" {
 int launch_w(void* stream, const void* page, int p, void* go, int spin_ns) {
   w_kernel<<<1, 32, 0, (cudaStream_t)stream>>>((const uint32_t*)page, p, (uint32_t*)go, spin_ns);
@@ -65,6 +79,10 @@ int launch_w(void* stream, const void* page, int p, void* go, int spin_ns) {
 }
 int launch_a(void* stream, const void* go, void* ack_line) {
   a_kernel<<<1, 32, 0, (cudaStream_t)stream>>>((const uint32_t*)go, (uint32_t*)ack_line);
+  return (int)cudaGetLastError();
+}
+int launch_probe(void* stream, const void* addr, int iters, void* out) {
+  probe_kernel<<<1, 32, 0, (cudaStream_t)stream>>>((const uint32_t*)addr, iters, (double*)out);
   return (int)cudaGetLastError();
 }
 int launch_nop(void* stream) {
