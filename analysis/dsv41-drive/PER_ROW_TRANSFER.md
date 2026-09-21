@@ -16,28 +16,56 @@ by the precheck from existing traces. **[A]** an assumption I could not check. *
 
 ## 0. What this document concludes
 
-1. **The idea is worth building, but not as the plan specifies it.** Copying rows to the GPU while the drives are still
-   reading saves about **7.5% (random lane order) to 15% (best order) of a mirrors-on decode step [M]**, subject to
-   assumption A1. **About 87% of that comes from RAM-hit lanes**, which need no read at all and can be copied the
-   moment the service has reserved the request. Only about 13% (random order) needs a *miss* row to finish earlier
-   than a later one, which is what "per-row" specifically adds. Section 1.
-2. **What per-row transfer adds over a two-phase copy is at most 5.06 ms per step, 2.0% of the step** (best order, free
-   launches), and 2.55 ms (1.0%) if lane order is random. The plan's own measurement design resolves about 1.5%
-   (`task1e-PREDICTIONS.txt`). Per-row costs 4 extra stages per layer over two-phase, on all 40 layers (section 4.4).
-   **Recommendation: build the two-phase mechanism (V1) first; record per-row (V2) as expected-REJECTED and admit it
-   only if a measurement overturns the arithmetic in section 6.2.** The plan's gate permits exactly this
-   ("if launch/head-of-line cost cancels the benefit, retain [the simpler mechanism] and record Task 6 as rejected").
-3. **Head-of-line waiting cannot make per-row slower than batched in overlap terms** (section 2, closed form), only by its
-   launch and poll costs. It does cut the miss-row part of the benefit to zero when the slowest row is first in lane
-   order, and to half on average when lane order is unrelated to completion order. In this corpus **pack order equals
-   ordinal order in 100% of 1,888 requests with m >= 2 [M]**, so HOL did not bite here; drive tails are the case it
-   would.
-4. **The two hazards the task named are settled by construction, not by a new assumption.** A4 as written is not the
-   property that matters; the property is "reservation is all-or-nothing, so no lane's readiness waits on a lease of its
-   own request", plus stream order on one linear chain (section 5.2). The 9.2 cycle cannot form because the mechanism
-   uses no second stream, no event and no `wait_stream`.
-5. **I retract a claim I made to the team lead earlier: that Task 6 must overturn `LEASE_PROTOCOL` DECIDE 3.** It need
-   not, for the current synchronous service. The real edits are in section 9.
+**Read this paragraph and stop only if you must.** Per-row transfer, the mechanism the plan specifies, is **not
+justified over a hits-then-rest two-phase copy**. About 87% of the modelled saving is RAM-hit lanes being copied while
+the NVMe read runs; only about 13% needs miss rows to finish at different times, and that part (what per-row adds over
+two-phase) is at most **5.06 ms per decode step, 2.0%, and 2.55 ms, 1.0%, if lane order is random**: below the
+~1.5% the plan's own measurement design can resolve. **But neither saving is available today.** The device learns of
+readiness from one word, `demand_done`, which the service stores only after `read()` has returned and every row is
+packed (`pump_demand` after `handle_demand`; section 3.1). No per-lane or per-phase early signal exists. The 87% is an
+upper bound for a mechanism that **first requires a new early, device-visible, generation-tagged readiness word per hit
+lane** (Task 5's `RowResult`, published at *reservation* instead of at the end), which is also what makes the early
+copy safe (section 3.1). The comparison to make is therefore two-phase = one early publication of the hit lanes; per-row
+= that plus a per-row publication hook inside `read()`, a per-lane wait chain, a partial terminal mask and lane ordering.
+
+**One workload.** The precheck ran on seven traced arms that are one request stream replayed (20,800 requests, 7,211
+demands in each). Every statement of the form "the saving is X" below is about this stream and its routing pattern, not
+about EXL3 decode in general. A different cache size or routing skew changes the hit-lane count per read layer (A1) and
+`Sigma(m-1)` (the per-row-specific part).
+
+1. **The ceiling for THIS configuration is 19.2 ms/step (random order) to 38.6 ms/step (best order), 7.5% to 15% of a
+   257.5 ms mirrors-on step** [M, section 1]. DSV41_REFERENCE 18.3's 20.8 ms (<= 5.3%) was computed for a different
+   configuration (the older 391 ms/step arm, G = 121.2, 18.8 RAM misses per step, mirrors off). Please plan against these
+   figures and cite both; my BEST figure is uncorrected for 18.3's 74.5% alignment haircut, which is why it is twice
+   18.3's. (I first read 221 VRAM misses per step from the first two `graph_step` lines and told the team lead so; over
+   all 495 steps it averages **131 [post-hoc]**, which reconciles with 18.2's G = 121 rather than contradicting it.)
+2. **The result rests on A1** (hit lanes are spread evenly over the 40 layers), because the trace does not record lanes per
+   layer. The SUPPORT bar still holds down to about **37% of the modelled hit lanes, about 0.8 hit lanes per read layer**;
+   it fails only if hit lanes sit almost entirely in layers that read nothing. **[REQ 4]** asks for one instrumentation word
+   that removes the assumption.
+3. **Registered outcome: SUPPORT, and SPREAD-IRRELEVANT.** The pre-registered reject test asked whether miss-row spread was
+   large enough to matter. It was, but it was aimed at the wrong quantity: the saving does not come from the miss rows.
+   The classification and the redirect both came from the same run, and the redirect is the result.
+4. **The spread that exists is Task 4's artefact, not the drives'.** Miss rows become ready about 2.7 ms apart (schema 2,
+   traced) because `pack_one` packs one row per loop turn on one thread, and that exceeds `c` (about 1.1 ms). So Task 6's
+   premise, "later reads finish later", was partly a misattribution of the packing staircase. **A counter-intuitive
+   consequence: the better Task 4 gets (parallel packing, Task 7's raw rows), the smaller the miss-row spread and the
+   smaller the 13%, so per-row becomes less attractive, not more.** The hit-lane part does not move.
+5. **Head-of-line cannot make per-row slower than batched in overlap terms** (section 2, closed form), only by launch and
+   poll cost. It zeroes the miss-row part when the slowest row is first and halves it on average for random lane order.
+   In this corpus pack order equalled ordinal order in 100% of 1,888 requests with m >= 2 [post-hoc], so HOL did not bite;
+   it may be forced by `pack_one`'s tie-break, and drive tails would expose it.
+6. **A4 as written is not required, and here is what replaces it.** `LEASE_PROTOCOL` A4 says lane `j`'s acknowledgement
+   precedes the GPU's wait on lane `j+1`. Two facts make it hold, and the second is the one that matters: (a) stream order
+   on one linear captured chain (a checkable graph shape); (b) **reservation is all-or-nothing, so no lane's readiness
+   waits on any lease of its own request**. Section 5.2. The 9.2 cycle cannot form: no second stream, no event, no
+   `wait_stream`.
+7. **I retract my claim that Task 6 must overturn DECIDE 3** (section 9, REQ 3), and I state why: `serve()` reserves all
+   slots in one `mutex_` pass, `wanted` excludes every routed and needed expert from victim choice for the whole call,
+   and `read()` blocks the single service thread, so nothing evicts in that tier between reservation and return.
+   Lease-at-publication is safe for hit lanes as long as they are published before `serve()` returns.
+8. **Tracing was on in every trace used, and all seven are schema 2; no schema-3 graph-decode trace exists.** Traced
+   request durations are stretched, so the denominator is the untraced step time.
 
 ---
 
@@ -53,7 +81,7 @@ request stream (20,800 requests, 7,211 demands in each) replayed with different 
 agreement of the run and the drives, not seven workloads.
 
 Model: per request that reads `m >= 1` rows, `k` lanes (`k = round(vram_miss/40)` for its graph step, capped at 6 **[A1]**),
-`h = k - m` RAM-hit lanes ready at the service's `reserved` stamp **[A2]**, miss row `j` ready at its `row_pack_ns[j].end`,
+`h = k - m` RAM-hit lanes ready at the service's `reserved` stamp **[A2: this assumes an early readiness signal that does not exist today; section 3.1]**, miss row `j` ready at its `row_pack_ns[j].end`,
 lane copy time `c = 1.055 ms` (DSV41_REFERENCE 18.2's measured gather per row). Batched time `T_b = done + k*c`; per-row
 time is the chain `e = max(e, ready) + c`. Full definition in the pre-registration.
 
@@ -92,6 +120,7 @@ contradicted by the step budget.
 
 ### 1.4 What carries the result, and what would break it
 
+- **A2 (an early hit-lane signal exists) is not true of the current tree** (section 3.1); the numbers are an upper bound for the mechanism that adds it.
 - **A1 (hit lanes spread evenly over layers) carries it.** The trace records `vram_miss` per step and `layer_ram_rows`
   (RAM rows per layer), not lanes per layer. Robustness: the SUPPORT bar still holds down to about 37% of the modelled
   hit lanes (RANDOM = 2.55 miss-only + 16.7 hit part; the bar needs 8.7 ms), i.e. about 0.8 hit lanes per read layer.
@@ -164,6 +193,38 @@ missing row's extents are queued at once, each as one `io_uring_prep_read` of it
 returns**: `serve()` then sets `kReady`, calls `publish_map` for every row, and only `handle_demand` stores
 `demand_done`. The per-row stamps (`row_pack_ns`, `extent_cqe_ns`) exist in `StageRecord`; the per-row publication does
 not. The plan's Task 4 says the same ("Partial host row completion is not yet permission for an early GPU read").
+
+### 3.1 Is there an early device-visible readiness signal today? No, and the modelled saving needs one
+
+Checked against the source, because the precheck's A2 (hit lanes ready at the `reserved` stamp) silently assumes it:
+
+- The service stores `kDemandDone` in exactly one place, `RamTier::pump_demand`, **after** `handle_demand` returns, i.e.
+  after `serve()` has finished `RowReader::read()`, published every row and set the record status. (The other
+  `kDemandDone` uses are the open-time seed and the simulated device's wait.) The advisory word `kAdviseDone` is a different ring.
+- `exl3_ram_miss_wait_kernel` polls **only** that word (`ld_acquire_sys(page + kDemandDone)`), then reads the record status,
+  then translates through `slot_map`. It has no per-lane or per-phase input.
+- `slot_map` does not help: `publish_map` for newly read rows happens after `read()` too, and for a **hit** the map entry
+  already exists but carries no ownership: nothing tells the device the service will not evict it. That is the D2 race
+  (`LEASE_PROTOCOL` 10.2). An advisory in progress on the same tier evicts non-protected `kReady` rows and protects only
+  its own ids, so a device that gathered hits straight from the map during a read would be relying on the temporal
+  exclusion that early copying removes.
+
+So the early copy of hit lanes needs **a new signal for both reasons at once**: it is what lets the GPU start (performance)
+and it is what grants the lease that keeps the slot immutable (safety). The precheck's numbers bound the *opportunity*; they
+do not show it is reachable without that signal. What the signal is, concretely, and what it costs:
+
+| | Two-phase (V1) | Per-row (V2) |
+|---|---|---|
+| New mapped word | hit lanes' `RowResult.ready` (Task 5's word, tagged with `G56`), published in the reservation critical section of `serve()`, before `read()` | the same, plus one `RowResult.ready` per miss row |
+| New service code | publish hit lanes early | that, plus a callback from `pack_one` into publication (a per-row hook inside a blocking `read()`) |
+| New device code | stage wait polls the hit lanes' words; one more copy stage | `S` stage waits and a finalize with a partial mask |
+| Ordering / HOL problem | none among hit lanes (all ready at reservation); a wrong hint only delays | yes (section 2) |
+| Partial terminal mask | needed only if stage 2 fails after stage 1 copied (two lanes groups) | needed for every lane |
+
+Honest framing: not "two-phase gets 87% nearly free" but **two-phase gets about 87% of a modelled 7.5-15% for one early
+publication of the hit lanes, and per-row gets the remaining 13% for per-row publication, per-lane waits and ordering**. The
+gap in mechanism narrows; the gap in yield does not (the 13% is below what the gate can resolve). Task 5 as designed publishes
+every lane after all rows land (whole-request scope), so *when* the words are published is the Task 6 change, not the words.
 
 **Stale or wrong claims in nearby documents, found by reading (each also recorded for its owner):**
 
@@ -386,7 +447,7 @@ earlier gather": `keep` protects the *compute*; the per-stage `go` protects each
 
 **What must be true for per-row to beat the alternatives, written before anyone measures.**
 
-- **V1 beats V0' iff** enough hit lanes sit in read layers and the read wait outlasts their copy. Predicted gain
+- **V1 beats V0' iff** enough hit lanes sit in read layers and the read wait outlasts their copy. Predicted gain, **conditional on the early hit-lane signal of section 3.1 existing**,
   **20.8 ms/step (18.3's bound) to 38.6 ms/step (BEST)**, i.e. 8% to 15% of the step, before the costs in section 8.
   Falsified if the untraced tok/s ratio V1 / V0' has a 95% interval containing 1.0, or if the point estimate is below 3%.
 - **V2 beats V1 iff** the miss-row gain exceeds the extra stage cost. With `g` the fixed cost of one stage triple
@@ -461,11 +522,18 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
 
 - **Task 5 is the foundation and is not implemented.** Everything here assumes its `RowResult` / `LaneAck` / `Terminal`
   words, generations, leases and retirement. If Task 5 changes, section 5 changes.
-- **A failed demand today "publishes nothing unless every row landed"** (the comment above `serve()`; the
-  `packed`-gated publication is only for a cancelled advisory). With per-row publication, rows that packed whole before
-  a failure stay published as ordinary `kReady` rows under the usual eviction rules. That is safe (`pack_one` refuses to
-  publish a row whose bytes a drive did not deliver) but **it is a behaviour change** and any test pinning the old
-  behaviour needs updating.
+- **A failed demand today "publishes nothing unless every row landed"** (the comment above `serve()`, which arrived in
+  `ddcb0d55ff`, "make a row unpublishable unless its bytes were read"; pinned by
+  `test_a_failed_part_fails_the_row_and_never_leaves_a_half_packed_one` in `test_exl3_ram_miss_split.py`: "the tier releases
+  those slots and publishes nothing"). **This is a behaviour change in its own right, not a test update.** With per-row
+  publication, rows that packed whole before a failure stay published as ordinary `kReady` rows under the usual
+  eviction rules. Why that is acceptable: the guarantee's purpose, as its commit states it, is that **no row is published
+  whose bytes were not read**. That is now enforced per row and independently of request outcome, by `pack_one`'s coverage
+  check (`filled >= needed` fails the request rather than packing) and by `packed[ordinal]`; a cancelled advisory
+  already publishes its completed rows under exactly this rule, so the semantics exist and are accepted. What is
+  given up is a simpler statement ("a failed demand leaves the tier unchanged"); anything that relied on it (a test, a
+  counter such as `rows_read`, the `kVersion` bump on a failed request) needs an explicit look. I could not find another
+  consumer of the old guarantee by reading; that is not proof there is none.
 - **`kVersion`** must still bump once per request (Python's `NativePinnedSlotTable.expert_to_slot` rebuilds when it
   moves); do not bump per row.
 - **Task 8** sees longer-held hit leases (5.2). Its `lease_on_ready` / R3 window is unaffected.
@@ -527,8 +595,9 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
   exists but I did not run or read its result.
 - **[OPEN 4]** Whether stage waits should each poll one mapped word per lane or one per stage (a per-request "row ready" bitmask
   written by the service would cut poll reads; it is a second writer-owned word on the same line).
-- **[OPEN 5]** Whether V1's hit group needs to wait on `RowResult` at all when `h` is fixed at reservation; the wait exists
-  for the wrong-hint case and its cost on the common path is unmeasured.
+- **[OPEN 5]** (narrowed by section 3.1) V1's hit group must wait on the early `RowResult` words: they are the only device-visible
+  early signal and the lease grant. What is open is their cost on the common path (a poll round trip per hit stage) and
+  whether one phase-level word written after all hit lanes would cut it; it is a second word with the same single writer.
 
 **Decisions I made that the owner may overturn**
 
