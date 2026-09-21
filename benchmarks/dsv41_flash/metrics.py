@@ -62,15 +62,49 @@ def request_record(
     }
 
 
-def aggregate(requests: list, *, wall_s: float) -> dict:
-    """Throughput and latency percentiles over the measured requests.
+def block_spread(samples: list, blocks: int) -> dict:
+    """p50 and min of each of `blocks` consecutive slices of the samples, and their relative range.
 
-    tokens_per_s is completion tokens over the wall time of the whole window (first submit to last finish), so
-    prefill and any queueing count; decode_tok_s_mean is the per-request rate after the first token.
+    The within-arm spread: if the blocks of one arm disagree by more than the effect looked for, the window
+    cannot resolve it. Consecutive slices, so a slow drift shows up as spread.
+    """
+    if blocks < 2 or len(samples) < 2 * blocks:
+        return {
+            "blocks": 0,
+            "reason": f"{len(samples)} samples cannot fill {blocks} blocks",
+        }
+    size = len(samples) // blocks
+    parts = [samples[i * size : (i + 1) * size] for i in range(blocks)]
+    p50s, mins = [nearest_rank(b, 50) for b in parts], [min(b) for b in parts]
+
+    def rel(values: list) -> float:
+        return (max(values) - min(values)) / (sum(values) / len(values))
+
+    return {
+        "blocks": blocks,
+        "block_size": size,
+        "p50s": p50s,
+        "mins": mins,
+        "p50_rel_range": rel(p50s),
+        "min_rel_range": rel(mins),
+    }
+
+
+def aggregate(
+    requests: list, *, wall_s: float, discard_steps: int, blocks: int
+) -> dict:
+    """Throughput and per-token decode latency over the measured requests.
+
+    The first `discard_steps` steps of every request are dropped (the hot cache is still settling after prefill)
+    and the rest are pooled in request order. tokens_per_s is completion tokens over the whole window's wall
+    time, prefill included.
     """
     if not requests:
         raise ValueError("no measured requests")
-    steps = [s for r in requests if r["step_s"] for s in r["step_s"]]
+    steps = []
+    for r in requests:
+        if r["step_s"]:
+            steps += r["step_s"][discard_steps:]
     total_tokens = sum(r["completion_tokens"] for r in requests)
     return {
         "requests": len(requests),
@@ -78,9 +112,11 @@ def aggregate(requests: list, *, wall_s: float) -> dict:
         "wall_s": wall_s,
         "tokens_per_s": total_tokens / wall_s,
         "decode_tok_s_mean": sum(r["decode_tok_s"] for r in requests) / len(requests),
-        "e2e_s": summarize([r["e2e_s"] for r in requests]),
-        "ttft_s": summarize([r["ttft_s"] for r in requests]),
+        "e2e_s_mean": sum(r["e2e_s"] for r in requests) / len(requests),
+        "ttft_s_mean": sum(r["ttft_s"] for r in requests) / len(requests),
+        "discarded_steps_per_request": discard_steps,
         "step_s": summarize(steps),
+        "step_blocks": block_spread(steps, blocks),
         "multi_token_chunks": sum(r["multi_token_chunks"] or 0 for r in requests),
         "steps_unavailable": sum(1 for r in requests if r["step_unavailable"]),
     }

@@ -1,12 +1,12 @@
 # DeepSeek-V4.1-Flash: RAM-miss leases on vs off, end to end
 
 Serving-level A/B of `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES` through a real `sglang.Engine`: tokens/s, and
-p50/p95/p99 of per-token decode latency, time to first token and end-to-end request latency. The closest
+min/p50/p95/p99 of per-token decode latency. The closest
 existing thing is `analysis/dsv41-drive/open11/open11_serving_path.py`, which drives the real backend and the
 real switch but no Engine; this drives the whole server path.
 
 **Nothing here has been run against the model.** A real run loads the model, holds the whole card and ~80 GiB
-of host RAM for hours, and needs explicit approval. What was verified without loading it is in the hand-off
+of host RAM for many minutes per process, and needs explicit approval. What was verified without loading it is in the hand-off
 report: `--dry-run`, the import-path assertion, the paths, and `test_harness.py`.
 
 ## The GRAPH_GATHER trap
@@ -31,6 +31,12 @@ Do not read "both arms gave the same number" as a finding. Read `lease_check` in
 | `compare.py` | the comparison table over a directory of results |
 | `test_harness.py` | CPU tests, no Engine (`PYTHONPATH=$PWD/python python -m pytest benchmarks/dsv41_flash/test_harness.py`) |
 
+## Cost model: two loads, nothing more
+
+The model load (~70 GiB pinned host cache) dominates; decode tokens are cheap (~67 ms each). The switch is read once at
+service start, so two process launches is the floor, and it is the default: one `lease_off`, one `lease_on`, one
+repetition. Nothing is pre-planned beyond that. `--reps` (default 1) counts pairs.
+
 ## Launch
 
 On divix01, in `wt-dsv41` after `git pull --ff-only shared dsv41`:
@@ -40,33 +46,69 @@ cd /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41
 # rehearsal: prints every command and both resolved launches, asserts the EXL3 gate; no lock, no GPU
 taskset -c 0-63 env OMP_NUM_THREADS=16 PYTHONPATH=$PWD/python \
   /data/models/slang/.venv/bin/python benchmarks/dsv41_flash/run_ab.py --dry-run
-# the real thing (needs approval); every arm runs under gpu-run.sh, which takes cc-gpu.lock
+# the real thing (needs approval); each arm runs under gpu-run.sh, which takes cc-gpu.lock
 PYTHONPATH=$PWD/python /data/models/slang/.venv/bin/python benchmarks/dsv41_flash/run_ab.py \
-  --reps 3 --out-dir /data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-flash-bench/$(date -u +%Y%m%d)
+  --out-dir /data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-flash-bench/$(date -u +%Y%m%d)
 ```
 
 `run_ab.py` passes unknown flags to `bench_arm.py` (`--requests`, `--output-tokens`, ...). `PYTHONPATH` must name the
 tree under test: `/data/models/slang/.venv/bin/python` otherwise imports sglang from `main-port-probe-7bc4eb`, so
 `bench_arm.py` asserts `sglang.__file__` resolves under this repo and exits 2 (`REFUSED: ImportPathError`) if not.
-The per-arm command is `gpu-run.sh <python> bench_arm.py --arm {lease_off,lease_on} --rep N --out ...`; the recipe
-environment is set inside `bench_arm.py`, so it cannot drift between arms.
+The per-arm command is `gpu-run.sh <python> bench_arm.py --arm {lease_off,lease_on} --rep N --position P --out ...`;
+the recipe environment is set inside `bench_arm.py`, so it cannot drift between arms.
 
-Arm order alternates (off,on then on,off) across reps so host drift does not favour one arm. Every `.json.gz` holds
-the arm, the env that differs between arms (only the lease switch), the whole recipe env, the workload, the counters,
-`rows_read`, and every request's raw record including per-token step latencies, so any percentile can be recomputed.
+Each `.json.gz` holds the arm, the env that differs between arms (only the lease switch), the whole recipe env, the
+workload, all service counters, `rows_read`, the measured-window mix, and every request's raw record including every
+per-token step latency, so any percentile can be recomputed. `--position` records whether the process was first or
+second of its pair.
 
 ## What is measured
 
-- **Load**: closed loop, `--concurrency` requests in flight (default 1), `--warmup-requests` (default 4, not measured)
-  then `--requests` (default 16). Prompts are first turns of `sessions.jsonl` cut to exactly `--input-tokens` (256),
-  greedy, `ignore_eos`, `--output-tokens` (128). Both arms see the same prompts in the same order.
-- **Concurrency stays 1.** The EXL3 gate allows decode graphs at batch size 1 only, so a batch of two runs eagerly and
+- **Statistic: per-token decode latency**, the time between consecutive streamed chunks. One request of 896 tokens is
+  ~900 samples, so p50/p95/p99 cost seconds, not requests. Per-request percentiles are not computed: with two
+  requests they would be meaningless (e2e and TTFT appear as means only).
+- **Warmup discarded, and recorded**: one warmup request (`--warmup-requests 1`, 64 tokens) before the window, then
+  the first `--discard-steps` (30) steps of every measured request are dropped. The count is in
+  `summary.discarded_steps_per_request`.
+- **Default window**: 2 requests x 896 tokens, 256-token prompts, greedy, `ignore_eos`: 2 x (896 - 1 - 30) = 1730
+  per-token samples per arm, ~2 min at 67 ms. Both arms see the same prompts in the same order.
+- Reported: min, p50, p95, p99 and mean of step latency; tokens/s over the whole window (prefill included).
+- **Within-arm spread**: the samples are cut into `--blocks` (5) consecutive slices; `p50s`/`mins` of each slice and
+  their relative range are recorded. Consecutive, so a drift within the window shows up as spread.
+- **Concurrency stays 1**: the EXL3 gate allows decode graphs at batch size 1 only, so a batch of two runs eagerly and
   skips the lease path. `--concurrency 2` is refused unless `--allow-eager-batches`.
-- **tokens/s**: completion tokens over the wall time of the window (first submit to last finish), so prefill counts.
-  `decode_tok_s_mean` is the per-request rate after the first token.
-- **Decode step latency**: time between consecutive streamed chunks, per token, pooled over all measured requests
-  (`provenance.step_latency`). **e2e**: submit to last chunk. **TTFT**: submit to first chunk. Percentiles are
-  nearest-rank; with 16 requests the request-level p99 is the maximum, so trust the per-token p99 (~2000 samples).
+
+## The effect to resolve, and why 1730 tokens
+
+The lease cost is ~0.68 ms per 40-layer step on ~66.8 ms: about 1%. The standard error of a p50 over n samples is
+about 1.25 x sd / sqrt(n), so 1730 samples resolve 0.67 ms if the per-step sd is below roughly 8 ms; a run whose
+steps stall on RAM misses (sd of tens of ms) will not, and the block spread will say so. The main threat is
+cross-process variance (two processes, two loads), which is why `min` is reported beside p50: on the OPEN 11 re-take
+min-to-min and p50 agreed to 0.4 us on a quiet card and disagreed six-fold on a busy one. A p50 delta whose min-to-min
+delta disagrees in sign is box noise.
+
+## Decision rule: do not reflexively run three of everything
+
+Run the pair once. Then read the last lines of `comparison.md` (also `compare.py RUN_DIR`):
+
+- **Done** when `|p50 delta| >= 2 x within-arm spread` and the min-to-min delta has the same sign: the table prints
+  `decision: RESOLVED`. Two loads were enough.
+- **Otherwise** run one more pair with the order flipped, into the same directory:
+  `run_ab.py --rep-start 1 --out-dir <same dir>` (odd reps put `lease_on` first, so the order effect cancels), or a
+  longer window (`--output-tokens 1800`, context allows ~3800) if the block spread itself is large. Then decide again.
+- **Invalid** whatever the deltas, if the lease check failed (below). An identical number from both arms is the
+  symptom of a lease path that never ran, not a result.
+
+The 2x factor and the 5 blocks are judgment, not a statistical test; they are constants at the top of `compare.py`.
+
+## Hit/miss mix
+
+OPEN 11's arming cost falls on all-hit layers; the lease machinery exists for misses. So the window's mix is recorded:
+deltas of `served`, `touch_only`, `rows_read`, `evictions` over the measured window (`window.counters_delta` has every
+counter), `mix.layer_miss_fraction` (layer-steps with a demand RAM-miss row, over all layer-steps), and a label:
+`all-hit` (< 1%), `all-miss` (> 90%), else `mixed`. The cut-offs are arbitrary; the fraction is what to read. An
+all-hit or all-miss window measures a different regime from steady-state serving, and `compare.py` says so. If the two
+arms' fractions differ by more than 5 points it warns, because then they did different work.
 
 ## How the lease path is proven to have run
 
@@ -86,15 +128,9 @@ recorded: the trace snapshots per batch, not per step boundary, so a nonzero fin
 weaker than in `open11`.
 
 **The trace is on in both arms**, so the service also takes stage timestamps and the scheduler writes a JSON line per
-decode step. That is symmetric, small next to a step of hundreds of ms, and unmeasured. `--no-trace` removes it and
+decode step. That is symmetric between the arms so it cancels in the delta, but its cost per step is unmeasured, and it adds
+to the step time the 1% is taken against. `--no-trace` removes it and
 the verification with it.
-
-## Effect size
-
-`open11_serving_path.py` measured about 8 us per all-hit layer for lease mode, ~0.32 ms per 40-layer step. Streamed
-decode in the Sept 19 corpus runs took 300-450 ms per token, so an all-hit overhead is ~0.1% of a step and will not
-show in tokens/s. Anything larger has to come from misses. `compare.py` prints each metric's rep-to-rep spread next
-to the delta and says whether the delta is inside it; believe the delta only where it is not.
 
 ## Fixed choices, and where they come from
 

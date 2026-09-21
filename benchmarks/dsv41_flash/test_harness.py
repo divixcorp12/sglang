@@ -118,7 +118,15 @@ def _cursor(tmp_path, snapshots):
     path = tmp_path / "trace.jsonl"
     path.write_text(
         "".join(
-            json.dumps({"kind": "graph_step", "ram_miss": 3, "thread": s}) + "\n"
+            json.dumps(
+                {
+                    "kind": "graph_step",
+                    "ram_miss": 3,
+                    "layer_ram_rows": [3, 0],
+                    "thread": s,
+                }
+            )
+            + "\n"
             for s in snapshots
         )
     )
@@ -191,33 +199,87 @@ class _Clock:
         return self.now
 
 
-def test_the_driver_reports_per_token_and_per_request_latency():
+def test_the_driver_discards_warmup_steps_and_reports_per_token_latency():
     clock = _Clock()
 
     async def generate(**kwargs):
         return _FakeStream(kwargs["sampling_params"]["max_new_tokens"], 0.5, clock)
 
-    prompts = [{"input_ids": [1, 2, 3]} for _ in range(4)]
+    prompts = [{"input_ids": [1, 2, 3]} for _ in range(2)]
     records, wall = asyncio.run(
         workload.run_closed_loop(
             generate,
             prompts=prompts,
-            params=workload.sampling_params(output_tokens=8),
+            params=workload.sampling_params(output_tokens=41),
             concurrency=1,
             clock=clock,
         )
     )
-    summary = metrics.aggregate(records, wall_s=wall)
+    summary = metrics.aggregate(records, wall_s=wall, discard_steps=30, blocks=2)
+    # 40 steps per request, the first 30 dropped from each
+    assert summary["step_s"]["n"] == 20 and summary["step_s"]["min"] == 0.5
     assert (
-        wall == 16.0
-        and summary["completion_tokens"] == 32
-        and summary["tokens_per_s"] == 2.0
+        summary["discarded_steps_per_request"] == 30
+        and summary["tokens_per_s"] == 82 / 41.0
     )
-    assert (
-        summary["e2e_s"]["p99"] == 4.0
-        and summary["step_s"]["p50"] == 0.5
-        and summary["step_s"]["n"] == 28
+
+
+def test_block_spread_sees_a_drift_that_a_pooled_percentile_hides():
+    drifting = [1.0] * 50 + [1.1] * 50
+    assert metrics.block_spread(drifting, 2)["p50_rel_range"] == pytest.approx(
+        0.1 / 1.05
     )
+    assert metrics.block_spread([1.0] * 9, 5)["blocks"] == 0
+
+
+def test_the_window_mix_tells_all_hit_from_mixed():
+    def win(missed):
+        delta = dict.fromkeys(counters.MIX_KEYS, 0)
+        return {
+            "graph_steps": 10,
+            "layer_steps": 400,
+            "layer_steps_missed": missed,
+            "demand_rows": missed,
+            "counters_delta": delta,
+        }
+
+    assert counters.mix(win(0))["label"] == "all-hit"
+    assert counters.mix(win(100))["label"] == "mixed"
+    assert counters.mix(win(399))["label"] == "all-miss"
+
+
+def _run(arm, p50, mn, spread, ok=True):
+    return {
+        "arm": arm,
+        "rep": 0,
+        "position": 0,
+        "lease_check": {"ok": ok, "reasons": [] if ok else ["leases_granted == 0"]},
+        "summary": {
+            "step_s": {"p50": p50, "min": mn, "n": 1700},
+            "step_blocks": {"p50_rel_range": spread},
+            "tokens_per_s": 1.0,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "on_p50, on_min, spread, verdict",
+    [
+        (0.0675, 0.0605, 0.002, "RESOLVED"),  # +1% p50 and min, spread 0.2%
+        (
+            0.0675,
+            0.0605,
+            0.02,
+            "NOT RESOLVED. |p50 delta|",
+        ),  # same delta buried in 2% spread
+        (0.0675, 0.0590, 0.002, "disagree in sign"),  # p50 up, min down: box noise
+    ],
+)
+def test_the_second_pair_decision_rule(on_p50, on_min, spread, verdict):
+    off = _run("lease_off", 0.0668, 0.0600, spread)
+    on = _run("lease_on", on_p50, on_min, spread)
+    text = "\n".join(compare.decision({"lease_off": [off], "lease_on": [on]}))
+    assert verdict in text
 
 
 def test_compare_flags_an_unverified_lease_run():

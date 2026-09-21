@@ -24,6 +24,8 @@ class TraceCursor:
         self.offset = 0
         self.graph_steps = 0
         self.demand_rows = 0
+        self.layer_steps = 0
+        self.layer_steps_missed = 0
         self.snapshots: list[dict] = []
         self._partial = ""
 
@@ -43,6 +45,10 @@ class TraceCursor:
             if row.get("kind") == "graph_step":
                 self.graph_steps += 1
                 self.demand_rows += row["ram_miss"]
+                self.layer_steps += len(row["layer_ram_rows"])
+                self.layer_steps_missed += sum(
+                    1 for v in row["layer_ram_rows"] if v > 0
+                )
                 if "thread" in row:
                     self.snapshots.append(row["thread"])
         return self
@@ -53,6 +59,8 @@ class TraceCursor:
         return {
             "graph_steps": self.graph_steps,
             "demand_rows": self.demand_rows,
+            "layer_steps": self.layer_steps,
+            "layer_steps_missed": self.layer_steps_missed,
             "counters": dict(self.snapshots[-1]) if self.snapshots else None,
             "snapshots": len(self.snapshots),
         }
@@ -66,7 +74,38 @@ def window(start: dict, end: dict) -> dict:
     return {
         "graph_steps": end["graph_steps"] - start["graph_steps"],
         "demand_rows": end["demand_rows"] - start["demand_rows"],
+        "layer_steps": end["layer_steps"] - start["layer_steps"],
+        "layer_steps_missed": end["layer_steps_missed"] - start["layer_steps_missed"],
         "counters_delta": delta,
+    }
+
+
+# Arbitrary cut-offs; the fraction itself is recorded, the label only orients a reader.
+ALL_HIT_BELOW = 0.01
+ALL_MISS_ABOVE = 0.90
+MIX_KEYS = ("served", "touch_only", "rows_read", "evictions")
+
+
+def mix(win: dict) -> dict:
+    """The hit/miss mix of a window: OPEN 11's arming cost falls on all-hit layers, leases exist for misses."""
+    if win["layer_steps"] == 0:
+        return {"label": "unknown", "reason": "no graph step in the window"}
+    fraction = win["layer_steps_missed"] / win["layer_steps"]
+    label = (
+        "all-hit"
+        if fraction < ALL_HIT_BELOW
+        else "all-miss"
+        if fraction > ALL_MISS_ABOVE
+        else "mixed"
+    )
+    delta = win["counters_delta"] or {}
+    return {
+        "label": label,
+        "layer_steps": win["layer_steps"],
+        "layer_miss_fraction": fraction,
+        "demand_rows": win["demand_rows"],
+        "demand_rows_per_graph_step": win["demand_rows"] / win["graph_steps"],
+        "counters": {k: delta.get(k) for k in MIX_KEYS},
     }
 
 

@@ -1,10 +1,11 @@
 """Run both arms of the RAM-miss lease benchmark, as separate processes under gpu-run.sh, N repetitions, and compare.
 
-    PYTHONPATH=$PWD/python python benchmarks/dsv41_flash/run_ab.py --reps 3 --out-dir RUNS/2026-09-22
+    PYTHONPATH=$PWD/python python benchmarks/dsv41_flash/run_ab.py --out-dir RUNS/2026-09-22
     python benchmarks/dsv41_flash/run_ab.py --dry-run
 
-Arms alternate off/on then on/off across repetitions, so a drift in host state (page cache, drive wear) does not
-favour one arm. Each process holds cc-gpu.lock via gpu-run.sh for its whole life. --dry-run prints the commands
+One repetition is two processes, the minimum (the lease switch is read once at service start). A second pair is
+decided after reading the first pair's table, not planned: rerun with --rep-start 1 into the same --out-dir; the
+pair's order flips on odd reps, so the order effect cancels. Each process holds cc-gpu.lock via gpu-run.sh for its whole life. --dry-run prints the commands
 and runs bench_arm.py --dry-run under taskset -c 0-63: no lock, no GPU, no Engine.
 """
 
@@ -32,7 +33,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         + "\nAny other flag (workload, resources) is passed through to bench_arm.py.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--reps", type=int, default=3)
+    p.add_argument(
+        "--reps",
+        type=int,
+        default=1,
+        help="pairs of processes; more only after reading the first pair",
+    )
+    p.add_argument(
+        "--rep-start",
+        type=int,
+        default=0,
+        help="index of the first rep, so a later pair joins an earlier out-dir",
+    )
     p.add_argument(
         "--out-dir",
         default=None,
@@ -63,17 +75,18 @@ def child_env() -> dict:
     }
 
 
-def arm_order(reps: int, first: str) -> list[tuple[int, str]]:
+def arm_order(reps: int, first: str, start: int = 0) -> list[tuple[int, str, int]]:
+    """(rep, arm, position in its pair); the pair's order flips every rep."""
     second = next(a for a in ac.ARMS if a != first)
-    return [
-        (rep, arm)
-        for rep in range(reps)
-        for arm in ((first, second) if rep % 2 == 0 else (second, first))
-    ]
+    out = []
+    for rep in range(start, start + reps):
+        pair = (first, second) if rep % 2 == 0 else (second, first)
+        out += [(rep, arm, position) for position, arm in enumerate(pair)]
+    return out
 
 
 def arm_command(
-    args, *, arm: str, rep: int, out_dir: Path, passthrough: list[str]
+    args, *, arm: str, rep: int, position: int, out_dir: Path, passthrough: list[str]
 ) -> list[str]:
     out = out_dir / f"{arm}_rep{rep}.json.gz"
     return [
@@ -84,6 +97,8 @@ def arm_command(
         arm,
         "--rep",
         str(rep),
+        "--position",
+        str(position),
         "--out",
         str(out),
         "--gpu-run",
@@ -96,13 +111,18 @@ def main(argv=None) -> int:
     args, passthrough = parse_args(argv)
     env = child_env()
     if args.dry_run:
-        plan = arm_order(args.reps, args.first_arm)
+        plan = arm_order(args.reps, args.first_arm, args.rep_start)
         out_dir = Path(args.out_dir or "dsv41_flash_runs/<stamp>")
-        for rep, arm in plan:
+        for rep, arm, position in plan:
             print(
                 shlex.join(
                     arm_command(
-                        args, arm=arm, rep=rep, out_dir=out_dir, passthrough=passthrough
+                        args,
+                        arm=arm,
+                        rep=rep,
+                        position=position,
+                        out_dir=out_dir,
+                        passthrough=passthrough,
                     )
                 )
             )
@@ -123,9 +143,14 @@ def main(argv=None) -> int:
     out_dir = Path(args.out_dir or f"dsv41_flash_runs/{stamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
     codes = []
-    for rep, arm in arm_order(args.reps, args.first_arm):
+    for rep, arm, position in arm_order(args.reps, args.first_arm, args.rep_start):
         cmd = arm_command(
-            args, arm=arm, rep=rep, out_dir=out_dir, passthrough=passthrough
+            args,
+            arm=arm,
+            rep=rep,
+            position=position,
+            out_dir=out_dir,
+            passthrough=passthrough,
         )
         print(
             f"\n[{datetime.datetime.now().isoformat(timespec='seconds')}] {shlex.join(cmd)}",

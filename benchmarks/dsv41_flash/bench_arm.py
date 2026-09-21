@@ -44,6 +44,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--rep", type=int, default=0, help="repetition index, recorded in the result"
     )
+    p.add_argument(
+        "--position",
+        type=int,
+        default=0,
+        help="0 if this arm's process is the first of its pair, 1 if the second (order effect)",
+    )
     w = p.add_argument_group("workload (recorded in the result)")
     w.add_argument(
         "--concurrency",
@@ -51,10 +57,28 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=1,
         help="requests in flight; >1 needs --allow-eager-batches",
     )
-    w.add_argument("--warmup-requests", type=int, default=4)
-    w.add_argument("--requests", type=int, default=16, help="measured requests")
+    w.add_argument("--warmup-requests", type=int, default=1)
+    w.add_argument("--warmup-output-tokens", type=int, default=64)
+    w.add_argument("--requests", type=int, default=2, help="measured requests")
     w.add_argument("--input-tokens", type=int, default=256)
-    w.add_argument("--output-tokens", type=int, default=128)
+    w.add_argument(
+        "--output-tokens",
+        type=int,
+        default=896,
+        help="per measured request; 2 x (896 - 1 - discard) ~ 1730 per-token samples",
+    )
+    w.add_argument(
+        "--discard-steps",
+        type=int,
+        default=30,
+        help="first decode steps of every measured request left out of the statistics",
+    )
+    w.add_argument(
+        "--blocks",
+        type=int,
+        default=5,
+        help="consecutive slices of the samples, for the within-arm spread",
+    )
     w.add_argument(
         "--skip",
         type=int,
@@ -114,6 +138,9 @@ def workload_record(args: argparse.Namespace) -> dict:
     return {
         "concurrency": args.concurrency,
         "warmup_requests": args.warmup_requests,
+        "warmup_output_tokens": args.warmup_output_tokens,
+        "discard_steps": args.discard_steps,
+        "blocks": args.blocks,
         "measured_requests": args.requests,
         "input_tokens": args.input_tokens,
         "output_tokens": args.output_tokens,
@@ -125,7 +152,24 @@ def workload_record(args: argparse.Namespace) -> dict:
     }
 
 
+MIN_SAMPLES_PER_BLOCK = 20
+
+
+def check_workload(args: argparse.Namespace) -> None:
+    if args.input_tokens + args.output_tokens > args.context_length:
+        raise ValueError(
+            f"{args.input_tokens} + {args.output_tokens} tokens exceed --context-length {args.context_length}"
+        )
+    samples = args.requests * (args.output_tokens - 1 - args.discard_steps)
+    if samples < args.blocks * MIN_SAMPLES_PER_BLOCK:
+        raise ValueError(
+            f"{samples} per-token samples after discarding {args.discard_steps} steps per request cannot fill "
+            f"{args.blocks} blocks of {MIN_SAMPLES_PER_BLOCK}"
+        )
+
+
 def resolve_arms(args: argparse.Namespace) -> dict:
+    check_workload(args)
     paths, res = build_config(args)
     kwargs = ac.engine_kwargs(paths=paths, res=res)
     arms = ac.ARMS if args.arm == "both" else (args.arm,)
@@ -255,7 +299,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
         env = {**env, ac.TRACE_ENV: trace_path}
     os.environ.update(env)
 
-    from counters import TraceCursor, verify_lease, window
+    from counters import TraceCursor, mix, verify_lease, window
     from metrics import aggregate
     from transformers import AutoTokenizer
     from workload import run_closed_loop, sampling_params, select_prompts
@@ -273,6 +317,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
     )
     warm, measured = prompts[: args.warmup_requests], prompts[args.warmup_requests :]
     params = sampling_params(output_tokens=args.output_tokens)
+    warm_params = sampling_params(output_tokens=args.warmup_output_tokens)
     prov = prov_mod.capture({"bench_arm": os.path.abspath(__file__)})
     prov["drive_idle_check"] = prov_mod.drive_idle_check()
 
@@ -280,6 +325,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
         "schema": 1,
         "arm": arm,
         "rep": args.rep,
+        "position": args.position,
         "lease_switch": {"name": ac.LEASE_ENV, "value": env[ac.LEASE_ENV]},
         "env_arm": env,
         "env_differs_between_arms": ac.env_diff(
@@ -305,23 +351,28 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
     result["provenance"] = prov
     marks = {}
     try:
-        run = lambda batch: engine.loop.run_until_complete(  # noqa: E731
+        run = lambda batch, sp: engine.loop.run_until_complete(  # noqa: E731
             run_closed_loop(
                 engine.async_generate,
                 prompts=batch,
-                params=params,
+                params=sp,
                 concurrency=args.concurrency,
             )
         )
-        warm_records, _ = run(warm) if warm else ([], 0.0)
+        warm_records, _ = run(warm, warm_params) if warm else ([], 0.0)
         result["warmup"] = [
             {k: v for k, v in r.items() if k != "step_s"} for r in warm_records
         ]
         marks["start"] = cursor.mark() if cursor else None
-        records, wall_s = run(measured)
+        records, wall_s = run(measured, params)
         time.sleep(2.0)
         marks["end"] = cursor.mark() if cursor else None
-        result["summary"] = aggregate(records, wall_s=wall_s)
+        result["summary"] = aggregate(
+            records,
+            wall_s=wall_s,
+            discard_steps=args.discard_steps,
+            blocks=args.blocks,
+        )
         result["requests"] = records
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -336,6 +387,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
             result["window"] = window(marks["start"], marks["end"])
             delta = result["window"]["counters_delta"]
             result["rows_read_window"] = None if delta is None else delta["rows_read"]
+            result["mix"] = mix(result["window"])
         result["rows_read_total"] = (
             result["counters_final"]["rows_read"] if result["counters_final"] else None
         )
