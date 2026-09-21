@@ -153,7 +153,7 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 >
 > **Mirrors-on moves the bottleneck onto the packer**, which is the finding that matters for what comes next. The read window shrinks from 15.3 ms to 6.0 ms at p50 while packing stays at 5.6-5.7 ms per request, so packing covers 18% of the read window with mirrors off and **49-54% with mirrors on**; rows that waited on the packer go from **0 of 4332 to 104-112 of 4332**. Note that 74% of served requests are single-row and cannot overlap within a request at all, which is a property of the blocking-per-request design rather than a defect.
 >
-> **Two independent analyses converge on this number.** Task 6's precheck, working from the same corpus for a different purpose, found that miss-row completion spread is dominated by serial packing at ~2.7 ms per row -- the same quantity as the exposed tail here. So the packing tail IS the row spread that Task 6 was designed to exploit, and **parallelising packing would shrink Task 4's exposed tail and Task 6's remaining benefit at the same time**. That makes the unchecked packing-worker item below the highest-value remaining work in this task.
+> **Two independent analyses converge on this number, in the mirrors-on regime only.** Task 6's precheck, working from the same corpus for a different purpose, found that miss-row completion spread is 2.77 ms with mirrors on -- the same quantity as the exposed tail here, and the basis for calling that spread serial packing. **With mirrors off the spread is 7.4 ms and drive-bound**, so the convergence is a property of the mirrors-on regime, not a general fact about where row spread comes from. Earlier text in this plan, and the commit message that introduced these figures, stated it without that qualifier; the commit cannot be amended, so this correction lives here and in `analysis/dsv41-drive/STORAGE_V2_REPORT.md`. So the packing tail IS the row spread that Task 6 was designed to exploit, and **parallelising packing would shrink Task 4's exposed tail and Task 6's remaining benefit at the same time**. That makes the unchecked packing-worker item below the highest-value remaining work in this task.
 
 ## Task 5: Implement and test source leases and device acknowledgements
 
@@ -190,14 +190,29 @@ Include expert identity in the immutable row result and validate it against the 
 > assumption, no partial terminal mask and no head-of-line problem. Prefer it
 > unless a measurement shows otherwise.
 >
-> Two further corrections from the same analysis: the measured miss-row spread
-> is **Task 4's serial packing** (~2.7 ms per row), not drive completion order,
-> so this task's premise was partly a misattribution of a Task 4 artefact -- and
-> parallelising packing would shrink the 13% further, making per-row *less*
-> attractive as Task 4 improves. The caveat that carries the result is that hit
+> Two further corrections from the same analysis: **with mirrors on** the
+> measured miss-row spread is **Task 4's serial packing** (2.77 ms, against ~2.7
+> ms per row of packing), not drive completion order, so this task's premise was
+> partly a misattribution of a Task 4 artefact -- and parallelising packing would
+> shrink the 13% further, making per-row *less* attractive as Task 4 improves.
+> **With mirrors off the spread is 7.4 ms and is drive-bound**, so the
+> misattribution claim holds only in the regime this system actually runs in, and
+> must not be restated as a general one. The precheck's modelled saving is the
+> same either way. The caveat that carries the result is that hit
 > lanes are assumed to spread evenly over layers; the traces do not record lanes
 > per layer, so an instrumentation item is requested to record the planned lane
 > count per request.
+>
+> **OPEN CHALLENGE, not yet answered.** The 87% figure assumes the hit-lane
+> gather can start while the NVMe read is still outstanding. The device's only
+> visible readiness signal today is `demand_done`, which the host stores *after*
+> `read()` returns. If no earlier device-visible signal exists, the hit phase
+> cannot begin until the read has already finished and **the 87% saving does not
+> exist as modelled** -- for the two-phase mechanism as well as for per-row,
+> since both depend on the same early start. This was raised against the
+> precheck and is awaiting an answer; until it is resolved, treat every figure in
+> this blockquote as conditional on an early signal that has not been shown to
+> exist.
 
 **Chosen first mechanism:** Retain the existing SM-driven host gather and one graph stream. Capture a fixed number of lane operations determined by plan capacity. Each active lane waits for its own generation-qualified readiness, copies only that row to its reserved GPU destination, then acknowledges source consumption. Inactive lanes are no-ops. All lane copies precede one fused MoE invocation.
 
