@@ -310,17 +310,33 @@ Include expert identity in the immutable row result and validate it against the 
 >
 >    That margin is `k`-free, so **no lane measurement can settle it**, and it
 >    turns on a per-stage cost `g` of 8-14 us that **has never been measured**.
->    By this section's own arithmetic the crossing is at **`g` = 6.96 us**
->    (net = 4.93 - 160g against a bar of 0.015 x 254.4 = 3.82 ms) -- **less than
->    1 us below the assumed range**, not the "around 5 us" an earlier revision
->    carried from `PER_ROW_TRANSFER.md` §5.6. So the verdict rests on an
->    unmeasured parameter whose crossing sits immediately next to the assumed
->    value. The label further survives only because the real resolution is
->    *worse* than 1.5% (the series is UNRESOLVED on the contended box) -- i.e. on
->    the weakness of the instrument, not the strength of the result.
->    **Measuring `g` is the cheapest open item that could overturn a standing
->    verdict in this plan**, and the §5.6 derivation of "about 5 us" should be
->    re-checked when it is.
+>    The crossing is at **`g` = 6.98 us if every extra triple is exposed**
+>    (net = 4.93 - 159.55g against a bar of 0.015 x 254.4 = 3.82 ms), and at
+>    **`g` = 8.03 us** once the triples that hide are removed -- **which puts it
+>    inside the assumed 8-14 us range, at its low end** (`c0fc397738`). The
+>    plan's flat "160 x g" drops two conditions. **Exposure:** of 159.55 extra
+>    triples per step, 85.10 are empty tail stages, 48.93 are extra active stages
+>    in layers that read nothing and 4.65 are extra miss-row stages -- all always
+>    exposed -- while **20.86 hit-lane stages in read layers hide behind the read
+>    wait**. **Empty is not active:** an empty triple is three launches and no
+>    host read; an active one pays poll round trips, an ack fence and the copy
+>    path. They must be measured separately.
+>
+>    **`g` cannot settle this alone, and that is the more important finding.**
+>    The gross 4.93 is proportional to `c`, which is **unmeasured for this path**,
+>    and a 10% error in `c` moves the crossing by about 3 us (2.4 us at c = 0.90;
+>    12.7 us at c = 1.25). **If `g` lands between about 4 and 10 us -- where it is
+>    expected to -- `c` decides the verdict more than `g` does.** So this plan
+>    should stop calling `g` the cheapest item that could overturn the label.
+>    **The binding unmeasured quantity is `c`.**
+>
+>    The "about 5 us" an earlier revision carried from `PER_ROW_TRANSFER.md` §5.6
+>    **cannot be derived from §5.6's own inputs** and its origin is unknown;
+>    `g*` is 6.7-8.0 us at a 1.5% bar across every plausible gross figure and
+>    denominator. Do not reuse it. The label further survives only because the
+>    real resolution is *worse* than 1.5% (the series is UNRESOLVED on the
+>    contended box) -- i.e. on the weakness of the instrument, not the strength
+>    of the result.
 > 3. **Neither mechanism's saving exists today.** Both need an early,
 >    device-visible readiness signal. None exists: `kDemandDone` is stored in
 >    exactly one place, `RamTier::pump_demand`, *after* `handle_demand` returns,
