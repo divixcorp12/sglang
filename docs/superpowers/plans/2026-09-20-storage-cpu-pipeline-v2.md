@@ -777,6 +777,27 @@ This is explicitly separate from demand delivery, but must be implemented before
 | GDS | Proven native platform support, fallback detection, inclusive RAM-cache policy | End-to-end gain and acceptable cache behavior |
 | Alternate-root failover/content refresh | Completion-safe retry buffers; immutable manifest/identity validation for refreshed mirrors | Fault recovery without mixed/stale checkpoint bytes |
 
+**THE GPU QUEUE AS OF 2026-09-21, and it does NOT share one blocker.** Five
+measurements are now waiting on hardware, and treating them as one queue behind
+"a quiet box" would mis-schedule all of them. They need three different things:
+
+| Waiting measurement | What it actually needs | Why |
+|---|---|---|
+| **`c`** (per-row copy cost) | A physical core with **both SMT siblings** under the frozen 10% gate | A microbenchmark; per-core contention enters it directly. NOT MEASURED 2026-09-21 -- no such core exists while the user's ~21-22 cores of permanent load run |
+| **Sibling pilot** (`--reps 40`, staged and hashed) | The same, briefly | Settles whether SMT-sibling load enters the measured interval **for this instrument**; a "not in T" verdict would bear on the two Gate clauses as well. Two aborts, both from lane-coordination errors, neither from the instrument |
+| **Gate clause 1** (A1vA0, A2vA1, A2vA0) | Unknown -- **unresolved, see Task 6** | End-to-end decode, so possibly tolerant of a noisier box; but its verdict turns on a **0.1-0.4 point** net margin |
+| **Gate clause 4** (`g`) | The same as `c` | Crossing at 6.98-8.03 us: microbenchmark territory |
+| **Barrier ordering test** (`SHUTDOWN_WIRING_REVIEW.md`) | **A GPU, not a quiet one** | Asserts an *ordering* (free happens only after a spin kernel completes), not a small timing difference. Poisoned slab + skip-barrier mutant; also exercises the real `cudaHostUnregister`. **Queued behind F1/F2** -- running it first would test code already known to be wrong |
+| **NVMe pack-worker comparison** (`PACK_WORKERS.md`) | **Quiet DRIVES, not quiet cores** | Pre-registered: command, coordination, diskstats, success at `c=4` across two consecutive runs. The existing comparison used buffered `/dev/shm`, so this is what closes the Task 4 box |
+
+**Two are schedulable in conditions the others are not** -- the barrier test needs
+only a GPU, and the NVMe comparison needs drives rather than cores. **One cannot
+be settled by any run on this box at all:** the review's F2 (a helper thread
+starting on CUDA device 0 rather than inheriting the scheduler's device) is
+unobservable on a single-GPU machine, and its only instrument is a unit test
+recording the `device` argument. Reaching for hardware there would produce a
+green result meaning nothing.
+
 | Task 3 placement measurements (storage alone, SM transfer alone, simultaneous) | Designed in `TOPOLOGY.md` 9.A-9.C. Needs the GPU lock **and** a quiet box; a contended box invalidates them as surely as a busy GPU | Deferred: this task's gate was to choose placement for Task 4, which is already implemented, so the measurement is retrospective |
 | Registered bounce (`READ_FIXED`) in the native service | One iovec covers 100% of extents because the bounce is a single allocation, so the fallback rate is zero by construction; registration measured at 59.9 ms (THP) / 106.6 ms (4 KiB) for 256 MiB | Deferred until a Task 4 timeline shows the owner thread saturated. Registration is not mandatory merely because it exists |
 | `SINGLE_ISSUER` / `DEFER_TASKRUN` in the native service | **Measured negative, already recorded.** A probe shows a `DEFER_TASKRUN` ring reveals a deferred completion only through `io_uring_get_events()`, `submit_and_wait(1)` or `TASKRUN_FLAG` — never `submit(0)`, which is the path `reap()` takes whenever a packed row is ready | Rejected for now: adopting it would starve storage credit while rows pack. `IOPOLL` is unexercisable (`poll_queues=0`); `SQPOLL` untried |
