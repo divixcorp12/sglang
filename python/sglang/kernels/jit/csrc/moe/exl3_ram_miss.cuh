@@ -244,9 +244,10 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   }
   state[kPosted] = static_cast<int32_t>(seq);
   uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
-  // Lease mode arms every request that has planned lanes, not only those with a miss: the service leases RAM hits too
-  // (7.2), and it reads a request's lanes only when the record is armed. An unarmed request with lanes would be copied
-  // from slots nobody leased.
+  // Lease mode arms every request that has planned lanes, not only those with a miss (LEASE_PROTOCOL.md section 15:
+  // the all-hit handshake is where the lease is granted, so an unarmed record is reachable only for count == 0). The
+  // service leases RAM hits too (7.2) and reads a request's lanes only when the record is armed; an unarmed request
+  // with lanes would be copied from slots nobody leased. The extra service round trip per layer is unmeasured (OPEN 11).
   const bool armed = need_count > 0 || advise != 0 || (lease != nullptr && planned_count > 0);
   const uint32_t lanes = static_cast<uint32_t>(max(count[0], 0));  // the plan's lanes, unclamped
   if (lease != nullptr) {
