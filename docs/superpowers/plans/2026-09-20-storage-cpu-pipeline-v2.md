@@ -267,7 +267,22 @@ Include expert identity in the immutable row result and validate it against the 
 > this first):
 > 1. The mechanism this plan originally specified -- fixed-order per-row -- is
 >    **expected-REJECTED by arithmetic**, and is about **15.7 ms/step *worse***
->    than the two-phase alternative.
+>    than the two-phase alternative. **Read that label precisely** (`d22af00980`):
+>    the rejection is decisive at *random* lane order, where per-row loses
+>    outright by 15.67 ms and where measured `k` strengthened it by 2.6 ms. At
+>    *best* order it is **thin and does not follow from arithmetic alone**: the
+>    gross increment is +4.93 ms, and net of V2's 160 extra stage triples per step
+>    it is about +2.7 to +3.6 ms, **1.1-1.4% against a 1.5% resolution -- a margin
+>    of 0.1 to 0.4 points**. That margin is `k`-free, so no lane measurement can
+>    settle it, and it turns on a stage cost of 8-14 us that **has never been
+>    measured**: at about 5 us or below, best-order per-row would clear the bar
+>    instead. The honest statement is *not distinguishable from V1 at best order,
+>    losing outright at random order*. What saves the label is that the real
+>    resolution is worse than 1.5% (the series is UNRESOLVED on the contended
+>    box), which favours rejection -- i.e. the label survives on the weakness of
+>    our instrument, not on the strength of the result.
+>    **Measuring the per-stage cost would settle this**, and is the cheapest
+>    open item that could overturn a standing verdict.
 > 2. **Two-phase (hits, then the rest) is the chosen mechanism.** It is
 >    **supported by the modelled ceiling as an upper bound, and not yet
 >    measured**; per-row is retained below only as the variant that must beat it.
@@ -293,6 +308,14 @@ Include expert identity in the immutable row result and validate it against the 
 >    that link, and any of them running inside a read wait subtracts directly from
 >    the hiding. **Task 6 arms must run with promotions off**, and must say so, or
 >    they measure the link contention rather than the mechanism.
+>
+> **The pre-registered GENEROUS reject test is `k`-free and did not reject**
+> (`d22af00980`). It tests early transfer *as a whole*, not per-row against
+> two-phase, and it fixes `k` = 6 for every reading request, so no lane estimate
+> enters it and the measurement could not move it. Rescaled to 511 steps it is
+> **73.0 ms/step, 28.7% of 254.4 ms, against a 1.5% (3.8 ms) reject threshold --
+> about 19x margin**. Early transfer is not in doubt; only the choice of
+> mechanism is.
 >
 > **CURRENT FIGURES.** Per **511** decode steps, shares of **254.4 ms**. These
 > supersede every figure in the audit trail below, which records how they moved
