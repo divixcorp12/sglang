@@ -2379,3 +2379,68 @@ real `cudaHostUnregister` (the tier tests use `device="cpu"`); that every teardo
 and the gate sits outside the method the tests drive); the two GPU-only doorbell tests that call the real method
 (`test_expert_doorbell_copier.py`, lines 1519 and 1543) skip without a GPU and were not run with the block present; a
 multi-rank teardown.
+
+### 20.2k R3: retirement between the reader's batches (7.5, call site 2): HELD, with its mutation ledger
+
+The change: `serve()`'s abandon callback calls `retire_leases()` before it decides whether to give up. One added call in
+`exl3_ram_miss_host.cpp`; `serve`, `pump_demand`, `pump_advice`, `handle_demand` and `RowReader` are otherwise untouched.
+The call is idempotent (a per-lane state machine), never blocks, and cannot touch the request in service (its own
+leases are granted after publication). Cost: a null check and a relaxed atomic load of `lanes_outstanding_` come before
+any lock, so a turn with no lease outstanding adds one load and a branch; `mutex_` (which `serve` does not hold while
+reading) is taken only when a lease is outstanding.
+
+**Test** (`test_exl3_ram_miss_lease_thread.py`, run inline and with two pack workers): request 1's lease is
+acknowledged while request 2 is asleep in the injected delay before its read; request 2 then reads and stalls before
+`demand_done`. Nothing else retires in that stall, so `leases_acked` reaching 1 while `demand_done` has not advanced,
+after `rows_read` moved, can only come from inside the read. The counter is read before `demand_done`, so a mutant's late
+move cannot pass by racing. A second test (`test_exl3_ram_miss_lease_service.py`) repeats retirement with another lease
+still outstanding, because with nothing outstanding retirement returns at once and would hide a lane released twice.
+
+Baseline 25 of 25 collected and passed before each run; every reported run executed all collected tests.
+
+| Mutant | Result | Killed by |
+|---|---|---|
+| D1 no retirement inside the read (only at the top of `pump_demand`) | KILLED 2 | the in-read test, both modes, at the assertion "the lease was retired only after the request had finished" |
+| D2 the callback retires only for advisories | KILLED 2 | the same, both modes |
+| D3 the callback retires only from the second batch on | KILLED 2 | the same, both modes (a one-row read calls the callback once, at batch 0) |
+| D4 a released lane keeps its state | KILLED 6 of 17 (service file alone) | five earlier tests and the new idempotence test |
+
+**D4 is not a clean number.** Run together with the thread tests, D4 makes the service thread throw `lease underflow`,
+which aborts the process: the run has no summary and the driver correctly scored it INVALID. It was scored on the
+service file alone (17 collected), where the failures are exceptions from `pump()`. The new idempotence test was first
+written without a second outstanding lease and did NOT kill D4: the early return on `lanes_outstanding_ == 0` hid a
+lane released twice. **The optimisation that makes the per-turn call cheap and the blind spot of the first test are the
+same line of code.** It was rewritten with another lease held and then killed D4.
+
+**Not established.** The worker-mode behaviour is exercised only through `pack_workers=2` on a one-row read: the callback
+was not shown to be evaluated on packing turns, only that the counter moves during the read in both modes. The fault
+that slows packing (`pack_delay_ns`) is not reachable from the service, so a multi-batch read with retirement between
+batches was not built. The cost of the added call while a lease IS outstanding was not measured: each such evaluation takes `mutex_` and
+scans up to 16 entries, on a loop that polls in worker mode. With none outstanding it is one relaxed load and a branch
+(read from the code, not measured). Box 5 ("keeps reaping") is not ticked here.
+
+**Second-reviewer findings (`RETIRE_IN_READ_REVIEW.md`), accepted.** The change has no consumer today (see the commit
+body): the test proves the call exists and runs at read start, not that it runs between batches, because a one-batch read
+has no between. D1-D3 are one test's worth of assurance (the same test in two modes), not three. The reviewer predicted a
+flake from asserting `rows_read` after polling for the counter; the assertion was redundant (the done stall already
+proves nothing else retires) and was removed. The reviewer's suggested replacement, `busy_since_ns() != 0`, was tried
+and FAILED every run: `busy_since` is cleared at the end of `handle_demand`, before the stall. The test then passed 8
+of 8 repeated runs and D1-D3 were killed again on the same assertion. Advisory-path retirement between rows has no test:
+a delay before the read can only place an acknowledgement before the first call, which the top-of-loop retire also
+covers, and the fault that slows individual rows is not reachable from the service.
+
+**Decision: HELD, not landed (team-lead, on the second reviewer's finding).** Recorded here so it is not rediscovered.
+1. **The Task 6 dependency.** No consumer exists today. A demand is one batch, so the callback runs once at batch 0,
+   microseconds after `pump_demand`'s own retire; the only observable effect is that `leases_acked` moves earlier. The
+   rationale (a long read holding an already-acknowledged lease) is what V2's per-row transfer creates, and it is not built.
+2. **The blocker for a test that would make it meaningful.** It needs a multi-batch read, and the fault that slows
+   individual rows (`pack_delay_ns`, in `ReadFault`) is not reachable from the service's own reader: `RamTier::inject`
+   takes only a delay before the read, a read failure, a demand count and an abandon count. Exposing a per-row delay on the
+   service's reader is the first thing to do when Task 6 picks this up, and it is worth more than the one-line diff.
+3. **The flake, fixed in the held package.** The first test asserted `rows_read == rows_before + 1` after a 2 ms poll saw
+   the acknowledgement; the retire happens at read start and `rows_read` increments at publication, so a poll landing
+   inside the read fails it. The assertion was redundant and is removed. The suggested replacement,
+   `busy_since_ns() != 0`, is WRONG and must not be reintroduced: `busy_since` is cleared at the end of `handle_demand`,
+   before the done stall, and the test failed 6 of 6 runs with it. Without either, 8 of 8 repeated runs pass and D1-D3 are
+   killed again on the same assertion.
+The patch is kept at `analysis/dsv41-drive/held/R3_retire_in_read.diff` (applies on `bcfe378f0d`).
