@@ -526,5 +526,35 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 - [ ] Timeline proves each claimed overlap independently: I/O/packing for Task 4; I/O/GPU transfer for Task 6.
 - [ ] Matched unprofiled runs report tokens/s, p50/p95/p99 step latency, sample counts/variation, traffic, cache misses, CPU cost, pinned/VRAM footprint, and promotion stalls.
 - [ ] Original workload and numerical behavior remain unchanged; cache-capacity differences are disclosed.
-- [ ] An independent reviewer checks ownership transitions and evidence after each structural milestone. No approval based solely on checklist completion.
+> **PROCESS FINDING, 2026-09-21: eight checks in this project were found unable
+> to fail.** `pack_one`'s `filled >= needed` coverage check; the generation gate
+> (printed `GENERATION unknown` then `VALID`, exit 0, and the arm preflight never
+> read the manifest); `PROMOTION_ASYNC` §11.2's M0 test (could fail only because
+> a list has no `.tolist()`); `test_a_failed_read_publishes_none_of_the_rows_it_
+> had_already_packed` (injects `fail_reads`, which short-circuits before
+> `reader_.read()`, so no row ever packs); a `kLease*` agreement test that scans
+> and matches nothing; `PROMOTION_ASYNC` §11.2a's Priority bullet (drives a
+> Python model of the service, so it tests the model against itself); and its
+> ring-full and byte-cap tests (fake events complete instantly, so the ring never
+> fills and the gauge never rises).
+>
+> **Root cause, in the words of the author who found three of them in his own
+> document:** *each specified an assertion without first asking what an incorrect
+> implementation would do to it.* Several were unfailable **as specified**,
+> before any code existed -- so this is a defect in how tests are designed, not
+> in how they are written.
+>
+> **RULE for the remainder of this plan: write the mutant first.** Before a test
+> is accepted as evidence for any gate here, name the specific change to
+> production code it must fail against, and show it failing. A test whose
+> failure mode is an `AttributeError`, an empty scan, or a fixture that cannot
+> reach the state its name describes is not evidence. This applies to tests
+> *specified* in design documents, not only to tests already written.
+>
+> Related, same day and same shape: an arm disqualified by the acceptance gates
+> (`task1-6`, INVALID) was nonetheless inside the step-time denominator of every
+> percentage in the Task 6 analysis. A gate that does not remove its subject from
+> downstream use is the same defect one level up.
+
+- [ ] An independent reviewer checks ownership transitions and evidence after each structural milestone. **Strengthened by the process finding below: a reviewer must check that each cited test can fail, not merely that it passes.** No approval based solely on checklist completion.
 - [ ] Final report names accepted, rejected, and deferred work. Storage overlap is not labeled a fully asynchronous inference pipeline while Task 8 remains blocking.
