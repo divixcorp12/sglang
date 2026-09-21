@@ -952,6 +952,26 @@ This is explicitly separate from demand delivery, but must be implemented before
 | GDS | Proven native platform support, fallback detection, inclusive RAM-cache policy | End-to-end gain and acceptable cache behavior |
 | Alternate-root failover/content refresh | Completion-safe retry buffers; immutable manifest/identity validation for refreshed mirrors | Fault recovery without mixed/stale checkpoint bytes |
 
+**BOX CONDITIONS CHANGED 2026-09-21 12:26 -- the gate below is now satisfiable.**
+For the whole of this session no physical core had both SMT siblings under the
+frozen 10% gate, which is half of why `c` is NOT MEASURED. Measured now
+(`mpstat -P ALL 5 1` under `taskset -c 0-63`): **33 of 36 physical cores have both
+siblings under 10%** (cpu0+cpu36 at 5.0/0.8, cpu2+cpu38 at 1.4/1.0, and so on);
+load average is **2.09**, down from 60.46 an hour earlier; the GPU is at 63 MiB and
+P8 with no compute apps; `cc-gpu.lock` is free. One core is saturated (cpu43 at
+100%) and cpu31/cpu20 sit at 23.3/14.2, so the gate is satisfiable but not
+universal -- pick the core, do not assume it.
+
+**This retires only the first of `c`'s two blockers.** The other stands: the
+in-force harness would have crashed at `--check-only`. `c` being over-determined
+was the finding; one of the two determinants has lifted, and the measurement is not
+unblocked until the harness one has too.
+
+**It does NOT unblock the barrier ordering test.** That is queued behind F1/F2, not
+behind hardware: F1 is a live defect in landed code, so a run now would test code
+already known to be wrong, and F2 is unobservable on a single-GPU machine by any
+run at all. A free GPU changes neither.
+
 **THE GPU QUEUE AS OF 2026-09-21, and it does NOT share one blocker.** Five
 measurements are now waiting on hardware, and treating them as one queue behind
 "a quiet box" would mis-schedule all of them. They need three different things:
