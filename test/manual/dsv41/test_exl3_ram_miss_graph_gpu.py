@@ -22,17 +22,17 @@ REL_BOUND = 1.2e-2  # the probe's bar (D7), against the fp32 reference
 LOOSE_BOUND = 2.5e-2  # graph vs loop (Task 9)
 
 
-def _source_rows(tmp_path):
-    """Every expert's streamed rows, read afresh from the checkpoint."""
+def _source_rows(tmp_path, layer_id=0):
+    """Every expert's streamed rows of one layer, read afresh from the checkpoint."""
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 
     layout = build_exl3_expert_layout(str(tmp_path))
-    fmt = Exl3ExpertFormat(layout, 0, direct=False)
+    fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
     specs = {spec.name: spec for spec in fmt.tensor_specs(None)}
     source = {name: torch.empty((EXPERTS,) + spec.row_shape, dtype=spec.dtype) for name, spec in specs.items()}
-    Exl3ShardRowSource.for_layer(layout, 0, fmt.segment_map(), direct=False).read(
+    Exl3ShardRowSource.for_layer(layout, layer_id, fmt.segment_map(), direct=False).read(
         torch.arange(EXPERTS, dtype=torch.long), source
     )
     return source
@@ -66,7 +66,7 @@ def _rel(y, ref):
     return float((y.float() - ref.float()).norm() / ref.float().norm())
 
 
-def _layers(tmp_path, timeout_ms=2000, lease=False):
+def _layers(tmp_path, timeout_ms=2000, lease=False, num_layers=1):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -75,7 +75,7 @@ def _layers(tmp_path, timeout_ms=2000, lease=False):
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
-    write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
+    write_fake_exl3(str(tmp_path), num_layers=num_layers, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     with (
@@ -86,25 +86,47 @@ def _layers(tmp_path, timeout_ms=2000, lease=False):
         # Read once, when the service starts (ensure_started, inside attach): the switch under test.
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(lease),
     ):
-        layer = torch.nn.Module()
-        layer.layer_id = 0
-        layer.top_k = TOP_K
-        fmt = Exl3ExpertFormat(layout, 0, direct=False)
-        streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
-        layer._nvfp4_expert_streamer = streamer
-        pinned = ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))
-        hot = ExpertHotCache(streamer, 3, scratch_rows=TOP_K)
-        hot.reassign([0, 1, 2])
-        streamer.enable_graph_gather(TOP_K)
+        pairs, hots = [], []
+        # Every pinned tier registers before the service starts, and a tier built after it is refused.
+        for layer_id in range(num_layers):
+            layer = torch.nn.Module()
+            layer.layer_id = layer_id
+            layer.top_k = TOP_K
+            fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
+            streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
+            layer._nvfp4_expert_streamer = streamer
+            ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))
+            pairs.append((layer, streamer))
+        for layer, streamer in pairs:
+            hot = ExpertHotCache(streamer, 3, scratch_rows=TOP_K)
+            hot.reassign([0, 1, 2])
+            streamer.enable_graph_gather(TOP_K)
+            hots.append(hot)
         checks = []
-        manager = type("M", (), {"register_fail_stop_check": lambda self, f: checks.append(f), "add_residency_listener": lambda self, f: f(0, list(hot.slot_to_expert))})()
-        fmt.attach_hot_cache_manager(manager, streamer)
+
+        def add_residency_listener(self, listener):
+            for layer_id, hot in enumerate(hots):
+                listener(layer_id, list(hot.slot_to_expert))
+
+        manager = type(
+            "M",
+            (),
+            {"register_fail_stop_check": lambda self, f: checks.append(f), "add_residency_listener": add_residency_listener},
+        )()
+        for _, streamer in pairs:
+            streamer.format.attach_hot_cache_manager(manager, streamer)
     service = service_module.Exl3RamMissService.get()
     assert service.lease_mode is lease and (service.device_side.lease_block is not None) is lease
-    return layer, streamer, service, checks
+    if num_layers == 1:
+        return (*pairs[0], service, checks)  # the shape every single-layer test unpacks
+    return pairs, service, checks
 
 
 LEASES = pytest.mark.parametrize("lease", [False, True], ids=["leases_off", "leases_on"])
+# The demand ring and the lease lanes are 16 deep (kDemandRecords, kLeaseRing): 4 layers fit, and 20 wrap them
+# inside one replay, as the 40+ streamed layers of a real decode step do.
+LAYER_COUNTS = pytest.mark.parametrize("layers", [4, 20], ids=["layers_4", "layers_20"])
+REPLAY_STEPS = 4
 
 
 @LEASES
@@ -249,6 +271,155 @@ def test_lease_mode_output_is_byte_exact_against_off(tmp_path):
     on, on_counters = _replayed_outputs(tmp_path / "on", True, routes)
     for n, (a, b) in enumerate(zip(off, on)):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"replay {n} differs"
+    assert off_counters["leases_granted"] == 0
+    assert on_counters["leases_granted"] > 0 and on_counters["leases_voided"] == 0, on_counters
+
+
+def _step_route(layer_id, step):
+    """Two VRAM-hot experts (0, 1) and four from the 13 others, walked around a cycle 4 further each step.
+
+    The pinned tier holds 8 rows: 3 hot and 5 evictable. The 4 experts of a step are never among the 5 most
+    recently loaded, so every layer misses RAM at every step, and the hot rows plus the route (7) fit the tier.
+    """
+    others = [3 + (4 * step + 3 * layer_id + i) % (EXPERTS - 3) for i in range(4)]
+    return [others[0], 0, others[1], others[2], 1, others[3]]
+
+
+def _capture_layers(pairs, seed):
+    """Per-layer inputs; one eager pass, then every layer's ``_apply_graph`` captured into ONE graph in layer order."""
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    inputs = []
+    for layer_id in range(len(pairs)):
+        x = (torch.randn((1, HIDDEN), generator=gen) * 0.5).to("cuda", torch.bfloat16)
+        weights = torch.softmax(torch.randn((1, TOP_K), generator=gen), -1).cuda()
+        ids = torch.tensor([_step_route(layer_id, -1)], device="cuda", dtype=torch.int32)
+        inputs.append((x, weights, ids))
+
+    def run():
+        return [
+            Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+            for (layer, streamer), (x, weights, ids) in zip(pairs, inputs)
+        ]
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = run()
+    return inputs, graph, outs
+
+
+def _replay_step(pairs, service, inputs, graph, step, checks):
+    """Replay every layer on routes that miss its pinned tier; each layer's misses must be read and none dropped."""
+    expected = []
+    for layer_id, (_, streamer) in enumerate(pairs):
+        hot, tier = streamer.hot_cache.slot_to_expert, streamer.pinned_host_cache._lru
+        missing = [e for e in _step_route(layer_id, step) if e not in hot and e not in tier]
+        # A layer with nothing to read would post an all-hit request and leave the RAM-miss path unexercised.
+        assert missing, (layer_id, step)
+        expected.append(len(missing))
+    before = service.host.layer_rows()
+    for layer_id, (_, _, ids) in enumerate(inputs):
+        ids.copy_(torch.tensor([_step_route(layer_id, step)], device="cuda", dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+    for layer_id, (_, streamer) in enumerate(pairs):
+        assert streamer.row_backend.keep.item() == 1.0, (layer_id, step, service.host.counters(), service.host.fatal_seq())
+        assert streamer.row_backend.ram_miss.item() == 0, (layer_id, step)
+    for check in checks:
+        check()
+
+    def served():
+        rows = service.host.layer_rows()
+        return [rows[service.row_of(n)] - before[service.row_of(n)] for n in range(len(pairs))]
+
+    deadline = time.perf_counter() + 10.0
+    while time.perf_counter() < deadline and served() != expected:
+        time.sleep(0.005)
+    assert served() == expected, (step, served(), expected, service.host.counters())
+
+
+def _assert_service_healthy(service):
+    counters = service.host.counters()
+    assert service.host.fatal_seq() == 0, counters
+    for name in ("overruns", "read_errors", "no_victim", "late_after_terminal", "late_after_fatal", "leases_voided", "lease_double_signal"):
+        assert counters[name] == 0, (name, counters)
+
+
+@LAYER_COUNTS
+@LEASES
+def test_many_layers_in_one_replay_are_served(tmp_path, lease, layers):
+    """Every layer of one graph posts its own RAM-miss request per replay, and each layer's output is right."""
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    pairs, service, checks = _layers(tmp_path, lease=lease, num_layers=layers)
+    sources = [_source_rows(tmp_path, layer_id) for layer_id in range(layers)]
+    try:
+        inputs, graph, outs = _capture_layers(pairs, seed=5)
+        for step in range(REPLAY_STEPS):
+            _replay_step(pairs, service, inputs, graph, step, checks)
+            for layer_id, ((layer, streamer), (x, weights, ids), out) in enumerate(zip(pairs, inputs, outs)):
+                route = _step_route(layer_id, step)
+                got = out.float().clone()
+                # As in the single-layer test: an eager call repeats the replay bit for bit, so its gather names
+                # the replay's slots. Here they must also hold this layer's rows, not a neighbour's.
+                assert torch.equal(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT).float(), got), (layer_id, step)
+                remap, tensors = streamer.gather(ids)
+                slots = remap.reshape(-1).tolist()
+                for k, expert in enumerate(route):
+                    for name, rows in tensors.items():
+                        assert torch.equal(rows[slots[k]].cpu(), sources[layer_id][name][expert]), (layer_id, step, k, expert, name)
+                ref = _reference(x, weights.reshape(-1), remap.reshape(-1), tensors)
+                loop = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids.long(), ACT_LIMIT)
+                rel, rel_loop, rel_graph_loop = _rel(got, ref), _rel(loop, ref), _rel(got, loop)
+                assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (layer_id, step, route, rel, rel_loop)
+                assert rel_graph_loop <= LOOSE_BOUND, (layer_id, step, route, rel_graph_loop)
+        if lease:
+            def retired():
+                c = service.host.counters()
+                return c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]
+
+            deadline = time.perf_counter() + 10.0
+            while time.perf_counter() < deadline and not retired():
+                time.sleep(0.005)
+            assert retired(), service.host.counters()
+            for layer_id in range(layers):
+                assert all(info[2] == 0 for info in service.host.slot_info(service.row_of(layer_id))), f"layer {layer_id} has a leased slot"
+        else:
+            assert service.host.counters()["leases_granted"] == 0
+        _assert_service_healthy(service)
+    finally:
+        service.shutdown()
+
+
+def _replayed_layer_outputs(tmp_path, lease, num_layers):
+    """Capture ``num_layers`` layers in one graph and replay every step; each replay's output bytes per layer."""
+    pairs, service, checks = _layers(tmp_path, lease=lease, num_layers=num_layers)
+    try:
+        inputs, graph, outs = _capture_layers(pairs, seed=11)
+        outputs = []
+        for step in range(REPLAY_STEPS):
+            _replay_step(pairs, service, inputs, graph, step, checks)
+            outputs.append([out.clone() for out in outs])
+        _assert_service_healthy(service)
+        return outputs, service.host.counters()
+    finally:
+        service.shutdown()
+        service_module = sys.modules["sglang.srt.layers.moe.exl3_ram_miss"]
+        service_module.Exl3RamMissService._instance = None
+
+
+@LAYER_COUNTS
+def test_lease_mode_multi_layer_graph_is_byte_exact_against_off(tmp_path, layers):
+    """Same weights, same routes: with leases on, every layer of a many-post graph returns off's very bytes."""
+    (tmp_path / "off").mkdir()
+    (tmp_path / "on").mkdir()
+    off, off_counters = _replayed_layer_outputs(tmp_path / "off", False, layers)
+    on, on_counters = _replayed_layer_outputs(tmp_path / "on", True, layers)
+    for step, (off_step, on_step) in enumerate(zip(off, on)):
+        for layer_id, (a, b) in enumerate(zip(off_step, on_step)):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"replay {step} layer {layer_id} differs"
     assert off_counters["leases_granted"] == 0
     assert on_counters["leases_granted"] > 0 and on_counters["leases_voided"] == 0, on_counters
 
