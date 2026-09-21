@@ -1089,6 +1089,35 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > and run pristine baselines for every file group rather than inferring from
 > pass counts matching file test counts.
 >
+> **(k) A LATENT DEFECT IN LANDED CODE, HARMLESS ONLY BECAUSE THE CODE IS
+> UNREACHABLE -- and the "no production caller" finding is what protects us.**
+> Independent review of the proposed `Scheduler.release_host_resources()`
+> wiring (`SHUTDOWN_WIRING_REVIEW.md`) found that `Exl3RamMissService.shutdown()`
+> -- **already landed** in step 6 -- decides `uncertain` **before** `host.stop()`
+> runs and never updates it. So a `stop()` that raises after a clean barrier
+> takes the **free** branch, while the service thread may still be writing into
+> those slabs through raw addresses.
+>
+> **It cannot bite today only because nothing calls it.** The exit hook passes
+> `at_exit=True` and quarantines unconditionally; tests are the only other
+> caller. The reachability finding that looked like step 6's weakness -- *no
+> production caller* -- is currently the thing standing between this defect and
+> production. Wiring the call without fixing it would have made that path
+> **strictly worse than not wiring**, which is the opposite of the fail-safe
+> argument the wiring was approved on (by me, from reading, and wrong).
+>
+> **Two consequences worth generalising:**
+> - **"Unreachable" is not "correct".** Step 6's 13 mutants, its 302/302 run and
+>   two rounds of review all passed over this, because none of them asked what
+>   happens when a *late* step fails after an *early* decision has been taken.
+>   A decision computed before the operations it describes is a shape worth
+>   grepping for.
+> - **A reviewer with no stake found it by reading the same code its author and
+>   I had both read.** Neither of us was careless; we were both inside the
+>   argument. That is the case for an independent reader on any change that
+>   makes something production-reachable for the first time -- which this would
+>   have been, and which nothing else landed this session was.
+>
 > **(e) OUR OWN MEASUREMENT HARNESS, caught by the same rule.** The `c`
 > harness -- gated, hashed and amended five times over a day -- carried two
 > defects that only the first real GPU launch exposed: `RealDevice._plan` used a
