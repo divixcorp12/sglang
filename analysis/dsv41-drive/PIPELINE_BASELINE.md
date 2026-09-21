@@ -394,6 +394,8 @@ So "matched" here means matched in workload, seed, capacity, policy and code. It
    (`task1-results/GENERATIONS.txt`, section 4, with the observed refusal). It was advisory before: an unknown tree printed `GENERATION unknown` and
    the arm was still `VALID`. The id names `python/` only, so it does not catch a change to the harness (`scripts/dsv41/provenance.py` changed at `c87b8dc181`);
    compare the harness commit as well.
+   And a re-run of an old generation's code is not a reproduction: the gate needs `EXPECT_NEW` at or after `9d5bfc184b`, so it runs a newer harness than the original arm did
+   (`task1-results/GENERATIONS.txt`, section 3). Say "a new arm at an old tree", not "repeated".
 8. **The gates below were calibrated for a quiet box and are wrong for this one** (task1e, `task1-results/task1e-RESULT.txt`). Register the gates for the
    machine you actually have **before** the series, not during it; task1e needed two amendments and still ended UNRESOLVED (2 valid arms).
    - *CONTENDED* disqualifies every arm when reth-binary, nimbus_beacon_node, htop and tmux are running on cores 32-63, as they were in all three task1e
