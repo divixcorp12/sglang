@@ -56,7 +56,7 @@ LAUNCHES_PER_CELL = 200
 WARMUP_LAUNCHES = 20
 PASSES = 5
 SLEEP_US = 600
-IDLE_DRIVE_MAX_GBS = 0.02          # an idle-arm cell during which the NVMe devices moved more than this (reads + writes) is contaminated: rho's baseline. The user's services live on /data (LVM root), not on these drives.
+IDLE_DRIVE_MAX_GBS = 0.02          # an idle-arm cell during which the WATCHED NVMe devices (those holding the mirror roots and the source checkpoint) moved more than this (reads + writes) is contaminated: rho's baseline. The user's services live on /data (LVM root), not on these drives; other NVMe devices (nvme1) are recorded, not judged.
 MAX_ATTEMPTS = 3                   # a visit that fails an ENVIRONMENTAL check is re-run in place up to this many times; every attempt is logged to retries.jsonl
 ENV_FOREIGN_PCT = 10.0             # the frozen per-core gate's threshold, applied to a single visit for the retry decision
 LOAD_FOREIGN_IO_MAX = 0.10         # in a load cell, drive bytes beyond the reader's own may not exceed 10% of the reader's bytes
@@ -118,19 +118,30 @@ def node_cpus(node):
 
 # ------------------------------------------------------------------------------------------------- box conditions
 
+_SIB_CACHE = {}
+def thread_siblings(cpu):
+    """The logical CPUs sharing a physical core with `cpu` (including itself), from /sys/devices/system/cpu/cpuN/topology/thread_siblings_list.
+    SMT is active on this box (2 threads per core): a logical CPU is half a physical core, so 'the cores the run uses' are physical cores."""
+    if cpu not in _SIB_CACHE:
+        try: _SIB_CACHE[cpu] = tuple(_parse_cpus(Path("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list" % cpu).read_text().strip()))
+        except OSError: _SIB_CACHE[cpu] = (cpu,)
+    return _SIB_CACHE[cpu]
+
 class ForeignLoad:
     """Foreign CPU use on the cores WE use, over one window, from /proc/stat (cheap, so it can run around every visit).
 
     busy(core) = user + nice + system ticks (irq, softirq, steal, iowait and idle are NOT busy, so the interrupt time of our own NVMe and GPU
     traffic is not counted against us). foreign(core) = busy(core) minus the ticks of our own threads (the harness, the reader), each own thread's
     ticks attributed to the core it was on at the end of the window (split with the core it was on at the start if it moved).
-    Returns (worst, where): the largest per-core foreign percentage of one core over `cores`. RESOLUTION: ticks are 10 ms; a core with fewer than
+    Returns (worst, where): the largest per-core foreign percentage of one core over the cores WE USED in the window (own threads on it for >= USED_FRACTION of the
+    window; all of `cores` when we had no presence). RESOLUTION: ticks are 10 ms; a core with fewer than
     MIN_TICKS foreign ticks in the window is reported as at most 9.9%, because one or two ticks in a window of 100-200 ms are not evidence of 10%.
     `last["box_foreign_cores"]` is the same quantity summed over every CPU, in cores. It still contains kernel worker threads that carry our I/O
     (system time), so it is an upper bound on foreign load, which makes the box-drift gate conservative."""
     MIN_TICKS = 3
-    def __init__(self, own_pids, cores):
-        self.own = set(own_pids); self.cores = set(cores); self.hz = os.sysconf("SC_CLK_TCK")
+    USED_FRACTION = 0.10          # a core counts as USED by us if our own threads ran on it for at least this fraction of the window
+    def __init__(self, own_pids, cores, siblings=thread_siblings):
+        self.own = set(own_pids); self.cores = set(cores); self.hz = os.sysconf("SC_CLK_TCK"); self.siblings = siblings
     def add_own(self, pid): self.own.add(pid)
     last = {}
     def _cpu(self):
@@ -160,11 +171,18 @@ class ForeignLoad:
         foreign = {c: max(0.0, (b[c] - self.a.get(c, b[c])) - own_c.get(c, 0.0)) for c in b}
         box = sum(foreign.values()) / self.hz / dt
         self.last = {"box_foreign_cores": box, "top": [], "loadavg": Path("/proc/loadavg").read_text().split()[:3], "window_s": dt}
-        mine = {c: foreign[c] for c in foreign if c in self.cores}
+        # the cores the run USES in this window: those where our own threads accrued at least USED_FRACTION of the window; a spare core of the allowed mask on
+        # which we did nothing cannot contend with us for CPU. With no own presence at all (a plain survey) every core of the set counts.
+        used = {c for c in self.cores if own_c.get(c, 0.0) >= self.USED_FRACTION * self.hz * dt}
+        if not used and own_c: used = {c for c in own_c if c in self.cores}
+        # SMT: a used logical CPU is half of a physical core, so the foreign CPU on its thread sibling counts against the same gate (summed over the pair)
+        def phys(c): return sum(foreign.get(x, 0.0) for x in self.siblings(c) if x in foreign)
+        mine = {c: phys(c) for c in (used or self.cores) if c in foreign}
+        self.last["used_cores"] = sorted(used); self.last["sibling_foreign_ticks"] = {c: round(phys(c) - foreign.get(c, 0.0), 1) for c in mine}
         if not mine: return (0.0, "")
         c = max(mine, key=mine.get); ticks = mine[c]; pct = 100.0 * ticks / self.hz / dt
         if ticks < self.MIN_TICKS: pct = min(pct, 9.9)
-        return (pct, "cpu%d: %.1f foreign ticks in %.2f s" % (c, ticks, dt))
+        return (pct, "cpu%d+siblings%s: %.1f foreign ticks in %.2f s" % (c, list(self.siblings(c)), ticks, dt))
 
 class TopScan:
     """Once per pass, a full thread scan (0.25 s at load 30): who the biggest foreign processes are, by process name and CPU, with their command lines.
@@ -242,6 +260,22 @@ def nvme_rw():
     for line in Path("/proc/diskstats").read_text().splitlines():
         f = line.split()
         if len(f) > 9 and f[2].startswith("nvme") and "p" not in f[2].split("n", 1)[1]: out[f[2]] = (int(f[5]) * 512, int(f[9]) * 512)
+    return out
+
+DRIVE_PATHS = ("/mnt/nvme0/dsv41_flash", "/mnt/nvme4/dsv41_flash", "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw")   # the two mirror roots the reader reads and the source checkpoint (bench_mirror_rows defaults)
+
+def watched_nvme(paths):
+    """Whole NVMe devices (nvme<N>n<M>) that hold `paths`, resolved through st_dev and /sys/dev/block, never by mount label. None entries (a path
+    that is not on NVMe or does not exist) are skipped; an empty result means the drives could not be resolved."""
+    out = set()
+    for pth in paths:
+        try:
+            st = os.stat(pth).st_dev; real = os.path.realpath("/sys/dev/block/%d:%d" % (os.major(st), os.minor(st)))
+        except OSError: continue
+        parts = real.split("/")
+        for name in reversed(parts):
+            if name.startswith("nvme") and "n" in name[4:]:
+                out.add(name.split("p")[0] if "p" in name[4:] else name); break
     return out
 
 def _cmdlines(pids):
@@ -322,8 +356,9 @@ class RealDevice:
         self.stream = torch.cuda.Stream(device=self.dev)
         self.dest = [torch.empty((SCRATCH_SLOTS, b), dtype=torch.uint8, device=self.dev) for _, b in SEGMENTS]
         self.src, self.seg, self.ring, self.consumed, meta = {}, {}, {}, {}, {"nodes": {}}
-        self.global_seq = {0: [], 1: []}
-        for node in (0, 1):
+        self.nodes = tuple(getattr(args, "nodes", (0, 1)))
+        self.global_seq = {n_: [] for n_ in self.nodes}
+        for node in self.nodes:
             free_before = node_free_mib(node); mem_before = node_mem_mib(node)
             set_mempolicy(node)
             try:
@@ -339,7 +374,7 @@ class RealDevice:
             self.ring[node] = ring_ids(ROWS_PER_NODE, SEED + node); self.consumed[node] = 0
             meta["nodes"][node] = {"page_fraction_on_node": fracs, "free_mib_before": free_before, "free_mib_after": node_free_mib(node), "mem_mib_before": mem_before, "mem_mib_after": node_mem_mib(node)}
         # each row's first 8 bytes carry its id, so a launch can be checked to have moved the intended rows
-        for node in (0, 1):
+        for node in self.nodes:
             for s in self.src[node]:
                 ids = torch.arange(ROWS_PER_NODE, dtype=torch.int64) + 1000 * (node + 1)
                 s[:, :8].copy_(ids.view(torch.uint8).view(ROWS_PER_NODE, 8))
@@ -354,12 +389,12 @@ class RealDevice:
         torch.cuda._sleep(int(1e6)); torch.cuda.synchronize()
         e0.record(); torch.cuda._sleep(int(2e7)); e1.record(); torch.cuda.synchronize()
         self.cycles_per_us = 2e7 / (e0.elapsed_time(e1) * 1000.0); meta["spin_cycles_per_us"] = self.cycles_per_us
-        self._verify(0); self._verify(1)
+        for node in self.nodes: self._verify(node)
         meta["device"] = torch.cuda.get_device_name(self.dev); meta["torch"] = torch.__version__
         return meta
     def _plan(self, node, n, rows, slots):
         t = self.torch
-        r = torch.zeros(6, dtype=torch.int64); r[:n] = torch.tensor(rows); s = torch.zeros(6, dtype=torch.int32); s[:n] = torch.tensor(slots)
+        r = t.zeros(6, dtype=t.int64); r[:n] = t.tensor(rows); s = t.zeros(6, dtype=t.int32); s[:n] = t.tensor(slots)      # (v5: was bare `torch`, a NameError found on the first real launch)
         return r, s
     def _verify(self, node):
         t = self.torch; rows = [5, 9, 1, 100, 77, 3]; slots = [10, 11, 12, 13, 14, 15]
@@ -422,7 +457,7 @@ class RealDevice:
         T = [s.elapsed_time(e) for s, e in zip(starts, ends)][WARMUP_LAUNCHES:]
         self.consumed[node] += launches * n
         if cell.state != "repeat": self.global_seq[node].extend(ids)     # time-ordered rows read from this node's slabs (warm-up launches included)
-        return T, {"cpu": os.sched_getcpu()}
+        return T, {"cpu": _syscalls().sched_getcpu()}                # (v6: os.sched_getcpu does not exist; found on the first real visit)
     def close(self):
         pass
 
@@ -447,6 +482,9 @@ def run(args):
     meta["repo"] = str(args.repo)
     try: meta["repo_head"] = subprocess.check_output(["git", "-C", str(args.repo), "rev-parse", "HEAD"], text=True).strip()
     except Exception: meta["repo_head"] = None
+    watched = set() if dry else watched_nvme(args.drive_paths)
+    if not dry and not watched: raise SystemExit("cannot resolve the NVMe devices of %s" % (args.drive_paths,))
+    meta["watched_drives"] = sorted(watched)
     meta.update(dev.setup(args))
     if args.check_only:
         (out / "meta.json").write_text(json.dumps(meta, indent=1, default=str)); print("check-only ok"); return 0
@@ -495,8 +533,8 @@ def run(args):
         t1 = time.monotonic(); fp = foreign.stop(); ds1 = None if dry else nvme_rw(); extra = dict(extra)
         extra["foreign"] = dict(foreign.last); extra["loadavg_start"] = la0
         if dry: extra["foreign"]["box_foreign_cores"] = extra.get("dry_box", 0.0)
-        extra["drive_read_bytes"] = None if dry else sum(ds1[k][0] - ds0.get(k, (0, 0))[0] for k in ds1)
-        extra["drive_write_bytes"] = None if dry else sum(ds1[k][1] - ds0.get(k, (0, 0))[1] for k in ds1)
+        extra["drive_read_bytes"] = None if dry else sum(ds1[k][0] - ds0.get(k, (0, 0))[0] for k in ds1 if k in watched)       # only the drives this run reads
+        extra["drive_write_bytes"] = None if dry else sum(ds1[k][1] - ds0.get(k, (0, 0))[1] for k in ds1 if k in watched)
         extra["drive_by_dev"] = None if dry else {k: [ds1[k][0] - ds0.get(k, (0, 0))[0], ds1[k][1] - ds0.get(k, (0, 0))[1]] for k in ds1 if ds1[k] != ds0.get(k)}
         extra["drive_bytes"] = extra["drive_read_bytes"]
         return (T, extra, t0, t1, fp)
@@ -576,6 +614,7 @@ def main(argv=None):
     p.add_argument("--with-nvme", action="store_true", help="run the nvme load arm (needs the drives idle and the reader's cores)")
     p.add_argument("--bounce-node", type=int, default=1); p.add_argument("--reader-cpus", default="")
     p.add_argument("--min-reader-gbs", type=float, default=1.0)
+    p.add_argument("--drive-paths", nargs="+", default=list(DRIVE_PATHS), help="paths whose NVMe devices are the ones the idle-drive and load-match rules watch")
     p.add_argument("--skip-arms", nargs="*", default=[], choices=["hot", "repeat", "ce", "graph"],
                    help="DEVIATION from the registered arm list; recorded in meta.json. The frozen analysis still requires the primary arms.")
     a = p.parse_args(argv)

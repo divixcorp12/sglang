@@ -1,7 +1,8 @@
 """CPU tests for c_harness.py and its hand-off to c_analysis.py. No CUDA. Run: python3 test_c_harness.py"""
 import json, sys, tempfile, importlib, os, itertools
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 import c_harness as h, c_analysis as a
 
 def test_segments():
@@ -79,6 +80,20 @@ def test_foreign_load_counts_only_the_cores_we_use_and_not_ours():
     finally:
         on_mine.kill(); on_other.kill()
 
+def test_foreign_load_counts_cores_we_used_not_the_whole_mask():
+    import time
+    cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2
+    ours, spare = cpus[0], cpus[1]
+    mine, foreign_spin = _spin_on(ours), _spin_on(spare); time.sleep(0.3)               # our spinner on `ours`; someone else's spinner on the spare core of our mask
+    try:
+        no_smt = lambda c: (c,)                                                           # isolate the used-core rule from the sibling rule (tested separately)
+        f = h.ForeignLoad([os.getpid(), mine.pid], {ours, spare}, siblings=no_smt); f.start(); time.sleep(1.0); pct, where = f.stop()
+        assert f.last["used_cores"] == [ours] and pct < 60.0, (f.last, pct, where)      # foreign CPU on the spare core is not counted: we did not run there
+        f = h.ForeignLoad([os.getpid()], {spare}, siblings=no_smt); f.start(); time.sleep(1.0); pct2, _ = f.stop()
+        assert pct2 > 50.0                                                                # with no presence of ours the whole set counts (a survey stays conservative)
+    finally:
+        mine.kill(); foreign_spin.kill()
+
 def test_foreign_load_resolution_floor():
     import time
     for ticks, clamped in ((2, True), (3, False)):
@@ -136,18 +151,84 @@ def test_meta_records_not_measured_and_load_fields():
         line = json.loads(open(Path(d, "results.jsonl")).readline())
         assert {"box_foreign_cores", "loadavg_start", "loadavg_end", "attempts"} <= set(line)
 
-def test_quiet_check_candidates_use_the_interleaved_numa_layout():
+def _sib_map():
+    """This box's layout as measured 2026-09-21: 2 threads per core; cpu c and c+36 (mod 72) are siblings, so 28-31 pair with 64-67 and 35 with 71."""
+    return lambda c: tuple(sorted({c % 36, c % 36 + 36}))
+
+def test_quiet_check_candidates_use_the_interleaved_numa_layout_and_exclude_reserved_neighbours():
     import quiet_check as q
     n0, n1 = h._parse_cpus("0-17,36-53"), h._parse_cpus("18-35,54-71")
-    hc, rc = q.candidates(n0, n1)
-    assert hc == list(range(36, 54)) and rc == list(range(18, 32))                 # 18 harness candidates, 14 reader candidates, as the lead worked out
+    hc, rc = q.candidates(n0, n1, _sib_map())
+    assert hc == list(range(36, 54))                                                  # no node-0 candidate has a sibling in 64-71
+    assert rc == list(range(18, 28)) and all(c not in rc for c in (28, 29, 30, 31, 35))   # 28-31 pair with 64-67, 35 with 71: excluded permanently
+    assert q.reserved_neighbours(_sib_map()) == [28, 29, 30, 31, 32, 33, 34, 35]
     assert not any(64 <= c <= 71 for c in rc + hc) and all(c in n0 for c in hc) and all(c in n1 for c in rc)
-    assert q.candidates(list(range(0, 36)), list(range(36, 72)))[0] == list(range(32, 36))   # a contiguous split gives a different (wrong for this box) answer: that is why the lists come from /sys
+    assert q.candidates(list(range(0, 36)), list(range(36, 72)), _sib_map())[0] == []        # a contiguous split would give a different answer: the lists come from /sys
+
+def test_pairs_show_both_members_and_score_the_worst():
+    import quiet_check as q
+    got = q.pairs([42, 44], {42: 5.0, 6: 30.0, 44: 40.0, 8: 2.0}, lambda c: tuple(sorted({c % 36, c % 36 + 36})))
+    assert got[0][0] == 42 and got[0][1] == [6] and got[0][2] == 30.0 and got[1][2] == 40.0
+
+def test_sibling_foreign_cpu_is_counted_against_a_used_core():
+    import time
+    cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2
+    ours, sib = cpus[0], cpus[1]
+    mine, other = _spin_on(ours), _spin_on(sib); time.sleep(0.3)
+    try:
+        f = h.ForeignLoad([os.getpid(), mine.pid], {ours}, siblings=lambda c: (ours, sib)); f.start(); time.sleep(1.0); pct, where = f.stop()
+        assert pct > 50.0 and "siblings" in where, (pct, where, f.last)                  # a foreign thread on the SIBLING of a core we occupy is contention, and is scored
+        f = h.ForeignLoad([os.getpid(), mine.pid], {ours}, siblings=lambda c: (c,)); f.start(); time.sleep(1.0); pct2, _ = f.stop()
+        assert pct2 < 50.0, pct2                                                          # without the sibling rule the same situation scores as clean (the hole the lead measured)
+    finally:
+        mine.kill(); other.kill()
+
+def test_lane_guard_sees_a_decoy_lane_and_ignores_itself():
+    import quiet_check as q, subprocess, time
+    decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)", "pytest", "-p", "orderplug"]); time.sleep(0.3)
+    try:
+        assert any(p == decoy.pid for p, _ in q.lane_processes())                        # a lane of ours is seen
+        assert not any(p == os.getpid() for p, _ in q.lane_processes())                   # and this process is not counted
+    finally: decoy.kill()
 
 def test_rehearsal_measures_windows():
     import quiet_check as q
     cpus = sorted(os.sched_getaffinity(0)); res = q.rehearse(cpus[1:3], cpus[1:2], 2.0, window=0.5)
     assert len(res) == 4 and all(isinstance(x[0], float) for x in res)
+
+def test_watched_nvme_resolves_through_st_dev_and_skips_the_unresolvable():
+    assert h.watched_nvme(["/definitely/not/a/path"]) == set()
+    got = h.watched_nvme(["/", "/tmp", os.path.expanduser("~")])
+    assert all(n.startswith("nvme") and "p" not in n[4:] for n in got)               # whole devices only, never a partition or a mapper name
+
+
+def test_stdlib_attributes_used_by_the_scripts_exist():
+    """The class of defect the first real launch found (os.sched_getcpu does not exist): every `module.attr` the scripts use on an imported stdlib module must exist. Catches typos and platform-only names on a CPU box."""
+    import ast, importlib, sys as _s
+    for path in [HERE / "c_harness.py", HERE / "quiet_check.py"]:
+        tree = ast.parse(Path(path).read_text()); mods = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name.split(".")[0] in _s.stdlib_module_names: mods[(a.asname or a.name).split(".")[0]] = a.name
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in mods:
+                m = importlib.import_module(mods[n.value.id])
+                assert hasattr(m, n.attr), "%s: %s.%s does not exist" % (path, n.value.id, n.attr)
+
+def test_plan_and_launch_cpu_construct_without_a_gpu():
+    """The two defects of the first real launch, reproduced on CPU: `_plan` built its tensors from a bare `torch`; the launch CPU came from a nonexistent os function."""
+    import torch
+    stub = type("S", (), {"torch": torch})()
+    r, s_ = h.RealDevice._plan(stub, 0, 2, [7, 9], [3, 4])
+    assert r.tolist()[:2] == [7, 9] and s_.tolist()[:2] == [3, 4] and r.dtype == torch.int64 and s_.dtype == torch.int32
+    assert h._syscalls().sched_getcpu() >= 0
+
+def test_lane_guard_ignores_processes_that_only_mention_a_lane():
+    import quiet_check as q
+    assert q._harmless("bash -c test -f /data/x/t1-ordersweep/sweep.done") and q._harmless("/bin/bash -c cat /x/sweep3.log") and q._harmless("sleep 600") and q._harmless("ls /x/orderplug")
+    assert not q._harmless("/bin/bash -c cd /x && systemd-run --user --unit=t1py python sweep_py.py")       # a launcher counts
+    assert not q._harmless("python -m pytest -p orderplug test/x.py") and not q._harmless("xargs -P 3 -I{} bash -c one {}")
 
 def test_node_mem_reader():
     try: m = h.node_mem_mib(0)
