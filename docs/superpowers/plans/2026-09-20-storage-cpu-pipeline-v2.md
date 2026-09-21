@@ -1079,11 +1079,50 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > result -- the same defect as measuring something adjacent to the question and
 > reporting it as the answer.
 >
-> **The class is real and stays; the live count is currently zero of 90.** The
-> sweep's detector was validated against three synthetic controls (dangerous /
-> annoying / independent) plus that real pre-fix case, and found **no
-> order-dependent file among the 90 that actually ran tests**. That is a
-> meaningful negative result because the detector is known to fire.
+> **THE SWEEP IS COMPLETE (`4696db28a9`, swept at `41e589976f` via `git
+> archive`), and the headline is a validated negative.** Of 830 registered CPU
+> files, **307 have two or more test classes**; all 307 were swept under three
+> class orders -- `alpha` (CI's unittest order), `file` (pytest's) and `rev` --
+> comparing **6,563 test ids**. **263 files identical across all three orders**;
+> 32 fail identically for environment reasons; 9 ran nothing; **3 differed,
+> which serial re-runs cut to ONE.**
+>
+> **In the dangerous direction -- passes under pytest, fails under CI's
+> alphabetical order -- there are NONE.** The detector was validated against
+> three synthetic controls plus the real pre-fix `TestCacheStatsSink`, so the
+> negative carries weight.
+>
+> **TWO OF THE THREE APPARENT HITS WERE THE HARNESS, NOT THE CODE**, which is a
+> methodological finding in its own right. The sweep ran a file's three orders
+> **concurrently**, and `test_zaya_cca.py` hard-codes distributed port 29632, so
+> two runs collided with `EADDRINUSE`. Six serial runs: every test passes in
+> every order. **A parallel test harness manufactures order-dependence-shaped
+> artefacts**, and the discriminator is a serial re-run rather than more
+> analysis. It generalises past this sweep: **any test with a hard-coded port
+> collides with a second CI job on the same runner, whatever the class order.**
+>
+> **THE ONE REAL HIT IS LATENT -- neither runner's order triggers it.**
+> `test_server_args.py::TestMultimodalFeatureTransport::test_default_transport_is_cpu_for_unsupported_multinode_model`
+> fails only when `TestNoneMeansUnset` runs before it (2 of 2 under `rev`, 0 of
+> 4 under `alpha`/`file`). **Mechanism: the code under test writes the process
+> environment.** `serving_hook.handle_multimodal_feature_transport` ends with
+> `envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(...)` on every call; the polluter
+> reaches it through `ServerArgs` resolution and leaves the variable set; the
+> victim, unlike its neighbours, never calls `.clear()`, so it takes the
+> "legacy variable is set" branch and asserts on the wrong log line. Both
+> runners happen to order the polluter after the victim, so it is invisible
+> today and would surface on any reordering.
+>
+> **Named mechanisms in this corpus, found rather than supposed:** (a) a weak
+> registry kept alive by a reference cycle (`TestCacheStatsSink`, fixed in
+> `d28348b736`); (b) **production code setting a process environment variable
+> that nothing restores**. Two instances is thin evidence for a taxonomy of
+> mechanisms, and the author says so.
+>
+> **What the sweep cannot show**, stated by its author: three orders rather than
+> all of them, so a leak needing one specific pair in one sequence can hide;
+> CPU-registered files only, with 41 of 307 running incompletely for environment
+> reasons; and no GPU tests at all.
 >
 > **But the sweep's first pass was mostly blind, and that is the larger
 > finding.** Of 307 files swept, **only 90 ran any test**. **217 died
@@ -1106,13 +1145,15 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > result produced with the empty form must be re-checked: files that error at
 > collection are not failures a reader would notice.
 >
-> **(h) A TEST THAT KILLS ITS OWN PROCESS GROUP.** At least one test in this
-> corpus kills its process group, taking down the runner and everything the
-> runner launched. It killed a sweep driver three times mid-run; running each
-> `pytest` in its own session fixed it. Not yet identified. Two consequences
-> beyond the test itself: a harness can die for reasons that look like an
-> external agent stopping it, and **an agent's own shell is in that process
-> group** if it launches tests directly.
+> **(h) WITHDRAWN.** An earlier revision recorded "a test that kills its own
+> process group", from a report that a sweep driver had died three times
+> mid-run. **Its author retracted it**: across about 1,150 logs, once each
+> `pytest` ran in its own session, **no log shows a signal exit**, and what
+> killed the driver is unexplained. Treat it as an open question about that
+> harness, not a property of the corpus. Recorded rather than deleted because
+> the claim was acted on -- lanes were told to run each `pytest` under
+> `setsid`, which stays harmless advice against an unexplained failure but is
+> not justified by evidence.
 >
 > **THE WHOLE CI SUITE CANNOT COLLECT ON THIS BRANCH, AND A REGISTERED FILE WITH
 > NO `__main__` BLOCK RUNS ZERO TESTS AND EXITS 0** (`1e210f524a`). `test/run_suite.py`
