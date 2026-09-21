@@ -143,11 +143,16 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 | file | sha256 |
 |---|---|
 | `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c` |
-| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `adcd041f5660ef77d95bad4b8769d472a53fcb1e31b51d64b5b7164c18b6b8eb` (**supersedes every earlier hash: sections 12, 13, 14**) |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `35dcf8215ae5c2c92b56afde2c0a1598b6d40cee1ef2dd92f47951ad52ebe010` (**IN FORCE: amendment 4, section 15**) |
 | `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
-| `c_measurement/quiet_check.py` (the pre-flight: is the box quiet, on which cores; reads /proc only) | `e50bd7abae727220e2d98971e19b0cb602d75b7c9a9df4958d093524dd0435a3` |
+| `c_measurement/quiet_check.py` (the pre-flight: is the box quiet, on which cores; reads /proc only) | `9b190d2905b296b1bdd43edcbaa3f0850e7154addade5610e0bbd2543d166ffb` |
+| `c_measurement/verify_hashes.py` (checks the files against this table; run it immediately before the window) | `26bb113eb3699d6d48440f795656e5fe077e51d617dd3c75535efe931141f542` |
 | `c_measurement/prebuild_jit.py` (compiles the gather kernel's JIT module with no GPU) | `015215022edf78dd69f98002e1c1d7bbc982fa2662cd5cca09ab7091d4fbb782` |
-| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `a8f96f0f87833719ad09061c10f734b72e625ee19f9ea0ddeacad65d5bff5874` (13 CPU tests) |
+| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `627cd3ece503c3337d842a16fe0a31f744f4cdc46b0d10cae1334f90f873c393` (15 CPU tests) |
+
+**Superseded hashes: none of these is the registered harness.** `c_harness.py` `171302f871ee45d2…` (first version, commit `8313506f25`) was superseded by amendment 1 (section 12, `c2eddc482b`); `6b7313b05132798c…` (amendment 1) by amendment 2 (section 13, `cb436aec3b`);
+`d39270e19a7fcd90…` (amendment 2) by amendment 3 (section 14, `bc02ab9ddf`); `adcd041f5660ef77…` (amendment 3) by amendment 4 (section 15). Earlier `test_c_harness.py` hashes (`3fe04030…`, `94082c54…`, `e71c672a…`, `a8f96f0f…`) and `quiet_check.py` `0190708b…`, `e50bd7ab…` are superseded the same way.
+**`c_analysis.py` has one commit (`05c5510392`) and has not been touched since: `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c`. It is what turns numbers into a verdict, and it is the one file that does not move.**
 
 Self-test, 2026-09-21 on divix01, CPU: `c = 1.00` gives STANDS (`g*_H` 6.22), `c = 1.055` gives INTERMEDIATE (`g*_X` 7.01, `g*_H` 8.06, gross 4.92: the earlier model's 6.98 / 8.03 / 4.93 within `f`), `c = 1.15` INTERMEDIATE, `c = 1.40` WITHDRAWN, and an
 impossible bandwidth, an idle link, row reuse, foreign load and a wrong row size are INVALID. **That tests the logic and the arithmetic reproduction, not the GPU.**
@@ -189,7 +194,7 @@ python3 <dir>/c_measurement/c_analysis.py <outdir>/results.jsonl        # the fr
 
 ## 12. Amendment before any data: what "quiet" means, the idle baseline for `rho`, and how contention is handled (2026-09-21)
 
-**Partly superseded by section 14: the 0.02 GB/s idle-drive criterion (item 2's GO condition and item 3(a)) and the idea that the box should be quiesced are withdrawn; the drift rules replace them. Read section 14 first.**
+**Partly superseded by sections 14 and 15: the 0.02 GB/s idle-drive criterion (item 2's GO condition and item 3(a)) and the idea that the box should be quiesced are withdrawn; the drift rules replace them. Read section 14 first.**
 
 Prompted by the lead's note that the box carried a load average of 27.8 (36 when I looked: every core from 0 to 63 was between 20% and 100% busy) while the GPU itself was free. **Nothing has been run; this
 changes the registered design only by making three things explicit, all before a launch, and the harness hash in section 9 is the one that includes them.**
@@ -200,7 +205,8 @@ unrepeatable, unrecorded mixture of foreign load, so its difference from the qui
 loaded pass as an extra, it is reported beside the quiet run, labelled contended, never merged and never used by the rule.
 
 **2. How quiet.** The frozen gate (4.1) is "no foreign process above 10% of a core"; `foreign_max_core_pct` is now **defined** as the largest per-core sum of foreign thread CPU over the cores the run uses (the harness's and the reader's), not the box-wide maximum, so a
-permanent daemon on a core we do not use (nimbus, reth) does not trip it and the same daemon migrating onto one of our cores does. To have margin the pre-flight asks for half of it: **`quiet_check.py` must print GO: the eight harness cores (node 0, within 32-63) and the eight
+permanent daemon on a core we do not use (nimbus, reth) does not trip it and the same daemon migrating onto one of our cores does.
+**KNOWN UNGATED FAILURE MODE, stated here beside the redefinition and not elsewhere: restricting the count to our cores makes this gate BLIND to memory-bandwidth and memory-controller contention from daemons on cores we do not use, which is exactly the coupling that matters for `c`, because the source rows cross PCIe and share controllers with them. Nothing in the run gates it; it is bounded only by the box-drift rule (idle versus load arms) and by the recorded foreign CPU.** To have margin the pre-flight asks for half of it: **`quiet_check.py` must print GO: the eight harness cores (node 0, within 32-63) and the eight
 reader cores (node 1, outside 32-63, never 64-71) it picks are each under 5% busy over 10 s, and the NVMe devices read under 0.02 GB/s.** It is run at the start of the window and again after, and both outputs are kept. Beyond the gate I ask the lanes to **suspend CPU-heavy and
 memory-heavy jobs box-wide for the ~15 minutes** (the gate cannot see memory-bandwidth contention on cores we do not use); the harness then launches on the quiet cores through `taskset -c <picked>`, inside `gpu-run.sh`'s 32-63 mask, and the reader on its picked cores.
 Today's `quiet_check.py` result on divix01 was NO-GO (load 34.8; the quietest eight harness cores were 20-27% busy, the reader's 10-56%).
@@ -234,7 +240,7 @@ defended, the run goes without `--with-nvme` and `nvme` is **reported NOT MEASUR
 
 **Order of the report** (as required): the `--check-only` result first, and if it finds a problem I stop and tell the lead before proceeding; then the verdict word; and if `c_m` is within about 2% of 1.055 I say so plainly and report the label as unchanged.
 
-## 14. Correction before any data, third: the box's permanent load is the CONDITION, not contamination (2026-09-21, lead's correction)
+## 14. Correction before any data, third (items 1 and 2 SUPERSEDED by section 15): the box's permanent load is the CONDITION, not contamination (2026-09-21, lead's correction)
 
 `nimbus_beacon_node` (Ethereum mainnet consensus), `op-reth` (Optimism full node) and `aggregate-runner` (`aggregate-runner.service`, a feed scraper) are the user's own permanent infrastructure, and production normally runs beside them. **They are not stopped and nobody is asked to stop them.**
 Measuring `c` with them running is measuring the environment V1 would ship into; the run is quoted as **"`c` measured under the box's steady-state load"** and `meta.json` records that load rather than assuming it away. This **supersedes** what sections 12 and 13 said about quiet, in three places:
@@ -250,3 +256,20 @@ Measuring `c` with them running is measuring the environment V1 would ship into;
 
 **A tension I cannot resolve by design and am recording before the run.** The frozen per-core gate (`foreign_max_core_pct` at most 10% on the cores we use) is not a drift rule; with a 21-core foreign floor a service thread landing on one of our cores for 100 ms of a 1-second visit fails it. Cores are chosen as the quietest by `quiet_check.py` (four harness cores on node 0, four reader cores on node 1) to minimise that.
 **If the run is INVALID and the only failing gate is `foreign_max_core_pct`, and the recorded `foreign_where` names a steady service on one of our cores, I ask for one re-run on freshly picked cores, with both runs reported.** I will not loosen the gate or drop cells to get a VALID run. That request is not a permission I take; it needs the lead's yes after seeing the failure.
+
+## 15. Amendment before any data, fourth: retractions, what the per-cell gates can and cannot catch, and the retry rule (2026-09-21)
+
+**1. Retractions (the lead measured the drives).** `/data`, where `nimbus_beacon_node`, `op-reth` and `reth-binary` keep their data, is the LVM root volume (`/dev/mapper/rl00-root`), not an NVMe mount; the harness drives are `nvme0n1`, `nvme1n1`, `nvme2n1` and `nvme3n1` (mounts nvme0, nvme1, nvme2, nvme4), and a 10 s
+`/proc/diskstats` sample showed 0.0000 GB/s on three of them and 0.0132 GB/s on `nvme1n1`, which is one of our own lanes. So the services do **not** touch the drives the harness reads. **Withdrawn:** section 14's per-process `/proc/<pid>/io` sampling (removed from the harness), its 0.10 GB/s drive-drift gate, and its statement that the 0.02 GB/s idle rule is withdrawn.
+**Restored:** an idle-arm cell that moved more than **0.02 GB/s** (reads plus writes over the whole NVMe devices) is contaminated and the run writes `results.INVALID` (exit 3); a load cell must match the reader's own bytes within 10%. Per-device deltas are still recorded. `quiet_check.py` again requires the drives under 0.02 GB/s for GO.
+
+**2. What the per-cell gates catch about a daemon migrating onto a harness core mid-run (the lead's question).** Three different things, so it matters which:
+- **The foreign-CPU measure (`foreign_max_core_pct`, per visit) catches it, at the visit where it happens.** It is per-core foreign CPU from `/proc/stat` (user + nice + system ticks, our own threads subtracted, irq/softirq/steal/iowait excluded so our own NVMe and GPU interrupt time is not counted against us). **Resolution:** ticks are 10 ms, so a core with fewer than 3 foreign ticks in a window is reported as at most 9.9% (one or two ticks in a 100-200 ms visit are not evidence of 10%).
+- **`p99 / p50` does NOT do this job.** It is a frozen cell-level gate that fails the whole run; it only sees launch-side stalls (a preempted launching thread lets the GPU run past the 600 us spin, so that launch's `T` is inflated), and only if at least two of a cell's 200 launches are affected. A uniform slowdown (memory-bandwidth contention, an SMT sibling) does not move it at all. So it is not a mid-run migration detector.
+- **Retry rule (new, harness-level, declared before data).** A visit (100 launches) that fails an *environmental* check is re-run in place, up to 3 attempts: foreign CPU above 10% on our cores, another process on the GPU, or the PCIe link not at Gen3. **No `T` is looked at** (a value-based retry would select on the result), the P-state is deliberately not a retry criterion (it is the registered fallback, not a transient), and every failed attempt is written to `retries.jsonl`
+  with its reason and the foreign core and load. If all 3 attempts fail the last is kept and the frozen gate judges it. `meta.json` records `visits`, `retried_visits` and `retry_fraction`; a fraction above 10% is reported with the result. **This converts a migration onto a harness core from a lost run into a re-run visit; it does not touch memory-bandwidth contention, which stays an ungated failure mode (section 12, item 2).**
+
+**3. Steady state as actually measured.** `quiet_check.py` (thread scan, 2 s) at 04:5x: foreign CPU **22 cores**: QuestDB `java` about **14 cores**, `aggregate-runner` about 3.3, `nimbus_beacon_node` 1.1, one lane's pytest 0.8, `op-reth` 0.5, `reth-binary` 0.4. The lead's `ps`-based estimate of about 4.9 cores understates it, because `ps` `%CPU` is a lifetime average and QuestDB's ingest was running.
+This matters to the box-drift gate: **QuestDB alone moving by a core or more between the idle and load arms of a pass would make the `nvme` ratio INVALID.** If a pass fails that gate marginally, first check whether it is one daemon breathing (`aggregate-runner` alone swings by about 0.2 cores) before concluding that a lane collided. The per-pass top-foreign list and command lines are in `meta.json` `steady_state_by_pass`.
+
+**4. Hash discipline.** Section 9 lists the harness in force and, separately, every superseded hash with the amendment that superseded it. `verify_hashes.py` checks the files against the section 9 table and is run **immediately before the window**, not only at staging, together with a plain `sha256sum` of `c_analysis.py` against `4657702c…c21c`.

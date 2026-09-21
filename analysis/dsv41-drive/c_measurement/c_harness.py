@@ -25,10 +25,12 @@ IMPLEMENTATION NOTES THAT THE PREREG DOES NOT SPELL OUT (each is a disclosed cho
     measured 13,315,584 B; they are not read from a loaded layout here.
   * Each cell line carries extra fields (the launching CPU, the worst foreign process, clocks). c_analysis.py ignores them; the
     NUMA page check, free memory and the copy check are in meta.json.
-  * STEADY STATE: nimbus_beacon_node, op-reth and aggregate-runner are the user's permanent services and are NOT stopped. Their CPU and the box's
-    NVMe traffic are recorded per cell (box_foreign_cores, foreign_top, foreign_proc_io from /proc/<pid>/io where readable, drive_by_dev) and
-    the nvme ratio is refused (results.INVALID) when foreign CPU (1.0 core) or foreign NVMe traffic (0.10 GB/s) DIFFERS between the idle and load
-    arms of a pass. A steady load cancels in the ratio; a drifting one invalidates it.
+  * STEADY STATE: the user's permanent services are NOT stopped. Foreign CPU is recorded per cell (box_foreign_cores, from /proc/stat) and per pass
+    (steady_state_by_pass in meta.json: the top foreign processes and command lines, from a thread scan), and the nvme ratio is refused when the
+    foreign CPU differs between the idle and load arms of a pass by more than 1.0 core. The services' data is on /data (LVM root), not on the
+    NVMe drives the harness reads, so idle cells must move under 0.02 GB/s on those drives. A steady load cancels in the ratio; a drifting one invalidates it.
+  * RETRY: a visit that fails an environmental check (foreign > 10% on our cores, another GPU process, link not Gen3) is re-run in place up to 3 times;
+    every failed attempt is in retries.jsonl. The check is never value-based (no T is looked at), so retries do not select on the result.
   * `foreign_max_core_pct` (the field gate 4.1 reads) is FOREIGN CPU USE ON THE CORES WE USE (the harness's and the reader's), the largest per-core sum
     of non-own thread CPU; not the box-wide maximum, so a permanent daemon on a core we do not use does not trip it. Idle-arm cells also record the
     NVMe read/write rates (see STEADY STATE above); in load cells the drives' bytes must match the reader's within 10%.
@@ -54,8 +56,9 @@ LAUNCHES_PER_CELL = 200
 WARMUP_LAUNCHES = 20
 PASSES = 5
 SLEEP_US = 600
-FOREIGN_DRIVE_MAX_DELTA_GBS = 0.10  # per pass: foreign NVMe traffic (reads+writes, the reader's own bytes removed) may differ by at most this between idle and load cells
-WATCH_COMM = ("nimbus_beacon_n", "op-reth", "reth-binary", "aggregate-runner")   # the box's steady-state services (the user's own); their I/O is sampled per cell
+IDLE_DRIVE_MAX_GBS = 0.02          # an idle-arm cell during which the NVMe devices moved more than this (reads + writes) is contaminated: rho's baseline. The user's services live on /data (LVM root), not on these drives.
+MAX_ATTEMPTS = 3                   # a visit that fails an ENVIRONMENTAL check is re-run in place up to this many times; every attempt is logged to retries.jsonl
+ENV_FOREIGN_PCT = 10.0             # the frozen per-core gate's threshold, applied to a single visit for the retry decision
 LOAD_FOREIGN_IO_MAX = 0.10         # in a load cell, drive bytes beyond the reader's own may not exceed 10% of the reader's bytes
 SEED = 20260921
 
@@ -116,17 +119,58 @@ def node_cpus(node):
 # ------------------------------------------------------------------------------------------------- box conditions
 
 class ForeignLoad:
-    """Foreign CPU use on the cores WE use, over one window.
+    """Foreign CPU use on the cores WE use, over one window, from /proc/stat (cheap, so it can run around every visit).
 
-    Every thread of every process that is not ours is sampled twice (utime + stime and the CPU it last ran on). A thread counts
-    if it ran on one of `cores` at either sample. Returns (worst, name): the largest per-core SUM of foreign thread CPU
-    (percent of one core) over `cores`, and the biggest contributor on that core. A permanent daemon on a core we do not use
-    (nimbus on core 29, say) does not count; the same daemon migrating onto one of our cores does. Own pids, and the reader's,
-    are excluded."""
+    busy(core) = user + nice + system ticks (irq, softirq, steal, iowait and idle are NOT busy, so the interrupt time of our own NVMe and GPU
+    traffic is not counted against us). foreign(core) = busy(core) minus the ticks of our own threads (the harness, the reader), each own thread's
+    ticks attributed to the core it was on at the end of the window (split with the core it was on at the start if it moved).
+    Returns (worst, where): the largest per-core foreign percentage of one core over `cores`. RESOLUTION: ticks are 10 ms; a core with fewer than
+    MIN_TICKS foreign ticks in the window is reported as at most 9.9%, because one or two ticks in a window of 100-200 ms are not evidence of 10%.
+    `last["box_foreign_cores"]` is the same quantity summed over every CPU, in cores. It still contains kernel worker threads that carry our I/O
+    (system time), so it is an upper bound on foreign load, which makes the box-drift gate conservative."""
+    MIN_TICKS = 3
     def __init__(self, own_pids, cores):
         self.own = set(own_pids); self.cores = set(cores); self.hz = os.sysconf("SC_CLK_TCK")
     def add_own(self, pid): self.own.add(pid)
     last = {}
+    def _cpu(self):
+        out = {}
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("cpu") and line[3].isdigit():
+                f = line.split(); out[int(f[0][3:])] = int(f[1]) + int(f[2]) + int(f[3])
+        return out
+    def _own(self):
+        out = {}
+        for pid in self.own:
+            try:
+                for t in os.listdir("/proc/%d/task" % pid):
+                    f = Path("/proc/%d/task/%s/stat" % (pid, t)).read_text(); rest = f[f.rindex(")") + 2:].split()
+                    out[(pid, int(t))] = (int(rest[11]) + int(rest[12]), int(rest[36]))
+            except (OSError, ValueError, IndexError): pass
+        return out
+    def start(self):
+        self.a = self._cpu(); self.ao = self._own(); self.t = time.monotonic()
+    def stop(self):
+        b = self._cpu(); bo = self._own(); dt = max(time.monotonic() - self.t, 1e-9)
+        own_c = collections.defaultdict(float)
+        for key, (j, cpu) in bo.items():
+            j0, cpu0 = self.ao.get(key, (j, cpu)); d = max(0, j - j0)
+            if cpu0 != cpu: own_c[cpu] += d / 2.0; own_c[cpu0] += d / 2.0
+            else: own_c[cpu] += d
+        foreign = {c: max(0.0, (b[c] - self.a.get(c, b[c])) - own_c.get(c, 0.0)) for c in b}
+        box = sum(foreign.values()) / self.hz / dt
+        self.last = {"box_foreign_cores": box, "top": [], "loadavg": Path("/proc/loadavg").read_text().split()[:3], "window_s": dt}
+        mine = {c: foreign[c] for c in foreign if c in self.cores}
+        if not mine: return (0.0, "")
+        c = max(mine, key=mine.get); ticks = mine[c]; pct = 100.0 * ticks / self.hz / dt
+        if ticks < self.MIN_TICKS: pct = min(pct, 9.9)
+        return (pct, "cpu%d: %.1f foreign ticks in %.2f s" % (c, ticks, dt))
+
+class TopScan:
+    """Once per pass, a full thread scan (0.25 s at load 30): who the biggest foreign processes are, by process name and CPU, with their command lines.
+    Not used by any gate; it is the record of what the steady state was made of."""
+    def __init__(self, own_pids): self.own = set(own_pids); self.hz = os.sysconf("SC_CLK_TCK")
+    def add_own(self, pid): self.own.add(pid)
     def _snap(self):
         out = {}
         for d in os.listdir("/proc"):
@@ -135,35 +179,27 @@ class ForeignLoad:
             except OSError: continue
             for t in tids:
                 try:
-                    f = Path("/proc/%s/task/%s/stat" % (d, t)).read_text()
-                    name = f[f.index("(") + 1:f.rindex(")")]; rest = f[f.rindex(")") + 2:].split()
-                    out[(int(d), int(t))] = (int(rest[11]) + int(rest[12]), int(rest[36]), name)
+                    f = Path("/proc/%s/task/%s/stat" % (d, t)).read_text(); name = f[f.index("(") + 1:f.rindex(")")]; rest = f[f.rindex(")") + 2:].split()
+                    out[(int(d), int(t))] = (int(rest[11]) + int(rest[12]), name)
                 except (OSError, ValueError, IndexError): pass
         return out
-    def start(self):
-        self.a = self._snap(); self.t = time.monotonic()
-    def stop(self):
-        b = self._snap(); dt = time.monotonic() - self.t; per_core = collections.defaultdict(float); top = {}
-        box = 0.0; by_proc = collections.defaultdict(float); names = {}
-        for key, (j, cpu, name) in b.items():
-            if key not in self.a: continue
-            j0, cpu0, _ = self.a[key]; pct = 100.0 * (j - j0) / self.hz / dt
-            if pct > 0 and not name.startswith(KERNEL_IO_THREADS):     # kernel threads that carry OUR I/O (softirq, kworker, nvme) are not foreign load
-                box += pct; by_proc[key[0]] += pct
-                if key[1] == key[0] or key[0] not in names: names[key[0]] = name      # the process name, not whichever thread was seen last
-            for c in {cpu, cpu0}:
-                if c in self.cores and pct > 0:
-                    per_core[c] += pct
-                    if pct > top.get(c, (0.0, ""))[0]: top[c] = (pct, "%s[%d/%d]" % (name, key[0], key[1]))
-        self.last = {"box_foreign_cores": box / 100.0, "top": [(names[p_], p_, round(v, 1)) for p_, v in sorted(by_proc.items(), key=lambda kv: -kv[1])[:5]],
-                     "loadavg": Path("/proc/loadavg").read_text().split()[:3]}
-        if not per_core: return (0.0, "")
-        c = max(per_core, key=per_core.get); return (per_core[c], "cpu%d: %s" % (c, top[c][1]))
+    def sample(self, seconds=1.0):
+        a = self._snap(); t = time.monotonic(); time.sleep(seconds); b = self._snap(); dt = time.monotonic() - t
+        by = collections.defaultdict(float); nm = {}
+        for k, (j, name) in b.items():
+            if k in a and not name.startswith(KERNEL_IO_THREADS):
+                by[k[0]] += 100.0 * (j - a[k][0]) / self.hz / dt
+                if k[1] == k[0] or k[0] not in nm: nm[k[0]] = name
+        top = sorted(by.items(), key=lambda kv: -kv[1])[:6]
+        return [{"pid": p_, "comm": nm[p_], "cpu_pct": round(v, 1), "cmdline": _cmdlines([p_]).get(str(p_), "")[:160]} for p_, v in top if v > 1.0]
+
+DRY_FOREIGN_SEQ = []               # tests only: successive per-visit foreign percentages the dry run reports
 
 class _NoForeign:
     last = {"box_foreign_cores": 0.0, "top": [], "loadavg": ["0", "0", "0"]}
     def start(self): pass
-    def stop(self): return (0.0, "")
+    def add_own(self, pid): pass
+    def stop(self): return (DRY_FOREIGN_SEQ.pop(0) if DRY_FOREIGN_SEQ else 0.0, "dry")
 
 class SmiSampler:
     """Streams nvidia-smi so that cell start/end conditions cost nothing inside the timed region."""
@@ -207,34 +243,6 @@ def nvme_rw():
         f = line.split()
         if len(f) > 9 and f[2].startswith("nvme") and "p" not in f[2].split("n", 1)[1]: out[f[2]] = (int(f[5]) * 512, int(f[9]) * 512)
     return out
-
-class ProcIO:
-    """Read/write bytes of the watched services (and any foreign process that was among the top CPU users), per visit, from /proc/<pid>/io.
-    /proc/<pid>/io is readable only for our own uid; a process it cannot read is recorded as unreadable, never as zero."""
-    def __init__(self, own): self.own = set(own); self.pids = {}
-    def _refresh(self, extra=()):
-        for d in os.listdir("/proc"):
-            if d.isdigit() and int(d) not in self.own:
-                try:
-                    name = Path("/proc/%s/comm" % d).read_text().strip()
-                except OSError: continue
-                if name in WATCH_COMM or name in extra: self.pids[int(d)] = name
-    def _read(self):
-        out = {}
-        for pid, name in list(self.pids.items()):
-            try:
-                f = dict(x.split(": ") for x in Path("/proc/%d/io" % pid).read_text().splitlines())
-                out[pid] = (name, int(f["read_bytes"]), int(f["write_bytes"]))
-            except (OSError, KeyError, ValueError): out[pid] = (name, None, None)
-        return out
-    def start(self, extra=()): self._refresh(extra); self.a = self._read(); self.t = time.monotonic()
-    def stop(self):
-        b = self._read(); dt = max(time.monotonic() - self.t, 1e-9); out = {}
-        for pid, (name, r, w) in b.items():
-            key = "%s[%d]" % (name, pid)
-            if r is None or pid not in self.a or self.a[pid][1] is None: out[key] = "unreadable"
-            else: out[key] = {"read_MB_s": round((r - self.a[pid][1]) / 1e6 / dt, 2), "write_MB_s": round((w - self.a[pid][2]) / 1e6 / dt, 2)}
-        return out
 
 def _cmdlines(pids):
     out = {}
@@ -435,7 +443,7 @@ def run(args):
     meta = {"harness": str(Path(__file__).name), "dry_run": dry, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "passes": PASSES,
             "launches_per_cell": LAUNCHES_PER_CELL, "rows_per_node": ROWS_PER_NODE, "scratch_slots": SCRATCH_SLOTS, "sleep_us": SLEEP_US}
     import hashlib
-    meta["file_sha256"] = {n: hashlib.sha256((HERE / n).read_bytes()).hexdigest() for n in ("c_harness.py", "nvme_load_reader.py", "c_analysis.py") if (HERE / n).exists()}
+    meta["file_sha256"] = {n: hashlib.sha256((HERE / n).read_bytes()).hexdigest() for n in ("c_harness.py", "nvme_load_reader.py", "c_analysis.py", "quiet_check.py") if (HERE / n).exists()}
     meta["repo"] = str(args.repo)
     try: meta["repo_head"] = subprocess.check_output(["git", "-C", str(args.repo), "rev-parse", "HEAD"], text=True).strip()
     except Exception: meta["repo_head"] = None
@@ -445,10 +453,11 @@ def run(args):
     rng = random.Random(SEED)
     mycores = set(os.sched_getaffinity(0)) | set(_parse_cpus(args.reader_cpus))
     foreign = _NoForeign() if dry else ForeignLoad([os.getpid()], mycores); smi = None      # a dry run must not depend on the ambient load of the machine it runs on
+    topscan = None if dry else TopScan([os.getpid()])
     if not dry:
         smi = SmiSampler(os.getpid()); smi.start(); time.sleep(2.0)
         # untimed load so the link leaves Gen1 (L5), then one look at the state
-        for _ in range(3): dev.run_visit(Cell("sm", "cold", 0, "idle", "eager", 6), 40, 0, args)
+        for _ in range(3): dev.run_visit(Cell("sm", "cold", 0, "idle", "eager", 6), 40, args)
     reader = None
     if args.with_nvme:
         go, stop, ready, logp = [out / x for x in ("reader.go", "reader.stop", "reader.ready", "reader_log.json")]
@@ -456,43 +465,61 @@ def run(args):
         pin = [] if dry else ["numactl", "--membind=%d" % args.bounce_node, "taskset", "-c", args.reader_cpus]
         cmd = pin + [sys.executable, str(HERE / "nvme_load_reader.py"),
                      "--go", str(go), "--stop", str(stop), "--ready", str(ready), "--out", str(logp)] + (["--dry-run"] if dry else [])
-        reader = subprocess.Popen(cmd); foreign.add_own(reader.pid) if not dry else None
+        reader = subprocess.Popen(cmd); foreign.add_own(reader.pid)
+        if topscan: topscan.add_own(reader.pid)
         for _ in range(600):
             if ready.exists(): break
             time.sleep(0.5)
         else: reader.kill(); raise SystemExit("reader never became ready")
-    lines = (out / "results.jsonl").open("w")
+    lines = (out / "results.jsonl").open("w"); retries_f = (out / "retries.jsonl").open("w")
     skip = set(args.skip_arms)
     cells = [c for c in cell_list() if c.state not in skip and c.engine not in skip and c.launch not in skip]
     load_cells = load_cell_list() if args.with_nvme else []
     meta["skipped_arms"] = sorted(skip); meta["NOT_MEASURED"] = sorted(skip) + ([] if args.with_nvme else ["nvme"])      # a skipped arm is a declared deviation from the registered design and must be named in the report
     order_log = []; load_windows = []; load_drive = []; box_idle = []; box_load = []; box_shift = []
-    drive_rows = []; top_pids = set(); pio = None if dry else ProcIO([os.getpid()]); load_drive_w = []; load_pass = []
-    def visit(cell, sink):
+    idle_dirty = []; steady = []; n_visits = [0]; n_retries = [0]
+    def env_failure(fp, t0, t1):
+        """Environmental (not value-based) reasons to re-run a visit: foreign CPU on our cores, another GPU process, the link not at Gen3."""
+        why = []
+        if fp[0] > ENV_FOREIGN_PCT: why.append("foreign %.1f%% on our cores (%s)" % (fp[0], fp[1]))
+        if smi:
+            c = smi.window(t0, t1)
+            if c is not None:
+                if c["other_gpu_procs"] > 0: why.append("another GPU process")
+                if c["link_gen_start"] != 3 or c["link_gen_end"] != 3: why.append("PCIe link gen %s/%s" % (c["link_gen_start"], c["link_gen_end"]))
+        return why
+    def one_visit(cell):
         la0 = Path("/proc/loadavg").read_text().split()[:3]
-        foreign.start(); ds0 = None if dry else nvme_rw()
-        if pio: pio.start([t_[0] for t_ in foreign.last.get("top", [])[:3]] if foreign.last else [])
-        t0 = time.monotonic()
+        foreign.start(); ds0 = None if dry else nvme_rw(); t0 = time.monotonic()
         T, extra = dev.run_visit(cell, LAUNCHES_PER_CELL // 2, args)
         t1 = time.monotonic(); fp = foreign.stop(); ds1 = None if dry else nvme_rw(); extra = dict(extra)
-        extra["foreign_proc_io"] = pio.stop() if pio else {}
         extra["foreign"] = dict(foreign.last); extra["loadavg_start"] = la0
-        for t_ in extra["foreign"]["top"]: top_pids.add(t_[1])
         if dry: extra["foreign"]["box_foreign_cores"] = extra.get("dry_box", 0.0)
         extra["drive_read_bytes"] = None if dry else sum(ds1[k][0] - ds0.get(k, (0, 0))[0] for k in ds1)
         extra["drive_write_bytes"] = None if dry else sum(ds1[k][1] - ds0.get(k, (0, 0))[1] for k in ds1)
         extra["drive_by_dev"] = None if dry else {k: [ds1[k][0] - ds0.get(k, (0, 0))[0], ds1[k][1] - ds0.get(k, (0, 0))[1]] for k in ds1 if ds1[k] != ds0.get(k)}
         extra["drive_bytes"] = extra["drive_read_bytes"]
-        sink.append((T, extra, t0, t1, fp))
+        return (T, extra, t0, t1, fp)
+    def visit(cell, sink, pass_idx):
+        for attempt in range(MAX_ATTEMPTS):
+            v = one_visit(cell); n_visits[0] += 1
+            why = env_failure(v[4], v[2], v[3])
+            if not why or attempt == MAX_ATTEMPTS - 1:
+                if why: v[1]["env_failure_kept"] = why          # out of attempts: kept, and the frozen gate will judge it
+                v[1]["attempts"] = attempt + 1; sink.append(v); return
+            n_retries[0] += 1
+            retries_f.write(json.dumps({"pass": pass_idx, "cell": list(cell), "attempt": attempt + 1, "why": why, "median_T_ms": S.median(v[0]),
+                                        "foreign_where": v[4][1], "loadavg": v[1]["loadavg_start"]}) + "\n"); retries_f.flush()
     for p in range(PASSES):
+        if topscan: steady.append({"pass": p, "start": topscan.sample(1.0)})
         acc = collections.defaultdict(list)
         for cell, v in abba(cells, rng):
-            visit(cell, acc[cell]); order_log.append((p, list(cell), v))
+            visit(cell, acc[cell], p); order_log.append((p, list(cell), v))
         load_acc = collections.defaultdict(list)
         if args.with_nvme:
             go.write_text("go\n"); time.sleep(0.5)
             for cell, v in abba(load_cells, rng):
-                visit(cell, load_acc[cell]); order_log.append((p, list(cell), v)); load_windows.append((list(cell), load_acc[cell][-1][2], load_acc[cell][-1][3])); load_drive.append(load_acc[cell][-1][1]["drive_bytes"]); load_drive_w.append(load_acc[cell][-1][1]["drive_write_bytes"]); load_pass.append(p)
+                visit(cell, load_acc[cell], p); order_log.append((p, list(cell), v)); load_windows.append((list(cell), load_acc[cell][-1][2], load_acc[cell][-1][3])); load_drive.append(load_acc[cell][-1][1]["drive_bytes"])
             go.unlink(); time.sleep(0.5)
         for cell, visits in list(acc.items()) + list(load_acc.items()):
             T = [x for v in visits for x in v[0]]
@@ -502,13 +529,14 @@ def run(args):
             worst = max((v[4] for v in visits), key=lambda x: x[0])
             dur = sum(v[3] - v[2] for v in visits); db = None if dry else sum(v[1]["drive_bytes"] for v in visits)
             dw = None if dry else sum(v[1]["drive_write_bytes"] for v in visits)
-            extra = {"cpu": visits[0][1].get("cpu"), "pass": p, "visits": len(visits), "drive_bytes": db, "drive_write_bytes": dw, "drive_gb_per_s": None if dry else db / 1e9 / max(dur, 1e-9),
-                     "drive_by_dev": [v[1]["drive_by_dev"] for v in visits], "foreign_proc_io": [v[1]["foreign_proc_io"] for v in visits], "foreign_where": worst[1],
-                     "box_foreign_cores": max(v[1]["foreign"]["box_foreign_cores"] for v in visits), "foreign_top": [v[1]["foreign"]["top"] for v in visits],
+            extra = {"cpu": visits[0][1].get("cpu"), "pass": p, "visits": len(visits), "attempts": [v[1]["attempts"] for v in visits], "drive_bytes": db, "drive_write_bytes": dw,
+                     "drive_gb_per_s": None if dry else db / 1e9 / max(dur, 1e-9), "drive_by_dev": [v[1]["drive_by_dev"] for v in visits], "foreign_where": worst[1],
+                     "box_foreign_cores": max(v[1]["foreign"]["box_foreign_cores"] for v in visits),
                      "loadavg_start": visits[0][1]["loadavg_start"], "loadavg_end": visits[-1][1]["foreign"]["loadavg"]}
-            if cell.load == "idle" and not dry: drive_rows.append((p, (db + dw) / 1e9 / max(dur, 1e-9)))
+            if cell.load == "idle" and not dry and (db + dw) / 1e9 / max(dur, 1e-9) > IDLE_DRIVE_MAX_GBS: idle_dirty.append((list(cell), p, round((db + dw) / 1e9 / max(dur, 1e-9), 4)))
             (box_load if cell.load == "nvme" else box_idle).append((p, extra["box_foreign_cores"]))
             lines.write(json.dumps(record(cell, p, T, dev.reuse_distance(cell.node) if cell.state != "repeat" else 10 ** 9, cond, worst, extra)) + "\n"); lines.flush()
+        if topscan: steady[-1]["end"] = topscan.sample(1.0)
         print("pass %d done" % p, flush=True)
     rc = 0
     if reader:
@@ -519,18 +547,10 @@ def run(args):
         for cell, t0, t1 in load_windows:
             b = sum(x[1] for x in rl if int(t0 * 1e9) <= x[0] <= int(t1 * 1e9))       # time.monotonic() and CLOCK_MONOTONIC share an epoch on Linux
             gbs.append({"cell": cell, "reader_gb_per_s": b / max(t1 - t0, 1e-9) / 1e9})
-        drift = []
-        for g, (cell, t0, t1), db, dw, pp in zip(gbs, load_windows, load_drive, load_drive_w, load_pass):
+        for g, (cell, t0, t1), db in zip(gbs, load_windows, load_drive):
             rb = g["reader_gb_per_s"] * (t1 - t0) * 1e9
-            g["drive_bytes"] = db; g["foreign_io_fraction"] = None if (dry or rb <= 0) else (db - rb) / rb; g["pass"] = pp
-            g["foreign_drive_gb_per_s"] = None if dry else ((db + dw) - rb) / 1e9 / max(t1 - t0, 1e-9)
+            g["drive_bytes"] = db; g["foreign_io_fraction"] = None if (dry or rb <= 0) else (db - rb) / rb
         meta["load_windows"] = gbs
-        if not dry:                                   # foreign NVMe traffic (reads + writes, the reader's own bytes removed) must not differ between the arms of the ratio
-            for pp in range(PASSES):
-                i_ = [x for q, x in drive_rows if q == pp]; l_ = [g["foreign_drive_gb_per_s"] for g in gbs if g["pass"] == pp]
-                if i_ and l_ and abs(S.mean(l_) - S.mean(i_)) > FOREIGN_DRIVE_MAX_DELTA_GBS: drift.append((pp, round(S.mean(i_), 3), round(S.mean(l_), 3)))
-            meta["foreign_drive_gb_per_s_idle_vs_load_by_pass"] = [(pp, round(S.mean([x for q, x in drive_rows if q == pp] or [0]), 3), round(S.mean([g["foreign_drive_gb_per_s"] for g in gbs if g["pass"] == pp] or [0]), 3)) for pp in range(PASSES)]
-            if drift: (out / "results.INVALID").write_text("foreign NVMe traffic changed by more than %.2f GB/s between the idle and load arms in pass(es) %s: the nvme ratio is invalid\n" % (FOREIGN_DRIVE_MAX_DELTA_GBS, drift)); rc = 3
         if not dry and any(g["foreign_io_fraction"] is None or abs(g["foreign_io_fraction"]) > LOAD_FOREIGN_IO_MAX for g in gbs):
             (out / "results.INVALID").write_text("drive traffic in a load window differs from the reader's own bytes by more than %.0f%%: another lane used the drives; the nvme arm's rho is not to be quoted\n" % (100 * LOAD_FOREIGN_IO_MAX)); rc = 3
         if any(g["reader_gb_per_s"] < args.min_reader_gbs for g in gbs) and not dry:
@@ -540,8 +560,11 @@ def run(args):
         if i_ and l_ and abs(S.mean(l_) - S.mean(i_)) > BOX_FOREIGN_MAX_DELTA: box_shift.append((p_, round(S.mean(i_), 2), round(S.mean(l_), 2)))
     meta["box_foreign_cores_idle_vs_load_by_pass"] = [(p_, round(S.mean([x for q, x in box_idle if q == p_] or [0]), 2), round(S.mean([x for q, x in box_load if q == p_] or [0]), 2)) for p_ in range(PASSES)]
     if box_shift:
-        (out / "results.INVALID").write_text("foreign CPU (non-own, kernel I/O threads excluded) changed by more than %.1f cores between the idle and load arms in pass(es) %s: the nvme ratio is invalid\n" % (BOX_FOREIGN_MAX_DELTA, box_shift)); rc = 3
-    meta["steady_state"] = _cmdlines(top_pids)
+        (out / "results.INVALID").write_text("foreign CPU (non-own, from /proc/stat, an upper bound) changed by more than %.1f cores between the idle and load arms in pass(es) %s: the nvme ratio is invalid\n" % (BOX_FOREIGN_MAX_DELTA, box_shift)); rc = 3
+    if idle_dirty:
+        (out / "results.INVALID").write_text("an idle-arm cell moved NVMe data above %.2f GB/s (rho's baseline is contaminated): %s\n" % (IDLE_DRIVE_MAX_GBS, idle_dirty[:5])); rc = 3
+    meta["idle_dirty"] = idle_dirty; meta["steady_state_by_pass"] = steady
+    meta["visits"] = n_visits[0]; meta["retried_visits"] = n_retries[0]; meta["retry_fraction"] = n_retries[0] / max(1, n_visits[0])
     if smi: smi.stop()
     meta["cell_order"] = order_log; meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     (out / "meta.json").write_text(json.dumps(meta, indent=1, default=str)); dev.close(); return rc

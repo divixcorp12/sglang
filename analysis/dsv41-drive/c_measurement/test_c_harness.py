@@ -64,24 +64,48 @@ def _spin_on(cpu):
     import subprocess
     return subprocess.Popen(["taskset", "-c", str(cpu), sys.executable, "-c", "while True: pass"])
 
-def test_foreign_load_counts_only_the_cores_we_use():
+def test_foreign_load_counts_only_the_cores_we_use_and_not_ours():
     import time
-    cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2
+    cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 3
     mine, other = cpus[0], cpus[1]
     on_mine, on_other = _spin_on(mine), _spin_on(other); time.sleep(0.3)
     try:
         f = h.ForeignLoad([os.getpid()], {mine}); f.start(); time.sleep(1.0); pct, where = f.stop()
-        assert pct > 50.0 and ("cpu%d" % mine) in where, (pct, where)                    # the spinner on our core is seen
-        f = h.ForeignLoad([os.getpid()], {other}); f.start(); time.sleep(1.0); pct2, where2 = f.stop()
-        assert pct2 > 50.0 and ("cpu%d" % other) in where2, (pct2, where2)
+        assert pct > 50.0 and ("cpu%d" % mine) in where, (pct, where)                    # a spinner on our core is seen
+        f = h.ForeignLoad([os.getpid()], {cpus[2]}); f.start(); time.sleep(1.0); pct2, _ = f.stop()
+        assert pct2 < 60.0                                                               # a core with no spinner of ours is not blamed for the other two (the box may be busy: only bound it)
+        assert f.last["box_foreign_cores"] >= 1.5, f.last                                # box-wide, both spinners are foreign
         f = h.ForeignLoad([os.getpid(), on_mine.pid, on_other.pid], {mine, other}); f.start(); time.sleep(1.0); pct3, _ = f.stop()
-        assert pct3 < 10.0, pct3                                                          # own pids are excluded
-        busy = [c for c in cpus if c not in (mine, other)][:1]
-        if busy:                                                                          # a core nobody spins on reads as quiet only if the box is
-            f = h.ForeignLoad([os.getpid()], set(busy)); f.start(); time.sleep(0.5); pct4, _ = f.stop()
-            assert pct4 >= 0.0
+        assert pct3 < 30.0, pct3                                                          # declaring the spinners ours removes them (attribution, not perfect: ticks)
     finally:
         on_mine.kill(); on_other.kill()
+
+def test_foreign_load_resolution_floor():
+    f = h.ForeignLoad([os.getpid()], {0}); f.start(); import time; time.sleep(0.05)
+    f.a[0] -= 2                                            # pretend 2 foreign ticks appeared on core 0 within a 50 ms window: 40%, but below MIN_TICKS
+    pct, _ = f.stop(); assert pct <= 9.9, pct
+
+def test_top_scan_names_a_spinner():
+    import time
+    sp = _spin_on(sorted(os.sched_getaffinity(0))[0]); time.sleep(0.3)
+    try:
+        top = h.TopScan([os.getpid()]).sample(1.0)
+        assert any(t["cpu_pct"] > 50 and "while True" in t["cmdline"] for t in top), top
+    finally: sp.kill()
+
+def test_visit_retry_is_environmental_and_logged():
+    for seq, want_retries in (([], 0), ([25.0, 0.0], 1), ([30.0, 30.0, 30.0] + [0.0] * 5000, 0)):     # the last: every attempt of the first visit fails, then clean
+        h.DRY_FOREIGN_SEQ[:] = list(seq)
+        with tempfile.TemporaryDirectory() as d:
+            assert h.main(["--out", d, "--dry-run"]) == 0
+            r = [json.loads(l) for l in open(Path(d, "retries.jsonl"))]; m = json.loads(Path(d, "meta.json").read_text())
+            if seq == []: assert r == [] and m["retried_visits"] == 0
+            elif seq[:2] == [25.0, 0.0]: assert len(r) == 1 and "foreign 25.0%" in r[0]["why"][0] and m["retried_visits"] == 1
+            else:
+                assert len(r) == 2 and m["retried_visits"] == 2                       # attempts 1 and 2 logged; the third is kept and left to the frozen gate
+                kept = [json.loads(l) for l in open(Path(d, "results.jsonl"))]
+                assert any(x["foreign_max_core_pct"] == 30.0 for x in kept)
+    h.DRY_FOREIGN_SEQ[:] = []
 
 def test_drive_accounting_helpers():
     assert abs(h.drive_gb_per_s({"nvme0n1": 0}, {"nvme0n1": 2_000_000}, 1.0) - 1.024) < 1e-6         # 2e6 sectors x 512 B in 1 s
@@ -93,16 +117,8 @@ def test_drive_accounting_helpers():
 def test_cpu_list_parser():
     assert h._parse_cpus("18-20,54") == [18, 19, 20, 54] and h._parse_cpus("") == []
 
-def test_box_foreign_gate_and_measure():
-    import subprocess, time
-    # 1. the meter: a one-core spinner shows up as about 1 box-wide foreign core and is named
-    sp = _spin_on(sorted(os.sched_getaffinity(0))[0]); time.sleep(0.3)
-    try:
-        f = h.ForeignLoad([os.getpid()], set(os.sched_getaffinity(0))); f.start(); time.sleep(1.0); f.stop()
-        assert f.last["box_foreign_cores"] >= 0.8 and any(t[0] in ("python3", "python") and t[2] > 50 for t in f.last["top"]), f.last["top"]
-        assert len(f.last["loadavg"]) == 3
-    finally: sp.kill()
-    # 2. the gate: foreign CPU that differs between the idle and the load arms by more than a core writes results.INVALID (exit 3)
+def test_box_foreign_gate():
+    # the gate: foreign CPU that differs between the idle and the load arms by more than a core writes results.INVALID (exit 3)
     for shift, want_rc in ((0.0, 0), (2.5, 3)):
         h.DRY_BOX_SHIFT = shift
         with tempfile.TemporaryDirectory() as d:
@@ -117,18 +133,7 @@ def test_meta_records_not_measured_and_load_fields():
         m = json.loads(Path(d, "meta.json").read_text())
         assert "hot" in m["NOT_MEASURED"] and "nvme" in m["NOT_MEASURED"]                    # nvme is reported not measured when it was not run
         line = json.loads(open(Path(d, "results.jsonl")).readline())
-        assert {"box_foreign_cores", "foreign_top", "loadavg_start", "loadavg_end"} <= set(line)
-
-def test_proc_io_sees_a_writer_and_marks_the_unreadable():
-    import subprocess, time, tempfile
-    with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as d:          # /tmp is RAM-backed on some hosts: write_bytes counts disk writes only
-        code = "import os,time\nf=open(%r,'wb')\nt=time.time()\nwhile time.time()-t<2:\n    f.write(b'x'*(4<<20)); f.flush(); os.fsync(f.fileno())" % os.path.join(d, "w")
-        w = subprocess.Popen([sys.executable, "-c", code]); time.sleep(0.3)
-        pio = h.ProcIO([os.getpid()]); pio.start(extra=(os.path.basename(sys.executable), "python3", "python")); time.sleep(1.0); out = pio.stop(); w.kill()
-        mine = [v for k, v in out.items() if isinstance(v, dict) and v["write_MB_s"] > 5.0]
-        assert mine, out
-        pio.pids[1] = "init"; pio.a = pio._read(); pio.t = time.monotonic()                     # pid 1 is another uid: recorded as unreadable, never as zero
-        if os.getuid() != 0: assert pio.stop().get("init[1]") == "unreadable"
+        assert {"box_foreign_cores", "loadavg_start", "loadavg_end", "attempts"} <= set(line)
 
 def test_node_mem_reader():
     try: m = h.node_mem_mib(0)
