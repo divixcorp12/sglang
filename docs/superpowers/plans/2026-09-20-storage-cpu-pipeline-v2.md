@@ -1031,6 +1031,31 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > valid. Any future A/B on this machine using an idle-sibling baseline inherits
 > the defect.
 >
+> **(c) GENERALISED, after three independent instances in one day: A KILL
+> EVIDENCED BY AN ABSENCE IS NOT A KILL.** The three mechanisms differ; the
+> shape does not.
+> 1. A `-k` selector matched only the author's own new test, so a mutant was
+>    reported caught by a test that was never invoked.
+> 2. An empty `CUDA_VISIBLE_DEVICES` errors a file at *collection*, so it neither
+>    passes nor fails and contributes nothing to any count.
+> 3. A mutation driver decided "killed" by grepping the output for `FAILED`.
+>    **A test that never ran produces no `FAILED` line**, so an uncollected file
+>    is indistinguishable from a passing baseline, and a mutant that was never
+>    exercised reads as survived -- or, with the baseline equally broken, as
+>    killed.
+>
+> In all three the assertion was sound and the test did not execute. Reading a
+> test's *source* cannot detect any of them. **The defence is positive
+> confirmation that the intended tests ran**: assert the collected count, assert
+> collected equals run, require both nonzero, and check summaries for `error`
+> and `Interrupted` rather than trusting an exit status or the absence of a
+> keyword. An exit status lies under every one of these defects.
+>
+> This is the same rule as (a) applied one level up: (a) demands a witness that
+> the intended *code path* ran; (c) demands a witness that the intended *test*
+> ran. A suite can satisfy (a) perfectly and still be worthless if nobody
+> checked (c).
+>
 > **(d) ORDER-DEPENDENT RESULTS -- a test whose verdict depends on what ran
 > before it.** Every other class here concerns a test that passes for the wrong
 > reason; this is a test whose result is not a property of the test at all.
