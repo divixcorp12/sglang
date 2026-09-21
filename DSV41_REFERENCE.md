@@ -2578,6 +2578,19 @@ The old number was right; only the label attached to it was wrong.
   concurrently with the buffered weight load, is pre-registered and **untested**.
 - **Spans are not compared across schema 1 and 2** (see the schema note above),
   so the old-versus-new comparison here is on tok/s and bytes only.
+- **Nothing recorded whether the box was quiet during the arms above.** Load and
+  foreign-process sampling was only added afterwards, and a later series caught
+  three unrelated jobs starting mid-run on cores overlapping the arms', which
+  cost those arms 17 to 31 per cent. The arms in the table were very probably
+  quiet -- their tok/s repeats to 0.5-0.6 per cent within a cell, which
+  contention does not usually permit -- but that is inferred from the outcome,
+  not observed in the condition. Treat "matched" here as matched in workload,
+  seed, capacity, policy and code, not in machine load.
+- **The old-barrier figure is one clean arm.** Four further old arms ran while
+  the box was contended and are excluded. Their least-disturbed sessions repeat
+  the clean arm's per-session values to 1-2 per cent, which corroborates the
+  ~3.8 level without supplying a second clean measurement. The honest phrasing
+  is n=1 clean, corroborated by undisturbed sessions of disturbed arms.
 
 #### The gate: service-attributed expert bytes
 
