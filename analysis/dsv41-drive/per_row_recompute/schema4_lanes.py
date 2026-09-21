@@ -25,9 +25,9 @@ def main(path):
                 sys.exit("not a schema-4 trace: cannot answer the per-layer question")
             reqs.append(d)
     dec = [d for d in reqs if d["forward"] in steps]
-    nst = len(steps)
-    print("decode requests %d of %d, graph steps %d, dropped_before nonzero %d" %
-          (len(dec), len(reqs), nst, sum(1 for d in reqs if d.get("dropped_before"))))
+    nst = sum(s.get("steps", 1) for s in steps.values())   # decode steps, NOT graph_step lines: a line can cover 2 steps (see merged_steps.py)
+    print("decode requests %d of %d, graph_step lines %d covering %d decode steps, dropped_before nonzero %d" %
+          (len(dec), len(reqs), len(steps), nst, sum(1 for d in reqs if d.get("dropped_before"))))
     # 1. the sum check that decides whether `lanes` means what the commit says
     sl = sum(d["request"]["lanes"] for d in dec); sr = sum(d["rows_asked"] for d in dec)
     sv = sum(s["vram_miss"] for s in steps.values()); sm = sum(s["ram_miss"] for s in steps.values())
@@ -57,7 +57,7 @@ def main(path):
         tot["best"] += best; tot["rand"] += rnd; tot["two"] += two
     for kname in ("best", "rand", "two"):
         print("   %-5s %.2f ms/step" % (kname, tot[kname] / nst))
-    print("   per-row over two-phase: best %.2f, random %.2f ms/step; compare the A1 model: 38.61 / 19.17 / 33.53" %
+    print("   per-row over two-phase: best %.2f, random %.2f ms/step; compare the A1 model, same denominator: 37.40 / 18.57 / 32.48 (per 511 steps; 38.61 / 19.17 / 33.53 per 495 lines)" %
           ((tot["best"] - tot["two"]) / nst, (tot["rand"] - tot["two"]) / nst))
 
 main(sys.argv[1])

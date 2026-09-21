@@ -15,7 +15,7 @@ per-session step times.
 **Everything in the precheck's headline arithmetic reproduces from the traces.** Nothing I found changes the classification
 (SUPPORT, SPREAD-IRRELEVANT) or the redirect (two-phase before per-row). I found one misstated comparison (R1), one claim
 that the data can now test rather than assume (R2), one explanation that is right for a different reason than stated (R3),
-one independence statement to tighten (R4), and two small denominator notes (R5). Nothing here is HIGH.
+one independence statement to tighten (R4), two small denominator notes (R5), and, found later, a 3-7% overstatement of every absolute ms/step figure because 16 of the 495 trace lines cover two decode steps (R6). Nothing here is HIGH, and no verdict changes.
 
 ## What reproduces
 
@@ -125,6 +125,42 @@ should sit beside the headline.
   UNRESOLVED (contended box), so the resolution on the real box is worse than 1.5%. This sharpens the document's point that the
   per-row-over-two-phase increment (2.0% at best, negative at random) is below what the gate can see.
 
+### R6 (medium, a systematic overstatement I found while chasing the "extra ~2 requests per step"): 495 graph_step lines are 511 decode steps
+
+Found after the first version of this review, on the same traces, by explaining why 20,800 request lines are 42.0 per graph_step against 40 layers.
+Sixteen of the 495 `graph_step` lines are merged: `steps == 2`, `routed_rows == 480` (= 2 x 240 for the other 479 lines), `vram_miss` 266.5 on average against
+126.5, and the request lines filed under those 16 `forward` ids number 65-81 (about 2 x 40) instead of 38-41. `_trace_step` says why: a lagged register read leaves one
+step for the next line and the line counts `steps = round(routed / routed_rows_per_step)`. So the trace holds **511 decode steps in 495 lines** (the client
+saw 4 x 127 = 508; I do not know the 3-step gap). The rest of the residual is explained too: four request groups filed under forwards 2, 126, 251, 376 that have
+no `graph_step` (374 + 14 + 15 + 15 = 418 lines; one per session, at a 125-forward stride) and the +-1 lag at ordinary boundaries (38-41 per forward). 20,382
+requests over 511 steps is 39.9 per step.
+
+Two errors follow in the precheck, both in the direction of a larger saving:
+1. **The denominator.** Savings are summed over requests from 511 steps and divided by 495. Every ms/step figure is 3.2% too large (511/495).
+2. **The lane count on the 16 merged lines.** `k = round(vram_miss / 40)` uses a two-step `vram_miss` (about 6.7, capped at 6) for each of ~1,280 requests where the truth is about 3.3.
+   That over-credits hit lanes on about 6% of requests.
+
+Recomputed with `vram_miss / steps` for `k` and 511 as the denominator (`merged_steps.py`; the four arms agree to 0.1 ms):
+
+| ms per decode step | as registered (/495, k per line) | denominator fixed only (/511) | both fixed |
+|---|---:|---:|---:|
+| BEST | 38.61 | 37.40 | **35.80** |
+| RANDOM | 19.17 | 18.57 | **17.79** |
+| two-phase | 33.53 | 32.48 | **30.88** |
+| per-row over two-phase, best order | +5.09 | +4.93 | **+4.93** |
+| per-row over two-phase, random order | -14.35 | -13.90 | **-13.08** |
+| hit lanes credited per step | 31.9 | 30.9 | **29.3** |
+
+Against 257.5 ms: BEST 13.9%, RANDOM 6.9%, two-phase 12.0% (registered 15.0 / 7.5 / 13.0). Miss-only RANDOM 2.55 -> 2.46; `Sigma(m-1)*c` over 511 steps is 4.90, not 5.06.
+Total hit lanes per step (R2) 111.9 -> 108.4 and `vram_miss` per step 131 -> 126.9 (nearer 18.2's 121). **No verdict changes**: RANDOM minus 1 ms is 6.5% against the 3% bar,
+two-phase clears it, per-row over two-phase is still +4.9 ms best and -13.1 ms random, miss-only/RANDOM stays about 0.13, and the 87/13 split is a ratio of two
+quantities that scale together. But every absolute figure in `PER_ROW_TRANSFER.md` section 1 (and everything quoted from it) is 3-7% high, and
+**the R2 bounds (10.8 to 63.6, worst-case two-phase about 4%) were computed per 495 lines and are slightly loose in the same direction**. I have not redone them with 511.
+Also note that 495 appears as a per-step count in `per_row_precheck.py` itself, not only in the document.
+
+For the schema-4 analysis this matters twice: `schema4_lanes.py` now divides by `sum(steps)`, and the sum check of lanes against `vram_miss` is unaffected (sums), but any per-step
+grouping must use the merged lines' `steps`.
+
 ## Not recomputed or not verifiable from the traces
 
 - **A2** (hit lanes ready at `reserved`): it is an assumption because the signal does not exist today (the document says so).
@@ -192,6 +228,7 @@ directory on divix01.
   `rows_asked` / `vram_miss` / `ram_miss`.
 - `spread_hide_tstep.py`: spread p50, hide_ok, read-wait, T_step variants.
 - `reap_ties.py`: same-reap tie counts (mirrors-on and mirrors-off).
+- `merged_steps.py`: R6, the merged `graph_step` lines and the recomputation with `steps` (four arms).
 - `schema4_lanes.py`: the measured-`k` version for a schema-4 trace (see the Schema 4 section; plumbing-tested on a synthetic file only).
 
 The core function, for reference:
