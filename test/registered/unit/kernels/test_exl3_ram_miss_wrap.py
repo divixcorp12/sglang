@@ -3,7 +3,9 @@
 The device skips sequence 0 on wrap (post kernel and sim_post: `if (seq == 0) seq = 1`), so the
 service must too. pump_demand and pump_advice both advance with `next += 1u`, so after 0xFFFFFFFF
 each spends one iteration on a phantom seq 0: the done word steps back to 0 and the ring slot
-`(0 - 1) % records` is read as if it held a request.
+`(0 - 1) % records` is read as if it held a request. Nothing can wait on seq 0, since the device never
+posts it, so the cost is a spurious counter increment and a spurious stage record per wrap; the
+invariant broken is that the done word never takes the value 0. A lapped ring can resume at 0 as well.
 
 That phantom looks different on the two page states, so both are covered:
   used page   the slot holds an older sequence, the seqlock read fails, one overrun (demand) or one
@@ -54,7 +56,8 @@ def _word(page, offset):
 def _drive(tmp_path, *, advisory, seed, used):
     """Seed both words at `seed`, post four records through the wrap, pump exactly four times.
 
-    Returns the done word after every pump and the host's counters."""
+    Returns the posted sequences, the done word after every pump, the result of one more pump and the
+    host's counters."""
     kind = "advise" if advisory else "demand"
     ring, records = (ADVISE_RING, ADVISE_RECORDS) if advisory else (DEMAND_RING, DEMAND_RECORDS)
     s = ram_miss_setup(tmp_path, capacity=6)
@@ -106,3 +109,32 @@ def test_the_control_a_service_opened_at_the_wrap_already_skips_zero(tmp_path, a
     assert posted == [1, 2, 3, 4]
     assert done == posted and idle == 0
     assert counters["overruns"] == 0 and counters["advisories_skipped"] == 0
+
+
+@pytest.mark.parametrize("advisory", [False, True], ids=["demand", "advisory"])
+def test_a_lap_that_would_resume_at_sequence_zero_skips_it(tmp_path, advisory):
+    """Posting a full ring, starting two before the wrap, leaves head - next == records, and a lap resumes
+    at head - (records - 2), which is 0 here. The service must resume at 1 instead: the done word never
+    takes the value 0 and the records that survived the lap are all served."""
+    kind = "advise" if advisory else "demand"
+    records = ADVISE_RECORDS if advisory else DEMAND_RECORDS
+    s = ram_miss_setup(tmp_path, capacity=6)
+    page = new_page(pin=False)
+    _set_word(page, WORDS[f"{kind}_head"], 0xFFFFFFFD)
+    _set_word(page, WORDS[f"{kind}_done"], 0xFFFFFFFD)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    try:
+        posted = [
+            sim_post(page, 1, need=[i % 6], protect=[i % 6], advisory=advisory) for i in range(records)
+        ]
+        assert posted[:3] == [0xFFFFFFFE, 0xFFFFFFFF, 1] and posted[-1] == records - 2
+        done = []
+        for _ in range(records + 2):
+            if host.pump() == 0:
+                break
+            done.append(_word(page, WORDS[f"{kind}_done"]))
+        assert 0 not in done, done
+        assert done[-1] == posted[-1]
+        assert done == sorted(done)  # the survivors, in order, none twice
+    finally:
+        host.stop()

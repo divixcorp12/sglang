@@ -1337,6 +1337,13 @@ inline void store_release(uint8_t* address, uint32_t value) {
   __atomic_store_n(reinterpret_cast<uint32_t*>(address), value, __ATOMIC_RELEASE);
 }
 
+// The device never posts sequence 0 (the post kernel and sim_post wrap 0xFFFFFFFF to 1), so a
+// service that reaches 0 would spend an iteration on a record nobody posted and store a done word
+// of 0.
+inline uint32_t skip_zero(uint32_t seq) {
+  return seq == 0 ? 1u : seq;
+}
+
 inline bool reached(uint32_t observed, uint32_t seq) {
   return static_cast<int32_t>(observed - seq) >= 0;
 }
@@ -1505,7 +1512,7 @@ class RamTier {
     if (head - next_demand_ >= kDemandRecords) {
       // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq.
       counters_[kOverruns].fetch_add(head - next_demand_ - (kDemandRecords - 2));
-      next_demand_ = head - kDemandRecords + 2u;
+      next_demand_ = skip_zero(head - kDemandRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
     Request request;
@@ -1517,7 +1524,7 @@ class RamTier {
     _mm_sfence();
     store_release(page_ + kDemandDone, next_demand_);
     end_stage();
-    next_demand_ += 1u;
+    next_demand_ = skip_zero(next_demand_ + 1u);
     return true;
   }
 
@@ -1528,7 +1535,7 @@ class RamTier {
     begin_stage(kStageAdvisory, next_advice_, head - next_advice_);
     if (head - next_advice_ >= kAdviseRecords) {
       counters_[kAdvisoriesSkipped].fetch_add(head - next_advice_ - (kAdviseRecords - 2));
-      next_advice_ = head - kAdviseRecords + 2u;
+      next_advice_ = skip_zero(head - kAdviseRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kAdviseRing, kAdviseRecords, next_advice_);
     Request request;
@@ -1553,7 +1560,7 @@ class RamTier {
     }
     store_release(page_ + kAdviseDone, next_advice_);
     end_stage();
-    next_advice_ += 1u;
+    next_advice_ = skip_zero(next_advice_ + 1u);
     return true;
   }
 
