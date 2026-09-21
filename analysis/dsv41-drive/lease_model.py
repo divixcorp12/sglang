@@ -13,6 +13,11 @@ a request accepted as successful whose delivered bytes are not the requested exp
 find a known bug is too weak, so ``Config`` also builds the *mutants* (one protocol rule removed each) and the
 protocol *as it exists today*; the tests require the model to find what is known to be wrong.
 
+Task 8's side (LEASE_PROTOCOL.md 17.1): a *promoter* takes host leases on ready slots, copies from them on
+its own stream and releases them, and an *eager* caller pauses the service and assigns a slot by hand
+(``before_host_use``). ``pause_counts_host`` and ``copy_waits_on_serving`` are the two rules Task 8 depends on:
+the pause counts graph-lane leases only, and a lease holder's copy never waits on the serving stream.
+
 What it does not model. It is sequentially consistent except for one relaxation: the device's stores to the
 acknowledgement and terminal words reach the service in any order across different words (same word stays in
 order). Missing fences, ``ld.global.nc`` staleness and PCIe reordering of the service's stores are outside it,
@@ -37,6 +42,9 @@ FREE, LOADING, READY = range(3)
 NONE, GRANTED, ACKED, VOID = range(4)
 CONSUMED, VIOLATED = 1, 2
 TORN = -1
+# Promoter program counters, and the eager caller's.
+H_IDLE, H_COPY_B, H_COPY_E, H_REL = range(4)
+E_IDLE, E_TAKE, E_WB, E_WE, E_RESUME = range(5)
 
 
 @dataclass(frozen=True)
@@ -56,6 +64,13 @@ class Config:
     cuda_error: bool = False  # the device may die mid-kernel
     shutdown: bool = False  # the service may be shut down, and Python then frees or quarantines
     max_states: int = 6_000_000
+    promotions: int = 0  # host-lease acquisitions the promoter makes (Task 8); 0 leaves the actor out
+    eager_uses: int = 0  # pause-assign-resume cycles of the eager caller; 0 leaves the actor out
+    host_guard: bool = True  # eviction by the service respects host leases
+    eager_host_guard: bool = True  # the eager assign respects host leases
+    pause_counts_host: bool = False  # True: the pause also waits for host leases (R2 says it must not)
+    copy_waits_on_serving: bool = False  # True: the promotion copy waits on the serving stream (A3 says it must not)
+    host_release: bool = True  # False: the promoter never releases its lease
     stale_ack: Optional[tuple] = None  # (idx, lane, gen): an acknowledgement left by an idle lane a full sequence cycle ago
     menu: Optional[tuple] = None  # the lane lists a request may take (default: every list of up to ``lanes`` experts)
 
@@ -124,6 +139,7 @@ FIELDS = (
     "sst sexp slease scont "
     "nd sep spc sreq splan out advleft overruns freed quar dead "
     "dseq dep dk dpc dreq di dok dgo dctx dhold dread ddel dstop "
+    "hl hpc hslot hexp hsnap hneed hleft paused epc eplan eleft "
     "viol"
 ).split()
 IX = {name: i for i, name in enumerate(FIELDS)}
@@ -165,6 +181,8 @@ class Model:
             dseq=c.start, dep=0, dk=0, dpc=IDLE, dreq=None, di=0, dok=True, dgo=0,
             dctx=idle_lanes, dhold=tuple(-1 for _ in range(c.lanes)), dread=idle_lanes,
             ddel=idle_lanes, dstop=0,
+            hl=tuple(0 for _ in range(c.slots)), hpc=H_IDLE, hslot=-1, hexp=-1, hsnap=None, hneed=-1,
+            hleft=c.promotions, paused=0, epc=E_IDLE, eplan=(), eleft=c.eager_uses,
             viol=(),
         )
         if c.stale_ack is not None:
@@ -226,6 +244,8 @@ class Model:
         yield from self.service(st)
         yield from self.deliveries(st)
         yield from self.environment(st)
+        yield from self.host(st)
+        yield from self.eager(st)
 
     def deliveries(self, st: dict):
         seen = set()
@@ -283,6 +303,8 @@ class Model:
                 n["dpc"] = HALT
                 yield ("device finished", self.emit(n))
                 return
+            if st["paused"]:
+                return  # the eager caller owns the slots: no graph replay runs meanwhile
             seq, ep = next_seq_device(c, st["dseq"], st["dep"])
             idx = ring_index(c, seq)
             shapes = c.menu if c.menu is not None else [
@@ -431,7 +453,7 @@ class Model:
     def service(self, st: dict):
         c = self.c
         pc = st["spc"]
-        if st["dead"]:
+        if st["dead"] or st["paused"]:
             return
         if pc == S_IDLE:
             yield from self.retire(st)
@@ -520,9 +542,15 @@ class Model:
             n["splan"], n["spc"] = (), S_IDLE
             yield (f"advisory finishes slot {slot} (expert {expert})", self.emit(n))
 
+    def leased(self, st: dict, slot: int, eager: bool = False) -> bool:
+        """The eviction predicate: a graph-lane lease, or a host lease on the path that respects them."""
+        c = self.c
+        host_guard = c.eager_host_guard if eager else c.host_guard
+        return (c.leases and st["slease"][slot] > 0) or (host_guard and st["hl"][slot] > 0)
+
     def check_evict(self, n: dict, slot: int) -> None:
-        """Ghost check of I1 at the first byte store: no lease and no device lane may hold the slot."""
-        if n["slease"][slot] > 0 or self.holds(n, slot):
+        """Ghost check of I1 at the first byte store: no lease of either kind and no reader may hold the slot."""
+        if n["slease"][slot] > 0 or n["hl"][slot] > 0 or self.holds(n, slot):
             self.flag(n, "RecycledUnderReader")
 
     def advise(self, st: dict):
@@ -533,7 +561,7 @@ class Model:
                     continue
                 if st["sst"][slot] == LOADING:
                     continue
-                if st["sst"][slot] == READY and c.leases and st["slease"][slot] > 0:
+                if st["sst"][slot] == READY and self.leased(st, slot):
                     continue
                 n = dict(st)
                 if st["sst"][slot] == READY:
@@ -610,15 +638,15 @@ class Model:
         free = [sl for sl in range(c.slots) if base[sl] == FREE]
         evictable = [
             sl for sl in range(c.slots)
-            if base[sl] == READY and st["sexp"][sl] not in wanted and not (c.leases and st["slease"][sl] > 0)
+            if base[sl] == READY and st["sexp"][sl] not in wanted and not self.leased(st, sl)
         ]
         blocked = [
             sl for sl in range(c.slots)
-            if base[sl] == READY and st["sexp"][sl] not in wanted and (c.leases and st["slease"][sl] > 0)
+            if base[sl] == READY and st["sexp"][sl] not in wanted and self.leased(st, sl)
         ]
         pool = free + evictable
         if len(pool) < len(missing):
-            if len(pool) + len(blocked) >= len(missing) and c.leases and c.defer_leased:
+            if len(pool) + len(blocked) >= len(missing) and (c.leases or c.host_guard) and c.defer_leased:
                 self.note("deferred: victims are leased")
                 return  # deferred: it would fit if leases retired
             n["sreq"] = (idx, gen, seq, count, experts, 1, 0, True)
@@ -684,14 +712,130 @@ class Model:
                     n["out"] = put(st["out"], idx, None if done else (gen, tuple(new), final))
                     yield (f"service retires lane {lane} of request slot {idx} by {why}", self.emit(n))
 
+    # ---- Task 8: the promoter (host leases) ----
+    def host(self, st: dict):
+        c = self.c
+        pc = st["hpc"]
+        if pc == H_IDLE:
+            if st["hleft"] <= 0:
+                return
+            for slot in range(c.slots):
+                if st["sst"][slot] != READY:
+                    continue
+                n = dict(st)
+                n["hl"] = put(st["hl"], slot, st["hl"][slot] + 1)
+                n["hslot"], n["hexp"], n["hleft"] = slot, st["sexp"][slot], st["hleft"] - 1
+                in_flight = st["dpc"] not in (IDLE, HALT, ERR)
+                # A3 violated: the copy is ordered after the serving stream's queued work (wait_stream).
+                n["hneed"] = st["dk"] if (c.copy_waits_on_serving and in_flight) else -1
+                n["hpc"] = H_COPY_B
+                self.note("host lease taken")
+                yield (f"promoter leases slot {slot} (expert {st['sexp'][slot]})", self.emit(n))
+        elif pc == H_COPY_B:
+            waits = st["hneed"] >= 0 and not (st["dpc"] in (IDLE, HALT, ERR) or st["dk"] > st["hneed"])
+            if waits:
+                return  # the copy is queued behind the serving stream
+            slot = st["hslot"]
+            n = dict(st)
+            n["hsnap"] = st["scont"][slot]
+            n["hpc"] = H_COPY_E
+            yield (f"promotion copy begins on slot {slot}", self.emit(n))
+        elif pc == H_COPY_E:
+            slot = st["hslot"]
+            now = st["scont"][slot]
+            n = dict(st)
+            if now != st["hsnap"] or now[0] == TORN:
+                self.flag(n, "BytesChangedUnderCopy")
+            if now[0] != st["hexp"]:
+                self.flag(n, "WrongBytesRead")
+            n["hpc"] = H_REL
+            yield (f"promotion copy ends on slot {slot}", self.emit(n))
+        elif pc == H_REL:
+            slot = st["hslot"]
+            n = dict(st)
+            if c.host_release:
+                if st["hl"][slot] <= 0:
+                    self.flag(n, "LeaseUnderflow")
+                n["hl"] = put(st["hl"], slot, st["hl"][slot] - 1)
+            n["hpc"], n["hslot"], n["hsnap"] = H_IDLE, -1, None
+            yield (f"promoter releases slot {slot}", self.emit(n))
+
+    # ---- the eager caller: pause, assign by hand, resume (before_host_use) ----
+    def eager(self, st: dict):
+        c = self.c
+        pc = st["epc"]
+        if pc == E_IDLE:
+            if st["eleft"] <= 0 or st["paused"] or st["spc"] != S_IDLE:
+                return
+            # The current stream was synchronized (no graph work in flight, device stores landed) and the
+            # pause acknowledgement retired what it could: graph-lane leases must be zero.
+            base = st["dpc"] in (IDLE, HALT) and not st["pend"] and all(o is None for o in st["out"])
+            if not base or st["fatal"]:
+                return
+            if any(x > 0 for x in st["hl"]) and c.pause_counts_host:
+                n = dict(st)
+                self.flag(n, "PauseBlockedByHostLease")
+                yield ("the eager pause is refused only because a promotion holds a lease", self.emit(n))
+                return
+            n = dict(st)
+            n["paused"], n["epc"] = 1, E_TAKE
+            if any(x > 0 for x in st["hl"]):
+                self.note("pause granted while a host lease is held")
+            yield ("eager caller pauses the service", self.emit(n))
+        elif pc == E_TAKE:
+            n = dict(st)
+            n["epc"] = E_RESUME
+            yield ("eager caller assigns nothing", self.emit(n))
+            for slot in range(c.slots):
+                for expert in range(c.experts):
+                    if self.resident(st, expert) >= 0:
+                        continue
+                    if st["sst"][slot] == LOADING:
+                        continue
+                    if st["sst"][slot] == READY and self.leased(st, slot, eager=True):
+                        continue
+                    n = dict(st)
+                    if st["sst"][slot] == READY:
+                        n["map"] = put(st["map"], st["sexp"][slot], -1)
+                    n["sgen"] = put(st["sgen"], slot, (st["sgen"][slot] + 1) % 4)
+                    n["sst"] = put(st["sst"], slot, LOADING)
+                    n["sexp"] = put(st["sexp"], slot, expert)
+                    n["eplan"] = ((slot, expert),)
+                    n["epc"] = E_WB
+                    yield (f"eager assign takes slot {slot} for expert {expert}", self.emit(n))
+        elif pc == E_WB:
+            slot, expert = st["eplan"][0]
+            n = dict(st)
+            self.check_evict(n, slot)
+            n["scont"] = put(st["scont"], slot, (TORN, st["scont"][slot][1]))
+            n["epc"] = E_WE
+            yield (f"eager assign begins writing slot {slot}", self.emit(n))
+        elif pc == E_WE:
+            slot, expert = st["eplan"][0]
+            n = dict(st)
+            n["scont"] = put(st["scont"], slot, (expert, (st["scont"][slot][1] + 1) % 4))
+            n["sst"] = put(st["sst"], slot, READY)
+            n["map"] = put(st["map"], expert, slot)
+            n["eplan"], n["epc"] = (), E_RESUME
+            yield (f"eager assign finishes slot {slot}", self.emit(n))
+        elif pc == E_RESUME:
+            n = dict(st)
+            n["paused"], n["epc"], n["eleft"] = 0, E_IDLE, st["eleft"] - 1
+            yield ("eager caller resumes the service", self.emit(n))
+
     # ---- classification of states ----
     def quiescent_problem(self, st: dict) -> Optional[str]:
         """Called for a state with no successor: a deadlock, or a leak in a healthy run, or nothing."""
         c = self.c
         if st["dead"] or st["quar"] or st["freed"]:
             return None
-        healthy_done = st["dpc"] in (HALT,) and st["spc"] == S_IDLE and not st["pend"] and not self.demand_visible(st)
+        healthy_done = (
+            st["dpc"] in (HALT,) and st["spc"] == S_IDLE and not st["pend"] and not self.demand_visible(st)
+            and st["hpc"] == H_IDLE and st["epc"] == E_IDLE and not st["paused"]
+        )
         if healthy_done and not st["fatal"]:
+            if any(x > 0 for x in st["hl"]):
+                return "LeakedLease"
             if c.protocol and (any(x > 0 for x in st["slease"]) or any(o is not None for o in st["out"])):
                 return "LeakedLease"
             return None

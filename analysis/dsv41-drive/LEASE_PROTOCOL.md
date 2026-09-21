@@ -1432,7 +1432,7 @@ GPU (under the lock; not run here):
 ### 18.3 The model check (done, bounded)
 
 `analysis/dsv41-drive/lease_model.py` is a self-contained explicit-state model of this
-protocol; `test_lease_model.py` (23 tests, about two minutes, pure Python) pins what it
+protocol; `test_lease_model.py` (31 tests, about four minutes, pure Python) pins what it
 finds. It has two threads (the device's post, wait, copy, acknowledge, consume; the service's
 observe, reserve, load, grant and publish, retire), pinned slots that an advisory may evict
 and reload whenever the service is idle, injectable timeouts and read failures, an optional
@@ -1458,6 +1458,11 @@ Results, all exhaustive over the bounds (up to about 2.4 million states each, co
 | Today's protocol, one timeout | I1 violated (D1); wrong bytes not accepted, because `keep = 0` contains it |
 | Today's protocol without the exclusion | wrong bytes accepted (D2) |
 | Service that does not skip 0 (D6) | a phantom sequence, nothing else |
+| **Task 8 extension.** Designed protocol plus a promoter (host lease, copy, release) and an eager caller (pause, assign, resume); 2 requests; with and without timeouts and read failures | no violation, no deadlock, no leak; the eager pause was granted **while a host lease was held**, and a demand was deferred for want of an unleased victim (both reached) |
+| Mutant: the service evicts a host-leased slot; the eager assign takes a host-leased slot | each is I1 violated (the two paths are checked separately: R5 covers `take_slot_locked`, `assign` and `release`) |
+| Mutant: the eager pause also waits for host leases (R2 broken) | `PauseBlockedByHostLease`: the pause is refused with graph leases at zero and only a promotion's lease in the way |
+| Mutant: the promotion copy waits on the serving stream once it holds a lease (**A3 broken**) | **Deadlock**, found by search: the demand waits for the service, the service defers because its only victim is the host-leased slot, the lease is released only when the copy finishes, and the copy waits for the serving stream. This is the cycle `PROMOTION_ASYNC.md` 9.2 found by reading, so A3 is now shown necessary, not asserted |
+| Mutant: the promoter never releases its lease | Deadlock (a demand deferred behind a lease that never retires; with the device timeout this becomes a fatal, which is why R4 bounds the hold time) |
 
 What this does **not** establish, stated so a pass is not over-read:
 
@@ -1475,6 +1480,19 @@ What this does **not** establish, stated so a pass is not over-read:
 - It did not cover the `pause`/eager path (F10) or its graph-lane/host split, host leases
   at all (Task 8), the lease-mode arming cost, or the watchdog beyond "fatal is followed by
   abort".
+- **The Task 8 extension is thinner than the graph side.** One promotion, one eager cycle,
+  2 requests and four request shapes (against 3 requests for the graph-only runs), so its
+  world is smaller by one request. It models the *contract* (lease, copy, release; pause and
+  assign), not Task 8's protocol: no promotion admission, no `lease_on_ready` window (a
+  mutant for R3 would need the promoter to hold a slot number across a gap, which my
+  `acquire_host_lease` lookup-by-expert does not do, so the model has no such window), no
+  capped copies or executor-stream events, no bound on hold time (R4's "release
+  leased-not-yet-COPYING leases immediately" is not modelled), no stale or repeated
+  `LeaseRef` (R1), no counters (R7) and no `kVersion` effect (R8). The stream dependency is a
+  coarse "the copy is queued behind the serving stream's tail at acquisition time". The
+  eager pause's synchronization is idealized (device idle, its stores landed). R2's safety
+  claim is therefore checked *as an eviction-predicate property over the modelled
+  interleavings*, not against Task 8's real copy path.
 - Its advisory pressure is applied only while no demand is visible to the service, and to
   the single modelled row. In the real service an advisory for the *next* row can start while
   a demand is deferred (section 8); that is a different tier and cannot take the deferred

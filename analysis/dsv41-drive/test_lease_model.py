@@ -3,7 +3,7 @@ enough to find each thing that is known to be wrong.
 
 A model that cannot find a known bug is too weak to say "nothing" about the design, so half of this file is
 mutants: one protocol rule removed each, with the violation it must produce. Pure Python, no GPU, no torch;
-the whole file takes about two minutes and under 1 GiB.
+the whole file takes about four minutes and under 1 GiB.
 
     OMP_NUM_THREADS=1 python -m pytest analysis/dsv41-drive/test_lease_model.py -p no:cacheprovider
 """
@@ -109,6 +109,26 @@ def test_a_stale_acknowledgement_a_full_cycle_old_is_not_taken_for_a_new_one():
     assert run(cfg).violation is None
 
 
+# ---- Task 8: host leases, the eager pause, and the stream dependency (LEASE_PROTOCOL.md 17.1, A3) ----
+
+TASK8 = dict(requests=2, menu=EVICTING, promotions=1, eager_uses=1)
+
+
+def test_host_leases_and_the_eager_pause_are_clean_with_timeouts_and_read_failures():
+    result = run(lm.Config(**TASK8))
+    assert result.violation is None
+
+
+def test_an_eager_pause_is_granted_while_a_promotion_holds_a_lease_and_nothing_deadlocks():
+    """R2: the pause counts graph-lane leases only. With no fault the run must finish, the pause must have
+    been granted with a host lease held, and a demand must have been deferred for want of an unleased victim."""
+    result = run(lm.Config(**TASK8, **CLEAN))
+    assert result.violation is None
+    assert result.coverage.get("pause granted while a host lease is held", 0) > 0
+    assert result.coverage.get("host lease taken", 0) > 0
+    assert result.coverage.get("deferred: victims are leased", 0) > 0
+
+
 # ---- mutants: each removed rule must be found ----
 
 
@@ -141,6 +161,35 @@ def test_each_removed_rule_is_found(name, cfg, kind):
     result = run(cfg)
     assert result.violation == kind, name
     assert replay(cfg, result.trace)["viol"] or kind in ("Deadlock", "LeakedLease", "SpuriousFatal")
+
+
+@pytest.mark.parametrize(
+    "name, kw, kind",
+    [
+        ("the service evicts a host-leased slot", dict(host_guard=False), "RecycledUnderReader"),
+        ("the eager assign takes a host-leased slot", dict(eager_host_guard=False), "RecycledUnderReader"),
+        ("the eager pause also waits for host leases (R2 broken)", dict(pause_counts_host=True), "PauseBlockedByHostLease"),
+        (
+            "the promotion copy waits on the serving stream while holding a lease (A3 broken)",
+            dict(copy_waits_on_serving=True),
+            "Deadlock",
+        ),
+        ("the promoter never releases its lease", dict(host_release=False), "Deadlock"),
+    ],
+)
+def test_each_removed_task8_rule_is_found(name, kw, kind):
+    assert run(lm.Config(**TASK8, **CLEAN, **kw)).violation == kind, name
+
+
+def test_the_stream_dependency_cycle_is_the_one_task_8_found_by_reading():
+    """A3: a promotion holds a lease on slot S, its copy waits on the serving stream, and the serving stream sits
+    in an armed wait whose only victim is S. The trace ends with the wait stuck and nothing enabled."""
+    cfg = lm.Config(**TASK8, **CLEAN, copy_waits_on_serving=True)
+    result = run(cfg)
+    assert result.violation == "Deadlock"
+    final = replay(cfg, result.trace)
+    assert final["dpc"] == lm.WAIT and final["hpc"] == lm.H_COPY_B and final["hneed"] >= 0
+    assert any(final["hl"]) and final["spc"] == lm.S_IDLE and lm.Model(cfg).demand_visible(final)
 
 
 def test_the_detector_turns_a_recycled_slot_into_a_failure_instead_of_a_success():
