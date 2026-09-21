@@ -1032,14 +1032,56 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > the defect.
 >
 > **(d) ORDER-DEPENDENT RESULTS -- a test whose verdict depends on what ran
-> before it.** `test_prefix_tier.py::TestCacheStatsSink::test_snapshots_are_throttled_and_cumulative`
-> **passes under `alpha` and `rev` order and fails under `file` order.** Every
-> other class in this taxonomy is about a test that passes for the wrong reason;
-> this is a test whose result is not a property of the test at all. Both are ways
-> a green suite lies, and only one was being catalogued. Found by the order
-> sweep, which also carries deliberate controls (`test_ctrl_annoying`,
-> `test_ctrl_dangerous`, `test_ctrl_independent`) to show the instrument can
-> detect a known order-dependency before it is trusted on unknown ones.
+> before it.** Every other class here concerns a test that passes for the wrong
+> reason; this is a test whose result is not a property of the test at all.
+>
+> **CORRECTION, 2026-09-21, to this entry's own evidence.** An earlier revision
+> cited `test_prefix_tier.py::TestCacheStatsSink::test_snapshots_are_throttled_and_cumulative`
+> (alpha PASS, file FAIL, rev PASS) as a **live** finding of the order sweep. It
+> is not. That result came from the sweep's `ctrl/` directory and is a
+> **detector control**: the defect was already fixed earlier the same day in
+> `d28348b736` ("isolate the cache-stats sink test from other tests' pinned
+> tables" -- it failed `4 != 1` on `lines[0]["admissions"]` whenever
+> `test_expert_host_tier.py` ran as a whole). The sweep replays the pre-fix
+> state at `d28348b736^` to show its detector can catch a **known**
+> order-dependency before being trusted on unknown ones. I read a control as a
+> result -- the same defect as measuring something adjacent to the question and
+> reporting it as the answer.
+>
+> **The class is real and stays; the live count is currently zero of 90.** The
+> sweep's detector was validated against three synthetic controls (dangerous /
+> annoying / independent) plus that real pre-fix case, and found **no
+> order-dependent file among the 90 that actually ran tests**. That is a
+> meaningful negative result because the detector is known to fire.
+>
+> **But the sweep's first pass was mostly blind, and that is the larger
+> finding.** Of 307 files swept, **only 90 ran any test**. **217 died
+> identically at collection under all three orders** and say nothing about
+> order: 202 with `pyarrow has no attribute PyExtensionType` (the venv's
+> `pyarrow` is too new for `datasets`), 7 missing `polars`, 1 `imageio`, 1 `av`,
+> plus the `CUDA_VISIBLE_DEVICES` defect below. So a coverage hole larger than
+> the registration gap sits underneath these suites: **on this environment, most
+> of the corpus cannot be collected at all**, and any statement about it -- of
+> ours or anyone's -- is a statement about roughly a third of it.
+>
+> **(g) AN EMPTY `CUDA_VISIBLE_DEVICES` BREAKS COLLECTION.**
+> `sglang/test/test_utils.py:246` does
+> `int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0])`, so an **empty** value
+> raises `IndexError: string index out of range` **at import**. Every test file
+> importing `sglang.test.test_utils` then errors at collection. `CUDA_VISIBLE_DEVICES=`
+> is the obvious way to say "no GPU" and was circulated in this team's own run
+> invocations. Use a nonexistent index instead -- `CUDA_VISIBLE_DEVICES=9`
+> leaves `torch.cuda.is_available()` False and touches no GPU. Any CPU-only
+> result produced with the empty form must be re-checked: files that error at
+> collection are not failures a reader would notice.
+>
+> **(h) A TEST THAT KILLS ITS OWN PROCESS GROUP.** At least one test in this
+> corpus kills its process group, taking down the runner and everything the
+> runner launched. It killed a sweep driver three times mid-run; running each
+> `pytest` in its own session fixed it. Not yet identified. Two consequences
+> beyond the test itself: a harness can die for reasons that look like an
+> external agent stopping it, and **an agent's own shell is in that process
+> group** if it launches tests directly.
 >
 > **THE WHOLE CI SUITE CANNOT COLLECT ON THIS BRANCH, AND A REGISTERED FILE WITH
 > NO `__main__` BLOCK RUNS ZERO TESTS AND EXITS 0** (`1e210f524a`). `test/run_suite.py`
