@@ -20,9 +20,11 @@ by the precheck from existing traces. **[A]** an assumption I could not check. *
 justified over a hits-then-rest two-phase copy**. About 87% of the modelled saving is RAM-hit lanes being copied while
 the NVMe read runs; only about 13% needs miss rows to finish at different times, and that part (what per-row adds over
 two-phase) is at most **5.06 ms per decode step, 2.0%, gross** (best order, free launches); after the extra stage cost
-of V2 over V1 (section 4.4) about **1.1-1.5%**, at or below the ~1.5% the plan's own measurement design can resolve. (The
-registered 2.55 ms, 1.0%, is the *random-order, miss-rows-only* figure: it describes the plan's original fixed-order
-per-row, not V2 with the order array of section 4.2.) **But neither saving is available today.** The device learns of
+of V2 over V1 (section 4.4) about **1.1-1.5%**, at or below the ~1.5% the plan's own measurement design can resolve. **Per-row's increment over
+two-phase has two signs: +5.09 ms at best order (with the order array of section 4.2), and -14.35 ms at random order (per-row
+loses outright to two-phase, 5.6% of the step).** "2.0% gross" is a gain only at best order. (The registered 2.55 ms, 1.0%, is
+the *random-order, miss-rows-only* share, not an increment over two-phase.) [Independent recomputation,
+`PER_ROW_PRECHECK_REVIEW.md` R1: 5.09 by simulation against my 5.06 by arithmetic.] **But neither saving is available today.** The device learns of
 readiness from one word, `demand_done`, which the service stores only after `read()` has returned and every row is
 packed (`pump_demand` after `handle_demand`; section 3.1). No per-lane or per-phase early signal exists. The 87% is an
 upper bound for a mechanism that **first requires a new early, device-visible, generation-tagged readiness word per hit
@@ -58,10 +60,14 @@ about EXL3 decode in general. A different cache size or routing skew changes the
    figures and cite both; my BEST figure is uncorrected for 18.3's 74.5% alignment haircut, which is why it is twice
    18.3's. (I first read 221 VRAM misses per step from the first two `graph_step` lines and told the team lead so; over
    all 495 steps it averages **131 [post-hoc]**, which reconciles with 18.2's G = 121 rather than contradicting it.)
-3. **The result rests on A1** (hit lanes are spread evenly over the 40 layers), because the trace does not record lanes per
-   layer. The SUPPORT bar still holds down to about **37% of the modelled hit lanes, about 0.8 hit lanes per read layer**;
-   it fails only if hit lanes sit almost entirely in layers that read nothing. **[REQ 4]** asks for one instrumentation word
-   that removes the assumption.
+3. **A1 (hit lanes spread evenly over the 40 layers) is bounded by the data, and decides the per-row column only.** The trace
+   does not record lanes per layer, but `vram_miss`, `layer_ram_rows` and the 6-lane cap bound the placement without A1
+   (independent recomputation, `PER_ROW_PRECHECK_REVIEW.md` R2, not registered): of 111.9 hit lanes per step, **at least 10.8
+   and at most 63.6 are forced into read layers** (A1 credits 31.9). **At the worst placement two-phase still yields about 4%
+   and clears the 3% bar; random-order per-row falls to about 2.8% and does not.** So A1 does not prop V1 up; it decides
+   whether the per-row column clears the bar. (My earlier, weaker statement: the bar holds down to 37% of the modelled 31.9,
+   about 11.7 per step, which is above the forced minimum of 10.8.) **[REQ 4]** (`4e63616666`, trace schema 4) would
+   replace these bounds with a measurement.
 4. **Registered outcome: SUPPORT, and SPREAD-IRRELEVANT.** The pre-registered reject test asked whether miss-row spread was
    large enough to matter. It was, but it was aimed at the wrong quantity: the saving does not come from the miss rows.
    The classification and the redirect both came from the same run, and the redirect is the result.
@@ -72,9 +78,14 @@ about EXL3 decode in general. A different cache size or routing skew changes the
    smaller the 13%, so per-row becomes less attractive, not more.** The hit-lane part does not move.
 6. **Head-of-line cannot make per-row slower than batched in overlap terms** (section 2, closed form), only by launch and
    poll cost. It zeroes the miss-row part when the slowest row is first and halves it on average for random lane order.
-   In this corpus pack order equalled ordinal order in 100% of 1,888 requests with m >= 2 [post-hoc]. **That is a property
-   of the packer, not of the storage**: 100% is the shape a lowest-ordinal tie-break produces, and I did not test it with the
-   tie-break changed. Do not read it as "the drives complete in ordinal order". Drive tails would expose it.
+   In this corpus pack order equalled ordinal order in 100% of 1,888 requests with m >= 2 [post-hoc]. **I had relabelled
+   that a property of `pack_one`'s tie-break; that was wrong and is reversed.** The independent recomputation
+   (`PER_ROW_PRECHECK_REVIEW.md` R3, from the row completion stamps) finds 0 inversions in 1,842 m>=2 requests in each of the
+   three mirrors-on arms and the mirrors-off arm, 0 of 4,750 consecutive rows on one drive part completing out of order, and
+   same-reap ties (where the tie-break decides) in only 3.7% of adjacent pairs mirrors-on and 0% mirrors-off. **The cause is
+   per-drive FIFO completion, not the packer.** The design therefore carries **FIFO completion per drive part** as an
+   explicit assumption (section 10): it is a property of the drives, the queue depth and the I/O scheduler, and could fail on
+   other hardware. A row tail (MIRROR_ROWS) means a slow row *delays its followers* (bunching), not reordering.
 7. **A4 as written is not required, and here is what replaces it.** `LEASE_PROTOCOL` A4 says lane `j`'s acknowledgement
    precedes the GPU's wait on lane `j+1`. Two facts make it hold, and the second is the one that matters: (a) stream order
    on one linear captured chain (a checkable graph shape); (b) **reservation is all-or-nothing, so no lane's readiness
@@ -142,10 +153,13 @@ contradicted by the step budget.
 
 - **A2 (an early hit-lane signal exists) is not true of the current tree** (section 3.1); the numbers are an upper bound for the mechanism that adds it.
 - **A1 (hit lanes spread evenly over layers) carries it.** The trace records `vram_miss` per step and `layer_ram_rows`
-  (RAM rows per layer), not lanes per layer. Robustness: the SUPPORT bar still holds down to about 37% of the modelled
+  (RAM rows per layer), not lanes per layer. Robustness, as first stated: the SUPPORT bar still holds down to about 37% of the modelled
   hit lanes (RANDOM = 2.55 miss-only + 16.7 hit part; the bar needs 8.7 ms), i.e. about 0.8 hit lanes per read layer.
-  It fails only if hit lanes sit almost entirely in layers that do not read, which is possible in principle (26
-  non-read layers can hold 156 lanes, more than the 112 hit lanes per step) and is not excluded by any data I have.
+  **Stronger, from the independent recomputation (R2, unregistered): A1 is bounded by the data.** Of 111.9 hit lanes per step,
+  at least 10.8 and at most 63.6 are forced into read layers (A1 credits 31.9). At the worst placement two-phase yields about 4%,
+  above the 3% bar; random-order per-row about 2.8%, below it. A1 therefore decides the per-row column, not V1.
+  My earlier remark that no data excludes the all-hits-in-non-read-layers case was too weak: the layer cap of 6 lanes
+  forces at least 10.8 hit lanes into read layers.
   **[REQ 4]** asks for one instrumentation word that removes A1.
 - A2: a hit lane is ready when the service has reserved the request. This needs the service to publish hit lanes before
   it reads; it does not today (sections 3.1 and 4.3).
@@ -180,11 +194,15 @@ Consequences.
 than `c`. In the corpus it did not: **pack order equals ordinal order in 1,888 of 1,888 requests with m >= 2 in each
 of three arms [M, post-hoc, `per_row_precheck_posthoc2.py`]**, and the lane order among miss lanes equals the ordinal order
 by construction (both are first appearance in the routed list: `plan_graph_routes`, and `serve()` builds `wanted` from
-`protect` first, which `Exl3MoEMethod._apply_graph` fills from `topk_ids`). Two cautions. First, **treat this as a
-property of the packer, not of the drives, until shown to survive a changed tie-break (not done)**: `pack_one` packs the *lowest ordinal among rows that are `Ready`*, and rows
-that complete in one reaped batch are all `Ready` together. Second, `MIRROR_ROWS.md` measures a per-row tail even on the mirrored arm (p50 4.164 ms, p99 7.387 ms, so a row can
-arrive about 3 ms, three copy times, after the median), which is exactly the slow-first-row case where `S` collapses to
-the hit part. (Its nvme4 first-touch 18.3 ms is a warming outlier by its own account and is not used.)
+`protect` first, which `Exl3MoEMethod._apply_graph` fills from `topk_ids`). Two notes. First, **the ordering is
+per-drive FIFO completion, not the packer's tie-break** (I had said the reverse, and was corrected by the independent
+recomputation: 0 inversions in 1,842 requests, 0 of 4,750 same-drive pairs out of order; same-reap ties, the only place
+`pack_one`'s lowest-ordinal rule decides, are 3.7% of adjacent pairs mirrors-on and 0% mirrors-off). That makes FIFO per
+drive part an **assumption about the drives, queue depth and scheduler**, not a fact about this corpus. Second,
+`MIRROR_ROWS.md` measures a per-row tail even on the mirrored arm (p50 4.164 ms, p99 7.387 ms, so a row can arrive about
+3 ms, three copy times, after the median). The recomputation reads that as **bunching, not reordering**: a slow row delays
+its followers, which restarts the chain for per-row (later rows arrive together) while leaving the order array right, and
+it is the slow-first-row case where `S` collapses to the hit part. (Its nvme4 first-touch 18.3 ms is a warming outlier by its own account and is not used.)
 For the *hit part*, HOL does not apply, because hit lanes are ready at reservation; it applies only if the order hint
 is wrong (a lane that looked like a hit at post time turns out to need a read; section 4.2).
 
@@ -297,8 +315,9 @@ is safe only while all of these hold, none of them a lease: (i) one service thre
 advisory can run in that tier until it finishes; (ii) `take_slot_locked` never evicts an expert in `wanted`, and a routed
 hit is in `protect`, so this request's own reservation cannot evict it; (iii) eager use is paused. A hit that an earlier
 advisory evicted before `kBusySeq` reads as `-1` and joins the second phase. It is **not Task 5 compliant** (no lease, no
-acknowledgement, no generation), it **borrows the temporal exclusion instead of replacing it**, and it **expires the moment
-the service becomes asynchronous** (Task 8's promotions, Task 5's `progress()`). Unverified: whether the device reliably
+acknowledgement, no generation), it **borrows the temporal exclusion instead of replacing it**, and it **expires when the service stops
+serving one request at a time** (the corrected condition; Task 8 does not do that, so it does not by itself expire V1b; a Task 5
+`progress()` that interleaves requests would). Unverified: whether the device reliably
 observes `kBusySeq` before it clears (a short request may clear it inside one poll interval, in which case the hit phase
 simply degrades to the batched path), and whether every planned lane is in `protect` for every producer (OPEN 12).
 
@@ -586,8 +605,10 @@ stays an assumption and the V1 prediction keeps a wide interval.
 
 1. **Per-row's own part is the miss rows only**, `Sigma(m-1) * c = 5.06 ms/step` best case (2.0%), because most read
    requests read one row (5,297 of 7,139) and a single miss row has nothing to overlap *with each other*.
-2. **Lane order.** Under random lane order, half of even that is lost (2.55 ms, 1.0%; section 2). The order array
-   restores it only if reads finish in lane order, which held in this corpus and does not hold for a drive tail.
+2. **Lane order.** Per-row's increment over two-phase is **+5.09 ms at best order and -14.35 ms at random order** (section 0):
+   without the order array per-row loses outright to two-phase. The order array restores the gain only if reads finish in
+   lane order. That held in this corpus, because of per-drive FIFO completion (an assumption about the drives, section 10),
+   and a row tail bunches followers rather than reordering them.
 
 ### 6.2 What would overturn "V2 expected REJECTED"
 
@@ -700,7 +721,7 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
 
 - A1 (lanes per layer spread evenly) and A2 (hit lanes ready at `reserved`): section 1.4.
 - A3 `c = 1.055 ms` is right for this path; **A4'** a kernel-node gap of 2-4 us; a stage triple costs 8-14 us. Both unmeasured.
-- Lane order among miss rows equals pack order in practice (100% in this corpus). **This is a property of `pack_one`'s lowest-ordinal tie-break, not shown to hold for drive completion order.**
+- **FIFO completion per drive part.** Lane order among miss rows equals pack order in practice (100% in this corpus, 0 inversions in 1,842 requests, 0 of 4,750 same-drive pairs out of order). The cause is per-drive FIFO completion, not the tie-break (same-reap ties are 3.7% of pairs mirrors-on). It is an assumption about the drives, queue depth and I/O scheduler, and the V2 order array relies on it. Evidence: `PER_ROW_PRECHECK_REVIEW.md` R3 (independent). It could fail on other hardware.
 - The launch count, not the lane count, is what per-row costs; the SM footprint of a one-row call is the same 8 blocks.
 
 **Open (could not determine)**
