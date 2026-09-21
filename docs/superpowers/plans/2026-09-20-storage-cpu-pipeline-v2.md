@@ -171,6 +171,28 @@ Include expert identity in the immutable row result and validate it against the 
 
 **Files:** Files from Task 5; `python/sglang/srt/layers/moe/expert_row_plan.py`; `python/sglang/kernels/ops/moe/expert_cache_transfer.py`; `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`; graph wrapper/backend tests; `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`.
 
+> **The chosen mechanism below is not justified by the benefit it was designed
+> to exploit.** A pre-registered analysis of the existing graph-decode traces
+> (`analysis/dsv41-drive/PER_ROW_PRECHECK_PREREG.txt`, hashed before it ran)
+> finds the modelled saving is real -- 19.2 ms/step at random lane order, about
+> 7.1% after launch cost -- but that **87% of it is RAM-HIT lanes gathered while
+> the NVMe read runs, and only 13% needs miss rows to finish at different
+> times**. Per-row transfer's own contribution over a simple **hits-then-rest
+> two-phase copy** is at most 2.55 ms/step, about 1.0%, which is **below what
+> this plan's own measurement design can resolve**. The two-phase mechanism
+> captures nearly the same benefit with no per-lane wait chain, no A4 ordering
+> assumption, no partial terminal mask and no head-of-line problem. Prefer it
+> unless a measurement shows otherwise.
+>
+> Two further corrections from the same analysis: the measured miss-row spread
+> is **Task 4's serial packing** (~2.7 ms per row), not drive completion order,
+> so this task's premise was partly a misattribution of a Task 4 artefact -- and
+> parallelising packing would shrink the 13% further, making per-row *less*
+> attractive as Task 4 improves. The caveat that carries the result is that hit
+> lanes are assumed to spread evenly over layers; the traces do not record lanes
+> per layer, so an instrumentation item is requested to record the planned lane
+> count per request.
+
 **Chosen first mechanism:** Retain the existing SM-driven host gather and one graph stream. Capture a fixed number of lane operations determined by plan capacity. Each active lane waits for its own generation-qualified readiness, copies only that row to its reserved GPU destination, then acknowledges source consumption. Inactive lanes are no-ops. All lane copies precede one fused MoE invocation.
 
 ```text
