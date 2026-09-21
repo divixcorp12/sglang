@@ -37,6 +37,17 @@ NS_FULL = (0, 40, 80, 160, 320, 640)
 NS_BASE = (0, 160, 640)
 P_OF = {"empty": 0, "control20": 0, "empty_base8k": 0, "active_p1": 1, "active_p4": 4, "active_p6": 6}
 BASE_NODES = 8000
+# EXTENSION variants, NOT registered: the same triples on top of K filler nodes, K = 1000..8000, for empty and active(p=4). They
+# exist because the registered bare-chain slope and the registered 8,000-node slope disagreed in the first preliminary run, and
+# the plan's decode graph has ~8,000 nodes. They are written to results_ext.jsonl so the frozen g_analysis.py never sees them.
+EXT_BASES = (1000, 2000, 4000, 8000)
+EXT_NS = (0, 160, 640)
+for _k in EXT_BASES:
+    P_OF["ext_empty_b%d" % _k] = 0; P_OF["ext_active_p4_b%d" % _k] = 4
+def base_of(variant):
+    if variant == "empty_base8k": return BASE_NODES
+    if variant.startswith("ext_"): return int(variant.rsplit("_b", 1)[1])
+    return 0
 ACK_LINES = 1024
 NVCC = os.environ.get("NVCC", "/usr/local/cuda-13.2/bin/nvcc")
 SEED = 20260921
@@ -94,8 +105,7 @@ def run(a):
         s = stream.cuda_stream
         def chk(rc):
             if rc != 0: raise RuntimeError("kernel launch failed: cudaError %d" % rc)
-        if variant == "empty_base8k":
-            for _ in range(BASE_NODES): chk(lib.launch_nop(s))
+        for _ in range(base_of(variant)): chk(lib.launch_nop(s))
         for i in range(N):
             chk(lib.launch_w(s, page.data_ptr(), p, go.data_ptr(), spin))
             copy_expert_row_segments_gpu(seg, rows, slots, go)
@@ -103,7 +113,7 @@ def run(a):
 
     def capture(variant, N):
         with torch.cuda.stream(stream):
-            chain(variant, min(N, 2))                           # eager warm-up: JIT, first-touch, context
+            chain("empty" if base_of(variant) else variant, min(N, 2))   # eager warm-up: JIT, first-touch, context
         stream.synchronize()
         g = torch.cuda.CUDAGraph(keep_graph=True)              # keep_graph: the raw graph is needed to count nodes
         with torch.cuda.graph(g, stream=stream):
@@ -125,9 +135,12 @@ def run(a):
     except Exception as e: meta["nvidia_smi_error"] = str(e)   # noqa: E701
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 
+    ext = [v for v in P_OF if v.startswith("ext_")]
     variants = [v for v in VARIANTS if not a.variants or v in a.variants.split(",")]
+    if a.variants: variants += [v for v in ext if v in a.variants.split(",")]
+    elif a.ext: variants += ext
     ns_full = tuple(int(x) for x in a.ns.split(",")) if a.ns else NS_FULL
-    cells = [(v, N) for v in variants for N in (tuple(n for n in ns_full if n in NS_BASE) if v == "empty_base8k" else ns_full)]
+    cells = [(v, N) for v in variants for N in (tuple(n for n in ns_full if n in EXT_NS) if v.startswith("ext_") else tuple(n for n in ns_full if n in NS_BASE) if v == "empty_base8k" else ns_full)]
     random.Random(SEED + a.process).shuffle(cells)
 
     # graph correctness first: one active graph must actually poll, ack and copy (a wrong-but-fast graph is the failure to fear)
@@ -162,9 +175,9 @@ def run(a):
     del gw
 
     e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    resf = open(out / "results.jsonl", "a")
+    resf = open(out / "results.jsonl", "a"); extf = open(out / "results_ext.jsonl", "a")
     for ci, (variant, N) in enumerate(cells):
-        g, nodes = capture(variant, N) if N > 0 else capture_empty(torch, stream)
+        g, nodes = capture_empty(torch, stream) if (N == 0 and base_of(variant) == 0) else capture(variant, N)
         with torch.cuda.stream(stream):
             for _ in range(3): g.replay()
         stream.synchronize()
@@ -180,12 +193,12 @@ def run(a):
                 batches.append(e0.elapsed_time(e1))
         t1 = time.monotonic()
         cond = smi.window(t0, t1) or {"link_gen_start": None, "link_gen_end": None, "pstate_start": None, "sm_mhz_min": 0, "sm_mhz_max": 0, "other_gpu_procs": None}
-        rec = {"process": a.process, "variant": variant, "N": N, "R": a.R, "batch_ms": batches, "nodes": nodes,
+        rec = {"process": a.process, "variant": variant, "N": N, "R": a.R, "batch_ms": batches, "nodes": nodes, "base_nodes": base_of(variant),
                "link_gen_start": cond["link_gen_start"], "link_gen_end": cond["link_gen_end"], "sm_mhz_min": cond["sm_mhz_min"],
                "sm_mhz_max": cond["sm_mhz_max"], "other_gpu_procs": cond["other_gpu_procs"],
                "pstate_start": cond["pstate_start"], "host_launch_ms_per_replay": host_launch, "wall_s": t1 - t0,
                "loadavg1": float(open("/proc/loadavg").read().split()[0])}
-        resf.write(json.dumps(rec) + "\n"); resf.flush()
+        (extf if variant.startswith("ext_") else resf).write(json.dumps(rec) + "\n"); (extf if variant.startswith("ext_") else resf).flush()
         print("cell %3d/%d %-13s N=%3d nodes=%5d  per-replay p50 %.4f ms  link %s/%s P%s SM %s-%s MHz apps=%s" % (
             ci + 1, len(cells), variant, N, nodes, S.median(batches) / a.R, cond["link_gen_start"], cond["link_gen_end"], cond["pstate_start"],
             cond["sm_mhz_min"], cond["sm_mhz_max"], cond["other_gpu_procs"]), flush=True)
@@ -223,6 +236,17 @@ def summary(path):
         GX = (GA.E_EMPTY * ge + (GA.E_B + GA.E_C + GA.E_D) * ga) / 1000; GH = (GA.E_EMPTY * ge + (GA.E_B + GA.E_D) * ga) / 1000
         print("g_e = %.2f us, g_a(p=4) = %.2f us  ->  G_X (all exposed) = %.3f ms/step, G_H (class C hidden) = %.3f ms/step   vs G* = %.3f ms" % (ge, ga, GX, GH, GA.G_STAR_MS))
         print("  = 85.10 empty x g_e + (48.93 + 4.65 [+ 20.86 in G_X]) active x g_a; crossings: uniform g* = 6.98 (all exposed) / 8.03 us (C hidden)")
+    ext = Path(path).with_name("results_ext.jsonl")
+    if ext.exists() and ext.stat().st_size:
+        import collections
+        cells = collections.defaultdict(lambda: collections.defaultdict(dict))
+        for l in open(ext):
+            d = json.loads(l); cells[d["variant"]][d["process"]][d["N"]] = [b / d["R"] for b in d["batch_ms"]]
+        print("EXTENSION (unregistered): slope us/triple by filler-node count K (OLS on N = 0,160,640, per-N medians)")
+        import random
+        for v in sorted(cells, key=lambda x: (x.split("_b")[0], int(x.rsplit("_b", 1)[1]))):
+            sl = {p: GA.slope_us(c, random.Random(1))[0] for p, c in sorted(cells[v].items())}
+            print("  %-22s %s" % (v, "  ".join("proc %s: %.2f" % (p, x) for p, x in sl.items())))
     return 0
 
 
@@ -232,6 +256,7 @@ def main():
     r = sub.add_parser("run"); r.add_argument("--repo", required=True); r.add_argument("--out", required=True)
     r.add_argument("--process", type=int, default=0); r.add_argument("--R", type=int, default=50); r.add_argument("--batches", type=int, default=20)
     r.add_argument("--variants", default="", help="comma list (default: all six)"); r.add_argument("--ns", default="", help="comma list (default: 0,40,80,160,320,640)")
+    r.add_argument("--ext", action="store_true", help="also run the unregistered ext_* variants (graph-size dependence) into results_ext.jsonl")
     r.add_argument("--keepalive", action="store_true", help="tiny H2D copies during cells so the link stays out of Gen1 (recorded; changes what the empty cells run beside)")
     r.add_argument("--build-dir", default=str(Path.home() / ".cache" / "g_kernels"))
     b = sub.add_parser("build"); b.add_argument("--build-dir", default=str(Path.home() / ".cache" / "g_kernels"))
