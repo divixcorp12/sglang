@@ -1318,6 +1318,39 @@ constexpr int64_t kRecLanes = 84;
 constexpr uint16_t kServed = 1;
 constexpr uint16_t kFailed = 2;
 
+// ---- Lease block (LEASE_PROTOCOL.md section 4) ----
+// The layout is written here, in exl3_ram_miss.cuh and in ops/moe/exl3_lease_block.py; the layout test checks
+// that they agree, so these lines use only + - * over integers and known names. The service writes areas H and
+// S (header, row table, row results, slot generations); the device writes area D; Python writes nothing.
+constexpr int64_t kLeaseRing = 16;  // == kDemandRecords
+constexpr int64_t kLeaseLanes = 8;  // == kMaxIds
+constexpr int64_t kLeaseHeaderRing = 8;
+constexpr int64_t kLeaseHeaderLanes = 12;
+constexpr int64_t kLeaseHeaderShutdown = 20;
+constexpr int64_t kLeaseHeaderSlotGenOffset = 32;
+constexpr int64_t kLeaseHeaderDOffset = 36;
+constexpr int64_t kLeaseRowTable = 128;
+constexpr int64_t kLeaseRowResult = 4096;
+constexpr int64_t kLeaseRowResultBytes = 32;
+constexpr int64_t kLeaseRrReady = 0;
+constexpr int64_t kLeaseRrSlotGeneration = 8;
+constexpr int64_t kLeaseRrHostSlot = 12;
+constexpr int64_t kLeaseRrExpert = 16;
+constexpr int64_t kLeaseSlotGen = kLeaseRowResult + kLeaseRing * kLeaseLanes * kLeaseRowResultBytes;
+constexpr int64_t kLeaseLaneRequest = 0;
+constexpr int64_t kLeaseLaneRequestBytes = 64;
+constexpr int64_t kLeaseLrGen = 0;
+constexpr int64_t kLeaseLrCount = 8;
+constexpr int64_t kLeaseLrRow = 12;
+constexpr int64_t kLeaseLrExpert = 16;
+constexpr int64_t kLeaseLaneAck = kLeaseLaneRequest + kLeaseRing * kLeaseLaneRequestBytes;
+constexpr int64_t kLeaseLaneAckBytes = 8;
+constexpr int64_t kLeaseTerminal = kLeaseLaneAck + kLeaseRing * kLeaseLanes * kLeaseLaneAckBytes;
+constexpr int64_t kLeaseTerminalBytes = 16;
+constexpr int64_t kLeaseTermSkippedMask = 0;
+constexpr int64_t kLeaseTermReason = 4;
+constexpr int64_t kLeaseTermGen = 8;
+
 enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2 };
 
 enum Counter : int {
@@ -1335,6 +1368,7 @@ enum Counter : int {
   kVersion,
   kRunning,
   kSpinCpu,
+  kDeferred,  // demands the tier could serve only if leases retired; none evicted (step 2: counted, then failed)
   kCounterCount,
 };
 
@@ -1452,8 +1486,17 @@ struct Tier {
   std::vector<uint64_t> stamp;
   std::vector<int32_t> expert_slot;  // assigned slot (LOADING or READY) or -1
   std::vector<uint8_t> hot;
+  std::vector<uint32_t> leases;      // GPU-reader leases per slot (LEASE_PROTOCOL.md section 8); 0 frees a slot for eviction
+  std::vector<uint32_t> generation;  // bumped before a slot's bytes change; mirrored into the lease block's SlotGen
   int64_t rows_demand = 0;
   int64_t rows_advisory = 0;
+};
+
+// What a request could take from a tier, counted without taking anything.
+struct VictimCensus {
+  int64_t free = 0;       // FREE slots
+  int64_t evictable = 0;  // READY, not hot, not requested, not leased
+  int64_t leased = 0;     // as evictable, but leased: they would be victims if the leases retired
 };
 
 // The pinned-slot bookkeeping of every streamed layer (plan D12) and the service of one
@@ -1461,9 +1504,12 @@ struct Tier {
 // pump(), or the Task 12 thread. The Python-facing methods take the same mutex.
 class RamTier {
  public:
-  RamTier(uint8_t* page, int32_t* slot_map, Tables tables, std::vector<int64_t> capacity, bool direct)
+  RamTier(
+      uint8_t* page, int32_t* slot_map, uint8_t* lease, int64_t lease_bytes, Tables tables, std::vector<int64_t> capacity,
+      bool direct)
       : page_(page),
         map_(slot_map),
+        lease_(lease),
         layers_(tables.layers),
         experts_(tables.experts),
         reader_(std::move(tables), direct),
@@ -1478,7 +1524,10 @@ class RamTier {
       tier.stamp.assign(tier.capacity, 0);
       tier.expert_slot.assign(experts_, -1);
       tier.hot.assign(experts_, 0);
+      tier.leases.assign(tier.capacity, 0);
+      tier.generation.assign(tier.capacity, 0);
     }
+    if (lease_ != nullptr) init_lease_block(capacity, lease_bytes);
   }
 
   bool open() {
@@ -1623,6 +1672,7 @@ class RamTier {
     }
     const int64_t slot = take_slot_locked(row, protect, fallback, evicted);
     if (slot < 0) return -1;
+    bump_generation_locked(row, slot);  // the caller writes the bytes after this returns
     tier.slot_to_expert[slot] = static_cast<int32_t>(expert);
     tier.state[slot] = kReady;
     tier.stamp[slot] = ++tick_;
@@ -1638,8 +1688,38 @@ class RamTier {
       // The service is filling it and will publish it; freeing it would hand it out twice.
       throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while it is loading");
     }
+    if (leased_locked(tiers_[row], slot)) {
+      throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while it is leased");
+    }
     release_locked(row, slot);
     counters_[kVersion].fetch_add(1);
+  }
+
+  // Test hooks and introspection. slot_info: [state, expert, leases, generation] per slot.
+  void slot_info(int64_t row, int64_t* out) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const Tier& tier = tiers_[row];
+    for (int64_t slot = 0; slot < tier.capacity; ++slot) {
+      out[4 * slot] = tier.state[slot];
+      out[4 * slot + 1] = tier.slot_to_expert[slot];
+      out[4 * slot + 2] = tier.leases[slot];
+      out[4 * slot + 3] = tier.generation[slot];
+    }
+  }
+
+  // Test only: the service grants leases itself from step 3; until then a test stands in for the device's holder.
+  void inject_lease(int64_t row, int64_t slot, int64_t delta) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    Tier& tier = tiers_[row];
+    if (delta < 0 && tier.leases[slot] < static_cast<uint32_t>(-delta)) {
+      throw std::runtime_error("exl3 RAM miss: lease underflow on slot " + std::to_string(slot));
+    }
+    tier.leases[slot] = static_cast<uint32_t>(static_cast<int64_t>(tier.leases[slot]) + delta);
+  }
+
+  VictimCensus victim_census(int64_t row, const std::vector<int32_t>& wanted) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return census_locked(row, wanted);
   }
 
   void mapping(int64_t row, int64_t* out) {
@@ -1727,6 +1807,84 @@ class RamTier {
     cur_ = nullptr;
   }
 
+  static int64_t round_up_page(int64_t value) {
+    return (value + 4095) / 4096 * 4096;
+  }
+
+  // The service is the only writer of the header, the row table and SlotGen, and writes them before the
+  // service thread or any device exists, so plain stores and one fence suffice.
+  void init_lease_block(const std::vector<int64_t>& capacity, int64_t lease_bytes) {
+    if (reinterpret_cast<uintptr_t>(lease_) % 4096 != 0) {
+      throw std::runtime_error("exl3 RAM miss: the lease block must be 4096-byte aligned");
+    }
+    if (layers_ > (kLeaseRowResult - kLeaseRowTable) / 8) {
+      throw std::runtime_error("exl3 RAM miss: too many rows for the lease block's row table");
+    }
+    slot_gen_base_.assign(static_cast<size_t>(layers_), 0);
+    int64_t total_slots = 0;
+    for (int64_t row = 0; row < layers_; ++row) {
+      slot_gen_base_[row] = total_slots;
+      total_slots += capacity[row];
+    }
+    const int64_t d_offset = round_up_page(kLeaseSlotGen + 4 * total_slots);
+    const int64_t needed = round_up_page(d_offset + kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes);
+    if (lease_bytes < needed) {
+      throw std::runtime_error(
+          "exl3 RAM miss: the lease block has " + std::to_string(lease_bytes) + " bytes, its layout needs " +
+          std::to_string(needed));
+    }
+    auto put_u32 = [&](int64_t offset, uint32_t value) { std::memcpy(lease_ + offset, &value, 4); };
+    put_u32(0, 0x4C534531u);  // "LSE1"
+    put_u32(4, 1u);           // ABI version
+    put_u32(kLeaseHeaderRing, static_cast<uint32_t>(kLeaseRing));
+    put_u32(kLeaseHeaderLanes, static_cast<uint32_t>(kLeaseLanes));
+    put_u32(16, static_cast<uint32_t>(layers_));
+    put_u32(kLeaseHeaderShutdown, 0u);
+    put_u32(kLeaseHeaderSlotGenOffset, static_cast<uint32_t>(kLeaseSlotGen));
+    put_u32(kLeaseHeaderDOffset, static_cast<uint32_t>(d_offset));
+    for (int64_t row = 0; row < layers_; ++row) {
+      put_u32(kLeaseRowTable + 8 * row, static_cast<uint32_t>(slot_gen_base_[row]));
+      put_u32(kLeaseRowTable + 8 * row + 4, static_cast<uint32_t>(capacity[row]));
+    }
+    slot_gen_ = reinterpret_cast<uint32_t*>(lease_ + kLeaseSlotGen);
+    _mm_sfence();
+  }
+
+  // A slot is about to hold different bytes: bump its generation, and fence it ahead of the first byte store, so
+  // that a GPU reader that re-reads the generation after copying (LEASE_PROTOCOL.md 6.5) sees any rewrite.
+  void bump_generation_locked(int64_t row, int64_t slot) {
+    Tier& tier = tiers_[row];
+    const uint32_t next = ++tier.generation[slot];
+    if (slot_gen_ != nullptr) {
+      store_release(reinterpret_cast<uint8_t*>(slot_gen_ + slot_gen_base_[row] + slot), next);
+      _mm_sfence();
+    }
+  }
+
+  // The eviction predicate's lease half. Task 8 adds host leases here as one more term.
+  bool leased_locked(const Tier& tier, int64_t slot) const {
+    return tier.leases[slot] > 0;
+  }
+
+  VictimCensus census_locked(int64_t row, const std::vector<int32_t>& wanted) const {
+    const Tier& tier = tiers_[row];
+    VictimCensus census;
+    for (int64_t slot = 0; slot < tier.capacity; ++slot) {
+      if (tier.state[slot] == kFree) {
+        ++census.free;
+      } else if (tier.state[slot] == kReady) {
+        const int32_t expert = tier.slot_to_expert[slot];
+        if (tier.hot[expert] || listed(wanted, expert)) continue;
+        if (leased_locked(tier, slot)) {
+          ++census.leased;
+        } else {
+          ++census.evictable;
+        }
+      }
+    }
+    return census;
+  }
+
   void publish_map(int64_t row, int64_t expert, int32_t slot) {
     __atomic_store_n(map_ + row * experts_ + expert, slot, __ATOMIC_RELEASE);
   }
@@ -1741,6 +1899,7 @@ class RamTier {
     int64_t spare = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
       if (tier.state[slot] != kReady) continue;
+      if (leased_locked(tier, slot)) continue;  // a GPU reader may still be reading it
       const int32_t expert = tier.slot_to_expert[slot];
       if (tier.hot[expert]) continue;
       if (listed(protect, expert)) {
@@ -1804,8 +1963,9 @@ class RamTier {
   // already submitted, publishes the rows that completed and packed (each is a whole, valid row and
   // enters the tier as any READY row: evictable under the usual protection rules) and releases the rest.
   // A demand publishes nothing unless every row landed. *rows: the rows it read (0 when it failed).
-  bool serve(const Request& request, bool advisory, int64_t* rows) {
+  bool serve(const Request& request, bool advisory, int64_t* rows, bool* deferred = nullptr) {
     *rows = 0;
+    if (deferred != nullptr) *deferred = false;
     if (cur_) cur_->lanes = request.lanes;
     std::vector<int32_t> wanted;
     for (const auto* ids : {&request.protect, &request.need}) {
@@ -1831,6 +1991,21 @@ class RamTier {
           missing.push_back(expert);
         }
       }
+      if (ok && !missing.empty()) {
+        // A request the tier could serve only once leases retire is refused BEFORE any slot is taken: the take
+        // loop unmaps a victim per call and keeps that eviction when the request then fails, so a refusal that
+        // ran it would evict a row on every retry. A demand is counted as deferred (step 3 retries it); an
+        // advisory simply gives up. When leases could not help either, the loop runs as it always has.
+        const VictimCensus census = census_locked(request.row, wanted);
+        const int64_t want = static_cast<int64_t>(missing.size());
+        if (census.free + census.evictable < want && census.free + census.evictable + census.leased >= want) {
+          if (!advisory) {
+            counters_[kDeferred].fetch_add(1);
+            if (deferred != nullptr) *deferred = true;
+          }
+          ok = false;
+        }
+      }
       for (size_t i = 0; ok && i < missing.size(); ++i) {
         int64_t evicted = -1;
         const int64_t slot = take_slot_locked(request.row, wanted, false, &evicted);
@@ -1838,6 +2013,7 @@ class RamTier {
           ok = false;
           break;
         }
+        bump_generation_locked(request.row, slot);  // before any byte of the new row is written
         tier.slot_to_expert[slot] = missing[i];
         tier.state[slot] = kLoading;
         tier.expert_slot[missing[i]] = static_cast<int32_t>(slot);
@@ -1952,6 +2128,9 @@ class RamTier {
 
   uint8_t* page_;
   int32_t* map_;
+  uint8_t* lease_;             // the lease block, or null when the service runs without one
+  uint32_t* slot_gen_ = nullptr;  // SlotGen[] inside it
+  std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
   int64_t layers_;
   int64_t experts_;
   RowReader reader_;
@@ -2016,12 +2195,15 @@ int64_t exl3_ram_miss_open(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
-    int64_t direct) {
+    int64_t direct,
+    TensorView lease) {
   using namespace exl3_ram_miss;
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
   auto tier = std::make_shared<RamTier>(
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(slot_map.data_ptr()),
+      static_cast<uint8_t*>(lease.data_ptr()),
+      lease.size(0),
       tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0);
@@ -2062,6 +2244,23 @@ void exl3_ram_miss_assign(
 
 void exl3_ram_miss_release(int64_t handle, int64_t row, int64_t slot) {
   exl3_ram_miss::find(handle)->release(row, slot);
+}
+
+void exl3_ram_miss_slot_info(int64_t handle, int64_t row, TensorView out) {
+  exl3_ram_miss::find(handle)->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
+}
+
+void exl3_ram_miss_inject_lease(int64_t handle, int64_t row, int64_t slot, int64_t delta) {
+  exl3_ram_miss::find(handle)->inject_lease(row, slot, delta);
+}
+
+// out: free, evictable, leased.
+void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted, TensorView out) {
+  const auto census = exl3_ram_miss::find(handle)->victim_census(row, exl3_ram_miss::ids_of(wanted));
+  auto* result = static_cast<int64_t*>(out.data_ptr());
+  result[0] = census.free;
+  result[1] = census.evictable;
+  result[2] = census.leased;
 }
 
 void exl3_ram_miss_mapping(int64_t handle, int64_t row, TensorView out) {
@@ -2247,6 +2446,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_contains, exl3_ram_miss_contains);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_touch, exl3_ram_miss_touch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_assign, exl3_ram_miss_assign);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_release, exl3_ram_miss_release);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_census);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_to_expert, exl3_ram_miss_slot_to_expert);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_lru_order, exl3_ram_miss_lru_order);

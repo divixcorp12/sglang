@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.moe import exl3_lease_block
 
 # Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
 # row slots each. A bank is reused only after every row read into it has packed.
@@ -353,6 +354,7 @@ COUNTERS = (
     "version",
     "running",
     "spin_cpu",
+    "deferred",
 )
 
 
@@ -417,7 +419,9 @@ class Exl3RamMissHost:
     ``start_thread()``, then by the C++ service thread until ``stop()``.
     """
 
-    def __init__(self, tables, *, page: torch.Tensor, slot_map: torch.Tensor, direct: bool) -> None:
+    def __init__(
+        self, tables, *, page: torch.Tensor, slot_map: torch.Tensor, direct: bool, lease_block: Optional[torch.Tensor] = None
+    ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
         if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.starts.shape):
@@ -429,6 +433,14 @@ class Exl3RamMissHost:
             raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
         self._module = _host_module()
         self.threaded = False
+        # The lease block (LEASE_PROTOCOL.md section 4): the service writes its header and slot generations
+        # through a raw address, so this object holds it. Allocated here when the caller passes none.
+        self.lease_layout = exl3_lease_block.lease_layout([int(c) for c in tables.capacity])
+        if lease_block is None:
+            lease_block = exl3_lease_block.new_lease_block(self.lease_layout, pin=page.is_pinned())
+        else:
+            exl3_lease_block.check_lease_block(lease_block, self.lease_layout, need_pinned=page.is_pinned())
+        self.lease_block = lease_block
         # The C++ service writes through raw addresses of the page, the slot map and the
         # slabs (``tables.keepalive``): this object holds all three, and the finalizer
         # below closes the service before they can be released.
@@ -440,7 +452,7 @@ class Exl3RamMissHost:
             self._module.exl3_ram_miss_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
                 tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
-                "\n".join(tables.source_paths), tables.slot_bytes, int(direct),
+                "\n".join(tables.source_paths), tables.slot_bytes, int(direct), self.lease_block,
             )
         )
         if self.handle < 0:
@@ -507,12 +519,51 @@ class Exl3RamMissHost:
         if evicted == -2:
             raise ValueError(f"expert {expert} already holds a pinned slot")
         if slot < 0:
-            raise RuntimeError("every pinned host slot holds a protected expert")
+            raise RuntimeError("every pinned host slot holds a protected or leased expert")
         return slot, (None if evicted < 0 else evicted)
 
     def release(self, row: int, slot: int) -> None:
         self._check(row, slot=slot)
         self._module.exl3_ram_miss_release(self.handle, row, slot)
+
+    def slot_info(self, row: int) -> list[tuple[int, int, int, int]]:
+        """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY."""
+        self._check(row)
+        out = torch.empty(int(self.tables.capacity[row]) * 4, dtype=torch.int64)
+        self._module.exl3_ram_miss_slot_info(self.handle, row, out)
+        values = out.tolist()
+        return [tuple(values[i : i + 4]) for i in range(0, len(values), 4)]
+
+    def inject_lease(self, row: int, slot: int, delta: int) -> None:
+        """Test only: stand in for a GPU reader's lease (the service grants its own from step 3)."""
+        self._check(row, slot=slot)
+        self._module.exl3_ram_miss_inject_lease(self.handle, row, slot, delta)
+
+    def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int, int]:
+        """(free, evictable, leased) slots a request wanting ``wanted`` could take, counted without taking any."""
+        self._check(row)
+        out = torch.empty(3, dtype=torch.int64)
+        self._module.exl3_ram_miss_victim_census(self.handle, row, _ids(wanted), out)
+        return tuple(out.tolist())
+
+    def lease_header(self) -> dict[str, int]:
+        """The header words the service wrote (u32 each), read back from the block."""
+        words = self.lease_block[: exl3_lease_block.HEADER_BYTES].view(torch.int32).tolist()
+        return {name: words[offset // 4] & 0xFFFFFFFF for name, offset in exl3_lease_block.HEADER.items()}
+
+    def lease_row_table(self) -> list[tuple[int, int]]:
+        """(slot_gen_base, capacity) per row, as the service wrote them."""
+        start = exl3_lease_block.ROW_TABLE
+        words = self.lease_block[start : start + 8 * self.layers].view(torch.int32).tolist()
+        return [(words[2 * r], words[2 * r + 1]) for r in range(self.layers)]
+
+    def mapped_slot_generations(self, row: int) -> list[int]:
+        """The SlotGen words of ``row`` in the lease block: what a GPU reader would see."""
+        self._check(row)
+        layout = self.lease_layout
+        start = layout.slot_gen_offset + 4 * layout.slot_gen_base[row]
+        capacity = int(self.tables.capacity[row])
+        return [w & 0xFFFFFFFF for w in self.lease_block[start : start + 4 * capacity].view(torch.int32).tolist()]
 
     def mapping(self, row: int) -> list[int]:
         self._check(row)
