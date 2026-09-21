@@ -2461,3 +2461,8 @@ The patch is kept at `analysis/dsv41-drive/held/R3_retire_in_read.diff` (applies
    worker mode evaluates the callback on more turns") was false for demands: `admit()` evaluates the callback only inside
    `while (next_batch < batches)`, so for a demand it is never evaluated after batch 0. Idempotence is still cheap and
    correct, but it was not the constraint it was presented as.
+
+**20.2j addendum: a known limit of the S1 test.** The interrupt test replaces `_establish_gpu_completion` with a function that
+raises `KeyboardInterrupt` in the calling thread, so it bypasses the real helper-thread `join`. It is accepted because a real
+interrupt during the join lands in the same `except BaseException`, but the `join` itself is not exercised by it. The
+post-landing review of `bcfe378f0d` found nothing to fix forward.
