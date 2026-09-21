@@ -2444,3 +2444,20 @@ covers, and the fault that slows individual rows is not reachable from the servi
    before the done stall, and the test failed 6 of 6 runs with it. Without either, 8 of 8 repeated runs pass and D1-D3 are
    killed again on the same assertion.
 The patch is kept at `analysis/dsv41-drive/held/R3_retire_in_read.diff` (applies on `bcfe378f0d`).
+
+**20.2k addendum, from the reviewer's third pass.**
+1. **The idempotence test adds nothing for D4 and does not touch the new call.** D4 (a released lane keeps its state) is
+   already killed by five earlier tests, and the test drives `pump()`, which exercises the existing top-of-function
+   retire, not the call in the abandon callback. It closes a gap in the retire function, not in R3. (Its first version was
+   vacuous for the reason given above; the second is merely redundant.)
+2. **A mutant on `lanes_outstanding_` itself, run.** E1: `lanes_outstanding_` is not decremented on release, so the
+   fast path is never taken and an eager pause would be refused forever. **KILLED by exactly one test**, in
+   `test_exl3_ram_miss_lease_thread.py` (`test_a_pause_is_refused_promptly_while_a_graph_lane_lease_is_outstanding_and_
+   granted_once_it_retires`: 1 of 8 failed), and it SURVIVES the whole service file (17), the leases file (14) and the
+   defer file (8). The kill fires as the `RuntimeError` "not paused, a GPU reader still holds a graph-lane lease" raised
+   by the `pause()` call the test expects to succeed: the behaviour under test, not a call-site accident, but a single
+   test's worth of assurance for the counter that every fast path and every pause depends on.
+3. **A correction to the constraint this change was written to.** The requirement passed on as binding ("idempotent because
+   worker mode evaluates the callback on more turns") was false for demands: `admit()` evaluates the callback only inside
+   `while (next_batch < batches)`, so for a demand it is never evaluated after batch 0. Idempotence is still cheap and
+   correct, but it was not the constraint it was presented as.
