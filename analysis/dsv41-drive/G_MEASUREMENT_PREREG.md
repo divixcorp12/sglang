@@ -191,3 +191,11 @@ outside about 4-10 us**, because of `c` (section 2.3).
 
 Self-test (run 2026-09-21, CPU): CLEARS, REJECTION-STANDS, EXPOSURE-DEPENDENT, UNRESOLVED and the INVALID cases (bad positive control, idle link, foreign GPU user, non-linear, 8,000-node base slope) all produce the
 expected verdict on synthetic data with known `g`. **That tests the logic of the rule, not the GPU.**
+
+## Amendment, 2026-09-21 (after the lead's request to confirm or drop the guess in 1.1)
+
+**The guess about "about 5 us" is dropped, not confirmed.** In the first version of `PER_ROW_TRANSFER.md` (`116533cb61`) "about 5 us" appears twice (5.6 and 6.2) with no derivation; `git log -S` finds it introduced in that commit and
+carried through `d22af00980`, `8c78c3d645`, `344b15623b` and `64e01cae78`. Its neighbours are the "8-14 us" range and a "kernel-node gap of 2-4 us [A]"; the 18.2 wait-kernel median of 5 us is not cited anywhere in that document. There is
+therefore no textual link between the two 5's, and the guess has nothing under it. **Origin: unknown.** Nothing else in this document changes; this note is appended rather than edited into 1.1 so the registered text stays as frozen.
+
+**Status of the `g` run: cancelled by the lead** (message of 2026-09-21): `g` is to be measured on the real `W_s`/`A_s` inside arm A3. This document is kept as the design A3 will use; `g_analysis.py` and its self-test stand.
