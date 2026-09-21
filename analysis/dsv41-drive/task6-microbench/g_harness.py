@@ -55,7 +55,7 @@ def build_lib(build_dir):
 def node_count(g):
     from cuda.bindings import runtime as cudart
     graph = cudart.cudaGraph_t(g.raw_cuda_graph())
-    err, _, n = cudart.cudaGraphGetNodes(graph, None)
+    err, _, n = cudart.cudaGraphGetNodes(graph, 0)
     if err != cudart.cudaError_t.cudaSuccess: raise RuntimeError("cudaGraphGetNodes: %s" % err)
     return int(n)
 
