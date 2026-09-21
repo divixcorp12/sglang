@@ -244,7 +244,7 @@ that a guard can be removed unseen:
 | test | what cannot be seen | status |
 |---|---|---|
 | `test_exl3_ram_miss_stage_trace_causal.py:111` resubmit keeps first submit | nothing compares an extent's submit stamp to the record's, so first and last submit are indistinguishable; missed mutant `host.cpp:906-911` | `[re-verified]` |
-| `test_exl3_ram_miss_stage_trace.py:109` per-drive bytes sum to the total | the fixture has one drive (`roots=()`, and the mirror roots share one `st_dev`), so the sums are trivially true; missed mutants `host.cpp:519-522`, `:1049`, `:1200` | `[re-verified]` |
+| `test_exl3_ram_miss_stage_trace.py:109` per-drive bytes sum to the total | the fixture has one drive (`roots=()`, and the mirror roots share one `st_dev`), so the sums are trivially true, **so this test cannot see a per-drive attribution bug. The code is not unguarded, though: mutation-tested, the mutants at `host.cpp` `file_drive_.push_back(0)` and `drive_bytes[0]` are both killed by `test_exl3_ram_miss_split.py::test_mirrored_reads_are_accounted_per_drive` (see "Mutation update")** | `[re-verified]` for the test; the guard exists in another file |
 | `test_exl3_verify_expert_mirror.py:184` first byte is lowest by row offset | separates "first name wins" from "lowest offset", not "last name wins"; no verdict effect | `[reviewer-established]` |
 | `test_expert_doorbell_copier.py:1265` `assert prime_row["bytes"] == 0 or prime_row["enqueued_ns"] != 0` | always true; the rest of that test is real | `[reviewer-established]` |
 | `test_expert_hot_cache.py:669` copy backend "before initial population" | observes only the end state | `[reviewer-established]` |
@@ -316,3 +316,21 @@ run. Counted with the repo's own parser (`ut_parse_one_file`) over the 82 in-sco
 - This sweep found what it found in about 1,140 tests. It says nothing about the suites it did not cover,
   and a clean file here means "the reviewer could not construct a surviving mutant", not "no surviving
   mutant exists".
+
+## Mutation update (2026-09-21, after the mutant run)
+
+Twenty-two mutants were run against the host-facing tests on a pristine export of `a01f9347d6` (baseline
+297 passed, 1 skipped), each applied to an unmodified copy and reverted; the full results and the
+survivor classification are in `MUTATION_RESULTS.md`. What it changes in this report:
+
+- **Confirmed as suite-level survivors (nothing else in the run catches them):** the publish gate widened
+  (finding 1), the verifier reading buffered while reporting direct, for the mirror rows and for the
+  source rows separately (finding 3), the layout ignoring its prefix (finding 4), the resubmit stamp, and a
+  failed thread start leaving the tier marked threaded. That is 5 of the 6 sweep findings I could map to a
+  mutant I was able to run (6 of 8 by mutant: the verifier is two mutants and the per-drive entry two).
+- **Refuted as suite-level:** the per-drive attribution entry above. The test I flagged still cannot see
+  the bug, but another test catches it. The two kinds of claim differ: a sweep finding says "this test
+  cannot fail on this bug", a mutation result says "nothing in the run fails on this bug". The sweep counts
+  the first; only a mutant run establishes the second, and one of six did not carry over.
+- Not run (need a GPU, not permitted here): the stale-ticket generation gate (finding 2) and the
+  insert-on-miss victim (finding 5). They remain source arguments.
