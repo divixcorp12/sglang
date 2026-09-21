@@ -394,7 +394,7 @@ class RealDevice:
         return meta
     def _plan(self, node, n, rows, slots):
         t = self.torch
-        r = torch.zeros(6, dtype=torch.int64); r[:n] = torch.tensor(rows); s = torch.zeros(6, dtype=torch.int32); s[:n] = torch.tensor(slots)
+        r = t.zeros(6, dtype=t.int64); r[:n] = t.tensor(rows); s = t.zeros(6, dtype=t.int32); s[:n] = t.tensor(slots)      # (v5: was bare `torch`, a NameError found on the first real launch)
         return r, s
     def _verify(self, node):
         t = self.torch; rows = [5, 9, 1, 100, 77, 3]; slots = [10, 11, 12, 13, 14, 15]
@@ -457,7 +457,7 @@ class RealDevice:
         T = [s.elapsed_time(e) for s, e in zip(starts, ends)][WARMUP_LAUNCHES:]
         self.consumed[node] += launches * n
         if cell.state != "repeat": self.global_seq[node].extend(ids)     # time-ordered rows read from this node's slabs (warm-up launches included)
-        return T, {"cpu": os.sched_getcpu()}
+        return T, {"cpu": _syscalls().sched_getcpu()}                # (v6: os.sched_getcpu does not exist; found on the first real visit)
     def close(self):
         pass
 

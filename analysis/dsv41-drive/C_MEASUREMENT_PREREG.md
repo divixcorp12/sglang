@@ -326,7 +326,7 @@ A mid-run arrival during the measurement itself is visible afterwards in `meta.j
 
 | file | sha256 |
 |---|---|
-| `proposed_amendment6/c_harness.py` | `4aed80a181e8ea66d6f58c126ac0e688b2e0282ab69862455bcb1fe762a046f0` |
+| `proposed_amendment6/c_harness.py` | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
 | `proposed_amendment6/quiet_check.py` | `c9017bb8c3e4fe85e2c1781764511c1b157a48c627b923ee25324f03a8b45e99` |
 | `proposed_amendment6/test_c_harness.py` | `b735ca4723768fdcb45f87360a31f538a24bb08d8f0ed35a55ac1561f4a32904` |
 
@@ -359,5 +359,18 @@ INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling
 | `sibling_pilot/sibling_pilot.py` (the runner (GPU; needs the lock)) | `4b9219521077bb8e3ccd251b8047dd895bba2d278222f4dacba88ff5e2afdff0` |
 | `sibling_pilot/sibling_pilot_analysis.py` (the frozen rule and verdict (CPU; `--selftest` passes all ten cases)) | `5d85f67c946e55445598421ff79765be0e40fb748a131e55988fd8d9b24b3bc5` |
 | `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `0f7de46f249bb782a35547ddd4221538d8ba61e2e99ef92a4f157411e741c9f8` |
-| `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `e21b496b68e087ef238b8d99c9e104760cb54009cef5cb8983dbf3037ef41495` |
+| `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
 | `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `c9017bb8c3e4fe85e2c1781764511c1b157a48c627b923ee25324f03a8b45e99` |
+
+### 18.1 Run 1 of the pilot: INVALID, twice over; no verdict is quoted (2026-09-21, 05:37:55-05:40:26, raw output on divix01 in `c_measurement_run/pilot_out_053754/`, `meta.json` in `sibling_pilot/run1_meta.json`)
+
+**Verdict word: INVALID.** Two independent registered reasons, either sufficient:
+1. **Fewer than 8 valid reps per `n`: 7 of 20 for `n = 3` and 7 of 20 for `n = 6`** (126 of 160 visits valid). The B arm was clean and the instrument behaved (spinner achieved **99%** of the window in every B visit, minimum 99; the sibling's foreign busy in B was at most 2.1%; the launching CPU's foreign busy at most 4.3%; the A spinner accrued 0 ticks in every A visit). **The A arm was not: the sibling of a spinning CPU is foreign-busy in A** (median 8.5%, **maximum 93.2%**), because the scheduler moves foreign threads off the CPU we spin on and onto its idle sibling, exactly the hole the lead measured for the main gate.
+   Reps with any A visit at 10% or more were excluded, as registered; 13 of 20 remained excluded for each `n`.
+2. **A "lane of ours" at the END** (`quiet_check.lane_processes()`): two short-lived `bash -c test -f /data/models/slang/nvfp4-work/t1-ordersweep/sweep.done` pollers (the order-sweep lane's release probe, matched by the `sweep` substring). They are almost certainly harmless (no CPU), but the rule as registered is any hit, so the run is voided by it too. I do not reinterpret the rule after the fact.
+Also recorded: link Gen3 throughout, P1 (busy), SM clock 2760-2970 MHz, no other GPU process; the sweep's `t1py` unit was stopped by the lead before the run, `pgrep` was clean at the start (the in-harness guard passed).
+
+**No shift and no verdict was computed or looked at**: only the validity statistics above were read from `visits.jsonl`. **Bugs found on the first real GPU launches** (before any timed data, so they cost nothing but the minute): `RealDevice._plan` used a bare `torch` (`NameError`) and `run_visit` called `os.sched_getcpu`, which does not exist. Fixed in `proposed_amendment6/c_harness.py` (v6, hash updated above). **The in-force harness `35dcf8215ae5c2c9…` carries both bugs**; had the main run gone ahead it would have crashed at `--check-only`. `pyflakes` now clean on the undefined-name class of error; an attribute error like the second is not caught by it, which is why the first real launch is the test.
+
+**What this does and does not say.** It says nothing about whether a busy sibling moves `T`. It says something about the box that the pilot's design depends on: **on divix01 the idle SMT sibling of a CPU we occupy is foreign-busy above 10% in roughly a third of 0.5-0.9 s windows even on the quietest physical core the survey found**, so a clean A arm is available only about a third of the time.
+**Options, none taken without the lead:** re-run with more reps (about 40, so that about 14 valid are expected against the minimum of 8: a change of a registered parameter after an INVALID, so it needs the lead's yes and a new hash), and either stop the sweep lane's `test -f` pollers or exclude pure `test -f` probes from the lane pattern (a guard change; it would be made before, not after, looking at any shift).
