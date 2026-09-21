@@ -203,18 +203,31 @@ Include expert identity in the immutable row result and validate it against the 
 > per layer, so an instrumentation item is requested to record the planned lane
 > count per request.
 >
-> **OPEN CHALLENGE, not yet answered.** The 87% figure assumes the hit-lane
-> gather can start while the NVMe read is still outstanding. The device's only
-> visible readiness signal today is `demand_done`, which the host stores *after*
-> `read()` returns. If no earlier device-visible signal exists, the hit phase
-> cannot begin until the read has already finished and **the 87% saving does not
-> exist as modelled** -- for the two-phase mechanism as well as for per-row,
-> since both depend on the same early start. This was raised against the
-> precheck and is awaiting an answer; until it is resolved, treat every figure in
-> this blockquote as conditional on an early signal that has not been shown to
-> exist.
+> **BLOCKING DEPENDENCY.** The 7.5-15% saving, and the 87% share attributed to
+> hit lanes, both assume the hit-lane gather can start while the NVMe read is
+> still outstanding. Publication today is **per-request**, and `demand_done` is
+> stored *after* `read()` returns, so no such early signal exists. The Task 6
+> design's own `[REQ 1]` -- asking `LEASE_PROTOCOL` to permit per-lane,
+> time-staged publication -- **is** that signal, filed as a protocol request
+> rather than as the prerequisite it is. Consequences:
+>
+> - Every figure in this blockquote is conditional on building `[REQ 1]`.
+> - It binds **V1 two-phase exactly as hard as V2 per-row**. V1's advantage is
+>   the 87% hit-lane share, which is unreachable without it. Preferring V1 does
+>   not avoid this cost, it relocates it.
+> - `[REQ 1]`'s cost is currently booked to Task 5 and appears in no Task 6
+>   estimate. The cheapest form depends on whether hit lanes are already
+>   resolved at plan time and merely kept host-side; that is under independent
+>   check and is not yet established.
+>
+> An independent code-level confirmation of the above is in progress. Until it
+> lands, treat the dependency as identified but not verified.
 
-**Chosen first mechanism:** Retain the existing SM-driven host gather and one graph stream. Capture a fixed number of lane operations determined by plan capacity. Each active lane waits for its own generation-qualified readiness, copies only that row to its reserved GPU destination, then acknowledges source consumption. Inactive lanes are no-ops. All lane copies precede one fused MoE invocation.
+**Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step (2.0%), or 2.55 ms at random lane order, against a gate that resolves about 1.5% -- while costing 160 extra stage triples per step across all 40 layers. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
+
+**Baseline correction:** the fair comparison is Task 5 **lease-mode batched**, not today's unleased path. Lease mode arms every `count > 0` record, so all 40 layers pay a service round trip (OPEN 11, unmeasured). That cost must be netted out or any Task 6 arm flatters itself.
+
+**Per-row variant (V2):** Retain the existing SM-driven host gather and one graph stream. Capture a fixed number of lane operations determined by plan capacity. Each active lane waits for its own generation-qualified readiness, copies only that row to its reserved GPU destination, then acknowledges source consumption. Inactive lanes are no-ops. All lane copies precede one fused MoE invocation.
 
 ```text
 post_request(all demand lanes)
