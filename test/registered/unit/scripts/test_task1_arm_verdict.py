@@ -344,3 +344,45 @@ def test_a_flag_against_a_single_reference_arm_says_so(tmp_path):
     assert single and "single reference arm" in single[0]
     two = [one, _arm_file(tmp_path, "two", [3.0, 4.0], [50, 30])]
     assert "single reference arm" not in verdict.cross_arm_outliers(slow, str(tmp_path / "me.json"), two)[0]
+
+
+# --- code generation, derived from the imported tree ----------------------------------------------
+
+
+def _git_repo(tmp_path):
+    import subprocess
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    (tmp_path / "python").mkdir()
+    (tmp_path / "python" / "m.py").write_text("x = 1\n")
+    git("init", "-q"), git("add", "."), git("commit", "-qm", "gen1")
+    first = git("rev-parse", "HEAD")
+    (tmp_path / "docs.md").write_text("only docs changed\n")          # python/ tree unchanged
+    git("add", "."), git("commit", "-qm", "docs")
+    docs_only = git("rev-parse", "HEAD")
+    (tmp_path / "python" / "m.py").write_text("x = 2\n")              # the measured tree changes
+    git("add", "."), git("commit", "-qm", "gen2")
+    return first, docs_only, git("rev-parse", "HEAD"), git("rev-parse", f"{first}:python")
+
+
+def _arm_at(head):
+    return {"provenance": {"git": {"head": head}}}
+
+
+def test_generation_is_derived_from_the_python_tree_of_the_imported_head(tmp_path):
+    """A docs-only commit is the same generation; a change under python/ is not, and is never guessed."""
+    first, docs_only, changed, tree1 = _git_repo(tmp_path)
+    manifest = {"generations": {tree1: "gen1 = python/ of the first commit"}}
+    assert verdict.generation(_arm_at(first), str(tmp_path), manifest) == ("gen1 = python/ of the first commit", tree1)
+    assert verdict.generation(_arm_at(docs_only), str(tmp_path), manifest)[0].startswith("gen1")
+    label, tree = verdict.generation(_arm_at(changed), str(tmp_path), manifest)
+    assert label.startswith("unknown: python tree") and "not in the manifest" in label and tree != tree1
+    assert verdict.generation(_arm_at(changed), str(tmp_path), None)[0].startswith("unknown")
+
+
+def test_generation_is_unknown_when_the_head_cannot_be_resolved(tmp_path):
+    assert verdict.generation({}, str(tmp_path), {})[0].startswith("unknown")
+    assert verdict.generation(_arm_at("0" * 40), str(tmp_path), {})[0].startswith("unknown")

@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 
 # Must equal provenance._SECRET_NAME (a unit test pins that): an over-matching filter hides values.
@@ -259,6 +260,29 @@ def contention(report: dict):
     return "not contended", []
 
 
+def python_tree(root: str, head):
+    """The git tree id of python/ at the commit the arm's process imported sglang from, or None. It names the
+    code that ran (two commits with the same python/ tree ran the same sglang) and is derived, not remembered."""
+    if not head:
+        return None
+    try:
+        return subprocess.run(["git", "-C", root, "rev-parse", f"{head}:python"], capture_output=True, text=True,
+                              timeout=30, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def generation(report: dict, root: str, manifest):
+    """(label, tree). The label comes from the manifest's "generations" map {python tree id: label}; a tree that is
+    not in it is reported as unknown, never guessed, so a new code generation cannot pass as an old one."""
+    head = ((report.get("provenance") or {}).get("git") or {}).get("head")
+    tree = python_tree(root, head)
+    if tree is None:
+        return "unknown: python tree not resolvable from the recorded HEAD", None
+    labels = (manifest or {}).get("generations") or {}
+    return labels.get(tree, f"unknown: python tree {tree[:12]} is not in the manifest"), tree
+
+
 def _median(values):
     v = sorted(values)
     n = len(v)
@@ -360,6 +384,22 @@ def main() -> int:
             refs = json.load(f).get(f"{args.code}:{args.mirror}", [])
         cross = cross_arm_outliers(report, args.arm_json, refs)
         notes += cross if cross is not None else [f"CROSS-ARM not judged: no other clean arm in cell {args.code}:{args.mirror}"]
+    manifest = None
+    if args.reference:
+        with open(args.reference) as f:
+            manifest = json.load(f)
+    gen, tree = generation(report, args.root, manifest)
+    notes.insert(0, f"GENERATION {gen}" + (f" (python tree {tree})" if tree else ""))
+    if manifest and cross:
+        for path in (manifest.get(f"{args.code}:{args.mirror}") or []):
+            try:
+                ref_gen, _ = generation(json.load(open(path)), args.root, manifest)
+            except (OSError, ValueError):
+                continue
+            if ref_gen != gen and os.path.realpath(path) != os.path.realpath(args.arm_json):
+                notes.append(f"GENERATION MISMATCH: this arm is {gen!r} but reference {os.path.basename(path)} is {ref_gen!r}; "
+                             "the cross-arm comparison crosses code generations")
+                break
     contended, why = contention(report)
     meaning = {
         "not contended": "means only that no foreign process using >= 50% CPU was sampled on cores 32-63 at a boundary; it does NOT mean the arm was undisturbed",
@@ -373,7 +413,7 @@ def main() -> int:
                                               if phases["last"][d] is not None and phases["ready"][d] is not None}
         with open(args.summary_json, "w") as f:
             json.dump({"regime": kind, "boot_growth_bytes": growth, "timed_growth_bytes": timed, "boot_phase": phase,
-                       "outlier_sessions": [n for n in notes if n.startswith("OUTLIER")], "contended": contended,
+                       "outlier_sessions": [n for n in notes if n.startswith("OUTLIER")], "contended": contended, "generation": gen, "python_tree": tree,
                        "cross_arm_flags": cross, "valid": not problems}, f, indent=2)
     for n in notes:
         print("NOTE", n)
