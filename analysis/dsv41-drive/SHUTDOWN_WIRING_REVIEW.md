@@ -175,3 +175,20 @@ stop; anything after `run_scheduler_process` returns beyond the atexit hooks nam
    cannot count as a kill; report kills by distinct killing test, not by count.
 5. Land the wiring after that. It is a small change and the direction is right: an orderly release is better than an unconditional quarantine,
    provided the failure modes cannot make it worse.
+
+## 7. Addendum: F1 and F2 are defects in landed code, not only in a proposal
+
+F1 and F2 are properties of `Exl3RamMissService.shutdown()` and `_establish_gpu_completion` **as landed in `fa22865ac6`**; the proposal only makes them
+reachable. They are harmless today for a specific reason: `shutdown()` has no production caller except the exit hook, and the exit hook passes `at_exit=True`, which
+sets `uncertain` unconditionally, so the free branch is reachable only from tests. That is "unreachable", which is not "correct". The step-6 ledger (13 mutants, 20
+tests) never asked what happens when a *late* step (`stop()`) fails after an *early* decision (`uncertain`) has been taken, so neither defect could have surfaced there.
+Any fix should be reviewed as a change to landed code, and the wiring must not be the first thing to exercise the free branch outside the tests.
+
+F2 in particular has no instrument on divix01 (one GPU, device 0 only): the unit test recording the `device` argument passed to `torch.cuda.synchronize` is the only
+thing that can see it, and a hardware run would return a green result that means nothing about it.
+
+**The barrier test that a GPU window can settle (queued behind F1 and F2; not before, since it would test code known to be wrong).** A long spin kernel on a side
+stream reading a registered slab; the real `shutdown()` with the real `torch.cuda.synchronize`; assert the tiers are freed only after the kernel completes and the slab
+stays readable until then. The mutant is "skip the barrier". The slab must be **poisoned with a detectable pattern** so the mutant fails on wrong bytes: reading
+freed-but-not-reused memory usually succeeds, and without the poison the mutant would most likely pass. It also exercises the real `cudaHostUnregister` on a real slab,
+which the CPU tiers (`device="cpu"`, an empty unregister list) never do.
