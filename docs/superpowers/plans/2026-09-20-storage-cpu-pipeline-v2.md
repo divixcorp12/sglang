@@ -1320,9 +1320,21 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > removed, those assertions become the only protection and there is no evidence
 > they fire.
 >
-> **The rule: when a guard is added for detectability, re-run the mutant with
-> the guard disabled and record that the requirement's own assertion fires.**
-> Keep the guard -- it converts a hang into a failure -- but keep both facts.
+> **The rule, corrected after this entry contradicted itself:** when a guard is
+> added for detectability, re-run the mutant with the guard disabled and
+> **record what actually fires** -- not "record that the assertion fires", which
+> an earlier revision of this very rule prescribed and which is impossible here.
+> Three outcomes, all informative:
+> - **the requirement's assertion fires** -- the guard was masking a working
+>   demonstration, and you now have both;
+> - **something else fires** (here, a second guard) -- your evidence was never
+>   the assertion, and you have been crediting the wrong check;
+> - **it hangs, or produces no result** -- the assertion is **unreachable**
+>   under that mutant, and no mutation will ever exercise it. Then test the
+>   assertion directly as a pure function, and say that is what you did.
+>
+> Keep the guard either way -- it converts a hang into a failure -- but keep
+> whichever fact you actually obtained.
 > This is the two-part rule turned on the *suite* rather than on a single test:
 > the guard is the path witness, the assertion is the property, and a kill that
 > exercises only the first is not evidence for the second.
