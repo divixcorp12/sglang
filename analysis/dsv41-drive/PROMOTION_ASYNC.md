@@ -58,7 +58,10 @@ Files cited (all under `python/sglang/`):
    ints. `_prepare_promotion` turns that list into a CUDA tensor; `ensure_rows` then
    calls `.tolist()` on it (a blocking device-to-host copy) to rebuild a list, and then
    builds CPU tensors from that list. list -> CUDA tensor -> list -> CPU tensor, with a
-   hidden device sync, for data that never left the host (section 3). It is milestone M0.
+   hidden device sync, for data that never left the host (section 3). It is milestone M0,
+   **now closed on throughput grounds and not a prerequisite for M1 or M2**: measured at about 54 us
+   per promotion chunk, under 1% of the boundary excess (`EXPERT_ID_ROUNDTRIP.md`), and the asynchronous
+   path never calls `ensure_rows` (section 3).
 3. **A lot already works.** The dedicated transfer stream, the 8-event ring, non-blocking
    completion queries, stale-ticket safety, generation-qualified slot tickets, and above
    all the failed-copy quarantine in `_load_reserved_in_chunks` are correct and are
@@ -79,7 +82,7 @@ Milestones (each has its own gate, section 12):
 
 | | What | Depends on |
 |---|---|---|
-| M0 | Preserve CPU expert ids through admission (item 1). CPU-testable. | nothing |
+| M0 | Preserve CPU expert ids through admission (item 1). **Optional, closed for throughput** (about 54 us per chunk; `EXPERT_ID_ROUNDTRIP.md`); not a dependency of M1 or M2. Improves only the synchronous path they replace. | nothing |
 | M1 | Spare slots, draining state, ticketed async copy and publication, for rows already resident in the pinned RAM tier | Task 5 host-lease API |
 | M2 | Asynchronous RAM admission through the native service at promotion priority (no NVMe read on the scheduler thread; no pause) | M1 |
 | M3 | Asynchronous decision readback, backpressure, tuning, and the gate measurement | M2 |
@@ -265,13 +268,28 @@ from it). Path: **list -> CUDA tensor -> list -> CPU tensor**, with a hidden dev
 for data that never needed to leave the host.
 
 Where the sync hides: inside `host_use()`, whose entry already ran
-`current_stream().synchronize()`. In today's design the stream is idle at that point, so
-the round trip's *wall-time* cost is small (microseconds of transfer plus a sync that
-returns at once). That does not make it harmless. In M1 and later the promotion path
-must not synchronize at all, and an `ensure_rows` that takes a CUDA tensor and calls
-`.tolist()` on it would reintroduce a device sync inside a path whose whole point is to
-have none. It is the kind of dependency that a "no synchronization" proof (section 11.1)
-would have to find; better to remove it now.
+`current_stream().synchronize()`. The stream is idle at that point, so the round trip's wall-time cost
+is small: **measured at about 54 us per promotion chunk (median; max 92 us), about 0.8 ms per
+residency boundary, under 1% of the 82 to 115 ms boundary excess** (`EXPERT_ID_ROUNDTRIP.md`,
+`t2-scheduling`, from an existing Nsight export; one window, one session, node-mode so an upper bound).
+
+**Correction to this section's first draft.** It argued the round trip matters because "in M1 and later
+the promotion path must not synchronize at all, and an `ensure_rows` that takes a CUDA tensor and calls
+`.tolist()` on it would reintroduce a device sync". That does not survive sections 6 and 7 of this same
+document: **the asynchronous path never calls `ensure_rows`.** M1 leases rows already resident in the
+pinned tier (acquire by expert, section 9.1 R3) and copies from the leased host slot; a row that is not
+resident is dropped from the wave and left for a later boundary (it is *not* sent through the synchronous
+path, which blocks); M2 admits missing rows through the service. So M0 is not a prerequisite for M1 or M2.
+It improves only the synchronous path they replace, and it was argued on grounds the later sections
+removed. The item stands as a real, avoidable, behaviour-identical inefficiency worth about 15 lines if
+anyone wants it for clarity; it is not on the critical path.
+
+**Answer to the conditional left open by the close-out** ("if any promotion path that survives into the
+async design still calls `ensure_rows` with a CUDA tensor, the synchronize becomes a real cost there"):
+**no surviving asynchronous path does.** The remaining callers are the eager demand gather
+(`gather_rows`, whose ids are real routed experts on the device, legitimately), and the synchronous
+fallbacks `assign_prefetch` and startup `reassign` through `_load_reserved`, which the async mode refuses
+or leaves out of scope (sections 1.1, 15). So the item can be closed outright.
 
 `ExpertPinnedHostCache.gather_rows` legitimately receives CUDA ids (they are real routed
 experts from the device) and its `lookup` / `.tolist()` / `.item()` calls are the demand
@@ -296,7 +314,8 @@ M0 does not change any byte, any slot, or any ordering. Its gate is byte-for-byt
 identical admissions and copies, and a CUDA-API trace showing one fewer
 `cudaMemcpy`-family call and one fewer stream synchronization inside `ensure_rows` per
 promotion chunk. The measured wall-time gain is expected to be near zero in the current
-synchronous design; its value is that M1 and M2 need it.
+synchronous design (measured: about 54 us per chunk). It is not a prerequisite for M1 or M2; see the
+correction in section 3.
 
 ---
 
@@ -1309,6 +1328,7 @@ the wrap fix is believed because eight deliberate mutations each failed the inte
 | R-G: at most one non-DONE ticket per layer | allow a second ticket while the first is COPIED |
 | Quarantine has exits (section 5.4) | leave a recoverable quarantine without an exit |
 | P1: publication on the serving stream | publish from the executor stream |
+| M0 (if built): `_prepare_promotion` passes host ints | pass a CUDA tensor built from the list (today's code) and assert the argument-type test fails |
 
 A test with no row here is not a safety test and must not be described as one.
 
@@ -1407,9 +1427,9 @@ with fakes:
 - **Insufficient capacity**: (i) `K = 0` full cache: every promotion deferred with
   `no_free_vram_slot`, none forced; (ii) fewer FREE slots than promotions: the highest-rank subset is
   reserved and the rest deferred, **and reservation is all-or-nothing** (a wave that cannot reserve all
-  its destination slots reserves none); (iii) ring full: `try_submit` returns `None`, deferral
+  its destination slots reserves none); (iii) ring full (**the fake events must be held incomplete**, otherwise the ring never fills and the test passes on any implementation): `try_submit` returns `None`, deferral
   counted, no exception; (iv) all RAM candidates leased: `no_ram_victim_leases`, and a *demand* in the
-  same state defers rather than fails (needs the tri-state); (v) byte cap: in-flight bytes never exceed
+  same state defers rather than fails (needs the tri-state); (v) byte cap (**hold the fake copy events incomplete until the test releases them**, so in-flight bytes actually accumulate to the cap; with instantly-complete events the gauge never rises and the test cannot fail): in-flight bytes never exceed
   `max_inflight_bytes` over a 832-promotion burst; assert the maximum of the gauge, not the final value;
   (vi) `plan_busy`, `demand_pending`, `eager_host_use`, `shutdown`: each reason has a test, not only
   the five listed in the first draft.
@@ -1424,16 +1444,30 @@ with fakes:
   (d) a replay ordered *between* the copy event and the publication is legal and reads the old map.
   This is a logic-level check only: it shares the ordering assumption it tests, so it is **not** the
   evidence for DRAINING (11.4 is). Mutation control: free the victim at publication.
-- **Priority**: a service model in which a demand arrives during a promotion admit cancels the admit at
-  the next row; assert the rows already complete are published whole and the rest released; assert the
-  promotion class is never served while a demand or advisory is pending.
-- **M0**: `ensure_rows(list)` on a CPU-tier `ExpertPinnedHostCache` performs no CUDA call (a spy on
-  `torch.tensor` with a `device` argument and on `Tensor.tolist` of CUDA tensors); admissions equal those
-  of the tensor entry for the same ids, including duplicates and more misses than slots ("More misses
-  than slots reassign a slot within this call"). **Unverified**: that the streamer and tier can be
-  constructed without CUDA in a unit test; the class docstring says a CPU-device tier runs without a
-  GPU, but `ExpertStreamer` construction was not traced. If it cannot, this is a CUDA-runner test.
-  Mutation control: the old CUDA-tensor entry must make the spy fire.
+- **Priority (spec level only): this bullet cannot fail on the C++ service.** It drives a Python *model*
+  of the service, so it tests the model against itself. It is kept only to pin the ledger's handling of an
+  admit result that arrives for a cancelled ticket (drained and ignored, no lease); the behaviour it is
+  named for (a posted demand cancels a promotion admit within one row; the promotion class is never served
+  while a demand or advisory is pending) is tested against the real thread in 11.3. Do not cite this bullet
+  as evidence of priority.
+- **M0 (only if M0 is built; it is optional, section 3): what discriminates, and what does not.**
+  *The first draft's test does not discriminate and must not be used as evidence.* It asserted that
+  `ensure_rows(list)` on a CPU-tier `ExpertPinnedHostCache` "performs no CUDA call (a spy on `torch.tensor`
+  with a `device` argument and on `Tensor.tolist` of CUDA tensors)". A CPU tier has no CUDA device, so
+  neither the old code nor the new can make a CUDA call there; run CPU-only it would fail on the old code
+  only because a list has no `.tolist()`, an API-existence check under a behaviour test's name (the same
+  pattern as second review B1; found by `t2-scheduling`, `EXPERT_ID_ROUNDTRIP.md`). What fails on the bug:
+  the regression is that `_prepare_promotion` hands the pinned tier a CUDA tensor built from the host list,
+  so the test must assert **what `_prepare_promotion` passes**. Call `ExpertHotCache._prepare_promotion` on a
+  lightweight stand-in for `self` (`ExpertHotCache.__init__` needs a GPU, so a real instance cannot be built
+  on a CPU-only runner; second review B2) with a recording fake pinned cache whose `ensure_rows` (or the new
+  host-ids entry) stores its argument, and assert the argument is **a list of Python ints in ticket order,
+  not a `torch.Tensor`**. That assertion fails on current code and passes on the change (mutation control: the
+  old code). A parity test over admission decisions (same slots, evictions and `populated_rows` for the same
+  ids, including duplicates and more misses than slots, "More misses than slots reassign a slot within this
+  call") is worth having but cannot discriminate: old and new are identical by construction there, and it
+  measures nothing about latency or what crosses the device boundary. Whoever verifies M0 must not cite the
+  spy test.
 
 **11.2b. CUDA-runner unit tests** (in `test/registered/unit/layers/moe/` beside
 `test_expert_hot_cache.py` and `test_expert_hot_cache_publication.py`, which are
@@ -1581,7 +1615,7 @@ attribution, cache state recorded.
 | Arm | Live slots | Spare | Promotion mode | Purpose |
 |---|---|---|---|---|
 | A0 | `C` | 0 | synchronous (today) | baseline; the `c32` arm |
-| A1 | `C` | 0 | synchronous + M0 | isolates M0 |
+| A1 | `C` | 0 | synchronous + M0 | isolates M0 (**dropped unless M0 is built**: its effect is about 54 us per chunk, far below anything the arms resolve, section 3) |
 | A2 | `C - K` | `K` | async (M1..M3) | **the gate arm, matched VRAM** |
 | A3 | `C` | `K` extra | async | **unmatched, labelled**: isolates the spare-slot cost from the protocol cost; more VRAM |
 | A4 | `C - K` | `K` | synchronous | isolates the capacity cost of `K` alone (`K` slots unused) |
@@ -1801,11 +1835,12 @@ arm's capacity can be verified from its log instead of trusted.
 
 Each milestone has a gate that can fail. Do not merge a milestone on its checklist.
 
-**M0: CPU ids.** Files: `expert_hot_cache.py` (`_prepare_promotion`), `expert_stream.py`
-(`ensure_rows`), tests. Gate: identical admissions and copies (byte parity, same slot
-assignment, same stats) on the CPU-tier unit tests and one eager EXL3 run; API trace shows
-the `torch.tensor(..., device=cuda)` H2D and the `.tolist()` D2H gone from `ensure_rows`. No
-performance claim.
+**M0: CPU ids. Optional; closed for throughput; not a dependency of M1 or M2 (section 3).** Files: `expert_hot_cache.py` (`_prepare_promotion`), `expert_stream.py`
+(`ensure_rows`), tests. Gate: the argument-type test of 11.2a (a list of ints in ticket order, not a
+tensor) passes and **fails on the current code**; identical admissions and copies (byte parity, same slot
+assignment, same stats) on a parity test and one eager EXL3 run, understood as non-discriminating (11.2a); the
+API trace shows the `torch.tensor(..., device=cuda)` H2D and the `.tolist()` D2H gone from `ensure_rows`.
+No performance claim (about 54 us per chunk).
 
 **M1: spare slots, draining, async copy and publication, RAM-resident rows.** Requires the
 host-lease API (R1, R2, R5, R6, R7, R8) **and the device acknowledgement with the service-side
