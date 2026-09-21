@@ -495,7 +495,12 @@ def test_when_every_resident_expert_is_protected_the_request_fails_and_evicts_no
         host.stop()
 
 
-def test_a_failed_read_publishes_none_of_the_rows_it_had_already_packed(tmp_path):
+def test_a_read_that_fails_before_it_starts_publishes_nothing_and_frees_every_slot(tmp_path):
+    """``fail_reads`` returns before ``reader_.read`` runs, so nothing here has packed: this pins the
+    pre-read failure path only -- slots were reserved, the read never happened, and the tier leaves
+    behind neither a mapping nor a LOADING slot. It says nothing about all-or-nothing publication,
+    which is pinned at the tier by test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_
+    and_publishes_none (test_exl3_ram_miss_tier.py), the only test that fails a row mid-read."""
     s, page, host = _tier(tmp_path)
     try:
         host.enable_trace()
