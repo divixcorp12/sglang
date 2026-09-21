@@ -79,6 +79,21 @@ Test-side repair the reviewer suggested (untried): truncate the source file to e
 superset so rows 0 and 1 pack and row 2 fails, then assert on rows 0 and 1. A mid-read injector is the
 cleaner fix.
 
+**CLOSED 2026-09-21 at `ae936b5bf5`, by the mid-read injector.** `RamTier::inject_fault` (`c8a1309cf7`)
+installs the reader tests' full `ReadFault` on the tier's reader without short-circuiting ahead of
+`reader_.read`, and `test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_and_publishes_none`
+(`test_exl3_ram_miss_tier.py`) uses `part_error=EIO, ordinal=2, hold_ordinal=2` so rows 0 and 1 are packed
+into their slots when row 2 fails. The mutant this document names -- widening the publish gate to
+`if (ok || (i < packed.size() && packed[i] != 0))` -- was run on that commit against
+`test_exl3_ram_miss_tier.py` and `test_exl3_ram_miss_thread.py` together: **1 failed, 50 passed**, the one
+failure being that test, on `host.mapping(1) == [0, 1, -1, -1, -1, -1]`. The suite is no longer blind to
+per-row publication, and the Task 6 V2 behaviour change is now falsifiable in both directions.
+
+The vacuous test itself was **renamed, not retired**, to
+`test_a_read_that_fails_before_it_starts_publishes_nothing_and_frees_every_slot`: its assertions do pin a
+real path (slots reserved, read never run, no mapping and no LOADING slot left), and it stayed green under
+the mutant above, which is the direct evidence that the name -- not the test -- was the defect.
+
 ### 2. The stale-ticket generation gate, `test_expert_hot_cache.py:311` `[re-verified]`
 
 `test_reservation_hides_victim_until_matching_generation_is_ready`. The guarded invariant: a stale ticket
