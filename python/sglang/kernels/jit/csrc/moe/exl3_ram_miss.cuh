@@ -56,6 +56,38 @@ constexpr int64_t kRecArmed = 80;
 constexpr int64_t kRecLanes = 84;
 constexpr uint16_t kServed = 1;
 
+// The lease block beside the request page (LEASE_PROTOCOL.md section 4). Its layout is written here, in
+// exl3_ram_miss_host.cpp and in ops/moe/exl3_lease_block.py; test_exl3_lease_block checks they agree. The
+// publication word (tag << 56 | generation) is built in code: the layout test parses these lines with + - * only.
+constexpr int64_t kLeaseRing = 16;   // == kDemandRecords
+constexpr int64_t kLeaseLanes = 8;   // == kMaxIds
+constexpr int64_t kLeaseHeaderRing = 8;
+constexpr int64_t kLeaseHeaderLanes = 12;
+constexpr int64_t kLeaseHeaderShutdown = 20;
+constexpr int64_t kLeaseHeaderSlotGenOffset = 32;
+constexpr int64_t kLeaseHeaderDOffset = 36;
+constexpr int64_t kLeaseRowTable = 128;
+constexpr int64_t kLeaseRowResult = 4096;
+constexpr int64_t kLeaseRowResultBytes = 32;
+constexpr int64_t kLeaseRrReady = 0;
+constexpr int64_t kLeaseRrSlotGeneration = 8;
+constexpr int64_t kLeaseRrHostSlot = 12;
+constexpr int64_t kLeaseRrExpert = 16;
+constexpr int64_t kLeaseSlotGen = kLeaseRowResult + kLeaseRing * kLeaseLanes * kLeaseRowResultBytes;
+constexpr int64_t kLeaseLaneRequest = 0;
+constexpr int64_t kLeaseLaneRequestBytes = 64;
+constexpr int64_t kLeaseLrGen = 0;
+constexpr int64_t kLeaseLrCount = 8;
+constexpr int64_t kLeaseLrRow = 12;
+constexpr int64_t kLeaseLrExpert = 16;
+constexpr int64_t kLeaseLaneAck = kLeaseLaneRequest + kLeaseRing * kLeaseLaneRequestBytes;
+constexpr int64_t kLeaseLaneAckBytes = 8;
+constexpr int64_t kLeaseTerminal = kLeaseLaneAck + kLeaseRing * kLeaseLanes * kLeaseLaneAckBytes;
+constexpr int64_t kLeaseTerminalBytes = 16;
+constexpr int64_t kLeaseTermSkippedMask = 0;
+constexpr int64_t kLeaseTermReason = 4;
+constexpr int64_t kLeaseTermGen = 8;
+
 constexpr int kPosted = 0;
 constexpr int kPending = 1;
 constexpr int kTimeouts = 2;

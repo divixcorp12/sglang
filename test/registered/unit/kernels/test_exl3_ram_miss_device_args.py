@@ -183,6 +183,61 @@ def test_the_device_kernels_speak_the_host_page_layout():
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
 
 
+def _lease_python_constants():
+    from sglang.kernels.ops.moe import exl3_lease_block as lease
+
+    return {
+        "kLeaseRing": lease.RING,
+        "kLeaseLanes": lease.LANES,
+        "kLeaseHeaderRing": lease.HEADER["ring"],
+        "kLeaseHeaderLanes": lease.HEADER["lanes"],
+        "kLeaseHeaderShutdown": lease.HEADER["shutdown"],
+        "kLeaseHeaderSlotGenOffset": lease.HEADER["slot_gen_offset"],
+        "kLeaseHeaderDOffset": lease.HEADER["d_offset"],
+        "kLeaseRowTable": lease.ROW_TABLE,
+        "kLeaseRowResult": lease.ROW_RESULT,
+        "kLeaseRowResultBytes": lease.ROW_RESULT_BYTES,
+        "kLeaseRrReady": lease.ROW_RESULT_FIELDS["ready"],
+        "kLeaseRrSlotGeneration": lease.ROW_RESULT_FIELDS["slot_generation"],
+        "kLeaseRrHostSlot": lease.ROW_RESULT_FIELDS["host_slot"],
+        "kLeaseRrExpert": lease.ROW_RESULT_FIELDS["expert"],
+        "kLeaseSlotGen": lease.SLOT_GEN,
+        "kLeaseLaneRequest": lease.LANE_REQUEST,
+        "kLeaseLaneRequestBytes": lease.LANE_REQUEST_BYTES,
+        "kLeaseLrGen": lease.LANE_REQUEST_FIELDS["gen"],
+        "kLeaseLrCount": lease.LANE_REQUEST_FIELDS["count"],
+        "kLeaseLrRow": lease.LANE_REQUEST_FIELDS["row"],
+        "kLeaseLrExpert": lease.LANE_REQUEST_FIELDS["expert"],
+        "kLeaseLaneAck": lease.LANE_ACK,
+        "kLeaseLaneAckBytes": lease.LANE_ACK_BYTES,
+        "kLeaseTerminal": lease.TERMINAL,
+        "kLeaseTerminalBytes": lease.TERMINAL_BYTES,
+        "kLeaseTermSkippedMask": lease.TERMINAL_FIELDS["skipped_mask"],
+        "kLeaseTermReason": lease.TERMINAL_FIELDS["reason"],
+        "kLeaseTermGen": lease.TERMINAL_FIELDS["gen"],
+    }
+
+
+def test_the_lease_block_layout_is_written_once_in_python_and_in_the_device_source():
+    """The lease block (LEASE_PROTOCOL.md section 4) joins the page's agreement check: one layout, several writers."""
+    device = _constants(CSRC / "exl3_ram_miss.cuh")
+    python = _lease_python_constants()
+    for name, value in python.items():
+        assert name in device, name
+        assert device[name] == value, (name, device[name], value)
+    assert python["kLeaseRing"] == device["kDemandRecords"] and python["kLeaseLanes"] == device["kMaxIds"]
+
+
+def test_the_host_source_agrees_with_the_lease_layout_wherever_it_defines_it():
+    """The host source gets its lease constants in a later step; from then on they must equal the Python ones."""
+    host = _constants(CSRC / "exl3_ram_miss_host.cpp")
+    python = _lease_python_constants()
+    for name, value in host.items():
+        if name.startswith("kLease"):
+            assert name in python, f"{name} is defined in the host source but not mirrored in Python"
+            assert value == python[name], (name, value, python[name])
+
+
 if __name__ == "__main__":
     import sys
 
