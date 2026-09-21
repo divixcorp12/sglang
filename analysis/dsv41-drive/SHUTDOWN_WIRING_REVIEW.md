@@ -192,3 +192,76 @@ stream reading a registered slab; the real `shutdown()` with the real `torch.cud
 stays readable until then. The mutant is "skip the barrier". The slab must be **poisoned with a detectable pattern** so the mutant fails on wrong bytes: reading
 freed-but-not-reused memory usually succeeds, and without the poison the mutant would most likely pass. It also exercises the real `cudaHostUnregister` on a real slab,
 which the CPU tiers (`device="cpu"`, an empty unregister list) never do.
+
+---
+
+# Second pass: `t5-patches/wiring.diff` (not landed), 2026-09-21
+
+Reviewed: `wiring.diff` (3 files), `wiring.msg`, `wiring_ledger.md`, and the C++ `RamThread::stop` ordering. Read-only; nothing run (the package's own 366/366 and 19/19
+runs were on divix01 and are taken from their report, not reproduced). Same reviewer.
+
+## Verdict
+
+**F1, F2, F3, F4 and F5 are fixed in the code and the fixes are sound as far as CPU evidence goes; I would let it land after the five items below, none of which is a
+defect in the fix itself.** The tests now discriminate: I checked each fixed finding's test against its mutant and found the killing assertions are the ones the requirement
+states. Two of the items are gaps in what the tests exercise (S2, S3), not in the code.
+
+## What I checked and agree with
+
+- **F1.** `stop()` is now inside its own `try`; any `BaseException` sets `stop_error` and `uncertain = uncertain or ...`, so the free branch cannot run after a failed or
+  interrupted stop; `KeyboardInterrupt` and `SystemExit` are re-raised only after the quarantine, `Exception` is logged and swallowed. `_completed` is set after the
+  free-or-quarantine block, inside the `finally`, so a raising `_quarantine` or a raising `tier.close()` leaves it `False` and the exit hook retries. The killing tests
+  assert the exact step list `[close_admission, synchronize, stop, quarantine0, quarantine1]`, which is the requirement.
+- **F2.** `_barrier_device()` is called on the calling thread before the helper starts; tiers' devices come from tensors' devices (explicit index). `test_..._current_device_on_the_calling_thread`
+  answers 2 on the main thread and 0 elsewhere, so a lookup inside the helper is killed by the assertion `seen == [cuda:2]`. Correctly labelled "recorder only".
+- **F3.** Last in the method, after every cheaper release. Their exposure statement is accurate, and I confirmed the reasoning it rests on in the source: `RamThread::stop` joins the
+  service thread **before** it stops the watchdog ("a join that blocks on a hung read is then aborted by its stuck rule instead of hanging the process"), so a hung `stop()`
+  ends in `std::abort()`, not an unbounded hang. State that in the proposal as what a hung `stop()` **is**: a process abort in the middle of a graceful shutdown, before
+  `abort_distributed_environment()`, exactly as the exit hook does today but now earlier.
+- **F4, F5, double-free.** `sys.modules` guard, `_completed` separate from `_shut_down`, orderly-then-exit test: all as reported.
+- **The ledger's arithmetic:** 19 mutants listed, 18 killed, 1 survivor; the killers named are 13 distinct tests; nine single-test kills. The survivor (`except Exception: return`)
+  really is equivalent now that nothing follows the block; the test asserts `CHEAP + ["ram_miss"]`, so adding a release after the block breaks it on purpose.
+- **Disclosure.** They state what was not done (failing lines for only five mutants; no test for `_quarantine` itself raising) and what no CPU test can show.
+
+## Items
+
+### S1. MEDIUM-LOW: an interrupt during the barrier is swallowed; only an interrupt during `stop()` is re-raised
+
+The first `try` in `shutdown()` is `except BaseException as error: uncertain = f"closing admission failed: ..."`. A `KeyboardInterrupt` or a `SystemExit` raised while the
+main thread is in `helper.join(deadline)` (up to 7 s) is caught there, becomes an `uncertain` reason, quarantines, and is **not re-raised**, so shutdown carries on. The
+new `stop()` block re-raises the same two after quarantining; the barrier block does not. The two blocks should treat an interrupt the same way (quarantine, then re-raise).
+*Test:* a fake barrier that raises `KeyboardInterrupt` in the caller's thread (patch `_establish_gpu_completion` to raise it); assert quarantine then `pytest.raises`.
+*Mutation:* swallow it.
+
+### S2. MEDIUM-LOW: the device-choice branch production will use first is untested
+
+`_barrier_device` prefers `self.device_side.state.device`, then the tiers, then `current_device()`. In production `device_side` exists after `attach`; the F2 tests run with
+`device_side is None` (the `world` fixture never attaches) and cover only the tiers branch and the fallback. A regression in the first branch (wrong attribute; preferring the tiers
+over the device buffers; ignoring `device_side`) is invisible to every test, and it fails safe to quarantine only by accident (the `AttributeError` would be caught by the
+first `try` and turn every orderly shutdown into a quarantine, silently). *Test:* a stub `device_side` whose `.state` is on `cuda:1` with tiers on `cuda:3`; assert the recorder saw
+`cuda:1`. *Mutation:* prefer the tiers. Also normalize a device with `index is None` on the calling thread (`torch.device("cuda")` passed to `torch.cuda.synchronize` from the helper
+resolves its index on the helper, which is the original bug again), and synchronize each distinct CUDA device rather than only the first.
+
+### S3. LOW: kill evidence, and one test whose named mutation was not run
+
+- Failing assertion lines were read for five of the 18 kills. The nine single-test kills are where a fixture error is the likeliest false kill; of those, W4 and F5a were read and
+  **W4c, W5, W7a, F1b, F2b, F4 and F5b were not**. Please read and record those seven lines.
+- `test_a_second_orderly_shutdown_does_nothing` names the mutation "`shutdown()` is not idempotent", which is not in the ledger. Either run it (remove the
+  `self._completed or ...` early return and confirm that test, and not only X, fails) or drop the claim from the docstring.
+- `test_the_scheduler_release_imports_nothing_when_the_module_was_never_loaded` deletes the module from `sys.modules` and then imports `scheduler` inside the helper. If a cold
+  import of `scheduler` pulls `exl3_ram_miss` in, the assertion would fail for a reason unrelated to the mutant, and it passes in the full run only because `scheduler` was already
+  imported. Run that test alone once and record the result.
+
+### S4. LOW: `stop()`'s outcome when it returns normally but the thread did not stop is still not observed
+
+`Exl3RamMissHost.stop()` returns normally after `exl3_ram_miss_stop_thread`; if that returned without joining (not the case in the C++ I read: it joins), the free branch would run.
+Nothing in Python checks the thread is gone. It is fine as read; note it as an assumption the free branch rests on, and add a post-stop `host.threaded == False` / running-counter check if it is cheap.
+
+### S5. LOW: what stays unestablished, and should stay in the message
+
+The message already lists: the real barrier ordering GPU work, F2 on a real second GPU, real `cudaHostUnregister`, `gracefully_exit` reachability, the two GPU-only doorbell tests
+with the block present. Add: **a hung `stop()` ends the graceful shutdown with `std::abort()`** (above), and that the block changes when that abort happens.
+
+## Recommendation
+
+Land after S1 to S3 (all small, all tests). S4 and S5 are notes. The GPU barrier test stays queued behind this. No box moves.
