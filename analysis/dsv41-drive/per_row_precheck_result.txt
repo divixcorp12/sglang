@@ -75,3 +75,6 @@ ram_miss mean 19.1 traced step dt median 244.6 ms mean 452.0 ms
 k hist {2: 665, 3: 4017, 4: 1299, 5: 241, 6: 917} mean h 2.21
 read-wait ms p10 5.2 p50 5.3 p90 8.9 mean 6.5; sum over steps per step 93.2 ms
 modelled gather per step = mean vram_miss*1.055 = 138.2 ms
+task1-2-new-on-T.trace m>=2 requests 1888 pack order == ordinal order: 1.0 {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0}
+task1c-0-new-on-T.trace m>=2 requests 1888 pack order == ordinal order: 1.0 {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0}
+task1-1-new-off-T.trace m>=2 requests 1888 pack order == ordinal order: 1.0 {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0}
