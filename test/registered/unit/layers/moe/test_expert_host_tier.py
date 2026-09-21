@@ -312,14 +312,13 @@ class TestQuarantine(unittest.TestCase):
         self.assertEqual(quarantined_slab_count(), before + len(cache.tensors))
         del cache
         gc.collect()
-        # Interpreter finalization clears module globals: only the extra reference can keep the slab.
+        # Interpreter finalization clears module globals: only the extra reference can keep the slab. Nothing
+        # here may hold a strong reference of its own, or the assertion below could not fail.
         from sglang.srt.layers.moe import expert_host_tier
 
-        kept = list(expert_host_tier._QUARANTINED)
         expert_host_tier._QUARANTINED.clear()
         gc.collect()
         self.assertIsNotNone(slab())
-        expert_host_tier._QUARANTINED.extend(kept)
 
     def test_an_unquarantined_slab_is_freed_with_its_cache(self):
         released = []
