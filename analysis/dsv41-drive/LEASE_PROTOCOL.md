@@ -2210,3 +2210,39 @@ no `ERROR exl3` on stderr. The hung-read abort itself is still tested by the exi
 Baseline 6 of 6 collected and passed; every run executed all 6. Not established: the test does not vary
 `fatal_wait` against the deferral (5x is a fixed ratio, on a 0.3 s watchdog); a deferral of a request-slot reuse
 (`kDeferredReuse`) rather than a victim shortage was not run through the watchdog.
+
+### 20.2h Scope and caveats of the step 6, R5, R2, R4 and R1 numbers
+
+**Archive scope.** The step 6 count (348 collected = 348 passed, 20 files) and the R5 table (13/13, 13/13, 8/8,
+15/15, 14/14, 3/3, 2/2, 5/5) were taken on exports of `python test` (the 348 run added `scripts/dsv41` after the first
+red). That scope is too narrow for the corpus: 16 test files reach `scripts/` or `analysis/` by relative path, and
+the one red in the first run (`test_graph_steps_are_traced_and_read_back_by_tier_sim`) is one of them, not an
+undeclared `PYTHONPATH` entry as first reported. None of the lease or shutdown files reaches outside `python/` or
+`test/`. The numbers are correct for that scope and are not whole-tree numbers.
+
+**Re-taken on the full scope, on a named commit.** A fresh `git archive b022c8ee6b python test scripts analysis`
+(divix01, `CUDA_VISIBLE_DEVICES=9`, `taskset -c 0-63`, every run executing all collected tests):
+- 20 files, 352 collected = 352 passed; each lease file and `test_exl3_ram_miss_shutdown.py` run as CI runs it
+  (`python3 <file> -f`): 13, 13, 8, 16, 14, 6, 2, 5 passed, equal to pytest's counts.
+- R2 mutants A1-A5, R1 mutants C1-C4, R4 mutants B1-B4: **the same verdicts and the same killing tests as in
+  20.2e-20.2g.** (Those sections' first numbers came from an export whose host files matched the landed ones; this
+  run supersedes them as the citable one.)
+
+**"13 of 13" (20.2d) is fewer independent pieces of evidence than it reads.** The thirteen shutdown mutants were
+killed by **five distinct tests** (order, CUDA-error, barrier-timeout, exit-quarantine, header-word) out of 20
+collected. S6 and S7 die to the same single test; S4, S8 and S9 to the same single test; S13 and S14 to the same
+single test. The evidence is the set of tests that fired, not the tally.
+
+**Box 3 stays open.** R4 supersedes item 2 of 18.2 (a byte-level immutability check with service-granted leases,
+uniquely detecting B1-B3 in its file). The box's first clause is "inject delayed GPU consumption", and there is no
+GPU consumer: the delay is injected into `LeaseSim`, a stand-in written from the same specification. R4 does not
+change that.
+
+**Class order.** Nine of my ten new or changed test files have no test classes, so the class-order divergence between
+`unittest` and pytest cannot apply to them (closed by construction, not swept). The exception is `TestQuarantine`
+in `test_expert_host_tier.py`, a 12-class file that is not mine. Not established for any of them: isolation between
+functions (a reverse-order run was not done) and that no production path writes an environment variable the tests
+read (established by reading, not demonstrated).
+
+**R1's subprocess.** `subprocess.run(..., capture_output=True, timeout=60)` reads both pipes to the end, so a full
+pipe cannot block the child, and the timeout bounds a hang. Neither was tested by making the child chatty.
