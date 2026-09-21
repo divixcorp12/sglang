@@ -1267,6 +1267,33 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > of the corpus cannot be collected at all**, and any statement about it -- of
 > ours or anyone's -- is a statement about roughly a third of it.
 >
+> **(j) A GUARD THAT DETECTS A MUTANT WHILE MASKING THE ASSERTION THAT STATES
+> THE REQUIREMENT.** Detection improved and demonstration got worse, in the same
+> change, and only the first is visible in a kill count.
+>
+> The release-at-dispatch mutant used to **deadlock** the reader. A five-line
+> `admit_batch` guard -- refusing a batch into a slot whose row is not `Free`,
+> never reached in correct code -- turns that hang into a clean failure, which
+> is a real gain: a hang is the worst failure mode available, because it reads
+> as a kill to any driver keying on exit status. **But the guard now trips
+> first.** Both the original `test_a_bank_is_not_reused_until_every_row_in_it_has_packed`
+> (15 of 15 worker parametrisations) and the dedicated
+> `test_no_extent_reuses_a_bank...` fail on `assert (0 == 1)` from the refusal
+> -- **neither fails on its own ordering assertion any more.** Before the guard
+> existed, the dedicated test *did* fail on that assertion.
+>
+> So the suite still detects the defect, and **nothing in it has been observed
+> failing on the rule the requirement names.** If the guard is later changed or
+> removed, those assertions become the only protection and there is no evidence
+> they fire.
+>
+> **The rule: when a guard is added for detectability, re-run the mutant with
+> the guard disabled and record that the requirement's own assertion fires.**
+> Keep the guard -- it converts a hang into a failure -- but keep both facts.
+> This is the two-part rule turned on the *suite* rather than on a single test:
+> the guard is the path witness, the assertion is the property, and a kill that
+> exercises only the first is not evidence for the second.
+>
 > **(i) A VERIFICATION RECIPE THAT EXPORTS TOO LITTLE.** Not a test defect and
 > not an invocation defect -- a defect in *how a tree is reconstructed for
 > verification*, which makes correct tests fail and narrows every count taken
