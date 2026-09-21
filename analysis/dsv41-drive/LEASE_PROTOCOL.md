@@ -1657,9 +1657,19 @@ naming the path is not enough. Each entry says what the shortcut would be.
 | R4 | **Item 2 of 18.2 as written: a served request's leased slot keeps its bytes under a newer request and an advisory.** | the tier is exhausted so the leased slot is the only possible victim; the newer request's reservation ran (`deferred` moved, or `evictions` moved on another slot) | a sentinel written into the leased slot's slab bytes after publication is intact, and its `slot_generation` and `SlotGen` word are unchanged | eviction that reloads the same expert into the leased slot with identical bytes (a state-and-generation check would not see a missed bump either) |
 | R5 | **CI runs what pytest runs.** Run each lease test file as CI does (`python3 <file> -f`) and compare the count with pytest's; the class-order hazard (CI runs classes alphabetically) is tested by the same run. | the two counts, side by side | equal counts, and no file that passes under pytest and fails under CI | a file whose `__main__` block is missing (runs nothing, exits 0) |
 
+**A general rule that R1 illustrates: a test that asserts something does NOT happen is vacuous by default.** "The
+watchdog does not abort on a long deferral" passes on any build in which the deferral was short, or in which
+`fatal_wait` exceeded the wait, so nothing could have aborted. Such a test needs a witness that the *conditions for
+the event were present* (here: the deferral measurably older than `fatal_wait` on the test's own clock, with the
+rule's input `busy_since` observed at 0), or it proves nothing about the event's absence. R1's first wording in this
+document said the opposite ("abort after a long deferral"); the requirement is that a long deferral does not trip the
+stuck rule.
+
 **Claims about the service that no CPU test defends** (code-reading claims; a device-side harness would be the way
 to defend them, and the list is now long enough to argue for one): the write order of a row result's payload versus
-its ready word (`grant_lanes_locked`); `kBusySeq` cleared before `demand_done`; that the pause's own retirement pass
+its ready word (`grant_lanes_locked`); `kBusySeq` cleared before `demand_done` (this one is known to be undefendable
+by CPU tests, not merely undefended: a mutant that clears it after the done store is not caught, because a host
+poller cannot land in a sub-microsecond gap, and the plan labels it READ FROM SOURCE, NOT EXECUTED); that the pause's own retirement pass
 matters (the running thread retires first); and that the grant precedes `set_status` (only the ordering before
 `demand_done` is observed, through `inject_done_stall`).
 
