@@ -1,21 +1,21 @@
-# Mutation results for the host-facing tests, base 1 (2026-09-21)
+# Mutation results for the host-facing tests, three bases (2026-09-21)
 
 `TESTS_THAT_CANNOT_FAIL.md` argued from source that some tests cannot fail. This document is the same
 question answered by running: apply one small change to production code, run the tests, and see whether
 anything fails. Nothing here was committed to `exl3_ram_miss_host.cpp`; every mutant was applied to a copy
 in a `git archive` export on divix01 and reverted from a pristine base before the next.
 
-## Base, method and what is not yet in this document
+## Bases and method
 
 - **Base 1 = `a01f9347d6`.** `exl3_ram_miss_host.cpp` md5 `8d7ca11951d2ec49b984e1340f30d2df`. **This base does
   NOT contain Task 5 step 2 (`6ea3b6a4f9`)**: that commit is not an ancestor of `a01f9347d6`, and it changes
   `take_slot_locked`, `assign`, `release` and `serve` and adds a tensor argument to `exl3_ram_miss_open`.
   Everything below is a statement about the tree before it.
-- **Base 2 = `457e44e036`** (contains `6ea3b6a4f9`; host.cpp md5 `99cca0912c8bd837746b88fac50c8521`) is exported
-  and every mutant patches it text-exactly once, **but no base-2 result exists yet.** A first attempt to run it
-  was launched twice by mistake and its results are discarded as contaminated (see "What went wrong"). It has
-  to be rerun in a single pass, and the question it answers (does the publish gate's coverage differ after
-  Task 5 step 2, given that step 2 touched `serve`?) is open.
+- **Base 2 = `457e44e036`** (contains `6ea3b6a4f9`; host.cpp md5 `99cca0912c8bd837746b88fac50c8521`) and
+  **base 3 = `2fc2155e42`** (through steps 3a-3c; host.cpp md5 `c4f8e782822896cdaec3652516cf599f`, identical to
+  `bc02ab9ddf`) were run afterwards; see "Rerun results" below. A first attempt at base 2 was launched twice by
+  mistake and is discarded (see "What went wrong"). The sections above this heading up to "Rerun plan" describe
+  base 1 only.
 - Tests: 14 files, the host-facing set (`test_exl3_ram_miss_{split,thread,tier,advisory,attach_lanes,wrap,
   device_args,stage_trace,stage_trace_causal,stage_trace_lanes,trace_export}.py`, `test_exl3_lease_block.py`,
   `test_exl3_ram_miss_service.py`, `test_exl3_ram_miss_tables.py`). Baseline: **297 passed, 1 skipped** (the
@@ -53,7 +53,7 @@ demand failed" (Task 6 V2, section 7). 297 passed, 1 skipped.
   2's superset so rows 0 and 1 pack and row 2 fails, was not tried.
 - **What it means for Task 6:** the edit V2 intends to make deliberately would leave the suite green. Someone
   could implement early publication, get it subtly wrong in the other direction, and see nothing.
-  **Established on base 1 only.** Whether it holds after `6ea3b6a4f9` is the open base-2 question.
+  **Established on base 1 here; the same result on bases 2 and 3 is in "Rerun results".**
 
 ### H15: a resubmitted extent overwrites its first submit stamp `SURVIVED`
 
@@ -255,6 +255,123 @@ coverage" from "3a did". Runs: base 3 full (baseline, 22 mutants, H19 and H20); 
 assertion reads a counter and nothing else), since those are the kills most likely to be accidents, and base
 3 is the code Task 6 will change.
 
+## Rerun results, three bases (2026-09-21)
+
+Run as one chain (`chain.sh`, lock file, single launch verified with an exact `ps` match), `taskset -c 0-63`,
+`OMP_NUM_THREADS=8`, `CUDA_VISIBLE_DEVICES=9` (see deviations), a private JIT cache, each mutant applied to a
+pristine tree and restored. Launch conditions (`launch-conditions.json` on divix01): loadavg 21.95 / 22.44 /
+26.28, mean busy on cores 0-63 32.0%. Per-mutant load at start was 23.4-37.3 and wall time 121-159 s for the
+host set, 12-20 s for the verifier, layout and uring groups; nothing was out of line with its neighbours.
+
+| base | commit | host.cpp md5 (first 8) | baseline (clean run) |
+|---|---|---|---|
+| 1 | `a01f9347d6` | `8d7ca119` | 297 passed, 1 skipped (298 total), re-run pristine in this chain |
+| 2 | `457e44e036` | `99cca091` | 298 passed, 0 skipped |
+| 3 | `2fc2155e42` | `c4f8e782` | 301 passed, 0 skipped |
+
+**Base 3 moved from `bc02ab9ddf` to `2fc2155e42` for documentation reasons only**: `host.cpp` has the same md5 at
+both shas and `git diff --stat bc02ab9ddf 2fc2155e42 -- python test scripts` is empty (21 files differ, all
+analysis and plan). The md5, not the sha, pins the code. The baselines differ in what they can run: base 1
+skipped the `kLease*` agreement stub, bases 2 and 3 run it (298), and base 3 has 3 more tests than base 2 in
+the same 14 files.
+
+### H01 across the three bases, and the gate's other directions
+
+| mutant | base 1 | base 2 | base 3 |
+|---|---|---|---|
+| **H01** widen the gate (keep rows packed before a hard failure; Task 6 V2's edit) | **SURVIVED** | **SURVIVED** | **SURVIVED** |
+| H02 (control) cancelled advisory keeps none | killed by 2 | killed by 2 | killed by 2 |
+| **H19** `if (true)`: publish every slot on any failure | killed by 11 | killed by 11 | killed by 11 |
+| **H20** `if (ok \|\| cancelled)`: a cancelled advisory publishes rows that never packed | killed by 6 | killed by 6 | killed by 6 |
+
+**H01 survives identically on all three bases, and H19 and H20 are killed identically on all three.** So Task
+5 step 2 and steps 3a-3c did not change the gate's coverage in either direction. The gate is pinned against
+two of its three ways of being wrong (publishing everything on a failure, publishing rows that never packed)
+and against the cancelled-advisory control, and is not pinned against the third: publishing rows that DID
+pack when the demand failed afterwards. That third one is exactly what Task 6 V2 intends to do deliberately.
+`test_a_failed_read_publishes_none...` is among the tests that kill H19 on bases 2 and 3 (its FAILED line is in
+both logs), which is the "aimed elsewhere, not inert" classification shown by a run rather than asserted.
+
+The common cause, stated as a claim about the corpus: **no test in the host-facing set constructs a failure
+that arrives after some rows have packed.** It holds across three code states of the host and does not depend
+on lease mode, which is off in these tests. A fourth code path, t4-packworker's pack-worker mode, reproduces
+the same blind spot by their own reading of their diff; that is a **source-read observation from them, not a
+mutant run**, and is not counted here.
+
+### The other survivors and the kills, base 3 against base 1
+
+| mutant | base 1 | base 3 |
+|---|---|---|
+| H15 resubmit overwrites first submit stamp | SURVIVED | SURVIVED |
+| H18 failed start leaves tier threaded | SURVIVED | SURVIVED |
+| P01, P02, P03 (verifier direct x2, layout prefix) | SURVIVED | SURVIVED (the verifier, layout and uring files are byte-identical between bases) |
+| H03 unpublished slots not released | 9 | 9 |
+| H04 / H06 lap resume without `skip_zero` (demand / advisory) | 1 / 1 | 1 / 1 |
+| H05 / H07 advance without `skip_zero` | 4 / 2 | 4 / 2 |
+| H08 / H09 lap resumes one record early | 2 / 1 | 2 / 1 |
+| H10 overrun count | 1 | 1 |
+| H11 evict hot | 4 | 4 |
+| H12 no unmap of victim | 4 | 4 |
+| H13 `expert_slot` left pointing | 8 | 10 |
+| H14 `pump_demand` tail for an unreadable record | 1 (original text) | 1 (**rewrite**; killed by the same test, `test_a_record_whose_seq_does_not_match_is_an_overrun`) |
+| H16 / H17 per-drive attribution | 1 / 1 | 1 / 1 (`test_mirrored_reads_are_accounted_per_drive`) |
+| U01 never `O_DIRECT` | 1 (incidental) | 1 (same test) |
+
+Every kill set is the same size except H13 (8 to 10), which is 3 new tests across the same files and is a wider
+net, not a narrower one. **H14's rewritten text was killed by the same single test that killed the original**,
+so the rewrite is at least as sharp as the original on this evidence.
+
+**H15 on base 3, what its fixture reaches.** The test text is byte-identical to base 1 (a `diff` of the test
+function is empty) and so is the `extent_submit` code region. It therefore reaches exactly what it did: the
+fault fires (`retried_bytes > 0`), an attempt is counted (`sum(attempts) >= 1`) and the chain ordering holds;
+it does not assert the first submit is kept. Task 5 did not change what H15's test reaches, so the plan's H15
+entry does not need a second update from this run.
+
+### Kills that might rest on a counter alone: the four flagged, read and judged
+
+`summarize3.py` flagged four kills whose failing assertion line mentions a counter. Each was re-run as a single
+test with `--tb=short` (each collected exactly one test, `1 failed`) to see which conjunct failed. None is a
+counter-only kill that hides a missed path:
+- **`test_exl3_ram_miss_tier.py:136` under H03 and under H19, in `test_a_file_cut_short_after_open_fails_the_read`:**
+  the failing part is `assert (not True)` where `True = contains(0, 0)`, the **state** conjunct, evaluated
+  before the counter. **Real.**
+- **`test_exl3_ram_miss_tier.py:194` under H08 (`test_a_lapped_demand_ring_counts_every_skipped_record`):** the
+  assertion read `(5 == 5 and 5 == 6)`: the overrun counter matched (5) and **`demand_done` failed** (5 against
+  6), a position check. **Real**, and not a counter kill.
+- **The same line under H10:** the failing part is `assert (1 == 5)`, the counter itself. H10 mutates only that
+  counter, so the counter is the mutant's whole observable effect and the kill is right. It does show that the
+  overrun count is pinned by exactly one test and that nothing in production reads it (it is logged at exit),
+  so the test is its only consumer.
+
+### Invocation check (the third instance of "a kill whose only evidence is an absence")
+
+Every run's collected total equals its baseline: all 20 base-3 host runs collected 301; the base-2 runs 298; base
+1's H19 and H20 298 (11+286+1 and 6+291+1). The three file-specific groups have pristine baselines on base 1
+(verifier 37, layout 8, uring group 98) and every P and U run collected exactly those totals on base 1 and on
+base 3. So no kill or survivor here comes from a selector that matched fewer tests than intended.
+
+### Predictions, scored (registered in `5794482961` before any of this)
+
+1. H01 survives on bases 2 and 3: **held**. 2. H19 killed on all three bases: **held**. 3. H20 killed on all
+three: **held**. 4. H14 killed on base 3 by the same test: **held**. 5. The four `skip_zero` mutants stay killed
+on base 3, the lap-resume ones by one test each: **held**. 6. Base-3 baseline passes with no more skips than
+base 2: **held** (301 passed, 0 skipped; base 2's clean baseline is 298 passed, 0 skipped, so the earlier
+provisional figure was right). Six of six. The one that could have been a surprise (H01 changing on base 3)
+was not: the lease code is inert with respect to these tests when disabled.
+
+### Deviations, so the record is exact
+
+- **The base-1 H19/H20 step in the chain crashed** (my error: the script named a directory `base1`, the export is
+  `base`; the traceback is in `chain.out`) and the chain went on to the baselines. After the chain finished I ran
+  those two mutants by hand as one process on the pristine `tree1x`. Their totals (298) and md5s check out, but
+  they did not run inside the lock-file chain.
+- `CUDA_VISIBLE_DEVICES=9` in this chain; base 1's original 22 mutants used the empty form. Their collected totals
+  matched the files' test counts, and this chain's pristine base-1 baselines reproduce them (297+1, 37, 8, 98),
+  so the two sets are comparable.
+- I told the lead the chain was resumable per mutant; it is not (it clears its results and takes a lock). Each
+  mutant's result row is appended as it finishes, so nothing completed is lost, and the rest can be re-run with
+  `mutate_gen.py`, but not automatically.
+
 ## What went wrong, and what is not established
 
 - **Double launch, base 2.** I started the base-2 queue twice (a shell quoting error in the first launch
@@ -263,12 +380,9 @@ assertion reads a counter and nothing else), since those are the kills most like
   `results2.CONTAMINATED-double-launch.jsonl` on divix01. The processes were killed by PID, the tree recopied
   from the pristine export, and the trees' md5s checked. Base 1's queue was a single launch with unique ids
   and is unaffected.
-- **Base 2 has not been run.** Whether H01 and the other gate mutants survive after `6ea3b6a4f9` is open.
-  If the result differs between bases, that is a finding about Task 5's landing changing the coverage of code
-  Task 6 intends to change.
-- **H19 (`if (true)`) and H20 (`if (ok || cancelled)`), the other directions of the same gate,** are defined
-  and patch cleanly but have not been run on either base. The prediction that
-  `test_a_failed_read_publishes_none...` kills H19 is a prediction until they run.
+- **Base 2 and H19/H20 were run afterwards** (single launch, lock file); the results and the answer to whether
+  Task 5's landing changed the gate's coverage are in "Rerun results". They were not run when the paragraph
+  above this one was first written, which is why an earlier version of this document said they were open.
 - **Time-sensitive tests** ran on a box loaded to about 35 by other work. I did not re-run any mutant and
   did not read every failure message, so a load-induced kill cannot be excluded for the sparse ones (H04,
   H06, H09, H10, H14, H16, H17, U01: one test each). No survivor can be a load artifact: a survivor is a
