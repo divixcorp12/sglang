@@ -1107,15 +1107,35 @@ completion of all GPU readers before freeing their memory. If a CUDA error preve
 establishing completion, retain/quarantine allocations until process teardown; never
 recycle uncertain storage." Today (D5) the code frees first and never checks.
 
-**FINDING, before anything else in this section: `Exl3RamMissService.shutdown()` has no production caller.** Its
-only callers are tests and the exit hook the wiring adds. So the orderly sequence below (S0-S5) is correct, tested
-and mutation-checked as a *wiring*, and changes nothing about what a production teardown does. What is reachable in
-production today is **only the exit-hook quarantine, and only on a normal interpreter exit**: the docstring of
-`record_graph_step` in `exl3_stream_trace.py` says the scheduler is SIGKILLed at shutdown (not confirmed from the
-launcher), in which case **no part of step 6 runs in production at all**, and neither did the unregister finalizers
-this section replaces (D5's hazard is then a normal-exit and test-teardown hazard only). Do not read any test or
-mutation result on this step as protection of a production path. No Task 5 box that mentions shutdown is to be ticked
-on step 6's strength without this paragraph attached. Whether a production caller belongs in Task 5 is stated in 14.6.
+**FINDING, before anything else in this section: `Exl3RamMissService.shutdown()` has no production caller today, but
+the place to call it already exists.** Its only callers are tests and the exit hook the wiring adds. So the orderly
+sequence below (S0-S5) is correct, tested and mutation-checked as a *wiring*, and changes nothing about what a
+production teardown does until it is called. What is reachable in production today is **only the exit-hook quarantine,
+and only on a normal interpreter exit**.
+
+**The caller is an extension point that already exists: `Scheduler.release_host_resources()`**
+(`managers/scheduler.py`, "Release pinned host buffers in userspace on graceful shutdown ... Called from
+`run_scheduler_process`'s finally"). It is reached only on the graceful path (`if scheduler.gracefully_exit:` in that
+`finally`, set by a `ShutdownReq`), and the code there already makes the decision this design makes: the comment says
+the device barrier is not attempted on the exception path "because the GPU may be wedged and the synchronize() could
+itself hang". It already stops the expert doorbell (`stop_doorbell()`, inside a try/except that logs and continues),
+destroys the hisparse coordinator, and releases the tree cache's and the decode-offload manager's host resources: the
+same class of work with the same failure discipline. A call to `Exl3RamMissService.shutdown()` belongs there. **Not
+wired**, and not to be wired without reading `large-class-style` (`Scheduler` is a frozen class under
+`.claude/rules/modify-component-must-read.md`) and a review of the placement: whether it goes before or after
+`stop_doorbell()` (no other reader of the slabs may still run when the slabs are freed) is undecided.
+
+An earlier version of this paragraph said the scheduler is SIGKILLed at shutdown, sourced to a docstring in
+`exl3_stream_trace.py`. **That is wrong for the graceful path** and is withdrawn: `run_event_loop()` blocks until a
+`ShutdownReq` sets `gracefully_exit`, the only `os.killpg(SIGKILL)` in `scheduler.py` is on the exception path behind
+`SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION`, and the existence of `stop_doorbell()` and the other host-buffer releases is
+itself evidence that the graceful path runs. **Not established:** whether *every* production teardown takes it.
+`Engine.shutdown()` kills its children's process tree (`kill_process_tree`, SIGKILL); whether a `ShutdownReq` always
+reaches the scheduler and drains before that is untraced. That is the residue of OPEN 18.
+
+**Do not read any test or mutation result on this step as protection of a production path, and no Task 5 box that
+mentions shutdown is to be ticked on step 6's strength**, until the call is wired and a graceful-shutdown test drives
+it through `release_host_resources()`.
 
 ### 14.1 What is quarantined, precisely
 
@@ -1259,14 +1279,11 @@ check, and it is Task 5's non-goal.
 ## 16. The worker never waits for an acknowledgement, and why it cannot deadlock
 
 
-**Status of that requirement (asked directly: deliberate, out of scope, or blocked?).** It is **out of Task 5's scope,
-not deliberate and not technically blocked**, and it is **unowned**. It was recorded as a requirement when the design was
-written (this section) precisely so it would not be assumed, but no task assigns it: the natural caller is scheduler
-teardown, which is not in Task 5's file list, and if the scheduler is SIGKILLed at shutdown there is no orderly
-teardown to hook, so a caller may need a launcher change instead. I could not determine who owns that, or whether the
-launcher SIGKILLs (**[OPEN 18]**). Consequence for Task 6: its "stop during SM transfer" case (a shutdown while lane
-copies are in flight) can only be exercised by tests that call `shutdown()` directly, and nothing in production will
-ever run that path until someone owns the caller.
+**Status of that requirement.** It is **unwired into an existing extension point**, not unowned and not blocked:
+`Scheduler.release_host_resources()` on the graceful-shutdown path (see the finding at the top of this section). Wiring
+it is one call inside a function of a frozen class and needs its own review; it is not part of Task 5's file list.
+Consequence for Task 6, still true until that call is wired: its "stop during SM transfer" case (a shutdown while lane
+copies are in flight) can only be exercised by tests that call `shutdown()` directly.
 
 ### 16.1 The rule
 
@@ -1853,8 +1870,9 @@ side is transcribed faithfully.
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
 - **[OPEN 16]** (designed in 17.3; the design's own assumption is OPEN 17) The mechanics of the
   executor-stream release callback (17.1 R1a).
-- **[OPEN 18]** Who owns a production caller of `Exl3RamMissService.shutdown()`, and whether the scheduler is
-  SIGKILLed at shutdown (so that no orderly teardown exists to hook). Unowned and undetermined (14, 14.6).
+- **[OPEN 18]** (narrowed) Whether every production teardown reaches `Scheduler.release_host_resources()`:
+  `Engine.shutdown()` kills its children's process tree, and whether a `ShutdownReq` always drains the scheduler first
+  is untraced. The caller itself is identified (14).
 - **[OPEN 17]** That `tvm_ffi` never unloads a JIT module, so the function address the device module
   holds stays valid for the process. Unchecked; 17.3 rule 2 rests on it.
 - **[OPEN 15]** How a deferral interacts with the stage record's `observed`, `prev_done` and
