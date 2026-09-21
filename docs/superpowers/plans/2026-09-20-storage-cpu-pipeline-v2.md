@@ -161,6 +161,17 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 > only to 0.97-1.08 ms by existing evidence, and that range does not choose
 > within itself. A 10% error in `c` moves the crossing ~3 us against 1.1 us for
 > the whole exposure correction.
+>
+> **Attempted and blocked, 2026-09-21; `c` stays NOT MEASURED.** A pre-registered
+> run completed (235 cells, both nodes, five passes) and is INVALID: gate 4.1
+> requires the GPU in P0, the same pre-registration requires a quiet box, and on a
+> quiet box the card idles to P1 -- all 235 cells recorded P1 while SM clocks sat
+> at 82-95% of peak, so the guard rejected a card that was not throttled.
+> **That contradiction is unresolved and is the lead's call.** Full account,
+> including the two harness defects found and fixed on the way and the guidance to
+> evaluate `c`-dependent conclusions at both ends of 0.97-1.08 rather than at
+> 1.055, is in `analysis/dsv41-drive/PIPELINE_BASELINE.md` section 7.5; the run's
+> raw data is committed at `analysis/dsv41-drive/c_measurement/c_run1/`.
 
 
 **Files:** Proposed `analysis/dsv41-drive/TOPOLOGY.md`; benchmark helpers only.

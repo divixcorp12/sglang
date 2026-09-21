@@ -368,6 +368,71 @@ its cell-mates' in a way anyone has shown to matter. It does mean the old cell, 
 cleanliness is unknown, and that the harness cannot be added to the old-versus-new comparison as a checked condition. Do not read either as "the numbers are wrong", and do not treat it as future work only.
 The preflight and the provenance record that close both holes are in `task1-results/GENERATIONS.txt` section 6.
 
+## 7.5 `c` cannot be measured on this box under its own pre-registration (2026-09-21)
+
+**Status: `c` is NOT MEASURED and no point value should be quoted for it.** Use the band in the table below. This
+section exists so the next person does not repeat the attempt without knowing what stops it.
+
+**What `c` is.** The marginal time to gather one expert row (13,315,584 B in six segments) from pinned host memory
+into VRAM: the slope of `T(n) = f + c * n`. It is the binding unmeasured input to the per-row-vs-two-phase decision,
+and it enters the plan's arithmetic in three places (`C_MEASUREMENT_PREREG.md` section 0). The value used today,
+`c = 1.055 ms`, is **not a measurement of this path**: it is `128 ms / 121.2 rows` from an nsys trace of an older tree,
+with a row denominator resting on 74.5% per-layer agreement.
+
+| `c` (ms) | where it comes from |
+|---:|---|
+| 0.966 | copy engine in isolation |
+| 1.009 | the same 128 ms over the later corpus's 126.9 rows |
+| 1.055 | the figure in use |
+| 1.079 | this kernel in isolation |
+
+**The existing numbers bound `c` to roughly 0.97-1.08 and do not choose within it.** Anything that depends on `c`
+should be checked at both ends of that band rather than at 1.055.
+
+**What was attempted.** A pre-registered measurement (`C_MEASUREMENT_PREREG.md`, harness + frozen analysis, gates
+fixed by sha256 before the run). Run 1 ran on 2026-09-21 13:32-13:40 and **completed**: both NUMA nodes, five passes,
+235 cells, 1.1 MB of `results.jsonl`. Its verdict is **INVALID** and no number is quoted from it. The raw data,
+the marker and `meta.json` are committed at `analysis/dsv41-drive/c_measurement/c_run1/`, and the verdict reproduces
+from that committed data alone.
+
+**The blocker, and it is a design contradiction rather than a bug.** Gate 4.1 requires the GPU to be in **P0** at every
+cell, which is the ordinary guard against timing a downclocked card. A GPU enters P0 under sustained load. The same
+pre-registration requires a **quiet box** — no other lanes, production stopped — so that nothing disturbs the timings.
+On a quiet box the card idles to P1. **All 235 cells recorded `pstate_start = 1`, in every arm, on both nodes**, so the
+registered `--skip-arms hot` fallback (written for the case where only the `hot` arm drops out of P0) does not help.
+
+**The card was not actually slow.** Recorded SM clocks over the run were **min 2572 MHz, median 2662, max 2970, against a
+3135 MHz maximum** — 82% to 95% of peak — and `link_gen` was `(3, 3)` on all 235 cells, so the link half of the gate
+passes. P1 was a label, not a throttle. This copy is PCIe-bandwidth-bound rather than SM-clock-bound, so the P-state
+label is arguably not measuring anything this workload is sensitive to; that argument is recorded, not acted on.
+
+**Three ways out, none taken.** Lock application clocks so the card reports P0 (needs privileges, changes box state);
+run a load purely to hold P0 (self-defeating, it contaminates the quiet requirement the gate sits inside); or judge the
+recorded SM clocks instead of the P-state label (the harness already records `sm_mhz_min`/`sm_mhz_max`). **Each is a
+gate relaxation proposed after watching that gate fail, by someone who had by then seen the fitted values it was
+withholding**, which is the move the pre-registration exists to forbid. The decision is the lead's and is open.
+
+**Two real defects were found and fixed on the way, so a later attempt need not rediscover them** (both are harness
+defects; no gate was touched):
+1. **The four small segments were not NUMA-bindable** (amendment 8, `C_MEASUREMENT_PREREG.md` section 19). glibc serves
+   allocations under `M_MMAP_THRESHOLD` from the heap arena, whose pages are already faulted; `MPOL_BIND` governs only
+   new faults and never moves a resident page. The two mmap-backed trellis slabs always bound correctly; the four small
+   segments could not, and the precondition refused the run. Fixed by forcing mmap for the allocation and restoring the
+   threshold before any timing.
+2. **The `repeat` arm advanced a ring cursor it never drew from** (amendment 9, section 21), tearing the sequence the L2
+   guard measures: for `n = 6`, `1320 mod 150 = 120`, leaving a reported minimum reuse distance of `150 - 120 = 30`
+   instead of 150. `repeat` runs on node 0 only, which is why run 1 failed that gate on 80 node-0 cells and no node-1
+   cell. **It was a bookkeeping artifact, not cache residency** — true spacing was still 4.2x the 96 MiB L2. A prediction
+   is registered for the next run: node-0 SM cells must record `min_reuse_distance_rows = 150`. If they record 30 again,
+   the diagnosis is wrong and must be re-opened rather than patched.
+
+**Also fixed:** `c_analysis.py` printed its per-arm fits even on an INVALID verdict, which is how run 1's numbers were
+seen before its verdict line was read. It now prints the verdict, the gates and the marker and nothing else, and exits 3.
+
+**Practical guidance until this is resolved.** Do not quote 1.055 as measured. Where a conclusion depends on `c`, state
+it across 0.97-1.08; if the conclusion is the same at both ends, `c` does not need measuring for that purpose, and if it
+differs, that difference is the argument for resolving the P-state question.
+
 ## 8. What was not monitored
 
 - **13 of the 17 arms have no machine-load record.** Boundary samples (`boundary_samples` in the arm json: load average, meminfo, per-drive sectors, the five busiest foreign processes) exist for
