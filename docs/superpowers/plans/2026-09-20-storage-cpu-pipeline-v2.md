@@ -346,7 +346,31 @@ Include expert identity in the immutable row result and validate it against the 
     - **M1, the tag's generation replaced by a constant.** Killed 6 of 11: every leases-on arm, single-layer included; all five leases-off arms passed. It proves the suite is not vacuous, but it breaks every acknowledgement rather than only aliased ones, so it fails at the first layer and discriminates nothing.
     - **M2, the epoch kept and the sequence masked to 4 bits**, so seq 17 aliases seq 1 on the lane-ack words while seqs 1-16 stay distinct. Killed **only the four multi-layer tests**; **both single-layer lease tests passed**. The single-layer tests issue too few posts for the sequence to pass 16, so ring aliasing never occurs and the fault is invisible to them. **This is a fault the multi-layer tests catch and the single-layer tests cannot see.**
   - **Still not established:** that `layers_20` adds coverage over `layers_4`. Both catch M2, because four layers over four replay steps also cross seq 16 -- wrap *across* replays, not the intra-replay wrap that motivated N=20. A mutant separating the two remains unwritten, so N=20 is a superset of N=4's coverage and not yet more than that.
-- [ ] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
+- [x] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
+> **TICKED 2026-09-21 (`c69d070c2e`). The refusal below named its own condition -- "revisit when the ack kernel
+> exists" -- and `70847da92f` met it.** The consumer is now the real acknowledgement kernel, and the delay is real
+> rather than simulated: the first device posts, waits and copies, then simply does not acknowledge.
+>
+> **How the concurrency objection is answered.** `go_count` and `lane_ctx` belong to the device object, not the page,
+> so a second `Exl3RamMissDevice` -- built after the first has posted, continuing the demand sequence from the page's
+> `demand_head` -- runs whole newer requests of its own while the first request's leases stay outstanding. Six of them
+> are posted, served, copied and acknowledged in full. That is the stronger sense this note's own CORRECTION said was
+> unproven: the newer requests are not interleaved by hand through `host.pump()`.
+>
+> **Why it is not vacuous, three ways.** (1) The held experts carry the oldest `stamp` values in the tier, so
+> `take_slot_locked` would choose them *first*; the only thing standing between them and the victim search is the
+> `leased_locked` skip at `exl3_ram_miss_host.cpp:2415`. (2) **Seen to fail:** deleting that skip kills exactly this
+> test, **1 failed / 32 passed**, on the property line (expert 3 evicted out from under its own lease, `leases_granted`
+> 14 against `leases_acked` 11); reverting restores **33 passed**. No other test in the file catches it. (3) A control
+> in the test body: after the acknowledgement retires the leases, the same pressure evicts experts 3 and 4 first, in
+> stamp order -- the choice the lease had been suppressing.
+>
+> **An independent second verdict on the same property, from the device.** After six forced evictions the ack kernel
+> returns `CONSUMED` with `keep` intact for every lane, which means no lane's slot generation moved while the lease was
+> held. A recycled source would have made it `VIOLATED`. That is the hardware's own answer, not the test's bookkeeping.
+>
+> Run under `cc-gpu.lock` on the 5090, `PYTHONPATH` pointed at the tree under test and verified by import path.
+> The mutant was built in a private detached worktree, never `wt-dsv41`, and the worktree removed after the revert run.
 > **REFUSED AGAIN 2026-09-21, and the refusal is now worth more than a tick would
 > be.** The CPU-observable property IS closed, by `4fc530880b`
 > (`test_a_served_requests_leased_slot_keeps_its_bytes_under_a_newer_demand_and_an_advisory`,
