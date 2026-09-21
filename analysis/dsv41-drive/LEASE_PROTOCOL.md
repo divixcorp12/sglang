@@ -1642,6 +1642,27 @@ passes on an idle worker; (A11) item 12's timeout must fire after the post; (A12
 test fails today with a missing name, which is not evidence, so the mutation column is the
 acceptance criterion; (A13) three model mutants have no CPU analogue.
 
+### 18.2a Tests still owed after step 3, each with a path witness and a property
+
+Rule from the mutation work (two survivors of mine in test-first steps, six of `t2-scheduling`'s): a test needs
+**both** a *path witness* (something that proves the intended path actually ran, so a shortcut that produces the
+same outcome fails it) **and** the *property* asserted on that path. Naming the outcome is not enough, and
+naming the path is not enough. Each entry says what the shortcut would be.
+
+| # | Test | Path witness | Property | The shortcut the outcome alone would accept |
+|---|---|---|---|---|
+| R1 | **A long deferral does not trip the watchdog's stuck rule** (thread mode, real watchdog, in a subprocess because an abort kills the interpreter). This corrects the request "abort after a long deferral": the requirement is that a *deferral* never aborts, while a hung read still does (existing test). | `deferred == 1`, the deferral observed to be older than `fatal_wait` on the test's own clock (start the thread with `fatal_wait_s` well below the wait), `busy_since_ns() == 0` and `busy_seq == 0` sampled throughout | the process is alive at the end; the demand is served after the lease retires | a `fatal_wait` larger than the wait (nothing could abort); a deferral that is short. Mutation: the deferral marks itself busy (already killed in pump mode by the `busy_since` assertion; this is the real-watchdog version) |
+| R2 | **An advisory arriving while a demand is deferred is processed, not skipped, and touches nothing the deferred demand needs.** Replaces the weaker check in `test_exl3_ram_miss_lease_thread.py`, which asserts only that `advise_done` advanced (a stale-skip advances it too). | posted **after** `deferred == 1` is observed; `advisories` counter +1 and `advisories_skipped` unchanged (it entered `serve`, it was not skipped as stale); `demand_pending()` true at that moment | it gives up before reading (`advisory_rows == 0`); no leased slot is taken; the deferred demand's `demand_done` is unchanged; an advisory for **another row** reserves in that row's own tier | an advisory marked stale and dropped (advances `advise_done`, does nothing); an advisory that reads while a demand is deferred (priority violation); an advisory that takes a leased slot |
+| R3 | **Retirement between the reader's batches** (needs the missing call site 2 of 7.5 first). | a delayed read (`inject(delay_s)`) so the request is provably in `serve`'s read phase when the acknowledgement is delivered; `demand_done` not yet advanced | `leases_acked` increments **during** the read, not after it | retirement only at the top of `pump_demand` (today's behaviour): the counter moves only after the read returns |
+| R4 | **Item 2 of 18.2 as written: a served request's leased slot keeps its bytes under a newer request and an advisory.** | the tier is exhausted so the leased slot is the only possible victim; the newer request's reservation ran (`deferred` moved, or `evictions` moved on another slot) | a sentinel written into the leased slot's slab bytes after publication is intact, and its `slot_generation` and `SlotGen` word are unchanged | eviction that reloads the same expert into the leased slot with identical bytes (a state-and-generation check would not see a missed bump either) |
+| R5 | **CI runs what pytest runs.** Run each lease test file as CI does (`python3 <file> -f`) and compare the count with pytest's; the class-order hazard (CI runs classes alphabetically) is tested by the same run. | the two counts, side by side | equal counts, and no file that passes under pytest and fails under CI | a file whose `__main__` block is missing (runs nothing, exits 0) |
+
+**Claims about the service that no CPU test defends** (code-reading claims; a device-side harness would be the way
+to defend them, and the list is now long enough to argue for one): the write order of a row result's payload versus
+its ready word (`grant_lanes_locked`); `kBusySeq` cleared before `demand_done`; that the pause's own retirement pass
+matters (the running thread retires first); and that the grant precedes `set_status` (only the ordering before
+`demand_done` is observed, through `inject_done_stall`).
+
 ### 18.3 The model check (done, bounded)
 
 `analysis/dsv41-drive/lease_model.py` is a self-contained explicit-state model of this
