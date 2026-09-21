@@ -234,9 +234,17 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 > those demonstrable; they do not demonstrate them. Ticking on kernel evidence would repeat the error this plan has
 > refused all along, that a stand-in written from the same specification is not the consumer.
 >
-> **The gap to close next is step 5 of `LEASE_PROTOCOL.md` 20.1, the backend wiring**: `Exl3RamMissRowBackend` has no
+> **STALE, corrected 2026-09-21: step 5 of `LEASE_PROTOCOL.md` 20.1 has landed.** The paragraph below was true when
+> written and is not true now. `49784e1105` wired lease mode into the row backend and the service behind
+> `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES` (default off): `Exl3RamMissRowBackend.post`
+> (`python/sglang/srt/layers/moe/exl3_ram_miss.py:306`) branches on `device_side.lease_block`, takes the copy's active
+> count from the wait kernel's `go_count` rather than the plan's `count`, and launches the acknowledgement kernel after
+> the copy in the same stream. So the serving path *can* run lease mode, and an end-to-end number is no longer blocked
+> on wiring. Checked against the tree, not inferred from this plan.
+>
+> ~~**The gap to close next is step 5 of `LEASE_PROTOCOL.md` 20.1, the backend wiring**: `Exl3RamMissRowBackend` has no
 > lease `post` override and **there is no environment switch**, so lease mode cannot be enabled in the serving path at
-> all. Until it lands, every lease number is a kernel-and-service number, never an end-to-end one.
+> all. Until it lands, every lease number is a kernel-and-service number, never an end-to-end one.~~
 >
 > **OPEN 11 is now measured** (`analysis/dsv41-drive/open11/`, three runs agreeing to 6%): arming every `count > 0`
 > record costs **about 8 us per all-hit layer, ~0.32 ms per step at 40 layers**. The exposed cost is the wait alone
