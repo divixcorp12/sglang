@@ -1285,6 +1285,21 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > and `Interrupted` rather than trusting an exit status or the absence of a
 > keyword. An exit status lies under every one of these defects.
 >
+> **AND COVERAGE CAN BE CONCENTRATED IN THE WRONG FILE.** A mutant on
+> `lanes_outstanding_` -- the counter whose relaxed load gates **every** fast
+> path and whose correctness decides **every** eager-pause refusal -- was run at
+> the reviewer's suggestion. **E1 (not decremented on release) is killed by
+> exactly ONE test**, in the *thread* file, and **survives the whole service
+> file (17 tests), the leases file (14) and the defer file (8).** It fires as
+> the `RuntimeError` from the `pause()` the test expects to succeed -- the
+> behaviour under test, not a fixture, so the kill is legitimate.
+>
+> So a property every lease path depends on is defended by **one test, in a file
+> most lease work does not run.** Anyone verifying a lease change against the
+> service, leases and defer files -- the obvious three -- gets a clean result
+> from a tree where that counter is broken. **A tally of kills would have shown
+> this as covered; only asking *which file* the killer lives in reveals it.**
+>
 > **A KILL COUNT IS NOT A COVERAGE COUNT, and the gap is larger than it looks.**
 > Step 6's ledger reports **13 mutants killed** -- resting on **5 distinct tests
 > out of 20**: S6+S7 share one killer, S4+S8+S9 share one, S13+S14 share one.
