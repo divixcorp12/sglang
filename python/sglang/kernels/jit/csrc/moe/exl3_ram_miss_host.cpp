@@ -1369,6 +1369,11 @@ enum Counter : int {
   kRunning,
   kSpinCpu,
   kDeferred,  // demands the tier could serve only if leases retired; none evicted (step 2: counted, then failed)
+  kLeasesGranted,     // one per lane of a served request in lease mode
+  kLeasesAcked,       // released by the device's acknowledgement
+  kLeasesVoided,      // released by a terminal record that named the lane
+  kLeaseDoubleSignal, // a lane signalled by both, or twice: released once, counted here
+  kLateAfterTerminal, // a request the device had already given up on: dropped without a lease
   kCounterCount,
 };
 
@@ -1378,6 +1383,28 @@ inline uint32_t load_acquire(const uint8_t* address) {
 
 inline void store_release(uint8_t* address, uint32_t value) {
   __atomic_store_n(reinterpret_cast<uint32_t*>(address), value, __ATOMIC_RELEASE);
+}
+
+// The lease block's publication words are 64 bits: a tag in the top byte over a 56-bit request generation
+// (LEASE_PROTOCOL.md 4.2). Built in code, not in a k-constant: the layout test parses those with + - * only.
+inline uint64_t load_acquire64(const uint8_t* address) {
+  return __atomic_load_n(reinterpret_cast<const uint64_t*>(address), __ATOMIC_ACQUIRE);
+}
+
+inline void store_release64(uint8_t* address, uint64_t value) {
+  __atomic_store_n(reinterpret_cast<uint64_t*>(address), value, __ATOMIC_RELEASE);
+}
+
+inline uint64_t generation_of(uint64_t word) {
+  return word & ((uint64_t(1) << 56) - 1);
+}
+
+inline uint64_t tag_of(uint64_t word) {
+  return word >> 56;
+}
+
+inline uint64_t tagged_word(uint64_t tag, uint64_t generation) {
+  return (tag << 56) | generation;
 }
 
 // The device never posts sequence 0 (the post kernel and sim_post wrap 0xFFFFFFFF to 1), so a
@@ -1403,6 +1430,25 @@ struct Request {
   uint32_t lanes = 0;
   std::vector<int32_t> need;
   std::vector<int32_t> protect;
+  // Lease mode: the device's lane list and 56-bit request generation, from the lane request (not the record).
+  uint64_t gen = 0;
+  std::vector<int32_t> lane_experts;
+};
+
+// The service's private account of one request's leases, by request slot (LEASE_PROTOCOL.md 5.2).
+struct LaneLease {
+  uint8_t state = 0;  // 0 none, 1 granted, 2 acknowledged, 3 voided by a terminal
+  int32_t slot = -1;
+  uint32_t slot_generation = 0;
+  bool counted = false;  // a second signal for this lane was already counted
+};
+
+struct Outstanding {
+  bool active = false;
+  uint64_t gen = 0;
+  int64_t row = 0;
+  uint32_t count = 0;
+  LaneLease lane[kLeaseLanes];
 };
 
 // Seqlock read: the writer stores the payload, fences, then the seq word last, so a
@@ -1566,6 +1612,7 @@ class RamTier {
 
   // Serve the next posted demand record, if any. True when it handled one.
   bool pump_demand() {
+    retire_leases();  // first, so that an idle pump still retires what the device has acknowledged
     const uint32_t head = load_acquire(page_ + kDemandHead);
     if (head == 0 || !reached(head, next_demand_)) return false;
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
@@ -1577,9 +1624,18 @@ class RamTier {
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
     Request request;
     if (read_record(record, next_demand_, &request)) {
-      handle_demand(request, record);
+      if (lease_mode_ && request.armed && !read_lane_request(next_demand_, &request)) {
+        counters_[kOverruns].fetch_add(1);  // a later request overwrote the lane request: a lapped record
+      } else if (lease_mode_ && request.armed && terminal_seen(request)) {
+        counters_[kLateAfterTerminal].fetch_add(1);  // the device gave up on it: serve nothing, lease nothing
+      } else {
+        handle_demand(request, record);
+      }
     } else {
       counters_[kOverruns].fetch_add(1);  // status stays pending: a waiting layer fails stop
+    }
+    if (const int64_t stall = done_stall_ns_.load(); stall > 0) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(stall));  // test only: see inject_done_stall
     }
     _mm_sfence();
     store_release(page_ + kDemandDone, next_demand_);
@@ -1693,6 +1749,141 @@ class RamTier {
     }
     release_locked(row, slot);
     counters_[kVersion].fetch_add(1);
+  }
+
+  // Lease mode: the service reads each armed request's lane request, leases every lane's source slot and publishes
+  // a row result per lane before it answers (LEASE_PROTOCOL.md 7). Off leaves every request as it always was.
+  void set_lease_mode(bool on) {
+    if (lease_ == nullptr) throw std::runtime_error("exl3 RAM miss: lease mode needs a lease block");
+    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set lease mode before the service thread starts");
+    lease_mode_ = on;
+  }
+
+  void inject_done_stall(int64_t ns) {
+    done_stall_ns_.store(ns);
+  }
+
+  // The seqlock read of the device's lane request for `seq`: false when a later request has already overwritten it.
+  bool read_lane_request(uint32_t seq, Request* request) const {
+    const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
+    const uint8_t* base = lease_ + lease_d_ + kLeaseLaneRequest + idx * kLeaseLaneRequestBytes;
+    const uint64_t word = load_acquire64(base + kLeaseLrGen);
+    if (tag_of(word) == 0 || (generation_of(word) & 0xFFFFFFFFull) != seq) return false;
+    uint32_t count = 0, row = 0;
+    std::memcpy(&count, base + kLeaseLrCount, 4);
+    std::memcpy(&row, base + kLeaseLrRow, 4);
+    int32_t experts[kLeaseLanes];
+    std::memcpy(experts, base + kLeaseLrExpert, sizeof(experts));
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (load_acquire64(base + kLeaseLrGen) != word) return false;
+    if (count > static_cast<uint32_t>(kLeaseLanes) || static_cast<int64_t>(row) != request->row) return false;
+    request->gen = generation_of(word);
+    request->lane_experts.assign(experts, experts + count);
+    return true;
+  }
+
+  // The device has published a terminal for this request: it will never read a source for the lanes it names.
+  bool terminal_seen(const Request& request) const {
+    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    const uint8_t* base = lease_ + lease_d_ + kLeaseTerminal + idx * kLeaseTerminalBytes;
+    return generation_of(load_acquire64(base + kLeaseTermGen)) == request.gen && tag_of(load_acquire64(base + kLeaseTermGen)) != 0;
+  }
+
+  // Lease every lane's source slot and publish its row result, in one critical section, after the rows are ready
+  // and before the caller answers. A lease is counted before its row result is published (6.1). False on an
+  // internal inconsistency: nothing is granted then.
+  bool grant_lanes_locked(const Request& request) {
+    if (request.lane_experts.empty()) return true;
+    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    Outstanding& entry = outstanding_[idx];
+    if (entry.active) return false;  // the request slot still holds an unretired lease row
+    Tier& tier = tiers_[request.row];
+    const size_t count = request.lane_experts.size();
+    int32_t slots[kLeaseLanes];
+    for (size_t lane = 0; lane < count; ++lane) {
+      const int32_t expert = request.lane_experts[lane];
+      if (expert < 0 || expert >= experts_) return false;
+      const int32_t slot = tier.expert_slot[expert];
+      if (slot < 0 || tier.state[slot] != kReady || tier.slot_to_expert[slot] != expert) return false;
+      slots[lane] = slot;
+    }
+    entry = Outstanding();
+    entry.active = true;
+    entry.gen = request.gen;
+    entry.row = request.row;
+    entry.count = static_cast<uint32_t>(count);
+    uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
+    for (size_t lane = 0; lane < count; ++lane) {
+      const int32_t slot = slots[lane];
+      tier.leases[slot] += 1;
+      entry.lane[lane] = LaneLease{1, slot, tier.generation[slot], false};
+      uint8_t* result = results + lane * kLeaseRowResultBytes;
+      const uint32_t generation = tier.generation[slot];
+      const int32_t expert = request.lane_experts[lane];
+      const uint16_t row16 = static_cast<uint16_t>(request.row), lane16 = static_cast<uint16_t>(lane);
+      std::memcpy(result + kLeaseRrSlotGeneration, &generation, 4);
+      std::memcpy(result + kLeaseRrHostSlot, &slot, 4);
+      std::memcpy(result + kLeaseRrExpert, &expert, 4);
+      std::memcpy(result + 20, &row16, 2);
+      std::memcpy(result + 22, &lane16, 2);
+    }
+    _mm_sfence();  // the payload of every lane lands before any ready word
+    for (size_t lane = 0; lane < count; ++lane) {
+      store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(1, request.gen));
+    }
+    lanes_outstanding_.fetch_add(static_cast<int64_t>(count));
+    counters_[kLeasesGranted].fetch_add(static_cast<int64_t>(count));
+    return true;
+  }
+
+  // Retire the leases the device has acknowledged, or voided with a terminal, without waiting for either. Cheap when
+  // nothing is outstanding. Called from the service loop; never blocks (LEASE_PROTOCOL.md 7.5, 16).
+  void retire_leases() {
+    if (lease_ == nullptr || lanes_outstanding_.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (int64_t idx = 0; idx < kDemandRecords; ++idx) {
+      Outstanding& entry = outstanding_[idx];
+      if (!entry.active) continue;
+      Tier& tier = tiers_[entry.row];
+      const uint8_t* acks = lease_ + lease_d_ + kLeaseLaneAck + idx * kLeaseLanes * kLeaseLaneAckBytes;
+      const uint8_t* terminal = lease_ + lease_d_ + kLeaseTerminal + idx * kLeaseTerminalBytes;
+      const uint64_t stamp = load_acquire64(terminal + kLeaseTermGen);
+      const bool terminated = tag_of(stamp) != 0 && generation_of(stamp) == entry.gen;
+      uint32_t mask = 0;
+      if (terminated) std::memcpy(&mask, terminal + kLeaseTermSkippedMask, 4);
+      for (uint32_t lane = 0; lane < entry.count; ++lane) {
+        LaneLease& held = entry.lane[lane];
+        const uint64_t word = load_acquire64(acks + lane * kLeaseLaneAckBytes);
+        const bool acknowledged = tag_of(word) != 0 && generation_of(word) == entry.gen;
+        const bool voided = terminated && (mask >> lane & 1u) != 0;
+        if (held.state == 1) {
+          if (acknowledged) {
+            release_lease_locked(tier, held, kLeasesAcked);
+          } else if (voided) {
+            release_lease_locked(tier, held, kLeasesVoided);
+          }
+        }
+        // A second signal for a lane already released: counted once, and it releases nothing.
+        if (!held.counted && ((held.state == 2 && voided) || (held.state == 3 && acknowledged))) {
+          held.counted = true;
+          counters_[kLeaseDoubleSignal].fetch_add(1);
+        }
+      }
+      bool open = false;
+      for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
+      if (!open) entry.active = false;
+    }
+  }
+
+  // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless.
+  void release_lease_locked(Tier& tier, LaneLease& held, int counter) {
+    if (tier.leases[held.slot] == 0) {
+      throw std::runtime_error("exl3 RAM miss: lease underflow on slot " + std::to_string(held.slot));
+    }
+    tier.leases[held.slot] -= 1;
+    held.state = counter == kLeasesAcked ? 2 : 3;
+    lanes_outstanding_.fetch_sub(1);
+    counters_[counter].fetch_add(1);
   }
 
   // Test hooks and introspection. slot_info: [state, expert, leases, generation] per slot.
@@ -1827,6 +2018,7 @@ class RamTier {
       total_slots += capacity[row];
     }
     const int64_t d_offset = round_up_page(kLeaseSlotGen + 4 * total_slots);
+    lease_d_ = d_offset;
     const int64_t needed = round_up_page(d_offset + kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes);
     if (lease_bytes < needed) {
       throw std::runtime_error(
@@ -1973,6 +2165,10 @@ class RamTier {
         if (!listed(wanted, expert)) wanted.push_back(expert);  // one slot per expert (device bytes may repeat)
       }
     }
+    // A lane's own expert must never be a victim of the request that leases it, whatever the post kernel protected.
+    for (int32_t expert : request.lane_experts) {
+      if (!listed(wanted, expert)) wanted.push_back(expert);
+    }
     std::vector<int32_t> missing;
     std::vector<int64_t> slots;
     bool ok = request.row >= 0 && request.row < layers_;
@@ -2090,6 +2286,11 @@ class RamTier {
         counters_[kVersion].fetch_add(1);
       }
     }
+    if (ok && lease_mode_ && !advisory) {
+      // Every lane's source is leased, and its row result published, before the caller answers the request.
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (!grant_lanes_locked(request)) ok = false;
+    }
     if (cur_) {
       cur_->mapped = stamp(cur_);
       cur_->row = request.row;
@@ -2131,6 +2332,11 @@ class RamTier {
   uint8_t* lease_;             // the lease block, or null when the service runs without one
   uint32_t* slot_gen_ = nullptr;  // SlotGen[] inside it
   std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
+  int64_t lease_d_ = 0;                 // byte offset of area D (the device-written words)
+  bool lease_mode_ = false;             // set before the service thread starts; off is today's protocol
+  Outstanding outstanding_[kDemandRecords];  // by request slot; guarded by mutex_
+  std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
+  std::atomic<int64_t> done_stall_ns_{0};      // test only: sleep between serving a demand and storing demand_done
   int64_t layers_;
   int64_t experts_;
   RowReader reader_;
@@ -2261,6 +2467,14 @@ void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted,
   result[0] = census.free;
   result[1] = census.evictable;
   result[2] = census.leased;
+}
+
+void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
+  exl3_ram_miss::find(handle)->set_lease_mode(on != 0);
+}
+
+void exl3_ram_miss_inject_done_stall(int64_t handle, int64_t ns) {
+  exl3_ram_miss::find(handle)->inject_done_stall(ns);
 }
 
 void exl3_ram_miss_mapping(int64_t handle, int64_t row, TensorView out) {
@@ -2449,6 +2663,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_release, exl3_ram_miss_release);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_census);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_to_expert, exl3_ram_miss_slot_to_expert);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_lru_order, exl3_ram_miss_lru_order);

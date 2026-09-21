@@ -355,6 +355,11 @@ COUNTERS = (
     "running",
     "spin_cpu",
     "deferred",
+    "leases_granted",
+    "leases_acked",
+    "leases_voided",
+    "lease_double_signal",
+    "late_after_terminal",
 )
 
 
@@ -545,6 +550,14 @@ class Exl3RamMissHost:
         out = torch.empty(3, dtype=torch.int64)
         self._module.exl3_ram_miss_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
+
+    def enable_lease_mode(self) -> None:
+        """Lease every armed request's lanes and publish their row results (LEASE_PROTOCOL.md 7); before the thread starts."""
+        self._module.exl3_ram_miss_set_lease_mode(self.handle, 1)
+
+    def inject_done_stall(self, seconds: float) -> None:
+        """Test only: sleep between serving a demand and storing demand_done."""
+        self._module.exl3_ram_miss_inject_done_stall(self.handle, int(seconds * 1e9))
 
     def lease_header(self) -> dict[str, int]:
         """The header words the service wrote (u32 each), read back from the block."""
