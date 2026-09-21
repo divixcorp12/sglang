@@ -1602,6 +1602,26 @@ code; this says which can and which cannot). Applied to the finished service and
 | **`ack_after_copy=False`, `fail_closed=False` (fail-open), `detector=False`** | **none on the CPU** | **kernel properties: only items 5(kernel) and 12 can catch them.** The simulator would only re-implement the rule under test |
 | `copy_waits_on_serving` | none | a property of the Task 8 copy path, not of the service |
 
+**Mutation run status** (naming a mutation is necessary but not sufficient: it must be *run*
+against finished code). Runs were made on divix01 with `/data/models/slang/.venv/bin/python`
+(from `t1-instrument`), from a plain `git archive HEAD` export (`48da151fb0`), CPU only, cores 0-63,
+a private JIT cache directory. Status today:
+
+| Test or check | Mutation | Status |
+|---|---|---|
+| Item 7(a): the wrap tests (`test_exl3_ram_miss_wrap.py`, 10 cases) | remove `skip_zero` at each of the four sites in `host.cpp`, one at a time | **RUN, all four caught; unmutated 10 pass.** Demand increment (line 1538): 4 tests fail (both waiter tests and both page states). Advisory increment (line 1574): 2 fail. Demand lap resume (line 1526): 1 fails. Advisory lap resume (line 1549): 1 fails. Each lap resume is guarded by exactly one test, so those two are thin |
+| `TestQuarantine` (step 6, part) | `quarantine()` without `detach()`; no extra reference (`Py_IncRef`) | **RUN, both caught** (the second only after I removed a strong reference that made the first version of that test unable to fail) |
+| Lease layout agreement (step 1) | change a constant on the Python side (`LANE_ACK_BYTES` 8 to 16); change one in the `.cuh` (`kLeaseTerminalBytes`) | **RUN, both caught** (2 tests fail on the Python-side change: the layout test and the agreement test) |
+| Lease block allocator (step 1) | skip the alignment check; allow generation 0 | **RUN, both caught** (one test each) |
+| Host-lease agreement guard | rename, partial, drifted and unmirrored constants | run as **input mutations** on synthetic sources (`test_the_host_lease_guard_can_fail`); not a mutation of `host.cpp`, which has no lease code |
+| Items 1-4, 6, 7(b)-(d), 8, 10, 14-16, and the service half of 9 | every mutation in the ledger above | **NOT RUNNABLE**: the code they mutate does not exist until steps 2 and 3. Their status is *specified, unrun* |
+| Item 9(c) shutdown wiring (`Exl3RamMissService.shutdown`) | frees when the sync failed | **NOT RUNNABLE**: needs the file another change holds. Only the slab half is run (row 2) |
+| Items 5(kernel), 12; `ack_after_copy`, fail-open, detector | see the ledger | **NOT RUN**: need step 4 and the GPU |
+
+The nearest the existing tree comes to demonstrating a *service-side* lease mutation today is
+none: the closest is the wrap tests above, which mutate existing service code and are the only
+service-level mutation evidence in this list.
+
 #### Audit
 
 Findings against the first version of this list, each shown at the source or by a named
