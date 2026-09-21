@@ -16,8 +16,8 @@ All 17 baseline arms are in
 `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/` on **divix01**
 (134 MB; the traces are most of it). Below, `R/` means that directory.
 
-**It is not in the git tree.** `git ls-files` in the `dsv41` worktree lists only the arm script, the verdict
-tool and its unit test, and `git log --all -- '*task1-results*'` finds nothing. Section 19 and the plan say "raw output in
+**The arm outputs are not in the git tree.** At `ec64c07999`, `git ls-files analysis/dsv41-drive/task1-results` lists only `clean-reference.json` and
+`task1e-PREDICTIONS.txt` (added by `450f86d17a`); the arm jsons, verdicts, caches, traces and the other PREDICTIONS files are on divix01 only. `git log --all -- '*task1-results*'` finds no commit that added them. Section 19 and the plan say "raw output in
 `analysis/dsv41-drive/task1-results/`"; that is true of divix01's analysis directory, not of the repository. The
 arms are therefore identified below by file name and by the first 12 hex digits of the sha256 of each arm
 json (Appendix A), so a later reader can tell whether a file is the one this document describes.
@@ -354,7 +354,7 @@ Against the committed text (`bea06e789c` is the last commit to touch it here; if
 3. The 3.798 arm "measured on the same reader **four days earlier**" than 3.8016 is wrong: the two are about 21 hours apart (section 5).
 4. "−3.4 to +5.1 GiB" boot-phase range mixes units and omits `task1d-3` (section 7.2); the values are −3.21 to +5.31 GiB.
 5. "The earlier arms have no load record" understates: **thirteen** arms have none, including `task1c-3` and `-4`.
-6. It does not mention that the results directory is not in git, nor `task1d-3`'s in-session residency collapse (section 7.3).
+6. It does not mention that the arm outputs are not in git (only `clean-reference.json` and `task1e-PREDICTIONS.txt` are), nor `task1d-3`'s in-session residency collapse (section 7.3).
 
 ## Appendix A: arm files (sha256, first 12 hex digits, of `R/<arm>.json`)
 

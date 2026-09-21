@@ -64,8 +64,9 @@ window (2026-09-17 16:03-16:28 CDT, `ls -l`), and they differ in the two ways th
 
 Together they say more than either alone: **B is both 47x more fragmented and capped at half the request size, and the drive model, firmware,
 queue count (16 against 31), link capability (Gen5 against Gen4) and filesystem (xfs against ext4) differ as well** (§7A). Whether any of this
-changes throughput is **not measured**: nothing recorded varies one difference while holding the rest fixed, and each mirror alone reached
-about 3.3-3.5 GB/s in earlier runs (Revision 1 §1.3, `SCHEDULING.md`). For anyone investigating a drive-level asymmetry: **read these rows
+changes throughput is **not established**: nothing recorded varies one difference while holding the rest fixed. What *is* measured (`SCHEDULING.md`, Finding 1) is that, solo, the drive with
+twice the requests per byte was the faster one (nvme4 3456 and 3412 MB/s against nvme0 3329 and 3293), so request count did not bind at 3.3-3.5 GB/s; the 13-against-26 request figures themselves
+are that document's unvalidated model, as they are arithmetic here. For anyone investigating a drive-level asymmetry: **read these rows
 before theorising, and do not attribute an asymmetry to the filesystem name (xfs or ext4) while extent count and request size are measured, available, and
 differ this much.** The filesystem is confounded with both.
 
