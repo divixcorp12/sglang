@@ -725,6 +725,17 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > drives, not RAM -- 2.25 and 2.31 GB/s per root, with 204.5 GB per root unable
 > to sit in a 188 GB box's cache.
 >
+> **This is no longer reasoning; it has been run** (mutation sweep, base
+> `a01f9347d6`). P01 and P02 -- the verifier reading mirror rows, or source rows,
+> buffered while still reporting `direct` -- **both survive all 37 verifier
+> tests**. P03, the layout ignoring its prefix, survives all 8 layout tests. And
+> U01, `O_DIRECT` never opened at all, is killed by **exactly one test**
+> (`test_failed_read_raises_and_reader_stays_usable`) and only **incidentally**:
+> that test passes an unaligned destination, which direct mode rejects and
+> buffered accepts. **No test about aligned reads can tell direct from buffered.**
+> So the direct-I/O path is essentially unguarded, and the instrument's own
+> `reads: O_DIRECT` line carries no information.
+>
 > **State it as "proven by source at that commit and corroborated by throughput,
 > not measured" wherever it is cited.** No diskstats or `fincore` delta was taken
 > during that run, unlike the `dd` control. The instrument whose entire job is
@@ -817,6 +828,23 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > `[reviewer-established]` at the source, with a ranked list of the mutations
 > worth actually running (`host.cpp:2054`, `expert_hot_cache.py:292`,
 > `verify_expert_mirror.py:519`/`:534` separately, `exl3_expert_layout.py:64`).
+>
+> **Two further survivors from the same sweep, both live risks rather than test
+> hygiene.** **H15:** a resubmitted extent overwriting its first submit stamp
+> survives. That matters beyond the unit under test, because the per-drive FIFO
+> finding this plan carries as an explicit assumption was derived from **submit
+> and completion stamps**; if a resubmit can silently overwrite a submit stamp
+> and no test notices, stamp-derived ordering analyses have an unguarded premise.
+> **H18:** a failed thread start leaves the tier marked threaded, and survives.
+>
+> **And the one that reaches Task 6 directly. H01** -- the publish gate with
+> `cancelled &&` removed -- **survives all 297 host-facing tests** on
+> `a01f9347d6`. That gate is the code V2's early publication would change. So a
+> Task 6 implementer can alter publication behaviour and see a green suite.
+> Whether this still holds after Task 5 step 2 touched `serve` is being measured
+> separately on `457e44e036`; **if the two bases differ, Task 5's landing changed
+> the test coverage of code Task 6 intends to modify**, which nothing in this
+> plan anticipated.
 >
 > **RULE for the remainder of this plan: write the mutant first.** Before a test
 > is accepted as evidence for any gate here, name the specific change to
