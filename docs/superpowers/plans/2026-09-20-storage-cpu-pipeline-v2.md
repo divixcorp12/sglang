@@ -403,6 +403,41 @@ Include expert identity in the immutable row result and validate it against the 
 > consumer (two independent searches agree); `lease_model.py` and
 > `LEASE_PROTOCOL` §7.2 / row F1 do encode it, and are what the change
 > invalidates.
+>
+> **SUPERSEDED 2026-09-21: the prerequisite is built and the hole is closed.**
+> The paragraph above is stale from "`RamTier::inject` exposes only" onward.
+> `RamTier::inject_fault` (`c8a1309cf7`, `exl3_ram_miss_host.cpp:2271`) carries
+> the reader's full `ReadFault` vocabulary to the tier and is installed
+> immediately before `reader_.read`, so unlike `fail_reads_` it does **not**
+> short-circuit: the read runs and the fault lands after rows have packed.
+> `test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_and_publishes_none`
+> (`test_exl3_ram_miss_tier.py:160`) uses it on a mirrored tier.
+>
+> **Seen to fail, and it closes a named hole.** Relaxing the publication gate at
+> `:2598` from `ok || (cancelled && packed[i])` to `ok || packed[i]` -- per-row
+> publication -- kills exactly that one test of 51 (`mapping(1)` comes back
+> `[0, 1, -1, -1, -1, -1]`), and reverting restores 51. Reproduced independently.
+> That mutant is Tier 1 item 1 of `TESTS_THAT_CANNOT_FAIL.md`, recorded as
+> escaping the whole kernels suite; it no longer does.
+>
+> **The vacuous test was renamed, not retired** (`ae936b5bf5`), to
+> `test_a_read_that_fails_before_it_starts_publishes_nothing_and_frees_every_slot`.
+> It stayed green under the mutant above, which is the direct evidence that only
+> its name was false: its body pins the pre-read failure path -- slots reserved,
+> read never run, no mapping and no stuck LOADING slot -- which nothing else covers.
+>
+> **Observed behaviour, stated as measured rather than as documented:**
+> all-or-nothing holds at the **publication boundary, not the byte level**. With
+> rows 0 and 1 packed and row 2 failing, the packed rows' bytes are present and
+> byte-exact in the pinned slabs; what the tier withholds is visibility -- no map
+> entry, every slot released, `slot_to_expert` cleared, `rows_read` 0 and
+> `read_errors` 1. A later reservation overwrites stale-but-valid bytes. The work
+> is discarded, the memory is not scrubbed. Task 6's V2 decision can now be made
+> on evidence.
+>
+> **The box stays open** on its other clauses: timeout before copy, suppressing
+> dependent compute on a fatal demand error, and a skipped GPU copy not emitting
+> a successful consumption acknowledgement are all still unexercised.
 
 - [ ] Handle failure before readiness, timeout before copy, and failure after a subset copied. Suppress dependent compute on any fatal demand error. A skipped GPU copy must not accidentally emit a successful source-consumption acknowledgement.
 > **R3 (retire-between-batches) IS WRITTEN, REVIEWED AND HELD -- it belongs with
