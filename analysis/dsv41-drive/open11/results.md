@@ -38,7 +38,8 @@ service round trip that an unarmed one skipped.
   describes the warm-cache steady state, which is the case that matters, rather than an average.
 * **Against Task 6's budget it is material: ~0.32 ms is about 28-30% of the 1.114 ms `G*`** that Task 6 is
   trying to win. Section 17.2's requirement that Task 6's benefit be measured net of OPEN 11 now has a number.
-* **Against absolute step latency it is small**: ~0.5% of a ~66.8 ms/token decode step.
+* **Against absolute step latency it is small**: see the step-time correction at the end of this file. The
+  66.8 ms/token figure this bullet originally used is a Qwen3.8 NVFP4 number and does not apply to DSV4.1.
 * **Not production geometry.** Two layers, three lanes, capacity 8. The x40 is a linear extrapolation that
   assumes per-layer costs are additive and do not overlap between layers; in a real decode the wait may overlap
   other work (making it smaller) or contend (making it larger). It is labelled as extrapolation, not measured
@@ -134,4 +135,42 @@ min disagreed by a factor of six, and neither could be quoted.
 **Consequence for Task 6: OPEN 11 is about 61% of the 1.114 ms `G*`, not 28-30%.** Section 17.2's requirement
 that Task 6's benefit be reported net of OPEN 11 now bites roughly twice as hard as recorded. Still an upper
 bound -- it is attained only when every layer is all-hit, and a layer with a miss was already armed -- and
-still ~1% of a ~66.8 ms/token decode step in absolute terms.
+in absolute terms it is **~0.19% of a ~360 ms DSV4.1 decode step** (see the correction below).
+
+
+---
+
+# Correction: the step-time denominator was the wrong model line (2026-09-21)
+
+**Every "% of a step" figure written above before this section used 66.8 ms/token, which is not a DSV4.1 number.**
+The delta measurements themselves are unaffected -- 17 us per armed layer and 0.68 ms per 40-layer step stand, and so
+does the comparison against Task 6's `G*`, which is a DSV4.1 quantity. Only the ratios against absolute step latency
+were wrong, and they were wrong in the flattering direction: they made OPEN 11 look five times more significant
+against a decode step than it is.
+
+**Where 66.8 ms/token comes from.** `analysis/step-tail/` reads
+`servers/prefetch-recovery-llapor-trace-d-final/run-20260916-190633/trace/report.sqlite`, a prefetch server on the
+Qwen3.8 NVFP4 line, with 48 layers per step. The repo's CLAUDE.md quotes it correctly for that line. DSV4.1 EXL3 has
+40 layers, a 4.8x larger expert row, and a different expert format; `DSV41_REFERENCE.md` §3 is the byte-geometry
+comparison that makes the two incomparable.
+
+**The DSV4.1 EXL3 rates, kept separate by configuration rather than averaged:**
+
+| config | source | tok/s | ms/token |
+|---|---|---|---|
+| eager decode | `dsv41-phase3a/corpus-cold.json`, `corpus-seeded.json`; REFERENCE 16.12 | 1.60-1.63 | ~615-623 |
+| breakable graph, `GRAPH_GATHER=0` | `dsv41-phase3b/corpus-p1.json` | 1.97 | ~510 |
+| **breakable graph, `GRAPH_GATHER=1` (in-graph)** | `dsv41-phase3b/corpus-c.json`, `corpus-cpf.json` | **2.78** | **~360** |
+| same, under nsys | `corpus-prof-graph.json`; REFERENCE 18 | 2.10 | 423 traced |
+
+`DSV41_REFERENCE.md:4` states the in-graph figure directly: 2.781 tok/s.
+
+**So OPEN 11's 0.68 ms/step is about 0.19% of an in-graph DSV4.1 decode step**, not 1%. Its significance against
+Task 6 is unchanged and remains the number that matters, because `G*` and OPEN 11 are both per-step DSV4.1
+quantities and the ratio between them does not involve the step time at all.
+
+**Consequence for the end-to-end serving benchmark.** A 0.19% effect is roughly an order of magnitude below what a
+window of a few thousand decode tokens can resolve at a per-step sd of 60-100 ms. `benchmarks/dsv41_flash` would
+return an UNRESOLVED bound of a few percent. The instrument that answers this question is the microbenchmark, which
+resolves 8 us per layer; the serving benchmark is the wrong tool for an effect this size, and was scoped on the
+wrong denominator.

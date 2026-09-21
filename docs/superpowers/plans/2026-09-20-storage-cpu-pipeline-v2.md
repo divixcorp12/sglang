@@ -255,7 +255,11 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 > measurement gave +90.5 us at p50 against +14.8 us min-to-min, and neither could be quoted. The ~8 us came from
 > `open11_arming_cost.py`'s hand-written step; the real backend path costs about twice that.
 > **So OPEN 11 is ~61% of the 1.114 ms `G*`, not 28-30%**, and section 17.2's net-of-OPEN-11 requirement on Task 6
-> bites twice as hard as recorded. Still an upper bound, still ~1% of a ~66.8 ms/token step.
+> bites twice as hard as recorded. Still an upper bound, attained only when every layer is all-hit.
+> **Correction to this note's own first draft:** it said "~1% of a ~66.8 ms/token step". 66.8 ms/token is a Qwen3.8
+> NVFP4 figure from `analysis/step-tail/`, which reads a prefetch server on that line and counts 48 layers per step.
+> DSV4.1 EXL3 in-graph decode is ~360 ms/step (2.781 tok/s, `DSV41_REFERENCE.md:4`), so OPEN 11 is **~0.19% of a
+> decode step**, not 1%. The `G*` comparison above is unaffected: both are per-step DSV4.1 quantities.
 >
 > ~~**OPEN 11 is now measured** (`analysis/dsv41-drive/open11/`, three runs agreeing to 6%): arming every `count > 0`
 > record costs **about 8 us per all-hit layer, ~0.32 ms per step at 40 layers**. The exposed cost is the wait alone
