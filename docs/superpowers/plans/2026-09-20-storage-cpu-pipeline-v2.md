@@ -877,6 +877,16 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > the test coverage of code Task 6 intends to modify**, which nothing in this
 > plan anticipated.
 >
+> **This plan's own lease suites were among the casualties.** Three files landed
+> by Task 5 steps 1, 2 and 3a (`test_exl3_lease_block.py`,
+> `test_exl3_ram_miss_leases.py`, `test_exl3_ram_miss_lease_service.py`) had no
+> `__main__` entry, so **CI would have collected nothing from them** between
+> landing and `e28f2126da`. Be precise about what that does and does not mean:
+> those 33 tests **did** run, under explicit `pytest` invocations, and could fail
+> — so they are not members of the "cannot fail" class. What was worthless was
+> any statement that *CI* covered the lease work. The author found it from this
+> plan's note rather than by looking, and fixed it in the same landing.
+>
 > **THE WHOLE CI SUITE CANNOT COLLECT ON THIS BRANCH, AND A REGISTERED FILE WITH
 > NO `__main__` BLOCK RUNS ZERO TESTS AND EXITS 0** (`1e210f524a`). `test/run_suite.py`
 > globs every file under `test/registered` and calls `collect_tests(..., sanity_check=True)`,
@@ -909,13 +919,24 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > reach the state its name describes is not evidence. This applies to tests
 > *specified* in design documents, not only to tests already written.
 >
-> **Writing the tests first does NOT substitute for this, and that was tested.**
-> Task 5 step 3a was built test-first: 12 requirement-shaped tests from §18.2
-> written before any C++, passing on the first compile. Survivor rate **1 in 17**,
-> against **1 in 19** for step 2, which was written code-first. That is not enough
-> data to claim test-first helped, and more to the point **it did not prevent the
-> defect it was supposed to**: the survivor's test was drafted from the
-> requirement text and was still aimed at the wrong mechanism. (Mutant L4, "grant
+> **Writing the tests first does NOT substitute for this, and that was tested
+> three times.** Survivor rates: step 2 **1 in 19** (code-first), step 3a **1 in
+> 17** (test-first), step 3b **1 in 12** (test-first). The order does not prevent
+> the survivor, and the three points do not show it helping.
+>
+> **The pattern in *which* mutant survives is the useful result.** In both
+> test-first steps the survivor was a **retry-or-failure path the
+> requirement-shaped test never reached**. 3a's L4 ("grant ignores whether the
+> request succeeded") survived because the test injected `fail_reads`, which
+> released the slots, so the grant refused on its own — mutant or not. 3b's F11
+> ("every refused retry counts as a new deferral") survived because the test only
+> polled without a retirement, so the deferral was never retried and the counting
+> path never ran. **A test written from a requirement tends to exercise the
+> requirement's happy path and to set up failures by the shortest available
+> route, which is often a route that short-circuits the mechanism under test.**
+> Requirement-shaped is not claim-shaped, and neither is reliably path-shaped.
+> When writing tests for a retry or failure rule, state which *path* must be
+> taken to reach it, not only which outcome is expected. (Mutant L4, "grant
 > ignores whether the request succeeded", survived because the test injected
 > `fail_reads`, which released the slots, so the lane's expert was not resident
 > and the grant refused on its own — mutant or not. The test could never
