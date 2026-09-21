@@ -1,0 +1,54 @@
+{
+ "launch_cpu": 44,
+ "sibling_cpu": 8,
+ "reps": 40,
+ "ns": [
+  3,
+  6
+ ],
+ "visit_launches": 100,
+ "started": "2026-09-21T12:36:08-0500",
+ "dry_run": false,
+ "nodes": {
+  "0": {
+   "page_fraction_on_node": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "free_mib_before": 18116,
+   "free_mib_after": 16835,
+   "mem_mib_before": {
+    "MemFree": 18116,
+    "Active(file)": 1664,
+    "Inactive(file)": 15722,
+    "FilePages": 18734
+   },
+   "mem_mib_after": {
+    "MemFree": 16836,
+    "Active(file)": 1667,
+    "Inactive(file)": 15315,
+    "FilePages": 18330
+   }
+  }
+ },
+ "ce_backend": null,
+ "spin_cycles_per_us": 2950.5349198003687,
+ "device": "NVIDIA GeForce RTX 5090",
+ "torch": "2.13.0+cu130",
+ "link_gen_min": 3,
+ "pstates": [
+  1
+ ],
+ "other_gpu_procs_max": 0,
+ "sm_mhz": [
+  2955,
+  2970
+ ],
+ "lanes_end": [],
+ "finished": "2026-09-21T12:40:47-0500",
+ "rows": 320
+}
