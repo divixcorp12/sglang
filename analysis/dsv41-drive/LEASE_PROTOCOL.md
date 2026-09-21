@@ -2530,19 +2530,35 @@ named test is the *first* failure only; others may also kill a given mutant and 
 | M13 | wait kernel drops the request-generation comparison on `ready` | same as M7, `[stale_generation]` |
 | M14 | post kernel does not bump the epoch when the sequence wraps | `..._the_epoch_advances_when_the_sequence_wraps_and_names_the_generation` |
 
-**Every killing test is in `TestHandDriven`. The end-to-end class killed nothing.** Those end-to-end cases (graph
-capture and replay, the real C++ service thread with the real copy kernel) are evidence that the pieces compose, and
-they are not evidence that the tests would notice a broken handshake. All the mutation strength rests on the
-hand-driven cases, and a reader quoting these numbers should know that.
+**Of M1-M14 every killing test is in `TestHandDriven`; the end-to-end class killed none of them** (it kills one of
+the two later mutants below). Those end-to-end cases (graph capture and replay, the real C++ service thread with the
+real copy kernel) are mostly evidence that the pieces compose rather than evidence that the tests would notice a
+broken handshake. Mutation strength rests almost entirely on the hand-driven cases, and a reader quoting these
+numbers should know that.
+
+**M15 and M16, run afterwards to close the gap this ledger first reported as outstanding. Both KILLED.** Run in
+full, without `-x`, so every failing test is listed.
+
+| # | Mutant | Failing tests |
+|---|---|---|
+| M15 | ack kernel uses `n = (go_count == 0) ? 8 : go_count`: a refused request acks all lanes from the stale `lane_ctx` | `..._a_refused_request_emits_no_acknowledgement_even_with_a_stale_lane_context` at all three parameters `[identity]`, `[timeout]`, `[sticky]`, **and** `TestServiceEndToEnd::..._a_timeout_gives_the_copy_nothing_to_read_and_no_acknowledgement...` |
+| M16 | `n = (go_count == 0) ? 1 : go_count`: the **minimal** case, one spurious acknowledgement | the same four tests |
+
+M16 is the one that matters: a single spurious acknowledgement, the smallest possible violation, is caught. The
+stale-lane-context test kills both on its own, on every refusal path it covers. **This is also the one place an
+end-to-end test did some killing**: the timeout case asserts the acknowledgement area is all zero afterwards.
+
+On the host-chain consequence this ledger describes: no test checks `retire_leases`'s branch order directly, but the
+timeout test asserts `leases_acked == 0` and `leases_granted == leases_voided`, so it would have caught the masking
+outcome too; it simply fails on the acknowledgement-area assertion first.
 
 **Not established, listed so nobody mistakes this ledger for more than it is.**
-1. **7.4's central "by construction" property is the one thing no mutant probed.** M1 and M2 are killed by the
-   exact-lane-set test, not by `..._a_refused_request_emits_no_acknowledgement_even_with_a_stale_lane_context`, so
-   that test's power to kill an "ack ignores `go_count == 0`" mutant is **unproven**. It matters because the host
-   makes it consequential: in `retire_leases` the `acknowledged` branch is tested **before** `voided`, so on a
+1. ~~7.4's central "by construction" property is the one thing no mutant probed.~~ **RESOLVED by M15 and M16
+   above**, which were run after this ledger first recorded the gap. The property that a skipped copy emits no
+   acknowledgement is now backed by mutation evidence, in the minimal single-ack form. The reason it was worth
+   closing rather than arguing: in `retire_leases` the `acknowledged` branch is tested **before** `voided`, so on a
    refused request (whose `Terminal` marks the lanes skipped) a spurious ack would win the if-chain, retire the lane
    as `kLeasesAcked`, record that the GPU consumed a source it never read, and hide the refusal from the counters.
-   That mutant is outstanding.
 2. **Ordering is not covered and mostly cannot be.** No mutant touches the 11.4 re-read of `ready`, and none swaps
    the `Terminal` and fatal stores (F2). Memory-ordering defects are not deterministically observable in a single
    run; they need stress or a formal argument. **The ordering guarantee rests on section 6.4's argument, not on any
