@@ -2591,6 +2591,22 @@ The old number was right; only the label attached to it was wrong.
   concurrently with the buffered weight load, is pre-registered and **untested**.
 - **Spans are not compared across schema 1 and 2** (see the schema note above),
   so the old-versus-new comparison here is on tok/s and bytes only.
+- **An attempt to raise the old cell above n=1 failed, and the reason is
+  recorded.** A six-arm interleaved series was run on 2026-09-21 to measure the
+  same comparison at n=3 per cell. It returned **UNRESOLVED**: three arms ran,
+  two were valid, and the third was refused because a mirror drive was reading
+  1.90 MB/s at its idle probe against a 1.05 MB/s limit. Its single pair gives
+  1.047, which is **not a result** -- one pair, both arms contended, and the two
+  cells displaced from their references by different amounts. Full write-up and
+  the pre-registration in `analysis/dsv41-drive/task1-results/`
+  (`task1e-RESULT.txt`). The useful output was that **two of the verdict's gates
+  are calibrated for a quiet machine**: the contention gate, which disqualifies
+  every arm on a box where contention is the norm, and the cross-arm check,
+  which compares against a single historical reference arm. A third gate, the
+  drive-idle probe, correctly caught a transient. Also recorded: foreign
+  processes do not respect their nominal CPU affinities, so no core range avoids
+  them. **Resolving a ~3% effect here needs a quiet machine**, and that is now a
+  prerequisite rather than a detail.
 - **Nothing recorded whether the box was quiet during the arms above.** Load and
   foreign-process sampling was only added afterwards, and a later series caught
   three unrelated jobs starting mid-run on cores overlapping the arms', which
