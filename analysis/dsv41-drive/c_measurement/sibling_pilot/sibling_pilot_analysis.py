@@ -14,7 +14,7 @@ Rules (registered before any run):
             INCONCLUSIVE otherwise (an interval that straddles a band edge, or is wider than the band)
 Usage: sibling_pilot_analysis.py visits.jsonl | --selftest
 """
-import json, sys, statistics as S, random
+import json, os, sys, statistics as S, random
 BAND = 0.005; MIN_VALID = 8; FOREIGN_MAX = 10.0; SPIN_MIN = 90.0
 T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
         16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093}
@@ -68,6 +68,9 @@ def selftest():
 
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--selftest": sys.exit(selftest())
+    marker = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "INVALID")          # REFUSAL ONLY (added after run 2): a run marked INVALID is never analysed
+    if os.path.exists(marker):
+        print("VERDICT: INVALID"); print(open(marker).read().strip()); sys.exit(3)
     r = analyse([json.loads(l) for l in open(sys.argv[1])]); print("VERDICT:", r["verdict"])
     for n, d in r["per_n"].items(): print(" n=%s" % n, {k: (round(v, 5) if isinstance(v, float) else v) for k, v in d.items()})
     print(" excluded (n, rep):", r["excluded"])

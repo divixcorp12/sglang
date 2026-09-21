@@ -357,8 +357,8 @@ INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling
 | file | sha256 |
 |---|---|
 | `sibling_pilot/sibling_pilot.py` (the runner (GPU; needs the lock)) | `d313a6d1394beddb886bbf7f93b998e3218af172bd37745400e8bcb358553304` |
-| `sibling_pilot/sibling_pilot_analysis.py` (the frozen rule and verdict (CPU; `--selftest` passes all ten cases)) | `5d85f67c946e55445598421ff79765be0e40fb748a131e55988fd8d9b24b3bc5` |
-| `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `8709257809e254459a7079743b79525250d702a2934cc1c12142527edcf4f076` |
+| `sibling_pilot/sibling_pilot_analysis.py` (the frozen rule and verdict (CPU; `--selftest` passes all ten cases)) | `7e95adefa819450992dda69c2228d3603d1e64b93f84962126c75017bfc33ef1` |
+| `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `4a75527a58fb4ccffc4c3921c113ba9ec9d2f758c67481ee12b4c062580c3cb9` |
 | `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
 | `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` |
 
@@ -438,3 +438,11 @@ Everything else about the run was as registered: link Gen3 throughout, P1, SM cl
 **Before the next attempt (the lead's commitments):** no more time-based or open-ended releases; one explicit HOLD to every lane before any GPU run and one explicit CLEAR after it, with the state confirmed by process table in between; the CPU-time-based lane guard first; and the pilot runs **before** anything else is released. **From this side (proposed, not made):** the analysis script refuses to run beside an `INVALID` marker (section 18.7).
 **Why the sweep deserved the box:** of 307 files only 90 ran tests in the sweep's first pass; 217 died identically at collection under all three orders (202 because the venv's `pyarrow` is too new for `datasets`), so `sweep_py3.py` is a genuine coverage repair, larger than the registration gap it was looking for.
 **State at stand-down:** `c` NOT MEASURED; the sibling pilot INVALID twice (runs 1 and 2) and deferred; the runner (`--reps 40` by argument), analysis, guards and tests staged on divix01 and committed; nothing pushed.
+
+### 18.9 A change to the pilot's frozen analysis file, and it can only refuse (approved by the lead, 2026-09-21)
+
+**Attribution, closed.** `sweep_py3.py` (run 2's contaminant) was launched by t1-instrument **on the lead's authorisation**: when its sweep finished at 05:50:12 the lead told it the box was its own with no time limit, and `sweep_py3.py` is its re-run of the 217 files its first pass could not collect, behind a `pyarrow` shim (about an hour, a genuine repair). It collided with a pilot the lead had un-deferred without withdrawing that authorisation. There is no unattributed launch in this record.
+
+**The change.** `sibling_pilot/sibling_pilot_analysis.py` (the pilot's analysis, **not** `c_analysis.py`, which is untouched at `4657702c…c21c`) now **refuses to run beside an `INVALID` marker**: it prints `VERDICT: INVALID` and the marker's text and exits with code 3, computing nothing. The reason is run 2: a collection command that computed before it checked, so a verdict line was seen for a voided run; the answer to "I saw something I should not have" is a mechanism that makes seeing it impossible.
+**The rule is unchanged: only the file.** The diff against the previous file is exactly two things (`diff` recorded in the commit): the import line gains `os`, and three lines are added in `main()` that look for the marker. No threshold, statistic, interval, validity condition or verdict logic is touched. **The change makes the analysis strictly stricter, never more permissive**, and it is made before any valid pilot data exists; a change to a frozen file that can only refuse more is a different kind of change from one that could admit more.
+Tests (in `test_sibling_pilot.py`): it refuses beside a marker and prints nothing but the refusal (no verdict word, no shift, no valid-rep counts); it computes exactly as before when no marker is present; and the constants and verdict logic are byte-checked. **Old hash (superseded): `5d85f67c946e5544…`** (the hash in section 18 at commit `91369c7f11`); new hashes in the table above.

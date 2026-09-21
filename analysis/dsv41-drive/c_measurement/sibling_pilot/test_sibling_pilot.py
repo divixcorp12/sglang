@@ -17,6 +17,28 @@ def test_visit_validity_rules():
     a = {**ok, "arm": "A", "sib_spinner_pct": 0.0, "spinner_ticks": 0}
     assert an.visit_ok(a) and not an.visit_ok({**a, "spinner_ticks": 3}) and not an.visit_ok({**a, "sib_foreign_pct": 15.0})   # foreign on the sibling in A makes A look like B
 
+def _visits_file(d):
+    rows = [{"rep": r, "n": n, "arm": arm, "T_ms": [1.0] * 100, "sib_spinner_pct": 99.0 if arm == "B" else 0.0, "spinner_ticks": 50 if arm == "B" else 0,
+             "sib_foreign_pct": 1.0, "launch_foreign_pct": 1.0, "window_s": 0.5} for n in (3, 6) for r in range(10) for arm in "ABBA"]
+    f = Path(d, "visits.jsonl"); f.write_text("".join(json.dumps(x) + "\n" for x in rows)); return f
+
+def test_analysis_refuses_beside_an_invalid_marker_and_computes_without_one():
+    with tempfile.TemporaryDirectory() as d:
+        f = _visits_file(d)
+        ok = subprocess.run([sys.executable, str(HERE / "sibling_pilot_analysis.py"), str(f)], capture_output=True, text=True)
+        assert ok.returncode == 0 and "VERDICT: INSENSITIVE" in ok.stdout                                  # no marker: computes as before
+        Path(d, "INVALID").write_text("a lane of ours at the END: [(1, 'x')]\n")
+        bad = subprocess.run([sys.executable, str(HERE / "sibling_pilot_analysis.py"), str(f)], capture_output=True, text=True)
+        assert bad.returncode == 3 and bad.stdout.strip().splitlines()[0] == "VERDICT: INVALID" and "lane of ours" in bad.stdout
+        assert "INSENSITIVE" not in bad.stdout and "SENSITIVE" not in bad.stdout and "shift" not in bad.stdout and "valid_reps" not in bad.stdout     # nothing else is printed
+
+def test_analysis_diff_only_adds_a_refusal():
+    """The rule is untouched: the constants and the verdict logic are byte-identical to the pre-refusal file (its hash is in the prereg, section 9 note)."""
+    src = (HERE / "sibling_pilot_analysis.py").read_text()
+    for frag in ("BAND = 0.005; MIN_VALID = 8; FOREIGN_MAX = 10.0; SPIN_MIN = 90.0", "if all(lo >= -BAND and hi <= BAND for lo, hi in cis): out[\"verdict\"] = \"INSENSITIVE\"",
+                 "elif any(lo > BAND or hi < -BAND for lo, hi in cis): out[\"verdict\"] = \"SENSITIVE\"", "T975[len(shifts) - 1] * S.stdev(shifts) / len(shifts) ** 0.5"):
+        assert frag in src
+
 def test_dry_run_plumbing():
     cpus = sorted(os.sched_getaffinity(0)); L = cpus[0]
     with tempfile.TemporaryDirectory() as d:
