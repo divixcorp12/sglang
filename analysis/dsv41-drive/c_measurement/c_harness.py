@@ -296,6 +296,23 @@ def _syscalls():
     if _libc is None: _libc = ctypes.CDLL(None, use_errno=True)
     return _libc
 
+M_MMAP_THRESHOLD = -3               # mallopt parameter number
+MMAP_THRESHOLD_BIND = 4096          # amendment 8: every slab becomes a fresh mmap
+MMAP_THRESHOLD_DEFAULT = 128 * 1024 # glibc's default, restored before any timing runs
+
+def set_mmap_threshold(nbytes):
+    """Amendment 8. glibc serves requests below M_MMAP_THRESHOLD from the heap arena, whose
+    pages are frequently already faulted; MPOL_BIND governs only NEW faults and never moves a
+    resident page. The four small segments (691 KB - 3 MB) are therefore unbindable by default
+    and landed off-node, while the two mmap'd trellis slabs always landed 1.00. Measured on
+    divix01 2026-09-21: stock min(frac) 0.28 in the run and 0.9375 under a reproduction, vs
+    1.0000 on all six segments and both nodes with the threshold at 4096.
+
+    The threshold is process-wide and is restored before any timing happens: left at 4096 it
+    would turn every allocation above 4 KiB in the measured region into an mmap/munmap pair."""
+    if _syscalls().mallopt(M_MMAP_THRESHOLD, nbytes) != 1:
+        raise SystemExit("mallopt(M_MMAP_THRESHOLD, %d) failed: refusing (L4)" % nbytes)
+
 def set_mempolicy(node):
     """MPOL_BIND to `node`, or MPOL_DEFAULT when node is None (x86_64 syscall 238)."""
     mask = ctypes.c_ulong(0 if node is None else 1 << node)
@@ -361,10 +378,12 @@ class RealDevice:
         for node in self.nodes:
             free_before = node_free_mib(node); mem_before = node_mem_mib(node)
             set_mempolicy(node)
+            set_mmap_threshold(MMAP_THRESHOLD_BIND)                             # amendment 8
             try:
                 slabs = [allocate_host_slab(ROWS_PER_NODE, (b,), torch.uint8, register=False) for _, b in SEGMENTS]
                 for s in slabs: s.fill_(1)                                      # first touch under MPOL_BIND(node)
             finally:
+                set_mmap_threshold(MMAP_THRESHOLD_DEFAULT)
                 set_mempolicy(None)
             fracs = [pages_on_node(s.data_ptr(), s.numel(), node) for s in slabs]
             if min(fracs) < 0.99: raise SystemExit("node %d slabs are only %.2f on the node: refusing (L4)" % (node, min(fracs)))
