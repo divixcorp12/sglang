@@ -282,19 +282,20 @@ def cross_arm_outliers(report: dict, arm_path: str, references: list):
         return None
     rows = report.get("per_session") or []
     notes = []
+    single = " [single reference arm: a flag near the 8% threshold is not distinguishable from that one arm's own noise]" if len(refs) == 1 else ""
     for i, row in enumerate(rows):
         ref_tps = [r[i]["decode_tok_s"] for r in refs if i < len(r) and r[i].get("decode_tok_s")]
         if ref_tps and row.get("decode_tok_s") is not None:
             ref = _median(ref_tps)
             if row["decode_tok_s"] < (1 - CROSS_ARM_SLOWER) * ref:
                 notes.append(f"CROSS-ARM session_{i}: decode {row['decode_tok_s']:.3f} tok/s is {100 * (1 - row['decode_tok_s'] / ref):.0f}% below "
-                             f"the {len(ref_tps)}-arm clean median {ref:.3f}")
+                             f"the {len(ref_tps)}-arm clean median {ref:.3f}{single}")
         ref_ttft = [r[i]["ttft_s"] for r in refs if i < len(r) and r[i].get("ttft_s")]
         if i >= 1 and ref_ttft and row.get("ttft_s") is not None:
             ref = _median(ref_ttft)
             if row["ttft_s"] > (1 + CROSS_ARM_SLOWER) * ref:
                 notes.append(f"CROSS-ARM session_{i}: ttft {row['ttft_s']:.1f} s is {100 * (row['ttft_s'] / ref - 1):.0f}% above "
-                             f"the {len(ref_ttft)}-arm clean median {ref:.1f} s")
+                             f"the {len(ref_ttft)}-arm clean median {ref:.1f} s{single}")
     return notes
 
 
@@ -360,7 +361,12 @@ def main() -> int:
         cross = cross_arm_outliers(report, args.arm_json, refs)
         notes += cross if cross is not None else [f"CROSS-ARM not judged: no other clean arm in cell {args.code}:{args.mirror}"]
     contended, why = contention(report)
-    notes.insert(2, f"CONTENDED {contended} {json.dumps(why)}")
+    meaning = {
+        "not contended": "means only that no foreign process using >= 50% CPU was sampled on cores 32-63 at a boundary; it does NOT mean the arm was undisturbed",
+        "unknown": "means the samples do not say (no samples, or no core recorded); it is not evidence either way",
+        "contended": "means a foreign process using >= 50% CPU last ran on an arm core at a sampled boundary",
+    }[contended]
+    notes.insert(2, f"CONTENDED {contended} {json.dumps(why)} -- {meaning}")
     notes += boundary_notes(report)
     if args.summary_json:
         timed = None if phases is None else {d: phases["last"][d] - phases["ready"][d] for d in phases["ready"]

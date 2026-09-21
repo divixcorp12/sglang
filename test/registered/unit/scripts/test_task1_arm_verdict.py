@@ -323,3 +323,24 @@ def test_cross_arm_is_leave_one_out_and_not_judged_without_another_reference(tmp
     assert verdict.cross_arm_outliers(report, only, [only]) is None      # the arm is never its own reference
     other = _arm_file(tmp_path, "other", [3.0, 4.0], [50, 30])
     assert verdict.cross_arm_outliers(report, only, [only, other]) == []
+
+
+def test_the_contended_line_states_what_not_contended_does_not_mean(monkeypatch, capsys, tmp_path):
+    """Bug: task1d-0 was visibly disturbed (session 0 -31%) and reads 'not contended'; a later reader of the
+    verdict alone must be told that label is not a clean bill of health."""
+    flat = {SRC: 16 * GiB}
+    report = _phased(flat, flat, [flat])
+    report["boundary_samples"] = [_sample("session_0", {}, 1)]
+    _, out, summary = _run_main(monkeypatch, capsys, tmp_path, report)
+    line = [l for l in out.splitlines() if "CONTENDED" in l][0]
+    assert "not contended" in line and "does NOT mean the arm was undisturbed" in line
+    assert summary["contended"] == "not contended"
+
+
+def test_a_flag_against_a_single_reference_arm_says_so(tmp_path):
+    one = _arm_file(tmp_path, "one", [3.0, 4.0], [50, 30])
+    slow = {"per_session": [{"decode_tok_s": 3.0, "ttft_s": 50}, {"decode_tok_s": 4.0, "ttft_s": 34}]}
+    single = verdict.cross_arm_outliers(slow, str(tmp_path / "me.json"), [one])
+    assert single and "single reference arm" in single[0]
+    two = [one, _arm_file(tmp_path, "two", [3.0, 4.0], [50, 30])]
+    assert "single reference arm" not in verdict.cross_arm_outliers(slow, str(tmp_path / "me.json"), two)[0]
