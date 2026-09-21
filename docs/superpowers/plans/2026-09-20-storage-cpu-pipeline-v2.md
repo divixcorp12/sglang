@@ -1156,6 +1156,23 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > that every `module.attr` used on an imported stdlib module actually exists
 > (catches `os.sched_getcpu`, and generalises to every future bug of that kind).
 >
+> **THE SAME RECURSION, TWICE MORE, AND IT IS WORTH EXPECTING.** (i) A mutation
+> driver decided "killed" by the **absence** of a `FAILED` line -- the very
+> absence its own subject matter is about. (ii) A review found that the barrier
+> synced the wrong device because a helper thread does not inherit it; the
+> **fix** for that then shipped with **its own untested production branch** --
+> `device_side.state.device`, the path production takes first, exercised by no
+> test because they all run with `device_side is None`. A wrong attribute there
+> would silently turn every orderly shutdown into a quarantine.
+>
+> **A fix for an untested-production-path defect is unusually likely to have an
+> untested production path**, because the author's attention is on the branch
+> that was wrong, not on the branch that replaces it. Add it to the list with
+> `run_suite`, which could not collect the suite that would have caught it, and
+> `collect_tests`, whose own sanity check is what makes CI raise. **When a
+> defect is about a check failing to check itself, check the fix the same
+> way.**
+>
 > **(f) A CONTROL ARM THAT THE ACT OF MEASURING DESTROYS.** The sibling pilot's
 > A arm requires one CPU's SMT sibling to stay idle. Measured: with a spinner on
 > the sibling, foreign busy stayed **under 2.1%**; with it left idle, foreign
