@@ -940,6 +940,34 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > through `run_suite` at all**, and the offenders concentrate in `layers/moe` (27)
 > and `kernels` (15) -- this plan's own area.
 >
+> **RE-MEASURED AT `d604e18b2d` (2026-09-21), and the figures above are stale.**
+> Run with the project's own parser (`ut_parse_one_file`, the function
+> `collect_tests` itself calls) rather than a reimplementation, so the lint
+> cannot disagree with the rule it is checking. Over **2,126** files:
+>
+> | class | count | concentrated in |
+> |---|---|---|
+> | no CI registry | **30** | `layers/moe` 20, `kernels` 3, `layers/quantization` 3 |
+> | registered, no `__main__` | **19** | `layers/moe` 7, `kernels` 4, `models` 4 |
+> | **malformed registration** | **1** | `unit/eplb` |
+>
+> `run_suite` still raises first at `test/registered/unit/test_file_row_reader.py`,
+> so the headline finding is unchanged: **no registered test runs through
+> `run_suite` at all.**
+>
+> Two corrections to the earlier record. **The `__main__` count has fallen 27 ->
+> 19**, consistent with the lease files' fixes landing in `e28f2126da` (none of
+> the three appears in the current list). And **there is a third failure class
+> the earlier count did not have**: `unit/eplb/test_expert_distribution_observer.py`
+> raises `register_cpu_ci() must specify exactly one of (stage, runner_config)
+> pair or suite` -- a registration that is present but malformed, which fails
+> during parsing rather than through either sanity check. A file can therefore
+> break collection in three ways, not two.
+>
+> Full lists: `/tmp/lint_no_registry.txt`, `/tmp/lint_no_main.txt` at the time of
+> writing; regenerate with the parser rather than by grepping, since a grep for
+> `register_*_ci(` cannot see a malformed call or a disabled registry.
+>
 > The second half is the more dangerous one and was **demonstrated**, not
 > inferred: a registered file with its `__main__` block removed, run the way CI
 > runs it, **exits 0 having executed no test**. That is an entire file that cannot
