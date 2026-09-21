@@ -960,10 +960,43 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > `cancelled &&` removed -- **survives all 297 host-facing tests** on
 > `a01f9347d6`. That gate is the code V2's early publication would change. So a
 > Task 6 implementer can alter publication behaviour and see a green suite.
-> Whether this still holds after Task 5 step 2 touched `serve` is being measured
-> separately on `457e44e036`; **if the two bases differ, Task 5's landing changed
-> the test coverage of code Task 6 intends to modify**, which nothing in this
-> plan anticipated.
+> **MEASURED ACROSS THREE BASES (`52b8a3448c`): H01 SURVIVES ON ALL THREE**
+> -- `a01f9347d6` (pre-lease), `457e44e036` (step 2), `2fc2155e42` (through
+> step 3c). So **Task 5's landing did not change the gate's coverage in either
+> direction**, and the contingency this plan flagged does not fire.
+>
+> **The sharper result is what the gate IS pinned against.** H19 and H20 -- the
+> gate's other two ways of being wrong -- are **killed identically on all three
+> bases** (11 and 6 tests). So the publish gate is protected against
+> **publishing everything on a failure** and against **publishing rows that
+> never packed**, and is *not* protected against **publishing rows that DID
+> pack when the demand failed after** -- which is exactly the edit Task 6 V2
+> makes. The hole is not general; it is precisely V2-shaped.
+>
+> **The common cause, stated as a claim about the corpus:** no test in the
+> host-facing set constructs a failure that arrives *after* some rows have
+> packed. It holds across three host code states and does not depend on lease
+> mode. A worker-mode reproduction of the same blind spot exists from the
+> pack-worker lane, recorded there as a **source-read observation, not a mutant
+> run**.
+>
+> **All six pre-registered predictions held**, including the one that could have
+> surprised: H01 was *not* killed on base 3, so disabled lease code is inert to
+> these tests. `test_a_failed_read_publishes_none...` appears among H19's kills
+> on bases 2 and 3 with its `FAILED` line in both logs -- so "aimed elsewhere,
+> not inert" is now shown by a run rather than argued from reading.
+>
+> **Invocation witness:** every run's collected total equalled its baseline --
+> 301 across all 20 base-3 host runs, 298 on base 2 and on base-1 H19/H20, and
+> 37/8/98 for the verifier, layout and uring groups. **No kill or survivor came
+> from a selector that matched fewer tests than intended.**
+>
+> **Two deviations, recorded by their author:** the base-1 H19/H20 step crashed
+> on a directory-name mismatch and was re-run by hand outside the lock-file
+> chain (totals and md5s check out, but it did not run inside the chain); and
+> this run used `CUDA_VISIBLE_DEVICES=9` where base 1's original 22 used the
+> empty form, with pristine base-1 baselines reproducing the original totals
+> (297+1, 37, 8, 98) to establish comparability.
 >
 > **This plan's own lease suites were among the casualties.** Three files landed
 > by Task 5 steps 1, 2 and 3a (`test_exl3_lease_block.py`,
