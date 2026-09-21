@@ -1090,13 +1090,24 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > hang), and finally a real kill -- **and only the third came from the code
 > actually being exercised.**
 >
-> **It also found a genuine defect.** The hang was not an artefact of the mutant:
-> `admit_batch` could fill a bank slot whose row was not `Free`. The fix refuses
-> that admission (`b009cc8574`); it never fires in correct code. After it, the
-> mutant fails all 15 worker parametrisations of the original test with
-> `assert (0 == 1)`. **A mutation campaign that had scored this mutant "caught"
-> would have shipped the missing invariant**, which is the concrete cost of the
-> whole class.
+> **CORRECTION, made by the author against an earlier revision of this entry.**
+> That revision called `b009cc8574` a bug fix and said a campaign scoring the
+> mutant "caught" would have shipped a missing invariant. **Both overstate it.**
+> The five lines in `admit_batch` are a **detectability guard**, not a repair:
+> they refuse to admit a batch into a slot whose row is not `Free`, and **no
+> correct-code run has ever reached them** -- a slot is `Free` from `finish_row`
+> until admission. They exist so that a mutant which would otherwise deadlock
+> the reader instead produces a failed read. Nothing latent was shipped or
+> nearly shipped.
+>
+> **And the kill's provenance matters more than the kill.** With the guard, the
+> original test fails in all 15 worker parametrisations -- **but it fails on the
+> guard's refusal, not on its own assertions.** Its byte and ordering asserts
+> are not what fires first. So the original test still does not demonstrate the
+> ordering rule; the dedicated `test_no_extent_reuses_a_bank...` is the test
+> whose assertion states it. A kill obtained from a guard added for
+> detectability is a weaker thing than a kill obtained from the assertion the
+> requirement names, and the two must not be recorded as the same.
 >
 > **A malformed mutant is the case nobody designs for**, and it produces exactly
 > the absence the old check read as evidence. Note also what it says about
