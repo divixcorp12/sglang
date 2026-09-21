@@ -285,10 +285,14 @@ Include expert identity in the immutable row result and validate it against the 
 >    88% share with no service change, safe only under today's invariants. It is
 >    excluded, and item 4 says why.
 > 7. **The hit-phase saving is capped by link idle inside read waits**
->    (`PER_ROW_TRANSFER_REVIEW.md` G1). `c` is the Gen3 link's time per row, so
+>    (`PER_ROW_TRANSFER_REVIEW.md` G1). `c` is the Gen3 link's time per row
+>    (13.3 MB in 1.055 ms is about 12.6 GB/s against a measured 12.02), so
 >    copying early *moves* link time into the read wait rather than creating
->    capacity, and promotion copies on the same link subtract from it. V1's
->    ceiling is a ceiling by construction.
+>    capacity. V1's ceiling is a ceiling by construction. **Consequence for the
+>    arms:** promotion copies, the prefetch puller and the eager gather all share
+>    that link, and any of them running inside a read wait subtracts directly from
+>    the hiding. **Task 6 arms must run with promotions off**, and must say so, or
+>    they measure the link contention rather than the mechanism.
 >
 > **CURRENT FIGURES.** Per **511** decode steps, shares of **254.4 ms**. These
 > supersede every figure in the audit trail below, which records how they moved
@@ -303,19 +307,36 @@ Include expert identity in the immutable row result and validate it against the 
 > stamps joined from `task1-2-new-on-T`. A better `k` does not make them
 > measurements. **No saving in this task has been measured end to end.**
 >
-> | source of `k` | BEST | RANDOM | two-phase | hit lanes, read layers |
+> | quantity | ms/step | share of 254.4 | moves with `k`? |
+> |---|---:|---:|:--|
+> | V2 / BEST (per-row, order array, best order) | **40.67** | 16.0% | yes |
+> | V1 / two-phase (hits, then the rest) | **35.74** | 14.0% | yes |
+> | plan-original fixed-order per-row / RANDOM | **20.07** | 7.9% | yes |
+> | per-row over two-phase, **best** order | **+4.93** | +1.9% | **no** -- it is Sigma(m-1)c |
+> | per-row over two-phase, **random** order | **-15.67** | -6.2% | yes |
+> | hit lanes per step in layers that read | **33.9** | -- | this **is** the measurement |
+>
+> **The fourth row is the one to read carefully.** Three rows of savings move
+> when `k` moves, and the best-order increment does not: it is Sigma(m-1)c and is
+> independent of the lane count. A reader who sees the other figures rise by
+> 13-16% between the `k` estimates below and reasonably assumes +4.93 rose with
+> them will draw the wrong conclusion about what the measurement bought.
+> (Suggested by `t6-perrow`, whose `PER_ROW_TRANSFER.md` §1.2 carries the same
+> column; before this the point was made only in a parenthesis.)
+>
+> (RANDOM - 1 ms)/T = **7.5%** against the 3% bar. two-phase/BEST = **87.9%**, so
+> the split quoted elsewhere as 87/13 is 88/12. A1's estimate undercounted hit
+> lanes in read layers by about **14%**: per read request its `k` was exact for
+> only 36%, low for 42% and high for 22%.
+>
+> **How `k` moved the savings** (audit trail for the table above; these rows are
+> superseded top-down and must not be quoted):
+>
+> | source of `k` | BEST | RANDOM | two-phase | hit lanes |
 > |---|---:|---:|---:|---:|
-> | **measured `k`** (`dad59f1b48`) | **40.67** (16.0%) | **20.07** (7.9%) | **35.74** (14.0%) | **33.9** (measured) |
+> | **measured `k`** (`dad59f1b48`) | **40.67** | **20.07** | **35.74** | **33.9** |
 > | estimated `k` (A1), R6-corrected | 35.80 | 17.79 | 30.88 | 29.3 |
 > | estimated `k` (A1), as registered | 38.61 | 19.17 | 33.53 | 31.9 |
->
-> Per-row over two-phase: **+4.93 ms** at best order (this increment is
-> Sigma(m-1)c and does not depend on the lane count), **-15.67 ms** at random
-> order, i.e. **+1.9%** and **-6.2%**. (RANDOM - 1 ms)/T = **7.5%** against the
-> 3% bar. two-phase/BEST =
-> **87.9%**, so the split quoted elsewhere as 87/13 is 88/12. A1's estimate
-> undercounted hit lanes in read layers by about **14%**: per read request its
-> `k` was exact for only 36%, low for 42% and high for 22%.
 >
 > **Denominator: 254.4 ms, decided here so the plan and the design agree.** It
 > is the mean of the `new:on` arms `clean-reference.json` accepts. The 257.5 ms
