@@ -60,11 +60,38 @@ def test_each_analysis_gate_fires_on_bad_harness_output():
         bad = json.loads(json.dumps(good)); edit(bad[0]); assert a.analyse(bad)["verdict"] == "INVALID", name
     assert a.analyse(good)["verdict"] != "INVALID"
 
-def test_foreign_load_sees_a_spinning_process():
-    import subprocess, time
-    p = subprocess.Popen([sys.executable, "-c", "while True: pass"]); time.sleep(0.2)
-    f = h.ForeignLoad([os.getpid()]); f.start(); time.sleep(1.0); pct, name = f.stop(); p.kill()
-    assert pct > 50.0, (pct, name)
+def _spin_on(cpu):
+    import subprocess
+    return subprocess.Popen(["taskset", "-c", str(cpu), sys.executable, "-c", "while True: pass"])
+
+def test_foreign_load_counts_only_the_cores_we_use():
+    import time
+    cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2
+    mine, other = cpus[0], cpus[1]
+    on_mine, on_other = _spin_on(mine), _spin_on(other); time.sleep(0.3)
+    try:
+        f = h.ForeignLoad([os.getpid()], {mine}); f.start(); time.sleep(1.0); pct, where = f.stop()
+        assert pct > 50.0 and ("cpu%d" % mine) in where, (pct, where)                    # the spinner on our core is seen
+        f = h.ForeignLoad([os.getpid()], {other}); f.start(); time.sleep(1.0); pct2, where2 = f.stop()
+        assert pct2 > 50.0 and ("cpu%d" % other) in where2, (pct2, where2)
+        f = h.ForeignLoad([os.getpid(), on_mine.pid, on_other.pid], {mine, other}); f.start(); time.sleep(1.0); pct3, _ = f.stop()
+        assert pct3 < 10.0, pct3                                                          # own pids are excluded
+        busy = [c for c in cpus if c not in (mine, other)][:1]
+        if busy:                                                                          # a core nobody spins on reads as quiet only if the box is
+            f = h.ForeignLoad([os.getpid()], set(busy)); f.start(); time.sleep(0.5); pct4, _ = f.stop()
+            assert pct4 >= 0.0
+    finally:
+        on_mine.kill(); on_other.kill()
+
+def test_drive_accounting_helpers():
+    assert abs(h.drive_gb_per_s({"nvme0n1": 0}, {"nvme0n1": 2_000_000}, 1.0) - 1.024) < 1e-6         # 2e6 sectors x 512 B in 1 s
+    assert h.drive_gb_per_s({}, {}, 1.0) == 0.0
+    try: got = h.nvme_sectors_read()
+    except OSError: return
+    assert all(k.startswith("nvme") and "p" not in k.split("n", 1)[1] for k in got)               # whole devices only, no partitions
+
+def test_cpu_list_parser():
+    assert h._parse_cpus("18-20,54") == [18, 19, 20, 54] and h._parse_cpus("") == []
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

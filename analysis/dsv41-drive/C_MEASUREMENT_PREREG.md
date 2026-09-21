@@ -143,10 +143,11 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 | file | sha256 |
 |---|---|
 | `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c` |
-| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `171302f871ee45d2c14d9743d6f9c92ec02edc64c3bcee11a9d6fb553b6f7992` |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `6b7313b05132798cdae4ca77401280eaa010b8961a3f6c8fd8249264c3519b8b` (**supersedes `171302f8…` after the amendment in section 12**) |
 | `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
+| `c_measurement/quiet_check.py` (the pre-flight: is the box quiet, on which cores; reads /proc only) | `0190708bf9ab4bf37a573f80a8a088b193e7d82d252d6af72143dffd310df6f4` |
 | `c_measurement/prebuild_jit.py` (compiles the gather kernel's JIT module with no GPU) | `015215022edf78dd69f98002e1c1d7bbc982fa2662cd5cca09ab7091d4fbb782` |
-| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `3fe0403056a2947299bbf2a5ad9943d018a7d7ff03ca91fba5e55d2f876a1750` |
+| `c_measurement/test_c_harness.py` (7 CPU tests, including the harness-to-analysis hand-off) | `94082c546ec5a9e777f0466bde2d1e6ac0fdf5a00e9b727abfca4bbf213c84ad` (9 CPU tests; supersedes `3fe04030…`) |
 
 Self-test, 2026-09-21 on divix01, CPU: `c = 1.00` gives STANDS (`g*_H` 6.22), `c = 1.055` gives INTERMEDIATE (`g*_X` 7.01, `g*_H` 8.06, gross 4.92: the earlier model's 6.98 / 8.03 / 4.93 within `f`), `c = 1.15` INTERMEDIATE, `c = 1.40` WITHDRAWN, and an
 impossible bandwidth, an idle link, row reuse, foreign load and a wrong row size are INVALID. **That tests the logic and the arithmetic reproduction, not the GPU.**
@@ -185,3 +186,27 @@ python3 <dir>/c_measurement/c_analysis.py <outdir>/results.jsonl        # the fr
 ## 11. Retirement of the earlier design
 
 `TOPOLOGY.md` 9.B is **retired**, superseded by this document; 9.C's GPU side is carried by the `nvme` arm (its remote-bounce placement matrix stays open and unscheduled); **9.A (storage alone, no GPU) stays as an independent item.** The status lines in `TOPOLOGY.md` say so.
+
+## 12. Amendment before any data: what "quiet" means, the idle baseline for `rho`, and how contention is handled (2026-09-21)
+
+Prompted by the lead's note that the box carried a load average of 27.8 (36 when I looked: every core from 0 to 63 was between 20% and 100% busy) while the GPU itself was free. **Nothing has been run; this
+changes the registered design only by making three things explicit, all before a launch, and the harness hash in section 9 is the one that includes them.**
+
+**1. Decision: the registered run is the QUIET run, and it waits for a quiet box. I do not register a loaded run.** The measurement is not GPU-bound in the sense that would let host contention be ignored: the source rows are read *from host
+memory over PCIe* (memory controllers, the IIO and the pinned-page path are shared with every other lane), the `hot` arm is CPU packing, the `nvme` arm is drive-to-host DMA, and the effect being sought is at the 2-8% level that a busy box moves. A loaded pass would have an
+unrepeatable, unrecorded mixture of foreign load, so its difference from the quiet pass could not be interpreted; it would be a caveat, not a second data point. (The `nvme` arm is the *designed* contention, and it is controlled.) If the lead nonetheless wants a
+loaded pass as an extra, it is reported beside the quiet run, labelled contended, never merged and never used by the rule.
+
+**2. How quiet.** The frozen gate (4.1) is "no foreign process above 10% of a core"; `foreign_max_core_pct` is now **defined** as the largest per-core sum of foreign thread CPU over the cores the run uses (the harness's and the reader's), not the box-wide maximum, so a
+permanent daemon on a core we do not use (nimbus, reth) does not trip it and the same daemon migrating onto one of our cores does. To have margin the pre-flight asks for half of it: **`quiet_check.py` must print GO: the eight harness cores (node 0, within 32-63) and the eight
+reader cores (node 1, outside 32-63, never 64-71) it picks are each under 5% busy over 10 s, and the NVMe devices read under 0.02 GB/s.** It is run at the start of the window and again after, and both outputs are kept. Beyond the gate I ask the lanes to **suspend CPU-heavy and
+memory-heavy jobs box-wide for the ~15 minutes** (the gate cannot see memory-bandwidth contention on cores we do not use); the harness then launches on the quiet cores through `taskset -c <picked>`, inside `gpu-run.sh`'s 32-63 mask, and the reader on its picked cores.
+Today's `quiet_check.py` result on divix01 was NO-GO (load 34.8; the quietest eight harness cores were 20-27% busy, the reader's 10-56%).
+
+**3. The idle baseline for `rho = T_load / T_idle`.** If other lanes read the drives during the idle cells, `T_idle` is not idle and `rho` is understated, which flatters the hiding claim. Two harness-level rules, additional to the frozen gates and treated the same way (INVALID, no number):
+(a) **every idle-arm cell records the NVMe read rate** (`/proc/diskstats`, all whole `nvme*n*` devices, over the cell's own window) **and the run is INVALID if any idle cell read faster than 0.02 GB/s** (`results.INVALID`, exit 3);
+(b) **in every load cell the drives' bytes must equal the reader's own bytes to within 10%**, or another lane used the drives during the load window and the `nvme` arm is INVALID. The reader is direct (O_DIRECT through `uring_direct`), so the page cache of other lanes does not enter it.
+This establishes the idle baseline by measurement in the same window, not by assumption; a baseline taken on a box where three lanes are doing I/O fails (a).
+
+**4. What contention would still get through.** Memory-bandwidth pressure from cores outside our set, and the drives' queues seen by a lane that reads a different device set: (a) sees all whole NVMe devices, so the second is covered; the first is not gated, which is why the request to suspend box-wide jobs is for the window and not only for our cores. The per-cell
+`p99 / p50` gate and the recorded foreign-thread name (`foreign_where`) are how a contaminated cell would show.
