@@ -250,6 +250,19 @@ def test_resident_bytes_counts_cached_shards_per_directory(tmp_path):
     assert out[str(b)] == 0 and out[str(tmp_path / "missing")] == 0
 
 
+def test_meminfo_parse_takes_only_the_fields_the_gate_uses(tmp_path):
+    f = tmp_path / "meminfo"
+    f.write_text("MemTotal: 1 kB\nMemFree: 2 kB\nMemAvailable: 3 kB\nCached: 4 kB\nSwapCached: 5 kB\n")
+    assert prov._meminfo_kb(str(f)) == {"MemFree": 2, "MemAvailable": 3, "Cached": 4}
+
+
+def test_system_sample_has_every_field_and_is_json_serialisable():
+    out = prov.system_sample(cpu_interval=0.01)
+    assert {"utc", "monotonic", "diskstats_sectors", "meminfo_kb", "loadavg", "top_other_cpu"} <= set(out)
+    json.dumps(out)
+    assert out["meminfo_kb"] is None or set(out["meminfo_kb"]) == set(prov.MEMINFO_FIELDS)
+
+
 def test_arm_harnesses_embed_provenance_in_the_result_json():
     for parts in (("analysis", "dsv41-drive", "eager_arm_driver.py"), ("scripts", "dsv41", "trace_corpus.py")):
         with open(os.path.join(_ROOT, *parts)) as f:
@@ -258,6 +271,8 @@ def test_arm_harnesses_embed_provenance_in_the_result_json():
         assert "provenance.capture(" in source and "drive_idle_check()" in source, parts
         assert "provenance.timed_chunks(" in source and "provenance.step_latency(" in source, parts
         assert "provenance.process_tree_cpu_s()" in source, parts
+    with open(os.path.join(_ROOT, "scripts", "dsv41", "trace_corpus.py")) as f:
+        assert '"boundary_samples": boundaries' in f.read()
 
 
 if __name__ == "__main__":

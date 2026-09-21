@@ -297,3 +297,64 @@ def resident_bytes(dirs: list, chunk: int = 200) -> dict:
         except Exception:
             out[d] = None
     return out
+
+
+MEMINFO_FIELDS = ("MemFree", "MemAvailable", "Cached")
+
+
+def _meminfo_kb(path: str = "/proc/meminfo") -> dict:
+    out = {}
+    with open(path) as f:
+        for line in f:
+            name, _, rest = line.partition(":")
+            if name in MEMINFO_FIELDS:
+                out[name] = int(rest.split()[0])
+    return out
+
+
+def system_sample(cpu_interval: float = 0.2, top: int = 5) -> dict:
+    """One reading of the box at a phase boundary: per-drive cumulative sectors read, meminfo, load
+    average and the busiest processes outside this run's own tree. Each field is None if unreadable.
+
+    The two things it exists to answer: did the device do the reads that the page cache says it did,
+    and was something else running when a session came out slow. Taken between sessions, never inside
+    the timed stream; the CPU sampling costs ``cpu_interval`` seconds."""
+    import time
+
+    out = {"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "monotonic": time.monotonic()}
+    for key, read in (
+        ("diskstats_sectors", read_sectors),
+        ("meminfo_kb", _meminfo_kb),
+        ("loadavg", lambda: [float(x) for x in open("/proc/loadavg").read().split()[:3]]),
+    ):
+        try:
+            out[key] = read()
+        except Exception:
+            out[key] = None
+    try:
+        import psutil
+
+        mine = {os.getpid()}
+        try:
+            mine |= {c.pid for c in psutil.Process().children(recursive=True)}
+        except psutil.Error:
+            pass
+        procs = [p for p in psutil.process_iter(["pid", "name"]) if p.info["pid"] not in mine]
+        for p in procs:
+            try:
+                p.cpu_percent(None)
+            except psutil.Error:
+                pass
+        time.sleep(cpu_interval)
+        busy = []
+        for p in procs:
+            try:
+                pct = p.cpu_percent(None)
+            except psutil.Error:
+                continue
+            if pct >= 1.0:
+                busy.append({"pid": p.info["pid"], "name": p.info["name"], "cpu_pct": pct})
+        out["top_other_cpu"] = sorted(busy, key=lambda b: -b["cpu_pct"])[:top]
+    except Exception:
+        out["top_other_cpu"] = None
+    return out

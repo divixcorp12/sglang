@@ -183,12 +183,14 @@ def main() -> None:
 
     residency_dirs = [d for d in args.residency_dirs.split(":") if d]
     residency = {"dirs": residency_dirs, "before_engine": provenance.resident_bytes(residency_dirs)}
+    boundaries = [{"label": "before_engine", **provenance.system_sample()}]
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     prov = provenance.capture({"trace_corpus": os.path.abspath(__file__)})
     prov["drive_idle_check"] = provenance.drive_idle_check()
     engine = sglang.Engine(**engine_kwargs(args))
     prov["sglang_env_drift_at_engine_ready"] = provenance.env_drift(prov["sglang_env"], provenance.process_env())
     residency["after_engine_ready"] = provenance.resident_bytes(residency_dirs)
+    boundaries.append({"label": "engine_ready", **provenance.system_sample()})
     sessions = []
     for text in texts:
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
@@ -212,9 +214,10 @@ def main() -> None:
                 **timing,
             }
         )
+        boundaries.append({"label": f"session_{len(sessions) - 1}", **provenance.system_sample()})
         print(json.dumps(sessions[-1]), flush=True)
     engine.shutdown()
-    report = {"provenance": prov, "expert_residency": residency, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
+    report = {"provenance": prov, "expert_residency": residency, "boundary_samples": boundaries, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
 

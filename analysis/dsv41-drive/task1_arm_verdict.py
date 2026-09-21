@@ -166,6 +166,70 @@ def residency_notes(report: dict) -> list:
     return notes
 
 
+SECTOR_BYTES = 512
+SESSION_TTFT_OUTLIER = 1.25   # x the fastest TTFT among the other sessions 1..n
+P5_FLAT_KB = 256 * 1024       # Cached falling by less than this across boot counts as flat
+
+
+def boot_phase(report: dict):
+    """Device reads and meminfo change between the before_engine and engine_ready samples."""
+    by = {b.get("label"): b for b in report.get("boundary_samples") or []}
+    a, b = by.get("before_engine"), by.get("engine_ready")
+    if not a or not b:
+        return None
+    reads = None
+    if isinstance(a.get("diskstats_sectors"), dict) and isinstance(b.get("diskstats_sectors"), dict):
+        reads = {k: (b["diskstats_sectors"][k] - a["diskstats_sectors"][k]) * SECTOR_BYTES for k in sorted(a["diskstats_sectors"])
+                 if k in b["diskstats_sectors"]}
+    mem = None
+    if isinstance(a.get("meminfo_kb"), dict) and isinstance(b.get("meminfo_kb"), dict):
+        mem = {k: b["meminfo_kb"][k] - a["meminfo_kb"][k] for k in sorted(a["meminfo_kb"]) if k in b["meminfo_kb"]}
+    return {"device_read_bytes": reads, "meminfo_delta_kb": mem}
+
+
+def p5_note(boot_growth_bytes, phase) -> str:
+    """P5 (team-lead's hypothesis): a negative source-dir boot growth comes with Cached falling across boot."""
+    if not phase or not phase.get("meminfo_delta_kb") or not boot_growth_bytes:
+        return "P5 not testable: no boot-boundary meminfo"
+    negative = {d: g for d, g in boot_growth_bytes.items() if g is not None and g < -P5_FLAT_KB * 1024}
+    if not negative:
+        return "P5 not testable in this arm: no directory's residency fell during boot"
+    cached = phase["meminfo_delta_kb"].get("Cached")
+    d, g = min(negative.items(), key=lambda kv: kv[1])
+    verdict = "REFUTED (Cached flat or rising)" if cached >= -P5_FLAT_KB else "consistent (Cached fell)"
+    return f"P5 {verdict}: {d} residency {g / (1 << 20):+.0f} MiB during boot, Cached {cached / 1024:+.0f} MiB"
+
+
+def session_outliers(report: dict) -> list:
+    """NOTES, never failures: a session whose TTFT is far above the fastest of its siblings'. Session 0 is
+    exempt (it is cold and differs by up to 2x by design). The reference is the fastest sibling, not the
+    median: with three sessions to compare, two disturbed ones would otherwise drag the median up and hide
+    each other. Only TTFT is checked: decode tok/s differs 3.2-4.7 between sessions of a healthy arm because
+    the prompts differ, so an arm-internal tok/s rule would either miss or cry wolf. An arm in which every
+    session is slow is invisible to this check."""
+    rows = report.get("per_session") or []
+    notes = []
+    for i in range(1, len(rows)):
+        others = [r["ttft_s"] for j, r in enumerate(rows) if j not in (0, i) and r.get("ttft_s") is not None]
+        if others and rows[i].get("ttft_s") is not None and rows[i]["ttft_s"] > SESSION_TTFT_OUTLIER * min(others):
+            notes.append(
+                f"OUTLIER session_{i}: ttft {rows[i]['ttft_s']:.1f} s vs {min(others):.1f} s for its fastest sibling "
+                f"(decode {rows[i].get('decode_tok_s', 0):.3f} tok/s): a disturbed session, not gated"
+            )
+    return notes
+
+
+def boundary_notes(report: dict) -> list:
+    """Load and busy foreign processes seen at any boundary, so a disturbance can be explained."""
+    notes = []
+    for b in report.get("boundary_samples") or []:
+        busy = [f"{p['name']}({p['cpu_pct']:.0f}%)" for p in (b.get("top_other_cpu") or []) if p["cpu_pct"] >= 20]
+        load = (b.get("loadavg") or [None])[0]
+        if busy or (load is not None and load >= 4):
+            notes.append(f"at {b['label']}: load1 {load}, busy other processes: {', '.join(busy) or 'none >=20%'}")
+    return notes
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("arm_json")
@@ -199,12 +263,18 @@ def main() -> int:
     notes += residency_notes(report)
     kind = regime(phases)
     growth = boot_growth(phases) if phases is not None else None
+    phase = boot_phase(report)
     notes.insert(0, f"REGIME {kind} boot_growth_bytes={json.dumps(growth)}")
+    notes.insert(1, f"BOOT_PHASE {json.dumps(phase)}")
+    notes.append(p5_note(growth, phase))
+    notes += session_outliers(report)
+    notes += boundary_notes(report)
     if args.summary_json:
         timed = None if phases is None else {d: phases["last"][d] - phases["ready"][d] for d in phases["ready"]
                                               if phases["last"][d] is not None and phases["ready"][d] is not None}
         with open(args.summary_json, "w") as f:
-            json.dump({"regime": kind, "boot_growth_bytes": growth, "timed_growth_bytes": timed, "valid": not problems}, f, indent=2)
+            json.dump({"regime": kind, "boot_growth_bytes": growth, "timed_growth_bytes": timed, "boot_phase": phase,
+                       "outlier_sessions": [n for n in notes if n.startswith("OUTLIER")], "valid": not problems}, f, indent=2)
     for n in notes:
         print("NOTE", n)
     for x in problems:

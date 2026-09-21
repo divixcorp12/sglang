@@ -226,3 +226,49 @@ def test_unmeasured_timed_residency_is_a_problem(monkeypatch, capsys, tmp_path):
     ok = {SRC: 16 * GiB}
     code, out, _ = _run_main(monkeypatch, capsys, tmp_path, _phased(ok, ok, [{SRC: None}]))
     assert code == 1 and "could not be measured" in out
+
+
+# --- boundary samples, P5 and disturbed sessions ---------------------------------------------------
+
+
+def _sample(label, sectors, cached, load=0.5, busy=()):
+    return {"label": label, "diskstats_sectors": sectors, "meminfo_kb": {"MemFree": 1, "MemAvailable": 1, "Cached": cached},
+            "loadavg": [load, 0, 0], "top_other_cpu": [{"pid": 9, "name": n, "cpu_pct": c} for n, c in busy]}
+
+
+def test_boot_phase_reports_device_reads_and_meminfo_change_for_every_arm():
+    report = {"boundary_samples": [
+        _sample("before_engine", {"nvme2": 1000}, 80_000_000),
+        _sample("engine_ready", {"nvme2": 1000 + (2 << 20)}, 76_000_000),  # 2M sectors = 1 GiB
+    ]}
+    out = verdict.boot_phase(report)
+    assert out["device_read_bytes"] == {"nvme2": 1 << 30} and out["meminfo_delta_kb"]["Cached"] == -4_000_000
+    assert verdict.boot_phase({}) is None
+
+
+def test_p5_is_refuted_by_flat_cached_and_consistent_with_a_falling_one():
+    """team-lead's hypothesis: pages reclaimed during boot, so Cached should FALL where residency fell."""
+    fell = {"/src": -3 * GiB, "/m4": 0}
+    assert "REFUTED" in verdict.p5_note(fell, {"meminfo_delta_kb": {"Cached": 0}})
+    assert "REFUTED" in verdict.p5_note(fell, {"meminfo_delta_kb": {"Cached": 5_000}})
+    assert "consistent" in verdict.p5_note(fell, {"meminfo_delta_kb": {"Cached": -3_000_000}})
+    assert "not testable in this arm" in verdict.p5_note({"/src": 0}, {"meminfo_delta_kb": {"Cached": 0}})
+    assert "not testable" in verdict.p5_note(fell, None)
+
+
+def test_a_disturbed_session_announces_itself_and_healthy_arms_stay_quiet():
+    """Both disturbed sessions of the task1c series were one session far off its siblings and no check saw them."""
+    def arm(ttfts):
+        return {"per_session": [{"ttft_s": t, "decode_tok_s": 3.0} for t in ttfts]}
+    assert verdict.session_outliers(arm([59.3, 29.8, 28.6, 43.5]))[0].startswith("OUTLIER session_3")
+    assert len(verdict.session_outliers(arm([59.7, 29.7, 59.5, 43.1]))) == 2
+    assert verdict.session_outliers(arm([50.8, 30.0, 29.1, 30.5])) == []      # session 0 is exempt
+    assert verdict.session_outliers(arm([96.4, 55.3, 53.6, 56.4])) == []      # off arm
+    assert verdict.session_outliers(arm([60.0, 30.0])) == []                   # no sibling to compare
+
+
+def test_boundary_notes_name_busy_foreign_processes_and_high_load():
+    report = {"boundary_samples": [_sample("session_2", {}, 1, load=3.9, busy=[("rsync", 80)]),
+                                   _sample("session_3", {}, 1, load=5.2), _sample("engine_ready", {}, 1)]}
+    notes = verdict.boundary_notes(report)
+    assert len(notes) == 2 and "rsync(80%)" in notes[0] and "load1 5.2" in notes[1]
