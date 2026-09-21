@@ -804,6 +804,25 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > reach the state its name describes is not evidence. This applies to tests
 > *specified* in design documents, not only to tests already written.
 >
+> **Writing the tests first does NOT substitute for this, and that was tested.**
+> Task 5 step 3a was built test-first: 12 requirement-shaped tests from §18.2
+> written before any C++, passing on the first compile. Survivor rate **1 in 17**,
+> against **1 in 19** for step 2, which was written code-first. That is not enough
+> data to claim test-first helped, and more to the point **it did not prevent the
+> defect it was supposed to**: the survivor's test was drafted from the
+> requirement text and was still aimed at the wrong mechanism. (Mutant L4, "grant
+> ignores whether the request succeeded", survived because the test injected
+> `fail_reads`, which released the slots, so the lane's expert was not resident
+> and the grant refused on its own — mutant or not. The test could never
+> distinguish them.) **Requirement-shaped is not the same as claim-shaped.** Only
+> running the mutant finds that out.
+>
+> What test-first *did* buy, recorded because it is a different benefit than the
+> one claimed for it: writing the simulated device first forced the lane word
+> layout to be specified before the service, which exposed the `LaneRequest`
+> seqlock re-check and the double-signal counting rules early, and produced two
+> tests that would not otherwise have been written.
+>
 > Related, same day and same shape: an arm disqualified by the acceptance gates
 > (`task1-6`, INVALID -- "expert shard page-cache residency grew 1.40 GiB across
 > the arm") was nonetheless inside the step-time denominator of every percentage
