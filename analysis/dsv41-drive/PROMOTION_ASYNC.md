@@ -864,7 +864,31 @@ milestone is not implementable as written.
     lease, not by the absence of the thread.
   So: graph-lane leases block the pause; host leases do not, because their slots are
   protected by `leases > 0`.
-- **R3. `lease_on_ready` for service-initiated admission (M2).** A promotion-admit row
+  Checked in `lease_model.py`: the model grants an eager pause while a host lease is held, and
+  making the pause also wait for host leases produces `PauseBlockedByHostLease` (pause refused
+  with zero graph leases, blocked only by a promotion's lease). Mutants where the service
+  evicts, or the eager `assign` takes, a host-leased slot are found as separate violations,
+  matching R5. **What the model does not cover** (do not over-read the pass): promotion admission,
+  capped copies or executor-stream events, the hold-time bound (so R4's "release LEASED-but-not-
+  yet-COPYING leases immediately" is unmodelled), stale or repeated `LeaseRef` (R1), counters
+  (R7), `kVersion` (R8), and more than one promotion and one eager cycle. R2's safety is checked
+  as an eviction-predicate property over the modelled interleavings, not against the real copy
+  path.
+- **R3. Two permitted acquisition forms, and no third.** The choice is made here, not at
+  implementation time (`lease_model.py` cannot vouch for a gap: its acquire is a lookup by
+  expert, re-validated at acquire time, so it has no window between `kReady` and the lease and
+  its author could not write an honest R3 mutant).
+  - **(a) `lease_on_ready` (M2, service-initiated admission).** The row becomes `kReady` and is
+    leased in the same `mutex_` critical section. No gap exists.
+  - **(b) Acquire by expert, re-validated at acquire time (M1, rows already resident).**
+    `acquire_host_lease(row, expert)` runs under `mutex_` and, in that one critical section,
+    checks `expert_slot[expert] >= 0`, `state[slot] == kReady`, and reads the slot's current
+    generation into the returned `LeaseRef`. It fails (returns none) otherwise; the caller
+    defers. The scheduler thread never holds a slot *number* across a gap and later leases it.
+  - **Forbidden:** acquiring by slot number after observing `kReady` in an earlier call. If an
+    implementation wants that, it must first state what the acquirer re-checks, and no model
+    covers it.
+  Original rationale for (a). A promotion-admit row
   becomes `kReady` and is leased in the same `mutex_` critical section. Section 17.1 says
   the slot "must be kReady" at `acquire_host_lease`; that leaves a window between
   `kReady` and the lease in which a demand or advisory eviction could take the row unless it
@@ -909,6 +933,17 @@ slot S and its copy waits on the serving stream. The serving stream is inside an
 only victim is S. Cycle: demand wait -> service deferral (lease on S) -> lease release
 needs copy completion -> copy waits for the serving stream -> serving stream is in the
 wait. The 2 s device timeout would break it, as a fatal.
+
+**This cycle is now demonstrated necessary by model search, not only argued.**
+`analysis/dsv41-drive/lease_model.py` was extended with a promoter actor and a stream-dependency
+knob (`copy_waits_on_serving`); with the promotion copy queued behind the serving stream's tail
+while holding a lease, the search finds `Deadlock` in about 2,000 states, and
+`test_the_stream_dependency_cycle_is_the_one_task_8_found_by_reading` replays the trace and
+asserts the final state: device in WAIT, promoter stuck at copy-begin with a lease held, service
+idle with a demand visible but deferred, nothing enabled. With the device timeout on it ends as a
+fatal after 2 s. It was built by another agent independently of this document. Its limits: the
+stream dependency is modelled coarsely as "queued behind the serving stream's tail at
+acquisition", and it does not model the real copy path.
 
 This is why section 7.2 forbids any dependency of the copy stream on the serving stream
 once a lease is held: the plan upload goes on the executor stream and `producer_stream` is
