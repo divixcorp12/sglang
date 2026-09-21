@@ -105,6 +105,9 @@ def _fault_tensor(
     hold_ordinal: int = -1,
     abandon_after: int = 0,
     step: int = 0,
+    pack_workers: int = 0,
+    pack_split: int = 0,
+    hold_rest: bool = False,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -127,6 +130,9 @@ def _fault_tensor(
             hold_ordinal,
             abandon_after,
             step,
+            pack_workers,
+            pack_split,
+            int(hold_rest),
         ],
         dtype=torch.int64,
     )
@@ -191,24 +197,32 @@ def read_rows_with_fault(
     ``generation_start`` seeds the generation counter (near 2**32 it wraps); ``hold_ordinal`` withholds
     the completions of that row of the request from the reader until every other row is done (a slow
     drive: buffered reads of cached data complete inside submit, so nothing else can hold an extent
-    outstanding while other rows pack); ``submit_short_call``
+    outstanding while other rows pack; with ``hold_rest``, every row from that ordinal on, released
+    together, so they become ready in one reap); ``submit_short_call``
     makes that submit consume nothing and report success; ``abandon_after`` stops admitting batches
     after that many; ``step`` is the faulted read's rows per batch (default ``BOUNCE_ROWS``).
+    ``pack_workers`` packs on that many copy threads instead of the owner (0: inline, the default),
+    each row in ``pack_split`` byte-range chunks (0: one per worker).
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
-    completions reaped after each read, ``stats`` the reader's ``stale_cqes`` and ``generation_wraps``.
+    completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
+    ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0) and
+    ``pack_workers``.
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
-    results = torch.zeros(6, dtype=torch.int64)
+    results = torch.zeros(8, dtype=torch.int64)
     _host_module().exl3_ram_miss_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
     if cqes is not None:
         cqes[:] = [int(results[2]), int(results[3])]
     if stats is not None:
-        stats.update(stale_cqes=int(results[4]), generation_wraps=int(results[5]))
+        stats.update(
+            stale_cqes=int(results[4]), generation_wraps=int(results[5]), unfinished_jobs=int(results[6]),
+            pack_workers=int(results[7]),
+        )
     return int(results[0]), int(results[1])
 
 
@@ -426,7 +440,14 @@ class Exl3RamMissHost:
     """
 
     def __init__(
-        self, tables, *, page: torch.Tensor, slot_map: torch.Tensor, direct: bool, lease_block: Optional[torch.Tensor] = None
+        self,
+        tables,
+        *,
+        page: torch.Tensor,
+        slot_map: torch.Tensor,
+        direct: bool,
+        lease_block: Optional[torch.Tensor] = None,
+        pack_workers: int = 0,
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
@@ -458,7 +479,7 @@ class Exl3RamMissHost:
             self._module.exl3_ram_miss_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
                 tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
-                "\n".join(tables.source_paths), tables.slot_bytes, int(direct), self.lease_block,
+                "\n".join(tables.source_paths), tables.slot_bytes, int(direct), self.lease_block, int(pack_workers),
             )
         )
         if self.handle < 0:

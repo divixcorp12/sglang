@@ -1809,6 +1809,11 @@ class Envs:
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
     # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # Option C: copy each RAM-miss row from the bounce bank into the pinned slabs on this many worker
+    # threads (each row split into this many byte ranges) instead of on the service thread. 0 keeps the
+    # copy on the service thread (there is no auto). Workers never run on cores 64-71. Do not enable in a run
+    # that produces stage traces until the trace record carries the mode: overlap_timeline.py misreads them.
+    SGLANG_DSV41_RAM_MISS_PACK_WORKERS = EnvInt(0)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.

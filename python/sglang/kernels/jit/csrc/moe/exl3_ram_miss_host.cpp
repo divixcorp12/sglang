@@ -38,6 +38,8 @@
 #include <utility>
 #include <vector>
 
+#include "exl3_ram_miss_pack_pool.h"
+
 namespace sglang {
 namespace exl3_ram_miss {
 
@@ -170,13 +172,15 @@ struct StageRecord {
   int64_t submit = 0;     // just before the first io_uring submit
   int64_t first_cqe = 0;  // the call that returned the first completion, returned
   int64_t last_cqe = 0;   // the call that returned the last completion, returned
-  int64_t pack_start = 0;  // the first row's packing started
+  // With packing workers (SGLANG_DSV41_RAM_MISS_PACK_WORKERS) rows pack concurrently and a row's span starts at
+  // its first chunk, after the worker woke: do not read overlap or "waited for the packer" out of these stamps.
+  int64_t pack_start = 0;  // the earliest row's packing started
   int64_t pack_end = 0;    // the last row's packing ended
   int64_t mapped = 0;  // slots marked READY and slot-map entries published
   int64_t done = 0;    // completion word stored: the device's wait can release
   int64_t submit_to_first_cqe_ns = 0;
   int64_t first_to_last_cqe_ns = 0;
-  int64_t pack_ns = 0;  // the sum of the rows' packing spans
+  int64_t pack_ns = 0;  // the sum of the rows' packing spans; with workers the spans overlap, so it can exceed pack_end - pack_start
   int64_t bytes = 0;    // completed bytes, summed over drives (see the byte split)
   int64_t extents = 0;  // reads issued: one per row and root with a non-empty part
   int64_t drive_dev[kMaxDrives] = {};  // st_dev of the drive's filesystem; -1 folds several drives
@@ -382,13 +386,23 @@ struct ReadFault {
   // is in flight or waiting to pack, then delivered. Cached buffered reads complete inside submit, so
   // without this no test can hold an extent outstanding while other rows pack (-1: none).
   int64_t hold_ordinal = -1;
+  // With hold_ordinal set: withhold every row from that ordinal on, not only that row. They are released
+  // together, so they become ready in one reap (a burst of rows the packer meets at once).
+  bool hold_rest = false;
 };
 
-// The fault tensor of the test entry points: 19 int64 words. The last two are not reader faults:
+// A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
+// for a traced read).
+inline int64_t worker_stamp(const void* trace) {
+  return stamp(static_cast<const StageRecord*>(trace));
+}
+
+// The fault tensor of the test entry points: 22 int64 words. Four of them are not reader faults:
 // abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
-// (0: never), and step (0: kBounceRows) is the faulted call's rows per batch. Keep the layout in step
-// with _fault_tensor in ops/moe/exl3_ram_miss.py.
-constexpr int64_t kFaultWords = 19;
+// (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and pack_workers / pack_split
+// configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
+// one chunk per worker); word 21 is hold_rest. Keep the layout in step with _fault_tensor in ops/moe/exl3_ram_miss.py.
+constexpr int64_t kFaultWords = 22;
 
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;
@@ -409,6 +423,7 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.submit_short_call = f[14];
   fault.ordinal = f[15];
   fault.hold_ordinal = f[16];
+  fault.hold_rest = f[21] != 0;
   return fault;
 }
 
@@ -444,17 +459,37 @@ inline std::function<bool(size_t)> abandon_after(int64_t after) {
 // half-packed one, and the caller releases them.
 class RowReader {
  public:
-  RowReader(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {}
+  RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
+      : t_(std::move(tables)), direct_(direct) {
+    set_pack(pack_workers, pack_split);
+  }
   RowReader(const RowReader&) = delete;  // owns fds, the ring and the bounce
   RowReader& operator=(const RowReader&) = delete;
 
   ~RowReader() {
+    pool_.reset();  // joins the workers before the bounce they read from is freed
     if (ring_ready_) io_uring_queue_exit(&ring_);
     for (int fd : fds_) ::close(fd);
     std::free(bounce_);
   }
 
   const Tables& tables() const { return t_; }
+
+  // Pack on `workers` copy threads instead of the owner (0: on the owner, the default), each row in
+  // `split` byte-range chunks (0: one per worker). Takes effect at open().
+  void set_pack(int64_t workers, int64_t split) {
+    pack_workers_ = static_cast<unsigned>(std::max<int64_t>(0, workers));
+    pack_split_ = split > 0 ? static_cast<unsigned>(split) : pack_workers_;
+  }
+  unsigned pack_workers() const { return pack_workers_; }
+  // Copies a worker still holds. read() leaves none: this is what a test checks after it returns.
+  int64_t unfinished_jobs() const {
+    int64_t open_jobs = 0;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      if (rows_[s].state == RowState::Packing && !jobs_[s].done()) ++open_jobs;
+    }
+    return open_jobs;
+  }
 
   void set_fault(const ReadFault& fault) {
     fault_ = fault;
@@ -522,6 +557,14 @@ class RowReader {
     again_.reserve(extents);
     if (io_uring_queue_init(queue_depth(), &ring_, 0) != 0) return false;
     ring_ready_ = true;
+    if (pack_workers_ > 0) {
+      // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
+      runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
+      cpu_set_t inherited;
+      CPU_ZERO(&inherited);
+      pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited);
+      pool_ = std::make_unique<PackPool>(pack_workers_, inherited, static_cast<size_t>(kBounceSlots));
+    }
     return true;
   }
 
@@ -572,17 +615,26 @@ class RowReader {
     if (trace) trace->rows_asked = static_cast<int64_t>(c.total);
     reset_pipeline();
     held_.clear();
+    // Whatever way this call ends, no packing worker may still be copying when it does: the caller
+    // releases the slots on return and the next read reuses the bounce. Runs on exceptions too.
+    struct Quiesce {
+      RowReader* reader;
+      ~Quiesce() { reader->quiesce(); }
+    } quiesce_on_exit{this};
     while (true) {
+      collect_packed();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
       if (!c.failed) refill();
       if (c.failed) break;
       const bool ready = has_ready();
-      if (c.pending == 0 && !ready && held_.empty()) break;
+      if (c.pending == 0 && !ready && held_.empty() && c.packing == 0) break;
       // Submit what was prepared before packing, so storage stays busy while the CPU copies; only
-      // block for a completion when there is no complete row to pack.
-      if (c.pending > 0 || (!ready && !held_.empty())) reap(ready);
+      // block for a completion when there is no complete row to pack. With rows packing on workers the
+      // owner cannot be woken from a blocking wait when one finishes, so it polls instead. The
+      // withheld completions of the slow-drive fault arrive only once every other row has packed.
+      if (c.pending > 0 || (!ready && c.packing == 0 && !held_.empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
-      pack_one();
+      if (!pack_one() && c.packing > 0) _mm_pause();
     }
     // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
     // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
@@ -615,7 +667,8 @@ class RowReader {
   static constexpr uint8_t kPoisonFill = 0xA5;
   static constexpr int32_t kPoisonSlot = 0x7EADBEEF;
 
-  enum class RowState : uint8_t { Free, Reading, Ready };
+  // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
+  enum class RowState : uint8_t { Free, Reading, Ready, Packing };
 
   // One extent's read, live from admission until its last completion retires it (generation != 0).
   struct ExtentDesc {
@@ -664,6 +717,7 @@ class RowReader {
     bool failed = false;
     bool abandoned = false;
     bool stalled = false;  // a batch is waiting for its bank to retire
+    size_t packing = 0;    // rows handed to the packing workers and not yet finished by the owner
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
   };
@@ -749,6 +803,11 @@ class RowReader {
     Call& c = c_;
     const size_t parts = static_cast<size_t>(t_.parts);
     if (bank_live_[bank] != 0) return false;  // an extent still names this bank: never reuse it
+    // Nor may a row still be packing (a worker holds its copy) or ready in one of its slots: rows_busy_ says so,
+    // and this refuses if the two ever disagree instead of overwriting a row a worker is reading.
+    for (size_t i = 0; i < count; ++i) {
+      if (rows_[bank * kBounceRows + i].state != RowState::Free) return false;
+    }
     // Validate the whole batch before touching any state, so a bad row leaves nothing to undo.
     for (size_t i = 0; i < count; ++i) {
       const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[first + i]);
@@ -921,7 +980,8 @@ class RowReader {
         const uint32_t index = static_cast<uint32_t>(completions_[k].data & 0xFFFFFFFFu);
         const bool live = index < descs_.size() && descs_[index].generation != 0 &&
                           descs_[index].generation == static_cast<uint32_t>(completions_[k].data >> 32);
-        if (live && static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) {
+        if (live && (fault_.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault_.hold_ordinal
+                                       : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal)) {
           held_.push_back(completions_[k]);
         } else {
           completions_[kept++] = completions_[k];
@@ -1022,7 +1082,7 @@ class RowReader {
   }
 
   // The earliest row in request order among those ready, vetted for packing; kBounceSlots when there is
-  // none or the vetting failed the call. Runs before any copy.
+  // none or the vetting failed the call. Runs on the owner, before any copy, however the copy is done.
   size_t take_ready_row() {
     Call& c = c_;
     size_t best = kBounceSlots;
@@ -1046,9 +1106,11 @@ class RowReader {
     return best;
   }
 
-  // Pack ONE complete row, the earliest in request order among those ready. One row per loop turn
-  // keeps packing bounded: the loop refills and reaps between rows.
+  // Pack ONE complete row inline, the earliest in request order among those ready. One row per loop turn
+  // keeps packing bounded: the loop refills and reaps between rows. With a packing pool, every ready row
+  // is handed to the workers instead, and the loop finishes each one when its copy is done.
   bool pack_one() {
+    if (pool_) return dispatch_ready_rows();
     const size_t best = take_ready_row();
     if (best == static_cast<size_t>(kBounceSlots)) return false;
     Call& c = c_;
@@ -1068,6 +1130,62 @@ class RowReader {
     return true;
   }
 
+  // Hand every ready row to the packing workers. The row was vetted by take_ready_row on this thread; from
+  // here until its job is done the workers own the copy and this thread must not touch its bounce slot.
+  bool dispatch_ready_rows() {
+    Call& c = c_;
+    bool any = false;
+    while (true) {
+      const size_t best = take_ready_row();
+      if (best == static_cast<size_t>(kBounceSlots)) return any;
+      const size_t ordinal = rows_[best].ordinal;
+      const uint8_t* base =
+          bounce_slot(best) + t_.starts[static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal])];
+      const int64_t slot = (*c.slots)[ordinal];
+      // A slot's job is free only once its previous copy is done; arming it earlier would hand a worker a
+      // half-armed job. Like queue_push's overflow, this cannot happen unless the accounting above is wrong.
+      if (!jobs_[best].done()) throw std::runtime_error("exl3 RAM miss: a packing job was re-armed while a worker still holds it");
+      CopyRun* runs = &runs_[best * t_.segments.size()];
+      for (size_t i = 0; i < t_.segments.size(); ++i) {
+        const Segment& segment = t_.segments[i];
+        runs[i] = CopyRun{
+            t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
+            segment.bytes};
+      }
+      jobs_[best].arm(
+          runs, t_.segments.size(), pack_split_, fault_.pack_delay_ns, c.trace ? &worker_stamp : nullptr, c.trace);
+      pool_->post(&jobs_[best]);  // throws before queueing: a row is Packing only once its job is posted
+      rows_[best].state = RowState::Packing;
+      ++c.packing;
+      any = true;
+    }
+  }
+
+  // Finish every row whose copy the workers have completed: the bank's packing reference is released
+  // here, on the owner, and only after its job reads done.
+  void collect_packed() {
+    Call& c = c_;
+    if (c.packing == 0) return;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      if (rows_[s].state != RowState::Packing || !jobs_[s].done()) continue;
+      finish_row(s, jobs_[s].first_start.load(std::memory_order_relaxed), jobs_[s].last_end.load(std::memory_order_relaxed));
+      --c.packing;
+    }
+  }
+
+  // Wait for every copy the workers still hold, and finish those rows like any other: they were copied
+  // whole, and the accounting says so. On a failure the caller still releases every slot; this
+  // guarantees nothing writes into them, or reads the bounce, afterwards.
+  void quiesce() {
+    Call& c = c_;
+    if (c.packing == 0) return;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      if (rows_[s].state != RowState::Packing) continue;
+      while (!jobs_[s].done()) _mm_pause();
+    }
+    collect_packed();
+  }
+
   // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank
   // held on this slot: only now may it be reused.
   void finish_row(size_t best, int64_t start, int64_t end) {
@@ -1081,7 +1199,8 @@ class RowReader {
         ++c.trace->rows_untraced;
       }
       for (const Segment& segment : t_.segments) c.trace->useful_bytes += segment.bytes;
-      if (c.trace->pack_start == 0) c.trace->pack_start = start;
+      // Rows pack in completion order and may overlap, so the first to finish is not always the first to start.
+      if (c.trace->pack_start == 0 || start < c.trace->pack_start) c.trace->pack_start = start;
       c.trace->pack_end = std::max(c.trace->pack_end, end);
       c.trace->pack_ns += end - start;
     }
@@ -1169,6 +1288,12 @@ class RowReader {
   std::vector<Completion> held_;  // fault: completions withheld from the reader (hold_ordinal)
   std::vector<uint32_t> again_;
   BounceRow rows_[kBounceSlots];
+  // Packing workers (set_pack; none by default): a job and a run list per bounce slot, sized at open().
+  unsigned pack_workers_ = 0;
+  unsigned pack_split_ = 0;
+  std::unique_ptr<PackPool> pool_;
+  PackJob jobs_[kBounceSlots];
+  std::vector<CopyRun> runs_;
   size_t rows_busy_[kBanks] = {};   // rows not yet packed, per bank: the packing references
   size_t bank_live_[kBanks] = {};   // extents not yet retired, per bank: the I/O references
   uint32_t generation_ = 0;
@@ -1241,10 +1366,12 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView fault,
     TensorView record) {
   using namespace exl3_ram_miss;
-  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
-  if (!reader.open()) return 0;
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+  RowReader reader(
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      direct != 0, f[19], f[20]);
+  if (!reader.open()) return 0;
   reader.set_fault(fault_from(f));
   StageRecord stage;
   const int result = reader.read(
@@ -1258,9 +1385,11 @@ int64_t exl3_ram_miss_read_rows_traced(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_traced, exl3_ram_miss_read_rows_traced);
 
 // Test only: one reader reads `experts` into `slots` with `fault` injected
-// (see ReadFault and fault_from), then reads `then_experts` into `then_slots` with no fault. Results go to
-// `results[0..5]`: the two reads' results, the completions the reader had reaped after each, then its
-// stale completions and generation wraps.
+// (see ReadFault and fault_from), then reads `then_experts` into `then_slots` with no fault (no second read when
+// there are none). Results go to
+// `results[0..7]`: the two reads' results, the completions the reader had reaped after each, then its
+// stale completions, generation wraps, the packing jobs still open when the first read returned and the
+// number of packing workers the reader has.
 void exl3_ram_miss_read_rows_faulted(
     TensorView extents,
     TensorView starts,
@@ -1281,25 +1410,74 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView results) {
   using namespace exl3_ram_miss;
   auto* out = static_cast<int64_t*>(results.data_ptr());
-  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
-  if (!reader.open()) {
-    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = 0;
-    return;
-  }
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+  RowReader reader(
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      direct != 0, f[19], f[20]);
+  if (!reader.open()) {
+    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = 0;
+    return;
+  }
   reader.set_fault(fault_from(f));
   const size_t step = f[18] > 0 ? static_cast<size_t>(f[18]) : static_cast<size_t>(kBounceRows);
   out[0] = reader.read(row, ids_of(experts), slots_of(slots), step, abandon_after(f[17]));
   out[2] = reader.cqes();
   out[4] = reader.stale_cqes();
   out[5] = reader.generation_wraps();
+  out[6] = reader.unfinished_jobs();
+  out[7] = reader.pack_workers();
   reader.set_fault(ReadFault{});
+  if (then_experts.size(0) == 0) return;  // a test that only wants the first read's state
   out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, abandon_after(0));
   out[3] = reader.cqes();
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_faulted, exl3_ram_miss_read_rows_faulted);
+
+// Test only: build a packing pool as if the creating thread could run on the cores set in `inherited`
+// (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
+// (two words per worker). Throws, like the pool, when no core is left.
+void exl3_ram_miss_pack_pool_affinity(TensorView inherited, int64_t workers, TensorView out) {
+  using namespace exl3_ram_miss;
+  const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  for (int core = 0; core < 128; ++core) {
+    if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
+  }
+  PackPool pool(static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots));
+  auto* words = static_cast<int64_t*>(out.data_ptr());
+  for (size_t w = 0; w < pool.workers(); ++w) {
+    const cpu_set_t set = pool.worker_affinity(w);
+    words[2 * w] = words[2 * w + 1] = 0;
+    for (int core = 0; core < 128; ++core) {
+      if (CPU_ISSET(core, &set)) words[2 * w + core / 64] |= static_cast<int64_t>(uint64_t{1} << (core % 64));
+    }
+  }
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pack_pool_affinity, exl3_ram_miss_pack_pool_affinity);
+
+// Test only: the cores a packing worker may use when the creating thread may use those set in `inherited`
+// (two int64 words, cores 0-127), as two words in `out`. Starts no thread.
+void exl3_ram_miss_pack_worker_cpus(TensorView inherited, TensorView out) {
+  using namespace exl3_ram_miss;
+  const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  for (int core = 0; core < 128; ++core) {
+    if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
+  }
+  const cpu_set_t allowed = pack_worker_cpus(mask);
+  auto* words = static_cast<int64_t*>(out.data_ptr());
+  words[0] = words[1] = 0;
+  for (int core = 0; core < 128; ++core) {
+    if (CPU_ISSET(core, &allowed)) words[core / 64] |= static_cast<int64_t>(uint64_t{1} << (core % 64));
+  }
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pack_worker_cpus, exl3_ram_miss_pack_worker_cpus);
 
 namespace exl3_ram_miss {
 
@@ -1568,13 +1746,13 @@ class RamTier {
  public:
   RamTier(
       uint8_t* page, int32_t* slot_map, uint8_t* lease, int64_t lease_bytes, Tables tables, std::vector<int64_t> capacity,
-      bool direct)
+      bool direct, int64_t pack_workers = 0)
       : page_(page),
         map_(slot_map),
         lease_(lease),
         layers_(tables.layers),
         experts_(tables.experts),
-        reader_(std::move(tables), direct),
+        reader_(std::move(tables), direct, pack_workers),
         tiers_(static_cast<size_t>(layers_)) {
     for (auto& counter : counters_)
       counter.store(0);
@@ -2505,7 +2683,8 @@ int64_t exl3_ram_miss_open(
     std::string source_paths,
     int64_t slot_bytes,
     int64_t direct,
-    TensorView lease) {
+    TensorView lease,
+    int64_t pack_workers) {
   using namespace exl3_ram_miss;
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
   auto tier = std::make_shared<RamTier>(
@@ -2515,7 +2694,8 @@ int64_t exl3_ram_miss_open(
       lease.size(0),
       tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
-      direct != 0);
+      direct != 0,
+      pack_workers);
   if (!tier->open()) return -1;
   std::lock_guard<std::mutex> guard(registry_mutex());
   static int64_t next_handle = 1;

@@ -385,7 +385,13 @@ class Exl3RamMissService:
         page = new_page(pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
-        host = Exl3RamMissHost(tables, page=page, slot_map=slot_map, direct=fmt._resolve_direct())
+        host = Exl3RamMissHost(
+            tables,
+            page=page,
+            slot_map=slot_map,
+            direct=fmt._resolve_direct(),
+            pack_workers=envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.get(),
+        )
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
