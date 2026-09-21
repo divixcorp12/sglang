@@ -89,9 +89,10 @@ def test_a_host_lease_does_not_block_an_eager_pause(running):
     assert host.slot_info(0)[0][2] == 1, "the lease is still held, and only protecting the slot is left to it"
 
 
-def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_stopping_or_taking_advisories(running):
-    """Mutation: the worker waits for the acknowledgement inside serve (or the deferral): the pause times out, an
-    advisory is never consumed and stop hangs. The lease is a host lease here, so the pause is granted, not refused."""
+def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_or_stopping(running):
+    """Mutation: the worker waits for the acknowledgement inside serve (or the deferral): the pause times out and stop
+    hangs. The lease is a host lease here, so the pause is granted, not refused. That an advisory is still processed
+    is asserted by the two R2 tests below, on counters that a stale skip cannot move."""
     s, page, host, sim = running
     host.assign(0, 3, protected=[3])
     host.assign(0, 4, protected=[4])
@@ -100,8 +101,6 @@ def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_stopping_or_tak
     seq = sim.post(0, [1, 2]).seq
     assert _until(lambda: host.counters()["deferred"] == 1), "precondition: a demand is deferred"
     assert page_word(page, "demand_done") != seq
-    advisory = sim_post(page, 1, need=[5], protect=[5], advisory=True, after=page_word(page, "demand_head") + 10)
-    assert _until(lambda: page_word(page, "advise_done") == advisory), "an advisory is still consumed while a demand waits"
     start = time.perf_counter()
     host.pause(2.0)
     host.resume()
@@ -109,6 +108,62 @@ def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_stopping_or_tak
     start = time.perf_counter()
     host.stop()
     assert time.perf_counter() - start < PROMPT, "stop does not wait for a lease to retire"
+
+
+def _deferred_demand(running):
+    """Row 0 full of host leases, and a demand for two experts it cannot hold: deferred, and observed to be."""
+    s, page, host, sim = running
+    host.assign(0, 3, protected=[3])
+    host.assign(0, 4, protected=[4])
+    for slot in (0, 1):
+        host.inject_lease(0, slot, +1)
+    seq = sim.post(0, [1, 2]).seq
+    assert _until(lambda: host.counters()["deferred"] == 1), "precondition: a demand is deferred"
+    assert page_word(page, "demand_done") != seq
+    return seq
+
+
+def _advisory_processed(host, page, before, row, expert):
+    """Post an advisory after the demand (so it is not stale by the `after` rule) and wait until it was SERVED:
+    the ``advisories`` counter moved, which a stale skip never does (it moves ``advisories_skipped``)."""
+    advisory = sim_post(page, row, need=[expert], protect=[expert], advisory=True, after=page_word(page, "demand_head"))
+    assert _until(lambda: page_word(page, "advise_done") == advisory), "the advisory was consumed"
+    now = host.counters()
+    assert now["advisories"] == before["advisories"] + 1, "it entered serve; it was not dropped"
+    assert now["advisories_skipped"] == before["advisories_skipped"], "and it was not skipped as stale"
+    return now
+
+
+def test_an_advisory_for_another_row_arriving_during_a_deferral_gives_up_before_reading(running):
+    """Mutations: the advisory is dropped as stale (advisories_skipped moves, advisories does not); it reads while a
+    demand waits (advisory_rows moves: demand_pending() in the give-up test is made false); the deferral of the
+    demand is counted again by it (deferred moves)."""
+    s, page, host, sim = running
+    seq = _deferred_demand(running)
+    row0 = host.slot_info(0)
+    before = host.counters()
+    assert page_word(page, "demand_head") == seq and page_word(page, "demand_done") != seq, "a demand is pending"
+    now = _advisory_processed(host, page, before, row=1, expert=5)
+    assert now["advisory_rows"] == before["advisory_rows"] == 0, "it gave up before reading a row"
+    assert now["deferred"] == 1, "the advisory did not count as a second deferral"
+    assert now["rows_read"] == before["rows_read"]
+    assert host.slot_info(0) == row0, "nothing of the deferred demand's row moved"
+    assert page_word(page, "demand_done") != seq, "and the demand is still deferred, not served or failed"
+
+
+def test_an_advisory_for_the_deferred_demands_own_row_takes_no_leased_slot(running):
+    """Mutations: the advisory evicts a leased slot (its map, generation or lease count changes); the advisory counts
+    as a deferral of its own; the advisory is dropped as stale."""
+    s, page, host, sim = running
+    seq = _deferred_demand(running)
+    row0, gens = host.slot_info(0), host.mapped_slot_generations(0)
+    before = host.counters()
+    now = _advisory_processed(host, page, before, row=0, expert=5)
+    assert now["advisory_rows"] == 0
+    assert now["evictions"] == before["evictions"], "no slot was evicted for it"
+    assert now["deferred"] == 1, "an advisory that cannot be served gives up; only a demand is deferred"
+    assert host.slot_info(0) == row0 and host.mapped_slot_generations(0) == gens
+    assert page_word(page, "demand_done") != seq
 
 
 if __name__ == "__main__":

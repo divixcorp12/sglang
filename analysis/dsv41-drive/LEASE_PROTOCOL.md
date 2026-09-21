@@ -2127,3 +2127,31 @@ looked for a `FAILED` line would have read that as *survived*, or, with an equal
 The driver reported `INVALID (not every collected test ran)`. The mutant was rewritten to replace the line with
 `pass`, and it then died to a named test. Evidence that the collected-equals-executed rule works on a case
 that was not in the three it was derived from.
+
+### 20.2e R2 (an advisory during a deferral): tests and mutation ledger
+
+Two tests in `test_exl3_ram_miss_lease_thread.py` replace the `advise_done`-only check that lived in the
+third test of that file. That check passed when the advisory was dropped as stale (a stale skip also advances
+`advise_done`). Shown, not argued: the old file run against mutants A1 and A4 below gives SURVIVED both times
+(3 passed of 3 collected, 0 failed); the new file kills both.
+
+Path witness in both: a demand for two experts is deferred (`deferred == 1`, `demand_done` not advanced, so
+`demand_pending()` is true), the advisory is posted **after** that, with `after` equal to the demand's seq (not stale
+by the `after` rule), and the advisory is observed to have been *served*: `advisories` +1 and
+`advisories_skipped` unchanged. Property, row 1 test: `advisory_rows == 0`, `rows_read` unchanged, `deferred`
+still 1, the deferred row's slot table unchanged, the demand still not done. Property, own-row test: no eviction,
+slot table and `SlotGen` words unchanged, `deferred` still 1.
+
+| Mutant | Result | Killed by |
+|---|---|---|
+| A1 advisory dropped as stale while a demand is pending | KILLED 2 of 5 | both R2 tests |
+| A2 advisory reads while a demand is deferred (`demand_pending()` removed from the give-up test) | KILLED 1 of 5 | the other-row test |
+| A3 an advisory that cannot be served counts as a deferral | KILLED 1 of 5 | the own-row test |
+| A4 an advisory ignores leases when choosing a victim (census guard and lease skip both bypassed for advisories) | KILLED 1 of 5 | the own-row test |
+| A5 an advisory is not consumed at all while a demand is pending | KILLED 2 of 5 | both R2 tests (fail on "the advisory was consumed") |
+
+Baseline 5 of 5 collected and passed before each run; every kill has passed + failed == collected. The A5 kill is
+a wait that times out on a positive assertion, not an absence read as a pass.
+
+Not established: an advisory for a row whose tier is only *partly* leased; the advisory's interaction with a
+deferral that a retirement is about to end (no test overlaps the two in time).
