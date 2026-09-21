@@ -862,10 +862,29 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 >
 > **Two further survivors from the same sweep, both live risks rather than test
 > hygiene.** **H15:** a resubmitted extent overwriting its first submit stamp
-> survives. That matters beyond the unit under test, because the per-drive FIFO
-> finding this plan carries as an explicit assumption was derived from **submit
-> and completion stamps**; if a resubmit can silently overwrite a submit stamp
-> and no test notices, stamp-derived ordering analyses have an unguarded premise.
+> survives; a later classification grades it **half real** -- the fixture does
+> assert the fault fired and that an attempt is counted, but "keeps its first
+> submit" is not asserted at all, which one comparison fixes.
+>
+> **CORRECTION, and it reverses this entry's original reasoning.** An earlier
+> revision argued H15 undermined the per-drive FIFO finding, "because that
+> finding was derived from **submit and completion stamps**." It was not: the
+> FIFO analysis used **completion stamps only**, since the schema-2 traces it
+> read carry no per-extent submit stamp at all. That correction was made against
+> the qualification list above and **did not propagate here**, so this document
+> asserted and denied the same fact about 230 lines apart. H15 corrupts no
+> stamp any completed analysis read.
+>
+> **H15 is still a live risk, in the future tense, and the corrected version is
+> sharper than the wrong one.** The FIFO assumption is *already* untestable for
+> retries -- every analysed trace has `retried == 0`, and a short-read resubmit
+> breaks per-drive FIFO **by construction**. Schema 3 adds the per-extent submit
+> stamp that would finally make the retry case measurable. H15 means that the
+> moment those stamps exist and retries occur, a resubmit can silently overwrite
+> the first submit and no test will notice. So H15 does not damage what we have
+> measured; **it damages the instrument we intend to close the retry gap with**,
+> before that instrument has been used once.
+>
 > **H18:** a failed thread start leaves the tier marked threaded, and survives.
 >
 > **And the one that reaches Task 6 directly. H01** -- the publish gate with
