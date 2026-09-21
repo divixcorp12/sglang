@@ -109,6 +109,57 @@ tests pass.
   the real checkpoint (`test/manual/dsv41/test_exl3_checkpoint_layout.py`, shapes only) would catch it, and
   it was not run.
 
+## Which path through the code each survivor's test never takes
+
+The question: for the aimed-elsewhere survivors, which path does the test never take, and is the pattern
+"a requirement-shaped test reaches the OUTCOME of a retry or failure path but never the path"? Answering it
+for all six, not only the aimed-elsewhere ones, because the answer is not uniform and the difference matters.
+
+| survivor | the path the production code takes | what the test does instead | is the path reached? |
+|---|---|---|---|
+| H01 | a demand fails **after** some rows packed: `read()` returns 0 with `packed[i] != 0` for some `i`, and the gate decides which to publish | `fail_reads` sets `ok = false` and skips `read()` entirely (`host.cpp` in `serve()`), so `packed` is empty and the gate has nothing to decide | **No.** A shortcut path produces the same outcome ("nothing published") |
+| H15 | an extent is resubmitted after a short read or EINTR: `extent_submit` already set, `extent_attempts` incremented | the fault fires (`retried_bytes > 0` is asserted) and the resubmit path runs | **Yes**, and it is witnessed. The **property on that path** ("keeps its first submit") is not asserted |
+| H18 | `start()` fails to pin: join the thread, `set_threaded(false)`, throw | `start_thread` raises, so the failure path runs | **Yes.** The **cleanup effect** on C++ state is not observed: the assertion reads a Python mirror that C++ cannot change |
+| P01, P02 | the production configuration, `direct=True`: rows read through `O_DIRECT` files | every test that reads uses `direct=False` (fixtures pass it, because tmpfs and CI cannot O_DIRECT); the one `direct=True` run asserts a label printed from the flag | **No.** The default production path is never taken by a test that reads |
+| P03 | a non-default prefix selects a different tensor set | `prefix="mtp"` is passed, so the branch runs | **Yes**, but the fixture is degenerate: both sets share a key, so both branches produce the same observable result |
+
+**What the table says, without forcing it.** The pattern you proposed holds for three of the six, and only
+in a modified form:
+- **H01 fits it exactly.** A retry-or-failure path (failure after packing) whose *outcome* is reached by a
+  shortcut. This is the clean instance.
+- **H15 and H18 reach the path and miss the property on it.** The test takes the failure or retry path and
+  even witnesses it (H15 asserts the fault fired), then asserts something the path's defect does not
+  disturb: an ordering any later stamp satisfies (H15), a Python flag (H18). So the failure is not "never
+  takes the path" but "asserts an outcome a broken path also produces".
+- **P01, P02 and P03 are not retry-or-failure paths at all.** P01/P02 are the production configuration never
+  exercised because fixtures choose the portable configuration; P03 is a degenerate fixture. They share the
+  same root as the other three, below, but not the retry/failure shape.
+
+**The pattern that does hold across all six:** each survivor's test asserts an OUTCOME that a *shortcut*
+also produces, and none asserts a witness that the intended path ran and a property on that path.
+- H01: "nothing published", true when nothing packed.
+- H15: `admit <= submit <= cqe <= start`, true for any later stamp.
+- H18: `not host.threaded`, true because Python never set it.
+- P01/P02: `"O_DIRECT"` in the output, true because the label is printed from the flag.
+- P03: `list(layout.records) == [(0, 0)]`, true under both prefixes.
+
+That is a statement about how requirements get turned into tests: the requirement's *postcondition* is
+easy to assert and easy to satisfy by accident, and the *path* that makes the postcondition meaningful is
+left implicit.
+
+**A concrete instance of the missing witness (H01).** The test calls `host.enable_trace()` and never calls
+`drain_trace()`. The stage record it enables would have shown `row_pack` empty under `fail_reads`, which is
+exactly the fact that makes the test vacuous. So the witness was one unused call away, and the setup line
+suggests it was intended. This is stated from reading the test at the base; I did not run it.
+
+**What I would put in the plan, as a recommendation and not a finding:** a test for a failure, retry or
+configuration requirement should carry two assertions the postcondition does not supply: (1) a **path
+witness**, an observable that the intended path ran (rows packed, attempts incremented, the file opened with
+the flag, the non-default branch taken); and (2) the **property on that path** (what is published, which stamp
+is kept, which state is left behind). H15's test has (1) and lacks (2); H01's has neither; the verifier has
+neither. Together with the mutation control already required of safety tests, that is a mechanical checklist
+for a requirement's acceptance test.
+
 ## Killed (16 of 22), one line each
 
 | id | mutation | killed by |
