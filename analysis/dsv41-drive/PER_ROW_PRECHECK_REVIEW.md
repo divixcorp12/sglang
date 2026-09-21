@@ -15,7 +15,7 @@ per-session step times.
 **Everything in the precheck's headline arithmetic reproduces from the traces.** Nothing I found changes the classification
 (SUPPORT, SPREAD-IRRELEVANT) or the redirect (two-phase before per-row). I found one misstated comparison (R1), one claim
 that the data can now test rather than assume (R2), one explanation that is right for a different reason than stated (R3),
-one independence statement to tighten (R4), two small denominator notes (R5), and, found later, a 3-7% overstatement of every absolute ms/step figure because 16 of the 495 trace lines cover two decode steps (R6). Nothing here is HIGH, and no verdict changes.
+one independence statement to tighten (R4), two small denominator notes (R5), and, found later, a 3-9% overstatement of the absolute ms/step figures (7.2-7.9% for BEST, RANDOM and two-phase) because 16 of the 495 trace lines cover two decode steps (R6). Nothing here is HIGH, and no verdict changes.
 
 ## What reproduces
 
@@ -118,9 +118,11 @@ should sit beside the headline.
 
 ### R5 (low): denominators
 
-- **T_step = 257.5 ms** is built from untraced arms including `task1-6` (marked INVALID in the baseline) and `task1c-3`
-  (disturbed). The clean untraced on-arms give **254.4 ms**, a 1.2% relative shift in every percentage: immaterial to every
-  verdict.
+- **T_step = 257.5 ms** is the mean of three untraced arms (`task1-3`, `task1-6`, `task1c-3`: 3.927, 3.936, 3.787 tok/s). One of them, `task1-6`, is marked INVALID (page-cache growth 1.40 GiB);
+  `task1c-3` is VALID with a boot-warm regime note (the "disturbed" label I first gave it was mine, not the verdict file's). Dropping `task1-6` alone moves the mean **up** to 259.3 ms, not down.
+  The 254.4 ms I first called "clean untraced" is the mean of the four `new:on` arms I used (`task1-2`, `task1b-0`, `task1c-0` are **traced**; only `task1-3` is untraced); the only untraced valid
+  on-arm alone gives 254.7 ms (n = 1). So the denominator lies in about 254-259 ms depending on the arm set, which is +-1% on every percentage: immaterial to every verdict, but not "clean" in either direction.
+  (Corrected 2026-09-21 after the plan's own check of the verdict files; the error was mine.)
 - The "1.5% the plan's design can resolve" comes from `task1e`'s quiet-box standard deviation. That series is recorded
   UNRESOLVED (contended box), so the resolution on the real box is worse than 1.5%. This sharpens the document's point that the
   per-row-over-two-phase increment (2.0% at best, negative at random) is below what the gate can see.
@@ -154,7 +156,7 @@ Recomputed with `vram_miss / steps` for `k` and 511 as the denominator (`merged_
 Against 257.5 ms: BEST 13.9%, RANDOM 6.9%, two-phase 12.0% (registered 15.0 / 7.5 / 13.0). Miss-only RANDOM 2.55 -> 2.46; `Sigma(m-1)*c` over 511 steps is 4.90, not 5.06.
 Total hit lanes per step (R2) 111.9 -> 108.4 and `vram_miss` per step 131 -> 126.9 (nearer 18.2's 121). **No verdict changes**: RANDOM minus 1 ms is 6.5% against the 3% bar,
 two-phase clears it, per-row over two-phase is still +4.9 ms best and -13.1 ms random, miss-only/RANDOM stays about 0.13, and the 87/13 split is a ratio of two
-quantities that scale together. But every absolute figure in `PER_ROW_TRANSFER.md` section 1 (and everything quoted from it) is 3-7% high, and
+quantities that scale together. But every absolute figure in `PER_ROW_TRANSFER.md` section 1 (and everything quoted from it) is 3-9% high (about 7-8% for BEST, RANDOM and two-phase, 3% for the best-order per-row increment), and
 **the R2 bounds (10.8 to 63.6, worst-case two-phase about 4%) were computed per 495 lines and are slightly loose in the same direction**. I have not redone them with 511.
 Also note that 495 appears as a per-step count in `per_row_precheck.py` itself, not only in the document.
 
