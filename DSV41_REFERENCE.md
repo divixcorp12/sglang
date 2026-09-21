@@ -2517,6 +2517,8 @@ an expected sha, and each result carrying `scripts/dsv41/provenance.py`'s record
 of the resolved environment, the imported tree, the reader mode in force and a
 drive-idle check. Scripts `analysis/dsv41-drive/task1-baseline-arms.sh` and
 `task1_arm_verdict.py`; raw output in `analysis/dsv41-drive/task1-results/`.
+To run an arm, set `REFERENCE=<clean-reference.json>` (and `EXPECT_NEW`): the script refuses to start, exit 5, if it is unset or if an arm's
+`git rev-parse <sha>:python` is not registered there. See `analysis/dsv41-drive/PIPELINE_BASELINE.md` section 2 and `task1-results/GENERATIONS.txt`.
 
 Graph decode, `GRAPH_GATHER=1`, 4 sessions, 256 prompt / 128 new, 70 GiB pinned
 tier. `multi_token_chunks` was 0 in every arm of the series, so the step-latency

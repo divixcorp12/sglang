@@ -54,6 +54,11 @@ shakedown (`R/t1-0-SHAKEDOWN.txt`): it is not a baseline arm and is not counted 
 Every arm runs the same workload, launched by `analysis/dsv41-drive/task1-baseline-arms.sh` (blob at HEAD; each
 arm's `R/*-run.out` header prints the script's and the verdict tool's sha):
 
+**To run an arm, set `REFERENCE`, or the script refuses to start.** `EXPECT_NEW=<full sha> REFERENCE=<path to clean-reference.json>
+task1-baseline-arms.sh <label> <run-dir> <code>:<mirror>:<trace>...` (`DRY=1` also checks). It exits 5 before the first arm if `REFERENCE`
+is unset or unreadable, or if any arm's `git rev-parse <sha>:python` is not a key of its `generations` (register the tree first;
+`task1-results/GENERATIONS.txt`, section 4). Before 2026-09-21 `REFERENCE` was optional and an unregistered tree ran and read `VALID`.
+
 - graph decode, `SGLANG_MOE_EXPERT_GRAPH_GATHER=1`, 4 sessions (`--skip 0 --n 4`) of 256 prompt tokens and 128 new
   tokens each, 70 GiB pinned host tier (section 19), the harness `scripts/dsv41/trace_corpus.py` from the new worktree in every
   arm so the old arms have the same driver and fields;
