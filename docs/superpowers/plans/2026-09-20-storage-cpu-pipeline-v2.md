@@ -262,6 +262,30 @@ Include expert identity in the immutable row result and validate it against the 
 > it" is not a demonstration that it holds under leases.** That can only be shown
 > once lease mode exists and its handshake is exercised, at step 5/8.
 
+> **ALL SIX REMAINING TASK 5 BOXES SHARE ONE BLOCKER, 2026-09-21.** Read their text
+> together and every one names a GPU reader or an acknowledgement: box 2 "exercise
+> the acknowledgements"; box 3 "delayed GPU consumption"; box 4 "a skipped GPU copy
+> must not ... emit a successful ... acknowledgement"; box 5 "no GPU reader can
+> start" and "never synchronously wait for an acknowledgement"; box 6 "establish
+> completion of all GPU readers"; box 7 "Option F's acknowledgement/eviction
+> ordering". **`exl3_ram_miss.cuh` carries three layout constants for `LaneAck`
+> (:83-85) and no kernel.** So Task 5 is not six open items -- it is one dependency,
+> step 4 plus a GPU, seen six times.
+>
+> **What follows for how these are read.** The CPU half of several is already built
+> and, in box 3's case, mutation-verified; what is missing each time is the same
+> absent consumer, stood in for by `LeaseSim`, a simulation written from this
+> specification by the same hand. That is the one thing a simulation cannot
+> independently confirm, which is why each of these is refused on the same clause
+> rather than ticked at CPU scope. Box 6 is the nearest to closable and has the most
+> uncited evidence (22 tests in `test_exl3_ram_miss_shutdown.py`, production-reachable
+> since `bcfe378f0d`), but its barrier is a faked `torch.cuda.synchronize`, so it
+> fails on the same clause as box 3 and is refused for the same reason. **That
+> assessment is second-hand and has not been verified here.**
+>
+> **The practical consequence: no amount of CPU work moves Task 5's count.** Anyone
+> planning around this should treat the six as one GPU-gated unit, and should not
+> read six open boxes as six independent pieces of remaining work.
 - [ ] Initially exercise the acknowledgements after the existing whole-request copy, without changing its scheduling. Include RAM hits as well as newly read rows in source ownership.
 - [ ] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
 > **REFUSED AGAIN 2026-09-21, and the refusal is now worth more than a tick would
