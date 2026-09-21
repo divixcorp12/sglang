@@ -19,6 +19,7 @@ from typing import Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS, Exl3RamMissDevice, Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
@@ -301,6 +302,21 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
         self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
 
+    def post(self, tag, plan) -> None:
+        """Without leases: the inherited translate then copy of ``plan.count`` rows.
+
+        With them (LEASE_PROTOCOL.md 7): the copy's active count is the wait kernel's ``go_count``, not the plan's
+        ``count`` (zero on any refusal, so a refused request reads nothing), and the acknowledgement kernel follows the
+        copy in the same stream. Whether a record is armed is decided by the post kernel and read back by the service
+        from the record, so no arming decision is made here.
+        """
+        if self.device_side.lease_block is None:
+            super().post(tag, plan)
+            return
+        self.translate(tag, plan)
+        copy_expert_row_segments_gpu(self.segments[tag], self.host_rows, plan.slots, self.device_side.go_count)
+        self.device_side.ack(self.keep)
+
 
 def watchdog_wait_s(timeout_ms: int) -> float:
     """The C++ watchdog's abort limit for a wait timeout of ``timeout_ms``: max(30 s, 3 x timeout).
@@ -351,6 +367,9 @@ class Exl3RamMissService:
         self._shut_down = False
         self._quarantined = False
         self._completed = False
+        # Fixed once, in ensure_started, from SGLANG_DSV41_ENABLE_RAM_MISS_LEASES: the host and the device are both
+        # configured from this one field, so they cannot disagree about whether a record is leased.
+        self.lease_mode = False
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -396,6 +415,9 @@ class Exl3RamMissService:
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
+            lease_mode = envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get()
+            if lease_mode:
+                host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
@@ -410,7 +432,7 @@ class Exl3RamMissService:
             # before anything can release them.
             host.stop()
             raise
-        self.page, self.slot_map, self.host = page, slot_map, host
+        self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
         # later is refused by register()), makes this run before that hook, so the slabs are quarantined and their
@@ -418,8 +440,9 @@ class Exl3RamMissService:
         atexit.register(_quarantine_service_at_exit, weakref.ref(self))
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
-            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms",
+            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
+            "on" if lease_mode else "off",
         )
 
     def before_host_use(self) -> None:
@@ -463,6 +486,9 @@ class Exl3RamMissService:
                 layers=len(self._rows),
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 advise=prefetch_enabled(),
+                # The host owns the block (Exl3RamMissHost allocates it); the device reads the same one.
+                lease_block=self.host.lease_block if self.lease_mode else None,
+                lease_layout=self.host.lease_layout if self.lease_mode else None,
             )
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
@@ -681,6 +707,7 @@ class Exl3RamMissService:
             owned += [self.host.page, self.host.slot_map, self.host.lease_block]
         if self.device_side is not None:
             owned += [self.device_side.state, self.device_side.last_routes]
+            owned += [t for t in (self.device_side.go_count, self.device_side.lane_ctx) if t is not None]
         for layer_id in sorted(self.tables):
             streamer = self.tables[layer_id].streamer_of()
             tier = getattr(streamer, "pinned_host_cache", None)

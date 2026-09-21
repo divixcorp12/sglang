@@ -239,6 +239,80 @@ def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, 
         assert streamer.row_backend.device_side is service.device_side  # one device side, shared by every layer
 
 
+def _attach_all(service, streamers):
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+    for streamer in streamers.values():
+        streamer._graph_pinned_tier = True
+        streamer.hot_cache = SimpleNamespace(device="cpu")
+        streamer.graph_gather_rows = 6
+        streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
+        streamer.format.attach_hot_cache_manager(manager, streamer)
+
+
+def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):
+    service, streamers, caches = tiers
+    enabled = []
+    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: enabled.append(self))
+    assert envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get() is False
+    _attach_all(service, streamers)
+    assert enabled == [] and service.lease_mode is False
+    assert service.device_side.lease_block is None and service.device_side.go_count is None
+
+
+def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_with_the_hosts_block(tiers, monkeypatch):
+    """One env read (ensure_started) feeds both sides, so the device's arming and the service's leasing cannot disagree."""
+    service, streamers, caches = tiers
+    order = []
+    enable, start = module.Exl3RamMissHost.enable_lease_mode, module.Exl3RamMissHost.start_thread
+    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
+    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
+        _attach_all(service, streamers)
+    assert order == ["lease", "thread"] and service.lease_mode is True
+    device = service.device_side
+    assert device.lease_block is service.host.lease_block  # the block the host writes, not a second one
+    assert device.go_count is not None and device.go_count.dtype == torch.int32 and device.go_count.shape == (1,)
+    # The env is read once, when the service starts: flipping it afterwards changes nothing.
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False):
+        service.ensure_started()
+    assert service.lease_mode is True
+
+
+def _backend_calls(monkeypatch, *, lease):
+    calls = []
+    device_side = SimpleNamespace(
+        lease_block=object() if lease else None,
+        go_count="GO_COUNT",
+        post=lambda *a: calls.append("post"),
+        wait=lambda *a: calls.append("wait"),
+        ack=lambda keep: calls.append(("ack", keep)),
+    )
+    monkeypatch.setattr(
+        module,
+        "copy_expert_row_segments_gpu",
+        lambda segments, host_rows, slots, count: calls.append(("copy", count)),
+    )
+    backend = module.Exl3RamMissRowBackend({0: "SEG"}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
+    plan = SimpleNamespace(
+        expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]),
+        slots=torch.arange(6, dtype=torch.int32),
+        count=torch.tensor([3], dtype=torch.int32),
+    )
+    backend.post(0, plan)
+    return calls, backend, plan
+
+
+def test_without_leases_the_row_backend_copies_plan_count_and_acknowledges_nothing(monkeypatch):
+    calls, backend, plan = _backend_calls(monkeypatch, lease=False)
+    assert calls == ["post", "wait", ("copy", plan.count)]
+
+
+def test_with_leases_the_copy_takes_go_count_and_the_acknowledgement_follows_it(monkeypatch):
+    calls, backend, plan = _backend_calls(monkeypatch, lease=True)
+    assert calls == ["post", "wait", ("copy", "GO_COUNT"), ("ack", backend.keep)]
+    assert calls[2][1] is not plan.count
+
+
 def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monkeypatch):
     service, streamers, caches = tiers
     service.ensure_started()

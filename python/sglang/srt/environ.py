@@ -1822,6 +1822,12 @@ class Envs:
     # the previous token's routes for layer L+1 that are not in RAM as advisory
     # reads for the RAM-miss thread (demands always go first). Off by default.
     SGLANG_DSV41_ENABLE_EXPERT_PREFETCH = EnvBool(False)
+    # Option C lease mode (analysis/dsv41-drive/LEASE_PROTOCOL.md): the RAM-miss thread leases every pinned slot the
+    # in-graph copy reads, the device copies only what it holds a lease on and acknowledges after the copy, and the
+    # thread never evicts a leased slot. It arms every record that plans rows, so each MoE layer pays one service round
+    # trip even when every row is in RAM (LEASE_PROTOCOL.md 15). Read once when the service starts; off is today's
+    # protocol bit for bit. Off by default.
+    SGLANG_DSV41_ENABLE_RAM_MISS_LEASES = EnvBool(False)
     # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
     # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
     # plain np.memmap path.
