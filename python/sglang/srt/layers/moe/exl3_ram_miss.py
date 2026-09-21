@@ -16,7 +16,7 @@ from typing import Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS, Exl3RamMissDevice, Exl3RamMissHost, new_page
-from sglang.srt.environ import envs
+from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
@@ -281,6 +281,8 @@ class Exl3RamMissService:
         # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
         self.routed_rows_per_step = 0
         self._shut_down = False
+        # Resolved by ensure_started, not here: the service is a process singleton built before the env is final.
+        self._ram_miss_timeout_ms: Optional[int] = None
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -312,10 +314,11 @@ class Exl3RamMissService:
         page = new_page(pin=pin)
         slot_map = torch.full(tuple(tables.reads.shape[:2]), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
+        cfg = Dsv41Config.from_envs()
         host = Exl3RamMissHost(tables, page=page, slot_map=slot_map, direct=fmt._resolve_direct())
         try:
-            host.start_thread(fatal_wait_s=watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get()))
-            fault = parse_fault(envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get())
+            host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            fault = parse_fault(cfg.ram_miss_fault)
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)
@@ -326,10 +329,11 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host = page, slot_map, host
+        self._ram_miss_timeout_ms = cfg.ram_miss_timeout_ms
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms",
-            len(tables.layer_ids), len(tables.paths), tables.slot_bytes, envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
+            len(tables.layer_ids), len(tables.paths), tables.slot_bytes, self._ram_miss_timeout_ms,
         )
 
     def before_host_use(self) -> None:
@@ -338,7 +342,7 @@ class Exl3RamMissService:
         if self._pause_depth == 0:
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 torch.cuda.current_stream().synchronize()
-            self.host.pause(2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0)
+            self.host.pause(2 * self._ram_miss_timeout_ms / 1000 + 1.0)
         self._pause_depth += 1
 
     def after_host_use(self) -> None:
@@ -364,7 +368,7 @@ class Exl3RamMissService:
                 self.slot_map,
                 device=cache.device,
                 layers=len(self._rows),
-                timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
+                timeout_ms=self._ram_miss_timeout_ms,
                 advise=prefetch_enabled(),
             )
         self.routed_rows_per_step += streamer.graph_gather_rows
