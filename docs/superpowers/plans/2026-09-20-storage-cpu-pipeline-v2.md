@@ -213,6 +213,31 @@ Include expert identity in the immutable row result and validate it against the 
 > kernel rows need step 4 and a GPU. **The wrap tests are the only
 > service-level mutation evidence in the entire lease test list today.**
 
+> **SUPERSEDED, 2026-09-21 -- the blockquote above is stale and is kept only so
+> the correction has something to point at.** Steps 3a-3c have since landed
+> (`9e9b9cd204` grant/publish/retire, `e28f2126da` deferral, `928e375bd0` pause
+> and wrap), and `LEASE_PROTOCOL.md:1654` records **34 mutants run on divix01
+> against the landed service** -- 17 of grant/publish/retire, 12 of deferral, 5 of
+> pause and wrap -- all killed after two survivors were found and fixed. So three
+> statements above are now false: "Task 5 has NO service-level mutation evidence",
+> "Everything else is specification, not evidence", and (in the next blockquote)
+> "No lease is granted by the service". The service grants leases today.
+>
+> **The two survivors are the part worth keeping.** 3a's "grant ignores whether
+> the request succeeded" survived because its test left no lane resident, so the
+> grant could not happen either way; 3b's "every refused retry counts as a new
+> deferral" survived because no test retried. Both are the same failure as the
+> vacuous tests catalogued elsewhere in this plan -- a mutant survives because the
+> test never reaches the path, not because the code is right. **Test-first did not
+> prevent either**, which is the strongest evidence here against treating test-first
+> as a substitute for checking that a test can fail.
+>
+> **Why this went unnoticed:** the evidence landed in `LEASE_PROTOCOL.md` and the
+> plan was never reconciled against it. An independent check (t11, adversarial,
+> asked to break the claim rather than confirm it) found the same staleness while
+> verifying something else. Treat every "no evidence exists" claim in this plan as
+> carrying a date, not a fact.
+
 - [x] Document aligned fields, single-writer ownership, system release/acquire operations, wrap handling, and request-slot reuse before coding. Use a coherently validated protocol; ordinary Python stores are not its implementation.
   - **Artefacts:** `LEASE_PROTOCOL.md` (`cc30fe34f4`) covering aligned fields §4, single-writer ownership §5, release/acquire §6, wrap §11, request-slot reuse §11.4; the explicit-state model `lease_model.py` (`3d11d02265`); the independent transcription review `LEASE_MODEL_REVIEW.md` (`2cbe9b4b92`).
   - **"Before coding" is checked, not asserted:** the document lands 01:16, the model 01:45, and the first lease code is step 1 (`1b22ea4626`, 02:44). `git log -S kLease -- python` returns only steps 1 and 2. The doc precedes the first line of lease code by about 88 minutes.
@@ -239,6 +264,34 @@ Include expert identity in the immutable row result and validate it against the 
 
 - [ ] Initially exercise the acknowledgements after the existing whole-request copy, without changing its scheduling. Include RAM hits as well as newly read rows in source ownership.
 - [ ] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
+> **REFUSED AGAIN 2026-09-21, and the refusal is now worth more than a tick would
+> be.** The CPU-observable property IS closed, by `4fc530880b`
+> (`test_a_served_requests_leased_slot_keeps_its_bytes_under_a_newer_demand_and_an_advisory`,
+> `test_exl3_ram_miss_lease_service.py:300`), which this plan never cited. An
+> adversarial check confirmed it is not vacuous: four mutants of `take_slot_locked`
+> (`leased_locked` returns false; drop the skip but keep the census guard; demand
+> ignores leases; advisory ignores leases) were each killed by **exactly this test,
+> 1 of 17**, and all four failed on the property line ("the sentinel in the leased
+> slot was overwritten"), not the witness. The control at :337-341 shows the
+> sentinel assertion can fail in unmutated code once the lease retires, which rules
+> out the usual way a sentinel check goes vacuous -- test slabs that do not alias
+> the memory the service writes.
+>
+> **It stays open on its first clause, not its last.** "Inject delayed GPU
+> consumption" is satisfied by `LeaseSim`, a CPU stand-in written from this same
+> specification, and `exl3_ram_miss.cuh` carries only the layout constants for
+> `LaneAck` (:83-85) -- **no acknowledgement kernel exists**. `LEASE_PROTOCOL`
+> 20.2h (:2236) already ruled this way: "R4 does not change that."
+>
+> **Recorded because the argument for ticking is good and should not have to be
+> re-derived to be re-refused.** It runs: step 3 has landed, the leases are
+> service-granted rather than injected, and the property lives entirely in the
+> eviction predicate, which sees only "ack word not yet present" -- so a real GPU
+> consumer would change nothing about what is under test. That may well be right.
+> It was still refused, because the clause says GPU and the consumer is a
+> simulation written by the same hand from the same spec, which is the one thing a
+> simulation cannot independently confirm. Revisit when the ack kernel exists, not
+> before.
 > **The all-or-nothing guarantee is unpinned in BOTH directions** (second
 > review, `0fc5640141`). The test named for it,
 > `test_a_failed_read_publishes_none_of_the_rows_it_had_already_packed`, injects
