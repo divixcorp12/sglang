@@ -619,6 +619,20 @@ Include expert identity in the immutable row result and validate it against the 
 >     for `pack_one`, which acts per reap, and R3 accounts for it through the
 >     same-reap ties (83 of 1,842 requests) -- but "0 inversions" should not be
 >     read as a statement about individual completions.
+>   - **The arms are independent runs, checked rather than assumed.** All eight
+>     traces have identical `(layer, type, rows_asked)` for all 20,800 requests,
+>     which looked like it might mean some were copies -- in which case "0
+>     inversions on each of three mirrors-on arms" would be one observation
+>     reported three times. It does not. All eight sha256 differ; across all 28
+>     pairs no request shares an `observed` stamp or an extent-completion tuple;
+>     total spans differ (445.8-458.7 s off, 287.6-289.4 s on, 318.7 s for
+>     `task1f`); the arm JSONs carry eight distinct host pids and mtimes spanning
+>     two days. The identical content is **only** the non-timing stream, which is
+>     the signature of a deterministic harness. **So these are three independent
+>     timing observations of one request stream** -- evidence that the ordering is
+>     stable across runs, not evidence across workloads, which is what the wording
+>     already claimed. Not checked: whether all eight ran under the same code
+>     generation.
 >   - The analysis used **completion stamps only**, not submit stamps. (An earlier
 >     revision of this plan, and a question I asked from it, said "submit and
 >     completion"; the schema-2 traces it read carry no per-extent submit stamp at
