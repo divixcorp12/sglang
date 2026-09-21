@@ -11,6 +11,13 @@ that name these components (82 files). Read-only: nothing was fixed, and `exl3_r
 not touched. Working-tree line numbers; the host `.cpp`, `ops/moe/exl3_ram_miss.py`, `environ.py` and
 two moe files were dirty while this was written.
 
+**Line numbers into `exl3_ram_miss_host.cpp` in this document are stale and should not be used.** They are
+from the working tree the reviewers read; the file has since moved under three lanes (busy-seq and trace
+schema 4, then Task 5 steps 2-3c). Where a citation matters it is anchored by text below, with the line it has
+at each base run in `MUTATION_RESULTS.md`: at `a01f9347d6` the publish gate is at 1904, the first-submit stamp
+at 861-863, `file_drive_.push_back` at 499, the two `drive_bytes[drive]` updates at 1004 and 1087, and the
+failed-start `set_threaded(false)` at 2301; the `2054` and `2473` below are the reviewers' numbers.
+
 ## Result
 
 About 1,140 tests were read across five slices. **About 20 were proven unable to fail for the reason
@@ -47,7 +54,7 @@ The test injects `host.inject(fail_reads=True)` and asserts nothing published. I
 calling `reader_.read(...)`, so `read()` never runs, no row ever packs, `packed` is empty (it is cleared
 at :2013 and refilled only inside `read()`), and "nothing published" is true by construction.
 
-**The mutant that escapes the whole slice**: in `exl3_ram_miss_host.cpp:2054`, widen
+**The mutant that escapes the whole slice**: in `exl3_ram_miss_host.cpp`'s `serve()` (line 2054 in the tree the reviewer read, 1904 at `a01f9347d6`, 2347 at `bc02ab9ddf`), widen
 `if (ok || (cancelled && i < packed.size() && packed[i] != 0))` to
 `if (ok || (i < packed.size() && packed[i] != 0))`, so rows packed before a hard failure are published.
 Every test in `test/registered/unit/kernels/` stays green. Nothing else kills it: the tier test at
@@ -287,7 +294,7 @@ run. Counted with the repo's own parser (`ut_parse_one_file`) over the 82 in-sco
 
 ## Mutation tests worth spending time on, in order
 
-1. `exl3_ram_miss_host.cpp:2054` (finding 1), and the same edit as Task 6 V2 intends.
+1. The publish gate in `serve()` (`exl3_ram_miss_host.cpp`, `if (ok || (cancelled && i < packed.size() && ...`; not line 2054, see the note at the top) (finding 1), and the same edit as Task 6 V2 intends.
 2. `expert_hot_cache.py:292`, delete the generation comparison (finding 2).
 3. `verify_expert_mirror.py:519` and `:534` separately, `direct=False` (finding 3).
 4. `exl3_expert_layout.py:64`, `re.escape(prefix)` -> `"layers"` (finding 4).
