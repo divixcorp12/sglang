@@ -605,7 +605,24 @@ Include expert identity in the immutable row result and validate it against the 
 >   1,842 m>=2 requests; 0 of 4,750 consecutive same-drive pairs; same-reap ties
 >   3.7% on, 0% off). FIFO is **not separately tested** -- NVMe does not guarantee
 >   it -- so the design must carry it as an explicit assumption. `MIRROR_ROWS`' tail
->   means bunching, not reordering.
+>   means bunching, not reordering. Three qualifications, all established rather
+>   than supposed:
+>   - **It is also an assumption about *no retries*, and that half is untestable
+>     from this corpus.** Every analysed trace has `byte_split.retried == 0` and
+>     `completed == submitted` in all 20,800 requests, and the schema-4 file has
+>     `attempts == 0` on all 19,310 extents. So "0 inversions" is evidence **for
+>     retry-free runs only**. A short-read resubmit breaks per-drive FIFO **by
+>     construction**, since the extent then completes after later extents on the
+>     same drive. Nothing in the corpus can test that case.
+>   - **The ordering is measured at reap granularity, not per completion.** The
+>     `cqe` stamp is when the reaping wait returned. That is the right granularity
+>     for `pack_one`, which acts per reap, and R3 accounts for it through the
+>     same-reap ties (83 of 1,842 requests) -- but "0 inversions" should not be
+>     read as a statement about individual completions.
+>   - The analysis used **completion stamps only**, not submit stamps. (An earlier
+>     revision of this plan, and a question I asked from it, said "submit and
+>     completion"; the schema-2 traces it read carry no per-extent submit stamp at
+>     all -- that field arrives in schema 3.)
 > - `[REQ 1]`'s cost is booked to Task 5 and appears in no Task 6 estimate.
 
 **Chosen mechanism: two-phase.** Per-row costs 160 extra stage triples per step across all 40 layers to buy an increment that is 1.1-1.4% net **at best order**, and that is **-6.2% at fixed lane order** (STANDING item 2). `PER_ROW_TRANSFER.md` §6.2 lists what would overturn that.
