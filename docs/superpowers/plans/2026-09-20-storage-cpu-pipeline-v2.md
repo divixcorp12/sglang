@@ -290,15 +290,24 @@ Include expert identity in the immutable row result and validate it against the 
 >    capacity, and promotion copies on the same link subtract from it. V1's
 >    ceiling is a ceiling by construction.
 >
-> **CURRENT FIGURES** -- measured lane counts, per **511** decode steps, shares
-> of 257.5 ms. **These supersede every figure in the audit trail below, which
-> records how they moved and must not be quoted:**
+> **CURRENT FIGURES.** Per **511** decode steps, shares of 257.5 ms. These
+> supersede every figure in the audit trail below, which records how they moved
+> and **must not be quoted**.
 >
-> | source | BEST | RANDOM | two-phase | hit lanes, read layers |
+> **Every saving in this table is MODELLED, not measured.** What the trace
+> measured is the *lane count* `k` -- the last column -- which used to be an
+> estimate and now is not. BEST, RANDOM and two-phase are model outputs that
+> consume `k`, and they still rest on exactly the untested inputs they always
+> did: `c` = 1.055 ms per row, **A2** (hit lanes ready at reservation -- the
+> signal that does not exist), the 1.0 ms launch cost, one workload, and stage
+> stamps joined from `task1-2-new-on-T`. A better `k` does not make them
+> measurements. **No saving in this task has been measured end to end.**
+>
+> | source of `k` | BEST | RANDOM | two-phase | hit lanes, read layers |
 > |---|---:|---:|---:|---:|
-> | **measured** (`dad59f1b48`) | **40.67** (15.8%) | **20.07** (7.8%) | **35.74** (13.9%) | **33.9** |
-> | A1 estimate, R6-corrected | 35.80 | 17.79 | 30.88 | 29.3 |
-> | A1 estimate, as registered | 38.61 | 19.17 | 33.53 | 31.9 |
+> | **measured `k`** (`dad59f1b48`) | **40.67** (15.8%) | **20.07** (7.8%) | **35.74** (13.9%) | **33.9** (measured) |
+> | estimated `k` (A1), R6-corrected | 35.80 | 17.79 | 30.88 | 29.3 |
+> | estimated `k` (A1), as registered | 38.61 | 19.17 | 33.53 | 31.9 |
 >
 > Per-row over two-phase: **+4.93 ms** at best order (this increment is
 > Sigma(m-1)c and does not depend on the lane count), **-15.67 ms** at random
