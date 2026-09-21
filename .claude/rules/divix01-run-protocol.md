@@ -40,6 +40,29 @@ Running unverified code needs a commit first. That is the intended trade: the
 branch carries a fix-up commit rather than the box carrying an untracked state
 nobody can reconstruct. Do not amend or rebase to tidy it.
 
+## Mutants and concurrent lanes
+
+A mutant is deliberately throwaway, so it is the one edit that is made on
+divix01 rather than pushed: apply it in the worktree, run, then
+`git checkout --` the file. Never commit one.
+
+Apply it in a **private** worktree, not `wt-dsv41`, whenever anything else may
+be working the branch:
+
+```bash
+git -C <repo> worktree add --detach /data/models/slang/nvfp4-work/wt-<name> <commit>
+# ... mutate, run, revert ...
+git -C <repo> worktree remove /data/models/slang/nvfp4-work/wt-<name>
+```
+
+On 2026-09-21 mutants were run in `wt-dsv41` while an agent worked the same
+branch; it found the tree dirty and had to build its own worktree to proceed.
+Nothing was lost, but a concurrent `git checkout --` would have destroyed its
+uncommitted work.
+
+After reverting, re-run the suite and record that it is green again. A mutation
+result is only meaningful next to the restored baseline.
+
 ## CPU and cores
 
 Every CPU job runs under `taskset -c 0-63` with threads capped
