@@ -2423,7 +2423,7 @@ scans up to 16 entries, on a loop that polls in worker mode. With none outstandi
 body): the test proves the call exists and runs at read start, not that it runs between batches, because a one-batch read
 has no between. D1-D3 are one test's worth of assurance (the same test in two modes), not three. The reviewer predicted a
 flake from asserting `rows_read` after polling for the counter; the assertion was redundant (the done stall already
-proves nothing else retires) and was removed. The reviewer's suggested replacement, `busy_since_ns() != 0`, was tried
+proves nothing else retires) and was removed. A replacement, `busy_since_ns() != 0`, was tried
 and FAILED every run: `busy_since` is cleared at the end of `handle_demand`, before the stall. The test then passed 8
 of 8 repeated runs and D1-D3 were killed again on the same assertion. Advisory-path retirement between rows has no test:
 a delay before the read can only place an acknowledgement before the first call, which the top-of-loop retire also
