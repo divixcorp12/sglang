@@ -5,9 +5,47 @@ min/p50/p95/p99 of per-token decode latency. The closest
 existing thing is `analysis/dsv41-drive/open11/open11_serving_path.py`, which drives the real backend and the
 real switch but no Engine; this drives the whole server path.
 
-**Nothing here has been run against the model.** A real run loads the model, holds the whole card and ~80 GiB
-of host RAM for many minutes per process, and needs explicit approval. What was verified without loading it is in the hand-off
-report: `--dry-run`, the import-path assertion, the paths, and `test_harness.py`.
+## SHELVED: built, validated, deliberately NOT RUN
+
+Do not run this to measure lease-mode arming cost. It cannot resolve it.
+
+- **Why.** The effect it was built to detect, lease-mode arming, is 0.68 ms per step (OPEN 11: 18.24 us per layer x 40).
+  A DSV4.1 EXL3 in-graph decode step is ~360 ms, so the effect is **~0.19%** of a step. At a per-step sd of 60-100 ms
+  (RAM-miss stalls; base sessions span 2.2-3.5 tok/s) a window of a few thousand decode tokens resolves roughly
+  **2-3%**: an order of magnitude short. The run would return `UNRESOLVED` with that bound, i.e. an expensive
+  measurement of the step time.
+- **The rate depends on the configuration. Never average across rows** (DSV4.1 EXL3, `dsv41-full40`, 256-token
+  prompts, 128 new tokens, cold sessions):
+
+  | config | source | tok/s | ms/token |
+  |---|---|---|---|
+  | eager decode | `analysis/dsv41-phase3a/corpus-cold.json`, `corpus-seeded.json`; DSV41_REFERENCE 16.12 | 1.60-1.63 | ~615-623 |
+  | breakable graph, GRAPH_GATHER=0 (MoE as eager breaks) | `analysis/dsv41-phase3b/corpus-p1.json` | 1.97 | ~510 |
+  | **breakable graph, GRAPH_GATHER=1 (in-graph; this harness's config)** | `analysis/dsv41-phase3b/corpus-c.json`, `corpus-cpf.json` | **2.78** (sessions 2.18-3.53) | **~360** |
+  | same, under nsys | `corpus-prof-graph.json`; DSV41_REFERENCE 18 | 2.10 | 423 in capture, 261 after |
+
+  Later trees, same config: DSV41_REFERENCE 17.6-19 has 16 sessions at 2.83 tok/s and non-boundary steps at 359 ms.
+  All figures predate two-bank (REFERENCE 18-19 says so).
+- **66.8 ms/token is not a DSV4.1 number.** It is the Qwen3.8 NVFP4 production line, from `analysis/step-tail`
+  (`s7_untraced.py` reads the `prefetch-final-llapor-d-p*` server logs; that trace has 48 layers per step, DSV4.1
+  has 40). The repo's CLAUDE.md quotes it correctly for that line. The mistake was carrying it across models, which
+  made the effect look like ~1% instead of ~0.19%, and this harness was scoped on it.
+- **The instrument that does answer this**: `analysis/dsv41-drive/open11/` (`open11_serving_path.py`), which resolves
+  8 us per layer by driving the real backend and the real switch in isolation.
+- **When this harness becomes the right tool**: an effect of a few percent of a step, roughly **10 ms per step or
+  more** at the ~360 ms step, where a ~1900-sample window can resolve it. Anything smaller is below what an
+  end-to-end window sees.
+- **Idea, not built: a paired difference.** Greedy decoding gives both arms identical tokens and routes, so per-token
+  step latencies could be compared token by token instead of as pooled distributions. That should cancel the
+  route-driven variance, but not the hot cache's timing-dependent promotion or NVMe latency noise, which may be most
+  of what remains. `compare.py` would need a paired-difference statistic; the raw per-token latencies are already in
+  every result JSON.
+
+What was verified without loading the model: `--dry-run` on divix01, the import-path assertion, all paths, and
+`test_harness.py`. Nothing here has ever been run against the model.
+
+The rest of this file describes the harness as built. Its figures of ~67 ms per token and a ~1% effect
+(Cost model, Launch, and the effect section below) come from the wrong denominator; read them with the note above.
 
 ## The GRAPH_GATHER trap
 
@@ -33,7 +71,7 @@ Do not read "both arms gave the same number" as a finding. Read `lease_check` in
 
 ## Cost model: two loads, nothing more
 
-The model load (~70 GiB pinned host cache) dominates; decode tokens are cheap (~67 ms each). The switch is read once at
+The model load (~70 GiB pinned host cache) dominates; decode tokens are cheap (67 ms each was assumed; the measured DSV4.1 in-graph figure is ~360 ms, see the shelving note). The switch is read once at
 service start, so two process launches is the floor, and it is the default: one `lease_off`, one `lease_on`, one
 repetition. Nothing is pre-planned beyond that. `--reps` (default 1) counts pairs.
 
@@ -89,7 +127,7 @@ second of its pair.
 
 ## The effect to resolve, and why ~1900 tokens
 
-The lease cost is ~0.68 ms per 40-layer step on ~66.8 ms: about 1%. The standard error of a p50 over n samples is
+The lease cost is ~0.68 ms per 40-layer step. On the ~66.8 ms this section was written against that is about 1%; on the real ~360 ms DSV4.1 step it is ~0.19% (see the shelving note). The standard error of a p50 over n samples is
 about 1.25 x sd / sqrt(n), so 1924 samples resolve 0.67 ms if the per-step sd is below roughly 8 ms; a run whose
 steps stall on RAM misses (sd of tens of ms) will not, and the block spread will say so. **This is the condition under which the exercise fails**: if the per-step sd is above ~8 ms (RAM-miss stalls, box
 contention) the 1% is unresolvable from one pair, and a `NOT RESOLVED` verdict says that, not that there is no effect.
