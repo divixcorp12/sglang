@@ -20,6 +20,7 @@ import torch
 
 from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS, Exl3RamMissDevice, Exl3RamMissHost, new_page
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
@@ -389,6 +390,7 @@ class Exl3RamMissService:
         self._refuse_if_shut_down()
         if self.host is not None:
             return
+        cfg = Dsv41Config.from_envs()
         streamers = {layer_id: table.streamer_of() for layer_id, table in sorted(self.tables.items())}
         missing = [layer_id for layer_id, s in streamers.items() if s is None or s.pinned_host_cache is None]
         if missing:
@@ -410,19 +412,19 @@ class Exl3RamMissService:
             page=page,
             slot_map=slot_map,
             direct=fmt._resolve_direct(),
-            pack_workers=envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.get(),
+            pack_workers=cfg.ram_miss_pack_workers,
         )
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-            lease_mode = envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get()
+            lease_mode = cfg.enable_ram_miss_leases
             if lease_mode:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
-            host.start_thread(fatal_wait_s=watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get()))
-            fault = parse_fault(envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get())
+            host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            fault = parse_fault(cfg.ram_miss_fault)
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)
@@ -441,7 +443,7 @@ class Exl3RamMissService:
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s",
-            len(tables.layer_ids), len(tables.paths), tables.slot_bytes, envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
+            len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
             "on" if lease_mode else "off",
         )
 

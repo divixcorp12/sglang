@@ -1786,10 +1786,19 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+
+    # DeepSeek-V4.1 fork knobs (engram file table, EXL3 expert streaming), resolved
+    # together by sglang.srt.dsv41_config.Dsv41Config. The declarations above and
+    # SGLANG_DSV41_TORCH_PREFILL_INDEXER below are upstream's; leave them in place.
+
     # When set, every EngramEmbedding serves rows from this directory's safetensors
     # shards via np.memmap instead of loading the table (device or host memory).
     # The layer-1 table is 101.5 GB, larger than the host RAM budget on some rigs.
     SGLANG_DSV41_ENGRAM_TABLE_DIR = EnvStr("")
+    # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
+    # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
+    # plain np.memmap path.
+    SGLANG_DSV41_ENGRAM_RAM_GIB = EnvFloat(0.0)
 
     # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
     # checkpoint loader skips them and each MoE layer gathers the experts it
@@ -1828,10 +1837,6 @@ class Envs:
     # trip even when every row is in RAM (LEASE_PROTOCOL.md 15). Read once when the service starts; off is today's
     # protocol bit for bit. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_LEASES = EnvBool(False)
-    # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
-    # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
-    # plain np.memmap path.
-    SGLANG_DSV41_ENGRAM_RAM_GIB = EnvFloat(0.0)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
