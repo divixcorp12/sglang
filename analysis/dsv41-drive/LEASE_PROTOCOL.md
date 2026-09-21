@@ -2086,3 +2086,44 @@ lease design are listed.
 `1 -> 2 -> 3`, `3 -> 4`, `4 -> 5`, `2 -> 6`, `3 -> 7`, `5 + 6 -> 8`. Steps 1-3, 6 and 7 are
 GPU-free, so they can run while the GPU is scheduled elsewhere; 4, 5 and 8 need the
 scheduled GPU time.
+
+### 20.2d Step 6 (shutdown) landed as `fa22865ac6`: reachability, boundary, mutation ledger
+
+**Reachability, first.** Nothing here is wired into `Scheduler.release_host_resources()`. What reaches production
+is the exit-hook quarantine (`atexit`, registered inside `ensure_started`) on a normal interpreter exit,
+subject to OPEN 18's residue. The barrier in the tests is faked (`_cuda_active`, `_synchronize`): the tests show
+the wiring and the order, not that a real device barrier orders GPU work. No shutdown box is ticked by this step.
+
+**Boundary in `exl3_ram_miss_host.cpp`.** `pump_demand` is touched (one added line after the `retire_leases()`
+call), `pump_advice` gets one added line, and `close_admission` plus its export are new. `handle_demand`, `serve`,
+`pack_one` and `RowReader` are not touched.
+
+**Mutation ledger.** Driver: a mutant counts as KILLED only if `passed + failed == collected` and at least one
+named test failed; baseline asserted clean first (20 collected, 20 passed). Files: `test_exl3_ram_miss_shutdown.py`
+and `test_exl3_ram_miss_lease_service.py`.
+
+| Mutant | Result | Killed by |
+|---|---|---|
+| S1 barrier skipped | KILLED 3 | order test, cuda-error test, barrier-timeout test |
+| S2 barrier before admission closes | KILLED 3 | same three |
+| S4 CUDA error at the barrier treated as success | KILLED 1 | cuda-error test |
+| S5 non-returning barrier treated as success | KILLED 1 | barrier-timeout test |
+| S6 exit path attempts the barrier | KILLED 1 | exit-quarantine test |
+| S7 exit path frees | KILLED 1 | exit-quarantine test |
+| S8 quarantine keeps no host tensors | KILLED 1 | cuda-error test |
+| S9 exit-time finalizer left attached | KILLED 1 | cuda-error test |
+| S10 uncertain shutdown frees anyway | KILLED 3 | cuda-error, barrier-timeout, exit-quarantine |
+| S11 barrier joined without the deadline | KILLED 1 | barrier-timeout test (47 s wall: the mutant waits 30 s by construction) |
+| S12 `close_admission` does not set the header word | KILLED 2 | order test, header-word test |
+| S13 request served after admission closes | KILLED 1 | header-word test |
+| S14 retirement stops when admission closes | KILLED 1 | header-word test |
+
+13 of 13 killed; no survivors. Not established: S3 was not written (the numbering skips it), and S6 and S7 are
+killed by the same single test, so it alone distinguishes the two.
+
+**S8 was first INVALID, and that stays in the record.** As first written S8 removed the line and left an empty
+`if` body: an `IndentationError`, so the run produced 0 passed and 0 failed of 20 collected. A driver that
+looked for a `FAILED` line would have read that as *survived*, or, with an equally broken baseline, as *killed*.
+The driver reported `INVALID (not every collected test ran)`. The mutant was rewritten to replace the line with
+`pass`, and it then died to a named test. Evidence that the collected-equals-executed rule works on a case
+that was not in the three it was derived from.
