@@ -13,9 +13,10 @@ two moe files were dirty while this was written.
 
 ## Result
 
-About 1,140 tests were read across five slices. **21 were proven unable to fail for the reason they
-claim** (about 2%), and 9 groups of weaker candidates are listed as needing one mutant to settle. The
-rest read as sound. That is a real and useful result, so say it first:
+About 1,140 tests were read across five slices. **About 20 were proven unable to fail for the reason
+they claim** (under 2%; some findings bundle several cases), and a further set of weaker candidates is
+listed as needing one mutant to settle. The rest read as sound. The count excludes the registration gap
+below, which is a different class. That is a real and useful result, so say it first:
 
 - **The byte-exactness suites are not vacuous.** The reader, mirror-source, read-split, copy-kernel,
   doorbell-copy, host-tier, hot-cache-publication and fused-route-plan tests use distinct random rows,
@@ -259,7 +260,7 @@ that a guard can be removed unseen:
 
 | known item | in this sweep's scope | result |
 |---|---|---|
-| `pack_one`'s `filled >= needed` coverage | yes (`test_exl3_ram_miss_split.py`) | the reviewer found the split tests sound: the coverage check and the stale-CQE, EOF and generation-wrap tests each fail if the guarded line is mutated, and the file's fault firing is confirmed by extra CQE counts. Its remaining note is that two tests overlap with a second defence (post-loop `clean` check, `host.cpp:633-636`) so deleting one guard alone would not show |
+| `pack_one`'s `filled >= needed` coverage | yes (`test_exl3_ram_miss_split.py`) | the reviewer read all 50 tests and found the file sound apart from two redundancy notes: it reports that the coverage-check, EOF-clamp, stale-CQE and generation-wrap tests each fail if the guarded production line is mutated, and that fault firing is confirmed by extra CQE counts. That is the reviewer's source argument and I did not re-verify it; the two `pack_one` mutants recorded separately are the stronger evidence |
 | the generation gate (`GENERATION unknown` then `VALID`) | no (a script and manifest, not these suites) | not covered |
 | `PROMOTION_ASYNC` M0 test | no (a design document) | known, in Tier 3 |
 | `test_a_failed_read_publishes_none...` | yes | confirmed, and finding 1 adds the mutant |
