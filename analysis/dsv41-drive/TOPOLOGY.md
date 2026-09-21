@@ -36,8 +36,8 @@ hazard**; `taskset -c 0-63` alone does not.
 
 **This is a snapshot, not a setting.** `irqbalance` is **active** on this machine (`systemctl
 is-active irqbalance`, pid 3369), and `default_smp_affinity` is all 72 CPUs, so the kernel or the daemon can
-move a vector at any time. The map was identical in two reads about 25 minutes apart, which shows it is
-stable over that span and shows nothing more. **Do not pin or plan against this table as if it were
+move a vector at any time. The map was identical in two reads about 25 minutes apart even with `irqbalance` running, so it is
+stable in practice over that span; that is an observation about the span, not evidence that anything holds it in place. **Do not pin or plan against this table as if it were
 configuration: re-run Appendix F before and after every arm that cares, and record the result with the
 arm.** Changing the affinity (or stopping `irqbalance`) is a privileged change I did not make.
 
@@ -49,6 +49,25 @@ showed an unrelated Ray log monitor on core 71 (`ps -eo pid,psr,pcpu,cmd`): noth
 non-production processes off 64-71 either.
 
 Details, counts and the per-drive maps are in §7.3.
+
+## Headline 2: the two mirrors are different storage devices, not interchangeable halves
+
+Every layer above the drives treats the two mirror roots as one pair and splits the bytes 50/50 (service-attributed 50.0/50.0; diskstats
+197.48 and 198.19 GiB, `DSV41_REFERENCE.md:2611-2616`). By bytes that is exact. The two roots hold the same 41 files, written in the same
+window (2026-09-17 16:03-16:28 CDT, `ls -l`), and they differ in the two ways that most directly set how many I/O operations a byte costs [S2]:
+
+| | mirror A: `/mnt/nvme0` (`nvme0n1`) | mirror B: `/mnt/nvme4` (**`nvme3n1`**) | B / A |
+|---|---|---|---|
+| **physical extents, 41 shards** (`filefrag -v`) | **66** | **3,112** | **47x** |
+| **block-request ceiling** (`max_hw_sectors_kb`, a hardware limit) | **512 KiB** | **256 KiB** | half, so 2x the requests per byte |
+| block requests for one 6.5 MiB extent (arithmetic on the ceiling) | 13 | 26 | 2x |
+
+Together they say more than either alone: **B is both 47x more fragmented and capped at half the request size, and the drive model, firmware,
+queue count (16 against 31), link capability (Gen5 against Gen4) and filesystem (xfs against ext4) differ as well** (§7A). Whether any of this
+changes throughput is **not measured**: nothing recorded varies one difference while holding the rest fixed, and each mirror alone reached
+about 3.3-3.5 GB/s in earlier runs (Revision 1 §1.3, `SCHEDULING.md`). For anyone investigating a drive-level asymmetry: **read these rows
+before theorising, and do not attribute an asymmetry to the filesystem name (xfs or ext4) while extent count and request size are measured, available, and
+differ this much.** The filesystem is confounded with both.
 
 **Every claim carries one tag.**
 
@@ -830,7 +849,7 @@ and by **queueing** it is not. Sources are the sysfs reads of 2026-09-21 [S2] un
 | `max_segments` (`virt_boundary_mask` 4095: one segment per 4 KiB page) | 128 | 65 |
 | hardware queues / interrupt vectors | 16 | 31 |
 | **block requests for one 6.5 MiB (6,815,744 B) extent** | **13.0** (6,815,744 / 524,288) | **26.0** (6,815,744 / 262,144) |
-| extents per mirror, 41 shards (§7.4) | 66 | 3,112 |
+| **extents per mirror, 41 shards (§7.4): 47x** | 66 | **3,112** |
 | median physical extent | 4,096 MiB | 16 MiB |
 | page cache, first sample (~06:00 UTC, unstamped) / 06:13 UTC (§7.2) | 0.10 / 0.03 GB | 15.3 / 10.9 GB |
 
@@ -1010,6 +1029,8 @@ a number valid, so the run can be scheduled without further design.
 
 ### 9.A Storage alone (heavy drive I/O; no GPU)
 
+**Status: designed, not run; an option.** Needs no GPU. It would need the drives otherwise idle and a quiet box.
+
 - **Question.** What does each mirror deliver alone and both together with the production read geometry, and what
   does the submitting thread spend? Revision 1 has nvme0 alone (3.56 GB/s, 90 % of the Gen3 x4 ceiling) and
   `SCHEDULING.md` has both together; **nvme4 alone has never been recorded**, and mirror B's layout is 47x more
@@ -1026,6 +1047,8 @@ a number valid, so the run can be scheduled without further design.
   fragmentation needs a fix (re-copy contiguously with `fallocate`), which would be a separate, labelled experiment.
 
 ### 9.B Current SM transfer alone (GPU)
+
+**Status: deferred, not queued.** Moved to Task 9's tracking table. Reason: the Task 3 gate is "choose placement and a resource budget for Task 4", and Task 4 is already implemented and committed, so this measurement is retrospective; the placement recommendation (§7.8) and the negative results (§8.4a) stand without it. It needs the GPU lock and a quiet box if it is ever run.
 
 - **Question.** What does the production SM (GPU-pull) gather deliver from host to device, at an honest working
   set, on this box's Gen3 link and NUMA layout, and what does the copy engine deliver as a separately labelled comparison?
@@ -1051,6 +1074,8 @@ a number valid, so the run can be scheduled without further design.
 
 ### 9.C Storage and SM transfer simultaneously (GPU + heavy drive I/O)
 
+**Status: deferred, not queued.** Moved to Task 9's tracking table, for the reason given in §9.B; the two-drive-into-remote-bounce question it would answer stays **[U]**.
+
 - **Question.** Do the two add, or do they contend? Contention is possible in the drive-to-host DMA writes into
   memory, the socket interconnect (drives and the GPU are on different nodes, §1.2), the memory controllers of
   the node holding the slabs, and the cores that run the reader and the gather.
@@ -1069,6 +1094,8 @@ a number valid, so the run can be scheduled without further design.
 - **Needs the GPU lock, a scheduled slot, and the drives idle.** Roughly 30-45 min including repetitions.
 
 ### 9.D The registered-bounce decision after Task 4
+
+**Status: deferred, not queued.** Moved to Task 9's tracking table. Reason: the recommendation (do not adopt `READ_FIXED` or `SINGLE_ISSUER|DEFER_TASKRUN` in the native service) is already established from the code and the probes (§8.4a), which is the negative result the gate asks for; nothing measured argues for building the experiment.
 
 Revision 1 §3.4 says do not build it now and revisit under two conditions. Revision 2 keeps that and adds what the
 experiment must record if it is run:
