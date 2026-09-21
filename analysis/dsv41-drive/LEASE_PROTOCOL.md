@@ -1265,7 +1265,8 @@ missing) avoid the service round trip. In lease mode a request with `count > 0` 
 skip the handshake, because the GPU may only read a source it holds a lease on and only
 the service grants leases. So lease mode arms every record with `count > 0`, exactly as
 Option F already does when advise is on. That is a per-layer round trip added for the
-no-advise configuration; its cost is unmeasured **[OPEN 11]**. The plan anticipates this:
+no-advise configuration; **measured 2026-09-21 at about 8 us per all-hit layer, ~0.32 ms per step at 40 layers
+(OPEN 11, `open11/results.md`)**. The plan anticipates this:
 "Removing its all-hit handshake is a separate optimization after equivalent protection is
 proven." What an equivalent protection would be, and why I did not design it here: a
 device-side lease taken by an atomic on a mapped per-slot counter would have to be
@@ -1457,7 +1458,11 @@ Task 6 also inherits OPEN 11. Lease mode arms every record with `count > 0`, so 
 pays a service round trip even when nothing is read, and that cost lands on exactly the
 path Task 6 is trying to shorten. Task 6's benefit has to be measured net of it, and the
 "removing the all-hit handshake" optimization of section 15 is the thing that would give it
-back.
+back. **That cost is now measured (2026-09-21): about 8 us per all-hit layer, ~0.32 ms per
+step at 40 layers, which is about 28-30% of the 1.114 ms `G*` Task 6 is trying to win.**
+Material rather than fatal, and it is the figure Task 6's net benefit must be reported
+against. See `open11/results.md` for the limits, chiefly that it is an upper bound attained
+only when every layer is all-hit, and that it is not a serving-path number.
 
 Task 6 must add, and I have not designed: per-lane wait/copy/ack kernels with a lane
 predicate that reads the lane's own readiness (the wait becomes per lane); a finalize
@@ -1865,7 +1870,11 @@ side is transcribed faithfully.
 - **[OPEN 10]** Whether `io_uring_queue_exit` in `~RowReader` waits for an in-flight
   O_DIRECT read into a slab. Storage-side shutdown, not GPU-side; relevant to "drain
   storage" before freeing slabs.
-- **[OPEN 11]** The per-layer cost of arming every `count > 0` record when advise is off.
+- **[OPEN 11]** ~~The per-layer cost of arming every `count > 0` record when advise is off.~~ **MEASURED
+  2026-09-21: about 8 us per all-hit layer, ~0.32 ms per step at 40 layers** (three runs agreeing to 6%;
+  `open11/results.md`). The exposed cost is the wait alone (+11 us); the acknowledgement kernel costs ~14 us in
+  isolation but is largely hidden in the stream. Upper bound: a layer with a miss was already armed and pays
+  nothing. Not the serving path, which cannot be measured until step 5 lands.
 - **[OPEN 12]** Whether planned experts are always a subset of the routed experts in the
   post kernel's `protect` set. The design does not rely on it (7.1 step 4).
 - **[OPEN 16]** (designed in 17.3; the design's own assumption is OPEN 17) The mechanics of the
@@ -2024,8 +2033,8 @@ independent review) that lease mode defaults off.
   with planned lanes is the registered rule, not an implementer's choice, and **it is not open to being optimised away
   here**: section 15 records that removing the handshake needs an equivalent protection (a device-side lease by mapped
   atomic) whose Dekker-style argument in both directions and model check are an explicit Task 5 non-goal. Cost: a wait
-  per streamed layer that today would have been skipped, which is section 15's already-registered **OPEN 11**, still
-  unmeasured. The implementation matching the spec is a stronger result than a defensible choice would have been. (3) **Where the wait kernel refuses
+  per streamed layer that today would have been skipped, which is section 15's already-registered **OPEN 11**,
+  **measured 2026-09-21 at about 8 us per all-hit layer (~0.32 ms per step at 40 layers); see `open11/results.md`**. The implementation matching the spec is a stronger result than a defensible choice would have been. (3) **Where the wait kernel refuses
   with no generation to name** (sticky at entry, or lanes with nothing armed) it publishes no `Terminal`: nothing was
   posted, so nothing was leased. Terminal `reason` values (`timeout 1, aborted 2, failed 3, identity 4, count 5`) are
   mine; the service does not interpret them. The wait also refuses a `host_slot` at or above the row's capacity
