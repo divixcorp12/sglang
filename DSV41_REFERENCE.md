@@ -2564,6 +2564,12 @@ The old number was right; only the label attached to it was wrong.
 
 ##### What these arms do not settle
 
+- **The harness of the old arms was not pinned, and one script sha is blank.** The harness always runs from `wt-task1-new`, but only the code under test is
+  recorded, so for an old arm neither the harness commit nor its cleanliness was recorded or checked. Reconstructed from that worktree's HEAD reflog: `task1c-1` (the
+  one clean old arm) and `task1c-4` ran with harness `f6608901a3`, `task1d-0/2/3` with `4626789547`, `task1e-0/2` with `87417376f5`; dirtiness is unrecoverable. Separately,
+  `task1e`'s run.out has a blank script sha (a relative `$0` after `cd`). Expected effect: on what is recorded and gated (harness changes since gen2 touch drive counters and the
+  idle check, not the timed loop), not on decode tok/s; this does not invalidate the cells above, and it is why the old cell stays "n=1, harness by reconstruction". See
+  `analysis/dsv41-drive/PIPELINE_BASELINE.md` section 7.4.
 - **Session-0 TTFT varies from 49.8 to 60.3 s across mirrors-on arms**, with no
   explanation. A pre-registered prediction (`task1c-PREDICTIONS.txt`, sha256
   recorded before the run) that this tracked boot-phase page-cache growth was

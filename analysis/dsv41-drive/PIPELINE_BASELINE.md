@@ -334,6 +334,37 @@ This is from the recorded files, and it was not in section 19.
   recorded. It happened in the timed phase, not at boot, so it neither supports nor tests P5. It does not invalidate an O_DIRECT arm, but it shows the page-cache gate cannot see falls and that
   **cache residency on both mirrors is time-varying: sample it before and after every arm, do not assume it.**
 
+## 7.4 Two provenance holes that already occurred (found 2026-09-21; they limit the arm results cited here)
+
+"The harness" is not one thing. It is three repo files (`scripts/dsv41/trace_corpus.py`, `scripts/dsv41/provenance.py`, and, since `c87b8dc181`, `analysis/dsv41-drive/drive_conditions.py`,
+which `provenance.py` loads by path), two hand-copied runtime files outside any repo (the arm script and `task1_arm_verdict.py` under `$CC/analysis/dsv41-drive`), two divix01-only
+shell files in no repo (`dsv41-phase3b/env-full.sh`, `gpu-run.sh`), and the `sessions.jsonl` input. Two of its properties were never recorded, and both already cost us information.
+
+**Hole 1: the harness of an OLD arm was unpinned.** The arm script takes the code under test from `wt-task1-old` (old) or `wt-task1-new` (new) but always runs the harness from `wt-task1-new`. For a
+new arm the recorded `provenance.git.head` therefore covers code and harness. For an old arm it names only `wt-task1-old` (`099eadba33`); the harness worktree's HEAD and dirtiness were **neither
+recorded nor checked** (the preflight inspects only the worktree of the code under test; `provenance.harness_files` is a path with no hash). Reconstructed afterwards from `wt-task1-new`'s own HEAD
+reflog against each arm's recorded start time (the method reproduces all 13 new arms' recorded heads; it cannot recover dirtiness):
+
+| old arm | harness commit (reconstructed) |
+|---|---|
+| `task1c-1-old-on-U` (the one clean old arm, the +3.2 % comparator) | `f6608901a3` |
+| `task1c-4-old-on-U` | `f6608901a3` |
+| `task1d-0`, `task1d-2`, `task1d-3` (old, on, U) | `4626789547` |
+| `task1e-0-old-on-U`, `task1e-2-old-on-U` (the latter INVALID) | `87417376f5` |
+
+Whether `wt-task1-new` had uncommitted changes during any old arm is unknown. Every one of these harness commits precedes `c87b8dc181` and `5203f9ffc7`, so all of them read drive counters by name.
+
+**Hole 2: the arm script's own sha printed blank for `task1e`.** `sha1sum "$0"` runs after `env-full.sh` has changed directory, so a relative `$0` no longer resolves; `task1e-run.out` and the
+killed `task1e2`-`task1e4` run.out files read `script:   verdict: 44c77ddb4cd6`. `task1`, `task1b`, `task1c` and `task1d` printed a script sha (launched by absolute path). For `task1e` the artifact does
+not say which script ran; the runtime copy in place at the time was sha256 `ca803a79a56ce2492ecb849d766450eb3f141f5f7752c704f1421be206147c3f` (kept as `task1-baseline-arms.sh.pre-gengate`, and equal to the blob
+at `450f86d17a`), so the attribution rests on that backup, not on the header.
+
+**What this does and does not mean.** It does not invalidate the arm results. The harness changes after gen2 touch what is *recorded and judged* (drive counters, the idle check), not the timed decode loop, so a
+harness difference is likelier to move a gate than the decode rate; `trace_corpus.py` is the one file whose change (workload or timing) would move the rate, and no old arm's reconstructed harness differs from
+its cell-mates' in a way anyone has shown to matter. It does mean the old cell, which the two-bank comparison rests on, was run with a harness whose commit is known only by reconstruction and whose
+cleanliness is unknown, and that the harness cannot be added to the old-versus-new comparison as a checked condition. Do not read either as "the numbers are wrong", and do not treat it as future work only.
+The preflight and the provenance record that close both holes are in `task1-results/GENERATIONS.txt` section 6.
+
 ## 8. What was not monitored
 
 - **13 of the 17 arms have no machine-load record.** Boundary samples (`boundary_samples` in the arm json: load average, meminfo, per-drive sectors, the five busiest foreign processes) exist for
