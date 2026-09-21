@@ -1003,6 +1003,34 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > and run pristine baselines for every file group rather than inferring from
 > pass counts matching file test counts.
 >
+> **(e) OUR OWN MEASUREMENT HARNESS, caught by the same rule.** The `c`
+> harness -- gated, hashed and amended five times over a day -- carried two
+> defects that only the first real GPU launch exposed: `RealDevice._plan` used a
+> bare `torch` (NameError) and `run_visit` called `os.sched_getcpu`, which does
+> not exist. **Had the box passed its gate, the run would have crashed at
+> `--check-only`.** So the day's NOT MEASURED verdict was over-determined: the
+> box could not meet the gate *and* the instrument had never executed the only
+> path that matters.
+>
+> **19-22 CPU tests passed throughout.** They exercised everything except the
+> real path, asserting outcomes a broken GPU path also produces, with no witness
+> that the GPU path ran at all -- rule (a) exactly, in our own tooling rather
+> than in someone else's code. Two GPU-free tests now stand in its place: one
+> constructs the plan and reads the launch CPU (catches both), and one checks
+> that every `module.attr` used on an imported stdlib module actually exists
+> (catches `os.sched_getcpu`, and generalises to every future bug of that kind).
+>
+> **(f) A CONTROL ARM THAT THE ACT OF MEASURING DESTROYS.** The sibling pilot's
+> A arm requires one CPU's SMT sibling to stay idle. Measured: with a spinner on
+> the sibling, foreign busy stayed **under 2.1%**; with it left idle, foreign
+> busy reached **93.2%** (median 8.5%). **Spinning on a CPU evacuates foreign
+> threads onto its SMT sibling** -- the scheduler moves them off the CPU we
+> occupy and the nearest idle CPU is its twin. So "leave the sibling idle" is
+> not a neutral baseline on this box; it is an attractor for exactly the load
+> the control exists to exclude, and only about a third of A windows come back
+> valid. Any future A/B on this machine using an idle-sibling baseline inherits
+> the defect.
+>
 > **(d) ORDER-DEPENDENT RESULTS -- a test whose verdict depends on what ran
 > before it.** `test_prefix_tier.py::TestCacheStatsSink::test_snapshots_are_throttled_and_cumulative`
 > **passes under `alpha` and `rev` order and fails under `file` order.** Every
