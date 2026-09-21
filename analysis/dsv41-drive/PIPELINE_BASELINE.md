@@ -58,6 +58,9 @@ arm's `R/*-run.out` header prints the script's and the verdict tool's sha):
 task1-baseline-arms.sh <label> <run-dir> <code>:<mirror>:<trace>...` (`DRY=1` also checks). It exits 5 before the first arm if `REFERENCE`
 is unset or unreadable, or if any arm's `git rev-parse <sha>:python` is not a key of its `generations` (register the tree first;
 `task1-results/GENERATIONS.txt`, section 4). Before 2026-09-21 `REFERENCE` was optional and an unregistered tree ran and read `VALID`.
+It also exits 6 unless `wt-task1-new` is clean and at `EXPECT_NEW` (the harness runs from it for old arms too) and the runtime copies of the script and
+the verdict equal their blobs at `EXPECT_NEW`: move `wt-task1-new` to a commit that contains the versions you are running. Each arm's run.out header and
+`cache.json` now carry sha256 of the script, verdict, `env-full.sh` and `gpu-run.sh`, and its json carries the harness files it loaded (section 7.4).
 
 - graph decode, `SGLANG_MOE_EXPERT_GRAPH_GATHER=1`, 4 sessions (`--skip 0 --n 4`) of 256 prompt tokens and 128 new
   tokens each, 70 GiB pinned host tier (section 19), the harness `scripts/dsv41/trace_corpus.py` from the new worktree in every
