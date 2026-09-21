@@ -566,6 +566,28 @@ python -m pytest test/registered/unit/kernels/test_exl3_ram_miss_split.py test/r
 Add the existing advisory/service/mirror tests and the new task-specific tests to the invocation as those paths change. Read manual GPU test launch requirements and run them only under the target GPU lock. Do not report skipped hardware tests as passed evidence.
 
 - [ ] Byte parity and model-output parity hold for eager and graph paths.
+
+> **How strong the 205 GB mirror verification actually is.** The single full
+> `VERIFIED` run (2026-09-19 22:03 CDT, 15,360 of 15,360 expert rows, 204.527 GB
+> per root, 0 mismatching, 438.4 s) is the parity evidence `MIRROR_ROWS.md`
+> cites. Its `reads: O_DIRECT` header **does not prove** the reads were direct:
+> that line is printed from `result.direct`, which is set from the CLI flag, not
+> from how rows were read -- and the test guarding it asserts only exit 0 and
+> that string, so mutating `direct=direct` to `direct=False` at
+> `verify_expert_mirror.py:519` and `:534` leaves every test green while the run
+> reads through the page cache and still prints VERIFIED.
+>
+> The run itself **is** sound, established two ways: `verify_expert_mirror.py`
+> is byte-identical at the commit that ran it (`ad5d795cf`) and today, with
+> `direct=True` threaded through `shared_row_reader` (cache key includes
+> `bool(direct)`) to `O_RDONLY | O_CLOEXEC | O_DIRECT`; and the throughput fits
+> drives, not RAM -- 2.25 and 2.31 GB/s per root, with 204.5 GB per root unable
+> to sit in a 188 GB box's cache.
+>
+> **State it as "proven by source at that commit and corroborated by throughput,
+> not measured" wherever it is cited.** No diskstats or `fincore` delta was taken
+> during that run, unlike the `dd` control. The instrument whose entire job is
+> byte certification has a self-report that no test binds to its behaviour.
 - [ ] Fault tests cover zero parts, EOF/truncation, retries, queue saturation, stale completion, generation reuse/wrap, partial delivery, shutdown, and full-cache pressure.
 - [ ] Timeline proves each claimed overlap independently: I/O/packing for Task 4; I/O/GPU transfer for Task 6.
 - [ ] Matched unprofiled runs report tokens/s, p50/p95/p99 step latency, sample counts/variation, traffic, cache misses, CPU cost, pinned/VRAM footprint, and promotion stalls.
