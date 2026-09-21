@@ -71,3 +71,25 @@ Estimated at a few percent per run (read time over 2 ms, worker hand-off making 
 
 Whether any *other* consumer of a mid-read retirement exists outside the C++ (Python side reads `leases_acked`? I found none); the worker-mode packing turns (as they say); the actual read duration of the fake rows
 (the flake estimate depends on it); the plan's "box 5" wording (taken from their description); multi-rank behaviour. Nothing was run.
+
+## 5. Addendum: the three points the lead asked me to check rather than take from the account
+
+**D4 scored on the service file alone: legitimate, and it says something about the new tests.** D4 ("a released lane keeps its state") makes a lane release twice, which throws `lease underflow`.
+On the service file the throw surfaces as a Python error from `pump()` and fails tests; with the thread tests it happens on the service thread, whose `run()` has no handler, so `std::terminate` ends the whole
+pytest process with no summary, which the driver's "every collected test must execute" rule correctly scores INVALID. The abort is itself a detection (the mutant does not survive), so file-alone scoring is not a way around
+it, provided it is disclosed, which it is. What it exposes: D4 is killed by **five earlier tests plus the new idempotence test**, so the new idempotence test adds nothing for D4. Its stated purpose (retirement is
+called on more turns in worker mode, so must be idempotent per call) also does not apply to it: it drives `pump()` five times, which exercises the existing top-of-`pump_demand` retirement, not the new call site.
+The new thread test is not shown to catch D4 at all; the abort does, but attributed to no test.
+
+**The early return and the blind spot are one line, and the early return is sound.** `if (lease_ == nullptr || lanes_outstanding_.load(relaxed) == 0) return;` is correct provided
+`lanes_outstanding_ == 0` implies no entry has a lane in state 1: it is incremented by the lane count at grant and decremented once per release, both under `mutex_`, and `entry.active` clears only when no lane is
+open, so a released entry is skipped anyway. It loses nothing except that a second signal for an already-released lane in an entry that has gone inactive is not counted (`lease_double_signal` counts only while
+some lane of that entry is open). That is a counter nuance, not a missed retirement. The *test* blind spot is the flip side: any test that asserts "nothing changes" with nothing outstanding passes a mutated release
+whatever it does. Their rewrite (a second lease held) fixes it for that test. The counter itself is the one thing the optimisation adds that no listed mutant attacks: `lanes_outstanding_` not incremented at grant (retirement
+never runs: any lease test would fail), not decremented on release (the fast path is never taken and `graph_leases_outstanding()` stays high, so an eager pause is refused forever). Add the second as a mutant and confirm a pause-refusal
+test kills it; I did not check that one exists.
+
+**Packing turns in worker mode: for demands the callback never runs on them.** `admit()` is called every loop turn, but the callback is evaluated only inside `while (... c.next_batch < c.batches)`. Once the last batch is
+admitted (batch 0 for a demand) `admit` does not call it again, so no packing turn of a demand, inline or on workers, evaluates it. The turns that do evaluate it repeatedly are advisories (step 1, one row reading,
+"one wait spanning three turns is the normal case"), and those are the case with no test. So "not established: the callback on packing turns" is narrower than stated: for demands it is unreachable, and for advisories it is
+reachable and untested. That reinforces section 3: the property the idempotence requirement exists for lives entirely on a path no test drives.
