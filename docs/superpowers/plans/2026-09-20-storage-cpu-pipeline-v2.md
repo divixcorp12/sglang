@@ -800,7 +800,15 @@ Include expert identity in the immutable row result and validate it against the 
 >   and a partial terminal mask for the case where stage 2 fails after stage 1
 >   copied. `lease_model.py` models none of those.
 > - **(b) large, Task 5's:** the words themselves, lease counters and retirement,
->   the eviction predicate, and generations. **None of this exists.**
+>   the eviction predicate, and generations. ~~**None of this exists.**~~
+>   **SATISFIED 2026-09-21, checked in the tree rather than inferred.** All five exist and four are
+>   mutation-tested: the `RowResult` words (`exl3_ram_miss_host.cpp:1544-1549`, published per lane at `:2099-2116`
+>   with an `sfence` between payload and ready words); `leases_granted` / `leases_acked` / `leases_voided`;
+>   `retire_leases()` (`:2124`), which never blocks; the eviction predicate `leased_locked` in `take_slot_locked`
+>   (`:2415`), whose deletion kills exactly one test and nothing else; and `tier.generation[slot]`, carried into
+>   `kLeaseRrSlotGeneration` and validated by the acknowledgement kernel, which returns VIOLATED when it moves.
+>   **The consequence is the one this plan reserved for this moment: V1's checklist, "deliberately absent" and
+>   "deferred until Task 5 (b) is real", is now due.**
 >
 > The hit lease must be taken **in the same `mutex_` section as the reservation**,
 > not merely "at reservation": today's `serve()` drops the mutex between
