@@ -22,6 +22,59 @@ followed within minutes and their idleness was **not** sampled. Nothing was read
 bytes the probe issued exactly (41,875 MB, 12 processes × 4 passes × 128 × 6.5 MiB),
 so the O_DIRECT reads reached the drive.
 
+## 0. Revision 2 (2026-09-21): what it supersedes and what it adds
+
+Revision 1 (sections 1-6 and Appendices A-D below, commit `50cf23b619`) was written at
+`099eadba33`. Revision 2 re-audits the reader code at `0752c0c0e6` (HEAD moved on to `e7a9cc3e7c` while I wrote; the audited blobs are named in §0.1 and did not change) and adds the topology facts
+Revision 1 lacked (§7), a reader audit with current citations (§8), and the two measurements Task 3
+still owes, **designed and not run** (§9). Where §0.1 contradicts sections 1-6, §0.1 wins.
+
+Revision 2 was collected on divix01 between about 05:56 and 06:10 UTC on 2026-09-21 (`date -u`,
+`date` printed CDT = UTC-5 at the end). It used **only** sysfs/procfs/`fincore`/`filefrag` reads,
+two 32 MiB O_DIRECT `dd` reads, and one CPU-only pipe probe (Appendix E) pinned with
+`taskset -c 2`. No GPU work (`nvidia-smi` queries only), no bulk drive read, nothing under
+`/mnt/nvme1` or `/mnt/nvme2` beyond metadata. The machine was quiet: `nvidia-smi` showed 63 MiB used, P8,
+0 % utilisation; `ps` showed no sglang or production process; load average 8.4 from unrelated
+services (nimbus, reth, questdb). New tags: **[M2]** measured 2026-09-21 with the stated
+command, **[S2]** read from sysfs/procfs/a tool on 2026-09-21, **[C2]** read in code at
+`0752c0c0e6` (cited against `git show HEAD:<path>`, not the working tree).
+
+### 0.1 Superseded or corrected
+
+| Revision 1 said | Now | source |
+|---|---|---|
+| Worktree HEAD `099eadba33` | `0752c0c0e6`; 25 commits later (`git log --oneline 099eadba33..HEAD`). The native service file was rewritten in that span (two-bank pipeline `ddcb0d55ff`, stage trace, fault hooks): **every `exl3_ram_miss_host.cpp:NNN` citation in sections 2-4 is stale** and is remapped below | `git diff --shortstat 099eadba33 HEAD -- <native file>`: 774 insertions, 272 deletions [C2] |
+| Native bounce is `kBounceRows x slot_bytes` = 8 slots, about 106 MB (§1.6, §4.3) | **`kBanks x kBounceRows` = 2 x 8 = 16 slots, about 213 MB.** "Task 4 asks for two banks" is already done (`ddcb0d55ff`), not future. The ring depth is `kQueueDepth x parts` = 16 x parts and is independent of the banks. 213 MB is 16 x the slot size Revision 1 took from `MIRROR_ROWS.md:42` (about 13.3 MB); the slot size was not read back from a live table | `exl3_ram_miss_host.cpp:49-52, :464, :634` [C2] |
+| `cudaHostRegister` at `expert_host_tier.py:174-183` | `expert_host_tier.py:249` (`_cuda_host_register(slab, ...)`), `expert_host_arena.py:124`, implemented in `pool_host/common.py:132-167` | `grep -n _cuda_host_register` [C2] |
+| The native service "creates its ring in `RowReader::open`, drives it from the service thread, `flags=0`" | Still true, at new lines (map below). The working tree of `exl3_ram_miss_host.cpp`, `ops/moe/exl3_ram_miss.py` and `exl3_stream_trace.py` carries **uncommitted edits by another session** (`git status`: `M`, +68/-12 in the native file); I audited the committed blob, not those edits | `git rev-parse HEAD:python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp` = `284a4d7e33d8d08471e33b2dc96670f513ac0267` [C2] |
+| `uring_file_reader.cpp` citations | **Unchanged and still correct**: the file's last commit is `9ae02e21e9`, older than Revision 1's HEAD; blob `5e2f3744cd2af0c73ac7d1f7e93ff2d25609cf4d` | `git log -1 -- <path>`; `git rev-parse HEAD:<path>` [C2] |
+| §5 "no serving process exists now" | Still true at 05:56 UTC (no `sglang` in `ps`, GPU 63 MiB); the live pinned-tier placement therefore remains undetermined | `ps -eo ... --sort=-pcpu`; `nvidia-smi` [S2] |
+| Plan Task 3 "existing READ_FIXED and SINGLE_ISSUER/DEFER_TASKRUN support" | Adds one measured constraint Revision 1 missed: **a `DEFER_TASKRUN` ring shows no completion after `io_uring_submit()`, `submit_and_wait(0)` or `peek_cqe`, only after `io_uring_get_events()`, `submit_and_wait(1)` or with `IORING_SETUP_TASKRUN_FLAG`** (§8.3) | Appendix E [M2] |
+
+Citation remap for `exl3_ram_miss_host.cpp` (Revision 1 line -> `0752c0c0e6` line):
+
+| what | Rev 1 | now |
+|---|---|---|
+| `kBounceRows`, `kBanks`, `kQueueDepth`, `kPage` | `:46-47` | `:49`, `:50`, `:52`, `:53` |
+| construction validation `dest + length <= slot_bytes` | `:237` | `:253` |
+| bounce `posix_memalign` | `:339` | `:464` |
+| `io_uring_queue_init(..., 0)` in `RowReader::open` | `:343` | `:482` |
+| `open()` opens files `O_RDONLY\|O_CLOEXEC\|O_DIRECT` (when `direct_`) | (not cited) | `:435` |
+| `io_uring_prep_read` (the only op) | `:425` | `:807` |
+| `read()` "every return leaves the ring empty (I1)" | `:351` | `:495-504` |
+| `reap()`; `submit(ready ? 0 : 1)` | `:600`, `:613` | `:822`, `:841` |
+| `submit()` and its `io_uring_submit` / `_and_wait` | `:600` | `:1042`, `:1057` |
+| `drain()`: `wait_cqe`, then `queue_exit` + `queue_init` | `:613`, `:621-622` | `:1065`, `:1070`, `:1078-1079` |
+| destructor `io_uring_queue_exit` before `free(bounce_)` | `:293-295` | `:411-413` |
+| `RamTier::open` -> `RowReader::open` | `:940-941` | `:1415-1416` |
+| `exl3_ram_miss_open` (Python thread) | `:1456` | `:1935`, `:1957` |
+| `exl3_ram_miss_pump` (caller-thread pump) | `:1467-1472` | `:1969` |
+| `reader_.read(...)` in the service | `:1782` | `:1806` |
+| service `std::thread`; `RamThread::run()` | `:1708`, run `:1782` | `:2210`, `:2259` |
+| idle `_mm_pause` | `:1788` | `:2290` |
+| `exl3_ram_miss_start_thread` | (not cited) | `:2362` |
+| test-only `read_rows*` entry points | `:673-756` | `:1132`, `:1159`, `:1197` |
+
 ## 1. Static topology and budget
 
 ### 1.1 Machine, kernel, versions
@@ -155,7 +208,7 @@ file start offsets are not 4 KiB-aligned, so a superset read wastes 500-4,596 B
 |---|---|---|
 | pinned tier (recorded run) | 71,680 MB requested → 5,644 rows, 75,153,156,096 B resident, six slabs | [D] `DSV41_REFERENCE.md:1404` |
 | hot GPU cache | 14,336 MB → 1,128 slots, 15.0 GB | [D] same |
-| native bounce | `kBounceRows × slot_bytes` = 8 × ~13.3 MB ≈ **106 MB** (slot_bytes from `MIRROR_ROWS.md:42`, not read back from a live table) | [C] `exl3_ram_miss_host.cpp:46,339`; [D] |
+| native bounce | **superseded by §0.1: now 16 slots ≈ 213 MB.** Rev 1: `kBounceRows × slot_bytes` = 8 × ~13.3 MB ≈ **106 MB** (slot_bytes from `MIRROR_ROWS.md:42`, not read back from a live table) | [C] `exl3_ram_miss_host.cpp:46,339`; [D] |
 | Python EXL3 bounce | `BOUNCE_ROWS=8` rows of `slot_bytes`, plain `torch.empty` (not CUDA-pinned) | [C] `exl3_shard_row_source.py:29,51-60,99` |
 | registration granularity | one `cudaHostRegister` per slab (chunk limit `SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB`, default 256) | [C] `environ.py:996`, `pool_host/common.py:139-160` |
 | live process value | **[U]**: there is no sglang process on divix01 at this moment; the budget above is the last recorded run's |
@@ -175,6 +228,8 @@ file start offsets are not 4 KiB-aligned, so a superset read wastes 500-4,596 B
 this box while the limit is unlimited.
 
 ## 2. io_uring feature audit
+
+> **Line numbers for `exl3_ram_miss_host.cpp` in sections 1-4 are Revision 1's and are stale; see the remap in §0.1. §8 re-audits at `0752c0c0e6`.**
 
 Two rings exist. Keep them apart.
 
@@ -446,6 +501,20 @@ Undetermined:
 - Whether the shared general reader actually runs in `SINGLE_ISSUER|DEFER_TASKRUN` mode inside the server
   (inferred from the probe and the code, not logged).
 
+Revision 2 additions to the negative and undetermined lists (2026-09-21):
+
+- Negative for adoption: plain `SINGLE_ISSUER|DEFER_TASKRUN` would leave the native loop's `submit(0)` unable to reap
+  completions while a row packs (§8.3); it needs `TASKRUN_FLAG` or an explicit `io_uring_get_events()`. The native service
+  has no `READ_FIXED` at all and the EXL3 eager path does not engage the general reader's (§8.1). Neither is
+  needed for anything measured so far.
+- Negative for the pipeline's premises: "one owning thread per ring" and "creator-thread ownership" do not describe the
+  native service today (§8.2).
+- Not measured, by instruction: storage alone on nvme4, SM transfer alone, both together, the registered-bounce
+  experiment (all designed in §9). `IOPOLL` cannot be exercised and `SQPOLL` is untried (§7.4, §9.D).
+- Three things Revision 1 could not have seen and Revision 2 found: mirror B is 7 % in page cache and 47x more
+  fragmented than mirror A (§7.2, §7.4); NVMe completion interrupts reach reserved cores 64-71 from submitters
+  on some cores in 0-63 (§7.3); the label `nvme4` is device `nvme3n1` (§7.1).
+
 ## 6. Reproduce
 
 Probes ran from `/dev/shm` on divix01 with `CUDA_VISIBLE_DEVICES=` and the cores stated. Sources are in the
@@ -463,6 +532,417 @@ gcc -O2 memcpy_numa.c -o memcpy_numa -lnuma ; ./memcpy_numa <core> <src node> <d
 
 Before a drive run: `awk '$3=="nvme0n1"{print $6}' /proc/diskstats`, wait 3 s, and require the
 delta to be 0.
+
+## 7. Topology facts added in Revision 2
+
+All rows are 2026-09-21 reads on divix01; the command is in the "source" column. Nothing here
+touched the GPU or read data from `/mnt/nvme1` or `/mnt/nvme2`.
+
+### 7.1 Mount label, block device, PCI function: the `nvme4` trap
+
+**There is no `nvme4` device.** `/mnt/nvme4` is a label. Its filesystem is on `/dev/nvme3n1p1`.
+`ls /dev/nvme* /sys/block` lists `nvme0..nvme3` and `nvme0n1..nvme3n1`, and `/proc/diskstats`
+has no `nvme4*` row [S2]. A check written as `awk '$3=="nvme4n1"' /proc/diskstats` matches nothing,
+prints nothing, and reads as "0 sectors, drive idle" (or, in a delta, as "this run read 0 bytes").
+
+| mount label | `/proc/mounts` source | `/proc/diskstats` name | PCI function | model (`lsblk`) | filesystem |
+|---|---|---|---|---|---|
+| `/mnt/nvme0` | `/dev/nvme0n1p1` | `nvme0n1` | 0000:86:00.0 | Samsung 990 EVO Plus 2 TB (Revision 1) | xfs |
+| `/mnt/nvme1` | `/dev/nvme1n1p1` | `nvme1n1` | 0000:87:00.0 | `CT4000P310SSD8` | xfs |
+| `/mnt/nvme2` | `/dev/nvme2n1p1` | `nvme2n1` | 0000:88:00.0 | Samsung 990 EVO Plus 2 TB (Revision 1) | xfs |
+| **`/mnt/nvme4`** | **`/dev/nvme3n1p1`** | **`nvme3n1`** | 0000:89:00.0 | `SPCC M.2 PCIe SSD` | **ext4** |
+
+Sources: `grep nvme /proc/mounts`; `ls -l /sys/block/`; `lsblk -o NAME,MODEL,...`. Resolve a
+mount to its device with `st_dev` (`os.stat(path).st_dev` -> major:minor -> the `/proc/diskstats`
+row) or `findmnt -no SOURCE <mount>`, never by the label string. **The existing tooling already does
+this:** `bench_row_scheduling.py:771-796` and `native_mirror_report.py:10,27` resolve by `st_dev`, and the
+`*.sh` arm scripts hard-code `[nvme4]=nvme3n1` (`task1-baseline-arms.sh:28`, `eager-cache-arms.sh:36`,
+`run-native-mirror-arm.sh:33`) [C2]. A new script or an ad-hoc `awk` is where the mistake would enter.
+
+### 7.2 What is in the page cache: the nvme4 mirror is not cold
+
+`fincore -b -n -o RES,SIZE <root>/*.safetensors`, 41 files per root [S2]:
+
+| tree | resident | files with any resident page | total size |
+|---|---|---|---|
+| `/mnt/nvme0/dsv41_flash` (mirror A, xfs) | 106,430,464 B (101.5 MiB) | 3 of 41 | 219,195,394,582 B |
+| `/mnt/nvme4/dsv41_flash` (mirror B, ext4) | **15,335,759,872 B (14.3 GiB, 7.0 %)** | **23 of 41** | same |
+| `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw` (source) | 7,722,295,296 B (7.2 GiB) | 15 of 41 | same |
+
+`du -sb` reports 219,273,773,785 B for all three trees (78,379,203 B more than the summed shard size: non-shard files and directory entries, not itemised) [S2]. **O_DIRECT reads are not affected by this residency**, but any
+buffered access to mirror B (a `cat`, a mmap, a Python `safetensors` open that maps) hits RAM for those
+files and the drive for the rest. A benchmark that reports "cold-file" numbers for mirror B has to
+record this table before and after, which `task1-baseline-arms.sh` does per directory (`expert_resident_by_dir_*`).
+
+Node memory at the same time [S2] (`/sys/devices/system/node/node{0,1}/meminfo`, `free -b`):
+
+| | MemTotal | MemFree | FilePages | Unevictable | Mlocked |
+|---|---|---|---|---|---|
+| node 0 | 93.6 GiB | **64.0 GiB** | 15.7 GiB | 7.3 MiB | 0 |
+| node 1 | 94.4 GiB | **1.29 GiB** | **75.1 GiB** | 22 MiB | 0 |
+| system | 188.0 GiB | (`MemAvailable` 159.9 GiB) | | 30,000 kB | 0 |
+
+Node 1 holds the page cache and almost no free memory; node 0 has 64 GiB free. **The 70.0 GiB pinned tier
+(75,153,156,096 B) is 74.8 % of node 0's total, 37.2 % of the system's, and 87.9 % of what node 0 can
+supply without evicting anything** (`MemFree` + `FilePages` = 79.7 GiB). So a node-0-bound tier fits only
+by reclaiming node-0 cache; a default first-touch tier spills to node 1 as Revision 1 measured
+(62.9 % / 37.1 % for 1 GiB touched from a node-1 core). Where the live tier landed is **[U]** (§7.9).
+
+### 7.3 NVMe queues, interrupts, and the reserved cores
+
+**Queue-to-CPU maps.** `/sys/block/nvmeXn1/mq/*/cpu_list` (which CPUs submit into a hardware queue) and
+`/proc/irq/<n>/effective_affinity_list` (the CPU that takes that queue's interrupt), joined through
+`/proc/interrupts` names `nvme<N>q<hctx+1>` [S2]. The script is Appendix F. For every submitting core
+in `0-63`, where does its completion interrupt run?
+
+| drive | hardware queues | submitter cores in 0-63 whose completion IRQ lands on a reserved core (64-71) | node-0 submitters (0-17, 36-53): IRQ node |
+|---|---|---|---|
+| nvme0 (mirror A) | 16 | **34, 35, 56, 59, 62** | all node 0 |
+| nvme2 (source) | 16 | 27-35, 63 | all node 0 |
+| nvme3 (mirror B, "nvme4") | 31 | 28-35, 63 | all node 0 |
+
+Examples from the same maps: nvme0 hctx6 serves CPUs 34, 35, 70, 71 and its interrupt is on **core 71**
+(production's doorbell spin core); nvme3 hctx11 serves 35, 71 and its interrupt is on core 71; nvme3
+hctx7 (CPUs 31, 67) is on core 67. `rq_affinity` is 1 on nvme0n1 and nvme3n1 (`cat
+/sys/block/*/queue/rq_affinity`), which by the kernel's documented semantics moves the completion softirq, not the hard interrupt (documentation, not tested here).
+
+Cumulative interrupts serviced on cores 64-71 by NVMe vectors since boot (`/proc/interrupts`, 9 days
+uptime): 64: 7.6 M, 65: 1.7 M, 66: 25.6 M, 67: 20.9 M, 68: 24.1 M, 69: 21.3 M, 70: 24.7 M, **71: 20.3 M**
+(of which nvme3q12 alone 20.1 M) [S2]. **This does not show who submitted them:** core 71 is in its
+own hardware queue's CPU list, so work running on core 71 itself produces these; the count is a reason
+to look, not evidence of leakage from cores 0-63.
+
+Caveats, all binding: `irqbalance` is **active** (`systemctl is-active irqbalance`, pid 3369), so the
+effective affinity is a snapshot that can move; `default_smp_affinity` is `ff,ffffffff,ffffffff` (all
+72 CPUs) [S2]; the mapping of a submitter to its queue is the kernel's (blk-mq default), not set
+here. Appendix F was run twice about 25 minutes apart, with `irqbalance` active, and printed identical lists both times. **`taskset -c 0-63` keeps our threads off cores 64-71 but does not keep NVMe interrupts off them.**
+A service thread on any of cores 27-35 would still take its completions on a core in 64-71 for two of the
+three drives. Pinning it to a node-0 core avoids this (every node-0 submitter's IRQ is on node 0 for all
+three drives). This is the second independent argument, after THP backing, for Revision 1's §4 rec. 1-2.
+
+### 7.4 Block layer limits and file layout
+
+| item | nvme0n1 | nvme1n1 | nvme2n1 | nvme3n1 | source |
+|---|---|---|---|---|---|
+| `queue/max_sectors_kb` | **512** | 256 | **512** | **256** | sysfs [S2] |
+| hardware queues (`mq/`) | 16 | 32 | 16 | 31 | sysfs [S2] |
+| `nr_requests` / scheduler / `io_poll` / `read_ahead_kb` | 1023 / none / 0 / 4096 | same | same | same | sysfs [S2] |
+| NVMe `poll_queues` (module) | 0 | | | | `/sys/module/nvme/parameters/poll_queues` [S2] |
+
+So a 6.5 MiB extent (Revision 1's read size; half a two-root mirror row) is split by the block layer
+into about **13 requests on the Samsungs (512 KiB) and about 26 on mirror B (256 KiB)**. This is
+arithmetic from `max_sectors_kb`, not an observation of the request stream. Per-drive I/O count is
+therefore not comparable across the two mirrors.
+
+**File layout differs sharply between the mirrors.** `filefrag` (FIEMAP, metadata only) over all 41
+shards of each tree [S2]:
+
+| tree | fs | total extents | per-file min / max | extent length (median / p10 / p90) |
+|---|---|---|---|---|
+| `/mnt/nvme0/dsv41_flash` | xfs | **66** | 1 / 3 | 4,096 / 885 / 4,981 MiB |
+| `/mnt/nvme4/dsv41_flash` | ext4 | **3,112** | 16 / 255 | **16 / 8 / 184 MiB** |
+| `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw` | xfs | 175 | 2 / 6 | (not computed) |
+
+`model-00020` on nvme4 starts with extents of 8, 56, 8, 16 and 200 MiB (`filefrag -v`). A 6.5 MiB read
+against a 16 MiB median extent crosses a physical discontinuity often, and the ext4 file is
+physically scattered while the xfs one is one or two runs. **Whether this costs anything is [U]:** the
+prior sessions measured 3.3-3.5 GB/s per drive with both mirrors reading (`SCHEDULING.md`), and
+Revision 1 measured only nvme0 alone (3.56 GB/s). Nobody has recorded nvme4 alone. §9.A does.
+
+### 7.5 Filesystem parameters and file age
+
+| item | nvme0 | nvme2 | nvme4 | source |
+|---|---|---|---|---|
+| type; block | xfs, 4096 | xfs, 4096 | ext4, 4096 | `/proc/mounts`; `stat -f` [S2] |
+| mount options | `relatime`, `attr2,inode64,logbufs=8,logbsize=32k` | `noatime`, same xfs opts | `relatime` (defaults) | `/proc/mounts` [S2] |
+| xfs geometry | agcount 72, `sunit=0 swidth=0`, reflink=1 | agcount 72, `sunit=0 swidth=0` | ext4 stripe **[U]** (`tune2fs` needs root) | `xfs_info` [S2] |
+| partition start | sector 2048 (1 MiB) | 2048 | 2048 | Revision 1 §1.4 [S] |
+| free / used | 757 G free, 60 % | 219 G free, 89 % | 1.4 T free, 21 % | `df -h` [S2] |
+| DIO alignment | mem 4, offset 512 | same | same | Revision 1 `statx` [M] |
+
+`/mnt/nvme1` is xfs with `sunit=8,swidth=8` (a stripe hint) and is not used. **File age:** the 41
+`model-*.safetensors` in each mirror were written 2026-09-17 16:03-16:28 local time (CDT, UTC-5)
+(`ls -l --time-style=long-iso`), so 3.5 days old at the audit; both are complete copies of the
+source (equal `du -sb`). The mirrors are **existing, not fresh, files**; mirror B had 3,112 extents at
+audit. The plan's "distinguish fresh-file tests from existing-file tests" applies: any test that
+rewrites a mirror changes its layout.
+
+**O_DIRECT is honoured on both filesystems, re-verified [M2]:** `dd if=<cold shard> bs=1M count=32
+skip=2000 iflag=direct` on `model-00001` of nvme0 (xfs) and of nvme4 (ext4), `fincore` residency before
+and after: `0 -> 0` on both (32 MiB read: 743 MB/s and 1.6 GB/s, single-shot, not a throughput measure).
+The product code opens `O_RDONLY|O_CLOEXEC|O_DIRECT` when `direct_` (`exl3_ram_miss_host.cpp:435`) [C2], and
+the general reader comment at `expert_file_reader.py:47-50` (HEAD) says its direct mode opens `O_DIRECT` unconditionally and never reads through the
+page cache.
+
+### 7.6 PCIe, IOMMU, GPU state
+
+| item | value | source |
+|---|---|---|
+| Links | as Revision 1 §1.3: nvme0 8 GT/s x4, nvme1 x4, **nvme2 x2 (capable x4; root port `85:02.0` x2 of x4)**, nvme3 x4; every port's max is 8 GT/s | `/sys/bus/pci/devices/0000:*/current_link_{speed,width}`, `max_link_*` [S2]; identical to Revision 1 |
+| GPU link at audit | 2.5 GT/s x16 (`37:00.0` and its port `36:00.0`, whose max is 8 GT/s x16); `nvidia-smi` gen current 1, gpumax 5, hostmax 3; P8; persistence on | sysfs; `nvidia-smi --query-gpu=pcie.link.gen.*` [S2] |
+| GPU BAR1 | 256 MiB (`nvidia-smi -q`), so Resizable BAR is not in effect | [S2] |
+| IOMMU | `intel_iommu=on iommu=pt`; the IOMMU group of nvme0 (`86:00.0`) and of the GPU (`37:00.0`) are both type `identity` (no translation on their DMA) | `/proc/cmdline`; `/sys/kernel/iommu_groups/<g>/type` [S2] |
+| CPU caches | 36 x 1 MiB L2 (36 MiB total), 2 x 24.75 MiB L3 (49.5 MiB total); no `cpufreq` directory is exposed (`ls /sys/devices/system/cpu/cpu0/cpufreq` fails), so the governor is not observable | `lscpu`; sysfs [S2] |
+| GPU L2 | **not queried**: `nvidia-smi` has no field for it and a CUDA call would use the GPU. `CLAUDE.md` says ~128 MB and the plan requires verifying it; §9.B sizes the working set past any plausible value | [U] |
+
+The GPU link was at gen 1 at every idle read. Whether it reaches Gen3 under the SM path, and how
+long the ramp takes, is a GPU measurement (§9.B), and the idle value must not be reported as the
+link's capability.
+
+### 7.7 Pinned-memory budget and registration limits, restated
+
+The 70 GiB tier is the recorded run's (Revision 1 §1.6: 71,680 MB requested -> 5,644 rows,
+75,153,156,096 B, six slabs, one `cudaHostRegister` per slab). New in Revision 2:
+
+- **There is no `mlock` accounting to run into here:** `RLIMIT_MEMLOCK` is unlimited (Revision 1 §1.7). The
+  budget constraint is physical placement (§7.2), not a limit.
+- **`Unevictable` was 30,000 kB and `Mlocked` 0 kB** with no serving process (`/proc/meminfo`) [S2]. A live
+  `cudaHostRegister`'d tier would appear there; recording it during the first production or arm run
+  after this is the cheap way to obtain the live budget.
+- **The bounce grew.** 213 MB (16 slots), not 106 MB (§0.1). Registering it with io_uring would be one
+  iovec (limit 1 GiB, Revision 1 §1.7). Registration cost re-measured [M2] with Revision 1's `cost` probe
+  under `numactl --physcpubind=2 --membind=0`, one run, each cell the median of 7 as before: 104 MiB not-faulted 21.2 ms (THP-ok) / 42.6 ms (4 KiB pages),
+  matching Revision 1's 20.0 / 39.7; **256 MiB not-faulted 59.9 ms (THP-ok) / 106.6 ms (4 KiB pages); faulted 11.7 / 9.4 ms; unregister about 1 ms**.
+  A 203 MiB (16 x 13.3 MB) bounce sits between the 104 and 256 MiB rows, so expect roughly 45-60 ms (THP) or
+  85-107 ms (4 KiB) once at start-up and again after each ring reset; that is an interpolation, not a run.
+
+### 7.8 Placement and budget for Task 4 (gate): what changes from Revision 1 §4
+
+Revision 1's recommendation stands. The added evidence and the one added requirement:
+
+1. **Service thread on a node-0 core.** For: bounce THP-backed on node 0 (Revision 1), local row scatter (1.0x against
+   1.2-1.8x, Revision 1), GPU on node 0, and **node-0 submitters take their NVMe completion interrupts on node-0 cores
+   for all three drives, never on 64-71 (§7.3)**. Against: node 0 has 64.0 GiB free against a 70.0 GiB
+   tier, so the tier's slabs will not all be node-0 unless node-0 cache is reclaimed (`numactl --membind` /
+   `MPOL_BIND` reclaims; default first-touch spills, Revision 1 §1.5). **Two-drive DMA into a remote or
+   local bounce is still [U]** and is now part of §9.C.
+2. **Pass `cpu_core` explicitly.** The production call is `host.start_thread(fatal_wait_s=...)`
+   (`srt/layers/moe/exl3_ram_miss.py:383`), so `cpu_core=-1` inherits the launcher's affinity. The wrapper
+   and the native `start_thread` now refuse 64-71 and the native one warns when an inherited mask contains
+   them (`ops/moe/exl3_ram_miss.py:448`, `exl3_ram_miss_host.cpp:2362+`) [C2], which stops the mistake but
+   does not choose a node.
+3. **Budget:** bounce 213 MB (two banks) plus the unchanged 75.2 GB tier; no registered buffer in Task 4.
+   The gate's "resource budget" is: 70.0 GiB pinned host tier, 0.2 GiB bounce, one service thread on a
+   node-0 core, no core in 64-71, both mirrors' rows read with O_DIRECT (no page-cache growth).
+
+### 7.9 Undetermined after Revision 2
+
+- Where the live pinned tier landed (§7.2): no serving process exists; `numa_maps` of a 75 GB process walks its whole
+  address space and can stall it, so I did not read one from a running arm and I ask before doing so.
+- GPU link under load, GPU L2 size, `cudaHostRegister` first-touch and page-locking behaviour (need a CUDA context).
+- Two mirrors at once into a remote bounce; nvme4 alone (§9.A).
+- Why `88:00.0` is x2, ext4 stripe of `/mnt/nvme4`, `dmesg` for AER (root-only).
+- Stability of the IRQ map under `irqbalance` (one snapshot).
+
+## 8. Reader audit at `0752c0c0e6`: `READ_FIXED`, `SINGLE_ISSUER`, `DEFER_TASKRUN`
+
+Two rings, as Revision 1 §2 says. Citations are `git show HEAD:<path>` line numbers (blobs in §0.1).
+`G:` is `csrc/io/uring_file_reader.cpp`; `N:` is `csrc/moe/exl3_ram_miss_host.cpp`.
+
+### 8.1 Support matrix
+
+| feature | general reader (G) | native service (N) | works on this kernel/liburing |
+|---|---|---|---|
+| `READ_FIXED` (registered buffers) | **Implemented.** 1,024-slot sparse table registered at construction (`G:26,96`), registrations chunked to 1 GiB (`G:27,142-177`), `find_buffer_` (`G:231,624`), `io_uring_prep_read_fixed` only when the whole destination lies inside one registration, else `io_uring_prep_read` (`G:379-381`). **Engaged only when a caller registers**: `ExpertFileRowReader.register_destinations` (`expert_file_reader.py:188`, from `expert_stream.py:212`). The EXL3 row source's `register_destinations` returns 0 (`exl3_shard_row_source.py:128-131`), so EXL3 eager reads are `IORING_OP_READ` | **Not supported.** The only opcode is `io_uring_prep_read` (`N:807`); no `io_uring_register_*` anywhere in the file (`grep`: 0 hits) | yes (Revision 1 [M]) |
+| `SINGLE_ISSUER` | **Requested**, fallback to flags 0 only on `-EINVAL` (`G:45-58`) | **Not requested**: `io_uring_queue_init(depth, &ring_, 0)` (`N:482`, re-created `N:1079`) | yes (Revision 1 [M]) |
+| `DEFER_TASKRUN` | **Requested** with `SINGLE_ISSUER` (`G:49`) | Not requested | yes; requires `SINGLE_ISSUER` (Revision 1 [M]) |
+| `TASKRUN_FLAG`, `COOP_TASKRUN`, `SQPOLL`, `IOPOLL` | absent (`grep -c` = 0 in both files) | absent | `IOPOLL` ring initialises; NVMe `poll_queues=0` means polled reads cannot work (§7.4) |
+
+The plan's wording, "existing `READ_FIXED` ... support in the general reader **versus** native service", has a
+literal answer: the general reader has it and does not use it for EXL3; the native service has none. This
+is a finding, not a gap: nothing measured so far says the native service needs it (Revision 1 §3, §8.4 below).
+
+### 8.2 Creator-thread ownership
+
+**General reader: enforced.** `owner_(current_thread_id())` is captured in the constructor (`G:89`); every public
+call runs `check_owner_()` (`G:586-593`) and `enter_()` (`G:597`), and a call from another thread throws
+`"io_uring file reader belongs to thread ..."`. Its waits are `io_uring_submit_and_wait(&ring_, 1)`
+(`G:389`) and `io_uring_wait_cqe` (`G:519`), both blocking entries with `GETEVENTS`, so `DEFER_TASKRUN`
+never leaves a completion stranded. The shared instance belongs to whichever thread first calls
+`get_shared_uring_file_reader` (`ops/io/uring_file_reader.py:168-173`, Revision 1 §2.3). **Whether the
+running server's shared reader is in `SINGLE_ISSUER|DEFER_TASKRUN` or in the fallback mode is not logged
+and not observed** (the fallback is silent).
+
+**Native service: not enforced; creator != driver.**
+
+| step | thread | where |
+|---|---|---|
+| ring created | the Python caller of `exl3_ram_miss_open` | `N:1935` -> `RamTier::open` `N:1415-1416` -> `RowReader::open` `N:433,482` (`N:1957` `if (!tier->open()) return -1`) |
+| ring driven | the `RamThread` service thread | `std::thread` `N:2210`; `run()` `N:2259`; `pump_demand` -> `reader_.read` `N:1806` |
+| ring re-created after a failed read | whichever thread called `read()`, in practice the service thread | `drain()` `N:1065-1079` |
+| ring destroyed | whichever thread drops the last reference (not traced; expected the Python side at `stop`/`close`) | destructor `N:411-413` |
+| ring also driven by | the caller thread, in the non-threaded test paths | `exl3_ram_miss_pump` `N:1969`, `exl3_ram_miss_read_rows*` `N:1132,1159,1197` |
+
+So the plan's constraint "One owning CPU thread drives each ring" is satisfied by convention only, and
+"preserve creator-thread ownership" is **not a property the native service has today**. It would be one
+the pipeline has to acquire, on the thread that will drive it (§8.4).
+
+### 8.3 Regular kernel entries for deferred task work: new measurement
+
+Revision 1 measured that a spinner on CQ memory never sees a `DEFER_TASKRUN` completion. Which *calls* do enter
+usefully was not measured. `defer_probe` (Appendix E, CPU-only, `taskset -c 2`, kernel 6.12 + liburing 2.12)
+submits a read on an empty pipe, has a helper thread write to it at 50 ms, waits 120 ms, then performs **one**
+call on the owner thread and reports `io_uring_cq_ready()` before and after [M2]:
+
+| call on the owner thread | `flags=0` | `SI\|DTR` | `SI\|DTR\|TASKRUN_FLAG` |
+|---|---|---|---|
+| `cq_ready()` only (no syscall) | 1 (already there) | **0** | 0 |
+| `io_uring_submit()`, SQ empty | 1 | **0** | 1 |
+| `io_uring_submit()` with a NOP prepared | 1 -> 2 | **0 -> 1 (the NOP only; the pipe read stays hidden)** | 0 -> 2 |
+| `io_uring_submit_and_wait(0)` | 1 | **0** | 1 |
+| `io_uring_peek_cqe()` | 1 | **-EAGAIN** | 1 |
+| `io_uring_get_events()` | 1 | **0 -> 1** | 0 -> 1 |
+| `io_uring_submit_and_wait(1)` | 1 | **0 -> 1** | 0 -> 1 |
+
+Only a call that enters the kernel **with `IORING_ENTER_GETEVENTS`** runs deferred work, and liburing adds
+that flag on the non-waiting paths only when the ring advertises pending task work, which needs
+`IORING_SETUP_TASKRUN_FLAG`. (I did not disassemble liburing; this is the observed behaviour of 2.12.)
+Each cell is a single run of a deterministic probe, not a statistic.
+
+**What this means for the native loop** [C2 + M2, an inference, not a run of the service]:
+`RowReader::read()` calls `reap(ready)` every iteration (`N:822`), and `reap` calls `submit(ready ? 0 : 1)`
+(`N:841`). With `ready` (a fully read row waiting to pack) that is `io_uring_submit` (`N:1057`), which under
+plain `SI|DTR` reaps nothing new; the completions it should have reaped wait until an iteration finds no
+ready row and blocks in `submit_and_wait(1)`. While rows pack, each packing pass (about 1.6 ms per row,
+`MIRROR_ROWS.md:36`) would run with the CQ frozen and SQ credit unreturned, so storage would starve.
+Flags 0 has no such stall today. `DEFER_TASKRUN` therefore needs one of: `IORING_SETUP_TASKRUN_FLAG` at
+setup, or an explicit `io_uring_get_events()` before each `for_each_cqe`.
+
+### 8.4 What Task 4/5 must preserve if it adopts either flag (checklist; nothing adopted)
+
+The recommendation from Revision 1 §2.3 stands: **do not adopt `SINGLE_ISSUER`/`DEFER_TASKRUN` or
+`READ_FIXED` in the native service for Task 4**, because no wall-time benefit was measured on large
+drive-bound reads and the flags add an ownership hazard. If the asynchronous service later wants them, the
+audit above turns into these acceptance conditions:
+
+1. The ring is created, or `io_uring_enable_rings`-ed (`IORING_SETUP_R_DISABLED`, measured to work in Revision 1),
+   **on the thread that will drive it**; `RowReader::open` (`N:433`) currently runs on the Python thread and
+   reports failure synchronously through `exl3_ram_miss_open` (`N:1957`), which constrains where creation can move.
+2. Every progress step of the asynchronous interface enters the kernel with `GETEVENTS`
+   (`io_uring_get_events`, or `TASKRUN_FLAG`), including when a row is ready to pack and when the idle loop is spinning
+   (`_mm_pause`, `N:2290`) with reads still owned by the service. A thread that spins on the mailbox while the ring
+   holds work would hang.
+3. `drain()`'s ring reset (`N:1078-1079`) repeats the same setup on the same thread; a reset that quietly
+   falls back to flags 0 is a silent loss of the mode, and for `READ_FIXED` a silent loss of the registration.
+4. The caller-thread entry points (`N:1132,1159,1197,1969`) and the test hooks run on the thread that owns
+   the ring, or the tests fail with `-EEXIST` on the first submit (measured, Revision 1).
+5. A counter of SQEs by opcode (`READ_FIXED` vs `READ`) and by ring mode, logged once, because a registration
+   or flag failure changes no result and is otherwise invisible (the general reader has this problem today, §8.2).
+6. `READ_FIXED` only: one iovec over `[bounce_, bounce_ + 16 * slot_bytes)` registered after `N:482`,
+   re-registered after `N:1079`, unregistered before `free(bounce_)` (`N:411-413`); registration failure
+   falls back with a logged reason. Every extent already lies inside one slot (`N:253`), so the fallback
+   rate is 0 by construction; it is a counter to assert zero, not a rate to measure (Revision 1 §3.2).
+
+## 9. The measurements Task 3 still owes: design only, none run
+
+**Nothing in this section has been run.** The plan's second bullet (storage alone, current SM transfer alone,
+their simultaneous execution) and its fourth (the registered-bounce decision) need the GPU and/or heavy drive
+I/O. Revision 2 was under a standing instruction not to use the GPU (timed arms may be running) and not to
+run drive benchmarks on nvme0/2/4. What follows is what I would measure and the conditions that would make
+a number valid, so the run can be scheduled without further design.
+
+### 9.0 Preconditions common to every arm
+
+- Schedule GPU time with the owner of the machine and take `cc-gpu.lock` through `$ANA/gpu-run.sh`. **Verify the
+  wrapper and `$ANA` exist first**; the plan's own constraint. Do not start or stop production. The storage-only arm (§9.A) needs neither and is
+  a heavy-I/O run: it needs the drives to be otherwise idle.
+- CPU jobs `taskset -c 0-63`, `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` (plan) or fewer; **never 64-71**. Confirm with
+  `ps -eLo pid,psr,comm | awk '$2>=64'` that none of ours is there. Because NVMe interrupts can still land on 64-71
+  (§7.3), record the effective IRQ map before and after each arm (Appendix F) and the rate of change of
+  `/proc/interrupts` on cores 64-71 across the run.
+- Before and after every arm: `/proc/diskstats` **by resolved device** (§7.1: `nvme0n1`, `nvme3n1`, never a label),
+  `fincore` on both mirrors, `nvidia-smi --query-gpu=pcie.link.gen.current,pstate,memory.used`, `/proc/meminfo` and
+  per-node `meminfo`, `pgrep` for a foreign process. Require 0 sectors in 3 s on the drives before starting, as Revision 1 §6.
+- **Validity gates, each abort-on-fail:** diskstats bytes read equals bytes issued within 1 % (else a foreign reader
+  or a buffered path is present); implied per-drive bandwidth at most the link ceiling (3.94 GB/s for x4, 1.97 GB/s
+  for the x2 drive; a value above it means a cache, not a drive) and GPU transfer at most the Gen3 x16 15.75 GB/s;
+  the GPU link generation read at the end of each GPU arm is 3, not 1; no page-cache growth in the mirrors' `fincore`.
+- Arm order randomised, each condition repeated at least 5 times, interleaved (A B B A) so drift is not read as a
+  difference; report every repetition, the median, and min-max, never a mean of two.
+- Record the state the plan asks for: file age/state (§7.5), cache residency (§7.2), IOMMU (§7.6), versions
+  (§1.1), IRQ map (§7.3), and that the drives are at their negotiated Gen3 (nvme2 at x2) (§7.6).
+
+### 9.A Storage alone (heavy drive I/O; no GPU)
+
+- **Question.** What does each mirror deliver alone and both together with the production read geometry, and what
+  does the submitting thread spend? Revision 1 has nvme0 alone (3.56 GB/s, 90 % of the Gen3 x4 ceiling) and
+  `SCHEDULING.md` has both together; **nvme4 alone has never been recorded**, and mirror B's layout is 47x more
+  fragmented than A's (§7.4).
+- **Arms.** nvme0 alone; nvme4 alone; both from one thread; both from two threads. O_DIRECT, 6.5 MiB extents
+  (`LEN = 6,815,744` in `uring_probe`), queue depth 16 per drive, 128 reads per pass, at least 5 passes per arm after
+  one discarded, offsets random over the whole 41-file set (204 GiB, so no drive-side reuse), same seed in every arm.
+  Use the existing harnesses (`bench_row_scheduling.py`, `uring_probe read`) rather than a new tool; extend `uring_probe`
+  to take two files if needed. Bounce sized as production, 213 MB (16 slots), on node 0, then on node 1.
+- **Record:** wall, GB/s, thread CPU (`getrusage(RUSAGE_THREAD)`), diskstats delta by device, IRQ map, and for each
+  arm the submitter's core and node. Expected footprint: 0.87 GB per pass, about 13 GB per arm at 15 passes,
+  well under 200 GB for the whole matrix, minutes of wall time.
+- **Decision it feeds:** the Task 4 resource budget (bytes/s the storage side can supply) and whether mirror B's
+  fragmentation needs a fix (re-copy contiguously with `fallocate`), which would be a separate, labelled experiment.
+
+### 9.B Current SM transfer alone (GPU)
+
+- **Question.** What does the production SM (GPU-pull) gather deliver from host to device, at an honest working
+  set, on this box's Gen3 link and NUMA layout, and what does the copy engine deliver as a separately labelled comparison?
+- **Tool.** `benchmark/kernels/moe/benchmark_expert_cache_transfer.py --backend gpu` (production path; add `--cuda-graph`
+  to match capture). **Its defaults do not qualify:** 128 source experts x 65,536 B x 6 tensors is about 50 MB, less than
+  any plausible L2 (§7.6, CLAUDE.md's "size the working set past L2"). Set `--source-experts` and `--row-bytes` so the
+  pinned source is at least **4 GiB**, and draw rows without replacement across it each iteration (so successive
+  iterations do not re-read one row). Take the six tensor segment sizes from the real EXL3 layout, not `--row-bytes 65536`
+  (an NVFP4 row); the layout is the per-row `slot_bytes` of about 13.3 MB (`MIRROR_ROWS.md:42`) split into its six segments,
+  which must be read from the loaded table.
+- **Arms.** rows per submission in {8, 32, 48} (8 is the native batch, 48 the `bench_mirror_rows` default) x pinned
+  source on node 0, node 1, interleaved. `--backend dma` is a **separate arm, labelled "copy engine, not the
+  production SM path"**, never merged into the SM figures (plan).
+- **Placement must be verified, not assumed.** Allocate under `numactl --membind=N` and touch the memory before
+  `cudaHostRegister` (Revision 1: `cudaHostRegister`'s first-touch is not established). Confirm with `move_pages`
+  or `/proc/self/numa_maps` **of the benchmark's own process** before any timing. Node 1 has 1.29 GiB free (§7.2), so a
+  4 GiB node-1 source reclaims page cache; record that.
+- **Link.** Idle the GPU is P8 / Gen1 (§7.6). Run at least 2 s of traffic untimed to bring it up, sample
+  `pcie.link.gen.current` once at the end, abort the arm if it is not 3.
+- **Record:** per-iteration CUDA-event time (p50/p95/p99), GB/s, gen, pstate, source and destination node, whether the
+  destination cache rows are reused. Expected footprint: 4 GiB pinned host + the destination rows, a few seconds per
+  condition, about 10 minutes total. **Needs the GPU lock and a scheduled slot.**
+
+### 9.C Storage and SM transfer simultaneously (GPU + heavy drive I/O)
+
+- **Question.** Do the two add, or do they contend? Contention is possible in the drive-to-host DMA writes into
+  memory, the socket interconnect (drives and the GPU are on different nodes, §1.2), the memory controllers of
+  the node holding the slabs, and the cores that run the reader and the gather.
+- **Design.** Two processes, started together on a barrier, each reporting per-iteration timestamps on the
+  same monotonic clock: the reader process (§9.A geometry, CPU-only, no CUDA) and the GPU process (§9.B). Only the
+  window where both are running counts, at least 5 s. Placement matrix, 5 conditions: (bounce node, pinned-source node) in
+  {0,1}^2 with the reader on a node-0 core, plus (bounce 1, source 0) with the reader on a node-1 core that avoids 27-35
+  and 63 (§7.3).
+- **Third load, kept separate:** a variant where the reader thread additionally `memcpy`s each completed row from the bounce
+  to a second host buffer (the production scatter, about 1.6 ms per 13.3 MB row), because that is the actual
+  memory-bandwidth competitor. Label the two variants "storage only" and "storage + scatter".
+- **Report** each side's throughput and p99 latency alone, together, and the ratio together/alone. The decisive
+  numbers are storage GB/s and SM p99 under load. **A ratio near 1 is a result** ("they add"), not a failed experiment.
+- **Abort** if diskstats shows more than 1 % foreign bytes, if a production process appears, if the GPU link is not
+  Gen3 at the end, or if any of our threads is found on cores 64-71.
+- **Needs the GPU lock, a scheduled slot, and the drives idle.** Roughly 30-45 min including repetitions.
+
+### 9.D The registered-bounce decision after Task 4
+
+Revision 1 §3.4 says do not build it now and revisit under two conditions. Revision 2 keeps that and adds what the
+experiment must record if it is run:
+
+- **Trigger:** the Task 4 timeline shows the owner thread saturated (no idle wait between batches) **and** the recorded bounce
+  placement shows 4 KiB backing after node placement is settled (§7.8 rec. 1 may make the second moot).
+- **Arms (native service, same binary, flag-selected):** plain `IORING_OP_READ` (today); one registered iovec over the 16-slot
+  bounce; the same with a 2 MiB-aligned `MADV_HUGEPAGE` bounce and no registration (the cheaper lever); registered +
+  `SI|DTR|TASKRUN_FLAG` only if the ownership work of §8.4 is done.
+- **Record per arm:** registration time at start-up and after each ring reset (expect roughly 45-107 ms once, §7.7);
+  fixed and plain SQE counters and their sum equalling submitted reads; the fallback count (must be 0, and 100 %
+  if a reset dropped the registration); owner-thread CPU per batch and its idle-wait fraction; `AnonHugePages` of the
+  bounce; `RLIMIT_MEMLOCK` and pinned bytes (`Unevictable`); end-to-end decode latency p50/p99 against the matched Task 1
+  baseline.
+- **Adopt only if** the end-to-end p50 difference exceeds the baseline's own repeat spread. Task 1 already records that two-bank
+  itself moved throughput about 3 % rather than the 35 % first claimed (`d432533a61`), which is the scale a CPU-side
+  saving of 1.6-3.7 ms per 8-row batch (Revision 1 §3.1) has to be measured against.
+- **`IOPOLL`/`SQPOLL`** stay optional and measured, never assumed. `IOPOLL` cannot be exercised here (`poll_queues=0`;
+  enabling it is a privileged module-parameter change) and is recorded as such. `SQPOLL` would dedicate a spinning
+  kernel thread: only on a core in 0-63, only as its own labelled arm, and not before the ownership work.
 
 <details><summary>Appendix A: uring_probe.c</summary>
 
@@ -852,6 +1332,126 @@ int main(int argc, char** argv) {
 #include <stdio.h>
 #include <sys/stat.h>
 int main(int c, char** v) { for (int i = 1; i < c; ++i) { struct statx sx; if (statx(AT_FDCWD, v[i], 0, STATX_DIOALIGN, &sx)) { perror(v[i]); continue; } printf("%s: dio_mem_align=%u dio_offset_align=%u (mask has DIOALIGN: %d)\n", v[i], sx.stx_dio_mem_align, sx.stx_dio_offset_align, !!(sx.stx_mask & STATX_DIOALIGN)); } return 0; }
+```
+
+</details>
+
+<details><summary>Appendix E: defer_probe.c and its output (2026-09-21)</summary>
+
+```c
+// CPU-only: which calls on a DEFER_TASKRUN ring make a deferred completion visible? No drive, no GPU.
+//   gcc -O2 -pthread defer_probe.c -o defer_probe -luring
+#define _GNU_SOURCE
+#include <liburing.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
+static void* w(void*a){usleep(50000);char c='x';(void)!write(*(int*)a,&c,1);return 0;}
+static void run(const char*name,unsigned flags,int step){
+  struct io_uring r;struct io_uring_params p;memset(&p,0,sizeof p);p.flags=flags;
+  if(io_uring_queue_init_params(8,&r,&p)<0){printf("%s init failed\n",name);return;}
+  int pf[2];(void)!pipe(pf);char b[1];
+  struct io_uring_sqe*s=io_uring_get_sqe(&r);io_uring_prep_read(s,pf[0],b,1,0);io_uring_submit(&r);
+  pthread_t t;pthread_create(&t,0,w,&pf[1]);usleep(120000); // write landed at 50 ms; owner has not entered since
+  unsigned before=io_uring_cq_ready(&r);
+  const char*what="";int rc=0;
+  switch(step){
+    case 0: what="cq_ready only (no syscall)";break;
+    case 1: what="io_uring_submit() with an empty SQ";rc=io_uring_submit(&r);break;
+    case 2: {what="io_uring_submit() with a NOP prepared";struct io_uring_sqe*n=io_uring_get_sqe(&r);io_uring_prep_nop(n);rc=io_uring_submit(&r);break;}
+    case 3: what="io_uring_get_events()";rc=io_uring_get_events(&r);break;
+    case 4: what="io_uring_submit_and_wait(0)";rc=io_uring_submit_and_wait(&r,0);break;
+    case 5: {struct io_uring_cqe*c;what="io_uring_peek_cqe()";rc=io_uring_peek_cqe(&r,&c);break;}
+    case 6: {what="io_uring_submit_and_wait(1)";rc=io_uring_submit_and_wait(&r,1);break;}
+  }
+  unsigned after=io_uring_cq_ready(&r);
+  printf("%-32s %-40s rc=%d cq_ready before=%u after=%u\n",name,what,rc,before,after);
+  pthread_join(t,0);close(pf[0]);close(pf[1]);io_uring_queue_exit(&r);
+}
+int main(void){
+  for(int st=0;st<=6;st++){
+    run("flags=0",0,st);
+    run("SI|DTR",IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN,st);
+    run("SI|DTR|TASKRUN_FLAG",IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_TASKRUN_FLAG,st);
+  }
+  return 0;}
+```
+
+Output on divix01 (`CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 taskset -c 2 ./defer_probe`, kernel 6.12.0-211.51.1.el10_2, liburing 2.12):
+
+```
+flags=0                          cq_ready only (no syscall)               rc=0 cq_ready before=1 after=1
+SI|DTR                           cq_ready only (no syscall)               rc=0 cq_ready before=0 after=0
+SI|DTR|TASKRUN_FLAG              cq_ready only (no syscall)               rc=0 cq_ready before=0 after=0
+flags=0                          io_uring_submit() with an empty SQ       rc=0 cq_ready before=1 after=1
+SI|DTR                           io_uring_submit() with an empty SQ       rc=0 cq_ready before=0 after=0
+SI|DTR|TASKRUN_FLAG              io_uring_submit() with an empty SQ       rc=0 cq_ready before=0 after=1
+flags=0                          io_uring_submit() with a NOP prepared    rc=1 cq_ready before=1 after=2
+SI|DTR                           io_uring_submit() with a NOP prepared    rc=1 cq_ready before=0 after=1
+SI|DTR|TASKRUN_FLAG              io_uring_submit() with a NOP prepared    rc=1 cq_ready before=0 after=2
+flags=0                          io_uring_get_events()                    rc=0 cq_ready before=1 after=1
+SI|DTR                           io_uring_get_events()                    rc=0 cq_ready before=0 after=1
+SI|DTR|TASKRUN_FLAG              io_uring_get_events()                    rc=0 cq_ready before=0 after=1
+flags=0                          io_uring_submit_and_wait(0)              rc=0 cq_ready before=1 after=1
+SI|DTR                           io_uring_submit_and_wait(0)              rc=0 cq_ready before=0 after=0
+SI|DTR|TASKRUN_FLAG              io_uring_submit_and_wait(0)              rc=0 cq_ready before=0 after=1
+flags=0                          io_uring_peek_cqe()                      rc=0 cq_ready before=1 after=1
+SI|DTR                           io_uring_peek_cqe()                      rc=-11 cq_ready before=0 after=0
+SI|DTR|TASKRUN_FLAG              io_uring_peek_cqe()                      rc=0 cq_ready before=0 after=1
+flags=0                          io_uring_submit_and_wait(1)              rc=0 cq_ready before=1 after=1
+SI|DTR                           io_uring_submit_and_wait(1)              rc=0 cq_ready before=0 after=1
+SI|DTR|TASKRUN_FLAG              io_uring_submit_and_wait(1)              rc=0 cq_ready before=0 after=1
+```
+
+</details>
+
+<details><summary>Appendix F: nvme_irq_map.py and the Revision 2 command list</summary>
+
+```python
+#!/usr/bin/env python3
+# Which CPU takes the completion interrupt of each NVMe submitting core? Read-only sysfs/procfs.
+#   python3 nvme_irq_map.py            # prints, per drive, the submitter cores in 0-63 whose IRQ is on 64-71
+import os
+def cpus(s):
+    out = []
+    for p in s.strip().split(","):
+        if "-" in p:
+            a, b = p.split("-"); out += range(int(a), int(b) + 1)
+        elif p:
+            out.append(int(p))
+    return out
+irqs = {}
+for line in open("/proc/interrupts"):
+    f = line.split()
+    if f and f[-1].startswith("nvme"):
+        irqs[f[-1]] = f[0].rstrip(":")
+for dev in ("nvme0", "nvme2", "nvme3"):        # nvme3 is the drive mounted at /mnt/nvme4
+    m = {}
+    for q in os.listdir(f"/sys/block/{dev}n1/mq"):
+        cl = cpus(open(f"/sys/block/{dev}n1/mq/{q}/cpu_list").read())
+        irq = irqs[f"{dev}q{int(q) + 1}"]
+        eff = cpus(open(f"/proc/irq/{irq}/effective_affinity_list").read())[0]
+        for c in cl:
+            m[c] = eff
+    print(dev, "submitter cores in 0-63 whose completion IRQ lands on 64-71:", sorted(c for c in m if c < 64 and 64 <= m[c] <= 71))
+    print(dev, "node-0 submitters' IRQ nodes:", sorted({("n0" if (m[c] < 18 or 36 <= m[c] < 54) else "n1") for c in m if c < 18 or 36 <= c < 54}))
+```
+
+```sh
+# Revision 2 commands (all read-only on divix01; no GPU; nothing under /mnt/nvme1 or /mnt/nvme2 beyond metadata)
+grep -E "nvme|/data/models" /proc/mounts ; ls /dev/nvme* /sys/block
+for r in /mnt/nvme0/dsv41_flash /mnt/nvme4/dsv41_flash /mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw; do fincore -b -n -o RES,SIZE $r/*.safetensors; done
+filefrag -v /mnt/nvme4/dsv41_flash/*.safetensors          # FIEMAP: metadata only
+xfs_info /mnt/nvme0 ; xfs_info /mnt/nvme2 ; cat /sys/block/nvme*n1/queue/max_sectors_kb
+cat /sys/bus/pci/devices/0000:{86,87,88,89}:00.0/current_link_{speed,width}
+cat /proc/cmdline ; cat /sys/kernel/iommu_groups/<group of 0000:86:00.0>/type
+dd if=<cold shard> of=/dev/null bs=1M count=32 skip=2000 iflag=direct ; fincore -b -n -o RES <shard>   # before and after
+python3 nvme_irq_map.py                                    # Appendix F ; then compare /proc/interrupts on CPUs 64-71
+gcc -O2 -pthread defer_probe.c -o defer_probe -luring ; taskset -c 2 ./defer_probe    # Appendix E
+numactl --physcpubind=2 --membind=0 ./uring_probe cost    # Appendix A, registration cost incl. 256 MiB
 ```
 
 </details>
