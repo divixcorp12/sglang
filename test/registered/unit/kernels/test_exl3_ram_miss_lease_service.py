@@ -341,6 +341,35 @@ def test_a_served_requests_leased_slot_keeps_its_bytes_under_a_newer_demand_and_
     assert host.mapping(1)[3] == leased and not _slab_is(s, 1, leased, 0xAB), "once retired, the slot is reusable"
 
 
+def test_an_acknowledged_graph_lane_lease_no_longer_holds_back_an_eager_pause(tmp_path):
+    """The counter behind every retirement fast path and every pause refusal (`lanes_outstanding_`) must go down when a
+    lease is released. It has no Python accessor; the only observer is the eager pause, so this runs the service thread.
+    Path witness: while the lease is outstanding the pause IS refused. Property: once the acknowledgement retired it, the
+    pause is granted. Mutation: `lanes_outstanding_` is not decremented on release (the pause is refused for ever)."""
+    s = ram_miss_setup(tmp_path, capacity=3)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host.enable_lease_mode()
+    host.start_thread(fatal_wait_s=60.0, spin_us=200)
+    sim = LeaseSim(host, page, s.slabs)
+    try:
+        req = sim.post(0, [3])
+        waited = sim.wait(req, timeout_s=5.0)
+        assert waited.status == 1
+        with pytest.raises(RuntimeError, match="graph-lane lease"):
+            host.pause(2.0)  # the witness: a granted lease is counted, so the pause is refused
+        sim.ack(req, waited)
+        sim.deliver()
+        deadline = time.perf_counter() + 5.0
+        while host.counters()["leases_acked"] != 1:
+            assert time.perf_counter() < deadline, "the acknowledgement was never retired"
+            time.sleep(0.002)
+        host.pause(2.0)  # the property: the retired lease is no longer counted
+        host.resume()
+    finally:
+        host.stop()
+
+
 if __name__ == "__main__":
     import sys
 
