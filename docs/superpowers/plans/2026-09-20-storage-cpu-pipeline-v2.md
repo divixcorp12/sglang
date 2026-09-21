@@ -1294,8 +1294,23 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > the `RuntimeError` from the `pause()` the test expects to succeed -- the
 > behaviour under test, not a fixture, so the kill is legitimate.
 >
-> So a property every lease path depends on is defended by **one test, in a file
-> most lease work does not run.** Anyone verifying a lease change against the
+> **THE GAP IS ONE-DIRECTIONAL, established by running the opposite mutant.**
+> E2 -- the counter **never incremented on grant** -- is killed by **9 of 17**
+> tests, on earlier assertions (`[1,0,0] == [0,0,0]`, `2 == 1`). So the
+> stale-**low** direction was already well defended and only the stale-**high**
+> direction was thin. **A gap found in one direction is not evidence of a gap in
+> the other**, and checking costs one mutant run.
+>
+> **The fix also had to defeat its own file's fixture.** The new test lives in
+> the service file, whose `world` fixture is **pump mode, where `pause()` is a
+> no-op** -- so the natural way to write it there would have passed while
+> testing nothing. It starts the service thread itself. And it had to be a pause
+> test after all: **`lanes_outstanding_` has no Python accessor and the eager
+> pause is its only observer**, so the lead's "it need not be a pause test" was
+> wrong and the author said so.
+>
+> So a property every lease path depends on was defended, **in the decrement
+> direction**, by **one test, in a file most lease work does not run.** Anyone verifying a lease change against the
 > service, leases and defer files -- the obvious three -- gets a clean result
 > from a tree where that counter is broken. **A tally of kills would have shown
 > this as covered; only asking *which file* the killer lives in reveals it.**
