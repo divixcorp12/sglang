@@ -182,14 +182,19 @@ def test_a_forced_timeout_fails_stop_without_hanging(tmp_path, lease):
             Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
         service.host.inject(delay_s=10.0)
         ids.copy_(torch.tensor([[13, 14, 15, 0, 1, 2]], device="cuda", dtype=torch.int32))
+        base = streamer.row_planner.scratch_base
+        scratch_before = {name: t[base : base + TOP_K].clone() for name, t in streamer.hot_cache.tensors.items()}
         started = time.perf_counter()
         graph.replay()
         torch.cuda.synchronize()
         assert time.perf_counter() - started < 2.0
         assert streamer.row_backend.keep.item() == 0.0
         if lease:
-            # A refused request commits nothing: the copy read nothing and no acknowledgement was emitted.
+            # A refused request commits nothing: the copy read nothing (the scratch rows are untouched) and
+            # no acknowledgement was emitted.
             assert service.device_side.go_count.item() == 0
+            for name, t in streamer.hot_cache.tensors.items():
+                assert torch.equal(t[base : base + TOP_K].view(torch.uint8), scratch_before[name].view(torch.uint8)), name
         with pytest.raises(RuntimeError, match="exl3 RAM miss"):
             for check in checks:
                 check()
@@ -217,7 +222,7 @@ def _replayed_outputs(tmp_path, lease, routes):
             ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
             graph.replay()
             torch.cuda.synchronize()
-            assert streamer.row_backend.keep.item() == 1.0
+            assert streamer.row_backend.keep.item() == 1.0, (lease, route, service.host.counters(), service.host.fatal_seq())
             for check in checks:
                 check()
             outputs.append(out.clone())
@@ -236,7 +241,7 @@ def test_lease_mode_output_is_byte_exact_against_off(tmp_path):
         [13, 14, 15, 2, 9, 4],
         [13, 14, 15, 2, 9, 4],  # every row now resident: the all-hit handshake
         [0, 1, 2, 9, 10, 11],
-        [3, 5, 7, 6, 8, 12],
+        [4, 9, 10, 12, 0, 1],  # at most four misses a call: the 8-row tier plus the hot rows cannot hold six
     ]
     (tmp_path / "off").mkdir()
     (tmp_path / "on").mkdir()
