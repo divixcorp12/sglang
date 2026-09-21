@@ -20,7 +20,14 @@ import faulthandler
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import WORDS, Exl3RamMissHost, new_page, sim_post
+from sglang.kernels.ops.moe.exl3_ram_miss import (
+    WORDS,
+    Exl3RamMissHost,
+    new_page,
+    page_word,
+    sim_post,
+    sim_wait,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
@@ -136,5 +143,30 @@ def test_a_lap_that_would_resume_at_sequence_zero_skips_it(tmp_path, advisory):
         assert 0 not in done, done
         assert done[-1] == posted[-1]
         assert done == sorted(done)  # the survivors, in order, none twice
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("used", [True, False], ids=["used_page", "fresh_page"])
+def test_the_service_thread_serves_a_real_waiter_for_every_sequence_through_the_wrap(tmp_path, used):
+    """The pump-driven cases above are deterministic and see the phantom's signature; this one runs the
+    real service thread with a waiter on each sequence, as the wait kernel waits, so it also shows that
+    no waiter is failed or timed out and nothing wedges: every wait returns 1 and the fatal word stays 0."""
+    s = ram_miss_setup(tmp_path, capacity=6)
+    page = new_page(pin=False)
+    _set_word(page, WORDS["demand_head"], 0xFFFFFFFD)
+    _set_word(page, WORDS["demand_done"], 0xFFFFFFFD)
+    if used:
+        _set_word(page, DEMAND_RING + (DEMAND_RECORDS - 1) * RECORD_BYTES, STALE_SEQ)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host.start_thread(fatal_wait_s=5.0)
+    try:
+        posted = [sim_post(page, 1, need=[expert], protect=[expert]) for expert in (0, 1, 2, 3)]
+        assert posted == [0xFFFFFFFE, 0xFFFFFFFF, 1, 2]
+        assert [sim_wait(page, seq, 10) for seq in posted] == [1, 1, 1, 1]
+        assert page_word(page, "fatal") == 0
+        # Every served sequence was posted, so nothing was spent on a phantom one.
+        counters = host.counters()
+        assert counters["served"] == 4 and counters["touch_only"] == 0 and counters["overruns"] == 0
     finally:
         host.stop()
