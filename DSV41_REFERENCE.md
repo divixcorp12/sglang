@@ -2532,19 +2532,32 @@ percentiles are exact rather than smoothed.
 1.3482x above with repeats and provenance. Run-to-run spread within a cell is
 0.5-0.6%, far below the effect, and the four off arms span 2.903-2.919.
 
-**Two-bank is worth about +3.2%** (3.92 clean new / 3.798 clean old), and the
-sign is consistent across all four sessions individually (+3-5%, +3%, +4-5%,
-+2%). This is the number `ddcb0d55ff`'s commit message should have carried.
-It is not the 1.35x, which belongs to the mirrors.
+**New code beats old by about +3.2%** (3.92 clean new / 3.798 clean old; +3.5%
+if `task1b-0` is included as the manifest does, giving n=4). The sign is
+consistent across all four sessions individually (+3-5%, +3%, +4-5%, +2%) and
+across arms (+2.8% to +4.2%).
 
-**The old arm's n is 1.** Two old arms ran; one had disturbed sessions (below)
-and is excluded, leaving a single clean measurement at 3.798 against three clean
-new arms. Every other cell has n=3 or more. More old arms are being collected,
-and until they exist the +3.2% should be read as "about 3%, sign-consistent
-across sessions, old-arm n=1", not as a precise figure.
+**This is NOT two-bank's effect alone, and the distinction is the same one this
+section corrects elsewhere.** The `099eadba33` to `f6608901a3` delta is four
+commits touching `python/`, two of them behavioural: `ddcb0d55ff` (the two-bank
+pipeline) and `cd14545797` (pinned-tier and Engram traffic counters, which touch
+`engram_row_cache.py` and `expert_host_tier.py`). The other two, `be76ba501f`
+and `6a606e2b33`, are comment-only and can be excluded by inspection. So +3.2%
+is what those two behavioural commits are worth together. Attributing it to
+two-bank alone would repeat, in this file, exactly the error this section
+corrects in `ddcb0d55ff`'s commit message.
+
+**The old arm's n is 1.** Five old arms have run; four were disturbed by machine
+contention and are excluded, leaving a single clean measurement at 3.798 against
+three clean new arms. Their undisturbed sessions repeat the clean arm's
+per-session values to 1-2%, which corroborates the ~3.8 level without supplying
+a second clean measurement. The honest phrasing is n=1 clean, corroborated by
+undisturbed sessions of disturbed arms; the figure should be read as "about 3%,
+sign-consistent", not as a precise value.
 
 Corroboration worth noting: that clean old arm reads 3.798 against this
-section's single-shot 3.8016, measured on the same reader four days earlier.
+section's single-shot 3.8016, measured on the same reader about 21 hours
+earlier (2026-09-20 02:56 CDT against 23:43 CDT).
 The old number was right; only the label attached to it was wrong.
 
 ##### What these arms do not settle
@@ -2571,7 +2584,7 @@ The old number was right; only the label attached to it was wrong.
   two mirrors are on different filesystems: `/mnt/nvme0` is xfs, `/mnt/nvme4` is
   ext4 and is physically `nvme3n1`.
 - **Boot-phase page-cache behaviour is not understood.** Residency of the source
-  directory changes during engine startup by anywhere from -3.4 to +5.1 GiB, and
+  directory changes during engine startup by anywhere from -3.21 to +5.31 GiB, and
   these changes do not track device reads. An explanation in terms of eviction
   and re-reading was proposed and **withdrawn** when diskstats contradicted it.
   A second hypothesis, that the 70 GiB pinned allocation reclaims page cache
