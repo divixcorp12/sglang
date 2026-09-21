@@ -257,6 +257,39 @@ Include expert identity in the immutable row result and validate it against the 
 > invalidates.
 
 - [ ] Handle failure before readiness, timeout before copy, and failure after a subset copied. Suppress dependent compute on any fatal demand error. A skipped GPU copy must not accidentally emit a successful source-consumption acknowledgement.
+> **R3 (retire-between-batches) IS WRITTEN, REVIEWED AND HELD -- it belongs with
+> Task 6, not before it.** One line adding `retire_leases()` to `serve()`'s
+> abandon callback. Independent review cleared the code on all four risks
+> (no path calls `read()` holding `mutex_`; the request in service is unaffected,
+> its slots `kLoading` and unleased; the `lease_changes_` wake is never earlier
+> than the existing retire; cost negligible) and then found the reason to wait:
+>
+> **It has no consumer today.** A demand is at most 8 rows **in one batch**, so
+> the callback runs **once, at batch 0, microseconds after `pump_demand`'s own
+> `retire_leases()`**. Nothing can use a lease released mid-read before the read
+> ends -- the request in service has already reserved, a deferred demand is not
+> examined until the loop returns, an eager pause retires itself, promotion
+> leases are separate. **The only observable effect is that `leases_acked` moves
+> earlier.**
+>
+> **And its test cannot test what it is for:** it cannot distinguish "at read
+> start" from "between batches", because a one-batch read has no between. A path
+> witness with no property, where the property is **unexercisable on today's
+> workload** rather than merely unasserted.
+>
+> **The rationale is a Task 6 situation** -- a long read holding an
+> already-acknowledged lease is what V2's per-row transfer creates. So this is a
+> correct change for a world not yet built.
+>
+> **THE BLOCKER TO FIX FIRST when Task 6 picks it up, and it is worth more than
+> the diff:** the meaningful test needs a **multi-batch read**, and
+> `pack_delay_ns` is **not reachable from the service**, so the between-batches
+> case cannot currently be constructed at all. Build that before building the
+> test, or the test will again pass for a reason unrelated to the requirement.
+>
+> **Box 5 does not move either way** -- "keeps reaping during a long read" has a
+> call site in the held package and no multi-batch demonstration anywhere.
+
 - [ ] Retire unconsumed leases after a terminal cancellation handshake establishes that no GPU reader can start. Already copied lanes retire through their matching acknowledgements. The worker must keep submitting/reaping and processing cancellations while acknowledgements are outstanding; never synchronously wait for an acknowledgement inside its I/O progress loop.
 - [ ] On shutdown, stop admission, drain storage/packing, then establish completion of all GPU readers before freeing their memory. If a CUDA error prevents establishing completion, retain/quarantine allocations until process teardown; never recycle uncertain storage.
 - [ ] Preserve Option F's acknowledgement/eviction ordering. Removing its all-hit handshake is a separate optimization after equivalent protection is proven.
