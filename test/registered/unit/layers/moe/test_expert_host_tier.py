@@ -1,10 +1,12 @@
 """CPU tests for the pinned host expert tier: slot LRU, slabs and chunked gathers."""
 
+import gc
 import heapq
 import json
 import random
 import tempfile
 import unittest
+import weakref
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +21,7 @@ from sglang.srt.layers.moe.expert_host_tier import (
     PAGE_BYTES,
     PinnedSlotLRU,
     allocate_host_slab,
+    quarantined_slab_count,
     tier_snapshot,
 )
 from sglang.srt.layers.moe.expert_stream import (
@@ -276,6 +279,55 @@ class TestPinnedSlotLRUCounters(unittest.TestCase):
         )
         self.assertEqual(stats["occupancy"], len(plain.expert_to_slot))
         self.assertGreater(evicted_seen, 100)
+
+
+class TestQuarantine(unittest.TestCase):
+    """LEASE_PROTOCOL.md section 14: a tier whose GPU readers are uncertain is never unregistered or freed."""
+
+    def _cache(self, released):
+        streamer = ExpertStreamer(_host_layer(experts=4), ("host_rows",))
+        with patch.object(expert_stream, "release_host_slabs", released.append):
+            return ExpertPinnedHostCache(streamer, 2, device="cpu")
+
+    def test_close_releases_the_slabs_once(self):
+        released = []
+        self._cache(released).close()
+        self.assertEqual(len(released), 1)
+
+    def test_a_quarantined_tier_is_never_released_not_even_at_collection(self):
+        released = []
+        cache = self._cache(released)
+        cache.quarantine()
+        cache.close()
+        del cache
+        gc.collect()
+        self.assertEqual(released, [])
+
+    def test_quarantined_slabs_outlive_the_cache_and_the_module_list(self):
+        released = []
+        cache = self._cache(released)
+        slab = weakref.ref(next(iter(cache.tensors.values())))
+        before = quarantined_slab_count()
+        cache.quarantine()
+        self.assertEqual(quarantined_slab_count(), before + len(cache.tensors))
+        del cache
+        gc.collect()
+        # Interpreter finalization clears module globals: only the extra reference can keep the slab.
+        from sglang.srt.layers.moe import expert_host_tier
+
+        kept = list(expert_host_tier._QUARANTINED)
+        expert_host_tier._QUARANTINED.clear()
+        gc.collect()
+        self.assertIsNotNone(slab())
+        expert_host_tier._QUARANTINED.extend(kept)
+
+    def test_an_unquarantined_slab_is_freed_with_its_cache(self):
+        released = []
+        cache = self._cache(released)
+        slab = weakref.ref(next(iter(cache.tensors.values())))
+        del cache
+        gc.collect()
+        self.assertIsNone(slab())
 
 
 class TestTierSnapshot(unittest.TestCase):

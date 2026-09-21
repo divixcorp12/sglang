@@ -7,6 +7,7 @@ are testable on a CPU-only host.
 
 from __future__ import annotations
 
+import ctypes
 import heapq
 import itertools
 import math
@@ -16,6 +17,7 @@ from typing import (
     Any,
     Callable,
     Collection,
+    Iterable,
     Mapping,
     NamedTuple,
     Optional,
@@ -258,3 +260,24 @@ def release_host_slabs(slabs: Sequence[torch.Tensor]) -> None:
 
     for slab in slabs:
         _cuda_host_unregister(slab)
+
+
+# The list only makes the quarantine countable. The protection is the extra reference taken below: interpreter
+# finalization clears module globals, which would free the slabs of a list that were the only owner.
+_QUARANTINED: list[torch.Tensor] = []
+
+
+def quarantine_host_slabs(slabs: Iterable[torch.Tensor]) -> None:
+    """Keep slabs alive, and registered, until the process ends.
+
+    For a tier whose GPU readers cannot be shown to have finished (a CUDA error, or a synchronize that did not
+    return): recycling that storage could feed a reader another expert's bytes. Each slab gets a reference that
+    is never released.
+    """
+    for slab in slabs:
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(slab))
+        _QUARANTINED.append(slab)
+
+
+def quarantined_slab_count() -> int:
+    return len(_QUARANTINED)
