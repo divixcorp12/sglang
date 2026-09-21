@@ -255,7 +255,11 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 > measurement gave +90.5 us at p50 against +14.8 us min-to-min, and neither could be quoted. The ~8 us came from
 > `open11_arming_cost.py`'s hand-written step; the real backend path costs about twice that.
 > **So OPEN 11 is ~61% of the 1.114 ms `G*`, not 28-30%**, and section 17.2's net-of-OPEN-11 requirement on Task 6
-> bites twice as hard as recorded. Still an upper bound, still ~1% of a ~66.8 ms/token step.
+> bites twice as hard as recorded. Still an upper bound, attained only when every layer is all-hit.
+> **Correction to this note's own first draft:** it said "~1% of a ~66.8 ms/token step". 66.8 ms/token is a Qwen3.8
+> NVFP4 figure from `analysis/step-tail/`, which reads a prefetch server on that line and counts 48 layers per step.
+> DSV4.1 EXL3 in-graph decode is ~360 ms/step (2.781 tok/s, `DSV41_REFERENCE.md:4`), so OPEN 11 is **~0.19% of a
+> decode step**, not 1%. The `G*` comparison above is unaffected: both are per-step DSV4.1 quantities.
 >
 > ~~**OPEN 11 is now measured** (`analysis/dsv41-drive/open11/`, three runs agreeing to 6%): arming every `count > 0`
 > record costs **about 8 us per all-hit layer, ~0.32 ms per step at 40 layers**. The exposed cost is the wait alone
@@ -796,7 +800,27 @@ Include expert identity in the immutable row result and validate it against the 
 >   and a partial terminal mask for the case where stage 2 fails after stage 1
 >   copied. `lease_model.py` models none of those.
 > - **(b) large, Task 5's:** the words themselves, lease counters and retirement,
->   the eviction predicate, and generations. **None of this exists.**
+>   the eviction predicate, and generations. ~~**None of this exists.**~~
+>   **SATISFIED 2026-09-21, checked in the tree rather than inferred.** All five exist and four are
+>   mutation-tested: the `RowResult` words (`exl3_ram_miss_host.cpp:1544-1549`, published per lane at `:2099-2116`
+>   with an `sfence` between payload and ready words); `leases_granted` / `leases_acked` / `leases_voided`;
+>   `retire_leases()` (`:2124`), which never blocks; the eviction predicate `leased_locked` in `take_slot_locked`
+>   (`:2415`), whose deletion kills exactly one test and nothing else; and `tier.generation[slot]`, carried into
+>   `kLeaseRrSlotGeneration` and validated by the acknowledgement kernel, which returns VIOLATED when it moves.
+>   **The consequence is the one this plan reserved for this moment: V1's checklist, "deliberately absent" and
+>   "deferred until Task 5 (b) is real", is now due.**
+>
+>   **NARROWED 2026-09-21, and this correction is to the note above rather than to the plan.** Saying the eviction
+>   predicate is "delivered" overstates it. `leased_locked` has exactly three call sites: the public `release()`
+>   throw (`:1981`), `census_locked` (`:2391`), and `take_slot_locked`'s **`kReady` eviction scan** (`:2415`). The
+>   free-slot fast path at the top of `take_slot_locked` (`:2408-2409`) returns the first `kFree` slot and never
+>   consults it. **So the predicate protects a leased slot only while that slot is `kReady`; the moment anything
+>   puts it in `kFree` the protection is gone, silently.** That is consistent with the mutation result rather than
+>   contradicted by it -- "deletion kills exactly one test and nothing else" is itself a hint that no test stands
+>   over the free-slot path. It is the same gap that Task 6's checklist records as the `release_locked` landmine
+>   (`task6-v1-checklist.md` section 2), seen from the Task 5 side, and Task 5 item 5's R3 mutant reaches it from a
+>   third direction. V1 is not exposed, because it never frees a leased slot, but nothing in the tree enforces that
+>   for the next mechanism that tries.
 >
 > The hit lease must be taken **in the same `mutex_` section as the reservation**,
 > not merely "at reservation": today's `serve()` drops the mutex between
