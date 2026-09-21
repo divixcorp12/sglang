@@ -433,6 +433,68 @@ def test_a_full_cache_serves_a_demand_that_exactly_fills_it_and_fails_one_that_c
         host.stop()
 
 
+# ---- What protects a resident row from the request that is served for it ----
+#
+# A record carries `need` (planned experts missing from RAM) and `protect` (the routed experts); the
+# service never sees which experts the device planned. serve() reserves slots with take_slot_locked, and
+# `wanted` (protect and need) is the only thing that keeps a resident row from being that request's own
+# victim. So a planned RAM hit that is absent from protect is a legal victim: a device that read
+# slot_map early and copied it would copy a slot the same request then overwrites, and nothing re-reads
+# the map afterwards. The kBusySeq-gated hit phase (PER_ROW_TRANSFER, V1b) depends on this; these tests
+# pin the mechanism it depends on.
+
+
+def _fill(page, host, experts):
+    for expert in experts:  # each is a demand of its own, so the first one served is the least recently used
+        seq = sim_post(page, 1, need=[expert], protect=[expert])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+
+
+def _resident(host, row=1):
+    return [e for e in range(6) if host.contains(row, e)]
+
+
+def test_a_resident_expert_outside_protect_is_evicted_by_the_request_that_needs_another(tmp_path):
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        _fill(page, host, [0, 1, 2])  # expert 0 is the least recently used
+        assert _resident(host) == [0, 1, 2] and host.counters()["evictions"] == 0
+        seq = sim_post(page, 1, need=[4], protect=[4])  # expert 0 is neither needed nor protected
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        assert _resident(host) == [1, 2, 4]
+        assert host.counters()["evictions"] == 1
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_a_resident_expert_in_protect_is_not_the_victim(tmp_path):
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        _fill(page, host, [0, 1, 2])
+        seq = sim_post(page, 1, need=[4], protect=[4, 0])  # the same request, now protecting expert 0
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        assert _resident(host) == [0, 2, 4]  # expert 1 went instead
+    finally:
+        host.stop()
+
+
+def test_when_every_resident_expert_is_protected_the_request_fails_and_evicts_nothing(tmp_path):
+    """The case that separates protection from mere recency: a request that touches its protected
+    residents makes them the most recently used, so it is only when NO other victim exists that the
+    protection is the only thing standing between a resident row and eviction."""
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        _fill(page, host, [0, 1, 2])
+        seq = sim_post(page, 1, need=[4], protect=[0, 1, 2])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 2
+        assert _resident(host) == [0, 1, 2]
+        assert host.counters()["no_victim"] == 1 and host.counters()["evictions"] == 0
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
 def test_a_failed_read_publishes_none_of_the_rows_it_had_already_packed(tmp_path):
     s, page, host = _tier(tmp_path)
     try:
