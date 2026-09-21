@@ -145,6 +145,12 @@ def main() -> None:
     p.add_argument("--prompt-tokens", type=int, default=512)
     p.add_argument("--new-tokens", type=int, default=128)
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--residency-dirs",
+        default="",
+        help="colon-separated dirs whose .safetensors page-cache residency is recorded before the "
+        "Engine, once it is ready, and after every session, so cache growth names its session",
+    )
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     p.add_argument("--chunked-prefill-size", type=int, default=512)
     p.add_argument("--graphs", action="store_true", help="breakable decode graphs at batch size 1")
@@ -175,11 +181,14 @@ def main() -> None:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import provenance
 
+    residency_dirs = [d for d in args.residency_dirs.split(":") if d]
+    residency = {"dirs": residency_dirs, "before_engine": provenance.resident_bytes(residency_dirs)}
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     prov = provenance.capture({"trace_corpus": os.path.abspath(__file__)})
     prov["drive_idle_check"] = provenance.drive_idle_check()
     engine = sglang.Engine(**engine_kwargs(args))
     prov["sglang_env_drift_at_engine_ready"] = provenance.env_drift(prov["sglang_env"], provenance.process_env())
+    residency["after_engine_ready"] = provenance.resident_bytes(residency_dirs)
     sessions = []
     for text in texts:
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
@@ -199,12 +208,13 @@ def main() -> None:
                 "new_tokens": args.new_tokens,
                 "cpu_s": None if None in (cpu_before, cpu_after) else cpu_after - cpu_before,
                 "step_latency": provenance.step_latency(chunk_log),
+                "expert_resident_bytes": provenance.resident_bytes(residency_dirs),
                 **timing,
             }
         )
         print(json.dumps(sessions[-1]), flush=True)
     engine.shutdown()
-    report = {"provenance": prov, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
+    report = {"provenance": prov, "expert_residency": residency, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
 

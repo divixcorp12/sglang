@@ -275,3 +275,25 @@ def process_tree_cpu_s() -> float | None:
         return total
     except Exception:
         return None
+
+
+def resident_bytes(dirs: list, chunk: int = 200) -> dict:
+    """Page-cache-resident bytes of the .safetensors files under each dir, by ``fincore`` (mincore:
+    it reads no file data). {dir: bytes}, or {dir: None} if it could not be measured."""
+    out = {}
+    for d in dirs:
+        try:
+            files = sorted(
+                os.path.join(root, f) for root, _, names in os.walk(d) for f in names if f.endswith(".safetensors")
+            )
+            total = 0
+            for i in range(0, len(files), chunk):
+                res = subprocess.run(
+                    ["fincore", "-b", "-n", "--raw", "-o", "RES", *files[i : i + chunk]],
+                    capture_output=True, text=True, timeout=60, check=True,
+                )
+                total += sum(int(x) for x in res.stdout.split())
+            out[d] = total
+        except Exception:
+            out[d] = None
+    return out

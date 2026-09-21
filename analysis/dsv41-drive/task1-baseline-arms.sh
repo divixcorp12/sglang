@@ -30,17 +30,29 @@ declare -A DEV=( [nvme0]=nvme0n1 [nvme2]=nvme2n1 [nvme4]=nvme3n1 )
 LABEL="$1"; shift
 OUTDIR="$1"; shift
 mkdir -p "$OUTDIR"
+# A completion sentinel, so a watcher can poll for one file over short connections instead of
+# holding a long-lived one that a dropped ssh takes down with it. It is written on every way out.
+specs=("$@"); idx=0
+SENTINEL="$OUTDIR/$LABEL.sentinel"
+rm -f "$SENTINEL"
+trap 'rc_exit=$?; { echo "status=$([ $rc_exit -eq 0 ] && echo DONE || echo ABORTED) exit=$rc_exit finished=$(date --iso-8601=seconds)"; echo "arms_started=$idx of ${#specs[@]}"; } > "$SENTINEL"' EXIT
+trap 'exit 130' INT TERM
 echo "script: $(sha1sum "$0" | cut -c1-12)  verdict: $(sha1sum "$VERDICT" | cut -c1-12)  host: $(hostname)"
 
 sectors() { awk -v d="$1" '$3==d {print $6}' /proc/diskstats; }
 
-# Resident page-cache bytes of the expert shards (mincore only; reads no data).
-expert_resident_bytes() {
-  local d
+# Resident page-cache bytes of the expert shards (mincore only; reads no data), per directory as a
+# json object {"<dir>": bytes}, so a failure names the directory that grew.
+resident_by_dir_json() {
+  local d sep="" res
+  printf '{'
   for d in "${EXPERT_SHARD_DIRS[@]}"; do
-    [ -d "$d" ] && find "$d" -type f -name '*.safetensors' -print0 2>/dev/null | xargs -0 -r fincore -b -n --raw -o RES 2>/dev/null
-  done | awk '{s+=$1} END {print s+0}'
+    res=$(find "$d" -type f -name '*.safetensors' -print0 2>/dev/null | xargs -0 -r fincore -b -n --raw -o RES 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    printf '%s"%s": %s' "$sep" "$d" "$res"; sep=", "
+  done
+  printf '}'
 }
+RESIDENCY_DIRS=$(IFS=:; echo "${EXPERT_SHARD_DIRS[*]}")
 meminfo_cached_kb() { awk '/^Cached:/ {print $2}' /proc/meminfo; }
 
 idle_check() {
@@ -65,8 +77,6 @@ preflight() {  # refuse to start unless the GPU, the port and the worktree are w
   fi
 }
 
-specs=("$@")
-idx=0
 for spec in "${specs[@]}"; do
   IFS=: read -r code mirror trace <<<"$spec"
   case "$code" in old) wt=$WT_OLD; want=$HEAD_OLD ;; new) wt=$WT_NEW; want=$HEAD_NEW ;; *) echo "bad code in $spec"; exit 2 ;; esac
@@ -78,7 +88,7 @@ for spec in "${specs[@]}"; do
   [ "$mirror" = on ] && env_args+=(SGLANG_MOE_EXPERT_MIRROR_DIRS="$MIRRORS")
   [ "$trace" = T ] && env_args+=(SGLANG_DSV41_EXPERT_TRACE_PATH="$OUTDIR/$name.trace")
   cmd=("$PY" scripts/dsv41/trace_corpus.py --model "$FULL" --sessions "$SESSIONS" --skip 0 --n 4
-       --prompt-tokens 256 --new-tokens 128 --graphs --out "$OUTDIR/$name.json")
+       --prompt-tokens 256 --new-tokens 128 --graphs --residency-dirs "$RESIDENCY_DIRS" --out "$OUTDIR/$name.json")
 
   echo "=================================================================="
   echo "ARM $name  code=$code@$want mirror=$mirror trace=$trace  $(date --iso-8601=seconds)"
@@ -92,17 +102,17 @@ for spec in "${specs[@]}"; do
   cd "$WT_NEW"                       # harness comes from here; PYTHONPATH picks the sglang under test
   idle_check
   rm -f "$OUTDIR/$name.trace" "$OUTDIR/$name.trace.cache-stats"
-  cached0=$(meminfo_cached_kb); res0=$(expert_resident_bytes)
+  cached0=$(meminfo_cached_kb); res0=$(resident_by_dir_json)
   declare -A before; for k in nvme0 nvme2 nvme4; do before[$k]=$(sectors "${DEV[$k]}"); done
   t0=$(date +%s)
   $ANA/gpu-run.sh env "${env_args[@]}" "${cmd[@]}" > "$OUTDIR/$name.log" 2>&1
   rc=$?
   wall=$(( $(date +%s) - t0 ))
-  cached1=$(meminfo_cached_kb); res1=$(expert_resident_bytes)
+  cached1=$(meminfo_cached_kb); res1=$(resident_by_dir_json)
   {
     printf '{"arm": "%s", "rc": %s, "wall_s": %s, "meminfo_cached_kb_before": %s, "meminfo_cached_kb_after": %s,' \
       "$name" "$rc" "$wall" "$cached0" "$cached1"
-    printf ' "expert_resident_bytes_before": %s, "expert_resident_bytes_after": %s, "diskstats_read_bytes": {' "$res0" "$res1"
+    printf ' "expert_resident_by_dir_before": %s, "expert_resident_by_dir_after": %s, "diskstats_read_bytes": {' "$res0" "$res1"
     sep=""; for k in nvme0 nvme2 nvme4; do
       printf '%s"%s": %s' "$sep" "$k" $(( ($(sectors "${DEV[$k]}") - ${before[$k]}) * 512 )); sep=", "
     done

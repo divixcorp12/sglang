@@ -90,13 +90,32 @@ def check_arm(report: dict, *, root: str, head: str, mirror: bool, traced: bool,
 
 
 def check_cache(cache: dict) -> list:
-    """Reject an arm that left expert shard bytes in the page cache."""
-    before, after = cache.get("expert_resident_bytes_before"), cache.get("expert_resident_bytes_after")
-    if before is None or after is None:
-        return ["expert page-cache residency was not measured"]
-    if after - before > MAX_EXPERT_CACHE_GROWTH_BYTES:
-        return [f"expert shard page-cache residency grew {(after - before) / (1 << 30):.2f} GiB across the arm"]
-    return []
+    """Reject an arm that left expert shard bytes in the page cache, naming the directory."""
+    before, after = cache.get("expert_resident_by_dir_before"), cache.get("expert_resident_by_dir_after")
+    if not isinstance(before, dict) or not isinstance(after, dict) or set(before) != set(after):
+        return ["expert page-cache residency was not measured per directory"]
+    problems = []
+    for d in sorted(before):
+        grew = after[d] - before[d]
+        if grew > MAX_EXPERT_CACHE_GROWTH_BYTES:
+            problems.append(f"expert shard page-cache residency grew {grew / (1 << 30):.2f} GiB across the arm in {d}")
+    return problems
+
+
+def residency_notes(report: dict) -> list:
+    """Where in the run each directory's residency changed, from the driver's own samples."""
+    res = report.get("expert_residency") or {}
+    steps = [("before_engine", res.get("before_engine")), ("engine_ready", res.get("after_engine_ready"))]
+    steps += [(f"session_{i}", row.get("expert_resident_bytes")) for i, row in enumerate(report.get("per_session") or [])]
+    notes, prev = [], None
+    for label, sample in steps:
+        if isinstance(sample, dict) and isinstance(prev, dict):
+            for d in sorted(sample):
+                if sample[d] is not None and prev.get(d) is not None and sample[d] != prev[d]:
+                    notes.append(f"residency of {d} changed {(sample[d] - prev[d]) / (1 << 20):+.1f} MiB at {label}")
+        if isinstance(sample, dict):
+            prev = sample
+    return notes
 
 
 def main() -> int:
@@ -120,6 +139,7 @@ def main() -> int:
     )
     if cache is not None:
         problems += check_cache(cache)
+    notes += residency_notes(report)
     for n in notes:
         print("NOTE", n)
     for x in problems:

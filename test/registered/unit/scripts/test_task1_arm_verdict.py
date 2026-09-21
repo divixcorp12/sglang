@@ -118,7 +118,37 @@ def test_multi_token_chunks_are_a_note_not_a_failure():
     assert problems == [] and "3 chunks" in notes[0]
 
 
-def test_expert_page_cache_growth_rejects_the_arm():
-    assert verdict.check_cache({"expert_resident_bytes_before": 0, "expert_resident_bytes_after": 1 << 20}) == []
-    assert verdict.check_cache({"expert_resident_bytes_before": 0, "expert_resident_bytes_after": 5 << 30})
-    assert verdict.check_cache({"expert_resident_bytes_before": None, "expert_resident_bytes_after": 0})
+def _cache(before, after):
+    return {"expert_resident_by_dir_before": before, "expert_resident_by_dir_after": after}
+
+
+def test_page_cache_growth_rejects_the_arm_and_names_the_directory():
+    """Bug: the summed gate said an arm's residency grew 1.40 GiB without saying where."""
+    quiet = {"/src": 16 << 30, "/m0": 0, "/m4": 30 << 30}
+    assert verdict.check_cache(_cache(quiet, dict(quiet, **{"/m4": (30 << 30) + (1 << 20)}))) == []
+    problems = verdict.check_cache(_cache(quiet, dict(quiet, **{"/m4": (31 << 30) + (1 << 29)})))
+    assert len(problems) == 1 and "/m4" in problems[0] and "1.50 GiB" in problems[0]
+
+
+def test_growth_is_judged_per_directory_not_summed_across_a_shrinking_one():
+    before = {"/src": 20 << 30, "/m4": 0}
+    after = {"/src": 10 << 30, "/m4": 2 << 30}  # the sum fell, but /m4 grew 2 GiB
+    assert any("/m4" in p for p in verdict.check_cache(_cache(before, after)))
+
+
+def test_unmeasured_or_mismatched_residency_is_a_problem():
+    assert verdict.check_cache({})
+    assert verdict.check_cache(_cache({"/a": 0}, {"/b": 0}))
+
+
+def test_residency_notes_name_the_session_where_a_directory_changed():
+    report = {
+        "expert_residency": {"before_engine": {"/m4": 100 << 20}, "after_engine_ready": {"/m4": 100 << 20}},
+        "per_session": [
+            {"expert_resident_bytes": {"/m4": 100 << 20}},
+            {"expert_resident_bytes": {"/m4": (100 << 20) + (1400 << 20)}},
+        ],
+    }
+    notes = verdict.residency_notes(report)
+    assert notes == ["residency of /m4 changed +1400.0 MiB at session_1"]
+    assert verdict.residency_notes({}) == []

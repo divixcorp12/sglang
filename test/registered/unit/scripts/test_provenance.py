@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -236,6 +237,17 @@ def test_process_tree_cpu_s_counts_this_process():
     before = prov.process_tree_cpu_s()
     sum(i * i for i in range(2_000_000))
     assert prov.process_tree_cpu_s() > before
+
+
+@pytest.mark.skipif(shutil.which("fincore") is None, reason="needs util-linux fincore")
+def test_resident_bytes_counts_cached_shards_per_directory(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    (a / "x.safetensors").write_bytes(b"\0" * (4 << 20))  # written buffered, so resident
+    (a / "ignored.json").write_bytes(b"\0" * (4 << 20))
+    out = prov.resident_bytes([str(a), str(b), str(tmp_path / "missing")])
+    assert 4 << 20 <= out[str(a)] < 8 << 20
+    assert out[str(b)] == 0 and out[str(tmp_path / "missing")] == 0
 
 
 def test_arm_harnesses_embed_provenance_in_the_result_json():
