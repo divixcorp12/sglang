@@ -2286,3 +2286,18 @@ path). A GPU run needs crypto-c9's scheduling.
 
 **Not decided here.** Whether `scheduler.py` review wants the block behind a config gate; the function is a no-op
 without a live service, so this proposal has none.
+
+**20.2i addendum: the test drives the real method, and the ordering is what it asserts.** `test_expert_doorbell_copier.py`
+(`_scheduler_stub`, `_release_scheduler_host_resources`, lines ~1500-1553) already calls the *unbound real*
+`Scheduler.release_host_resources(stub)` with the module's capturers patched, and has one test that the doorbell is
+stopped through the model runner and one that a failing `stop_doorbell` still releases the rest. The wiring test
+follows that pattern and no other: it must run the real method, not a copy of its order. Two tests. (1) A recorder
+stub: the doorbell stop, the RAM-miss shutdown and `tree_cache.release_host_resources` append to one list; assert
+the list equals `[doorbell, ram_miss, tree_cache]` (the relative order to `stop_doorbell` being the point). (2) The
+same with a live `Exl3RamMissService` whose barrier is the faked `_synchronize` of `test_exl3_ram_miss_shutdown.py`:
+the copier reports `running == 0` at the moment the service closes admission, and afterwards the tiers are freed
+(barrier clean) or quarantined (barrier errored); a failing RAM-miss shutdown must still reach the tree-cache
+release. Mutations, each to be run and its killing test read: block omitted; before the doorbell stop; after the
+tree-cache release; `except` removed; the function constructs the singleton when none exists (a run without EXL3
+would then create a service at shutdown). The fake barrier is still a fake: the second test shows the wiring, not
+that the real barrier orders GPU work.
