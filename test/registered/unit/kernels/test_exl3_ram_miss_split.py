@@ -1000,6 +1000,30 @@ def test_a_row_with_nothing_to_read_fails_instead_of_packing_stale_bytes(tmp_pat
 
 
 
+@pytest.mark.parametrize("weights", [None, (1.0, 1.0)])
+def test_a_row_whose_extents_deliver_less_than_its_segments_read_fails_instead_of_packing(tmp_path, weights):
+    """The last defence against publishing bytes no drive delivered. The table is built and the file
+    is big enough, so the table build and admit_batch's EOF guard both accept the row; only the
+    coverage check at pack time sees that the extents, read whole and clean, still fall a page short of
+    the last byte the segments copy. It must fail the request and leave the slot untouched."""
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=weights)
+    need_end = int((s.tables.segments[:, 2] + s.tables.segments[:, 3]).max())
+    experts, slots = [0, 1, 2], [0, 1, 2]
+    reading = [p for p in range(s.tables.parts) if int(s.tables.extents[1, 1, p, 2]) > 0]
+    delivered = sum(int(s.tables.extents[1, 1, p, 2]) for p in reading)
+    needed = int(s.tables.starts[1, 1]) + need_end
+    assert needed <= delivered < needed + PAGE  # the table is minimal: one page fewer is short
+    s.tables.extents[1, 1, reading[-1], 2] -= PAGE
+    for slot in slots:
+        _sentinel(s, 1, slot)
+    assert ops.read_rows_with_fault(
+        s.tables, 1, experts, slots, [5, 4], [3, 4], direct=False, poison=True
+    ) == (0, 1)
+    assert _untouched(s, 1, 1)
+    _exact_or_untouched(s, 1, experts, slots)
+    _assert_rows(s, 1, [5, 4], [3, 4])  # the reader is clean afterwards
+
+
 if __name__ == "__main__":
     import sys
 
