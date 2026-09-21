@@ -33,38 +33,48 @@ demands in each). Every statement of the form "the saving is X" below is about t
 about EXL3 decode in general. A different cache size or routing skew changes the hit-lane count per read layer (A1) and
 `Sigma(m-1)` (the per-row-specific part).
 
-1. **The ceiling for THIS configuration is 19.2 ms/step (random order) to 38.6 ms/step (best order), 7.5% to 15% of a
+1. **The saving is conditional on a blocking dependency that is unbudgeted: per-lane, time-staged publication ([REQ 1]).**
+   Every figure below, the 7.5-15% and the 87%, requires that the service publish a lane's readiness, and take its lease,
+   *before* the request completes. That does not exist today (section 3.1). **[REQ 1] is a prerequisite for the two-phase
+   mechanism V1 exactly as much as for per-row V2**; V1's advantage over V2 is that it needs one early publication instead
+   of one per row, not that it needs none. A cost estimate for V1 that books the protocol change as someone else's work is
+   wrong. Cost line (section 9): the *timing* change in `serve()` is small (a few stores per hit lane inside a critical
+   section that already exists); the *words* it publishes, their generations, the lease counters and retirement are
+   Task 5, which is designed but not implemented. So V1's real cost is "Task 5, plus a small reordering", and it is
+   unknown until Task 5 lands.
+2. **The ceiling for THIS configuration is 19.2 ms/step (random order) to 38.6 ms/step (best order), 7.5% to 15% of a
    257.5 ms mirrors-on step** [M, section 1]. DSV41_REFERENCE 18.3's 20.8 ms (<= 5.3%) was computed for a different
    configuration (the older 391 ms/step arm, G = 121.2, 18.8 RAM misses per step, mirrors off). Please plan against these
    figures and cite both; my BEST figure is uncorrected for 18.3's 74.5% alignment haircut, which is why it is twice
    18.3's. (I first read 221 VRAM misses per step from the first two `graph_step` lines and told the team lead so; over
    all 495 steps it averages **131 [post-hoc]**, which reconciles with 18.2's G = 121 rather than contradicting it.)
-2. **The result rests on A1** (hit lanes are spread evenly over the 40 layers), because the trace does not record lanes per
+3. **The result rests on A1** (hit lanes are spread evenly over the 40 layers), because the trace does not record lanes per
    layer. The SUPPORT bar still holds down to about **37% of the modelled hit lanes, about 0.8 hit lanes per read layer**;
    it fails only if hit lanes sit almost entirely in layers that read nothing. **[REQ 4]** asks for one instrumentation word
    that removes the assumption.
-3. **Registered outcome: SUPPORT, and SPREAD-IRRELEVANT.** The pre-registered reject test asked whether miss-row spread was
+4. **Registered outcome: SUPPORT, and SPREAD-IRRELEVANT.** The pre-registered reject test asked whether miss-row spread was
    large enough to matter. It was, but it was aimed at the wrong quantity: the saving does not come from the miss rows.
    The classification and the redirect both came from the same run, and the redirect is the result.
-4. **The spread that exists is Task 4's artefact, not the drives'.** Miss rows become ready about 2.7 ms apart (schema 2,
+5. **The spread that exists is Task 4's artefact, not the drives'.** Miss rows become ready about 2.7 ms apart (schema 2,
    traced) because `pack_one` packs one row per loop turn on one thread, and that exceeds `c` (about 1.1 ms). So Task 6's
    premise, "later reads finish later", was partly a misattribution of the packing staircase. **A counter-intuitive
    consequence: the better Task 4 gets (parallel packing, Task 7's raw rows), the smaller the miss-row spread and the
    smaller the 13%, so per-row becomes less attractive, not more.** The hit-lane part does not move.
-5. **Head-of-line cannot make per-row slower than batched in overlap terms** (section 2, closed form), only by launch and
+6. **Head-of-line cannot make per-row slower than batched in overlap terms** (section 2, closed form), only by launch and
    poll cost. It zeroes the miss-row part when the slowest row is first and halves it on average for random lane order.
-   In this corpus pack order equalled ordinal order in 100% of 1,888 requests with m >= 2 [post-hoc], so HOL did not bite;
-   it may be forced by `pack_one`'s tie-break, and drive tails would expose it.
-6. **A4 as written is not required, and here is what replaces it.** `LEASE_PROTOCOL` A4 says lane `j`'s acknowledgement
+   In this corpus pack order equalled ordinal order in 100% of 1,888 requests with m >= 2 [post-hoc]. **That is a property
+   of the packer, not of the storage**: 100% is the shape a lowest-ordinal tie-break produces, and I did not test it with the
+   tie-break changed. Do not read it as "the drives complete in ordinal order". Drive tails would expose it.
+7. **A4 as written is not required, and here is what replaces it.** `LEASE_PROTOCOL` A4 says lane `j`'s acknowledgement
    precedes the GPU's wait on lane `j+1`. Two facts make it hold, and the second is the one that matters: (a) stream order
    on one linear captured chain (a checkable graph shape); (b) **reservation is all-or-nothing, so no lane's readiness
    waits on any lease of its own request**. Section 5.2. The 9.2 cycle cannot form: no second stream, no event, no
    `wait_stream`.
-7. **I retract my claim that Task 6 must overturn DECIDE 3** (section 9, REQ 3), and I state why: `serve()` reserves all
+8. **I retract my claim that Task 6 must overturn DECIDE 3** (section 9, REQ 3), and I state why: `serve()` reserves all
    slots in one `mutex_` pass, `wanted` excludes every routed and needed expert from victim choice for the whole call,
    and `read()` blocks the single service thread, so nothing evicts in that tier between reservation and return.
    Lease-at-publication is safe for hit lanes as long as they are published before `serve()` returns.
-8. **Tracing was on in every trace used, and all seven are schema 2; no schema-3 graph-decode trace exists.** Traced
+9. **Tracing was on in every trace used, and all seven are schema 2; no schema-3 graph-decode trace exists.** Traced
    request durations are stretched, so the denominator is the untraced step time.
 
 ---
@@ -160,8 +170,8 @@ Consequences.
 than `c`. In the corpus it did not: **pack order equals ordinal order in 1,888 of 1,888 requests with m >= 2 in each
 of three arms [M, post-hoc, `per_row_precheck_posthoc2.py`]**, and the lane order among miss lanes equals the ordinal order
 by construction (both are first appearance in the routed list: `plan_graph_routes`, and `serve()` builds `wanted` from
-`protect` first, which `Exl3MoEMethod._apply_graph` fills from `topk_ids`). Two cautions. First, this may be forced
-by the reader rather than by the drives: `pack_one` packs the *lowest ordinal among rows that are `Ready`*, and rows
+`protect` first, which `Exl3MoEMethod._apply_graph` fills from `topk_ids`). Two cautions. First, **treat this as a
+property of the packer, not of the drives, until shown to survive a changed tie-break (not done)**: `pack_one` packs the *lowest ordinal among rows that are `Ready`*, and rows
 that complete in one reaped batch are all `Ready` together. Second, `MIRROR_ROWS.md` measures a per-row tail even on the mirrored arm (p50 4.164 ms, p99 7.387 ms, so a row can
 arrive about 3 ms, three copy times, after the median), which is exactly the slow-first-row case where `S` collapses to
 the hit part. (Its nvme4 first-touch 18.3 ms is a warming outlier by its own account and is not used.)
@@ -195,6 +205,15 @@ returns**: `serve()` then sets `kReady`, calls `publish_map` for every row, and 
 not. The plan's Task 4 says the same ("Partial host row completion is not yet permission for an early GPU read").
 
 ### 3.1 Is there an early device-visible readiness signal today? No, and the modelled saving needs one
+
+**Are hit lanes resolved at plan time, before any read is submitted?** Yes, in two different places, and only one is
+authoritative. On the **device**, the post kernel decides `need` from `slot_map` (`ld_volatile`, first `min(count, 8)`
+planned lanes) at post time: a racy hint, with no ownership. On the **host**, `RamTier::serve` resolves it authoritatively
+under `mutex_` **before any read is submitted**: `tier.expert_slot[expert] >= 0` is a hit (its LRU stamp is touched), otherwise
+the expert joins `missing` and gets a `kLoading` slot. That resolution is **host-side only**: it lives in C++-private
+`Tier` state and reaches the device only as a side effect of the map after `read()`. So the information the early signal
+must carry already exists, at the right moment, in the right thread; the missing piece is publishing it, which is why the
+timing change is small and the words it publishes are the real cost.
 
 Checked against the source, because the precheck's A2 (hit lanes ready at the `reserved` stamp) silently assumes it:
 
@@ -554,9 +573,15 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
 
 **To the `LEASE_PROTOCOL` / `lease_model.py` owner**
 
-- **[REQ 1]** Section 7.2 and 6.1: publication is per lane and staged in time (hits at reservation, miss rows at pack).
-  `demand_done` remains the request-level terminal, and per-lane waits poll it, so section 7.3's "the device never
-  inspects lanes when status is FAILED" (F1) must allow the wait to read status **while** waiting on lanes.
+- **[REQ 1] BLOCKING DEPENDENCY, not a request to route.** Section 7.2 and 6.1: publication is per lane and staged in time
+  (hits at reservation, miss rows at pack). This **is** the early device-visible readiness signal (section 3.1); without it
+  no early copy exists, for V1 or V2. `demand_done` remains the request-level terminal, and per-lane waits poll it, so
+  section 7.3's "the device never inspects lanes when status is FAILED" (F1) must allow the wait to read status **while**
+  waiting on lanes. **Cost: unknown, owned by Task 5.** Two parts. (a) Small, and mine: in `serve()`, publish each hit
+  lane's `RowResult` in the reservation critical section instead of after `read()`; a few stores per lane in a section that
+  already runs. (b) Large, and Task 5's: the words themselves (`RowResult`, `LaneRequest`, `LaneAck`, `Terminal`), the
+  lease counters and their retirement, the eviction predicate, generations and wrap, none of which exists. Task 6 cannot be
+  accepted before (b); (a) is the whole of Task 6's protocol delta for V1.
 - **[REQ 2]** Extend the model with per-lane / per-stage copy, the finalize kernel, and a **partial terminal mask**
   (`lease_model.py` section "what this does not establish"): a request whose stage `j` fails after stages `< j` copied and
   acknowledged, and a stage skipped because an earlier stage set `req_failed`.
@@ -584,7 +609,7 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
 
 - A1 (lanes per layer spread evenly) and A2 (hit lanes ready at `reserved`): section 1.4.
 - A3 `c = 1.055 ms` is right for this path; **A4'** a kernel-node gap of 2-4 us; a stage triple costs 8-14 us. Both unmeasured.
-- Lane order among miss rows equals pack order in practice (100% in this corpus; may be forced by the reader's tie-break).
+- Lane order among miss rows equals pack order in practice (100% in this corpus). **This is a property of `pack_one`'s lowest-ordinal tie-break, not shown to hold for drive completion order.**
 - The launch count, not the lane count, is what per-row costs; the SM footprint of a one-row call is the same 8 blocks.
 
 **Open (could not determine)**
