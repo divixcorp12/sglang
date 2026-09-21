@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import statistics
 
 from arm_config import import_provenance
 
@@ -19,6 +20,7 @@ def summarize(values: list) -> dict:
     return {
         "n": len(values),
         "mean": sum(values) / len(values),
+        "sd": statistics.pstdev(values),
         "min": min(values),
         "p50": nearest_rank(values, 50),
         "p95": nearest_rank(values, 95),
@@ -129,22 +131,43 @@ def project(
     output_tokens: int,
     startup_s: float,
     warm_wall_s: float,
+    discard_steps: int,
+    expected_effect_s: float,
 ) -> dict:
-    """Wall clock of the rest of the run, from the warmup request's own TTFT and decode rate.
+    """Wall clock of the rest of the run, and what the window can resolve, from the warmup request alone.
 
-    The warmup is the coldest request the process serves, so this leans slow; it is for deciding in the first
-    minutes whether to abort, not a forecast.
+    The warmup is the coldest request the process serves, so both lean pessimistic; this is for deciding in the
+    first minutes whether to abort, not a forecast. The sd comes from the warmup's per-token steps after the
+    discard; None when too few remain.
     """
+    from compare import detectable_delta_s
+
     rate = warm["decode_tok_s"]
     if rate <= 0:
         raise ValueError("warmup request reported no decode rate")
     per_request = warm["ttft_s"] + (output_tokens - 1) / rate
     measured = requests * per_request
-    return {
+    out = {
         "warmup_ttft_s": warm["ttft_s"],
         "warmup_decode_tok_s": rate,
         "warmup_ms_per_token": 1e3 / rate,
         "per_request_s": per_request,
         "measured_window_s": measured,
         "process_total_s": startup_s + warm_wall_s + measured,
+        "expected_effect_s": expected_effect_s,
     }
+    steps = (warm["step_s"] or [])[discard_steps:]
+    if len(steps) >= 10:
+        planned = requests * (output_tokens - 1 - discard_steps)
+        sd, p50 = statistics.pstdev(steps), nearest_rank(steps, 50)
+        resolvable = detectable_delta_s(sd_a=sd, n_a=planned, sd_b=sd, n_b=planned)
+        out |= {
+            "warmup_step_samples": len(steps),
+            "warmup_step_sd_s": sd,
+            "warmup_step_p50_s": p50,
+            "resolvable_delta_s": resolvable,
+            "resolvable_delta_rel": resolvable / p50,
+            "expected_effect_rel": expected_effect_s / p50,
+            "resolvable": resolvable <= expected_effect_s,
+        }
+    return out

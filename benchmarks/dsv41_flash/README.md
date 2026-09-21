@@ -66,7 +66,7 @@ second of its pair.
 
 - **Statistic: per-token decode latency**, the time between consecutive streamed chunks. Per-request percentiles are
   not computed (4 requests); e2e and TTFT appear as means only.
-- **Warmup discarded, and recorded**: one warmup request (`--warmup-requests 1`, 64 tokens) before the window, then
+- **Warmup discarded, and recorded**: one warmup request (`--warmup-requests 1`, 128 tokens, so ~98 steps remain for the sd estimate) before the window, then
   the first `--discard-steps` (30) steps of every measured request are dropped. The count is in
   `summary.discarded_steps_per_request`.
 - **Default window: 4 requests x 512 tokens**, four different corpus prompts of 256 tokens, greedy, `ignore_eos`:
@@ -104,6 +104,13 @@ Run the pair once. Then read the last lines of `comparison.md` (also `compare.py
 
 - **Done** when `|p50 delta| >= 2 x within-arm spread` and the min-to-min delta has the same sign: the table prints
   `decision: RESOLVED`. Two loads were enough.
+- **`UNRESOLVED` is a result**: "any effect of lease mode on the p50 decode step is below X%", where X is what this
+  window could resolve (the larger of 2x the block spread and 3 standard errors of the p50 difference from the
+  per-token sd). At a 400 ms step that bound is a few percent and the 0.68 ms effect is under 0.2%, so expect this
+  verdict there; it is an upper bound, not a null.
+- **Watch the first two minutes**: after warmup each process prints `[projection]` and `[resolvability]` (per-token sd of
+  the warmup request, what the planned window resolves, versus `--expected-effect-ms`, default 0.68). If it says
+  `UNLIKELY TO RESOLVE`, abort before the second arm. Warmup is the coldest request, so this leans pessimistic.
 - **Otherwise** run one more pair with the order flipped, into the same directory:
   `run_ab.py --rep-start 1 --out-dir <same dir>` (odd reps put `lease_on` first, so the order effect cancels), or a
   longer window (`--output-tokens 1024 --requests 4`; the context length allows 256 + 3800) if the block spread itself is large. Then decide again.

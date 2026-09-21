@@ -17,8 +17,17 @@ from pathlib import Path
 ARMS = ("lease_off", "lease_on")
 # A delta counts as resolved when it is at least this many times the within-arm block spread.
 RESOLVE_FACTOR = 2.0
+# The window "resolves" a delta of Z standard errors of a difference of two p50s; 1.25 is the p50's SE over the
+# sd/sqrt(n) of the mean for a roughly normal sample. Judgment, like RESOLVE_FACTOR.
+DETECT_Z = 3.0
+P50_SE_FACTOR = 1.25
 # Arms whose layer miss fractions differ by more than this saw different work.
 MIX_TOLERANCE = 0.05
+
+
+def detectable_delta_s(*, sd_a: float, n_a: int, sd_b: float, n_b: int) -> float:
+    """Smallest difference of two p50s (seconds) this many samples at this sd can resolve."""
+    return DETECT_Z * P50_SE_FACTOR * ((sd_a**2 / n_a) + (sd_b**2 / n_b)) ** 0.5
 
 
 def _get(run: dict, *keys):
@@ -154,21 +163,40 @@ def decision(by_arm: dict) -> list[str]:
         ]
     d_p50, d_min = p50[1] / p50[0] - 1, mn[1] / mn[0] - 1
     spread = max(spreads)
+    pooled = [
+        (
+            statistics.fmean(_values(by_arm[a], ("summary", "step_s", "sd"), 1)),
+            sum(_values(by_arm[a], ("summary", "step_s", "n"), 1)),
+        )
+        for a in ARMS
+    ]
+    noise = (
+        detectable_delta_s(
+            sd_a=pooled[0][0], n_a=pooled[0][1], sd_b=pooled[1][0], n_b=pooled[1][1]
+        )
+        / p50[0]
+    )
+    bound = max(noise, RESOLVE_FACTOR * spread)
     lines = [
-        f"decision inputs: p50 delta {d_p50 * 100:+.2f}%, min-to-min delta {d_min * 100:+.2f}%, within-arm spread {spread * 100:.2f}%"
+        f"decision inputs: p50 delta {d_p50 * 100:+.2f}%, min-to-min delta {d_min * 100:+.2f}%, "
+        f"within-arm spread {spread * 100:.2f}% (x{RESOLVE_FACTOR:g} = {RESOLVE_FACTOR * spread * 100:.2f}%), "
+        f"per-token sd noise floor {noise * 100:.2f}% ({DETECT_Z:g} SE)"
     ]
     signs_agree = (d_p50 >= 0) == (d_min >= 0)
-    if abs(d_p50) >= RESOLVE_FACTOR * spread and signs_agree:
+    if abs(d_p50) >= bound and signs_agree:
         lines.append(
-            f"decision: RESOLVED. |p50 delta| >= {RESOLVE_FACTOR:g}x spread and min-to-min agrees: two loads were enough; do not rerun."
+            f"decision: RESOLVED. |p50 delta| {abs(d_p50) * 100:.2f}% >= the {bound * 100:.2f}% this window resolves, and min-to-min agrees: two loads were enough; do not rerun."
         )
-    elif abs(d_p50) >= RESOLVE_FACTOR * spread:
+    elif abs(d_p50) >= bound:
         lines.append(
             "decision: NOT RESOLVED. p50 and min-to-min disagree in sign: suspect cross-process noise; run a second pair with the order flipped (--rep-start 1)."
         )
     else:
         lines.append(
-            f"decision: NOT RESOLVED. |p50 delta| < {RESOLVE_FACTOR:g}x spread: run a second pair with the order flipped (--rep-start 1), or a longer window if the spread itself is large."
+            f"decision: UNRESOLVED. Any effect of lease mode on the p50 decode step is below {bound * 100:.2f}% "
+            f"({bound * p50[0] * 1e3:.2f} ms of a {p50[0] * 1e3:.1f} ms step); this window could not resolve less. "
+            f"Measured delta {d_p50 * 100:+.2f}% is inside that. That is an upper bound, not a null: "
+            "a second pair with the order flipped (--rep-start 1) or a longer window only helps if the bound is above the effect you need."
         )
     return lines
 

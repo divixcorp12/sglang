@@ -51,6 +51,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="abort after warmup if the projected measured window exceeds this many seconds (0 = never)",
     )
     p.add_argument(
+        "--expected-effect-ms",
+        type=float,
+        default=0.68,
+        help="per-step lease cost being looked for (OPEN 11 re-take), for the after-warmup resolvability line",
+    )
+    p.add_argument(
         "--position",
         type=int,
         default=0,
@@ -64,7 +70,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="requests in flight; >1 needs --allow-eager-batches",
     )
     w.add_argument("--warmup-requests", type=int, default=1)
-    w.add_argument("--warmup-output-tokens", type=int, default=64)
+    w.add_argument("--warmup-output-tokens", type=int, default=128)
     w.add_argument(
         "--requests",
         type=int,
@@ -278,6 +284,30 @@ def dry_run(args: argparse.Namespace, sglang_file: str) -> int:
     return 0 if not problems else EXIT_BAD_LAUNCH
 
 
+def _resolvability_line(proj: dict) -> str:
+    if "warmup_step_sd_s" not in proj:
+        return "[resolvability] too few warmup steps after the discard to estimate the per-token sd"
+    verdict = (
+        "the window should resolve it"
+        if proj["resolvable"]
+        else "UNLIKELY TO RESOLVE the expected effect at this sd: consider aborting (the result would be an upper bound)"
+    )
+    return (
+        "[resolvability] warmup per-token p50 {p:.1f} ms, sd {sd:.1f} ms over {n} steps; the planned window resolves "
+        "~{r:.2f} ms ({rr:.2f}%) vs the {e:.2f} ms ({er:.2f}%) looked for: {v}. Warmup is the coldest request, so this "
+        "leans pessimistic.".format(
+            p=proj["warmup_step_p50_s"] * 1e3,
+            sd=proj["warmup_step_sd_s"] * 1e3,
+            n=proj["warmup_step_samples"],
+            r=proj["resolvable_delta_s"] * 1e3,
+            rr=proj["resolvable_delta_rel"] * 100,
+            e=proj["expected_effect_s"] * 1e3,
+            er=proj["expected_effect_rel"] * 100,
+            v=verdict,
+        )
+    )
+
+
 def write_result(path: str, result: dict) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt") as f:
@@ -384,6 +414,8 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
                 output_tokens=args.output_tokens,
                 startup_s=result["startup_s"],
                 warm_wall_s=warm_wall_s,
+                discard_steps=args.discard_steps,
+                expected_effect_s=args.expected_effect_ms / 1e3,
             )
             print(
                 "[projection] warmup TTFT {warmup_ttft_s:.1f} s, decode {warmup_decode_tok_s:.2f} tok/s "
@@ -393,6 +425,7 @@ def run_arm(args: argparse.Namespace, sglang_file: str) -> int:
                 ),
                 flush=True,
             )
+            print(_resolvability_line(result["projection"]), flush=True)
             if (
                 args.max_projected_s
                 and result["projection"]["measured_window_s"] > args.max_projected_s

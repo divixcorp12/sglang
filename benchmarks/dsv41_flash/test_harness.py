@@ -255,7 +255,7 @@ def _run(arm, p50, mn, spread, ok=True):
         "position": 0,
         "lease_check": {"ok": ok, "reasons": [] if ok else ["leases_granted == 0"]},
         "summary": {
-            "step_s": {"p50": p50, "min": mn, "n": 1700},
+            "step_s": {"p50": p50, "min": mn, "n": 1700, "sd": 0.001},
             "step_blocks": {"p50_rel_range": spread},
             "tokens_per_s": 1.0,
         },
@@ -270,7 +270,7 @@ def _run(arm, p50, mn, spread, ok=True):
             0.0675,
             0.0605,
             0.02,
-            "NOT RESOLVED. |p50 delta|",
+            "UNRESOLVED. Any effect of lease mode",
         ),  # same delta buried in 2% spread
         (0.0675, 0.0590, 0.002, "disagree in sign"),  # p50 up, min down: box noise
     ],
@@ -300,22 +300,54 @@ def test_compare_flags_an_unverified_lease_run():
     )
 
 
-def test_the_projection_uses_the_warmup_request_own_rate():
-    warm = {"ttft_s": 50.0, "decode_tok_s": 4.0}
+def test_the_projection_uses_the_warmup_request_own_rate_and_sd():
+    warm = {"ttft_s": 50.0, "decode_tok_s": 4.0, "step_s": [0.25] * 140}
     got = metrics.project(
-        warm=warm, requests=4, output_tokens=401, startup_s=100.0, warm_wall_s=160.0
+        warm=warm,
+        requests=4,
+        output_tokens=401,
+        startup_s=100.0,
+        warm_wall_s=160.0,
+        discard_steps=30,
+        expected_effect_s=0.001,
     )
-    assert (
-        got["per_request_s"] == 150.0
-        and got["measured_window_s"] == 600.0
-        and got["process_total_s"] == 860.0
-    )
+    assert got["per_request_s"] == 150.0 and got["process_total_s"] == 860.0
     assert got["warmup_ms_per_token"] == 250.0
+    assert got["warmup_step_sd_s"] == 0.0 and got["resolvable"] is True
     with pytest.raises(ValueError, match="no decode rate"):
         metrics.project(
-            warm={"ttft_s": 1.0, "decode_tok_s": 0.0},
+            warm={"ttft_s": 1.0, "decode_tok_s": 0.0, "step_s": []},
             requests=1,
             output_tokens=10,
             startup_s=0,
             warm_wall_s=0,
+            discard_steps=0,
+            expected_effect_s=0.001,
         )
+
+
+def test_a_noisy_step_time_makes_the_expected_effect_unresolvable_and_says_so():
+    # 400 ms steps with a 60 ms sd: the window resolves ~10 ms, far above a 0.68 ms effect.
+    steps = [0.34, 0.46] * 100
+    warm = {"ttft_s": 50.0, "decode_tok_s": 2.5, "step_s": steps}
+    got = metrics.project(
+        warm=warm,
+        requests=4,
+        output_tokens=512,
+        startup_s=0,
+        warm_wall_s=0,
+        discard_steps=30,
+        expected_effect_s=0.00068,
+    )
+    assert got["resolvable"] is False and got["resolvable_delta_s"] > 0.005
+
+
+def test_the_unresolved_verdict_states_the_bound_from_the_per_token_sd():
+    off, on = (
+        _run("lease_off", 0.400, 0.35, 0.001),
+        _run("lease_on", 0.4004, 0.35, 0.001),
+    )
+    for r in (off, on):
+        r["summary"]["step_s"]["sd"] = 0.05
+    text = "\n".join(compare.decision({"lease_off": [off], "lease_on": [on]}))
+    assert "UNRESOLVED" in text and "below 1.6" in text
