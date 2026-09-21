@@ -521,3 +521,34 @@ glibc serves requests below `M_MMAP_THRESHOLD` (default 128 KiB, and dynamically
 **Effect on data already collected: none, and the reason.** The sibling pilot allocated **node 0 only** and passed L4 as recorded at the time, so its runs are unaffected and run 2's INSENSITIVE verdict stands. `c` has never produced a timed datum, so there is nothing to revisit. The amendment-6 copies in `c_measurement/proposed_amendment6/` are left **byte-unchanged** as the frozen record of that amendment, and therefore now differ from the harness in force; section 18's pilot table continues to point at them correctly.
 
 **Hashes.** `c_measurement/c_harness.py`: **old `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` (amendment 6, superseded by this amendment)**, new `85b08323274e56b4592a90f39767d9f0971ece2ee1a030536fbf1e57733408ca`. Section 9 is flipped in a separate commit, as before, and only with the 25 CPU tests green on the amended file.
+
+## 20. Run 1 of `c`: complete, INVALID under the registered gates; no number is quoted (2026-09-21, 13:32-13:40, `c_run_131210/out_real2/`)
+
+**Verdict word: INVALID.** Reported before any other number, as section 9 requires. `--check-only` returned `check-only ok` (EXIT=0) beforehand, so the reporting order's first item is clean. **`c` remains NOT MEASURED.**
+
+**This is nonetheless the first run that ever produced data.** Amendment 8 cleared L4: both nodes bound and verified, all five passes completed, 235 cells and 1.1 MB of `results.jsonl`. Every previous attempt died before a timed datum existed. What follows are three defects found *by* the instrument, which is what it is for.
+
+**Disclosure, plainly, and it is the same defect as pilot run 2.** I collected the analysis output with `tail -45`, which showed the per-arm fits **before** I had read line 1 (`VERDICT: INVALID`). **I saw fitted `c_marginal` values for a voided run.** They are not quoted here or anywhere, they are not evidence, and they had no part in the verdict, which is the frozen script's own. The fix proposed in section 18.7 — the analysis refuses to run beside an `INVALID` marker — was applied to `sibling_pilot_analysis.py` only, and section 18.9 records that `c_analysis.py` was deliberately left untouched. A `results.INVALID` marker **was** sitting beside this input and `c_analysis.py` computed anyway. **The lesson is that the fix was applied to one of the two scripts that needed it.** That I have now seen those numbers is also the reason no gate may be revisited on my own judgement: any such change would be contaminated.
+
+**The scoped marker (not a section 4.1 gate).** `results.INVALID` reads: *drive traffic in a load window differs from the reader's own bytes by more than 10%: another lane used the drives; the nvme arm's rho is not to be quoted.* Section 12 item 3(b), and sections 13 and 16, scope this failure to **the `nvme` arm's `rho`**, not to the run. That scope was determined from the registered text and recorded **before** the analysis was run.
+
+**The three section 4.1 gate failures.**
+
+| gate | cells | spread |
+|---|---:|---|
+| `link gen/pstate not 3/P0` | 235 | **every cell of every arm**, both nodes |
+| `rows re-read within 30 rows` | 80 | **node 0 only**; node 1 has none |
+| `foreign process above 10% of a core` | 1 | `sm/cold/n0/nvme/eager` p4 n=6 |
+
+**1. The P-state gate is unsatisfiable on the box the pre-registration demands.** `link_gen` is `(3, 3)` on all 235 cells, so the link half passes; the gate fails only on `pstate_start`, which is **1 on every cell of every arm**. Section 18's pre-run note anticipated this for the `hot` arm alone, with `--skip-arms hot` as the registered fallback; **that fallback would not have helped**, because `ce`, `cold`, `hot` and `repeat` all record P1. The recorded SM clocks say P1 was a label and not a throttle: **min 2572 MHz, median 2662, max 2970, against a 3135 MHz maximum** — 82% to 95% of peak — and implied bandwidth was flat across `n`. The card reaches P0 under sustained production load; this run required, and got, a quiet box, where it does not. **The registered design therefore contains a contradiction: gate 4.1 assumes production conditions and the run conditions forbid them.** Resolving it means either forcing clocks (locked application clocks, which needs privileges and changes the box), adding a load whose only purpose is to hold P0 (which contaminates the quiet requirement), or amending the gate to judge SM clocks instead of the P-state label. **All three are gate changes made after seeing a failure, by someone who has now seen the fits. None is proposed here and none is taken.** It goes to the lead with the evidence.
+
+**2. The row-reuse gate failed on a bookkeeping artifact, not on L2 residency.** The analyser's threshold is `MIN_REUSE_ROWS = 100`, matching section 4.1 exactly; the `30` in the message is the observed distance, not the limit. The cause is a harness defect, and the arithmetic is exact:
+- `_tables` (line 433): a `repeat` cell reads `rows = list(range(n))` and never touches the ring;
+- `run_visit` (line 477): `self.consumed[node] += launches * n` runs **unconditionally**, so a `repeat` cell still advances the shared ring cursor;
+- (line 478): a `repeat` cell does not append to `global_seq[node]`.
+
+So each node-0 `repeat` cell jumps the cursor while contributing no entries, tearing the sequence that `reuse_distance` measures. For the `n = 6` repeat cell, `220 x 6 = 1320` and `1320 mod 150 = 120`, so the next node-0 cell resumes 120 positions into a 150-row ring, leaving a minimum reuse distance of `150 - 120 = 30` — **the reported figure exactly**. `cell_list` places `repeat` on **node 0 only**, which is why node 1 records not one failure. The true spacing within any measured cell is still 30 rows (0.4 GB, 4.2 x the 96 MiB L2), so **no cell was actually cache-resident**; the statistic is wrong, not the data. The fix is to advance `consumed[node]` only for cells that contribute to `global_seq`, or to measure reuse per cell rather than globally. It is a harness defect of the same class as amendment 8 and is **not** a gate change.
+
+**3. One foreign-CPU cell** exhausted its three attempts (`retries.jsonl`, 20 retries total, mostly cores 18/19 and their siblings 54/55 at 14-24%). Section 16's one-re-run clause is written for the case where `foreign_max_core_pct` is **the only** failing gate; three gates failed, so that clause does not apply and is not invoked.
+
+**Status.** `c` NOT MEASURED. The data, the `INVALID` marker, `meta.json`, `reader_log.json` and `retries.jsonl` are kept in `out_real2/` as the registered record. Two harness defects (2, and the `c_analysis.py` half of the 18.7 fix) are repairable without touching any gate. One blocker (1) is a genuine design contradiction that only the lead can resolve.
