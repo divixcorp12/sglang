@@ -163,6 +163,17 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 
 Include expert identity in the immutable row result and validate it against the lane's request. GPU resolution reads this result, never a subsequently mutable global expert-to-slot map. Deduplicate expert requests before granting lanes, or count one source lease per consuming lane; one acknowledgement cannot release another lane's source.
 
+> **Task 5 has NO service-level mutation evidence** (`5636049f28`). Every
+> §18.2 mutation runnable against today's code was run: the four `skip_zero`
+> sites in `host.cpp` are all caught (demand increment 4 tests, advisory
+> increment 2, **each lap resume exactly 1** -- the thinnest coverage in the
+> file, and worth knowing before anyone edits those two tests); `TestQuarantine`
+> both mutants caught; step 1's layout and allocator all caught. **Everything
+> else is specification, not evidence.** Items 1-4, 6, 7(b)-(d), 8, 10, 14-16
+> and the service half of 9 mutate code that does not exist until steps 2-3; the
+> kernel rows need step 4 and a GPU. **The wrap tests are the only
+> service-level mutation evidence in the entire lease test list today.**
+
 - [ ] Document aligned fields, single-writer ownership, system release/acquire operations, wrap handling, and request-slot reuse before coding. Use a coherently validated protocol; ordinary Python stores are not its implementation.
 - [ ] Initially exercise the acknowledgements after the existing whole-request copy, without changing its scheduling. Include RAM hits as well as newly read rows in source ownership.
 - [ ] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
