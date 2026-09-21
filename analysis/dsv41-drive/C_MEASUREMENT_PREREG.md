@@ -328,7 +328,7 @@ A mid-run arrival during the measurement itself is visible afterwards in `meta.j
 |---|---|
 | `proposed_amendment6/c_harness.py` | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
 | `proposed_amendment6/quiet_check.py` | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` |
-| `proposed_amendment6/test_c_harness.py` | `b735ca4723768fdcb45f87360a31f538a24bb08d8f0ed35a55ac1561f4a32904` |
+| `proposed_amendment6/test_c_harness.py` | `b6815a802c84e9bf8ec831dcb1ec3f23c855cb9e315108fc7a023860910b27a3` (**reconciled 2026-09-21**; was `b735ca47...`, superseded by `8769df5aa5`) |
 
 ## 18. The SMT-sibling pilot: pre-registration (2026-09-21; approved by the lead; nothing has been run)
 
@@ -361,6 +361,18 @@ INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling
 | `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `4a75527a58fb4ccffc4c3921c113ba9ec9d2f758c67481ee12b4c062580c3cb9` |
 | `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
 | `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` |
+
+### 17a. Hash reconciliation of `proposed_amendment6/test_c_harness.py` (2026-09-21)
+
+The section 17 table recorded `b735ca47...`; the file hashes to `b6815a80...`. Reconciled in favour of the file, on evidence rather than on the assumption that a newer file is a better one.
+
+**The record was correct when written.** At `8769df5aa5^` the file hashes to `b735ca47...` exactly. Commit `8769df5aa5` changed it and the table was not updated.
+
+**The change is additive and strengthening.** Its only deletion is a `sys.path.insert` line hoisted into a `HERE` variable; everything else adds two guard tests for the defect class that would have crashed the `c` run -- `test_stdlib_attributes_used_by_the_scripts_exist` (every `module.attr` the scripts use on an imported stdlib module must exist, which is what `os.sched_getcpu` violated) and `test_plan_and_launch_cpu_construct_without_a_gpu` (both first-launch defects reproduced on CPU).
+
+**Checked, not assumed:** the file at the new hash passes, on divix01 under `taskset -c 0-63`, **25 collected = 25 passed**. An earlier run of mine reported 2 failed / 23 passed; both failures were `nvme_load_reader.py: No such file`, a staging omission on my part and not a defect in the file. `c_analysis.py` was verified unchanged at `4657702c...` in the same run.
+
+With this, section 9 may be flipped to amendment 6, which is done in a separate commit as section 17 requires.
 
 ### 18.2 Run 2 of the pilot: VALID, verdict INSENSITIVE (2026-09-21, 12:36:08-12:40:47, raw output on divix01 in `c_measurement_run/pilot_out_123607/`)
 
