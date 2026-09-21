@@ -548,7 +548,13 @@ model). The plan lists it as a Task 9 item ("readiness-aware gather"); this docu
   publication, rows that packed whole before a failure stay published as ordinary `kReady` rows under the usual
   eviction rules. Why that is acceptable: the guarantee's purpose, as its commit states it, is that **no row is published
   whose bytes were not read**. That is now enforced per row and independently of request outcome, by `pack_one`'s coverage
-  check (`filled >= needed` fails the request rather than packing) and by `packed[ordinal]`; a cancelled advisory
+  check (`filled >= needed` fails the request rather than packing) and by `packed[ordinal]`. **The coverage check had no
+  test until `5af2975164`**: before that nothing had shown it fire, because every neighbouring case is refused earlier by
+  the table build or `admit_batch`. That commit adds
+  `test_a_row_whose_extents_deliver_less_than_its_segments_read_fails_instead_of_packing` (single-root and mirrored), and
+  reports two negative controls run against it: the check deleted publishes the short row and both parametrisations fail;
+  the check weakened by one page also fails both. (I read the commit message and the test; I did not run the controls.)
+  So this rationale rests on a tested safeguard, but only as of that commit; a cancelled advisory
   already publishes its completed rows under exactly this rule, so the semantics exist and are accepted. What is
   given up is a simpler statement ("a failed demand leaves the tier unchanged"); anything that relied on it (a test, a
   counter such as `rows_read`, the `kVersion` bump on a failed request) needs an explicit look. I could not find another
