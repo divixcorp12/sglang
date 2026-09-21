@@ -74,9 +74,8 @@ The document says A1 (hit lanes spread evenly over layers) carries the result an
 
 So V1's justification survives the worst A1-free placement; the per-row column can fall just below the bar in that same
 placement. That is consistent with the document's redirect and adds a margin the document did not have. It does not remove
-[REQ 4]: these are bounds, the real placement is unknown. I have not examined `4e63616666` ("record the planned lane count per
-request; trace schema 4", an ancestor of `HEAD`), which looks like the [REQ 4] instrumentation; a schema-4 trace would replace
-these bounds by a measurement. The eager per-layer lines in the older traces (200 of them) are no help as an A1 analogue:
+[REQ 4]: these are bounds, the real placement is unknown. `4e63616666` ("record the planned lane count per request; trace schema 4", an ancestor of `HEAD`) is the [REQ 4] instrumentation; a schema-4 trace would replace
+these bounds by a measurement (section "Schema 4" below). The eager per-layer lines in the older traces (200 of them) are no help as an A1 analogue:
 they are prefill-regime and all have `ram_miss > 0`.
 
 ### R3 (low/medium, right conclusion, different reason): the "pack order equals ordinal order" result comes from drive FIFO, not the tie-break
@@ -137,6 +136,50 @@ should sit beside the headline.
   `PER_ROW_TRANSFER_REVIEW.md` for that.
 - Traces beyond the four arms above (three mirrors-on + one mirrors-off, plus `task1-3-new-on-U` for sessions).
 
+## Schema 4 (`4e63616666`): does it replace R2's bounds with a measurement?
+
+**Yes, and it replaces more than R2.** Read at the source (diff of `4e63616666`, plus `exl3_stream_trace.py` and `exl3_ram_miss.py` at `HEAD`); not
+run (no GPU, and no schema-4 trace exists yet, so nothing below has met real data).
+
+What it records. The post kernel stores `count[0]` (the plan's lane count, unclamped) at offset 84 of every demand record; the service copies
+it into the stage record (`cur_->lanes`, in `serve()` and in the touch path) and the trace line gets `request.lanes`. The line already carries `layer`.
+Per request, **hit lanes = `lanes` - `rows_asked`**, and `lanes` is the planned lanes, so it also replaces the precheck's per-request
+`k = min(6, max(m, round(vram_miss/40)))` estimate. That estimate fed every headline figure, not only the A1 bound: 19.17, 33.5 and 38.6 can all be
+recomputed with the measured `k` and no A1 and no cap at 6.
+
+Why every layer is covered, checked on the existing schema-3 arm `task1-2-new-on-T`: its 20,800 request lines are 7,211 read demands plus **13,589
+`touch` records** (unarmed, no rows read); there are no advisory or no-read lines in that arm. Touch records carry `lanes` too (`cur_->lanes`
+in the touch path), so lanes in layers that read nothing are `sum(lanes)` over touches, and lanes in read layers are `sum(lanes - rows_asked)` over
+demands. `dropped_before` is 0 on every line. That gives lanes per layer directly. **One number replaces the two bounds:** hit lanes per step in
+read layers, against the A1 credit of 31.9 and the data-forced range 10.8-63.6.
+
+Caveats I can already see:
+- **The sum check has a tolerance, not equality.** `_trace_step` says a line may pair one step's demand rows with the previous step's. On the schema-3
+  trace, `sum(rows_asked)` over decode requests is 9,514 against `sum(ram_miss)` over `graph_step` lines 9,462 (0.5%). Expect `sum(lanes)` against
+  `sum(vram_miss)` to agree to about that, not exactly. A large gap would mean `lanes` is not what the commit says.
+- **Request-to-step grouping is approximate.** 20,800 requests over 495 steps is 42.0 per step against 40 layers, and 418 lines carry a `forward` with
+  no `graph_step`. I do not know what the extra ~2 per step are (warm-up or a boundary effect); the schema-4 analysis restricts to lines whose `forward`
+  has a `graph_step`, as the precheck did, and the first trace should reconcile the count.
+- **`hits = lanes - rows_asked` assumes `rows_asked` counts every planned lane the service was asked for.** The post kernel requests `min(count, 8)` lanes;
+  `attach` refuses `graph_gather_rows > 8` (`8c78749b35`), so `count <= 8` holds in a config that attaches. I check `lanes >= rows_asked` on every request.
+- `lanes` up to 8 (histogram will show) means RANDOM at `k > 6` cannot be averaged over all permutations (8! = 40,320 per request); the script samples 64.
+- It does not touch A2 (hit lanes ready at `reserved`); there is still no early signal.
+- Arms at code before `4e63616666` are not comparable in timing (the commit says so); only placement is wanted here.
+
+**What run is needed.** One graph-decode arm with tracing on at `HEAD` >= `4e63616666`, same prompts and configuration as `task1-2-new-on-T` (mirrors on),
+whose request stream is deterministic (identical `rows_asked`/`vram_miss` sequences in all four arms I compared, mirrors-off included), so the
+placement it records is this corpus's placement. Only placement is wanted, so a contended box does not matter for this question, and a partial
+run gives the placement of the prefix; the full 495 steps allows comparison with the totals above. It needs GPU time scheduled through the usual owner,
+and a generation entry in `clean-reference.json` first (the arm script refuses an unregistered generation, `e1d1621394`); the tree's `python/` at
+`HEAD` is not in the manifest.
+
+**Script, ready now.** `per_row_recompute/schema4_lanes.py <trace>` refuses a non-schema-4 trace; otherwise it prints the sum checks, hit lanes per step
+in read layers and in layers that read nothing, the lane histogram, the `lanes >= rows_asked` check, and BEST / RANDOM / two-phase with the measured `k`
+next to the A1-model figures. **Plumbing test only**: run against a copy of `task1-2-new-on-T.trace` with `lanes` injected from the A1 model (a synthetic
+file, not a measurement). It reproduced 38.61 / 19.17 / 33.53 ms per step, +5.09 / -14.35 per-row over two-phase, and 31.9 hit lanes per step in
+read layers (the A1 credit), and it printed a sum-check mismatch on the synthetic data (68,832 lanes against 64,857 `vram_miss`), so the check can fail. On the real
+schema-3 trace it exits with "not a schema-4 trace". It says nothing about the real placement.
+
 ## Appendix: scripts (`per_row_recompute/`)
 
 Run from divix01 with the directory copied over; each prints the numbers above. `D` in `core.py` is the hard-coded results
@@ -149,6 +192,7 @@ directory on divix01.
   `rows_asked` / `vram_miss` / `ram_miss`.
 - `spread_hide_tstep.py`: spread p50, hide_ok, read-wait, T_step variants.
 - `reap_ties.py`: same-reap tie counts (mirrors-on and mirrors-off).
+- `schema4_lanes.py`: the measured-`k` version for a schema-4 trace (see the Schema 4 section; plumbing-tested on a synthetic file only).
 
 The core function, for reference:
 
