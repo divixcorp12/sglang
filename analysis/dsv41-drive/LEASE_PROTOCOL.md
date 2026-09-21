@@ -1652,7 +1652,7 @@ a private JIT cache directory. Status today:
 | Lease block allocator (step 1) | skip the alignment check; allow generation 0 | **RUN, both caught** (one test each) |
 | Host-lease agreement guard | rename, partial, drifted and unmirrored constants | run as **input mutations** on synthetic sources (`test_the_host_lease_guard_can_fail`); not a mutation of `host.cpp`, which has no lease code |
 | Items 1, 2(part), 3, 6, 7(b)-(d), 8, 10, 14 and the service half of 9 (steps 3a-3c) | 17 mutants of grant/publish/retire (3a), 12 of deferral (3b), 5 of pause and wrap (3c), on divix01 against the landed service | **RUN, all killed after two survivors were fixed.** 3a: "grant ignores whether the request succeeded" survived (its test left no lane resident, so the grant could not happen anyway); 3b: "every refused retry counts as a new deferral" survived (no test retried). Both now die to a test that reaches the path. Test-first did not prevent either. Not testable on the CPU: the write order of a row result's payload versus its ready word, and that the pause's own retirement pass matters (the running thread retires first) |
-| Item 2 (delayed ack with a newer request present) | as item 1 | **PARTIAL**: with injected leases (step 2, run) the leased slot is never chosen and never rewritten; with service-granted leases the same predicate is exercised by the deferral tests. There is no test that fires an advisory at a served request's leased slot and checks a sentinel, so the wording of item 2 is not demonstrated as written |
+| Item 2 (delayed ack with a newer request present) | as item 1 | **PARTIAL**: with injected leases (step 2, run) the leased slot is never chosen and never rewritten; with service-granted leases the same predicate is exercised by the deferral tests. **Superseded by R4 (section 20.2f): a test now fires a newer demand and an advisory at a served request's leased slot and checks a sentinel, so item 2 is demonstrated as written on the CPU service.** |
 | Item 4 F1/F2 service-observable rows | grant on failure; a terminal already seen | **RUN** (3a) |
 | Items 15 (stale `LeaseRef`, `kVersion`) and 16 (callback race) | | **NOT RUNNABLE**: the host-lease API is step 7 |
 | Item 9(c) shutdown wiring (`Exl3RamMissService.shutdown`) | frees when the sync failed | **NOT RUNNABLE**: needs the file another change holds. Only the slab half is run (row 2) |
@@ -2155,3 +2155,33 @@ a wait that times out on a positive assertion, not an absence read as a pass.
 
 Not established: an advisory for a row whose tier is only *partly* leased; the advisory's interaction with a
 deferral that a retirement is about to end (no test overlaps the two in time).
+
+### 20.2f R4 (item 2 of 18.2 as written): test and mutation ledger
+
+`test_a_served_requests_leased_slot_keeps_its_bytes_under_a_newer_demand_and_an_advisory` in
+`test_exl3_ram_miss_lease_service.py`, capacity-2 row. A request leases expert 2 and its acknowledgement is
+withheld. A newer unleased neighbour (expert 5) is made resident **after** it, so the leased slot is the
+least recently used one: exactly the victim an unguarded eviction chooses. A sentinel (0xAB) is written into the
+leased slot's slab bytes after publication. A newer demand (expert 4) is then served and retires normally, and an
+advisory (expert 1) is served and reads.
+
+Path witness (asserted before the property): both newer requests reserved and read (`evictions` +2, `rows_read`
++2, `advisory_rows` +1, `deferred` unchanged), and the advisory's expert landed in the unleased slot. Property:
+the sentinel is intact in every streamed tensor of the leased slot; its `slot_info` entry (state, expert, lease
+count, generation) and its `SlotGen` word are unchanged. Control: after the late acknowledgement retires the lease,
+a further demand takes that same slot and the sentinel is gone, so the lease was the only thing protecting it.
+
+The first version failed at the witness (`evictions` +1, `advisory_rows` 0): the newer demand's own lane request
+had leased the second slot, so the advisory gave up with nothing to take. Fixed by having the newer request
+acknowledge normally; recorded because a version without the witness would have passed the property trivially.
+
+| Mutant | Result | Killed by |
+|---|---|---|
+| B1 the eviction ignores leases | KILLED 1 of 16 | this test (the other 15 service tests do not catch it) |
+| B2 a demand ignores leases, an advisory respects them | KILLED 1 of 16 | this test |
+| B3 an advisory ignores leases, a demand respects them | KILLED 1 of 16 | this test |
+| B4 the slot generation is not bumped on reassignment | KILLED 1 of 16 | `test_each_lane_gets_a_row_result...`, **not** this test: R4's generation check is meaningful only once a slot is rewritten, which a guarded service never does |
+
+Baseline 16 of 16 collected and passed before the run. Not established: the sentinel check covers the CPU
+service's slab writes, not the device kernels' reads (item 5 and 12 stay GPU-only); a slot leased by two lanes was
+not the subject here.

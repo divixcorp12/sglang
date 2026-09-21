@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, Exl3RamMissHost, new_page, page_word, sim_post
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
@@ -290,6 +290,55 @@ def test_closing_admission_sets_the_header_word_stops_new_service_and_keeps_reti
     host.pump()
     assert _leases(host, 0) == [0, 0, 0] and host.counters()["leases_acked"] == 1, "retirement goes on"
     assert late.seq != first.seq
+
+
+def _slab_is(s, row, slot, value):
+    return all(bool((s.slabs[row][name][slot].view(torch.uint8) == value).all()) for name in EXL3_STREAMED_NAMES)
+
+
+@pytest.mark.parametrize("world", [2], indirect=True)
+def test_a_served_requests_leased_slot_keeps_its_bytes_under_a_newer_demand_and_an_advisory(world):
+    """LEASE_PROTOCOL 18.2 item 2 as written (R4): the acknowledgement is delayed, a newer demand and an advisory
+    reserve and READ on the same row, and a sentinel written into the leased slot after publication survives, with
+    its generation and lease count. The leased slot is the least recently used one, so it is exactly the victim an
+    unguarded eviction would choose. Mutations: the eviction ignores the lease (the sentinel is overwritten, the
+    generation moves); the eviction reloads the leased slot with the new row (same)."""
+    s, page, host, sim = world
+    req, waited = _serve(host, sim, 1, [2])  # expert 2 in the older slot, leased, its acknowledgement withheld
+    leased = _slot_of(host, 1, 2)
+    host.assign(1, 5, protected=[5])  # a newer, unleased neighbour: the only legal victim
+    other = _slot_of(host, 1, 5)
+    assert other != leased
+    for name in EXL3_STREAMED_NAMES:
+        s.slabs[1][name][leased].view(torch.uint8).fill_(0xAB)  # after publication: only a rewrite can change it
+    held = (host.slot_info(1)[leased], host.mapped_slot_generations(1)[leased])
+    assert held[0][2] == 1
+    before = host.counters()
+
+    newer = sim.post(1, [4])
+    assert host.pump() == 1
+    newer_wait = sim.wait(newer)
+    assert newer_wait.status == 1
+    _release(host, sim, newer, newer_wait)  # the newer request completes normally; only the first ack stays late
+    assert _leases(host, 1)[leased] == 1 and _leases(host, 1)[other] == 0
+    sim_post(page, 1, need=[1], protect=[1], advisory=True, after=page_word(page, "demand_head"))
+    assert host.pump() == 2
+    now = host.counters()
+
+    # path witness: both newer requests reserved AND read, each on the only slot they were allowed to take
+    assert now["evictions"] == before["evictions"] + 2 and now["rows_read"] == before["rows_read"] + 2
+    assert now["advisory_rows"] == before["advisory_rows"] + 1 and now["deferred"] == before["deferred"]
+    assert host.mapping(1)[1] == other, "the advisory's expert landed in the unleased slot"
+    # property: the leased slot is exactly as it was published
+    assert _slab_is(s, 1, leased, 0xAB), "the sentinel in the leased slot was overwritten"
+    assert (host.slot_info(1)[leased], host.mapped_slot_generations(1)[leased]) == held
+
+    # control: the lease is the only thing that protected it
+    _release(host, sim, req, waited)
+    assert _leases(host, 1)[leased] == 0
+    third = sim.post(1, [3])
+    assert host.pump() == 1 and sim.wait(third).status == 1
+    assert host.mapping(1)[3] == leased and not _slab_is(s, 1, leased, 0xAB), "once retired, the slot is reusable"
 
 
 if __name__ == "__main__":
