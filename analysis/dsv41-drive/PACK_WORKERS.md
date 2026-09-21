@@ -153,24 +153,124 @@ is never on the critical path except after the last read.
 
 ## What this cannot say
 
-* **Real NVMe timing.** Cached reads complete a few ms apart because of the page-cache copy and the kernel's
-  io workers, not because of a drive. Production's read window with mirrors is 6.0 ms at p50 against
-  5.6-5.7 ms of packing per request; that regime (a drive-paced overlap, rows sometimes waiting on the packer)
-  is not reproduced here.
-* **O_DIRECT.** Direct reads leave the bounce cold in DRAM; buffered reads leave part of it warm. The
-  direction of the difference for a worker on another core is not known from these runs.
+* **Read completion timing of production.** The registered run (below) used a real NVMe with O_DIRECT, so
+  completions are drive-paced, but both mirror roots sit on the same drive; production splits them across
+  drives. That degrades the realism of the read completion timing (how far apart the rows finish), not the
+  mechanism under test: whether a cold DRAM bounce changes the packing tail is a DRAM-state effect and does not
+  depend on which drive the bytes came from. The earlier buffered runs on /dev/shm did not have drive timing at
+  all. Production's read window with mirrors is 6.0 ms at p50 against 5.6-5.7 ms of packing per request; the
+  read window here is 5.0-5.3 ms per row and ~16-27 ms for 4 rows (one drive serving all of it).
+* **O_DIRECT: answered for the registered comparison, see the section below.** No cold-bounce penalty of 10% or
+  more was measured for a worker on another core (one-row `1:1` against inline: 2.50 and 2.55 ms against 2.73
+  and 2.73). That is a statement about this load and this drive, not about production.
 * **Production contention.** N extra runnable threads compete with the scheduler and tokenizer threads, and
   the copy crosses NUMA nodes when workers land on the other socket. Neither is priced here.
 * **Small differences.** No difference under ~10% between two modes should be believed at this load.
 
-## The run that would settle it (not run: it reads the production drives)
+## The registered O_DIRECT run (run 2026-09-21)
 
-Same script with `--direct --scenarios natural --work-dir <a directory on the drive under test>`: O_DIRECT
-reads of real mirror-split rows, modes `0:0,1:1,4:1,4:4` (drop the others), 60 repetitions, 1/2/4 rows.
-(`--direct` on /dev/shm is accepted by tmpfs and behaves as buffered, so it only means something on a real drive.)
-Preconditions from the plan's global constraints: coordinate with crypto-c9 (it reads a production drive),
-record `/proc/diskstats` before and during (the script stores the device's line at start and end), run under
-`taskset -c 0-63` with OMP/MKL capped, cores 64-71 free, state the file age and temperature, and do it when
-the box is quiet enough that inline's own tail reproduces between two runs (it did not here). Success test
-written before the run: at c=4 the p50 `tail` is at most 0.6x inline's and its p90 is not above inline's, in
-two consecutive runs.
+Same script, `--direct --scenarios natural --work-dir /mnt/nvme0/cc-packworkers-scratch`, modes
+`0:0,1:1,4:1,4:4`, 60 repetitions, 1/2/4 rows, unchanged. Each mode ran in every round, so drift hits all modes.
+Code at `36b512f515` (the `dsv41` tip on `shared`), a fresh detached worktree on divix01, run with
+`PYTHONPATH=<that worktree>/python`. Under `taskset -c 0-63`, OMP/MKL/OpenBLAS = 1, cores 64-71 untouched
+(`cores_used` in each JSON), GPU hidden, production not running (nothing on :7867, GPU 63 MiB), no GPU lock.
+Raw output, driver script and the drive's /proc/diskstats sampled every second:
+`pack-workers-odirect/{gate1,gate2,run1,run2}.json`, `*.diskstats.txt`, `run.sh`.
+
+**Drive: `nvme0n1` (Samsung 990 EVO Plus 2 TB, `/mnt/nvme0`, 811 GB free), approved by the lead.** It is a
+production-class drive, chosen because no non-production NVMe exists on the box (`nvme1` forbidden, `nvme2` 89%
+full, `nvme3`/`/mnt/nvme4` carries a live Ray session). Working set ~1.3 GB (ckpt plus two mirror copies, 32 rows of
+13.3 MB each), a fresh directory next to nothing of production's. `--direct` was real: the drive's read counter
+rose by 5,385 MiB per gate run and 21,388 MiB per full run, which is the bytes the reps read (60 reps x 7 rows x
+12.7 MiB x modes) and not the ~zero a buffered read of a warm file would give.
+**File age and temperature.** The files were written by the run itself, under a minute before their first read
+and about 20 s before their last (each run builds a new set and deletes it). They were dirty at the start: the
+drive shows one 205 MiB write burst (416 write ops, identical in every run) in the first seconds, which is the
+setup's writeback flushed by the first direct reads, so the first few repetitions overlap it. Every read then went
+to the drive (O_DIRECT bypasses the file's own page-cache pages, which are warm from the write). The bounce buffer is
+cold in DRAM by construction.
+**Foreign traffic on `nvme0n1`:** none of substance. Whole-device counters over each window equal the
+partition's own (writes: 416 to 439 ops = 204.8 to 205.0 MiB in total, all of it the setup burst; 23 extra write
+ops in run 2 and 6 in gate 1, at most ~0.2 MiB; reads exceed the partition's by 14 to 23 ops in
+~12,000 to ~45,000, with the byte totals equal). The rest of the box was busy: load1 3.1-3.5 at each start, 3.4-4.5 at each end; foreign top
+processes java (QuestDB, 239%), nimbus (92%), reth (46%), op-reth (26%).
+
+### Precondition: does inline's own tail reproduce?
+
+Fixed before any data, and applied to p50 and p90 at every row count: two runs "reproduce" if they differ by at most
+10% of the smaller. (The registered text gives no number; ~10% is the document's own no-belief threshold.)
+
+| inline `0:0`, tail p50 / p90 ms | rows 1 | rows 2 | rows 4 |
+|---|---|---|---|
+| gate 1 (inline only) | 2.549 / 2.694 | 2.693 / 2.879 | 5.566 / 8.938 |
+| gate 2 (inline only, run straight after) | 2.751 / 2.885 | 2.785 / 2.983 | 5.620 / 8.999 |
+| gate difference | 7.9% / 7.1% | 3.4% / 3.6% | 1.0% / 0.7% |
+| run 1 (inline in the four-mode run) | 2.732 / 2.876 | 2.745 / 2.922 | **2.758** / 5.884 |
+| run 2 (inline in the four-mode run, straight after run 1) | 2.727 / 2.771 | 2.749 / 2.829 | **5.538** / 6.097 |
+| run 1 vs run 2 difference | 0.2% / 3.8% | 0.1% / 3.2% | **101% / 3.6%** |
+
+* The gate pair (inline alone, two consecutive runs) **passed** everywhere.
+* **The comparison pair did not reproduce inline at 4 rows.** Inline's p50 tail at 4 rows was 2.76 ms in run 1 and
+  5.54 ms in run 2; three of the four inline observations at 4 rows (5.57, 5.62, 5.54) agree and one (2.76) does not.
+  The 4-row inline tail is bimodal: one row's packing (~2.7 ms) when the last read finishes after the row before it
+  has packed, two rows' packing (~5.5 ms) when the last two rows finish within one pack of each other. The p50 sits
+  on the boundary between the modes, so a small change in the read gaps flips it (the 4-row inline read window was
+  26.7, 18.9, 18.4 and 20.7 ms in the four runs). Its p90 (5.9-9.0 ms) is stable to 3.6% in the two full runs but not
+  between the gate and the full runs (8.9-9.0 against 5.9-6.1). At 1 and 2 rows inline reproduces.
+* So the precondition the registered text asks for held for the gate and for 1 and 2 rows, and **failed for the
+  4-row p50 of the pair the success test is evaluated on**. That means inline's 4-row p50 in this run is a coin
+  between ~2.7 and ~5.5 ms, and any ratio to it is uncertain by 2x. The verdict below is computed as registered and
+  is also checked against the more favourable-to-inline value.
+
+### Result (4 rows = the "c=4" of the registered test; `4:4` is c=4; tail = `pack_end - last_cqe`, p50 / p90 ms, n=60)
+
+| mode | rows | run 1 | run 2 | vs inline p50, run 1 / run 2 |
+|---|---|---|---|---|
+| inline `0:0` | 4 | 2.758 / 5.884 | 5.538 / 6.097 | 1 |
+| `1:1` | 4 | 4.990 / 6.467 | 7.661 / 8.235 | 1.81x / 1.38x |
+| `4:1` | 4 | 2.741 / 2.954 | 2.816 / 3.350 | 0.99x / 0.51x |
+| **`4:4` (c=4)** | 4 | **1.119 / 1.233** | **1.082 / 1.279** | **0.41x / 0.20x** |
+| inline `0:0` | 2 | 2.745 / 2.922 | 2.749 / 2.829 | 1 |
+| `4:4` | 2 | 0.950 / 1.086 | 0.993 / 1.185 | 0.35x / 0.36x |
+| inline `0:0` | 1 | 2.732 / 2.876 | 2.727 / 2.771 | 1 |
+| `1:1` | 1 | 2.504 / 2.851 | 2.550 / 2.732 | 0.92x / 0.94x |
+| `4:1` | 1 | 2.498 / 2.886 | 2.542 / 2.739 | 0.91x / 0.93x |
+| `4:4` | 1 | 0.791 / 1.098 | 0.818 / 0.868 | 0.29x / 0.30x |
+
+(Rows 2 for `1:1` and `4:1` are within 3% of inline, not believed.) Whole-process CPU per request p50, 4 rows:
+inline 22.0 / 28.5 ms, `4:4` 34.7 / 38.8 ms, `1:1` 33.3 / 39.0 ms (workers spin; the rows are packed in the same time
+but the box pays for it).
+
+### Verdict on the pre-registered test
+
+Test, fixed in advance: at c=4 the p50 `tail` is at most 0.6x inline's and its p90 is not above inline's, in two
+consecutive runs.
+
+**Passed, in both consecutive runs, as registered:** run 1 p50 1.119 <= 0.6 x 2.758 = 1.655 and p90 1.233 <= 5.884;
+run 2 p50 1.082 <= 0.6 x 5.538 = 3.323 and p90 1.279 <= 6.097. It also holds at 1 and 2 rows (0.29x-0.36x).
+It does not depend on the unstable inline value: run 1's inline 4-row p50 of 2.758 ms is the *lowest* inline value
+seen at 4 rows in any of the four runs, and `4:4` still clears 0.6x against it in both runs; and against the
+smallest inline p90 seen (5.884) it is 4.6x under. **Caveat, stated plainly: the registered precondition (inline
+reproduces between the two runs) failed for the 4-row p50, so the size of the ratio at 4 rows (0.20x-0.41x) is not
+a stable number; what is stable is the sign and a factor of at least 2.4x.** The 1- and 2-row ratios are on inline
+values that did reproduce.
+
+What this says and does not say:
+
+* **Splitting each row across four workers (`4:4`) shortens the exposed tail under O_DIRECT reads on a real NVMe**,
+  to about 0.8-1.1 ms from 2.7-5.5 ms. This confirms the buffered result (1.7x-2.7x) under the condition it could not
+  cover. A cold bounce buffer does not turn a cross-core copy into a loss.
+* **No cold-bounce penalty was found for a whole-row worker on another core.** One row: `1:1` 2.50 / 2.55 ms against
+  inline 2.73 / 2.73 (0.91x-0.94x, under the 10% the document does not believe, so "no worse", not "better").
+* **A single worker is not a win at 4 rows and is worse than inline in both runs** (`1:1` 4.99 and 7.66 ms against 2.76
+  and 5.54; 1.4x-1.8x, more than 10% in both). The likely reason, not tested here, is that one serial worker packs 4
+  rows back to back while the owner has stopped packing. `4:1` (four workers, no split) is at or below inline at 4 rows.
+* What the run cannot say still stands: production's two-drive completion timing, and production contention (the
+  packing workers here ran on idle cores; the scheduler/tokenizer threads were not competing).
+
+Deviations from the brief, named: (1) the divix01 `dsv41` worktrees were stale, so a new detached worktree at
+`36b512f515` was made (`nvfp4-work/cc-packworkers-odirect/wt`); (2) the reproduction gate was defined as at most 10% of
+the smaller on p50 and p90 at every row count, because the registered text gave no number; (3) the driver `run.sh`
+also samples `nvme0n1` every second, which the script alone does not. Cleanup: the script's `rmtree` ran in all four
+runs (scratch directory was empty afterwards and then removed; `df` used bytes on `/mnt/nvme0` are identical before
+the first and after the last run, 1,187,494,809,600).
