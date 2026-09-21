@@ -125,6 +125,44 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 
 ## Task 3: Topology and registered-resource decision
 
+> **`c` IS NOT MEASURED AS OF 2026-09-21.** The pre-registered harness ran its
+> pre-flight on a clean box and the frozen gate could not be met. Recorded here
+> because a quantity this plan leans on is easier to quote than to re-check.
+>
+> **Why.** divix01 has SMT enabled (2 threads per core, 18 cores/socket, 2
+> sockets) and about **21-22 cores of permanent foreign load** from the user's
+> own services -- a QuestDB instance steady at ~14.4 cores (sampled 1444/1448/
+> 1430%, so no ingest burst to wait out), `aggregate-runner` ~2.6-3.3, an
+> Ethereum `nimbus_beacon_node` ~1, `op-reth` + `reth-binary` ~0.9, and a Ray
+> `log_monitor`. Spread over 36 physical cores that is ~60% of a physical core
+> on average, and **no physical core has both SMT siblings under the frozen 10%
+> gate**: best harness pair 12-24%, best reader pair 21-49%, measured
+> independently twice. The clean SMT-corrected pre-flight put 40% of windows
+> above the gate on both masks.
+>
+> **Two measurement rules this cost us, both now enforced in the harness:**
+> - **A logical CPU is half a physical core.** Counting foreign CPU only on the
+>   logical CPUs a run occupies scores a core as 0% while a daemon saturates its
+>   sibling -- direct contention for the same front end and execution ports, not
+>   the memory-bandwidth channel already declared ungated. Selection and
+>   measurement both take the **physical core** as the unit.
+> - **Cores 28-35 are unusable for this work**, because their siblings are
+>   64-71: the band reserved for production, whose core 71 is the doorbell spin
+>   core (cpu35's sibling *is* cpu71). Occupying cpu30 does not put a thread on
+>   cpu66 but does occupy the physical core cpu66 lives on.
+>
+> **Two known biases, both toward V1**, to be read together whenever `c` or a
+> `rho` is eventually quoted: a non-idle `T_idle` understates `rho =
+> T_load/T_idle`, and a busy SMT sibling lowers the `nvme` arm's reader
+> throughput, weakening the very load that arm applies. A marginal pro-V1 result
+> must be read with both in view.
+>
+> **`c` therefore remains the binding unmeasured quantity for Task 6**, bounded
+> only to 0.97-1.08 ms by existing evidence, and that range does not choose
+> within itself. A 10% error in `c` moves the crossing ~3 us against 1.1 us for
+> the whole exposure correction.
+
+
 **Files:** Proposed `analysis/dsv41-drive/TOPOLOGY.md`; benchmark helpers only.
 
 - [x] Record GPU/drive topology, negotiated links, NUMA allocation and first-touch, filesystem alignment, versions, pinned-memory budget, and registration limits. — `50cf23b619`, extended and re-verified against current code in `036900c5cd`: `analysis/dsv41-drive/TOPOLOGY.md`. **Two findings that matter more than the inventory:** the mirrors are not symmetric hardware (`max_sectors_kb` 512 on nvme0 versus 256 on nvme3, which backs /mnt/nvme4; 66 file extents versus 3,112 by `filefrag`), and NVMe completion interrupts for several submitter cores land on cores 64-71 including core 71, so `taskset -c 0-63` does not keep interrupts off production's cores.
