@@ -33,6 +33,7 @@ mkdir -p "$OUTDIR"
 SESSIONS=/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl
 MIRRORS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash
 DRIVER=/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/eager_arm_driver.py
+# Keyed by NAME, correct only while /mnt/nvme4 is nvme3n1 (there is no nvme4 device); provenance.resolve_devices() resolves by st_dev.
 declare -A DEV=( [nvme0]=nvme0n1 [nvme2]=nvme2n1 [nvme4]=nvme3n1 )
 
 sectors() { awk -v d="$1" '$3==d {print $6}' /proc/diskstats; }

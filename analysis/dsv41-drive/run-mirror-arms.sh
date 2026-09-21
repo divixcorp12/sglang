@@ -26,6 +26,7 @@ SESSIONS=/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl
 MIRRORS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash
 
 # mount point -> block device, for /proc/diskstats field 3 (sectors read, 512 B)
+# Keyed by NAME, correct only while /mnt/nvme4 is nvme3n1 (there is no nvme4 device); provenance.resolve_devices() resolves by st_dev.
 declare -A DEV=( [nvme0]=nvme0n1 [nvme2]=nvme2n1 [nvme4]=nvme3n1 )
 
 snap_reads() {  # prints "name=sectors" per drive

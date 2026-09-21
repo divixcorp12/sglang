@@ -25,6 +25,7 @@ SESSIONS=/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl
 MIRRORS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash
 EXPERT_SHARD_DIRS=(/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw /mnt/nvme0/dsv41_flash /mnt/nvme4/dsv41_flash)
 VERDICT=$CC/analysis/dsv41-drive/task1_arm_verdict.py   # a copy beside this script: neither worktree holds it
+# Keyed by NAME, correct only while /mnt/nvme4 is nvme3n1 (there is no nvme4 device); provenance.resolve_devices() resolves by st_dev.
 declare -A DEV=( [nvme0]=nvme0n1 [nvme2]=nvme2n1 [nvme4]=nvme3n1 )
 
 LABEL="$1"; shift
