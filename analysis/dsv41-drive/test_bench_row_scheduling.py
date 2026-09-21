@@ -10,6 +10,7 @@ touches the real drives.
 """
 
 import importlib.util
+import os
 import json
 import shutil
 import sys
@@ -383,3 +384,155 @@ def test_report_carries_paired_comparison_for_every_non_reference_arm(tmp_path):
     assert set(report["paired"]["arms"]) == {"whole-row", "one-root drive0", "weighted 3:1"}
     one = report["paired"]["arms"]["one-root drive0"]["4"]["after_rep0"]
     assert one["pairs"] == 2 and one["median_ratio"] > 0  # both fake roots share one disk
+
+
+# ------------------------------------------------- request model and conditions
+
+
+def _drive(path, name, max_sectors_kb):
+    return sched.dc.DriveInfo(path, name, 259, 1, "xfs", max_sectors_kb, max_sectors_kb, 128, 0, "fake")
+
+
+def _model(tmp_path, kinds, drives, sizes=("1", "2", "4")):
+    source, _ = _make(tmp_path)
+    layout = build_exl3_expert_layout(source)
+    replay = sched.build_replay(NUM_EXPERTS, [0], [int(s) for s in sizes], 8, 1234)
+    specs = sched.build_arm_specs(kinds, 2, ["a", "b"], 0, (3.0, 1.0))
+    return layout, replay, sched.request_model(specs, replay, layout, drives)
+
+
+def test_request_model_counts_extents_against_each_drives_own_cap(tmp_path):
+    drives = [_drive("/a", "nvme0n1p1", 4), _drive("/b", "nvme3n1p1", 2)]
+    layout, replay, model = _model(tmp_path, ["within_row"], drives)
+    planner = sched.SplitPlanner((1.0, 1.0))
+    for size, cell in model["within-row 1:1"].items():
+        group = [b for b in replay if b.size == int(size)]
+        expected = [0, 0]
+        for batch in group:
+            for e in planner.plan([sched.row_geometry(layout, r) for r in batch.rows]):
+                expected[e.root] += -(-e.length // (drives[e.root].max_sectors_kb * 1024))
+        assert cell["requests_per_batch"] == [x / len(group) for x in expected]
+        assert cell["requests_per_batch"][1] >= cell["requests_per_batch"][0]  # the 2 KiB cap splits more
+        assert cell["bytes_per_batch"][0] == cell["bytes_per_batch"][1] or abs(
+            cell["bytes_per_batch"][0] - cell["bytes_per_batch"][1]
+        ) <= 4096 * int(size)  # within-row 1:1 is byte-balanced; the requests are what differ
+
+
+def test_request_model_resets_whole_row_state_per_size_group_like_the_run(tmp_path):
+    drives = [_drive("/a", "d0", 4), _drive("/b", "d1", 4)]
+    _, _, model = _model(tmp_path, ["whole_row"], drives)
+    one = model["whole-row"]["1"]
+    assert one["extents_per_batch"] == [0.5, 0.5]  # single-row batches alternate roots from a reset start
+    assert model["whole-row"]["2"]["extents_per_batch"] == [1.0, 1.0]
+
+
+def test_request_model_reports_one_root_as_infinite_imbalance_not_a_crash(tmp_path):
+    drives = [_drive("/a", "d0", 4), _drive("/b", "d1", 4)]
+    _, _, model = _model(tmp_path, ["one_root"], drives)
+    cell = model["one-root a"]["2"]
+    assert cell["requests_per_batch"][1] == 0
+    assert cell["busiest_over_quietest_requests"] is None
+    assert cell["request_share"] == [1.0, 0.0]
+
+
+def test_model_requests_mode_reads_nothing_and_records_its_conditions(tmp_path, capsys, monkeypatch):
+    source, roots = _make(tmp_path)
+    out = tmp_path / "model.json"
+    monkeypatch.setattr(
+        sched.Exl3RowReader, "_submit", lambda *a, **k: pytest.fail("model mode read")
+    )
+    assert sched.main(_args(source, roots, out, "--model-requests")) == 0
+    data = json.loads(out.read_text())
+    assert [d["path"] for d in data["drives"]] == [os.path.realpath(r) for r in roots]
+    assert all(d["device"] and d["max_sectors_kb"] > 0 for d in data["drives"])
+    assert len(data["load_average"]) == 3 and "model" in data
+    text = capsys.readouterr().out
+    assert "max_sectors_kb" in text and "not measured" in text
+
+
+def test_model_requests_needs_explicit_weights_for_the_weighted_arm(tmp_path):
+    source, roots = _make(tmp_path)
+    args = _args(source, roots, tmp_path / "m.json", "--model-requests")
+    args[args.index("--weights") + 1] = "auto"
+    with pytest.raises(SystemExit, match="explicit --weights"):
+        sched.main(args)
+
+
+def test_a_root_whose_device_cannot_be_attributed_stops_the_run_before_any_read(tmp_path, monkeypatch):
+    source, roots = _make(tmp_path)
+
+    def refuse(path, **_):
+        raise ValueError(f"{path}: no diskstats row")
+
+    monkeypatch.setattr(sched.dc, "resolve_drive", refuse)
+    monkeypatch.setattr(
+        sched.Exl3RowReader, "_submit", lambda *a, **k: pytest.fail("read before attribution")
+    )
+    with pytest.raises(ValueError, match="no diskstats row"):
+        sched.main(_args(source, roots, tmp_path / "r.json"))
+
+
+def test_every_block_carries_device_request_cache_and_load_conditions(tmp_path):
+    _, report, _, roots = _run(tmp_path)
+    arms, sizes, reps = len(report["arms"]), len(SIZES), 2
+    assert len(report["condition_blocks"]) == arms * sizes * reps
+    assert [d["path"] for d in report["drives"]] == [os.path.realpath(r) for r in roots]
+    assert report["load_average_at_start"] and report["load_average_at_end"]
+    lo, hi, count = report["cpus_allowed"]
+    assert lo <= hi and count >= 1
+    for block in report["condition_blocks"]:
+        assert set(block) >= {"arm", "rep", "size", "batches", "wall_s", "load_average_before",
+                              "foreign_cores_all", "drives"}  # fmt: skip
+        assert len(block["drives"]) == 2
+        assert all("residency_before" in d and "reads_completed" in d for d in block["drives"])
+    cell = report["conditions"]["within-row 1:1"]["4"]
+    samples = [s for s in report["batch_samples"] if s["arm"] == "within-row 1:1" and s["size"] == 4]
+    assert [d["predicted_requests"] for d in cell["drives"]] == [
+        sum(s["drive_requests_model"][r] for s in samples) for r in (0, 1)
+    ]
+    assert all(d["asked_bytes"] > 0 for d in cell["drives"])
+
+
+def _block(arm, size, *, reads, before, after, measured_bytes=0):
+    drive = {
+        "device": "d0", "read_bytes": measured_bytes, "reads_completed": reads,
+        "reads_merged": 0, "io_ms": 10, "weighted_io_ms": 40,
+        "residency_before": None if before is None else {"resident_bytes": before, "total_bytes": 1 << 40},
+        "residency_delta_bytes": None if before is None or after is None else after - before,
+    }  # fmt: skip
+    return {"arm": arm, "size": size, "rep": 0, "batches": 1, "drives": [drive],
+            "load_average_before": [4.0, 0, 0], "load_average_after": [5.0, 0, 0],
+            "foreign_cores_low": 0.5, "foreign_cores_all": 1.5}  # fmt: skip
+
+
+def _sample(arm, size, requests):
+    return sched.BatchSample(arm, 0, size, 0, 1, 1, 1, size, 1, [100], [1], 1, 100, 100, [requests])
+
+
+def test_conditions_summary_flags_request_disagreement_and_cache_movement():
+    samples = [_sample("a", 4, 100)]
+    ok = sched.conditions_summary([_block("a", 4, reads=110, before=1 << 30, after=(1 << 30) + 1)], samples, 1)
+    cell = ok["a"]["4"]["drives"][0]
+    assert cell["requests_disagree"] is False and cell["residency_moved"] is False
+    assert cell["depth_when_busy"] == 4.0
+    assert ok["a"]["4"]["load_average_1m"] == [4.0, 5.0]
+    bad = sched.conditions_summary(
+        [_block("a", 4, reads=200, before=1 << 30, after=(1 << 30) + 100 * (1 << 20))], samples, 1
+    )["a"]["4"]["drives"][0]
+    assert bad["requests_disagree"] is True and bad["residency_moved"] is True
+
+
+def test_unmeasured_residency_counts_as_moved_not_as_cold():
+    cell = sched.conditions_summary([_block("a", 4, reads=100, before=None, after=None)],
+                                    [_sample("a", 4, 100)], 1)["a"]["4"]["drives"][0]  # fmt: skip
+    assert cell["residency_unmeasured"] is True and cell["residency_moved"] is True
+    assert cell["residency_before_min"] is None
+
+
+def test_conditions_table_prints_model_measurement_and_flags():
+    summary = sched.conditions_summary(
+        [_block("a", 4, reads=200, before=1 << 30, after=(1 << 30) + 100 * (1 << 20))],
+        [_sample("a", 4, 100)], 1,
+    )  # fmt: skip
+    text = sched.format_conditions(summary)
+    assert "100/200?" in text and "1.0-1.0!" in text and "d0" in text

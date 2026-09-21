@@ -55,6 +55,7 @@ from typing import NamedTuple, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_mirror_rows as base  # noqa: E402  (also puts this worktree's python/ on sys.path)
+import drive_conditions as dc  # noqa: E402
 
 import torch  # noqa: E402
 
@@ -289,6 +290,84 @@ def plan_summary(
     }  # fmt: skip
 
 
+def request_model(
+    specs: Sequence[ArmSpec],
+    batches: Sequence[Batch],
+    layout: Exl3ExpertLayout,
+    drives: Sequence[dc.DriveInfo],
+) -> dict:
+    """Per-drive extents and predicted block requests for each arm, per batch size.
+
+    Plans exactly as ``run_replay`` does (stateful planners reset at the start of
+    every batch-size group) and reads nothing but the layout. The request counts
+    are ``block_requests`` of each extent, a model of the block layer, not a
+    measurement.
+    """
+    num_roots = len(drives)
+    groups = group_by_size(batches)
+    out: dict = {}
+    for spec in specs:
+        planner = make_planner(spec, num_roots)
+        per_size = {}
+        for size, group in groups.items():
+            planner.reset()
+            nbytes = [0] * num_roots
+            extents = [0] * num_roots
+            requests = [0] * num_roots
+            for batch in group:
+                geoms = [row_geometry(layout, r) for r in batch.rows]
+                for e in planner.plan(geoms):
+                    nbytes[e.root] += e.length
+                    extents[e.root] += 1
+                    requests[e.root] += dc.block_requests(
+                        length=e.length, max_request_bytes=drives[e.root].max_request_bytes
+                    )  # fmt: skip
+            n = len(group)
+            busiest = max(requests)
+            per_size[str(size)] = {
+                "batches": n,
+                "bytes_per_batch": [b / n for b in nbytes],
+                "extents_per_batch": [x / n for x in extents],
+                "requests_per_batch": [r / n for r in requests],
+                "bytes_per_request": [b / r if r else None for b, r in zip(nbytes, requests)],
+                "request_share": [r / sum(requests) if sum(requests) else None for r in requests],
+                "busiest_over_quietest_requests": (
+                    busiest / min(requests) if min(requests) else None
+                ),
+            }
+        out[spec.name] = per_size
+    return out
+
+
+def format_request_model(model: dict, drives: Sequence[dc.DriveInfo]) -> str:
+    lines = [
+        "predicted block requests per batch (model: ceil(extent / max_sectors_kb), not measured)",
+        "drives: "
+        + "; ".join(
+            f"[{i}] {d.path} = {d.device} ({d.model}, {d.fs_type}, max_sectors_kb={d.max_sectors_kb}, "
+            f"max_segments={d.max_segments})"
+            for i, d in enumerate(drives)
+        ),
+    ]
+    header = (
+        f"{'arm':<22}{'rows':>5}  {'extents/drive':<16}{'MB/drive':<18}"
+        f"{'requests/drive':<18}{'req share':<16}{'max/min req':>11}"
+    )
+    lines += [header, "-" * len(header)]
+    for name, per_size in model.items():
+        for size, r in per_size.items():
+            ratio = r["busiest_over_quietest_requests"]
+            lines.append(
+                f"{name:<22}{size:>5}  "
+                f"{'/'.join(f'{x:.1f}' for x in r['extents_per_batch']):<16}"
+                f"{'/'.join(f'{x / 1e6:.1f}' for x in r['bytes_per_batch']):<18}"
+                f"{'/'.join(f'{x:.1f}' for x in r['requests_per_batch']):<18}"
+                f"{'/'.join(f'{x:.2f}' for x in r['request_share'] if x is not None):<16}"
+                f"{('inf' if ratio is None else f'{ratio:.2f}'):>11}"
+            )
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------ execution
 
 
@@ -308,6 +387,7 @@ class BatchSample:
     useful_bytes: int
     requested_bytes: int
     completed_bytes: int
+    drive_requests: list = field(default_factory=list)  # model, empty without drive limits
 
 
 class LayerContext(NamedTuple):
@@ -324,12 +404,13 @@ class Harness:
     bounce: torch.Tensor
     dests: dict[str, torch.Tensor]
     root_bytes: list = field(default_factory=list)  # bytes asked of each root, all phases
+    drives: tuple = ()  # dc.DriveInfo per root; empty disables the request model
 
     def __post_init__(self) -> None:
         self.root_bytes = [0] * len(self.roots)
 
     @classmethod
-    def build(cls, layout, source: str, roots, layers, max_rows: int) -> "Harness":
+    def build(cls, layout, source: str, roots, layers, max_rows: int, drives=()) -> "Harness":
         roots = tuple(roots)
         reader = shared_row_reader(layout, True, source)
         contexts = {}
@@ -347,7 +428,10 @@ class Harness:
         storage = torch.empty(max_rows * slot_bytes + PAGE_BYTES, dtype=torch.uint8)
         start = (-storage.data_ptr()) % PAGE_BYTES
         bounce = storage[start : start + max_rows * slot_bytes].view(max_rows, -1)
-        return cls(layout, reader, roots, contexts, bounce, base.make_destinations(first, max_rows))
+        return cls(
+            layout, reader, roots, contexts, bounce,
+            base.make_destinations(first, max_rows), drives=tuple(drives),
+        )  # fmt: skip
 
     def open_everything(self, batches: Sequence[Batch]) -> None:
         """Open every (root, shard) the replay touches, outside any timing."""
@@ -411,9 +495,14 @@ class Harness:
         pack_done = time.perf_counter_ns()
         drive_bytes = [0] * num_roots
         drive_extents = [0] * num_roots
+        drive_requests = [0] * num_roots
         for e in extents:
             drive_bytes[e.root] += e.length
             drive_extents[e.root] += 1
+            if self.drives:
+                drive_requests[e.root] += dc.block_requests(
+                    length=e.length, max_request_bytes=self.drives[e.root].max_request_bytes
+                )  # fmt: skip
         for root, nbytes in enumerate(drive_bytes):
             self.root_bytes[root] += nbytes
         sample = BatchSample(
@@ -421,6 +510,7 @@ class Harness:
             read_done - planned, pack_done - read_done, planned - began,
             batch.size, len(extents), drive_bytes, drive_extents,
             sum(g.useful for g in geoms), sum(g.length for g in geoms), completed,
+            drive_requests if self.drives else [],
         )  # fmt: skip
         return sample, (self.digests(batch.size) if check else None)
 
@@ -453,6 +543,7 @@ class Harness:
 class RunResult:
     samples: list = field(default_factory=list)
     warmup_bytes: int = 0
+    blocks: list = field(default_factory=list)  # one conditions record per (rep, size, arm)
     mismatches: list = field(default_factory=list)
     source_mismatches: list = field(default_factory=list)
     verified_rows: int = 0
@@ -477,6 +568,7 @@ def run_replay(
     warmup: Sequence[Batch],
     verify_rows: int,
     verbose: bool = True,
+    probe: Optional[dc.ConditionProbe] = None,
 ) -> RunResult:
     result = RunResult()
     num_roots = len(harness.roots)
@@ -500,6 +592,7 @@ def run_replay(
             for spec in rotate(list(specs), block):
                 planner = planners[spec.name]
                 planner.reset()
+                started = probe.start() if probe else None
                 for batch in group:
                     check = rep == 0
                     sample, digest = harness.run_batch(spec, planner, batch, rep, check)
@@ -514,6 +607,11 @@ def run_replay(
                                         {"arm": spec.name, "batch": batch.index,
                                          "layer": row.layer, "expert": row.expert}
                                     )  # fmt: skip
+                if probe:
+                    result.blocks.append(
+                        {"arm": spec.name, "rep": rep, "size": size, "batches": len(group),
+                         **probe.stop(started)}
+                    )  # fmt: skip
                 if verbose:
                     ms = [s.read_ns / 1e6 for s in result.samples
                           if s.arm == spec.name and s.size == size and s.rep == rep]
@@ -657,6 +755,103 @@ def paired_vs_first(samples: Sequence[BatchSample], specs: Sequence[ArmSpec]) ->
     return {"reference": ref, "arms": out}
 
 
+RESIDENCY_CHANGE_BYTES = 64 << 20  # arbitrary; a block whose shard residency moved more is not cold-vs-warm comparable
+REQUEST_DISAGREE = 0.25  # arbitrary; the model is a size-cap-only estimate, so a wide margin
+
+
+def conditions_summary(
+    blocks: Sequence[dict], samples: Sequence[BatchSample], num_roots: int
+) -> dict:
+    """Per (arm, size): model against measurement and the conditions it was taken under."""
+    out: dict = {}
+    for arm in dict.fromkeys(b["arm"] for b in blocks):
+        per_size = {}
+        for size in dict.fromkeys(b["size"] for b in blocks if b["arm"] == arm):
+            group = [b for b in blocks if b["arm"] == arm and b["size"] == size]
+            picked = [s for s in samples if s.arm == arm and s.size == size]
+            drives = []
+            for r in range(num_roots):
+                cells = [b["drives"][r] for b in group]
+                predicted = sum(s.drive_requests[r] for s in picked) if picked[0].drive_requests else None
+                measured = sum(c["reads_completed"] for c in cells)
+                asked = sum(s.drive_bytes[r] for s in picked)
+                busy = sum(c["io_ms"] for c in cells)
+                deltas = [c["residency_delta_bytes"] for c in cells]
+                drives.append({
+                    "device": cells[0]["device"],
+                    "asked_bytes": asked,
+                    "diskstats_bytes": sum(c["read_bytes"] for c in cells),
+                    "predicted_requests": predicted,
+                    "measured_requests": measured,
+                    "measured_merged": sum(c["reads_merged"] for c in cells),
+                    "requests_disagree": (
+                        None if not predicted
+                        else abs(measured - predicted) / predicted > REQUEST_DISAGREE
+                    ),
+                    "depth_when_busy": (
+                        sum(c["weighted_io_ms"] for c in cells) / busy if busy else None
+                    ),
+                    "residency_before_min": _min_none(
+                        c["residency_before"] and c["residency_before"]["resident_bytes"] for c in cells
+                    ),
+                    "residency_before_max": _max_none(
+                        c["residency_before"] and c["residency_before"]["resident_bytes"] for c in cells
+                    ),
+                    "residency_unmeasured": any(d is None for d in deltas),
+                    "residency_moved": any(d is None or abs(d) > RESIDENCY_CHANGE_BYTES for d in deltas),
+                })  # fmt: skip
+            per_size[str(size)] = {
+                "blocks": len(group),
+                "drives": drives,
+                "load_average_1m": [
+                    min(b["load_average_before"][0] for b in group),
+                    max(b["load_average_after"][0] for b in group),
+                ],
+                "foreign_cores_low_max": max(b["foreign_cores_low"] or 0.0 for b in group),
+                "foreign_cores_all_max": max(b["foreign_cores_all"] or 0.0 for b in group),
+            }
+        out[arm] = per_size
+    return out
+
+
+def _min_none(values):
+    vals = [v for v in values if v is not None]
+    return min(vals) if vals else None
+
+
+def _max_none(values):
+    vals = [v for v in values if v is not None]
+    return max(vals) if vals else None
+
+
+def format_conditions(summary: dict) -> str:
+    lines = [
+        "conditions per (arm, batch size): requests = block requests per drive over the whole",
+        "block (model / measured reads-completed); depth = in-flight requests while busy;",
+        "cache = resident shard GiB at block start (min-max), '!' if it moved > 64 MiB;",
+        "load = 1-min loadavg range; foreign = other processes' cores on cpus 0-63 / all.",
+    ]
+    header = f"{'arm':<22}{'rows':>5}  {'device':<12}{'req model/meas':>18}{'depth':>7}{'cache GiB':>14}{'load':>12}{'foreign':>12}"
+    lines += [header, "-" * len(header)]
+    for arm, per_size in summary.items():
+        for size, c in per_size.items():
+            load = f"{c['load_average_1m'][0]:.1f}-{c['load_average_1m'][1]:.1f}"
+            foreign = f"{c['foreign_cores_low_max']:.1f}/{c['foreign_cores_all_max']:.1f}"
+            for i, d in enumerate(c["drives"]):
+                pred = "-" if d["predicted_requests"] is None else str(d["predicted_requests"])
+                flag = "?" if d["requests_disagree"] else " "
+                depth = "-" if d["depth_when_busy"] is None else f"{d['depth_when_busy']:.1f}"
+                lo, hi = d["residency_before_min"], d["residency_before_max"]
+                cache = "unmeasured" if lo is None else f"{lo / GIB:.1f}-{hi / GIB:.1f}"
+                cache += "!" if d["residency_moved"] else ""
+                lines.append(
+                    f"{arm if i == 0 else '':<22}{size if i == 0 else '':>5}  {d['device']:<12}"
+                    f"{pred + '/' + str(d['measured_requests']) + flag:>18}{depth:>7}{cache:>14}"
+                    f"{load if i == 0 else '':>12}{foreign if i == 0 else '':>12}"
+                )
+    return "\n".join(lines)
+
+
 def build_report(
     result: RunResult,
     specs: Sequence[ArmSpec],
@@ -675,6 +870,9 @@ def build_report(
         results[spec.name] = per_size
     report = dict(meta)
     report["results"] = results
+    if result.blocks:
+        report["conditions"] = conditions_summary(result.blocks, result.samples, num_roots)
+        report["condition_blocks"] = result.blocks
     report["accounting_errors"] = check_equal_work(result.samples, specs)
     report["paired"] = paired_vs_first(result.samples, specs)
     report["bytes_match"] = not result.mismatches and not result.source_mismatches
@@ -686,6 +884,7 @@ def build_report(
             "arm": s.arm, "rep": s.rep, "size": s.size, "batch": s.batch,
             "read_ns": s.read_ns, "pack_ns": s.pack_ns, "plan_ns": s.plan_ns,
             "extents": s.extents, "drive_bytes": s.drive_bytes,
+            "drive_requests_model": s.drive_requests,
         }
         for s in result.samples
     ]  # fmt: skip
@@ -721,6 +920,8 @@ def format_table(report: dict) -> str:
                 f"{r['read_mb_per_s']:>7.0f}  {mean} / {top}   {reps}"
             )
         lines.append("")
+    if report.get("conditions"):
+        lines += [format_conditions(report["conditions"]), ""]
     paired = report["paired"]
     lines.append(
         f"paired against {paired['reference']} on the same batch (ratio < 1 is faster; "
@@ -831,6 +1032,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="rows also read from the source checkpoint, as ground truth")  # fmt: skip
     p.add_argument("--max-gib", type=float, default=80.0,
                    help="refuse to run if the planned reads exceed this")  # fmt: skip
+    p.add_argument("--model-requests", action="store_true",
+                   help="predict per-drive block requests for the replay from sysfs limits "
+                        "and the extent plan; reads only the checkpoint headers")  # fmt: skip
     p.add_argument("--dry-run", action="store_true",
                    help="print the plan, per-drive bytes and total I/O; read nothing")  # fmt: skip
     p.add_argument("--output", default=None)
@@ -847,6 +1051,32 @@ def mean_row_bytes(layout, layers: Sequence[int]) -> int:
         for e in range(layout.num_experts)
     ]
     return sum(lengths) // len(lengths)
+
+
+def report_request_model(args, specs, replay, layout, roots) -> int:
+    if "weighted" in args.arms and args.weights == "auto":
+        raise SystemExit("--model-requests needs explicit --weights for the weighted arm")
+    drives = [dc.resolve_drive(r) for r in roots]
+    model = request_model(specs, replay, layout, drives)
+    print()
+    print(format_request_model(model, drives))
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(
+                {
+                    "when": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                    "argv": sys.argv,
+                    "replay_digest": replay_digest(replay),
+                    "load_average": dc.load_average(),
+                    "drives": [d._asdict() for d in drives],
+                    "arms": [
+                        {"name": s.name, "kind": s.kind, "weights": list(s.weights)} for s in specs
+                    ],
+                    "model": model,
+                },
+                f, indent=2,
+            )  # fmt: skip
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -948,12 +1178,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"  {name:<22} extents={s['extents']:>5} rows={s['rows']} "
             f"per-drive GiB={[round(b / GIB, 2) for b in s['drive_bytes']]}"
         )
+    if args.model_requests:
+        return report_request_model(args, specs, replay, layout, roots)
     if args.dry_run:
         return 0
 
+    drives = [dc.resolve_drive(r) for r in roots]
+    print("drives: " + "; ".join(
+        f"{d.path} = {d.device} ({d.model}, {d.fs_type}, max_sectors_kb={d.max_sectors_kb})"
+        for d in drives
+    ))  # fmt: skip
+    probe = dc.ConditionProbe(drives)
+    load_start = dc.load_average()
+    cpus = sorted(os.sched_getaffinity(0))
     watched = roots + [source]
     disk_before = read_diskstats(watched)
-    harness = Harness.build(layout, source, roots, args.layers, max(args.sizes))
+    harness = Harness.build(layout, source, roots, args.layers, max(args.sizes), drives=drives)
     calib = None
     if "weighted" in args.arms and auto:
         calib = calibrate_weights(harness, calibration)
@@ -967,7 +1207,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for spec in specs
         }
 
-    result = run_replay(harness, specs, replay, args.reps, warmup, args.verify_rows)
+    result = run_replay(harness, specs, replay, args.reps, warmup, args.verify_rows, probe=probe)
     disk_after = read_diskstats(watched)
     identical = []
     seen: dict[str, str] = {}
@@ -1003,6 +1243,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "direct": True,
         "ring_depth": int(os.environ.get("SGLANG_URING_FILE_READER_QUEUE_DEPTH", 128)),
         "same_device_roots": len(devices) != len(roots),
+        "drives": [d._asdict() for d in drives],
+        "load_average_at_start": load_start,
+        "load_average_at_end": dc.load_average(),
+        "cpus_allowed": [min(cpus), max(cpus), len(cpus)],  # lowest, highest, count
         "io": {
             "planned_mirror_bytes": plan_bytes,
             "harness_bytes_per_root": dict(zip(roots, harness.root_bytes)),

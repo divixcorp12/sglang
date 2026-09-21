@@ -1,17 +1,102 @@
-# Drive scheduling for batched row reads — 2026-09-20
+# Drive scheduling for batched row reads — 2026-09-20, conditions added 2026-09-21
 
-Plan: `docs/superpowers/plans/2026-09-20-storage-cpu-pipeline-v2.md`, Task 2, the
-part that needs no model run. Script `bench_row_scheduling.py`; raw results
+Plan: `docs/superpowers/plans/2026-09-20-storage-cpu-pipeline-v2.md`, Task 2. Script
+`bench_row_scheduling.py` with `drive_conditions.py`; raw results
 `row-scheduling-run1.json`, `row-scheduling-run2.json`; tests
-`test_bench_row_scheduling.py` (22 pass).
+`test_bench_row_scheduling.py` and `test_drive_conditions.py`.
 
-CPU/IO only, no GPU. divix01, `CUDA_VISIBLE_DEVICES=`, `taskset -c 0-63`,
-`OMP_NUM_THREADS=8`, O_DIRECT, layer 19, page-aligned destinations. Mirrors
-`/mnt/nvme0/dsv41_flash` and `/mnt/nvme4/dsv41_flash` (`nvme3n1`). Both were idle
-before run 1 (nvme0 0 sectors and nvme4 16 sectors read over 10 s); during both
-runs the diskstats deltas matched the harness's own bytes (below).
+**Result: keep static 1:1.** No policy tested here beats it by enough to change the
+default. This document does not resolve the 1.54x eager byte increase; it cannot
+(next section).
 
-## What was measured
+## What this analysis is not
+
+Every arm requests the same rows and the same bytes by construction, and the harness
+stops (exit 2) if it does not. Scheduling therefore cannot add or remove a byte, so a
+scheduling replay says nothing about the 1.54x eager traffic increase, which is
+Task 2's first item and needs cache counters (hits, misses, admissions, evictions,
+promotions, advisory bytes) from the eager serving path. Building this replay must
+not be recorded as having investigated that anomaly. It stays unresolved.
+
+## Limits of the existing evidence
+
+`row-scheduling-run1.json` and `-run2.json` were taken without three things that a
+matched comparison needs: **per-arm page-cache residency of the mirror shards**
+(`fincore` before and after each arm), **per-drive block-request counts**, and the
+**load average and foreign CPU use**. The arms were interleaved in one process, so
+the whole-run `/proc/diskstats` deltas that were recorded cannot be split per arm
+either. The runs therefore cannot be cited as matched evidence for, or against, any
+effect of request count, cache state or load. What they do support is exactly the
+property the verdict rests on: identical requested bytes in every batch for every arm
+(enforced, not assumed), and the timing of each arm under whatever conditions held.
+The missing conditions are a limitation of the evidence, not a reason to discard the
+verdict. One caution: the nvme4 mirror was reported on 2026-09-21 to hold about 15 GB
+of page-cache residency from earlier writes, varying over time. O_DIRECT was reported
+to bypass the cache on both filesystems (`dd iflag=direct` against a buffered control),
+so residency should not affect these reads; it was not sampled during either run, so
+that is not shown here.
+
+The harness now records all three per (rep, size, arm) block (below), so a re-run, if
+one is ever wanted, is conditioned. None is planned.
+
+## The two mirrors are not symmetric hardware
+
+Resolved at run time from `/proc/self/mountinfo`, `/proc/diskstats` and
+`/sys/dev/block/<major>:<minor>` by `os.stat().st_dev`, never by name (there is no
+`nvme4` block device; `/mnt/nvme4` is `nvme3n1`, and diskstats keys the partition):
+
+| mirror | device | model | fs | `max_sectors_kb` | `max_segments` |
+|---|---|---|---|---|---|
+| `/mnt/nvme0/dsv41_flash` | `nvme0n1p1` | Samsung SSD 990 EVO Plus 2TB | xfs | 512 | 128 |
+| `/mnt/nvme4/dsv41_flash` | `nvme3n1p1` | SPCC M.2 PCIe SSD | ext4 | 256 | 65 |
+
+The same 6.66 MB extent (one row on one drive) becomes about 13 block requests on
+nvme0 and 26 on nvme3. A 50/50 byte split is a 1:2 request split.
+
+### Request-count model applied to run 1 and run 2 (no drive I/O)
+
+`bench_row_scheduling.py --model-requests --weights 0.96:1` (and `0.97:1` for run 2)
+re-plans the recorded replay (digest `ad92c28366896b0d`, 100 batches, 304 rows per
+rep) through the same planners, resetting stateful planners per batch-size group
+exactly as the run did, and predicts requests as `ceil(extent / max_sectors_kb)` per
+extent. It read only the checkpoint headers. Its per-arm per-drive bytes reproduce the
+recorded ones (1.89/1.89 GiB within-row and whole-row, 3.77/0 one-root, 1.85/1.92 and
+1.86/1.91 weighted). Predicted requests per batch, nvme0 / nvme3:
+
+| rows | within-row 1:1 | whole-row | weighted 0.96:1 |
+|---|---|---|---|
+| 1 | 13.0 / 26.0 | 13.0 / 25.5 | 13.0 / 26.0 |
+| 2 | 26 / 52 | 26 / 51 | 26 / 52 |
+| 4 | 52 / 104 | 52 / 102 | 52 / 104 |
+| 6 | 78 / 156 | 78 / 153 | 78 / 156 |
+| 8 | 104 / 208 | 104 / 204 | 104 / 208 |
+| 32 | 416 / 832 | 416 / 816 | 416 / 832 |
+
+Request share nvme0 / nvme3 is 0.33 / 0.67 for within-row and weighted and 0.34 / 0.66
+for whole-row (busiest over quietest 2.00 against 1.96). One-root nvme0 puts all
+requests (26 per row) on nvme0.
+
+**What this says.** The request asymmetry is a property of the two drives at a given
+byte split, not of the policy: the two arms that are compared (within-row and
+whole-row) carry the same 1:2 request split, so it cannot explain whole-row's 1-2%
+gain at 4 or more rows or its 1.8x loss at one row (one extent on one drive, a byte
+effect). The one place the existing data touch the question is solo throughput: the
+calibration read nvme0 (13 requests per extent) at 3329 and 3293 MB/s and nvme4 (26
+per extent) at 3456 and 3412 MB/s in run 1 and run 2, and the per-row solo p50 was
+5.916 ms against 6.007 ms in `MIRROR_ROWS.md`. The drive with twice the requests per
+byte was not slower, so nothing here shows request count binding at 3.3-3.5 GB/s. The
+one arm this cannot rule out is a request-balanced split (about 2:1 bytes toward
+nvme0), which the calibration gives no reason to expect to win because nvme3 is not
+the slower drive.
+
+**What it does not say.** The model counts only the size cap; segment merging and the
+way xfs and ext4 build bios can move the real count. It has not been checked against
+`reads_completed`, since the existing runs recorded none. Treat 13 and 26 as a
+prediction until a conditioned run compares them; the harness prints predicted and
+measured side by side and marks a block `?` when they differ by more than 25%
+(arbitrary threshold).
+
+## What was measured (runs 1 and 2)
 
 One fixed replay (`ad92c28366896b0d`, seed 1234): 100 batches, 304 application
 rows per rep, batch sizes 1/2/4/6/8/32, every batch a set of distinct experts of
@@ -137,6 +222,30 @@ default. If the batch-size mix in production turns out to be dominated by 4+
 row eager batches, a hybrid (whole-row only above a row threshold) is the one
 variant this data could support, and it would need an end-to-end arm.
 
+## What a conditioned run records
+
+Each (rep, size, arm) block is bracketed by `drive_conditions.ConditionProbe`, and
+every summary row carries these, per drive unless noted:
+
+- device name, model, filesystem, `max_sectors_kb`, `max_segments`, `chunk_sectors`
+  (`report["drives"]`); a root with no `/proc/diskstats` row stops the run before any
+  read instead of reading zero;
+- block requests: model, and measured `reads_completed` and `reads_merged` over the
+  block; mean in-flight requests while the drive was busy (`weighted_io_ms / io_ms`);
+- page-cache residency of the shards under the mirror root before and after the block
+  (`fincore`, outside the timed interval); a block whose residency moved more than
+  64 MiB (arbitrary) is marked `!`, and an unmeasured residency counts as moved, not
+  as cold;
+- 1-minute load average before and after, cores' worth of CPU used by other
+  processes on cpus 0-63 and on all cpus (from `/proc/stat` minus this process), and
+  the cpus this process was allowed;
+- application rows, extents and per-drive bytes stay separate; plus p50/p90/p95/p99,
+  sample counts (`n`), read and pack time as before.
+
+The reader does not expose per-extent completion times, so per-drive service time is
+still not measured: queue depth and request counts are the block-level view, batch
+wall time is the only latency.
+
 ## Interface a whole-row policy would need
 
 `SplitPolicy.plan(length)` is length-only and, in `Exl3RowReader.read_split`,
@@ -163,11 +272,78 @@ implements this for the synchronous case (`assign` plus a `served` history
 standing in for `outstanding`). A `SplitPolicy` remains right for the
 within-row policies, which really are a function of length.
 
+`outstanding` here is this reader's own in-flight bytes per root. It does not include
+another process's reads, so it cannot steer around a drive that someone else is
+loading (see the asymmetric-load design below). And because the two mirrors differ in
+`max_sectors_kb`, equal outstanding bytes are unequal outstanding block requests; a
+policy that wanted request balance would have to be given the per-root request cap
+as well. The data above give no reason to want that.
+
+## Asymmetric-load experiment (design only; not built, not run)
+
+Question: does the ranking of within-row 1:1, whole-row and the measured weighted
+split change when one mirror is busy with someone else's reads? The interface below
+counts only this reader's own outstanding bytes, so a least-outstanding rule cannot
+see foreign load; if a load-adaptive policy is ever wanted it would need completion
+timing fed back, which the reader does not expose today. That is a hypothesis to test,
+not a finding.
+
+- **Reserved scratch space is required.** The interferer must not read the mirror
+  shards (that would move their page cache and contend with production). It needs its
+  own scratch file per mirror device, created once on the same filesystem as the
+  mirror root, of a size well past the drive's cache (arbitrary: 16 GiB each), and
+  space reserved for it by whoever owns the machine. Do not run it on `/mnt/nvme1` or
+  `/mnt/nvme2`.
+- **Interferer.** An O_DIRECT reader of the scratch file at a fixed rate (for
+  example `fio --rate`), at two levels (25% and 50% of a solo drive's rate; arbitrary),
+  on one mirror at a time. Its own achieved bytes per block are logged, and
+  subtracted from the device's diskstats delta to keep the harness's own bytes
+  attributable.
+- **Arms and rotation.** within-row 1:1, whole-row and weighted, crossed with load on
+  nvme0, load on nvme3, and none, in a Latin-square order across at least three
+  replicates so no arm always meets a warming or cooling drive. The weighted arm is
+  calibrated once under quiet conditions and not re-tuned under load; a second variant
+  re-calibrated under load is a separate arm.
+- **Batch sizes 4 and 8 only** (where whole-row was measured to differ at all), 48 rows
+  per size, 3 reps: about 35 GB of mirror reads across the 54 blocks, plus the
+  interferer's own bytes.
+- **Separate results.** Written to their own file with the load placement and level in
+  the header, never merged into a quiet-drive table, and never labelled quiet unless
+  the foreign reads on both devices were near zero.
+- **Decision rule.** Change the default only if a policy beats 1:1 by a margin that is
+  reproduced across replicates on paired per-batch ratios in the loaded cases and does
+  not lose in the quiet case. Otherwise keep static 1:1.
+
+Needs before running: the reserved scratch space, a window with no production
+traffic on the drives under test, and a small interferer launcher plus a load tag in
+the harness header; neither exists yet.
+
 ## Reproduce
 
+Everything runs on divix01 under `taskset -c 0-63` with `CUDA_VISIBLE_DEVICES=`,
+`OMP_NUM_THREADS=8`, `MKL_NUM_THREADS=8`. Do not start a run while other drive work
+is going on; the harness reports load and foreign CPU but cannot make a contended
+machine quiet.
+
 ```
+# no drive I/O beyond checkpoint headers: prints the request model per arm and size
+python bench_row_scheduling.py --model-requests --weights 0.96:1 --output model.json
+
 python bench_row_scheduling.py --dry-run     # plan, per-drive GiB, total I/O; reads nothing
-python bench_row_scheduling.py               # ~47.6 GiB from the mirrors, 0.2 from the source
+
+# a conditioned run: about 47.6 GiB from the mirrors, 0.2 from the source
+python bench_row_scheduling.py --output row-scheduling-runN.json
+
+# smaller check that the request model matches the block layer (about 0.12 GB in total,
+# one extent per drive per row, so 13 / 26 requests per row are expected)
+python bench_row_scheduling.py --arms within_row --sizes 1 --rows-per-size 8 \
+    --reps 1 --warmup-batches 1 --verify-rows 0 --weights 1:1 --output check.json
 ```
 
-`--max-gib` (default 80) refuses to start a run whose planned reads exceed it.
+`--max-gib` (default 80) refuses to start a run whose planned reads exceed it. Tests
+need a real filesystem for O_DIRECT, so pass `--basetemp` on a disk:
+
+```
+python -m pytest analysis/dsv41-drive/test_bench_row_scheduling.py \
+    analysis/dsv41-drive/test_drive_conditions.py -p no:cacheprovider --basetemp <disk dir>
+```
