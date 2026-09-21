@@ -17,7 +17,12 @@ Usage: sibling_pilot_analysis.py visits.jsonl | --selftest
 import json, os, sys, statistics as S, random
 BAND = 0.005; MIN_VALID = 8; FOREIGN_MAX = 10.0; SPIN_MIN = 90.0
 T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
-        16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093}
+        16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093,
+        # df 20-39 added for the reps-40 re-run (amendment 7): the table stopped at 19, so reps 40 raised
+        # KeyError(38) before any shift was computed. Same source as 1-19, which scipy reproduces exactly.
+        20: 2.086, 21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048,
+        29: 2.045, 30: 2.042, 31: 2.040, 32: 2.037, 33: 2.035, 34: 2.032, 35: 2.030, 36: 2.028, 37: 2.026,
+        38: 2.024, 39: 2.023}
 
 def visit_ok(v):
     if v["launch_foreign_pct"] >= FOREIGN_MAX or v["sib_foreign_pct"] >= FOREIGN_MAX: return False

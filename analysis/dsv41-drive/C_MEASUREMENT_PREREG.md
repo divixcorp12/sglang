@@ -362,6 +362,35 @@ INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling
 | `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` |
 | `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` |
 
+### 18.2 Run 2 of the pilot: VALID, verdict INSENSITIVE (2026-09-21, 12:36:08-12:40:47, raw output on divix01 in `c_measurement_run/pilot_out_123607/`)
+
+**Verdict word: INSENSITIVE.** A busy SMT sibling does not shift the GPU-side time `T` of one production gather launch.
+
+| n | valid reps | mean shift | 95% CI |
+|---|---|---|---|
+| 3 | 39 of 40 | -1e-05 | (-3.18e-05, +6.24e-06) |
+| 6 | 40 of 40 | -4e-05 | (-8.20e-05, +1.14e-05) |
+
+One rep excluded, `(3, 26)`. Both intervals straddle zero and sit far inside the registered band.
+
+**Validity, checked before the verdict was computed.** `lanes_end []` (run 1's second voiding reason, gone: the `test -f ... sweep.done` pollers that caused it were killed in an out-of-memory event earlier); `dry_run false`; `other_gpu_procs_max 0`; node-0 `page_fraction_on_node` 1.0 for all six; P1; link Gen3; SM 2955-2970 MHz; launch cpu 44 with sibling cpu 8, as in run 1. Staged hashes for all five files were checked on divix01 immediately before the window and matched section 18's table.
+
+**A CONFOUND, stated because it cuts against reading this as a clean reps-40 fix.** Run 1's first voiding reason was 7 of 20 valid reps, caused by the sibling of a spinning CPU being foreign-busy in the A arm (median 8.5%, max 93.2%). `--reps 40` was the registered remedy and it is what the lead approved. But the box also changed: load average 2.09 here against 25-32 in run 1, and the A-arm mechanism is the scheduler parking foreign threads on the idle sibling, which needs foreign threads to park. **Two things changed at once, and the jump from 7/20 to 39-40/40 is more plausibly the quiet box than the extra reps.** Nothing here separates them; a reps-20 run on a quiet box would, and was not done.
+
+**What this does and does not license.** As registered: "it changes no gate; a 'not in T' verdict is an argument for a future amendment that goes to the lead first". The SMT-sibling gate of amendment 6 item 5 stands unchanged. This verdict is an argument that a steady sibling load may be treatable as a declared condition for this instrument on this box, and nothing more. It speaks only to the cold SM launch: not `hot`, `ce`, graph or `nvme`.
+
+### 18.1a Amendment 7: the frozen analyser could not read its own registered re-run
+
+`--reps 40` is the re-run parameter section 18.1 proposed, and the analyser's `T975` table covered degrees of freedom 1-19 only, which is exactly reps 20. Forty reps give 39 shifts and need df 38, so the frozen rule raised `KeyError: 38` **before computing or printing any shift**. The ten-case selftest passed at the same moment and could not have caught it: every case uses 20 reps.
+
+Extended to df 39 with the lead's approval, no shift or verdict having been looked at. The added constants come from the same source as the existing ones: `scipy.stats.t.ppf(0.975, df)` reproduces every existing entry from 1 to 19 exactly, which is the check that the extension is consistent rather than merely plausible. No existing value, no band, and no verdict logic was changed; the selftest still passes all ten. `c_analysis.py` stays `4657702c...`.
+
+| file | old sha256 | new sha256 |
+|---|---|---|
+| `sibling_pilot/sibling_pilot_analysis.py` | `7e95adefa819450992dda69c2228d3603d1e64b93f84962126c75017bfc33ef1` | `725cc8a66c7b17d6ca712e8f72d92ce2e0199b06caa77bbc1acec98fa87beb5b` |
+
+**Also found, not fixed here:** `proposed_amendment6/test_c_harness.py` no longer matches its section 17 hash (`b735ca47...` recorded, `b6815a80...` actual). Commit `8769df5aa5` added two guard tests to it and the table was not updated. The drift strengthens the file and does not touch the harness, but **section 9 must not be flipped to amendment 6 until that hash is reconciled**, so `c` remains blocked on a record correction rather than on hardware.
+
 ### 18.1 Run 1 of the pilot: INVALID, twice over; no verdict is quoted (2026-09-21, 05:37:55-05:40:26, raw output on divix01 in `c_measurement_run/pilot_out_053754/`, `meta.json` in `sibling_pilot/run1_meta.json`)
 
 **Verdict word: INVALID.** Two independent registered reasons, either sufficient:
