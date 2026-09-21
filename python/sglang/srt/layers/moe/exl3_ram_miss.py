@@ -350,6 +350,7 @@ class Exl3RamMissService:
         self.routed_rows_per_step = 0
         self._shut_down = False
         self._quarantined = False
+        self._completed = False
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -554,8 +555,29 @@ class Exl3RamMissService:
     def _cuda_active(self) -> bool:
         return torch.cuda.is_available() and torch.cuda.is_initialized()
 
-    def _synchronize(self) -> None:
-        torch.cuda.synchronize()
+    def _synchronize(self, device: torch.device) -> None:
+        torch.cuda.synchronize(device)
+
+    def _barrier_devices(self) -> list[torch.device]:
+        """The CUDA devices whose kernels may read the slabs, each with an explicit index. Chosen on the CALLING thread:
+        a helper thread starts on device 0, and a device-less synchronize there waits for the wrong device on any rank
+        that serves another GPU (and would resolve an index-less ``cuda`` to device 0 the same way)."""
+        candidates = []
+        if self.device_side is not None:
+            candidates.append(self.device_side.state.device)
+        for layer_id in sorted(self.tables):
+            tier = getattr(self.tables[layer_id].streamer_of(), "pinned_host_cache", None)
+            if tier is not None:
+                candidates.append(tier.device)
+        devices: list[torch.device] = []
+        for device in candidates:
+            if device.type != "cuda":
+                continue
+            if device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            if device not in devices:
+                devices.append(device)
+        return devices or [torch.device("cuda", torch.cuda.current_device())]
 
     def _completion_deadline_s(self) -> float:
         # A wait kernel is bounded by the wait timeout (and, once admission is closed, by the header word).
@@ -570,10 +592,12 @@ class Exl3RamMissService:
         if not self._cuda_active():
             return None
         outcome: dict = {}
+        devices = self._barrier_devices()
 
         def run() -> None:
             try:
-                self._synchronize()
+                for device in devices:
+                    self._synchronize(device)
                 outcome["done"] = True
             except BaseException as error:  # noqa: BLE001 - any CUDA error means completion is not established
                 outcome["error"] = error
@@ -592,24 +616,44 @@ class Exl3RamMissService:
         """Stop admission, establish that no GPU reader runs, then free; else quarantine (LEASE_PROTOCOL.md 14.3).
 
         Idempotent. The tiers must not be used afterwards. ``at_exit``: no device barrier is attempted in an exit
-        handler, so the tiers are quarantined unconditionally. Today this is called by tests and by the exit hook;
-        a production caller of the orderly path does not exist yet (LEASE_PROTOCOL.md 14.6).
+        handler, so the tiers are quarantined unconditionally. The scheduler's graceful shutdown calls the orderly path
+        through ``shutdown_exl3_ram_miss_service`` (LEASE_PROTOCOL.md 20.2i); the exit hook calls this with ``at_exit``.
+        Anything that leaves it unknown whether the service thread or a GPU reader still runs (the barrier, or
+        stopping the thread) makes the shutdown quarantine; it frees only when both are known to be finished.
         """
-        if self._shut_down:
+        if self._completed or (self._shut_down and not at_exit):
             return
+        # At exit a shutdown that started and did not complete is finished as a quarantine, never left half done.
+        uncertain: Optional[str] = "an earlier shutdown did not complete" if self._shut_down else None
         self._shut_down = True
-        uncertain: Optional[str] = None
+        stop_error: Optional[BaseException] = None
+        interrupt: Optional[BaseException] = None  # a KeyboardInterrupt or SystemExit: re-raised once the slabs are safe
         try:
             if self.host is not None:
                 self.host.close_admission()
-                uncertain = "process exit: no device barrier is attempted" if at_exit else self._establish_gpu_completion()
+                if uncertain is None:
+                    uncertain = (
+                        "process exit: no device barrier is attempted" if at_exit else self._establish_gpu_completion()
+                    )
         except BaseException as error:  # noqa: BLE001 - a failure to even close admission is an uncertain state
-            uncertain = f"closing admission failed: {error!r}"
+            uncertain = f"closing admission or the barrier failed: {error!r}"
+            if not isinstance(error, Exception):
+                interrupt = error
         finally:
             try:
                 # The service thread writes into the slabs through raw addresses, so it stops before anything is freed.
+                # A service thread hung in a read ends this in the service watchdog's abort (see LEASE_PROTOCOL 20.2j).
                 if self.host is not None:
+                    logger.info(
+                        "exl3 RAM miss: stopping the service thread; a read that hangs ends in the watchdog's abort "
+                        "after max(30 s, 3 x the wait timeout)"
+                    )
                     self.host.stop()
+            except BaseException as error:  # noqa: BLE001 - a thread that may still run must not have its slabs freed
+                stop_error = error
+                uncertain = uncertain or f"stopping the service thread failed: {error!r}"
+                if not isinstance(error, Exception):
+                    interrupt = interrupt or error
             finally:
                 if uncertain is None:
                     for layer_id in sorted(self.tables):
@@ -619,6 +663,11 @@ class Exl3RamMissService:
                             tier.close()
                 else:
                     self._quarantine(uncertain)
+                self._completed = True
+        if interrupt is not None:
+            raise interrupt  # KeyboardInterrupt and SystemExit go on, after the quarantine
+        if stop_error is not None:
+            logger.error("exl3 RAM miss: stopping the service thread failed: %r", stop_error)
 
     def _quarantine(self, reason: str) -> None:
         """Keep everything a GPU kernel may still read or write alive until the process ends; free nothing."""
@@ -644,3 +693,13 @@ class Exl3RamMissService:
                     owned.append(tensor)
         quarantine_host_slabs(owned)
         self._quarantined = True
+
+
+def shutdown_exl3_ram_miss_service() -> None:
+    """The scheduler's graceful-shutdown entry (LEASE_PROTOCOL.md 20.2i): shut the service down if one exists.
+
+    A no-op when no service was ever created: a run without EXL3 must not construct the singleton at shutdown.
+    """
+    service = Exl3RamMissService._instance
+    if service is not None:
+        service.shutdown()

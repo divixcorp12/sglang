@@ -2312,3 +2312,70 @@ The block reads `sys.modules` rather than importing (F4). The claim "the worst c
 was false until `shutdown()` treated a failed `stop()` as uncertain (F1), chose the barrier's device on the calling
 thread (F2) and recorded completion separately from start (F5). The code and its ledger are in a patch awaiting the
 reviewer's second pass; nothing is landed. The mutation ledger goes with the code (20.2j).
+
+### 20.2j The scheduler wiring: what landed, after two independent review passes (`SHUTDOWN_WIRING_REVIEW.md`)
+
+The change (proposal and revision in 20.2i): one block, **last** in `Scheduler.release_host_resources()`, that reads
+`sys.modules` and, when `exl3_ram_miss` is loaded, calls `shutdown_exl3_ram_miss_service()` inside a `try/except` that
+logs. The function is a no-op unless a service exists. Fixes in `shutdown()`: a failed or interrupted `stop()` makes it
+uncertain (F1); the barrier's devices are chosen on the calling thread, each with an explicit index and de-duplicated,
+from the service's device buffers and the tiers (F2, S2); completion is tracked apart from start (F5); an interrupt in
+the barrier is re-raised after the quarantine like one in `stop()` (S1). The block must stay last (a comment says so).
+
+**The earlier claim "the worst case is what the exit hook does today" was false until F1, F2 and F5 were fixed.**
+
+**Accepted risk, ruled on by the reviewer (read from the C++, not run).** (a) A graceful shutdown with the service thread
+hung in a read ends in SIGABRT after up to `max(30 s, 3 x RAM_MISS_TIMEOUT)`, before `abort_distributed_environment()`:
+`RamThread::stop` joins the service thread before it stops the watchdog, and the watchdog aborts on `busy_since != 0`
+for longer than that, for a demand or an advisory. This is the exit hook's outcome reached earlier, and other ranks see a
+dead peer. (b) A hang outside a request (`busy_since == 0`, for example a lock deadlock in the thread) is not covered by
+the watchdog and would hang the join without bound; that already holds at the exit hook. (c) `stop()` is not bounded and
+this is not tested: bounding it would put two threads in one `std::thread` join with the exit hook, which is worse.
+Revisit if a stop hang is ever observed. A log line before `stop()` names the abort deadline.
+
+**Tests** (`test_exl3_ram_miss_shutdown.py`, 5 to 22). The wiring tests drive the real unbound
+`Scheduler.release_host_resources` on a stub recording `doorbell, hisparse, tree_cache, decode_offload, both capturers,
+rank_consensus`, so the block's position against every neighbour is asserted. The barrier is a fake; F2 and S2 are shown
+against a recorder of the `device` argument, which is the only instrument available on a one-GPU box and not a weaker
+substitute for a hardware check.
+
+**Mutation ledger.** Baseline 22 of 22 collected and passed; every run executed all 22; the failing assertion line was
+read for every kill (`--tb=line`) and none was an error at a call site, a hang or a fixture. Killers: 25 kills rest on
+**17 distinct tests**; twelve mutants each depend on a single test (W4, W4c, W5, W7a, F1b, F4, F5a, F5b, S1, S2a, S2b, S2c).
+
+| Mutant | Result | Fired on |
+|---|---|---|
+| W1 block omitted | KILLED 6 | the `==` on the recorded order |
+| W2 / W3a / W3b / W3c block before the doorbell / before hisparse / before the tree cache / before the last cheap release | KILLED 5 each | the same `==` |
+| W4 try/except removed | KILLED 1 | "the release raised RuntimeError(...)" (the test's own assertion) |
+| W4b `except Exception: return` | **SURVIVED, equivalent, only because the block is last** | (no failure: nothing follows the block; if it stops being last the mutant is live again) |
+| W4c nested under the hot-cache-manager check | KILLED 1 | `'close_admission' in order` |
+| W5 the function constructs the singleton | KILLED 1 | the singleton is not None |
+| W6 the function passes `at_exit=True` | KILLED 4 | free expected, quarantine seen |
+| W7a exit hook ignores completion | KILLED 1 | the recorded order after the hook |
+| W7b completion never recorded | KILLED 4 | `_completed` asserts |
+| W7c `shutdown()` has no idempotence guard | KILLED 2 | the exit-hook order and the second-shutdown order |
+| F1a a `stop()` failure does not make it uncertain | KILLED 2 | free seen where quarantine expected |
+| F1b an interrupt during `stop()` is swallowed | KILLED 1 | DID NOT RAISE KeyboardInterrupt |
+| F2a device-less synchronize | KILLED 4 | `[None]` against `cuda:3` and `cuda:2` |
+| F2b devices looked up inside the helper thread | KILLED 2 | `cuda:0` against `cuda:2` |
+| F4 the block imports unconditionally | KILLED 1 | "the scheduler imported the module" |
+| F5a exit hook returns once a shutdown started | KILLED 1 | `_completed` assert |
+| F5b completion recorded on entry | KILLED 1 | `assert not True` |
+| S1 an interrupt in the barrier is swallowed | KILLED 1 | DID NOT RAISE KeyboardInterrupt (raised in the calling thread) |
+| S1b no interrupt is ever re-raised | KILLED 2 | the same, both interrupt tests |
+| S2a the service's device is ignored | KILLED 1 | `[cuda:3, cuda:2]` against `[cuda:1, cuda:3, cuda:2]` |
+| S2b only the first device is synced | KILLED 1 | `[cuda:1]` against three devices |
+| S2c an index-less device is passed on | KILLED 1 | `device(type='cuda')` in the recorded list |
+| S2d devices are not de-duplicated | KILLED 2 | the tiers-only and the shared-device lists |
+
+The S2 test sets `device_side.state` on `cuda:1` while the tiers claim `cuda:3` and an index-less `cuda`, so a test in
+which both agreed (which would pass the mutant) is not the one that ran. The "imports nothing" test was also run alone,
+in a fresh process, and passed. Not covered: that the service thread is gone after a normal `stop()` returns (the orderly
+test asserts `host.threaded` is False, which reflects the Python wrapper, not the thread).
+
+**Not established, and not credited to any test here.** The real barrier ordering GPU work, on a real second GPU;
+real `cudaHostUnregister` (the tier tests use `device="cpu"`); that every teardown path sets `gracefully_exit` (OPEN 18,
+and the gate sits outside the method the tests drive); the two GPU-only doorbell tests that call the real method
+(`test_expert_doorbell_copier.py`, lines 1519 and 1543) skip without a GPU and were not run with the block present; a
+multi-rank teardown.
