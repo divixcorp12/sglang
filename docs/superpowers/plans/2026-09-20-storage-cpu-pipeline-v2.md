@@ -1188,6 +1188,37 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > of the corpus cannot be collected at all**, and any statement about it -- of
 > ours or anyone's -- is a statement about roughly a third of it.
 >
+> **(i) A VERIFICATION RECIPE THAT EXPORTS TOO LITTLE.** Not a test defect and
+> not an invocation defect -- a defect in *how a tree is reconstructed for
+> verification*, which makes correct tests fail and narrows every count taken
+> from that tree.
+>
+> Several fresh-archive verifications this day used `git archive <sha> python
+> test`. **16 test files reach into `scripts/` or `analysis/` by relative path**
+> -- the `tier_sim` pair, the six under `unit/scripts/`, `test_task1_arm_verdict`,
+> `test_provenance` and others -- and the analysis-dir tests need `analysis/`
+> too. Controlled both ways on fresh archives with no extra `PYTHONPATH`:
+> archive of `python test scripts` -> passes; the same archive with `scripts/`
+> moved away -> `ModuleNotFoundError` at the import. **The recipe is
+> `git archive <sha> python test scripts analysis`.**
+>
+> **This entry began as a misdiagnosis of mine and the correction is the
+> content.** I read the failure as an *undeclared* `PYTHONPATH` dependency and
+> filed it as another invocation defect. The opposite is true: the test
+> **declares** its path, inserting a file-relative `../../../../../scripts/dsv41`
+> before the import, so it resolves wherever the file sits. It is better-behaved
+> than most. The tree was wrong, not the test. **A count taken on an incomplete
+> export is not wrong, it is narrower than it looks**, and must carry its archive
+> scope the way any other measurement carries its conditions.
+>
+> **The fix that was refused matters as much as the one adopted.** Making the
+> test skip when `scripts/` is missing was available and was declined, in its
+> author's words, because *"that turns a wrong archive into a silent skip, the
+> exact shape we have been removing."* Given how many ways this document now
+> records an absence being read as a pass, adding one deliberately would have
+> been the worst available choice. Enforce the scope in the archive step
+> instead.
+>
 > **(g) AN EMPTY `CUDA_VISIBLE_DEVICES` BREAKS COLLECTION.**
 > `sglang/test/test_utils.py:246` does
 > `int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0])`, so an **empty** value
