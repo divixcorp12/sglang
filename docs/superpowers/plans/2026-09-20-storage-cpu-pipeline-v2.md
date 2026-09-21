@@ -552,9 +552,26 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > *specified* in design documents, not only to tests already written.
 >
 > Related, same day and same shape: an arm disqualified by the acceptance gates
-> (`task1-6`, INVALID) was nonetheless inside the step-time denominator of every
-> percentage in the Task 6 analysis. A gate that does not remove its subject from
-> downstream use is the same defect one level up.
+> (`task1-6`, INVALID -- "expert shard page-cache residency grew 1.40 GiB across
+> the arm") was nonetheless inside the step-time denominator of every percentage
+> in the Task 6 analysis, and nothing checked arm verdicts before they were named
+> in a pre-registration. A gate that does not remove its subject from downstream
+> use is the same defect one level up.
+>
+> **But the causal claim attached to this must not be repeated.** It was first
+> reported, and I restated it, as though the INVALID arm was what moved the
+> number. Checked against the verdict files: **removing `task1-6` alone moves the
+> mean the other way** (it is 254.1 ms against a 3-arm registered mean of 257.5).
+> The shift comes from `task1c-3`, whose verdict file reads **VALID** with a
+> boot-warm regime note -- no "disturbed" mark exists; that label was the
+> reviewer's. And the replacement denominator, 254.4 ms, is **not** "clean
+> untraced": it is the mean of four `new:on` arms in `clean-reference.json`, three
+> of them traced. The only clean untraced on-arm alone gives 254.7 ms (n = 1), so
+> traced stretching is not fully excluded from either figure.
+>
+> The provenance defect is real and stands on its own. The arithmetic story that
+> grew around it was wrong, and was corrected by the person asked to apply it
+> rather than by the person who reported it or the one who amplified it.
 
 - [ ] An independent reviewer checks ownership transitions and evidence after each structural milestone. **Strengthened by the process finding below: a reviewer must check that each cited test can fail, not merely that it passes.** No approval based solely on checklist completion.
 - [ ] Final report names accepted, rejected, and deferred work. Storage overlap is not labeled a fully asynchronous inference pipeline while Task 8 remains blocking.
