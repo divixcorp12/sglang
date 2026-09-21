@@ -67,7 +67,7 @@ Order randomised within each of **5 interleaved passes** (A B B A); every repeti
 
 ### 4.1 Gates (any failure: INVALID, no number quoted)
 
-Row bytes equal 13,315,584; **no row re-read within 100 rows** (1.33 GB = 13.9 x L2) in any non-`repeat` SM cell; link Gen3 and P0 at the start and end of every cell; no other GPU process; no foreign process above 10% of a core; `p99 / p50 <= 1.25` per cell;
+Row bytes equal 13,315,584; **no row re-read within 100 rows** (1.33 GB = 13.9 x L2) in any non-`repeat` SM cell; link Gen3 at the start and end of every cell (the P0 clause was replaced by the SM-clock conditions of section 22, amendment 10); no other GPU process; no foreign process above 10% of a core; `p99 / p50 <= 1.25` per cell;
 **no implied bandwidth above 15.75 GB/s (spec) or above 1.03 x 13.79 GB/s** (13.79 is the copy-engine figure measured in `NC_VISIBILITY.md`, a registered constant; the run's own `ce` arm is reported beside it and a `ce` figure more than 5% off 13.79 is noted as a change of box state) (the impossible-number detector; L2 residency would trip it); SM bandwidth at `n >= 2` at least 8 GB/s (else the harness or the box is broken);
 graph within 3% of eager at `n = 3`; both nodes present with 5 passes and every `n`.
 
@@ -572,3 +572,55 @@ if cell.state != "repeat":
 **One deliberate difference from the pilot's version, and the reason.** `sibling_pilot_analysis.py` refuses outright beside a marker. `c_analysis.py` does **not**, because section 12 item 3(b) scopes a drive-traffic marker to the **`nvme` arm's `rho`, not to the run**; an unconditional refusal would permanently block a run whose only fault is `rho` and would be a stricter rule than the one registered. The marker is instead printed immediately after the verdict word so its scope is always in view. **Both behaviours can only withhold numbers, never admit them**, which is the property section 18.9 required of a change to a frozen analysis file.
 
 **Hashes.** `c_harness.py`: old `85b08323274e56b4592a90f39767d9f0971ece2ee1a030536fbf1e57733408ca` (amendment 8), new `9e7d8e4e0f1df596e9a5037facd810c071f9187852b35329a63717490845faed`. `c_analysis.py`: **old `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c`, the constant cited throughout this document and in section 18.9, superseded here for the first time**, new `b93ebf7c776314d1a1b0a09d2493b7c9d385e912a5487a6087f478a30a1e34d4`. 25 CPU tests and the 10-case selftest pass on both. Section 9 is flipped in a separate commit.
+
+## 22. Amendment 10, the lead's resolution of section 20 item 1: gate 4.1 judges SM clocks, not the P-state label (2026-09-21)
+
+**This is a gate change, made after seeing a gate failure. That is the thing this document is most careful about, so the
+conditions are stated before the change.**
+
+**It does not rescue run 1.** Run 1 stays INVALID and no number from it may be quoted, now or later. The amended gate
+applies only to runs started after this section was written. Any other reading would be gate-shopping to rescue a
+result, which is exactly what the registered design exists to prevent.
+
+**Contamination, disclosed.** The agent that ran run 1 saw fitted `c_marginal` values for the voided run and is
+therefore disqualified from proposing this change; section 20 says so and correctly refused to propose it. The lead is
+not perfectly clean either: in reading section 20 to understand the blocker I saw the sentence "implied bandwidth was
+flat across `n`", which is a partial statement about the result. I have not seen the fits. The argument below is made
+from the gate's purpose and does not use that observation; it would read the same had run 1 never happened.
+
+**The contradiction being resolved.** Gate 4.1 required P0 at the start and end of every cell. The card reaches P0 only
+under sustained production load, and this measurement requires a quiet box. Run 1 recorded P1 on 235 of 235 cells, on
+every arm and both nodes, so the gate is unsatisfiable under the conditions the same design demands.
+
+**Why the P-state label was the wrong proxy, argued from purpose.** The gate exists to stop a throttled card producing
+a `T(n)` that the real workload would never see. But the quantity this measurement decides is **marginal**: the delta
+between a `count = 1` launch and its batched share, which is what `PER_ROW_TRANSFER.md` OPEN 1 turns on. Both terms of
+that delta scale with clock. What biases a marginal quantity is therefore **clock variation correlated with the
+independent variable**, not the absolute clock level. A card pinned at 82% of peak for every cell yields the same delta
+as one pinned at 100%; a card that drifts between them *as `n` rises* does not. The P-state label measures neither, and
+run 1's own record shows why it is a poor stand-in: P1 there meant 2572-2970 MHz against a 3135 MHz maximum, a label
+rather than a throttle.
+
+**The change.** In gate 4.1, the clause "link Gen3 and P0 at the start and end of every cell" is replaced by "link Gen3
+at the start and end of every cell", plus the three clock conditions below. The P-state is still recorded on every cell
+and is still reported; it is no longer a gate.
+
+- **(a) Floor.** Every recorded SM clock is at least **0.80 x `clocks.max.sm`** (2508 MHz on this 3135 MHz card). This
+  is the throttle detector the P-state label was standing in for. The 0.80 is chosen to sit just below run 1's observed
+  minimum of 2572 MHz (82%): a box that behaves as run 1's did passes, and one that drops materially below it does not.
+  **Declared arbitrary to that extent** -- it is calibrated to the observed quiet-box floor, not derived.
+- **(b) Within-cell stability.** For every cell, `|clock_end - clock_start| / clock_start <= 0.05`. A cell whose clock
+  moves while it is being timed cannot be attributed to an `n`.
+- **(c) Non-correlation with `n`, which is the condition that actually protects the verdict.** Within each arm, take the
+  mean SM clock of the cells at each `n`; the spread `(max - min) / mean` across those per-`n` means must be
+  **at most 0.02**. This bounds the clock-induced bias on `T(n)` at 2%, which is far below the effect the measurement
+  must resolve: OPEN 1's decision turns on a delta of order 80 us, and 2% of any plausible `T(n)` here is a few us.
+  An arm that fails (c) is INVALID; the failure is reported per arm, with the observed spread.
+
+**What does not change.** No threshold, arm, statistic, verdict rule, or validity condition other than the P-state
+clause. The link-Gen3 half of the clause stands unaltered. The impossible-bandwidth detector, the row-reuse gate, the
+foreign-process gate, the `p99/p50` gate and the two-node requirement all stand. `c_analysis.py --selftest` must still
+pass all ten cases after the harness is updated, and a run that fails any surviving gate is still INVALID.
+
+**Consequence if the amended gate also fails.** Then the box cannot support this measurement and the answer is to say
+so, not to amend again. A third gate change on this quantity should be refused by whoever is asked for it.
