@@ -284,3 +284,105 @@ reader see that the only inputs beyond the measured `k` are `c` and A2, which is
 
 The measured lane counts (`dad59f1b48`, 33.9, 64,635 against 64,857, the 36/42/22 split) and the join onto `task1-2-new-on-T`'s stamps: I checked the table's internal arithmetic (shares, 87.9%, +4.93, -15.67,
 7.4%, 33.9 x c) and not the trace. `t3-topology` is sweeping the rest of the plan for stale figures; I read only Task 6. The 3-slot demonstration and the `kBusySeq` windows remain uncommitted (the plan now says so).
+
+---
+
+# Third audit: the restructured section (`344b15623b`, with the Gate in `10bd465fd8` and `a01f9347d6`), 2026-09-21
+
+Same limits: read-only, nothing run, no trace re-read. The section is now lines 264 to 508 of the plan (blockquote 204 lines, from 434). I compared it against
+the pre-deletion text (`344b15623b^`) to check what was dropped, and re-derived the arithmetic that could be re-derived from the plan's own numbers.
+
+## Verdict
+
+The restructure worked: the section reads as one current-state document, a grep of the Task 6 section for the superseded figures (38.61, 19.17, 33.53, 35.80, 17.79, 30.88, 5.06,
+2.55, 7.1%, 257.5, 87/13, 31.9, 29.3, 111.9, "about 14", "earlier revision", "first written") returns nothing (the one `495` is "16 of 495 lines", correct), and the Gate now enforces
+the two refusals (F1 of the second audit is closed). **Compression did drop one load-bearing item (C1) and left four things weaker, mislabelled or newly contradictory (B1 to B4).**
+No HIGH. Two MEDIUM.
+
+## A. Live content: each item present exactly once, and whether it was weakened
+
+| Item | Present? | Stated as strongly as before? |
+|---|---|---|
+| V1b (definition, cost, no service change, 88% share without `[REQ 1]`) | once, in SAFETY | yes. The phrase "not Task 5 compliant" is gone from the text (the exclusion is now Gate 2); implied, not stated |
+| the three `kBusySeq` facts (clears before `demand_done`; advisories never set it; observation window / hit copy vs window) | once | yes; the "0.2-0.9 us gap", "`(done pending, busy 0)` once", "only `== seq` carries information" are all kept |
+| invariant (b), `wanted` never a victim | once, in the SAFETY opening | yes |
+| **invariant (a), no actor evicts in that tier between the request finishing and the device's next post** | **no** | **dropped (C1)** |
+| "the gate's safety does not come from the word; safety rests on invariants that outlive it" | **no** | **dropped (C1)** |
+| V2 cleanup landmine | once | yes, complete |
+| armed / unarmed hint analysis | once | yes; "Today a failure there is loud" is kept and correctly scoped to today's path |
+| silent-wrong-bytes demonstration (3-slot tier) | once | yes, and improved: it now says outright that today's producer satisfies the relation |
+| same-`mutex_`-section requirement | once | yes |
+| (a) small / (b) large cost split | once | yes, and the "not the whole delta" qualifier is kept |
+| the provenance caveat that the `kBusySeq` windows and the demonstration have no committed artefact | once | yes |
+| FIFO as an assumption, not a finding; bunching not reordering | once | yes |
+| Task 8 does not break the borrowed invariants | once, in the V1b paragraph | yes |
+| link bound (`c` is link time; promotions share the link) | once, in FIGURES | yes; the explicit cap `min(read_wait, h*c)` and the 93 ms comparison are gone, acceptable as derivation detail |
+| A1's per-request `k` was exact for 36% / low 42% / high 22%; layer premise held | no | dropped; it is a fact about the *estimate* now retired, and lives in `PER_ROW_TRANSFER.md`. Acceptable |
+
+## B. Findings
+
+### B1. MEDIUM: STANDING item 5, "Early transfer as a whole is not in doubt", is a reject test that did not reject, presented as a demonstration
+
+Item 5 says the GENEROUS reject test "gives every reading request `k` = 6 ... at 73.0 ms/step it is 28.7% of the step against a 1.5% (3.8 ms) reject threshold, about 19x margin. It did not reject.
+**Only the choice of mechanism is open.**" The arithmetic is right (73.0 / 254.4 = 28.7%, 1.5% of 254.4 = 3.8 ms, 73.0 / 3.8 = 19.2). What it shows is that an **upper bound** (six lanes on every reading request, best order,
+launches free) is above a reject threshold. That cannot reject the idea; it does not make the benefit robust, and "19x margin" is the margin of a ceiling over a threshold, not of an effect over noise. The
+realistic figure is the measured-`k` two-phase 35.74 ms, itself a ceiling by construction (FIGURES), and both rest on A2, the signal that does not exist. The section elsewhere says "It is **not measured**" (item 1) and
+"No saving in this task has been measured end to end" (FIGURES). "Not in doubt" contradicts those. Suggested: "Early transfer cannot be rejected on arithmetic: even the k-free reject test's ceiling is far above the
+threshold. It is not demonstrated: no saving has been measured."
+
+### B2. MEDIUM: the per-row verdict's `g` threshold is mis-stated, and the verdict is more fragile than it reads
+
+STANDING item 2: "at `g` around 5 us or below, best-order per-row clears the bar." From the section's own inputs: the bar is 1.5% of 254.4 = 3.82 ms; net = 4.93 - 160 g; setting net = 3.82 gives
+**g = 6.96 us**, not 5. (The section's own range is 8-14 us, giving +3.65 to +2.69 ms, 1.43% to 1.06%: correct.) So best-order per-row clears the bar at g of about **7 us**, less than 1 us below the low end of the
+assumed range. That makes "expected-REJECTED" rest on an unmeasured parameter whose crossing point is adjacent to the assumed range, which is a stronger statement of the item-2 caveat ("has never been measured") than the text
+gives. The figure "5 us" appears to be carried from `PER_ROW_TRANSFER.md` 5.6 ("unless a measurement shows g under about 5 us and the order is best"), whose derivation I have not seen; it does not match this arithmetic.
+Either the design's condition includes something the section drops, or the number is wrong; either way the plan should state the crossing it computes.
+
+### B3. MEDIUM-LOW: "Fixed-order per-row (V2)" is used for two different mechanisms
+
+STANDING item 2 calls V2 "Fixed-order per-row" and says it is "only marginally" rejected "at best order". But **fixed order and best order are different mechanisms**: best order needs the order array
+(`ord`), which is in the design's V2 (`PER_ROW_TRANSFER.md` 4.2) and is **not in the plan's V2 pseudo-code or checklist** (`for lane in fixed_capture_capacity: wait_row ...` has no `ord`). The FIGURES table
+does separate them ("plan-original fixed-order per-row / RANDOM" at -15.67; "V2 / BEST (per-row, order array, best order)" at +4.93), but the STANDING text and the "Chosen mechanism" paragraph do not, and the checklist
+specifies the fixed-order one. Consequence: an implementer following the checklist builds the variant that is 15.7 ms worse than two-phase, not the +4.93 one the marginal-verdict discussion is about. The section should say
+that the checklist's V2 has no order array and is the -15.67 row, and that the +4.93 row requires adding `ord` to it. (This is the same trap as the A8 note about the checklist, one level down.)
+
+### B4. LOW: the Gate
+
+- **Gate 1 mentions measuring V1b** ("V1b, needing no lease mode, is measured against A0 directly") while Gate 2 refuses V1b "however well it measures". Consistent only if it means an exploratory measurement; the text
+  does not say so.
+- **"eager gathers off"** during a decode arm cannot mean prefill's eager gathers; it should say "no eager gather inside the measured decode window".
+- **Two labels collide:** "A2" is the model assumption (hit lanes ready at reservation) in FIGURES and the arm (the Task 6 mechanism) in Gate 1; "A1"/"A0" are arms. Say "arm A2" or rename the arms.
+- **The baseline correction is stated twice**, as a paragraph and again in Gate 1. Two statements will diverge; keep the one in the Gate.
+- **Gate 2's wording is broader than intended.** "A mechanism whose correctness holds only because the service serves one request at a time is rejected." Task 5's own design leans on the same fact for its
+  reservation argument (DECIDE 3 stands "for the current synchronous service"). The clause should say "whose *source-read safety*" so a lease-based V1 is not caught by it.
+- **"Today's only producer (router-miss via `expert_row_plan.py`)"** in the demonstration paragraph: `plan_candidates` also lives in `expert_row_plan.py`, with no production caller found. "Only *production* producer" is
+  accurate; "only producer" drops the one place a non-routed planned lane could come from, which the deleted text named as "Latent and not closed".
+
+### B5. LOW: provenance arithmetic
+
+"33.9 hit lanes/step ... inside the 10.8-63.6 bounds ... 46% across": (33.9 - 10.8) / (63.6 - 10.8) = 43.8%. The 46% is the position in the *rescaled* bounds (10.5-61.6), which the deleted text said and this text dropped. Quote
+one pair. And "3.0x the SUPPORT floor" is 2.9x against 11.7 (37% of 31.9) and 3.1x against 10.8; "about 3x".
+
+## C. What compression removed that should come back
+
+### C1. MEDIUM: invariant (a) and "safety does not come from the word"
+
+The deleted text ended the `kBusySeq` analysis with: "the gate's safety does not come from the word. ... Safety therefore rests on invariants that outlive the word -- (a) no actor evicts in that tier
+between the request finishing and the device's next post, (b) `wanted` is never a victim." The restructured SAFETY block keeps (b) and replaces (a) with "no advisory runs once a request is taken". They are not the
+same. "Once a request is taken" is the interval *during* the request. (a) is the interval *after* it finishes, and it is the one that matters for the requests where the word is least observable: an all-hit request
+finishes in 0.6-1.8 us (the section says so) while its hit copy lasts milliseconds, so the copy runs **after** the request is over, protected by nothing but (a). Dropping it leaves the reader with the impression that the
+temporal exclusion is about the service's current request, which understates what V1b (and today's unarmed path) leans on. Restore both sentences in one place, as "invariants that outlive the word", so the Gate 2
+ground ("borrowed temporal exclusion") has its object stated.
+
+## D. Your three deliberate choices
+
+1. **Promoting the per-row marginality to STANDING item 2: agree.** It is the weakest load-bearing claim and it was hiding. Two corrections to its content (B2's threshold; B3's V2 labelling) so what is promoted is right.
+2. **The V2-only checklist note: sufficient for the checklist, not for the name.** The note ("would build the variant the plan expects to reject") is honest. B3 shows the deeper version: the checklist builds the
+   -15.67 variant, not just the wrong one of {V1, V2}.
+3. **Deleting the trail: correct**, and the evidence that it was right is the section itself, which now has no "earlier revision" clause and no mixed layers. The clause left in *Task 9's* row ("Task 6's gate referenced a Task 9 row that
+   did not exist until this edit") is the same kind of history embedded in live text and is worth deleting.
+
+## E. Not checked
+
+The measured lane counts and the session-grouped sum (`sum(lanes) = sum(vram_miss)` exactly in sessions 2-4, session 1 under forward 2, the 127/128/128/128 step counts: I checked that 127 + 128 x 3 = 511 and 127 x 4 = 508,
+not the trace); the 254.7 ms n=1 figure; the derivation of "about 5 us" in `PER_ROW_TRANSFER.md` 5.6. Nothing was run.
