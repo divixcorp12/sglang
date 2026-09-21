@@ -132,8 +132,12 @@ def test_git_state_refuses_a_directory_outside_any_worktree(tmp_path):
         prov.git_state(str(tmp_path))
 
 
+# What the mounts resolve to on the box today; note that the label nvme4 is the device nvme3n1.
+DEVICES = {"nvme0": "nvme0n1", "nvme2": "nvme2n1", "nvme4": "nvme3n1"}
+
+
 def _write_diskstats(path, sectors):
-    rows = [f"   259       0 {dev} 1 0 {sectors[name]} 0 0 0 0 0 0 0 0" for name, dev in prov.DRIVES.items()]
+    rows = [f"   259       0 {dev} 1 0 {sectors[name]} 0 0 0 0 0 0 0 0" for name, dev in DEVICES.items()]
     path.write_text("\n".join(rows) + "\n")
 
 
@@ -146,7 +150,7 @@ def test_drive_idle_check_flags_a_busy_drive(tmp_path):
         state["nvme2"] += 8 * 1024 * 1024 // 512 * 2  # 8 MiB/s over 2 s
         _write_diskstats(stats, state)
 
-    result = prov.drive_idle_check(seconds=2.0, diskstats=str(stats), sleep=sleep)
+    result = prov.drive_idle_check(seconds=2.0, diskstats=str(stats), sleep=sleep, devices=DEVICES)
     assert result["idle"] is False
     assert result["bytes_per_s"]["nvme2"] == pytest.approx(8 * 1024 * 1024)
     assert result["bytes_per_s"]["nvme0"] == 0
@@ -155,15 +159,52 @@ def test_drive_idle_check_flags_a_busy_drive(tmp_path):
 def test_drive_idle_check_reports_an_idle_drive(tmp_path):
     stats = tmp_path / "diskstats"
     _write_diskstats(stats, {"nvme0": 5, "nvme2": 5, "nvme4": 5})
-    result = prov.drive_idle_check(seconds=1.0, diskstats=str(stats), sleep=lambda s: None)
+    result = prov.drive_idle_check(seconds=1.0, diskstats=str(stats), sleep=lambda s: None, devices=DEVICES)
     assert result["idle"] is True
     assert set(result["bytes_per_s"]) == set(prov.DRIVES)
+    assert result["devices"] == DEVICES  # the result says which kernel device each label was
 
 
 def test_drive_idle_check_unreadable_diskstats_is_null_with_reason(tmp_path):
-    result = prov.drive_idle_check(seconds=0.0, diskstats=str(tmp_path / "missing"), sleep=lambda s: None)
+    result = prov.drive_idle_check(
+        seconds=0.0, diskstats=str(tmp_path / "missing"), sleep=lambda s: None, devices=DEVICES
+    )
     assert result["idle"] is None
     assert "FileNotFoundError" in result["unavailable"]
+
+
+def _fake_trees(tmp_path, *, device_name, listed=True):
+    """A mount directory plus fake /proc and /sys trees in which its st_dev is the disk ``device_name``."""
+    mount = tmp_path / "mnt" / "nvme4"
+    mount.mkdir(parents=True)
+    st = os.stat(mount).st_dev
+    major, minor = os.major(st), os.minor(st)
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "mountinfo").write_text("1 1 0:1 / / rw - ext4 /dev/fake rw\n")
+    row = f"{major} {minor} {device_name} 1 0 5 0 0 0 0 0 0 0 0\n" if listed else "8 0 sda 1 0 5 0 0 0 0 0 0 0 0\n"
+    (proc / "diskstats").write_text(row)
+    (sys_root / "dev" / "block" / f"{major}:{minor}" / "queue").mkdir(parents=True)
+    return {"nvme4": str(mount)}, {"proc_root": str(proc), "sys_root": str(sys_root)}
+
+
+def test_a_drive_is_resolved_by_its_st_dev_not_by_the_name_of_its_mount(tmp_path):
+    drives, roots = _fake_trees(tmp_path, device_name="nvme7n1")  # neither nvme4 nor today's nvme3n1
+    assert prov.resolve_devices(drives, **roots) == {"nvme4": "nvme7n1"}
+
+
+def test_a_mount_with_no_diskstats_row_stops_the_arm_instead_of_reading_zero(tmp_path):
+    drives, roots = _fake_trees(tmp_path, device_name="nvme7n1", listed=False)
+    with pytest.raises(ValueError, match="no .*diskstats row"):
+        prov.resolve_devices(drives, **roots)
+
+
+def test_reading_sectors_for_a_device_missing_from_diskstats_raises(tmp_path):
+    stats = tmp_path / "diskstats"
+    _write_diskstats(stats, {"nvme0": 1, "nvme2": 2, "nvme4": 3})
+    assert prov.read_sectors(str(stats), devices=DEVICES) == {"nvme0": 1, "nvme2": 2, "nvme4": 3}
+    with pytest.raises(ValueError, match="nvme9n1"):
+        prov.read_sectors(str(stats), devices={**DEVICES, "nvme9": "nvme9n1"})
 
 
 def test_capture_records_the_imported_sglang_and_its_worktree():
@@ -276,8 +317,13 @@ def test_arm_harnesses_embed_provenance_in_the_result_json():
         assert "provenance.capture(" in source and "drive_idle_check()" in source, parts
         assert "provenance.timed_chunks(" in source and "provenance.step_latency(" in source, parts
         assert "provenance.process_tree_cpu_s()" in source, parts
-    with open(os.path.join(_ROOT, "scripts", "dsv41", "trace_corpus.py")) as f:
-        assert '"boundary_samples": boundaries' in f.read()
+    for parts in (("analysis", "dsv41-drive", "eager_arm_driver.py"), ("scripts", "dsv41", "trace_corpus.py")):
+        with open(os.path.join(_ROOT, *parts)) as f:
+            source = f.read()
+        assert '"boundary_samples": boundaries' in source, parts
+        assert '"expert_residency": residency' in source, parts
+        assert '"expert_resident_bytes": provenance.resident_bytes(' in source, parts
+        assert "provenance.system_sample()" in source, parts
 
 
 if __name__ == "__main__":

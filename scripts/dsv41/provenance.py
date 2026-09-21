@@ -30,8 +30,10 @@ OTHER_ENV = ("PYTHONPATH", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_T
 _SECRET_NAME = re.compile(r"(API_?KEY|SECRET(_?KEY)?|PASSWORD|CREDENTIALS?|(AUTH|ACCESS|API|HF|BEARER)_TOKEN)$", re.I)
 REDACTED = "<redacted>"
 
-# mount point -> block device, as in run-mirror-arms.sh
-DRIVES = {"nvme0": "nvme0n1", "nvme2": "nvme2n1", "nvme4": "nvme3n1"}
+# label -> mount point, as in run-mirror-arms.sh. The kernel block device behind a mount is resolved by
+# st_dev (resolve_devices), never by name: the drive mounted at /mnt/nvme4 is nvme3n1 today, and a
+# name-keyed table reads nothing, so as idle, the day that mapping changes.
+DRIVES = {"nvme0": "/mnt/nvme0", "nvme2": "/mnt/nvme2", "nvme4": "/mnt/nvme4"}
 # A drive another job is using reads well above this; the arms' own boot reads are not sampled here.
 IDLE_MAX_BYTES_PER_S = 1 << 20
 SECTOR_BYTES = 512
@@ -122,19 +124,51 @@ def git_state(package_dir: str) -> dict:
     }
 
 
-def read_sectors(path: str = "/proc/diskstats") -> dict:
-    """Cumulative sectors read per drive (/proc/diskstats field 6), keyed by mount name."""
-    wanted = {device: name for name, device in DRIVES.items()}
+def _drive_conditions():
+    """analysis/dsv41-drive/drive_conditions.py, loaded by path: it is the one resolver of a directory to
+    its block device, and it lives beside the drive analysis rather than in a package."""
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "analysis", "dsv41-drive", "drive_conditions.py"
+    )
+    spec = importlib.util.spec_from_file_location("drive_conditions", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def resolve_devices(drives: dict | None = None, **roots) -> dict:
+    """{label: kernel block device name}, resolved from each mount's st_dev.
+
+    Raises ValueError for a mount whose device has no /proc/diskstats row (tmpfs, a missing mount):
+    a counter for a device that cannot be found must stop the arm, not read as zero. ``roots``
+    (proc_root, sys_root) are passed to the resolver so a test can supply fake trees."""
+    resolve = _drive_conditions().resolve_drive
+    return {label: resolve(mount, **roots).device for label, mount in (drives or DRIVES).items()}
+
+
+def read_sectors(path: str = "/proc/diskstats", devices: dict | None = None) -> dict:
+    """Cumulative sectors read per drive (/proc/diskstats field 6), keyed by label.
+
+    ``devices`` maps label -> block device name; by default it is resolved from DRIVES' mounts."""
+    devices = resolve_devices() if devices is None else devices
+    wanted = {device: name for name, device in devices.items()}
     out = {}
     with open(path) as f:
         for line in f:
             fields = line.split()
             if len(fields) > 5 and fields[2] in wanted:
                 out[wanted[fields[2]]] = int(fields[5])
+    missing = sorted(set(devices) - set(out))
+    if missing:
+        raise ValueError(f"no {path} row for {[devices[label] for label in missing]} (labels {missing})")
     return out
 
 
-def drive_idle_check(seconds: float = 2.0, diskstats: str = "/proc/diskstats", sleep=None) -> dict:
+def drive_idle_check(
+    seconds: float = 2.0, diskstats: str = "/proc/diskstats", sleep=None, devices: dict | None = None
+) -> dict:
     """Bytes/s read from each drive over ``seconds`` with the arm not yet started.
 
     A drive another job is reading makes an arm's timing and per-drive bytes meaningless, so the
@@ -144,15 +178,17 @@ def drive_idle_check(seconds: float = 2.0, diskstats: str = "/proc/diskstats", s
     sleep = sleep or time.sleep
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
-        before = read_sectors(diskstats)
+        devices = resolve_devices() if devices is None else devices
+        before = read_sectors(diskstats, devices)
         sleep(seconds)
-        after = read_sectors(diskstats)
-        rates = {k: (after[k] - before[k]) * SECTOR_BYTES / seconds for k in DRIVES}
+        after = read_sectors(diskstats, devices)
+        rates = {k: (after[k] - before[k]) * SECTOR_BYTES / seconds for k in devices}
     except Exception as e:
         return {"idle": None, "unavailable": f"{type(e).__name__}: {e}", "measured_at_utc": started}
     return {
         "idle": all(r <= IDLE_MAX_BYTES_PER_S for r in rates.values()),
         "bytes_per_s": rates,
+        "devices": devices,  # which kernel device each label resolved to
         "seconds": seconds,
         "max_idle_bytes_per_s": IDLE_MAX_BYTES_PER_S,
         "measured_at_utc": started,

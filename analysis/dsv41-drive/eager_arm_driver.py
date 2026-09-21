@@ -46,6 +46,12 @@ def main() -> None:
     p.add_argument("--new-tokens", type=int, default=128)
     p.add_argument("--out", required=True)
     p.add_argument("--arm", required=True)
+    p.add_argument(
+        "--residency-dirs",
+        default="",
+        help="colon-separated dirs whose .safetensors page-cache residency is recorded before the "
+        "Engine, once it is ready, and after every session, so cache growth names its session",
+    )
     args = p.parse_args()
     args.mem_fraction_static = 0.85
     args.chunked_prefill_size = 512
@@ -59,6 +65,9 @@ def main() -> None:
     import sglang
     from transformers import AutoTokenizer
 
+    residency_dirs = [d for d in args.residency_dirs.split(":") if d]
+    residency = {"dirs": residency_dirs, "before_engine": provenance.resident_bytes(residency_dirs)}
+    boundaries = [{"label": "before_engine", **provenance.system_sample()}]
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     prov = provenance.capture({"driver": os.path.abspath(__file__), "trace_corpus": trace_corpus.__file__})
     prov["drive_idle_check"] = provenance.drive_idle_check()
@@ -69,6 +78,8 @@ def main() -> None:
     ready_sectors = read_sectors()
     # Engine launch may edit os.environ before it spawns the scheduler; record what it changed.
     prov["sglang_env_drift_at_engine_ready"] = provenance.env_drift(prov["sglang_env"], provenance.process_env())
+    residency["after_engine_ready"] = provenance.resident_bytes(residency_dirs)
+    boundaries.append({"label": "engine_ready", **provenance.system_sample()})
     sessions = []
     for index, text in enumerate(texts):
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
@@ -101,9 +112,11 @@ def main() -> None:
             "output_sha1": hashlib.sha1(output_text.encode()).hexdigest(),
             "cpu_s": None if None in (cpu_before, cpu_after) else cpu_after - cpu_before,
             "step_latency": provenance.step_latency(chunk_log),
+            "expert_resident_bytes": provenance.resident_bytes(residency_dirs),
             **timing,
         }
         sessions.append(row)
+        boundaries.append({"label": f"session_{index}", **provenance.system_sample()})
         print(json.dumps(row), flush=True)
     engine.shutdown()
     report = {
@@ -115,6 +128,8 @@ def main() -> None:
         "startup_disk_bytes": {
             k: (ready_sectors[k] - boot_sectors[k]) * SECTOR_BYTES for k in DRIVES
         },
+        "expert_residency": residency,
+        "boundary_samples": boundaries,
         "per_session": sessions,
         "mean_decode_tok_s": trace_corpus.mean_decode_tok_s(sessions),
     }
