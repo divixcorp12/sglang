@@ -45,8 +45,9 @@ def capturing_graphs() -> bool:
 # only mechanical answer to which fields a file has and which quantities it compares.
 # 2: stage stamps and spans cover the whole read, not the first io_uring batch, and packing can fall
 # inside first_to_last_cqe. 3: adds row_pack[].admit, extent_cqe[].submit/attempts and dropped_before;
-# no schema-2 field changed meaning.
-RAM_MISS_TRACE_SCHEMA = 3
+# no schema-2 field changed meaning. 4: adds request.lanes, the planned lane count the device posted;
+# every schema-3 field keeps its meaning, so spans, byte totals and per-drive shares compare across 3 and 4.
+RAM_MISS_TRACE_SCHEMA = 4
 
 
 class Exl3StreamTrace:
@@ -191,6 +192,8 @@ class Exl3StreamTrace:
         ``extent_cqe_ns[].cqe`` is when the wait that reaped the extent returned, not a per-completion time.
         ``dropped_before`` is how many records the native trace ring dropped, for being full, just
         before this line's record: nonzero means lines are missing at this point of the file.
+        ``schema`` 4 adds ``request.lanes``: the layer's planned lane count for that request (RAM hits and
+        misses; ``rows_asked`` counts only the misses read), which with the line's ``layer`` gives lanes per layer.
         """
         if self._file is None or not records:
             return
@@ -209,6 +212,7 @@ class Exl3StreamTrace:
                     "rows": record["rows"],
                     "batches": record["batches"],
                     "backlog": record["backlog"],
+                    "lanes": record["lanes"],
                 },
                 "status": record["status"],
                 "rows_asked": record["rows_asked"],

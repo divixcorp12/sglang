@@ -237,6 +237,7 @@ STAGE_FIELDS = (
     *(f"row_admit_{k}" for k in range(STAGE_TRACE_ROWS)),
     *(f"extent_submit_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
+    "lanes",
 )
 STAGE_KINDS = ("demand", "advisory", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
@@ -267,7 +268,8 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     ``extent_cqe`` one ``{"row", "part", "submit", "attempts", "cqe"}`` per extent issued (first
     ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed, ``attempts`` its resubmissions.
     ``cqe`` is when the wait that reaped the extent returned: io_uring gives no per-completion time.
-    ``dropped_before`` counts the records the ring dropped just before this one.
+    ``dropped_before`` counts the records the ring dropped just before this one. ``lanes`` is the planned
+    lane count the device posted with the request (schema 4).
     ``bytes`` is the completed total; the rest of the split is ``useful/submitted/retried/cancelled_bytes``.
     """
     out = []
@@ -364,14 +366,21 @@ def page_word(page: torch.Tensor, name: str) -> int:
     return int(page[offset : offset + 4].view(torch.int32)[0]) & 0xFFFFFFFF
 
 
-def sim_post(page, row: int, need, protect, *, advisory: bool = False, after: int = 0, armed: bool = True) -> int:
+def sim_post(
+    page, row: int, need, protect, *, advisory: bool = False, after: int = 0, armed: bool = True, lanes: Optional[int] = None
+) -> int:
     """Post a record as the device post kernel does; returns its sequence.
+
+    ``lanes``: the planned lane count the record carries (the plan's count, unclamped); by default the
+    number of need ids, as if every planned lane were a miss.
 
     ``armed``: a device waits on the record. The post kernel arms a demand record when
     its need is non-empty or advisories are on; the thread only touches for an unarmed one.
     """
     return int(
-        _host_module().exl3_ram_miss_sim_post(page, row, _ids(need), _ids(protect), int(advisory), after, int(armed))
+        _host_module().exl3_ram_miss_sim_post(
+            page, row, _ids(need), _ids(protect), int(advisory), after, int(armed), len(list(need)) if lanes is None else int(lanes)
+        )
     )
 
 

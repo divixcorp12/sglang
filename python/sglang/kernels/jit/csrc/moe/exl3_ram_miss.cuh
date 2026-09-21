@@ -53,6 +53,7 @@ constexpr int64_t kRecAfter = 12;
 constexpr int64_t kRecNeed = 16;
 constexpr int64_t kRecProtect = 48;
 constexpr int64_t kRecArmed = 80;
+constexpr int64_t kRecLanes = 84;
 constexpr uint16_t kServed = 1;
 
 constexpr int kPosted = 0;
@@ -98,7 +99,7 @@ __device__ __forceinline__ bool listed(const int32_t* ids, int count, int32_t id
 
 __device__ __forceinline__ void write_record(
     uint8_t* record, uint32_t seq, int64_t row, const int32_t* need, int need_count, const int32_t* protect,
-    int protect_count, uint32_t after, uint32_t armed) {
+    int protect_count, uint32_t after, uint32_t armed, uint32_t lanes) {
   volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(record);
   volatile uint16_t* halves = reinterpret_cast<volatile uint16_t*>(record);
   // Seqlock writer: invalidate seq before touching the payload, so a lapped record that
@@ -111,6 +112,7 @@ __device__ __forceinline__ void write_record(
   halves[kRecStatus / 2] = 0;
   words[kRecAfter / 4] = after;
   words[kRecArmed / 4] = armed;
+  words[kRecLanes / 4] = lanes;
   volatile int32_t* need_out = reinterpret_cast<volatile int32_t*>(record + kRecNeed);
   volatile int32_t* protect_out = reinterpret_cast<volatile int32_t*>(record + kRecProtect);
   for (int i = 0; i < kMaxIds; ++i) {
@@ -172,7 +174,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   state[kPosted] = static_cast<int32_t>(seq);
   uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
   const bool armed = need_count > 0 || advise != 0;
-  write_record(record, seq, row, need, need_count, protect, protect_count, 0, armed ? 1u : 0u);
+  const uint32_t lanes = static_cast<uint32_t>(max(count[0], 0));  // the plan's lanes, unclamped
+  write_record(record, seq, row, need, need_count, protect, protect_count, 0, armed ? 1u : 0u, lanes);
   __threadfence_system();
   st_release_sys(page + kDemandHead, seq);
   state[kPending] = armed ? static_cast<int32_t>(seq) : 0;
@@ -191,7 +194,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   if (advice == 0) advice = 1;
   state[kAdvised] = static_cast<int32_t>(advice);
   uint8_t* advice_record = page + kAdviseRing + static_cast<int64_t>((advice - 1u) % kAdviseRecords) * kRecordBytes;
-  write_record(advice_record, advice, next_row, ahead, ahead_count, ahead, ahead_count, seq, 1u);
+  write_record(advice_record, advice, next_row, ahead, ahead_count, ahead, ahead_count, seq, 1u, ahead_count);
   __threadfence_system();
   st_release_sys(page + kAdviseHead, advice);
 }

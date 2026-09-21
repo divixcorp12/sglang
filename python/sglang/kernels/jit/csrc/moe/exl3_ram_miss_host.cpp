@@ -138,6 +138,11 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // These are not in STAGE_ORDER on purpose: rows overlap, so no single order of stamps holds across
 // rows. Compare a row's own stamps: row_admit <= its extents' submit <= their cqe <= its pack_start.
 //
+// lanes (schema 4): the planned lane count the device posted with this request (kRecLanes), so a layer's
+// lanes per request can be read against its `row`. It counts RAM hits as well as the rows read: rows_asked
+// is only what was missing. Not clamped to kMaxIds, so a plan wider than the lanes the service is asked
+// for shows here.
+//
 // dropped_before: records the trace ring dropped, for being full, immediately before this one was
 // pushed. A gap in `seq` cannot locate a loss on its own (a skipped advisory has no record either).
 //
@@ -196,6 +201,7 @@ struct StageRecord {
   int64_t row_admit[kTraceRows] = {};
   int64_t extent_submit[kTraceExtents] = {};
   int64_t extent_attempts[kTraceExtents] = {};
+  int64_t lanes = 0;
 };
 static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
 // A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
@@ -1306,6 +1312,9 @@ constexpr int64_t kRecNeed = 16;
 constexpr int64_t kRecProtect = 48;
 // uint32: nonzero when the device waits on this demand record (need non-empty or advise on).
 constexpr int64_t kRecArmed = 80;
+// uint32: the layer's planned lane count as the device knew it when it posted (plan.count, RAM hits and
+// misses together, not clamped to kMaxIds); an advisory carries the rows it asks for.
+constexpr int64_t kRecLanes = 84;
 constexpr uint16_t kServed = 1;
 constexpr uint16_t kFailed = 2;
 
@@ -1357,6 +1366,7 @@ struct Request {
   int64_t row = 0;
   uint32_t after = 0;
   bool armed = true;
+  uint32_t lanes = 0;
   std::vector<int32_t> need;
   std::vector<int32_t> protect;
 };
@@ -1372,6 +1382,7 @@ inline bool read_record(const uint8_t* record, uint32_t expected, Request* reque
   std::memcpy(&request->after, record + kRecAfter, 4);
   uint32_t armed;
   std::memcpy(&armed, record + kRecArmed, 4);
+  std::memcpy(&request->lanes, record + kRecLanes, 4);
   request->armed = armed != 0;
   request->seq = expected;
   request->row = row;
@@ -1795,6 +1806,7 @@ class RamTier {
   // A demand publishes nothing unless every row landed. *rows: the rows it read (0 when it failed).
   bool serve(const Request& request, bool advisory, int64_t* rows) {
     *rows = 0;
+    if (cur_) cur_->lanes = request.lanes;
     std::vector<int32_t> wanted;
     for (const auto* ids : {&request.protect, &request.need}) {
       for (int32_t expert : *ids) {
@@ -1925,6 +1937,7 @@ class RamTier {
     const bool ok = request.armed ? serve(request, false, &rows) : touch_request(request);
     if (cur_ && !request.armed) {
       cur_->kind = kStageTouch;
+      cur_->lanes = request.lanes;
       cur_->row = request.row;
       cur_->ok = ok ? 1 : 0;
       cur_->status = ok ? kStatusTouch : kStatusFailed;
@@ -2106,7 +2119,14 @@ int64_t exl3_ram_miss_trace_dropped(int64_t handle) {
 // ---- Host-side simulated device: the post and wait kernels' protocol, for CPU tests ----
 
 int64_t exl3_ram_miss_sim_post(
-    TensorView page, int64_t row, TensorView need, TensorView protect, int64_t advisory, int64_t after, int64_t armed) {
+    TensorView page,
+    int64_t row,
+    TensorView need,
+    TensorView protect,
+    int64_t advisory,
+    int64_t after,
+    int64_t armed,
+    int64_t lanes) {
   using namespace exl3_ram_miss;
   auto* base = static_cast<uint8_t*>(page.data_ptr());
   const int64_t head_word = advisory ? kAdviseHead : kDemandHead;
@@ -2133,6 +2153,8 @@ int64_t exl3_ram_miss_sim_post(
   std::memcpy(record + kRecStatus, &pending, 2);
   std::memcpy(record + kRecAfter, &after32, 4);
   std::memcpy(record + kRecArmed, &armed32, 4);
+  const uint32_t lanes32 = static_cast<uint32_t>(std::max<int64_t>(0, lanes));
+  std::memcpy(record + kRecLanes, &lanes32, 4);
   if (need_count) std::memcpy(record + kRecNeed, need_ids.data(), 4 * need_count);  // data() may be null when empty
   if (protect_count) std::memcpy(record + kRecProtect, protect_ids.data(), 4 * protect_count);
   std::atomic_thread_fence(std::memory_order_seq_cst);
