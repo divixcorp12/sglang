@@ -505,12 +505,30 @@ Include expert identity in the immutable row result and validate it against the 
 > **never re-read**. Demonstrated on a 3-slot tier holding experts 0,1,2: a request
 > protecting only expert 4 leaves [1,2,4], while the same request also protecting
 > 0 leaves [0,2,4] -- **the resident planned lane 0 was evicted by the very
-> request it was planned for.** The demonstration is committed and runnable
-> (`unprotected_lane_eviction.py`), and it has been shown to fail: a mutant making
-> victim selection skip the resident planned lane turns it red, green again when
-> restored. Note what it represents -- the service never sees the device's planned
-> experts, only `need` and `protect`, so "planned lane not in `protect`" appears
-> as "resident and in neither". Today's only producer
+> request it was planned for.** This is now three CPU tests against the real tier
+> (`test_exl3_ram_miss_thread.py`, `ac58cb7f7d`), not a script. Note what they
+> represent: the service never sees the device's planned experts, only `need` and
+> `protect`, so "planned lane not in `protect`" appears as "resident and in
+> neither". If anyone later makes `take_slot_locked` protect lanes the service
+> cannot see, test 1 goes red **on purpose**, and V1b's precondition changes with
+> it.
+>
+> **A mutation control aimed at the mechanism can leave the claim untested.** The
+> control specified for this property was "the reservation ignores `wanted`"
+> (`take_slot_locked`'s `listed(protect, expert)` forced false). Run, it turns red
+> **only** the third test -- every-resident-protected, where the request must fail
+> and instead gets served. The eviction tests **stay green**, because a request
+> touches the residents it protects, making them most-recently-used, so **recency
+> alone selects the same victim whether or not `wanted` is honoured**. Protection
+> is the sole thing keeping a resident row only when no other victim exists. The
+> claim "an unprotected resident is a legal victim of its own request" therefore
+> needs its own control -- victim selection skipping that resident -- which does
+> turn the eviction test red. **Both controls are required; neither substitutes
+> for the other, and the intuitive one defends the weaker claim.** Generalise
+> this when writing any mutation control: a mutant that breaks the mechanism may
+> still be masked by an unrelated property of the code (here, LRU recency), so
+> derive the mutant from the sentence the test claims, not from the function the
+> test calls. Today's only producer
 > (router-miss via `expert_row_plan.py`) *does* keep every planned lane inside
 > `protect`, so this is a guarantee demanded of future producers rather than a live
 > defect; the Gate requires it asserted **on the device side**.
@@ -586,7 +604,7 @@ This permits CPU I/O for later rows to overlap the earlier row's SM transfer. It
 
    **Report all three differences with intervals: A1 v A0, A2 v A1, and A2 v A0** (A0 = today's unleased path, A1 = Task 5 lease-mode batched, A2 = the Task 6 mechanism). **A2 against A0 alone must not be presented as "the Task 6 result"** -- it credits Task 6 with the cost it inherits from Task 5. A2 against A1 alone is also not enough: quoting it without A1 against A0 hides a possible loss from Task 5. V1b, needing no lease mode, is measured against A0 directly. (`PER_ROW_TRANSFER_REVIEW.md` G2, a report-time trap that a correct baseline statement does not cover.)
 2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose **source-read safety** holds only because the service serves one request at a time, i.e. one that relies on invariants (a) or (b) in SAFETY rather than on an ownership grant, is rejected. (It is refused before measurement; clause 1 does not apply to it.) The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** The ground is *not* that the borrowed invariants go unstated -- this plan and `PER_ROW_TRANSFER.md` §3.3 state them -- so do not reinstate that reasoning.
-3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. Stated precisely: today's only **production** producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect` (`plan_candidates` lives in the same file with no production caller found), so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one.
+3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. **The control must be matched to the claim, not to the mechanism** -- see SAFETY, where the obvious control for this property turned out to leave the property's own test green. Stated precisely: today's only **production** producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect` (`plan_candidates` lives in the same file with no production caller found), so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one.
 4. **Required measurement:** the per-stage cost `g`. The per-row-versus-two-phase verdict turns on it at best order, where the net margin is 0.1-0.4 points, and no measurement of it exists.
 
 **A rejected variant is not a rejected task.** Two-phase is the chosen mechanism and is judged on its own; if launch or head-of-line cost cancels the benefit for *per-row*, that rejects per-row. Record which variant was rejected. If early transfer as a whole fails, retain Task 4 and evaluate native DMA or a readiness-aware gather under Task 9's **"Native DMA vs SM gather"** row, which now names the readiness-aware gather explicitly.
