@@ -4,7 +4,8 @@
 # Graph decode, GRAPH_GATHER=1, sessions 0-3, 256 prompt / 128 new tokens, 70 GiB pinned tier:
 # the workload of run-native-mirror-arm.sh, from clean detached worktrees instead of wt-dsv41.
 #
-# Usage: [DRY=1] task1-baseline-arms.sh <label> <run-dir> <code>:<mirror>:<trace>...
+# Usage: [DRY=1] EXPECT_NEW=<sha> REFERENCE=<clean-reference.json> task1-baseline-arms.sh <label> <run-dir> <code>:<mirror>:<trace>...
+# REFERENCE is REQUIRED and every arm's python/ tree must be in its "generations" (see generation_gate); else exit 5 before any arm.
 #   code   old | new     old = wt-task1-old (pre two-bank reader), new = wt-task1-new
 #   mirror on | off      SGLANG_MOE_EXPERT_MIRROR_DIRS set / unset
 #   trace  T | U         SGLANG_DSV41_EXPERT_TRACE_PATH set (traced) / unset (untraced)
@@ -77,6 +78,30 @@ preflight() {  # refuse to start unless the GPU, the port and the worktree are w
     echo "REFUSE: a compute process holds the GPU"; return 1
   fi
 }
+
+# Generation gate. REFERENCE (clean-reference.json) must be set, and the python/ tree of every arm's code must be one of its
+# "generations", or no arm runs. Checked for the whole list before the first arm so a bad tail cannot cost GPU time, and with DRY=1
+# too. Not overridable: an unregistered tree is a new code generation that would be compared as if it were an old one.
+# (Before this gate the manifest was advisory: an unknown tree printed "GENERATION unknown" and the arm was still VALID.)
+generation_gate() {  # <worktree> <sha>
+  local wt="$1" want="$2" tree label
+  if [ -z "${REFERENCE:-}" ] || [ ! -r "$REFERENCE" ]; then
+    echo "REFUSE: REFERENCE is unset or unreadable (${REFERENCE:-unset}); no arm's code generation can be checked. Set REFERENCE=<path to clean-reference.json>."
+    return 1
+  fi
+  tree=$(git -C "$wt" rev-parse "$want:python" 2>/dev/null) || { echo "REFUSE: cannot resolve $want:python in $wt"; return 1; }
+  label=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("generations", {}).get(sys.argv[2], ""))' "$REFERENCE" "$tree") || return 1
+  if [ -z "$label" ]; then
+    echo "REFUSE: python tree $tree of $want is in no generation of $REFERENCE. Register it first (key = git rev-parse <sha>:python)."
+    return 1
+  fi
+  echo "generation ok: $want python tree $tree = ${label:0:70}"
+}
+for spec in "${specs[@]}"; do
+  IFS=: read -r code _ _ <<<"$spec"
+  case "$code" in old) gwt=$WT_OLD; gwant=$HEAD_OLD ;; new) gwt=$WT_NEW; gwant=$HEAD_NEW ;; *) echo "bad code in $spec"; exit 2 ;; esac
+  generation_gate "$gwt" "$gwant" || { echo "NO ARM RUN (generation gate, arm spec $spec)"; exit 5; }
+done
 
 for spec in "${specs[@]}"; do
   IFS=: read -r code mirror trace <<<"$spec"

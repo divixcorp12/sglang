@@ -82,7 +82,7 @@ the difference matters exists and has not run (section 6, R1).
 behavioural commits: `85cdbf9382` (the service skips sequence 0 through the wrap; a C++ change, so the host module recompiles) and
 `8c78749b35` (attach refuses a gather wider than the 8 lanes; startup only). Both are expected to be inert on decode tok/s and neither has been
 measured, so a gen3 arm against a gen2 number is not a clean comparison. Registered in `task1-results/clean-reference.json`; the commit-by-commit
-table, the check that the manifest reproduces, and the finding that **nothing enforces the manifest** are in `task1-results/GENERATIONS.txt`.
+table, the check that the manifest reproduces, and the record that the manifest was advisory and is now enforced at launch are in `task1-results/GENERATIONS.txt`.
 
 ## 3. The matched baselines
 
@@ -351,8 +351,10 @@ So "matched" here means matched in workload, seed, capacity, policy and code. It
 5. **Do not quote the old-barrier gap to two decimals.** Until a second clean old arm exists, "about 3 %, all four sessions positive, old `n=1`, and the delta is four commits, not only two-bank".
 6. **Record cache residency of both mirrors and the source before and after** each arm. It moves without our reads (section 7.3).
 7. **Register the code generation before the first arm, not after.** `git rev-parse <HEAD>:python` must be a key in `clean-reference.json` `generations`.
-   Nothing enforces this: an arm run against an unregistered tree prints `GENERATION unknown` and is still `VALID` with exit status 0
-   (`task1-results/GENERATIONS.txt`, section 4). Check by hand, or add a preflight to `task1-baseline-arms.sh`.
+   `task1-baseline-arms.sh` now refuses (exit 5) to run any arm whose python tree is not registered, and refuses to run without `REFERENCE`
+   (`task1-results/GENERATIONS.txt`, section 4, with the observed refusal). It was advisory before: an unknown tree printed `GENERATION unknown` and
+   the arm was still `VALID`. The id names `python/` only, so it does not catch a change to the harness (`scripts/dsv41/provenance.py` changed at `c87b8dc181`);
+   compare the harness commit as well.
 8. **The gates below were calibrated for a quiet box and are wrong for this one** (task1e, `task1-results/task1e-RESULT.txt`). Register the gates for the
    machine you actually have **before** the series, not during it; task1e needed two amendments and still ended UNRESOLVED (2 valid arms).
    - *CONTENDED* disqualifies every arm when reth-binary, nimbus_beacon_node, htop and tmux are running on cores 32-63, as they were in all three task1e
