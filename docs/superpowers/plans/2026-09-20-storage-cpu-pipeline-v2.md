@@ -810,6 +810,18 @@ Include expert identity in the immutable row result and validate it against the 
 >   **The consequence is the one this plan reserved for this moment: V1's checklist, "deliberately absent" and
 >   "deferred until Task 5 (b) is real", is now due.**
 >
+>   **NARROWED 2026-09-21, and this correction is to the note above rather than to the plan.** Saying the eviction
+>   predicate is "delivered" overstates it. `leased_locked` has exactly three call sites: the public `release()`
+>   throw (`:1981`), `census_locked` (`:2391`), and `take_slot_locked`'s **`kReady` eviction scan** (`:2415`). The
+>   free-slot fast path at the top of `take_slot_locked` (`:2408-2409`) returns the first `kFree` slot and never
+>   consults it. **So the predicate protects a leased slot only while that slot is `kReady`; the moment anything
+>   puts it in `kFree` the protection is gone, silently.** That is consistent with the mutation result rather than
+>   contradicted by it -- "deletion kills exactly one test and nothing else" is itself a hint that no test stands
+>   over the free-slot path. It is the same gap that Task 6's checklist records as the `release_locked` landmine
+>   (`task6-v1-checklist.md` section 2), seen from the Task 5 side, and Task 5 item 5's R3 mutant reaches it from a
+>   third direction. V1 is not exposed, because it never frees a leased slot, but nothing in the tree enforces that
+>   for the next mechanism that tries.
+>
 > The hit lease must be taken **in the same `mutex_` section as the reservation**,
 > not merely "at reservation": today's `serve()` drops the mutex between
 > reservation and `read()`. What Task 5 must absorb is **when** the `RowResult`

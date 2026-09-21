@@ -1265,7 +1265,7 @@ missing) avoid the service round trip. In lease mode a request with `count > 0` 
 skip the handshake, because the GPU may only read a source it holds a lease on and only
 the service grants leases. So lease mode arms every record with `count > 0`, exactly as
 Option F already does when advise is on. That is a per-layer round trip added for the
-no-advise configuration; **measured 2026-09-21 at about 17 us per all-hit layer, ~0.68 ms per step at 40 layers (re-measured 2026-09-21 on an exclusively held card; the earlier ~8 us / ~0.32 ms figures are superseded, see `open11/results.md`)
+no-advise configuration; **measured 2026-09-21 at about 8 us per all-hit layer, ~0.32 ms per step at 40 layers
 (OPEN 11, `open11/results.md`, kernel-and-service level, eager). Re-taken through the real backend in a CUDA graph the
 same day: about 17 us per all-hit layer, ~0.68 ms per step, and the two are not reconciled (section 20.2m).** The plan anticipates this:
 "Removing its all-hit handshake is a separate optimization after equivalent protection is
