@@ -404,20 +404,39 @@ Include expert identity in the immutable row result and validate it against the 
 > -- M2 promotion admission is a request class on the same thread, below demand,
 > cancelled at the next row, and a promotion's source lease only adds protection.)
 >
-> **Facts a `kBusySeq` consumer must honour.** It **clears before `demand_done`**
-> (0.2-0.9 us gap), so both words must be polled together and a reader may
-> legitimately see `(done pending, busy 0)` once. **Advisories never set it**, so
-> `== 0` does not mean idle -- only `== seq` carries information. Observation is
-> **not guaranteed but fail-safe**: the window is 5.03 ms (mirrors on) / 10.25 ms
-> (off) for requests that read rows, but **0.6-1.8 us for requests that read
-> nothing**, at or below one poll period, so all-hit requests are not reliably
-> observable; a miss falls through to the batched path and grants nothing. A hit
-> copy lasts milliseconds (~2.3 ms for two lanes at `c`), longer than the all-hit
-> window, so the word does not contain the copy in the case where it is least
-> observable. **These window figures and the 3-slot demonstration below are cited
-> to a message, not to a committed artefact** (`t1-instrument` is closing this);
-> they are plausible against the source but not currently re-checkable from the
-> tree.
+> **Facts a `kBusySeq` consumer must honour**, each labelled by how it is known
+> (`de31ca98b8`; scripts and output under `analysis/dsv41-drive/`).
+>
+> - **Advisories never set it** -- so `== 0` does not mean the service is idle;
+>   only `== seq` carries information. *Directly observed* by a polling probe: the
+>   word stayed 0 throughout an advisory, and read `== seq` 4,782 times during one
+>   request and 0 times after it.
+> - **It clears before `demand_done`.** *Read from the source, not executed.*
+>   `handle_demand` and `pump_demand` issue release stores in that order on one
+>   thread. A mutant that moves the clear to **after** the done store is **NOT
+>   caught** by the probe (3 runs, all pass): a host poller cannot land in a
+>   sub-microsecond gap. So a consumer must still poll both words together and
+>   tolerate seeing `(done pending, busy 0)` once -- but this plan asserts the
+>   ordering on a code reading, and no test defends it. Making it testable needs a
+>   device poll under the GPU lock.
+> - **Window sizes are DERIVED FROM STAGE STAMPS, not observed on the word**, and
+>   every one of them **overstates** the true window because the stamps bracket
+>   more than the word's lifetime. Read-requests: minimum 5.03 ms (mirrors on) /
+>   10.25 ms (off), n = 7,211 each. All-hit requests: p50 0.61-0.75 us, p99
+>   1.55-1.75 us, n = 13,589. Clear-to-done: p50 0.22-0.34 us, p99 0.64-0.88 us --
+>   an **upper bound** containing `set_status`, the sfence, the clear, the done
+>   store and the stamp.
+>   **The read-request window is not a protocol fact.** It tracks this workload's
+>   read time by construction, so it is a statement about these drives under this
+>   workload and must not be carried to another.
+>
+> The consumer-facing consequence is unchanged: all-hit requests are **not
+> reliably observable** (their window is at or below one poll period), a missed
+> observation is benign (it falls through to the batched path and grants nothing),
+> and a hit copy lasts milliseconds (~2.3 ms for two lanes at `c`) -- longer than
+> the all-hit window, so the word does not contain the copy in the case where it
+> is least observable. **Still unmeasured:** how often a *device* poll lands in
+> the window, which needs a kernel under the GPU lock.
 >
 > **An early-read variant fails SILENTLY, not loudly.** On today's path the wait
 > kernel reads the map *after* `demand_done`, an evicted planned lane reads -1 and
@@ -426,8 +445,14 @@ Include expert identity in the immutable row result and validate it against the 
 > VRAM misses, so `hot` does not save them). Phase 1 sees `entry >= 0` and copies
 > it; phase 2 handles only lanes that were `< 0` at phase 1; a later eviction is
 > **never re-read**. Demonstrated on a 3-slot tier holding experts 0,1,2: a request
-> protecting only expert 4 leaves [1,2,4] -- **the resident planned lane 0 was
-> evicted by the very request it was planned for.** Today's only producer
+> protecting only expert 4 leaves [1,2,4], while the same request also protecting
+> 0 leaves [0,2,4] -- **the resident planned lane 0 was evicted by the very
+> request it was planned for.** The demonstration is committed and runnable
+> (`unprotected_lane_eviction.py`), and it has been shown to fail: a mutant making
+> victim selection skip the resident planned lane turns it red, green again when
+> restored. Note what it represents -- the service never sees the device's planned
+> experts, only `need` and `protect`, so "planned lane not in `protect`" appears
+> as "resident and in neither". Today's only producer
 > (router-miss via `expert_row_plan.py`) *does* keep every planned lane inside
 > `protect`, so this is a guarantee demanded of future producers rather than a live
 > defect; the Gate requires it asserted **on the device side**.
