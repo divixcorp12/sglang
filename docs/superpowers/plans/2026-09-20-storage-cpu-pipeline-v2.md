@@ -661,6 +661,33 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > by inspection.** Only executing the mutant found it. So "name the mutation" is
 > necessary but not sufficient -- the mutation must be *run*.
 >
+> **CALIBRATION -- read this before quoting the count** (`TESTS_THAT_CANNOT_FAIL.md`,
+> `e1c7bde9e6` + `c44f962f36`). A five-slice sweep read **~1,140 tests** and
+> proved **~20** unable to fail for the reason they claim: **under 2%**,
+> excluding the registration gap. **The byte-exactness suites are NOT vacuous.**
+> Readers, mirror sources, read-split, copy kernels, doorbell copies, host tier,
+> hot-cache publication and fused route plan all use distinct random rows,
+> non-identity permutations, zeroed or sentinel destinations, independent
+> references, and poison bytes in bytes the code actually reads.
+>
+> **The defects cluster in three places:** failure-path tests, guards that some
+> *other* condition already satisfies (so the guard under test never fires), and
+> an instrument's self-report. That is a far more useful statement than the raw
+> count, and the count must not be quoted without it -- "21 checks cannot fail"
+> invites the false inference that the suite is worthless, and it is not.
+>
+> Separately and not merged into the count: **22 files / 279 tests have no
+> `register_*_ci` call and 17 files / 171 tests are registered with no
+> `__main__` entry.** `collect_tests` raises loudly on both, so this is not a
+> silent green -- those files run only under a manual pytest invocation. It is a
+> coverage-plumbing problem, a different defect from a test that passes for the
+> wrong reason.
+>
+> **No mutant in that sweep was run**; findings are marked `[re-verified]` or
+> `[reviewer-established]` at the source, with a ranked list of the mutations
+> worth actually running (`host.cpp:2054`, `expert_hot_cache.py:292`,
+> `verify_expert_mirror.py:519`/`:534` separately, `exl3_expert_layout.py:64`).
+>
 > **RULE for the remainder of this plan: write the mutant first.** Before a test
 > is accepted as evidence for any gate here, name the specific change to
 > production code it must fail against, and show it failing. A test whose
