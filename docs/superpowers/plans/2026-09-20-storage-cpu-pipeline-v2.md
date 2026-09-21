@@ -392,10 +392,18 @@ Include expert identity in the immutable row result and validate it against the 
 >   only direct measurement of this kernel is 12.34 GB/s past L2
 >   (`NC_VISIBILITY.md`), giving **c = 1.079**; `cudaMemcpyAsync` gives 0.966.
 >   **The existing evidence bounds `c` to roughly 0.97-1.08 ms and does not choose
->   within it.** The qualitative point stands -- the copy is link work, so copying
->   early moves link time into the read wait
->   **moves** link time into the read wait rather than creating capacity, and
->   promotion copies, the prefetch puller and the eager gather share that link.
+>   within it.** The qualitative point stands: the copy is link work, so copying
+>   early **moves** link time into the read wait rather than creating capacity,
+>   and promotion copies, the prefetch puller and the eager gather share that
+>   link.
+>
+> - **A single `c` is the wrong model, and the error it hides is larger than the
+>   bandwidth one.** The per-row mechanism copies one row per launch, so what
+>   matters is `T(n)`, the gather's cost at counts 1-6. If a `count = 1` launch
+>   costs delta more than its batched share, per-row loses 13.97 read requests per
+>   step x delta -- and **delta = 80 us costs 1.1 ms/step, the whole of
+>   G* = 1.114 ms.** That is `PER_ROW_TRANSFER.md` OPEN 1, it is invisible to any
+>   bandwidth check, and it can decide the per-row verdict on its own.
 >
 > Supporting figures: (RANDOM - 1 ms)/T = 7.5% against the 3% bar; two-phase/BEST
 > = 87.9%, so the split is 88/12; hit lanes in layers that read nothing are 73.9,
