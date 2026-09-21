@@ -265,441 +265,212 @@ Include expert identity in the immutable row result and validate it against the 
 
 **Files:** Files from Task 5; `python/sglang/srt/layers/moe/expert_row_plan.py`; `python/sglang/kernels/ops/moe/expert_cache_transfer.py`; `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`; graph wrapper/backend tests; `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`.
 
-> **SUMMARY OF THIS TASK'S STANDING** (the detail below is the audit trail; read
-> this first):
-> 1. The mechanism this plan originally specified -- fixed-order per-row -- is
->    **expected-REJECTED by arithmetic**, and is about **15.7 ms/step *worse***
->    than the two-phase alternative. **Read that label precisely** (`d22af00980`):
->    the rejection is decisive at *random* lane order, where per-row loses
->    outright by 15.67 ms and where measured `k` strengthened it by 2.6 ms. At
->    *best* order it is **thin and does not follow from arithmetic alone**: the
->    gross increment is +4.93 ms, and net of V2's 160 extra stage triples per step
->    it is about +2.7 to +3.6 ms, **1.1-1.4% against a 1.5% resolution -- a margin
->    of 0.1 to 0.4 points**. That margin is `k`-free, so no lane measurement can
->    settle it, and it turns on a stage cost of 8-14 us that **has never been
->    measured**: at about 5 us or below, best-order per-row would clear the bar
->    instead. The honest statement is *not distinguishable from V1 at best order,
->    losing outright at random order*. What saves the label is that the real
->    resolution is worse than 1.5% (the series is UNRESOLVED on the contended
->    box), which favours rejection -- i.e. the label survives on the weakness of
->    our instrument, not on the strength of the result.
->    **Measuring the per-stage cost would settle this**, and is the cheapest
->    open item that could overturn a standing verdict.
-> 2. **Two-phase (hits, then the rest) is the chosen mechanism.** It is
->    **supported by the modelled ceiling as an upper bound, and not yet
->    measured**; per-row is retained below only as the variant that must beat it.
+> **STANDING.** Every statement here is current; nothing in this section is a
+> correction of something above it. The history of how these figures and claims
+> moved is **deliberately not here** -- it is in `PER_ROW_TRANSFER.md` §1.5, in
+> `PER_ROW_PRECHECK_REVIEW.md` R1-R6, in `PLAN_TASK6_REVIEW.md`, and in the
+> commit messages on this file. If a number below disagrees with one of those,
+> this one is right.
+>
+> 1. **Two-phase (hit lanes, then the rest) is the chosen mechanism.** It is
+>    supported by a modelled ceiling as an upper bound. It is **not measured**.
+> 2. **Fixed-order per-row (V2) is expected-REJECTED**, decisively at random lane
+>    order (-15.67 ms/step) and **only marginally at best order**, where the net
+>    increment is +2.7 to +3.6 ms, or 1.1-1.4% against a 1.5% resolution. That
+>    margin is 0.1-0.4 points, is `k`-free, and turns on a per-stage cost `g` of
+>    8-14 us that **has never been measured**; at `g` around 5 us or below,
+>    best-order per-row clears the bar. The label currently survives because the
+>    real resolution is *worse* than 1.5% (the series is UNRESOLVED on the
+>    contended box) -- i.e. on the weakness of the instrument, not the strength of
+>    the result. **Measuring `g` is the cheapest open item that could overturn a
+>    standing verdict in this plan.**
 > 3. **Neither mechanism's saving exists today.** Both need an early,
->    device-visible readiness signal that does not exist, confirmed at the
->    source. For a **Task-5-compliant** mechanism that signal is also a *safety*
->    requirement; the gated variant V1b below borrows today's temporal exclusion
->    instead, and pays for it with a device-side invariant no producer guarantees.
-> 4. **No Task-5-compliant Task 6 can be accepted before Task 5 (b) lands**, and
->    Task 6 invalidates the standing justification for a race that is benign today.
-> 5. **A1 no longer has to be assumed.** The lane counts are now *measured*
->    (schema 4, `dad59f1b48`). Every figure remains conditional on (3), on
->    c = 1.055, on the 1.0 ms launch cost, and on one workload.
-> 6. **A cheaper, non-Task-5-compliant V1 exists** (V1b, `kBusySeq`-gated): the
->    88% share with no service change, safe only under today's invariants. **It
->    is excluded by the Gate**, clause 2 -- the borrowed exclusion expires when
->    the service stops serving one request at a time. (An earlier revision
->    pointed at item 4, which is about Task 5 (b) and is not the reason.)
-> 7. **The hit-phase saving is capped by link idle inside read waits**
->    (`PER_ROW_TRANSFER_REVIEW.md` G1). `c` is the Gen3 link's time per row
->    (13.3 MB in 1.055 ms is about 12.6 GB/s against a measured 12.02), so
->    copying early *moves* link time into the read wait rather than creating
->    capacity. V1's ceiling is a ceiling by construction. **Consequence for the
->    arms:** promotion copies, the prefetch puller and the eager gather all share
->    that link, and any of them running inside a read wait subtracts directly from
->    the hiding. **Task 6 arms must run with promotions off**, and must say so, or
->    they measure the link contention rather than the mechanism.
->
-> **The pre-registered GENEROUS reject test is `k`-free and did not reject**
-> (`d22af00980`). It tests early transfer *as a whole*, not per-row against
-> two-phase, and it fixes `k` = 6 for every reading request, so no lane estimate
-> enters it and the measurement could not move it. Rescaled to 511 steps it is
-> **73.0 ms/step, 28.7% of 254.4 ms, against a 1.5% (3.8 ms) reject threshold --
-> about 19x margin**. Early transfer is not in doubt; only the choice of
-> mechanism is.
->
-> **CURRENT FIGURES.** Per **511** decode steps, shares of **254.4 ms**. These
-> supersede every figure in the audit trail below, which records how they moved
-> and **must not be quoted**.
->
-> **Every saving in this table is MODELLED, not measured.** What the trace
-> measured is the *lane count* `k` -- the last column -- which used to be an
-> estimate and now is not. BEST, RANDOM and two-phase are model outputs that
-> consume `k`, and they still rest on exactly the untested inputs they always
-> did: `c` = 1.055 ms per row, **A2** (hit lanes ready at reservation -- the
-> signal that does not exist), the 1.0 ms launch cost, one workload, and stage
-> stamps joined from `task1-2-new-on-T`. A better `k` does not make them
-> measurements. **No saving in this task has been measured end to end.**
->
-> | quantity | ms/step | share of 254.4 | moves with `k`? |
-> |---|---:|---:|:--|
-> | V2 / BEST (per-row, order array, best order) | **40.67** | 16.0% | yes |
-> | V1 / two-phase (hits, then the rest) | **35.74** | 14.0% | yes |
-> | plan-original fixed-order per-row / RANDOM | **20.07** | 7.9% | yes |
-> | per-row over two-phase, **best** order | **+4.93** | +1.9% | **no** -- it is Sigma(m-1)c |
-> | per-row over two-phase, **random** order | **-15.67** | -6.2% | yes |
-> | hit lanes per step in layers that read | **33.9** | -- | this **is** the measurement |
->
-> **The two-phase row is a ceiling by construction, and the table should not be
-> read as a prediction.** 33.9 hit lanes x c = 1.055 gives 35.77, which is the
-> 35.74 figure to rounding: it is simply *every hit copy perfectly hidden*. The
-> only inputs beyond the measured lane count are `c` and A2. Nothing in it models
-> a hit copy that fails to hide.
->
-> **The fourth row is the one to read carefully.** Three rows of savings move
-> when `k` moves, and the best-order increment does not: it is Sigma(m-1)c and is
-> independent of the lane count. A reader who sees the other figures rise by
-> 13-16% between the `k` estimates below and reasonably assumes +4.93 rose with
-> them will draw the wrong conclusion about what the measurement bought.
-> (Suggested by `t6-perrow`, whose `PER_ROW_TRANSFER.md` §1.2 carries the same
-> column; before this the point was made only in a parenthesis.)
->
-> (RANDOM - 1 ms)/T = **7.5%** against the 3% bar. two-phase/BEST = **87.9%**, so
-> the split quoted elsewhere as 87/13 is 88/12. A1's estimate undercounted hit
-> lanes in read layers by about **14%**: per read request its `k` was exact for
-> only 36%, low for 42% and high for 22%.
->
-> **How `k` moved the savings** (audit trail for the table above; these rows are
-> superseded top-down and must not be quoted):
->
-> | source of `k` | BEST | RANDOM | two-phase | hit lanes |
-> |---|---:|---:|---:|---:|
-> | **measured `k`** (`dad59f1b48`) | **40.67** | **20.07** | **35.74** | **33.9** |
-> | estimated `k` (A1), R6-corrected | 35.80 | 17.79 | 30.88 | 29.3 |
-> | estimated `k` (A1), as registered | 38.61 | 19.17 | 33.53 | 31.9 |
->
-> **Denominator: 254.4 ms, decided here so the plan and the design agree.** It
-> is the mean of the `new:on` arms `clean-reference.json` accepts. The 257.5 ms
-> set used previously was named before its verdicts were read and includes the
-> INVALID `task1-6`. The two differ by 1.2% and cross no bar, so nothing turns on
-> the choice -- but the same shares were being quoted against two step times in
-> two documents, which is how a 1.2% discrepancy becomes an argument later.
-> **Neither figure is purely untraced:** 254.4 is a mean of four arms, three of
-> them traced, and the only clean untraced on-arm alone gives 254.7 ms (n = 1),
-> so traced stretching is not excluded from either. An earlier revision of this
-> paragraph called `task1c-3` "disturbed"; **that label is withdrawn** -- its
-> verdict file reads VALID with a boot-warm regime note and no disturbance mark
-> exists. See the correction later in this plan, which this paragraph
-> contradicted.
+>    device-visible readiness signal. None exists: `kDemandDone` is stored in
+>    exactly one place, `RamTier::pump_demand`, *after* `handle_demand` returns,
+>    and `exl3_ram_miss_wait_kernel` polls only that word. `slot_map` does not
+>    substitute -- `publish_map` for new rows also runs after `read()`.
+> 4. **No Task-5-compliant Task 6 can be accepted before Task 5 (b) lands.** The
+>    one mechanism that escapes this (V1b) is refused by the Gate; see SAFETY.
+> 5. **Early transfer as a whole is not in doubt.** The pre-registered GENEROUS
+>    reject test gives every reading request `k` = 6, so no lane estimate enters
+>    it; at 73.0 ms/step it is 28.7% of the step against a 1.5% (3.8 ms) reject
+>    threshold, about 19x margin. It did not reject. **Only the choice of
+>    mechanism is open.**
 >
 > ---
 >
-> **The mechanism this plan originally specified is not justified by the benefit
-> it was designed to exploit.** A pre-registered analysis of the existing graph-decode traces
-> (`analysis/dsv41-drive/PER_ROW_PRECHECK_PREREG.txt`, hashed before it ran)
-> finds the modelled saving is real -- **20.07 ms/step** at random lane order,
-> about **7.4%** after launch cost -- but that **88% of it is RAM-HIT lanes gathered while
-> the NVMe read runs, and only 13% needs miss rows to finish at different
-> times**. Per-row transfer's own contribution over a simple **hits-then-rest
-> two-phase copy** is at most **4.93 ms/step**, about **1.9% gross** -- which is
-> *above* the ~1.5% this plan's arms resolve (`task1e-PREDICTIONS.txt` line 10)
-> -- and **that 1.5% is itself optimistic**, since it derives from task1e's
-> quiet-box standard deviation and that series is UNRESOLVED. The true
-> resolution is worse, which widens rather than narrows the gap.
-> It falls to about 1% only **net of launch cost**, i.e. **at** the design's
-> resolution rather than clearly below it. (An earlier revision of this
-> blockquote cited 2.55 ms / 1.0% as the gross figure and called it below
-> resolution; that was wrong on both counts. 2.55 ms is the registered
-> `RANDOM-miss-only`, which is per-row against *batched*, not V2 minus V1.) The two-phase mechanism
-> captures nearly the same benefit with no per-lane wait chain, no A4 ordering
-> assumption, no *per-lane* partial terminal mask (`PER_ROW_TRANSFER.md` §3.1
-> notes V1 still needs one if stage 2 fails after stage 1 copied) and no
-> head-of-line problem. Prefer it
-> unless a measurement shows otherwise.
+> **FIGURES.** Per **511** decode steps, shares of **254.4 ms**.
 >
-> Two further corrections from the same analysis: **with mirrors on** the
-> measured miss-row spread is **Task 4's serial packing** (2.77 ms, against ~2.7
-> ms per row of packing), not drive completion order, so this task's premise was
-> partly a misattribution of a Task 4 artefact -- and parallelising packing would
-> shrink the 13% further, making per-row *less* attractive as Task 4 improves.
-> **Correction:** the perfect pack-order result (1,888 of 1,888) was attributed
-> in earlier revisions of this plan -- by me, and in the first independent
-> review -- to `pack_one`'s lowest-ordinal
-> tie-break. **That is refuted.** Row completion stamps show **0 inversions** in
-> 1,842 m>=2 requests on each of three on-arms and the off-arm, and **0 of 4,750
-> consecutive-row pairs on one drive part** completed out of order, with
-> same-reap ties only 3.7% of adjacent pairs (0% mirrors-off). The ordering is
-> **consistent with per-drive FIFO completion** and not with the packer. FIFO is
-> the natural explanation and is *not* separately tested -- NVMe does not
-> guarantee completion order, and uniform-size reads submitted in row order would
-> look the same -- so the design must carry FIFO completion per drive part as an
-> explicit assumption rather than a finding; `MIRROR_ROWS`' tail
-> means bunching, not reordering.
-> **With mirrors off the spread is 7.4 ms and is drive-bound**, so the
-> misattribution claim holds only in the regime this system actually runs in, and
-> must not be restated as a general one. The precheck's modelled saving is the
-> same either way. The caveat that carries the result is that hit
-> lanes are assumed to spread evenly over layers; the traces do not record lanes
-> per layer, so an instrumentation item is requested to record the planned lane
-> count per request (**landed**: schema 4, `4e63616666`, records `lanes` per
-> request; a schema-4 trace can replace the bounds below with a measurement).
+> | quantity | ms/step | share | moves with `k`? |
+> |---|---:|---:|:--|
+> | V2 / BEST (per-row, order array, best order) | 40.67 | 16.0% | yes |
+> | V1 / two-phase (hits, then the rest) | 35.74 | 14.0% | yes |
+> | plan-original fixed-order per-row / RANDOM | 20.07 | 7.9% | yes |
+> | per-row over two-phase, **best** order | +4.93 | +1.9% | **no** -- it is Sigma(m-1)c |
+> | per-row over two-phase, **random** order | -15.67 | -6.2% | yes |
+> | hit lanes per step in layers that read | 33.9 | -- | this **is** the measurement |
 >
-> **FIGURE HISTORY -- SUPERSEDED BY THE MEASURED TABLE ABOVE; DO NOT QUOTE THE
-> NUMBERS IN THIS PARAGRAPH OR THE ONES BEFORE IT.** Two rounds of correction
-> moved these figures, and this paragraph records the first. (`1c829245ab`, R6.)
-> The traces'
-> 495 `graph_step` lines cover **511 decode steps**: 16 lines are merged
-> (`steps` = 2, `routed_rows` 480 against 240). The precheck divides savings from
-> 511 steps' requests by 495, *and* takes `k` from a two-step `vram_miss` on
-> those merged lines, giving `k` = 6 (capped) where the truth is about 3.3 on ~6%
-> of requests. Both errors inflate. Corrected, per decode step: **BEST 35.80**
-> (not 38.61), **RANDOM 17.79** (not 19.17), **two-phase 30.88** (not 33.53),
-> per-row over two-phase **+4.93** best / **−13.08** random. Hit lanes credited
-> fall 31.9 -> 29.3. **No verdict changed** -- (RANDOM − 1 ms)/T was 6.5% against
-> the 3% bar, and the 87/13 split is a ratio of quantities that scale together.
-> The spread of the correction is **3% to 9%** depending on the quantity (an
-> earlier revision said 3-7%, copying R6's prose, which its own table contradicts).
-> The script divides by `n_steps = len(used_steps)` -- the number of distinct
-> `graph_step` *lines*, 495 here -- so the **pre-registered script carries the
-> bug**, not merely the prose. (There is no literal `495` in the script; an
-> earlier revision of this plan said there was.) R6 also notes that the client
-> saw 4 x 127 = 508 steps and the **3-step gap to 511 is unexplained**; it moves
-> any figure by 0.6%. The A1 bounds below were not recomputed at 511.
+> **Every saving in this table is MODELLED. No saving in this task has been
+> measured end to end.** What the trace measured is the lane count `k` -- the last
+> row. The rest are model outputs consuming it, and rest on `c` = 1.055 ms/row,
+> **A2** (hit lanes ready at reservation -- the signal that does not exist), a
+> 1.0 ms launch cost, one workload, and stage stamps joined from
+> `task1-2-new-on-T`. Two consequences a reader will otherwise get wrong:
 >
-> **A1 was first bounded, then measured, and the prediction held.** The bounding
-> step (independent recompute, `f1cda7ba72`) *bounded* hit-lane placement without
-> assuming it: of 111.9 hit lanes/step, the data force **at least 10.8 and at
-> most 63.6** into read layers (A1 credited 31.9). At the worst placement
-> two-phase still yielded about 4%, clearing the 3% bar, while random-order
-> per-row fell to about 2.8%, just under it -- so A1 decided the per-row column
-> only. Two-phase floors (unregistered): >=3% at f = 0.26, >=1.5% at f = 0.145.
+> - **The best-order increment does not move with `k`.** It is Sigma(m-1)c. No
+>   lane measurement can settle the per-row verdict at best order.
+> - **The two-phase row is a ceiling by construction.** 33.9 x 1.055 = 35.77,
+>   which *is* the 35.74 figure: it is every hit copy perfectly hidden. Nothing in
+>   it models a hit copy that fails to hide. `c` is the Gen3 link's time per row
+>   (13.3 MB in 1.055 ms is 12.62 GB/s against a measured 12.02), so copying early
+>   **moves** link time into the read wait rather than creating capacity, and
+>   promotion copies, the prefetch puller and the eager gather share that link.
 >
-> **The measurement then landed inside those bounds** (schema 4 on
-> `task1f-0-new-on-T`, `dad59f1b48`): **33.9 hit lanes per decode step in layers
-> that read**, against bounds of 10.8-63.6 (about 10.5-61.6 rescaled to 511, by
-> scaling rather than recomputation). 33.9 sits 46% of the way across, nowhere
-> near an edge, and is **3.0x the registered SUPPORT floor**. A1's layer-level
-> premise -- that lanes spread evenly over layers -- held (2.4 to 4.1 lanes per
-> layer per step; first ten layers 3.07 against 3.17 for the last ten); its
-> *per-request* lane count did not. The figures above the table are therefore
-> history, and the measured row is what this task plans against.
+> Supporting figures: (RANDOM - 1 ms)/T = 7.5% against the 3% bar; two-phase/BEST
+> = 87.9%, so the split is 88/12; hit lanes in layers that read nothing are 73.9,
+> total 107.9.
 >
-> Checks on that trace: every one of 20,800 records is schema 4 with `lanes`
-> present, `dropped_before` is 0 throughout, `lanes >= rows_asked` on every read
-> request, and max `lanes` is 6 so the model's cap never bound. `sum(lanes)` over
-> decode requests is 64,635 against `sum(vram_miss)` 64,857, **-0.34%**, inside
-> the 0.5% tolerance; the residual **-222 lanes are unexplained** (register lag at
-> session start is the candidate and was not shown). **The per-line sum does not
-> hold** -- it matches on only 16 of 495 lines -- so only run sums are usable.
-> **Both residuals are now closed or localised** (`daef1deaf1`). The -222 lanes
-> were an artefact of the "has a `graph_step` line" filter, not of the trace:
-> grouped by session, `sum(lanes)` equals `sum(vram_miss)` **exactly** (0
-> difference) in sessions 2, 3 and 4, and session 1's difference is entirely
-> under forward 2, the first pass, which is not a graph decode step. -222 = 142 +
-> 80 exactly. **The check is exact per session**, which is a stronger statement
-> than the 0.5% tolerance it was first reported against -- though still not exact
-> per line. The 508-versus-511 gap is **localised, not explained**: sessions hold
-> 127, 128, 128, 128 graph steps against 127 client steps each, the extras
-> sitting at the boundaries where the no-line stubs are. A tail step split across
-> the boundary is the candidate and the mechanism is not shown.
+> **Denominator: 254.4 ms**, the mean of the `new:on` arms `clean-reference.json`
+> accepts, matching `PER_ROW_TRANSFER.md`. **It is not "clean untraced"**: it
+> averages four arms, three of them traced, and the only clean untraced on-arm
+> alone gives 254.7 ms (n = 1). Traced stretching is excluded from neither.
 >
-> The lane counts are joined onto `task1-2-new-on-T`'s stage stamps, because the
-> durations are timing-derived and `task1f` ran under accepted CPU contention; the
-> request streams are identical, and running the model on `task1f`'s own stamps
-> instead moves the figures by at most 0.06 ms.
+> **Measurement provenance** (schema 4, `4e63616666`, on `task1f-0-new-on-T`,
+> `dad59f1b48`). 33.9 hit lanes/step in layers that read, inside the 10.8-63.6
+> bounds predicted before the arm ran, 46% across and 3.0x the SUPPORT floor.
+> All 20,800 records carry `lanes`; `dropped_before` is 0; `lanes >= rows_asked`
+> on every read request; max `lanes` is 6, so the model's cap never bound.
+> Grouped by session, `sum(lanes)` equals `sum(vram_miss)` **exactly** in sessions
+> 2-4, session 1's difference falling entirely under forward 2 (the first pass,
+> not a graph decode step). **The per-line sum does not hold** (16 of 495 lines) --
+> **use run sums only**. The 508-vs-511 step gap is localised to session
+> boundaries (127/128/128/128 against 127 client steps each); the mechanism is not
+> shown. Timing is joined from `task1-2-new-on-T` because `task1f` ran under
+> accepted CPU contention; the request streams are identical and using `task1f`'s
+> own stamps moves nothing by more than 0.06 ms.
 >
-> **BLOCKING DEPENDENCY.** The 7.5-15% saving, and the 87% share attributed to
-> hit lanes, both assume the hit-lane gather can start while the NVMe read is
-> still outstanding. Publication today is **per-request**, and `demand_done` is
-> stored *after* `read()` returns, so no such early signal exists. The Task 6
-> design's own `[REQ 1]` -- asking `LEASE_PROTOCOL` to permit per-lane,
-> time-staged publication -- **is** that signal, filed as a protocol request
-> rather than as the prerequisite it is. Consequences:
+> ---
 >
-> - Every figure here is conditional on an early signal of *some* kind. For a
->   **Task-5-compliant** mechanism that signal is `[REQ 1]`; V1b below reaches the
->   same share by gating on `kBusySeq` and needs no `[REQ 1]`. As first written
->   this bullet said every figure was conditional on `[REQ 1]` itself, which V1b
->   falsifies.
-> - Among the compliant options it binds **V1 two-phase exactly as hard as V2
->   per-row**. V1's advantage is the 88% hit-lane share, unreachable without an
->   early signal. Preferring V1 does not avoid this cost, it relocates it.
-> - `[REQ 1]`'s cost is currently booked to Task 5 and appears in no Task 6
->   estimate. The cheapest form depends on whether hit lanes are already
->   resolved at plan time and merely kept host-side; that is under independent
->   check and is not yet established.
+> **WHAT THE SIGNAL COSTS, BY OWNER.** The information exists at the right moment
+> in the right thread: `RamTier::serve` resolves hit lanes authoritatively under
+> `mutex_`, before any read is submitted (`tier.expert_slot[expert] >= 0`),
+> host-side only, in C++-private `Tier` state.
 >
-> **CONFIRMED against the source** (`53bc8c7229`). `kDemandDone` is stored in
-> exactly one place, `RamTier::pump_demand`, *after* `handle_demand` returns --
-> i.e. after `serve()` has finished `RowReader::read()` and published every row.
-> `exl3_ram_miss_wait_kernel` polls only that word and has no per-lane or
-> per-phase input. `slot_map` does not substitute: `publish_map` for new rows
-> also runs after `read()`.
+> - **(a) small, Task 6's own:** publish each hit lane's `RowResult` inside the
+>   reservation critical section rather than after `read()`. This is V1's whole
+>   **service-side** delta. It is not the whole delta: `PER_ROW_TRANSFER.md` §3.1
+>   also requires a stage wait polling the hit lanes' words, one more copy stage,
+>   and a partial terminal mask for the case where stage 2 fails after stage 1
+>   copied. `lease_model.py` models none of those.
+> - **(b) large, Task 5's:** the words themselves, lease counters and retirement,
+>   the eviction predicate, and generations. **None of this exists.**
 >
-> **The early signal is a safety requirement, not only a performance one.** For
-> a RAM hit the `slot_map` entry already exists, so it is tempting to gather
-> hits from it during the read. That would be a correctness bug. The entry
-> carries **no ownership**, and today's safety rests on temporal exclusion that
-> early copying is precisely what removes -- an in-progress advisory on the same
-> tier evicts unprotected rows. The same early publication that lets the GPU
-> start is what grants the lease keeping the slot immutable. Any implementation
-> that treats this as a performance-only change, and reads `slot_map` early
-> without taking a lease, is reading memory that may be evicted under it.
+> The hit lease must be taken **in the same `mutex_` section as the reservation**,
+> not merely "at reservation": today's `serve()` drops the mutex between
+> reservation and `read()`. What Task 5 must absorb is **when** the `RowResult`
+> words are published, not which words exist.
 >
-> The change Task 5 must absorb is **when** the `RowResult` words are published
-> (at reservation, for hit lanes), not which words exist.
+> **Implementation landmine, V2 only.** Publishing miss rows early lets a row be
+> `kReady` and leased when a *later* row of the same request fails. `serve()`'s
+> `!ok && !cancelled` cleanup calls `release_locked` on every slot, and Task 5
+> makes releasing a leased slot throw, so the cleanup must skip published lanes or
+> the service thread throws on any mid-request failure. V1 does not hit this: its
+> hit lanes are already `kReady`.
 >
-> **CORRECTION to the "no early signal exists" claim above** (second review,
-> `0fc5640141`). No early *readiness* signal exists -- that stands. But
-> **`kBusySeq` (page offset 24) is device-observable and is written before
-> `serve()`**: `handle_demand` stores it as its first action, before reservation
-> and before `read()`, and clears it after `set_status`. No device kernel reads
-> it today; only the host watchdog does. So a **cheaper V1 exists** than the one
-> costed above: gate the hit phase on `kBusySeq == seq`, then read `slot_map`
-> and copy lanes that are `>= 0`. That costs a wait-kernel change and a stage
-> kernel, with **no service change at all**.
+> ---
 >
-> It is safe only under today's invariants -- one service thread, so no advisory
-> can run once the request is taken; `take_slot_locked` never evicts `wanted`;
-> eager paused -- and it is **not Task 5 compliant**. It buys the 87% by
-> *borrowing* the temporal exclusion rather than replacing it.
+> **SAFETY.** Today's correctness rests on **temporal exclusion** -- one service
+> thread, so no advisory runs once a request is taken; `take_slot_locked` never
+> evicts `wanted`; eager paused. **Early copying is precisely what removes it.**
+> A `slot_map` entry carries no ownership, so gathering hits from it during the
+> read is a correctness bug, not a performance shortcut. The same early
+> publication that lets the GPU start is what grants the lease keeping the slot
+> immutable. Precisely: an early copy needs *either* a service ownership grant
+> *or* a gate keeping the copy inside the interval where the single service thread
+> is within this request. The exposed window for an ungated copy is up to one
+> advisory serve (~10 ms, advise on), not microseconds, because eviction happens
+> at the advisory's reservation pass.
 >
-> **Correction to the expiry condition** (`98b4146ead`, G3): I first wrote that
-> it expires when the service becomes asynchronous, "which Task 8 exists to make
-> it". That is wrong. Checked against `PROMOTION_ASYNC.md`, the borrowed
-> invariants **survive Task 8 as designed** -- M2 promotion admission is a
-> request class on the same thread, strictly below demand and advisory, cancelled
-> at the next row when a demand is posted; and a promotion's source lease only
-> adds protection, so `wanted` is still never evicted. The correct condition is
-> that it **expires when the service stops serving one request at a time**. Task
-> 8 does not do that; Task 5's "asynchronous `progress()`" wording might. What
-> actually breaks it: overlapping the read of one request with serving another, a
-> producer whose planned lanes are not in `protect`, or any change letting an
-> eviction run inside a demand's read. Two things unverified: whether the
-> device reliably observes `kBusySeq` before it clears, and whether every planned
-> lane is in `protect` for every producer. **Both are answered below** -- the
-> first NOT guaranteed but fail-safe, the second *false*, and false in a way that
-> yields silent wrong bytes rather than a loud failure.
+> **V1b, the gated variant, and why the Gate refuses it.** `kBusySeq` (page offset
+> 24) is device-observable and written **before** `serve()`: `handle_demand`
+> stores it as its first action, before reservation and before `read()`, and
+> clears it after `set_status`. No device kernel reads it today; only the host
+> watchdog. So a cheaper V1 exists -- gate the hit phase on `kBusySeq == seq`,
+> then read `slot_map` and copy lanes `>= 0` -- costing a wait-kernel change and a
+> stage kernel with **no service change at all**, and reaching the 88% share
+> without `[REQ 1]`. It is refused on **durability**: the borrowed exclusion
+> expires when the service stops serving one request at a time, which Task 5's
+> asynchronous `progress()` wording contemplates. (It survives Task 8 as designed
+> -- M2 promotion admission is a request class on the same thread, below demand,
+> cancelled at the next row, and a promotion's source lease only adds protection.)
 >
-> **Consequence for the plan's costing:** "V1 needs one early publication" is the
-> cost of a *safe, durable* V1, not of the cheapest one. The lease is still what
-> this plan wants -- a mechanism whose correctness argument evaporates when the
-> service **stops serving one request at a time** is a liability in a plan whose
-> Task 5 wording contemplates an asynchronous `progress()`. (Task 8 as designed
-> does **not** break it; see the correction just above. An earlier revision of
-> this sentence said "a plan whose Task 8 makes it async", re-asserting the claim
-> the correction had just withdrawn.) That is a choice being made, not the only
-> option available.
+> **Facts a `kBusySeq` consumer must honour.** It **clears before `demand_done`**
+> (0.2-0.9 us gap), so both words must be polled together and a reader may
+> legitimately see `(done pending, busy 0)` once. **Advisories never set it**, so
+> `== 0` does not mean idle -- only `== seq` carries information. Observation is
+> **not guaranteed but fail-safe**: the window is 5.03 ms (mirrors on) / 10.25 ms
+> (off) for requests that read rows, but **0.6-1.8 us for requests that read
+> nothing**, at or below one poll period, so all-hit requests are not reliably
+> observable; a miss falls through to the batched path and grants nothing. A hit
+> copy lasts milliseconds (~2.3 ms for two lanes at `c`), longer than the all-hit
+> window, so the word does not contain the copy in the case where it is least
+> observable. **These window figures and the 3-slot demonstration below are cited
+> to a message, not to a committed artefact** (`t1-instrument` is closing this);
+> they are plausible against the source but not currently re-checkable from the
+> tree.
 >
-> **Refinement of the safety claim above:** the eviction happens at the
-> advisory's *reservation pass*, not throughout its read, so the exposed window
-> for an ungated early copy is up to **one advisory serve (~10 ms)**, not
-> microseconds, and only with advise on. The precise statement is that an early
-> copy needs *either* a service ownership grant *or* a gate keeping the copy
-> inside the interval where the single service thread is within this request --
-> not "any early copy needs Task 5's lease".
+> **An early-read variant fails SILENTLY, not loudly.** On today's path the wait
+> kernel reads the map *after* `demand_done`, an evicted planned lane reads -1 and
+> raises `unserved_misses`. **Under an early read the map is read before that.** A
+> planned RAM hit absent from `protect` is a legal victim (LRU; planned lanes are
+> VRAM misses, so `hot` does not save them). Phase 1 sees `entry >= 0` and copies
+> it; phase 2 handles only lanes that were `< 0` at phase 1; a later eviction is
+> **never re-read**. Demonstrated on a 3-slot tier holding experts 0,1,2: a request
+> protecting only expert 4 leaves [1,2,4] -- **the resident planned lane 0 was
+> evicted by the very request it was planned for.** Today's only producer
+> (router-miss via `expert_row_plan.py`) *does* keep every planned lane inside
+> `protect`, so this is a guarantee demanded of future producers rather than a live
+> defect; the Gate requires it asserted **on the device side**.
 >
-> **Cost, split by owner** (`c5c572bd92`). The information the signal must carry
-> already exists at the right moment and in the right thread: `RamTier::serve`
-> resolves hit lanes authoritatively under `mutex_`, before any read is
-> submitted (`tier.expert_slot[expert] >= 0`). It is host-side only, in
-> C++-private `Tier` state. So:
-> - **(a) small, Task 6's own:** in `serve()`, publish each hit lane's
->   `RowResult` inside the reservation critical section rather than after
->   `read()`. That is the whole of V1's **service-side** protocol delta;
->   `PER_ROW_TRANSFER.md` §3.1 also lists a stage wait polling the hit lanes'
->   words, one more copy stage, and a partial terminal mask, and `lease_model.py`
->   models none of them.
-> - **(b) large, Task 5's:** the words themselves, lease counters and
->   retirement, the eviction predicate, and generations. **None of this
->   exists.**
->
-> Two corrections from the first independent review (`PER_ROW_TRANSFER_REVIEW.md`):
-> the hit lease must be taken **in the same `mutex_` section as the
-> reservation**, not merely "in the reservation step" -- today's `serve()` drops
-> the mutex between reservation and `read()`. And V1's own saving bound is
-> **33.5 ms**, not the 38.6 ms quoted for early transfer generally, which is
-> V2's figure. (Both are pre-measurement; the current pair is 35.74 against
-> 40.67.)
->
-> **Implementation landmine for V2 only.** Publishing miss rows early means a row
-> can be `kReady` and leased when a *later* row of the same request fails.
-> `serve()`'s `!ok && !cancelled` cleanup calls `release_locked` on every slot,
-> and Task 5 makes releasing a leased slot throw -- so the cleanup must skip
-> published lanes or the service thread throws on any mid-request failure. V1
-> does not hit this, because its hit lanes are already `kReady`. That is a
-> further argument for V1 first.
->
-> **Sequencing consequence: no Task-5-compliant Task 6 can be accepted before
-> Task 5 (b) lands.** Not merely "should follow" -- (b) is what makes (a) safe,
-> per the ownership argument above. This orders the remaining plan work for every
-> mechanism **except V1b**, which by the plan's own account needs no Task 5 (b).
-> (An earlier revision said "regardless of which mechanism is chosen", which V1b
-> contradicts.) **V1b is nonetheless excluded**, and as a rule rather than a
-> preference: its safety is borrowed from invariants no document predating this
-> task states as load-bearing, and it requires a device-side
-> `planned subset of protect` assertion that no producer guarantees. The Gate
-> below refuses a mechanism whose correctness rests on either.
->
-> **The post kernel's `slot_map` hint: benign today, and *why* is the point.**
-> It classifies `need` from `slot_map` at post time with no ownership. Checked
-> against the source, it cannot silently suppress a demand -- but the two paths
-> are safe for different reasons, and only one of them survives this task:
+> **This task invalidates a standing justification.** The post kernel's `slot_map`
+> hint classifies `need` at post time with no ownership. It cannot silently
+> suppress a demand, but the two paths are safe for different reasons and only one
+> survives:
 > - **Armed record:** the host re-resolves. `serve()` builds `wanted = protect +
 >   need`, and `protect` comes from the layer's routed experts (`topk_ids` via
->   `_apply_graph`), *not* from `need`. Any `wanted` expert with
->   `tier.expert_slot[expert] < 0` at serve time is re-read. This reason is
->   independent of Task 6 and survives it.
+>   `_apply_graph`), *not* from `need`, so any `wanted` expert with
+>   `tier.expert_slot[expert] < 0` at serve time is re-read. Independent of Task 6;
+>   survives it.
 > - **Unarmed record (advise off):** the host does **not** re-derive. It is safe
->   only because with advise off no advisories exist, so nothing evicts between
->   post and wait -- **the temporal exclusion of `LEASE_PROTOCOL` §1.1 rule 5,
->   which is precisely the premise this task removes.** Were it to fail today the
->   failure is loud (`unserved_misses` -> `raise_fatal`, fail-stop), not wrong
->   bytes.
+>   only because with advise off nothing evicts between post and wait -- **the
+>   temporal exclusion of `LEASE_PROTOCOL` §1.1 rule 5, the premise this task
+>   removes.** Today a failure there is loud (`unserved_misses` -> `raise_fatal`).
 >
-> So this task does not merely need a lease for the hit lanes it copies early;
-> it **invalidates the standing justification for an existing benign race**.
-> Any Task 6 work must re-establish safety for the unarmed path rather than
-> inherit it. The same argument makes V1's order array `ord` benign -- a wrong
-> hint only changes *when* a lane is copied, because correctness comes from the
-> per-lane `RowResult`.
+> So Task 6 must **re-establish** safety for the unarmed path rather than inherit
+> it. The same argument makes V1's order array `ord` benign: a wrong hint changes
+> only *when* a lane is copied, because correctness comes from the per-lane
+> `RowResult`.
 >
-> Latent and not closed: a planned expert absent from `protect` (a
-> `plan_candidates` producer) is suppressed by the hint and never re-derived,
-> failing loudly -- **on today's path only; see the withdrawal below.** No production caller exists outside `expert_row_plan.py`
-> (`LEASE_PROTOCOL` OPEN 12, seen from the hint side).
+> ---
 >
-> **"FAILS LOUDLY" IS WITHDRAWN FOR THE EARLY-READ VARIANT** (source audit, msg
-> `58f2ccd5`). It holds only for today's path, where the wait kernel reads the
-> map *after* `demand_done` and an evicted planned lane reads -1, raising
-> `unserved_misses`. **Under V1b the map is read EARLY.** A planned RAM hit
-> absent from `protect` is a legal victim (LRU; planned lanes are VRAM misses, so
-> `hot` does not save them). Phase 1 sees `entry >= 0` and copies it; phase 2
-> handles only lanes that were `< 0` at phase 1; a later eviction of that lane is
-> **never re-read**. That is **silent wrong bytes**, racing with the reservation
-> that runs microseconds after `kBusySeq` is set. Demonstrated on a 3-slot tier
-> holding experts 0,1,2: a request protecting only expert 4 leaves [1,2,4] --
-> **the resident planned lane 0 was evicted by the very request it was planned
-> for.** So `planned subset of protect` becomes an invariant a V1b consumer must
-> assert **on the device side**; it cannot be assumed for a future producer.
->
-> **`kBusySeq` observation: NOT guaranteed, but fail-safe -- and the gate's
-> safety does not come from the word.** The window is 5.03 ms (mirrors on) /
-> 10.25 ms (off) minimum for requests that read rows, thousands of poll periods;
-> but **0.6-1.8 us for requests that read nothing**, at or below one poll period,
-> so all-hit requests are not reliably observable. A miss is benign (falls
-> through to the batched path; a missed observation grants nothing). Three facts
-> a consumer must honour: `kBusySeq` **clears before `demand_done`** (0.2-0.9 us
-> gap), so both words must be polled together and a reader may legitimately see
-> `(done pending, busy 0)` once; **advisories never set the word**, so `== 0`
-> does *not* mean the service is idle -- only `== seq` carries information; and a
-> hit copy lasts **milliseconds** (about 2.3 ms for two lanes at
-> c = 1.055) -- far longer than the 0.6-1.8 us all-hit window, though *shorter*
-> than the 5.03/10.25 ms read-request one, so the word does not contain the copy
-> in the case where it is least observable. Safety
-> therefore rests on invariants that outlive the word -- (a) no actor evicts in
-> that tier between the request finishing and the device's next post, (b)
-> `wanted` is never a victim -- **neither of which any document predating this
-> task states as load-bearing** (this plan now does, and `PER_ROW_TRANSFER.md`
-> §3.3 does). The `kBusySeq` window figures and the 3-slot demonstration are
-> cited to a message rather than to a committed artefact, so a future reader
-> **cannot re-check them from the tree**; they are plausible against the source
-> but unverifiable as cited.
+> **ASSUMPTIONS AND OPEN ITEMS.**
+> - `c` = 1.055 ms/row, A2, and the 1.0 ms launch cost are unmeasured inputs to
+>   every figure above.
+> - `g`, the per-stage cost (8-14 us assumed), is unmeasured and decides the
+>   per-row verdict at best order.
+> - Miss-row spread is **Task 4's serial packing** with mirrors on (2.77 ms), not
+>   drive completion order -- so improving Task 4 shrinks the per-row increment.
+>   It does **not** shrink two-phase, which is 88% hit-lane hiding and independent
+>   of miss-row spread. **With mirrors off the spread is 7.4 ms and drive-bound**;
+>   the attribution holds only in the regime this system runs in.
+> - Row ordering is **consistent with per-drive FIFO completion** (0 inversions in
+>   1,842 m>=2 requests; 0 of 4,750 consecutive same-drive pairs; same-reap ties
+>   3.7% on, 0% off). FIFO is **not separately tested** -- NVMe does not guarantee
+>   it -- so the design must carry it as an explicit assumption. `MIRROR_ROWS`' tail
+>   means bunching, not reordering.
+> - `[REQ 1]`'s cost is booked to Task 5 and appears in no Task 6 estimate.
 
-**Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most **4.93 ms/step, 1.9% gross**, falling to **1.1-1.5%** net of launch cost (`PER_ROW_TRANSFER.md` §0 and §5.6, for an unmeasured g of 8-14 us per stage triple) -- against a gate that resolves about 1.5%, so it sits **at** the resolution limit, not below it -- while costing 160 extra stage triples per step across all 40 layers. An earlier revision quoted "about 1%", the low end of that range presented as the estimate. The strongest argument for the redirect is a different one, currently unregistered: the plan's *original* fixed-order per-row is about **15.7 ms/step worse than V1** (40.67 - 4.93 - 20.07), because random lane order forfeits roughly half the ideal saving. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
+**Chosen mechanism: two-phase.** Per-row costs 160 extra stage triples per step across all 40 layers to buy an increment that is 1.1-1.4% net at best order and negative at random order (STANDING item 2). `PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. **The checklist and pseudo-code below specify V2 (per-row) only**, and are retained as the specification of the variant that must beat two-phase; V1's checklist is deferred until Task 5 (b) is real, so that it is written once against the mechanism actually being built. A reader implementing this task from the checklist alone would build the variant the plan expects to reject -- read the Gate first.
 
 **Baseline correction:** the fair comparison is Task 5 **lease-mode batched**, not today's unleased path. Lease mode arms every `count > 0` record, so all 40 layers pay a service round trip (OPEN 11, unmeasured). That cost must be netted out or any Task 6 arm flatters itself.
 
@@ -724,13 +495,13 @@ This permits CPU I/O for later rows to overlap the earlier row's SM transfer. It
 - [ ] Gate each copy on valid lane readiness and an acquired source lease. Failed, timed-out, inactive, or canceled lanes read no source bytes; setting the fused MoE's `keep` to zero alone does not protect an earlier gather. A final request-success check suppresses compute even when some earlier lanes already copied successfully.
 - [ ] Compare batched SM transfer with per-row SM transfer at real miss counts; report kernel overhead, link throughput, SM contention, step latency, and token rate. Sweep launch geometry only as a separate measured variant.
 
-**Gate.** All of the following. Items 2 and 3 are refusals: a mechanism that fails them is rejected however well it measures, and they are written here because a prohibition stated only in prose is not an acceptance test. (Added after review found the plan asserted "the Gate below refuses" a mechanism the Gate as written would have accepted.)
+**Gate.** All of the following. Items 2 and 3 are **refusals**: a mechanism that fails them is rejected however well it measures. They are stated here, in the acceptance test, because a prohibition that lives only in prose is not one.
 
 1. **Measured:** demonstrated I/O/H2D overlap and untraced end-to-end benefit at unchanged cache capacity, against the **Task 5 lease-mode batched** baseline rather than today's unleased path. Preconditions on every arm: **promotions, the prefetch puller and eager gathers off**, and each arm's record must say so -- they share the Gen3 link, and contention on it subtracts from the hiding in the direction that flatters a null result. A combined Task 6 + Task 8 arm is a separate, labelled experiment.
 
    **Report all three differences with intervals: A1 v A0, A2 v A1, and A2 v A0** (A0 = today's unleased path, A1 = Task 5 lease-mode batched, A2 = the Task 6 mechanism). **A2 against A0 alone must not be presented as "the Task 6 result"** -- it credits Task 6 with the cost it inherits from Task 5. A2 against A1 alone is also not enough: quoting it without A1 against A0 hides a possible loss from Task 5. V1b, needing no lease mode, is measured against A0 directly. (`PER_ROW_TRANSFER_REVIEW.md` G2, a report-time trap that a correct baseline statement does not cover.)
-2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose correctness holds only because the service serves one request at a time is rejected. The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** (An earlier revision justified the exclusion by saying no document states the borrowed invariants as load-bearing. That reason cancelled itself, since this plan and `PER_ROW_TRANSFER.md` §3.3 now do state them.)
-3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. Stated precisely: today's only producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect`, so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one. (An earlier revision called this item "false"; the 3-slot demonstration constructs a producer that does not exist, so "not guaranteed for a future producer" is what the evidence supports.)
+2. **REFUSED -- borrowed temporal exclusion.** A mechanism whose correctness holds only because the service serves one request at a time is rejected. The ground is durability, not novelty: that exclusion expires when the service stops serving one request at a time, which Task 5's asynchronous `progress()` wording contemplates. **This is the clause that excludes V1b.** The ground is *not* that the borrowed invariants go unstated -- this plan and `PER_ROW_TRANSFER.md` §3.3 state them -- so do not reinstate that reasoning.
+3. **REFUSED -- unasserted `planned` subset of `protect`.** Any mechanism that reads `slot_map` before `demand_done` must assert the subset relation **on the device side**, with a mutation control demonstrating the assertion fires. Stated precisely: today's only producer, router-miss via `expert_row_plan.py`, *does* keep every planned lane inside `protect`, so this is a guarantee demanded for future producers rather than a live defect. It is a refusal because the failure is **silent wrong bytes**, not a loud one.
 4. **Required measurement:** the per-stage cost `g`. The per-row-versus-two-phase verdict turns on it at best order, where the net margin is 0.1-0.4 points, and no measurement of it exists.
 
 **A rejected variant is not a rejected task.** Two-phase is the chosen mechanism and is judged on its own; if launch or head-of-line cost cancels the benefit for *per-row*, that rejects per-row. Record which variant was rejected. If early transfer as a whole fails, retain Task 4 and evaluate native DMA or a readiness-aware gather under Task 9's **"Native DMA vs SM gather"** row, which now names the readiness-aware gather explicitly.
