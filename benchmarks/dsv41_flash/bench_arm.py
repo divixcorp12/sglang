@@ -153,10 +153,20 @@ def stray_sglang_env(env: dict) -> dict:
 
 
 def env_conflicts(env: dict) -> dict:
+    """SGLANG_* variables the process already has at another value; those change what runs, so they are refused."""
     return {
         k: {"process": os.environ[k], "arm": v}
         for k, v in env.items()
-        if k in os.environ and os.environ[k] != v
+        if k.startswith("SGLANG_") and k in os.environ and os.environ[k] != v
+    }
+
+
+def infra_overrides(env: dict) -> dict:
+    """Non-SGLANG variables (CUDA_HOME, thread caps) the recipe replaces, as env.sh does; the box's shell has CUDA 13.4."""
+    return {
+        k: {"process": os.environ[k], "arm": v}
+        for k, v in env.items()
+        if not k.startswith("SGLANG_") and k in os.environ and os.environ[k] != v
     }
 
 
@@ -179,6 +189,7 @@ def dry_run(args: argparse.Namespace, sglang_file: str) -> int:
         "paths": path_report,
         "resources": msgspec.to_builtins(resolved["resources"]),
         "arms": arms,
+        "infra_env_overridden": infra_overrides(next(iter(arms.values()))["env"]),
     }
     if len(arms) == 2:
         report["env_differs_between_arms"] = ac.env_diff(
