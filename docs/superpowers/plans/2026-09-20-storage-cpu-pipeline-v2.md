@@ -284,6 +284,20 @@ Include expert identity in the immutable row result and validate it against the 
 > count per request (**landed**: schema 4, `4e63616666`, records `lanes` per
 > request; a schema-4 trace can replace the bounds below with a measurement).
 >
+> **EVERY ABSOLUTE FIGURE BELOW IS 3-7% HIGH** (`1c829245ab`, R6). The traces'
+> 495 `graph_step` lines cover **511 decode steps**: 16 lines are merged
+> (`steps` = 2, `routed_rows` 480 against 240). The precheck divides savings from
+> 511 steps' requests by 495, *and* takes `k` from a two-step `vram_miss` on
+> those merged lines, giving `k` = 6 (capped) where the truth is about 3.3 on ~6%
+> of requests. Both errors inflate. Corrected, per decode step: **BEST 35.80**
+> (not 38.61), **RANDOM 17.79** (not 19.17), **two-phase 30.88** (not 33.53),
+> per-row over two-phase **+4.93** best / **−13.08** random. Hit lanes credited
+> fall 31.9 -> 29.3. **No verdict changes** -- (RANDOM − 1 ms)/T is 6.5% against
+> the 3% bar, and the 87/13 split is a ratio of quantities that scale together.
+> The `495` is in `per_row_precheck.py` itself, so the **pre-registered script
+> carries the bug**, not merely the prose. The A1 bounds below were not recomputed
+> at 511 and are loose in the same direction.
+>
 > **A1 no longer has to be assumed, and this strengthens the redirect**
 > (independent recompute, `f1cda7ba72`). The trace *bounds* hit-lane placement
 > without assuming it: of 111.9 hit lanes/step, the data force **at least 10.8
@@ -433,6 +447,36 @@ Include expert identity in the immutable row result and validate it against the 
 > `plan_candidates` producer) is suppressed by the hint and never re-derived,
 > failing loudly. No production caller exists outside `expert_row_plan.py`
 > (`LEASE_PROTOCOL` OPEN 12, seen from the hint side).
+>
+> **"FAILS LOUDLY" IS WITHDRAWN FOR THE EARLY-READ VARIANT** (source audit, msg
+> `58f2ccd5`). It holds only for today's path, where the wait kernel reads the
+> map *after* `demand_done` and an evicted planned lane reads -1, raising
+> `unserved_misses`. **Under V1b the map is read EARLY.** A planned RAM hit
+> absent from `protect` is a legal victim (LRU; planned lanes are VRAM misses, so
+> `hot` does not save them). Phase 1 sees `entry >= 0` and copies it; phase 2
+> handles only lanes that were `< 0` at phase 1; a later eviction of that lane is
+> **never re-read**. That is **silent wrong bytes**, racing with the reservation
+> that runs microseconds after `kBusySeq` is set. Demonstrated on a 3-slot tier
+> holding experts 0,1,2: a request protecting only expert 4 leaves [1,2,4] --
+> **the resident planned lane 0 was evicted by the very request it was planned
+> for.** So `planned subset of protect` becomes an invariant a V1b consumer must
+> assert **on the device side**; it cannot be assumed for a future producer.
+>
+> **`kBusySeq` observation: NOT guaranteed, but fail-safe -- and the gate's
+> safety does not come from the word.** The window is 5.03 ms (mirrors on) /
+> 10.25 ms (off) minimum for requests that read rows, thousands of poll periods;
+> but **0.6-1.8 us for requests that read nothing**, at or below one poll period,
+> so all-hit requests are not reliably observable. A miss is benign (falls
+> through to the batched path; a missed observation grants nothing). Three facts
+> a consumer must honour: `kBusySeq` **clears before `demand_done`** (0.2-0.9 us
+> gap), so both words must be polled together and a reader may legitimately see
+> `(done pending, busy 0)` once; **advisories never set the word**, so `== 0`
+> does *not* mean the service is idle -- only `== seq` carries information; and a
+> hit copy lasts **milliseconds**, far longer than the window itself. Safety
+> therefore rests on invariants that outlive the word -- (a) no actor evicts in
+> that tier between the request finishing and the device's next post, (b)
+> `wanted` is never a victim -- **neither of which any document states as
+> load-bearing.**
 
 **Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step, **2.0% gross**, falling to about 1% net of launch cost -- against a gate that resolves about 1.5%, so it sits **at** the resolution limit, not below it -- while costing 160 extra stage triples per step across all 40 layers. The strongest argument for the redirect is a different one, currently unregistered: the plan's *original* fixed-order per-row is about **14 ms/step worse than V1** (38.6 - 5.06 - 19.2), because random lane order forfeits roughly half the ideal saving. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
 
