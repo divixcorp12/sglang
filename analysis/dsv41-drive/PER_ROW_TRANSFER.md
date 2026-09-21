@@ -34,7 +34,7 @@ copy safe (section 3.1). The comparison to make is therefore two-phase = one ear
 
 **The three mechanisms, on the same registered arithmetic** (the last two lines are arithmetic on registered figures, not
 separately registered statistics): the plan's original **fixed-order per-row** is the RANDOM figure, **19.2 ms/step**; **V1**
-(hits first by hint, the rest batched) is BEST minus the miss-row part, `38.6 - 5.06 = 33.5 ms/step` (13.0%); **V2** with
+(hits first by hint, the rest batched) is BEST minus the miss-row part, `38.6 - 5.06 = 33.5 ms/step` (13.2% of a 254.4 ms step); **V2** with
 the order array is BEST, 38.6 ms/step. So the plan's mechanism as written sits about **14 ms below V1** (`33.5 - 19.2`),
 mostly because lane order routes hits behind slow rows; the order array fixes that, and V1 gets it with less machinery.
 
@@ -55,7 +55,7 @@ about EXL3 decode in general. A different cache size or routing skew changes the
    which the service already writes first in `handle_demand` and no device kernel reads. It needs a wait-kernel and a stage
    kernel and no service change, is not Task 5 compliant, and is safe only while the service stays synchronous.
 2. **The ceiling for THIS configuration is 19.2 ms/step (random order) to 38.6 ms/step (best order), 7.5% to 15% of a
-   257.5 ms mirrors-on step** [M, section 1]. DSV41_REFERENCE 18.3's 20.8 ms (<= 5.3%) was computed for a different
+   254.4 ms mirrors-on step** [M, section 1]. DSV41_REFERENCE 18.3's 20.8 ms (<= 5.3%) was computed for a different
    configuration (the older 391 ms/step arm, G = 121.2, 18.8 RAM misses per step, mirrors off). Please plan against these
    figures and cite both; my BEST figure is uncorrected for 18.3's 74.5% alignment haircut, which is why it is twice
    18.3's. (I first read 221 VRAM misses per step from the first two `graph_step` lines and told the team lead so; over
@@ -95,8 +95,10 @@ about EXL3 decode in general. A different cache size or routing skew changes the
    slots in one `mutex_` pass, `wanted` excludes every routed and needed expert from victim choice for the whole call,
    and `read()` blocks the single service thread, so nothing evicts in that tier between reservation and return.
    Lease-at-publication is safe for hit lanes as long as they are published before `serve()` returns.
-9. **Tracing was on in every trace used, and all seven are schema 2; no schema-3 graph-decode trace exists.** Traced
-   request durations are stretched, so the denominator is the untraced step time.
+9. **A disqualified arm sat inside the registered denominator, unchallenged** (section 1.2's denominator note): the pattern, an
+   acceptance gate that exists to keep bad arms out and did not, is the finding, not the 1.2% it moved. **Tracing was on in every trace used, and all seven are schema 2; no schema-3 graph-decode trace exists.** Traced
+   request durations are stretched; the step-time denominator is built from `clean-reference.json`'s `new:on` arms, three of which are
+   traced, so it is not a purely untraced figure (section 1.2).
 
 ---
 
@@ -116,18 +118,47 @@ Model: per request that reads `m >= 1` rows, `k` lanes (`k = round(vram_miss/40)
 lane copy time `c = 1.055 ms` (DSV41_REFERENCE 18.2's measured gather per row). Batched time `T_b = done + k*c`; per-row
 time is the chain `e = max(e, ready) + c`. Full definition in the pre-registration.
 
-### 1.2 Result [M] (three mirrors-ON arms; they agree to 0.1 ms; step time 257.5 ms from untraced 3.884 tok/s)
+### 1.2 Result [M] (three mirrors-ON arms; they agree to 0.1 ms; step time 254.4 ms, see the denominator note below)
 
-| Quantity, ms per decode step | c = 0.55 | **c = 1.055** | c = 1.6 | share of 257.5 ms step |
+| Quantity, ms per decode step | c = 0.55 | **c = 1.055** | c = 1.6 | share of 254.4 ms step |
 |---|---:|---:|---:|---:|
-| BEST: hits first, then miss rows in pack order, free launches | 20.2 | **38.6** | 54.9 | **15.0%** |
+| BEST: hits first, then miss rows in pack order, free launches | 20.2 | **38.6** | 54.9 | **15.2%** |
 | RANDOM lane order (64 permutations per request) | 10.1 | **19.2** | 27.7 | **7.5%** |
 | RANDOM, miss rows only (no hit lanes) | 1.35 | **2.55** | 3.8 | 1.0% |
-| GENEROUS (6 lanes, best order): the registered reject test | 39.7 | 75.4 | 86.9 | 29% |
+| GENEROUS (6 lanes, best order): the registered reject test | 39.7 | 75.4 | 86.9 | 30% |
 
-Registered outcome: **SUPPORT** (RANDOM minus 1 ms of launch cost = 7.1% of step, bar 3%, all three arms) and
+Registered outcome: **SUPPORT** (RANDOM minus 1 ms of launch cost = 7.1% of a 254.4 ms step, 7.0% of the registered 257.5 ms; bar 3%, all three arms) and
 **SPREAD-IRRELEVANT** (miss-only / RANDOM = 0.133 < 0.25 in all three arms). Mirrors-OFF (step 344 ms) gives the same
 classes. The Task 6 reject test therefore did **not** reject.
+
+**Beside the headline: the range across sessions, and the floor** (independent recomputation, `PER_ROW_PRECHECK_REVIEW.md` R4;
+step times from `task1-3-new-on-U`, sessions 1-4: 313.4, 226.3, 300.0, 209.9 ms). The 7.5% headline is not a prediction
+for any one session:
+
+| Session | RANDOM, ms/step (share of that session's step) | two-phase, ms/step (share) |
+|---|---:|---:|
+| 1 | 27.15 (8.7%) | 48.68 (15.5%) |
+| 2 | 12.97 (5.7%) | 22.25 (9.8%) |
+| 3 | 25.47 (8.5%) | 43.71 (14.6%) |
+| 4 | 11.17 (5.3%) | 19.59 (9.3%) |
+
+**The range is wide (2.4x) and the floor is above the bar: every session clears 3%**, for RANDOM (lowest 5.3%) and for
+two-phase (lowest 9.3%). That floor is the statement to carry, not the mean. The four sessions are within one request stream,
+so this is not four workloads (§1.1); it is the spread of one stream's sessions.
+
+**Denominator, and a provenance note.** The registered `T_step` (257.5 ms, from `task1-3`, `task1-6`, `task1c-3` untraced,
+named in the pre-registration) included **an arm the acceptance gates disqualified**: `task1-6-new-on-U` is INVALID in its
+verdict file ("expert shard page-cache residency grew 1.40 GiB across the arm"), and `task1c-3-new-on-U` is excluded from
+`clean-reference.json` (its verdict file says VALID with a boot-warm regime note; I did not find the disturbance mark R5 cites,
+so that label is R5's, not mine). I did not check the arms' verdicts before naming them in the pre-registration, and the
+gates that exist to keep such arms out of a result did not stop it. **This document now uses 254.4 ms, the mean of the four
+`new:on` arms in `clean-reference.json`** (`task1-2`, `task1b-0`, `task1c-0` traced, `task1-3` untraced), not "clean untraced
+arms": three of the four are traced, and the only clean untraced on-arm alone gives 254.7 ms (n = 1). What I reproduced, so a
+reader can weigh it: the 3-arm mean is 257.5 ms; `task1c-3` alone is 264.0 ms; `task1-6` (INVALID) alone is 254.1 ms, so
+**removing the INVALID arm alone would have moved the mean the other way**, and the shift comes from `task1c-3`. The registered
+class outcomes hold under either denominator; the percentages in this document are on 254.4 ms and are about 1.2% larger
+than those the pre-registered run would print. Anyone comparing them to another document's percentages should check which
+denominator it used.
 
 `Sigma(m-1)` over the arm's requests is `1407 + 2*352 + 3*70 + 4*11 + 5*2 = 2375` rows over 495 steps, so the
 miss-row-only best case is `2375 * 1.055 / 495 = 5.06 ms/step` (2.0%). This is arithmetic on the registered output
@@ -138,7 +169,7 @@ random-order counterpart, 2.55, is the registered figure and is half, as the clo
 
 18.3 bounds "gather a layer's RAM-resident missed rows while its NVMe read runs" at **20.8 ms/step, <= 5.3%**, on a
 74.5% per-layer alignment, from the older 391 ms/step arm (G = 121.2 VRAM misses, 18.8 RAM misses per step, nvme2 only).
-Mine is 19.2 (random) to 38.6 (best) on a 257.5 ms step. The RANDOM figure is within 8% of 18.3's; the BEST figure is
+Mine is 19.2 (random) to 38.6 (best) on a 254.4 ms step. The RANDOM figure is within 8% of 18.3's; the BEST figure is
 about twice it, because BEST assumes every hit lane in a read layer is copied inside the read wait (94% of requests wait at
 least `h*c` [M]; read-wait p50 5.3 ms and p90 8.9 ms against `h*c` of about 2.3 ms are post-hoc and unregistered,
 `per_row_precheck_posthoc.py`) and does not apply 18.3's
@@ -146,7 +177,7 @@ alignment haircut. **A reader should take 18.3's 20.8 ms as the planning figure 
 trace's per-step averages (vram_miss 131 and ram_miss 19.1 are post-hoc; 14.4 read requests per step is 7,139 / 495) are consistent with 18.2's.
 
 Consistency check that used no fitting: modelled gather `131 * 1.055 = 138 ms` + measured read-wait `93 ms/step` + about
-17 ms compute (18.2's figure) = 248 ms against a measured 257.5 ms step. The model's `c` and lane count are not
+17 ms compute (18.2's figure) = 248 ms against a measured 254.4 ms step (257.5 ms under the registered denominator). The model's `c` and lane count are not
 contradicted by the step budget.
 
 ### 1.4 What carries the result, and what would break it
@@ -164,7 +195,7 @@ contradicted by the step budget.
 - A2: a hit lane is ready when the service has reserved the request. This needs the service to publish hit lanes before
   it reads; it does not today (sections 3.1 and 4.3).
 - `c = 1.055` is 18.2's number, from a node-mode trace of an older tree; it was not measured for this path in isolation.
-- Tracing was on in every trace used, which stretches request durations. The untraced denominator keeps `T_step` honest.
+- Tracing was on in every trace used, which stretches request durations. The step-time denominator is the `clean-reference.json` `new:on` mean (three traced arms, one untraced; section 1.2), so traced stretching is not fully excluded from it.
 - The precheck models no lease latency, poll latency or per-stage launch gap. Those are the costs of the design (section 8).
 
 ---
