@@ -968,6 +968,51 @@ Add the existing advisory/service/mirror tests and the new task-specific tests t
 > any statement that *CI* covered the lease work. The author found it from this
 > plan's note rather than by looking, and fixed it in the same landing.
 >
+> **FOUR ADDITIONS TO THE TAXONOMY, 2026-09-21.** Three are new defect classes;
+> one is the rule that generalises the originals. All four came from lanes
+> auditing their own landed work, unprompted.
+>
+> **(a) The two-part rule, and the refutation that produced it.** A
+> generalisation was offered -- "the survivor lives on a retry-or-failure path
+> the requirement-shaped test never reaches" -- and tested against six
+> classified survivors. It held cleanly for **one**, in modified form for two
+> (path reached, property on it unasserted), and **not at all for three**
+> (configuration and fixture degeneracy). What holds for all six is stricter and
+> more useful: **each test asserts an outcome that a shortcut also produces.**
+> `not host.threaded` passes because Python never set the flag. `"O_DIRECT"`
+> passes because it is read back off a flag rather than observed on the open.
+> `admit <= submit <= cqe` passes for any later stamp. So a failure, retry or
+> configuration requirement's acceptance test needs **(1) a path witness** --
+> rows actually packed, an attempt actually incremented, the file actually
+> opened with the flag -- **AND (2) the property asserted on that path.** The
+> sharpest instance: a test called `enable_trace()` and never `drain_trace()`;
+> the record it switched on would have shown `row_pack` empty, which is exactly
+> why the test was vacuous. The witness was one unused call away.
+>
+> **(b) A test for "X does not happen" is vacuous by default.** Unless something
+> proves the conditions for X were present, it passes for free. Found when a
+> requirement was recorded backwards -- "aborts after a long deferral" when the
+> requirement is that a long deferral does **not** trip the stuck rule -- and a
+> `fatal_wait` larger than the wait means nothing could ever have aborted.
+>
+> **(c) A vacuous INVOCATION, not a vacuous test.** A mutant was reported caught
+> by a named test; the `-k` selector had matched only the author's own new test
+> and never the one credited. The assertion was sound; **the test never ran.**
+> Distinct from every other class here, and invisible to any amount of reading
+> the test. Defence: compare each run's *collected total* against its baseline,
+> and run pristine baselines for every file group rather than inferring from
+> pass counts matching file test counts.
+>
+> **(d) ORDER-DEPENDENT RESULTS -- a test whose verdict depends on what ran
+> before it.** `test_prefix_tier.py::TestCacheStatsSink::test_snapshots_are_throttled_and_cumulative`
+> **passes under `alpha` and `rev` order and fails under `file` order.** Every
+> other class in this taxonomy is about a test that passes for the wrong reason;
+> this is a test whose result is not a property of the test at all. Both are ways
+> a green suite lies, and only one was being catalogued. Found by the order
+> sweep, which also carries deliberate controls (`test_ctrl_annoying`,
+> `test_ctrl_dangerous`, `test_ctrl_independent`) to show the instrument can
+> detect a known order-dependency before it is trusted on unknown ones.
+>
 > **THE WHOLE CI SUITE CANNOT COLLECT ON THIS BRANCH, AND A REGISTERED FILE WITH
 > NO `__main__` BLOCK RUNS ZERO TESTS AND EXITS 0** (`1e210f524a`). `test/run_suite.py`
 > globs every file under `test/registered` and calls `collect_tests(..., sanity_check=True)`,
