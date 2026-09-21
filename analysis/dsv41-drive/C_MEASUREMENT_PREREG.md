@@ -143,7 +143,7 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 | file | sha256 |
 |---|---|
 | `c_measurement/c_analysis.py` (gates, `T(n)` fits, the model recompute on measured lanes, the label; `--selftest` produces STANDS / INTERMEDIATE / WITHDRAWN and five INVALID cases from synthetic `T(n)` with known `c`, needs the divix01 traces) | `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c` |
-| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `ca12a3ae35d6a454c9a63507298862290c4c0729b1788219fc54e892ef31a15f` (**IN FORCE: amendment 6, section 17**) |
+| `c_measurement/c_harness.py` (the harness; `--dry-run` for CPU tests) | `85b08323274e56b4592a90f39767d9f0971ece2ee1a030536fbf1e57733408ca` (**IN FORCE: amendment 8, section 19**) |
 | `c_measurement/nvme_load_reader.py` (the `nvme` arm's background reader) | `9ac57d78957d5657fdeccb70d0406c4e972ff3c14c4626b46088d1c66fdb08ba` |
 | `c_measurement/quiet_check.py` (the pre-flight: candidate cores from /sys, the idle-core check, and the CPU-only `--rehearse` of the frozen gate) | `1e715a8929b0451e4664e0a7a5297c0e3c95a4fea9a4308b6c9b86269297a569` (**IN FORCE: amendment 6, section 17**) |
 | `c_measurement/verify_hashes.py` (checks the files against this table; run it immediately before the window) | `26bb113eb3699d6d48440f795656e5fe077e51d617dd3c75535efe931141f542` |
@@ -152,6 +152,7 @@ production `c` differs between a traced and an untraced arm (this is a standalon
 
 **Superseded hashes: none of these is the registered harness.** `c_harness.py` `171302f871ee45d2…` (first version, commit `8313506f25`) was superseded by amendment 1 (section 12, `c2eddc482b`); `6b7313b05132798c…` (amendment 1) by amendment 2 (section 13, `cb436aec3b`);
 `d39270e19a7fcd90…` (amendment 2) by amendment 3 (section 14, `bc02ab9ddf`); `adcd041f5660ef77…` (amendment 3) by amendment 4 (section 15). Earlier `test_c_harness.py` hashes (`3fe04030…`, `94082c54…`, `e71c672a…`, `a8f96f0f…`) and `quiet_check.py` `0190708b…`, `e50bd7ab…` are superseded the same way.
+**Amendment 8 flipped in force 2026-09-21** (section 19, after 25 CPU tests passed on the amended file): `c_harness.py` `ca12a3ae35d6a454c...` (amendment 6) is superseded by amendment 8. The amendment-6 copy remains in `c_measurement/proposed_amendment6/` byte-unchanged, so it no longer equals the harness in force; section 18's pilot table points at it deliberately.
 **Amendment 6 flipped in force 2026-09-21** (section 17, after the 17a hash reconciliation): `c_harness.py` `35dcf8215ae5c2c9...` (amendment 4), `quiet_check.py` `f557d035d9c82fdd...` and `test_c_harness.py` `ccb5e6eae19a9f21...` are superseded by amendment 6. The amendment-6 copies remain in `c_measurement/proposed_amendment6/` unchanged, which is what section 18's pilot table points at.
 
 **`c_analysis.py` has one commit (`05c5510392`) and has not been touched since: `4657702c0b63d7956fc699bf99ee16c1bbf4810ebf8ef9774652a1c375f7c21c`. It is what turns numbers into a verdict, and it is the one file that does not move.**
