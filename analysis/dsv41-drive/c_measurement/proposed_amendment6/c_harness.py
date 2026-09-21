@@ -356,8 +356,9 @@ class RealDevice:
         self.stream = torch.cuda.Stream(device=self.dev)
         self.dest = [torch.empty((SCRATCH_SLOTS, b), dtype=torch.uint8, device=self.dev) for _, b in SEGMENTS]
         self.src, self.seg, self.ring, self.consumed, meta = {}, {}, {}, {}, {"nodes": {}}
-        self.global_seq = {0: [], 1: []}
-        for node in (0, 1):
+        self.nodes = tuple(getattr(args, "nodes", (0, 1)))
+        self.global_seq = {n_: [] for n_ in self.nodes}
+        for node in self.nodes:
             free_before = node_free_mib(node); mem_before = node_mem_mib(node)
             set_mempolicy(node)
             try:
@@ -373,7 +374,7 @@ class RealDevice:
             self.ring[node] = ring_ids(ROWS_PER_NODE, SEED + node); self.consumed[node] = 0
             meta["nodes"][node] = {"page_fraction_on_node": fracs, "free_mib_before": free_before, "free_mib_after": node_free_mib(node), "mem_mib_before": mem_before, "mem_mib_after": node_mem_mib(node)}
         # each row's first 8 bytes carry its id, so a launch can be checked to have moved the intended rows
-        for node in (0, 1):
+        for node in self.nodes:
             for s in self.src[node]:
                 ids = torch.arange(ROWS_PER_NODE, dtype=torch.int64) + 1000 * (node + 1)
                 s[:, :8].copy_(ids.view(torch.uint8).view(ROWS_PER_NODE, 8))
@@ -388,7 +389,7 @@ class RealDevice:
         torch.cuda._sleep(int(1e6)); torch.cuda.synchronize()
         e0.record(); torch.cuda._sleep(int(2e7)); e1.record(); torch.cuda.synchronize()
         self.cycles_per_us = 2e7 / (e0.elapsed_time(e1) * 1000.0); meta["spin_cycles_per_us"] = self.cycles_per_us
-        self._verify(0); self._verify(1)
+        for node in self.nodes: self._verify(node)
         meta["device"] = torch.cuda.get_device_name(self.dev); meta["torch"] = torch.__version__
         return meta
     def _plan(self, node, n, rows, slots):

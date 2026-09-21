@@ -329,3 +329,35 @@ A mid-run arrival during the measurement itself is visible afterwards in `meta.j
 | `proposed_amendment6/c_harness.py` | `4aed80a181e8ea66d6f58c126ac0e688b2e0282ab69862455bcb1fe762a046f0` |
 | `proposed_amendment6/quiet_check.py` | `c9017bb8c3e4fe85e2c1781764511c1b157a48c627b923ee25324f03a8b45e99` |
 | `proposed_amendment6/test_c_harness.py` | `b735ca4723768fdcb45f87360a31f538a24bb08d8f0ed35a55ac1561f4a32904` |
+
+## 18. The SMT-sibling pilot: pre-registration (2026-09-21; approved by the lead; nothing has been run)
+
+**Question.** Does a busy SMT sibling of the launching CPU shift the GPU-side time `T` of one production gather launch (cold rows, node 0)? This decides whether a steady sibling load can be treated as a *declared condition* on this box (it enters `T` not at all) or whether it makes any absolute `c_m` measured under sibling load meaningless. It changes **no gate**: a "not in T" verdict is an argument for a future amendment that goes to the lead first. `c_analysis.py` stays `4657702c…`.
+
+**Design (fixed before any run).** One process pinned to **one** logical CPU `L` (`taskset -c L`; refuses to start otherwise); its SMT sibling `S` is read from `/sys`. A spinner process is pinned to `S` and switched **on and off with SIGCONT / SIGSTOP** (it stays alive, so a switch costs microseconds and nothing is forked).
+The measured kernel and path are the harness's `RealDevice.run_visit` unchanged: production `copy_expert_row_segments_gpu_kernel`, cold distinct rows from the service-allocated slabs on node 0 (2 GiB), 64 scratch slots, a spin kernel before every timed launch, 20 discarded warm-up launches then 100 timed launches per visit. `n = 3` and `n = 6`.
+Per rep and per `n`: visits **A, B, B, A** (A = spinner stopped, B = spinner running). **20 reps.** About 160 visits, about 0.4-1 s each, plus 0.3 s for the spinner to settle before each B: roughly 2 minutes of GPU time and about 3 minutes with allocation.
+`nvidia-smi` samplers are moved off `L` and `S`. Only node 0 is allocated (no eviction of node 1's page cache).
+
+**Per visit it records** (not just that a spinner was started): the spinner's **achieved busy fraction** (its own ticks over the window), the **foreign busy fraction of the sibling** (busy ticks of `S` from `/proc/stat` minus the spinner's ticks) and **of `L`** (busy ticks minus our own), with the harness's tick-resolution floor (fewer than 3 ticks is reported as at most 9.9%).
+
+**Validity (registered).** A visit is valid iff the foreign busy fraction of `L` and of `S` are both under 10% **and** (B: the spinner achieved at least 90% of the window; A: the spinner accrued zero ticks). A **foreign burst on the sibling in an A visit would make A look like B, so it is excluded, not counted**; the same for B. A `(rep, n)` unit is valid iff all four of its visits are.
+**At least 8 valid reps per `n`, else INVALID.** The whole run is INVALID (no verdict quoted) if the PCIe link is not at Gen3 throughout, another process used the GPU, a lane of ours ran at the start (abort) or the end (`pgrep`-equivalent, `quiet_check.lane_processes()`).
+The lead's reason for this: a burst landing on the sibling *specifically* corrupts the contrast, not the level, and the failure direction that matters is a false "not in T", which would license running on this box.
+
+**Statistic and verdict.** `shift(rep, n) = median(T of the two B visits) / median(T of the two A visits) - 1`; per `n` the mean over valid reps and a two-sided 95% t-interval (df = valid reps - 1). **Verdict: INSENSITIVE** if both `n` have the whole interval inside +-0.5%; **SENSITIVE** if either `n` has the whole interval outside +-0.5%; **INCONCLUSIVE** otherwise. The verdict word is reported first.
+INSENSITIVE means a busy sibling did not move `T` by more than 0.5% (the sibling can then be a recorded, declared condition for the cold-SM `c_m`); SENSITIVE means a sibling load above 10% makes an absolute `c_m` unmeasurable on this box while the services run (a run needs a quiet pair, which does not exist today); INCONCLUSIVE means neither, and the pilot is repeated or not, at the lead's call.
+
+**Two biases that both favour V1, stated together so a marginal pro-V1 result is read with both in view.** (a) A non-idle `T_idle` (the box's steady services) is inflated, so `rho = T_load / T_idle` is understated (section 13). (b) The `nvme` arm's reader loses throughput when its SMT sibling is busy, so the concurrent load is weaker than production's could be. Neither is measured; both point the same way.
+
+**What it does not do.** It does not measure `c`; it does not test the `hot`, `ce`, graph or `nvme` arms (the sibling can matter for `ce`, which includes host enqueue in `T`, for `hot` through cache state and for `nvme` through reader throughput; the pilot speaks only to the cold SM launch); it does not change any gate.
+
+**Frozen files** (commit and hashes as of this section; the pilot is run from the staged copies and `verify_hashes`-style checked immediately before):
+
+| file | sha256 |
+|---|---|
+| `sibling_pilot/sibling_pilot.py` (the runner (GPU; needs the lock)) | `4b9219521077bb8e3ccd251b8047dd895bba2d278222f4dacba88ff5e2afdff0` |
+| `sibling_pilot/sibling_pilot_analysis.py` (the frozen rule and verdict (CPU; `--selftest` passes all ten cases)) | `5d85f67c946e55445598421ff79765be0e40fb748a131e55988fd8d9b24b3bc5` |
+| `sibling_pilot/test_sibling_pilot.py` (3 CPU tests incl. the dry-run plumbing) | `0f7de46f249bb782a35547ddd4221538d8ba61e2e99ef92a4f157411e741c9f8` |
+| `proposed_amendment6/c_harness.py` (v4: only change from v3 is `RealDevice.setup` taking `nodes`, so the pilot allocates node 0 only) | `e21b496b68e087ef238b8d99c9e104760cb54009cef5cb8983dbf3037ef41495` |
+| `proposed_amendment6/quiet_check.py` (unchanged from v3 (`lane_processes()` is used by the pilot)) | `c9017bb8c3e4fe85e2c1781764511c1b157a48c627b923ee25324f03a8b45e99` |
