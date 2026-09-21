@@ -23,6 +23,22 @@ order** — the marginal variant (gross +4.93 ms, net +2.7 to +3.6 ms, 1.1-1.4% 
 both unmeasured. V1 has **two** stages, always, whatever `k` is. If a step below would
 give you more than two, it is wrong and you should stop rather than generalise it.
 
+**The single most likely bug in this task, stated here because §4 is what you read while
+debugging and this is what you need before you start.** Stage 1 will be written by copying
+`exl3_ram_miss_lease_wait_kernel`, and that kernel treats every lane it cannot validate the
+same way. In stage 1 the two cases are **opposite**:
+
+- A lane whose `RowResult.ready` is **not set** is **not a failure**. It is a miss lane,
+  the service has not published it yet, and it belongs to stage 2.
+- A lane that **is** ready but **invalid** — wrong expert, `host_slot` out of range, torn
+  seqlock — is a **hard failure**, exactly as today.
+
+In the source you would copy from, both arrive at the same `misses > 0 -> ok = false;
+reason = kLeaseReasonIdentity` branch (`:486-491`) and are indistinguishable. Conflating
+them fails every mixed request; conflating them the other way turns a genuine identity
+violation into a silent second-stage retry. Keep them apart from the first line you write.
+D1 restates this where the kernel is specified.
+
 ---
 
 ## 1. State of the tree, verified rather than inherited
@@ -62,10 +78,14 @@ footnote.
    a device change; `retire_leases` needs no edit for it. One small host edit *is* needed,
    for a different reason: see S4.
 
-6. **`state[kSticky]` is never cleared.** `exl3_ram_miss.cuh` sets it at `:217`, `:358`
-   and `:516`; there is no clear site in the kernels, and nothing in
+6. **`state[kSticky]` is never cleared, and that is by design.** `exl3_ram_miss.cuh` sets
+   it at `:217`, `:358` and `:516`; there is no clear site in the kernels, and nothing in
    `ops/moe/exl3_ram_miss.py` re-zeroes the state tensor after `:790`. It is a
-   process-lifetime fail-stop latch, not a per-request flag. Do not use it as `req_failed`.
+   **process-lifetime fail-stop latch**: once this device state has failed once, every
+   later request refuses at entry rather than proceeding on a page that may be
+   inconsistent. **The missing clear is the feature, not an oversight — do not "fix" it.**
+   Adding a clear would silently disarm the fatal path for every request after the first
+   failure. Do not use it as `req_failed`; D6 adds a real per-request word instead.
 
 7. **V1 needs no change to `RowReader::read` and no `pack_one` callback.** That hook is
    V2's, for publishing miss rows at their own pack. V1 publishes misses exactly where
@@ -135,6 +155,15 @@ general and the next person to hit it will not be implementing V1:
 > leased slot.** V1 takes the second route, and §3 S6 and §5 T3/T4/T4b are that proof.
 > V2, which publishes miss rows early, cannot take the second route: its miss rows are in
 > `slots` by construction, and it must take the first.
+
+**Corroborated from an independent direction.** While this section was being written, the
+agent closing **Task 5 item 5** found by mutation that the service acting on a `Terminal`
+**without checking its generation** survives the entire existing suite, and that a stale
+terminal from an earlier lap would release a lease a GPU may still be reading. That is the
+same unguarded invariant as this section's — *a lease released while its reader is live,
+caught by no existing test* — reached from the opposite end of the protocol. See Task 5
+item 5's **R3 mutant**. Whoever implements V1 should read both: this section covers the
+release path, R3 covers the signal that triggers it.
 
 **The exact edit that would arm it**, so a reviewer can recognise it: pushing a hit lane's
 slot into `slots` during the reservation loop (a plausible refactor, since `slots` looks
@@ -405,12 +434,16 @@ in favour of compaction and now lives at D1, with the condition that would reope
 - **O4. Stage 1's poll bound (D1) has no measured basis.** `g` is unmeasured, and so is
   the latency from the service's ready store to a device poll observing it. The bound is
   currently a guess and should be a measurement.
-- **O5. `T(n)` enters V1 too, and `PER_ROW_TRANSFER.md` §1.2's two-phase row does not
-  model it.** The plan books `T(n)` (OPEN 1, the gather's cost at `count` = 1-6) entirely
-  against V2, on the grounds that V2 copies one row per launch. But V1 splits one
-  `count = k` launch into `count = h` and `count = k - h`, both smaller than today's.
-  The penalty is smaller than V2's and is not zero. **It is not quantified anywhere**, and
-  it subtracts from the 35.74 ms ceiling.
+- **O5. `T(n)` enters V1 too, and §1.2's two-phase row does not model it.** Raised while
+  drafting this checklist and **recorded centrally in `PER_ROW_TRANSFER.md` at
+  `8f92f922af`**, which is the statement to cite; it is not repeated here. In short: V1
+  pays **one** extra fixed per-launch cost per reading request where V2 pays about
+  `k - 1`, and the 35.74 ms row models a single `c` per row with no per-launch term.
+  **No number is put on it, deliberately** — the magnitude is what the `c` measurement is
+  being taken to find. Two consequences for this checklist: V1's margin is optimistic by
+  an unquantified amount on top of already being a ceiling, and **clause 4's `g`
+  measurement will not catch it**, because `T(n)` is a copy-kernel cost and `g` is a stage
+  cost.
 - **O6. `c` is bounded to roughly 0.97-1.08 ms/row and not chosen within it.** V1's
   ceiling is `33.9 x c`, so it moves about +-3% on `c` alone. `c` was not measured on
   2026-09-21 (no physical core on divix01 had both SMT siblings under the frozen 10%
