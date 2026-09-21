@@ -184,8 +184,13 @@ Include expert identity in the immutable row result and validate it against the 
 > 7.1% after launch cost -- but that **87% of it is RAM-HIT lanes gathered while
 > the NVMe read runs, and only 13% needs miss rows to finish at different
 > times**. Per-row transfer's own contribution over a simple **hits-then-rest
-> two-phase copy** is at most 2.55 ms/step, about 1.0%, which is **below what
-> this plan's own measurement design can resolve**. The two-phase mechanism
+> two-phase copy** is at most 5.06 ms/step, about **2.0% gross** -- which is
+> *above* the ~1.5% this plan's arms resolve (`task1e-PREDICTIONS.txt` line 10).
+> It falls to about 1% only **net of launch cost**, i.e. **at** the design's
+> resolution rather than clearly below it. (An earlier revision of this
+> blockquote cited 2.55 ms / 1.0% as the gross figure and called it below
+> resolution; that was wrong on both counts. 2.55 ms is the registered
+> `RANDOM-miss-only`, which is per-row against *batched*, not V2 minus V1.) The two-phase mechanism
 > captures nearly the same benefit with no per-lane wait chain, no A4 ordering
 > assumption, no partial terminal mask and no head-of-line problem. Prefer it
 > unless a measurement shows otherwise.
@@ -252,6 +257,21 @@ Include expert identity in the immutable row result and validate it against the 
 >   retirement, the eviction predicate, and generations. **None of this
 >   exists.**
 >
+> Two corrections from the first independent review (`PER_ROW_TRANSFER_REVIEW.md`):
+> the hit lease must be taken **in the same `mutex_` section as the
+> reservation**, not merely "in the reservation step" -- today's `serve()` drops
+> the mutex between reservation and `read()`. And V1's own saving bound is
+> **33.5 ms**, not the 38.6 ms quoted for early transfer generally, which is
+> V2's figure.
+>
+> **Implementation landmine for V2 only.** Publishing miss rows early means a row
+> can be `kReady` and leased when a *later* row of the same request fails.
+> `serve()`'s `!ok && !cancelled` cleanup calls `release_locked` on every slot,
+> and Task 5 makes releasing a leased slot throw -- so the cleanup must skip
+> published lanes or the service thread throws on any mid-request failure. V1
+> does not hit this, because its hit lanes are already `kReady`. That is a
+> further argument for V1 first.
+>
 > **Sequencing consequence: Task 6 cannot be accepted before Task 5 (b) lands.**
 > Not merely "should follow" -- (b) is what makes (a) safe, per the ownership
 > argument above. This orders the remaining plan work regardless of which
@@ -261,7 +281,7 @@ Include expert identity in the immutable row result and validate it against the 
 > time. That is a racy hint carrying no ownership, benign only for as long as
 > the host re-resolves authoritatively before acting on it.
 
-**Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step (2.0%), or 2.55 ms at random lane order, against a gate that resolves about 1.5% -- while costing 160 extra stage triples per step across all 40 layers. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
+**Chosen first mechanism: two-phase (hit lanes, then the rest), with per-row as the variant that must beat it.** Per-row is recorded as *expected-REJECTED by arithmetic, not yet by measurement*: its own contribution over two-phase is at most 5.06 ms/step, **2.0% gross**, falling to about 1% net of launch cost -- against a gate that resolves about 1.5%, so it sits **at** the resolution limit, not below it -- while costing 160 extra stage triples per step across all 40 layers. The strongest argument for the redirect is a different one, currently unregistered: the plan's *original* fixed-order per-row is about **14 ms/step worse than V1** (38.6 - 5.06 - 19.2), because random lane order forfeits roughly half the ideal saving. `analysis/dsv41-drive/PER_ROW_TRANSFER.md` §6.2 lists what would overturn that. The per-row description below is retained as the specification of that variant.
 
 **Baseline correction:** the fair comparison is Task 5 **lease-mode batched**, not today's unleased path. Lease mode arms every `count > 0` record, so all 40 layers pay a service round trip (OPEN 11, unmeasured). That cost must be netted out or any Task 6 arm flatters itself.
 
