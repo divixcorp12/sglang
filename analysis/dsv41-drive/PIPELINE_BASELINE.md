@@ -78,6 +78,12 @@ measured at gen1 (all 17 here) are **not directly comparable to any arm at that 
 (`git rev-parse 5e92db22dc:python` = `ee7029642...`, its parent = `815cb72...`). A pre-registered check that would tell whether
 the difference matters exists and has not run (section 6, R1).
 
+`python/` has changed a third time. **gen3** (python tree `8d3312fdf0a7...`, `git rev-parse 8c78749b35:python`) differs from gen2 by two
+behavioural commits: `85cdbf9382` (the service skips sequence 0 through the wrap; a C++ change, so the host module recompiles) and
+`8c78749b35` (attach refuses a gather wider than the 8 lanes; startup only). Both are expected to be inert on decode tok/s and neither has been
+measured, so a gen3 arm against a gen2 number is not a clean comparison. Registered in `task1-results/clean-reference.json`; the commit-by-commit
+table, the check that the manifest reproduces, and the finding that **nothing enforces the manifest** are in `task1-results/GENERATIONS.txt`.
+
 ## 3. The matched baselines
 
 ### 3.1 The cells
@@ -344,6 +350,23 @@ So "matched" here means matched in workload, seed, capacity, policy and code. It
 4. **Do not pool session-0 TTFT** and do not read the regime as a predictor of it.
 5. **Do not quote the old-barrier gap to two decimals.** Until a second clean old arm exists, "about 3 %, all four sessions positive, old `n=1`, and the delta is four commits, not only two-bank".
 6. **Record cache residency of both mirrors and the source before and after** each arm. It moves without our reads (section 7.3).
+7. **Register the code generation before the first arm, not after.** `git rev-parse <HEAD>:python` must be a key in `clean-reference.json` `generations`.
+   Nothing enforces this: an arm run against an unregistered tree prints `GENERATION unknown` and is still `VALID` with exit status 0
+   (`task1-results/GENERATIONS.txt`, section 4). Check by hand, or add a preflight to `task1-baseline-arms.sh`.
+8. **The gates below were calibrated for a quiet box and are wrong for this one** (task1e, `task1-results/task1e-RESULT.txt`). Register the gates for the
+   machine you actually have **before** the series, not during it; task1e needed two amendments and still ended UNRESOLVED (2 valid arms).
+   - *CONTENDED* disqualifies every arm when reth-binary, nimbus_beacon_node, htop and tmux are running on cores 32-63, as they were in all three task1e
+     arms. On such a box a rule that drops contended arms can never return a result however evenly the contention falls. The protection for a paired
+     ratio is the stationarity test over the whole series, not a per-arm contention flag.
+   - *CROSS-ARM* against the historical reference set has one arm to compare with in the old cell (`task1c-1`), which the verdict itself says is
+     indistinguishable from that arm's noise near the 8 % threshold, and it compares across nights. Leave-one-out within the series (`task1e_analyze.py`)
+     needs at least 3 arms per cell to have a two-arm reference, and the median of two is their mean.
+   - *Foreign processes ignore their nominal affinities.* reth-binary (described as pinned to 30-50) was on core 47; nimbus was seen on cores 33, 39,
+     52, 54, 55, 58 and 61; htop and tmux sat on arm cores. No core range avoids them.
+   - *Boundary samples record process names, not command lines.* An 8-92 % python entry on an arm core cannot be attributed to a job, an agent or a
+     service from what was captured. Capture the full command line and owner of every listed foreign process.
+   - *Drive-idle* (1 MiB/s over a 2 s probe) is not mis-calibrated: it caught a real transient (nvme4 at 1.90 MB/s, 32 KB/s eight minutes later). It does
+     abort the whole script on one bad probe, which is a cost worth knowing about.
 
 ## 10. Corrections that section 19 of `DSV41_REFERENCE.md` needs
 

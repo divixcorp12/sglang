@@ -18,6 +18,7 @@
  "generations": {
   "921bc132c0479bd932e85fa700b9ab4aa39ccbb7": "gen0 = python/ of 099eadba33 (old barriers, pre two-bank)",
   "815cb723309886975d75e1cc582d45de39d535a5": "gen1 = python/ identical to f6608901a3",
-  "ee70296428321097df189c7fa5cadbb2d4300fa6": "gen2 = python/ of 87417376f5 (stage-trace schema 3: row_admit, extent_submit, extent_attempts, trace_clock_reads; exl3_ram_miss_host.cpp changed vs gen1)"
+  "ee70296428321097df189c7fa5cadbb2d4300fa6": "gen2 = python/ of 87417376f5 (stage-trace schema 3: row_admit, extent_submit, extent_attempts, trace_clock_reads; exl3_ram_miss_host.cpp changed vs gen1)",
+  "8d3312fdf0a7ecc38dfe70e04d1badfd0ca91cf6": "gen3 = python/ of 8c78749b35, BEHAVIOURAL vs gen2 (87417376f5): 85cdbf9382 wrap fix (service skips seq 0 through the 0xFFFFFFFF wrap, both rings; exl3_ram_miss_host.cpp) and 8c78749b35 attach refusal (ValueError when graph_gather_rows > 8 lanes; startup only; srt/layers/moe/exl3_ram_miss.py); every other commit since gen2 touches no python/ file; a gen3 arm vs a gen2 number is NOT a clean comparison, see GENERATIONS.txt"
  }
 }
