@@ -421,6 +421,13 @@ class Exl3RamMissService:
             manager.add_residency_listener(self.on_residency)
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
+        if streamer.graph_gather_rows > MAX_IDS:
+            # The post kernel requests min(count, MAX_IDS) lanes, so a plan can carry lanes the service is
+            # never asked for; the wait kernel then fail-stops on the first of them that is not in RAM.
+            raise ValueError(
+                f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
+                f"per call but the service requests at most {MAX_IDS} lanes"
+            )
         cache = streamer.hot_cache
         if self.device_side is None:
             from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
