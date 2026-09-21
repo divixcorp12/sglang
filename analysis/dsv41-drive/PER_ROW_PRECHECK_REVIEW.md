@@ -241,6 +241,14 @@ evenly over layers" is good at the layer level: lanes per layer per step range 2
 - Same stream as `task1-2-new-on-T`: `(layer, type, rows_asked, status)` identical for all 20,800 requests in order; 16 requests differ only in `forward` label and 4 `graph_step` lines shift a few
   RAM misses between adjacent steps (the register lag), with equal sums. That is what allows the next item.
 
+- **The -222 lanes are closed, and the check is exact, not a tolerance.** Grouped by session (forwards 3-125, 127-250, 252-375, 377-500) rather than filtered by "has a `graph_step`", `sum(lanes)` over **all** requests
+  equals `sum(vram_miss)` **exactly** in sessions 2, 3 and 4 (14,686; 17,959; 14,412; difference 0), including the 14-15 request stubs filed under forwards 126, 251, 376 that have no line (42, 52, 48 lanes; the next line's
+  `vram_miss` carries them). Session 1 differs by 2,018 lanes, all under forward 2 (374 requests, 2,098 lanes, no `graph_step` line): that is the first pass, which is not a graph decode step; the first line (forward 3,
+  `vram_miss` 221, twice a typical line) absorbs 80 of forward 2's lanes. The -222 the "has a `graph_step`" filter showed is exactly 142 (the three stubs) + 80 (forward 2's decode part). So the -0.34% was my filter, not the trace.
+  The exactness is per session, not per line (the per-line sum still fails in 479 of 495 lines).
+- **The 3-step gap is localised, not explained.** The sessions hold 127, 128, 128, 128 graph steps (511) against 127 client-observed steps each (508): sessions 2-4 each carry one more graph step than the client saw, one per session
+  boundary, where the no-line stubs sit. I have not shown the mechanism (a tail step split across the boundary is the obvious candidate).
+
 **3. Recomputed figures with measured `k`** (`schema4_join.py`: measured lanes from `task1f` joined request by request onto the stage timings of `task1-2-new-on-T`; ms per decode step, shares of 257.5 ms):
 
 | k | BEST | RANDOM | two-phase | hit lanes in read layers | per-row over two-phase, best / random order |
