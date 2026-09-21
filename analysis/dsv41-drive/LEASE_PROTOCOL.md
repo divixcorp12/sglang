@@ -1948,6 +1948,19 @@ independent review) that lease mode defaults off.
   `ExpertPinnedHostCache.quarantine()` and `quarantine_host_slabs()`. The `shutdown` wiring that
   calls it is still to do.
 
+- **DEFERRED AND WHY: retirement between the reader's batches** (7.5 call site 2, the give-up lambda of
+  `RowReader::read`) is **not implemented**, on purpose, pending `t4-packworker`'s refactor of the code around that
+  lambda: two sessions editing it from opposite directions would produce a merge nobody can review. Until it lands,
+  `retire_leases()` runs only at the top of `pump_demand`, so during one long read the acknowledgements of earlier
+  requests wait until it returns (a hold-time cost; nothing waits on an acknowledgement). It is why box 5 ("keeps
+  reaping") is not ticked. The test it needs: a delayed read (`inject(delay_s)`), a withheld-then-delivered
+  acknowledgement, and the witness that `leases_acked` moves **during** the read (R3 in 18.2a). If the refactor keeps
+  the lambda recognisably, the change is one call; if it dissolves it, where retirement belongs in the new shape is to
+  be decided before anyone writes it.
+- **A test-first suite's first run failed for the wrong reason, which is normal:** the first run of the 3c thread
+  tests failed because a raw `sim_post` writes no lane request, so the service saw an overrun; the test was wrong,
+  not the service.
+
 ### 20.2b Step 3's CPU simulated device: what the scaffolding must provide
 
 The simulated device of step 3 extends `exl3_ram_miss_sim_post` / `_sim_wait`. To be faithful to
