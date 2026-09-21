@@ -166,6 +166,23 @@ Include expert identity in the immutable row result and validate it against the 
 - [ ] Document aligned fields, single-writer ownership, system release/acquire operations, wrap handling, and request-slot reuse before coding. Use a coherently validated protocol; ordinary Python stores are not its implementation.
 - [ ] Initially exercise the acknowledgements after the existing whole-request copy, without changing its scheduling. Include RAM hits as well as newly read rows in source ownership.
 - [ ] Inject delayed GPU consumption while forcing RAM admission pressure. A leased source must remain immutable even after its read has completed and while a newer request exists.
+> **The all-or-nothing guarantee is unpinned in BOTH directions** (second
+> review, `0fc5640141`). The test named for it,
+> `test_a_failed_read_publishes_none_of_the_rows_it_had_already_packed`, injects
+> `fail_reads`, which **short-circuits before `reader_.read()`** -- so no row
+> ever packs and the assertion is **vacuous**. It would pass unchanged under
+> per-row publication. The test the Task 6 design cites as the real pin,
+> `test_a_failed_part_fails_the_row_and_never_leaves_a_half_packed_one`, calls
+> the standalone reader and pins whole-or-untouched *there*; the tier-level
+> claim is only a comment. **No test exercises a multi-row demand with some rows
+> packed and then a failure**, because `RamTier::inject` exposes only
+> `fail_reads`, delay and abandon. **A mid-read fault injector at the tier is a
+> prerequisite for changing this behaviour** -- without it the change is
+> unfalsifiable in either direction. Production code and tests have no other
+> consumer (two independent searches agree); `lease_model.py` and
+> `LEASE_PROTOCOL` §7.2 / row F1 do encode it, and are what the change
+> invalidates.
+
 - [ ] Handle failure before readiness, timeout before copy, and failure after a subset copied. Suppress dependent compute on any fatal demand error. A skipped GPU copy must not accidentally emit a successful source-consumption acknowledgement.
 - [ ] Retire unconsumed leases after a terminal cancellation handshake establishes that no GPU reader can start. Already copied lanes retire through their matching acknowledgements. The worker must keep submitting/reaping and processing cancellations while acknowledgements are outstanding; never synchronously wait for an acknowledgement inside its I/O progress loop.
 - [ ] On shutdown, stop admission, drain storage/packing, then establish completion of all GPU readers before freeing their memory. If a CUDA error prevents establishing completion, retain/quarantine allocations until process teardown; never recycle uncertain storage.
@@ -290,6 +307,38 @@ Include expert identity in the immutable row result and validate it against the 
 >
 > The change Task 5 must absorb is **when** the `RowResult` words are published
 > (at reservation, for hit lanes), not which words exist.
+>
+> **CORRECTION to the "no early signal exists" claim above** (second review,
+> `0fc5640141`). No early *readiness* signal exists -- that stands. But
+> **`kBusySeq` (page offset 24) is device-observable and is written before
+> `serve()`**: `handle_demand` stores it as its first action, before reservation
+> and before `read()`, and clears it after `set_status`. No device kernel reads
+> it today; only the host watchdog does. So a **cheaper V1 exists** than the one
+> costed above: gate the hit phase on `kBusySeq == seq`, then read `slot_map`
+> and copy lanes that are `>= 0`. That costs a wait-kernel change and a stage
+> kernel, with **no service change at all**.
+>
+> It is safe only under today's invariants -- one service thread, so no advisory
+> can run once the request is taken; `take_slot_locked` never evicts `wanted`;
+> eager paused -- and it is **not Task 5 compliant**. It buys the 87% by
+> *borrowing* the temporal exclusion rather than replacing it, so it expires the
+> moment the service becomes asynchronous. Two things unverified: whether the
+> device reliably observes `kBusySeq` before it clears, and whether every planned
+> lane is in `protect` for every producer.
+>
+> **Consequence for the plan's costing:** "V1 needs one early publication" is the
+> cost of a *safe, durable* V1, not of the cheapest one. The lease is still what
+> this plan wants -- a mechanism whose correctness argument evaporates when the
+> service goes async is a liability in a plan whose Task 8 makes it async -- but
+> that is now a choice being made, not the only option available.
+>
+> **Refinement of the safety claim above:** the eviction happens at the
+> advisory's *reservation pass*, not throughout its read, so the exposed window
+> for an ungated early copy is up to **one advisory serve (~10 ms)**, not
+> microseconds, and only with advise on. The precise statement is that an early
+> copy needs *either* a service ownership grant *or* a gate keeping the copy
+> inside the interval where the single service thread is within this request --
+> not "any early copy needs Task 5's lease".
 >
 > **Cost, split by owner** (`c5c572bd92`). The information the signal must carry
 > already exists at the right moment and in the right thread: `RamTier::serve`
