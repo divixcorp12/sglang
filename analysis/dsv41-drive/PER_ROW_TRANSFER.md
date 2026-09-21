@@ -140,8 +140,24 @@ random-order miss-rows-only share, 2.47 ms/step (the registered 2.55 ms at 495 d
 
 **Registered outcome, unchanged in kind: SUPPORT and SPREAD-IRRELEVANT** (miss-only / RANDOM < 0.25). Mirrors-OFF (step 344 ms)
 gave the same classes on the registered run and has not been recomputed with measured `k`. The reject test did **not** reject.
-The `c = 0.55 / 1.6` sweep, the GENEROUS reject case (registered 75.4 ms) and the per-session table below were computed under
-A1's `k` and are not recomputed with measured `k`; they are kept only in the history (1.5) or marked as such.
+The `c = 0.55 / 1.6` sweep and the per-session table below were computed under A1's `k` and are not recomputed with measured
+`k`; they are kept only in the history (1.5) or marked as such.
+
+**The GENEROUS reject case is `k`-free, so measured `k` cannot move it, and it did not reject.** It is the pre-registered reject
+test for early transfer *as a whole*, not a per-row-versus-two-phase comparison: every request that reads is given `k = 6` (the
+top-6 cap, `h = 6 - m`), best order, launch cost not subtracted (`request_savings(..., max(6, m), ...)` in
+`per_row_precheck.py`), so no estimate of `k` enters it. Only its divisor changes: 75.4 ms per step over 495 lines is **73.0 ms
+over 511 steps, 28.7% of 254.4 ms, against a reject threshold of 1.5% (3.8 ms): a margin of about 19x** (exact rescaling; the summed
+savings are unchanged). Nothing was rejected by it.
+
+**What "expected-REJECTED" for per-row rests on, and how thin it is.** It concerns per-row *over two-phase*, not early transfer.
+At best order the gross increment is **+4.93 ms and is `k`-free**; net of V2's extra stage cost (160 stage triples per step at an
+assumed, unmeasured 8-14 us) it is about +2.7 to +3.6 ms, **1.1-1.4% of 254.4 ms against a 1.5% resolution: a margin of 0.1-0.4
+points that measured `k` does not touch**, and that depends on the unmeasured stage cost (at about 5 us or less the best-order net
+would exceed 1.5%) and on the resolution itself (quiet-box; the series is recorded UNRESOLVED on the contended box, so the real
+resolution is worse, which favours rejection). At random order the increment is -15.67 ms, was -13.08 ms under A1's lower `k`, and
+so higher `k` strengthened that rejection by 2.6 ms. Read the label as: not distinguishable from V1 at best order given an
+unmeasured stage cost, and losing outright at random order.
 
 **Beside the headline: the range across sessions, and the floor** (independent recomputation R4, **computed under A1's `k`, not
 recomputed with measured `k`**; step times from `task1-3-new-on-U`, sessions 1-4: 313.4, 226.3, 300.0, 209.9 ms):
@@ -160,8 +176,8 @@ this is the spread of one stream's sessions, not four workloads (section 1.1).
 **Denominator, and a provenance note.** The registered `T_step` (257.5 ms, from `task1-3`, `task1-6`, `task1c-3` untraced,
 named in the pre-registration) included **an arm the acceptance gates disqualified**: `task1-6-new-on-U` is INVALID in its
 verdict file ("expert shard page-cache residency grew 1.40 GiB across the arm"), and `task1c-3-new-on-U` is excluded from
-`clean-reference.json` (its verdict file says VALID with a boot-warm regime note; I did not find the "disturbed" mark that
-R5 and the plan cite, so that label is theirs, not mine). I did not check the arms' verdicts before naming them in the
+`clean-reference.json` (its verdict file says VALID with a boot-warm regime note; **"disturbed" was the reviewer's word, not the record's, and the plan
+has withdrawn it** (`74d7fe988e`); it is not a property of the arm). I did not check the arms' verdicts before naming them in the
 pre-registration, and the gates that exist to keep such arms out of a result did not stop it. **This document uses 254.4 ms, the
 mean of the four `new:on` arms in `clean-reference.json`** (`task1-2`, `task1b-0`, `task1c-0` traced, `task1-3` untraced): three of
 the four are traced, and the only clean untraced on-arm alone gives 254.7 ms (n = 1), so it is not "clean untraced". Reproduced: the
