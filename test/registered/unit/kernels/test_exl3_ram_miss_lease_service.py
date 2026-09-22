@@ -377,10 +377,14 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
     acknowledges partway through a LATER read is retired before that read returns, not merely once it does.
 
     Mutation: remove read()'s in-loop progress() call, leaving retire_leases() reachable only from the top of
-    pump(). The acknowledgement (delivered while the second request's read is still packing, slowed by
-    pack_delay_ns) would then not retire until the read returns and pump() loops back to serve nothing -- this
-    test's poll, bounded well inside the read's own span, would still see leases_acked at 0 when the deadline
-    is reached, so it fails there rather than on a wrong value.
+    pump(). The acknowledgement (delivered once the second request's read has verifiably started, and while it
+    is still packing, slowed by pack_delay_ns) would then not retire until the read returns and pump() loops
+    back to serve nothing -- this test's poll, bounded well inside the read's own span, would still see
+    leases_acked at 0 when the deadline is reached, so it fails there rather than on a wrong value.
+
+    The ack is delivered only after busy_seq names req2: pump_demand() itself starts with an unconditional
+    retire_leases() call, unrelated to phase 1, so delivering the ack any earlier races that call -- it could
+    retire the lease before req2's read even starts, which would pass under the mutant too and prove nothing.
     """
     s = ram_miss_setup(tmp_path, capacity=4)
     page = new_page(pin=False)
@@ -399,6 +403,11 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
         # than the poll deadline below, so an ack delivered now can only be seen mid-read, not after req2 ends.
         host.inject_fault(pack_delay_ns=50_000_000)
         req2 = sim.post(0, [2, 3, 4])
+
+        started = time.perf_counter() + 2.0
+        while page_word(page, "busy_seq") != req2.seq:
+            assert time.perf_counter() < started, "req2 was never picked up by the service thread"
+            time.sleep(0.0005)
         sim.ack(req1, waited1)
         sim.deliver()
 
