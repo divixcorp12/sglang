@@ -618,6 +618,12 @@ class RowReader {
   // Null costs a branch per event and no clock read; the stamps only read the clock and add to
   // `trace`, so they cannot change what is submitted, reaped, drained or copied.
   //
+  // `progress`, when set, is invoked periodically from inside the drain loop -- at most once every
+  // kProgressIntervalNs, never once per turn, since a turn can be as short as a single _mm_pause().
+  // RowReader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
+  // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
+  // caller decides when to stop admitting. Null costs one comparison per turn and no clock read.
+  //
   // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in
   // range and `experts.size() == slots.size()`. The service (Task 11) and
   // read_rows_once (Python) validate at their boundaries.
@@ -629,7 +635,8 @@ class RowReader {
       const std::function<bool(size_t)>& abandon,
       StageRecord* trace = nullptr,
       std::vector<uint8_t>* packed = nullptr,
-      size_t max_reading_rows = SIZE_MAX) {
+      size_t max_reading_rows = SIZE_MAX,
+      const std::function<void()>& progress = nullptr) {
     if (!ring_ready_) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
@@ -661,7 +668,24 @@ class RowReader {
       RowReader* reader;
       ~Quiesce() { reader->quiesce(); }
     } quiesce_on_exit{this};
+    // 0 forces the first turn to fire immediately, so a short read still gets one call before it
+    // returns rather than waiting a full interval that may outlast the whole request.
+    int64_t next_progress_ns = 0;
     while (true) {
+      // Gated on elapsed time, not on a completion being reaped: reaped completions are this
+      // reader's own I/O finishing, uncorrelated with the device acknowledging a lease (that arrives
+      // through the lease block serve() owns), so a request whose reads finish early but is still
+      // packing would otherwise stop calling progress() before the read returns. Time keeps firing
+      // regardless of which sub-phase the loop is in. The interval is sized well under a typical
+      // request's span (tens of ms, see the plan) so a lease is retired promptly, while staying far
+      // above a single turn (as short as one _mm_pause()) so this never becomes a per-turn mutex take.
+      if (progress) {
+        const int64_t now = now_ns();
+        if (now >= next_progress_ns) {
+          progress();
+          next_progress_ns = now + kProgressIntervalNs;
+        }
+      }
       collect_packed();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
       if (!c.failed) refill();
@@ -706,6 +730,12 @@ class RowReader {
   static constexpr int kMaxRetries = 8;
   static constexpr uint8_t kPoisonFill = 0xA5;
   static constexpr int32_t kPoisonSlot = 0x7EADBEEF;
+  // How often read()'s drain loop may call its optional `progress` callback. Arbitrary; chosen to sit
+  // well under a request's typical span (tens of ms; see docs/superpowers/plans/2026-09-22-ram-miss-
+  // progress-loop.md) so a lease is retired promptly, and far above one loop turn (a bare _mm_pause())
+  // so the callback's own cost (a mutex and a walk over kDemandRecords, on the caller's side) cannot
+  // dominate the loop.
+  static constexpr int64_t kProgressIntervalNs = 200'000;  // 200 us
 
   // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
   enum class RowState : uint8_t { Free, Reading, Ready, Packing };
@@ -2722,7 +2752,13 @@ class RamTier {
             },
             cur_,
             &packed,
-            advisory ? 1 : SIZE_MAX);
+            advisory ? 1 : SIZE_MAX,
+            // Safety, not just style: read() runs here with mutex_ NOT held -- the only lock_guard in
+            // serve() near it is the scoped S2 reservation hold above, which closes before this call.
+            // retire_leases() takes mutex_ itself, so this is deadlock-free today. That is a property
+            // of the code as it stands, not a guarantee: if a future yield point is ever added to
+            // read()'s drain loop under a lock, this callback would deadlock against it.
+            [this] { retire_leases(); });
         if (result == 0) counters_[kReadErrors].fetch_add(1);
         ok = result == 1;
         cancelled = result == -1;
