@@ -127,6 +127,7 @@ class TwoPhaseService:
 
         self.segments = expert_row_segments([(self.slabs[0][n], self.dest[n]) for n in self.names])
         self.dest_slots = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
+        self.host_rows = torch.zeros(TOP_K, dtype=torch.int64, device="cuda")
 
     def close(self):
         _close(self.host, self.slabs)
@@ -184,6 +185,19 @@ class TwoPhaseService:
         self.copy2()
         self.ack2()
         self.finalize()
+
+    def step_batched(self, row=0, next_row=-1):
+        """The Task 5 batched (M1) chain, entirely separate kernels from every two-phase one
+        (D2's resolution: M1 stays unchanged so both arms exist in one binary). Used to establish
+        residency for a test without touching stage_ack/hit_wait/rest_wait/finalize at all, so a
+        two-phase-kernel mutant cannot leak into a test's setup step.
+        """
+        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+        self.dev.post(row, self.planned, self.count, self.routes, next_row)
+        self.dev.wait(row, self.planned, self.count, self.host_rows, self.keep, self.ram_miss)
+        copy_expert_row_segments_gpu(self.segments, self.host_rows, self.dest_slots, self.dev.go_count)
+        self.dev.ack(self.keep)
 
     def until(self, predicate, timeout_s=10.0):
         deadline = time.perf_counter() + timeout_s
@@ -367,12 +381,23 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
     about, so the test waits on the host's own ``hit_leases_granted`` counter -- incremented
     synchronously inside the reservation hold that publishes the RowResults -- before launching
     stage 1's kernel at all, removing it from this test's scope entirely.
+
+    Setup uses the batched (M1) chain, not the two-phase one: the residency-establishing request
+    is an all-miss request, so its own stage 1 is empty, and stage_ack's mutant (an empty stage
+    acknowledging lane 0 anyway) would corrupt it with a bogus, zero-generation acknowledgement --
+    which mismatches the real slot generation and raises VIOLATED, sending the finalize kernel's
+    ``keep = 0`` / sticky / fatal path during what is meant to be a clean setup step, before the
+    all-hit request this test is actually about ever runs. Confirmed empirically: with the T11
+    mutant applied and the two-phase chain used for setup, the all-hit request's own
+    ``hit_leases_granted`` wait timed out completely (the device latched sticky during setup), not
+    at the ``leases_acked`` assertion the checklist names. The batched chain shares no kernel with
+    stage_ack, so it cannot trip that mutant.
     """
     s = TwoPhaseService(tmp_path, poll_bound=64)
     try:
         experts = [1, 2, 3]
         s.plan(experts)
-        s.step_two_phase()  # first pass: loads all three via the miss path, establishing residency
+        s.step_batched()  # first pass: loads all three via the miss path, establishing residency
         _cuda_ready()
         assert s.until(lambda: s.host.counters()["leases_acked"] == len(experts)), s.host.counters()
 
