@@ -505,8 +505,9 @@ class TestOutputParity:
         Two more properties are pinned beyond output equality, because M1/M2 agreeing on output does
         not by itself prove stage 1 is doing anything (see the method below for why an exact go_1
         count is not safe to assert): a liveness check that stage 1 does claim a hit lane at least once
-        given enough identical warm requests, and a deterministic per-lane check that a lane whose
-        expert has never been resident cannot be claimed by stage 1 on its first read.
+        given enough identical warm requests, and a per-lane check -- under an injected read delay that
+        makes it deterministic rather than a second race -- that a lane whose expert has never been
+        resident cannot be claimed by stage 1 while its read is still outstanding.
         """
         from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
@@ -550,17 +551,31 @@ class TestOutputParity:
                 eager_outs, graph_outs, gathers = [], [], []
                 for route in routes:
                     ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
-                    eager_outs.append(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0).float().clone())
+                    inject_this_call = two_phase and route == routes[1]
+                    if inject_this_call:
+                        # Force this call's reads to take far longer than stage 1's poll bound (tens of
+                        # us at the default poll_bound), so the claim check below is deterministic, not a
+                        # race. Without an injected delay this is NOT a safe property to assert: verified
+                        # empirically that a lane whose expert was never resident before (12, here) can
+                        # still show claimed == 1 on its very first read, because stage 1 does not
+                        # distinguish "resident before this request" from "published while I was still
+                        # polling" (D1's own words) -- and this test's tiny fake checkpoint reads fast
+                        # enough that the miss's publish sometimes lands inside the poll window anyway.
+                        service.host.inject(delay_s=0.2)
+                    try:
+                        eager_outs.append(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0).float().clone())
+                    finally:
+                        if inject_this_call:
+                            service.host.inject(delay_s=0.0)
                     assert streamer.row_backend.keep.item() == 1.0, (arm, route, service.host.counters())
                     for check in checks:
                         check()
 
-                    if two_phase and route == routes[1]:
-                        # Deterministic, unlike the liveness loop above: experts 9, 10, 11, 12 have not
-                        # been touched anywhere before this exact call (route[0]'s two experts beyond
-                        # the hot set are 3, 5, 6, 7; only route[1] ever names 9, 10, 11, 12), so stage 1
-                        # cannot have anything published to claim for them -- no race, no poll-bound
-                        # dependency, just "a lane that was never resident is not a hit."
+                    if inject_this_call:
+                        # Now deterministic: experts 9, 10, 11, 12 were never resident anywhere before
+                        # this exact call (route[0]'s two experts beyond the hot set are 3, 5, 6, 7; only
+                        # route[1] ever names 9, 10, 11, 12), and the injected delay above guarantees
+                        # their reads outlast stage 1's poll, so none of them can be claimed by stage 1.
                         planned = streamer.row_backend.planned.tolist()
                         claimed = dev.claimed.tolist()
                         for expert in (9, 10, 11, 12):
