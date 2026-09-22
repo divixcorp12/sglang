@@ -2419,6 +2419,11 @@ multi-rank teardown.
 
 ### 20.2k R3: retirement between the reader's batches (7.5, call site 2): HELD, with its mutation ledger
 
+> **Resolved 2026-09-22 in 20.2n below, in a different shape.** The held diff is superseded, not
+> applied, and the "no meaningful test is possible" blocker recorded here has been removed. Read
+> this subsection as the record of why the abandon-callback form was rejected; it is still the
+> evidence for that.
+
 The change: `serve()`'s abandon callback calls `retire_leases()` before it decides whether to give up. One added call in
 `exl3_ram_miss_host.cpp`; `serve`, `pump_demand`, `pump_advice`, `handle_demand` and `RowReader` are otherwise untouched.
 The call is idempotent (a per-lane state machine), never blocks, and cannot touch the request in service (its own
@@ -2467,6 +2472,7 @@ a delay before the read can only place an acknowledgement before the first call,
 covers, and the fault that slows individual rows is not reachable from the service.
 
 **Decision: HELD, not landed (team-lead, on the second reviewer's finding).** Recorded here so it is not rediscovered.
+(Superseded 2026-09-22; see 20.2n. Blocker 2 below is gone, blocker 1 stands.)
 1. **The Task 6 dependency.** No consumer exists today. A demand is one batch, so the callback runs once at batch 0,
    microseconds after `pump_demand`'s own retire; the only observable effect is that `leases_acked` moves earlier. The
    rationale (a long read holding an already-acknowledged lease) is what V2's per-row transfer creates, and it is not built.
@@ -2498,11 +2504,6 @@ The patch is kept at `analysis/dsv41-drive/held/R3_retire_in_read.diff` (applies
    worker mode evaluates the callback on more turns") was false for demands: `admit()` evaluates the callback only inside
    `while (next_batch < batches)`, so for a demand it is never evaluated after batch 0. Idempotence is still cheap and
    correct, but it was not the constraint it was presented as.
-
-**20.2j addendum: a known limit of the S1 test.** The interrupt test replaces `_establish_gpu_completion` with a function that
-raises `KeyboardInterrupt` in the calling thread, so it bypasses the real helper-thread `join`. It is accepted because a real
-interrupt during the join lands in the same `except BaseException`, but the `join` itself is not exercised by it. The
-post-landing review of `bcfe378f0d` found nothing to fix forward.
 
 ### 20.2l The device kernels (7.3, 7.4) landed as `70847da92f`: verification ledger, and what it does not establish
 
@@ -2622,3 +2623,47 @@ Verification, by kind (none of it ticks a plan box):
   kernel-and-service level case above covers that combination); a model with more than one streamed layer through the
   graph path; eviction pressure with leases on through the backend; and everything section 20.2l lists as not
   established (the ordering argument of 6.4).
+
+### 20.2n R3 resolved: superseded by the phase-1 progress callback (2026-09-22)
+
+R3 is no longer held. It did not land in the held form, and the held diff
+(`analysis/dsv41-drive/held/R3_retire_in_read.diff`) is superseded rather than applied:
+hooking `serve()`'s abandon callback gave a call that ran once at batch 0, which is why
+20.2k could not build a test that meant anything. The landed shape instead passes an
+optional `progress` callback into `RowReader::read()` and calls it from the drain loop on
+a time gate (`kProgressIntervalNs`, 200 us), so retirement happens **between batches of a
+read**, which is what R3 was always for. Commits `d24c681fc3` (the call), `7b40535f91`
+(constant and test), `e5082832fe` (a race in that test).
+
+**Blocker 2 of the held decision is gone.** 20.2k recorded that a meaningful test needed a
+multi-batch read, and that `pack_delay_ns` was unreachable from the service's own reader,
+calling that "worth more than the one-line diff". `c8a1309cf7` carries a full `ReadFault`
+through to the tier's reader, so the test now injects `pack_delay_ns=50_000_000` on a
+three-row request: the read spans ~150 ms, far above both the 200 us progress gate and the
+test's 0.1 s poll deadline, and the acknowledged lease is observed retiring while that read
+is still running. That is the between-batches evidence 20.2k said did not exist.
+
+**Mutant, demonstrated 2026-09-22** in a private detached worktree at `38e981fc83`, cores
+0-31 (a GPU arm held 32-63): baseline **18 passed**, exit 0 -> `progress();` removed from
+the drain loop -> **1 failed, 17 passed**, exit 1, failing only
+`test_a_lease_acknowledged_mid_read_retires_before_that_read_returns` at its predicted
+assertion `retired_mid_flight` -> reverted -> **18 passed**, exit 0. This is D1 of 20.2k's
+ledger re-run against a test that can actually see the difference.
+
+**Blocker 1 stands.** There is still no consumer: V2's per-row transfer, the long read that
+holds an already-acknowledged lease, is not built. What changed is that the mechanism is now
+demonstrated rather than argued, so the question is whether to carry it, not whether it works.
+
+**Cost: no measurable throughput effect.** Served-path arms with lease mode on and off differ
+by 1.8% (2.141 vs 2.102 token-weighted) against a within-arm session spread of 1.67-2.28 at
+n=1 -- i.e. nothing resolvable. See `DSV41_REFERENCE.md` section 20, which also records why
+throughput is the wrong instrument for a stall/progress property.
+
+**One thing tried and reverted.** `de055eda15` throttled phase 1's clock read on idle spin
+turns; reverted in `134d1cd0b2`. The `now_ns()` per drain turn is not known to cost anything
+measurable, and the throttle added a second time source to reason about.
+
+**20.2j addendum: a known limit of the S1 test.** The interrupt test replaces `_establish_gpu_completion` with a function that
+raises `KeyboardInterrupt` in the calling thread, so it bypasses the real helper-thread `join`. It is accepted because a real
+interrupt during the join lands in the same `except BaseException`, but the `join` itself is not exercised by it. The
+post-landing review of `bcfe378f0d` found nothing to fix forward.
