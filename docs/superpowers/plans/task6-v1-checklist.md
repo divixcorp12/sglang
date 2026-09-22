@@ -9,45 +9,56 @@ editing.
 
 ---
 
-> ## PARKED 2026-09-21 — and **not** for lack of time
+> ## UNPARKED 2026-09-21 — the parking reasoning was wrong
 >
-> **Do not start implementing this.** Task 6 was parked by the user's decision after two
-> independent lines converged on the same conclusion: **V1 and V2 are both reordering work
-> on a saturated link.** This file is kept as the record of *how* to build V1 if the
-> picture changes. It was not abandoned half-finished; it was aimed at a hardware floor.
+> **This task was parked earlier today and is now live again.** The park note that stood
+> here is preserved in git history; it is replaced rather than amended because its central
+> claim was false and leaving it beside a correction invites someone to average the two.
 >
-> **1. The gather already runs at PCIe Gen3 x16 line rate.**
-> `copy_expert_row_segments_gpu_kernel` is 128 ms of a 391 ms step (32.7%) and moves a
-> 13.3 MB row in 1.055 ms — about 12.6 GB/s, which *is* the practical Gen3 x16 ceiling.
-> The link cannot be raised: the host is an **HPE ProLiant DL380 Gen10** with 1st/2nd-gen
-> Xeon Scalable, so **Gen3 is a platform limit, not a BIOS setting.** No software change
-> makes the gather faster. Only *fewer bytes per token* does. Everything in this checklist
-> moves copy time earlier; none of it moves fewer bytes.
+> **1. V1's value was misstated by an order of magnitude.** The note said "V1's honest
+> projection was 1.1-1.4% net throughout". That figure is **V2-at-best-order's marginal
+> increment over V1**, not V1. V1 two-phase is modelled at **35.74 ms/step, 14.0%**
+> (`2026-09-20-storage-cpu-pipeline-v2.md:789`, `PER_ROW_TRANSFER.md:138`). The error
+> originated in the lead's brief, not in this file's analysis, and was written down here
+> in good faith.
 >
-> **2. `g`'s lower bound already puts V2-at-best-order under its bar.** `g_a >= 7.26 us`
-> (see D1, and note it is a **lower bound**) makes V2-at-best-order's net at most about
-> **3.77 ms against a 3.82 ms bar** — under it before any further measurement. That is the
-> flag raised at the end of §7 O5's neighbourhood and it is recorded here because it
-> belongs with the parking decision rather than with the open questions.
+> **2. The "saturated link" argument does not bear on V1.** The note parked the task
+> because "V1 and V2 are both reordering work on a saturated link". PCIe Gen3 x16 line
+> rate bounds **how fast** the gather runs; it says nothing about **when it may start**.
+> V1's entire mechanism is starting hit-lane copies before the missed rows have been read
+> — 88% of the 35.74 ms is hit-lane hiding. The old note conceded the mechanism in its own
+> words ("everything in this checklist moves copy time earlier") and treated it as the
+> objection when it is the win.
 >
-> **What this vindicates.** V1's honest projection was **1.1-1.4% net** throughout, and
-> nothing ever contradicted it. The projection was right; the effort went into looking for
-> a reason it was wrong. A ceiling reached is not a task failed, and the two mechanism
-> rejections in §0 stand on their own arithmetic independently of this.
+> **3. A trace on today's code shows exactly the serialisation V1 removes.** Node-mode
+> nsys capture at `e61c505731`, mirrors on, decode-only window, graph body only:
+> `exl3_ram_miss_wait_kernel` **53.5%** and `copy_expert_row_segments_gpu_kernel` **41.8%**
+> of in-graph GPU time — **95.3% between them, serialised**, with all compute at ~3%. The
+> barrier is stated in the source: `exl3_ram_miss_host.cpp:468-469`, "read() itself
+> publishes nothing ... so no row is visible before the whole request is", with every slot
+> marked `kReady` together at `:2599`.
 >
-> **What survives and is worth reading even if V1 is never built:** §2 (the
-> `release_locked` landmine, which is a live hazard in today's code and is not V1-specific),
-> §1.3's correction about where the lease check actually lives, and §5's mutant discipline.
+> **What the old note got right and is retained.** The **Gen3 x16 ceiling is real** and
+> the host is an HPE ProLiant DL380 Gen10, so Gen3 is a platform limit rather than a BIOS
+> setting: no change makes the gather *faster*, and only fewer bytes per token reduces its
+> size. The **`g` lower bound** (`g_a >= 7.26 us`, D1) stands, but it bears on
+> **V2-at-best-order only** — it never applied to V1. §2's `release_locked` landmine, §1.3's
+> correction and §5's mutant discipline are unaffected.
 >
-> **Where the campaign went instead:** an end-to-end tok/s baseline on DSV4.1, then V2
-> changes re-sequenced around the **NVMe wait — 190 ms, 48.6% of the step, with the drive
-> idle about 200 ms of every step.** That is the part with real headroom. This task's
-> 1.114 ms `G*` is not.
+> **Read 35.74 ms as a ceiling, never as an expected gain.** It is
+> 33.9 hit lanes x 1.055 ms and "the model assumes every hit copy perfectly hidden"
+> (`PER_ROW_TRANSFER.md:236`). It is **modelled, not measured**. §7 O5 further warns that
+> V1 pays one extra fixed per-launch cost per reading request that the 35.74 row does not
+> model, so the margin is optimistic by an unquantified amount **on top of** being a
+> ceiling. §7 O6 puts +-3% on `c` alone.
 >
-> *One denominator caveat, since this file is strict about them elsewhere:* the 391 ms step
-> and the shares above come from the parking analysis. §6 of this checklist quotes **~360 ms**
-> (2.781 tok/s, `DSV41_REFERENCE.md:4`). They are different measurements and the shares here
-> are against 391 ms. Do not mix them.
+> *Denominators, corrected.* The old note's 391 ms step, its 190 ms / 48.6% NVMe wait and
+> its "drive idle about 200 ms of every step" are **pre-mirror single-drive figures** and
+> must not be reused. Today's machine runs **~255 ms/step** (3.905-3.933 tok/s mirrored,
+> `DSV41_REFERENCE.md` section 19 Task 1 matched baselines). Usefully, V1's model was
+> already built against a **254.4 ms** step, so **35.74 ms / 14.0% is calibrated to
+> today's step time, not to the stale one.** §6 of this checklist still quotes ~360 ms;
+> that is a third measurement and must not be mixed with either.
 
 
 ---
@@ -348,9 +359,27 @@ post  ->  W1  ->  C1  ->  A1  ->  W2  ->  C2  ->  A2  ->  F  ->  fused_moe
         - The price of compaction is a real failure mode — an indexing error that sends a
           lane's bytes to the wrong destination slot — which `ord` would not have. Test T9
           exists to pay it.
+        - **Two concrete instances, both hit while implementing this on 2026-09-21.** They
+          are recorded here because T9 tests for the second one while the instructions
+          warned of neither, so both were found by the implementer rather than by the file.
+          1. **Compaction breaks the ack-to-lane mapping.** The ack kernel keys its `LaneAck`
+             word by `threadIdx.x`, which after compaction is the *compacted* position, while
+             `retire_leases` reads acks *by lane*. Left alone this acknowledges the wrong
+             lease. It needs an explicit per-stage `origin[]` array.
+          2. **Destinations must be compacted with sources.** `copy_expert_row_segments_gpu`
+             takes `source_rows` **and** `destination_slots` index-aligned; compacting only
+             the sources sends a lane's bytes to another lane's slot — which is exactly
+             T9's mutant, arrived at by accident instead of on purpose.
 
 - [ ] **D2. Change `exl3_ram_miss_lease_wait_kernel` (`:382`) into stage 2.** It cannot be
       reused unmodified.
+      - **This instruction conflicts with §6 and §6 wins.** That kernel *is* the M1 arm.
+        Mutating it in place deletes M1 from the build, and §6 requires M1 and M2 measured
+        in one build. **Resolution taken 2026-09-21:** stage 2 was added *alongside* the
+        existing kernel, behind `SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE` (default off), so
+        M1 is unchanged and both arms exist in one binary. Same reason for a separate
+        stage-ack kernel. Read the bullets below as describing stage 2's required
+        behaviour, not as licence to edit the M1 kernel.
       - It must skip the lanes stage 1 committed: it needs `go_1` and stage 1's compaction
         map as inputs, and must build `rows_2[]`/`slots_2[]` over the complement.
       - `state[kPending] = 0` at `:458` must move to whichever stage runs last, or both
@@ -390,9 +419,13 @@ post  ->  W1  ->  C1  ->  A1  ->  W2  ->  C2  ->  A2  ->  F  ->  fused_moe
       (`python/sglang/srt/layers/moe/exl3_ram_miss.py:306`). Python runs at capture only;
       every buffer preallocated, every view sliced at capture. `Exl3RamMissDevice`
       (`python/sglang/kernels/ops/moe/exl3_ram_miss.py:798`) allocates **one** `go_count`
-      and **one** `lane_ctx`; it needs one per stage, and `_owned_tensors`
-      (`srt/layers/moe/exl3_ram_miss.py:712`) must list the new ones or they are freed out
-      from under the captured graph.
+      and **one** `lane_ctx`; it needs one per stage. **Correction (verified 2026-09-21):
+      there is no `_owned_tensors`** — the name appears nowhere in `python/`, `test/` or
+      `scripts/`. The thing at `srt/layers/moe/exl3_ram_miss.py:712` is a *local* `owned`
+      list built inside `Exl3RamMissService._quarantine`, and the stated rationale was also
+      wrong: these are attributes on a live object, so nothing frees them out from under the
+      captured graph. The real reason to add the new per-stage buffers to that list is
+      unclean-shutdown quarantine.
 
 - [ ] **D8. Register the new kernel names** in the `names` tuple at
       `python/sglang/kernels/ops/moe/exl3_ram_miss.py:740`. Omitting one fails at JIT load
@@ -421,7 +454,7 @@ mutant, that is said out loud rather than papered over.
 | **T6** | `keep` has exactly one writer. | GPU. Force a VIOLATED acknowledgement in stage 1 (bump the slot generation between grant and acknowledgement) and let stage 2 succeed. Assert `keep == 0` and no fused output. | Restore `keep[0] = 1.0f` in the stage-2 wait. Must go red. This is the concrete bug D2 exists to prevent and it is invisible without this test. |
 | **T7** | One request deadline, not one per stage. | Delay both stages to 0.9x the timeout; the request must fail at ~1x, not ~1.8x. | Give each stage its own `start + timeout_ns`. |
 | **T8** | The captured graph is the linear chain D7 builds. | Enumerate kernel-node dependencies with `cudaGraphGetEdges`; assert post → W1 → C1 → A1 → W2 → C2 → A2 → F → fused. | Capture A1 on a second stream. (`PER_ROW_TRANSFER.md` §5.2 item 1 requires this be checked, not assumed.) |
-| **T9** | Output parity. | Destination rows byte-equal and fused output bitwise equal against **A1** (Task 5 lease-mode batched) on fixed routes and seeds, eager and graph. | Swap two lanes' destination slots in stage 1's compaction. This is the failure mode compaction introduces and `ord` would not — it is the price of D1's compaction ruling and must be paid in a test. |
+| **T9** | Output parity. | Destination rows byte-equal and fused output bitwise equal against **M1** (the Task 5 lease-mode batched arm) on fixed routes and seeds, eager and graph. | Swap two lanes' destination slots in stage 1's compaction. This is the failure mode compaction introduces and `ord` would not — it is the price of D1's compaction ruling and must be paid in a test. |
 | **T10** | An all-miss request does not pay the read wait twice. | Every lane misses. Assert stage 1 commits `go_1 == 0` promptly, with a wall-clock upper bound. | Remove D1's poll bound and let stage 1 spin to the deadline. |
 | **T11** | The batched path survives as stage 1 covering every lane. | All-hit request: assert `go_1 == k`, `go_2 == 0`, the empty stage acknowledges nothing, and a poisoned source slab is not read by stage 2. | Make an empty stage's acknowledgement kernel acknowledge lane 0. Must go red on `leases_acked`. |
 
@@ -435,12 +468,20 @@ half); `test/manual/dsv41/test_exl3_lease_kernels_cuda.py`,
 
 ## 6. Reporting requirement and baseline
 
-**Baseline is A1 = Task 5 lease-mode batched**, not today's unleased path. Lease mode arms
-every `count > 0` record, so all 40 layers pay a service round trip that A0 does not.
+**Naming, fixed 2026-09-21 after it caused a real implementation deviation.** Earlier drafts
+of this file called the measurement arms A0/A1/A2 while the pipeline chain at §3 calls its
+kernel stages `post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F`. **`A1` and `A2` therefore meant
+two unrelated things in one document** — an acknowledgement kernel and a measurement arm —
+and the falsification criterion below is stated as a ratio against one of them. The arms are
+now **M0/M1/M2**; the stage names are unchanged, because they are in the implemented code.
+Read any surviving `A1`/`A2` in this file as a *stage*.
 
-**Report all three differences, each with an interval: A1 v A0, A2 v A1, A2 v A0**
-(A0 = today's unleased path, A1 = Task 5 lease-mode batched, A2 = this mechanism). A2 v A0
-alone credits V1 with the cost it inherits from Task 5; A2 v A1 alone hides a possible loss
+**Baseline is M1 = Task 5 lease-mode batched**, not today's unleased path. Lease mode arms
+every `count > 0` record, so all 40 layers pay a service round trip that M0 does not.
+
+**Report all three differences, each with an interval: M1 v M0, M2 v M1, M2 v M0**
+(M0 = today's unleased path, M1 = Task 5 lease-mode batched, M2 = this mechanism). M2 v M0
+alone credits V1 with the cost it inherits from Task 5; M2 v M1 alone hides a possible loss
 inside Task 5. Neither is "the Task 6 result" on its own.
 
 **Net out OPEN 11: 0.68 ms/step at 40 layers, 17 us per armed layer**, re-measured
@@ -469,7 +510,8 @@ direction that flatters a null result. A combined Task 6 + Task 8 arm is a separ
 labelled experiment.
 
 **Pre-registered falsification (`PER_ROW_TRANSFER.md` §5.6), fixed before measuring:** V1
-is falsified if the untraced tok/s ratio V1 / A1 has a 95% interval containing 1.0, or if
+is falsified if the untraced tok/s ratio V1 / M1 (M1 = the Task 5 lease-mode batched arm,
+not the stage-1 acknowledgement kernel) has a 95% interval containing 1.0, or if
 the point estimate is below 3%. The modelled prediction is 20.8 to 35.7 ms/step, 8% to 14%
 of the step — **modelled, not measured**, a ceiling by construction (35.74 = 33.9 hit lanes
 x `c` = every hit copy perfectly hidden), and nothing in it models a hit copy that fails to

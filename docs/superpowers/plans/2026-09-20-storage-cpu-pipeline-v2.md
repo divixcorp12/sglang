@@ -72,7 +72,7 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 
 **This is a property of the lease path as shipped, not of any proposed change, and it is
 placed here rather than under a task so that it is not read as conditional on that task
-going ahead.** Task 6 is parked; this is not. Nothing below asks for a fix — `LEASE_PROTOCOL`
+going ahead.** This risk stands on its own whatever Task 6 does. Nothing below asks for a fix — `LEASE_PROTOCOL`
 owns this code — it asks that the next person to touch the release or eviction path knows
 it.
 
@@ -117,8 +117,8 @@ a leased slot. Task 6 V1 could have taken the proof route; Task 6 V2 could not, 
 miss rows are in `slots` by construction.
 
 Full derivation, the call-site-by-call-site argument and the mutants that would falsify
-each half: `docs/superpowers/plans/task6-v1-checklist.md` §2. That checklist is **parked**;
-this risk is not, and does not depend on it.
+each half: `docs/superpowers/plans/task6-v1-checklist.md` §2. This risk does not depend on
+whether that checklist is being implemented.
 
 ## Task 0: Accept the native mirror prerequisite
 

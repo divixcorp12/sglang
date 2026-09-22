@@ -396,17 +396,68 @@ behind saturated, or idle?**
   earlier, and the ceiling is the resource's rate. No amount of overlap creates capacity.
 - **Idle** → the mechanism *creates* capacity, and the headroom is real.
 
-**The instance.** Task 6 set out to start GPU transfers before all reads finish. The
-resource it hid behind was the PCIe link, and the gather already runs at **Gen3 x16 line
-rate** (13.3 MB in 1.055 ms, ~12.6 GB/s) on a host — HPE ProLiant DL380 Gen10, 1st/2nd-gen
-Xeon Scalable — where **Gen3 is a platform limit, not a BIOS setting**. Every variant was
-therefore reordering work on a saturated link, which is exactly consistent with V1's honest
-1.1-1.4% net projection holding up unchallenged throughout. By contrast the NVMe wait is
-190 ms of the step with the drive idle about 200 ms of every step: an idle resource, where
-the same class of work creates capacity instead of moving it.
+**The instance, and it is a double one.** Task 6 set out to start GPU transfers before all
+reads finish. On 2026-09-21 it was parked on the grounds that the resource it hides behind
+is the PCIe link, which already runs at **Gen3 x16 line rate** (13.3 MB in 1.055 ms,
+~12.6 GB/s) on a host — HPE ProLiant DL380 Gen10, 1st/2nd-gen Xeon Scalable — where
+**Gen3 is a platform limit, not a BIOS setting**. That link fact is true and still is.
 
-**Why it belongs here.** The modelling was not wrong — it produced a small number and the
-number was right. What could not fail was the *framing*: a projection of 1.1-1.4% against a
-1.5% resolution bar can never reject, so the effort went into looking for reasons the
-projection was too low rather than asking whether the mechanism could pay at all. Asking
-the saturated-or-idle question in week one would have made Task 6 a paragraph.
+**The parking was still wrong, and this entry was written believing it.** V1 two-phase does
+not hide behind the PCIe link. It hides hit-lane copies behind the **NVMe wait**, which is
+the idle resource — line rate bounds how fast a copy runs, not when it may start. The
+mechanism was measured at **35.74 ms/step, 14.0%** (`PER_ROW_TRANSFER.md:138`), not the
+1.1-1.4% quoted when it was parked; that smaller figure is V2-at-best-order's marginal
+increment over V1 and had been misattributed to V1 through a chain of restatements.
+
+**Why it belongs here, in its corrected form.** The question in this entry is right, and
+asking it earlier would have helped. But the entry's first version answered it with the
+wrong resource and reached a confident, wrong conclusion — so the failure it now documents
+is not "nobody asked" but **"the question was asked and the resource was misidentified."**
+Naming a resource is the whole content of the answer, and a mechanism that touches two
+resources can be saturated in one and idle in the other. State which resource, and state
+which phase of the mechanism touches it: the copy is bandwidth-bound while it runs and
+schedule-bound in when it starts, and those are different questions with different answers.
+The framing defect that made this hard to see is separately real: a projection of 1.1-1.4%
+against a 1.5% resolution bar can never reject, so effort went into looking for reasons the
+projection was too low rather than asking whether the number described the mechanism at all.
+
+### C. A loop that re-runs a resumable step stops being a check after the first round
+
+**The pattern.** A repeated round is built out of a step that resumes by identity: given
+the same input identity and the same output artifact, it detects that the work is already
+done and returns without redoing it. That resume behaviour is correct and useful on its
+own. It becomes a defect only when something *else* depends on the step actually running
+again each round — a readiness loop that samples the machine's state after each round and
+waits for successive samples to agree. Round 1 does the real work and produces a real
+sample. Every round after it hits the resume path, returns instantly without touching the
+system under test, and the loop samples the state left over from round 1 — which trivially
+"agrees with itself" every time. The loop reports success (stable, quiet, converged) after
+exactly one real observation, on every run, and it converges *fastest* on precisely the
+machine states where more warming was needed, because the resume short-circuit is instant
+regardless of how far from steady-state the system actually is.
+
+**The instance.** The DSV4.1 baseline harness's warm-up readiness gate (`benchmarks/
+dsv41_baseline/run_arm.sh`, a sibling campaign to this one) sends repeated warm-up requests
+to the same session, checking after each round whether the SM clock and JIT-compile
+activity have settled. All rounds wrote to one shared results file. The HTTP driver
+(`run_capture_sessions.py`) resumes by `session_id`: once that session's one turn is
+written, every later call against the same file for the same session_id returns
+immediately without contacting the server. So every round after the first was a silent
+no-op. A live trace run the same day showed decode throughput still climbing at the sixth
+identical warm-up request (1.776 -> 3.154 -> ... -> 3.53 tok/s, flat only by request 6-7) —
+so a gate built this way would have reported "stable" after round 1 or 2, on a card nowhere
+near its steady state, on every arm, forever. It was found by reading the loop while adding
+a third stability condition, before any GPU time ran it, not by a failure in the field.
+
+**The check, which costs nothing to ask and nothing to run.** **Any loop that re-runs a
+resumable step must either give each round a fresh artifact, or prove the round actually
+executed.** The cheap countermeasure — used here — is the first: give each round its own
+output (`results-warmup-<round>.jsonl`, not one shared file), so resume-by-identity cannot
+span rounds. The stronger, more expensive countermeasure is the second: assert the round
+did work — a new record appeared with a timestamp inside this round's window, or an
+independent counter on the system under test (requests served, bytes read) advanced. The
+cheap fix is sufficient exactly when nothing else shares the artifact's identity; reach for
+the stronger one when a shared, cross-run artifact is unavoidable. Either way, idempotence
+and repetition are in tension by construction, and a loop that assumes both hold at once
+should be read the way this document reads a test: guilty until it names what would make it
+fail.
