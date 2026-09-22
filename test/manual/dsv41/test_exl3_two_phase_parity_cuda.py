@@ -7,7 +7,10 @@ T8: the graph D7 (``Exl3RamMissRowBackend.post``, two-phase branch) captures is 
 structure is copied from ``cuda_graph_dedup_mixin.py``'s ``graph_signature``, not derived: kernel
 identity comes from ``cuGraphKernelNodeGetParams(node).func``, a stable per-``__global__``-function
 handle, and edges come from ``cuGraphGetEdges`` on ``torch.cuda.CUDAGraph(keep_graph=True)``'s
-``raw_cuda_graph()``.
+``raw_cuda_graph()``. A second test captures the real production apply (the "-> fused" clause the
+checklist's row also names) and checks F is comparable to -- an ancestor or descendant of, never
+incomparable with -- every other node in that larger graph, so nothing can race it on a fork the
+stream-ordering happens to hide today.
 
 T9: two-phase's output -- both the destination rows the copy kernels write and the fused MoE
 consumer's bytes over them -- is bitwise identical to **M1**, the Task 5 lease-mode batched arm
@@ -25,12 +28,17 @@ under test. Recipes copied rather than derived, per the plan's instruction:
     python/sglang/srt/model_executor/runner_backend/cuda_graph_dedup_mixin.py (graph_signature)
 """
 
+import os
 import time
 
 import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+NEEDS_EXL3_SRC = pytest.mark.skipif(
+    not os.environ.get("SGLANG_EXL3_SRC"), reason="needs SGLANG_EXL3_SRC (an exllamav3 checkout)"
+)
 
 try:
     from cuda.bindings import driver as cuda_drv  # noqa: E402
@@ -250,6 +258,60 @@ def _graph_kernel_chain(raw_graph):
     return typed, n, len(from_nodes)
 
 
+def _assert_all_nodes_ordered_against(raw_graph, target_func):
+    """Every node in ``raw_graph`` is comparable to the node whose kernel identity is ``target_func``:
+    an ancestor of it, that node itself, or a descendant of it. Nothing is incomparable -- on neither a
+    directed path to nor from it, i.e. able to run concurrently with it on a fork.
+
+    This is the property T8's second test wants ("F precedes the fused consumer") without needing to
+    name every fused-compute node individually: instead of asserting F is the *direct* predecessor of
+    some specific downstream node (the internal shape of the fused kernel is not this test's business),
+    it asserts nothing in the whole captured graph can race F. Returns the descendant count, so the
+    caller can additionally assert the graph did not degenerate to nothing running after F at all.
+    """
+    _, num_nodes = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw_graph, 0))
+    nodes, _ = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw_graph, num_nodes))
+    node_list = list(nodes)
+    node_index = {int(n): i for i, n in enumerate(node_list)}
+
+    _, _, _, num_edges = checkCudaErrors(cuda_drv.cuGraphGetEdges(raw_graph, 0))
+    from_nodes, to_nodes, _, _ = checkCudaErrors(cuda_drv.cuGraphGetEdges(raw_graph, num_edges))
+    children = [[] for _ in node_list]
+    parents = [[] for _ in node_list]
+    for src, dst in zip(from_nodes, to_nodes):
+        si, di = node_index[int(src)], node_index[int(dst)]
+        children[si].append(di)
+        parents[di].append(si)
+
+    target_idx = None
+    for i, node in enumerate(node_list):
+        node_type = checkCudaErrors(cuda_drv.cuGraphNodeGetType(node))
+        if node_type != cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            continue
+        params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node))
+        if int(params.func) == target_func:
+            assert target_idx is None, "the target kernel identity appears in more than one node"
+            target_idx = i
+    assert target_idx is not None, "the target kernel identity was not found in the captured graph"
+
+    def _reach(start, adjacency):
+        seen, stack = set(), list(adjacency[start])
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(adjacency[cur])
+        return seen
+
+    descendants = _reach(target_idx, children)
+    ancestors = _reach(target_idx, parents)
+    comparable = ancestors | {target_idx} | descendants
+    incomparable = [i for i in range(len(node_list)) if i not in comparable]
+    assert not incomparable, f"{len(incomparable)} node(s) are neither before nor after the target kernel"
+    return len(descendants)
+
+
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
 class TestGraphTopology:
     def test_the_captured_two_phase_chain_is_the_linear_post_w1_c1_a1_w2_c2_a2_f(self, service):
@@ -316,6 +378,45 @@ class TestGraphTopology:
             assert match is not None, (func, resolved, remaining)
             resolved.append(match)
         assert resolved == expected_names, resolved
+
+    @NEEDS_EXL3_SRC
+    def test_finalize_precedes_the_fused_moe_consumer(self, tmp_path):
+        """T8's "-> fused" clause: the checklist row is ``post -> ... -> F -> fused``, not ``... -> F``.
+
+        The sibling test above captures ``backend.post`` alone and pins the 9-node RAM-miss chain
+        exactly; it says nothing about the fused MoE kernel that reads the rows F's success gates,
+        because that kernel is not in that capture. This test captures the real production apply
+        (``Exl3MoEMethod._apply_graph``, the same shape T9 uses) and checks that nothing in that larger
+        graph is incomparable with F -- neither an ancestor nor a descendant of it, i.e. able to run
+        concurrently with it on a fork. Stream ordering gives this in practice today, which is exactly
+        why a refactor that broke it would go unnoticed without this check.
+        """
+        from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+        layer, streamer, service, checks = _fused_layer(tmp_path, two_phase=True)
+        try:
+            gen = torch.Generator(device="cpu").manual_seed(7)
+            x = (torch.randn((1, HIDDEN), generator=gen) * 0.5).to("cuda", torch.bfloat16)
+            weights = torch.softmax(torch.randn((1, F_TOP_K), generator=gen), -1).cuda()
+            ids = torch.tensor([[0, 3, 5, 1, 7, 6]], device="cuda", dtype=torch.int32)
+            Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)  # warm-up: JIT, residency
+            _cuda_ready()
+
+            # F's kernel identity, learned from the exact device_side instance the capture below drives
+            # (not a separate harness): an isolated single-op capture of the same finalize() call.
+            dev = streamer.row_backend.device_side
+            f_func = _kernel_func(lambda: dev.finalize(torch.zeros(1, dtype=torch.int32, device="cuda"), streamer.row_backend.keep))
+
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            with torch.cuda.graph(graph):
+                Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+            raw = graph.raw_cuda_graph()
+            descendant_count = _assert_all_nodes_ordered_against(raw, f_func)
+            del graph
+            assert descendant_count > 0, "nothing in the captured graph runs after F: the fused consumer was not captured downstream of it"
+            assert service.host.fatal_seq() == 0, service.host.counters()
+        finally:
+            service.shutdown()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -388,15 +489,20 @@ def _fused_layer(tmp_path, *, two_phase: bool, timeout_ms=2000):
     return layer, streamer, service, checks
 
 
+@NEEDS_EXL3_SRC
 class TestOutputParity:
     def test_two_phase_output_is_bitwise_equal_to_m1_eager_and_graph(self, tmp_path):
         """T9: destination rows byte-equal and fused output bitwise equal against M1, eager and graph.
 
         M1 = Task 5's lease-mode batched arm (two_phase=False); M2 = this mechanism (two_phase=True).
-        Fixed seed, fixed routes: [0, 3, 5, 1, 7, 6] (mixed hit/miss against the [0, 1, 2] hot set) and
-        [9, 10, 11, 0, 1, 12] (all miss beyond the pinned rows, so stage 1 commits go_1 == 0 for that route
-        and the whole request is stage 2's -- exercising both the degenerate and the mixed case M1/M2 must
-        agree on).
+        Fixed seed, fixed routes: [0, 3, 5, 1, 7, 6] (mixed against the [0, 1, 2] hot set) and
+        [9, 10, 11, 0, 1, 12] (12, 11, 10, 9 never touched before this test; 0, 1 are hot-set hits).
+
+        Two more properties are pinned beyond output equality, because M1/M2 agreeing on output does
+        not by itself prove stage 1 is doing anything (see the method below for why an exact go_1
+        count is not safe to assert): a liveness check that stage 1 does claim a hit lane at least once
+        given enough identical warm requests, and a deterministic per-lane check that a lane whose
+        expert has never been resident cannot be claimed by stage 1 on its first read.
         """
         from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
@@ -414,6 +520,29 @@ class TestOutputParity:
             try:
                 ids = torch.tensor([routes[0]], device="cuda", dtype=torch.int32)
                 Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)  # eager warm-up
+                dev = streamer.row_backend.device_side
+
+                if two_phase:
+                    # Liveness, not an exact count. Stage 1's hit/miss split races real host-service
+                    # scheduling latency against the poll bound (checklist O4: neither is measured), so
+                    # a single call's go_1 is not safe to pin to a specific number -- verified
+                    # empirically against this exact route and service: identical inputs gave go_1 in
+                    # {0, 1, 3, 4} across independent runs on the same box. What a single flaky number
+                    # cannot state, and what this loop does instead, is the actual regression T9's
+                    # mutant papered over without a test statement: given enough attempts against warm
+                    # residency, stage 1 eventually claims a hit lane. A stage 1 that permanently
+                    # returns go_1 == 0 (a silent no-op) fails this within its deadline; a stage 1 that
+                    # sometimes does and sometimes does not (today's real behaviour) passes.
+                    live = False
+                    deadline = time.perf_counter() + 10.0
+                    while time.perf_counter() < deadline:
+                        Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+                        _cuda_ready()
+                        if int(dev.go_1.item()) > 0:
+                            live = True
+                            break
+                    assert live, "stage 1 never claimed a single hit lane across repeated identical warm requests"
+
                 eager_outs, graph_outs, gathers = [], [], []
                 for route in routes:
                     ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
@@ -421,6 +550,19 @@ class TestOutputParity:
                     assert streamer.row_backend.keep.item() == 1.0, (arm, route, service.host.counters())
                     for check in checks:
                         check()
+
+                    if two_phase and route == routes[1]:
+                        # Deterministic, unlike the liveness loop above: experts 9, 10, 11, 12 have not
+                        # been touched anywhere before this exact call (route[0]'s two experts beyond
+                        # the hot set are 3, 5, 6, 7; only route[1] ever names 9, 10, 11, 12), so stage 1
+                        # cannot have anything published to claim for them -- no race, no poll-bound
+                        # dependency, just "a lane that was never resident is not a hit."
+                        planned = streamer.row_backend.planned.tolist()
+                        claimed = dev.claimed.tolist()
+                        for expert in (9, 10, 11, 12):
+                            lane = planned.index(expert)
+                            assert claimed[lane] == 0, (arm, route, expert, lane, planned, claimed)
+
                     remap, tensors = streamer.gather(ids)
                     slots = remap.reshape(-1).tolist()
                     for k, expert in enumerate(route):
