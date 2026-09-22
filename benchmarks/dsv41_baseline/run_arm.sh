@@ -402,14 +402,14 @@ for session_id in \
 do
     before_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
     clock_start=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
-    cpu_start=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'null')")
+    cpu_start=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'None')")
     taskset -c 8-15 env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
         "$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py" \
         --port "$port" --sessions "$synthetic_sessions" --session-ids "$session_id" \
         --max-tokens "$max_tokens" --results "$run_dir/results.jsonl"
     rc=$?
     clock_end=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
-    cpu_end=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'null')")
+    cpu_end=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'None')")
     after_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
     compile_events=$(pyrun -c "import compile_watch as cw; print(cw.compile_events_in_range('$log', start_byte=$before_byte, end_byte=$after_byte))")
     contaminated=$([ "$compile_events" -gt 0 ] && echo True || echo False)
