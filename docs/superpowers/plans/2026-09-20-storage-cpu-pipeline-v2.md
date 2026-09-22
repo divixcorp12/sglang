@@ -641,6 +641,23 @@ Include expert identity in the immutable row result and validate it against the 
 
 ## Task 6: Start per-row GPU transfers before all reads finish
 
+> **READ THIS BEFORE THE CHECKLIST BELOW.** The implementation checklist and pseudo-code in this section specify
+> **V2 at fixed lane order**, which is measured at **-15.67 ms/step worse than two-phase** and is not the chosen
+> mechanism. They are retained as the specification of the variant that would have to beat two-phase, not as
+> instructions. **V1's checklist -- two-phase, the chosen mechanism -- is
+> `docs/superpowers/plans/task6-v1-checklist.md`** (added 2026-09-21, once Task 5 (b) was real, which is the
+> condition this plan set for writing it). Implement from that file, not from this section.
+>
+> It is written against the tree rather than the design documents, and three of its findings contradict this plan:
+> the `release_locked` landmine is stated here against a throw that does not exist; V1's escape from that landmine
+> is incidental rather than designed, so it is stated there as a rule binding future mechanisms; and a hit lease
+> granted before `read()` outliving a failed request is an exposure named nowhere else.
+>
+> **Revisit two of its entries when the `g` and `T(n)` measurements land.** D1 carries a reopening trigger for the
+> `ord` array conditioned on `g` arriving at the high end of 8-14 us -- if `g` is confirmed low, delete the trigger
+> rather than leave a condition that can never fire. Section 7's O5 tells the reader the magnitude of V1's
+> per-launch penalty is unknown; replace that with the measured figure.
+
 **Files:** Files from Task 5; `python/sglang/srt/layers/moe/expert_row_plan.py`; `python/sglang/kernels/ops/moe/expert_cache_transfer.py`; `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`; graph wrapper/backend tests; `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`.
 
 > **STANDING.** Every statement here is current; nothing in this section is a
@@ -809,6 +826,18 @@ Include expert identity in the immutable row result and validate it against the 
 >   `kLeaseRrSlotGeneration` and validated by the acknowledgement kernel, which returns VIOLATED when it moves.
 >   **The consequence is the one this plan reserved for this moment: V1's checklist, "deliberately absent" and
 >   "deferred until Task 5 (b) is real", is now due.**
+>
+>   **NARROWED 2026-09-21, and this correction is to the note above rather than to the plan.** Saying the eviction
+>   predicate is "delivered" overstates it. `leased_locked` has exactly three call sites: the public `release()`
+>   throw (`:1981`), `census_locked` (`:2391`), and `take_slot_locked`'s **`kReady` eviction scan** (`:2415`). The
+>   free-slot fast path at the top of `take_slot_locked` (`:2408-2409`) returns the first `kFree` slot and never
+>   consults it. **So the predicate protects a leased slot only while that slot is `kReady`; the moment anything
+>   puts it in `kFree` the protection is gone, silently.** That is consistent with the mutation result rather than
+>   contradicted by it -- "deletion kills exactly one test and nothing else" is itself a hint that no test stands
+>   over the free-slot path. It is the same gap that Task 6's checklist records as the `release_locked` landmine
+>   (`task6-v1-checklist.md` section 2), seen from the Task 5 side, and Task 5 item 5's R3 mutant reaches it from a
+>   third direction. V1 is not exposed, because it never frees a leased slot, but nothing in the tree enforces that
+>   for the next mechanism that tries.
 >
 > The hit lease must be taken **in the same `mutex_` section as the reservation**,
 > not merely "at reservation": today's `serve()` drops the mutex between

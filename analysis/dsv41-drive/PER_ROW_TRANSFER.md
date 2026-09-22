@@ -873,3 +873,33 @@ wait, ack-for-stage and finalize kernels; the stage chain in `Exl3RamMissRowBack
 graph-shape test of 5.2; the `hold_until_ack_lane` hook; the matrix of 5.4; then the arms of 5.6. Any new `SGLANG_*` flag
 (for example the stage count) must follow `env-var-conventions`, and the stage count is a capture-time constant, so changing it
 needs a fresh graph capture.
+
+---
+
+# OPEN 1 applies to V1 as well, and section 1.2's two-phase row does not model it (2026-09-21)
+
+**Recorded because nobody appears to have drawn it, and because it bears on the mechanism that was chosen rather
+than the one that was rejected.**
+
+OPEN 1 — `T(n)`, the gather's cost at `count` 1-6 — is booked here entirely against V2, on the grounds that V2
+copies one row per launch. But **V1 also splits launches.** Today a reading layer issues one launch of `count = k`.
+Under V1 it issues two, `count = h` (the hit lanes) and `count = k - h` (the rest). Both are smaller than today's,
+so if `T(n)` carries any fixed per-launch component, V1 pays one extra instance of it per reading request.
+
+The difference from V2 is one of degree and it is large: V2 turns one launch into `k`, so it pays roughly `k - 1`
+extra fixed costs, while **V1 pays exactly one**. At `k` around 6 that is about a fivefold difference, which is why
+V2's exposure is decisive and V1's is not. But V1's is not zero, and **section 1.2's two-phase row (35.74 = 33.9 x
+`c`) models a single `c` per row and no per-launch term at all.** So the 35.74 figure is optimistic by an
+unquantified amount, on top of already being a ceiling by construction.
+
+**No number is put on it here on purpose.** The magnitude is exactly what the `c` measurement is being taken to
+find, and inventing one from the same assumptions the ceiling already rests on would be worse than leaving it open.
+When `T(n)` lands, the quantity to compute for V1 is the fixed per-launch component times the reading requests per
+step, against the 35.74 ms it is being sold on.
+
+**It does not change the mechanism choice.** V1 still beats V2-at-fixed-order decisively and V2-at-best-order
+marginally, and this penalty is smaller for V1 than for either. What it changes is the honesty of V1's margin, and
+it raises the `c` measurement's status: that measurement now informs the chosen mechanism, not only the rejected
+one. **Clause 4's `g` measurement will not catch it**, because `T(n)` is a copy-kernel cost and `g` is a stage cost.
+
+Found while drafting V1's implementation checklist (`docs/superpowers/plans/task6-v1-checklist.md`).
