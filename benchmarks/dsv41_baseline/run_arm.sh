@@ -155,22 +155,33 @@ if ss -ltn 'sport = :7867' | grep -q LISTEN; then
     abort "production (7867) is up; not starting $arm"
 fi
 
-# --- launch (cold server per condition); `python -m sglang.launch_server` is the
-#     server process itself (no separate CLI-wrapper child to search for) ---
+# --- launch (cold server per condition) ---
+#     $! must be the server itself, so nothing may fork between the shell and python.
+#     `flock <file> <cmd>` DOES fork, which is why it is not used here: with it, $! was
+#     the flock wrapper, so /proc/$spid/environ read the launcher shell's environment
+#     (no SGLANG_* vars at all) and stop_server killed the wrapper and leaked a 27 GiB
+#     server holding the port. Take the lock on a descriptor instead and hold it for the
+#     whole arm -- which is the semantics wanted anyway: this arm owns the GPU. taskset
+#     and env both exec in place, and the python below execvp's, so $! stays the server.
+expected_env_path=$run_dir/expected-env.json
+printf '%s' "$expected_env_json" > "$expected_env_path"
 env_argv=()
 while IFS='=' read -r k v; do
     [ -n "$k" ] && env_argv+=("$k=$v")
 done < <(pyrun -c "
 import json
-for k, v in json.loads('''$expected_env_json''').items():
+for k, v in json.load(open('$expected_env_path')).items():
     print(f'{k}={v}')
 ")
+
+exec 9>"$gpu_lock" || abort "cannot open $gpu_lock"
+flock --nonblock 9 || abort "cc-gpu.lock is held by another GPU job; not starting $arm"
 
 cd "$worktree"
 # DECODE_LOG_INTERVAL overrides ServerArgs' default (unset here); see
 # decode_log_interval_compare.sh, which is the only caller that sets it.
 decode_log_interval_py=${DECODE_LOG_INTERVAL:-None}
-taskset -c 32-63 flock --nonblock "$gpu_lock" env "${env_argv[@]}" \
+taskset -c 32-63 env "${env_argv[@]}" \
     PYTHONPATH="$worktree/python" PYTHONUNBUFFERED=1 \
     "$py" -c "
 import sys
@@ -204,17 +215,22 @@ done
 echo "$arm healthy"
 
 # --- verify env from the live server process, not from what we think we set ---
-server_env_actual_json=$(pyrun -c "
-import json
-import tenancy
-actual = tenancy.parse_proc_environ(open('/proc/$spid/environ', 'rb').read())
-print(json.dumps(actual))
-")
+#     Both documents go through files: interpolating json.dumps output into a Python
+#     '''...''' literal unescapes backslashes a second time, so any value containing one
+#     (byobu exports a PS0 that does) produced a JSONDecodeError instead of a comparison.
+server_env_actual_path=$run_dir/server-env-actual.json
 pyrun -c "
 import json
 import tenancy
-actual = json.loads('''$server_env_actual_json''')
-expected = json.loads('''$expected_env_json''')
+actual = tenancy.parse_proc_environ(open('/proc/$spid/environ', 'rb').read())
+with open('$server_env_actual_path', 'w') as f:
+    json.dump(actual, f)
+" || { stop_server; abort "$arm could not read /proc/$spid/environ"; }
+pyrun -c "
+import json
+import tenancy
+actual = json.load(open('$server_env_actual_path'))
+expected = json.load(open('$expected_env_path'))
 tenancy.verify_env(actual=actual, expected=expected)
 print('env verified OK: all', len(expected), 'vars match /proc/$spid/environ')
 " || { stop_server; abort "$arm env verification failed"; }
@@ -391,8 +407,8 @@ sessions = report_builder.merge_sessions(
 boundary_samples = [json.loads(l) for l in open('$boundary_path') if l.strip()]
 report = report_builder.build_report(
     harness_provenance=json.loads('''$harness_provenance_json'''),
-    server_env_actual=json.loads('''$server_env_actual_json'''),
-    server_env_expected=json.loads('''$expected_env_json'''),
+    server_env_actual=json.load(open('$server_env_actual_path')),
+    server_env_expected=json.load(open('$expected_env_path')),
     boundary_samples=boundary_samples,
     residency={
         'dir': '$expert_shard_dir',
@@ -414,7 +430,7 @@ import verdict
 
 report = json.load(open('$report_path'))
 task1_module = task1_verdict.load_task1_verdict()
-mirror = 'SGLANG_MOE_EXPERT_MIRROR_DIRS' in json.loads('''$expected_env_json''')
+mirror = 'SGLANG_MOE_EXPERT_MIRROR_DIRS' in json.load(open('$expected_env_path'))
 result = verdict.judge(
     report, root='$worktree', head='$commit', mirror=mirror, traced=False, task1_module=task1_module,
 )
@@ -437,7 +453,7 @@ pyrun -c "
 import json
 import session_subset as ss
 
-env = json.loads('''$expected_env_json''')
+env = json.load(open('$expected_env_path'))
 manifest = {
     'arm': '$arm',
     'port': $port,
