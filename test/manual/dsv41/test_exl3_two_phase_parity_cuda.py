@@ -205,13 +205,13 @@ def _kernel_func(fn):
 
 
 def _graph_kernel_chain(raw_graph):
-    """The captured graph's kernel nodes and their direct-edge order.
+    """The captured graph's nodes, in direct-edge order, as ``(node_type, func_or_None)`` pairs.
 
-    Returns ``(funcs_in_order, node_count, edge_count)`` where ``funcs_in_order`` is the sequence of kernel
-    ``func`` handles found by walking direct edges from the unique in-degree-0 node. Asserts the graph is a
-    simple path over *every* node (not just the kernel ones) before returning: a fork (an extra predecessor or
-    successor anywhere, e.g. an event node inserted by a second-stream capture) fails here rather than being
-    silently skipped.
+    Walks direct edges from the unique in-degree-0 node, asserting the graph is a simple path over *every*
+    node (not just the kernel ones): a fork anywhere (an extra predecessor or successor, e.g. an event node
+    inserted by a second-stream capture) fails here rather than being silently skipped. ``func`` is the
+    kernel's identity for a KERNEL node and ``None`` otherwise (``post``'s planned-buffer refresh is a
+    device-to-device MEMCPY node, not a kernel launch, and is expected to lead the chain).
     """
     _, num_nodes = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw_graph, 0))
     nodes, _ = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw_graph, num_nodes))
@@ -239,13 +239,15 @@ def _graph_kernel_chain(raw_graph):
         assert len(parents[nxt]) == 1, f"node {nxt} has {len(parents[nxt])} predecessors: the graph forks"
         order.append(nxt)
 
-    funcs = []
+    typed = []
     for idx in order:
         node_type = checkCudaErrors(cuda_drv.cuGraphNodeGetType(node_list[idx]))
-        assert node_type == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL, f"node {idx} is not a kernel node ({node_type})"
-        params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node_list[idx]))
-        funcs.append(int(params.func))
-    return funcs, n, len(from_nodes)
+        if node_type == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node_list[idx]))
+            typed.append((node_type, int(params.func)))
+        else:
+            typed.append((node_type, None))
+    return typed, n, len(from_nodes)
 
 
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
@@ -289,10 +291,17 @@ class TestGraphTopology:
         with torch.cuda.graph(graph):
             backend.post(0, plan)
         raw = graph.raw_cuda_graph()
-        funcs, node_count, edge_count = _graph_kernel_chain(raw)
+        typed, node_count, edge_count = _graph_kernel_chain(raw)
         del graph
 
-        assert node_count == 8 and edge_count == 7, (node_count, edge_count)
+        # post's _stage_planned is a device-to-device tensor copy (a MEMCPY node, not a kernel launch); it leads
+        # the chain every replay refreshes it from the plan. Everything after it must be the 8-kernel chain.
+        assert node_count == 9 and edge_count == 8, (node_count, edge_count)
+        assert typed[0][0] == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, typed[0]
+        kernel_nodes = typed[1:]
+        assert all(t == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL for t, _ in kernel_nodes), typed
+        funcs = [f for _, f in kernel_nodes]
+
         # Resolve each captured node to a stage name by its position among same-identity stages (C1 then C2).
         remaining = dict(expected_funcs)
         resolved = []
