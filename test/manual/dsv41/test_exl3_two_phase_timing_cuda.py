@@ -323,54 +323,63 @@ def test_t10_all_miss_request_does_not_pay_the_read_wait_twice(tmp_path):
         s.close()
 
 
-def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(service):
+def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(tmp_path):
     """T11: the batched path survives as stage 1 covering every lane.
 
     All k lanes hit: stage 1 claims and acknowledges every lane, stage 2 legitimately commits
     zero, and its acknowledgement kernel -- guarded by ``entry < go_2[0]`` -- must touch nothing.
     A poisoned source slab planted at a slot no planned lane uses proves stage 2's (no-op) copy
     reads nothing: the destination tensors carry only the real rows.
+
+    ``poll_bound`` is set well above the real default: the real value (O4, unmeasured) is a guess
+    at the per-stage cost of a single lane's round trip, and this request grants three hit leases
+    inside one reservation hold before any is published, which is more round-trip latency than
+    the default is sized for. An inflated bound isolates T11's own claim -- every hit lane is
+    eventually claimed by stage 1 -- from that unrelated, already-flagged uncertainty.
     """
-    s = service
-    experts = [1, 2, 3]
-    s.plan(experts)
-    s.step_two_phase()  # first pass: loads all three via the miss path, establishing residency
-    _cuda_ready()
-    assert s.until(lambda: s.host.counters()["leases_acked"] == len(experts)), s.host.counters()
+    s = TwoPhaseService(tmp_path, poll_bound=10_000_000)
+    try:
+        experts = [1, 2, 3]
+        s.plan(experts)
+        s.step_two_phase()  # first pass: loads all three via the miss path, establishing residency
+        _cuda_ready()
+        assert s.until(lambda: s.host.counters()["leases_acked"] == len(experts)), s.host.counters()
 
-    for n in s.names:
-        s.dest[n].zero_()
-        s.slabs[0][n][5].fill_(-1)  # poison a slot no planned lane below will occupy
+        for n in s.names:
+            s.dest[n].zero_()
+            s.slabs[0][n][5].fill_(-1)  # poison a slot no planned lane below will occupy
 
-    s.plan(experts)  # all three now resident: an all-hit request
-    leases_acked_before = s.host.counters()["leases_acked"]
-    s.post()
-    s.hit_wait()
-    _cuda_ready()
-    assert int(s.dev.go_1[0]) == len(experts), "every lane must be claimed by stage 1"
-    s.copy1()
-    s.ack1()
-    _cuda_ready()
-    assert s.until(lambda: s.host.counters()["leases_acked"] == leases_acked_before + len(experts))
-    ack_words_after_stage1 = [s.block.ack_word(0, lane) for lane in range(len(experts))]
+        s.plan(experts)  # all three now resident: an all-hit request
+        leases_acked_before = s.host.counters()["leases_acked"]
+        s.post()
+        s.hit_wait()
+        _cuda_ready()
+        assert int(s.dev.go_1[0]) == len(experts), "every lane must be claimed by stage 1"
+        s.copy1()
+        s.ack1()
+        _cuda_ready()
+        assert s.until(lambda: s.host.counters()["leases_acked"] == leases_acked_before + len(experts))
+        ack_words_after_stage1 = [s.block.ack_word(0, lane) for lane in range(len(experts))]
 
-    s.rest_wait()
-    _cuda_ready()
-    assert int(s.dev.go_2[0]) == 0, "nothing is left for stage 2 to claim"
-    s.copy2()
-    s.ack2()
-    _cuda_ready()
+        s.rest_wait()
+        _cuda_ready()
+        assert int(s.dev.go_2[0]) == 0, "nothing is left for stage 2 to claim"
+        s.copy2()
+        s.ack2()
+        _cuda_ready()
 
-    assert [s.block.ack_word(0, lane) for lane in range(len(experts))] == ack_words_after_stage1, (
-        "an empty stage must acknowledge nothing"
-    )
-    assert s.host.counters()["leases_acked"] == leases_acked_before + len(experts)
-    for n in s.names:
-        assert not (s.dest[n].cpu() == -1).any(), n
+        assert [s.block.ack_word(0, lane) for lane in range(len(experts))] == ack_words_after_stage1, (
+            "an empty stage must acknowledge nothing"
+        )
+        assert s.host.counters()["leases_acked"] == leases_acked_before + len(experts)
+        for n in s.names:
+            assert not (s.dest[n].cpu() == -1).any(), n
 
-    s.finalize()
-    _cuda_ready()
-    assert s.keep.item() == 1.0
+        s.finalize()
+        _cuda_ready()
+        assert s.keep.item() == 1.0
+    finally:
+        s.close()
 
 
 if __name__ == "__main__":
