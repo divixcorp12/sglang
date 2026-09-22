@@ -352,13 +352,16 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
     after the chain runs, proves stage 2's (no-op) copy read nothing: a real int16 weight value
     can legitimately equal any sentinel, so only a full read-back-and-compare rules this out.
 
-    ``poll_bound`` is set well above the real default: the real value (O4, unmeasured) is a guess
-    at the per-stage cost of a single lane's round trip, and this request grants three hit leases
-    inside one reservation hold before any is published, which is more round-trip latency than
-    the default is sized for. An inflated bound isolates T11's own claim -- every hit lane is
-    eventually claimed by stage 1 -- from that unrelated, already-flagged uncertainty.
+    Stage 1's own poll timing (O4, unmeasured) is a separate, already-flagged concern (see T10):
+    a lane the poll has not yet observed by the time it gives up correctly and safely falls
+    through to stage 2, so a race between ``post`` and ``hit_wait`` can legitimately split an
+    all-hit request across both stages even at a generous poll bound (confirmed empirically: 1 of
+    7 runs at poll_bound=10_000_000 read only 2 of 3 lanes as hits). That race is not what T11 is
+    about, so the test waits on the host's own ``hit_leases_granted`` counter -- incremented
+    synchronously inside the reservation hold that publishes the RowResults -- before launching
+    stage 1's kernel at all, removing it from this test's scope entirely.
     """
-    s = TwoPhaseService(tmp_path, poll_bound=10_000_000)
+    s = TwoPhaseService(tmp_path, poll_bound=64)
     try:
         experts = [1, 2, 3]
         s.plan(experts)
@@ -372,7 +375,10 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
 
         s.plan(experts)  # all three now resident: an all-hit request
         leases_acked_before = s.host.counters()["leases_acked"]
+        hit_leases_before = s.host.counters()["hit_leases_granted"]
         s.post()
+        # Wait for all three hit publishes to land before stage 1 polls at all (see the docstring).
+        assert s.until(lambda: s.host.counters()["hit_leases_granted"] == hit_leases_before + len(experts))
         s.hit_wait()
         _cuda_ready()
         assert int(s.dev.go_1[0]) == len(experts), "every lane must be claimed by stage 1"
