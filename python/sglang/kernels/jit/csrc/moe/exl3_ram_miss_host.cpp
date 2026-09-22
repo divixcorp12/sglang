@@ -620,6 +620,8 @@ class RowReader {
   //
   // `progress`, when set, is invoked periodically from inside the drain loop -- at most once every
   // kProgressIntervalNs, never once per turn, since a turn can be as short as a single _mm_pause().
+  // The clock read that enforces that interval is itself throttled on idle spin turns; see
+  // kProgressSpinTurns for why the gate alone is not enough.
   // RowReader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
   // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
   // caller decides when to stop admitting. Null costs one comparison per turn and no clock read.
@@ -671,6 +673,7 @@ class RowReader {
     // 0 forces the first turn to fire immediately, so a short read still gets one call before it
     // returns rather than waiting a full interval that may outlast the whole request.
     int64_t next_progress_ns = 0;
+    uint32_t idle_spins = 0;
     while (true) {
       // Gated on elapsed time, not on a completion being reaped: reaped completions are this
       // reader's own I/O finishing, uncorrelated with the device acknowledging a lease (that arrives
@@ -679,7 +682,7 @@ class RowReader {
       // regardless of which sub-phase the loop is in. The interval is sized well under a typical
       // request's span (tens of ms, see the plan) so a lease is retired promptly, while staying far
       // above a single turn (as short as one _mm_pause()) so this never becomes a per-turn mutex take.
-      if (progress) {
+      if (progress && idle_spins == 0) {
         const int64_t now = now_ns();
         if (now >= next_progress_ns) {
           progress();
@@ -698,7 +701,12 @@ class RowReader {
       // withheld completions of the slow-drive fault arrive only once every other row has packed.
       if (c.pending > 0 || (!ready && c.packing == 0 && !held_.empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
-      if (!pack_one() && c.packing > 0) _mm_pause();
+      if (!pack_one() && c.packing > 0) {
+        _mm_pause();
+        idle_spins = (idle_spins + 1) % kProgressSpinTurns;  // sample the clock on one spin turn in N
+      } else {
+        idle_spins = 0;  // this turn did real work, so its own cost dwarfs a clock read
+      }
     }
     // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
     // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
@@ -736,6 +744,13 @@ class RowReader {
   // so the callback's own cost (a mutex and a walk over kDemandRecords, on the caller's side) cannot
   // dominate the loop.
   static constexpr int64_t kProgressIntervalNs = 200000;  // 200 us
+  // Gating the callback on elapsed time is not by itself enough, because the clock read that enforces the
+  // gate is not free. With packing workers the loop turns at _mm_pause() rate -- tens of ns -- while the
+  // workers copy, and an unconditional clock_gettime there roughly doubles the cost of a turn, perturbing
+  // the very spin the pack-workers path depends on. So idle spin turns are sampled one in N; a turn that
+  // did real work is long enough that a clock read is free and is never skipped, which keeps the interval
+  // honest in the inline-packing default (pack_workers = 0), where there is no spin at all.
+  static constexpr uint32_t kProgressSpinTurns = 64;
 
   // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
   enum class RowState : uint8_t { Free, Reading, Ready, Packing };
