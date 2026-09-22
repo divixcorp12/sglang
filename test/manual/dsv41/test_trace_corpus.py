@@ -82,5 +82,46 @@ def test_graphs_switch_to_breakable_decode_at_batch_size_one():
     assert eager["disable_cuda_graph"] is True
 
 
+def test_dspark_sets_speculative_kwargs_and_forces_eager():
+    args = SimpleNamespace(
+        model="/m", mem_fraction_static=0.85, chunked_prefill_size=512,
+        new_tokens=128, dspark="/draft/dir",
+    )
+    kwargs = trace_corpus.engine_kwargs(args)
+    assert kwargs["speculative_algorithm"] == "DSPARK"
+    assert kwargs["speculative_draft_model_path"] == "/draft/dir"
+    assert kwargs["speculative_dspark_block_size"] == 5
+    assert kwargs["disable_cuda_graph"] is True
+
+
+def test_dspark_overrides_graphs_since_the_gate_refuses_speculation_under_a_graph():
+    args = SimpleNamespace(
+        model="/m", mem_fraction_static=0.85, chunked_prefill_size=512,
+        new_tokens=128, graphs=True, dspark="/draft/dir",
+    )
+    kwargs = trace_corpus.engine_kwargs(args)
+    assert kwargs["disable_cuda_graph"] is True
+    assert "cuda_graph_backend_decode" not in kwargs
+    assert kwargs["speculative_algorithm"] == "DSPARK"
+
+
+def test_time_stream_captures_completion_tokens_and_spec_verify_ct_from_meta_info():
+    chunks = [
+        {"meta_info": {"completion_tokens": 1}},
+        {"meta_info": {"completion_tokens": 5, "spec_verify_ct": 2}},
+    ]
+    ticks = iter([10.0, 12.0, 14.0])
+    timing = trace_corpus.time_stream(iter(chunks), new_tokens=5, clock=lambda: next(ticks))
+    assert timing["completion_tokens"] == 5
+    assert timing["spec_verify_ct"] == 2
+
+
+def test_time_stream_without_meta_info_omits_the_spec_fields():
+    ticks = iter([10.0, 12.0, 14.0])
+    timing = trace_corpus.time_stream(iter(["a", "b", "c"]), new_tokens=5, clock=lambda: next(ticks))
+    assert "completion_tokens" not in timing
+    assert "spec_verify_ct" not in timing
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

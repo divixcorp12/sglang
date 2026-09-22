@@ -1,0 +1,33 @@
+{
+  "per_session": [
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 85.38821282004938,
+      "decode_tok_s": 1.460634128768547,
+      "completion_tokens": 128
+    },
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 55.14009083202109,
+      "decode_tok_s": 2.1627348657344347,
+      "completion_tokens": 128
+    },
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 24.843160493997857,
+      "decode_tok_s": 3.1919891272750545,
+      "completion_tokens": 128
+    },
+    {
+      "prompt_tokens": 256,
+      "new_tokens": 128,
+      "ttft_s": 5.633343513007276,
+      "decode_tok_s": 3.963359324251487,
+      "completion_tokens": 128
+    }
+  ],
+  "mean_decode_tok_s": 2.6946793615073807
+}

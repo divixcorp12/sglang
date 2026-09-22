@@ -7,8 +7,11 @@ int64 tensors, so the C++ thread reads and splits rows without Python.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import threading
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
@@ -16,21 +19,39 @@ from typing import Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS, Exl3RamMissDevice, Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
+from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
+from sglang.srt.layers.moe.exl3_row_reader import mirror_path
+from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
 
 logger = logging.getLogger(__name__)
 
 
+def _quarantine_service_at_exit(service: "weakref.ref[Exl3RamMissService]") -> None:
+    """Exit hook: no device barrier is attempted in an exit handler, so the tiers are quarantined, never freed."""
+    live = service()
+    if live is not None:
+        live.shutdown(at_exit=True)
+
+
 @dataclass(frozen=True)
 class Exl3RamMissTables:
     layer_ids: list[int]
     paths: list[str]
+    source_paths: list[str]  # per file: the source shard it copies (itself with no mirror roots)
     file_sizes: torch.Tensor  # int64 [F]
-    reads: torch.Tensor  # int64 [L, E, 4]: file index, aligned offset, aligned length, row start
+    # int64 [L, E, P, 4]: file index, aligned offset, aligned length, destination offset in the
+    # row's bounce slot. Part p of a row is served by root p; parts sum to the row's aligned length
+    # and a zero-length part means "this root serves none of this row" (issue no read).
+    extents: torch.Tensor
+    starts: torch.Tensor  # int64 [L, E]: where the row starts inside its aligned superset
+    parts: int  # P: mirror roots per row (1 with no roots)
     segments: torch.Tensor  # int64 [S, 4]: name index, dst offset, src offset, bytes
     slabs: torch.Tensor  # int64 [L, 6]: slab base addresses in EXL3_STREAMED_NAMES order
     row_bytes: torch.Tensor  # int64 [6]
@@ -45,22 +66,66 @@ def exl3_ram_miss_tables(
     layout: Exl3ExpertLayout,
     segments: Sequence[RowSegment],
     slabs_by_layer: Mapping[int, Mapping[str, torch.Tensor]],
+    *,
+    roots: Sequence[str] = (),
+    policy: Optional[SplitPolicy] = None,
+    source_root: Optional[str] = None,
 ) -> Exl3RamMissTables:
-    """Tables for the streamed layers in ``slabs_by_layer`` (ascending layer id = row order)."""
+    """Tables for the streamed layers in ``slabs_by_layer`` (ascending layer id = row order).
+
+    With ``roots`` (byte-identical mirrors of the checkpoint under ``source_root``), each row's
+    aligned read is split across them as ``policy`` plans it, the same policy the eager
+    ``read_split`` uses. ``paths`` is then shard-major, root-minor: part ``p`` of the shard with
+    source index ``s`` is file ``s * parts + p``. With no roots ``parts == 1``, the files are the
+    source shards and every extent starts at destination offset 0.
+    """
+    roots = tuple(roots)
+    if roots:
+        if policy is None or source_root is None:
+            raise ValueError("mirror roots need both a split policy and the source root")
+    else:
+        if policy is not None:
+            raise ValueError("a split policy needs mirror roots")
+        policy = StaticSplitPolicy((1.0,))
+    parts = len(roots) or 1
+    planned = len(policy.plan(PAGE_BYTES).part_bytes)
+    if planned != parts:
+        raise ValueError(f"split policy plans {planned} parts for {parts} roots")
     layer_ids = sorted(slabs_by_layer)
-    paths: list[str] = []
-    file_index: dict[str, int] = {}
-    reads = torch.empty((len(layer_ids), layout.num_experts, 4), dtype=torch.int64)
+    source_paths: list[str] = []
+    source_index: dict[str, int] = {}
+    extents = torch.empty((len(layer_ids), layout.num_experts, parts, 4), dtype=torch.int64)
+    starts = torch.empty((len(layer_ids), layout.num_experts), dtype=torch.int64)
+    splits: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}  # aligned length -> (part bytes, part starts)
     widest = 0
     for row, layer_id in enumerate(layer_ids):
         for expert in range(layout.num_experts):
             record = layout.records[(layer_id, expert)]
-            if record.path not in file_index:
-                file_index[record.path] = len(paths)
-                paths.append(record.path)
+            if record.path not in source_index:
+                source_index[record.path] = len(source_paths)
+                source_paths.append(record.path)
             offset, length, start = record.aligned_read(PAGE_BYTES)
-            reads[row, expert] = torch.tensor([file_index[record.path], offset, length, start])
+            if length not in splits:
+                split = policy.plan(length)
+                splits[length] = (split.part_bytes, split.starts)
+            part_bytes, part_starts = splits[length]
+            for part in range(parts):
+                extents[row, expert, part, 0] = source_index[record.path] * parts + part
+                extents[row, expert, part, 1] = offset + part_starts[part]
+                extents[row, expert, part, 2] = part_bytes[part]
+                extents[row, expert, part, 3] = part_starts[part]
+            starts[row, expert] = start
             widest = max(widest, length)
+    paths = (
+        [mirror_path(source_root, root, path) for path in source_paths for root in roots]
+        if roots
+        else source_paths
+    )
+    # What each file is a copy of, for the reader's open-time size check to name.
+    copied = [path for path in source_paths for _ in range(parts)]
+    # A mirror is a byte-identical copy, so every part of a shard is bounded by the source's size
+    # (as in the eager reader); the open-time check that each copy really has it is the reader's.
+    source_sizes = [os.path.getsize(path) for path in source_paths]
     names = {name: index for index, name in enumerate(EXL3_STREAMED_NAMES)}
     segment_table = torch.tensor(
         [[names[s.name], s.dst_offset, s.src_offset, s.nbytes] for s in segments], dtype=torch.int64
@@ -87,8 +152,11 @@ def exl3_ram_miss_tables(
     return Exl3RamMissTables(
         layer_ids=layer_ids,
         paths=paths,
-        file_sizes=torch.tensor([os.path.getsize(p) for p in paths], dtype=torch.int64),
-        reads=reads,
+        source_paths=copied,
+        file_sizes=torch.tensor([size for size in source_sizes for _ in range(parts)], dtype=torch.int64),
+        extents=extents,
+        starts=starts,
+        parts=parts,
         segments=segment_table,
         slabs=slabs,
         row_bytes=row_bytes,
@@ -235,6 +303,21 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
         self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
 
+    def post(self, tag, plan) -> None:
+        """Without leases: the inherited translate then copy of ``plan.count`` rows.
+
+        With them (LEASE_PROTOCOL.md 7): the copy's active count is the wait kernel's ``go_count``, not the plan's
+        ``count`` (zero on any refusal, so a refused request reads nothing), and the acknowledgement kernel follows the
+        copy in the same stream. Whether a record is armed is decided by the post kernel and read back by the service
+        from the record, so no arming decision is made here.
+        """
+        if self.device_side.lease_block is None:
+            super().post(tag, plan)
+            return
+        self.translate(tag, plan)
+        copy_expert_row_segments_gpu(self.segments[tag], self.host_rows, plan.slots, self.device_side.go_count)
+        self.device_side.ack(self.keep)
+
 
 def watchdog_wait_s(timeout_ms: int) -> float:
     """The C++ watchdog's abort limit for a wait timeout of ``timeout_ms``: max(30 s, 3 x timeout).
@@ -278,9 +361,16 @@ class Exl3RamMissService:
         self._pause_depth = 0
         self._trace_rows: Optional[list[int]] = None
         self._trace_graph: Optional[list[int]] = None
+        self._stages_traced = False  # the host records a stage line per request (trace runs only)
+        self._stages_dropped = 0
         # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
         self.routed_rows_per_step = 0
         self._shut_down = False
+        self._quarantined = False
+        self._completed = False
+        # Fixed once, in ensure_started, from SGLANG_DSV41_ENABLE_RAM_MISS_LEASES: the host and the device are both
+        # configured from this one field, so they cannot disagree about whether a record is leased.
+        self.lease_mode = False
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -300,22 +390,41 @@ class Exl3RamMissService:
         self._refuse_if_shut_down()
         if self.host is not None:
             return
+        cfg = Dsv41Config.from_envs()
         streamers = {layer_id: table.streamer_of() for layer_id, table in sorted(self.tables.items())}
         missing = [layer_id for layer_id, s in streamers.items() if s is None or s.pinned_host_cache is None]
         if missing:
             raise RuntimeError(f"exl3 RAM miss: layers {missing} have no pinned tier yet")
         fmt = next(iter(streamers.values())).format
+        # The mirror roots and weights the eager row source reads with, validated by the same code.
         tables = exl3_ram_miss_tables(
-            fmt.layout, fmt.segment_map(), {layer_id: s.pinned_host_cache.tensors for layer_id, s in streamers.items()}
+            fmt.layout,
+            fmt.segment_map(),
+            {layer_id: s.pinned_host_cache.tensors for layer_id, s in streamers.items()},
+            **fmt.mirror_table_args(),
         )
         pin = torch.cuda.is_available()
         page = new_page(pin=pin)
-        slot_map = torch.full(tuple(tables.reads.shape[:2]), -1, dtype=torch.int32)
+        slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
-        host = Exl3RamMissHost(tables, page=page, slot_map=slot_map, direct=fmt._resolve_direct())
+        host = Exl3RamMissHost(
+            tables,
+            page=page,
+            slot_map=slot_map,
+            direct=fmt._resolve_direct(),
+            pack_workers=cfg.ram_miss_pack_workers,
+        )
         try:
-            host.start_thread(fatal_wait_s=watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get()))
-            fault = parse_fault(envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get())
+            from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+            lease_mode = cfg.enable_ram_miss_leases
+            if lease_mode:
+                host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
+            if get_exl3_stream_trace().enabled:
+                host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
+                self._stages_traced = True
+            host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            fault = parse_fault(cfg.ram_miss_fault)
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)
@@ -325,11 +434,17 @@ class Exl3RamMissService:
             # before anything can release them.
             host.stop()
             raise
-        self.page, self.slot_map, self.host = page, slot_map, host
+        self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
+        # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
+        # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
+        # later is refused by register()), makes this run before that hook, so the slabs are quarantined and their
+        # finalizers detached before they could unregister them. Move this earlier and the quarantine is silently undone.
+        atexit.register(_quarantine_service_at_exit, weakref.ref(self))
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
-            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms",
-            len(tables.layer_ids), len(tables.paths), tables.slot_bytes, envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
+            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s",
+            len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
+            "on" if lease_mode else "off",
         )
 
     def before_host_use(self) -> None:
@@ -355,6 +470,13 @@ class Exl3RamMissService:
             manager.add_residency_listener(self.on_residency)
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
+        if streamer.graph_gather_rows > MAX_IDS:
+            # The post kernel requests min(count, MAX_IDS) lanes, so a plan can carry lanes the service is
+            # never asked for; the wait kernel then fail-stops on the first of them that is not in RAM.
+            raise ValueError(
+                f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
+                f"per call but the service requests at most {MAX_IDS} lanes"
+            )
         cache = streamer.hot_cache
         if self.device_side is None:
             from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
@@ -366,6 +488,9 @@ class Exl3RamMissService:
                 layers=len(self._rows),
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 advise=prefetch_enabled(),
+                # The host owns the block (Exl3RamMissHost allocates it); the device reads the same one.
+                lease_block=self.host.lease_block if self.lease_mode else None,
+                lease_layout=self.host.lease_layout if self.lease_mode else None,
             )
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
@@ -397,6 +522,21 @@ class Exl3RamMissService:
                 f"(thread {self.host.counters()}); fail-stop"
             )
         self._trace_step()
+        self._trace_stages()
+
+    def _trace_stages(self) -> None:
+        """The stage records the service produced since the last check, into the stream trace."""
+        if not self._stages_traced:
+            return
+        from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+        get_exl3_stream_trace().record_ram_miss_requests(
+            self.host.drain_trace(), sorted(self._rows, key=self._rows.__getitem__)
+        )
+        dropped = self.host.trace_dropped()
+        if dropped > self._stages_dropped:
+            logger.warning("exl3 RAM miss: %d stage records dropped (ring full)", dropped - self._stages_dropped)
+            self._stages_dropped = dropped
 
     def _graph_rows(self) -> Optional[list[int]]:
         """Routed rows and routed misses of every decode graph gather so far, from the
@@ -440,21 +580,155 @@ class Exl3RamMissService:
             )
         self._trace_rows, self._trace_graph = rows, graph
 
-    def shutdown(self) -> None:
-        """Join the thread, then unregister every pinned tier's slabs; idempotent.
+    def _cuda_active(self) -> bool:
+        return torch.cuda.is_available() and torch.cuda.is_initialized()
 
-        The thread writes into the slabs through raw addresses, so it stops first.
-        The tiers must not be used afterwards.
+    def _synchronize(self, device: torch.device) -> None:
+        torch.cuda.synchronize(device)
+
+    def _barrier_devices(self) -> list[torch.device]:
+        """The CUDA devices whose kernels may read the slabs, each with an explicit index. Chosen on the CALLING thread:
+        a helper thread starts on device 0, and a device-less synchronize there waits for the wrong device on any rank
+        that serves another GPU (and would resolve an index-less ``cuda`` to device 0 the same way)."""
+        candidates = []
+        if self.device_side is not None:
+            candidates.append(self.device_side.state.device)
+        for layer_id in sorted(self.tables):
+            tier = getattr(self.tables[layer_id].streamer_of(), "pinned_host_cache", None)
+            if tier is not None:
+                candidates.append(tier.device)
+        devices: list[torch.device] = []
+        for device in candidates:
+            if device.type != "cuda":
+                continue
+            if device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            if device not in devices:
+                devices.append(device)
+        return devices or [torch.device("cuda", torch.cuda.current_device())]
+
+    def _completion_deadline_s(self) -> float:
+        # A wait kernel is bounded by the wait timeout (and, once admission is closed, by the header word).
+        return envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 5.0
+
+    def _establish_gpu_completion(self) -> Optional[str]:
+        """None when every GPU reader is known to have finished, else why that could not be established.
+
+        The device-wide synchronize runs on a helper thread with a deadline: it is not interruptible, so a hung
+        kernel would otherwise hang shutdown with no way to say "uncertain".
         """
-        if self._shut_down:
+        if not self._cuda_active():
+            return None
+        outcome: dict = {}
+        devices = self._barrier_devices()
+
+        def run() -> None:
+            try:
+                for device in devices:
+                    self._synchronize(device)
+                outcome["done"] = True
+            except BaseException as error:  # noqa: BLE001 - any CUDA error means completion is not established
+                outcome["error"] = error
+
+        deadline = self._completion_deadline_s()
+        helper = threading.Thread(target=run, daemon=True, name="exl3-shutdown-sync")
+        helper.start()
+        helper.join(deadline)
+        if helper.is_alive():
+            return f"the device synchronize did not return within {deadline:.1f} s"
+        if "error" in outcome:
+            return f"the device synchronize failed: {outcome['error']!r}"
+        return None
+
+    def shutdown(self, *, at_exit: bool = False) -> None:
+        """Stop admission, establish that no GPU reader runs, then free; else quarantine (LEASE_PROTOCOL.md 14.3).
+
+        Idempotent. The tiers must not be used afterwards. ``at_exit``: no device barrier is attempted in an exit
+        handler, so the tiers are quarantined unconditionally. The scheduler's graceful shutdown calls the orderly path
+        through ``shutdown_exl3_ram_miss_service`` (LEASE_PROTOCOL.md 20.2i); the exit hook calls this with ``at_exit``.
+        Anything that leaves it unknown whether the service thread or a GPU reader still runs (the barrier, or
+        stopping the thread) makes the shutdown quarantine; it frees only when both are known to be finished.
+        """
+        if self._completed or (self._shut_down and not at_exit):
             return
+        # At exit a shutdown that started and did not complete is finished as a quarantine, never left half done.
+        uncertain: Optional[str] = "an earlier shutdown did not complete" if self._shut_down else None
         self._shut_down = True
+        stop_error: Optional[BaseException] = None
+        interrupt: Optional[BaseException] = None  # a KeyboardInterrupt or SystemExit: re-raised once the slabs are safe
         try:
             if self.host is not None:
-                self.host.stop()
+                self.host.close_admission()
+                if uncertain is None:
+                    uncertain = (
+                        "process exit: no device barrier is attempted" if at_exit else self._establish_gpu_completion()
+                    )
+        except BaseException as error:  # noqa: BLE001 - a failure to even close admission is an uncertain state
+            uncertain = f"closing admission or the barrier failed: {error!r}"
+            if not isinstance(error, Exception):
+                interrupt = error
         finally:
-            for layer_id in sorted(self.tables):
-                streamer = self.tables[layer_id].streamer_of()
-                tier = getattr(streamer, "pinned_host_cache", None)
-                if tier is not None:
-                    tier.close()
+            try:
+                # The service thread writes into the slabs through raw addresses, so it stops before anything is freed.
+                # A service thread hung in a read ends this in the service watchdog's abort (see LEASE_PROTOCOL 20.2j).
+                if self.host is not None:
+                    logger.info(
+                        "exl3 RAM miss: stopping the service thread; a read that hangs ends in the watchdog's abort "
+                        "after max(30 s, 3 x the wait timeout)"
+                    )
+                    self.host.stop()
+            except BaseException as error:  # noqa: BLE001 - a thread that may still run must not have its slabs freed
+                stop_error = error
+                uncertain = uncertain or f"stopping the service thread failed: {error!r}"
+                if not isinstance(error, Exception):
+                    interrupt = interrupt or error
+            finally:
+                if uncertain is None:
+                    for layer_id in sorted(self.tables):
+                        streamer = self.tables[layer_id].streamer_of()
+                        tier = getattr(streamer, "pinned_host_cache", None)
+                        if tier is not None:
+                            tier.close()
+                else:
+                    self._quarantine(uncertain)
+                self._completed = True
+        if interrupt is not None:
+            raise interrupt  # KeyboardInterrupt and SystemExit go on, after the quarantine
+        if stop_error is not None:
+            logger.error("exl3 RAM miss: stopping the service thread failed: %r", stop_error)
+
+    def _quarantine(self, reason: str) -> None:
+        """Keep everything a GPU kernel may still read or write alive until the process ends; free nothing."""
+        logger.error(
+            "exl3 RAM miss: shutdown could not establish that no GPU reader is running (%s); the pinned slabs, the "
+            "request page, the slot map, the lease block and the device buffers are quarantined until process exit",
+            reason,
+        )
+        owned: list[torch.Tensor] = []
+        if self.host is not None:
+            owned += [self.host.page, self.host.slot_map, self.host.lease_block]
+        if self.device_side is not None:
+            owned += [self.device_side.state, self.device_side.last_routes]
+            owned += [t for t in (self.device_side.go_count, self.device_side.lane_ctx) if t is not None]
+        for layer_id in sorted(self.tables):
+            streamer = self.tables[layer_id].streamer_of()
+            tier = getattr(streamer, "pinned_host_cache", None)
+            if tier is not None:
+                tier.quarantine()
+            backend = getattr(streamer, "row_backend", None)
+            for name in ("host_rows", "ram_miss", "keep", "routes", "planned"):
+                tensor = getattr(backend, name, None)
+                if isinstance(tensor, torch.Tensor):
+                    owned.append(tensor)
+        quarantine_host_slabs(owned)
+        self._quarantined = True
+
+
+def shutdown_exl3_ram_miss_service() -> None:
+    """The scheduler's graceful-shutdown entry (LEASE_PROTOCOL.md 20.2i): shut the service down if one exists.
+
+    A no-op when no service was ever created: a run without EXL3 must not construct the singleton at shutdown.
+    """
+    service = Exl3RamMissService._instance
+    if service is not None:
+        service.shutdown()

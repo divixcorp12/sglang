@@ -481,6 +481,11 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
     if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
         return False
+    if not all(hasattr(linear, "weight") for linear in wkv_linears):
+        # A quant method with applies_without_weight=True (EXL3) registers no
+        # dense `.weight`; the block-fp8 stack always reads one below, so this
+        # path does not apply rather than raising.
+        return False
     block_out = quant_method.quant_config.weight_block_size[0]
     return all(
         linear.weight.dtype == torch.float8_e4m3fn
@@ -491,7 +496,13 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
 
 def _dequant_supported(linear: torch.nn.Module) -> bool:
     """Mirrors the preconditions asserted in _dequant_linear_weight."""
-    weight = linear.weight
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        # A quant method with applies_without_weight=True (EXL3) registers no
+        # dense `.weight`; answer "not supported" so
+        # _fused_commit_kv_proj_supported routes to the per-linear torch path
+        # in CommitKvProj.execute instead of raising here.
+        return False
     if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return True
     if weight.dtype != torch.float8_e4m3fn:

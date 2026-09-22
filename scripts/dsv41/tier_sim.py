@@ -60,7 +60,9 @@ MAX_GATHER_ROWS = EXL3_MAX_GATHER_ROWS
 
 def load_trace(path: str) -> list[dict]:
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        lines = [json.loads(line) for line in f if line.strip()]
+    # Only forward calls and graph steps: a ram_miss_request line is stage timing, not a call.
+    return [line for line in lines if line.get("kind") != "ram_miss_request"]
 
 
 def ram_rows_per_layer(rows: int, num_layers: int, num_experts: int) -> list[int]:

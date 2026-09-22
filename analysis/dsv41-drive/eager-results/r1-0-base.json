@@ -1,0 +1,74 @@
+{
+  "arm": "r1-base",
+  "mirror_dirs": "",
+  "boot_t": 709782.966682812,
+  "ready_t": 709873.231573643,
+  "startup_disk_bytes": {
+    "nvme0": 0,
+    "nvme2": 25632952320,
+    "nvme4": 622878720
+  },
+  "per_session": [
+    {
+      "session": 0,
+      "prompt_tokens": 256,
+      "start_t": 709873.270820756,
+      "end_t": 710063.391774414,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 137300987904,
+        "nvme4": 165367808
+      },
+      "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+      "ttft_s": 100.51058418909088,
+      "decode_tok_s": 1.4172483645009064,
+      "completion_tokens": 128
+    },
+    {
+      "session": 1,
+      "prompt_tokens": 256,
+      "start_t": 710063.396299071,
+      "end_t": 710189.564601052,
+      "disk_bytes": {
+        "nvme0": 8192,
+        "nvme2": 88971878400,
+        "nvme4": 29679616
+      },
+      "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+      "ttft_s": 55.46690276404843,
+      "decode_tok_s": 1.7962882363612989,
+      "completion_tokens": 128
+    },
+    {
+      "session": 2,
+      "prompt_tokens": 256,
+      "start_t": 710189.568316635,
+      "end_t": 710327.166493392,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 99476664320,
+        "nvme4": 23293952
+      },
+      "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+      "ttft_s": 54.20603852591012,
+      "decode_tok_s": 1.5229261694180807,
+      "completion_tokens": 128
+    },
+    {
+      "session": 3,
+      "prompt_tokens": 256,
+      "start_t": 710327.172095149,
+      "end_t": 710447.266471327,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 83018125312,
+        "nvme4": 15818752
+      },
+      "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+      "ttft_s": 55.828621943015605,
+      "decode_tok_s": 1.976171138820475,
+      "completion_tokens": 128
+    }
+  ],
+  "mean_decode_tok_s": 1.6781584772751903
+}

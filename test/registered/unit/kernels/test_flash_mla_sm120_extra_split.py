@@ -48,3 +48,11 @@ def test_pbs128_extra_pool_is_split(monkeypatch):
     assert kv_u8 is extra
     assert src_pbs == 128
     assert tag == ":extra"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

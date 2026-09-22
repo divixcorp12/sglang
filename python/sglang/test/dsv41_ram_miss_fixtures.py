@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 
 import torch
@@ -20,6 +21,7 @@ class RamMissSetup:
     specs: dict
     slabs: dict
     tables: object
+    roots: tuple = ()  # byte-identical copies of the checkpoint, one per mirror weight
 
     def reference(self, layer: int, experts: list[int]) -> dict[str, torch.Tensor]:
         """Exl3ShardRowSource's split of ``experts`` of ``layer`` (the byte oracle)."""
@@ -37,8 +39,13 @@ def same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
 
 
-def ram_miss_setup(tmp_path, *, capacity: int = 3, layers: int = 2, experts: int = 6) -> RamMissSetup:
+def ram_miss_setup(
+    tmp_path, *, capacity: int = 3, layers: int = 2, experts: int = 6, mirror_weights=None
+) -> RamMissSetup:
+    """``mirror_weights``: one weight per mirror root; copies are made beside ``tmp_path`` and the
+    tables split every row across them (``parts == len(mirror_weights)``)."""
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
+    from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 
     write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts)
     layout = build_exl3_expert_layout(str(tmp_path))
@@ -51,4 +58,12 @@ def ram_miss_setup(tmp_path, *, capacity: int = 3, layers: int = 2, experts: int
         }
         for layer in range(layers)
     }
-    return RamMissSetup(layout, fmt, specs, slabs, exl3_ram_miss_tables(layout, fmt.segment_map(), slabs))
+    roots = ()
+    mirrors = {}
+    if mirror_weights is not None:
+        roots = tuple(str(tmp_path.parent / f"{tmp_path.name}_mirror{i}") for i in range(len(mirror_weights)))
+        for root in roots:
+            shutil.copytree(tmp_path, root)
+        mirrors = dict(roots=roots, policy=StaticSplitPolicy(mirror_weights), source_root=str(tmp_path))
+    tables = exl3_ram_miss_tables(layout, fmt.segment_map(), slabs, **mirrors)
+    return RamMissSetup(layout, fmt, specs, slabs, tables, roots)

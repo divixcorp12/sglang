@@ -189,3 +189,7 @@ class TestExpertHostArena(unittest.TestCase):
         from sglang.srt.layers.moe.expert_host_arena import ExpertHostArena
 
         self.assertIsNone(ExpertHostArena.from_model(torch.nn.Linear(2, 2)))
+
+
+if __name__ == "__main__":
+    unittest.main()

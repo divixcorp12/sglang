@@ -1,5 +1,6 @@
 """The C++ slot LRU and request service, pumped by hand against a host-simulated device (CPU)."""
 
+import errno
 import faulthandler
 import subprocess
 import sys
@@ -123,6 +124,87 @@ def test_a_failed_read_frees_its_slots_and_reports_failed(tier):
     assert _serve(page, host, 0, need=[1], protect=[1]) == 2
     assert slot_map[0, 1].item() == -1 and not host.contains(0, 1)
     assert host.counters()["read_errors"] == 1
+
+
+def _row_states(s, layer, experts):
+    """Per slot of ``layer``: 'whole' (a byte-exact row of one of ``experts``), 'untouched' (still the
+    0xAB sentinel) or 'torn'. Read from the slabs, so it sees a row packed but never published."""
+    reference = s.reference(layer, experts)
+    states = []
+    for slot in range(int(s.tables.capacity[layer])):
+        if all(bool((s.slabs[layer][n][slot].view(torch.uint8) == 0xAB).all()) for n in EXL3_STREAMED_NAMES):
+            states.append("untouched")
+        elif any(
+            all(same_bytes(s.slabs[layer][n][slot], reference[n][i]) for n in EXL3_STREAMED_NAMES)
+            for i in range(len(experts))
+        ):
+            states.append("whole")
+        else:
+            states.append("torn")
+    return states
+
+
+@pytest.fixture
+def mirrored_tier(tmp_path):
+    """A tier whose rows each read as two extents (two mirror parts), so a fault can hit one part of one row."""
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    for slot in range(6):
+        for name in EXL3_STREAMED_NAMES:
+            s.slabs[1][name][slot].view(torch.uint8).fill_(0xAB)
+    page = new_page(pin=False)
+    slot_map = torch.full((2, 6), -1, dtype=torch.int32)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    yield s, page, slot_map, host
+    host.stop()
+
+
+def test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_and_publishes_none(mirrored_tier):
+    """The case fail_reads cannot reach: that flag returns before the reader runs, so nothing has packed and
+    'publishes none of the rows it packed' holds vacuously. inject_fault reaches the reader, so rows 0 and 1
+    pack into their slots and row 2's part then fails; the tier must publish none of them."""
+    s, page, slot_map, host = mirrored_tier
+    # hold_ordinal withholds row 2's completions until the other rows have packed, so rows 0 and 1 are
+    # packed when row 2 fails, whatever order the kernel completes the reads in.
+    host.inject_fault(part=1, part_error=errno.EIO, ordinal=2, hold_ordinal=2)
+    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 2
+    states = _row_states(s, 1, [0, 1, 2])
+    # The reader packed two rows whole and never touched the failed one (nor any slot it was not given)...
+    assert sorted(states) == ["untouched"] * 4 + ["whole"] * 2, states
+    # ...and the tier, which had those two rows in hand, published neither and freed every slot.
+    assert host.mapping(1) == [-1] * 6 and slot_map[1].tolist() == [-1] * 6
+    assert host.slot_to_expert(1) == [-1] * 6
+    assert not any(host.contains(1, e) for e in (0, 1, 2))
+    assert host.counters()["read_errors"] == 1 and host.counters()["rows_read"] == 0
+
+
+def test_fail_reads_never_reaches_the_reader_so_no_row_packs(mirrored_tier):
+    """The contrast that makes the test above mean something: with fail_reads no row is packed at all."""
+    s, page, slot_map, host = mirrored_tier
+    host.inject(fail_reads=True)
+    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 2
+    assert _row_states(s, 1, [0, 1, 2]) == ["untouched"] * 6
+
+
+def test_a_pack_delay_injected_at_the_tier_slows_every_row_it_packs(mirrored_tier):
+    s, page, slot_map, host = mirrored_tier
+    delay_s = 0.05
+    host.inject_fault(pack_delay_ns=int(delay_s * 1e9))
+    started = time.perf_counter()
+    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 1
+    elapsed = time.perf_counter() - started
+    assert elapsed >= 3 * delay_s * 0.9, elapsed  # the reader sleeps inside each of the three rows' packing
+    assert all(host.contains(1, e) for e in (0, 1, 2))
+
+
+def test_a_file_cut_short_after_open_fails_the_read(tier):
+    s, page, slot_map, host = tier
+    # Open checked the size; a shard truncated afterwards reads short of the bytes the table
+    # expects, and that fails the demand (not a clamped, silently short row).
+    path = s.tables.paths[int(s.tables.extents[0, 0, 0, 0])]
+    with open(path, "r+b") as f:
+        f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)
+    assert _serve(page, host, 0, need=[0], protect=[0]) == 2
+    assert not host.contains(0, 0) and host.counters()["read_errors"] == 1
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):

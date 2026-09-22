@@ -28,16 +28,23 @@ from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
 # Superset reads per reader call: 8 x 13.3 MB = 107 MB of bounce for all layers.
 BOUNCE_ROWS = 8
 
-_SHARED_READERS: dict[tuple[int, bool], Exl3RowReader] = {}
+_SHARED_READERS: dict[tuple[int, bool, Optional[str]], Exl3RowReader] = {}
 _SHARED_BOUNCE: dict[tuple[int, int], torch.Tensor] = {}
 
 
-def shared_row_reader(layout: Exl3ExpertLayout, direct: bool) -> Exl3RowReader:
-    """One ``Exl3RowReader`` per layout and read mode, so shard files open once."""
-    key = (id(layout), bool(direct))
+def shared_row_reader(
+    layout: Exl3ExpertLayout, direct: bool, source_root: Optional[str] = None
+) -> Exl3RowReader:
+    """One ``Exl3RowReader`` per layout, read mode and source root, so shard
+    files open once. ``Exl3RowReader.read_split`` (mirrored reads) needs
+    ``source_root``, the directory the layout's paths live under; the
+    single-root ``read`` does not."""
+    key = (id(layout), bool(direct), source_root)
     reader = _SHARED_READERS.get(key)
     if reader is None or reader.layout is not layout:
-        reader = _SHARED_READERS[key] = Exl3RowReader(layout, direct=bool(direct))
+        reader = _SHARED_READERS[key] = Exl3RowReader(
+            layout, direct=bool(direct), source_root=source_root
+        )
     return reader
 
 
@@ -127,6 +134,13 @@ class Exl3ShardRowSource(SynchronousSubmit):
         # The reader and the bounce ring are shared by every layer's source.
         return None
 
+    def _read_rows(self, experts: Sequence[int], addresses: Sequence[int]) -> list[int]:
+        """One reader call: ``experts`` of this layer into page-aligned
+        ``addresses``; returns where each row starts inside its buffer."""
+        return self.reader.read(
+            [(self.layer_id, expert) for expert in experts], addresses
+        )
+
     def read(
         self,
         rows: torch.Tensor,
@@ -169,9 +183,8 @@ class Exl3ShardRowSource(SynchronousSubmit):
         for start in range(0, len(experts), self.preferred_batch_rows):
             chunk = experts[start : start + self.preferred_batch_rows]
             began = time.perf_counter_ns()
-            starts = self.reader.read(
-                [(self.layer_id, expert) for expert in chunk],
-                [self.bounce[i].data_ptr() for i in range(len(chunk))],
+            starts = self._read_rows(
+                chunk, [self.bounce[i].data_ptr() for i in range(len(chunk))]
             )
             read_done = time.perf_counter_ns()
             for i, (slot, row_start) in enumerate(

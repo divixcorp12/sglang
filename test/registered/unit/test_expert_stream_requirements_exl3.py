@@ -123,11 +123,29 @@ def test_window_c_launches_pass(model_dir):
         ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="breakable"))}, {}, "runs prefill eagerly"),
         ({}, {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_MOE_HOT_ASYNC_PROMOTIONS"),
         ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_MOE_HOT_ASYNC_PROMOTIONS"),
+        ({"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1}, {}, "DSpark"),
     ],
 )
 def test_unsupported_launches_are_refused(model_dir, launch_changes, env_changes, match):
     with pytest.raises(ValueError, match=match):
         _gate(_launch(model_dir, **launch_changes), **env_changes)
+
+
+def test_dspark_with_a_decode_graph_names_the_remedy(model_dir):
+    # The refusal message must name both the algorithm and the remedy so a launch
+    # operator knows what to change, not just that something is wrong.
+    with pytest.raises(ValueError) as exc_info:
+        _gate(_launch(model_dir, speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1))
+    message = str(exc_info.value)
+    assert "DSpark" in message
+    assert "--cuda-graph-backend-decode disabled" in message
+
+
+def test_dspark_speculation_passes_with_decode_disabled(model_dir):
+    # DSpark's verify step runs up to block_size + 1 tokens; option C's in-graph scratch
+    # and RAM-miss posting are sized for one token per step, so eager decode is required,
+    # but is otherwise unaffected by speculative decoding being enabled.
+    _gate(_launch(model_dir, speculative_algorithm="DSPARK"))
 
 
 def test_breakable_decode_at_batch_size_one_passes(model_dir):

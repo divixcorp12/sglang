@@ -223,3 +223,11 @@ def test_copy_expert_rows_gpu_replays_changed_fixed_plan():
         source[torch.tensor([6, 2, 4])].to("cuda"),
     )
     assert torch.equal(destination[1], torch.full_like(destination[1], 255))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

@@ -1,0 +1,74 @@
+{
+  "arm": "s19-0-base",
+  "mirror_dirs": "",
+  "boot_t": 737690.211456219,
+  "ready_t": 737776.460537095,
+  "startup_disk_bytes": {
+    "nvme0": 0,
+    "nvme2": 25788702720,
+    "nvme4": 301035520
+  },
+  "per_session": [
+    {
+      "session": 0,
+      "prompt_tokens": 256,
+      "start_t": 737776.771455955,
+      "end_t": 737959.712790652,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 137300987904,
+        "nvme4": 73670656
+      },
+      "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+      "ttft_s": 95.43613538704813,
+      "decode_tok_s": 1.4514280612229813,
+      "completion_tokens": 128
+    },
+    {
+      "session": 1,
+      "prompt_tokens": 256,
+      "start_t": 737959.764871969,
+      "end_t": 738084.531223693,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 88985194496,
+        "nvme4": 6705152
+      },
+      "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+      "ttft_s": 54.87340063904412,
+      "decode_tok_s": 1.8170660304346888,
+      "completion_tokens": 128
+    },
+    {
+      "session": 2,
+      "prompt_tokens": 256,
+      "start_t": 738084.572990908,
+      "end_t": 738220.513696945,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 99450028032,
+        "nvme4": 5435392
+      },
+      "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+      "ttft_s": 53.642984636942856,
+      "decode_tok_s": 1.5431786732852597,
+      "completion_tokens": 128
+    },
+    {
+      "session": 3,
+      "prompt_tokens": 256,
+      "start_t": 738220.561428685,
+      "end_t": 738340.028475324,
+      "disk_bytes": {
+        "nvme0": 0,
+        "nvme2": 82951548928,
+        "nvme4": 3342336
+      },
+      "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+      "ttft_s": 55.4039422130445,
+      "decode_tok_s": 1.98242198554398,
+      "completion_tokens": 128
+    }
+  ],
+  "mean_decode_tok_s": 1.6985236876217273
+}

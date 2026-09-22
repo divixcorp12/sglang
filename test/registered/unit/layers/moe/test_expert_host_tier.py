@@ -1,18 +1,28 @@
 """CPU tests for the pinned host expert tier: slot LRU, slabs and chunked gathers."""
 
+import gc
+import heapq
+import json
 import random
+import tempfile
 import unittest
+import weakref
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe import expert_stream
+from sglang.srt.environ import envs
+from sglang.srt.layers import engram_row_cache
+from sglang.srt.layers.moe import expert_host_tier, expert_stream
 from sglang.srt.layers.moe.expert_format import DenseLayerFormat
 from sglang.srt.layers.moe.expert_host_tier import (
     PAGE_BYTES,
     PinnedSlotLRU,
     allocate_host_slab,
+    quarantined_slab_count,
+    tier_snapshot,
 )
 from sglang.srt.layers.moe.expert_stream import (
     ExpertPinnedHostCache,
@@ -114,6 +124,302 @@ class TestPinnedSlotLRU(unittest.TestCase):
                 evictions += lru.assign(expert)[1] is not None
             self.assertEqual(lru.slot_to_expert, legacy.slot_to_expert)
             self.assertEqual(evictions, legacy.evictions)
+
+
+class _UncountedLRU:
+    """PinnedSlotLRU as it was before its counters (expert_host_tier.py at 099eadba33)."""
+
+    def __init__(self, capacity, is_pinned=None):
+        self.capacity = int(capacity)
+        self.is_pinned = is_pinned
+        self.slot_to_expert = [-1] * self.capacity
+        self.expert_to_slot = OrderedDict()
+        self._free = list(range(self.capacity))
+        heapq.heapify(self._free)
+
+    def __contains__(self, expert_id):
+        return expert_id in self.expert_to_slot
+
+    def touch(self, expert_id):
+        self.expert_to_slot.move_to_end(expert_id)
+
+    def assign(self, expert_id, protected=frozenset()):
+        if expert_id in self.expert_to_slot:
+            raise ValueError(f"expert {expert_id} already holds a pinned slot")
+        evicted = None
+        if self._free:
+            slot = heapq.heappop(self._free)
+        else:
+            evicted = self._victim(protected)
+            slot = self.expert_to_slot.pop(evicted)
+        self.slot_to_expert[slot] = expert_id
+        self.expert_to_slot[expert_id] = slot
+        return slot, evicted
+
+    def _victim(self, protected):
+        fallback = None
+        for expert_id in self.expert_to_slot:
+            if self.is_pinned is not None and self.is_pinned(expert_id):
+                continue
+            if expert_id not in protected:
+                return expert_id
+            if fallback is None:
+                fallback = expert_id
+        if fallback is not None:
+            return fallback
+        raise RuntimeError("every pinned host slot holds a protected expert")
+
+    def release(self, slot):
+        expert_id = self.slot_to_expert[slot]
+        if expert_id < 0:
+            return
+        self.expert_to_slot.pop(expert_id, None)
+        self.slot_to_expert[slot] = -1
+        heapq.heappush(self._free, slot)
+
+
+class TestPinnedSlotLRUCounters(unittest.TestCase):
+    def test_counters_start_at_zero(self):
+        lru = PinnedSlotLRU(3)
+        self.assertEqual(
+            lru.stats(),
+            {
+                "capacity": 3,
+                "occupancy": 0,
+                "hits": 0,
+                "admissions": 0,
+                "evictions": 0,
+                "protected_evictions": 0,
+                "releases": 0,
+            },
+        )
+
+    def test_counters_follow_admission_hit_eviction_and_release(self):
+        lru = PinnedSlotLRU(2)
+        lru.assign(1)
+        lru.assign(2)
+        self.assertEqual((lru.stats()["admissions"], lru.stats()["evictions"]), (2, 0))
+        lru.touch(1)
+        lru.touch(1)
+        self.assertEqual(lru.stats()["hits"], 2)
+        lru.assign(3)  # evicts 2, the oldest
+        stats = lru.stats()
+        self.assertEqual((stats["admissions"], stats["evictions"], stats["occupancy"]), (3, 1, 2))
+        self.assertEqual(stats["protected_evictions"], 0)
+        lru.release(0)
+        stats = lru.stats()
+        self.assertEqual((stats["releases"], stats["occupancy"]), (1, 1))
+        lru.release(0)  # already free: not a release
+        self.assertEqual(lru.stats()["releases"], 1)
+
+    def test_an_eviction_of_the_calls_own_expert_is_counted_apart(self):
+        lru = PinnedSlotLRU(2)
+        lru.assign(1)
+        lru.assign(2)
+        lru.assign(3, protected={1, 2, 3})
+        stats = lru.stats()
+        self.assertEqual((stats["evictions"], stats["protected_evictions"]), (1, 1))
+
+    def test_a_refused_assignment_counts_nothing(self):
+        lru = PinnedSlotLRU(1, is_pinned=lambda expert: True)
+        lru.assign(0)
+        before = lru.stats()
+        with self.assertRaises(RuntimeError):
+            lru.assign(1)
+        with self.assertRaises(ValueError):
+            lru.assign(0)
+        self.assertEqual(lru.stats(), before)
+
+    def test_counting_changes_no_decision(self):
+        # The counted table and a verbatim copy of the uncounted one see the same
+        # random traffic (assign with and without protection, touch, release, a
+        # pinned filter): every return value, the slot list and the eviction order
+        # must match, and the counters must agree with what was observed.
+        generator = random.Random(11)
+        pinned = {0, 5}
+        counted = PinnedSlotLRU(6, is_pinned=pinned.__contains__)
+        plain = _UncountedLRU(6, is_pinned=pinned.__contains__)
+        assigned = evicted_seen = touched = released = 0
+        for _ in range(4000):
+            action = generator.random()
+            expert = generator.randrange(20)
+            if action < 0.45:
+                if expert in plain:
+                    counted.touch(expert)
+                    plain.touch(expert)
+                    touched += 1
+                continue
+            if action < 0.9:
+                protected = frozenset(generator.sample(range(20), generator.randint(0, 8)))
+                if expert in plain:
+                    with self.assertRaises(ValueError):
+                        counted.assign(expert, protected)
+                    continue
+                try:
+                    expected = plain.assign(expert, protected)
+                except RuntimeError:
+                    with self.assertRaises(RuntimeError):
+                        counted.assign(expert, protected)
+                    continue
+                self.assertEqual(counted.assign(expert, protected), expected)
+                assigned += 1
+                evicted_seen += expected[1] is not None
+            else:
+                slot = generator.randrange(6)
+                released += plain.slot_to_expert[slot] >= 0
+                plain.release(slot)
+                counted.release(slot)
+            self.assertEqual(counted.slot_to_expert, plain.slot_to_expert)
+            self.assertEqual(list(counted.expert_to_slot.items()), list(plain.expert_to_slot.items()))
+            self.assertEqual(counted._free, plain._free)
+        stats = counted.stats()
+        self.assertEqual(
+            (stats["hits"], stats["admissions"], stats["evictions"], stats["releases"]),
+            (touched, assigned, evicted_seen, released),
+        )
+        self.assertEqual(stats["occupancy"], len(plain.expert_to_slot))
+        self.assertGreater(evicted_seen, 100)
+
+
+class TestQuarantine(unittest.TestCase):
+    """LEASE_PROTOCOL.md section 14: a tier whose GPU readers are uncertain is never unregistered or freed."""
+
+    def _cache(self, released):
+        streamer = ExpertStreamer(_host_layer(experts=4), ("host_rows",))
+        with patch.object(expert_stream, "release_host_slabs", released.append):
+            return ExpertPinnedHostCache(streamer, 2, device="cpu")
+
+    def test_close_releases_the_slabs_once(self):
+        released = []
+        self._cache(released).close()
+        self.assertEqual(len(released), 1)
+
+    def test_a_quarantined_tier_is_never_released_not_even_at_collection(self):
+        released = []
+        cache = self._cache(released)
+        cache.quarantine()
+        cache.close()
+        del cache
+        gc.collect()
+        self.assertEqual(released, [])
+
+    def test_quarantined_slabs_outlive_the_cache_and_the_module_list(self):
+        released = []
+        cache = self._cache(released)
+        slab = weakref.ref(next(iter(cache.tensors.values())))
+        before = quarantined_slab_count()
+        cache.quarantine()
+        self.assertEqual(quarantined_slab_count(), before + len(cache.tensors))
+        del cache
+        gc.collect()
+        # Interpreter finalization clears module globals: only the extra reference can keep the slab. Nothing
+        # here may hold a strong reference of its own, or the assertion below could not fail.
+        from sglang.srt.layers.moe import expert_host_tier
+
+        expert_host_tier._QUARANTINED.clear()
+        gc.collect()
+        self.assertIsNotNone(slab())
+
+    def test_an_unquarantined_slab_is_freed_with_its_cache(self):
+        released = []
+        cache = self._cache(released)
+        slab = weakref.ref(next(iter(cache.tensors.values())))
+        del cache
+        gc.collect()
+        self.assertIsNone(slab())
+
+
+class TestTierSnapshot(unittest.TestCase):
+    def test_the_snapshot_adds_the_tier_route_counters(self):
+        layer = _host_layer(experts=4)
+        streamer = ExpertStreamer(layer, ("host_rows",))
+        cache = ExpertPinnedHostCache(streamer, 2, device="cpu")
+        output = torch.zeros(3, 3, 4, dtype=torch.uint8)
+        cache.gather_rows(torch.tensor([1, 3, 1]), {"host_rows": output})
+        cache.gather_rows(torch.tensor([1, 2, 1]), {"host_rows": output})
+        lru = cache._lru
+        # Table-level: 3 rows admitted (1, 3, 2), one evicted (3), routes 1 and 1 hit.
+        self.assertEqual(
+            (lru.stats()["admissions"], lru.stats()["evictions"], lru.stats()["hits"]),
+            (3, 1, 2),
+        )
+        # Tier-level, route units: the first call misses all 3 routes, the second hits 2 of 3.
+        self.assertEqual(
+            (cache.stats.lookup_hits, cache.stats.lookup_misses), (2, 4)
+        )
+        snapshot = tier_snapshot()
+        mine = lru.stats()
+        # Other tests' tables may be alive: the snapshot sums at least this one.
+        self.assertGreaterEqual(snapshot["admissions"], mine["admissions"])
+        self.assertGreaterEqual(snapshot["lookup_misses"], 4)
+        self.assertGreaterEqual(snapshot["populated_bytes"], cache.stats.populated_bytes)
+        self.assertIn(mine["occupancy"], snapshot["layers"]["occupancy"])
+        cache.close()
+
+
+class TestCacheStatsSink(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.trace = f"{self.directory.name}/trace.jsonl"
+        self.addCleanup(setattr, engram_row_cache, "_SINK", engram_row_cache._SINK)
+        self.addCleanup(setattr, engram_row_cache, "_SINK_PATH", engram_row_cache._SINK_PATH)
+        engram_row_cache._SINK = None
+        engram_row_cache._SINK_PATH = ""
+        # tier_snapshot sums every table in the registry. An earlier test's streamer and cache reference
+        # each other, so its table stays listed until a collection happens to run, and pytest's file
+        # order (TestTierSnapshot first) then adds its admissions to this test's counts. A registry of
+        # its own makes the counts depend on this test alone.
+        self.addCleanup(setattr, expert_host_tier, "_LIVE_LRUS", expert_host_tier._LIVE_LRUS)
+        expert_host_tier._LIVE_LRUS = weakref.WeakSet()
+
+    def lines(self):
+        with open(self.trace + ".cache-stats") as f:
+            return [json.loads(line) for line in f]
+
+    def test_no_trace_path_means_no_sink_and_no_file(self):
+        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(""):
+            lru = PinnedSlotLRU(2)
+        self.assertIsNone(lru._sink)
+        lru.assign(1)
+        lru.touch(1)
+
+    def test_snapshots_are_throttled_and_cumulative(self):
+        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(self.trace):
+            lru = PinnedSlotLRU(4)
+            lru.assign(1)
+            for _ in range(50):
+                lru.touch(1)
+            # One write per interval: the first call wrote, the rest were throttled.
+            self.assertEqual(len(self.lines()), 1)
+            lru._sink._interval_s = 0.0
+            lru._sink._next.clear()
+            lru.assign(2)
+            lru.touch(2)
+        lines = self.lines()
+        self.assertEqual([line["kind"] for line in lines], ["pinned_tier"] * 3)
+        self.assertEqual(lines[0]["admissions"], 1)
+        self.assertEqual(lines[-1]["admissions"], 2)
+        self.assertEqual(lines[-1]["hits"], 51)
+        self.assertEqual(lines[-1]["occupancy"], 2)
+        self.assertLessEqual(lines[0]["t"], lines[-1]["t"])
+
+    def test_a_sink_writes_no_decision_of_its_own(self):
+        with envs.SGLANG_DSV41_EXPERT_TRACE_PATH.override(self.trace):
+            counted = PinnedSlotLRU(3)
+            counted._sink._interval_s = 0.0
+            plain = _UncountedLRU(3)
+            generator = random.Random(3)
+            for _ in range(300):
+                expert = generator.randrange(8)
+                if expert in plain:
+                    counted.touch(expert)
+                    plain.touch(expert)
+                else:
+                    self.assertEqual(counted.assign(expert), plain.assign(expert))
+        self.assertEqual(counted.slot_to_expert, plain.slot_to_expert)
+        self.assertGreater(len(self.lines()), 100)
+
 
 
 class TestHostSlab(unittest.TestCase):
@@ -287,8 +593,6 @@ class TestCpuPinnedTier(unittest.TestCase):
         # ensure_rows protects the whole chunk, so this can only happen if
         # something outside the call's own bookkeeping evicts a chunk member
         # mid-admission; force that race by patching _lru.assign.
-        import heapq
-
         layer = _host_layer()
         streamer = ExpertStreamer(layer, ("host_rows",))
         cache = ExpertPinnedHostCache(streamer, 2, device="cpu")

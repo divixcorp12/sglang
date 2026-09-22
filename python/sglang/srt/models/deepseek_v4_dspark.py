@@ -1034,9 +1034,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         last = self.stages[-1]
         x = last.norm(x_post_hc)
-        weight = self.lm_head.weight
-        if self._use_fp32_lm_head and weight.is_floating_point():
-            local_logits = F.linear(x.float(), weight.float())
+        if self._use_fp32_lm_head:
+            if not hasattr(self.lm_head, "weight"):
+                quant_method = getattr(self.lm_head, "quant_method", None)
+                raise ValueError(
+                    "SGLANG_DSPARK_FP32_LM_HEAD requires a dense `lm_head.weight`, "
+                    "but the shared target lm_head is quantized "
+                    f"(quant_method={type(quant_method).__name__}) and exposes no "
+                    "dense weight; unset SGLANG_DSPARK_FP32_LM_HEAD to use the "
+                    "quantized head's own apply path instead."
+                )
+            weight = self.lm_head.weight
+            if weight.is_floating_point():
+                local_logits = F.linear(x.float(), weight.float())
+            else:
+                local_logits = project_through_lm_head(x, self.lm_head)
         else:
             local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:
@@ -1068,8 +1080,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        is_exl3 = self.quant_config is not None and self.quant_config.get_name() == "exl3"
+        if is_exl3:
+            from sglang.srt.models.deepseek_v4_exl3_weights import (
+                adapt_exl3_weights,
+                dense_on_device,
+            )
+
+            weights = adapt_exl3_weights(weights, dense_on_device, self.config.o_groups)
+
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        unexpected_names: list[tuple[str, str]] = []
 
         weights = _dequant_fp8_wo_a_streaming(weights)
 
@@ -1132,9 +1154,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     break
                 else:
                     if mapped not in params_dict:
-                        logger.warning(
-                            "DSpark V4 draft: unexpected weight %r -> %r", name, mapped
-                        )
+                        if is_exl3:
+                            # A silent skip here would pass Task 8's load with a
+                            # partially-loaded draft; EXL3 checkpoints are known-
+                            # exact, so treat any leftover name as a bug, not noise.
+                            unexpected_names.append((name, mapped))
+                        else:
+                            logger.warning(
+                                "DSpark V4 draft: unexpected weight %r -> %r", name, mapped
+                            )
                         continue
                     param = params_dict[mapped]
                     weight_loader = getattr(
@@ -1142,6 +1170,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
+
+        if unexpected_names:
+            raise ValueError(
+                f"DSpark V4 draft (exl3): unexpected weights not found in the "
+                f"model: {unexpected_names}"
+            )
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params

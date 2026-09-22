@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 
 
@@ -54,17 +56,32 @@ def engine_kwargs(args) -> dict:
         # the stream trace would count as a decode token.
         disable_radix_cache=True,
     )
-    if getattr(args, "graphs", False):
+    dspark_draft = getattr(args, "dspark", None)
+    if getattr(args, "graphs", False) and not dspark_draft:
         # The capture, RAM-miss thread and hot cache startup lines are info logs.
         kwargs.update(GRAPH_KWARGS, log_level="info")
     else:
+        # The EXL3 expert-caching gate refuses speculation under a decode CUDA
+        # graph, so a --dspark run is always eager regardless of --graphs.
         kwargs["disable_cuda_graph"] = True
+    if dspark_draft:
+        kwargs.update(
+            speculative_algorithm="DSPARK",
+            speculative_draft_model_path=dspark_draft,
+            speculative_dspark_block_size=5,
+        )
     return kwargs
 
 
 def sampling_params(args) -> dict:
     # Every session decodes exactly new_tokens tokens, so tok/s is not inflated by EOS.
-    return {"max_new_tokens": args.new_tokens, "temperature": 0, "ignore_eos": True}
+    # --stop-at-eos turns that off for an acceptance-rate run, where tokens past
+    # EOS would bias the accept length in either direction.
+    return {
+        "max_new_tokens": args.new_tokens,
+        "temperature": 0,
+        "ignore_eos": not getattr(args, "stop_at_eos", False),
+    }
 
 
 def time_stream(stream, new_tokens: int, clock=time.perf_counter) -> dict:
@@ -72,19 +89,45 @@ def time_stream(stream, new_tokens: int, clock=time.perf_counter) -> dict:
 
     The first chunk carries the first token (end of prefill), so the remaining
     new_tokens - 1 tokens are the decode.
+
+    When a chunk is a dict with a "meta_info" field (the Engine's normal output
+    shape), the last chunk's completion_tokens and spec_verify_ct (present once
+    speculative decoding is active) are carried into the result. A later slice
+    divides them to get the accept length; this only captures the raw fields.
     """
     started = clock()
     first = None
-    for _chunk in stream:
+    last_meta_info = None
+    last_text = None
+    for chunk in stream:
         if first is None:
             first = clock()
+        if isinstance(chunk, dict):
+            last_meta_info = chunk.get("meta_info", last_meta_info)
+            # The Engine streams cumulative text, so the last chunk carries the
+            # whole completion. Greedy parity compares these across arms.
+            if chunk.get("text") is not None:
+                last_text = chunk["text"]
     if first is None:
         raise RuntimeError("generate stream yielded no chunks; cannot time the session")
     decode_s = clock() - first
-    return {
+    # With EOS honoured the session can stop early, so the decoded count is the
+    # server's completion_tokens when it reports one, not the requested ceiling.
+    decoded = new_tokens
+    if last_meta_info and last_meta_info.get("completion_tokens"):
+        decoded = int(last_meta_info["completion_tokens"])
+    result = {
         "ttft_s": first - started,
-        "decode_tok_s": (new_tokens - 1) / decode_s if decode_s > 0 else 0.0,
+        "decode_tok_s": (decoded - 1) / decode_s if decode_s > 0 and decoded > 1 else 0.0,
     }
+    if last_text is not None:
+        result["output_text"] = last_text
+    if last_meta_info:
+        if "completion_tokens" in last_meta_info:
+            result["completion_tokens"] = last_meta_info["completion_tokens"]
+        if "spec_verify_ct" in last_meta_info:
+            result["spec_verify_ct"] = last_meta_info["spec_verify_ct"]
+    return result
 
 
 def mean_decode_tok_s(sessions: list) -> float:
@@ -102,9 +145,27 @@ def main() -> None:
     p.add_argument("--prompt-tokens", type=int, default=512)
     p.add_argument("--new-tokens", type=int, default=128)
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--residency-dirs",
+        default="",
+        help="colon-separated dirs whose .safetensors page-cache residency is recorded before the "
+        "Engine, once it is ready, and after every session, so cache growth names its session",
+    )
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     p.add_argument("--chunked-prefill-size", type=int, default=512)
     p.add_argument("--graphs", action="store_true", help="breakable decode graphs at batch size 1")
+    p.add_argument(
+        "--dspark",
+        metavar="DRAFT_DIR",
+        help="run DSpark speculative decoding with this draft checkpoint dir "
+        "(forces eager decode; the EXL3 gate refuses speculation under a decode graph)",
+    )
+    p.add_argument(
+        "--stop-at-eos",
+        action="store_true",
+        help="honour EOS instead of decoding exactly --new-tokens; use for an "
+        "acceptance-rate run, where tokens past EOS would bias the accept length",
+    )
     args = p.parse_args()
 
     texts = list(_first_turns(args.sessions, args.n, args.skip))
@@ -117,19 +178,46 @@ def main() -> None:
     import sglang
     from transformers import AutoTokenizer
 
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import provenance
+
+    residency_dirs = [d for d in args.residency_dirs.split(":") if d]
+    residency = {"dirs": residency_dirs, "before_engine": provenance.resident_bytes(residency_dirs)}
+    boundaries = [{"label": "before_engine", **provenance.system_sample()}]
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    prov = provenance.capture({"trace_corpus": os.path.abspath(__file__)})
+    prov["drive_idle_check"] = provenance.drive_idle_check()
     engine = sglang.Engine(**engine_kwargs(args))
+    prov["sglang_env_drift_at_engine_ready"] = provenance.env_drift(prov["sglang_env"], provenance.process_env())
+    residency["after_engine_ready"] = provenance.resident_bytes(residency_dirs)
+    boundaries.append({"label": "engine_ready", **provenance.system_sample()})
     sessions = []
     for text in texts:
         ids = tokenizer(text).input_ids[: args.prompt_tokens]
+        chunk_log = []
+        cpu_before = provenance.process_tree_cpu_s()
         timing = time_stream(
-            engine.generate(input_ids=ids, sampling_params=sampling_params(args), stream=True),
+            provenance.timed_chunks(
+                engine.generate(input_ids=ids, sampling_params=sampling_params(args), stream=True),
+                chunk_log,
+            ),
             args.new_tokens,
         )
-        sessions.append({"prompt_tokens": len(ids), "new_tokens": args.new_tokens, **timing})
+        cpu_after = provenance.process_tree_cpu_s()
+        sessions.append(
+            {
+                "prompt_tokens": len(ids),
+                "new_tokens": args.new_tokens,
+                "cpu_s": None if None in (cpu_before, cpu_after) else cpu_after - cpu_before,
+                "step_latency": provenance.step_latency(chunk_log),
+                "expert_resident_bytes": provenance.resident_bytes(residency_dirs),
+                **timing,
+            }
+        )
+        boundaries.append({"label": f"session_{len(sessions) - 1}", **provenance.system_sample()})
         print(json.dumps(sessions[-1]), flush=True)
     engine.shutdown()
-    report = {"per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
+    report = {"provenance": prov, "expert_residency": residency, "boundary_samples": boundaries, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
 

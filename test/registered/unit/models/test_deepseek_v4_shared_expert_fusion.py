@@ -178,6 +178,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         class DraftModel:
             num_fused_shared_experts = 1
             confidence_head = None
+            quant_config = None
 
             def __init__(self):
                 self.config = config

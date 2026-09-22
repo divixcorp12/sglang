@@ -27,16 +27,20 @@ def classify_forward(forward_batch: Any) -> tuple[ForwardKind, int]:
     """Return a forward's kind and the tokens it adds to the residency clock.
 
     Draft-worker forwards add nothing: any forward carrying a draft spec input
-    (draft decode, draft extend after prefill, draft idle) and DRAFT_EXTEND_V2.
-    Target verify and idle forwards carry a verify input. A TARGET_VERIFY adds
-    its drafted tokens per request; the speculative worker later commits the
+    (draft decode, draft extend after prefill, draft idle), DRAFT_EXTEND_V2,
+    and a forward whose spec_info is marked ``is_draft_block`` (a draft
+    worker's own internal draft-block forward that borrows a verify-shaped
+    SpecInput, e.g. DSpark's DraftBlockProposer -- see spec_info.py). Target
+    verify and idle forwards carry a verify input. A TARGET_VERIFY adds its
+    drafted tokens per request; the speculative worker later commits the
     accepted count.
     """
     mode = forward_batch.forward_mode
     spec_info = getattr(forward_batch, "spec_info", None)
-    if (spec_info is not None and spec_info.is_draft_input()) or (
-        mode.is_draft_extend_v2()
-    ):
+    if (
+        spec_info is not None
+        and (spec_info.is_draft_input() or getattr(spec_info, "is_draft_block", False))
+    ) or (mode.is_draft_extend_v2()):
         return ForwardKind.DRAFT, 0
     batch_size = getattr(forward_batch, "batch_size", 1)
     if mode.is_target_verify():

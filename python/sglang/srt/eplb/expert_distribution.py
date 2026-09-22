@@ -281,6 +281,20 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             or torch.get_device_module().is_current_stream_capturing()
         ):
             return
+        if self._current_layer_idx.value is None:
+            # No model-level `with_current_layer` scope is active. Every
+            # instrumented model wraps its per-layer forward loop in one
+            # (see e.g. deepseek_v2.py, glm4_moe.py); a call that reaches
+            # here without one is not attributable to a layer and must not
+            # touch the layer-keyed gatherers. This is the draft path for
+            # speculative decoders whose own forward loop never enters
+            # `with_current_layer` (e.g. DSpark's per-stage MoE, which uses
+            # its own 0-based stage ids that collide with the target's
+            # layer-id space): without this guard, `layer_idx=None` reaches
+            # a tensor index (`self._data[None, :]`) that either raises
+            # (mismatched index/self dims in `scatter_add_`) or, for other
+            # gatherers, silently writes into the wrong layer.
+            return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value

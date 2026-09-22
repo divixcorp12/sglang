@@ -23,9 +23,12 @@ _CAPTURE_HEADROOM_GB = 1.0
 
 def _base_logits_dtype(model) -> torch.dtype:
     """Dtype of the block logits; a quantized head's packed `weight` carries no
-    logits dtype, its kernel emits the activation (draft param) dtype instead."""
-    weight = model.lm_head.weight
-    if weight.is_floating_point():
+    logits dtype, its kernel emits the activation (draft param) dtype instead.
+    A head with a quant method that applies without a dense `weight` at all
+    (e.g. EXL3, `applies_without_weight = True`) has no dtype to read here
+    either, so it falls into the same markov_head branch."""
+    weight = getattr(model.lm_head, "weight", None)
+    if weight is not None and weight.is_floating_point():
         return weight.dtype
     return next(model.markov_head.parameters()).dtype
 

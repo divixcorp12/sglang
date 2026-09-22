@@ -40,6 +40,20 @@ def capturing_graphs() -> bool:
     return bool(capture_mode.is_capture_mode)
 
 
+# Bumped whenever a ram_miss_request field changes meaning OR the record layout changes (a field
+# added or removed): a JSONL file has no field check like the native record's, so this integer is the
+# only mechanical answer to which fields a file has and which quantities it compares.
+# 2: stage stamps and spans cover the whole read, not the first io_uring batch, and packing can fall
+# inside first_to_last_cqe. 3: adds row_pack[].admit, extent_cqe[].submit/attempts and dropped_before;
+# no schema-2 field changed meaning. 4: adds request.lanes, the planned lane count the device posted;
+# every schema-3 field keeps its meaning, so spans, byte totals and per-drive shares compare across 3 and 4.
+# 5: adds request.pack_workers and request.pack_split, the packing mode the reader ran in. No earlier field
+# changed meaning, but a worker-mode record's pack stamps mean something else than an inline one's (a row's
+# pack_start is after the worker woke, its spans overlap). A file written before schema 5 does not say which
+# mode wrote it; it is ASSUMED inline, because the workers were barred from any run that writes a stage trace.
+RAM_MISS_TRACE_SCHEMA = 5
+
+
 class Exl3StreamTrace:
     def __init__(self, path: str = "", log_every: int = LOG_EVERY_FORWARDS) -> None:
         # Line-buffered: the scheduler process may exit without running atexit.
@@ -157,6 +171,85 @@ class Exl3StreamTrace:
             }
             if thread is not None:
                 line["thread"] = thread
+            self._file.write(json.dumps(line) + "\n")
+
+    def record_ram_miss_requests(self, records: list[dict], layer_ids: list[int]) -> None:
+        """One line per RAM-miss request the native service served, from ``Exl3RamMissHost.drain_trace``.
+
+        ``layer_ids[row]`` names each record's streamed row. The line is not a forward call: it has
+        no ``tokens``, and ``kind`` is ``ram_miss_request`` (tier_sim.load_trace skips it). Every
+        ``stages_ns`` value and ``prev_done_ns`` is the host's CLOCK_MONOTONIC in ns, which is what
+        ``t`` (``time.monotonic()``) reads too; 0 is a stage the request never reached. Nothing here
+        compares a GPU clock with the host's.
+
+        ``schema`` is RAM_MISS_TRACE_SCHEMA. In schema 1 the stamps below ``submit`` were the FIRST io_uring batch's,
+        ``pack_end`` the last's, and ``spans_ns`` summed the per-batch spans, so packing never fell
+        inside ``first_to_last_cqe``. From schema 2 every stamp spans the whole read and a row packs
+        as soon as its own extents land, so ``first_to_last_cqe`` can contain the packing of earlier
+        rows and is no longer pure drive latency. **The two are not comparable**; compare across the
+        boundary with ``extent_cqe_ns``, whose meaning is unchanged, or re-baseline.
+
+        ``bytes`` is the completed total; ``byte_split`` names the rest. ``row_pack_ns`` and
+        ``extent_cqe_ns`` are per-row and per-extent stamps, bounded (``untraced`` counts the rest).
+        ``schema`` 3 adds ``row_pack_ns[].admit``, ``extent_cqe_ns[].submit`` and ``.attempts``. A
+        row's stamps are compared with its own extents', never as one sorted list: rows overlap.
+        ``extent_cqe_ns[].cqe`` is when the wait that reaped the extent returned, not a per-completion time.
+        ``dropped_before`` is how many records the native trace ring dropped, for being full, just
+        before this line's record: nonzero means lines are missing at this point of the file.
+        ``schema`` 4 adds ``request.lanes``: the layer's planned lane count for that request (RAM hits and
+        misses; ``rows_asked`` counts only the misses read), which with the line's ``layer`` gives lanes per layer.
+        ``schema`` 5 adds ``request.pack_workers`` and ``request.pack_split``: the packing mode. ``pack_workers``
+        0 is the inline reader; above 0 the rows are packed by workers, and ``row_pack_ns`` starts, ``spans_ns.pack``
+        and anything derived from the gap between an extent's reap and its row's pack start are then not
+        comparable with an inline trace's (analysis/dsv41-drive/overlap_timeline.py refuses them).
+        """
+        if self._file is None or not records:
+            return
+        from sglang.kernels.ops.moe.exl3_ram_miss import STAGE_ORDER
+
+        for record in records:
+            line = {
+                "forward": self.forwards,
+                "layer": layer_ids[record["row"]],
+                "kind": "ram_miss_request",
+                "schema": RAM_MISS_TRACE_SCHEMA,
+                "request": {
+                    "seq": record["seq"],
+                    "type": record["kind"],
+                    "ok": record["ok"],
+                    "rows": record["rows"],
+                    "batches": record["batches"],
+                    "backlog": record["backlog"],
+                    "lanes": record["lanes"],
+                    "pack_workers": record["pack_workers"],
+                    "pack_split": record["pack_split"],
+                },
+                "status": record["status"],
+                "rows_asked": record["rows_asked"],
+                "stages_ns": {name: record[name] for name in STAGE_ORDER},
+                "missing_stages": record["missing_stages"],
+                "prev_done_ns": record["prev_done"],
+                "spans_ns": {
+                    "submit_to_first_cqe": record["submit_to_first_cqe_ns"],
+                    "first_to_last_cqe": record["first_to_last_cqe_ns"],
+                    "pack": record["pack_ns"],
+                },
+                "bytes": record["bytes"],
+                "byte_split": {
+                    "useful": record["useful_bytes"],
+                    "submitted": record["submitted_bytes"],
+                    "completed": record["bytes"],
+                    "retried": record["retried_bytes"],
+                    "cancelled": record["cancelled_bytes"],
+                },
+                "row_pack_ns": record["row_pack"],
+                "extent_cqe_ns": record["extent_cqe"],
+                "untraced": {"rows": record["rows_untraced"], "extents": record["extents_untraced"]},
+                "dropped_before": record["dropped_before"],
+                "extents": record["extents"],
+                "drives": record["drives"],
+                "t": round(time.monotonic(), 6),
+            }
             self._file.write(json.dumps(line) + "\n")
 
     def stats(self) -> dict:

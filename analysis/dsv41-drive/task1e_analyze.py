@@ -1,0 +1,320 @@
+"""Analysis for the task1e series (see task1e-PREDICTIONS.txt and task1e-AMENDMENT.txt).
+
+Revision 3 adds the leave-one-out CROSS-ARM of task1e-ADDENDUM.txt; revisions 1 and 2 are unchanged in every number
+they printed. Revision 2 adds the RELAXED sets of the amendment, written after arm 0's verdict and before arm 1's.
+Revision 1 (sha256 ca0f20e2db5ee40f1859ee4ab9515d07876a384d8f367f77998ad1540a769e9a, commit 450f86d17a) is the
+one the original pre-registration hashed; its STRICT and S1 numbers are unchanged in revision 2.
+
+    task1e_analyze.py <task1-results dir> <label-prefix>... [--manifest clean-reference.json]
+
+Reads every <prefix>-<i>-<code>-on-U.json in the results dir with its .verdict.txt, orders the arms by the
+UTC of their first boundary sample, classifies each as clean or INCONCLUSIVE by the pre-registered rules,
+and prints the comparison. Standard library only; run it under taskset -c 0-63.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+import os
+import re
+
+EXPECT_GEN = {"old": "gen0", "new": "gen2"}
+LOAD_SPREAD, LOAD_CELL_GAP, LOAD_TREND = 2.0, 1.0, 2.0          # load1 units
+FOREIGN_SPREAD, FOREIGN_CELL_GAP, FOREIGN_TREND = 100.0, 100.0, 100.0   # percentage points of one core, summed over foreign processes on cores 32-63
+SD_REFERENCE = 0.0209
+UNRESOLVABLE_SD = 3 * SD_REFERENCE
+ARM_CORES = range(32, 64)
+
+
+def _betacf(a, b, x):
+    tiny, m_max = 1e-300, 400
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, m_max + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-14:
+            break
+    return h
+
+
+def _betainc(a, b, x):
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    ln_front = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x)
+    if x < (a + 1) / (a + b + 2):
+        return math.exp(ln_front) * _betacf(a, b, x) / a
+    return 1 - math.exp(ln_front) * _betacf(b, a, 1 - x) / b
+
+
+def t_cdf(t, df):
+    x = df / (df + t * t)
+    p = 0.5 * _betainc(df / 2, 0.5, x)
+    return 1 - p if t > 0 else p
+
+
+def t_crit(df, level=0.95):
+    target, lo, hi = 1 - (1 - level) / 2, 0.0, 200.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if t_cdf(mid, df) < target else (lo, mid)
+    return (lo + hi) / 2
+
+
+def mean(v):
+    return sum(v) / len(v)
+
+
+def sd(v):
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1)) if len(v) > 1 else float("nan")
+
+
+def load_arm(json_path, code):
+    verdict_path = json_path[:-5] + ".verdict.txt"
+    rep = json.load(open(json_path))
+    text = open(verdict_path).read() if os.path.exists(verdict_path) else ""
+    lines = text.splitlines()
+    ps = rep.get("per_session") or []
+    samples = rep.get("boundary_samples") or []
+    gen = next((l[len("NOTE GENERATION "):] for l in lines if l.startswith("NOTE GENERATION ")), "missing")
+    contended = next((l.split()[2] for l in lines if l.startswith("NOTE CONTENDED ")), "missing")
+    problems = [l for l in lines if l.startswith("PROBLEM")]
+    valid = bool(lines) and lines[-1].strip() == "VALID"
+    outliers = [l for l in lines if l.startswith("NOTE OUTLIER")]
+    cross = [l for l in lines if re.match(r"NOTE CROSS-ARM session_", l)]
+    loads = [b["loadavg"][0] for b in samples if b.get("loadavg")]
+    foreign, sightings = [], []
+    for b in samples:
+        tot = 0.0
+        for p in b.get("top_other_cpu") or []:
+            if p.get("cpu_num") in ARM_CORES:
+                tot += p["cpu_pct"]
+                if p["cpu_pct"] >= 50:
+                    sightings.append(f"{p['name']}({p['cpu_pct']:.0f}%)@{b['label']}")
+        foreign.append(tot)
+    return {
+        "name": os.path.basename(json_path)[:-5], "code": code, "t0": (samples[0].get("utc") if samples else ""),
+        "sessions": [r["decode_tok_s"] for r in ps], "ttft": [r["ttft_s"] for r in ps],
+        "mean": mean([r["decode_tok_s"] for r in ps]) if ps else float("nan"),
+        "valid": valid, "gen": gen, "gen_ok": gen.startswith(EXPECT_GEN[code]), "contended": contended,
+        "outliers": outliers, "cross": cross, "problems": problems,
+        "L": mean(loads) if loads else float("nan"), "F": mean(foreign) if foreign else float("nan"),
+        "sightings": sightings,
+    }
+
+
+def inconclusive_reasons(a, ignore_cross=False, ignore_contended=False, loo=False):
+    r = []
+    if not a["valid"]:
+        r.append("not VALID")
+    if a["outliers"]:
+        r.append("OUTLIER note")
+    if a["cross"] and not ignore_cross and not loo:
+        r.append("CROSS-ARM flag (historical reference)")
+    if loo and not ignore_cross and a.get("loo"):
+        r.append("CROSS-ARM flag (leave-one-out, this series)")
+    if a["contended"] != "not" and not ignore_contended:
+        r.append(f"CONTENDED {a['contended']}")
+    if not a["gen_ok"]:
+        r.append(f"generation {a['gen'][:40]!r}")
+    return r
+
+
+CROSS_ARM_SLOWER = 0.08   # the verdict's own threshold, unchanged
+
+
+def _median(v):
+    v = sorted(v)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def loo_cross_flags(arms):
+    """Leave-one-out CROSS-ARM within this series (addendum): each arm's sessions against the median of the OTHER
+    VALID arms of the same cell in this series, same 8% rule as the verdict: decode tok/s any session, TTFT sessions
+    1..n. Sets a["loo"] to the list of flags ("not judged" if no other valid arm exists in the cell)."""
+    for a in arms:
+        others = [b for b in arms if b is not a and b["code"] == a["code"] and b["valid"]]
+        a["loo"] = None if not others else []
+        a["loo_refs"] = len(others)
+        for i, (tps, ttft) in enumerate(zip(a["sessions"], a["ttft"])):
+            ref = [b["sessions"][i] for b in others if i < len(b["sessions"])]
+            if ref and tps < (1 - CROSS_ARM_SLOWER) * _median(ref):
+                a["loo"].append(f"LOO session_{i}: decode {tps:.3f} tok/s is {100 * (1 - tps / _median(ref)):.0f}% below the {len(ref)}-arm same-series median {_median(ref):.3f}")
+            ref = [b["ttft"][i] for b in others if i < len(b["ttft"])]
+            if i >= 1 and ref and ttft > (1 + CROSS_ARM_SLOWER) * _median(ref):
+                a["loo"].append(f"LOO session_{i}: ttft {ttft:.1f} s is {100 * (ttft / _median(ref) - 1):.0f}% above the {len(ref)}-arm same-series median {_median(ref):.1f} s")
+
+
+def welch(new, old):
+    mn, mo, sn, so = mean(new), mean(old), sd(new), sd(old)
+    vn, vo = sn ** 2 / len(new), so ** 2 / len(old)
+    se = math.sqrt(vn + vo)
+    df = (vn + vo) ** 2 / (vn ** 2 / (len(new) - 1) + vo ** 2 / (len(old) - 1)) if se > 0 else float("nan")
+    tc = t_crit(df)
+    diff = mn - mo
+    lr_se = math.sqrt(vn / mn ** 2 + vo / mo ** 2)
+    lr = math.log(mn / mo)
+    return {"mn": mn, "mo": mo, "sn": sn, "so": so, "diff": diff, "se": se, "df": df, "tcrit": tc,
+            "diff_ci": (diff - tc * se, diff + tc * se), "ratio": mn / mo,
+            "ratio_ci": (math.exp(lr - tc * lr_se), math.exp(lr + tc * lr_se))}
+
+
+def ols(xs, ys):
+    n = len(xs)
+    mx, my = mean(xs), mean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx) if sxx else float("nan"), n
+
+
+def position_fit(arms_with_pos):
+    """tok/s = a + c*[new] + s*position by least squares (normal equations, 3 parameters)."""
+    rows = [(1.0, 1.0 if a["code"] == "new" else 0.0, float(p), a["mean"]) for a, p in arms_with_pos]
+    if len(rows) < 4 or len({r[1] for r in rows}) < 2:
+        return None
+    n = 3
+    ata = [[sum(r[i] * r[j] for r in rows) for j in range(n)] for i in range(n)]
+    atb = [sum(r[i] * r[3] for r in rows) for i in range(n)]
+    for i in range(n):  # gauss-jordan
+        piv = max(range(i, n), key=lambda k: abs(ata[k][i]))
+        if abs(ata[piv][i]) < 1e-12:
+            return None
+        ata[i], ata[piv], atb[i], atb[piv] = ata[piv], ata[i], atb[piv], atb[i]
+        for k in range(n):
+            if k != i:
+                f = ata[k][i] / ata[i][i]
+                ata[k] = [x - f * y for x, y in zip(ata[k], ata[i])]
+                atb[k] -= f * atb[i]
+    return {"cell_new_minus_old": atb[1] / ata[1][1], "slope_per_slot": atb[2] / ata[2][2]}
+
+
+def stationarity(arms):
+    """Every arm run, in order. Returns (non_stationary, [reasons])."""
+    reasons = []
+    for key, spread_t, gap_t, trend_t in (("L", LOAD_SPREAD, LOAD_CELL_GAP, LOAD_TREND), ("F", FOREIGN_SPREAD, FOREIGN_CELL_GAP, FOREIGN_TREND)):
+        vals = [a[key] for a in arms]
+        if any(math.isnan(v) for v in vals):
+            reasons.append(f"{key}: missing samples")
+            continue
+        spread = max(vals) - min(vals)
+        gn, go = [a[key] for a in arms if a["code"] == "new"], [a[key] for a in arms if a["code"] == "old"]
+        gap = mean(gn) - mean(go) if gn and go else 0.0
+        slope, _ = ols(list(range(len(vals))), vals)
+        trend = slope * (len(vals) - 1)
+        name = {"L": "load1", "F": "foreign CPU% on cores 32-63"}[key]
+        if spread > spread_t:
+            reasons.append(f"{name}: spread across arms {spread:.2f} > {spread_t}")
+        if abs(gap) > gap_t:
+            reasons.append(f"{name}: new-minus-old cell mean {gap:+.2f}, |.| > {gap_t}")
+        if abs(trend) > trend_t:
+            reasons.append(f"{name}: fitted change over the series {trend:+.2f}, |.| > {trend_t}")
+    cn = sum(1 for a in arms if a["code"] == "new" and a["sightings"])
+    co = sum(1 for a in arms if a["code"] == "old" and a["sightings"])
+    if abs(cn - co) >= 2:
+        reasons.append(f">=50% foreign process on an arm core seen in {cn} new arms vs {co} old arms")
+    return bool(reasons), reasons
+
+
+def report_set(title, arms):
+    new = [a["mean"] for a in arms if a["code"] == "new"]
+    old = [a["mean"] for a in arms if a["code"] == "old"]
+    print(f"\n== {title}: n_old={len(old)} n_new={len(new)}")
+    if len(new) < 2 or len(old) < 2:
+        print("   not computable (a cell has fewer than 2 arms)")
+        return None
+    w = welch(new, old)
+    print(f"   old mean {w['mo']:.4f} sd {w['so']:.4f} | new mean {w['mn']:.4f} sd {w['sn']:.4f}")
+    print(f"   diff {w['diff']:+.4f} tok/s  95% CI [{w['diff_ci'][0]:+.4f}, {w['diff_ci'][1]:+.4f}]  (Welch df {w['df']:.2f}, t {w['tcrit']:.3f})")
+    print(f"   RATIO new/old {w['ratio']:.4f}  95% CI [{w['ratio_ci'][0]:.4f}, {w['ratio_ci'][1]:.4f}]")
+    big = [n for n, s in (("old", w["so"]), ("new", w["sn"])) if s > UNRESOLVABLE_SD]
+    if big:
+        print(f"   NOTE: within-cell sd of {big} exceeds {UNRESOLVABLE_SD:.4f} (3x the gen1 quiet sd): this design cannot resolve 3.2%")
+    lo, hi = w["ratio_ci"]
+    print(f"   vs pre-registered rules: lower bound > 1.0: {lo > 1.0}; contains 1.032: {lo <= 1.032 <= hi}; contains 1.0: {lo <= 1.0 <= hi}")
+    return w
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("results")
+    p.add_argument("prefixes", nargs="+")
+    a = p.parse_args()
+    arms = []
+    for prefix in a.prefixes:
+        for path in sorted(glob.glob(os.path.join(a.results, f"{prefix}-*-*-on-U.json"))):
+            if path.endswith((".cache.json", ".regime.json")):
+                continue
+            code = os.path.basename(path).split("-")[2]
+            arms.append(load_arm(path, code))
+    arms.sort(key=lambda x: x["t0"])
+    pos = {x["name"]: i + 1 for i, x in enumerate(arms)}
+    print("ARMS IN TIME ORDER (position, name, mean tok/s, per-session, ttft, valid, gen, contended, outliers, cross, load1, foreignCPU)")
+    for x in arms:
+        print(f" {pos[x['name']]} {x['name']}: mean {x['mean']:.4f} sess {[round(s, 3) for s in x['sessions']]} ttft {[round(s, 1) for s in x['ttft']]} "
+              f"valid={x['valid']} gen={x['gen'][:6]} contended={x['contended']} outl={len(x['outliers'])} cross={len(x['cross'])} L={x['L']:.2f} F={x['F']:.0f}")
+        why = inconclusive_reasons(x)
+        print(f"    -> {'CLEAN' if not why else 'INCONCLUSIVE: ' + '; '.join(why)}" + (f"  sightings {x['sightings']}" if x["sightings"] else ""))
+        for n in x["outliers"] + x["cross"]:
+            print(f"       {n[:200]}")
+    loo_cross_flags(arms)
+    print("\nLEAVE-ONE-OUT CROSS-ARM (this series; primary for disqualification under the addendum):")
+    for x in arms:
+        print(f"   {x['name']}: " + ("not judged (no other valid arm of its cell)" if x["loo"] is None else (f"{len(x['loo'])} flag(s) vs {x['loo_refs']} other arm(s)" if x["loo"] else f"no flag vs {x['loo_refs']} other arm(s)")))
+        for n in x["loo"] or []:
+            print(f"       {n}")
+    non_stat, why = stationarity(arms)
+    print(f"\nSTATIONARITY over all {len(arms)} arms run: {'NON-STATIONARY' if non_stat else 'stationary'}")
+    for r in why:
+        print("   ", r)
+    strict = [x for x in arms if not inconclusive_reasons(x)]
+    sens1 = [x for x in arms if not inconclusive_reasons(x, ignore_cross=True)]
+    relaxed = [x for x in arms if not inconclusive_reasons(x, ignore_contended=True, loo=True)]
+    relaxed_hist = [x for x in arms if not inconclusive_reasons(x, ignore_contended=True)]
+    sens1r = [x for x in arms if not inconclusive_reasons(x, ignore_cross=True, ignore_contended=True)]
+    sens2 = [x for x in arms if x["valid"] and x["gen_ok"]]
+    print(f"\nARMS DROPPED of {len(arms)}: STRICT (original rules) {len(arms) - len(strict)}, S1 (strict, CROSS-ARM ignored) {len(arms) - len(sens1)}, "
+          f"RELAXED-LOO (amended + addendum: primary) {len(arms) - len(relaxed)}, RELAXED-HIST (historical CROSS-ARM) {len(arms) - len(relaxed_hist)}, S1r (relaxed, CROSS-ARM ignored) {len(arms) - len(sens1r)}, "
+          f"S2 (all VALID, right generation) {len(arms) - len(sens2)}")
+    for title, s in (("RELAXED-LOO = PRIMARY (CONTENDED ignored; OUTLIER and leave-one-out CROSS-ARM disqualify)", relaxed),
+                     ("RELAXED-HIST (CONTENDED ignored; OUTLIER and historical-reference CROSS-ARM disqualify)", relaxed_hist),
+                     ("STRICT (original task1e-PREDICTIONS rules)", strict),
+                     ("S1r sensitivity: relaxed with CROSS-ARM ignored (VALID, OUTLIER-free, right generation)", sens1r),
+                     ("S1 sensitivity, original definition: strict with CROSS-ARM ignored", sens1),
+                     ("S2 descriptive: every VALID right-generation arm", sens2)):
+        report_set(title, s)
+        fit = position_fit([(x, pos[x["name"]]) for x in s])
+        print("   position fit:", (f"cell(new-old) {fit['cell_new_minus_old']:+.4f} tok/s at fixed position, slope {fit['slope_per_slot']:+.4f} tok/s per slot" if fit else "not computable"))
+    print("\nPRE-REGISTERED VERDICTS (both are reported; the original is not erased):")
+    for label, s in (("STRICT (original rules)", strict), ("RELAXED-HIST (amendment, historical CROSS-ARM)", relaxed_hist), ("RELAXED-LOO (amendment + addendum: PRIMARY)", relaxed)):
+        n_new = sum(1 for x in s if x["code"] == "new")
+        n_old = sum(1 for x in s if x["code"] == "old")
+        if n_new < 3 or n_old < 3:
+            print(f"   {label}: UNRESOLVED: {n_old} clean old, {n_new} clean new; fewer than 3 in a cell.")
+        elif non_stat:
+            print(f"   {label}: UNRESOLVED: contention was non-stationary across the series; the ratio is not a result.")
+        else:
+            print(f"   {label}: the ratio and interval above are the result (contended absolute levels).")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,66 @@
+kBusySeq evidence, run 2026-09-21T03:40:00-05:00 on divix01 (CPU only, taskset -c 0-63), tree = git archive of dsv41 8d89f8c25c (python/, test/, analysis/) plus the uncommitted test_exl3_ram_miss_thread.py of the commit that adds this file; load 5.59 5.79 5.97
+
+### 1. busy_seq_windows.py (figures DERIVED from stage stamps; see the script's docstring)
+    python busy_seq_windows.py task1-0-new-off-T.trace (mirrors off) task1-2-new-on-T.trace (mirrors on), both schema 2, native service, O_DIRECT, from task1-results on divix01
+/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-0-new-off-T.trace  sha256[:16] 99e06b916434fe67  schemas [2]  skipped 0
+  read-request window  = mapped - observed (DERIVED, overstates the busy window): n=7211  min 10252.65  p1 10326.26  p10 10405.02  p50 10506.48  p99 32988.22  max 48148.95  (us)
+  touch-request window = done - observed   (DERIVED, includes the done store): n=13589  min 0.23  p1 0.37  p10 0.45  p50 0.75  p99 1.75  max 13.98  (us)
+  clear -> done        = done - mapped     (UPPER BOUND on the gap): n=7211  min 0.10  p1 0.13  p10 0.20  p50 0.34  p99 0.88  max 5.91  (us)
+
+/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-2-new-on-T.trace  sha256[:16] cc341a9aac06b410  schemas [2]  skipped 0
+  read-request window  = mapped - observed (DERIVED, overstates the busy window): n=7211  min 5029.51  p1 5096.07  p10 5150.19  p50 5295.52  p99 14587.32  max 25989.22  (us)
+  touch-request window = done - observed   (DERIVED, includes the done store): n=13589  min 0.20  p1 0.38  p10 0.46  p50 0.61  p99 1.55  max 8.70  (us)
+  clear -> done        = done - mapped     (UPPER BOUND on the gap): n=7211  min 0.09  p1 0.12  p10 0.17  p50 0.22  p99 0.64  max 7.36  (us)
+
+### 2. busy_seq_protocol_probe.py (DIRECT observation of the page word; gap_polls is chance, not asserted)
+demand : {'seq': 1, 'polls': 8534, 'busy_polls': 4264, 'order_violations': 0, 'gap_polls': 1, 'final_busy': 0, 'final_done': 1}
+advisory: {'in_service': True, 'busy_values': [0]}
+properties hold
+
+### 3. the eviction tests in test_exl3_ram_miss_thread.py (3-slot tier holding [0,1,2]; -k 'resident or protected')
+test_a_resident_expert_outside_protect_is_evicted_by_the_request_that_needs_another PASSED [ 33%]
+test_a_resident_expert_in_protect_is_not_the_victim PASSED [ 66%]
+test_when_every_resident_expert_is_protected_the_request_fails_and_evicts_nothing PASSED [100%]
+================ 3 passed, 23 deselected, 17 warnings in 9.72s =================
+
+### 4. busy_seq_mutants.sh (each mutant of the C++ must turn its named tests red, except the last)
+== MUTANT reservation_ignores_wanted
+test_when_every_resident_expert_is_protected_the_request_fails_and_evicts_nothing
+1 failed, 2 passed, 23 deselected, 17 warnings in 11.18s
+== MUTANT victim_skips_resident_expert_0
+test_a_resident_expert_outside_protect_is_evicted_by_the_request_that_needs_another
+1 failed, 2 passed, 23 deselected, 17 warnings in 10.62s
+== MUTANT busy_never_cleared
+test_the_word_equals_seq_during_service_and_is_clear_after_it
+1 failed, 1 passed, 16 warnings in 9.89s
+== MUTANT busy_never_set
+test_the_word_equals_seq_during_service_and_is_clear_after_it
+1 failed, 1 passed, 16 warnings in 10.23s
+== MUTANT busy_set_after_serve
+test_the_word_equals_seq_during_service_and_is_clear_after_it
+1 failed, 1 passed, 16 warnings in 11.76s
+== MUTANT advisory_sets_the_word
+test_an_advisory_in_service_leaves_the_word_at_zero
+1 failed, 1 passed, 16 warnings in 10.09s
+== MUTANT busy_cleared_after_done_store (3 runs)
+2 passed, 16 warnings in 10.79s
+2 passed, 16 warnings in 11.26s
+2 passed, 16 warnings in 11.64s
+== restored
+2 passed, 16 warnings in 11.91s
+3 passed, 23 deselected, 17 warnings in 12.64s
+
+### Reading this
+DIRECT (executed against the service): the protocol in section 2 (busy_seq == seq during service and 0 after; an advisory
+leaves it 0) and the eviction tests in section 3 (a resident expert in neither need nor protect is the victim of the request
+that needs another; the same expert in protect survives; when every resident is protected the request fails and evicts
+nothing). Each has a mutant that turns it red (section 4): the reservation ignoring wanted turns only the every-resident-is-
+protected case red, because a request touches the residents it protects so recency alone would pick the same victim
+otherwise; skipping a resident expert as a victim turns the evicted-outside-protect case red.
+DERIVED from stage stamps, not observed on the word: every figure in section 1. The read-request window overstates the busy
+window (it starts before the busy store and ends before the clear) and tracks the read time of this workload and these drives;
+the touch window includes the done store; clear->done includes set_status, the sfence, the clear and the done store, so it
+is an upper bound on the gap.
+NOT ESTABLISHED BY EXECUTION: that the word clears before demand_done. The mutant that clears it after the done store is not
+caught (3 of 3 runs pass): a Python poller cannot land in the sub-microsecond gap. That order is read from handle_demand and
+pump_demand. Also not measured: how often a device poll lands in the window (needs a kernel under the GPU lock).

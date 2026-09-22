@@ -1,0 +1,25 @@
+{
+ "new:off": [
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-0-new-off-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-1-new-off-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-4-new-off-U.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-5-new-off-U.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1c-2-new-off-T.json"
+ ],
+ "new:on": [
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-2-new-on-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1-3-new-on-U.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1b-0-new-on-T.json",
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1c-0-new-on-T.json"
+ ],
+ "old:on": [
+  "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/task1c-1-old-on-U.json"
+ ],
+ "generations": {
+  "921bc132c0479bd932e85fa700b9ab4aa39ccbb7": "gen0 = python/ of 099eadba33 (old barriers, pre two-bank)",
+  "815cb723309886975d75e1cc582d45de39d535a5": "gen1 = python/ identical to f6608901a3",
+  "ee70296428321097df189c7fa5cadbb2d4300fa6": "gen2 = python/ of 87417376f5 (stage-trace schema 3: row_admit, extent_submit, extent_attempts, trace_clock_reads; exl3_ram_miss_host.cpp changed vs gen1)",
+  "8d3312fdf0a7ecc38dfe70e04d1badfd0ca91cf6": "gen3 = python/ of 8c78749b35, BEHAVIOURAL vs gen2 (87417376f5): 85cdbf9382 wrap fix (service skips seq 0 through the 0xFFFFFFFF wrap, both rings; exl3_ram_miss_host.cpp) and 8c78749b35 attach refusal (ValueError when graph_gather_rows > 8 lanes; startup only; srt/layers/moe/exl3_ram_miss.py); every other commit since gen2 touches no python/ file; a gen3 arm vs a gen2 number is NOT a clean comparison, see GENERATIONS.txt. BLIND SPOT of every id here: it names python/ only, not the measurement harness (scripts/dsv41/provenance.py, trace_corpus.py, the arm script, the verdict); c87b8dc181 changed provenance.py after gen2 (drive counters now read the PARTITION, not the whole disk: absolute cumulative sectors differ by 2,608-42,400 per drive, per-session deltas agree), so two arms can share a generation while the instrument between them changed; ALSO: re-running any generation's code now needs a harness at or after the harness-gate commit 9d5bfc184b (harness_gate compares script blobs at EXPECT_NEW), so it is a new arm at an old tree, not a reproduction of the original",
+  "06f7428fdb5b57a2c28bca3da5f2c4cfadd56676": "gen4 = python/ of a6beb36b74 (same tree at 9d5bfc184b), BEHAVIOURAL vs gen3 (8c78749b35): 4e63616666 trace schema 4 (request.lanes = planned lane count per request; the device post kernel in exl3_ram_miss.cuh writes a uint32 at record offset 84, host C++ and the stage record change, so a gen4 boot recompiles), 1b22ea4626 lease block layout/allocator and constexprs in the .cuh (no behaviour per its message), a6beb36b74 slab quarantine (ExpertPinnedHostCache.quarantine(); nothing calls it yet); registered for ONE traced placement arm, before the pack-pool work lands; a gen4 arm vs a gen3 or gen2 number is NOT a clean comparison, see GENERATIONS.txt"
+ }
+}

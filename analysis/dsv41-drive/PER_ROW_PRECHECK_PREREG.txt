@@ -1,0 +1,80 @@
+PRE-REGISTERED before the per-row precheck was computed on any trace (written 2026-09-21).
+Author: t6-perrow, for team-lead. Task 6 of docs/superpowers/plans/2026-09-20-storage-cpu-pipeline-v2.md
+("Start per-row GPU transfers before all reads finish").
+The sha256 of this file and of per_row_precheck.py are reported to team-lead before the script is run on data.
+
+WHAT WAS LOOKED AT BEFORE THIS FILE WAS WRITTEN (so nothing here is claimed as blind to it):
+structure only. The keys of a ram_miss_request line and of a graph_step line, the count of lines per kind and
+schema in seven trace files, and ONE demand record with 3 rows (task1-2-new-on-T.trace, its first demand with
+rows_asked >= 2), which showed rows packing one after another about 2.7 ms apart and all extents of the request
+completing within 2.9 ms of each other. One graph_step line pair was also read: vram_miss 221 and 222, ram_miss 52
+and 43, out of 240 routed rows. No spread distribution, no saving, no per-step total was computed.
+
+QUESTION. Could starting a row's GPU copy before the request's last row is ready shorten a decode step by an
+amount the plan's gate could ever resolve? "Both demonstrated I/O/H2D overlap AND untraced end-to-end benefit at
+unchanged cache capacity" (plan, Task 6 gate); the plan permits "retain Task 4 and record Task 6 as rejected".
+
+DATA. analysis/dsv41-drive/task1-results/*-T.trace on divix01 (traced arms), read only. Every one of those files was
+found to be RAM_MISS_TRACE_SCHEMA 2 in the structure check above (not 3; no schema-3 trace of a graph decode run
+exists in that directory); the row-ready stamp used here is row_pack_ns[].end, whose meaning schema 2 and 3 share
+("a row packs as soon as its own extents land"; from schema 2 every stamp spans the whole read). Schema-1 latency spans
+are not used. Files: t1-0-new-off-T, task1-0-new-off-T, task1-1-new-off-T, task1c-2-new-off-T (mirrors OFF);
+task1-2-new-on-T, task1b-0-new-on-T, task1c-0-new-on-T (mirrors ON). t1-0 and task1-0 are reported separately.
+The three mirrors-ON arms are the primary set (the configuration the project defends); mirrors-OFF is reported.
+
+MODEL (frozen; code is per_row_precheck.py). Per qualifying request: type "demand", status "served", rows_asked m >= 1,
+untraced.rows == 0, len(row_pack_ns) == m, and its forward id is the forward of a graph_step line (else excluded and
+counted). Let t0 = stages_ns.observed, R_j = row_pack_ns[j].end (the moment miss row j is whole in its pinned slot),
+DONE = stages_ns.done (the completion word the current wait kernel releases on), RES = stages_ns.reserved.
+The layer's lane count is k = max(m, int(round(vram_miss / 40))) for that graph step (ASSUMPTION A1: the step's
+VRAM-miss lanes are spread evenly over the 40 streamed layers; the trace does not record lanes per layer), capped at 6
+(top-6). h = k - m lanes are RAM hits (ASSUMPTION A2: a hit lane is a planned expert already in RAM at request time; it
+needs no read and is ready when the service has reserved the request, RES). c = per-lane copy time. Primary c = 1.055
+ms (DSV41_REFERENCE 18.2's measured gather per row); sensitivity c in {0.55, 1.6}. The decision uses c = 1.055 only.
+  Batched (today):   T_b = DONE + k*c
+  Per-row, lane order pi over the k lanes:   e = t0; for each lane in pi: e = max(e, ready_lane) + c;  T_p = e
+        ready_lane = RES for a hit lane, R_j for miss row j.
+  Saving of a request = T_b - T_p (may be negative; negatives are kept, not clipped).
+  ORDERINGS.  BEST: hits first, then miss rows in R order (what a device-side order array plus a service that
+  finishes rows in that order would give).  RANDOM: 64 uniformly random permutations of the k lanes per request,
+  averaged, seed = sha1 of "<file>:<seq>" so the draw does not depend on run order.
+  GENEROUS (used only by the reject test): k = 6 for every request that reads, h = 6 - m, ordering BEST.
+Per-step saving P = (sum of request savings over qualifying requests) / (number of distinct graph_step forwards
+among them). Launch cost L = 1.0 ms per step (ASSUMED, unmeasured; 40 layers x 5 extra lane kernels x ~3 us is about
+0.6 ms, so 1.0 is a margin, and it is subtracted only in the support test). Step time T_step = 1000 / mean of
+mean_decode_tok_s over the UNTRACED arms with the same mirror setting (mirrors ON: task1-3-new-on-U,
+task1-6-new-on-U, task1c-3-new-on-U; OFF: task1-4-new-off-U, task1-5-new-off-U). Any of those files that does not
+exist is dropped and named.
+Quantities per arm: P0 = P(RANDOM, h = 0: miss rows only)   P1 = P(RANDOM, model k)   P2 = P(GENEROUS).
+Also reported: for requests with m >= 2, D = max R_j - min R_j and the fraction with D >= c; the fraction of
+requests whose read-wait (DONE - t0) is at least h*c (all hit copies can hide inside it).
+
+DECISION (mirrors-ON arms; all three must fall in the same class or the class is INCONCLUSIVE):
+  REJECT        iff  P2 / T_step < 1.5%  in all three arms.
+                (The plan's own resolution: task1e-PREDICTIONS.txt shows an n=3 v n=3 arm design resolves about 1.5%
+                 of tok/s. If even the generous case cannot reach that, the gate cannot be passed, so Task 6 is
+                 rejected without a design. Launch cost is NOT subtracted here, which favours Task 6.)
+  SUPPORT       iff  (P1 - L) / T_step >= 3.0%  in all three arms.
+                (Twice the resolvable effect, after the head-of-line loss and the launch cost. The support test uses
+                 the data-derived lane count, which is favourable to Task 6 if A1 fails and unfavourable if lanes
+                 concentrate in read layers, and RANDOM order, which is unfavourable to Task 6 relative to BEST.)
+  INCONCLUSIVE  otherwise.
+A SECOND, INDEPENDENT REGISTERED FINDING, evaluated on the same arms whatever the class above:
+  SPREAD-IRRELEVANT  iff  (P1 - P0) > 0 dominates, defined as  P0 / P1 < 0.25  in all three arms.
+  Meaning: fewer than a quarter of the modelled saving comes from miss rows finishing at different times; the rest is
+  RAM-hit lanes being copied while the reads run. In that case the trace does NOT support the per-row mechanism as
+  the source of the benefit, and the design must say so and treat a hits-then-rest two-phase copy as the alternative
+  the measurement has to include. The plan's per-row mechanism is then justified, if at all, only by what per-row adds
+  over that.
+
+LIMITS STATED IN ADVANCE. (1) Tracing was on in every file used; stage stamps cost time, so request durations are
+inflated relative to untraced runs by an amount this precheck cannot bound; the untraced denominators are used to
+avoid inflating T_step, so the ratio is, if anything, favourable to Task 6. (2) A1 and A2 are assumptions. (3) The
+workload is the arms' 4 sessions, 256 prompt / 128 new tokens, 70 GiB pinned tier, VRAM hot cache with few slots
+(vram_miss is about 92% of routed rows in the two graph_step lines read), which is NOT the configuration of
+DSV41_REFERENCE 18.2 (G = 121 VRAM misses per step); a ceiling computed here does not carry to another cache size.
+(4) c is not measured for this path on this hardware in isolation; sensitivity is reported, the decision uses 1.055.
+(5) The seven files are one deterministic request stream replayed with different timing (identical line counts:
+20800 requests, 7211 demands), so they are not seven independent workloads; agreement across them is agreement of the
+drives and the run, not of the workload. (6) The model has no lease latency, no wait-kernel poll latency and no
+per-lane launch gaps; those are costs of the design and are carried by L only.

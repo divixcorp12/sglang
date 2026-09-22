@@ -13,8 +13,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post, sim_wait
+from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -326,6 +327,233 @@ def test_collecting_a_threaded_host_stops_its_thread(tmp_path):
     beat = page_word(page, "heartbeat")
     time.sleep(0.5)
     assert page_word(page, "heartbeat") == beat
+
+
+# ---- Task 4: the pipelined reader as the service uses it ----
+
+
+def _tier(tmp_path, capacity=6):
+    """A host with no service thread: the tests pump it, so nothing races."""
+    s = ram_miss_setup(tmp_path, capacity=capacity)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    return s, page, host
+
+
+def _post_advisory(page, row, ids):
+    return sim_post(page, row, need=ids, protect=ids, advisory=True, after=page_word(page, "demand_head") + 10)
+
+
+def _assert_resident_rows_exact(s, host, row):
+    """Every READY row holds exactly its expert's bytes, and nothing is left LOADING."""
+    mapping = host.mapping(row)
+    resident = [e for e, slot in enumerate(mapping) if slot >= 0]
+    reference = s.reference(row, resident)
+    for i, expert in enumerate(resident):
+        for name in EXL3_STREAMED_NAMES:
+            assert same_bytes(s.slabs[row][name][mapping[expert]], reference[name][i]), (row, expert)
+    slots = [slot for slot in mapping if slot >= 0]
+    assert len(slots) == len(set(slots))
+    owned = [e for e in host.slot_to_expert(row) if e >= 0]
+    assert sorted(owned) == sorted(resident)  # a slot with an owner is mapped: none was left LOADING
+
+
+def test_a_cancelled_advisory_keeps_the_rows_that_completed_and_releases_the_rest(tmp_path):
+    s, page, host = _tier(tmp_path)
+    try:
+        host.enable_trace()
+        host.inject(abandon_after_batches=2)  # the advisory stops admitting after its second row
+        _post_advisory(page, 1, [1, 2, 3, 4])
+        assert host.pump() == 2
+        assert [host.contains(1, e) for e in (1, 2, 3, 4)] == [True, True, False, False]
+        counters = host.counters()
+        assert counters["advisory_rows"] == 2 and counters["rows_read"] == 2
+        (record,) = host.drain_trace()
+        assert record["status"] == "cancelled" and record["ok"] == 0
+        assert record["rows"] == 2 and record["rows_asked"] == 4 and record["batches"] == 2
+        packed = [row["row"] for row in record["row_pack"] if row["end"]]
+        assert packed == [0, 1]
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_rows_kept_from_a_cancelled_advisory_follow_the_usual_eviction_rules(tmp_path):
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        host.inject(abandon_after_batches=2)
+        _post_advisory(page, 1, [1, 2, 3])
+        assert host.pump() == 2
+        assert host.contains(1, 1) and host.contains(1, 2) and not host.contains(1, 3)
+        host.inject(abandon_after_batches=0)
+        host.set_hot(1, [1])  # an inclusive-hot row is never a victim, kept or not
+        seq = sim_post(page, 1, need=[4, 5], protect=[4, 5])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        # One free slot, then the least recently used row that is neither hot nor protected: expert 2.
+        assert [host.contains(1, e) for e in (1, 2, 4, 5)] == [True, False, True, True]
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_an_advisory_has_one_row_outstanding_and_a_demand_may_have_several(tmp_path):
+    s, page, host = _tier(tmp_path)
+    try:
+        host.enable_trace()
+        _post_advisory(page, 1, [0, 1, 2, 3])
+        assert host.pump() == 2
+        seq = sim_post(page, 1, need=[4, 5], protect=[4, 5])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        advisory, demand = host.drain_trace()
+        assert (advisory["kind"], advisory["status"], advisory["rows"]) == ("advisory", "served", 4)
+        assert advisory["rows_reading_max"] == 1 and advisory["batches"] == 4  # one row at a time
+        assert (demand["kind"], demand["status"], demand["rows"]) == ("demand", "served", 2)
+        assert demand["rows_reading_max"] == 2 and demand["batches"] == 1  # both rows in one batch
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_a_full_cache_serves_a_demand_that_exactly_fills_it_and_fails_one_that_cannot_fit(tmp_path):
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        host.enable_trace()
+        seq = sim_post(page, 1, need=[0, 1, 2], protect=[0, 1, 2])  # fills the cache exactly
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        # Four rows into three slots, all protected: no victim, so no read is even started.
+        seq = sim_post(page, 0, need=[0, 1, 2, 3], protect=[0, 1, 2, 3])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 2
+        served, failed = host.drain_trace()
+        assert (served["status"], served["rows"], served["rows_reading_max"]) == ("served", 3, 3)
+        assert failed["status"] == "failed" and failed["batches"] == 0 and failed["submitted_bytes"] == 0
+        assert host.counters()["no_victim"] == 1
+        assert not any(host.contains(0, e) for e in range(4))  # the failed request published nothing
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+# ---- What protects a resident row from the request that is served for it ----
+#
+# A record carries `need` (planned experts missing from RAM) and `protect` (the routed experts); the
+# service never sees which experts the device planned. serve() reserves slots with take_slot_locked, and
+# `wanted` (protect and need) is the only thing that keeps a resident row from being that request's own
+# victim. So a planned RAM hit that is absent from protect is a legal victim: a device that read
+# slot_map early and copied it would copy a slot the same request then overwrites, and nothing re-reads
+# the map afterwards. The kBusySeq-gated hit phase (PER_ROW_TRANSFER, V1b) depends on this; these tests
+# pin the mechanism it depends on.
+
+
+def _fill(page, host, experts):
+    for expert in experts:  # each is a demand of its own, so the first one served is the least recently used
+        seq = sim_post(page, 1, need=[expert], protect=[expert])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+
+
+def _resident(host, row=1):
+    return [e for e in range(6) if host.contains(row, e)]
+
+
+def test_a_resident_expert_outside_protect_is_evicted_by_the_request_that_needs_another(tmp_path):
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        _fill(page, host, [0, 1, 2])  # expert 0 is the least recently used
+        assert _resident(host) == [0, 1, 2] and host.counters()["evictions"] == 0
+        seq = sim_post(page, 1, need=[4], protect=[4])  # expert 0 is neither needed nor protected
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        assert _resident(host) == [1, 2, 4]
+        assert host.counters()["evictions"] == 1
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_a_resident_expert_in_protect_is_not_the_victim(tmp_path):
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        _fill(page, host, [0, 1, 2])
+        seq = sim_post(page, 1, need=[4], protect=[4, 0])  # the same request, now protecting expert 0
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        assert _resident(host) == [0, 2, 4]  # expert 1 went instead
+    finally:
+        host.stop()
+
+
+def test_when_every_resident_expert_is_protected_the_request_fails_and_evicts_nothing(tmp_path):
+    """The case that separates protection from mere recency: a request that touches its protected
+    residents makes them the most recently used, so it is only when NO other victim exists that the
+    protection is the only thing standing between a resident row and eviction."""
+    s, page, host = _tier(tmp_path, capacity=3)
+    try:
+        _fill(page, host, [0, 1, 2])
+        seq = sim_post(page, 1, need=[4], protect=[0, 1, 2])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 2
+        assert _resident(host) == [0, 1, 2]
+        assert host.counters()["no_victim"] == 1 and host.counters()["evictions"] == 0
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_a_read_that_fails_before_it_starts_publishes_nothing_and_frees_every_slot(tmp_path):
+    """``fail_reads`` returns before ``reader_.read`` runs, so nothing here has packed: this pins the
+    pre-read failure path only -- slots were reserved, the read never happened, and the tier leaves
+    behind neither a mapping nor a LOADING slot. It says nothing about all-or-nothing publication,
+    which is pinned at the tier by test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_
+    and_publishes_none (test_exl3_ram_miss_tier.py), the only test that fails a row mid-read."""
+    s, page, host = _tier(tmp_path)
+    try:
+        host.enable_trace()
+        host.inject(fail_reads=True)
+        seq = sim_post(page, 1, need=[0, 1, 2], protect=[0, 1, 2])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 2
+        assert not any(host.contains(1, e) for e in (0, 1, 2)) and host.mapping(1) == [-1] * 6
+        assert host.slot_to_expert(1) == [-1] * 6
+    finally:
+        host.inject(fail_reads=False)
+        host.stop()
+
+
+def test_a_stop_during_an_advisory_returns_promptly_and_leaves_the_tier_consistent(tmp_path):
+    s, page, slot_map, host = _host(tmp_path, capacity=6)
+    try:
+        host.inject(delay_s=0.4)  # the advisory sleeps before its first row
+        _post_advisory(page, 1, [1, 2, 3])
+        assert _until(lambda: host.counters()["advisories"] == 1)
+        started = time.perf_counter()
+        host._module.exl3_ram_miss_stop_thread(host.handle)  # the thread only: the tier stays inspectable
+        host.threaded = False
+        assert time.perf_counter() - started < 2.0
+        _assert_resident_rows_exact(s, host, 1)
+    finally:
+        host.stop()
+
+
+def test_multi_row_advisories_cut_short_by_pauses_leave_only_whole_rows(tmp_path):
+    """Advisories of several rows are cut short at arbitrary points by the eager path's pauses; each one
+    keeps the rows it completed. At the end every resident row must hold exactly its expert's bytes, the
+    device-visible map must equal the READY slots, and no slot may be left LOADING."""
+    s, page, slot_map, host = _host(tmp_path, capacity=4)
+    try:
+        for i in range(120):
+            _post_advisory(page, 0, [(i + k) % 6 for k in range(4)])
+            if i % 3 == 0:
+                host.pause(timeout_s=2.0)
+                try:
+                    expert = i % 6
+                    if not host.contains(0, expert):
+                        host.assign(0, expert, protected=[expert])
+                finally:
+                    host.resume()
+            time.sleep(0.001)
+        host.pause(timeout_s=2.0)
+        try:
+            assert slot_map[0].tolist() == host.mapping(0)
+            _assert_resident_rows_exact(s, host, 0)
+        finally:
+            host.resume()
+    finally:
+        host.stop()
 
 
 if __name__ == "__main__":

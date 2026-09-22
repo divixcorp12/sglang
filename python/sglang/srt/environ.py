@@ -503,6 +503,16 @@ class Envs:
     # expert format defines. auto keeps each format's default (dense NVFP4 layers:
     # their expert files through io_uring, unless SGLANG_MOE_EXPERT_FILE_READER=mmap).
     SGLANG_MOE_EXPERT_ROW_SOURCE = EnvStr("auto")
+    # Mirror roots for EXL3 expert rows, os.pathsep-separated: each holds a
+    # byte-identical copy of the checkpoint (one per drive). Non-empty selects the
+    # mirror row source, which reads every row from all roots at once; one entry
+    # reads everything from that root. Rows are read from the roots, while the
+    # layout is still built from SGLANG_DSV41_EXPERT_DIR. Check the copies with
+    # scripts/dsv41/verify_expert_mirror.py before trusting them.
+    SGLANG_MOE_EXPERT_MIRROR_DIRS = EnvStr("")
+    # Colon-separated relative read shares, one per root of
+    # SGLANG_MOE_EXPERT_MIRROR_DIRS (a 0 drops a root); empty means equal shares.
+    SGLANG_MOE_EXPERT_MIRROR_WEIGHTS = EnvStr("")
     SGLANG_URING_FILE_READER_QUEUE_DEPTH = EnvInt(128)
     # Copy all host expert rows into registered memory (replaces the pinned LRU).
     SGLANG_MOE_EXPERT_HOST_ARENA = EnvBool(False)
@@ -1782,10 +1792,19 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+
+    # DeepSeek-V4.1 fork knobs (engram file table, EXL3 expert streaming), resolved
+    # together by sglang.srt.dsv41_config.Dsv41Config. The declarations above and
+    # SGLANG_DSV41_TORCH_PREFILL_INDEXER below are upstream's; leave them in place.
+
     # When set, every EngramEmbedding serves rows from this directory's safetensors
     # shards via np.memmap instead of loading the table (device or host memory).
     # The layer-1 table is 101.5 GB, larger than the host RAM budget on some rigs.
     SGLANG_DSV41_ENGRAM_TABLE_DIR = EnvStr("")
+    # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
+    # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
+    # plain np.memmap path.
+    SGLANG_DSV41_ENGRAM_RAM_GIB = EnvFloat(0.0)
 
     # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
     # checkpoint loader skips them and each MoE layer gathers the experts it
@@ -1805,6 +1824,11 @@ class Envs:
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
     # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # Option C: copy each RAM-miss row from the bounce bank into the pinned slabs on this many worker
+    # threads (each row split into this many byte ranges) instead of on the service thread. 0 keeps the
+    # copy on the service thread (there is no auto). Workers never run on cores 64-71. Do not enable in a run
+    # that produces stage traces until the trace record carries the mode: overlap_timeline.py misreads them.
+    SGLANG_DSV41_RAM_MISS_PACK_WORKERS = EnvInt(0)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
@@ -1813,10 +1837,12 @@ class Envs:
     # the previous token's routes for layer L+1 that are not in RAM as advisory
     # reads for the RAM-miss thread (demands always go first). Off by default.
     SGLANG_DSV41_ENABLE_EXPERT_PREFETCH = EnvBool(False)
-    # Engram RAM row cache in GiB in front of SGLANG_DSV41_ENGRAM_TABLE_DIR,
-    # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
-    # plain np.memmap path.
-    SGLANG_DSV41_ENGRAM_RAM_GIB = EnvFloat(0.0)
+    # Option C lease mode (analysis/dsv41-drive/LEASE_PROTOCOL.md): the RAM-miss thread leases every pinned slot the
+    # in-graph copy reads, the device copies only what it holds a lease on and acknowledges after the copy, and the
+    # thread never evicts a leased slot. It arms every record that plans rows, so each MoE layer pays one service round
+    # trip even when every row is in RAM (LEASE_PROTOCOL.md 15). Read once when the service starts; off is today's
+    # protocol bit for bit. Off by default.
+    SGLANG_DSV41_ENABLE_RAM_MISS_LEASES = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

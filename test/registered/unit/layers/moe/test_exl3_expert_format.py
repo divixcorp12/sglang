@@ -1,9 +1,14 @@
 """The EXL3 expert format's row schema: six streamed names and the segment map."""
 
+import contextlib
 import dataclasses
+import os
+import shutil
 
 import pytest
 import torch
+
+from sglang.srt.environ import envs
 
 from sglang.srt.layers.moe.exl3_expert_format import (
     EXL3_MAX_GATHER_ROWS,
@@ -16,6 +21,10 @@ from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3TensorSpan,
     build_exl3_expert_layout,
 )
+from sglang.srt.layers.moe.exl3_mirror_row_source import Exl3MirrorRowSource
+from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
+from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import expert_spec, write_fake_exl3
 
@@ -128,7 +137,321 @@ def test_the_exl3_format_serves_graph_gathers_from_its_pinned_tier():
     assert graph_source_kind_of(Exl3ExpertFormat) == "pinned_tier"
 
 
+# --- Mirror row source selection (SGLANG_MOE_EXPERT_MIRROR_DIRS / _WEIGHTS) ----
+
+
+def _mirrored(tmp_path, num_roots=2):
+    """A fake checkpoint and ``num_roots`` byte-identical copies of it."""
+    source = tmp_path / "ckpt"
+    source.mkdir()
+    write_fake_exl3(str(source), num_layers=2, num_experts=4)
+    layout = build_exl3_expert_layout(str(source))
+    roots = []
+    for i in range(num_roots):
+        root = tmp_path / f"drive_{i}" / "copy"
+        shutil.copytree(source, root)
+        roots.append(str(root))
+    fmt = Exl3ExpertFormat(layout, 1, direct=False, source_root=str(source))
+    return fmt, roots
+
+
+def _row_source(fmt):
+    return fmt.default_row_source(None, fmt.tensor_specs(None), "auto")
+
+
+def _mirror_env(dirs, weights=""):
+    stack = contextlib.ExitStack()
+    stack.enter_context(envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(dirs))
+    stack.enter_context(envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override(weights))
+    return stack
+
+
+def test_mirror_dirs_select_the_mirror_source_with_equal_weights(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots)):
+        source = _row_source(fmt)
+    assert isinstance(source, Exl3MirrorRowSource)
+    assert source.roots == tuple(roots) and source.layer_id == 1
+    assert isinstance(source.policy, StaticSplitPolicy)
+    # Empty weights: every root gets an equal share of a row's pages.
+    assert source.policy.plan(8 * PAGE_BYTES).part_bytes == (4 * PAGE_BYTES,) * 2
+    assert source.reader.source_root == fmt.source_root
+
+
+def test_mirror_weights_reach_the_split_policy(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "3:1"):
+        source = _row_source(fmt)
+    assert source.policy.plan(8 * PAGE_BYTES).part_bytes == (
+        6 * PAGE_BYTES,
+        2 * PAGE_BYTES,
+    )
+    with _mirror_env(os.pathsep.join(roots), " 0.5 : 1.5 "):
+        source = _row_source(fmt)
+    assert source.policy.plan(8 * PAGE_BYTES).part_bytes == (
+        2 * PAGE_BYTES,
+        6 * PAGE_BYTES,
+    )
+
+
+def test_one_mirror_root_reads_everything_from_it(tmp_path):
+    fmt, roots = _mirrored(tmp_path, num_roots=1)
+    with _mirror_env(roots[0]):
+        source = _row_source(fmt)
+    assert isinstance(source, Exl3MirrorRowSource) and source.roots == (roots[0],)
+    assert source.policy.plan(8 * PAGE_BYTES).part_bytes == (8 * PAGE_BYTES,)
+    with _mirror_env(roots[0], "5"):
+        assert _row_source(fmt).policy.plan(2 * PAGE_BYTES).part_bytes == (
+            2 * PAGE_BYTES,
+        )
+
+
+def test_mirror_dirs_unset_keeps_the_shard_source(tmp_path):
+    fmt, _ = _mirrored(tmp_path)
+    for kind in ("auto", "shards"):
+        source = fmt.default_row_source(None, fmt.tensor_specs(None), kind)
+        assert type(source) is Exl3ShardRowSource
+    # Unset is the default, and a source root is not needed to read one root.
+    assert envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get() == ""
+    assert envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.get() == ""
+    plain = Exl3ExpertFormat(fmt.layout, 1, direct=False)
+    assert type(_row_source(plain)) is Exl3ShardRowSource
+
+
+def test_mirror_dirs_with_a_tensor_source_kind_are_still_refused(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots)):
+        with pytest.raises(ValueError, match="no row source kind 'tensor'"):
+            fmt.default_row_source(None, fmt.tensor_specs(None), "tensor")
+
+
+def test_weights_and_roots_of_different_length_are_refused_naming_both(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "1:1:1"):
+        with pytest.raises(ValueError) as caught:
+            _row_source(fmt)
+    message = str(caught.value)
+    assert "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS lists 3 weights" in message
+    assert "SGLANG_MOE_EXPERT_MIRROR_DIRS lists 2 roots" in message
+    with _mirror_env(os.pathsep.join(roots), "1"):
+        with pytest.raises(ValueError, match="lists 1 weights.*lists 2 roots"):
+            _row_source(fmt)
+
+
+@pytest.mark.parametrize(
+    "weights", ["1:x", "1:", ":1", "-1:2", "nan:1", "inf:1", "0:0"]
+)
+def test_unusable_weights_are_refused_naming_the_knob(tmp_path, weights):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), weights):
+        with pytest.raises(ValueError, match="SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"):
+            _row_source(fmt)
+
+
+def test_weights_without_roots_are_refused_rather_than_ignored(tmp_path):
+    fmt, _ = _mirrored(tmp_path)
+    with _mirror_env("", "1:1"):
+        with pytest.raises(ValueError, match="MIRROR_WEIGHTS is set.*MIRROR_DIRS"):
+            _row_source(fmt)
+
+
+def test_a_root_that_is_not_a_directory_is_refused_naming_it(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    missing = str(tmp_path / "no_such_drive" / "copy")
+    with _mirror_env(os.pathsep.join([roots[0], missing])):
+        with pytest.raises(ValueError, match="not a readable directory") as caught:
+            _row_source(fmt)
+    assert missing in str(caught.value) and roots[0] not in str(caught.value)
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")
+    with _mirror_env(os.pathsep.join([str(a_file), roots[1]])):
+        with pytest.raises(ValueError, match="not a readable directory") as caught:
+            _row_source(fmt)
+    assert str(a_file) in str(caught.value)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_an_unreadable_root_directory_is_refused_naming_it(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    os.chmod(roots[1], 0)
+    try:
+        with _mirror_env(os.pathsep.join(roots)):
+            with pytest.raises(ValueError, match="not a readable directory") as caught:
+                _row_source(fmt)
+    finally:
+        os.chmod(roots[1], 0o755)
+    assert roots[1] in str(caught.value)
+
+
+@pytest.mark.parametrize("shape", ["{a}::{b}", "{a}:", ":{a}", ":"])
+def test_an_empty_root_entry_is_refused(tmp_path, shape):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(shape.format(a=roots[0], b=roots[1])):
+        with pytest.raises(ValueError, match="empty entry"):
+            _row_source(fmt)
+
+
+def test_a_mirror_source_needs_the_source_root(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    bare = Exl3ExpertFormat(fmt.layout, 1, direct=False)
+    with _mirror_env(os.pathsep.join(roots)):
+        with pytest.raises(ValueError, match="source_root"):
+            _row_source(bare)
+
+
+def test_mirror_roots_are_checked_against_the_source_at_selection(tmp_path):
+    """The source's own size checks are not bypassed: a truncated copy is refused."""
+    fmt, roots = _mirrored(tmp_path)
+    victim = os.path.join(roots[1], "model-00002.safetensors")
+    with open(victim, "r+b") as f:
+        f.truncate(os.path.getsize(victim) - 1)
+    with _mirror_env(os.pathsep.join(roots)):
+        with pytest.raises(RuntimeError, match="incomplete or stale") as caught:
+            _row_source(fmt)
+    assert roots[1] in str(caught.value)
+
+
+def test_a_zero_weight_drops_a_root_from_the_split(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "1:0"):
+        source = _row_source(fmt)
+    assert source.policy.plan(8 * PAGE_BYTES).part_bytes == (8 * PAGE_BYTES, 0)
+    assert source.roots == tuple(roots)
+
+
+def test_a_relative_root_is_refused(tmp_path, monkeypatch):
+    fmt, roots = _mirrored(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    relative = os.path.relpath(roots[1], tmp_path)
+    with _mirror_env(os.pathsep.join([roots[0], relative])):
+        with pytest.raises(ValueError, match="relative path") as caught:
+            _row_source(fmt)
+    assert relative in str(caught.value)
+
+
+def test_the_same_drive_twice_is_refused(tmp_path):
+    """Two entries for one directory look like a two-drive mirror and read one drive."""
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join([roots[0], roots[0]])):
+        with pytest.raises(ValueError, match="same directory"):
+            _row_source(fmt)
+    alias = tmp_path / "alias"
+    os.symlink(roots[0], alias)
+    with _mirror_env(os.pathsep.join([roots[0], str(alias)])):
+        with pytest.raises(ValueError, match="same directory") as caught:
+            _row_source(fmt)
+    assert str(alias) in str(caught.value) and roots[0] in str(caught.value)
+
+
+def test_a_root_that_is_the_checkpoint_itself_is_refused(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join([roots[0], fmt.source_root])):
+        with pytest.raises(ValueError, match="checkpoint directory") as caught:
+            _row_source(fmt)
+    assert fmt.source_root in str(caught.value)
+
+
+def test_the_streamer_builder_hands_the_format_the_real_source_root(
+    tmp_path, monkeypatch
+):
+    """A wrong source_root gives wrong mirror paths, so the builder's value is pinned:
+    the realpath of the directory the layout is built from, through a symlink too."""
+    import types
+
+    from sglang.srt.layers.moe import expert_stream
+    from sglang.srt.layers.moe.exl3_expert_format import build_exl3_expert_streamer
+
+    fmt, roots = _mirrored(tmp_path)
+    link = tmp_path / "ckpt_link"
+    os.symlink(fmt.source_root, link)
+    captured = {}
+
+    class _Streamer:
+        def __init__(self, layer, names, *, layer_id, format):
+            captured["format"] = format
+
+    monkeypatch.setattr(expert_stream, "ExpertStreamer", _Streamer)
+    layer = types.SimpleNamespace(
+        layer_id=1, exl3_num_experts=4, exl3_hidden=128, exl3_inter=128
+    )
+    build_exl3_expert_streamer(layer, str(link))
+    built = captured["format"]
+    assert built.source_root == os.path.realpath(fmt.source_root)
+    assert built.source_root != str(link)
+    with (
+        _mirror_env(os.pathsep.join(roots)),
+        envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
+    ):
+        source = built.default_row_source(None, built.tensor_specs(None), "auto")
+    assert isinstance(source, Exl3MirrorRowSource)
+    assert source.reader.source_root == os.path.realpath(fmt.source_root)
+
+
 if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+# --- The native (in-graph) reader is configured from the same env, by the same validation ----
+
+
+def _native_args(fmt):
+    return fmt.mirror_table_args()
+
+
+def test_the_native_tables_get_no_mirror_arguments_when_the_env_is_unset(tmp_path):
+    fmt, _ = _mirrored(tmp_path)
+    assert _native_args(fmt) == {}
+
+
+def test_the_native_tables_get_the_same_roots_and_weights_as_the_eager_source(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "3:1"):
+        args = _native_args(fmt)
+        eager = _row_source(fmt)
+    assert args["roots"] == eager.roots == tuple(roots)
+    assert args["source_root"] == fmt.source_root
+    assert args["policy"].plan(4 * PAGE_BYTES).part_bytes == eager.policy.plan(4 * PAGE_BYTES).part_bytes
+    with _mirror_env(os.pathsep.join(roots)):
+        assert _native_args(fmt)["policy"].plan(4 * PAGE_BYTES).part_bytes == (2 * PAGE_BYTES,) * 2
+
+
+def test_a_zero_weight_reaches_the_native_policy(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    with _mirror_env(os.pathsep.join(roots), "1:0"):
+        assert _native_args(fmt)["policy"].plan(4 * PAGE_BYTES).part_bytes == (4 * PAGE_BYTES, 0)
+
+
+def _bad_mirror_configs(roots, source, tmp_path):
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")
+    join = os.pathsep.join
+    return [
+        (join(roots), "1:1:1"),  # more weights than roots
+        (join(roots), "1"),  # fewer
+        (join(roots), "1:x"),
+        (join(roots), "0:0"),
+        (join(roots), "-1:2"),
+        ("", "1:1"),  # weights without roots
+        (join([roots[0], str(tmp_path / "no_such_drive")]), ""),
+        (join([str(a_file), roots[1]]), ""),
+        (join([roots[0], ""]), ""),  # an empty entry
+        (join([roots[0], "relative/drive"]), ""),
+        (join([roots[0], roots[0]]), ""),  # the same drive twice
+        (join([roots[0], source]), ""),  # the checkpoint itself
+    ]
+
+
+def test_the_native_tables_refuse_every_configuration_the_eager_source_refuses(tmp_path):
+    fmt, roots = _mirrored(tmp_path)
+    bare = Exl3ExpertFormat(fmt.layout, 1, direct=False)  # no source_root
+    cases = [(fmt, dirs, weights) for dirs, weights in _bad_mirror_configs(roots, fmt.source_root, tmp_path)]
+    cases.append((bare, os.pathsep.join(roots), ""))
+    for used, dirs, weights in cases:
+        with _mirror_env(dirs, weights):
+            with pytest.raises(ValueError) as eager:
+                _row_source(used)
+            with pytest.raises(ValueError) as native:
+                _native_args(used)
+        assert str(native.value) == str(eager.value), (dirs, weights)

@@ -1,0 +1,4206 @@
+{
+  "when": "2026-09-20T03:19:17+00:00",
+  "argv": [
+    "analysis/dsv41-drive/bench_mirror_rows.py",
+    "--source",
+    "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw",
+    "--roots",
+    "/mnt/nvme0/dsv41_flash",
+    "/mnt/nvme4/dsv41_flash",
+    "--layers",
+    "19",
+    "--reps",
+    "3",
+    "--rows",
+    "48"
+  ],
+  "source": "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw",
+  "roots": [
+    "/mnt/nvme0/dsv41_flash",
+    "/mnt/nvme4/dsv41_flash"
+  ],
+  "weights": [
+    1.0,
+    1.0
+  ],
+  "layers": [
+    {
+      "layer": 19,
+      "experts": 384,
+      "shards": [
+        "model-00020-of-00041.safetensors"
+      ]
+    }
+  ],
+  "reps": 3,
+  "rows": 48,
+  "seed": 1234,
+  "direct": true,
+  "arms": [
+    "nvme2 baseline",
+    "nvme0 only",
+    "nvme4 only",
+    "mirrored 1:1"
+  ],
+  "gate_p50_ms": 4.0,
+  "same_device_roots": false,
+  "results": {
+    "nvme2 baseline": {
+      "n": 143,
+      "first_reads": [
+        {
+          "layer": 19,
+          "shard": "model-00020-of-00041.safetensors",
+          "ms": 13.224409
+        }
+      ],
+      "p50_ms": 9.273869,
+      "p90_ms": 9.3954844,
+      "p99_ms": 11.634700160000037,
+      "mean_ms": 9.532795286713286,
+      "min_ms": 9.115454,
+      "max_ms": 40.345237,
+      "bytes_per_row": 13319790.993006993,
+      "mb_per_s": 1397.2597325751851,
+      "read_ms_mean": 7.97643679020979,
+      "split_ms_mean": 1.4843827412587414,
+      "rep_p50_ms": [
+        9.33487,
+        9.216822,
+        9.308467
+      ]
+    },
+    "nvme0 only": {
+      "n": 143,
+      "first_reads": [
+        {
+          "layer": 19,
+          "shard": "model-00020-of-00041.safetensors",
+          "ms": 37.170283
+        }
+      ],
+      "p50_ms": 5.564905,
+      "p90_ms": 5.7446236,
+      "p99_ms": 7.550127220000037,
+      "mean_ms": 5.629583965034965,
+      "min_ms": 5.382466,
+      "max_ms": 9.072909,
+      "bytes_per_row": 13319790.993006993,
+      "mb_per_s": 2366.034697365823,
+      "read_ms_mean": 4.069753629370629,
+      "split_ms_mean": 1.4869225734265736,
+      "rep_p50_ms": [
+        5.684389,
+        5.5122765000000005,
+        5.549970500000001
+      ]
+    },
+    "nvme4 only": {
+      "n": 143,
+      "first_reads": [
+        {
+          "layer": 19,
+          "shard": "model-00020-of-00041.safetensors",
+          "ms": 21.243185
+        }
+      ],
+      "p50_ms": 5.72386,
+      "p90_ms": 13.034988599999986,
+      "p99_ms": 25.411557380000016,
+      "mean_ms": 7.842460384615385,
+      "min_ms": 5.52739,
+      "max_ms": 28.539011,
+      "bytes_per_row": 13319790.993006993,
+      "mb_per_s": 1698.4199268811776,
+      "read_ms_mean": 6.234919846153846,
+      "split_ms_mean": 1.5124935524475525,
+      "rep_p50_ms": [
+        8.76576,
+        5.69865,
+        5.668312500000001
+      ]
+    },
+    "mirrored 1:1": {
+      "n": 143,
+      "first_reads": [
+        {
+          "layer": 19,
+          "shard": "model-00020-of-00041.safetensors",
+          "ms": 7.328894
+        }
+      ],
+      "p50_ms": 4.167519,
+      "p90_ms": 4.2384964,
+      "p99_ms": 5.9060582000000315,
+      "mean_ms": 4.204290524475525,
+      "min_ms": 3.948024,
+      "max_ms": 7.243746,
+      "bytes_per_row": 13319790.993006993,
+      "mb_per_s": 3168.142381090233,
+      "read_ms_mean": 2.5962055034965035,
+      "split_ms_mean": 1.513063083916084,
+      "rep_p50_ms": [
+        4.209475,
+        4.1551860000000005,
+        4.120463
+      ]
+    }
+  },
+  "cache_suspects": [
+    "nvme4 only"
+  ],
+  "bytes_match": true,
+  "mismatches": [],
+  "p50_ratios": {
+    "nvme2 baseline p50 / mirrored 1:1 p50": 2.2252733580818704,
+    "nvme0 only p50 / mirrored 1:1 p50": 1.3353040502034903,
+    "nvme4 only p50 / mirrored 1:1 p50": 1.3734454479991571
+  },
+  "gate": {
+    "rule": "mirrored 1:1 p50 <= 4.0 ms",
+    "p50_ms": 4.167519,
+    "pass": false
+  },
+  "samples_ns": {
+    "nvme2 baseline": [
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 225,
+        "ns": 13224409,
+        "first": true
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 59,
+        "ns": 9297413,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 3,
+        "ns": 9241169,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 46,
+        "ns": 9206329,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 298,
+        "ns": 9281901,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 17,
+        "ns": 9225162,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 343,
+        "ns": 9372135,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 354,
+        "ns": 9302326,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 42,
+        "ns": 9297830,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 50,
+        "ns": 9304993,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 181,
+        "ns": 9336346,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 121,
+        "ns": 9348702,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 8,
+        "ns": 9324496,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 15,
+        "ns": 9303084,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 177,
+        "ns": 9347090,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 331,
+        "ns": 9383466,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 319,
+        "ns": 9298916,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 247,
+        "ns": 9378350,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 315,
+        "ns": 9431538,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 237,
+        "ns": 9349165,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 76,
+        "ns": 9376949,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 93,
+        "ns": 9425718,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 365,
+        "ns": 9357918,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 58,
+        "ns": 9310414,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 7,
+        "ns": 9308592,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 257,
+        "ns": 9379159,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 249,
+        "ns": 9348249,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 127,
+        "ns": 9346630,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 33,
+        "ns": 9389814,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 341,
+        "ns": 9292292,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 277,
+        "ns": 9381027,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 238,
+        "ns": 9260353,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 35,
+        "ns": 9338764,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 307,
+        "ns": 9329839,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 345,
+        "ns": 9272479,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 45,
+        "ns": 9216316,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 263,
+        "ns": 9334870,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 296,
+        "ns": 9240904,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 23,
+        "ns": 9349713,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 138,
+        "ns": 9485615,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 284,
+        "ns": 9656041,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 32,
+        "ns": 9483562,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 330,
+        "ns": 9327137,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 154,
+        "ns": 9260715,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 246,
+        "ns": 9258251,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 136,
+        "ns": 9272847,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 335,
+        "ns": 9369386,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 102,
+        "ns": 9361306,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 232,
+        "ns": 40345237,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 271,
+        "ns": 9469444,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 340,
+        "ns": 9403803,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 9,
+        "ns": 9904356,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 260,
+        "ns": 9210538,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 36,
+        "ns": 9189378,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 2,
+        "ns": 9257073,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 170,
+        "ns": 9233062,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 73,
+        "ns": 9179633,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 363,
+        "ns": 9250273,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 242,
+        "ns": 9219746,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 336,
+        "ns": 9219729,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 193,
+        "ns": 9244825,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 85,
+        "ns": 9253955,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 27,
+        "ns": 9275759,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 39,
+        "ns": 9213915,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 300,
+        "ns": 9144263,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 254,
+        "ns": 9242605,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 83,
+        "ns": 9141257,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 38,
+        "ns": 9185945,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 285,
+        "ns": 9228948,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 110,
+        "ns": 9229493,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 13,
+        "ns": 9198618,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 177,
+        "ns": 9233520,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 56,
+        "ns": 9177965,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 72,
+        "ns": 9158167,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 343,
+        "ns": 9187750,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 156,
+        "ns": 9196548,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 20,
+        "ns": 9206010,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 213,
+        "ns": 9212804,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 141,
+        "ns": 9213246,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 339,
+        "ns": 9143170,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 90,
+        "ns": 9115454,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 139,
+        "ns": 9262149,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 79,
+        "ns": 9260375,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 153,
+        "ns": 9241635,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 237,
+        "ns": 9211671,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 21,
+        "ns": 9263544,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 288,
+        "ns": 9174170,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 197,
+        "ns": 9253203,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 178,
+        "ns": 9171516,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 253,
+        "ns": 9211696,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 174,
+        "ns": 9133726,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 298,
+        "ns": 9257669,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 239,
+        "ns": 9168584,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 243,
+        "ns": 9196211,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 23,
+        "ns": 9225120,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 241,
+        "ns": 9269948,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 304,
+        "ns": 12887708,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 87,
+        "ns": 9342535,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 225,
+        "ns": 9273869,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 375,
+        "ns": 9336419,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 265,
+        "ns": 9244719,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 224,
+        "ns": 9189258,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 151,
+        "ns": 9280063,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 140,
+        "ns": 9355217,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 63,
+        "ns": 9311369,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 95,
+        "ns": 9319658,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 213,
+        "ns": 9234515,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 223,
+        "ns": 9222069,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 61,
+        "ns": 9297703,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 271,
+        "ns": 9376542,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 52,
+        "ns": 9349298,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 248,
+        "ns": 9330887,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 192,
+        "ns": 9229646,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 336,
+        "ns": 9273287,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 130,
+        "ns": 9244832,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 328,
+        "ns": 9264135,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 98,
+        "ns": 9159528,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 176,
+        "ns": 9216819,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 55,
+        "ns": 9138751,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 359,
+        "ns": 9210169,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 358,
+        "ns": 9176735,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 80,
+        "ns": 9373649,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 297,
+        "ns": 9336406,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 137,
+        "ns": 9396902,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 79,
+        "ns": 9158811,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 368,
+        "ns": 9368168,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 165,
+        "ns": 9344308,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 228,
+        "ns": 9358248,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 36,
+        "ns": 9224788,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 40,
+        "ns": 9264794,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 202,
+        "ns": 9308715,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 109,
+        "ns": 9311051,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 24,
+        "ns": 9370541,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 146,
+        "ns": 9302628,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 19,
+        "ns": 9458936,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 112,
+        "ns": 9511558,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 259,
+        "ns": 9440335,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 44,
+        "ns": 9308219,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 162,
+        "ns": 9338724,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 156,
+        "ns": 9404680,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 235,
+        "ns": 9272390,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 33,
+        "ns": 9286655,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 299,
+        "ns": 9367098,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 131,
+        "ns": 9263414,
+        "first": false
+      }
+    ],
+    "nvme0 only": [
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 225,
+        "ns": 37170283,
+        "first": true
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 59,
+        "ns": 5740916,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 3,
+        "ns": 5513654,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 46,
+        "ns": 5529374,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 298,
+        "ns": 5525140,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 17,
+        "ns": 5520168,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 343,
+        "ns": 5584141,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 354,
+        "ns": 5659007,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 42,
+        "ns": 5580303,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 50,
+        "ns": 5579930,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 181,
+        "ns": 5624264,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 121,
+        "ns": 5636307,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 8,
+        "ns": 5589118,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 15,
+        "ns": 5691289,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 177,
+        "ns": 5535249,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 331,
+        "ns": 5725117,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 319,
+        "ns": 5537186,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 247,
+        "ns": 5656556,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 315,
+        "ns": 5650885,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 237,
+        "ns": 5662311,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 76,
+        "ns": 5653562,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 93,
+        "ns": 5600010,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 365,
+        "ns": 5789036,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 58,
+        "ns": 5653153,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 7,
+        "ns": 5612821,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 257,
+        "ns": 5764787,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 249,
+        "ns": 5681259,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 127,
+        "ns": 5821184,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 33,
+        "ns": 5684389,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 341,
+        "ns": 5684073,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 277,
+        "ns": 5703940,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 238,
+        "ns": 5742358,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 35,
+        "ns": 5753453,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 307,
+        "ns": 5739319,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 345,
+        "ns": 5819968,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 45,
+        "ns": 5727059,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 263,
+        "ns": 5778392,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 296,
+        "ns": 5702859,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 23,
+        "ns": 5680201,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 138,
+        "ns": 5765567,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 284,
+        "ns": 5758773,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 32,
+        "ns": 5745190,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 330,
+        "ns": 5726080,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 154,
+        "ns": 5873052,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 246,
+        "ns": 5706684,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 136,
+        "ns": 5782863,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 335,
+        "ns": 5794456,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 102,
+        "ns": 5762414,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 232,
+        "ns": 8764561,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 271,
+        "ns": 5626822,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 340,
+        "ns": 5579738,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 9,
+        "ns": 5562449,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 260,
+        "ns": 5578710,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 36,
+        "ns": 5614051,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 2,
+        "ns": 5624286,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 170,
+        "ns": 5482458,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 73,
+        "ns": 5495735,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 363,
+        "ns": 5570370,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 242,
+        "ns": 5565007,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 336,
+        "ns": 5663893,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 193,
+        "ns": 5530309,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 85,
+        "ns": 5503036,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 27,
+        "ns": 5477120,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 39,
+        "ns": 5467142,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 300,
+        "ns": 5536851,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 254,
+        "ns": 5573447,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 83,
+        "ns": 5382466,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 38,
+        "ns": 5507807,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 285,
+        "ns": 5586867,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 110,
+        "ns": 5548168,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 13,
+        "ns": 5495272,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 177,
+        "ns": 5471276,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 56,
+        "ns": 5512399,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 72,
+        "ns": 5468221,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 343,
+        "ns": 5486138,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 156,
+        "ns": 5494505,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 20,
+        "ns": 5512154,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 213,
+        "ns": 5493688,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 141,
+        "ns": 5508142,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 339,
+        "ns": 5570193,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 90,
+        "ns": 5407869,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 139,
+        "ns": 5547798,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 79,
+        "ns": 5492918,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 153,
+        "ns": 5527508,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 237,
+        "ns": 5476316,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 21,
+        "ns": 5531255,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 288,
+        "ns": 5462324,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 197,
+        "ns": 5561492,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 178,
+        "ns": 5490944,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 253,
+        "ns": 5573125,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 174,
+        "ns": 5556885,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 298,
+        "ns": 5517528,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 239,
+        "ns": 5506770,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 243,
+        "ns": 5496615,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 23,
+        "ns": 5487017,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 241,
+        "ns": 5474439,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 304,
+        "ns": 9072909,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 87,
+        "ns": 5614898,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 225,
+        "ns": 5566049,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 375,
+        "ns": 5575707,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 265,
+        "ns": 5582027,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 224,
+        "ns": 5534130,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 151,
+        "ns": 5511807,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 140,
+        "ns": 5586308,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 63,
+        "ns": 5597097,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 95,
+        "ns": 5504813,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 213,
+        "ns": 5475250,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 223,
+        "ns": 5473072,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 61,
+        "ns": 5546450,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 271,
+        "ns": 5503051,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 52,
+        "ns": 5601286,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 248,
+        "ns": 5534112,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 192,
+        "ns": 5513040,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 336,
+        "ns": 5567973,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 130,
+        "ns": 5554559,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 328,
+        "ns": 5564905,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 98,
+        "ns": 5400013,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 176,
+        "ns": 5492154,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 55,
+        "ns": 5529077,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 359,
+        "ns": 5554045,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 358,
+        "ns": 5531799,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 80,
+        "ns": 5505784,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 297,
+        "ns": 5510474,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 137,
+        "ns": 5546633,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 79,
+        "ns": 5448546,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 368,
+        "ns": 5571830,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 165,
+        "ns": 5536364,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 228,
+        "ns": 5600286,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 36,
+        "ns": 5494703,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 40,
+        "ns": 5570407,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 202,
+        "ns": 5555142,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 109,
+        "ns": 5544434,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 24,
+        "ns": 5492437,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 146,
+        "ns": 5551687,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 19,
+        "ns": 5544942,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 112,
+        "ns": 5574486,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 259,
+        "ns": 5558143,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 44,
+        "ns": 5615569,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 162,
+        "ns": 5561665,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 156,
+        "ns": 5510144,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 235,
+        "ns": 5548254,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 33,
+        "ns": 5595540,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 299,
+        "ns": 5568609,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 131,
+        "ns": 5625996,
+        "first": false
+      }
+    ],
+    "nvme4 only": [
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 225,
+        "ns": 21243185,
+        "first": true
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 59,
+        "ns": 22442315,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 3,
+        "ns": 16106740,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 46,
+        "ns": 14366257,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 298,
+        "ns": 18049002,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 17,
+        "ns": 28539011,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 343,
+        "ns": 21080016,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 354,
+        "ns": 18999238,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 42,
+        "ns": 14023134,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 50,
+        "ns": 16231853,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 181,
+        "ns": 15214628,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 121,
+        "ns": 23688769,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 8,
+        "ns": 25953824,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 15,
+        "ns": 21640605,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 177,
+        "ns": 24662713,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 331,
+        "ns": 15991415,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 319,
+        "ns": 8408759,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 247,
+        "ns": 8408085,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 315,
+        "ns": 8397617,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 237,
+        "ns": 8927395,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 76,
+        "ns": 8818266,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 93,
+        "ns": 8743113,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 365,
+        "ns": 8453257,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 58,
+        "ns": 8676105,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 7,
+        "ns": 8332631,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 257,
+        "ns": 9082407,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 249,
+        "ns": 8970613,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 127,
+        "ns": 8559550,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 33,
+        "ns": 8387157,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 341,
+        "ns": 8434342,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 277,
+        "ns": 8801069,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 238,
+        "ns": 8693562,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 35,
+        "ns": 8621501,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 307,
+        "ns": 8803139,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 345,
+        "ns": 8492646,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 45,
+        "ns": 8623218,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 263,
+        "ns": 8747488,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 296,
+        "ns": 8413168,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 23,
+        "ns": 8404185,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 138,
+        "ns": 8544192,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 284,
+        "ns": 8696147,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 32,
+        "ns": 8755456,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 330,
+        "ns": 8526775,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 154,
+        "ns": 8577729,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 246,
+        "ns": 8962544,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 136,
+        "ns": 8765760,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 335,
+        "ns": 8824072,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 102,
+        "ns": 8263667,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 232,
+        "ns": 6320546,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 271,
+        "ns": 6079349,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 340,
+        "ns": 5930608,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 9,
+        "ns": 5771382,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 260,
+        "ns": 5954882,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 36,
+        "ns": 5948358,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 2,
+        "ns": 5863876,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 170,
+        "ns": 5845730,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 73,
+        "ns": 5929875,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 363,
+        "ns": 5671286,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 242,
+        "ns": 5656617,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 336,
+        "ns": 5660126,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 193,
+        "ns": 5680851,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 85,
+        "ns": 5712938,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 27,
+        "ns": 5671731,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 39,
+        "ns": 5600531,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 300,
+        "ns": 5700353,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 254,
+        "ns": 5687966,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 83,
+        "ns": 5696947,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 38,
+        "ns": 5710223,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 285,
+        "ns": 5700636,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 110,
+        "ns": 5691318,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 13,
+        "ns": 5739349,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 177,
+        "ns": 5678623,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 56,
+        "ns": 5659083,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 72,
+        "ns": 5772786,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 343,
+        "ns": 5670589,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 156,
+        "ns": 5691525,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 20,
+        "ns": 5742886,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 213,
+        "ns": 5823487,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 141,
+        "ns": 5674790,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 339,
+        "ns": 5731422,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 90,
+        "ns": 5686097,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 139,
+        "ns": 5663966,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 79,
+        "ns": 5676288,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 153,
+        "ns": 5710667,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 237,
+        "ns": 5598934,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 21,
+        "ns": 5743700,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 288,
+        "ns": 5715308,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 197,
+        "ns": 5839751,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 178,
+        "ns": 5682141,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 253,
+        "ns": 5675885,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 174,
+        "ns": 5637294,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 298,
+        "ns": 5647409,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 239,
+        "ns": 5527390,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 243,
+        "ns": 5689130,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 23,
+        "ns": 5708790,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 241,
+        "ns": 5712595,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 304,
+        "ns": 6281809,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 87,
+        "ns": 5655229,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 225,
+        "ns": 5631061,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 375,
+        "ns": 5663719,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 265,
+        "ns": 5672906,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 224,
+        "ns": 5631469,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 151,
+        "ns": 5585855,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 140,
+        "ns": 5587565,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 63,
+        "ns": 5714015,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 95,
+        "ns": 5651695,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 213,
+        "ns": 5815275,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 223,
+        "ns": 5567887,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 61,
+        "ns": 5603349,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 271,
+        "ns": 5626864,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 52,
+        "ns": 5565744,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 248,
+        "ns": 5699698,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 192,
+        "ns": 5854552,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 336,
+        "ns": 5675161,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 130,
+        "ns": 5600068,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 328,
+        "ns": 5592092,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 98,
+        "ns": 5580297,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 176,
+        "ns": 5580015,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 55,
+        "ns": 5632364,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 359,
+        "ns": 5586190,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 358,
+        "ns": 5700830,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 80,
+        "ns": 5625766,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 297,
+        "ns": 5659448,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 137,
+        "ns": 5654294,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 79,
+        "ns": 5614462,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 368,
+        "ns": 5616762,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 165,
+        "ns": 5714848,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 228,
+        "ns": 5675735,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 36,
+        "ns": 5576306,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 40,
+        "ns": 5662243,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 202,
+        "ns": 5703047,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 109,
+        "ns": 5676340,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 24,
+        "ns": 5764895,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 146,
+        "ns": 5678947,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 19,
+        "ns": 5710984,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 112,
+        "ns": 5723860,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 259,
+        "ns": 5919059,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 44,
+        "ns": 5722903,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 162,
+        "ns": 5686992,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 156,
+        "ns": 5698924,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 235,
+        "ns": 5701051,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 33,
+        "ns": 5742669,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 299,
+        "ns": 5755812,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 131,
+        "ns": 5739630,
+        "first": false
+      }
+    ],
+    "mirrored 1:1": [
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 225,
+        "ns": 7328894,
+        "first": true
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 59,
+        "ns": 4216279,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 3,
+        "ns": 4144500,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 46,
+        "ns": 4177151,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 298,
+        "ns": 4449394,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 17,
+        "ns": 4159789,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 343,
+        "ns": 4221689,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 354,
+        "ns": 4255444,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 42,
+        "ns": 4238531,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 50,
+        "ns": 4184446,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 181,
+        "ns": 4263217,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 121,
+        "ns": 4235440,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 8,
+        "ns": 4265630,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 15,
+        "ns": 4143723,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 177,
+        "ns": 4269350,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 331,
+        "ns": 4238482,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 319,
+        "ns": 4199661,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 247,
+        "ns": 4221102,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 315,
+        "ns": 4238500,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 237,
+        "ns": 4108051,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 76,
+        "ns": 4167519,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 93,
+        "ns": 4209475,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 365,
+        "ns": 4229591,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 58,
+        "ns": 4208887,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 7,
+        "ns": 4213944,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 257,
+        "ns": 4218019,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 249,
+        "ns": 4231576,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 127,
+        "ns": 4164936,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 33,
+        "ns": 4210848,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 341,
+        "ns": 4224513,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 277,
+        "ns": 4330368,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 238,
+        "ns": 4050797,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 35,
+        "ns": 4206383,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 307,
+        "ns": 4186002,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 345,
+        "ns": 4194036,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 45,
+        "ns": 4220662,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 263,
+        "ns": 4210708,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 296,
+        "ns": 4174044,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 23,
+        "ns": 4266636,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 138,
+        "ns": 4207180,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 284,
+        "ns": 4166191,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 32,
+        "ns": 4172837,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 330,
+        "ns": 4225125,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 154,
+        "ns": 4109870,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 246,
+        "ns": 4197633,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 136,
+        "ns": 4174104,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 335,
+        "ns": 4152535,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 0,
+        "expert": 102,
+        "ns": 4191812,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 232,
+        "ns": 6960884,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 271,
+        "ns": 4152153,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 340,
+        "ns": 4227466,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 9,
+        "ns": 4222777,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 260,
+        "ns": 4211803,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 36,
+        "ns": 4155194,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 2,
+        "ns": 4097088,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 170,
+        "ns": 4153306,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 73,
+        "ns": 3997148,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 363,
+        "ns": 4089484,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 242,
+        "ns": 4038770,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 336,
+        "ns": 4150666,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 193,
+        "ns": 4160679,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 85,
+        "ns": 3981600,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 27,
+        "ns": 4155178,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 39,
+        "ns": 4085758,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 300,
+        "ns": 4123132,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 254,
+        "ns": 4115512,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 83,
+        "ns": 4081371,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 38,
+        "ns": 4294273,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 285,
+        "ns": 4142862,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 110,
+        "ns": 4149335,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 13,
+        "ns": 4179181,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 177,
+        "ns": 4143534,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 56,
+        "ns": 4204820,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 72,
+        "ns": 4152682,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 343,
+        "ns": 4324150,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 156,
+        "ns": 4120214,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 20,
+        "ns": 4107908,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 213,
+        "ns": 4141105,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 141,
+        "ns": 4209926,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 339,
+        "ns": 4216863,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 90,
+        "ns": 4156298,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 139,
+        "ns": 4119966,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 79,
+        "ns": 4160687,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 153,
+        "ns": 4155707,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 237,
+        "ns": 4177196,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 21,
+        "ns": 4235641,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 288,
+        "ns": 4193300,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 197,
+        "ns": 4141323,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 178,
+        "ns": 4227559,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 253,
+        "ns": 4183846,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 174,
+        "ns": 4165731,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 298,
+        "ns": 4219303,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 239,
+        "ns": 4095576,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 243,
+        "ns": 4140013,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 23,
+        "ns": 4272823,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 1,
+        "expert": 241,
+        "ns": 4186920,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 304,
+        "ns": 7243746,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 87,
+        "ns": 4176523,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 225,
+        "ns": 4121414,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 375,
+        "ns": 4110606,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 265,
+        "ns": 4079790,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 224,
+        "ns": 4204735,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 151,
+        "ns": 4110079,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 140,
+        "ns": 4070288,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 63,
+        "ns": 4167359,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 95,
+        "ns": 4185785,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 213,
+        "ns": 3948024,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 223,
+        "ns": 4101318,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 61,
+        "ns": 4116357,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 271,
+        "ns": 3994466,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 52,
+        "ns": 4048098,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 248,
+        "ns": 4159054,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 192,
+        "ns": 4105694,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 336,
+        "ns": 4216721,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 130,
+        "ns": 4079517,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 328,
+        "ns": 4203881,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 98,
+        "ns": 4119512,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 176,
+        "ns": 4073068,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 55,
+        "ns": 4172282,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 359,
+        "ns": 4176318,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 358,
+        "ns": 4085459,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 80,
+        "ns": 4184073,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 297,
+        "ns": 4208319,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 137,
+        "ns": 4213793,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 79,
+        "ns": 4006033,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 368,
+        "ns": 4091069,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 165,
+        "ns": 4229869,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 228,
+        "ns": 4266290,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 36,
+        "ns": 4028270,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 40,
+        "ns": 4013075,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 202,
+        "ns": 4128127,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 109,
+        "ns": 4086864,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 24,
+        "ns": 4184752,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 146,
+        "ns": 4103471,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 19,
+        "ns": 4128882,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 112,
+        "ns": 4134670,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 259,
+        "ns": 4192849,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 44,
+        "ns": 4082208,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 162,
+        "ns": 4126466,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 156,
+        "ns": 4187972,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 235,
+        "ns": 4094327,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 33,
+        "ns": 4122657,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 299,
+        "ns": 4085111,
+        "first": false
+      },
+      {
+        "layer": 19,
+        "rep": 2,
+        "expert": 131,
+        "ns": 4118983,
+        "first": false
+      }
+    ]
+  }
+}

@@ -568,3 +568,11 @@ def test_physical_overlap_of_side_pull_and_origin_compute():
         "no positive kernel-interval overlap was measured between the side pull "
         "and origin compute on this hardware; overlap here is nominal, not physical."
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

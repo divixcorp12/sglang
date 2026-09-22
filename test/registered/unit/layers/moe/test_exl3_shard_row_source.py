@@ -176,6 +176,17 @@ def test_reader_mode_follows_the_file_reader_knob(tmp_path):
         assert fmt.default_row_source(None, specs, "shards").reader is shared_row_reader(layout, False)
 
 
+def test_shared_row_reader_is_keyed_by_source_root(tmp_path):
+    layout = _checkpoint(tmp_path)
+    plain = shared_row_reader(layout, True)
+    rooted = shared_row_reader(layout, True, source_root=str(tmp_path))
+    assert plain.source_root is None
+    assert rooted.source_root == str(tmp_path)
+    assert rooted is not plain
+    assert shared_row_reader(layout, True, source_root=str(tmp_path)) is rooted
+    assert shared_row_reader(layout, True) is plain
+
+
 def test_pinned_tier_options_protect_hot_cache_experts(tmp_path):
     layout = _checkpoint(tmp_path)
     fmt = Exl3ExpertFormat(layout, 1, direct=False)

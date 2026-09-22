@@ -140,7 +140,7 @@ def _constants(path: Path) -> dict[str, int]:
 PAGE_PROTOCOL = (
     "kDemandHead", "kDemandDone", "kFatal", "kAdviseHead", "kRecordBytes", "kDemandRing", "kDemandRecords",
     "kAdviseRing", "kAdviseRecords", "kMaxIds", "kRecSeq", "kRecRow", "kRecNeedCount", "kRecProtectCount",
-    "kRecStatus", "kRecAfter", "kRecNeed", "kRecProtect", "kRecArmed", "kServed",
+    "kRecStatus", "kRecAfter", "kRecNeed", "kRecProtect", "kRecArmed", "kRecLanes", "kServed",
 )
 
 
@@ -179,8 +179,123 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kSticky": "sticky",
         "kAdvised": "advised",
         "kUnservedMisses": "unserved_misses",
+        "kEpoch": "epoch",
+        "kPendingEpoch": "pending_epoch",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
+
+
+def _lease_python_constants():
+    from sglang.kernels.ops.moe import exl3_lease_block as lease
+
+    return {
+        "kLeaseRing": lease.RING,
+        "kLeaseLanes": lease.LANES,
+        "kLeaseHeaderRing": lease.HEADER["ring"],
+        "kLeaseHeaderLanes": lease.HEADER["lanes"],
+        "kLeaseHeaderShutdown": lease.HEADER["shutdown"],
+        "kLeaseHeaderSlotGenOffset": lease.HEADER["slot_gen_offset"],
+        "kLeaseHeaderDOffset": lease.HEADER["d_offset"],
+        "kLeaseRowTable": lease.ROW_TABLE,
+        "kLeaseRowResult": lease.ROW_RESULT,
+        "kLeaseRowResultBytes": lease.ROW_RESULT_BYTES,
+        "kLeaseRrReady": lease.ROW_RESULT_FIELDS["ready"],
+        "kLeaseRrSlotGeneration": lease.ROW_RESULT_FIELDS["slot_generation"],
+        "kLeaseRrHostSlot": lease.ROW_RESULT_FIELDS["host_slot"],
+        "kLeaseRrExpert": lease.ROW_RESULT_FIELDS["expert"],
+        "kLeaseSlotGen": lease.SLOT_GEN,
+        "kLeaseLaneRequest": lease.LANE_REQUEST,
+        "kLeaseLaneRequestBytes": lease.LANE_REQUEST_BYTES,
+        "kLeaseLrGen": lease.LANE_REQUEST_FIELDS["gen"],
+        "kLeaseLrCount": lease.LANE_REQUEST_FIELDS["count"],
+        "kLeaseLrRow": lease.LANE_REQUEST_FIELDS["row"],
+        "kLeaseLrExpert": lease.LANE_REQUEST_FIELDS["expert"],
+        "kLeaseLaneAck": lease.LANE_ACK,
+        "kLeaseLaneAckBytes": lease.LANE_ACK_BYTES,
+        "kLeaseTerminal": lease.TERMINAL,
+        "kLeaseTerminalBytes": lease.TERMINAL_BYTES,
+        "kLeaseTermSkippedMask": lease.TERMINAL_FIELDS["skipped_mask"],
+        "kLeaseTermReason": lease.TERMINAL_FIELDS["reason"],
+        "kLeaseTermGen": lease.TERMINAL_FIELDS["gen"],
+        "kLeaseRowTableBytes": lease.ROW_TABLE_ENTRY_BYTES,
+    }
+
+
+def _lease_device_only_constants():
+    """Words only the device kernels write or name: the tags and the Terminal reasons (the host never interprets them)."""
+    from sglang.kernels.ops.moe import exl3_lease_block as lease
+
+    return {
+        "kLeaseTagDemand": lease.DEMAND_TAG,
+        "kLeaseTagReady": lease.READY,
+        "kLeaseTagConsumed": lease.CONSUMED,
+        "kLeaseTagViolated": lease.VIOLATED,
+        "kLeaseTagTerminal": lease.TERMINAL_TAG,
+        "kLeaseReasonTimeout": lease.TERMINAL_REASONS["timeout"],
+        "kLeaseReasonAborted": lease.TERMINAL_REASONS["aborted"],
+        "kLeaseReasonFailed": lease.TERMINAL_REASONS["failed"],
+        "kLeaseReasonIdentity": lease.TERMINAL_REASONS["identity"],
+        "kLeaseReasonCount": lease.TERMINAL_REASONS["count"],
+    }
+
+
+def test_the_lease_block_layout_is_written_once_in_python_and_in_the_device_source():
+    """The lease block (LEASE_PROTOCOL.md section 4) joins the page's agreement check: one layout, several writers."""
+    device = _constants(CSRC / "exl3_ram_miss.cuh")
+    python = _lease_python_constants()
+    for name, value in python.items():
+        assert name in device, name
+        assert device[name] == value, (name, device[name], value)
+    assert python["kLeaseRing"] == device["kDemandRecords"] and python["kLeaseLanes"] == device["kMaxIds"]
+    for name, value in _lease_device_only_constants().items():
+        assert device[name] == value, (name, device[name], value)
+
+
+# Words that mean the host source has started to implement leases. Step 2 must name its constants kLease*; if it
+# adds the concepts under other names the guard below fails instead of leaving the agreement check matching nothing.
+_LEASE_CONCEPTS = re.compile(r"\b(?:LaneRequest|SlotGen|slot_generation|Outstanding|retire_leases|lease_block|leases)\b")
+
+
+def _check_host_lease_layout(host_source: str, host_constants: dict[str, int], python: dict[str, int]) -> str:
+    """"agreed", or "skip" while the host source has no lease code; raises when it has and does not agree."""
+    defined = {name: value for name, value in host_constants.items() if name.startswith("kLease")}
+    if not defined:
+        if _LEASE_CONCEPTS.search(host_source):
+            raise AssertionError(
+                "the host source mentions leases but defines no kLease* layout constants: the agreement check "
+                "would match nothing. Define the layout as kLease* constants (mirroring exl3_lease_block.py)."
+            )
+        return "skip"
+    for name, value in defined.items():
+        assert name in python, f"{name} is defined in the host source but not mirrored in Python"
+        assert value == python[name], (name, value, python[name])
+    missing = sorted(set(python) - set(defined))
+    assert not missing, f"the host source defines some lease constants but not {missing}"
+    return "agreed"
+
+
+def test_the_host_source_agrees_with_the_lease_layout_once_it_defines_it():
+    """Skips while the host source has no lease code (step 2 of LEASE_PROTOCOL.md section 20 adds it); from then on
+    it is a hard failure if the constants are missing, partial or different."""
+    path = CSRC / "exl3_ram_miss_host.cpp"
+    outcome = _check_host_lease_layout(path.read_text(), _constants(path), _lease_python_constants())
+    if outcome == "skip":
+        pytest.skip("the host source has no lease code yet; this check activates when it does")
+
+
+def test_the_host_lease_guard_can_fail():
+    """The guard is itself a check that must be able to fail: each way the host source can go wrong is refused."""
+    python = _lease_python_constants()
+    assert _check_host_lease_layout("// nothing about them", {}, python) == "skip"
+    assert _check_host_lease_layout("x", dict(python), python) == "agreed"
+    with pytest.raises(AssertionError, match="defines no kLease"):
+        _check_host_lease_layout("struct Outstanding {};", {}, python)  # lease code under other names
+    with pytest.raises(AssertionError, match="but not"):
+        _check_host_lease_layout("x", {"kLeaseRing": python["kLeaseRing"]}, python)  # partial
+    with pytest.raises(AssertionError):
+        _check_host_lease_layout("x", {**python, "kLeaseSlotGen": python["kLeaseSlotGen"] + 4}, python)  # drifted
+    with pytest.raises(AssertionError, match="not mirrored"):
+        _check_host_lease_layout("x", {**python, "kLeaseInvented": 1}, python)
 
 
 if __name__ == "__main__":

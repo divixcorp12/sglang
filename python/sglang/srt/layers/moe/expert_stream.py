@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.expert_host_tier import (
     PinnedSlotLRU,
     PinnedSlotTable,
     allocate_host_slab,
+    quarantine_host_slabs,
     release_host_slabs,
 )
 from sglang.srt.layers.moe.expert_row_source import (
@@ -269,6 +270,15 @@ class ExpertPinnedHostCache:
     def close(self) -> None:
         """Unregister the slabs; the cache must not be used afterwards."""
         self._release_slabs()
+
+    def quarantine(self) -> None:
+        """Keep every slab registered and alive until the process ends, and never unregister it.
+
+        For when a GPU reader of unknown state may still run (LEASE_PROTOCOL.md section 14). The finalizer that
+        unregisters the slabs at exit is detached, or it would undo this; ``close`` is then a no-op.
+        """
+        self._release_slabs.detach()
+        quarantine_host_slabs(self.tensors.values())
 
     def evictable_rows(self) -> int:
         """Slots a request can use: the capacity minus residents ``is_pinned`` protects."""

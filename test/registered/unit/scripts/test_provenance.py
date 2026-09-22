@@ -1,0 +1,388 @@
+"""Arm provenance: what the running process saw, with no key silently missing."""
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+
+import pytest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+
+
+def _load(name, *parts):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(_ROOT, *parts))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+prov = _load("provenance", "scripts", "dsv41", "provenance.py")
+
+REQUIRED_KEYS = {
+    "schema", "host", "utc", "pid", "argv", "cwd", "python", "harness_files", "sglang_env",
+    "sglang_env_at_exec", "sglang_file", "sglang_env_resolved", "git", "harness_loaded", "unavailable",
+}
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    (tmp_path / "python" / "pkg").mkdir(parents=True)
+    (tmp_path / "python" / "pkg" / "a.py").write_text("x = 1\n")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "-c", "user.name=t", "-c", "user.email=t@t", "add", "python/pkg/a.py")
+    _git(tmp_path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    return tmp_path
+
+
+def test_process_env_reports_only_steering_variables_and_redacts_secrets(monkeypatch):
+    for k in [k for k in os.environ if k.startswith(("SGLANG_", "SGL_"))]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("SGLANG_MOE_EXPERT_FILE_READER", "uring_direct")
+    monkeypatch.setenv("SGL_LEGACY_ALIAS", "1")
+    monkeypatch.setenv("SGLANG_API_TOKEN", "hunter2")
+    monkeypatch.setenv("UNRELATED_VAR", "no")
+    monkeypatch.setenv("OMP_NUM_THREADS", "16")
+    env = prov.process_env()
+    assert env["SGLANG_MOE_EXPERT_FILE_READER"] == "uring_direct"
+    assert env["SGL_LEGACY_ALIAS"] == "1"
+    assert env["OMP_NUM_THREADS"] == "16"
+    assert env["SGLANG_API_TOKEN"] == prov.REDACTED
+    assert "UNRELATED_VAR" not in env
+    assert "hunter2" not in json.dumps(env)
+
+
+def test_redaction_hits_secrets_and_spares_knobs_whose_names_only_contain_token():
+    """Bug: a substring match on TOKEN redacted SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS from the
+    first Task 1 arm's json, so a steering value in force was unrecoverable from the record."""
+    for name in ("SGLANG_API_TOKEN", "HF_TOKEN", "EXA_API_KEY", "SGLANG_SECRET_KEY", "DB_PASSWORD", "GITHUB_ACCESS_TOKEN"):
+        assert prov._redact(name, "v") == prov.REDACTED, name
+    for name in (
+        "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS", "SGLANG_USE_AITER_FP8_PER_TOKEN",
+        "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", "SGLANG_MAX_NEW_TOKENS_LIMIT", "SGLANG_MM_AVOID_RETOKENIZE",
+    ):
+        assert prov._redact(name, "256") == "256", name
+
+
+def test_resolved_env_redacts_only_secret_named_knobs():
+    resolved = prov.resolved_env()
+    redacted = {k for k, v in resolved.items() if v == prov.REDACTED}
+    assert redacted == {k for k in resolved if prov._SECRET_NAME.search(k)}
+    assert resolved["SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS"] != prov.REDACTED
+
+
+def test_exec_env_parses_nul_separated_environ(tmp_path):
+    f = tmp_path / "environ"
+    f.write_bytes(b"SGLANG_A=1\0PATH=/bin\0SGLANG_B=x=y\0SGLANG_SECRET_KEY=s\0")
+    env = prov.exec_env(str(f))
+    assert env == {"SGLANG_A": "1", "SGLANG_B": "x=y", "SGLANG_SECRET_KEY": prov.REDACTED}
+
+
+def test_env_drift_names_added_removed_and_changed():
+    before = {"SGLANG_A": "1", "SGLANG_B": "2", "SGLANG_C": "3"}
+    after = {"SGLANG_A": "1", "SGLANG_B": "9", "SGLANG_D": "4"}
+    assert prov.env_drift(before, after) == {
+        "SGLANG_B": ["2", "9"],
+        "SGLANG_C": ["3", None],
+        "SGLANG_D": [None, "4"],
+    }
+    assert prov.env_drift(before, before) == {}
+
+
+def test_resolved_env_shows_a_default_that_the_environment_does_not(monkeypatch):
+    monkeypatch.delenv("SGLANG_MOE_EXPERT_FILE_READER", raising=False)
+    resolved = prov.resolved_env()
+    assert resolved["SGLANG_MOE_EXPERT_FILE_READER"] == "mmap"
+    monkeypatch.setenv("SGLANG_MOE_EXPERT_FILE_READER", "uring_direct")
+    assert prov.resolved_env()["SGLANG_MOE_EXPERT_FILE_READER"] == "uring_direct"
+    json.dumps(resolved)  # every value must survive being written to the arm json
+
+
+def test_git_state_clean_dirty_and_untracked(repo):
+    pkg = str(repo / "python" / "pkg")
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    clean = prov.git_state(pkg)
+    assert clean["head"] == head
+    assert clean["toplevel"] == os.path.realpath(repo) or clean["toplevel"] == str(repo)
+    assert clean["dirty"] is False and clean["dirty_files"] == []
+    assert clean["untracked_in_package_count"] == 0
+
+    (repo / "python" / "pkg" / "a.py").write_text("x = 2\n")
+    (repo / "python" / "pkg" / "new.py").write_text("y = 1\n")
+    dirty = prov.git_state(pkg)
+    assert dirty["head"] == head
+    assert dirty["dirty"] is True and dirty["dirty_file_count"] == 1
+    assert dirty["tracked_diff_sha1"] != clean["tracked_diff_sha1"]
+    assert dirty["untracked_in_package"] == ["python/pkg/new.py"]
+
+
+def test_git_state_refuses_a_directory_outside_any_worktree(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError):
+        prov.git_state(str(tmp_path))
+
+
+# What the mounts resolve to on the box today; note that the label nvme4 is the device nvme3n1.
+DEVICES = {"nvme0": "nvme0n1", "nvme2": "nvme2n1", "nvme4": "nvme3n1"}
+
+
+def _write_diskstats(path, sectors):
+    rows = [f"   259       0 {dev} 1 0 {sectors[name]} 0 0 0 0 0 0 0 0" for name, dev in DEVICES.items()]
+    path.write_text("\n".join(rows) + "\n")
+
+
+def test_drive_idle_check_flags_a_busy_drive(tmp_path):
+    stats = tmp_path / "diskstats"
+    state = {"nvme0": 0, "nvme2": 0, "nvme4": 0}
+    _write_diskstats(stats, state)
+
+    def sleep(seconds):
+        state["nvme2"] += 8 * 1024 * 1024 // 512 * 2  # 8 MiB/s over 2 s
+        _write_diskstats(stats, state)
+
+    result = prov.drive_idle_check(seconds=2.0, diskstats=str(stats), sleep=sleep, devices=DEVICES)
+    assert result["idle"] is False
+    assert result["bytes_per_s"]["nvme2"] == pytest.approx(8 * 1024 * 1024)
+    assert result["bytes_per_s"]["nvme0"] == 0
+
+
+def test_drive_idle_check_reports_an_idle_drive(tmp_path):
+    stats = tmp_path / "diskstats"
+    _write_diskstats(stats, {"nvme0": 5, "nvme2": 5, "nvme4": 5})
+    result = prov.drive_idle_check(seconds=1.0, diskstats=str(stats), sleep=lambda s: None, devices=DEVICES)
+    assert result["idle"] is True
+    assert set(result["bytes_per_s"]) == set(prov.DRIVES)
+    assert result["devices"] == DEVICES  # the result says which kernel device each label was
+
+
+def test_drive_idle_check_unreadable_diskstats_is_null_with_reason(tmp_path):
+    result = prov.drive_idle_check(
+        seconds=0.0, diskstats=str(tmp_path / "missing"), sleep=lambda s: None, devices=DEVICES
+    )
+    assert result["idle"] is None
+    assert "FileNotFoundError" in result["unavailable"]
+
+
+def _fake_trees(tmp_path, *, device_name, listed=True):
+    """A mount directory plus fake /proc and /sys trees in which its st_dev is the disk ``device_name``."""
+    mount = tmp_path / "mnt" / "nvme4"
+    mount.mkdir(parents=True)
+    st = os.stat(mount).st_dev
+    major, minor = os.major(st), os.minor(st)
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "mountinfo").write_text("1 1 0:1 / / rw - ext4 /dev/fake rw\n")
+    row = f"{major} {minor} {device_name} 1 0 5 0 0 0 0 0 0 0 0\n" if listed else "8 0 sda 1 0 5 0 0 0 0 0 0 0 0\n"
+    (proc / "diskstats").write_text(row)
+    (sys_root / "dev" / "block" / f"{major}:{minor}" / "queue").mkdir(parents=True)
+    return {"nvme4": str(mount)}, {"proc_root": str(proc), "sys_root": str(sys_root)}
+
+
+def test_a_drive_is_resolved_by_its_st_dev_not_by_the_name_of_its_mount(tmp_path):
+    drives, roots = _fake_trees(tmp_path, device_name="nvme7n1")  # neither nvme4 nor today's nvme3n1
+    assert prov.resolve_devices(drives, **roots) == {"nvme4": "nvme7n1"}
+
+
+def test_a_mount_with_no_diskstats_row_stops_the_arm_instead_of_reading_zero(tmp_path):
+    drives, roots = _fake_trees(tmp_path, device_name="nvme7n1", listed=False)
+    with pytest.raises(ValueError, match="no .*diskstats row"):
+        prov.resolve_devices(drives, **roots)
+
+
+def test_reading_sectors_for_a_device_missing_from_diskstats_raises(tmp_path):
+    stats = tmp_path / "diskstats"
+    _write_diskstats(stats, {"nvme0": 1, "nvme2": 2, "nvme4": 3})
+    assert prov.read_sectors(str(stats), devices=DEVICES) == {"nvme0": 1, "nvme2": 2, "nvme4": 3}
+    with pytest.raises(ValueError, match="nvme9n1"):
+        prov.read_sectors(str(stats), devices={**DEVICES, "nvme9": "nvme9n1"})
+
+
+def test_capture_records_the_imported_sglang_and_its_worktree():
+    import sglang
+
+    out = prov.capture({"driver": "/x/driver.py"})
+    assert REQUIRED_KEYS <= set(out)
+    assert out["sglang_file"] == sglang.__file__
+    assert out["harness_files"] == {"driver": "/x/driver.py"}
+    assert out["host"] and out["utc"].endswith("+00:00")
+    json.dumps(out)  # the arm json must be writable
+    if out["git"] is not None:
+        assert len(out["git"]["head"]) == 40
+        assert isinstance(out["git"]["dirty"], bool)
+    else:
+        assert "git" in out["unavailable"]
+
+
+def test_capture_never_omits_a_key_when_a_source_is_unavailable(monkeypatch):
+    def refuse(*a, **k):
+        raise OSError("no such thing")
+
+    monkeypatch.setattr(prov, "exec_env", refuse)
+    monkeypatch.setattr(prov, "git_state", refuse)
+    monkeypatch.setattr(prov, "resolved_env", refuse)
+    out = prov.capture()
+    assert REQUIRED_KEYS <= set(out)
+    for field in ("sglang_env_at_exec", "git", "sglang_env_resolved"):
+        assert out[field] is None
+        assert "OSError: no such thing" in out["unavailable"][field]
+
+
+def _module(path):
+    import types
+
+    return types.SimpleNamespace(__file__=str(path))
+
+
+def test_harness_loaded_hashes_the_files_the_loader_saw_not_a_list(tmp_path):
+    import hashlib
+
+    (tmp_path / "scripts" / "dsv41").mkdir(parents=True)
+    (tmp_path / "analysis" / "dsv41-drive").mkdir(parents=True)
+    (tmp_path / "python").mkdir()
+    main, dep, unrelated, package = (
+        tmp_path / "scripts" / "dsv41" / "trace.py",
+        tmp_path / "analysis" / "dsv41-drive" / "dep.py",
+        tmp_path / "analysis" / "dsv41-drive" / "never_imported.py",
+        tmp_path / "python" / "code.py",
+    )
+    for f, text in ((main, "m"), (dep, "d"), (unrelated, "u"), (package, "p")):
+        f.write_text(text)
+    outside = tmp_path.parent / "elsewhere.py"
+    outside.write_text("o")
+    modules = {"dep": _module(dep), "code": _module(package), "elsewhere": _module(outside), "builtin": _module("")}
+    out = prov.harness_loaded(top=str(tmp_path), modules=modules, main_file=str(main))
+    sha = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    assert out["files"]["scripts/dsv41/trace.py"] == sha("m")
+    assert out["files"]["analysis/dsv41-drive/dep.py"] == sha("d")
+    assert "analysis/dsv41-drive/never_imported.py" not in out["files"]  # present on disk, never loaded
+    assert not any(k.startswith("python/") or "elsewhere" in k for k in out["files"])  # code under test and strangers are not harness
+    assert out["git"] is None and "git_unavailable" in out  # tmp_path is no worktree: said, not omitted
+    json.dumps(out)
+
+
+def test_harness_loaded_names_the_worktree_it_came_from(repo):
+    (repo / "scripts" / "dsv41").mkdir(parents=True)
+    (repo / "scripts" / "dsv41" / "x.py").write_text("1\n")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "add", "scripts/dsv41/x.py")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "harness")
+    out = prov.harness_loaded(top=str(repo), modules={}, main_file=str(repo / "scripts" / "dsv41" / "x.py"))
+    assert len(out["git"]["head"]) == 40 and out["git"]["dirty"] is False
+    (repo / "scripts" / "dsv41" / "x.py").write_text("2\n")
+    assert prov.harness_loaded(top=str(repo), modules={}, main_file=str(repo / "scripts" / "dsv41" / "x.py"))["git"]["dirty"] is True
+
+
+def test_the_by_path_drive_resolver_is_recorded_as_harness():
+    import hashlib
+
+    module = prov._drive_conditions()
+    out = prov.harness_loaded()
+    rel = "analysis/dsv41-drive/drive_conditions.py"
+    assert rel in out["files"], sorted(out["files"])
+    with open(module.__file__, "rb") as f:
+        assert out["files"][rel] == hashlib.sha256(f.read()).hexdigest()
+    assert "scripts/dsv41/provenance.py" in out["files"]  # this file names itself
+
+
+def _log(times, tokens):
+    return list(zip(times, tokens))
+
+
+def test_step_latency_is_exact_when_every_chunk_is_one_token():
+    # The first chunk (end of prefill, at t=10) starts the clock: 127 decode steps of 0.5 s, one a 2.0 s stall.
+    times = [10.0 + 0.5 * i for i in range(128)]
+    times[-1] += 1.5
+    out = prov.step_latency(_log(times, range(1, 129)))
+    assert out["steps"] == 127 and out["multi_token_chunks"] == 0
+    assert out["step_s_p50"] == pytest.approx(0.5)
+    assert out["step_s_p99"] == pytest.approx(0.5) and out["step_s_max"] == pytest.approx(2.0)
+    assert len(out["step_s"]) == 127
+
+
+def test_step_latency_flags_chunks_that_carry_several_tokens():
+    """A chunk of 3 tokens must not be read as one slow step: it is divided and counted."""
+    out = prov.step_latency(_log([0.0, 1.0, 4.0], [1, 2, 5]))
+    assert out["multi_token_chunks"] == 1
+    assert out["step_s"] == pytest.approx([1.0, 1.0])
+
+
+def test_step_latency_refuses_to_guess_without_token_counts():
+    out = prov.step_latency(_log([0.0, 1.0, 2.0], [1, None, 3]))
+    assert "unavailable" in out and "step_s_p50" not in out
+    assert "unavailable" in prov.step_latency(_log([0.0, 1.0, 2.0], [1, 3, 3]))  # a chunk with no new token
+    assert "unavailable" in prov.step_latency(_log([0.0], [1]))
+
+
+def test_timed_chunks_passes_the_stream_through_and_logs_cumulative_tokens():
+    ticks = iter([1.0, 2.0, 3.0])
+    log = []
+    chunks = [{"meta_info": {"completion_tokens": 1}}, {"meta_info": {"completion_tokens": 2}}, "bare"]
+    assert list(prov.timed_chunks(iter(chunks), log, clock=lambda: next(ticks))) == chunks
+    assert log == [(1.0, 1), (2.0, 2), (3.0, None)]
+
+
+def test_process_tree_cpu_s_counts_this_process():
+    before = prov.process_tree_cpu_s()
+    sum(i * i for i in range(2_000_000))
+    assert prov.process_tree_cpu_s() > before
+
+
+@pytest.mark.skipif(shutil.which("fincore") is None, reason="needs util-linux fincore")
+def test_resident_bytes_counts_cached_shards_per_directory(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    (a / "x.safetensors").write_bytes(b"\0" * (4 << 20))  # written buffered, so resident
+    (a / "ignored.json").write_bytes(b"\0" * (4 << 20))
+    out = prov.resident_bytes([str(a), str(b), str(tmp_path / "missing")])
+    assert 4 << 20 <= out[str(a)] < 8 << 20
+    assert out[str(b)] == 0 and out[str(tmp_path / "missing")] == 0
+
+
+def test_meminfo_parse_takes_only_the_fields_the_gate_uses(tmp_path):
+    f = tmp_path / "meminfo"
+    f.write_text("MemTotal: 1 kB\nMemFree: 2 kB\nMemAvailable: 3 kB\nCached: 4 kB\nSwapCached: 5 kB\n")
+    assert prov._meminfo_kb(str(f)) == {"MemFree": 2, "MemAvailable": 3, "Cached": 4}
+
+
+def test_system_sample_has_every_field_and_is_json_serialisable():
+    out = prov.system_sample(cpu_interval=0.01)
+    assert {"utc", "monotonic", "diskstats_sectors", "meminfo_kb", "loadavg", "top_other_cpu"} <= set(out)
+    json.dumps(out)
+    assert out["meminfo_kb"] is None or set(out["meminfo_kb"]) == set(prov.MEMINFO_FIELDS)
+
+
+def test_cpu_ranges_reads_like_taskset():
+    assert prov.cpu_ranges([32, 30, 31, 40, 30]) == "30-32,40"
+    assert prov.cpu_ranges(range(72)) == "0-71" and prov.cpu_ranges([]) == "" and prov.cpu_ranges([5]) == "5"
+
+
+def test_arm_harnesses_embed_provenance_in_the_result_json():
+    for parts in (("analysis", "dsv41-drive", "eager_arm_driver.py"), ("scripts", "dsv41", "trace_corpus.py")):
+        with open(os.path.join(_ROOT, *parts)) as f:
+            source = f.read()
+        assert '"provenance": prov' in source, parts
+        assert "provenance.capture(" in source and "drive_idle_check()" in source, parts
+        assert "provenance.timed_chunks(" in source and "provenance.step_latency(" in source, parts
+        assert "provenance.process_tree_cpu_s()" in source, parts
+    for parts in (("analysis", "dsv41-drive", "eager_arm_driver.py"), ("scripts", "dsv41", "trace_corpus.py")):
+        with open(os.path.join(_ROOT, *parts)) as f:
+            source = f.read()
+        assert '"boundary_samples": boundaries' in source, parts
+        assert '"expert_residency": residency' in source, parts
+        assert '"expert_resident_bytes": provenance.resident_bytes(' in source, parts
+        assert "provenance.system_sample()" in source, parts
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

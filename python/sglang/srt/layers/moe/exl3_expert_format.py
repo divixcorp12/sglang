@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.exl3_expert_layout import (
     Exl3ExpertLayout,
     build_exl3_expert_layout,
 )
+from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.srt.layers.moe.expert_format import ExpertTensorSpec, expert_streamer_of
 
 if TYPE_CHECKING:
@@ -119,7 +120,12 @@ class Exl3ExpertFormat:
     names = EXL3_STREAMED_NAMES
 
     def __init__(
-        self, layout: Exl3ExpertLayout, layer_id: int, *, direct: Optional[bool] = None
+        self,
+        layout: Exl3ExpertLayout,
+        layer_id: int,
+        *,
+        direct: Optional[bool] = None,
+        source_root: Optional[str] = None,
     ) -> None:
         if not 0 <= layer_id < layout.num_layers:
             raise ValueError(
@@ -129,6 +135,7 @@ class Exl3ExpertFormat:
         self.layout = layout
         self.layer_id = layer_id
         self.direct = direct
+        self.source_root = source_root
         self._specs, self._segments = _row_schema(layout)
 
     def tensor_specs(self, layer: torch.nn.Module) -> tuple[ExpertTensorSpec, ...]:
@@ -198,8 +205,12 @@ class Exl3ExpertFormat:
         specs: Sequence[ExpertTensorSpec],
         kind: str,
     ) -> Optional["ExpertRowSource"]:
-        """``auto`` and ``shards`` read the original EXL3 shards."""
+        """``auto`` and ``shards`` read the original EXL3 shards, or, when
+        ``SGLANG_MOE_EXPERT_MIRROR_DIRS`` is set, the mirrored copies of them."""
         if kind in ("auto", "shards"):
+            mirror = exl3_mirror_config()
+            if mirror is not None:
+                return self._mirror_row_source(*mirror)
             # Imported here: the source pulls in sglang.srt.model_loader, whose
             # package import reaches the quantization methods that import this module.
             from sglang.srt.layers.moe.exl3_shard_row_source import (
@@ -213,6 +224,48 @@ class Exl3ExpertFormat:
             f"expert format {self.key!r} has no row source kind {kind!r}; "
             "choose from ('auto', 'shards')"
         )
+
+    def _mirror_row_source(
+        self, roots: tuple[str, ...], weights: tuple[float, ...]
+    ) -> "ExpertRowSource":
+        self._check_mirror_roots(roots)
+        from sglang.srt.layers.moe.exl3_mirror_row_source import Exl3MirrorRowSource
+
+        return Exl3MirrorRowSource.for_mirrored_layer(
+            self.layout,
+            self.layer_id,
+            self._segments,
+            direct=self._resolve_direct(),
+            roots=roots,
+            policy=StaticSplitPolicy(weights),
+            source_root=self.source_root,
+        )
+
+    def _check_mirror_roots(self, roots: tuple[str, ...]) -> None:
+        """What the eager and the native reader both need of the roots, beyond parsing them."""
+        if self.source_root is None:
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_MIRROR_DIRS needs the format built with "
+                "source_root, the checkpoint directory the layout was read from "
+                "(SGLANG_DSV41_EXPERT_DIR), to find each root's copy of a shard"
+            )
+        for root in roots:
+            if os.path.realpath(root) == os.path.realpath(self.source_root):
+                raise ValueError(
+                    f"{_MIRROR_DIRS}: {root!r} is the checkpoint directory "
+                    f"{self.source_root!r} itself, not a mirror of it"
+                )
+
+    def mirror_table_args(self) -> dict:
+        """The mirror keyword arguments of ``exl3_ram_miss_tables`` (the native reader's tables):
+        empty without ``SGLANG_MOE_EXPERT_MIRROR_DIRS``, else the same validated roots and split
+        policy ``default_row_source`` builds its mirror source from."""
+        mirror = exl3_mirror_config()
+        if mirror is None:
+            return {}
+        roots, weights = mirror
+        self._check_mirror_roots(roots)
+        return dict(roots=roots, policy=StaticSplitPolicy(weights), source_root=self.source_root)
 
     def file_source_bytes_per_expert(
         self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]
@@ -232,6 +285,86 @@ class Exl3ExpertFormat:
                 "SGLANG_MOE_EXPERT_FILE_READER=uring_direct (or uring for buffered reads)"
             )
         return mode == "uring_direct"
+
+
+_MIRROR_DIRS = "SGLANG_MOE_EXPERT_MIRROR_DIRS"
+_MIRROR_WEIGHTS = "SGLANG_MOE_EXPERT_MIRROR_WEIGHTS"
+
+
+def parse_mirror_roots(value: str) -> tuple[str, ...]:
+    """The mirror roots in an ``os.pathsep``-separated ``SGLANG_MOE_EXPERT_MIRROR_DIRS``.
+
+    Each must be a readable directory. An empty entry (``a::b``, a trailing
+    separator) is refused rather than dropped: it changes the root count the
+    weights are matched against, and is far likelier a typo than intent.
+    """
+    entries = value.split(os.pathsep)
+    if any(not entry for entry in entries):
+        raise ValueError(
+            f"{_MIRROR_DIRS}={value!r} has an empty entry; separate roots with "
+            f"{os.pathsep!r} and no others"
+        )
+    for root in entries:
+        if not os.path.isabs(root):
+            raise ValueError(
+                f"{_MIRROR_DIRS}: {root!r} is a relative path, which would mean "
+                "a different directory in every working directory; give an absolute one"
+            )
+        if not (os.path.isdir(root) and os.access(root, os.R_OK | os.X_OK)):
+            raise ValueError(f"{_MIRROR_DIRS}: {root!r} is not a readable directory")
+    real = [os.path.realpath(root) for root in entries]
+    for i, path in enumerate(real):
+        if path in real[:i]:
+            raise ValueError(
+                f"{_MIRROR_DIRS}: {entries[i]!r} is the same directory as "
+                f"{entries[real.index(path)]!r}; two entries for one drive would "
+                "look like a two-drive mirror and read from one"
+            )
+    return tuple(entries)
+
+
+def parse_mirror_weights(value: str, num_roots: int) -> tuple[float, ...]:
+    """The split weights, one per root; empty means equal weights."""
+    if not value.strip():
+        return (1.0,) * num_roots
+    weights = []
+    for token in value.split(":"):
+        try:
+            weight = float(token)
+        except ValueError:
+            raise ValueError(
+                f"{_MIRROR_WEIGHTS}={value!r}: {token!r} is not a number; give "
+                "colon-separated non-negative numbers such as 3:1"
+            ) from None
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(
+                f"{_MIRROR_WEIGHTS}={value!r}: {token!r} is not a finite "
+                "non-negative number"
+            )
+        weights.append(weight)
+    if len(weights) != num_roots:
+        raise ValueError(
+            f"{_MIRROR_WEIGHTS} lists {len(weights)} weights but {_MIRROR_DIRS} "
+            f"lists {num_roots} roots"
+        )
+    if not any(weights):
+        raise ValueError(f"{_MIRROR_WEIGHTS}={value!r}: every weight is zero")
+    return tuple(weights)
+
+
+def exl3_mirror_config() -> Optional[tuple[tuple[str, ...], tuple[float, ...]]]:
+    """``(roots, weights)`` from the environment, or None when mirroring is off."""
+    dirs = envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.get()
+    weights = envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.get()
+    if not dirs:
+        if weights.strip():
+            raise ValueError(
+                f"{_MIRROR_WEIGHTS} is set but {_MIRROR_DIRS} is not; the weights "
+                "would be silently ignored"
+            )
+        return None
+    roots = parse_mirror_roots(dirs)
+    return roots, parse_mirror_weights(weights, len(roots))
 
 
 logger = logging.getLogger(__name__)
@@ -276,7 +409,9 @@ def build_exl3_expert_streamer(layer: torch.nn.Module, expert_dir: Optional[str]
             f"exl3 streaming: the layer has {layer.exl3_num_experts} experts, the "
             f"checkpoint {layout.num_experts}; launch with disable_shared_experts_fusion=True"
         )
-    fmt = Exl3ExpertFormat(layout, layer.layer_id)
+    fmt = Exl3ExpertFormat(
+        layout, layer.layer_id, source_root=os.path.realpath(expert_dir)
+    )
     specs = {spec.name: spec.row_shape for spec in fmt.tensor_specs(layer)}
     hidden, inter = layer.exl3_hidden // 16, layer.exl3_inter // 16
     if specs["w13_trellis"][:3] != (2, hidden, inter) or specs["w2_trellis"][:3] != (1, inter, hidden):

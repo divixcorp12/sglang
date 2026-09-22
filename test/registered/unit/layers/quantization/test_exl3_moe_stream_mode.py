@@ -127,7 +127,7 @@ def _streaming_env(ckpt):
 
 def test_stream_mode_registers_no_expert_parameters():
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
-        layer = _layer(Exl3MoEMethod(Exl3Config.from_config(CFG)))
+        layer = _layer(Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True))
     assert list(layer.named_parameters()) == []
     assert layer.exl3_streamed is True
 
@@ -138,7 +138,7 @@ def test_process_attaches_an_exl3_streamer(ckpt):
 
     a, b, c, d = _streaming_env(ckpt)
     with a, b, c, d:
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
         method.process_weights_after_loading(layer)
     streamer = expert_streamer_of(layer)
@@ -160,7 +160,7 @@ def test_process_rejects_a_mismatched_layer(ckpt, kwargs, env_dir, match):
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
         str(ckpt) if env_dir else ""
     ):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method, **kwargs)
         with pytest.raises(ValueError, match=match):
             method.process_weights_after_loading(layer)
@@ -173,7 +173,7 @@ def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
         str(ckpt)
     ), envs.SGLANG_MOE_PINNED_HOST_MB.override(0):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.exl3_expert_format"):
             for _ in range(2):
                 layer = _layer(method, hidden=2 * HIDDEN)  # fails after the warning
@@ -193,7 +193,7 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows)
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = FakeStreamer(reference, chunk_rows)
     layer._nvfp4_expert_streamer = streamer
@@ -231,7 +231,7 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
     monkeypatch.setattr(exl3_mod, "assert_not_capturing", refuse)
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = types.SimpleNamespace(serves_graph_gather=lambda topk: topk.topk_ids.numel() <= 6)
     layer._nvfp4_expert_streamer = streamer
@@ -247,6 +247,64 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     assert all(got_arg is want for got_arg, want in zip(calls[0], (layer, streamer, x, topk_weights, topk_ids)))
     assert calls[0][5] == 10.0
     assert torch.equal(got, torch.full_like(x, 1.5))  # the routed scale still applies
+
+
+def _select(x, logits, cfg):
+    from sglang.srt.layers.moe.topk import select_experts
+
+    return select_experts(hidden_states=x, router_logits=logits, topk_config=cfg, layer_id=1)
+
+
+@pytest.mark.parametrize("kind", ["standard", "packed", "bypassed"])
+def test_apply_routes_every_topk_format_alike(monkeypatch, kind):
+    """The draft path hands over a BypassedTopKOutput (hidden_states/router_logits/topk_config, no
+    topk_ids); apply must materialize it once, and pass the same routing to the streamer check and
+    the kernel as it does for the equivalent standard output."""
+    from sglang.srt.layers.moe.topk import (
+        BypassedTopKOutput,
+        StandardTopKOutputPacked,
+        TopKConfig,
+    )
+
+    calls, inspected = [], []
+
+    def fake_apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+        calls.append((topk_weights, topk_ids))
+        return torch.ones_like(x)
+
+    monkeypatch.setattr(Exl3MoEMethod, "_apply_graph", staticmethod(fake_apply_graph))
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
+        layer = _layer(method)
+
+    def serves_graph_gather(topk):
+        inspected.append(topk)
+        return isinstance(getattr(topk, "topk_ids", None), torch.Tensor)  # a bypassed output has no ids
+
+    layer._nvfp4_expert_streamer = types.SimpleNamespace(serves_graph_gather=serves_graph_gather)
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+    )
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(1, HIDDEN, generator=generator).to(torch.bfloat16)
+    logits = torch.randn(1, NUM_EXPERTS, generator=generator)
+    cfg = TopKConfig(top_k=3, renormalize=True, torch_native=True)  # the fused router needs CUDA
+    want = _select(x, logits, cfg)
+    if kind == "bypassed":
+        topk = BypassedTopKOutput(hidden_states=x, router_logits=logits, topk_config=cfg)
+    elif kind == "packed":
+        topk = StandardTopKOutputPacked(*want, want.topk_ids)
+    else:
+        topk = want
+
+    method.apply(layer, types.SimpleNamespace(hidden_states=x, topk_output=topk))
+
+    assert len(calls) == 1, "a bypassed output must reach the in-graph path, not fail before it"
+    assert torch.equal(calls[0][0], want.topk_weights) and torch.equal(calls[0][1], want.topk_ids)
+    assert len(inspected) == 1 and hasattr(inspected[0], "topk_ids")  # the converted value, once
+    if kind != "bypassed":
+        assert inspected[0] is topk  # standard formats are passed through untouched
 
 
 def _routed_inputs(topk_ids, seed=0):
@@ -272,7 +330,7 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     )
     a, b, c, d = _streaming_env(ckpt)
     with a, b, c, d:
-        method = Exl3MoEMethod(Exl3Config.from_config(CFG))
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
         method.process_weights_after_loading(layer)
     streamer = layer._nvfp4_expert_streamer

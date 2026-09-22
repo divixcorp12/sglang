@@ -290,3 +290,11 @@ def test_rejects_unknown_file_mismatched_extents_and_closed_reader(data_file):
     reader.close()
     with pytest.raises(Exception, match="closed"):
         reader.open(path, direct=False)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

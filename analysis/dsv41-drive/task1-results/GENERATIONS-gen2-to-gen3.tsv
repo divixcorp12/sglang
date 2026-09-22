@@ -1,0 +1,61 @@
+gen2 (87417376f5, python tree ee70296428321097df189c7fa5cadbb2d4300fa6) -> gen3 (HEAD a23480d2f2, python tree 8d3312fdf0a7ecc38dfe70e04d1badfd0ca91cf6): 58 commits
+  behavioural (touch python/): 2; harness: 3; no effect on an arm: 53
+
+5203f9ffc7 | HARNESS (adds analysis/dsv41-drive/drive_conditions.py, which provenance.py loads by path since c87b8dc181; not python/) | feat(dsv41): per-drive request model and per-block conditions for the row-scheduling harness
+1fac4133e0 | none (documentation, tests, analysis or results only) | docs(dsv41): mark what Task 2 has left after the scheduling verdict
+2db60d128c | none (documentation, tests, analysis or results only) | docs(dsv41): lead the request-count section with the measured solo result; mark the model unvalidate
+450f86d17a | none (documentation, tests, analysis or results only) | docs(dsv41): pre-register task1e (gen2 two-bank, 3 vs 3) with its replacement budget; add the gen2 m
+09dcb79564 | none (documentation, tests, analysis or results only) | docs(dsv41): design non-blocking expert promotions (Task 8)
+c0e337ca68 | none (documentation, tests, analysis or results only) | docs(dsv41): write PIPELINE_BASELINE.md, the Task 1 baseline deliverable
+9201e3facc | none (documentation, tests, analysis or results only) | docs(dsv41): the +3.2% is two behavioural commits, not two-bank alone
+7f0fecb948 | none (documentation, tests, analysis or results only) | docs(dsv41): the 1.54x is one base arm reading 147 GiB less; add the determinism argument and a stan
+ec64c07999 | none (documentation, tests, analysis or results only) | docs(dsv41): the eager byte anomaly is retired, not resolved
+6cc61bf495 | none (documentation, tests, analysis or results only) | docs(dsv41): amend task1e before arm 1's verdict: contention alone no longer disqualifies an arm
+30f254373e | none (documentation, tests, analysis or results only) | docs(dsv41): task1e addendum: CROSS-ARM also computed leave-one-out within the series (primary)
+6bd48d0a84 | none (documentation, tests, analysis or results only) | docs(dsv41): write STORAGE_V2_REPORT.md, the plan's final report; fix two cross-references
+597ae20704 | none (documentation, tests, analysis or results only) | docs(dsv41): track Task 3's deferrals, and flag a guard this plan claims but does not have
+2e8da0e4dd | none (documentation, tests, analysis or results only) | docs(dsv41): add the reviewed D1-D7 severities, the wrap execution result and the lanes<=8 latent bu
+3d11d02265 | none (documentation, tests, analysis or results only) | analysis(dsv41): model-check the lease protocol; correct its epoch design; add the wrap test
+54c5fc5980 | none (documentation, tests, analysis or results only) | docs(dsv41): make Task 6 inherit the lease-mode arming cost
+ec8ac4cf27 | none (documentation, tests, analysis or results only) | docs(dsv41): Task 5 needs two files the plan does not list
+8bc632f132 | none (documentation, tests, analysis or results only) | docs(dsv41): apply the independent review's corrections and Task 8's lease requirements
+05c07a2c6d | none (documentation, tests, analysis or results only) | docs(dsv41): task1e result: UNRESOLVED; two valid arms, three gates calibrated for a quiet box
+69599f2f9e | none (documentation, tests, analysis or results only) | docs(dsv41): task1e result: two mis-calibrated gates, drive-idle a correct catch; record the killed 
+bcc595b4dc | none (documentation, tests, analysis or results only) | docs(dsv41): independent review of PROMOTION_ASYNC.md against the source at HEAD
+f5cf63bb9c | none (documentation, tests, analysis or results only) | docs(dsv41): correct two line citations in the PROMOTION_ASYNC review
+2b342f4fd0 | none (documentation, tests, analysis or results only) | docs(dsv41): record the failed attempt to raise the old cell above n=1
+9f72d37dcc | none (documentation, tests, analysis or results only) | docs(dsv41): task1e result: record all three killed continuations as coordination, not harness insta
+88cd6f37c6 | none (documentation, tests, analysis or results only) | docs(dsv41): task1e result: note the unattributed pre-launch process before the killed task1e4
+731d264031 | none (documentation, tests, analysis or results only) | docs(dsv41): apply the PROMOTION_ASYNC review corrections
+d9d5622466 | none (documentation, tests, analysis or results only) | docs(dsv41): give PROMOTION_ASYNC B10 an owner and the poll step its own catch
+6e23053127 | none (documentation, tests, analysis or results only) | docs(dsv41): task1e result: record the boundary-sample gap (process names, not command lines)
+85cdbf9382 | BEHAVIOURAL (python/) | fix(exl3): skip sequence 0 when the service advances through the wrap, on both rings
+bd2568e9b9 | none (documentation, tests, analysis or results only) | analysis(dsv41): model Task 8's host leases, the eager pause and the A3 stream-dependency cycle
+3b80318c5c | none (documentation, tests, analysis or results only) | docs(dsv41): cite the lease model in PROMOTION_ASYNC and fix R3's acquisition forms
+8c78749b35 | BEHAVIOURAL (python/) | fix(exl3): refuse to attach an in-graph layer whose gather is wider than the service's lanes
+845a54994e | none (documentation, tests, analysis or results only) | analysis(dsv41): model the lap-resume-lands-on-zero wrap bug; record it in D6
+6a2643c1b4 | HARNESS-adjacent (stage-trace overhead tool only; not used by the arm script) | feat(dsv41): stage-trace overhead harness reports its own contention, clock reads and a prefaulted r
+b4da256a56 | none (documentation, tests, analysis or results only) | docs(dsv41): close Task 1's trace-export item; the overhead number is measured and qualified
+fee60eac87 | none (documentation, tests, analysis or results only) | docs(dsv41): record the four wrap signatures and the reserved-value lesson; order the Task 5 impleme
+c87b8dc181 | HARNESS (provenance.py: drive resolution/idle check; not python/) | fix(dsv41): resolve the arm harness's drives by st_dev, and record residency and boundary samples in
+a79ce2eef5 | none (documentation, tests, analysis or results only) | test(exl3): drive the wrap with the real service thread and a waiter on every sequence
+15eec36488 | none (documentation, tests, analysis or results only) | docs(dsv41): second review of PROMOTION_ASYNC sections 5 and 11
+3533e471a5 | none (documentation, tests, analysis or results only) | docs(dsv41): pre-register the ld.global.nc cross-kernel visibility experiment
+22dae687f7 | none (documentation, tests, analysis or results only) | docs(dsv41): pre-register the Task 6 per-row precheck before any trace is computed
+57846c5b8f | none (documentation, tests, analysis or results only) | analysis(dsv41): add the ld.global.nc visibility program and its runner
+b49cfcb96c | none (documentation, tests, analysis or results only) | feat(dsv41): overlap timeline from RAM-miss stage traces (Task 4's gate)
+bc9d453539 | none (documentation, tests, analysis or results only) | docs(dsv41): record the Task 6 per-row precheck result (support; spread-irrelevant)
+d5e0c3423c | none (a comment in the arm script; no behaviour) | docs(dsv41): say in the four arm scripts that the drive map is by name
+3eb95a7423 | none (documentation, tests, analysis or results only) | docs(dsv41): Task 6's chosen mechanism is not justified by its own benefit
+2cbe9b4b92 | none (documentation, tests, analysis or results only) | docs(dsv41): transcription review of lease_model.py
+a86020e8ce | none (documentation, tests, analysis or results only) | docs(dsv41): Task 4's timeline gate is met, and it points at the packer
+6b0b2b41f6 | none (documentation, tests, analysis or results only) | docs(dsv41): apply the second PROMOTION_ASYNC review (sections 5, 7, 10, 11)
+a3b2b317e1 | none (documentation, tests, analysis or results only) | docs(dsv41): state the strong form of the lease-release rule in PROMOTION_ASYNC
+5f226ece18 | none (documentation, tests, analysis or results only) | docs(dsv41): bring STORAGE_V2_REPORT up to date
+116533cb61 | none (documentation, tests, analysis or results only) | docs(dsv41): Task 6 design: early GPU transfers, with the precheck that bounds them
+49bb550890 | none (documentation, tests, analysis or results only) | docs(plan): qualify the miss-row spread as mirrors-on, and record the early-signal challenge to Task
+5af2975164 | none (documentation, tests, analysis or results only) | test(exl3): pin pack_one's coverage check, the last defence against publishing bytes no drive delive
+53bc8c7229 | none (documentation, tests, analysis or results only) | docs(dsv41): Task 6 design: state that no early readiness signal exists today
+40cf66aa7c | none (documentation, tests, analysis or results only) | docs(plan): Task 6 becomes two-phase-first, and its early signal is recorded as a blocking dependenc
+c5c572bd92 | none (documentation, tests, analysis or results only) | docs(dsv41): Task 6 design: per-lane staged publication is a blocking dependency
+a23480d2f2 | none (documentation, tests, analysis or results only) | docs(plan): the Task 6 early signal is confirmed absent, and it is a safety requirement

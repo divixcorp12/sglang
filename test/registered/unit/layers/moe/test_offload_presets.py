@@ -316,3 +316,7 @@ class TestPipelineWiring(unittest.TestCase):
     def test_off_with_no_offload_env_resolves_cleanly(self):
         self._resolve(moe_offload_preset="off")
         self.assertEqual(presets.explicit_offload_env(os.environ), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -104,6 +104,28 @@ class TestExpertDistributionObserver(unittest.TestCase):
             lambda batch, data: self.fail("noop must not call observer")
         )
 
+    def test_select_experts_outside_layer_scope_is_ignored(self):
+        """A speculative-decoding draft worker (e.g. DSpark) runs its own
+        per-stage forward loop and never enters `with_current_layer` -- its
+        stage ids (0..N) would otherwise collide with the target's layer-id
+        space. A `on_select_experts` call reached with no current layer must
+        be dropped, not attributed to some layer or allowed to crash the
+        layer-keyed gatherer's tensor indexing.
+        """
+        recorder = self.recorder
+        recorder.start_record()
+        gatherer = next(iter(recorder._single_pass_gatherers.values()))
+        before = gatherer._data.clone()
+        with recorder.with_forward_pass(0, self.batch):
+            # No with_current_layer() scope -- this is what an
+            # uninstrumented draft-model forward loop does today.
+            recorder.on_select_experts(torch.tensor([[0, 1, 1, -1]]))
+        self.assertTrue(torch.equal(gatherer._data, before))
+        # A legitimate, in-scope call on a real target layer still records.
+        self.forward(step=1)
+        self.assertEqual(gatherer._data[1].tolist(), [1, 2, 0, 0])
+        self.assertEqual(gatherer._data[0].tolist(), [0, 0, 0, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

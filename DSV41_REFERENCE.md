@@ -2252,22 +2252,477 @@ run back to back on 2026-09-19.
   1.6 s; p99 804 ms against `c0`'s 811.
 - So the 2.1 s stall of §18.2's window, and py-spy's 45 ms/step average on the same
   `--skip 12` session, are a promotion burst on that session, not the typical cost.
-  Extrapolating it (40–65 ms/token) was wrong. How often bursts happen across sessions is
-  unmeasured.
+  Extrapolating it (40–65 ms/token) was wrong.
 - **Ruling:** keep `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=32`; defer a real async promotion
-  path (under 1% on these sessions) unless bursts prove common.
+  path (under 1% on these sessions). The burst frequency below settles it.
+
+**Burst frequency** (`OVL/burst-run.sh`, `burst_analysis.py`; the `c32` arm again, sessions
+4–19, 16 sessions × 124 graph steps = 1,983 steps, 2.831 tok/s mean — the same as `c32`'s
+2.823 on sessions 0–3). Bursts are rare, and the slow steps are not at boundaries:
+
+| Quantity | Value |
+|---|---|
+| Steps over 1 s | **6 of 1,983 (0.3%)**, worst 1.40 s |
+| Their positions | steps 30, 82, 110, 110, 124, 125 — none with k%32 in (0,1) |
+| Boundary steps | 112, mean 417 ms, against 359 ms for the other 1,855 (**~115 ms excess per boundary, ~3.6 ms/token**) |
+| Step ms | p50 344, p90 540, p99 776, p99.9 1,267, max 1,403 |
+| Promotions per 32-forward window | median 25, max 832 over 48 windows |
+| Windows with ≥200 promotions | 2; mean window 12.6 s against 10.5–12.0 s for the smaller buckets |
+
+- **No boundary stall recurred.** Nothing approached the 2.1 s of the `--skip 12` session
+  in 16 further sessions; the worst step is 1.40 s, in line with `c32`'s 1.6 s on sessions
+  0–3. The six slow steps sit away from the boundaries, so they are NVMe tail latency on
+  RAM misses, not promotions.
+- **Promotion count barely moves the window.** The two ≥200-promotion windows (832 at the
+  top) run 12.6 s against 10.5–12.0 s elsewhere: ~1–2 s spread over 32 forwards, which is
+  the same ~3.6 ms/token the boundary mean shows.
+- The per-boundary excess is higher than sessions 0–3 suggested (~115 ms against 40–80 ms),
+  still **~1% of throughput**.
+- **Ruling (2026-09-19):** no async promotion path, and no cheaper substitute either (a
+  per-boundary promotion cap, or promoting only experts already in RAM). Both target ~1%,
+  and the cap would give back some of the 16% G reduction promotions buy. The tail belongs
+  to NVMe reads on misses, so prediction and prefetch (§18.4) are where the step time is.
 
 ### 18.7 Open
 
-- **How common are promotion bursts?** One session (`--skip 12`) stalled 2.1 s at a boundary;
-  sessions 0–3 never exceeded 1.6 s per step. Tracing more sessions settles whether async
-  promotions are worth building.
+- ~~How common are promotion bursts?~~ **Settled** (§18.6, burst frequency): 6 steps over
+  1 s in 1,983, none at a boundary, ~115 ms per boundary. No async promotion path.
 - **Stream 37's copies are the boundary's promotions** (§18.6); they do not run during
   ordinary steps.
+- **What is the NVMe tail?** The six slow steps are RAM misses whose reads ran long; the
+  per-row 10.16 ms of §18.2 is a mean. Their distribution is unmeasured, and it caps what
+  prefetch can hide.
 - A prefetch prototype (confidence-gated L+1 or L+2 lookahead, prefetch reads queued
   behind demand reads) would check §18.4's estimate.
 - Everything in §17.8's open list stands, including the raw-JSON `--cuda-graph-config`
   crash in `memory_hook.py`.
+
+## 19. Expert-row mirroring: end-to-end arms (2026-09-19)
+
+Two 205 GB byte-identical copies of the EXL3 expert checkpoint, on
+`/mnt/nvme0/dsv41_flash` and `/mnt/nvme4/dsv41_flash`, selected with
+`SGLANG_MOE_EXPERT_MIRROR_DIRS`. Four arms, sessions 0-3, 256-token prompts,
+128 new tokens, `c32` settings. Each arm's per-drive read volume comes from
+`/proc/diskstats` sectors-read deltas across the whole arm, which is what makes
+the routing question answerable rather than inferred.
+Script `analysis/dsv41-drive/run-mirror-arms.sh`; raw output in
+`analysis/dsv41-drive/e2e/`.
+
+| arm | graphs | GRAPH_GATHER | mirrors | mean decode tok/s |
+|---|---|---|---|---|
+| g-base | yes | 1 | none | 2.8286 |
+| g-mirror | yes | 1 | nvme0+nvme4 | 2.8277 |
+| e-base | no | 0 | none | 2.6947 |
+| e-mirror | no | 0 | nvme0+nvme4 | 2.0126 |
+
+`g-base` reproduces the recorded c32 baseline (2.823 tok/s) to 0.2%, so the
+harness is measuring the same thing as before.
+
+### Decode is untouched by mirroring; prefill is 1.84x faster
+
+Per session, graph arms:
+
+| session | g-base tok/s | g-mirror tok/s | g-base TTFT s | g-mirror TTFT s |
+|---|---|---|---|---|
+| 0 | 2.2540 | 2.2528 | 121.11 | 78.32 |
+| 1 | 3.2269 | 3.2320 | 55.26 | 30.13 |
+| 2 | 2.2923 | 2.2904 | 53.56 | 29.15 |
+| 3 | 3.5411 | 3.5357 | 56.41 | 30.58 |
+
+Decode throughput pairs to within 0.2% on every session: mirroring changes it
+by -0.03% overall, which is nothing. TTFT falls by **1.84x** in steady state
+(sessions 1-3).
+
+### Where the bytes went, which is the whole explanation
+
+| arm | nvme0 | nvme2 (source) | nvme4 | total |
+|---|---:|---:|---:|---:|
+| g-base | 0.00 | 401.30 | 0.10 | 401.40 |
+| g-mirror | 137.59 | 127.21 | 137.89 | 402.69 |
+| e-base | 0.00 | 257.93 | 0.03 | 257.96 |
+| e-mirror | 198.52 | 0.38 | 198.51 | 397.41 |
+
+All figures GiB.
+
+In `g-mirror` the mirrors carry 275.48 GiB and nvme2 still carries 127.21 GiB.
+Subtracting that residual from `g-base`'s single-drive total gives
+401.30 - 127.21 = 274.09 GiB, within 0.5% of the mirrored 275.48. The two
+arms move the same bytes; mirroring is byte-neutral end to end, which
+independently confirms the split is correct at scale. nvme0 and nvme4 differ
+by 0.2% (137.59 vs 137.89), so the static 1:1 policy holds across 275 GiB of
+real traffic.
+
+That residual 127 GiB is the finding. **`exl3_ram_miss_tables` builds its path
+table from `layout.records[(layer, expert)].path` - the source checkpoint - and
+never consults the row source** (`exl3_ram_miss.py:52-63`). When
+`SGLANG_MOE_EXPERT_GRAPH_GATHER` is set, `pinned_tier_options` installs the
+native `Exl3RamMissService` to own the tier's slots
+(`exl3_expert_format.py:176-186`), and every in-graph decode miss is served by
+the C++ reader from nvme2 alone. Only the eager row-source path - prefill -
+reaches the mirror source.
+
+So the 2.31x per-row gain measured in
+`analysis/dsv41-drive/MIRROR_ROWS.md` lands entirely on prefill and **does
+not reach graph decode at all**. Wiring a mirror-aware extent plan into the
+native reader is the prerequisite for any decode benefit; until then
+`SGLANG_MOE_EXPERT_MIRROR_DIRS` is a TTFT optimisation.
+
+### Unexplained: eager + mirrors is slower
+
+> **Superseded, 2026-09-20: `e-base` below did not reproduce, and the tier-warming
+> explanation is refuted.** A counterbalanced re-run (B M M B, six arms, ~1.9 TiB,
+> cache counters added for the purpose) reproduced `e-mirror` closely - TTFT
+> 65.3/29.9/29.0/30.1 s against 59.2/29.6/28.9/30.0, decode 2.01-2.03 against
+> 2.0126 - while `e-base` did not: it read 380.9 GiB of session bytes, not 257.96,
+> and held TTFT at ~55 s instead of warming to 5.6 s. Both arms then read the SAME
+> bytes, made identical cache decisions, and mirroring was faster in every session
+> (1.85x steady TTFT, 1.19x decode) with byte-identical greedy output.
+>
+> Neither tier warms: occupancy hits capacity (5644/5644) inside session 0 in both
+> arms and admissions equal evictions thereafter, so the "`e-base`'s tier warms and
+> `e-mirror`'s does not" reading is refuted rather than merely unconfirmed.
+>
+> What is now unexplained is not the mirror arm's extra bytes - there are none -
+> but `e-base`'s MISSING reads and its 5.6 s prefill. Ordering, tracing, the
+> counters and the environment are ruled out by measurement; system state that day
+> and an undiagnosed build difference are not.
+>
+> **Retired, same day: the code is exonerated.** The eager base arm was re-run at
+> §19's own commit `1525e43ab9` and reads 380.7 GiB with TTFT 95.4/54.9/53.6/55.4 -
+> indistinguishable from HEAD - with greedy output sha1s identical to HEAD's for all
+> four sessions. The old code reads the same rows and computes the same answer, so
+> nothing between `1525e43ab9` and HEAD caused it and there is nothing to bisect.
+> `e-base`'s 257.96 GiB and 5.6 s prefill are not reproducible from their own commit
+> and are retired, not merely unconfirmed: do not cite them, nor the 1.54x byte ratio
+> or the 25% regression derived from them.
+>
+> By elimination the cause was machine state that day, and the cause is unknown.
+>
+> **The page-cache candidate is strongly weakened, and excluded for today's arms only.**
+> It was attractive - the `g-mirror` arm ran immediately before `e-base` and read 127 GiB
+> from the same drive, against the 123 GiB by which `e-base` undershoots today - but that
+> coincidence is a mixed-basis artefact: 381 GiB is today's SESSION bytes and 258 GiB is
+> §19's WHOLE-ARM total including ~24 GiB of startup. Whole-arm to whole-arm the gap is
+> ~147 GiB against `g-mirror`'s 127.2 GiB, and they do not match. Three further facts cut
+> against it: 127 GiB of cached rows would not fit beside the 70 GiB pinned tier in 188 GiB
+> of RAM; `e-mirror` ran right after `g-mirror` had read ~137 GiB from each mirror and did
+> NOT benefit, reading its full 397 GiB with TTFTs within 1-3% of today's; and §19's decode
+> had already diverged in session 1 (2.16 vs 1.80 tok/s at an identical 55 s TTFT), which
+> no "the cache warms from session 2" story fits.
+>
+> For TODAY's arms it is excluded by measurement: after ~2.3 TiB of reads, `fincore` shows
+> 15.6 GiB of the 204.1 GiB source expert files resident, which is startup-scale. For §19
+> itself there is no process-level evidence - that run wrote no env dump and its logs carry
+> no reader line - so "it ran direct" rests on the config alone:
+> `dsv41-phase3a/env.sh:14` sets
+> `SGLANG_MOE_EXPERT_FILE_READER=uring_direct`; its mtime precedes the §19 run and
+> neither `run-mirror-arms.sh` nor `eager-cache-arms.sh` overrides it or drops caches.
+> The fd is opened `O_RDONLY | O_DIRECT` unconditionally when direct is set
+> (`io/uring_file_reader.cpp:115`), and an unaligned destination is served through a
+> page-aligned bounce the reader owns rather than by falling back to buffered reads
+> (`:249-252`). The comment at `expert_file_reader.py:47`, "O_DIRECT is used when a
+> destination is page-aligned, buffered reads otherwise", describes that bounce and
+> reads as if there were a fallback; there is not. So the only way §19 could have read
+> buffered is if that env var was not in force in its process, which nothing records.
+>
+> So §19's arm most likely requested ~147 GiB fewer bytes, which means it read fewer ROWS,
+> which means its pinned tier was hitting where today's misses. Why is not recoverable:
+> §19 set no trace path and had no per-row counters, and those counters exist only
+> because this investigation added them.
+>
+> Detail and full per-session tables: `analysis/dsv41-drive/EAGER_ANOMALY.md`,
+> commit `cd14545797`.
+
+`e-mirror` is 25% slower than `e-base` (2.0126 vs 2.6947) while reading 1.54x
+more bytes (397.41 vs 257.96 GiB). Its first two prefills are faster than
+`e-base`'s (59.2 vs 85.4 s, 29.6 vs 55.1 s), as mirroring predicts, but then it
+plateaus at ~30 s while `e-base` warms to 24.8 and 5.6 s. `e-base`'s pinned
+host tier is warming across sessions and `e-mirror`'s is not.
+
+Byte-neutrality is established by the graph arms above, so this is not each
+root reading a full row. The remaining candidates are a tier-population
+difference tied to the row source, or queue-depth behaviour: production reads
+many rows per call, and mirroring doubles the extents per batch, whereas the
+per-row bench measured one row per call. nvme4's fio QD6 result was
+catastrophic (p50 255 ms) on an untrimmed file; that measurement was withdrawn
+at QD1 on fresh data but **was never repeated at QD6 on fresh data**.
+
+Recorded as an open anomaly. Not explained, and no conclusion about eager
+mirroring should be drawn from this arm until miss counts are collected with
+`SGLANG_DSV41_EXPERT_TRACE_PATH` and the arms are repeated interleaved to rule
+out ordering.
+
+### Follow-up: the native reader now reaches the mirrors (2026-09-20)
+
+The bypass above is fixed. `exl3_ram_miss_tables` now builds a per-(row, expert,
+part) extent table `[file, offset, length, dest_offset]` from the row source, and
+the C++ reader submits one SQE per extent, so in-graph decode misses are served
+from the mirrors. Arms re-run with graphs on and `GRAPH_GATHER=1`, same corpus
+and settings as the table above. Script
+`analysis/dsv41-drive/run-native-mirror-arm.sh`, report
+`analysis/dsv41-drive/native_mirror_report.py`, raw output in
+`analysis/dsv41-drive/native-mirror/`.
+
+| arm | mean decode tok/s |
+|---|---|
+| base (mirrors off) | 2.8198 |
+| mirror (nvme0+nvme4) | 3.8016 |
+
+**1.3482x on graph decode**, against a ceiling of 1.38x recorded in the script
+before the run so it could be falsified. Coming in just under a ceiling is the
+expected shape; a result above it would have indicated a broken measurement.
+
+Per session, paired:
+
+| session | base tok/s | mirror tok/s | ratio | base TTFT s | mirror TTFT s |
+|---|---|---|---|---|---|
+| 0 | 2.2286 | 3.0651 | 1.3753 | 108.32 | 69.08 |
+| 1 | 3.2245 | 4.2881 | 1.3298 | 55.12 | 30.07 |
+| 2 | 2.2906 | 3.1942 | 1.3945 | 53.64 | 29.05 |
+| 3 | 3.5354 | 4.6589 | 1.3178 | 56.22 | 30.58 |
+
+Every session improves, in a 1.32-1.39x band. This matters more than the mean:
+base's own sessions span 2.23-3.54 tok/s, a 1.59x spread wider than the effect
+being measured, so a single session proves nothing and only the paired result
+carries the claim.
+
+> **What code these numbers measure, and one place they are misattributed.**
+> The arms above ran at `099eadba33`, the commit that made the native reader
+> build a per-extent table and reach the mirrors. That is what they establish,
+> and the section is scoped to it correctly.
+>
+> They do **not** measure the two-bank pipeline. `ddcb0d55ff`, which introduced
+> two-bank, quotes these same figures in its commit message as "Measured: mean
+> decode 2.8198 to 3.8016 tok/s, 1.3482x". That attribution is wrong: the
+> figures already existed in this file at `ddcb0d55ff`'s parent. The commit
+> message cannot be amended, so the correction lives here. The two-bank
+> pipeline's own effect is measured separately below, and it is **about +3%,
+> not 1.35x**.
+>
+> Both arms are also n=1 per cell and carry no provenance. Against a base spread
+> of 1.59x across sessions, wider than the 1.35x effect, the paired per-session
+> result is what carries the claim and the mean does not. Treat these as the
+> bypass fix landing, not as a baseline: Task 1's matched baselines are being
+> collected separately, repeated and interleaved, with
+> `scripts/dsv41/provenance.py` recording the resolved environment, the imported
+> tree's HEAD and dirtiness, the reader mode actually in force, and a drive-idle
+> check.
+
+
+#### Task 1 matched baselines, and what two-bank is actually worth (2026-09-21)
+
+The arms above were single shots without provenance. These are their replacement:
+repeated, interleaved, each arm refusing to start unless its worktree is clean at
+an expected sha, and each result carrying `scripts/dsv41/provenance.py`'s record
+of the resolved environment, the imported tree, the reader mode in force and a
+drive-idle check. Scripts `analysis/dsv41-drive/task1-baseline-arms.sh` and
+`task1_arm_verdict.py`; raw output in `analysis/dsv41-drive/task1-results/`.
+To run an arm, set `REFERENCE=<clean-reference.json>` (and `EXPECT_NEW`): the script refuses to start, exit 5, if it is unset or if an arm's
+`git rev-parse <sha>:python` is not registered there. See `analysis/dsv41-drive/PIPELINE_BASELINE.md` section 2 and `task1-results/GENERATIONS.txt`.
+
+Graph decode, `GRAPH_GATHER=1`, 4 sessions, 256 prompt / 128 new, 70 GiB pinned
+tier. `multi_token_chunks` was 0 in every arm of the series, so the step-latency
+percentiles are exact rather than smoothed.
+
+| arm | code | mirrors | mean decode tok/s | n |
+|---|---|---|---:|---:|
+| new, mirrors off | `f6608901a3` | off | 2.903, 2.905, 2.907, 2.917, 2.919 | 5 |
+| new, mirrors on | `f6608901a3` | on | 3.905, 3.927, 3.933 | 3 |
+| old, mirrors on | `099eadba33` | on | 3.798 | 1 |
+
+**The mirror effect is 1.347x** (3.92 / 2.91), reproducing the single-shot
+1.3482x above with repeats and provenance. Run-to-run spread within a cell is
+0.5-0.6%, far below the effect, and the four off arms span 2.903-2.919.
+
+**New code beats old by about +3.2%** (3.92 clean new / 3.798 clean old; +3.5%
+if `task1b-0` is included as the manifest does, giving n=4). The sign is
+consistent across all four sessions individually (+3-5%, +3%, +4-5%, +2%) and
+across arms (+2.8% to +4.2%).
+
+**This is NOT two-bank's effect alone, and the distinction is the same one this
+section corrects elsewhere.** The `099eadba33` to `f6608901a3` delta is four
+commits touching `python/`, two of them behavioural: `ddcb0d55ff` (the two-bank
+pipeline) and `cd14545797` (pinned-tier and Engram traffic counters, which touch
+`engram_row_cache.py` and `expert_host_tier.py`). The other two, `be76ba501f`
+and `6a606e2b33`, are comment-only and can be excluded by inspection. So +3.2%
+is what those two behavioural commits are worth together. Attributing it to
+two-bank alone would repeat, in this file, exactly the error this section
+corrects in `ddcb0d55ff`'s commit message.
+
+**The old arm's n is 1.** Five old arms have run; four were disturbed by machine
+contention and are excluded, leaving a single clean measurement at 3.798 against
+three clean new arms. Their undisturbed sessions repeat the clean arm's
+per-session values to 1-2%, which corroborates the ~3.8 level without supplying
+a second clean measurement. The honest phrasing is n=1 clean, corroborated by
+undisturbed sessions of disturbed arms; the figure should be read as "about 3%,
+sign-consistent", not as a precise value.
+
+Corroboration worth noting: that clean old arm reads 3.798 against this
+section's single-shot 3.8016, measured on the same reader about 21 hours
+earlier (2026-09-20 02:56 CDT against 23:43 CDT).
+The old number was right; only the label attached to it was wrong.
+
+##### What these arms do not settle
+
+- **The harness of the old arms was not pinned, and one script sha is blank.** The harness always runs from `wt-task1-new`, but only the code under test is
+  recorded, so for an old arm neither the harness commit nor its cleanliness was recorded or checked. Reconstructed from that worktree's HEAD reflog: `task1c-1` (the
+  one clean old arm) and `task1c-4` ran with harness `f6608901a3`, `task1d-0/2/3` with `4626789547`, `task1e-0/2` with `87417376f5`; dirtiness is unrecoverable. Separately,
+  `task1e`'s run.out has a blank script sha (a relative `$0` after `cd`). Expected effect: on what is recorded and gated (harness changes since gen2 touch drive counters and the
+  idle check, not the timed loop), not on decode tok/s; this does not invalidate the cells above, and it is why the old cell stays "n=1, harness by reconstruction". See
+  `analysis/dsv41-drive/PIPELINE_BASELINE.md` section 7.4.
+- **Session-0 TTFT varies from 49.8 to 60.3 s across mirrors-on arms**, with no
+  explanation. A pre-registered prediction (`task1c-PREDICTIONS.txt`, sha256
+  recorded before the run) that this tracked boot-phase page-cache growth was
+  **falsified**: a boot-warm arm came in at 50.8 s, inside the stated
+  falsification condition. Sessions 1-3 are stable at 29-30 s (on) and 53-56 s
+  (off) in every clean arm, so whatever this is, it is confined to the first
+  session. Do not pool session-0 TTFT across arms without saying so.
+- **Two arms had a disturbed session** that the verdict could not see, because it
+  checks start state only: one session's prefill ran 13 s and 30 s slow while
+  bytes read, residency and start-state idleness were all normal. Those arms are
+  recorded VALID-but-disturbed and are excluded from the means above. Box load
+  average was 2.5-2.9 at the time against 0.7 earlier, which is a hint and not a
+  cause.
+- **Page-cache independence rests on O_DIRECT, not on dropped caches**, because
+  no one here can drop them. It is supported rather than assumed: across six
+  arms reading ~400 GiB each, expert-shard residency moved by less than 0.09
+  GiB, and a direct test (`dd iflag=direct` against a cold shard on each mount,
+  with a buffered control) showed O_DIRECT populating **zero** bytes of page
+  cache on both xfs and ext4 while the control populated 70 MiB. Note that the
+  two mirrors are on different filesystems: `/mnt/nvme0` is xfs, `/mnt/nvme4` is
+  ext4 and is physically `nvme3n1`.
+- **Boot-phase page-cache behaviour is not understood.** Residency of the source
+  directory changes during engine startup by anywhere from -3.21 to +5.31 GiB, and
+  these changes do not track device reads. An explanation in terms of eviction
+  and re-reading was proposed and **withdrawn** when diskstats contradicted it.
+  A second hypothesis, that the 70 GiB pinned allocation reclaims page cache
+  concurrently with the buffered weight load, is pre-registered and **untested**.
+- **Spans are not compared across schema 1 and 2** (see the schema note above),
+  so the old-versus-new comparison here is on tok/s and bytes only.
+- **An attempt to raise the old cell above n=1 failed, and the reason is
+  recorded.** A six-arm interleaved series was run on 2026-09-21 to measure the
+  same comparison at n=3 per cell. It returned **UNRESOLVED**: three arms ran,
+  two were valid, and the third was refused because a mirror drive was reading
+  1.90 MB/s at its idle probe against a 1.05 MB/s limit. Its single pair gives
+  1.047, which is **not a result** -- one pair, both arms contended, and the two
+  cells displaced from their references by different amounts. Full write-up and
+  the pre-registration in `analysis/dsv41-drive/task1-results/`
+  (`task1e-RESULT.txt`). The useful output was that **two of the verdict's gates
+  are calibrated for a quiet machine**: the contention gate, which disqualifies
+  every arm on a box where contention is the norm, and the cross-arm check,
+  which compares against a single historical reference arm. A third gate, the
+  drive-idle probe, correctly caught a transient. Also recorded: foreign
+  processes do not respect their nominal CPU affinities, so no core range avoids
+  them. **Resolving a ~3% effect here needs a quiet machine**, and that is now a
+  prerequisite rather than a detail.
+- **Nothing recorded whether the box was quiet during the arms above.** Load and
+  foreign-process sampling was only added afterwards, and a later series caught
+  three unrelated jobs starting mid-run on cores overlapping the arms', which
+  cost those arms 17 to 31 per cent. The arms in the table were very probably
+  quiet -- their tok/s repeats to 0.5-0.6 per cent within a cell, which
+  contention does not usually permit -- but that is inferred from the outcome,
+  not observed in the condition. Treat "matched" here as matched in workload,
+  seed, capacity, policy and code, not in machine load.
+- **The old-barrier figure is one clean arm.** Four further old arms ran while
+  the box was contended and are excluded. Their least-disturbed sessions repeat
+  the clean arm's per-session values to 1-2 per cent, which corroborates the
+  ~3.8 level without supplying a second clean measurement. The honest phrasing
+  is n=1 clean, corroborated by undisturbed sessions of disturbed arms.
+
+#### The gate: service-attributed expert bytes
+
+Per-drive bytes come from the RAM-miss service's own accounting, carried on each
+`ram_miss_request` trace line as `drives: [{dev, bytes, extents}]`. This
+attributes expert bytes from inside the service; aggregate `/proc/diskstats`
+cannot, because it sees every read on the device whoever caused it. Device ids
+are `st_dev` resolved against the mount points, not assumed.
+
+| arm | nvme0 | nvme2 (source) | nvme4 | total | extents |
+|---|---:|---:|---:|---:|---:|
+| base | 0.00 | 119.77 | 0.00 | 119.77 | 9,655 |
+| mirror | 59.89 | 0.00 | 59.88 | 119.77 | 19,310 |
+
+All figures GiB, 20,800 requests per arm (13,589 touch, 7,211 demand), zero
+failed.
+
+nvme2 serves **0.00 GiB, 0.00%** of the mirror arm's expert bytes. A small
+residual was allowed for, since the layout is still built from nvme2; there is
+none. Byte parity is exact at 100.0%, the mirrors split 50.0/50.0, and the
+extent count doubles 9,655 -> 19,310 exactly as within-row splitting predicts.
+Diskstats agrees independently: nvme2 402.60 -> 7.66 GiB, mirrors 0 -> 197.48
+and 198.19 GiB. The 7.66 GiB residual is layout and metadata outside the
+service, which is why the service-attributed figure is the gate and diskstats
+is only corroboration.
+
+#### Where the time went
+
+| span | base | mirror |
+|---|---:|---:|
+| submit -> first cqe | 7.887 ms | 2.192 ms |
+| first -> last cqe | 9.664 ms (n=1,888) | 1.170 ms (n=7,211) |
+| pack | 3.656 ms | 3.669 ms |
+
+Queue wait falls 3.6x. `pack` is CPU work and is unchanged at 3.66 ms, which
+acts as a control: it says the gain is I/O and not measurement drift between
+arms. The `n` on first-to-last cqe rising to 7,211 is simply every request now
+spanning more than one extent.
+
+**These two spans are measured on the pre-Task-4 reader and do not carry
+forward.** There, each io_uring batch had its own submit-to-first and
+first-to-last span and the record summed them over batches, so packing never
+fell inside first-to-last. Task 4 makes each span cover the whole read, and
+first-to-last can then include the packing of early rows whenever completions
+return in more than one reap - which is the overlap itself, not a regression.
+The two definitions coincide only for a single-batch read whose completions all
+return in one reap. So this table may be compared with other pre-Task-4 runs and
+with nothing after it. How far the definitions diverge on this workload is
+unknown, because the split of these 1,888 and 7,211 requests between advisory,
+single-batch and multi-batch was not recorded.
+
+The per-extent `extent_cqe` stamps did not change meaning, so a comparison
+across that boundary should be built from those, or from a fresh baseline taken
+on the new reader.
+
+#### What the gain is measured against
+
+The mirrors-off arm reads from `/mnt/nvme2`, which is **Gen3 x2** (about 1.9 GB/s;
+see the drive table in section 2), while both mirrors are on Gen3 x4 drives. So
+the comparison is one half-width link against two full-width ones: roughly 4x the
+aggregate ceiling, not the 2x that "two drives instead of one" suggests.
+
+That is the right control, because nvme2 is what the system actually read from
+before mirroring, so 1.348x is the real gain from enabling it. But the mechanism
+should not be misattributed, and the per-row bench already separates it.
+`MIRROR_ROWS.md` records mirrored at **2.31x the nvme2 baseline and 1.42x nvme0
+alone**, so nvme0 alone was 2.31 / 1.42 = **1.63x** the source. At the per-row
+level, most of the gain came from leaving the half-width link, not from using
+two drives: 1.63x from the link and 1.42x from the split.
+
+That decomposition is per-row, not end to end; the decode arm's 1.348x has not
+been split the same way and one x4 mirror has never been run end to end. The
+practical reading is that a single x4 mirror would likely retain most of the
+benefit if a drive ever has to be freed. It does not qualify the measured
+result.
+
+Link state confirmed from PCI sysfs on 2026-09-20 (`lspci -vv` shows no LnkSta
+without root): 0000:88:00.0 (nvme2) `current_link_width` 2 against
+`max_link_width` 4, the other three at 4; its root port 0000:85:02.0 likewise
+negotiated x2 of 4. AER correctable counters 0. One snapshot, so a transient
+downtrain is not excluded. The 1.9 GB/s figure is the Gen3 x2 spec ceiling;
+nvme2's throughput was not measured here.
+
+#### Three defects found on the way
+
+The extent work surfaced bugs that the previous arms could not have exposed:
+
+1. **`ensure_started` built its tables with no roots**, so the env never reached
+   in-graph reads and the feature was inert. Task 4 would have measured nothing
+   for a second time.
+2. **A latent io_uring crash** at three or more roots: a fixed ring of 16 SQEs
+   against 3 roots x 8 rows returned a null `get_sqe`. The original plan
+   asserted this could not happen.
+3. **A past-EOF extent clamped to nothing returned SUCCESS** while publishing
+   stale bounce-buffer bytes. The `max(0, ...)` in the clamp is load-bearing.
 
 ## Sources
 

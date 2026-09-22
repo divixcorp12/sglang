@@ -2,6 +2,8 @@
 check, residency pushes and the per-step graph trace (CPU; the thread runs, no device)."""
 
 import faulthandler
+import os
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
 from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
@@ -40,7 +43,7 @@ def tiers(tmp_path, monkeypatch):
         for layer_id in range(LAYERS):
             layer = torch.nn.Module()
             layer.layer_id = layer_id
-            fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
+            fmt = Exl3ExpertFormat(layout, layer_id, direct=False, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
             options = fmt.pinned_tier_options(layer)
@@ -61,6 +64,31 @@ def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
     assert service.host.contains(row, 4) and service.host.contains(row, 2)
     assert cache.expert_to_slot[4].item() == service.host.mapping(row)[4]
     assert service.slot_map[row, 4].item() == cache.expert_to_slot[4].item()
+
+
+def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_path):
+    service, streamers, caches = tiers
+    roots = [tmp_path.parent / f"{tmp_path.name}_mirror{i}" for i in range(2)]
+    for root in roots:
+        shutil.copytree(tmp_path, root)
+    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(os.pathsep.join(map(str, roots))):
+        with envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override("3:1"):
+            caches[1].ensure_rows(torch.tensor([4, 2]))
+    tables = service.host.tables
+    assert tables.parts == 2
+    assert all(path.startswith(str(root)) for path, root in zip(tables.paths, roots * len(tables.paths)))
+    # Every row's parts are what the eager policy plans for 3:1.
+    planned = StaticSplitPolicy((3.0, 1.0)).plan(int(tables.slot_bytes)).part_bytes
+    assert bool((tables.extents[..., 2] == torch.tensor(planned)).all())
+    row = service.row_of(1)
+    assert service.host.contains(row, 4) and service.host.contains(row, 2)
+
+
+def test_the_service_refuses_a_mirror_configuration_the_eager_source_refuses(tiers, tmp_path):
+    service, streamers, caches = tiers
+    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(tmp_path)):  # the checkpoint itself
+        with pytest.raises(ValueError, match="not a mirror of it"):
+            caches[1].ensure_rows(torch.tensor([4]))
 
 
 def test_rows_the_thread_loads_reach_the_eager_map_on_next_host_use(tiers):
@@ -209,6 +237,80 @@ def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, 
     assert service.routed_rows_per_step == 6 * len(streamers)
     for layer_id, streamer in streamers.items():
         assert streamer.row_backend.device_side is service.device_side  # one device side, shared by every layer
+
+
+def _attach_all(service, streamers):
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+    for streamer in streamers.values():
+        streamer._graph_pinned_tier = True
+        streamer.hot_cache = SimpleNamespace(device="cpu")
+        streamer.graph_gather_rows = 6
+        streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
+        streamer.format.attach_hot_cache_manager(manager, streamer)
+
+
+def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):
+    service, streamers, caches = tiers
+    enabled = []
+    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: enabled.append(self))
+    assert envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get() is False
+    _attach_all(service, streamers)
+    assert enabled == [] and service.lease_mode is False
+    assert service.device_side.lease_block is None and service.device_side.go_count is None
+
+
+def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_with_the_hosts_block(tiers, monkeypatch):
+    """One env read (ensure_started) feeds both sides, so the device's arming and the service's leasing cannot disagree."""
+    service, streamers, caches = tiers
+    order = []
+    enable, start = module.Exl3RamMissHost.enable_lease_mode, module.Exl3RamMissHost.start_thread
+    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
+    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
+        _attach_all(service, streamers)
+    assert order == ["lease", "thread"] and service.lease_mode is True
+    device = service.device_side
+    assert device.lease_block is service.host.lease_block  # the block the host writes, not a second one
+    assert device.go_count is not None and device.go_count.dtype == torch.int32 and device.go_count.shape == (1,)
+    # The env is read once, when the service starts: flipping it afterwards changes nothing.
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False):
+        service.ensure_started()
+    assert service.lease_mode is True
+
+
+def _backend_calls(monkeypatch, *, lease):
+    calls = []
+    device_side = SimpleNamespace(
+        lease_block=object() if lease else None,
+        go_count="GO_COUNT",
+        post=lambda *a: calls.append("post"),
+        wait=lambda *a: calls.append("wait"),
+        ack=lambda keep: calls.append(("ack", keep)),
+    )
+    from sglang.srt.layers.moe import expert_row_plan
+
+    record = lambda segments, host_rows, slots, count: calls.append(("copy", count))  # noqa: E731
+    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", record)  # the lease post
+    monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", record)  # the inherited post
+    backend = module.Exl3RamMissRowBackend({0: "SEG"}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
+    plan = SimpleNamespace(
+        expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]),
+        slots=torch.arange(6, dtype=torch.int32),
+        count=torch.tensor([3], dtype=torch.int32),
+    )
+    backend.post(0, plan)
+    return calls, backend, plan
+
+
+def test_without_leases_the_row_backend_copies_plan_count_and_acknowledges_nothing(monkeypatch):
+    calls, backend, plan = _backend_calls(monkeypatch, lease=False)
+    assert calls == ["post", "wait", ("copy", plan.count)]
+
+
+def test_with_leases_the_copy_takes_go_count_and_the_acknowledgement_follows_it(monkeypatch):
+    calls, backend, plan = _backend_calls(monkeypatch, lease=True)
+    assert calls == ["post", "wait", ("copy", "GO_COUNT"), ("ack", backend.keep)]
+    assert calls[2][1] is not plan.count
 
 
 def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monkeypatch):
@@ -378,3 +480,22 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    sent = []
+    trace = SimpleNamespace(enabled=True, record_ram_miss_requests=lambda records, layer_ids: sent.append((records, layer_ids)))
+    monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
+    drained = []
+    service = module.Exl3RamMissService()
+    service._rows = {7: 0, 3: 1}  # layer id -> row
+    service.host = SimpleNamespace(
+        drain_trace=lambda: drained.append(1) or [{"row": 1}], trace_dropped=lambda: 0
+    )
+    service._trace_stages()  # not enabled on the host: it must not even drain
+    assert drained == [] and sent == []
+    service._stages_traced = True
+    service._trace_stages()
+    assert sent == [([{"row": 1}], [7, 3])]

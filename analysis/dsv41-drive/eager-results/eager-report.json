@@ -1,0 +1,666 @@
+{
+ "r1-0-base": [
+  {
+   "session": 0,
+   "ttft_s": 100.51058418909088,
+   "decode_tok_s": 1.4172483645009064,
+   "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 127.87150955200195,
+    "nvme4": 0.15401077270507812
+   },
+   "disk_gib_total": 128.02552032470703,
+   "vram_miss_rows": 23931,
+   "vram_miss_rows_prefill": 7062,
+   "ram_miss_rows": 10118,
+   "ram_miss_rows_prefill": 6984,
+   "background_rows": 180,
+   "read_time_s": 79.1900606,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13792,
+    "admissions": 10309,
+    "evictions": 5987,
+    "lookup_hits": 13791,
+    "lookup_misses": 10124,
+    "populated_bytes": 137283671040
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18408,
+    "hits": 849,
+    "misses": 15975,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.046121251629726204,
+   "engram_filled": 16023,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.730445990726354
+  },
+  {
+   "session": 1,
+   "ttft_s": 55.46690276404843,
+   "decode_tok_s": 1.7962882363612989,
+   "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+   "disk_gib": {
+    "nvme0": 7.62939453125e-06,
+    "nvme2": 82.86151885986328,
+    "nvme4": 0.02764129638671875
+   },
+   "disk_gib_total": 82.88916778564453,
+   "vram_miss_rows": 19803,
+   "vram_miss_rows_prefill": 6271,
+   "ram_miss_rows": 6637,
+   "ram_miss_rows_prefill": 4555,
+   "background_rows": 36,
+   "read_time_s": 51.676048900000005,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13147,
+    "admissions": 6683,
+    "evictions": 6683,
+    "lookup_hits": 13147,
+    "lookup_misses": 6647,
+    "populated_bytes": 88988047872
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 5416,
+    "misses": 10616,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2938368055555556,
+   "engram_filled": 26639,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.719692464034168
+  },
+  {
+   "session": 2,
+   "ttft_s": 54.20603852591012,
+   "decode_tok_s": 1.5229261694180807,
+   "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 92.64486312866211,
+    "nvme4": 0.021694183349609375
+   },
+   "disk_gib_total": 92.66655731201172,
+   "vram_miss_rows": 22386,
+   "vram_miss_rows_prefill": 5971,
+   "ram_miss_rows": 7416,
+   "ram_miss_rows_prefill": 4447,
+   "background_rows": 45,
+   "read_time_s": 57.7835235,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 14987,
+    "admissions": 7454,
+    "evictions": 7454,
+    "lookup_hits": 14987,
+    "lookup_misses": 7409,
+    "populated_bytes": 99254363136
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 4464,
+    "misses": 11632,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2421875,
+   "engram_filled": 38271,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.71820864327838
+  },
+  {
+   "session": 3,
+   "ttft_s": 55.828621943015605,
+   "decode_tok_s": 1.976171138820475,
+   "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 77.31665420532227,
+    "nvme4": 0.01473236083984375
+   },
+   "disk_gib_total": 77.33138656616211,
+   "vram_miss_rows": 19295,
+   "vram_miss_rows_prefill": 6233,
+   "ram_miss_rows": 6199,
+   "ram_miss_rows_prefill": 4592,
+   "background_rows": 27,
+   "read_time_s": 48.1815443,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13033,
+    "admissions": 6234,
+    "evictions": 6234,
+    "lookup_hits": 13033,
+    "lookup_misses": 6207,
+    "populated_bytes": 83009350656
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 7376,
+    "misses": 10640,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.4001736111111111,
+   "engram_filled": 48911,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.718814623152907
+  }
+ ],
+ "r1-3-base": [
+  {
+   "session": 0,
+   "ttft_s": 101.81427636393346,
+   "decode_tok_s": 1.441448958136823,
+   "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 127.87150955200195,
+    "nvme4": 0.13741683959960938
+   },
+   "disk_gib_total": 128.00892639160156,
+   "vram_miss_rows": 23931,
+   "vram_miss_rows_prefill": 7062,
+   "ram_miss_rows": 10118,
+   "ram_miss_rows_prefill": 6984,
+   "background_rows": 180,
+   "read_time_s": 78.4921585,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13784,
+    "admissions": 10306,
+    "evictions": 5984,
+    "lookup_hits": 13783,
+    "lookup_misses": 10121,
+    "populated_bytes": 137243724288
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18408,
+    "hits": 849,
+    "misses": 15975,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.046121251629726204,
+   "engram_filled": 16023,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.728795943387066
+  },
+  {
+   "session": 1,
+   "ttft_s": 55.13464799907524,
+   "decode_tok_s": 1.8021433715969506,
+   "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 82.84911346435547,
+    "nvme4": 0.036159515380859375
+   },
+   "disk_gib_total": 82.88527297973633,
+   "vram_miss_rows": 19801,
+   "vram_miss_rows_prefill": 6271,
+   "ram_miss_rows": 6636,
+   "ram_miss_rows_prefill": 4555,
+   "background_rows": 36,
+   "read_time_s": 51.5470832,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13149,
+    "admissions": 6686,
+    "evictions": 6686,
+    "lookup_hits": 13149,
+    "lookup_misses": 6650,
+    "populated_bytes": 89027994624
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 5416,
+    "misses": 10616,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2938368055555556,
+   "engram_filled": 26639,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.721001128784472
+  },
+  {
+   "session": 2,
+   "ttft_s": 53.844049477018416,
+   "decode_tok_s": 1.5237788850371743,
+   "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 92.62005615234375,
+    "nvme4": 0.0261993408203125
+   },
+   "disk_gib_total": 92.64625549316406,
+   "vram_miss_rows": 22386,
+   "vram_miss_rows_prefill": 5971,
+   "ram_miss_rows": 7414,
+   "ram_miss_rows_prefill": 4442,
+   "background_rows": 45,
+   "read_time_s": 57.653558700000005,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 14994,
+    "admissions": 7451,
+    "evictions": 7451,
+    "lookup_hits": 14994,
+    "lookup_misses": 7406,
+    "populated_bytes": 99214416384
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 4464,
+    "misses": 11632,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2421875,
+   "engram_filled": 38271,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.718831696608124
+  },
+  {
+   "session": 3,
+   "ttft_s": 55.693573110038415,
+   "decode_tok_s": 1.9745381471617964,
+   "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+   "disk_gib": {
+    "nvme0": 0.0,
+    "nvme2": 77.31665420532227,
+    "nvme4": 0.0689239501953125
+   },
+   "disk_gib_total": 77.38557815551758,
+   "vram_miss_rows": 19295,
+   "vram_miss_rows_prefill": 6233,
+   "ram_miss_rows": 6199,
+   "ram_miss_rows_prefill": 4592,
+   "background_rows": 27,
+   "read_time_s": 48.2545668,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13052,
+    "admissions": 6236,
+    "evictions": 6236,
+    "lookup_hits": 13052,
+    "lookup_misses": 6209,
+    "populated_bytes": 83035981824
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 7376,
+    "misses": 10640,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.4001736111111111,
+   "engram_filled": 48911,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.727727598980083
+  }
+ ],
+ "r1-1-mirror": [
+  {
+   "session": 0,
+   "ttft_s": 67.22029442002531,
+   "decode_tok_s": 1.7928191523889079,
+   "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+   "disk_gib": {
+    "nvme0": 63.87538146972656,
+    "nvme2": 0.12560653686523438,
+    "nvme4": 64.0185546875
+   },
+   "disk_gib_total": 128.0195426940918,
+   "vram_miss_rows": 23931,
+   "vram_miss_rows_prefill": 7062,
+   "ram_miss_rows": 10118,
+   "ram_miss_rows_prefill": 6984,
+   "background_rows": 180,
+   "read_time_s": 22.421358,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13750,
+    "admissions": 10273,
+    "evictions": 5969,
+    "lookup_hits": 13749,
+    "lookup_misses": 10088,
+    "populated_bytes": 136804310016
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18408,
+    "hits": 849,
+    "misses": 15975,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.046121251629726204,
+   "engram_filled": 16023,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.729851594362984
+  },
+  {
+   "session": 1,
+   "ttft_s": 29.699030210031196,
+   "decode_tok_s": 2.1482001465277016,
+   "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+   "disk_gib": {
+    "nvme0": 41.3843994140625,
+    "nvme2": 0.08335494995117188,
+    "nvme4": 41.43128967285156
+   },
+   "disk_gib_total": 82.89904403686523,
+   "vram_miss_rows": 19801,
+   "vram_miss_rows_prefill": 6271,
+   "ram_miss_rows": 6636,
+   "ram_miss_rows_prefill": 4555,
+   "background_rows": 36,
+   "read_time_s": 14.8918199,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13187,
+    "admissions": 6701,
+    "evictions": 6701,
+    "lookup_hits": 13187,
+    "lookup_misses": 6665,
+    "populated_bytes": 89227728384
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 5416,
+    "misses": 10616,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2938368055555556,
+   "engram_filled": 26639,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.723114672324641
+  },
+  {
+   "session": 2,
+   "ttft_s": 28.68245952599682,
+   "decode_tok_s": 1.895957587296613,
+   "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+   "disk_gib": {
+    "nvme0": 46.26592254638672,
+    "nvme2": 0.09162139892578125,
+    "nvme4": 46.29159164428711
+   },
+   "disk_gib_total": 92.64913558959961,
+   "vram_miss_rows": 22386,
+   "vram_miss_rows_prefill": 5971,
+   "ram_miss_rows": 7414,
+   "ram_miss_rows_prefill": 4442,
+   "background_rows": 45,
+   "read_time_s": 16.755196199999997,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 15013,
+    "admissions": 7463,
+    "evictions": 7463,
+    "lookup_hits": 15013,
+    "lookup_misses": 7418,
+    "populated_bytes": 99374203392
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 4464,
+    "misses": 11632,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2421875,
+   "engram_filled": 38271,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.719227087243599
+  },
+  {
+   "session": 3,
+   "ttft_s": 29.653765546972863,
+   "decode_tok_s": 2.296389274302992,
+   "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+   "disk_gib": {
+    "nvme0": 38.61799621582031,
+    "nvme2": 0.08344650268554688,
+    "nvme4": 38.633453369140625
+   },
+   "disk_gib_total": 77.33489608764648,
+   "vram_miss_rows": 19295,
+   "vram_miss_rows_prefill": 6233,
+   "ram_miss_rows": 6199,
+   "ram_miss_rows_prefill": 4592,
+   "background_rows": 27,
+   "read_time_s": 13.847104799999999,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13029,
+    "admissions": 6224,
+    "evictions": 6224,
+    "lookup_hits": 13029,
+    "lookup_misses": 6197,
+    "populated_bytes": 82876194816
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18384,
+    "hits": 7328,
+    "misses": 10640,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.39860748476936464,
+   "engram_filled": 48911,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.719391839664311
+  }
+ ],
+ "r1-2-mirror": [
+  {
+   "session": 0,
+   "ttft_s": 63.43962744704913,
+   "decode_tok_s": 1.7822571262921472,
+   "output_sha1": "ad32424c5a61d636afaf59c04b6f7a39d62f4693",
+   "disk_gib": {
+    "nvme0": 63.87538146972656,
+    "nvme2": 0.12560653686523438,
+    "nvme4": 64.03536987304688
+   },
+   "disk_gib_total": 128.03635787963867,
+   "vram_miss_rows": 23931,
+   "vram_miss_rows_prefill": 7062,
+   "ram_miss_rows": 10118,
+   "ram_miss_rows_prefill": 6984,
+   "background_rows": 180,
+   "read_time_s": 23.361707,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13773,
+    "admissions": 10307,
+    "evictions": 5980,
+    "lookup_hits": 13772,
+    "lookup_misses": 10123,
+    "populated_bytes": 137257039872
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 865,
+    "misses": 15983,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.046929253472222224,
+   "engram_filled": 16031,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.731523642333462
+  },
+  {
+   "session": 1,
+   "ttft_s": 30.026271327980794,
+   "decode_tok_s": 2.085470702253035,
+   "output_sha1": "de3bc7463d6a2ef3093f9600fcf6b66e0d1523d1",
+   "disk_gib": {
+    "nvme0": 41.3843994140625,
+    "nvme2": 0.08335494995117188,
+    "nvme4": 41.417057037353516
+   },
+   "disk_gib_total": 82.88481140136719,
+   "vram_miss_rows": 19801,
+   "vram_miss_rows_prefill": 6271,
+   "ram_miss_rows": 6636,
+   "ram_miss_rows_prefill": 4555,
+   "background_rows": 36,
+   "read_time_s": 15.556773499999998,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13098,
+    "admissions": 6684,
+    "evictions": 6684,
+    "lookup_hits": 13098,
+    "lookup_misses": 6648,
+    "populated_bytes": 89001363456
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18432,
+    "hits": 5424,
+    "misses": 10608,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.2942708333333333,
+   "engram_filled": 26639,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.720930287020384
+  },
+  {
+   "session": 2,
+   "ttft_s": 29.36970054800622,
+   "decode_tok_s": 1.8733825592050937,
+   "output_sha1": "915304189191cb33a7ec3b72aa27686cbf99f86c",
+   "disk_gib": {
+    "nvme0": 46.26592254638672,
+    "nvme2": 0.09162139892578125,
+    "nvme4": 46.28997802734375
+   },
+   "disk_gib_total": 92.64752197265625,
+   "vram_miss_rows": 22386,
+   "vram_miss_rows_prefill": 5971,
+   "ram_miss_rows": 7414,
+   "ram_miss_rows_prefill": 4442,
+   "background_rows": 45,
+   "read_time_s": 17.5149392,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 15036,
+    "admissions": 7447,
+    "evictions": 7447,
+    "lookup_hits": 15036,
+    "lookup_misses": 7402,
+    "populated_bytes": 99161154048
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18408,
+    "hits": 4440,
+    "misses": 11632,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.24119947848761408,
+   "engram_filled": 38271,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.719005563748492
+  },
+  {
+   "session": 3,
+   "ttft_s": 30.507796164019965,
+   "decode_tok_s": 2.2924121592838618,
+   "output_sha1": "5142f27144a879f5b7e77086fa4a584dcda77eac",
+   "disk_gib": {
+    "nvme0": 38.61799621582031,
+    "nvme2": 0.08344650268554688,
+    "nvme4": 38.631900787353516
+   },
+   "disk_gib_total": 77.33334350585938,
+   "vram_miss_rows": 19295,
+   "vram_miss_rows_prefill": 6233,
+   "ram_miss_rows": 6199,
+   "ram_miss_rows_prefill": 4592,
+   "background_rows": 27,
+   "read_time_s": 14.431293499999999,
+   "forwards": 129,
+   "decode_calls": 5120,
+   "tier": {
+    "hits": 13055,
+    "admissions": 6245,
+    "evictions": 6245,
+    "lookup_hits": 13055,
+    "lookup_misses": 6218,
+    "populated_bytes": 83155822080
+   },
+   "tier_occupancy": 5644,
+   "tier_capacity": 5644,
+   "tier_protected_evictions": 0,
+   "engram": {
+    "accesses": 18384,
+    "hits": 7328,
+    "misses": 10640,
+    "evictions": 0
+   },
+   "engram_hit_rate": 0.39860748476936464,
+   "engram_filled": 48911,
+   "engram_capacity": 20336016,
+   "mib_per_read_row": 12.71913648409894
+  }
+ ]
+}

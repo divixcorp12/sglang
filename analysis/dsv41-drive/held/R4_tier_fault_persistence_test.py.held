@@ -1,0 +1,38 @@
+# HELD, NOT LANDED -- this test is non-deterministic as written (measured 2026-09-21).
+#
+# It asserts one terminal status for a read that races. Observed on divix01, warm JIT,
+# taskset -c 0-63, the SAME invocation returning both values in long stable streaks:
+#
+#   returns 2 (kStatusNoRead, rows_read 0)    5 consecutive runs
+#   returns 3 (kStatusFailed, rows_read 3)   12 consecutive runs
+#
+# The assertion constant cannot change C++ behaviour, so the cause is environmental and
+# was NOT identified. Hypothesis, unproven: the fixture is `mirrored_tier`, and the fault
+# targets the FIRST completion of a part-0 extent. A mirrored read races two drives, so
+# which extent completes first is undetermined; whether the error is reaped before or
+# after the other rows complete decides the status. The other two mirrored tests that
+# landed are stable because neither depends on completion order.
+#
+# Do not fix this by picking whichever constant is passing today. That was tried twice
+# during triage and both times a short stable run looked like the answer. Either make the
+# race determinate (constrain completion order, or inject on a single-drive tier), or
+# assert the property that actually holds regardless of the race -- no row published, and
+# read_errors incremented -- rather than the terminal status.
+#
+# The rest of the inject_fault work landed without it; this is the only piece held back.
+
+def test_an_injected_fault_stays_until_cleared_and_a_cleared_tier_serves_the_same_demand(mirrored_tier):
+    s, page, slot_map, host = mirrored_tier
+    host.inject_fault(part=0, part_error=errno.EIO, ordinal=0)
+    for _ in range(2):  # not one-shot: every read meets it
+        assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 2
+    assert host.counters()["read_errors"] == 2 and host.mapping(1) == [-1] * 6
+    host.inject_fault()  # an all-default fault clears it
+    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 1
+    reference = s.reference(1, [0, 1, 2])
+    for i, expert in enumerate((0, 1, 2)):
+        slot = host.mapping(1)[expert]
+        assert slot >= 0
+        assert all(same_bytes(s.slabs[1][n][slot], reference[n][i]) for n in EXL3_STREAMED_NAMES)
+
+

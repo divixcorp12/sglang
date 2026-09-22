@@ -1,0 +1,71 @@
+{
+ "launch_cpu": 44,
+ "sibling_cpu": 8,
+ "reps": 20,
+ "ns": [
+  3,
+  6
+ ],
+ "visit_launches": 100,
+ "started": "2026-09-21T05:37:55-0500",
+ "dry_run": false,
+ "nodes": {
+  "0": {
+   "page_fraction_on_node": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "free_mib_before": 7702,
+   "free_mib_after": 7183,
+   "mem_mib_before": {
+    "MemFree": 7702,
+    "Active(file)": 9608,
+    "Inactive(file)": 41353,
+    "FilePages": 51854
+   },
+   "mem_mib_after": {
+    "MemFree": 7183,
+    "Active(file)": 9598,
+    "Inactive(file)": 41112,
+    "FilePages": 51600
+   }
+  }
+ },
+ "ce_backend": null,
+ "spin_cycles_per_us": 2952.3050066098263,
+ "device": "NVIDIA GeForce RTX 5090",
+ "torch": "2.13.0+cu130",
+ "link_gen_min": 3,
+ "pstates": [
+  1
+ ],
+ "other_gpu_procs_max": 0,
+ "sm_mhz": [
+  2760,
+  2970
+ ],
+ "lanes_end": [
+  [
+   3274284,
+   "bash -c test -f /data/models/slang/nvfp4-work/t1-ordersweep/sweep.done"
+  ],
+  [
+   3274313,
+   "bash -c test -f /data/models/slang/nvfp4-work/t1-ordersweep/sweep.done"
+  ],
+  [
+   3274316,
+   "bash -c test -f /data/models/slang/nvfp4-work/t1-ordersweep/sweep.done"
+  ],
+  [
+   3274345,
+   "bash -c test -f /data/models/slang/nvfp4-work/t1-ordersweep/sweep.done"
+  ]
+ ],
+ "finished": "2026-09-21T05:40:26-0500",
+ "rows": 160
+}

@@ -1,0 +1,87 @@
+task1e RESULT, written 2026-09-21 ~01:55-05:00 (divix01 clock). VERDICT: UNRESOLVED. Nothing here is a measurement of the two-bank effect.
+
+THINGS THAT WENT WRONG OR ARE INCONCLUSIVE (first)
+1. The series was stopped after 3 of the 6 planned arms, at team-lead's direction, and it produced 2 valid arms (one per cell), not 6 and not 3+3.
+   - task1e-2-old-on-U (arm 2) was INVALID: "drives not idle at start", nvme4 (nvme3n1) 1,898,496 B/s vs the 1,048,576 B/s limit over 2 s (measured 06:40:59 UTC). The script aborted by design (exit 4).
+   - A continuation (label task1e2: new old new old) was launched at 01:49 and stopped at 01:50:24, during boot of its first arm, before any timed session; two later continuations (task1e3, task1e4) were also killed during boot; see the record below. It wrote no json and no verdict (task1e2-0-new-on-U.log only; sentinel ABORTED exit=130). The process group was killed; afterwards no sglang or trace_corpus process of mine remained, the GPU showed 63 MiB, cc-gpu.lock was free (flock -n succeeded) and port 7867 was not listening.
+2. Under the registered rules every arm is inconclusive under STRICT (original) rules: arm 0 (CONTENDED + a historical CROSS-ARM flag), arm 1 (CONTENDED), arm 2 (INVALID + CONTENDED). STRICT admits 0 old and 0 new arms.
+3. Under the amended rules (task1e-AMENDMENT.txt, task1e-ADDENDUM.txt) RELAXED-LOO admits 1 old (arm 0) and 1 new (arm 1); RELAXED-HIST admits 0 old and 1 new; S1r 1 and 1; S2 1 and 1. No set reaches 3 per cell and none has 2 in a cell, so no interval is computable in any of them.
+4. No falsification of a registered prediction occurred, because no interval or stationarity verdict could be formed (see 6).
+
+THE ARMS (all three contended; absolute levels are uncitable as levels)
+ arm | cell | mean tok/s | per-session tok/s | session TTFT s | verdict / flags
+ 0 task1e-0-old-on-U | old gen0 099eadba33 | 3.6887 | 2.963 4.182 3.060 4.549 | 74.4 32.1 31.1 33.8 | VALID; CONTENDED (nimbus 101% core 39, reth 76-133% core 47, htop 60-68% cores 35/37 ...); CROSS-ARM vs the single historical reference: session_3 TTFT +11%
+ 1 task1e-1-new-on-U | new gen2 87417376f5 | 3.8620 | 3.159 4.350 3.308 4.631 | 92.4 31.1 29.3 30.9 | VALID; CONTENDED (reth core 47, nimbus cores 58/61, tmux core 62); no OUTLIER, no CROSS-ARM
+ 2 task1e-2-old-on-U | old gen0 | 3.7764 | 3.070 4.224 3.179 4.633 | 75.3 31.4 29.3 30.4 | INVALID (drive idle); CONTENDED (htop, nimbus core 33, reth core 47, kcompactd0 82% core 37); not used for anything
+ Session-0 TTFT (74-92 s here vs 50-60 s in the earlier quiet arms) is recorded, not judged, and is not pooled with decode throughput: arm 1 had the worse session-0 TTFT and the better decode.
+
+THE SINGLE-PAIR RATIO: 3.8620 / 3.6887 = 1.047. NOT A RESULT. It is one pair, both cells contended, and the two cells sit at different distances from their references: arm 0 is 2.9% below the earlier clean old arm (3.798), arm 1 is 1.7% below the gen1 mean (3.930). A pair displaced that way produces a spurious ratio. It is also not interchangeable with the earlier 1.032 (n=1 old, quiet box) or ~1.035 (four gen1 new arms vs one old, quiet box): different code generation (gen2 vs gen1), different machine condition (contended vs unmonitored-probably-quiet), n=1 per cell. Do not treat it as a better estimate of the same quantity.
+
+STATIONARITY: the script printed "stationary" over the 3 arms run (load1 arm means 5.56, 6.10, 6.10; foreign CPU on arm cores 167, 115, 128 percentage points; no >=50% sighting imbalance test possible with one new arm). Three arms, with one in the new cell, are too few for the registered cell-gap and trend tests to mean anything, so this is NOT evidence of stationarity. Within-arm load1 at boundaries: arm 0 4.38 -> 6.32 (rising through the arm), arm 1 5.8-6.4 (flat), arm 2 5.75-6.69. Contention was heavy and present at nearly every boundary of every arm (reth-binary on core 47 in all three arms, nimbus on 33-61, htop, tmux, and the kernel thread kcompactd0 at 82%).
+
+FORMAL VERDICT AGAINST THE PRE-REGISTRATION: UNRESOLVED. Fewer than 3 clean arms per cell under STRICT (0 old, 0 new), RELAXED-HIST (0 old, 1 new) and RELAXED-LOO (1 old, 1 new). The replacement budget was not exhausted; the series was stopped by team-lead's decision. The design's resolvable effect (about +-1.2% at 95% with 3 v 3 at gen1's quiet sd) was never tested. Registered files: task1e-PREDICTIONS.txt sha256 58f894523af8320bab1467a458ac1bb49164223c2140ca7b2366d10571746c50 (commit 450f86d17a); task1e-AMENDMENT.txt abc3841c274abf59209a25965b94373184c24a92bcd7f1efe342427bdd20990f (6cc61bf495); task1e-ADDENDUM.txt 5ff69ba79a3d64ac77f9c782a1d903dd7fd8ae2908e714733254defb8a8cb452 (30f254373e); task1e_analyze.py revision 3 1f437958912700d1d3309dbfa107fb54d743163e2b23430e8088a7f3c9610f95 (the hash of the script that produced the analysis below, checked on divix01 before running it).
+
+FINDING: TWO GATES WERE MIS-CALIBRATED FOR THE BOX THIS SERIES HAD, AND A THIRD CORRECTLY CAUGHT A TRANSIENT. (Corrected 2026-09-21 after review by team-lead; an earlier version of this file grouped drive-idle with the first two.)
+ a. CONTENDED disqualified every arm here (3 of 3); the earlier series predate core recording in the verdict, but 5 of their last 6 arms carried OUTLIER or disturbed sessions under similar load. The verdict samples one 0.2 s snapshot per boundary and marks "contended" when any foreign process using >=50% CPU last ran on cores 32-63; with reth-binary, nimbus, htop and tmux on those cores at almost every boundary it is true of every arm, so a rule that disqualifies contended arms can never yield a result on this box however evenly the contention falls, while the stationarity test is what protects a paired ratio. Foreign processes do not stay on their nominal affinities (reth-binary was described as pinned to 30-50 and was on core 47; nimbus was seen on cores 33, 39, 52, 54, 55, 58, 61), so no core range avoids them.
+ b. CROSS-ARM against a single historical reference arm. Arm 0 drew a +11% session-3 TTFT flag against one arm from another night; the verdict's own text says a flag near the 8% threshold against one reference is indistinguishable from that arm's noise. The leave-one-out form added in the addendum fixes the reference size but has 2 reference arms per cell at best, whose median is their mean.
+ c. NOT a mis-calibration: drive-idle. Arm 2 failed at 1.90 MB/s of foreign reads on nvme4 over a 2 s window against a 1.05 MB/s limit, and the same drive read 32 KB/s about 8 minutes later. That is a gate correctly refusing an arm whose start conditions were disturbed (about 0.2% of the arm's aggregate read rate, but a disturbance at the start is what the gate is for). It aborts the whole script by design, which is a cost, not a defect.
+ The next series needs its gates calibrated for the box we actually have, registered BEFORE it runs rather than amended during it (two amendments were made in this series). Open design question: whether quiet-box measurement (a cleared machine, now a recorded prerequisite for improving the old-barrier reference, which stays n=1 clean) or a paired design with a contention-tolerant rule registered in advance is the right instrument for a ~3% effect; tonight's data cannot answer it.
+ d. Instrument gap, same failure class: the verdict's boundary samples record foreign processes by NAME, PID, CPU% and (when >=50%) core only, not by command line, so a python process at 8-92% on an arm core cannot be attributed to a job, an agent or a service from what was captured (see the unattributed observation at the end). The next series should capture the full command line (and owner) of every foreign process it lists. Recorded at team-lead's request.
+
+ADDITIONAL RECORD OF THE STOP: THREE CONTINUATIONS WERE KILLED, EACH BY AN INSTRUCTION CROSSING IN FLIGHT, NONE BY ANY PROPERTY OF THE MEASUREMENT OR THE HARNESS. Team-lead's decisions on the continuation changed several times while my messages were in flight, and I acted on each as it arrived (sends and kills crossed). Each was killed during boot, before engine_ready and any timed session; none wrote a json or verdict. All times are divix01 clock.
+ - task1e2: launched 01:49:18, killed 01:50:24 on the first stop instruction (then reversed).
+ - task1e3: launched 01:52:57 after the reversal, killed 01:53:26 on "no relaunch".
+ - task1e4: launched 01:54:26 after the "run to completion" reversal, killed 01:55:00 on "closed, no launches".
+ Each sentinel reads ABORTED exit=130 (the SIGTERM trap), arms_started=1 of 4, and the partial logs task1e{2,3,4}-0-new-on-U.log and task1e{2,3,4}-run.out remain in the results directory on divix01. Three labels and three abort sentinels are coordination, not instability in the harness. The series therefore ended at 3 arms by decision, not because the replacement budget was exhausted, and the result stands as UNRESOLVED with 2 valid arms and 1 INVALID. The old-barrier reference stays at n=1 clean (task1c-1, 3.798), corroborated by undisturbed sessions of disturbed arms; improving it needs a quiet machine, recorded here as a prerequisite. Final state after the last kill: no process of mine running, GPU 63 MiB, cc-gpu.lock free, port 7867 down; wt-task1-new left at 87417376f5 and clean-reference.json.pre-gen2 left in place.
+
+P5 (the boot-phase page-cache hypothesis pre-registered in task1d-PREDICTIONS.txt) -- consistent with, not a confirmation. All three arms had a directory that fell more than 256 MiB during boot (arm 0 nvme4 -2392 MiB, arm 1 nvme4 -1219 MiB, arm 2 nvme4 -522 MiB) and in each /proc/meminfo Cached fell across the same interval (-32314, -2677, -1468 MiB), so none met the refutation condition (a fall with Cached flat or rising). MemFree fell 44-78 GB across boot in every arm (the 70 GiB pinned allocation). This is not a discriminating test: the verdict's own boot-phase numbers show Cached falling by very different amounts (32 GiB in arm 0, 1.5 GiB in arm 2) and in arm 2 the source directory GREW +4.95 GiB at engine_ready while Cached fell, so an unrelated cause of a Cached fall is not excluded. P5 stays UNTESTED as a mechanism; three opportunities to refute it passed without refuting it.
+
+ANALYSIS OUTPUT (task1e_analyze.py rev 3, prefixes task1e task1e2, run on divix01 under taskset -c 0-63):
+ARMS IN TIME ORDER (position, name, mean tok/s, per-session, ttft, valid, gen, contended, outliers, cross, load1, foreignCPU)
+ 1 task1e-0-old-on-U: mean 3.6887 sess [2.963, 4.182, 3.06, 4.549] ttft [74.4, 32.1, 31.1, 33.8] valid=True gen=gen0 = contended=contended outl=0 cross=1 L=5.56 F=167
+    -> INCONCLUSIVE: CROSS-ARM flag (historical reference); CONTENDED contended  sightings ['nimbus_beacon_node(101%)@before_engine', 'reth-binary(76%)@before_engine', 'htop(60%)@before_engine', 'nimbus_beacon_node(84%)@session_0', 'htop(68%)@session_0', 'nimbus_beacon_node(99%)@session_1', 'reth-binary(133%)@session_2', 'nimbus_beacon_node(100%)@session_2', 'reth-binary(85%)@session_3']
+       NOTE CROSS-ARM session_3: ttft 33.8 s is 11% above the 1-arm clean median 30.6 s [single reference arm: a flag near the 8% threshold is not distinguishable from that one arm's own noise]
+ 2 task1e-1-new-on-U: mean 3.8620 sess [3.159, 4.35, 3.308, 4.631] ttft [92.4, 31.1, 29.3, 30.9] valid=True gen=gen2 = contended=contended outl=0 cross=0 L=6.10 F=115
+    -> INCONCLUSIVE: CONTENDED contended  sightings ['reth-binary(76%)@before_engine', 'reth-binary(60%)@engine_ready', 'nimbus_beacon_node(100%)@session_0', 'reth-binary(64%)@session_1', 'tmux: server(61%)@session_1', 'nimbus_beacon_node(97%)@session_2', 'reth-binary(73%)@session_3']
+ 3 task1e-2-old-on-U: mean 3.7764 sess [3.07, 4.224, 3.179, 4.633] ttft [75.3, 31.4, 29.3, 30.4] valid=False gen=gen0 = contended=contended outl=0 cross=0 L=6.10 F=128
+    -> INCONCLUSIVE: not VALID; CONTENDED contended  sightings ['htop(60%)@before_engine', 'reth-binary(64%)@engine_ready', 'htop(77%)@session_0', 'nimbus_beacon_node(102%)@session_1', 'reth-binary(61%)@session_1', 'kcompactd0(82%)@session_2', 'htop(77%)@session_2', 'reth-binary(73%)@session_2']
+
+LEAVE-ONE-OUT CROSS-ARM (this series; primary for disqualification under the addendum):
+   task1e-0-old-on-U: not judged (no other valid arm of its cell)
+   task1e-1-new-on-U: not judged (no other valid arm of its cell)
+   task1e-2-old-on-U: no flag vs 1 other arm(s)
+
+STATIONARITY over all 3 arms run: stationary
+
+ARMS DROPPED of 3: STRICT (original rules) 3, S1 (strict, CROSS-ARM ignored) 3, RELAXED-LOO (amended + addendum: primary) 1, RELAXED-HIST (historical CROSS-ARM) 2, S1r (relaxed, CROSS-ARM ignored) 1, S2 (all VALID, right generation) 1
+
+== RELAXED-LOO = PRIMARY (CONTENDED ignored; OUTLIER and leave-one-out CROSS-ARM disqualify): n_old=1 n_new=1
+   not computable (a cell has fewer than 2 arms)
+   position fit: not computable
+
+== RELAXED-HIST (CONTENDED ignored; OUTLIER and historical-reference CROSS-ARM disqualify): n_old=0 n_new=1
+   not computable (a cell has fewer than 2 arms)
+   position fit: not computable
+
+== STRICT (original task1e-PREDICTIONS rules): n_old=0 n_new=0
+   not computable (a cell has fewer than 2 arms)
+   position fit: not computable
+
+== S1r sensitivity: relaxed with CROSS-ARM ignored (VALID, OUTLIER-free, right generation): n_old=1 n_new=1
+   not computable (a cell has fewer than 2 arms)
+   position fit: not computable
+
+== S1 sensitivity, original definition: strict with CROSS-ARM ignored: n_old=0 n_new=0
+   not computable (a cell has fewer than 2 arms)
+   position fit: not computable
+
+== S2 descriptive: every VALID right-generation arm: n_old=1 n_new=1
+   not computable (a cell has fewer than 2 arms)
+   position fit: not computable
+
+PRE-REGISTERED VERDICTS (both are reported; the original is not erased):
+   STRICT (original rules): UNRESOLVED: 0 clean old, 0 clean new; fewer than 3 in a cell.
+   RELAXED-HIST (amendment, historical CROSS-ARM): UNRESOLVED: 0 clean old, 1 clean new; fewer than 3 in a cell.
+   RELAXED-LOO (amendment + addendum: PRIMARY): UNRESOLVED: 1 clean old, 1 clean new; fewer than 3 in a cell.
+
+UNATTRIBUTED OBSERVATION (added 2026-09-21 ~02:00). Immediately before task1e4 was launched (about 01:54 divix01 clock, the killed run whose task1e4-run.out is in the results directory) a `pgrep -af "[t]race_corpus|[t]ask1-baseline"` count returned 1 matching process before my own launch. Its command line was not captured and it was gone at the next check, so it is UNATTRIBUTED: not shown to be another agent's unit-test run, and not shown to be anything else. It was observed after the three arms with data had finished (they ran 01:26-01:48) and task1e4 never reached a timed session, so no boundary sample of it exists. Whether it existed earlier is unknown. The boundary samples of arms 0-2 record foreign processes by name and CPU only, and they do include small python entries (e.g. a 92% python on core 15 at arm 0's before_engine, off the arm cores; 8-20% python entries elsewhere, some on arm cores such as core 35 and core 55), so they neither identify nor exclude it. Nothing in the numbers reported above depends on it; it is written down only so that a reader of task1e4-run.out is not left with an unexplained process before a killed run.

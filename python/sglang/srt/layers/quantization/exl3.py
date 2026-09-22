@@ -95,7 +95,11 @@ class Exl3Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Exl3LinearMethod(self)
         if isinstance(layer, FusedMoE):
-            return Exl3MoEMethod(self)
+            from sglang.srt.models.deepseek_v4_exl3_weights import (
+                is_streamed_expert_module,
+            )
+
+            return Exl3MoEMethod(self, streamed=is_streamed_expert_module(prefix))
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -277,8 +281,9 @@ EXL3_ROW_VIEWS = Exl3RowViews()
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
-    def __init__(self, config: Exl3Config):
+    def __init__(self, config: Exl3Config, *, streamed: bool):
         self.config = config
+        self.streamed = streamed
         self.moe_runner_config = None
 
     def create_weights(
@@ -308,7 +313,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden = hidden_size
         layer.exl3_inter = intermediate_size_per_partition
         layer.exl3_loaded = set()
-        layer.exl3_streamed = envs.SGLANG_DSV41_EXPERT_STREAM.get()
+        layer.exl3_streamed = self.streamed and envs.SGLANG_DSV41_EXPERT_STREAM.get()
         if layer.exl3_streamed:
             # Routed experts stay on disk. With no parameters, load_weights skips
             # them (deepseek_v4.load_weights' skip_unmaterialized_expert_param),
@@ -373,6 +378,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def apply(self, layer: nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         cfg = self.moe_runner_config
         # CONTRACT: exl3_moe_loop applies the route weight before w2 and does not
@@ -384,6 +390,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise NotImplementedError("exl3 MoE: apply_router_weight_on_input")
         # By name: StandardTopKOutputPacked (moe_fused_gate) carries a 4th field.
         topk = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_bypassed(topk):
+            # The draft path supplies routing lazily (hidden_states / router_logits); the
+            # exl3 loop needs explicit ids and weights, so materialize them once here.
+            topk = topk.to_standard(layer_id=layer.layer_id)
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         streamer = expert_streamer_of(layer)
         if streamer is not None and streamer.serves_graph_gather(topk):

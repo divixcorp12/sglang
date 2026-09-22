@@ -1,0 +1,41 @@
+Class-order sweep of the registered CPU test files, 2026-09-21, dsv41 41e589976f (git archive: host.cpp working-tree
+changes of other lanes are NOT in it), divix01, CPU only, CUDA_VISIBLE_DEVICES=9, threads capped at 2, taskset 0-63.
+
+DENOMINATOR
+  830 registered CPU files (register_cpu_ci) under test/registered
+  307 have two or more test classes (270 unittest-style, 36 pytest-style, 1 with no entry); 237 of them are NOT in
+      alphabetical class order (205 unittest, 32 pytest), which is what makes CI order differ from pytest order.
+  307 swept, each under three orders: alpha (CI's unittest order), file (pytest), rev (reverse alphabetical).
+  6,563 test ids compared across the three orders.
+
+OUTCOME, PER FILE
+  263  every test passes in all three orders
+   32  tests run; some fail IDENTICALLY in all orders (no sgl_kernel CPU ops, missing 'sglang' CLI, missing data file,
+       numa device index): uninformative for the failing tests, the rest of the file agrees
+    9  nothing ran (collection error in every order: 7 no polars, 1 no imageio, 1 no av): not swept in effect
+    3  outcome differs between orders; after 6 SERIAL reruns each (2 per order) of the 3:
+         1 REAL      unit/server_args/test_server_args.py, reproducible (2 of 2 rev runs fail, 0 of 4 alpha/file fail)
+         2 ARTIFACT  unit/models/test_zaya_cca.py (hard-coded port 29632: my three concurrent orders collided,
+                     EADDRINUSE) and unit/entrypoints/openai/test_serving_responses.py: no difference in 6 serial runs
+DANGEROUS CLASS (passes in pytest file order, fails in CI alphabetical order): none. The six that looked so were the
+zaya port collision.
+
+THE ONE REAL HIT (latent: neither the pytest order nor CI's alphabetical order triggers it)
+  test_server_args.py::TestMultimodalFeatureTransport::test_default_transport_is_cpu_for_unsupported_multinode_model
+  fails when TestNoneMeansUnset runs before TestMultimodalFeatureTransport (found by pairing each class that sorts after
+  it with the failing test): "'has not opted into CUDA VMM' not found in ... SGLANG_USE_CUDA_IPC_TRANSPORT is
+  deprecated". Mechanism: the code under test writes the process environment. serving_hook.handle_multimodal_feature_transport
+  ends with envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set("0"/"1") on every call; the tests of TestNoneMeansUnset reach it through
+  ServerArgs resolution and leave the variable set; this test, unlike its neighbours (which call .clear() first), does not
+  clear it, so it takes the "legacy variable is set" branch. Class of defect: process environment mutated by the code under
+  test and not restored by the test.
+
+DETECTOR VALIDATION (same pipeline)
+  synthetic: a file that fails only in alphabetical order -> DANGEROUS; one that fails only in file order -> CI-pass/pytest-fail;
+  an independent file -> stable. Real: TestCacheStatsSink at d28348b736^ (before its fix) -> CI-pass/pytest-fail.
+
+WHAT THIS DOES NOT SHOW
+  Three orders, not all orders: a leak needing one specific pair in one specific sequence can hide. Only CPU-registered
+  files; 41 of the 307 (32 partial + 9 none) ran incompletely for environment reasons. The mechanism named above is
+  from one hit; the reference-cycle registry leak (fixed in d28348b736) is the second mechanism found in the project,
+  not in this sweep (its file was already fixed when swept).

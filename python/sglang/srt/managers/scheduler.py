@@ -1885,6 +1885,16 @@ class Scheduler(
 
         rank_consensus_checker.shutdown()
 
+        # Last: the orderly shutdown can wait for a device barrier and for the service thread, so every cheaper
+        # release has already run. Keep it last: the `except` below is only harmless because nothing follows it.
+        # The module is only in sys.modules when a service could exist; nothing is imported.
+        exl3_ram_miss = sys.modules.get("sglang.srt.layers.moe.exl3_ram_miss")
+        if exl3_ram_miss is not None:
+            try:
+                exl3_ram_miss.shutdown_exl3_ram_miss_service()
+            except Exception:
+                logger.exception("Shutting down the EXL3 RAM-miss service failed; the exit hook will quarantine it.")
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
