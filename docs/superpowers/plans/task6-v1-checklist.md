@@ -143,6 +143,13 @@ footnote.
 
 ## 2. The `release_locked` landmine: unreachable today, incidentally, and how it arms
 
+> **This hazard has a home outside this parked file.** It is a property of the lease path
+> as shipped, so it is recorded as a **standing risk** in
+> `2026-09-20-storage-cpu-pipeline-v2.md`, under its own heading before Task 0 rather than
+> under Task 6, with the three independent routes that reached it. **That entry is not
+> parked and does not depend on Task 6 resuming.** What follows here is the full
+> derivation it points back to.
+
 The plan records this as an "implementation landmine, V2 only" and states it in terms of
 a throw. Both halves need correcting, and the correction makes it more dangerous rather
 than less. It is given its own section because a hazard whose only defence is that nobody

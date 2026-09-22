@@ -356,3 +356,57 @@ survivor classification are in `MUTATION_RESULTS.md`. What it changes in this re
   the first; only a mutant run establishes the second, and one of six did not carry over.
 - Not run (need a GPU, not permitted here): the stale-ticket generation gate (finding 2) and the
   insert-on-miss victim (finding 5). They remain source arguments.
+
+---
+
+## Reasoning patterns, not test findings (2026-09-21)
+
+Two patterns from Task 6 that belong with this document's subject — claims that cannot
+fail — even though neither is a test. Both are recorded because each caused a real error
+in a real document the same day, and both are cheap to check.
+
+### A. A bound propagated as an estimate
+
+**The pattern.** A figure is produced as an inequality, its direction is carried in the
+prose *around* it rather than in the figure itself, and the first restatement drops the
+direction. From then on a lower bound is read as an estimate and reasoned with in both
+directions.
+
+**The instance.** The per-stage cost `g` was measured as **`g_a >= 7.26 us`, a lower
+bound** — the stand-in kernels are strictly simpler than the real per-stage ones and
+ready-at-launch is the best case for polling. Written down as "7.26 us", against an assumed
+8-14 us range, it read as "`g` came in below the assumed range", which pointed to a
+conclusion the opposite of what the bound supports: 7.26 sits **above** the 6.98 us
+crossing it was being compared against. The misreading reached design guidance before it
+was caught.
+
+**The check, which costs nothing.** **Write the direction into the figure, never beside
+it.** `g_a >= 7.26 us (LOWER BOUND)`, not "7.26 us, which is a bound". A copy-paste then
+carries the qualification whether or not the copier read the sentence. The same failure
+shape produced the OPEN 11 factor-of-two and the `c` = 1.055 provenance: each was sound
+where it was produced and misleading one hop away, because what qualified it did not
+travel with it.
+
+### B. Hiding behind a resource without asking whether it is saturated
+
+**The question to ask before any mechanism is modelled:** **is the resource we are hiding
+behind saturated, or idle?**
+
+- **Saturated** → the mechanism can only *reorder* work. The best case is moving cost
+  earlier, and the ceiling is the resource's rate. No amount of overlap creates capacity.
+- **Idle** → the mechanism *creates* capacity, and the headroom is real.
+
+**The instance.** Task 6 set out to start GPU transfers before all reads finish. The
+resource it hid behind was the PCIe link, and the gather already runs at **Gen3 x16 line
+rate** (13.3 MB in 1.055 ms, ~12.6 GB/s) on a host — HPE ProLiant DL380 Gen10, 1st/2nd-gen
+Xeon Scalable — where **Gen3 is a platform limit, not a BIOS setting**. Every variant was
+therefore reordering work on a saturated link, which is exactly consistent with V1's honest
+1.1-1.4% net projection holding up unchallenged throughout. By contrast the NVMe wait is
+190 ms of the step with the drive idle about 200 ms of every step: an idle resource, where
+the same class of work creates capacity instead of moving it.
+
+**Why it belongs here.** The modelling was not wrong — it produced a small number and the
+number was right. What could not fail was the *framing*: a projection of 1.1-1.4% against a
+1.5% resolution bar can never reject, so the effort went into looking for reasons the
+projection was too low rather than asking whether the mechanism could pay at all. Asking
+the saturated-or-idle question in week one would have made Task 6 a paragraph.
