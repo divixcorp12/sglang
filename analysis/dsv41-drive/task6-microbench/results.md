@@ -4,6 +4,11 @@
 decide anything: the final readings belong on a card the main session knows to be quiet, taken with the commands in section 4.
 Nothing here is a conclusion about Task 6's verdict, and the plan and `PER_ROW_TRANSFER.md` are untouched.
 
+**Status of `c`: NOT MEASURED under `C_MEASUREMENT_PREREG.md`.** Section 1 below comes from `gather_tn.py`, a gate-free driver, so its `c_m`, `f`
+and `delta` are **ungated engineering numbers**. They must not be written into `PER_ROW_TRANSFER.md`, `LEASE_PROTOCOL.md` or the plan as `c`.
+The registered run (`run_c.sh`, amendments 10 and 11) is the only thing that produces a quotable `c`; its result goes in a separate file.
+Every `g` figure in section 2 is a **lower bound** on production `g`, for the reason given there.
+
 Code under test: branch `dsv41-microbench` (harness commits `d22cf9fd88` for `g`, `925354fff4` for the poll probe and `T(n)`),
 on a detached worktree of it at `/data/models/slang/nvfp4-work/cc-microbench` on divix01 (since removed). `sglang.__file__`
 resolved under that worktree (recorded in `data/tn_prelim/meta.json`).
@@ -81,13 +86,41 @@ kernel**, cell order randomised, 20 batches of 50 replays. Raw: `data/g_prelim/*
 `data/g_prelim/frozen_g_analysis.txt`. Each process first checked its graphs: an active chain of 3 has 9 nodes, `go = 1` and 3 acks
 written; an empty one 9 nodes, `go = 0`, no ack. Node counts equal `3N` (+8000) in all 99 cells.
 
+**DIRECTION OF THE BOUND, stated once and applying to every `g` figure in this file: the stand-in gives a LOWER bound.** Production `g`
+for the design as specified is at least these numbers, and nothing here says how far above. Do not read 7.26 us as an estimate of
+production `g`, and do not read "at or below the low end of 8-14 us" into it: a lower bound of 7.26 says almost nothing about which side
+of the 6.98 / 8.03 us crossings production lands on.
+
+Why it is a lower bound for the registered design (`p = 4`, the fail-closed conditions of `PER_ROW_TRANSFER.md` 5.5 read as written):
+
+1. the stand-in `W_s` does only the polls (four serial acquire loads) and one store; the real one also decodes what it read (page fatal,
+   `Header.shutdown`, `RowResult.ready`, the seqlock re-read and its compare-and-retry) and computes the per-lane `go` word;
+2. the stand-in `A_s` writes one release word; the real one acknowledges per lane;
+3. **ready-at-launch is the best case for polling**: every word is already published, so no poll ever repeats and no detection delay
+   is paid (`G_MEASUREMENT_PREREG.md` L10); a wait that really waits adds the poll period plus a round trip;
+4. the empty triple in the real design probably still reads the fail-closed words (fatal, shutdown) before it can return empty; the
+   stand-in's empty exit reads nothing. That makes the stand-in `g_e` a lower bound too.
+
+**What the bound does not cover:** a cheaper `W_s`. With one word (`p = 1`) the same harness gives 4.90 us, below 7.26. So the
+statement is "at least 7.26 us if the wait has to read four words", not "at least 7.26 us whatever the wait does". Nothing measured
+here argues that a one-word wait is unsafe or safe; that is a protocol question (`PER_ROW_TRANSFER.md` OPEN 4 and 5).
+
+**How far above would make a difference** (arithmetic on the frozen accounting, not a verdict): the lower bounds give `G_H` = 0.539
+and `G_X` = 0.690 ms/step against `G*` = 1.114, so production per-triple costs would have to average about **2.1x** (class C hidden)
+or **1.6x** (all exposed) these stand-in costs before the bar is crossed. Whether the real kernels are that much heavier is exactly
+what this run cannot say.
+
+**A3 is not replaced.** This harness bounds `g` from below, on the card, now. Only a traced A3 on real per-stage kernels measures
+production `g` (`G_MEASUREMENT_PREREG.md` section 8; the per-stage `W_s`/`A_s` do not exist, only the request-level post, lease-wait and
+ack kernels do). Nobody should retire A3 on the strength of these numbers.
+
 Slope of replay time against number of triples N, microseconds per triple, three processes (0, 1, 2):
 
 | variant | what | process 0 | 1 | 2 |
 |---|---|--:|--:|--:|
-| **`empty`** = `g_e` | three launches, no host read | 1.75 | 1.76 | 1.76 |
+| **`empty`** = `g_e` (lower bound) | three launches, no host read | 1.75 | 1.76 | 1.76 |
 | `empty_base8k` | the same on 8,000 filler nodes | 1.75 | 1.76 | 1.76 |
-| **`active_p4`** = `g_a` (registered p = 4) | four serial PCIe polls, ack fence, 4 KiB copy path | 7.26 | 7.26 | 7.27 |
+| **`active_p4`** = `g_a` (registered p = 4; lower bound) | four serial PCIe polls, ack fence, 4 KiB copy path | 7.26 | 7.26 | 7.27 |
 | `active_p1` / `active_p6` (sensitivity) | one / six polls | 4.90 / 8.82 | 4.91 / 8.80 | 4.90 / 8.81 |
 | `control20` (positive control) | `empty` + 20 us spin | 21.75 | 21.76 | 21.76 |
 
@@ -108,8 +141,8 @@ hit-lane stages that hide), in ms per decode step:
 
 | | ms/step | note |
 |---|--:|---|
-| `G_H` (class C hidden) = (85.10 x 1.76 + (48.93 + 4.65) x 7.26) / 1000 | **0.539** | |
-| `G_X` (all exposed) = (85.10 x 1.76 + (48.93 + 20.86 + 4.65) x 7.26) / 1000 | **0.690** | |
+| `G_H` (class C hidden) = (85.10 x 1.76 + (48.93 + 4.65) x 7.26) / 1000 | **0.539** | lower bound |
+| `G_X` (all exposed) = (85.10 x 1.76 + (48.93 + 20.86 + 4.65) x 7.26) / 1000 | **0.690** | lower bound |
 | `G*` (from the plan) | 1.114 | |
 | the uniform-`g` equivalents | 3.9 us (`G_H` / 138.69 triples) and 4.3 us (`G_X` / 159.55) | the plan's crossings, for comparison, were 8.03 and 6.98 us |
 | sensitivity, `G_X` at `active_p1` / `active_p6` | 0.515 / 0.805 | |
@@ -122,8 +155,9 @@ never seen here (`G_MEASUREMENT_PREREG.md` L10); (c) exposure (class C) is a pro
 inequality and the measured `c_m` (1.088 ms) is above the 1.055 the accounting uses; (e) the real backend's armed all-hit layer
 costs **~17 us** through the real post + lease-wait + copy + ack kernels (OPEN 11, `../open11/results.md`), which includes a service
 round trip that a pre-published-readiness triple never pays, so "active" in a real per-stage protocol is not necessarily 7 us.
-**Measured `g` is below the plan's assumed 8-14 us** on this stand-in, and below the pre-registration's own prediction (5-10 us empty,
-10-20 us active).
+**The stand-in lower bound (7.26 us for `g_a`) sits 0.7 us under the low end of the plan's assumed 8-14 us, and above the crossing of
+6.98 us.** Because it is a lower bound that neither supports nor refutes the assumed range. It is below the pre-registration's own
+prediction for the stand-in (5-10 us empty, 10-20 us active), which is a fact about the prediction.
 
 ## 3. Things in the brief that were stale or wrong when checked against the tree
 
@@ -138,8 +172,13 @@ round trip that a pre-published-readiness triple never pays, so "active" in a re
    it, sat at P1 with SM clocks of 94-95% of the maximum and produced flat 12.3 GB/s across n. **I have now seen `c_m` values from a
    non-registered driver; C_MEASUREMENT_PREREG.md sections 18-20 treat that as a contamination of any later gate amendment. The
    lead should weigh the P-state decision knowing these numbers exist.** I did not read the values from `c_run1`.
-3. **L2 is 96 MiB, not "~128 MB"** (`CLAUDE.md` and the brief). The pre-registrations cite `NC_VISIBILITY.md` for 96 MiB; I did not
-   re-measure it. The ring (2.0 GB) is 20.9 x 96 MiB, so the difference does not matter here.
+3. **L2 is 96 MiB, not "~128 MB", but the CLAUDE.md guidance is wrong in the SAFE direction, not the flattering one.** The card's L2 is
+   `l2CacheSize` = 100,663,296 bytes = 96 MiB. Evidence: `NC_VISIBILITY.md` ("Facts for the next benchmark author", lines 277-281) read it from
+   the device properties, and I re-read it today on divix01 (`torch.cuda.get_device_properties(0).L2_cache_size` = 100663296, RTX 5090).
+   Because 96 MiB < 128 MB, a working set sized past 128 MB also clears the real L2, so "size past ~128 MB" still works; the number is wrong
+   and should not be derived from, but it cannot make a cache-resident benchmark look cold. (It would be wrong the other way only on a card whose
+   L2 exceeds 128 MB.) NC_VISIBILITY.md already says the same in its own words; the CLAUDE.md line was never corrected. Our ring is 2.0 GB
+   = 20.9 x 96 MiB either way.
 4. **"`W_s`/`A_s` do not exist" is now half true.** The request-level kernels do: `exl3_ram_miss_post_kernel`,
    `exl3_ram_miss_lease_wait_kernel` and `exl3_ram_miss_lease_ack_kernel` (`python/sglang/kernels/jit/csrc/moe/exl3_ram_miss.cuh`),
    used by `Exl3RamMissRowBackend.post` in lease mode. The **per-stage** versions Task 6 needs do not. The first is why OPEN 11 has a
@@ -147,10 +186,28 @@ round trip that a pre-published-readiness triple never pays, so "active" in a re
 5. **`PER_ROW_TRANSFER.md` and its OPEN items live in `analysis/dsv41-drive/`**, not the repo root.
 6. **GPU scheduling.** The project memory says to message crypto-c9 before any GPU time; the brief says use `gpu-run.sh`. I used only
    `gpu-run.sh` (three short jobs, under 10 minutes of card each, under 1.5 GiB) and did not message crypto-c9.
-7. **A slip of mine:** I copied `g_kernels.cu` to `/tmp` on divix01 with `scp` once for a compile check, against the brief's
-   git-only rule. I deleted it immediately; every run afterwards used the git-fetched worktree.
+7. **Two slips of mine:** (a)  I copied `g_kernels.cu` to `/tmp` on divix01 with `scp` once for a compile check, against the brief's
+   git-only rule. I deleted it immediately; every run afterwards used the git-fetched worktree. (b) I queried the device's L2 size with a bare `torch.cuda.get_device_properties(0)` on divix01 without going through `gpu-run.sh`. It creates a CUDA context for a few seconds; nothing else was timed at that moment and `run_c.sh` now takes the same query inside the lock hold (`window.txt`), but it was a lock bypass and I say so.
 
 ## 4. Commands for the final readings, and the card time they need
+
+**`c` (registered; amendments 10 and 11; one lock hold: hash check, pre-flight rehearsal that must print GO, `--check-only`, run):**
+
+```text
+git -C /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41 fetch shared dsv41-microbench
+git -C /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41 worktree add --detach /data/models/slang/nvfp4-work/cc-microbench <sha>
+cd /data/models/slang/nvfp4-work/cc-microbench
+/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh bash analysis/dsv41-drive/task6-microbench/run_c.sh <outdir>        # add --no-nvme only by a decision recorded first
+# then, reading line 1 BEFORE anything else (never tail):
+python3 analysis/dsv41-drive/c_measurement/c_analysis.py <outdir>/results.jsonl | head -1
+# only if line 1 is a verdict word and not INVALID/REFUSED:
+python3 analysis/dsv41-drive/task6-microbench/c_intercept_report.py <outdir>/results.jsonl
+```
+
+If the pre-flight prints NO-GO, or a lane of ours arrives mid-rehearsal, the window does not open and nothing runs; that is the registered
+outcome, not something to retry until it passes. Card time about 10 minutes once GO (run 1 took 8 minutes for 235 cells), under 2 GiB.
+
+**`g` and the ungated `T(n)` driver (preliminary tools; commands unchanged):**
 
 Preconditions the main session should establish first: `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` empty; production
 stopped; load average recorded; the worktree made through git:
