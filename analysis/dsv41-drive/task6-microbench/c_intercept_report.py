@@ -8,8 +8,8 @@ cost per extra launch that PER_ROW_TRANSFER.md 1.2's `35.74 = 33.9 x c` does not
 slope `c_m` but no interval on either; this reports them, in those terms.
 
 THIS SCRIPT CAN ONLY WITHHOLD. It runs the frozen gates first (c_analysis.analyse with the trace model stubbed: the gates need no
-traces) and prints the verdict word on line 1; if a results.INVALID marker sits beside the input, or the verdict is INVALID, it prints
-that and nothing else and exits 3, exactly as c_analysis.py does. It reads the fitted values only after that.
+traces) and prints the verdict word on line 1; if a results.INVALID marker that voids the run sits beside the input (a marker scoped to the nvme arm's rho does not; it is printed and
+ignored), or the verdict is INVALID, it prints that and nothing else and exits 3, exactly as c_analysis.py does. It reads the fitted values only after that.
 
 Per node, for the registered arm sm/cold/idle/eager and, where present, graph launch:
   * fit A: T(n) = f + c_m n over n = 1..6 (what c_analysis.py fits);
@@ -42,12 +42,17 @@ def q(xs, p): xs = sorted(xs); return xs[min(len(xs) - 1, int(p * len(xs)))]
 
 def main(path):
     marker = os.path.join(os.path.dirname(os.path.abspath(path)), "results.INVALID")
+    scope = None
     if os.path.exists(marker):
-        print("VERDICT: REFUSED (a results.INVALID marker sits beside the input)"); print("  marker:", open(marker).read().strip()); return 3
+        text = open(marker).read().strip()
+        if not A.marker_is_scoped(text):
+            print("VERDICT: REFUSED (a results.INVALID marker that voids the run sits beside the input)"); print("  marker:", text); return 3
+        scope = text                       # scoped to the nvme arm's rho (amendment 11): T(n) may be quoted, rho may not; this report never touches the nvme arm
     recs = [json.loads(l) for l in open(path)]
     A.simulate = lambda T, *_: (0.0, 0.0, 0.0)          # the gates and the verdict word do not need the divix01 traces; the model is not used here
     r = A.analyse(recs)
     print("VERDICT (frozen gates, trace model not evaluated):", r["verdict"])
+    if scope: print("  SCOPED MARKER: %s | the nvme arm's rho is NOT to be quoted; nothing about the nvme arm is printed here" % scope)
     for g in r["gates"]: print("  gate:", g)
     if r["verdict"] == "INVALID": print("  (INVALID: no number is printed)"); return 3
     rng = random.Random(A.SEED)

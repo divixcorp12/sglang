@@ -14,6 +14,7 @@ export PYTHONPATH=$REPO/python CUDA_HOME=/usr/local/cuda-13.2 SGLANG_SKIP_SGL_KE
 mkdir -p "$O"
 { echo "start $(date -Is) load $(cat /proc/loadavg)"; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader; echo "repo $REPO $(git -C "$REPO" rev-parse HEAD)"; } > "$O/window.txt"
 python3 "$D/verify_hashes.py" > "$O/verify_hashes.txt" 2>&1 || { echo "HASH MISMATCH, nothing run"; cat "$O/verify_hashes.txt"; exit 4; }
+$PY -c "import torch; p=torch.cuda.get_device_properties(0); print('L2_cache_size', p.L2_cache_size, 'bytes =', p.L2_cache_size/2**20, 'MiB;', p.name)" >> "$O/window.txt" 2>&1
 $PY "$D/quiet_check.py" --rehearse 40 > "$O/quiet_check.txt" 2>&1; QC=$?
 if [ $QC -ne 0 ]; then echo "quiet_check did not print GO (rc $QC): the window does not open, nothing run"; tail -6 "$O/quiet_check.txt" | cut -c1-300; exit 5; fi
 HM=$(sed -n 's/^then: gpu-run.sh taskset -c \([0-9,]*\) .*--reader-cpus \([0-9,]*\)$/\1/p' "$O/quiet_check.txt"); RM=$(sed -n 's/^then: gpu-run.sh taskset -c \([0-9,]*\) .*--reader-cpus \([0-9,]*\)$/\2/p' "$O/quiet_check.txt")

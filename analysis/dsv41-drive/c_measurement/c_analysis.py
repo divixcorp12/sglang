@@ -35,6 +35,14 @@ G_LO_US, G_HI_US = 8.0, 14.0              # the plan's assumed range for g
 STEPS = 511
 BOOT, SEED = 1000, 20260921
 
+# Every marker c_harness.py writes is about the nvme arm (drive traffic in a load window, a load arm below its reader floor, box drift between
+# the idle and load arms, a dirty idle baseline): the phrases below are the ones those four texts carry. Anything else voids the run.
+SCOPED_MARKER_PHRASES = ("nvme arm", "nvme ratio", "load arm", "rho")
+
+def marker_is_scoped(text):
+    lines = [l for l in text.splitlines() if l.strip()]
+    return bool(lines) and all(any(ph in l for ph in SCOPED_MARKER_PHRASES) for l in lines)
+
 def pct(v, p): v = sorted(v); return v[min(len(v) - 1, int(p * len(v)))]
 
 def fit(T):                                # T: {n: ms} -> (f_ms, c_ms) least squares
@@ -203,18 +211,24 @@ if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--selftest": sys.exit(selftest())
     args = sys.argv[1:]; tr = None
     if "--traces" in args: i = args.index("--traces"); tr = args[i + 1:i + 3]; args = args[:i]
-    # amendment 10 / section 18.7: refuse to analyse beside a results.INVALID marker, BEFORE reading the input. Section 18.7 asked for
-    # this and section 18.9 applied it to sibling_pilot_analysis.py only; run 1 of `c` was analysed beside a marker and its fitted
-    # values were seen. This is stricter than section 21 item 2 (which left a drive-traffic marker scoped to the `nvme` arm's rho and
-    # let the analysis run): a marker of any scope now refuses the whole analysis. It can only withhold numbers, never admit them.
+    # amendment 11 / section 18.7: a results.INVALID marker that VOIDS THE RUN makes this script refuse, before reading its input, so that no
+    # fitted value can be seen for a voided run (run 1 of `c` was analysed beside a marker and its fits were seen). A marker the registration
+    # has already SCOPED to one quantity (sections 12 item 3(b), 13 and 16: every marker c_harness.py writes is about the `nvme` arm's rho or its
+    # baseline) does not void T(n): the analysis proceeds, prints the scope at the top, and prints nothing about the nvme arm. An unrecognised
+    # marker text is treated as voiding the run. This changes no gate, threshold, arm, statistic or verdict rule; it can only withhold numbers.
     marker = os.path.join(os.path.dirname(os.path.abspath(args[0])), "results.INVALID")
+    scope_note = None
     if os.path.exists(marker):
-        print("VERDICT: REFUSED (a results.INVALID marker sits beside the input; nothing was analysed and no number is printed)")
-        print("  marker:", open(marker).read().strip())
-        sys.exit(3)
+        text = open(marker).read().strip()
+        if not marker_is_scoped(text):
+            print("VERDICT: REFUSED (a results.INVALID marker that voids the run sits beside the input; nothing was analysed and no number is printed)")
+            print("  marker:", text)
+            sys.exit(3)
+        scope_note = "  SCOPED MARKER (sections 12 item 3(b), 13, 16): %s | The nvme arm's rho is NOT to be quoted and no nvme-arm value is printed below; T(n) is judged by the gates as registered." % text
     lines = [json.loads(l) for l in open(args[0])]
     r = analyse(lines, *(tr or [None, None]))
     print("VERDICT:", r["verdict"])
+    if scope_note: print(scope_note)
     for g in r["gates"]: print("  gate:", g)
     # amendment 9. On an INVALID verdict no fit, flag or model line is printed, whatever the caller does with the
     # output. Run 1 of `c` was collected with `tail`, which showed the fits before line 1 had been read, so fitted
@@ -223,6 +237,12 @@ if __name__ == "__main__":
     if r["verdict"] == "INVALID":
         print("  (INVALID: no fit, flag or model line is printed)")
         sys.exit(3)
-    for k, f in r["fits"].items(): print("  fit %s: f %.4f ms, c_marginal %.4f ms, T(1) off-line %.3f, GB/s by n %s" % (k, f[0], f[1], f[2], ["%.2f" % x for x in f[3]]))
-    for fl in r.get("flags", []): print("  flag:", fl)
-    for k, m in r.get("model", {}).items(): print("  model", k, {a: (round(b, 3) if isinstance(b, float) else b) for a, b in m.items()})
+    for k, f in r["fits"].items():
+        if scope_note and k[3] == "nvme": continue                         # the scoped quantity is never printed
+        print("  fit %s: f %.4f ms, c_marginal %.4f ms, T(1) off-line %.3f, GB/s by n %s" % (k, f[0], f[1], f[2], ["%.2f" % x for x in f[3]]))
+    for fl in r.get("flags", []):
+        if scope_note and "'nvme'" in fl: continue
+        print("  flag:", fl)
+    for k, m in r.get("model", {}).items():
+        if scope_note and k[3] == "nvme": continue
+        print("  model", k, {a: (round(b, 3) if isinstance(b, float) else b) for a, b in m.items()})
