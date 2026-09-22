@@ -171,8 +171,13 @@ def test_a_hit_lanes_slot_is_never_in_the_requests_release_set(running):
 
     # The consequence, which the membership fact alone does not cover: the slot is not handed to the next request.
     host.inject(fail_reads=False)
-    other = sim.post(0, [5])
-    sim.wait(other, timeout_s=10.0)
+    sim.post(0, [5])
+    # Deliberately not sim.wait: the failed request above latched the page's fatal word, and
+    # exl3_ram_miss_sim_wait returns 3 on a latched fatal as its first statement, before it ever consults
+    # demand_done. Waiting on it therefore synchronizes with nothing, leaving the assertion below racing the
+    # service thread -- and _slot_of raises StopIteration, not -1, when expert 5 is not mapped yet, so the
+    # race surfaces as an intermittent error rather than a clean failure. Poll the actual condition instead.
+    assert _until(lambda: any(st == READY and e == 5 for st, e, _, _ in host.slot_info(0))), "expert 5 never landed"
     assert _slot_of(host, 0, 5) != hit_slot, "a leased hit slot was handed to the next request"
 
     # And the lease is retired by the device, never by the host.
