@@ -130,17 +130,33 @@ class Service:
         self.routes.fill_(-1)
         self.routes[: len(experts)] = torch.tensor(experts, dtype=torch.int64)
 
+    def backend(self, row=0, poll_bound=64):
+        """The real D7 orchestration (``Exl3RamMissRowBackend``), not a hand-rolled duplicate of its chain:
+        T8's mutant is applied to that class, so T8 must run through it or the mutant would go untested."""
+        from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
+
+        return Exl3RamMissRowBackend(
+            segments={0: self.segments},
+            host_row_map=self.slot_map[0].to("cuda"),
+            device_side=self.dev,
+            row=row,
+            next_row=-1,
+            capacity=TOP_K,
+            two_phase=True,
+            poll_bound=poll_bound,
+        )
+
     def step_two_phase(self, row=0, poll_bound=64):
-        """D7's chain: post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F, one stream."""
-        dev = self.dev
-        dev.post(row, self.planned, self.count, self.routes, -1)
-        dev.hit_wait(row, self.planned, self.count, self.dest_slots, poll_bound)
-        copy_expert_row_segments_gpu(self.segments, dev.host_rows_1, dev.dst_slots_1, dev.go_1)
-        dev.stage_ack(1)
-        dev.rest_wait(row, self.planned, self.count, self.dest_slots, self.ram_miss)
-        copy_expert_row_segments_gpu(self.segments, dev.host_rows_2, dev.dst_slots_2, dev.go_2)
-        dev.stage_ack(2)
-        dev.finalize(self.count, self.keep)
+        """D7's chain, run through the real ``Exl3RamMissRowBackend.post`` (not a duplicate): post -> W1 ->
+        C1 -> A1 -> W2 -> C2 -> A2 -> F, one stream."""
+        from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
+
+        backend = self.backend(row=row, poll_bound=poll_bound)
+        plan = ExpertRowPlan(expert_ids=self.planned[:TOP_K].clone(), slots=self.dest_slots.clone(), count=self.count)
+        backend.post(0, plan)
+        self.keep.copy_(backend.keep)
+        self.ram_miss.add_(backend.ram_miss)
+        return backend
 
     def until(self, predicate, timeout_s=10.0):
         deadline = time.perf_counter() + timeout_s
