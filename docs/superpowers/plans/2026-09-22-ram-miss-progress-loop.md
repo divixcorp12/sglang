@@ -30,7 +30,7 @@ would service nothing.
 So do not justify this work by queueing, concurrency or backlog. Those are zero and will stay zero
 until something generates concurrent work.
 
-## The drive is idle three quarters of the time, and a producer for it already exists
+## The drive is idle three quarters of the time, and the plumbing to fill it exists unused
 
 Measured over the same trace, per decode forward, merging every request's `submit`..`last_cqe`:
 
@@ -48,16 +48,25 @@ Note where it is **not**: `batches == 1` for every request in the trace, so a re
 the queue all of its rows in one submission. Intra-request saturation is fine. **The idle sits
 between requests**, while the model computes a layer and has not yet asked for the next one's rows.
 
-The producer for that gap is already written and simply switched off. `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`
+The *plumbing* for that gap is already written and switched off -- note the distinction, because the policy that would drive it does not exist (see phase 0). `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`
 (`exl3_expert_format.py:374`, "Option F advisories") gates a full advisory path: advisory records on
 their own ring, `serve(request, advisory=true)` (`:2599`), a per-row abandon callback that gives up
 the moment a demand is posted or a pause or stop is requested (`:2720`), `kStatusCancelled` (`:99`)
 and `kAdvisoryRows` (`:2789`). The traced run had it off: zero advisory records among 113,400.
 
-## Phase 0: turn the existing prefetch on and measure it
+## Phase 0: turn the existing prefetch on -- BLOCKED, and not for a reason the code shows
 
-Do this before either phase below. It needs no new machinery, and it may capture most of the 206 ms
-on its own. Measure the drive-busy fraction with advisories enabled, and count how many are
+**Do not start this.** The advisory *plumbing* above is real and complete, but there is no expert
+predictor trained on the DSV4.1 network, so nothing can decide which experts an advisory should
+fetch. An advisory that guesses wrong spends the idle drive on rows nobody wants and is then
+cancelled when the real demand arrives -- worse than idle, because the bandwidth is consumed and
+the bounce slots are occupied.
+
+This is recorded because the env var is discoverable and the C++ path looks ready. It is not. The
+prerequisite is a trained predictor for this network, which is its own body of work
+(`scripts/expert_prediction/`), not a flag flip.
+
+If a predictor does land, the measurement below is what phase 0 becomes. Measure the drive-busy fraction with advisories enabled, and count how many are
 cancelled by `demand_pending()` before finishing.
 
 That cancellation count is the number that decides whether phase 2 is worth building. Today an
@@ -65,6 +74,33 @@ advisory **abandons** when demand arrives, because the pump can only service one
 If advisories mostly complete, the existing design already fills the gap and a re-entrant loop buys
 little. If they are mostly cancelled, the I/O is being started and thrown away, and *that* is the
 concrete argument for letting an advisory stay in flight alongside a demand -- which is phase 2.
+
+## `--max-running-requests` is a throughput lever, not a single-prompt one
+
+The gate at `expert_stream_requirements.py:235` pins it to 1, and unlike its neighbours it carries
+no rationale comment. The documented reason sits in `MOE_EXPERT_TRANSFER.md:339`, under **"Caveats
+before shipping"**: "Measured only at BS1 ... Concurrency changes the memory split between KV and
+the hot cache." That is a measurement scope and a sizing interaction, not a correctness invariant.
+`DSV41_REFERENCE.md:231` gives the mechanism: the pool configurator reserves SWA slots from
+`max_running_requests` before sizing the full pool, and `compare_oracle.py` needed 4 to avoid a
+starved pool.
+
+**But be clear about what raising it would and would not do.** It caps how many *inference
+requests* -- separate prompts, separate HTTP calls -- decode concurrently. It is the decode batch
+size. It is not parallelism within one prompt.
+
+- **With concurrent traffic:** more sequences means the router's expert union per layer grows, so a
+  layer's RAM-miss request carries more rows. That deepens the queue per submission, which is the
+  direct answer to the single-row shape (`rows_asked == 1` for 67.9% of requests). It does **not**
+  create concurrent requests: a forward still takes the whole batch through each layer once, so
+  there is still one expert gather per layer. Bigger requests, not more of them -- so it does not
+  give a re-entrant loop anything to service either.
+- **With one prompt:** it changes nothing. One sequence is one running request whatever the flag
+  says, and the 206 ms of idle drive stays exactly as measured.
+
+So it is a throughput lever for a multi-user workload, and irrelevant to the latency of a single
+interactive generation. Raising it costs a re-derived KV-versus-hot-cache budget and more bytes
+read per step; better drive utilisation is not automatically faster decode.
 
 ## What is actually wrong
 
@@ -145,6 +181,19 @@ in-loop `retire_leases()` call, and it must go red for that reason. Record the r
 ## What would make any of this measurable
 
 Phase 1's effects are observable without new workloads: slot reuse latency, and whether an eager
-pause can be granted during a read. Phase 2's are not. Before building phase 2, establish that a
-consumer exists which issues speculative or prefetch work concurrently with a demand read -- and
-size it, because at batch size 1 with sequential layers nothing does today.
+pause can be granted during a read. **Phase 1 is the only item here that is not blocked on
+something else**, which is why it is the one to build.
+
+Everything aimed at the idle drive needs a producer, and each candidate producer is blocked on its
+own prerequisite:
+
+| lever | what it needs first |
+|---|---|
+| prefetch advisories | an expert predictor trained on the DSV4.1 network |
+| a larger decode batch | concurrent traffic; irrelevant to one prompt |
+| phase 2, the re-entrant loop | one of the two above, since neither today's workload nor a bigger batch produces overlapping requests |
+
+Be honest that this leaves the single-prompt case open. The 206 ms of idle drive per forward is
+real and none of the levers here reach it: one sequence asks for one layer's rows at a time, waits
+for them, and computes. Closing that gap means predicting the next layer's experts, which is the
+predictor problem, not a service-thread problem.
