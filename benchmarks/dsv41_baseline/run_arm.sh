@@ -124,7 +124,12 @@ import sys, json
 sys.path.insert(0, '$worktree/python')
 import sglang  # noqa: F401  (so provenance.capture() resolves sglang_file/git/sglang_env_resolved)
 import provenance
-print(json.dumps(provenance.capture({'run_capture_sessions': '$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py', 'synthetic_corpus': '$here/synthetic_corpus.py'})))
+prov = provenance.capture({'run_capture_sessions': '$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py', 'synthetic_corpus': '$here/synthetic_corpus.py'})
+# Measured here or not at all: the check is 'no other job was reading these drives when the arm
+# started', which stops being answerable the moment the server does its first read. Leaving it
+# out did not read as unmeasured -- check_arm renders a missing one as 'drives not idle at start: {}'.
+prov['drive_idle_check'] = provenance.drive_idle_check()
+print(json.dumps(prov))
 ")
 residency_before=$(pyrun -c "
 import json, provenance
