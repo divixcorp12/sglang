@@ -332,13 +332,17 @@ def step_latency(log: list) -> dict:
     }
 
 
-def process_tree_cpu_s() -> float | None:
-    """User+system CPU seconds so far of this process and every live descendant (the scheduler and
-    its workers). Whole-process totals, not per thread: a spinning doorbell thread counts in full."""
+def process_tree_cpu_s(pid: int | None = None) -> float | None:
+    """User+system CPU seconds so far of ``pid`` (default: this process) and every live descendant
+    (the scheduler and its workers). Whole-process totals, not per thread: a spinning doorbell
+    thread counts in full.
+
+    ``pid`` lets a caller outside the measured process sample it (e.g. an HTTP driver sampling the
+    server it launched as a separate process, rather than itself)."""
     try:
         import psutil
 
-        me = psutil.Process()
+        me = psutil.Process() if pid is None else psutil.Process(pid)
         total = 0.0
         for p in [me, *me.children(recursive=True)]:
             try:
