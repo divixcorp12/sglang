@@ -348,7 +348,7 @@ do
     cpu_end=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'null')")
     after_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
     compile_events=$(pyrun -c "import compile_watch as cw; print(cw.compile_events_in_range('$log', start_byte=$before_byte, end_byte=$after_byte))")
-    contaminated=$([ "$compile_events" -gt 0 ] && echo true || echo false)
+    contaminated=$([ "$compile_events" -gt 0 ] && echo True || echo False)
     pyrun -c "
 import json
 with open('$clocks_path', 'a') as f:
