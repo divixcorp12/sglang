@@ -193,6 +193,26 @@ class TwoPhaseService:
             time.sleep(0.002)
         return False
 
+    def expected(self, experts):
+        """Ground truth per expert, read straight from the fake EXL3 files (test_exl3_lease_kernels_cuda.py)."""
+        from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
+
+        source = Exl3ShardRowSource.for_layer(self.layout, 0, self.fmt.segment_map(), direct=False)
+        rows = {}
+        for expert in sorted(set(experts)):
+            rows[expert] = {n: torch.empty(self.specs[n].row_shape, dtype=self.specs[n].dtype) for n in self.names}
+            source.read(torch.tensor([expert]), {n: t.unsqueeze(0) for n, t in rows[expert].items()})
+        return rows
+
+    def delivered(self, experts):
+        """Every lane's destination row is byte-identical to ground truth: nothing else was read."""
+        want = self.expected(experts)
+        for lane, expert in enumerate(experts):
+            for n in self.names:
+                if not torch.equal(self.dest[n][lane].cpu().view(torch.uint8), want[expert][n].view(torch.uint8)):
+                    return False
+        return True
+
 
 @pytest.fixture
 def service(tmp_path):
@@ -328,8 +348,9 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
 
     All k lanes hit: stage 1 claims and acknowledges every lane, stage 2 legitimately commits
     zero, and its acknowledgement kernel -- guarded by ``entry < go_2[0]`` -- must touch nothing.
-    A poisoned source slab planted at a slot no planned lane uses proves stage 2's (no-op) copy
-    reads nothing: the destination tensors carry only the real rows.
+    A poisoned source slab planted at a slot no planned lane uses, checked against ground truth
+    after the chain runs, proves stage 2's (no-op) copy read nothing: a real int16 weight value
+    can legitimately equal any sentinel, so only a full read-back-and-compare rules this out.
 
     ``poll_bound`` is set well above the real default: the real value (O4, unmeasured) is a guess
     at the per-stage cost of a single lane's round trip, and this request grants three hit leases
@@ -372,8 +393,7 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
             "an empty stage must acknowledge nothing"
         )
         assert s.host.counters()["leases_acked"] == leases_acked_before + len(experts)
-        for n in s.names:
-            assert not (s.dest[n].cpu() == -1).any(), n
+        assert s.delivered(experts), "stage 2 must not have touched the poisoned slot"
 
         s.finalize()
         _cuda_ready()
