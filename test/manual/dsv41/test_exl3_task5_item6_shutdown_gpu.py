@@ -97,13 +97,21 @@ def test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_i
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+        graph.replay()  # the warm route is resident: its leases are acknowledged and retired
+        torch.cuda.synchronize()
+        deadline = time.perf_counter() + 10.0
+        while time.perf_counter() < deadline:
+            c = service.host.counters()
+            if c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]:
+                break
+            time.sleep(0.005)
+        service.host.pause(2.0)  # nobody serves from here on, so the next wait kernel spins until its timeout
         ids.copy_(torch.tensor([_step_route(0, 0)], device="cuda", dtype=torch.int32))  # rows the tier lacks
-        service.host.inject(delay_s=3.0)  # the service is mid-read, so the wait kernel really spins
         graph.replay()
         time.sleep(0.4)
         done = torch.cuda.Event()
         done.record()
-        assert not done.query(), "precondition: the wait kernel is still spinning on the service"
+        assert not done.query(), "precondition: the wait kernel is still spinning on a service that is not serving"
         start = time.perf_counter()
         service.shutdown()
         elapsed = time.perf_counter() - start
