@@ -2320,6 +2320,16 @@ harness is measuring the same thing as before.
 
 ### Decode is untouched by mirroring; prefill is 1.84x faster
 
+> **Superseded as a general claim, 2026-09-20: decode was untouched here because
+> mirroring never reached it.** The arms below ran while `exl3_ram_miss_tables` built
+> its path table from the source checkpoint and never consulted the row source, so
+> every in-graph decode miss was served from nvme2 alone -- diagnosed two subsections
+> down, in "Where the bytes went". Once that bypass was fixed (`099eadba33`), the same
+> comparison gave **1.3482x on graph decode**, and Task 1's repeated arms gave 1.347x;
+> both are in "Follow-up: the native reader now reaches the mirrors", below. Read the
+> heading as "decode is untouched while the reader bypasses the mirrors", which is a
+> statement about that bug, not about mirroring.
+
 Per session, graph arms:
 
 | session | g-base tok/s | g-mirror tok/s | g-base TTFT s | g-mirror TTFT s |
@@ -2366,6 +2376,12 @@ So the 2.31x per-row gain measured in
 not reach graph decode at all**. Wiring a mirror-aware extent plan into the
 native reader is the prerequisite for any decode benefit; until then
 `SGLANG_MOE_EXPERT_MIRROR_DIRS` is a TTFT optimisation.
+
+> **That prerequisite was met the next day** (`099eadba33`, the follow-up below), so the
+> closing sentence no longer describes the code: `SGLANG_MOE_EXPERT_MIRROR_DIRS` is not a
+> TTFT-only optimisation any more. The diagnosis above stands and is what the fix acted on;
+> the 127 GiB nvme2 residual it explains is also the number to compare a later arm's residual
+> against -- 2026-09-22's HTTP arm left 9.3 GiB there.
 
 ### Unexplained: eager + mirrors is slower
 
@@ -2723,6 +2739,79 @@ The extent work surfaced bugs that the previous arms could not have exposed:
    asserted this could not happen.
 3. **A past-EOF extent clamped to nothing returned SUCCESS** while publishing
    stale bounce-buffer bytes. The `max(0, ...)` in the clamp is load-bearing.
+
+## 20. The HTTP serving harness: mirrors, leases, and what the arms compare (2026-09-22)
+
+`benchmarks/dsv41_baseline/run_arm.sh` drives the **served** path -- a real
+`sglang.launch_server` over `/v1/chat/completions` -- where sections 18-19 drove the
+offline `Engine`. It is a different workload on the same machine, so its numbers are
+comparable *within* the harness and not against sections 19's cells. Four arms, each
+n=1, 8 sessions from the cfq PDF corpus, 485 completion tokens, `--max-running-requests 1`,
+breakable decode graphs. Raw output under
+`cc-expert-prediction/dsv41-baseline/servers/<arm>/run-<stamp>/`.
+
+| arm | leases | mirrors | mean | median | token-weighted | mean TTFT s |
+|---|---|---|---:|---:|---:|---:|
+| `phase1-leases` | on | off | 2.037 | 1.997 | 2.141 | - |
+| `phase1-nolease` | off | off | 2.003 | 1.953 | 2.102 | 68.0 |
+| `phase1-nolease-mirror` | off | **on** | 2.775 | 2.851 | 2.741 | **38.9** |
+
+**Mirroring reproduces on the served path: 1.385x on the mean** (2.775 / 2.003),
+against 1.347x from Task 1's repeated Engine arms and 1.3482x from the paired
+single-shot pair. TTFT falls 1.75x (68.0 -> 38.9 s), against section 19's 1.84x.
+
+Per-drive reads, from `/proc/diskstats` sector deltas across the whole arm:
+
+| arm | nvme0 | nvme2 (source) | nvme4 | total |
+|---|---:|---:|---:|---:|
+| mirrors off | - | 1112.0 | 9.4 | 1121.4 |
+| mirrors on | 600.7 | 9.3 | 610.8 | 1220.8 |
+
+All figures GiB. The source drive falls to 9.3 GiB and the two mirrors split 49.6/50.4,
+so the native reader is reaching them: contrast section 19's pre-fix `g-mirror`, which
+left a 127.21 GiB residual on nvme2 because in-graph decode misses bypassed the mirrors.
+
+**Open, and weakly evidenced: the mirrored arm read 8.9% more bytes** (1220.8 vs 1121.4),
+where section 19's pre-fix pair was byte-neutral to 0.5%. One arm per cell, run half an
+hour apart with no page-cache control between them, so this is an observation to check on
+a repeat, not a finding.
+
+### Leases are not visible in throughput, and this is the wrong instrument for them
+
+`SGLANG_DSV41_ENABLE_RAM_MISS_LEASES` on vs off differs by **1.8%** (2.141 vs 2.102
+token-weighted), with per-session values spanning 1.67-2.28 within a single arm. At n=1
+against a spread that wide, the comparison resolves nothing except that lease mode plus
+the phase-1 progress callback costs no measurable throughput. Distinguishing an effect
+of that size needs roughly three arms per cell, about 2.5 h of GPU.
+
+This is also the wrong metric to look for phase 1 in: it retires leases *during* a read
+rather than only at the top of `pump()`, which is a stall/progress property. Its mechanism
+is established by a mutation-killed unit test
+(`test_a_lease_acknowledged_mid_read_retires_before_that_read_returns`), not by these arms.
+
+### Do not compare these to 2.91 / 3.93 without the offset
+
+Both arms sit at a consistent fraction of Task 1's matched Engine cells: 2.003 / 2.910 =
+**0.69** (mirrors off) and 2.775 / 3.930 = **0.71** (mirrors on). The same offset in both
+cells, with the mirror ratio reproducing between them, points at workload shape -- this
+corpus generates ~60 tokens per session behind a 39-68 s TTFT, against section 19's
+256-prompt / 128-new sessions -- rather than at anything mirror- or lease-related. The
+offset is unexplained and nobody has run the two corpora against each other.
+
+### The verdicts this harness printed before 2026-09-22 were graded on the wrong process
+
+`report_builder.build_report` copied `sglang_env` / `sglang_env_resolved` / `sglang_file`
+out of `provenance.capture()`, which samples the **harness**, into the keys
+`task1_arm_verdict.check_arm` reads as facts about the process that ran the arm. The
+harness holds none of the server's `SGLANG_*` vars, so every arm it graded was judged on
+the wrong process: it reported the reader as `mmap` and, on the mirrored arm,
+`SGLANG_MOE_EXPERT_MIRROR_DIRS` unset -- for a server whose `/proc/<pid>/environ` had it
+set and whose drive counters are the table above. Fixed at `a50d7683cb`; the server's own
+environ now populates those keys, and the checks that genuinely cannot be answered from
+outside the process are declared unavailable and re-asked of the measured environment.
+**No measurement was affected** -- the verdict runs after the timed set -- but every
+verdict printed before that commit should be re-read, not trusted.
+
 
 ## Sources
 

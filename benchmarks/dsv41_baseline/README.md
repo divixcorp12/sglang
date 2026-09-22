@@ -175,7 +175,9 @@ duplicated under a second name — see below), the same successive-agreement sha
 the SM-clock check, not a fixed count.
 
 **This traced asymptote (3.53-3.54) is ~10% below the untraced mirrored baseline
-(3.905-3.933, `DSV41_REFERENCE.md` section 19) — nsys node-mode tracing is NOT free
+(3.905-3.933, `DSV41_REFERENCE.md` section 19, "Task 1 matched baselines" --
+not section 19's opening table, whose "decode is untouched by mirroring" is
+superseded there) — nsys node-mode tracing is NOT free
 on this machine, provisionally.** This repo's own `CLAUDE.md` records tracing as
 negligible for DSV4.1 (390 ms untraced against 391 ms traced), but that was measured
 at a ~391 ms step; the step is now roughly a third shorter with the same node count,
@@ -198,7 +200,10 @@ tok/s table above possible to collect in the first place — the bug would have 
 this instability, not just failed to check for it.
 
 **Caveat on the table above**: recorded under nsys node-mode tracing, against an
-**untraced** mirrored baseline of 3.905-3.933 tok/s (`DSV41_REFERENCE.md` section 19).
+**untraced** mirrored baseline of 3.905-3.933 tok/s (`DSV41_REFERENCE.md` section 19,
+"Task 1 matched baselines"). Both are mirrors-**on** cells; the matched mirrors-off cell
+is 2.903-2.919, and an arm run without `SGLANG_MOE_EXPERT_MIRROR_DIRS` belongs against
+that one. Section 20 records what this harness measures against both.
 Tracing overhead is unmeasured for this configuration (`PIPELINE_BASELINE.md` section
 3.2 notes the same gap for the Engine path). Read this table as warm-up *shape*
 evidence — the first-request regime shift, the still-climbing tail — not as baseline
