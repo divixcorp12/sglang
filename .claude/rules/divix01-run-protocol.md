@@ -34,6 +34,50 @@ construction, so the failure mode does not exist.
 Without it a run exercises unrelated code and reports green. Print
 `sglang.__file__` and read it before trusting any result.
 
+## A pipeline reports the last command's status, not pytest's
+
+`... | tail -2` exits with `tail`'s status. `tail` succeeds at printing the
+output of a suite that failed, so the pipeline exits 0 while pytest exited 2,
+and a background runner reports "completed (exit code 0)" for a red suite.
+
+```bash
+# wrong: always 0
+pytest test/... -q 2>&1 | tail -2
+
+# right: read pytest's own status
+pytest test/... -q 2>&1 | tail -2; echo "EXIT=${PIPESTATUS[0]}"
+```
+
+On 2026-09-22 a run of the registered suite reported exit 0 while pytest had
+exited 2 with 1401 collection errors. Piping to `tail` is the normal way to keep
+a long run's output readable, so this is not a rare shape -- assume any suite
+result that came through a pipe is unverified until its `PIPESTATUS` is read.
+The same applies to `| grep`, which exits non-zero when it matches nothing.
+
+## Point the registered suite at `unit/kernels`, not the whole tree
+
+```bash
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
+  /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
+```
+
+`test/registered` and `test/registered/unit` sweep in directories (`xpu/`,
+`layers/moe/`, others) that fail collection on this box with `AttributeError:
+module 'pyarrow'` under pyarrow 25.0.1. The breakage is environmental and
+pre-existing -- it reproduces at any commit, with none of your work present --
+but pytest aborts the whole run on collection errors, so a wider target gives no
+signal at all rather than a partial one.
+
+Establish the comparison before reading a result as a regression: run the same
+target at the merge-base and diff the counts. On 2026-09-22 that turned a
+1401-error scare into a clean `1133 -> 1135`, the delta being exactly the two
+tests added under `test/registered/`.
+
+**Record the command next to any suite number you quote.** A plan that asserted
+"724 passed / 409 skipped" without its invocation could not be checked at all
+until the target was recovered by arithmetic: 724 + 409 is the 1133 that
+`test/registered/unit/kernels` collects, with the GPU tests skipping that day.
+
 ## What this costs
 
 Running unverified code needs a commit first. That is the intended trade: the
