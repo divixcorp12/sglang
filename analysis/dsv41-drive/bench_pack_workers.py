@@ -180,9 +180,16 @@ def main():
     allowed = sorted(os.sched_getaffinity(0) - RESERVED)
     assert allowed and not (os.sched_getaffinity(0) & RESERVED), "run under taskset -c 0-63"
     busy = cpu_busy()
-    cores = sorted(sorted(allowed, key=lambda c: busy[c])[: args.cores])
     if args.owner_core >= 0:
-        assert args.owner_core in cores, f"--owner-core {args.owner_core} is not among the selected cores {cores}"
+        # The least-busy set is picked fresh each run, so a fixed --owner-core would fail the old
+        # membership check most of the time by luck alone. Force it in instead, keeping the same total
+        # core count (so the pinned and unpinned runs use equally many cores): the owner core plus the
+        # `--cores - 1` least-busy of the rest.
+        assert args.owner_core in allowed, f"--owner-core {args.owner_core} is not in the allowed set {allowed}"
+        rest = [c for c in sorted(allowed, key=lambda c: busy[c]) if c != args.owner_core]
+        cores = sorted([args.owner_core] + rest[: args.cores - 1])
+    else:
+        cores = sorted(sorted(allowed, key=lambda c: busy[c])[: args.cores])
     cond = conditions(cores, busy)
     cond["owner_core"] = args.owner_core
     os.sched_setaffinity(0, cores)  # workers inherit this mask minus 64-71 (and minus owner_core, if pinned)
