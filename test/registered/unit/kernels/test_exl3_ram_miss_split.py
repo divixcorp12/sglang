@@ -839,6 +839,38 @@ def test_ring_credit_is_independent_of_the_banks(tmp_path, credit):
     _assert_rows(s, 1, experts, slots)
 
 
+def test_refill_submits_a_credit_freed_read_before_the_next_rows_blocking_pack(tmp_path):
+    """The plan's Task 4 item asks for evidence that refill() runs before bounded packing work, not just
+    before packing starts once. Loop order (exl3_ram_miss_host.cpp:642-655): collect_packed, admit,
+    refill, reap, pack_one -- every turn re-submits whatever credit allows BEFORE that turn spends the
+    CPU on one row's (blocking, inline) pack.
+
+    Three single-extent rows, credit for two: row 0 and row 1 submit and retire together, then row 0
+    packs (150 ms, inline, blocks the owner). Row 2 was never submitted (credit exhausted by rows 0-1),
+    so it can only submit once a slot frees -- which happens when row 0's turn ends and control returns
+    to the loop, BEFORE row 1 (the next row in packing order) is packed. So row 2's submit must land
+    before row 1's pack_start. A reader that called refill() after pack_one() instead would submit
+    nothing on the very first turn (pending and ready both start at 0), fail admission's post-loop
+    clean-state check, and return 0.
+
+    Note what that mutant does and does not pin. It kills this test through ``result == 1``, because
+    moving refill() after pack_one() stops the loop submitting anything at all -- so the submit-ordering
+    assertion below never gets to discriminate. No cheaper mutant is known that leaves the reader
+    working and only reorders refill against packing. Treat the ordering assertion as documentation of
+    the intended invariant with a coarse guard behind it, not as an independently falsified claim."""
+    s = ram_miss_setup(tmp_path, capacity=3)
+    experts, slots = [3, 0, 5], [0, 1, 2]
+    result, record = read_rows_traced(
+        s.tables, 1, experts, slots, direct=False, max_outstanding=2, pack_delay_ns=150_000_000,
+    )
+    assert result == 1
+    packs = _row_packs(record)
+    submits = {e["row"]: e["submit"] for e in record["extent_cqe"]}
+    assert submits[2] < packs[1]["start"], (submits, packs)
+    _assert_stages_ordered(record)
+    _assert_rows(s, 1, experts, slots)
+
+
 @pytest.mark.parametrize(
     "fault",
     [

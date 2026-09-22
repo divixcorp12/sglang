@@ -4,11 +4,28 @@ Plan item: "compare a packing worker against the bounded single-owner loop". Bui
 only; no GPU, no drive contention. Code: branch `t4-packworker` (worker pool, tests, benchmark). Flag:
 `SGLANG_DSV41_RAM_MISS_PACK_WORKERS=N` (default 0 = today's behaviour, no thread exists).
 
-**Gate on the flag.** `SGLANG_DSV41_RAM_MISS_PACK_WORKERS` defaults to 0 and is enabled nowhere. It must not be
-enabled in any run that produces stage traces until the StageRecord carries the mode (the word can ride
-with the schema bump that adds the per-extent submit stamp): `overlap_timeline.py` silently misreads
-worker-mode traces (see the WARNING under "What changed for the other safety arguments", which also names
-the metrics that stay valid).
+**Gate on the flag, updated 2026-09-21.** `SGLANG_DSV41_RAM_MISS_PACK_WORKERS` still defaults to 0 (off,
+inline) and is enabled nowhere in production; setting it does not change the default. The gate this note used to
+state -- "must not be enabled in any run that produces stage traces until the StageRecord carries the mode" -- is
+now **closed**: the stage record's `pack_workers`/`pack_split` fields (STAGE_FIELDS schema 5) carry the mode
+through to the exported JSONL (`test_the_mode_reaches_the_jsonl_a_trace_writes`) and `overlap_timeline.py`
+refuses a worker-mode trace's overlap-derived metrics while keeping the ones that stay valid
+(`test_the_analysis_refuses_the_metrics_of_a_trace_a_worker_host_wrote_and_keeps_those_of_an_inline_one`). So
+enabling the flag in a traced run is no longer a silent-misread hazard, just something to remember when reading
+`overlap_timeline.py`'s output (see the WARNING under "What changed for the other safety arguments" for which
+metrics that affects).
+
+**The measured configuration is already what a single env var selects.** `RowReader::set_pack(workers, split)`
+(`exl3_ram_miss_host.cpp`) defaults `split` to `workers` when the caller passes 0, and the only entry point wired
+into production (`exl3_ram_miss_open` -> `RamTier` -> `RowReader`, via `Dsv41Config.ram_miss_pack_workers` ->
+`Exl3RamMissRowBackend`) passes `pack_workers` alone -- there is no `SGLANG_DSV41_RAM_MISS_PACK_SPLIT`. So
+`SGLANG_DSV41_RAM_MISS_PACK_WORKERS=4` already gives exactly the measured winning mode, `4:4` (c=4), not `4:1`
+(which the registered run above found no better than inline) or any other split. **No code change was needed
+to land this**; the wiring already existed and already matches the measured result. Not exposing `pack_split`
+independently is deliberate, not an oversight: the registered data gives no reason to pick any ratio other than
+`N:N`, and a second env var would only add a way to accidentally select `4:1`. **The default stays 0** -- this
+document recommends measuring under production contention (see "What this cannot say") before enabling it, not
+changing what ships.
 
 ## Result
 
@@ -67,6 +84,36 @@ the bank mutation, which otherwise hung under the test's hang guard).
 `test(exl3): pin pack_one's coverage check`, with deletion and one-page-weakening mutations that fail it).
 The fake-checkpoint tests leak 6-8 file descriptors each until process exit; the pack-workers file lifts
 its own soft limit rather than change every fixture.
+
+## Evidence for "refill submitted I/O before performing bounded packing work"
+
+The Task 4 plan bullet has a second clause distinct from the packing-worker comparison above, and the plan
+recorded it as having no evidence of its own. The claim: the reader's main loop (`exl3_ram_miss_host.cpp:642-655`)
+calls `refill()` before `pack_one()` on every turn, so a read that credit frees up is submitted before the CPU
+spends that turn packing, not queued behind it.
+
+`test_refill_submits_a_credit_freed_read_before_the_next_rows_blocking_pack`
+(`test/registered/unit/kernels/test_exl3_ram_miss_split.py`) pins this down directly, in the inline reader (no
+packing workers, where "before packing" means before the owner blocks on a memcpy, not merely before a
+non-blocking dispatch). Three single-extent rows, credit for two: rows 0 and 1 submit and retire together, then
+row 0 packs (150 ms, inline, blocks the owner thread). Row 2 was never submitted -- credit was exhausted by rows
+0-1 -- so it can only submit once a slot frees, which happens when row 0's turn ends and control returns to the
+loop, **before** row 1 (the next row in packing order) packs. The test asserts exactly that: row 2's extent-submit
+timestamp precedes row 1's `pack_start`.
+
+**Mutation, applied and reverted on a private worktree (`nvfp4-work/cc-packrefill-task4`, `e61c505731`), not
+committed:** moving the `refill()` call from before `pack_one()` to after it (keeping admit/ready-check/reap in
+their original positions) makes the read fail outright. `c.pending` and `has_ready()` both start at 0 for a
+freshly admitted batch, so the loop's own termination check (`c.pending == 0 && !ready && ...`) fires on the very
+first turn, before anything was ever submitted; the post-loop clean-state check then sees rows still marked
+reading and fails the read. The test's `assert result == 1` catches this immediately (confirmed: the mutated
+build returns 0 and the test fails at that assertion, not at the finer timing check). Reverted with
+`git checkout --` after the run; `pytest -k refill_submits_a_credit_freed` and the full split/thread/pack_workers
+suites (539 passed) were re-run clean afterward.
+
+This is real evidence for the clause, not a restatement of the already-cited packing-worker result: it is a new
+scenario (credit-gated multi-row submission racing a blocking pack), not the "one upfront submit, then packing"
+scenario the timeline gate and `test_a_row_packs_while_another_rows_read_is_still_outstanding` already cover.
 
 ## What changed for the other safety arguments
 
@@ -274,3 +321,59 @@ the smaller on p50 and p90 at every row count, because the registered text gave 
 also samples `nvme0n1` every second, which the script alone does not. Cleanup: the script's `rmtree` ran in all four
 runs (scratch directory was empty afterwards and then removed; `df` used bytes on `/mnt/nvme0` are identical before
 the first and after the last run, 1,187,494,809,600).
+
+## The split-drive rerun (2026-09-21), mirror roots on separate drives
+
+The run above put both mirror roots under one `--work-dir` (`/mnt/nvme0`), so the two mirrors' read-completion
+timing was less realistic than production's, which splits them across drives. `bench_pack_workers.py` gained a
+`--work-dir2` argument (mirror 0 stays under `--work-dir`, mirror 1 moves under `--work-dir2`; omitting it keeps
+the old one-drive behaviour, so every existing invocation is unaffected) and reran the **same** pre-registered
+test, unchanged, with mirror 0 on `/mnt/nvme0` and mirror 1 on `/mnt/nvme4` (`nvme3n1p1`), the same two roots
+production splits its mirrors across.
+
+**Box condition, checked before the run:** load1 4.5 at start / 7.5 (run 1) and 6.5 / 6.2 (run 2) at end, similar
+to the single-drive run's 3.1-4.5; foreign top processes were the same standing services (nimbus, reth, op-reth,
+a QuestDB java process) and no other job held `cc-gpu.lock` (63 MiB used, nothing on :7867 -- this item is CPU
+and drive only and never touched the GPU). `--direct` was real on both drives: `nvme0n1p1` and `nvme3n1p1` each
+show ~10.7 GiB of additional sector reads per run (10696.0/10693.2 MiB run 1, 10696.0/10692.6 MiB run 2), matching
+each other to within 0.03% -- the StaticSplitPolicy((1.0, 1.0)) split each row's bytes evenly across the two
+drives, as production does, and both drives actually served their half.
+
+Code: the two changed files copied onto a fresh worktree at `e61c505731` (`nvfp4-work/cc-packrefill-task4`,
+removed after the run). Same script, same modes (`0:0,1:1,4:1,4:4`), same 60 reps, rows 1/2/4, natural scenario,
+`taskset -c 0-63`, OMP/MKL/OpenBLAS = 1, cores 64-71 untouched. Raw output and `run.sh`:
+`pack-workers-odirect-split/{run1,run2}.json`, `*.diskstats.log`.
+
+### Result
+
+| mode | rows | run 1 | run 2 | vs inline p50, run 1 / run 2 |
+|---|---|---|---|---|
+| inline `0:0` | 4 | 5.487 / 5.598 | 5.502 / 5.549 | 1 |
+| `1:1` | 4 | 7.573 / 7.878 | 7.503 / 7.856 | 1.38x / 1.36x |
+| `4:1` | 4 | 2.853 / 3.004 | 2.848 / 2.966 | 0.52x / 0.52x |
+| **`4:4` (c=4)** | 4 | **1.343 / 1.685** | **1.182 / 1.437** | **0.24x / 0.21x** |
+| inline `0:0` | 2 | 2.718 / 2.773 | 2.739 / 2.783 | 1 |
+| `4:4` | 2 | 0.908 / 1.439 | 0.895 / 0.955 | 0.33x / 0.33x |
+| inline `0:0` | 1 | 2.721 / 2.885 | 2.717 / 2.864 | 1 |
+| `4:4` | 1 | 0.787 / 0.879 | 0.768 / 0.904 | 0.29x / 0.27x |
+
+(p50 / p90 ms, n=60.) **Unlike the single-drive run, inline's own 4-row p50 reproduces here**: 5.487 ms and
+5.502 ms, 0.27% apart -- well inside the document's 10% no-belief threshold, at every row count. The single-drive
+run's bimodal straddle (one row's packing vs two rows') did not reappear; splitting the mirrors across drives
+gave the two rows a wider, more consistent completion gap, so the 4-row read consistently lands in the
+two-rows-packed regime. This removes the single-drive run's own caveat about its precondition failing at 4 rows.
+
+**Verdict on the pre-registered test, unchanged and unloosened: at c=4, p50 `tail` at most 0.6x inline's and p90
+not above inline's, in two consecutive runs.** Run 1: 1.343 <= 0.6 x 5.487 = 3.292 and 1.685 <= 5.598. Run 2:
+1.182 <= 0.6 x 5.502 = 3.301 and 1.437 <= 5.549. **PASSED, in both runs, with more margin than the single-drive
+run and no reproducibility caveat this time.**
+
+Whole-process CPU per request p50, 4 rows: inline 21.5 / 22.2 ms, `4:4` 36.1 / 36.5 ms (runs 1 / 2) -- about
+1.65x-1.68x, slightly higher than the single-drive run's 1.4x-1.6x but the same order of magnitude and the same
+mechanism (the workers spin).
+
+**What this closes and what it still does not say.** It closes the single-drive run's "both mirror roots sat on
+one drive" caveat: the mechanism (a cold DRAM bounce shrinks under a split copy) now holds under production's own
+drive topology, not just a plausibility argument that the source drive doesn't matter. It does not cover
+production contention (the packing workers here ran on otherwise-idle cores among `taskset -c 0-63`; the
+scheduler and tokenizer threads were not competing for those cores), and it does not touch the GPU or H2D path.

@@ -86,7 +86,11 @@ def conditions(cores: list[int], busy: dict[int, float]) -> dict:
     }
 
 
-def build_setup(root: Path, experts: int, mirrors: bool):
+def build_setup(root: Path, experts: int, mirror_roots: tuple[Path, Path] | None):
+    """``mirror_roots``, when given, is where mirror 0 and mirror 1 are copied -- pass roots on two
+    different drives to measure with the mirrors split the way production splits them (the registered
+    O_DIRECT run put both under the same ``--work-dir`` instead; see PACK_WORKERS.md). ``None`` disables
+    mirroring."""
     from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
@@ -108,8 +112,8 @@ def build_setup(root: Path, experts: int, mirrors: bool):
         for layer in range(2)
     }
     mirror_args = {}
-    if mirrors:
-        roots = (str(root) + "_mirror0", str(root) + "_mirror1")
+    if mirror_roots is not None:
+        roots = tuple(str(r) for r in mirror_roots)
         for r in roots:
             shutil.copytree(root, r)
         mirror_args = dict(roots=roots, policy=StaticSplitPolicy((1.0, 1.0)), source_root=str(root))
@@ -167,6 +171,11 @@ def main():
     ap.add_argument("--cores", type=int, default=12, help="least-busy cores of the allowed set to use")
     ap.add_argument("--experts", type=int, default=16)
     ap.add_argument("--work-dir", default="/dev/shm")
+    ap.add_argument(
+        "--work-dir2", default=None,
+        help="drive for mirror 1 (mirror 0 stays under --work-dir); default puts both mirrors under "
+        "--work-dir, as the registered run did",
+    )
     ap.add_argument("--direct", action="store_true", help="O_DIRECT reads: needs --work-dir on a real drive")
     ap.add_argument("--scenarios", default="natural,last,burst", help="natural is the only one a real drive needs")
     ap.add_argument("--out", required=True)
@@ -181,9 +190,13 @@ def main():
     modes = [tuple(map(int, m.split(":"))) for m in args.modes.split(",")]
 
     root = Path(tempfile.mkdtemp(dir=args.work_dir, prefix="packbench_"))
+    root2 = Path(tempfile.mkdtemp(dir=args.work_dir2, prefix="packbench2_")) if args.work_dir2 else None
     try:
-        tables, slabs = build_setup(root / "ckpt", args.experts, mirrors=True)
+        mirror_roots = (root / "ckpt_mirror0", (root2 or root) / "ckpt_mirror1")
+        tables, slabs = build_setup(root / "ckpt", args.experts, mirror_roots)
         cond["diskstats_start"] = diskstats_of(str(root))
+        if root2 is not None:
+            cond["diskstats2_start"] = diskstats_of(str(root2))
         cond["direct"] = args.direct
         results = {}
         for _ in range(2):  # warm the page cache and the JIT
@@ -198,6 +211,8 @@ def main():
                         got = one_read(tables, experts, mode, scenario=scenario, direct=args.direct)
                         results.setdefault((mode, n, scenario), []).append(got)
         cond["diskstats_end"] = diskstats_of(str(root))
+        if root2 is not None:
+            cond["diskstats2_end"] = diskstats_of(str(root2))
         cond["load1_end"] = os.getloadavg()[0]
         cond["foreign_top_processes_end"] = foreign_processes()
         summary = []
@@ -213,6 +228,8 @@ def main():
             print(row)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        if root2 is not None:
+            shutil.rmtree(root2, ignore_errors=True)
 
 
 if __name__ == "__main__":
