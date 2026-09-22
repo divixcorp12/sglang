@@ -197,9 +197,16 @@ if [ "${NSYS_TRACE:-0}" = 1 ]; then
     nsys_out_dir=${NSYS_OUT_DIR:-/mnt/nvme1/dsv41-nsys}
     mkdir -p "$nsys_out_dir" || abort "cannot create $nsys_out_dir"
     nsys_report=$nsys_out_dir/$arm-$(date +%Y%m%d-%H%M%S)
+    # NSYS_LAUNCH_ARGS adds application-scope options, which is where --cudabacktrace and
+    # --python-backtrace must go (nsys calls them "Application scope"); both also require
+    # CPU sampling, which this harness turns off by default, so NSYS_SAMPLE must be set
+    # with them or nsys collects the flags and no backtraces. Word-split deliberately.
+    # shellcheck disable=SC2206
+    nsys_launch_extra=(${NSYS_LAUNCH_ARGS:-})
     nsys_prefix=(nsys launch --session-new="$nsys_session"
                  --trace=cuda,nvtx,osrt
-                 --cuda-graph-trace=graph)
+                 --cuda-graph-trace=graph
+                 "${nsys_launch_extra[@]}")
 else
     nsys_prefix=()
 fi
@@ -368,7 +375,7 @@ if [ -n "$nsys_session" ]; then
     # Collection starts HERE, after warm-up: the clock is stable, the graph is captured
     # and no JIT compile remains, so the report contains steady-state decode only.
     nsys start --session="$nsys_session" --output="$nsys_report" \
-        --sample=none --cpuctxsw=none --force-overwrite=true \
+        --sample="${NSYS_SAMPLE:-none}" --cpuctxsw="${NSYS_CPUCTXSW:-none}" --force-overwrite=true \
         || { stop_server; abort "$arm: nsys start failed for session $nsys_session"; }
     echo "nsys capture started -> $nsys_report.nsys-rep"
 fi
@@ -394,6 +401,9 @@ cpu_path=$run_dir/cpu.jsonl
 : > "$clocks_path"
 : > "$compile_path"
 : > "$cpu_path"
+# DSV41_MAX_SESSIONS shortens the timed set. The verdict still expects every session it
+# is given, so a shortened arm is a diagnostic capture, never a baseline number.
+timed_sessions_done=0
 timed_rc=0
 for session_id in \
     'cfq-train-Single_CDW/2015/page_35.pdf-2' \
@@ -439,6 +449,11 @@ with open('$boundary_path', 'a') as f:
     fi
     if [ "$rc" != 0 ]; then
         timed_rc=$rc
+        break
+    fi
+    timed_sessions_done=$((timed_sessions_done + 1))
+    if [ -n "${DSV41_MAX_SESSIONS:-}" ] && [ "$timed_sessions_done" -ge "$DSV41_MAX_SESSIONS" ]; then
+        echo "stopping the timed set after $timed_sessions_done session(s): DSV41_MAX_SESSIONS=$DSV41_MAX_SESSIONS"
         break
     fi
 done
