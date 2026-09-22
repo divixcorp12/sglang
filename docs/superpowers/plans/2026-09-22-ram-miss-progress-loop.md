@@ -13,10 +13,13 @@ From `/mnt/nvme1/dsv41-stagetrace-20260921-220109.jsonl`, schema 5, the whole tr
 |---|---|
 | records examined (`demand` 48,732 + `touch` 64,668) | 113,400 |
 | whose `observed` falls inside another record's `pack_start`..`pack_end` | **0 (0.00%)** |
+| whose `observed` falls inside another record's **full service window** `observed`..`done` | **0 (0.00%)** |
 | `observed` -> `reserved` | p50 **6 us**, p90 8 us, p99 **11 us** |
 | `backlog` at observation | p50 0, p90 0, **max 0** |
 
 `backlog` never exceeds zero anywhere in the trace. Nothing ever queues behind the owner.
+
+The second row matters more than the first and was added after the pack-window measure was found too narrow: the pump is blocked for the **whole** request (`submit` -> `last_cqe` -> `pack_end`), not merely while packing, so a request arriving during the read but outside the pack window would have been missed. Measured over the full `observed`..`done` interval by a sweep line, the service windows **never overlap at all** -- not demand against demand, and not `touch` against demand either. There is nothing for a yielded pump to service, including the 64,668 touches.
 
 There is a structural reason. **EXL3 launches are gated to batch size 1**
 (`expert_stream_requirements.py`; see `.claude/rules/divix01-run-protocol.md`), and layers run in
