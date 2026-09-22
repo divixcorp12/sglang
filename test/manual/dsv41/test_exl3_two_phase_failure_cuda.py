@@ -171,7 +171,9 @@ def test_the_partial_terminal_mask_names_only_unacknowledged_lanes(service):
     assert s.dev.go_2.item() == 0, "stage 2 must commit nothing: its only lane's read failed"
     assert s.until(lambda: s.host.counters()["leases_acked"] == 2), s.host.counters()  # 1 above + this hit lane
 
-    assert s.until(lambda: s.host.counters()["leases_voided"] >= 1), s.host.counters()
+    # The miss lane (expert 9) was never granted a lease -- fail_reads trips before S3's grant, exactly as T4's
+    # host-side failure path does -- so there is nothing for retire_leases to void for it; leases_voided is not
+    # part of this claim. s.step() already synced the stream, so the finalize kernel's terminal store is visible.
     terminal = _terminal(s.host, seq)
     assert terminal["mask"] & 0b01 == 0, f"the hit lane's bit must be clear: {terminal}"
     assert terminal["mask"] & 0b10 != 0, f"the miss lane's bit must be set: {terminal}"
