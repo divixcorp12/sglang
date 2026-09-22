@@ -127,7 +127,12 @@ def test_a_failed_request_voids_hit_leases_and_releases_no_slot(running):
 
     host.inject(fail_reads=False)
     other = sim.post(0, [5])
-    sim.wait(other, timeout_s=10.0)
+    # Not sim.wait(other, ...): the failed request above already raised the page's fatal word, and
+    # exl3_ram_miss_sim_wait short-circuits to "fatal already raised" on any later call without
+    # checking demand_done -- so it would not actually synchronize on `other`. Poll the tier instead.
+    assert _until(lambda: any(e == 5 and st == READY for st, e, _, _ in host.slot_info(0)), timeout_s=10.0), (
+        "expert 5 was never served"
+    )
     assert _slot_of(host, 0, 5) != hit_slot, "a leased hit slot was handed to the next request"
 
     sim.terminal(req, mask=1 << 0)
