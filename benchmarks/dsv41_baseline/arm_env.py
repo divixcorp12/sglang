@@ -32,6 +32,10 @@ CC = f"{NVFP4_WORK}/cc-expert-prediction"
 MODEL_PATH = f"{CC}/dsv41-full40"
 ENGRAM_TABLE_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash"
 EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
+# Expert-row mirrors, on by default since 2026-09-22. Mirroring is a property of the
+# box's storage, not of any one arm, so an arm that forgets it measures a drive layout
+# nobody runs. Override to the empty string to measure the unmirrored drive.
+EXPERT_MIRROR_DIRS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash"
 EXL3_SRC = f"{NVFP4_WORK}/exllamav3"
 EXL3_BUILD_DIR = f"{CC}/exl3-build"
 CUDA_HOME = "/usr/local/cuda-13.2"
@@ -72,6 +76,7 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_EXPERT_STREAM": "1",
         "SGLANG_DSV41_EXPERT_DIR": EXPERT_DIR,
         "SGLANG_MOE_EXPERT_ROW_SOURCE": "shards",
+        "SGLANG_MOE_EXPERT_MIRROR_DIRS": EXPERT_MIRROR_DIRS,
         "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
         "SGLANG_MOE_PINNED_HOST_MB": "71680",
         "SGLANG_MOE_HOT_GPU_MB": "14336",

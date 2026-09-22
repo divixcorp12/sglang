@@ -202,8 +202,9 @@ this instability, not just failed to check for it.
 **Caveat on the table above**: recorded under nsys node-mode tracing, against an
 **untraced** mirrored baseline of 3.905-3.933 tok/s (`DSV41_REFERENCE.md` section 19,
 "Task 1 matched baselines"). Both are mirrors-**on** cells; the matched mirrors-off cell
-is 2.903-2.919, and an arm run without `SGLANG_MOE_EXPERT_MIRROR_DIRS` belongs against
-that one. Section 20 records what this harness measures against both.
+is 2.903-2.919. Since 2026-09-22 mirroring is **on by default** in `arm_env.base_env()`,
+so it is an arm that overrides `SGLANG_MOE_EXPERT_MIRROR_DIRS` to the empty string that
+belongs against the mirrors-off cell. Section 20 records what this harness measures against both.
 Tracing overhead is unmeasured for this configuration (`PIPELINE_BASELINE.md` section
 3.2 notes the same gap for the Engine path). Read this table as warm-up *shape*
 evidence — the first-request regime shift, the still-climbing tail — not as baseline
@@ -452,18 +453,23 @@ spawned — not from inside the server itself, since the server was told not to 
 taught to emit its own provenance yet (a real change to the launch path, not this
 task's to make).
 
-## Open: baseline commit and the mirror row source
+## Resolved: the mirror row source is now the default (2026-09-22)
 
-`SGLANG_MOE_EXPERT_MIRROR_DIRS` / `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` exist on
-`shared/dsv41` (commit `a68861ccdd`) but not on the commit the baseline is currently
-pinned to (`24404a3560`). Three 205 GB mirrors exist on nvme0/nvme2/nvme4, and
-production runs with mirrored reads on — the baseline commit may move, and the arm env
-may need the mirror variables set. This is undecided; **no code change is needed to
-support it when it lands**: `arm_env.arm_env(overrides)` already accepts arbitrary
-`KEY=VAL` pairs (`run_arm.sh <arm_name> <port> SGLANG_MOE_EXPERT_MIRROR_DIRS=...
-SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=...` would just work), and `run-manifest.json`
-already records the commit and the full merged environment. Switching baselines is a
-configuration change, not a rewrite.
+`base_env()` sets `SGLANG_MOE_EXPERT_MIRROR_DIRS=/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash`
+(`arm_env.EXPERT_MIRROR_DIRS`; both roots verified present at 205 GB / 50 entries).
+Mirroring is a property of the box's storage and production reads mirrored, so an arm
+that omitted it was measuring a drive layout nobody runs. To measure the unmirrored
+drive, override the var to the **empty string** — dropping the key is no longer possible,
+since `base_env()` always supplies one, and `exl3_expert_format.exl3_mirror_config()`
+reads an empty value as off.
+
+That last point is why the verdict's `mirror` flag tests the *value* and not the key
+(`run_arm.sh`, the `verdict.judge` call): a key-presence test would now judge every
+unmirrored arm against the mirrored baseline.
+
+`SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` is still unset, which means equal shares; the recorded
+split was 49.6/50.4 (`DSV41_REFERENCE.md` section 20). `run-manifest.json` records the
+commit and the full merged environment either way.
 
 **Mirrors confirmed working under load, live** (the same traced run as the warm-up
 table above): over a 5 s window, nvme0 read 2,233 MB and nvme3 (`/mnt/nvme4`) 2,247 MB

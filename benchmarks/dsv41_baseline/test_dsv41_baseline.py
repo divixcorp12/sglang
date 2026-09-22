@@ -841,3 +841,33 @@ def test_server_args_includes_decode_log_interval_when_set():
     argv = arm_env.ServerArgs(port=31050, decode_log_interval=1).argv()
     i = argv.index("--decode-log-interval")
     assert argv[i + 1] == "1"
+
+
+# --- arm_env: expert-row mirroring is on by default, and an arm turns it off by value ---
+
+
+def test_base_env_mirrors_expert_rows_by_default():
+    assert arm_env.base_env()["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == arm_env.EXPERT_MIRROR_DIRS
+
+
+def test_default_mirror_roots_are_two_absolute_paths_on_distinct_drives():
+    roots = arm_env.EXPERT_MIRROR_DIRS.split(os.pathsep)
+    assert len(roots) == 2, roots
+    assert all(r.startswith("/mnt/") for r in roots), roots
+    # Same drive twice would spread nothing; the point of the pair is two spindles.
+    assert len({r.split("/")[2] for r in roots}) == 2, roots
+
+
+def test_an_arm_turns_mirroring_off_with_an_empty_override():
+    # Not by dropping the key: base_env always supplies one, so the empty string is the
+    # only way off, and exl3_expert_format.exl3_mirror_config reads it as off.
+    env = arm_env.arm_env({"SGLANG_MOE_EXPERT_MIRROR_DIRS": ""})
+    assert env["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == ""
+
+
+def test_the_verdicts_mirror_flag_follows_the_value_not_the_key():
+    # The expression under test is run_arm.sh's, kept in sync by hand; a key-presence
+    # test would call an unmirrored arm mirrored now that base_env always sets the key.
+    mirror = lambda env: bool(env.get("SGLANG_MOE_EXPERT_MIRROR_DIRS"))
+    assert mirror(arm_env.base_env()) is True
+    assert mirror(arm_env.arm_env({"SGLANG_MOE_EXPERT_MIRROR_DIRS": ""})) is False
