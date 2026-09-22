@@ -30,6 +30,42 @@ would service nothing.
 So do not justify this work by queueing, concurrency or backlog. Those are zero and will stay zero
 until something generates concurrent work.
 
+## The drive is idle three quarters of the time, and a producer for it already exists
+
+Measured over the same trace, per decode forward, merging every request's `submit`..`last_cqe`:
+
+| measure | value |
+|---|---|
+| fraction of the forward span with a read in flight | p10 0.172, p50 **0.246**, p90 0.328 |
+| idle, no read in flight | p50 **206.14 ms** per forward (p90 255.42 ms) |
+| forward span, first `observed` -> last `done` | p50 270.10 ms |
+| `batches` per request | **1**, for all 48,732 |
+
+So the NVMe is busy about a quarter of the time. That is the real saturation opportunity, and it is
+large.
+
+Note where it is **not**: `batches == 1` for every request in the trace, so a request already hands
+the queue all of its rows in one submission. Intra-request saturation is fine. **The idle sits
+between requests**, while the model computes a layer and has not yet asked for the next one's rows.
+
+The producer for that gap is already written and simply switched off. `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`
+(`exl3_expert_format.py:374`, "Option F advisories") gates a full advisory path: advisory records on
+their own ring, `serve(request, advisory=true)` (`:2599`), a per-row abandon callback that gives up
+the moment a demand is posted or a pause or stop is requested (`:2720`), `kStatusCancelled` (`:99`)
+and `kAdvisoryRows` (`:2789`). The traced run had it off: zero advisory records among 113,400.
+
+## Phase 0: turn the existing prefetch on and measure it
+
+Do this before either phase below. It needs no new machinery, and it may capture most of the 206 ms
+on its own. Measure the drive-busy fraction with advisories enabled, and count how many are
+cancelled by `demand_pending()` before finishing.
+
+That cancellation count is the number that decides whether phase 2 is worth building. Today an
+advisory **abandons** when demand arrives, because the pump can only service one request at a time.
+If advisories mostly complete, the existing design already fills the gap and a re-entrant loop buys
+little. If they are mostly cancelled, the I/O is being started and thrown away, and *that* is the
+concrete argument for letting an advisory stay in flight alongside a demand -- which is phase 2.
+
 ## What is actually wrong
 
 `retire_leases()` is called from exactly one place in the normal path: the top of `pump()`
