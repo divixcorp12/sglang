@@ -11,6 +11,7 @@ Two fields are honestly unavailable rather than faked; see `STEP_LATENCY_UNAVAIL
 from __future__ import annotations
 
 import client_latency
+import provenance
 
 STEP_LATENCY_UNAVAILABLE = {
     "unavailable": (
@@ -24,6 +25,33 @@ STEP_LATENCY_UNAVAILABLE = {
         "investigation, not yet wired in — see README 'One harness, not two'."
     )
 }
+
+# `check_arm` reads these from the top level of `provenance` as facts about the process that ran
+# the arm. `provenance.capture()` samples them in the harness, which has none of the server's
+# SGLANG_* vars, so leaving them there had the verdict judge the wrong process: it reported the
+# reader as 'mmap' and SGLANG_MOE_EXPERT_MIRROR_DIRS as unset for a server whose /proc/<pid>/environ
+# had both set, and whose per-drive read counters showed the mirrors carrying the whole arm.
+HARNESS_PROCESS_FIELDS = ("sglang_env", "sglang_env_at_exec", "sglang_env_resolved", "sglang_file")
+
+# Written into provenance["unavailable"], which check_arm already reports rather than guessing.
+SERVER_UNAVAILABLE = {
+    "sglang_env_resolved": (
+        "resolved config values (envs.X.get(), which apply each knob's default) can only be read "
+        "inside the server, and it does not emit its own provenance; sglang_env below is the "
+        "server's real environment, so a knob this arm set explicitly is still checkable, but one "
+        "left at its default is not"
+    ),
+    "sglang_file": (
+        "the server's own sglang import path is not observable from outside it; PYTHONPATH in "
+        "sglang_env is the measured constraint on it"
+    ),
+}
+
+SERVER_ENV_IS_EXEC_TIME_NOTE = (
+    "sglang_env and sglang_env_at_exec are both /proc/<pid>/environ, the environment the kernel "
+    "handed the server at exec: an edit the server made to its own os.environ afterwards is not "
+    "visible from outside and would not appear in either"
+)
 
 SERVER_PROVENANCE_CEILING_NOTE = (
     "the server is a separate process from the one that captured the rest of this "
@@ -82,12 +110,24 @@ def build_report(
     residency: dict,
     sessions: list[dict],
 ) -> dict:
-    provenance = dict(harness_provenance)
-    provenance["server_env_actual"] = server_env_actual
-    provenance["server_env_expected"] = server_env_expected
-    provenance["server_provenance_ceiling"] = SERVER_PROVENANCE_CEILING_NOTE
+    prov = dict(harness_provenance)
+    prov["harness_process"] = {k: prov.pop(k) for k in HARNESS_PROCESS_FIELDS if k in prov}
+    # The subject of every check_arm env test is the server, so the server's own environment is
+    # what has to sit here -- filtered, because /proc/<pid>/environ carries the caller's secrets.
+    server_env = provenance.filter_env(server_env_actual)
+    prov["sglang_env"] = server_env
+    prov["sglang_env_at_exec"] = server_env
+    prov["sglang_env_resolved"] = None
+    prov["sglang_file"] = None
+    prov["unavailable"] = {**(prov.get("unavailable") or {}), **SERVER_UNAVAILABLE}
+    # Filtered for the same reason: a report is copied and quoted, and the raw environ the
+    # verification step read carries whatever secrets the launching shell held.
+    prov["server_env_actual"] = server_env
+    prov["server_env_expected"] = server_env_expected
+    prov["server_provenance_ceiling"] = SERVER_PROVENANCE_CEILING_NOTE
+    prov["server_env_is_exec_time"] = SERVER_ENV_IS_EXEC_TIME_NOTE
     return {
-        "provenance": provenance,
+        "provenance": prov,
         "boundary_samples": boundary_samples,
         "residency": residency,
         "per_session": sessions,

@@ -3,8 +3,14 @@
 Calls `task1_arm_verdict.check_arm` / `check_cache` / `contention` / `generation` /
 `session_outliers` / `cross_arm_outliers` (via `task1_verdict.load_task1_verdict`)
 against a report built by `report_builder.build_report`, and appends this campaign's
-own two checks (compile-contamination, the SM-clock readiness note) as clearly-labeled
-additions — never edits to Task 1's functions.
+own checks (compile-contamination, the measured server-env stand-ins, the SM-clock readiness
+note) as clearly-labeled additions — never edits to Task 1's functions.
+
+Two kinds of gap are acknowledged rather than hidden, and both are reported: the absent
+engine-side step latency (below), and the four checks `check_arm` makes of a process this
+campaign drives over HTTP and cannot sample from the inside. For the second kind
+`server_env_problems` asks the same question of the server's measured environment, so
+acknowledging the unknowable form of the check does not drop the check.
 
 **Known, currently-unresolved consequence: every arm reads INVALID.**
 `check_arm` requires `per_session[i]["step_latency"]` to carry real percentiles;
@@ -19,12 +25,73 @@ proceed, this module does not decide for it.
 
 from __future__ import annotations
 
+import os
+
 STEP_LATENCY_PROBLEM_PREFIX = "session "  # "session {i}: no step latency (...)" — check_arm's own wording
 STEP_LATENCY_PROBLEM_SUFFIX = "no step latency"
 
 
 def is_acknowledged_step_latency_problem(problem: str) -> bool:
     return problem.startswith(STEP_LATENCY_PROBLEM_PREFIX) and STEP_LATENCY_PROBLEM_SUFFIX in problem
+
+
+READER_ENV = "SGLANG_MOE_EXPERT_FILE_READER"
+GATHER_ENV = "SGLANG_MOE_EXPERT_GRAPH_GATHER"
+TRUE_VALUES = ("1", "true", "yes", "on")
+
+# check_arm asks four things of a process this campaign cannot sample from the inside: the
+# server's sglang import path, its resolved (default-applied) knob values, and the two knobs read
+# from them. `report_builder` now reports those as unavailable instead of handing over the
+# harness's own values, so check_arm says "unknown" where it used to say something false. These
+# are matched by wording, which is safe only because `task1_verdict` refuses to load the file at
+# all unless its sha256 still matches: a reworded check fails the pin, loudly, before it reaches
+# this list. `server_env_problems` re-asks each question of the server's measured environment.
+ACKNOWLEDGED_SERVER_PROVENANCE_MARKERS = (
+    "imported sglang from None",
+    "provenance fields unavailable",
+    f"{READER_ENV} resolved to None",
+    f"{GATHER_ENV} did not resolve to true",
+)
+
+
+def is_acknowledged_server_provenance_problem(problem: str) -> bool:
+    return any(marker in problem for marker in ACKNOWLEDGED_SERVER_PROVENANCE_MARKERS)
+
+
+def server_env_problems(report: dict, *, root: str) -> list[str]:
+    """NOT in Task 1's check_arm — this campaign's measured stand-ins for the checks above.
+
+    Each reads the server's own /proc/<pid>/environ (`provenance.sglang_env`), which run_arm.sh has
+    already string-compared against the arm's expected env. An explicitly set knob is therefore a
+    fact about the server; a knob left unset is a default applied inside a process this harness
+    cannot read, and is reported as unknown rather than assumed."""
+    prov = report.get("provenance") or {}
+    env = prov.get("sglang_env")
+    if not env:
+        return ["no server environment recorded: none of the env checks below were made"]
+
+    problems = []
+    reader = env.get(READER_ENV)
+    if reader is None:
+        problems.append(f"{READER_ENV} is unset in the server, so its default decides the reader and this arm cannot show which")
+    elif reader != "uring_direct":
+        problems.append(f"{READER_ENV}={reader!r} in the server, not 'uring_direct': reads may fill the page cache")
+
+    gather = env.get(GATHER_ENV)
+    if gather is None:
+        problems.append(f"{GATHER_ENV} is unset in the server, so this arm cannot show it used the in-graph reader")
+    elif gather.strip().lower() not in TRUE_VALUES:
+        problems.append(f"{GATHER_ENV}={gather!r} in the server: this is not the in-graph reader")
+
+    # Stands in for check_arm's sglang_file test: the import path itself is unobservable, but the
+    # only tree the server can import from is the one PYTHONPATH names.
+    want = os.path.join(os.path.realpath(root), "python")
+    entries = [os.path.realpath(e) for e in (env.get("PYTHONPATH") or "").split(os.pathsep) if e]
+    if not entries:
+        problems.append("PYTHONPATH is unset in the server, so which sglang tree it imported is unconstrained")
+    elif entries[0] != want:
+        problems.append(f"the server's first PYTHONPATH entry is {entries[0]!r}, not {want!r}")
+    return problems
 
 
 def compile_contamination_problems(report: dict) -> list[str]:
@@ -100,6 +167,7 @@ def judge(
     else:
         notes.append("RESIDENCY not judged: no residency section in this report")
     problems += compile_contamination_problems(report)
+    problems += server_env_problems(report, root=root)
     notes.append(clock_readiness_note(report))
 
     contended, why = task1_module.contention(report)
@@ -115,8 +183,11 @@ def judge(
         cross = task1_module.cross_arm_outliers(report, arm_json_path, reference_arms)
         notes += cross if cross is not None else ["CROSS-ARM not judged: no reference arm"]
 
-    acknowledged = [p for p in problems if is_acknowledged_step_latency_problem(p)]
-    unacknowledged = [p for p in problems if not is_acknowledged_step_latency_problem(p)]
+    def acknowledged_gap(problem: str) -> bool:
+        return is_acknowledged_step_latency_problem(problem) or is_acknowledged_server_provenance_problem(problem)
+
+    acknowledged = [p for p in problems if acknowledged_gap(p)]
+    unacknowledged = [p for p in problems if not acknowledged_gap(p)]
 
     return {
         "problems": problems,

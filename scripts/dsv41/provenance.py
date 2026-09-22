@@ -47,9 +47,18 @@ def _wanted(name: str) -> bool:
     return name.startswith(ENV_PREFIXES) or name in OTHER_ENV
 
 
+def filter_env(env) -> dict:
+    """``env`` reduced to the steering knobs, secrets redacted, sorted.
+
+    Takes a mapping so another process's environment (``/proc/<pid>/environ``, parsed) can be
+    stored in the same shape as this process's; a raw environ carries the caller's secrets and
+    must never reach a report unfiltered."""
+    return {k: _redact(k, v) for k, v in sorted(env.items()) if _wanted(k)}
+
+
 def process_env() -> dict:
     """The live ``os.environ``, filtered: what child processes spawned now will inherit."""
-    return {k: _redact(k, v) for k, v in sorted(os.environ.items()) if _wanted(k)}
+    return filter_env(os.environ)
 
 
 def exec_env(path: str = "/proc/self/environ") -> dict | None:

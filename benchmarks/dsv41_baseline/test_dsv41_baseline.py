@@ -486,19 +486,83 @@ def test_merge_sessions_tolerates_missing_side_data():
     assert merged["cpu_s"] is None
 
 
-def test_build_report_names_the_server_provenance_ceiling():
-    report = report_builder.build_report(
+SERVER_ENV = {
+    "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
+    "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
+    "PYTHONPATH": "/x/python",
+}
+
+
+def _build(**kwargs):
+    defaults = dict(
         harness_provenance={"git": {"head": "abc"}},
-        server_env_actual={"A": "1"},
-        server_env_expected={"A": "1"},
+        server_env_actual=dict(SERVER_ENV),
+        server_env_expected=dict(SERVER_ENV),
         boundary_samples=[{"label": "before_engine"}],
         residency={"dirs": [], "before": {}, "after": {}},
         sessions=[],
     )
+    return report_builder.build_report(**{**defaults, **kwargs})
+
+
+def test_build_report_names_the_server_provenance_ceiling():
+    report = _build()
     assert report["provenance"]["git"]["head"] == "abc"
-    assert report["provenance"]["server_env_actual"] == {"A": "1"}
     assert "separate process" in report["provenance"]["server_provenance_ceiling"]
     assert report["boundary_samples"] == [{"label": "before_engine"}]
+
+
+def test_build_report_puts_the_servers_env_where_check_arm_reads_it():
+    """The bug this guards: check_arm read the harness's env tables as if they were the arm's.
+
+    A leases-off, mirrors-on arm was graded with the harness's environment, which has none of
+    these vars, and the verdict reported the reader as 'mmap' and the mirror dirs as unset for a
+    server whose /proc/<pid>/environ had both set."""
+    report = _build(
+        harness_provenance={
+            "git": {"head": "abc"},
+            "sglang_env": {"SGLANG_MOE_EXPERT_FILE_READER": "mmap"},
+            "sglang_env_resolved": {"SGLANG_MOE_EXPERT_FILE_READER": "mmap"},
+            "sglang_file": "/harness/python/sglang/__init__.py",
+        },
+        server_env_actual={**SERVER_ENV, "SGLANG_MOE_EXPERT_MIRROR_DIRS": "/mnt/nvme0/x:/mnt/nvme4/x"},
+    )
+    prov = report["provenance"]
+    assert prov["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "uring_direct"
+    assert prov["sglang_env"]["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == "/mnt/nvme0/x:/mnt/nvme4/x"
+    # the harness's own values are kept, but not where they can be mistaken for the server's
+    assert prov["harness_process"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "mmap"
+    assert prov["harness_process"]["sglang_file"] == "/harness/python/sglang/__init__.py"
+
+
+def test_build_report_reports_resolved_values_as_unavailable_not_as_the_harnesss():
+    report = _build(harness_provenance={"git": {"head": "abc"}, "sglang_env_resolved": {"X": "y"}})
+    prov = report["provenance"]
+    assert prov["sglang_env_resolved"] is None
+    assert prov["sglang_file"] is None
+    assert "sglang_env_resolved" in prov["unavailable"]
+    assert "sglang_file" in prov["unavailable"]
+
+
+def test_build_report_keeps_an_earlier_unavailable_entry():
+    report = _build(harness_provenance={"git": None, "unavailable": {"git": "sglang did not import"}})
+    assert report["provenance"]["unavailable"]["git"] == "sglang did not import"
+    assert "sglang_env_resolved" in report["provenance"]["unavailable"]
+
+
+def test_build_report_does_not_store_the_raw_environ():
+    """/proc/<pid>/environ carries whatever the launching shell held; a report gets copied."""
+    report = _build(server_env_actual={
+        **SERVER_ENV,
+        "HF_TOKEN": "hunter2",          # not a steering knob: dropped outright
+        "HOME": "/home/x",              # not a steering knob either
+        "SGLANG_REMOTE_API_KEY": "sk-1",  # a knob whose name says secret: kept, redacted
+    })
+    for table in ("sglang_env", "server_env_actual"):
+        stored = report["provenance"][table]
+        assert "HF_TOKEN" not in stored
+        assert "HOME" not in stored
+        assert stored["SGLANG_REMOTE_API_KEY"] == "<redacted>"
 
 
 # --- verdict.py: orchestrates task1_arm_verdict's functions, adds two labeled checks ---
@@ -536,7 +600,7 @@ class _FakeTask1Verdict:
 
 def _sample_report(*, compiled_during_session=(False, False)):
     return {
-        "provenance": {"git": {"head": "abc"}},
+        "provenance": {"git": {"head": "abc"}, "sglang_env": dict(SERVER_ENV)},
         "per_session": [
             {"session_id": f"s{i}", "clock_sm_start_mhz": 2570, "compiled_during_session": c, "compile_events": int(c)}
             for i, c in enumerate(compiled_during_session)
@@ -547,6 +611,81 @@ def _sample_report(*, compiled_during_session=(False, False)):
 def test_is_acknowledged_step_latency_problem():
     assert verdict.is_acknowledged_step_latency_problem("session 0: no step latency (fewer than two chunks)")
     assert not verdict.is_acknowledged_step_latency_problem("git head 'abc' is not the expected 'def'")
+
+
+def test_server_env_problems_is_silent_on_a_correctly_configured_server():
+    assert verdict.server_env_problems(_sample_report(), root="/x") == []
+
+
+def test_server_env_problems_catches_the_wrong_reader():
+    report = _sample_report()
+    report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] = "mmap"
+    [problem] = verdict.server_env_problems(report, root="/x")
+    assert "mmap" in problem and "page cache" in problem
+
+
+def test_server_env_problems_separates_unset_from_wrong():
+    """An unset knob is a default applied inside a process this harness cannot read. Reporting it
+    as a wrong value would be the same mistake, one layer down."""
+    report = _sample_report()
+    del report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"]
+    [problem] = verdict.server_env_problems(report, root="/x")
+    assert "is unset in the server" in problem
+
+
+def test_server_env_problems_catches_a_falsy_graph_gather():
+    report = _sample_report()
+    report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = "0"
+    [problem] = verdict.server_env_problems(report, root="/x")
+    assert "in-graph reader" in problem
+
+
+def test_server_env_problems_accepts_the_other_true_spellings():
+    for spelling in ("1", "true", "TRUE", "yes", "on"):
+        report = _sample_report()
+        report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_GRAPH_GATHER"] = spelling
+        assert verdict.server_env_problems(report, root="/x") == [], spelling
+
+
+def test_server_env_problems_checks_the_tree_the_server_could_import():
+    report = _sample_report()
+    report["provenance"]["sglang_env"]["PYTHONPATH"] = "/other/python"
+    [problem] = verdict.server_env_problems(report, root="/x")
+    assert "/other/python" in problem
+
+
+def test_server_env_problems_refuses_to_pass_with_no_server_env_at_all():
+    report = _sample_report()
+    report["provenance"].pop("sglang_env")
+    [problem] = verdict.server_env_problems(report, root="/x")
+    assert "none of the env checks below were made" in problem
+
+
+def test_judge_acknowledges_only_the_unknowable_form_of_each_server_check():
+    """check_arm's four unanswerable-over-HTTP checks are acknowledged; the measured stand-ins
+    are not, so a genuinely misconfigured server still reads unacknowledged-INVALID."""
+    report = _sample_report()
+    report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] = "mmap"
+    fake = _FakeTask1Verdict(problems=[
+        "imported sglang from None, not /x/python/sglang",
+        "provenance fields unavailable: ['sglang_env_resolved', 'sglang_file']",
+        "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
+        "SGLANG_MOE_EXPERT_GRAPH_GATHER did not resolve to true: this is not the in-graph reader",
+    ])
+    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
+    assert len(result["acknowledged_problems"]) == 4
+    [unacknowledged] = result["unacknowledged_problems"]
+    assert "mmap" in unacknowledged
+    assert result["valid_except_acknowledged_gaps"] is False
+
+
+def test_judge_is_clean_when_the_server_env_answers_the_acknowledged_checks():
+    fake = _FakeTask1Verdict(problems=[
+        "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
+    ])
+    result = verdict.judge(_sample_report(), root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
+    assert result["unacknowledged_problems"] == []
+    assert result["valid_except_acknowledged_gaps"] is True
 
 
 def test_compile_contamination_problems_flags_only_contaminated_sessions():
