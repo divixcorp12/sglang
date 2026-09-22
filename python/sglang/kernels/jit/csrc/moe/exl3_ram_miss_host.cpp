@@ -484,6 +484,10 @@ class RowReader {
     if (ring_ready_) io_uring_queue_exit(&ring_);
     for (int fd : fds_) ::close(fd);
     std::free(bounce_);
+    // Undo the owner-pin scaffold's affinity change: the pin targets the calling thread, which a caller
+    // (e.g. the benchmark) may reuse across many readers, so a later open() must see the original mask,
+    // not the single core this reader pinned itself to.
+    if (owner_pinned_) pthread_setaffinity_np(pthread_self(), sizeof(unpinned_affinity_), &unpinned_affinity_);
   }
 
   const Tables& tables() const { return t_; }
@@ -496,6 +500,12 @@ class RowReader {
   }
   unsigned pack_workers() const { return pack_workers_; }
   unsigned pack_split() const { return pack_split_; }
+
+  // Test-only scaffold (PACK_WORKERS.md owner-pinning measurement): pin the owner thread to `core`
+  // at open() and build the packing pool's mask as the inherited set minus that core, so the owner and
+  // the workers never share a core. -1 (the default) leaves open() byte-for-byte what it is today: no
+  // pin, and the pool's mask is exactly the creating thread's inherited affinity.
+  void set_owner_core(int64_t core) { owner_core_ = core; }
   // Copies a worker still holds. read() leaves none: this is what a test checks after it returns.
   int64_t unfinished_jobs() const {
     int64_t open_jobs = 0;
@@ -571,12 +581,23 @@ class RowReader {
     again_.reserve(extents);
     if (io_uring_queue_init(queue_depth(), &ring_, 0) != 0) return false;
     ring_ready_ = true;
+    cpu_set_t inherited;
+    CPU_ZERO(&inherited);
+    pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited);
+    if (owner_core_ >= 0) {
+      unpinned_affinity_ = inherited;  // restored by the destructor
+      CPU_CLR(static_cast<int>(owner_core_), &inherited);
+      cpu_set_t owner_only;
+      CPU_ZERO(&owner_only);
+      CPU_SET(static_cast<int>(owner_core_), &owner_only);
+      if (pthread_setaffinity_np(pthread_self(), sizeof(owner_only), &owner_only) != 0) {
+        throw std::runtime_error("exl3 RAM miss: could not pin the owner thread to its core");
+      }
+      owner_pinned_ = true;
+    }
     if (pack_workers_ > 0) {
       // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
       runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
-      cpu_set_t inherited;
-      CPU_ZERO(&inherited);
-      pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited);
       pool_ = std::make_unique<PackPool>(pack_workers_, inherited, static_cast<size_t>(kBounceSlots));
     }
     return true;
@@ -1309,6 +1330,11 @@ class RowReader {
   // Packing workers (set_pack; none by default): a job and a run list per bounce slot, sized at open().
   unsigned pack_workers_ = 0;
   unsigned pack_split_ = 0;
+  // Test-only owner-pinning scaffold (set_owner_core; -1 by default, meaning "no pin"). `unpinned_affinity_`
+  // is the mask open() found before pinning, restored by the destructor.
+  int64_t owner_core_ = -1;
+  bool owner_pinned_ = false;
+  cpu_set_t unpinned_affinity_{};
   std::unique_ptr<PackPool> pool_;
   PackJob jobs_[kBounceSlots];
   std::vector<CopyRun> runs_;
@@ -1366,6 +1392,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows, exl3_ram_miss_read_rows);
 // (stage_words() int64), with `ok` and `status` set from the result. `fault` is the faulted call's
 // tensor, laid out as exl3_ram_miss_read_rows_faulted's (kFaultWords words); an all-zero tensor injects nothing
 // except that ordinal 0 selects row 0: the Python wrapper sends -1.
+// `owner_core` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1 (the Python wrapper's default)
+// leaves the reader byte-for-byte what it is without this parameter; >= 0 pins the calling/owner thread
+// to that core and excludes it from the packing pool's mask (RowReader::set_owner_core).
 int64_t exl3_ram_miss_read_rows_traced(
     TensorView extents,
     TensorView starts,
@@ -1382,13 +1411,15 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView slots,
     int64_t step,
     TensorView fault,
-    TensorView record) {
+    TensorView record,
+    int64_t owner_core) {
   using namespace exl3_ram_miss;
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   RowReader reader(
       tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       direct != 0, f[19], f[20]);
+  reader.set_owner_core(owner_core);
   if (!reader.open()) return 0;
   reader.set_fault(fault_from(f));
   StageRecord stage;

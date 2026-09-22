@@ -127,7 +127,7 @@ def diskstats_of(path: str) -> str:
     return ""
 
 
-def one_read(tables, experts, mode, *, scenario: str, direct: bool = False):
+def one_read(tables, experts, mode, *, scenario: str, direct: bool = False, owner_core: int = -1):
     from sglang.kernels.ops.moe.exl3_ram_miss import read_rows_traced
 
     workers, split = mode
@@ -136,7 +136,7 @@ def one_read(tables, experts, mode, *, scenario: str, direct: bool = False):
     result, rec = read_rows_traced(
         tables, 1, experts, list(range(n)), direct=direct, step=8,
         hold_ordinal={"natural": -1, "last": n - 1, "burst": 0}[scenario], hold_rest=scenario == "burst",
-        pack_workers=workers, pack_split=split,
+        pack_workers=workers, pack_split=split, owner_core=owner_core,
     )
     cpu, wall = time.process_time() - cpu0, time.perf_counter() - wall0
     assert result == 1, rec
@@ -169,6 +169,11 @@ def main():
     ap.add_argument("--work-dir", default="/dev/shm")
     ap.add_argument("--direct", action="store_true", help="O_DIRECT reads: needs --work-dir on a real drive")
     ap.add_argument("--scenarios", default="natural,last,burst", help="natural is the only one a real drive needs")
+    ap.add_argument(
+        "--owner-core", type=int, default=-1,
+        help="test-only scaffold (PACK_WORKERS.md): pin the owner thread to this core, excluded from the "
+        "packing pool's mask; -1 (default) leaves the reader unpinned, unchanged from before this flag existed",
+    )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -176,8 +181,11 @@ def main():
     assert allowed and not (os.sched_getaffinity(0) & RESERVED), "run under taskset -c 0-63"
     busy = cpu_busy()
     cores = sorted(sorted(allowed, key=lambda c: busy[c])[: args.cores])
+    if args.owner_core >= 0:
+        assert args.owner_core in cores, f"--owner-core {args.owner_core} is not among the selected cores {cores}"
     cond = conditions(cores, busy)
-    os.sched_setaffinity(0, cores)  # workers inherit this mask minus 64-71
+    cond["owner_core"] = args.owner_core
+    os.sched_setaffinity(0, cores)  # workers inherit this mask minus 64-71 (and minus owner_core, if pinned)
     modes = [tuple(map(int, m.split(":"))) for m in args.modes.split(",")]
 
     root = Path(tempfile.mkdtemp(dir=args.work_dir, prefix="packbench_"))
@@ -187,7 +195,7 @@ def main():
         cond["direct"] = args.direct
         results = {}
         for _ in range(2):  # warm the page cache and the JIT
-            one_read(tables, list(range(2)), modes[0], scenario="natural", direct=args.direct)
+            one_read(tables, list(range(2)), modes[0], scenario="natural", direct=args.direct, owner_core=args.owner_core)
         for rep in range(args.reps):
             for n in args.rows:
                 experts = [(rep * n + i) % args.experts for i in range(n)]
@@ -195,7 +203,7 @@ def main():
                     for scenario in args.scenarios.split(","):
                         if scenario != "natural" and n == 1:
                             continue
-                        got = one_read(tables, experts, mode, scenario=scenario, direct=args.direct)
+                        got = one_read(tables, experts, mode, scenario=scenario, direct=args.direct, owner_core=args.owner_core)
                         results.setdefault((mode, n, scenario), []).append(got)
         cond["diskstats_end"] = diskstats_of(str(root))
         cond["load1_end"] = os.getloadavg()[0]

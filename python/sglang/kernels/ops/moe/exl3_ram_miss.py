@@ -146,11 +146,18 @@ def read_rows_traced(
     *,
     direct: bool,
     step: int = BOUNCE_ROWS,
+    owner_core: int = -1,
     **faults,
 ) -> tuple[int, dict]:
     """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
     returns the reader's stage record, decoded by ``stage_records``. The reader-side stages only:
     the request-side ones (observed, reserved, mapped, done) are the tier's and stay 0.
+
+    ``owner_core`` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1, the default, leaves the
+    reader byte-for-byte what it is without this argument. >= 0 pins the calling/owner thread to that
+    core before open() and builds the packing pool's mask as the selected cores minus that core, so the
+    owner and the workers never share a core. Production is untouched: nothing wires this argument to
+    the real service.
 
     The result is 1 (every row landed), 0 (failed) or -1 (abandoned: ``abandon_after`` batches were
     admitted, the rows admitted were still read and packed, the rest never read)."""
@@ -159,7 +166,14 @@ def read_rows_traced(
     record = torch.zeros(_stage_words(), dtype=torch.int64)
     result = int(
         _host_module().exl3_ram_miss_read_rows_traced(
-            *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record
+            *_table_args(tables, direct),
+            row,
+            expert_ids,
+            slot_ids,
+            int(step),
+            fault,
+            record,
+            int(owner_core),
         )
     )
     return result, stage_records(record.unsqueeze(0))[0]
