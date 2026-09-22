@@ -392,7 +392,9 @@ class TestGraphTopology:
         why a refactor that broke it would go unnoticed without this check.
         """
         from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+        from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
+        write_fake_exl3(str(tmp_path), num_layers=1, num_experts=F_EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
         layer, streamer, service, checks = _fused_layer(tmp_path, two_phase=True)
         try:
             gen = torch.Generator(device="cpu").manual_seed(7)
