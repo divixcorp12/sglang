@@ -261,7 +261,7 @@ for round in $(seq 1 "$max_warmup_rounds"); do
     taskset -c 8-15 env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
         "$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py" \
         --port "$port" --sessions "$synthetic_sessions" --session-ids "$warmup_session_id" \
-        --max-tokens "$max_tokens" --results "$round_results" --rid-suffix "-w$round"
+        --max-tokens "$max_tokens" --results "$round_results" --rid-suffix="-w$round"
     rc=$?
     [ "$rc" = 0 ] || { stop_server; abort "$arm warm-up round $round rc=$rc"; }
     new_compile_count=$(pyrun -c "import compile_watch as cw; print(cw.compile_events_in_range('$log', start_byte=0))")
