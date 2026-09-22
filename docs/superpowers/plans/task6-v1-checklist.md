@@ -9,6 +9,49 @@ editing.
 
 ---
 
+> ## PARKED 2026-09-21 — and **not** for lack of time
+>
+> **Do not start implementing this.** Task 6 was parked by the user's decision after two
+> independent lines converged on the same conclusion: **V1 and V2 are both reordering work
+> on a saturated link.** This file is kept as the record of *how* to build V1 if the
+> picture changes. It was not abandoned half-finished; it was aimed at a hardware floor.
+>
+> **1. The gather already runs at PCIe Gen3 x16 line rate.**
+> `copy_expert_row_segments_gpu_kernel` is 128 ms of a 391 ms step (32.7%) and moves a
+> 13.3 MB row in 1.055 ms — about 12.6 GB/s, which *is* the practical Gen3 x16 ceiling.
+> The link cannot be raised: the host is an **HPE ProLiant DL380 Gen10** with 1st/2nd-gen
+> Xeon Scalable, so **Gen3 is a platform limit, not a BIOS setting.** No software change
+> makes the gather faster. Only *fewer bytes per token* does. Everything in this checklist
+> moves copy time earlier; none of it moves fewer bytes.
+>
+> **2. `g`'s lower bound already puts V2-at-best-order under its bar.** `g_a >= 7.26 us`
+> (see D1, and note it is a **lower bound**) makes V2-at-best-order's net at most about
+> **3.77 ms against a 3.82 ms bar** — under it before any further measurement. That is the
+> flag raised at the end of §7 O5's neighbourhood and it is recorded here because it
+> belongs with the parking decision rather than with the open questions.
+>
+> **What this vindicates.** V1's honest projection was **1.1-1.4% net** throughout, and
+> nothing ever contradicted it. The projection was right; the effort went into looking for
+> a reason it was wrong. A ceiling reached is not a task failed, and the two mechanism
+> rejections in §0 stand on their own arithmetic independently of this.
+>
+> **What survives and is worth reading even if V1 is never built:** §2 (the
+> `release_locked` landmine, which is a live hazard in today's code and is not V1-specific),
+> §1.3's correction about where the lease check actually lives, and §5's mutant discipline.
+>
+> **Where the campaign went instead:** an end-to-end tok/s baseline on DSV4.1, then V2
+> changes re-sequenced around the **NVMe wait — 190 ms, 48.6% of the step, with the drive
+> idle about 200 ms of every step.** That is the part with real headroom. This task's
+> 1.114 ms `G*` is not.
+>
+> *One denominator caveat, since this file is strict about them elsewhere:* the 391 ms step
+> and the shares above come from the parking analysis. §6 of this checklist quotes **~360 ms**
+> (2.781 tok/s, `DSV41_REFERENCE.md:4`). They are different measurements and the shares here
+> are against 391 ms. Do not mix them.
+
+
+---
+
 ## 0. Which mechanism this specifies, and which two it does not
 
 This checklist specifies **V1, the two-phase mechanism: publish each hit lane's
@@ -99,6 +142,13 @@ footnote.
 ---
 
 ## 2. The `release_locked` landmine: unreachable today, incidentally, and how it arms
+
+> **This hazard has a home outside this parked file.** It is a property of the lease path
+> as shipped, so it is recorded as a **standing risk** in
+> `2026-09-20-storage-cpu-pipeline-v2.md`, under its own heading before Task 0 rather than
+> under Task 6, with the three independent routes that reached it. **That entry is not
+> parked and does not depend on Task 6 resuming.** What follows here is the full
+> derivation it points back to.
 
 The plan records this as an "implementation landmine, V2 only" and states it in terms of
 a throw. Both halves need correcting, and the correction makes it more dangerous rather
@@ -276,9 +326,25 @@ post  ->  W1  ->  C1  ->  A1  ->  W2  ->  C2  ->  A2  ->  F  ->  fused_moe
           entirely. §4.2's rationale for `ord` is untouched and still correct: it is a
           pure performance hint, benign when wrong, because correctness lives in the
           per-lane `RowResult`.
-        - **The condition that reopens it:** if the per-stage cost `g` now being measured
-          comes in at the **high end of its assumed 8-14 us range**, poll reads stop being
-          negligible and `ord` deserves a second look. That is a trigger, not a dead end.
+        - **The condition that reopens it**, written so it survives both a new `g` figure
+          and a change to the wait design: **`ord` deserves a second look when the poll
+          cost of the wait design actually being built is shown to be a material share of
+          the per-stage cost `g`.** Not "when `g` is high" — `ord` saves *poll reads*, so
+          what reopens it is poll reads mattering, which depends on the wait as much as on
+          `g`. That is a trigger, not a dead end, and it does not expire when someone
+          redesigns the wait.
+        - **Record every `g` figure with its direction.** As of 2026-09-21 the only reading
+          is **`g_a >= 7.26 us`, a LOWER BOUND, not an estimate** — the stand-in kernels are
+          strictly simpler than the real per-stage ones (the stand-in `W_s` polls four words
+          and stores; the real one also decodes fatal, shutdown, `RowResult.ready` and the
+          seqlock, and computes per-lane `go`), and ready-at-launch is the best case for
+          polling. The bound sits **above** the 6.98 us crossing and 0.7 us below the low
+          end of the assumed 8-14 us range, so **it supports neither side of the `ord`
+          question and must not be read as "`g` came in low".** It also holds only for the
+          design **as specified at `p = 4`**: the same harness measures 4.90 us for a
+          one-word `W_s`, so a cheaper wait is not bounded by this number at all.
+          A bound quoted without its direction gets read as an estimate — that has already
+          happened once to this figure, which is why the direction is written next to it.
         - The price of compaction is a real failure mode — an indexing error that sends a
           lane's bytes to the wrong destination slot — which `ord` would not have. Test T9
           exists to pay it.
@@ -431,9 +497,12 @@ in favour of compaction and now lives at D1, with the condition that would reope
   thread. Whether that is acceptable, or whether a test-only second thread is worth
   building to make it falsifiable, is open. It matters because Task 5's asynchronous
   `progress()` wording contemplates exactly the world in which it stops being free.
-- **O4. Stage 1's poll bound (D1) has no measured basis.** `g` is unmeasured, and so is
-  the latency from the service's ready store to a device poll observing it. The bound is
-  currently a guess and should be a measurement.
+- **O4. Stage 1's poll bound (D1) has no measured basis.** `g` is **not measured** — the
+  only reading is the lower bound `g_a >= 7.26 us` recorded at D1, which is not an
+  estimate and settles nothing — and neither is the latency from the service's ready store
+  to a device poll observing it. The bound in D1 is currently a guess and should be a
+  measurement. `c` likewise remains **NOT MEASURED under its pre-registration**, and that
+  run is parked, so **no per-launch or per-row cost figure in this checklist is gated.**
 - **O5. `T(n)` enters V1 too, and §1.2's two-phase row does not model it.** Raised while
   drafting this checklist and **recorded centrally in `PER_ROW_TRANSFER.md` at
   `8f92f922af`**, which is the statement to cite; it is not repeated here. In short: V1

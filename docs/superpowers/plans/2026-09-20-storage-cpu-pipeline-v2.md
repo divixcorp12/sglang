@@ -68,6 +68,58 @@ void drain(RequestHandle request);  // no pending I/O, packing, or GPU readers o
 - Request completion and row completion are distinct. Use generation-qualified per-request records; never advance a global completed frontier past an unfinished request.
 - Retire completed speculative rows individually. Demand for an in-flight speculative expert attaches to that read and promotes its priority instead of issuing duplicate I/O.
 
+## Standing risk: a lease is protected only while its slot is `kReady`
+
+**This is a property of the lease path as shipped, not of any proposed change, and it is
+placed here rather than under a task so that it is not read as conditional on that task
+going ahead.** Task 6 is parked; this is not. Nothing below asks for a fix — `LEASE_PROTOCOL`
+owns this code — it asks that the next person to touch the release or eviction path knows
+it.
+
+**The gap.** A source lease stops a slot being evicted, but only along the `kReady`
+eviction path. Once a slot reaches `kFree` by any route, nothing consults the lease again,
+and the slot is handed to the next requester while a GPU reader may still be reading it:
+**wrong bytes with no diagnostic**, followed by a lease-count decrement against whichever
+expert now owns the slot.
+
+**Three independent routes reached it**, which is what makes it a finding rather than a
+hypothetical. Each was found by a different agent from a different direction:
+
+1. **`release_locked` has no lease check and fails silently, not loudly.**
+   `exl3_ram_miss_host.cpp:2439` publishes map `-1`, clears `slot_to_expert` and sets
+   `kFree`, checking nothing. The check everyone expects is in the *public*
+   `release(row, slot)` at `:1982` ("release of pinned slot N while it is leased"), which
+   is the Python pin/unpin API and is **not** what `serve()`'s cleanup calls. Task 6's own
+   text asserted that a mid-request failure would make the service thread throw; it will
+   not.
+2. **Task 5 item 5's R3 mutant survives the entire suite.** The service acting on a
+   `Terminal` *without checking its generation* is caught by no existing test, and a stale
+   terminal from an earlier lap would release a lease a GPU may still be reading. That is
+   the same invariant reached from the signalling end rather than the release end.
+3. **The free-slot fast path consults no lease predicate at all.**
+   `take_slot_locked`'s first loop (`:2408-2409`) returns the first `kFree` slot it finds.
+   `leased_locked` has three call sites, all of them about choosing a victim among
+   *resident* rows (`census_locked`, and the `kReady` eviction scan at `:2415`); none
+   covers the fast path. So the mutation result "deleting the eviction predicate kills
+   exactly one test" establishes that the `kReady` path is defended and says nothing about
+   the other.
+
+**Read route 3's mutation result the right way.** "Kills exactly one test" was quoted as
+evidence the predicate was solid. It is evidence the `kReady` path is solid. A mutation
+result that kills exactly one test is a **question about what covers the remaining paths**,
+not reassurance that they are covered.
+
+**The rule this imposes.** Any change that moves a lease grant earlier than the point where
+the request is known to have succeeded — Task 6 V1 or V2, a promotion holder, an
+asynchronous `progress()` — must either add a lease check to `release_locked` (`:2439`) and
+to `take_slot_locked`'s free-slot loop (`:2408-2409`), or **prove** that neither can reach
+a leased slot. Task 6 V1 could have taken the proof route; Task 6 V2 could not, because its
+miss rows are in `slots` by construction.
+
+Full derivation, the call-site-by-call-site argument and the mutants that would falsify
+each half: `docs/superpowers/plans/task6-v1-checklist.md` §2. That checklist is **parked**;
+this risk is not, and does not depend on it.
+
 ## Task 0: Accept the native mirror prerequisite
 
 **Files:** Existing native-mirror plan; `python/sglang/srt/layers/moe/exl3_ram_miss.py`; `python/sglang/kernels/ops/moe/exl3_ram_miss.py`; `python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp`; native split/thread and format tests.
