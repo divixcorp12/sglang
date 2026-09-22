@@ -287,6 +287,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         row: int,
         next_row: int,
         capacity: int,
+        two_phase: bool = False,
+        poll_bound: int = 64,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -294,12 +296,33 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.next_row = next_row
         self.routes = torch.full((capacity,), -1, dtype=torch.int64, device=host_row_map.device)
         self.planned = torch.full((max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device)
+        # Task 6 V1. Off builds the Task 5 batched chain, which is the A1 arm every V1 measurement is reported
+        # against, so both chains have to exist in one build.
+        self.two_phase = two_phase
+        # Stage 1's poll bound, in iterations of roughly 256 ns. Unmeasured: neither the per-stage cost nor the
+        # store-to-poll latency it should be derived from has a measurement (checklist O4).
+        self.poll_bound = poll_bound
 
-    def translate(self, tag, plan) -> None:
+    def _stage_planned(self, plan) -> None:
+        """Copy the plan's lane experts into the captured ``planned`` buffer, bounding the plan first.
+
+        Every chain needs this and none of them can skip it: the post kernel reads each lane's expert
+        out of ``planned``, which is otherwise still at the -1 fill it was allocated with, and a -1 lane
+        is rejected by the ``expert >= 0`` guard. It lives here rather than in ``translate`` because the
+        two-phase chain does not call ``translate``; when the copy lived there, two-phase posted a lane
+        array of -1 and fail-stopped on its first layer.
+
+        The bound check belongs with the copy for the same reason. Kept here, a plan wider than the
+        buffer raises at capture; left in ``translate``, two-phase degrades it to a device-side
+        ``kLeaseReasonCount`` fail-stop.
+        """
         lanes = plan.expert_ids.numel()
         if lanes > self.planned.numel():
             raise ValueError(f"a plan of {lanes} lanes does not fit the backend's {self.planned.numel()}")
         self.planned[:lanes].copy_(plan.expert_ids)  # a device copy: captured, refreshed every replay
+
+    def translate(self, tag, plan) -> None:
+        self._stage_planned(plan)
         self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
         self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
 
@@ -314,9 +337,27 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         if self.device_side.lease_block is None:
             super().post(tag, plan)
             return
-        self.translate(tag, plan)
-        copy_expert_row_segments_gpu(self.segments[tag], self.host_rows, plan.slots, self.device_side.go_count)
-        self.device_side.ack(self.keep)
+        if not self.two_phase:
+            self.translate(tag, plan)
+            copy_expert_row_segments_gpu(self.segments[tag], self.host_rows, plan.slots, self.device_side.go_count)
+            self.device_side.ack(self.keep)
+            return
+        # V1 two-phase (D7): post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F, one linear chain in one stream. Each
+        # stage copies its own compacted plan, so each copy takes that stage's source rows, destination slots and
+        # committed count rather than the plan's lane-ordered arrays.
+        self._stage_planned(plan)
+        self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
+        self.device_side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.poll_bound)
+        copy_expert_row_segments_gpu(
+            self.segments[tag], self.device_side.host_rows_1, self.device_side.dst_slots_1, self.device_side.go_1
+        )
+        self.device_side.stage_ack(1)
+        self.device_side.rest_wait(self.row, self.planned, plan.count, plan.slots, self.ram_miss)
+        copy_expert_row_segments_gpu(
+            self.segments[tag], self.device_side.host_rows_2, self.device_side.dst_slots_2, self.device_side.go_2
+        )
+        self.device_side.stage_ack(2)
+        self.device_side.finalize(plan.count, self.keep)
 
 
 def watchdog_wait_s(timeout_ms: int) -> float:
@@ -371,6 +412,10 @@ class Exl3RamMissService:
         # Fixed once, in ensure_started, from SGLANG_DSV41_ENABLE_RAM_MISS_LEASES: the host and the device are both
         # configured from this one field, so they cannot disagree about whether a record is leased.
         self.lease_mode = False
+        # Task 6 V1, fixed in ensure_started beside lease_mode so the host, the device and every backend cannot
+        # disagree about which chain this process runs.
+        self.two_phase = False
+        self.hit_poll_bound = 64
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -418,8 +463,17 @@ class Exl3RamMissService:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
             lease_mode = cfg.enable_ram_miss_leases
+            # Two-phase is a mode of lease mode, not an independent one: without leases there are no row results to
+            # publish early, so it is refused rather than silently ignored.
+            two_phase = cfg.enable_ram_miss_two_phase
+            if two_phase and not lease_mode:
+                raise RuntimeError(
+                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
+                )
             if lease_mode:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
+            if two_phase:
+                host.enable_two_phase()
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
@@ -435,6 +489,8 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
+        self.two_phase = two_phase
+        self.hit_poll_bound = cfg.ram_miss_hit_poll_bound
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
         # later is refused by register()), makes this run before that hook, so the slabs are quarantined and their
@@ -497,7 +553,8 @@ class Exl3RamMissService:
         next_row = row + 1 if row + 1 < len(self._rows) else -1
         previous = streamer.row_backend
         streamer.row_backend = Exl3RamMissRowBackend(
-            previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows
+            previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows,
+            two_phase=self.two_phase, poll_bound=self.hit_poll_bound,
         )
 
     def on_residency(self, layer_id: int, slot_to_expert: list[int]) -> None:
@@ -710,6 +767,24 @@ class Exl3RamMissService:
         if self.device_side is not None:
             owned += [self.device_side.state, self.device_side.last_routes]
             owned += [t for t in (self.device_side.go_count, self.device_side.lane_ctx) if t is not None]
+            owned += [
+                t
+                for t in (
+                    self.device_side.go_1,
+                    self.device_side.go_2,
+                    self.device_side.lane_ctx_1,
+                    self.device_side.lane_ctx_2,
+                    self.device_side.host_rows_1,
+                    self.device_side.host_rows_2,
+                    self.device_side.dst_slots_1,
+                    self.device_side.dst_slots_2,
+                    self.device_side.origin_1,
+                    self.device_side.origin_2,
+                    self.device_side.claimed,
+                    self.device_side.violated,
+                )
+                if t is not None
+            ]
         for layer_id in sorted(self.tables):
             streamer = self.tables[layer_id].streamer_of()
             tier = getattr(streamer, "pinned_host_cache", None)

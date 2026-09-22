@@ -1843,6 +1843,16 @@ class Envs:
     # trip even when every row is in RAM (LEASE_PROTOCOL.md 15). Read once when the service starts; off is today's
     # protocol bit for bit. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_LEASES = EnvBool(False)
+    # Option C lease mode, two-phase (Task 6 V1): the service grants the lanes already resident inside its
+    # reservation critical section, before it reads the missing rows, so the device copies those rows while the
+    # read is still running instead of after it. Needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES. Read once when the
+    # service starts; off leaves lease mode exactly as it shipped, which is the arm V1 is measured against.
+    SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE = EnvBool(False)
+    # Two-phase stage 1: how many poll iterations (roughly 256 ns each) it waits for the service to publish the
+    # resident lanes before copying whatever has arrived. It never waits for the request to be served, so this only
+    # trades a longer look for a fuller first stage. Unmeasured: neither the per-stage cost nor the store-to-poll
+    # latency this should be derived from has a measurement.
+    SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND = EnvInt(64)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

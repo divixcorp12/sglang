@@ -378,6 +378,7 @@ COUNTERS = (
     "lease_double_signal",
     "late_after_terminal",
     "deferred_reuse",
+    "hit_leases_granted",
 )
 
 
@@ -591,6 +592,10 @@ class Exl3RamMissHost:
         """Lease every armed request's lanes and publish their row results (LEASE_PROTOCOL.md 7); before the thread starts."""
         self._module.exl3_ram_miss_set_lease_mode(self.handle, 1)
 
+    def enable_two_phase(self) -> None:
+        """Grant the resident lanes inside the reservation hold, before read() (Task 6 V1); before the thread starts."""
+        self._module.exl3_ram_miss_set_two_phase(self.handle, 1)
+
     def inject_done_stall(self, seconds: float) -> None:
         """Test only: sleep between serving a demand and storing demand_done."""
         self._module.exl3_ram_miss_inject_done_stall(self.handle, int(seconds * 1e9))
@@ -732,12 +737,27 @@ STATE_WORDS = {
     "unserved_misses": 8,
     "epoch": 9,
     "pending_epoch": 10,
+    # D5: the one absolute request deadline both V1 stages compare against, as two int32 halves.
+    "deadline_lo": 11,
+    "deadline_hi": 12,
+    # D6: an earlier stage of THIS request failed, cleared per request by post. Not kSticky, which never clears.
+    "req_failed": 13,
+    "fail_reason": 14,
 }
 
 
 @cache_once
 def _device_module() -> Module:
-    names = ("exl3_ram_miss_post", "exl3_ram_miss_wait", "exl3_ram_miss_lease_wait", "exl3_ram_miss_lease_ack")
+    names = (
+        "exl3_ram_miss_post",
+        "exl3_ram_miss_wait",
+        "exl3_ram_miss_lease_wait",
+        "exl3_ram_miss_lease_ack",
+        "exl3_ram_miss_lease_hit_wait",
+        "exl3_ram_miss_lease_rest_wait",
+        "exl3_ram_miss_lease_stage_ack",
+        "exl3_ram_miss_lease_finalize",
+    )
     return load_jit(
         "exl3_ram_miss",
         cuda_files=["moe/exl3_ram_miss.cuh"],
@@ -797,6 +817,18 @@ class Exl3RamMissDevice:
         self._lease_d = 0
         self.go_count = None
         self.lane_ctx = None
+        self.go_1 = None
+        self.go_2 = None
+        self.lane_ctx_1 = None
+        self.lane_ctx_2 = None
+        self.host_rows_1 = None
+        self.host_rows_2 = None
+        self.dst_slots_1 = None
+        self.dst_slots_2 = None
+        self.origin_1 = None
+        self.origin_2 = None
+        self.claimed = None
+        self.violated = None
         if lease_block is not None:
             if lease_layout.rows != layers:
                 raise ValueError(f"the lease layout has {lease_layout.rows} rows for {layers} layers")
@@ -809,6 +841,23 @@ class Exl3RamMissDevice:
             # lane, {request generation, slot generation, row, host slot}. Stable addresses: a graph captures them.
             self.go_count = torch.zeros(1, dtype=torch.int32, device=device)
             self.lane_ctx = torch.zeros((exl3_lease_block.LANES, 4), dtype=torch.int64, device=device)
+            # V1 two-phase (D7): one committed count and one lane context PER STAGE, plus the compacted copy plans
+            # each stage hands its own copy launch. `claimed` is stage 1's per-lane verdict and stage 2's
+            # complement; `origin` maps a compacted entry back to the lane whose acknowledgement word it writes;
+            # `violated` replaces the acknowledgement kernel's keep write, and only the finalize kernel writes keep.
+            lanes = exl3_lease_block.LANES
+            self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
+            self.go_2 = torch.zeros(1, dtype=torch.int32, device=device)
+            self.lane_ctx_1 = torch.zeros((lanes, 4), dtype=torch.int64, device=device)
+            self.lane_ctx_2 = torch.zeros((lanes, 4), dtype=torch.int64, device=device)
+            self.host_rows_1 = torch.zeros(lanes, dtype=torch.int64, device=device)
+            self.host_rows_2 = torch.zeros(lanes, dtype=torch.int64, device=device)
+            self.dst_slots_1 = torch.zeros(lanes, dtype=torch.int32, device=device)
+            self.dst_slots_2 = torch.zeros(lanes, dtype=torch.int32, device=device)
+            self.origin_1 = torch.zeros(lanes, dtype=torch.int32, device=device)
+            self.origin_2 = torch.zeros(lanes, dtype=torch.int32, device=device)
+            self.claimed = torch.zeros(lanes, dtype=torch.int32, device=device)
+            self.violated = torch.zeros(1, dtype=torch.int32, device=device)
 
     def _kernels(self):
         if self._module is None:
@@ -832,7 +881,7 @@ class Exl3RamMissDevice:
         self._check_buffers(planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64))
         self._kernels().exl3_ram_miss_post(
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
-            self._lease_address, self._lease_d,
+            self._lease_address, self._lease_d, self.timeout_ns,
         )
 
     def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:
@@ -867,6 +916,69 @@ class Exl3RamMissDevice:
         self._check_buffers(keep=(keep, torch.float32))
         self._kernels().exl3_ram_miss_lease_ack(
             self.page, self.state, self._lease_address, self._lease_d, self.go_count, self.lane_ctx, keep
+        )
+
+    def hit_wait(self, row: int, planned, count, dst_slots, poll_bound: int) -> None:
+        """Stage 1 (D1): claim and compact the lanes the service published before read() returned.
+
+        It never waits on ``demand_done``; the bound caps how long it polls for a publish that may not be coming,
+        so an all-miss request does not pay the read wait twice.
+        """
+        self._check_row("row", row)
+        self._check_buffers(
+            planned=(planned, torch.int64), count=(count, torch.int32), dst_slots=(dst_slots, torch.int32)
+        )
+        if self.lease_block is None:
+            raise RuntimeError("this device was built without a lease block")
+        self._kernels().exl3_ram_miss_lease_hit_wait(
+            self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
+            self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
+            self.violated, poll_bound,
+        )
+
+    def rest_wait(self, row: int, planned, count, dst_slots, ram_miss) -> None:
+        """Stage 2 (D2): wait on ``demand_done`` and plan the complement of the lanes stage 1 claimed.
+
+        It writes neither ``keep`` nor a terminal: the finalize kernel owns both.
+        """
+        self._check_row("row", row)
+        self._check_buffers(
+            planned=(planned, torch.int64),
+            count=(count, torch.int32),
+            dst_slots=(dst_slots, torch.int32),
+            ram_miss=(ram_miss, torch.int64),
+        )
+        if self.lease_block is None:
+            raise RuntimeError("this device was built without a lease block")
+        self._kernels().exl3_ram_miss_lease_rest_wait(
+            self.page, self.state, planned, count, dst_slots, row, self.host_rows_2, self.dst_slots_2, ram_miss,
+            self._lease_address, self._lease_d, self.claimed, self.go_2, self.lane_ctx_2, self.origin_2,
+        )
+
+    def stage_ack(self, stage: int) -> None:
+        """Acknowledge one stage's lanes (D3), after that stage's copy kernel and in the same stream."""
+        if self.lease_block is None:
+            raise RuntimeError("this device was built without a lease block")
+        if stage not in (1, 2):
+            raise ValueError(f"stage must be 1 or 2, not {stage}")
+        go = self.go_1 if stage == 1 else self.go_2
+        lane_ctx = self.lane_ctx_1 if stage == 1 else self.lane_ctx_2
+        origin = self.origin_1 if stage == 1 else self.origin_2
+        self._kernels().exl3_ram_miss_lease_stage_ack(
+            self.page, self.state, self._lease_address, self._lease_d, go, lane_ctx, origin, self.violated
+        )
+
+    def finalize(self, count, keep) -> None:
+        """The sole writer of ``keep`` (D4), after every copy and acknowledgement and before the fused MoE.
+
+        On failure it publishes a terminal naming only the lanes no stage acknowledged.
+        """
+        if self.lease_block is None:
+            raise RuntimeError("this device was built without a lease block")
+        self._check_buffers(count=(count, torch.int32), keep=(keep, torch.float32))
+        self._kernels().exl3_ram_miss_lease_finalize(
+            self.page, self.state, count, self.go_1, self.go_2, self.violated, keep,
+            self._lease_address, self._lease_d,
         )
 
     def stats(self) -> dict[str, int]:
