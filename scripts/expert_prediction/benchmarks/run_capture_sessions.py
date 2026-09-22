@@ -195,6 +195,14 @@ def main():
         help="Comma list of session_ids to run, in this file's order; empty runs all.",
     )
     parser.add_argument(
+        "--rid-suffix",
+        default="",
+        help="Appended to every request id. A caller that replays the SAME session more than once against "
+        "one server needs this: the rid is otherwise session_id-tN every time, and TokenizerManager's "
+        "create_abort_task aborts whatever still holds a given rid two seconds on, so every replay after "
+        "the first dies one token in with finish_reason=abort and nothing logged server side.",
+    )
+    parser.add_argument(
         "--print-stream",
         action="store_true",
         help="Echo reasoning and answers to stdout as they stream.",
@@ -242,7 +250,7 @@ def main():
                     continue
 
                 history.append({"role": "user", "content": user_text})
-                rid = f"{session['session_id']}-t{turn_idx}"
+                rid = f"{session['session_id']}-t{turn_idx}{args.rid_suffix}"
                 expected = (
                     session["expected"][turn_idx]
                     if turn_idx < len(session["expected"])

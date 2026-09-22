@@ -261,15 +261,23 @@ for round in $(seq 1 "$max_warmup_rounds"); do
     taskset -c 8-15 env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
         "$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py" \
         --port "$port" --sessions "$synthetic_sessions" --session-ids "$warmup_session_id" \
-        --max-tokens "$max_tokens" --results "$round_results"
+        --max-tokens "$max_tokens" --results "$round_results" --rid-suffix "-w$round"
     rc=$?
     [ "$rc" = 0 ] || { stop_server; abort "$arm warm-up round $round rc=$rc"; }
     new_compile_count=$(pyrun -c "import compile_watch as cw; print(cw.compile_events_in_range('$log', start_byte=0))")
     clock=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
     tok_s=$(pyrun -c "
 from results_gate import load_results
-print(load_results('$round_results')[0]['decode_tokens_per_sec'])
-")
+row = load_results('$round_results')[0]
+value = row['decode_tokens_per_sec']
+if value is None:
+    raise SystemExit(
+        f\"warm-up round produced no decode rate: completion_tokens={row.get('completion_tokens')} \"
+        f\"finish_reason={row.get('finish_reason')}. A round that generated ~1 token with \"
+        f\"finish_reason=abort means the request was killed, not measured.\"
+    )
+print(value)
+") || { stop_server; abort "$arm warm-up round $round produced no decode rate"; }
     recent_clocks+=("$clock")
     recent_tok_s+=("$tok_s")
     # Only the two most recent rounds decide stability; older rounds don't count.
