@@ -14,7 +14,7 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
 
 ## GPU microbenchmarks on the RTX 5090
 
-- **Size the working set past L2 (~128 MB) or you are measuring L2, not HBM.** A
+- **Size the working set past L2 (96 MiB) or you are measuring L2, not HBM.** A
   benchmark that reuses one tensor across repetitions stays resident and reports
   bandwidth the real workload will never see. This produced two recorded
   constants that understate production cost by 1.5x and 2.3x
