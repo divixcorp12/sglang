@@ -735,7 +735,7 @@ class RowReader {
   // progress-loop.md) so a lease is retired promptly, and far above one loop turn (a bare _mm_pause())
   // so the callback's own cost (a mutex and a walk over kDemandRecords, on the caller's side) cannot
   // dominate the loop.
-  static constexpr int64_t kProgressIntervalNs = 200'000;  // 200 us
+  static constexpr int64_t kProgressIntervalNs = 200000;  // 200 us
 
   // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
   enum class RowState : uint8_t { Free, Reading, Ready, Packing };

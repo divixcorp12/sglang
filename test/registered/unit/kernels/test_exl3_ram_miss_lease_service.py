@@ -370,6 +370,56 @@ def test_an_acknowledged_graph_lane_lease_no_longer_holds_back_an_eager_pause(tm
         host.stop()
 
 
+def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path):
+    """Phase 1 (docs/superpowers/plans/2026-09-22-ram-miss-progress-loop.md): retire_leases() used to run only
+    at the top of pump(), so no lease was retired for the whole duration of a demand read (RowReader::read()'s
+    drain loop does not return until every row of the request is read and packed). Property: a lease the device
+    acknowledges partway through a LATER read is retired before that read returns, not merely once it does.
+
+    Mutation: remove read()'s in-loop progress() call, leaving retire_leases() reachable only from the top of
+    pump(). The acknowledgement (delivered while the second request's read is still packing, slowed by
+    pack_delay_ns) would then not retire until the read returns and pump() loops back to serve nothing -- this
+    test's poll, bounded well inside the read's own span, would still see leases_acked at 0 when the deadline
+    is reached, so it fails there rather than on a wrong value.
+    """
+    s = ram_miss_setup(tmp_path, capacity=4)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host.enable_lease_mode()
+    host.start_thread(fatal_wait_s=60.0, spin_us=200)
+    sim = LeaseSim(host, page, s.slabs)
+    try:
+        req1 = sim.post(0, [1])
+        waited1 = sim.wait(req1, timeout_s=5.0)
+        assert waited1.status == 1 and waited1.go == 1
+        assert host.counters()["leases_granted"] == 1, "req1's lease was not granted; nothing to retire mid-flight"
+
+        # Packing is inline on the owner thread (pack_workers defaults to 0) and one row at a time, so three
+        # missing rows at 50 ms each span ~150 ms -- comfortably longer than kProgressIntervalNs (200 us) and
+        # than the poll deadline below, so an ack delivered now can only be seen mid-read, not after req2 ends.
+        host.inject_fault(pack_delay_ns=50_000_000)
+        req2 = sim.post(0, [2, 3, 4])
+        sim.ack(req1, waited1)
+        sim.deliver()
+
+        deadline = time.perf_counter() + 0.1
+        retired_mid_flight = False
+        while time.perf_counter() < deadline:
+            if host.counters()["leases_acked"] == 1:
+                retired_mid_flight = True
+                break
+            time.sleep(0.002)
+        assert retired_mid_flight, "the acknowledged lease was not retired while req2's read was still running"
+        assert page_word(page, "demand_done") != req2.seq, (
+            "req2 had already finished by the time the poll succeeded: it proved nothing about mid-read retirement"
+        )
+
+        waited2 = sim.wait(req2, timeout_s=10.0)
+        assert waited2.status == 1 and waited2.go == 3
+    finally:
+        host.stop()
+
+
 if __name__ == "__main__":
     import sys
 

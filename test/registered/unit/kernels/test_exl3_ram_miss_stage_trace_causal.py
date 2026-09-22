@@ -229,7 +229,10 @@ NON_TRACE_CLOCK_READS = {
     "int64_t last_active = now_ns();": 1,
     "last_active = now_ns();": 1,
     "if (now_ns() - last_active < spin_ns_) {": 1,
-    "const int64_t now = now_ns();": 1,
+    # RamThread's watchdog poll (unchanged) and RowReader::read()'s progress-callback gate (phase 1,
+    # ram-miss-progress-phase1): only reached when a `progress` callback was passed, so the disabled
+    # (production-off) path still reads no clock when nothing is registered to run periodically.
+    "const int64_t now = now_ns();": 2,
 }
 
 
