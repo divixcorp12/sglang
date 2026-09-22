@@ -9,6 +9,49 @@ editing.
 
 ---
 
+> ## PARKED 2026-09-21 — and **not** for lack of time
+>
+> **Do not start implementing this.** Task 6 was parked by the user's decision after two
+> independent lines converged on the same conclusion: **V1 and V2 are both reordering work
+> on a saturated link.** This file is kept as the record of *how* to build V1 if the
+> picture changes. It was not abandoned half-finished; it was aimed at a hardware floor.
+>
+> **1. The gather already runs at PCIe Gen3 x16 line rate.**
+> `copy_expert_row_segments_gpu_kernel` is 128 ms of a 391 ms step (32.7%) and moves a
+> 13.3 MB row in 1.055 ms — about 12.6 GB/s, which *is* the practical Gen3 x16 ceiling.
+> The link cannot be raised: the host is an **HPE ProLiant DL380 Gen10** with 1st/2nd-gen
+> Xeon Scalable, so **Gen3 is a platform limit, not a BIOS setting.** No software change
+> makes the gather faster. Only *fewer bytes per token* does. Everything in this checklist
+> moves copy time earlier; none of it moves fewer bytes.
+>
+> **2. `g`'s lower bound already puts V2-at-best-order under its bar.** `g_a >= 7.26 us`
+> (see D1, and note it is a **lower bound**) makes V2-at-best-order's net at most about
+> **3.77 ms against a 3.82 ms bar** — under it before any further measurement. That is the
+> flag raised at the end of §7 O5's neighbourhood and it is recorded here because it
+> belongs with the parking decision rather than with the open questions.
+>
+> **What this vindicates.** V1's honest projection was **1.1-1.4% net** throughout, and
+> nothing ever contradicted it. The projection was right; the effort went into looking for
+> a reason it was wrong. A ceiling reached is not a task failed, and the two mechanism
+> rejections in §0 stand on their own arithmetic independently of this.
+>
+> **What survives and is worth reading even if V1 is never built:** §2 (the
+> `release_locked` landmine, which is a live hazard in today's code and is not V1-specific),
+> §1.3's correction about where the lease check actually lives, and §5's mutant discipline.
+>
+> **Where the campaign went instead:** an end-to-end tok/s baseline on DSV4.1, then V2
+> changes re-sequenced around the **NVMe wait — 190 ms, 48.6% of the step, with the drive
+> idle about 200 ms of every step.** That is the part with real headroom. This task's
+> 1.114 ms `G*` is not.
+>
+> *One denominator caveat, since this file is strict about them elsewhere:* the 391 ms step
+> and the shares above come from the parking analysis. §6 of this checklist quotes **~360 ms**
+> (2.781 tok/s, `DSV41_REFERENCE.md:4`). They are different measurements and the shares here
+> are against 391 ms. Do not mix them.
+
+
+---
+
 ## 0. Which mechanism this specifies, and which two it does not
 
 This checklist specifies **V1, the two-phase mechanism: publish each hit lane's
