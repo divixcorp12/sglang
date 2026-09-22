@@ -1,0 +1,62 @@
+{
+ "script": "gather_tn.py",
+ "started": "2026-09-21T18:38:27-0500",
+ "repo": "/data/models/slang/nvfp4-work/cc-microbench",
+ "repo_head": "925354fff4dcce33fc68f6339d7513488cd87ad4",
+ "c_harness_sha256": "9e7d8e4e0f1df596e9a5037facd810c071f9187852b35329a63717490845faed",
+ "gather_tn_sha256": "fb58fc74b57373632b8f213ebc0e3bf4928c18fcac334d1d0b7a8220663deee6",
+ "launches_per_visit": 100,
+ "passes": 3,
+ "nodes": {
+  "0": {
+   "page_fraction_on_node": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "free_mib_before": 21834,
+   "free_mib_after": 19996,
+   "mem_mib_before": {
+    "MemFree": 21834,
+    "Active(file)": 27285,
+    "Inactive(file)": 10409,
+    "FilePages": 40341
+   },
+   "mem_mib_after": {
+    "MemFree": 19996,
+    "Active(file)": 27222,
+    "Inactive(file)": 10396,
+    "FilePages": 40265
+   }
+  }
+ },
+ "box_start": {
+  "loadavg": [
+   "4.25",
+   "4.78",
+   "5.77"
+  ],
+  "gpu_apps": [],
+  "gpu_mem_used_mib": "66 MiB, 3, 3, 16, P0, 2572 MHz, 3135 MHz"
+ },
+ "ce_backend": null,
+ "spin_cycles_per_us": 2961.930790329778,
+ "device": "NVIDIA GeForce RTX 5090",
+ "torch": "2.13.0+cu130",
+ "sglang_file": "/data/models/slang/nvfp4-work/cc-microbench/python/sglang/__init__.py",
+ "box_end": {
+  "loadavg": [
+   "3.76",
+   "4.48",
+   "5.57"
+  ],
+  "gpu_apps": [
+   "993804, 1510 MiB"
+  ],
+  "gpu_mem_used_mib": "1584 MiB, 3, 3, 16, P1, 2955 MHz, 3135 MHz"
+ },
+ "finished": "2026-09-21T18:39:56-0500"
+}

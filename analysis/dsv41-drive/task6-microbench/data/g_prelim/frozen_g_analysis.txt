@@ -1,0 +1,25 @@
+VERDICT: CLEARS
+  g_empty_us (1.7577528634945503, 1.7521382132914207, 1.7581127193546102)
+  g_active_us (7.263173392004747, 7.258943680591435, 7.274042984005493)
+  G_star_ms 1.1139999999999999
+  G_ms_C_hidden (0.5387455990270006, 0.5380411643571891, 0.5393586155000917)
+  G_ms_C_exposed (0.6902553959842195, 0.6894627295343264, 0.6910951521464462)
+  p_sensitivity_us_and_G_X_H {'active_p1': (4.902280079025757, 0.5145104977660635, 0.41224893531758633), 'active_p6': (8.807696142035628, 0.8052296694965183, 0.6215011279736551)}
+  slope control20      process 0: 21.75 us/triple [21.75, 21.75], linearity diff 0.000
+  slope control20      process 1: 21.76 us/triple [21.76, 21.76], linearity diff 0.000
+  slope control20      process 2: 21.76 us/triple [21.76, 21.76], linearity diff 0.000
+  slope active_p1      process 0: 4.90 us/triple [4.89, 4.90], linearity diff 0.005
+  slope active_p1      process 1: 4.91 us/triple [4.90, 4.91], linearity diff 0.000
+  slope active_p1      process 2: 4.90 us/triple [4.90, 4.91], linearity diff 0.001
+  slope empty          process 0: 1.75 us/triple [1.75, 1.75], linearity diff 0.004
+  slope empty          process 1: 1.76 us/triple [1.76, 1.76], linearity diff 0.002
+  slope empty          process 2: 1.76 us/triple [1.76, 1.76], linearity diff 0.002
+  slope empty_base8k   process 0: 1.75 us/triple [1.75, 1.75], linearity diff n/a
+  slope empty_base8k   process 1: 1.76 us/triple [1.76, 1.76], linearity diff n/a
+  slope empty_base8k   process 2: 1.76 us/triple [1.76, 1.76], linearity diff n/a
+  slope active_p6      process 0: 8.82 us/triple [8.80, 8.82], linearity diff 0.000
+  slope active_p6      process 1: 8.80 us/triple [8.80, 8.81], linearity diff 0.002
+  slope active_p6      process 2: 8.81 us/triple [8.80, 8.81], linearity diff 0.001
+  slope active_p4      process 0: 7.26 us/triple [7.26, 7.27], linearity diff 0.002
+  slope active_p4      process 1: 7.26 us/triple [7.26, 7.26], linearity diff 0.000
+  slope active_p4      process 2: 7.27 us/triple [7.27, 7.27], linearity diff 0.001

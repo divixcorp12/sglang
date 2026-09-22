@@ -1,0 +1,33 @@
+PRELIMINARY LOOK. The frozen verdict below is meaningful only if it is not INVALID and the run was the full registered sweep.
+frozen g_analysis verdict: CLEARS
+slopes per process (us per triple, OLS on per-N medians, [bootstrap 95%], linearity diff N<=160 vs N>=160):
+  control20     process 0:   21.75 [  21.75,   21.75]   lin 0.000
+  control20     process 1:   21.76 [  21.76,   21.76]   lin 0.000
+  control20     process 2:   21.76 [  21.76,   21.76]   lin 0.000
+  active_p1     process 0:    4.90 [   4.89,    4.90]   lin 0.005
+  active_p1     process 1:    4.91 [   4.90,    4.91]   lin 0.000
+  active_p1     process 2:    4.90 [   4.90,    4.91]   lin 0.001
+  empty         process 0:    1.75 [   1.75,    1.75]   lin 0.004
+  empty         process 1:    1.76 [   1.76,    1.76]   lin 0.002
+  empty         process 2:    1.76 [   1.76,    1.76]   lin 0.002
+  empty_base8k  process 0:    1.75 [   1.75,    1.75]   lin n/a
+  empty_base8k  process 1:    1.76 [   1.76,    1.76]   lin n/a
+  empty_base8k  process 2:    1.76 [   1.76,    1.76]   lin n/a
+  active_p6     process 0:    8.82 [   8.80,    8.82]   lin 0.000
+  active_p6     process 1:    8.80 [   8.80,    8.81]   lin 0.002
+  active_p6     process 2:    8.81 [   8.80,    8.81]   lin 0.001
+  active_p4     process 0:    7.26 [   7.26,    7.27]   lin 0.002
+  active_p4     process 1:    7.26 [   7.26,    7.26]   lin 0.000
+  active_p4     process 2:    7.27 [   7.27,    7.27]   lin 0.001
+median across processes: {'control20': 21.76, 'active_p1': 4.9, 'empty': 1.76, 'empty_base8k': 1.76, 'active_p6': 8.81, 'active_p4': 7.26}
+g_e = 1.76 us, g_a(p=4) = 7.26 us  ->  G_X (all exposed) = 0.690 ms/step, G_H (class C hidden) = 0.539 ms/step   vs G* = 1.114 ms
+  = 85.10 empty x g_e + (48.93 + 4.65 [+ 20.86 in G_X]) active x g_a; crossings: uniform g* = 6.98 (all exposed) / 8.03 us (C hidden)
+EXTENSION (unregistered): slope us/triple by filler-node count K (OLS on N = 0,160,640, per-N medians)
+  ext_active_p4_b1000    proc 0: 7.27  proc 1: 7.26  proc 2: 7.27
+  ext_active_p4_b2000    proc 0: 7.27  proc 1: 7.26  proc 2: 7.27
+  ext_active_p4_b4000    proc 0: 7.27  proc 1: 7.25  proc 2: 7.27
+  ext_active_p4_b8000    proc 0: 7.26  proc 1: 7.25  proc 2: 7.27
+  ext_empty_b1000        proc 0: 1.76  proc 1: 1.76  proc 2: 1.76
+  ext_empty_b2000        proc 0: 1.75  proc 1: 1.76  proc 2: 1.76
+  ext_empty_b4000        proc 0: 1.76  proc 1: 1.76  proc 2: 1.76
+  ext_empty_b8000        proc 0: 1.76  proc 1: 1.75  proc 2: 1.76

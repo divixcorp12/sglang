@@ -38,7 +38,8 @@ def test_dry_run_feeds_the_analysis():
     with tempfile.TemporaryDirectory() as d:
         _dry(d, True)
         lines = [json.loads(l) for l in open(Path(d) / "results.jsonl")]
-        keys = {"process", "engine", "state", "node", "load", "launch", "n", "row_bytes", "T_ms", "distinct_rows", "min_reuse_distance_rows", "link_gen_start", "link_gen_end", "pstate_start", "other_gpu_procs", "foreign_max_core_pct"}
+        keys = {"process", "engine", "state", "node", "load", "launch", "n", "row_bytes", "T_ms", "distinct_rows", "min_reuse_distance_rows", "link_gen_start", "link_gen_end", "pstate_start", "other_gpu_procs", "foreign_max_core_pct",
+                "sm_mhz_min", "sm_mhz_start", "sm_mhz_end", "sm_mhz_mean", "sm_mhz_limit"}
         assert all(keys <= set(x) for x in lines)
         assert {x["process"] for x in lines} == set(range(h.PASSES)) and all(len(x["T_ms"]) == h.LAUNCHES_PER_CELL for x in lines)
         a.simulate = lambda T, *_: (36.0, 4.9, 0.0)                     # the trace model needs the divix01 traces; the gates and fits do not
@@ -57,9 +58,51 @@ def test_each_analysis_gate_fires_on_bad_harness_output():
     a.simulate = lambda T, *_: (36.0, 4.9, 0.0)
     for name, edit in (("row bytes", lambda x: x.update(row_bytes=2_764_808)), ("reuse", lambda x: x.update(min_reuse_distance_rows=3)),
                        ("link", lambda x: x.update(link_gen_start=1)), ("foreign", lambda x: x.update(foreign_max_core_pct=50.0)),
-                       ("other gpu", lambda x: x.update(other_gpu_procs=1)), ("tail", lambda x: x.update(T_ms=x["T_ms"][:190] + [x["T_ms"][0] * 3] * 10))):
+                       ("other gpu", lambda x: x.update(other_gpu_procs=1)), ("tail", lambda x: x.update(T_ms=x["T_ms"][:190] + [x["T_ms"][0] * 3] * 10)),
+                       # amendment 10: the three SM-clock conditions, and a record in the pre-amendment format
+                       ("clock floor (a)", lambda x: x.update(sm_mhz_min=int(0.79 * x["sm_mhz_limit"]))),
+                       ("clock drift within a cell (b)", lambda x: x.update(sm_mhz_end=int(x["sm_mhz_start"] * 1.06))),
+                       ("no clock fields", lambda x: [x.pop(k) for k in ("sm_mhz_min", "sm_mhz_start", "sm_mhz_end", "sm_mhz_mean", "sm_mhz_limit")])):
         bad = json.loads(json.dumps(good)); edit(bad[0]); assert a.analyse(bad)["verdict"] == "INVALID", name
     assert a.analyse(good)["verdict"] != "INVALID"
+    # (c): the mean clock of one arm's n = 6 cells 4% above its n = 1 cells (each cell individually within the floor and (b))
+    bad = json.loads(json.dumps(good))
+    for x in bad:
+        if x["n"] == 6: x["sm_mhz_mean"] *= 1.04
+    assert a.analyse(bad)["verdict"] == "INVALID" and any(g.startswith("(c)") for g in a.analyse(bad)["gates"])
+    # the P-state label is recorded and no longer gates
+    p1 = json.loads(json.dumps(good))
+    for x in p1: x["pstate_start"] = 1
+    assert a.analyse(p1)["verdict"] != "INVALID"
+
+def _run_analysis(d):
+    import subprocess
+    r = subprocess.run([sys.executable, str(HERE / "c_analysis.py"), str(Path(d) / "results.jsonl")], capture_output=True, text=True)
+    return r, r.stdout.strip().splitlines()
+
+def test_analysis_refuses_beside_a_marker_that_voids_the_run_and_prints_no_number():
+    with tempfile.TemporaryDirectory() as d:
+        _dry(d, False)
+        (Path(d) / "results.INVALID").write_text("some marker text nobody registered\n")           # unrecognised: treated as voiding the run
+        r, lines = _run_analysis(d)
+        assert r.returncode == 3 and lines[0].startswith("VERDICT: REFUSED"), r.stdout
+        assert not any("fit " in l or "c_marginal" in l or "model" in l for l in lines), r.stdout
+
+def test_a_marker_scoped_to_the_nvme_arm_does_not_void_T_of_n_and_hides_the_nvme_arm():
+    traces = "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-drive/task1-results/"
+    if not os.path.isdir(traces): return                      # the trace model needs the divix01 traces
+    for text in ("drive traffic in a load window differs from the reader's own bytes by more than 10%: another lane used the drives; the nvme arm's rho is not to be quoted",
+                 "the nvme load arm did not load the drives at >= 1.0 GB/s in every window: no load-arm number is to be quoted",
+                 "foreign CPU (non-own, from /proc/stat, an upper bound) changed by more than 1.0 cores between the idle and load arms in pass(es) [(0, 1.0, 3.0)]: the nvme ratio is invalid",
+                 "an idle-arm cell moved NVMe data above 0.02 GB/s (rho's baseline is contaminated): []"):
+        assert h and a.marker_is_scoped(text), text
+    with tempfile.TemporaryDirectory() as d:
+        _dry(d, True)
+        (Path(d) / "results.INVALID").write_text("drive traffic in a load window differs from the reader's own bytes by more than 10%: another lane used the drives; the nvme arm's rho is not to be quoted\n")
+        r, lines = _run_analysis(d)
+        assert lines[0].startswith("VERDICT:") and "REFUSED" not in lines[0] and lines[1].lstrip().startswith("SCOPED MARKER"), r.stdout
+        assert any(l.strip().startswith("fit ('sm', 'cold', 0, 'idle', 'eager')") for l in lines), r.stdout       # T(n) is printed
+        assert not any("nvme" in l for l in lines[2:]), r.stdout                                                # the scoped quantity is not
 
 def _spin_on(cpu):
     import subprocess
