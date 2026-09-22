@@ -234,6 +234,11 @@ def test_t6_stage2_wait_never_writes_keep_so_a_stage1_violation_is_not_overwritt
     its success path is exactly what would flip it if stage 2 wrote ``keep`` at all. Only after
     that is the hit lane's slot generation rewritten (what a recycle would do) and stage 1
     acknowledged, forcing VIOLATED; the finalize kernel must then be the one to decide `keep`.
+
+    The miss lane's read is delayed (``inject(delay_s=...)``): the fake EXL3 corpus is tiny enough
+    that an undelayed read can finish inside stage 1's own poll window, so the miss lane's
+    RowResult can legitimately publish before stage 1 gives up and get claimed as a second hit --
+    correct two-phase behavior, but it would make this mixed-request setup nondeterministic.
     """
     s = service
     s.plan([3])  # make expert 3 resident, so the mixed request's lane 0 is a hit
@@ -241,6 +246,7 @@ def test_t6_stage2_wait_never_writes_keep_so_a_stage1_violation_is_not_overwritt
     _cuda_ready()
     assert s.until(lambda: s.host.counters()["leases_acked"] == 1), s.host.counters()
 
+    s.host.inject(delay_s=0.05)  # keep lane 1 (expert 9) a miss past stage 1's poll window
     s.plan([3, 9])  # lane 0: hit (resident); lane 1: miss (never loaded)
     s.keep.fill_(0.0)  # sentinel: nothing but F may change this
     s.post()
@@ -271,6 +277,7 @@ def test_t6_stage2_wait_never_writes_keep_so_a_stage1_violation_is_not_overwritt
     _cuda_ready()
     assert s.keep.item() == 0.0, "F must fail the request: a VIOLATED lane makes it unserved"
     assert page_word(s.page, "fatal") != 0
+    s.host.inject(delay_s=0.0)
 
 
 def test_t7_one_request_deadline_not_one_per_stage(tmp_path):
