@@ -36,7 +36,8 @@ def _tiers(service):
     return [service.tables[i].streamer_of().pinned_host_cache for i in sorted(service.tables)]
 
 
-def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tmp_path):
+@pytest.mark.parametrize("side_stream", [False, True], ids=["default_stream", "side_stream"])
+def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tmp_path, side_stream):
     from test_exl3_ram_miss_graph_gpu import HIDDEN, TOP_K, _layers, _step_route
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
@@ -53,10 +54,13 @@ def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tm
         graph.replay()
         torch.cuda.synchronize()
         # The GPU's reader of the slabs, in flight: a real leased-chain replay, then a long kernel queued behind it.
-        graph.replay()
-        torch.cuda._sleep(int(4e9))  # a second or more of GPU time
-        done = torch.cuda.Event()
-        done.record()
+        # On a side stream the work is invisible to a barrier that waits only for the current stream.
+        stream = torch.cuda.Stream() if side_stream else torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            graph.replay()
+            torch.cuda._sleep(int(4e9))  # a second or more of GPU time
+            done = torch.cuda.Event()
+            done.record()
         assert not done.query(), "precondition: the GPU is still busy when shutdown starts"
         seen = []
         for tier in _tiers(service):
