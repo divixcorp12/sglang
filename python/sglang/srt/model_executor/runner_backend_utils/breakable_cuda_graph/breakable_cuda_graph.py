@@ -282,15 +282,43 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
 class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
-    eager break function between consecutive segments."""
+    eager break function between consecutive segments.
+
+    Graphs containing Engram host callbacks bind to their first replay stream.
+    Capture may use a separate stream. The callback reuses fixed pinned staging
+    buffers; launches on the bound stream are ordered by CUDA, while replays on
+    another stream are rejected because they could overwrite those buffers in
+    flight.
+    """
 
     def __init__(self, deduped_cuda_graph=None) -> None:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
+        # Objects referenced by captured CUDA host callbacks must outlive every
+        # replay of this graph (including pinned staging buffers and native
+        # callback contexts).
+        self._retained_host_callbacks: list[Any] = []
+        self._host_callback_replay_stream_handle: int | None = None
+        self._host_callback_replay_stream_lock = threading.Lock()
         self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
+        if self._retained_host_callbacks:
+            replay_stream_handle = self._host_callback_replay_stream_handle
+            if replay_stream_handle is None:
+                # Protect only first-use binding. This does not serialize replays;
+                # CUDA stream ordering does that for subsequent calls.
+                with self._host_callback_replay_stream_lock:
+                    replay_stream_handle = self._host_callback_replay_stream_handle
+                    if replay_stream_handle is None:
+                        replay_stream_handle = stream.cuda_stream
+                        self._host_callback_replay_stream_handle = replay_stream_handle
+            if stream.cuda_stream != replay_stream_handle:
+                raise RuntimeError(
+                    "Engram host-node graph must replay on its first replay stream; "
+                    "cross-stream replay could overwrite shared pinned staging buffers"
+                )
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
@@ -421,3 +449,25 @@ def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
     pass
+
+
+def is_breakable_graph_capturing() -> bool:
+    """Whether this thread is inside an active breakable graph capture."""
+    return _current_capture_var.get() is not None and not _in_break_var.get()
+
+
+def retain_for_current_graph(value: Any) -> None:
+    """Keep host callback state alive for the lifetime of the captured graph."""
+    capture = _current_capture_var.get()
+    if capture is None or _in_break_var.get():
+        raise RuntimeError("host callback state can only be retained during graph capture")
+    graph = capture.cuda_graph
+    graph._retained_host_callbacks.append(value)
+
+
+def current_capture_stream_handle() -> int:
+    """Return the stream handle for the active NVIDIA breakable capture."""
+    capture = _current_capture_var.get()
+    if capture is None or _in_break_var.get() or rt is None:
+        raise RuntimeError("CUDA stream handle requires an active NVIDIA graph capture")
+    return get_current_stream().cuda_stream

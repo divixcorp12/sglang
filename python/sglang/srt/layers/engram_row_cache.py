@@ -101,6 +101,30 @@ class EngramRowCache:
 
     def lookup(self, keys: np.ndarray, fetch: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
         keys = np.asarray(keys, dtype=np.int64).reshape(-1)
+        rows, inverse = self._lookup_unique(keys, fetch)
+        return rows[inverse]
+
+    def lookup_into(
+        self,
+        keys: np.ndarray,
+        fetch: Callable[[np.ndarray], np.ndarray],
+        destination: np.ndarray,
+    ) -> None:
+        """Fill caller-owned packed row storage in request order."""
+        keys = np.asarray(keys, dtype=np.int64).reshape(-1)
+        destination = np.asarray(destination)
+        if destination.shape != (keys.size, self.row_bytes) or destination.dtype != np.uint8:
+            raise ValueError(
+                f"destination must be uint8 [{keys.size}, {self.row_bytes}], got "
+                f"{destination.dtype} {destination.shape}"
+            )
+        rows, inverse = self._lookup_unique(keys, fetch)
+        for i, unique_index in enumerate(inverse):
+            destination[i] = rows[unique_index]
+
+    def _lookup_unique(
+        self, keys: np.ndarray, fetch: Callable[[np.ndarray], np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray]:
         self.clock += 1
         self.accesses += keys.size
         unique, inverse = np.unique(keys, return_inverse=True)
@@ -130,7 +154,7 @@ class EngramRowCache:
             self._sink.maybe_write("engram", self.stats)
         if self.log_every and self.clock % self.log_every == 0:
             self.log()
-        return out[inverse]
+        return out, inverse
 
     def stats(self) -> dict:
         return {

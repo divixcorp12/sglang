@@ -134,6 +134,16 @@ def test_empty_lookup_returns_no_rows_and_never_fetches():
     assert calls == [] and cache.accesses == 0
 
 
+def test_lookup_into_fills_caller_owned_rows_in_duplicate_order():
+    table = np.arange(32 * 4, dtype=np.uint8).reshape(32, 4)
+    cache = EngramRowCache(capacity_rows=16, row_bytes=4)
+    destination = np.zeros((4, 4), dtype=np.uint8)
+    cache.lookup_into(np.array([7, 3, 7, 1]), _fetcher(table, []), destination)
+    assert np.array_equal(destination, table[[7, 3, 7, 1]])
+    with pytest.raises(ValueError, match="destination must be uint8"):
+        cache.lookup_into(np.array([1]), _fetcher(table, []), np.zeros((1, 4), dtype=np.int8))
+
+
 def test_shared_cache_is_off_at_zero_gib(fresh_shared_cache):
     with envs.SGLANG_DSV41_ENGRAM_RAM_GIB.override(0.0):
         assert shared_engram_row_cache(66) is None

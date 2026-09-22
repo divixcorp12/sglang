@@ -1805,6 +1805,9 @@ class Envs:
     # shared by every Engram layer; misses read with O_DIRECT. 0 keeps the
     # plain np.memmap path.
     SGLANG_DSV41_ENGRAM_RAM_GIB = EnvFloat(0.0)
+    # Capture layer-1 Engram lookup as a CUDA host node backed by a shared native
+    # row cache and an io_uring worker. Disabled unless explicitly requested.
+    SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING = EnvBool(False)
 
     # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
     # checkpoint loader skips them and each MoE layer gathers the experts it

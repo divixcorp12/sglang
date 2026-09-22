@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.layers.moe.exl3_expert_layout import read_safetensors_header
 from sglang.srt.layers.quantization.exl3_ops import assert_not_capturing
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram_row_cache import EngramRowCache
@@ -46,6 +47,12 @@ class EngramFileTable:
                 f"{path}: rows/shape {w['shape']} {s['shape']} != [{num_embeddings}, {dim}]"
             )
         self.dim, self.block = dim, block
+        self.path = path
+        self.weight_offset = data_start + w["data_offsets"][0]
+        self.scale_offset = data_start + s["data_offsets"][0]
+        self.num_embeddings = num_embeddings
+        self._host_node_extension = None
+        self._native_store = None
         self.weight = np.memmap(path, np.uint8, "r", data_start + w["data_offsets"][0], (num_embeddings, dim))
         self.scale = np.memmap(
             path, np.uint8, "r", data_start + s["data_offsets"][0], (num_embeddings, dim // block)
@@ -62,11 +69,11 @@ class EngramFileTable:
             reader = reader if reader is not None else shared_uring_file_reader()
             self._weight_rows = PagedRowSource(
                 reader, path, dim, num_embeddings, direct=direct,
-                base_offset=data_start + w["data_offsets"][0],
+                base_offset=self.weight_offset,
             )
             self._scale_rows = PagedRowSource(
                 reader, path, dim // block, num_embeddings, direct=direct,
-                base_offset=data_start + s["data_offsets"][0],
+                base_offset=self.scale_offset,
             )
 
     def _fetch(self, keys: np.ndarray) -> np.ndarray:
@@ -94,15 +101,52 @@ class EngramFileTable:
                 from sglang.srt.layers.engram_row_cache import shared_engram_row_cache
 
                 scale_key = f"layers.{layer_id}.engram.embed.scale"
-                return cls(
+                table = cls(
                     path, weight_key, scale_key, num_embeddings, dim,
-                    cache=shared_engram_row_cache(dim + dim // 32), cache_tag=layer_id,
+                    cache=(None if envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get()
+                           else shared_engram_row_cache(dim + dim // 32)), cache_tag=layer_id,
                 )
+                if (
+                    envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get()
+                ):
+                    if torch.version.cuda is None or not torch.cuda.is_available():
+                        raise RuntimeError("SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING requires CUDA")
+                    try:
+                        from sglang.srt.layers.engram_host_node import native_engram_host_node
+
+                        table._host_node_extension = native_engram_host_node()
+                        budget = 5 << 30
+                        table._native_store = table._host_node_extension.get_shared_store(
+                            budget, dim + dim // 32
+                        )
+                        table._native_store.register_table(
+                            path, table.weight_offset, table.scale_offset,
+                            num_embeddings, dim, dim // table.block, layer_id << 40,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Engram CUDA host-node io_uring route initialization failed"
+                        ) from exc
+                return table
         raise FileNotFoundError(f"{weight_key} not found in {table_dir}")
 
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
         assert_not_capturing("EngramFileTable.lookup")
         flat = indices.reshape(-1).cpu().numpy()
+        if self._native_store is not None:
+            rows = self._native_store.lookup(flat.astype(np.int64), self._tag)
+            if self.cache is None:
+                from sglang.srt.layers.engram_row_cache import cache_stats_sink
+
+                sink = cache_stats_sink()
+                if sink is not None:
+                    sink.maybe_write("engram", self._native_store.stats)
+            weight_rows = np.ascontiguousarray(rows[:, : self.dim])
+            scale_rows = np.ascontiguousarray(rows[:, self.dim :])
+            weight = torch.from_numpy(weight_rows).to(indices.device).view(torch.float8_e4m3fn)
+            scale = torch.from_numpy(scale_rows).to(indices.device).view(torch.float8_e8m0fnu)
+            values = weight.float().unflatten(-1, (-1, self.block)) * scale.float().unsqueeze(-1)
+            return values.flatten(-2).to(torch.bfloat16).reshape(*indices.shape, self.dim)
         weight_rows, scale_rows = self._rows(flat)
         weight = torch.from_numpy(weight_rows).to(indices.device).view(torch.float8_e4m3fn)
         scale = torch.from_numpy(scale_rows).to(indices.device).view(torch.float8_e8m0fnu)

@@ -49,12 +49,82 @@ from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
+    current_capture_stream_handle,
+    is_breakable_graph_capturing,
+    retain_for_current_graph,
 )
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+class _EngramHostLookupContext:
+    """Pinned buffers and CPU table lookup state retained by a captured graph."""
+
+    def __init__(self, file_table: EngramFileTable, indices: torch.Tensor):
+        self.file_table = file_table
+        self.ids = torch.empty((indices.numel(),), dtype=indices.dtype, pin_memory=True)
+        self.rows = torch.empty(
+            (indices.numel(), file_table.dim + file_table.dim // file_table.block),
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        self.status = torch.zeros((1,), dtype=torch.int32, pin_memory=True)
+        native = getattr(file_table, "_host_node_extension", None)
+        store = getattr(file_table, "_native_store", None)
+        if native is None or store is None:
+            raise RuntimeError("native Engram CUDA host-node helper is unavailable")
+        self.native_context = native.EngramHostLookup(
+            store,
+            file_table.path,
+            file_table.weight_offset,
+            file_table.scale_offset,
+            file_table.num_embeddings,
+            file_table.dim,
+            file_table.dim // file_table.block,
+            file_table._tag,
+            indices.numel(),
+            self.ids.data_ptr(),
+            self.rows.data_ptr(),
+            self.status.data_ptr(),
+            self.ids.numel() * self.ids.element_size()
+            + self.rows.numel() * self.rows.element_size()
+            + self.status.numel() * self.status.element_size(),
+            indices.numel() * (file_table.dim + file_table.dim // file_table.block)
+            + self.status.element_size(),
+        )
+        self.packed_gpu = torch.empty(
+            self.rows.shape, dtype=torch.uint8, device=indices.device
+        )
+        self.status_gpu = torch.empty((1,), dtype=torch.int32, device=indices.device)
+
+
+def _capture_engram_file_lookup(
+    file_table: EngramFileTable, indices: torch.Tensor
+) -> torch.Tensor:
+    """Capture D2H ids, CPU file lookup and H2D packed rows as graph nodes."""
+    if not indices.is_cuda or indices.dtype != torch.int64:
+        raise ValueError("captured Engram file lookup expects CUDA int64 hash IDs")
+    context = _EngramHostLookupContext(file_table, indices)
+    # The D2H, host node, and H2D are all captured in stream order. The pinned
+    # buffers and callback context remain alive for all graph replays.
+    context.ids.copy_(indices.reshape(-1), non_blocking=True)
+    context.native_context.enqueue(current_capture_stream_handle())
+    context.packed_gpu.copy_(context.rows, non_blocking=True)
+    context.status_gpu.copy_(context.status, non_blocking=True)
+    torch._assert_async(
+        context.status_gpu.eq(0), "Engram file lookup failed in CUDA graph host node"
+    )
+    retain_for_current_graph(context)
+    weight = context.packed_gpu[:, : file_table.dim].view(torch.float8_e4m3fn)
+    scale = context.packed_gpu[:, file_table.dim :].view(torch.float8_e8m0fnu)
+    values = weight.float().unflatten(-1, (-1, file_table.block)) * scale.float().unsqueeze(
+        -1
+    )
+    result = values.flatten(-2).to(torch.bfloat16).reshape(*indices.shape, file_table.dim)
+    return result
 
 
 def _engram_lookup_capture_stub(file_table, indices):
@@ -696,6 +766,7 @@ class EngramEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
         super().__init__()
         self.dim = dim
+        self.layer_id = layer_id
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         self.row_start = num_embeddings * tp_rank // self.tp_size
@@ -770,6 +841,18 @@ class EngramEmbedding(nn.Module):
         if self.file_table is not None:
             if indices.shape[0] == 0:
                 return self._empty(indices)
+            if (
+                getattr(self, "layer_id", None) == 1
+                and getattr(self, "tp_size", None) == 1
+                and indices.is_cuda
+                and indices.shape[0] == 1
+                and getattr(self.file_table, "_host_node_extension", None) is not None
+                and getattr(self.file_table, "_native_store", None) is not None
+                and forward_batch is not None
+                and forward_batch.forward_mode.is_decode()
+                and is_breakable_graph_capturing()
+            ):
+                return _capture_engram_file_lookup(self.file_table, indices)
             return _engram_file_table_lookup(self.file_table, indices)
         if self._shared:
             if indices.shape[0] == 0:
