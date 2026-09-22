@@ -163,6 +163,9 @@ fi
 #     server holding the port. Take the lock on a descriptor instead and hold it for the
 #     whole arm -- which is the semantics wanted anyway: this arm owns the GPU. taskset
 #     and env both exec in place, and the python below execvp's, so $! stays the server.
+#     The ONE exception is NSYS_TRACE=1: `nsys launch` forks, so $! is the profiler's
+#     wrapper and the server pid is resolved by cmdline below instead. Anything else
+#     added between the shell and python must exec, or it breaks the same way.
 expected_env_path=$run_dir/expected-env.json
 printf '%s' "$expected_env_json" > "$expected_env_path"
 env_argv=()
@@ -174,6 +177,28 @@ for k, v in json.load(open('$expected_env_path')).items():
     print(f'{k}={v}')
 ")
 
+# --- optional Nsight Systems capture, gated so the default arm is untraced ---
+#     NSYS_TRACE=1 wraps the launch in `nsys launch`, which starts the application
+#     immediately but collects nothing until `nsys start`. That is exactly the shape
+#     asked for: warm-up runs untraced, the timed set is captured. Graph granularity is
+#     mandatory, not a preference -- see CLAUDE.md: `node` makes cudaGraphLaunch cost
+#     ~0.77 us per traced node and fabricates a ~6 ms idle gap at the end of every
+#     decode step. Read no per-kernel ranking out of a graph-mode report either; its
+#     kernel table omits the graph body.
+nsys_session=""
+if [ "${NSYS_TRACE:-0}" = 1 ]; then
+    command -v nsys >/dev/null 2>&1 || abort "NSYS_TRACE=1 but nsys is not on PATH"
+    nsys_session="dsv41-$arm-$$"
+    nsys_out_dir=${NSYS_OUT_DIR:-/mnt/nvme1/dsv41-nsys}
+    mkdir -p "$nsys_out_dir" || abort "cannot create $nsys_out_dir"
+    nsys_report=$nsys_out_dir/$arm-$(date +%Y%m%d-%H%M%S)
+    nsys_prefix=(nsys launch --session-new="$nsys_session"
+                 --trace=cuda,nvtx,osrt
+                 --cuda-graph-trace=graph)
+else
+    nsys_prefix=()
+fi
+
 exec 9>"$gpu_lock" || abort "cannot open $gpu_lock"
 flock --nonblock 9 || abort "cc-gpu.lock is held by another GPU job; not starting $arm"
 
@@ -181,7 +206,7 @@ cd "$worktree"
 # DECODE_LOG_INTERVAL overrides ServerArgs' default (unset here); see
 # decode_log_interval_compare.sh, which is the only caller that sets it.
 decode_log_interval_py=${DECODE_LOG_INTERVAL:-None}
-taskset -c 32-63 env "${env_argv[@]}" \
+taskset -c 32-63 "${nsys_prefix[@]}" env "${env_argv[@]}" \
     PYTHONPATH="$worktree/python" PYTHONUNBUFFERED=1 \
     "$py" -c "
 import sys
@@ -191,14 +216,44 @@ argv = arm_env.ServerArgs(port=$port, decode_log_interval=$decode_log_interval_p
 import os
 os.execvp(argv[0], argv)
 " >> "$log" 2>&1 &
-spid=$!
+launch_pid=$!
+spid=$launch_pid
+if [ -n "$nsys_session" ]; then
+    # `nsys launch` FORKS -- measured: the wrapper and the application are different
+    # pids. So $! is the wrapper here, and using it would reintroduce exactly the bug
+    # fixed in eb096a697c: /proc/$spid/environ would read the wrapper's environment and
+    # stop_server would kill the wrapper while the server kept the port and the GPU.
+    # Resolve the server by its own cmdline instead. The port makes it unambiguous.
+    spid=""
+    for _ in $(seq 1 180); do
+        spid=$(pgrep -f "sglang.launch_server.*--port $port" | head -1)
+        [ -n "$spid" ] && break
+        sleep 1
+    done
+    [ -n "$spid" ] || {
+        kill -TERM "$launch_pid" 2>/dev/null
+        nsys cancel --session="$nsys_session" >/dev/null 2>&1
+        abort "$arm: nsys launched but no sglang.launch_server appeared on port $port within 180s (see $log)"
+    }
+    echo "nsys session=$nsys_session launcher pid=$launch_pid report=$nsys_report"
+fi
 echo "server pid=$spid"
 
 stop_server() {
+    # A capture still running here would leave the session behind and never write a
+    # report, so end it first -- and cancel rather than stop, because every caller of
+    # stop_server is an abort path whose data is not worth a report.
+    if [ -n "$nsys_session" ]; then
+        nsys cancel --session="$nsys_session" >/dev/null 2>&1
+    fi
     kill -TERM "$spid" 2>/dev/null
     for _ in $(seq 1 120); do kill -0 "$spid" 2>/dev/null || break; sleep 1; done
     kill -KILL "$spid" 2>/dev/null
     wait "$spid" 2>/dev/null
+    if [ -n "$nsys_session" ] && [ -n "$launch_pid" ]; then
+        kill -TERM "$launch_pid" 2>/dev/null
+        wait "$launch_pid" 2>/dev/null
+    fi
     for _ in $(seq 1 60); do [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && break; sleep 2; done
 }
 
@@ -304,6 +359,15 @@ done
 [ "$ready" = 1 ] || { stop_server; abort "$arm never reached a clock-stable, tok/s-stable, compile-quiet state after $max_warmup_rounds warm-up rounds (last: clock=${clock}MHz decode=${tok_s}tok/s compile_events=$prev_compile_count; see $log)"; }
 echo "$arm ready: clock=${clock}MHz decode=${tok_s}tok/s compile_events=$prev_compile_count"
 
+if [ -n "$nsys_session" ]; then
+    # Collection starts HERE, after warm-up: the clock is stable, the graph is captured
+    # and no JIT compile remains, so the report contains steady-state decode only.
+    nsys start --session="$nsys_session" --output="$nsys_report" \
+        --sample=none --cpuctxsw=none --force-overwrite=true \
+        || { stop_server; abort "$arm: nsys start failed for session $nsys_session"; }
+    echo "nsys capture started -> $nsys_report.nsys-rep"
+fi
+
 residency_ready=$(pyrun -c "
 import json, provenance
 print(json.dumps(provenance.resident_bytes(['$expert_shard_dir'])))
@@ -373,6 +437,15 @@ with open('$boundary_path', 'a') as f:
         break
     fi
 done
+
+if [ -n "$nsys_session" ]; then
+    # Stop before the server is torn down; nsys writes the report on stop, and a killed
+    # application loses it. This is the one path that stops rather than cancels.
+    nsys stop --session="$nsys_session" || echo "WARNING: nsys stop failed for $nsys_session"
+    nsys_session=""
+    echo "nsys capture written: $nsys_report.nsys-rep"
+    ls -la "$nsys_report.nsys-rep" 2>/dev/null || echo "WARNING: no report at $nsys_report.nsys-rep"
+fi
 
 # --- residency after the timed set (whole-arm, not per-session: run_capture_sessions.py
 #     is unmodified and has no hook to sample it mid-session); tenancy at run end; stop
