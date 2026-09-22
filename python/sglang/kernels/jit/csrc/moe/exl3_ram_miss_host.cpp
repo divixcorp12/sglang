@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -1587,6 +1588,10 @@ enum Counter : int {
   kLeaseDoubleSignal, // a lane signalled by both, or twice: released once, counted here
   kLateAfterTerminal, // a request the device had already given up on: dropped without a lease
   kDeferredReuse,     // a demand held back because its request slot still holds an unretired lease row
+  // S7. The hit-lane subset of kLeasesGranted: lanes granted BEFORE read() by V1's first phase. Separate because
+  // kLeasesGranted cannot distinguish the groups, so a build that publishes nothing early -- falling through to
+  // the batched grant -- would satisfy every timing assertion by accident. Zero on the single-phase path.
+  kHitLeasesGranted,
   kCounterCount,
 };
 
@@ -1658,6 +1663,10 @@ struct LaneLease {
 
 struct Outstanding {
   bool active = false;
+  // A further lane group is still to be granted into this entry (V1 two-phase, S1/S4). While it is set the entry
+  // counts as open even though no lane is in state 1 yet, so retire_leases cannot free the ring index out from
+  // under a grant that has not run.
+  bool grants_pending = false;
   uint64_t gen = 0;
   int64_t row = 0;
   uint32_t count = 0;
@@ -1993,6 +2002,14 @@ class RamTier {
     lease_mode_ = on;
   }
 
+  // Two-phase mode (Task 6 V1): grant the resident lanes inside serve()'s reservation hold, before read(), so the
+  // device can copy them while the missing rows are still being read. Off leaves lease mode exactly as Task 5
+  // shipped it, which is the A1 arm every Task 6 measurement is reported against.
+  void set_two_phase(bool on) {
+    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set two-phase mode before the service thread starts");
+    two_phase_ = on;
+  }
+
   // Shutdown, first step (LEASE_PROTOCOL.md 14.3 S1): the header word tells the device to stop waiting on the service,
   // and the service serves nothing new. Retirement goes on, so acknowledgements of work already in flight still land.
   void close_admission() {
@@ -2073,31 +2090,86 @@ class RamTier {
     return lease_mode_ && terminal_seen_for(deferred_seq_, deferred_gen_);
   }
 
-  // Lease every lane's source slot and publish its row result, in one critical section, after the rows are ready
-  // and before the caller answers. A lease is counted before its row result is published (6.1). False on an
-  // internal inconsistency: nothing is granted then.
-  bool grant_lanes_locked(const Request& request) {
+  // S1. Open the ring entry for a request, ONCE, with its full lane count and every lane ungranted.
+  //
+  // V1 (two-phase) grants a request's lanes in two calls -- the hit lanes inside serve()'s reservation hold, the
+  // miss lanes after read() -- so the entry cannot be (re)initialised by the granter: the second call would erase
+  // the first call's leases. Opening is therefore its own step. `grants_pending` records that a further grant is
+  // still owed, which is what keeps the entry open across the gap (S4); retire_leases must not close a ring slot
+  // whose second grant has not run, or grant_lane_group_locked's `entry.active` guard stops protecting it.
+  //
+  // False on a still-active ring entry, exactly as the single-phase granter was: nothing is opened then.
+  bool open_lease_entry_locked(const Request& request) {
     if (request.lane_experts.empty()) return true;
+    const size_t count = request.lane_experts.size();
+    if (count > kLeaseLanes) return false;
     const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
     Outstanding& entry = outstanding_[idx];
     if (entry.active) return false;  // the request slot still holds an unretired lease row
-    Tier& tier = tiers_[request.row];
-    const size_t count = request.lane_experts.size();
-    int32_t slots[kLeaseLanes];
-    for (size_t lane = 0; lane < count; ++lane) {
-      const int32_t expert = request.lane_experts[lane];
-      if (expert < 0 || expert >= experts_) return false;
-      const int32_t slot = tier.expert_slot[expert];
-      if (slot < 0 || tier.state[slot] != kReady || tier.slot_to_expert[slot] != expert) return false;
-      slots[lane] = slot;
-    }
     entry = Outstanding();
     entry.active = true;
     entry.gen = request.gen;
     entry.row = request.row;
     entry.count = static_cast<uint32_t>(count);
+    entry.grants_pending = true;
+    return true;
+  }
+
+  // No further grant is owed for this request: the entry may close once its granted lanes retire. Called when the
+  // second group has been granted, and on every path that answers without granting it (S5). Without this a
+  // request that failed between the two grants would hold its ring index open for the life of the process.
+  //
+  // An entry that never granted a lane has nothing for the device to retire, so nothing would ever clear
+  // `active`. Such an entry is retired here instead; one that does hold leases stays active and is retired by the
+  // device's acknowledgement or its terminal, which is the whole of S5.
+  void close_pending_grants_locked(const Request& request) {
+    if (request.lane_experts.empty()) return;
+    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    Outstanding& entry = outstanding_[idx];
+    if (!entry.active || entry.gen != request.gen) return;
+    entry.grants_pending = false;
+    bool held = false;
+    for (uint32_t lane = 0; lane < entry.count; ++lane) held = held || entry.lane[lane].state == 1;
+    if (!held) entry.active = false;
+  }
+
+  // S1. Lease the source slot of every lane `select` picks, and publish its row result. Callable twice over
+  // disjoint subsets of one open entry. A lease is counted before its row result is published (6.1).
+  //
+  // All-or-nothing: every selected lane is validated before any is committed, so a false return has granted
+  // nothing and left the entry as it found it.
+  //
+  // The fence is PER GROUP and must stay that way. It separates THIS call's payload writes from THIS call's ready
+  // stores; it deliberately does not cover the other group. That is the correctness core of two-phase: the hit
+  // group's ready words have to become visible to the device while the miss group's payloads do not yet exist.
+  // Hoisting one fence to cover both groups would either publish hit lanes late (losing the entire mechanism) or
+  // publish miss lanes whose payloads have not been written (handing the device a torn row result).
+  template <typename Select>
+  bool grant_lane_group_locked(const Request& request, Select select, bool hit_phase = false) {
+    if (request.lane_experts.empty()) return true;
+    const size_t count = request.lane_experts.size();
+    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    Outstanding& entry = outstanding_[idx];
+    if (!entry.active || entry.gen != request.gen || entry.count != count) return false;
+    Tier& tier = tiers_[request.row];
+    int32_t slots[kLeaseLanes];
+    bool take[kLeaseLanes] = {};
+    size_t taken = 0;
+    for (size_t lane = 0; lane < count; ++lane) {
+      if (!select(lane)) continue;
+      if (entry.lane[lane].state != 0) return false;  // granted already: the two groups must be disjoint
+      const int32_t expert = request.lane_experts[lane];
+      if (expert < 0 || expert >= experts_) return false;
+      const int32_t slot = tier.expert_slot[expert];
+      if (slot < 0 || tier.state[slot] != kReady || tier.slot_to_expert[slot] != expert) return false;
+      slots[lane] = slot;
+      take[lane] = true;
+      ++taken;
+    }
+    if (taken == 0) return true;
     uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
     for (size_t lane = 0; lane < count; ++lane) {
+      if (!take[lane]) continue;
       const int32_t slot = slots[lane];
       tier.leases[slot] += 1;
       entry.lane[lane] = LaneLease{1, slot, tier.generation[slot], false};
@@ -2111,13 +2183,27 @@ class RamTier {
       std::memcpy(result + 20, &row16, 2);
       std::memcpy(result + 22, &lane16, 2);
     }
-    _mm_sfence();  // the payload of every lane lands before any ready word
+    _mm_sfence();  // THIS group's payloads land before THIS group's ready words -- see the note above
     for (size_t lane = 0; lane < count; ++lane) {
+      if (!take[lane]) continue;
       store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(1, request.gen));
     }
-    lanes_outstanding_.fetch_add(static_cast<int64_t>(count));
-    counters_[kLeasesGranted].fetch_add(static_cast<int64_t>(count));
+    lanes_outstanding_.fetch_add(static_cast<int64_t>(taken));
+    counters_[kLeasesGranted].fetch_add(static_cast<int64_t>(taken));
+    if (hit_phase) counters_[kHitLeasesGranted].fetch_add(static_cast<int64_t>(taken));  // S7
     return true;
+  }
+
+  // Lease every lane's source slot and publish its row result, in one critical section, after the rows are ready
+  // and before the caller answers. A lease is counted before its row result is published (6.1). False on an
+  // internal inconsistency: nothing is granted then.
+  //
+  // The single-phase composition, kept for the non-two-phase path: open the entry and grant every lane at once.
+  bool grant_lanes_locked(const Request& request) {
+    if (!open_lease_entry_locked(request)) return false;
+    const bool granted = grant_lane_group_locked(request, [](size_t) { return true; });
+    close_pending_grants_locked(request);  // retires the entry outright when the grant granted nothing
+    return granted;
   }
 
   // Retire the leases the device has acknowledged, or voided with a terminal, without waiting for either. Cheap when
@@ -2153,7 +2239,10 @@ class RamTier {
           counters_[kLeaseDoubleSignal].fetch_add(1);
         }
       }
-      bool open = false;
+      // S4. A lane whose grant has not run yet is still open. Under V1 the miss lanes sit ungranted between the
+      // two grants, so counting only state == 1 would clear `active` while a grant is still pending -- after
+      // which grant_lane_group_locked's `entry.active` guard no longer protects this ring slot.
+      bool open = entry.grants_pending;
       for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
       if (!open) entry.active = false;
     }
@@ -2536,9 +2625,33 @@ class RamTier {
         tier.expert_slot[missing[i]] = static_cast<int32_t>(slot);
         slots.push_back(slot);
       }
+      // S2. Grant and publish the HIT lanes here: in the same mutex_ hold as the reservation, after the take loop
+      // has completed with ok still true, and before the hold is dropped for read(). A lane is a hit iff its
+      // expert is not in `missing`. This is the whole of V1: these row results become visible to the device while
+      // the missing rows are still being read, so their copies overlap the read instead of following it.
+      //
+      // Neither ordering below it is available. Before the take loop, the !ok bail here returns with no lease
+      // unwind, and the deferral branch above sets ok = false for a request that is retried under the same seq --
+      // either way leases outlive a request that never ran. After the hold is dropped, the hit slot can be
+      // evicted in exactly the window this task exists to close, and the grant buys nothing.
+      if (ok && two_phase_ && lease_mode_ && !advisory && !request.lane_experts.empty()) {
+        if (!open_lease_entry_locked(request)) {
+          ok = false;
+        } else if (!grant_lane_group_locked(
+                       request, [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); }, true)) {
+          close_pending_grants_locked(request);  // granted nothing: retire the entry rather than leak the ring slot
+          ok = false;
+        }
+      }
       if (!ok) {
-        for (int64_t slot : slots)
+        for (int64_t slot : slots) {
+          // S6. §2's first fact as an assertion rather than an argument: `slots` holds only newly taken slots for
+          // experts in `missing`, and a hit lane's expert is by definition not in `missing`, so no slot released
+          // here is ever leased. release_locked checks nothing, and a leased slot through it is silent
+          // corruption -- the next request is handed a slot the GPU may still be reading.
+          assert(!leased_locked(tiers_[request.row], slot));
           release_locked(request.row, slot);
+        }
         // Each slot taken may have evicted a row, and that eviction stays: the map moved.
         if (!slots.empty()) counters_[kVersion].fetch_add(1);
         slots.clear();
@@ -2601,6 +2714,7 @@ class RamTier {
             publish_map(request.row, missing[i], static_cast<int32_t>(slots[i]));
             ++published;
           } else {
+            assert(!leased_locked(tier, slots[i]));  // S6, the same fact on the post-read path
             release_locked(request.row, slots[i]);
           }
         }
@@ -2608,10 +2722,29 @@ class RamTier {
         counters_[kVersion].fetch_add(1);
       }
     }
-    if (ok && lease_mode_ && !advisory) {
+    if (lease_mode_ && !advisory) {
       // Every lane's source is leased, and its row result published, before the caller answers the request.
+      //
+      // S3. Under two-phase this grants the MISS lanes only, into the entry S2 opened; it must not reopen that
+      // entry, which would erase the hit leases S2 already recorded and their row results with them.
+      //
+      // S5. The failure paths below now hold hit leases where Task 5 held none, and they deliberately do nothing
+      // about them: fail_reads, read() returning 0, a cancel (result == -1, reachable only on the advisory path
+      // today -- it becomes reachable for demands if the cancel predicate ever widens), and this grant itself
+      // failing. In every one the hit leases STAY OUTSTANDING and the request answers with a non-kServed status.
+      // They are retired by the device's stage-1 acknowledgement or voided by its terminal. Releasing them on the
+      // host is the silent-corruption path: release_locked checks no lease and take_slot_locked's free-slot loop
+      // consults none, so the slot goes straight to the next request while the GPU may still be reading it.
       std::lock_guard<std::mutex> guard(mutex_);
-      if (!grant_lanes_locked(request)) ok = false;
+      if (two_phase_) {
+        if (ok) {
+          if (!grant_lane_group_locked(request, [&](size_t lane) { return listed(missing, request.lane_experts[lane]); }))
+            ok = false;
+        }
+        close_pending_grants_locked(request);  // the second grant is owed no longer, however this request answered
+      } else if (ok) {
+        if (!grant_lanes_locked(request)) ok = false;
+      }
     }
     if (cur_) {
       cur_->mapped = stamp(cur_);
@@ -2656,6 +2789,7 @@ class RamTier {
   std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
   int64_t lease_d_ = 0;                 // byte offset of area D (the device-written words)
   bool lease_mode_ = false;             // set before the service thread starts; off is today's protocol
+  bool two_phase_ = false;              // Task 6 V1: hit lanes granted before read(); off is the Task 5 batched grant
   Outstanding outstanding_[kDemandRecords];  // by request slot; guarded by mutex_
   std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
   std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
@@ -2814,6 +2948,10 @@ void exl3_ram_miss_close_admission(int64_t handle) {
 
 void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
   exl3_ram_miss::find(handle)->set_lease_mode(on != 0);
+}
+
+void exl3_ram_miss_set_two_phase(int64_t handle, int64_t on) {
+  exl3_ram_miss::find(handle)->set_two_phase(on != 0);
 }
 
 void exl3_ram_miss_inject_done_stall(int64_t handle, int64_t ns) {
@@ -3015,6 +3153,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_busy_since, exl3_ram_miss_busy_since);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close_admission, exl3_ram_miss_close_admission);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_two_phase, exl3_ram_miss_set_two_phase);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_to_expert, exl3_ram_miss_slot_to_expert);

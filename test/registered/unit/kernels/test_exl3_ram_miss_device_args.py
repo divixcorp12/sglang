@@ -181,6 +181,14 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kUnservedMisses": "unserved_misses",
         "kEpoch": "epoch",
         "kPendingEpoch": "pending_epoch",
+        # Task 6 V1 two-phase (D5, D6). This mapping is hand-maintained and asserted for EQUALITY
+        # against STATE_WORDS, so a word added on both sides of the boundary still fails here until
+        # it is added here too -- which is the point: this test is the only thing that checks the
+        # .cuh and Python agree on the state layout, and it caught D5/D6 adding four words.
+        "kDeadlineLo": "deadline_lo",
+        "kDeadlineHi": "deadline_hi",
+        "kReqFailed": "req_failed",
+        "kFailReason": "fail_reason",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
 
