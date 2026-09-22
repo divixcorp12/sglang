@@ -130,9 +130,11 @@ class Service:
         self.routes.fill_(-1)
         self.routes[: len(experts)] = torch.tensor(experts, dtype=torch.int64)
 
-    def backend(self, row=0, poll_bound=64):
-        """The real D7 orchestration (``Exl3RamMissRowBackend``), not a hand-rolled duplicate of its chain:
-        T8's mutant is applied to that class, so T8 must run through it or the mutant would go untested."""
+    def make_backend(self, row=0, poll_bound=64):
+        """The real D7 orchestration (``Exl3RamMissRowBackend``), built once and reused across warm-up and
+        capture -- exactly how ``post`` is used in production (constructed at attach time, replayed every
+        step). Building a fresh one per call, inside a capture, allocates tensors mid-capture and is not
+        what D7 does; T8's mutant is applied to this class, so T8 must run through it, unmodified, to test it."""
         from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
 
         return Exl3RamMissRowBackend(
@@ -146,17 +148,10 @@ class Service:
             poll_bound=poll_bound,
         )
 
-    def step_two_phase(self, row=0, poll_bound=64):
-        """D7's chain, run through the real ``Exl3RamMissRowBackend.post`` (not a duplicate): post -> W1 ->
-        C1 -> A1 -> W2 -> C2 -> A2 -> F, one stream."""
+    def make_plan(self):
         from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
 
-        backend = self.backend(row=row, poll_bound=poll_bound)
-        plan = ExpertRowPlan(expert_ids=self.planned[:TOP_K].clone(), slots=self.dest_slots.clone(), count=self.count)
-        backend.post(0, plan)
-        self.keep.copy_(backend.keep)
-        self.ram_miss.add_(backend.ram_miss)
-        return backend
+        return ExpertRowPlan(expert_ids=self.planned[:TOP_K], slots=self.dest_slots, count=self.count)
 
     def until(self, predicate, timeout_s=10.0):
         deadline = time.perf_counter() + timeout_s
@@ -285,13 +280,14 @@ class TestGraphTopology:
         assert expected_funcs["C1"] == expected_funcs["C2"], "stage 1 and stage 2 use different copy kernels"
 
         s.plan([3, 5])
-        eager_call = lambda: s.step_two_phase(0)  # noqa: E731
+        backend = s.make_backend()
+        plan = s.make_plan()
         with torch.cuda.stream(torch.cuda.Stream()):
-            eager_call()  # warm-up outside capture: JIT, first-touch, context
+            backend.post(0, plan)  # warm-up outside capture: JIT, first-touch, context
         _cuda_ready()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph):
-            s.step_two_phase(0)
+            backend.post(0, plan)
         raw = graph.raw_cuda_graph()
         funcs, node_count, edge_count = _graph_kernel_chain(raw)
         del graph
