@@ -27,6 +27,119 @@ The design that follows is in §9. Decisions still open are in §12.
 
 ---
 
+## Running the benchmark server
+
+The served-path arms all go through `benchmarks/dsv41_baseline/run_arm.sh`, which takes
+`cc-gpu.lock` itself — never launch a bare server for a measured number. One arm is
+~20-25 min wall: ~200 s startup, a readiness gate (SM clock stability + JIT settling),
+then 8 sessions x 128 tokens. Usage is `run_arm.sh <arm_name> <port> [KEY=VAL ...]`,
+where the `KEY=VAL` overrides are layered onto `arm_env.py`'s base recipe **and verified
+afterwards against the live server's `/proc/<pid>/environ`**.
+
+Production holds 7867. Pick another port.
+
+**1. Laptop: commit and push.** The harness refuses a dirty tree, so unpushed work
+cannot be run. Never copy a tree to divix01 by other means
+(`.claude/rules/divix01-run-protocol.md`).
+
+```bash
+git push shared codex/nvfp4-expert-stream-main
+```
+
+**2. divix01: move the bench worktree onto the new commit.** No fetch is needed. The
+`shared` remote *is* divix01's bare repo
+(`/data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git`), and every divix01 checkout —
+`wt-p1bench`, `cc-dsv41-base`, `cc-engram-host-node-poc`, `wt-audit2` — is a linked
+worktree of it. Step 1's push therefore already updated the branch ref they all share.
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench \
+  && git checkout --detach codex/nvfp4-expert-stream-main && git log -1 --oneline'
+```
+
+**Every divix01 worktree stays detached, and this is load-bearing.** Git refuses a push
+to a branch that any worktree has checked out (`receive.denyCurrentBranch`). Check the
+branch out in `wt-p1bench` and the laptop's next `git push shared` fails with
+`! [remote rejected] ... (branch is currently checked out)`. Detached HEAD does not mean
+the work is off the branch: the commits are on `codex/nvfp4-expert-stream-main`, and the
+worktree simply points at the same commit without holding the ref.
+
+**3. Register the code generation.** Any change under `python/` is a new generation, and
+the gate refuses an unregistered tree so a new generation can never be silently compared
+against an old one. `generations.json` lives untracked in the worktree.
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench/benchmarks/dsv41_baseline \
+  && PYTHONPATH=$PWD:$PWD/../../python:$PWD/../../scripts/dsv41 OMP_NUM_THREADS=8 taskset -c 0-63 \
+     /data/models/slang/.venv/bin/python -c "
+import generations, subprocess
+tree = subprocess.check_output([\"git\",\"rev-parse\",\"HEAD:python\"], text=True).strip()
+generations.register(tree, \"<short-label>\")
+print(tree)"'
+```
+
+**4. Pre-build any JIT native extension before the arm, not during it.** `run_arm.sh`
+aborts hard on a compile event landing mid-session, and `torch.utils.cpp_extension.load`
+builds lazily on first call — i.e. inside decode. Force the build first. For the engram
+host node (`SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING`):
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench && OMP_NUM_THREADS=8 taskset -c 0-63 \
+  PYTHONPATH=$PWD/python /data/models/slang/.venv/bin/python -c "
+from sglang.srt.layers.engram_host_node import native_engram_host_node
+print(\"built\", native_engram_host_node())"'
+```
+
+A link failure on `-luring` here means liburing's headers are missing, not that the code
+is wrong.
+
+**5. Run the arm.**
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench/benchmarks/dsv41_baseline \
+  && EXPECT_SHA=$(git rev-parse HEAD) \
+     ./run_arm.sh engram-hostnode 7877 \
+       SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=1 \
+       SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=0'
+```
+
+`EXPECT_SHA` pins the tree: the arm refuses if the worktree is not at that exact commit.
+Expert-row mirroring needs no override — it is in `base_env()`. Note that mirroring
+applies to *expert rows* (`SGLANG_MOE_EXPERT_MIRROR_DIRS`), not to the Engram tables,
+which are read from `SGLANG_DSV41_ENGRAM_TABLE_DIR` on `/mnt/nvme2` and are unmirrored.
+
+### What to compare against
+
+Section 20's served-path cells, which are the only matched comparator for this harness.
+Which cell depends on mirroring, which is **on by default** since 2026-09-22:
+
+| arm shape | token-weighted | mean |
+|---|---:|---:|
+| default (mirrors on, leases off) | **2.741** | 2.775 |
+| `SGLANG_MOE_EXPERT_MIRROR_DIRS=` (mirrors off) | **2.102** | 2.003 |
+
+Do **not** compare a served-path arm against §19's 3.905-3.933 or §17's 2.781. Those are
+Engine-path cells, and the served path sits at a consistent 0.69-0.71 fraction of them
+for reasons not yet explained (§20) — an offset that is present with mirrors both on and
+off, so it is not a mirroring artifact.
+
+### Knobs worth knowing
+
+| var | effect |
+|---|---|
+| `EXPECT_SHA` | refuse unless the worktree is at this commit |
+| `DSV41_MAX_SESSIONS=N` | stop after N timed sessions; fails the result gate by design (`N records (expected 8)`), but the report is written first, so the abort is harmless |
+| `NSYS_TRACE=1` | wrap the server in Nsight; always graph-mode (`--cuda-graph-trace=graph`), so its kernel table omits the graph body (`CLAUDE.md`) |
+| `NSYS_SAMPLE=process-tree` | enable CPU sampling — required, or `--cudabacktrace`/`--python-backtrace` are silently inert |
+| `NSYS_LAUNCH_ARGS=...` | extra args for `nsys launch`; application-scope flags go here, not on `nsys start` |
+
+The decode flags the EXL3 path requires — `--cuda-graph-backend-decode breakable`,
+`--cuda-graph-bs-decode 1`, `--cuda-graph-max-bs-decode 1`,
+`--cuda-graph-backend-prefill disabled` — are already in `arm_env.py:134-141`. They are
+not overrides and should not be passed on the command line.
+
+---
+
 ## TL;DR
 
 1. **The model is much bigger than Qwen3.8, in every byte dimension that matters.**
