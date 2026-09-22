@@ -276,9 +276,25 @@ post  ->  W1  ->  C1  ->  A1  ->  W2  ->  C2  ->  A2  ->  F  ->  fused_moe
           entirely. §4.2's rationale for `ord` is untouched and still correct: it is a
           pure performance hint, benign when wrong, because correctness lives in the
           per-lane `RowResult`.
-        - **The condition that reopens it:** if the per-stage cost `g` now being measured
-          comes in at the **high end of its assumed 8-14 us range**, poll reads stop being
-          negligible and `ord` deserves a second look. That is a trigger, not a dead end.
+        - **The condition that reopens it**, written so it survives both a new `g` figure
+          and a change to the wait design: **`ord` deserves a second look when the poll
+          cost of the wait design actually being built is shown to be a material share of
+          the per-stage cost `g`.** Not "when `g` is high" — `ord` saves *poll reads*, so
+          what reopens it is poll reads mattering, which depends on the wait as much as on
+          `g`. That is a trigger, not a dead end, and it does not expire when someone
+          redesigns the wait.
+        - **Record every `g` figure with its direction.** As of 2026-09-21 the only reading
+          is **`g_a >= 7.26 us`, a LOWER BOUND, not an estimate** — the stand-in kernels are
+          strictly simpler than the real per-stage ones (the stand-in `W_s` polls four words
+          and stores; the real one also decodes fatal, shutdown, `RowResult.ready` and the
+          seqlock, and computes per-lane `go`), and ready-at-launch is the best case for
+          polling. The bound sits **above** the 6.98 us crossing and 0.7 us below the low
+          end of the assumed 8-14 us range, so **it supports neither side of the `ord`
+          question and must not be read as "`g` came in low".** It also holds only for the
+          design **as specified at `p = 4`**: the same harness measures 4.90 us for a
+          one-word `W_s`, so a cheaper wait is not bounded by this number at all.
+          A bound quoted without its direction gets read as an estimate — that has already
+          happened once to this figure, which is why the direction is written next to it.
         - The price of compaction is a real failure mode — an indexing error that sends a
           lane's bytes to the wrong destination slot — which `ord` would not have. Test T9
           exists to pay it.
@@ -431,9 +447,12 @@ in favour of compaction and now lives at D1, with the condition that would reope
   thread. Whether that is acceptable, or whether a test-only second thread is worth
   building to make it falsifiable, is open. It matters because Task 5's asynchronous
   `progress()` wording contemplates exactly the world in which it stops being free.
-- **O4. Stage 1's poll bound (D1) has no measured basis.** `g` is unmeasured, and so is
-  the latency from the service's ready store to a device poll observing it. The bound is
-  currently a guess and should be a measurement.
+- **O4. Stage 1's poll bound (D1) has no measured basis.** `g` is **not measured** — the
+  only reading is the lower bound `g_a >= 7.26 us` recorded at D1, which is not an
+  estimate and settles nothing — and neither is the latency from the service's ready store
+  to a device poll observing it. The bound in D1 is currently a guess and should be a
+  measurement. `c` likewise remains **NOT MEASURED under its pre-registration**, and that
+  run is parked, so **no per-launch or per-row cost figure in this checklist is gated.**
 - **O5. `T(n)` enters V1 too, and §1.2's two-phase row does not model it.** Raised while
   drafting this checklist and **recorded centrally in `PER_ROW_TRANSFER.md` at
   `8f92f922af`**, which is the statement to cite; it is not repeated here. In short: V1
