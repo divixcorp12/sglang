@@ -126,6 +126,23 @@ discrepancy rather than implementing around it silently.
 
 - T3, T4, T5-T11 written, each passing, each with its checklist mutant shown to kill and the
   baseline restored.
-- Full registered suite still green on divix01 (was 724 passed / 409 skipped at
-  `2916c544e4`).
+- Full registered suite still green on divix01. **The command, recorded 2026-09-22 because the
+  original number was not reproducible without it:**
+
+  ```
+  PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
+    /data/models/slang/.venv/bin/python -m pytest test/registered/unit/kernels -q -p no:randomly
+  ```
+
+  Do **not** point pytest at `test/registered` or `test/registered/unit`: both sweep in directories
+  (`xpu/`, `layers/moe/`, others) that fail collection on this box with `AttributeError: module
+  'pyarrow'` under pyarrow 25.0.1. That breakage is environmental and pre-existing -- it reproduces
+  identically at `2916c544e4` with none of this work present -- but it buries the signal in
+  hundreds of errors. Check the pytest exit status, not a pipeline's: `... | tail -2` reports
+  `tail`'s status, which is 0 even when pytest exits 2.
+
+  Measured: baseline `2916c544e4` **1133 passed**, merged `8c0613cc56` **1135 passed**, both exit 0.
+  The +2 is T3 and T4, the only new tests under `test/registered/`; the other three files are
+  `test/manual/` and are not collected. The earlier "724 passed / 409 skipped" figure was this same
+  target with 409 GPU tests skipping at the time.
 - No change to production behaviour: two-phase stays **off by default**.
