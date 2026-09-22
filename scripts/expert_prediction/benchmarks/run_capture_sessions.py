@@ -126,6 +126,12 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
     content_parts = []
     finish_reason = None
     usage = None
+    # Raw per-chunk arrival times (seconds since `start`), one per reasoning/content
+    # delta. Client-side observation only (detokenizer, serialization, socket, event
+    # loop and client scheduling are all inside it) -- never call this "step latency",
+    # which is an engine-side quantity measured elsewhere. Purely additive: nothing
+    # else in this function changes.
+    chunk_times = []
 
     with urllib.request.urlopen(request, timeout=timeout) as response:
         for raw_line in response:
@@ -151,6 +157,7 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
                 if ttft is None:
                     ttft = now - start
                 last_token = now
+                chunk_times.append(now - start)
             if reasoning_delta:
                 reasoning_parts.append(reasoning_delta)
                 if echo:
@@ -171,6 +178,7 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
         "content": "".join(content_parts),
         "finish_reason": finish_reason,
         "usage": usage,
+        "chunk_times": chunk_times,
     }
 
 
@@ -292,6 +300,7 @@ def main():
                     "content": content,
                     "expected": expected,
                     "correct": correct,
+                    "chunk_times": result["chunk_times"],
                 }
                 results_f.write(json.dumps(record) + "\n")
                 results_f.flush()
