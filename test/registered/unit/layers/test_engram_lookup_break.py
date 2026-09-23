@@ -90,6 +90,27 @@ def test_the_embedding_forward_goes_through_the_break():
     assert table.calls == 0 and out.shape == (1, 1, DIM)
 
 
+def test_layer14_without_native_route_keeps_the_eager_break_and_lookup():
+    capture, events = _fake_capture()
+    table = _Table()
+    module = SimpleNamespace(
+        file_table=table,
+        layer_id=14,
+        tp_size=1,
+    )
+    decode = SimpleNamespace(is_decode=lambda: True)
+    batch = SimpleNamespace(forward_mode=decode)
+    with _capturing(capture):
+        out = engram.EngramEmbedding.forward(module, torch.tensor([[5]]), batch)
+    assert events == ["end", "begin"]
+    assert len(capture.cuda_graph._break_fns) == 1
+    assert table.calls == 0 and out.shape == (1, 1, DIM)
+
+    eager = engram.EngramEmbedding.forward(module, torch.tensor([[5]]), batch)
+    assert eager.tolist() == [[[10.0] * DIM]]
+    assert table.calls == 1
+
+
 def test_outside_capture_the_embedding_forward_looks_up():
     table = _Table()
     module = SimpleNamespace(file_table=table)

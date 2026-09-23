@@ -1,6 +1,8 @@
 """The memmap Engram table dequantizes exactly like EngramEmbedding's torch path."""
 
 import json
+import multiprocessing
+import os
 import struct
 
 import numpy as np
@@ -45,6 +47,10 @@ def table(tmp_path):
     torch.manual_seed(0)
     weight = (torch.randn(ROWS, DIM) * 4).to(torch.float8_e4m3fn)
     scale = torch.randint(118, 130, (ROWS, DIM // BLOCK), dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    weight14 = (torch.randn(ROWS, DIM) * 3 + 5).to(torch.float8_e4m3fn)
+    scale14 = torch.randint(
+        110, 117, (ROWS, DIM // BLOCK), dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
     _write(
         tmp_path / "model-00047-of-00048.safetensors",
         {
@@ -52,15 +58,15 @@ def table(tmp_path):
             "layers.1.engram.test_padding": ("U8", torch.zeros(7, dtype=torch.uint8)),
             "layers.1.engram.embed.weight": ("F8_E4M3", weight),
             "layers.1.engram.embed.scale": ("F8_E8M0", scale),
-            "layers.14.engram.embed.weight": ("F8_E4M3", weight),
-            "layers.14.engram.embed.scale": ("F8_E8M0", scale),
+            "layers.14.engram.embed.weight": ("F8_E4M3", weight14),
+            "layers.14.engram.embed.scale": ("F8_E8M0", scale14),
         },
     )
-    return tmp_path, weight, scale
+    return tmp_path, weight, scale, weight14, scale14
 
 
 def test_lookup_matches_reference_dequant(table):
-    directory, weight, scale = table
+    directory, weight, scale, *_ = table
     t = EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
     idx = torch.tensor([[3, 0, 49], [7, 7, 1]])
     got = t.lookup(idx)
@@ -307,12 +313,12 @@ def test_ordinary_breakable_graph_can_replay_on_multiple_streams():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an NVIDIA CUDA device")
 @pytest.mark.parametrize("deduplicate", [False, True])
-def test_layer1_host_node_replays_file_rows_and_layer14_keeps_one_break(
+def test_two_layer_host_nodes_replay_file_rows_without_breaks(
     table, monkeypatch, deduplicate
 ):
     _prime_native_store()
     monkeypatch.setenv("SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING", "1")
-    directory, weight, scale = table
+    directory, weight, scale, weight14, scale14 = table
     table1 = EngramFileTable.open(str(directory), layer_id=1, num_embeddings=ROWS, dim=DIM)
     table14 = EngramFileTable.open(str(directory), layer_id=14, num_embeddings=ROWS, dim=DIM)
     layer1 = type(
@@ -333,17 +339,45 @@ def test_layer1_host_node_replays_file_rows_and_layer14_keeps_one_break(
         with BreakableCUDAGraphCapture(graph):
             out1 = engram.EngramEmbedding.forward(layer1, ids1, batch)
             out14 = engram.EngramEmbedding.forward(layer14, ids14, batch)
-    assert len(graph._segments) == 2
-    assert len(graph._break_fns) == 1
+    assert len(graph._segments) == 1
+    assert len(graph._break_fns) == 0
+    assert len(graph._retained_host_callbacks) == 2
+    context1, context14 = graph._retained_host_callbacks
+    for buffer_name in ("ids", "rows", "status"):
+        assert getattr(context1, buffer_name).data_ptr() != getattr(
+            context14, buffer_name
+        ).data_ptr()
+    assert table1._tag != table14._tag
+
+    graph2 = None
+    if deduplicate:
+        ids1_second = torch.tensor([[8, 9, 10]], device="cuda", dtype=torch.int64)
+        ids14_second = torch.tensor([[8, 11, 8]], device="cuda", dtype=torch.int64)
+        graph2 = BreakableCUDAGraph(deduped_cuda_graph=registry)
+        with torch.cuda.stream(capture_stream):
+            with BreakableCUDAGraphCapture(graph2):
+                out1_second = engram.EngramEmbedding.forward(
+                    layer1, ids1_second, batch
+                )
+                out14_second = engram.EngramEmbedding.forward(
+                    layer14, ids14_second, batch
+                )
+        assert len(graph2._segments) == 1
+        assert len(graph2._break_fns) == 0
+        assert len(graph2._retained_host_callbacks) == 2
+        assert registry.stats() == (2, 1)
+        assert graph._segments[0].group is graph2._segments[0].group
 
     with torch.cuda.stream(replay_stream):
         before = table1._native_store.stats()
         id_sets = (
             (
-                ([3, 0, 49], [7, 1, 7]),
-                ([3, 0, 49], [7, 1, 7]),
+                ([3, 0, 49], [3, 1, 3]),
+                ([3, 0, 49], [3, 1, 3]),
                 ([2, 10, 48], [4, 4, 2]),
                 ([49, 6, 0], [1, 3, 8]),
+                ([3, 0, 49], [10, 11, 12]),
+                ([3, 0, 49], [10, 11, 12]),
             )
             if not deduplicate
             else (
@@ -351,6 +385,8 @@ def test_layer1_host_node_replays_file_rows_and_layer14_keeps_one_break(
                 ([20, 21, 22], [23, 24, 23]),
                 ([30, 31, 32], [33, 34, 33]),
                 ([40, 41, 42], [43, 44, 43]),
+                ([20, 21, 22], [45, 46, 47]),
+                ([20, 21, 22], [45, 46, 47]),
             )
         )
         for replay_index, (new_ids1, new_ids14) in enumerate(id_sets):
@@ -358,11 +394,14 @@ def test_layer1_host_node_replays_file_rows_and_layer14_keeps_one_break(
             ids14.copy_(torch.tensor([new_ids14], device="cuda"))
             graph.replay()
             replay_stream.synchronize()
-            for got, row_ids in ((out1, new_ids1), (out14, new_ids14)):
+            for got, row_ids, layer_weight, layer_scale in (
+                (out1, new_ids1, weight, scale),
+                (out14, new_ids14, weight14, scale14),
+            ):
                 idx = torch.tensor(row_ids)
                 want = (
-                    weight[idx].float().unflatten(-1, (-1, BLOCK))
-                    * scale[idx].float().unsqueeze(-1)
+                    layer_weight[idx].float().unflatten(-1, (-1, BLOCK))
+                    * layer_scale[idx].float().unsqueeze(-1)
                 ).flatten(-2).to(torch.bfloat16)
                 assert torch.equal(got.cpu()[0], want)
             if replay_index == 0:
@@ -375,13 +414,157 @@ def test_layer1_host_node_replays_file_rows_and_layer14_keeps_one_break(
                 warm = table1._native_store.stats()
                 assert warm["submitted_sqes"] == cold["submitted_sqes"]
                 assert warm["hits"] - cold["hits"] == 6
+            elif replay_index == 3:
+                before_layer14_cold = table1._native_store.stats()
+            elif replay_index == 4:
+                layer14_cold = table1._native_store.stats()
+                assert (
+                    layer14_cold["submitted_sqes"]
+                    > before_layer14_cold["submitted_sqes"]
+                )
+                assert (
+                    layer14_cold["completed_cqes"]
+                    > before_layer14_cold["completed_cqes"]
+                )
+                assert (
+                    layer14_cold["unique_misses"]
+                    - before_layer14_cold["unique_misses"]
+                    == 3
+                )
+            elif replay_index == 5:
+                layer14_warm = table1._native_store.stats()
+                assert layer14_warm["submitted_sqes"] == layer14_cold["submitted_sqes"]
+                assert layer14_warm["completed_cqes"] == layer14_cold["completed_cqes"]
 
     other_stream = torch.cuda.Stream()
+    if graph2 is not None:
+        with torch.cuda.stream(replay_stream):
+            ids1_second.copy_(torch.tensor([[12, 13, 14]], device="cuda"))
+            ids14_second.copy_(torch.tensor([[12, 15, 12]], device="cuda"))
+            graph2.replay()
+            replay_stream.synchronize()
+        for got, row_ids, layer_weight, layer_scale in (
+            (out1_second, [12, 13, 14], weight, scale),
+            (out14_second, [12, 15, 12], weight14, scale14),
+        ):
+            idx = torch.tensor(row_ids)
+            want = (
+                layer_weight[idx].float().unflatten(-1, (-1, BLOCK))
+                * layer_scale[idx].float().unsqueeze(-1)
+            ).flatten(-2).to(torch.bfloat16)
+            assert torch.equal(got.cpu()[0], want)
+
+        # Switching back exercises the update path in the opposite direction.
+        with torch.cuda.stream(replay_stream):
+            graph.replay()
+            replay_stream.synchronize()
+        for got, row_ids, layer_weight, layer_scale in (
+            (out1, new_ids1, weight, scale),
+            (out14, new_ids14, weight14, scale14),
+        ):
+            idx = torch.tensor(row_ids)
+            want = (
+                layer_weight[idx].float().unflatten(-1, (-1, BLOCK))
+                * layer_scale[idx].float().unsqueeze(-1)
+            ).flatten(-2).to(torch.bfloat16)
+            assert torch.equal(got.cpu()[0], want)
     with torch.cuda.stream(other_stream):
         with pytest.raises(RuntimeError, match="first replay stream"):
             graph.replay()
     if registry is not None:
         registry.close()
+
+
+def _layer14_invalid_id_graph_worker(directory, connection):
+    try:
+        os.environ["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] = "1"
+        _prime_native_store()
+        table14 = EngramFileTable.open(
+            str(directory), layer_id=14, num_embeddings=ROWS, dim=DIM
+        )
+        layer14 = type(
+            "Layer",
+            (),
+            {"file_table": table14, "dim": DIM, "layer_id": 14, "tp_size": 1},
+        )()
+        decode_mode = type("DecodeMode", (), {"is_decode": lambda self: True})()
+        batch = type("Batch", (), {"forward_mode": decode_mode})()
+        ids = torch.tensor([[1, 2]], device="cuda", dtype=torch.int64)
+        graph = BreakableCUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        with torch.cuda.stream(capture_stream):
+            with BreakableCUDAGraphCapture(graph):
+                engram.EngramEmbedding.forward(layer14, ids, batch)
+        assert len(graph._break_fns) == 0
+        (context,) = graph._retained_host_callbacks
+        replay_stream = torch.cuda.Stream()
+        with torch.cuda.stream(replay_stream):
+            ids.copy_(torch.tensor([[1, 2]], device="cuda"))
+            graph.replay()
+            replay_stream.synchronize()
+        assert context.status.item() == 0
+        assert context.rows.any()
+
+        with torch.cuda.stream(replay_stream):
+            ids.copy_(torch.tensor([[-1, 2]], device="cuda"))
+            with pytest.raises(
+                RuntimeError,
+                match="Engram file lookup failed|device-side assert triggered",
+            ):
+                graph.replay()
+                replay_stream.synchronize()
+        assert context.status.item() != 0
+        assert not context.rows.any()
+        connection.send(("ok", ""))
+    except RuntimeError as exc:
+        if "io_uring_queue_init failed" in str(exc):
+            connection.send(("skip", str(exc)))
+        else:
+            connection.send(("error", repr(exc)))
+            raise
+    except BaseException as exc:
+        connection.send(("error", repr(exc)))
+        raise
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires an NVIDIA CUDA device"
+)
+def test_layer14_host_node_invalid_id_fails_captured_replay(table):
+    directory, *_ = table
+    process_context = multiprocessing.get_context("spawn")
+    receive, send = process_context.Pipe(duplex=False)
+    process = process_context.Process(
+        target=_layer14_invalid_id_graph_worker, args=(str(directory), send)
+    )
+    process.start()
+    send.close()
+    if not receive.poll(timeout=180):
+        process.terminate()
+        process.join()
+        pytest.fail("invalid-ID graph worker timed out after 180 seconds")
+    try:
+        result, details = receive.recv()
+    except EOFError:
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        pytest.fail(
+            f"invalid-ID graph worker exited without a result (exit code {process.exitcode})"
+        )
+    receive.close()
+    process.join(timeout=10)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        pytest.fail("invalid-ID graph worker did not exit after returning a result")
+    if result == "skip":
+        pytest.skip(f"io_uring is unavailable: {details}")
+    assert process.exitcode == 0, details
+    assert result == "ok", details
 
 
 def test_missing_layer_raises(table):

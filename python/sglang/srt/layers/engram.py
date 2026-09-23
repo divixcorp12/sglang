@@ -842,7 +842,7 @@ class EngramEmbedding(nn.Module):
             if indices.shape[0] == 0:
                 return self._empty(indices)
             if (
-                getattr(self, "layer_id", None) == 1
+                getattr(self, "layer_id", None) in (1, 14)
                 and getattr(self, "tp_size", None) == 1
                 and indices.is_cuda
                 and indices.shape[0] == 1
