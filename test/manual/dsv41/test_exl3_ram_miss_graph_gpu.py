@@ -216,7 +216,10 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             delivered = service.host.counters()["rows_read"]
             replay(first)  # next replay is all GPU hits
             assert service.host.counters()["rows_read"] == delivered
-            replay([12, 12, 13, 13, 14, 14])  # duplicate routes remain hits
+            # The fused planner is a unique-ID path because production top-k
+            # returns distinct experts; the generic planner covers duplicates.
+            if not fused:
+                replay([12, 12, 13, 13, 14, 14])  # duplicate routes remain hits
             top_slot = int(manager.gpu_residency.victims[0, 0].item())
             top_expert = int(manager.gpu_residency.slot_to_expert[0, top_slot].item())
             replay([top_expert, 18, 19, 20, 21, 22])  # routed hit is the top-ranked victim
@@ -225,7 +228,9 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             protected = 19
             streamer.pinned_host_cache.ensure_rows(torch.tensor([30, 31, 32, 33, 34, 35]))
             assert service.host.contains(0, protected)
-            replay([24, 24, 25, 25, 26, 26])  # duplicate misses copy once per unique expert
+            replay(
+                list(range(24, 30)) if fused else [24, 24, 25, 25, 26, 26]
+            )  # generic duplicate misses copy once per unique expert
             for start in (18, 24, 30):
                 replay(list(range(start, start + TOP_K)))
             mapping = manager.gpu_residency.mapping[0, :experts].cpu()
