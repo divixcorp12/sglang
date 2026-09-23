@@ -1120,6 +1120,11 @@ class ExpertHotCacheManager:
             require_graph_gather_support(
                 streamers.values(),
                 pinned_tier_ok=not (gpu_residency_update or expert_doorbell),
+                exl3_direct_ok=(
+                    gpu_residency_update
+                    and insert_on_miss == InsertOnMissStage.DIRECT
+                    and not expert_doorbell
+                ),
             )
         seed = None
         if seed_path is not None:
@@ -1194,9 +1199,16 @@ class ExpertHotCacheManager:
         # scores then spend the rest. When every layer clears the floor anyway, the
         # selection is unchanged: each layer's picks are its top-scored experts either way.
         floors = {
-            layer_id: min(2 * rows, streamers[layer_id].num_experts) if direct else 0
+            layer_id: 2 * rows if direct else 0
             for layer_id, rows in gather_rows.items()
         }
+        for layer_id, floor in floors.items():
+            if floor > streamers[layer_id].num_experts:
+                raise ValueError(
+                    f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
+                    f"{streamers[layer_id].num_experts} experts cannot provide the "
+                    f"required capacity {floor}"
+                )
         chosen = {layer_id: set() for layer_id in streamers}
         # A format with an inclusive pinned tier keeps every hot expert in host memory
         # too, so its layers hold at most `inclusive_hot_slot_limit` slots and the
@@ -1214,18 +1226,12 @@ class ExpertHotCacheManager:
                     continue
                 limit = slot_limits[layer_id]
                 if limit is not None and len(chosen[layer_id]) >= limit:
-                    # This clamp is reachable during the floor pass only if a
-                    # layer both has a floor (DIRECT, graph_gather_batch_size > 0)
-                    # and an inclusive pinned tier's slot limit. That never
-                    # happens today: DIRECT requires gpu_residency_update, under
-                    # which require_graph_gather_support refuses pinned_tier
-                    # formats (pinned_tier_ok=False), and no dense format sets
-                    # inclusive_pinned_tier. A pinned_tier format (EXL3's
-                    # inclusive tier) passes the support check only for the plain
-                    # graph gather, which has no floor. Assert this instead of
-                    # relying on it silently, since the clamp would otherwise
-                    # cut into a layer's floor and DIRECT would refuse the budget.
-                    assert not floor_pass or floors[layer_id] == 0
+                    if floor_pass and floors[layer_id] > limit:
+                        raise ValueError(
+                            f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
+                            f"pinned-tier limit {limit} resident slots is below "
+                            f"required capacity {floors[layer_id]}"
+                        )
                     clamped.add(layer_id)
                     continue
                 slot_bytes = streamers[layer_id].bytes_per_expert
@@ -1239,6 +1245,13 @@ class ExpertHotCacheManager:
         for _, expert_id, layer_id in candidates:
             if expert_id in chosen[layer_id]:
                 selected[layer_id].append(expert_id)
+        for layer_id, floor in floors.items():
+            if len(selected[layer_id]) < floor:
+                raise ValueError(
+                    f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
+                    f"budget provides {len(selected[layer_id])} resident slots; "
+                    f"required capacity is {floor} (twice its graph-gather rows)"
+                )
         for layer_id in sorted(clamped):
             streamer = streamers[layer_id]
             logger.info(
@@ -1418,8 +1431,6 @@ class ExpertHotCacheManager:
             if expert_doorbell
             else None
         )
-        if manager.gpu_residency is not None and manager.gpu_residency.insert_on_miss:
-            manager.gpu_residency.check_miss_plans()
         devices = {cache.device for cache in manager.caches.values()}
         logger.info(
             "Expert hot cache startup %s",
@@ -1450,6 +1461,8 @@ class ExpertHotCacheManager:
             ),
         )
         manager._attach_formats()
+        if manager.gpu_residency is not None and manager.gpu_residency.insert_on_miss:
+            manager.gpu_residency.check_miss_plans()
         return manager
 
     def on_pre_forward(self, forward_pass_id: int, forward_batch: "ForwardBatch") -> None:

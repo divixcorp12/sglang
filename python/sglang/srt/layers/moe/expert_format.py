@@ -269,7 +269,8 @@ def graph_gather_needs_host_arena(model: torch.nn.Module) -> bool:
 
 
 def require_graph_gather_support(
-    streamers: Iterable["ExpertStreamer"], *, pinned_tier_ok: bool = False
+    streamers: Iterable["ExpertStreamer"], *, pinned_tier_ok: bool = False,
+    exl3_direct_ok: bool = False,
 ) -> None:
     """Raise unless every streamer's format can serve sync-free graph gathers.
 
@@ -282,7 +283,7 @@ def require_graph_gather_support(
     for streamer in streamers:
         expert_format = streamer.format
         key = expert_format.key
-        if pinned_tier_ok and graph_source_kind_of(expert_format) == "pinned_tier":
+        if (pinned_tier_ok or (exl3_direct_ok and key == "exl3")) and graph_source_kind_of(expert_format) == "pinned_tier":
             if streamer.pinned_host_cache is None:
                 raise ValueError(
                     f"expert format {key!r} of layer {streamer.layer_id} serves graph "

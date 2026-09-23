@@ -306,7 +306,8 @@ class GpuResidencyUpdater:
             # megabyte rows were already on this kernel. A layer with nothing on the host has
             # nothing to stream and no reason to insert on miss, so refuse rather than
             # silently move its rows onto the slower path.
-            if not streamer._graph_host_pair_count:
+            if (not streamer._graph_host_pair_count
+                    and getattr(streamer.format, "key", None) != "exl3"):
                 raise ValueError(
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs host-source expert tensors; "
                     f"layer {layer_id} keeps every streamed tensor on the device"
@@ -347,6 +348,11 @@ class GpuResidencyUpdater:
         """
         from sglang.srt.environ import envs
 
+        if self.insert_direct:
+            exl3 = [getattr(s.format, "key", None) == "exl3" for s in self.streamers]
+            if any(exl3) and not all(exl3):
+                raise ValueError("EXL3 DIRECT requires every GPU-updated layer to use EXL3")
+
         if self.insert_direct and envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
             raise ValueError(
                 "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs "
@@ -354,6 +360,19 @@ class GpuResidencyUpdater:
                 "cache rows this mode commits residency for"
             )
         for streamer in self.streamers:
+            if self.insert_direct and getattr(streamer.format, "key", None) == "exl3":
+                from sglang.srt.dsv41_config import Dsv41Config
+                from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
+
+                cfg = Dsv41Config.from_envs()
+                if not cfg.enable_ram_miss_leases:
+                    raise ValueError("EXL3 DIRECT requires SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=1")
+                if cfg.enable_ram_miss_two_phase:
+                    raise ValueError("EXL3 DIRECT requires SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE=0")
+                if cfg.enable_expert_prefetch:
+                    raise ValueError("EXL3 DIRECT requires SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=0")
+                if not isinstance(streamer.row_backend, Exl3RamMissRowBackend):
+                    raise ValueError("EXL3 DIRECT requires the native EXL3 RAM-miss backend")
             plan = streamer.row_plan
             if (
                 plan.expert_ids.data_ptr() != streamer._graph_source_rows.data_ptr()
@@ -363,7 +382,8 @@ class GpuResidencyUpdater:
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan; "
                     "leave SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY at 0"
                 )
-            if self.insert_direct and streamer.pinned_host_cache is not None:
+            if (self.insert_direct and streamer.pinned_host_cache is not None
+                    and getattr(streamer.format, "key", None) != "exl3"):
                 raise ValueError(
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 cannot admit rows through the "
                     "pinned host cache"
