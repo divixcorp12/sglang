@@ -156,6 +156,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(False),
             envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(False),
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
+            envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
         ):
             model = torch.nn.Module()
             layer = torch.nn.Module()
@@ -175,7 +176,9 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
                 graph_gather_batch_size=1, update_decode_forwards=1,
                 gpu_residency_update=True, insert_on_miss=2,
             )
-            streamer._fused_plan_enabled = fused
+            assert streamer._fused_plan_enabled is fused
+            assert (streamer._graph_fused_slots_scratch is not None) is fused
+            assert (streamer._graph_fused_remaps is not None) is fused
             assert isinstance(streamer.row_backend, service_module.Exl3RamMissRowBackend)
             assert service.gpu_hot_enabled
             assert manager.caches[0].scratch_rows == 0
