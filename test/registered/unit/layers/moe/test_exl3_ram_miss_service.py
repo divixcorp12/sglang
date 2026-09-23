@@ -158,6 +158,84 @@ def test_attach_registers_once_and_pushes_residency(tiers):
     assert [service.host.contains(cold_row, e) for e in (3, 0, 1, 2)] == [False, True, True, True]
 
 
+def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tiers):
+    service, streamers, caches = tiers
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
+        service.ensure_started()
+    table = caches[0]._lru
+    # The initial reassignment predates the updater: this path must use the
+    # Python hot list until the GPU bank has been created.
+    streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1, -1])
+    assert not service.gpu_hot_enabled
+    table.before_host_use(caches[0])
+    try:
+        for expert in (0, 1, 2):
+            service.host.assign(service.row_of(0), expert)
+        assert service.host.victim_census(service.row_of(0)) == (0, 2, 0)
+    finally:
+        table.after_host_use(caches[0])
+
+    bank = torch.tensor([[4, -1, -1], [-1, -1, -1]], dtype=torch.int64)
+    updater = SimpleNamespace(
+        device=torch.device("cpu"), slot_to_expert=bank,
+        layer_ids=[0, 1], caches=[SimpleNamespace(capacity=3), SimpleNamespace(capacity=3)],
+    )
+    service._enable_gpu_hot(updater)
+    assert service.hot_experts(0) == [4]
+    bank[0, 0] = 2  # the next eager handoff must use this, not stale Python [0]
+    table.before_host_use(caches[0])
+    try:
+        assert service.hot_experts(0) == [2]
+        assert service.host.victim_census(service.row_of(0)) == (0, 2, 0)
+        slot, evicted = service.host.assign(service.row_of(0), 3, protected_fallback=False)
+        assert evicted == 0 and slot >= 0 and service.host.contains(service.row_of(0), 2)
+    finally:
+        table.after_host_use(caches[0])
+
+
+def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
+    from sglang.srt.layers.moe.expert_format import require_graph_gather_support
+    from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+    source = torch.zeros(8, dtype=torch.int64)
+    count = torch.zeros(1, dtype=torch.int32)
+    fmt = SimpleNamespace(key="exl3", graph_source_kind="pinned_tier", supports_graph_gather=False)
+    backend = object.__new__(module.Exl3RamMissRowBackend)
+    streamer = SimpleNamespace(
+        format=fmt, layer_id=0, pinned_host_cache=SimpleNamespace(capacity=16),
+        has_spec_only_tensors=True, _graph_source_rows=source, _graph_miss_count=count,
+        row_plan=SimpleNamespace(expert_ids=source, count=count), row_backend=backend,
+    )
+    # OFF/SCRATCH and a doorbell configuration retain the original EXL3 GPU
+    # update rejection. Only the DIRECT caller opts into pinned-tier support.
+    for stage in (0, 1):
+        with pytest.raises(ValueError, match="does not support graph gather"):
+            require_graph_gather_support([streamer], exl3_direct_ok=False)
+    require_graph_gather_support([streamer], exl3_direct_ok=True)
+    updater = object.__new__(GpuResidencyUpdater)
+    updater.insert_direct = True
+    updater.streamers = [streamer]
+    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"):
+        with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False):
+            with pytest.raises(ValueError, match="ENABLE_RAM_MISS_LEASES=1"):
+                updater.check_miss_plans()
+        with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
+            with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
+                with pytest.raises(ValueError, match="TWO_PHASE=0"):
+                    updater.check_miss_plans()
+            with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
+                with pytest.raises(ValueError, match="ENABLE_EXPERT_PREFETCH=0"):
+                    updater.check_miss_plans()
+            streamer.row_backend = object()
+            with pytest.raises(ValueError, match="native EXL3 RAM-miss backend"):
+                updater.check_miss_plans()
+            streamer.row_backend = backend
+            updater.check_miss_plans()
+    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
+        with pytest.raises(ValueError, match="PREFETCH_PULL_MODE=off"):
+            updater.check_miss_plans()
+
+
 def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_hot(tiers):
     """Minor 1: the hot cache reserves chunk 1's experts before the residency listener
     pushes them to C++. Chunk 2's admission (its own host use) must still protect them,

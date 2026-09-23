@@ -1572,6 +1572,9 @@ constexpr int64_t kHeartbeat = 28;
 constexpr int64_t kRecordBytes = 128;
 constexpr int64_t kDemandRing = 64;
 constexpr uint32_t kDemandRecords = 16;
+constexpr int64_t kHotHeaderBytes = 8;
+constexpr int64_t kHotAlignment = 64;
+constexpr uint32_t kHotRecords = kDemandRecords;
 constexpr int64_t kAdviseRing = kDemandRing + kDemandRecords * kRecordBytes;
 constexpr uint32_t kAdviseRecords = 64;
 constexpr int kMaxIds = 8;
@@ -1709,6 +1712,7 @@ struct Request {
   uint32_t lanes = 0;
   std::vector<int32_t> need;
   std::vector<int32_t> protect;
+  std::vector<uint8_t> hot_bitmap;
   // Lease mode: the device's lane list and 56-bit request generation, from the lane request (not the record).
   uint64_t gen = 0;
   std::vector<int32_t> lane_experts;
@@ -1835,14 +1839,18 @@ class RamTier {
  public:
   RamTier(
       uint8_t* page, int32_t* slot_map, uint8_t* lease, int64_t lease_bytes, Tables tables, std::vector<int64_t> capacity,
-      bool direct, int64_t pack_workers = 0)
+      bool direct, int64_t pack_workers, uint8_t* hot_page, int64_t hot_bytes)
       : page_(page),
         map_(slot_map),
         lease_(lease),
+        hot_page_(hot_page),
         layers_(tables.layers),
         experts_(tables.experts),
         reader_(std::move(tables), direct, pack_workers),
         tiers_(static_cast<size_t>(layers_)) {
+    hot_stride_ = ((kHotHeaderBytes + (experts_ + 7) / 8 + kHotAlignment - 1) / kHotAlignment) * kHotAlignment;
+    if (hot_page_ != nullptr && hot_bytes != kHotRecords * hot_stride_)
+      throw std::runtime_error("exl3 RAM miss: hot bitmap sidecar size disagrees with expert count");
     for (auto& counter : counters_)
       counter.store(0);
     for (int64_t row = 0; row < layers_; ++row) {
@@ -1910,28 +1918,39 @@ class RamTier {
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
     Request request;
     if (read_record(record, next_demand_, &request)) {
-      if (lease_mode_ && request.armed && !read_lane_request(next_demand_, &request)) {
+      const bool gpu_hot = gpu_hot_mode_.load() && request.armed;
+      const bool hot_ok = !gpu_hot ||
+          (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
+           load_acquire(record + kRecSeq) == next_demand_);
+      if (!hot_ok) {
+        counters_[kOverruns].fetch_add(1);
+        set_status(record, kFailed);
+      } else if (lease_mode_ && request.armed && !read_lane_request(next_demand_, &request)) {
         counters_[kOverruns].fetch_add(1);  // a later request overwrote the lane request: a lapped record
       } else if (lease_mode_ && request.armed && terminal_seen(request)) {
         counters_[kLateAfterTerminal].fetch_add(1);  // the device gave up on it: serve nothing, lease nothing
-      } else if (const Defer reason = request.armed ? defers(request) : Defer::kNone; reason != Defer::kNone) {
-        // Held back, not failed and not served: return before handle_demand (so busy_since_ and kBusySeq stay
-        // untouched, or the watchdog would count the wait as a hung read) and before the tail (no demand_done, no
-        // advance). No stage record is pushed; the first observation time is kept for the one written when it is served.
-        if (deferred_seq_ != next_demand_) {
-          deferred_seq_ = next_demand_;
-          deferred_observed_ns_ = cur_ != nullptr ? cur_->observed : 0;
-          counters_[reason == Defer::kRequestSlot ? kDeferredReuse : kDeferred].fetch_add(1);
-        }
-        deferred_stamp_ = lease_changes_.load();
-        deferred_gen_ = request.gen;
-        cur_ = nullptr;
-        return false;
       } else {
-        if (cur_ != nullptr && deferred_seq_ == next_demand_ && deferred_observed_ns_ != 0) {
-          cur_->observed = deferred_observed_ns_;
+        if (gpu_hot) apply_gpu_hot(request);
+        const Defer reason = request.armed ? defers(request) : Defer::kNone;
+        if (reason != Defer::kNone) {
+          // Held back, not failed and not served: return before handle_demand (so busy_since_ and kBusySeq stay
+          // untouched, or the watchdog would count the wait as a hung read) and before the tail (no demand_done, no
+          // advance). No stage record is pushed; the first observation time is kept for the one written when it is served.
+          if (deferred_seq_ != next_demand_) {
+            deferred_seq_ = next_demand_;
+            deferred_observed_ns_ = cur_ != nullptr ? cur_->observed : 0;
+            counters_[reason == Defer::kRequestSlot ? kDeferredReuse : kDeferred].fetch_add(1);
+          }
+          deferred_stamp_ = lease_changes_.load();
+          deferred_gen_ = request.gen;
+          cur_ = nullptr;
+          return false;
+        } else {
+          if (cur_ != nullptr && deferred_seq_ == next_demand_ && deferred_observed_ns_ != 0) {
+            cur_->observed = deferred_observed_ns_;
+          }
+          handle_demand(request, record);
         }
-        handle_demand(request, record);
       }
     } else {
       counters_[kOverruns].fetch_add(1);  // status stays pending: a waiting layer fails stop
@@ -2061,6 +2080,36 @@ class RamTier {
     if (lease_ == nullptr) throw std::runtime_error("exl3 RAM miss: lease mode needs a lease block");
     if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set lease mode before the service thread starts");
     lease_mode_ = on;
+  }
+
+  void set_gpu_hot(bool on) {
+    if (hot_page_ == nullptr) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs a sidecar");
+    if (!lease_mode_ || two_phase_) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs single-phase leases");
+    gpu_hot_mode_.store(on);
+  }
+
+  bool read_gpu_hot(uint32_t expected, Request* request) const {
+    if (hot_page_ == nullptr) return false;
+    const uint8_t* record = hot_page_ + static_cast<int64_t>((expected - 1u) % kHotRecords) * hot_stride_;
+    if (load_acquire(record) != expected) return false;
+    uint32_t count = 0;
+    std::memcpy(&count, record + 4, 4);
+    if (count != experts_) return false;
+    const int64_t bytes = (experts_ + 7) / 8;
+    request->hot_bitmap.assign(record + kHotHeaderBytes, record + kHotHeaderBytes + bytes);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (load_acquire(record) != expected) return false;
+    if (experts_ % 8 != 0 &&
+        (request->hot_bitmap.back() & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
+      return false;
+    return true;
+  }
+
+  void apply_gpu_hot(const Request& request) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    Tier& tier = tiers_[request.row];
+    for (int64_t expert = 0; expert < experts_; ++expert)
+      tier.hot[expert] = (request.hot_bitmap[expert / 8] >> (expert % 8)) & 1;
   }
 
   // Two-phase mode (Task 6 V1): grant the resident lanes inside serve()'s reservation hold, before read(), so the
@@ -2852,6 +2901,9 @@ class RamTier {
   uint8_t* page_;
   int32_t* map_;
   uint8_t* lease_;             // the lease block, or null when the service runs without one
+  uint8_t* hot_page_ = nullptr;
+  int64_t hot_stride_ = 0;
+  std::atomic<bool> gpu_hot_mode_{false};
   uint32_t* slot_gen_ = nullptr;  // SlotGen[] inside it
   std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
   int64_t lease_d_ = 0;                 // byte offset of area D (the device-written words)
@@ -2937,7 +2989,8 @@ int64_t exl3_ram_miss_open(
     int64_t slot_bytes,
     int64_t direct,
     TensorView lease,
-    int64_t pack_workers) {
+    int64_t pack_workers,
+    TensorView hot_page) {
   using namespace exl3_ram_miss;
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
   auto tier = std::make_shared<RamTier>(
@@ -2948,7 +3001,9 @@ int64_t exl3_ram_miss_open(
       tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0,
-      pack_workers);
+      pack_workers,
+      hot_page.size(0) ? static_cast<uint8_t*>(hot_page.data_ptr()) : nullptr,
+      hot_page.size(0));
   if (!tier->open()) return -1;
   std::lock_guard<std::mutex> guard(registry_mutex());
   static int64_t next_handle = 1;
@@ -3015,6 +3070,10 @@ void exl3_ram_miss_close_admission(int64_t handle) {
 
 void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
   exl3_ram_miss::find(handle)->set_lease_mode(on != 0);
+}
+
+void exl3_ram_miss_set_gpu_hot(int64_t handle, int64_t on) {
+  exl3_ram_miss::find(handle)->set_gpu_hot(on != 0);
 }
 
 void exl3_ram_miss_set_two_phase(int64_t handle, int64_t on) {
@@ -3220,6 +3279,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_busy_since, exl3_ram_miss_busy_since);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close_admission, exl3_ram_miss_close_admission);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_gpu_hot, exl3_ram_miss_set_gpu_hot);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_two_phase, exl3_ram_miss_set_two_phase);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);

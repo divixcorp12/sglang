@@ -22,7 +22,7 @@ REL_BOUND = 1.2e-2  # the probe's bar (D7), against the fp32 reference
 LOOSE_BOUND = 2.5e-2  # graph vs loop (Task 9)
 
 
-def _source_rows(tmp_path, layer_id=0):
+def _source_rows(tmp_path, layer_id=0, num_experts=EXPERTS):
     """Every expert's streamed rows of one layer, read afresh from the checkpoint."""
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -31,9 +31,9 @@ def _source_rows(tmp_path, layer_id=0):
     layout = build_exl3_expert_layout(str(tmp_path))
     fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
     specs = {spec.name: spec for spec in fmt.tensor_specs(None)}
-    source = {name: torch.empty((EXPERTS,) + spec.row_shape, dtype=spec.dtype) for name, spec in specs.items()}
+    source = {name: torch.empty((num_experts,) + spec.row_shape, dtype=spec.dtype) for name, spec in specs.items()}
     Exl3ShardRowSource.for_layer(layout, layer_id, fmt.segment_map(), direct=False).read(
-        torch.arange(EXPERTS, dtype=torch.long), source
+        torch.arange(num_experts, dtype=torch.long), source
     )
     return source
 
@@ -127,6 +127,121 @@ LEASES = pytest.mark.parametrize("lease", [False, True], ids=["leases_off", "lea
 # inside one replay, as the 40+ streamed layers of a real decode step do.
 LAYER_COUNTS = pytest.mark.parametrize("layers", [4, 20], ids=["layers_4", "layers_20"])
 REPLAY_STEPS = 4
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["generic_routes", "fused_routes"])
+def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused):
+    """Runs only on divix01: actual EXL3 bytes, native leases, and captured
+    MoE output across a DIRECT insertion and an eager pinned-tier eviction."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import exl3_ram_miss as service_module
+    from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
+    from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
+    from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
+    from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+    from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+
+    experts = 36
+    write_fake_exl3(str(tmp_path), num_layers=1, num_experts=experts, hidden=HIDDEN, inter=INTER, finite=True)
+    source = _source_rows(tmp_path, num_experts=experts)
+    layout = build_exl3_expert_layout(str(tmp_path))
+    service_module.Exl3RamMissService._instance = None
+    service = service_module.Exl3RamMissService.get()
+    try:
+        with (
+            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
+            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
+            envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
+            envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(False),
+            envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(False),
+            envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
+        ):
+            model = torch.nn.Module()
+            layer = torch.nn.Module()
+            layer.layer_id, layer.top_k = 0, TOP_K
+            fmt = Exl3ExpertFormat(layout, 0, direct=False)
+            # A tiny synthetic checkpoint uses its routed width as the eager
+            # staging bound; production leaves the format's 64-row bound.
+            fmt.max_gather_rows = TOP_K
+            streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
+            layer._nvfp4_expert_streamer = streamer
+            model.add_module("expert_layer", layer)
+            ExpertPinnedHostCache(streamer, 3 * TOP_K, **fmt.pinned_tier_options(layer))
+            manager = ExpertHotCacheManager.from_model(
+                model, budget_bytes=2 * TOP_K * streamer.bytes_per_expert,
+                seed_path=None, dynamic=True, update_prefill_tokens=16,
+                min_residence_forwards=0, benefit_ratio=0.0,
+                graph_gather_batch_size=1, update_decode_forwards=1,
+                gpu_residency_update=True, insert_on_miss=2,
+            )
+            streamer._fused_plan_enabled = fused
+            assert isinstance(streamer.row_backend, service_module.Exl3RamMissRowBackend)
+            assert service.gpu_hot_enabled
+            assert manager.caches[0].scratch_rows == 0
+            assert manager.caches[0].capacity == 2 * TOP_K
+            x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
+            weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
+            ids = torch.tensor([list(range(12, 18))], device="cuda", dtype=torch.int32)
+            Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)
+            manager.discard_graph_capture_routes()
+            assert manager.gpu_residency.victims_fresh
+
+            def replay(route):
+                ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
+                graph.replay()
+                torch.cuda.synchronize()
+                service.fail_stop_check()
+                assert streamer.row_backend.keep.item() == 1.0
+                mapping = manager.gpu_residency.mapping[0, :experts].cpu()
+                slots = [int(mapping[e]) for e in route]
+                assert all(slot >= 0 for slot in slots)
+                for expert, slot in zip(route, slots):
+                    for name, rows in manager.caches[0].tensors.items():
+                        assert torch.equal(rows[slot].cpu(), source[name][expert]), (expert, slot, name)
+                ref = _reference(x, weights.reshape(-1), torch.tensor(slots), manager.caches[0].tensors)
+                assert _rel(out, ref) <= REL_BOUND
+
+            first = list(range(12, 18))
+            replay(first)  # miss and direct copy
+            delivered = service.host.counters()["rows_read"]
+            replay(first)  # next replay is all GPU hits
+            assert service.host.counters()["rows_read"] == delivered
+            replay([12, 12, 13, 13, 14, 14])  # duplicate routes remain hits
+            top_slot = int(manager.gpu_residency.victims[0, 0].item())
+            top_expert = int(manager.gpu_residency.slot_to_expert[0, top_slot].item())
+            replay([top_expert, 18, 19, 20, 21, 22])  # routed hit is the top-ranked victim
+            # The final insertion must remain in pinned RAM when eager prefill
+            # admits cold rows before another same-layer graph post.
+            protected = 19
+            streamer.pinned_host_cache.ensure_rows(torch.tensor([30, 31, 32, 33, 34, 35]))
+            assert service.host.contains(0, protected)
+            replay([24, 24, 25, 25, 26, 26])  # duplicate misses copy once per unique expert
+            for start in (18, 24, 30):
+                replay(list(range(start, start + TOP_K)))
+            mapping = manager.gpu_residency.mapping[0, :experts].cpu()
+            evicted = next(expert for expert in first if mapping[expert] < 0)
+            replay([evicted, 30, 31, 32, 33, 34])  # refetch into GPU residency
+            assert manager.gpu_residency.insertion_truncated[0].item() == 0
+            before_failure = manager.gpu_residency.mapping[0].clone()
+            cold = next(e for e in range(experts) if not service.host.contains(0, e)
+                        and before_failure[e].item() < 0)
+            service.host.inject(delay_s=10.0)
+            ids.copy_(torch.tensor([[cold, 30, 31, 32, 33, 34]], device="cuda", dtype=torch.int32))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert streamer.row_backend.delivered_count.item() == 0
+            assert streamer.row_backend.keep.item() == 0.0
+            assert torch.equal(manager.gpu_residency.mapping[0], before_failure)
+            with pytest.raises(RuntimeError, match="exl3 RAM miss"):
+                service.fail_stop_check()  # no response can be served after fatal delivery
+    finally:
+        if service.host is not None:
+            service.host.inject(delay_s=0.0)
+        service.shutdown()
 
 
 @LEASES

@@ -11,11 +11,14 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import exl3_ram_miss
+from sglang.kernels.ops.moe import exl3_lease_block as lease
 from sglang.kernels.ops.moe.exl3_ram_miss import (
     DEMAND_RECORDS,
     PAGE_BYTES,
     Exl3RamMissHost,
     new_page,
+    new_hot_page,
+    hot_record_bytes,
     page_word,
     sim_post,
     sim_wait,
@@ -60,6 +63,82 @@ def _serve(page, host, row, need, protect):
     seq = sim_post(page, row, need=need, protect=protect)
     assert host.pump() == 1
     return sim_wait(page, seq, timeout_s=1.0)
+
+
+def _post_gpu_hot(page, host, hot_page, *, row=0, need=(), protect=(), lanes=(), hot=(), hot_seq=None):
+    """CPU simulator for the post kernel's sidecar and lease request publication."""
+    seq = sim_post(page, row, need=list(need), protect=list(protect), lanes=len(lanes), armed=True)
+    stride = hot_record_bytes(host.experts)
+    record = hot_page[(seq - 1) % DEMAND_RECORDS * stride : (seq - 1) % DEMAND_RECORDS * stride + stride]
+    record[:4].view(torch.int32)[0] = 0
+    record[4:8].view(torch.int32)[0] = host.experts
+    record[8 : 8 + (host.experts + 7) // 8].zero_()
+    for expert in hot:
+        record[8 + expert // 8] |= 1 << (expert % 8)
+    record[:4].view(torch.int32)[0] = seq if hot_seq is None else hot_seq
+    start = host.lease_layout.d_offset + lease.LANE_REQUEST + (seq - 1) % lease.RING * lease.LANE_REQUEST_BYTES
+    request = host.lease_block[start : start + lease.LANE_REQUEST_BYTES]
+    request[:8].view(torch.int64)[0] = 0
+    request[8:12].view(torch.int32)[0] = len(lanes)
+    request[12:16].view(torch.int32)[0] = row
+    request[16:48].view(torch.int32).fill_(-1)
+    for lane, expert in enumerate(lanes):
+        request[16 + lane * 4 : 20 + lane * 4].view(torch.int32)[0] = expert
+    request[:8].view(torch.int64)[0] = lease.tagged(lease.DEMAND_TAG, seq)
+    return seq
+
+
+def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=3)
+    page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
+    slot_map = torch.full((2, 6), -1, dtype=torch.int32)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    try:
+        host.enable_lease_mode()
+        host.enable_gpu_hot()
+        for expert in (0, 1, 2):
+            host.assign(0, expert)
+        seq = _post_gpu_hot(page, host, hot_page, protect=[0], lanes=[0], hot=[0])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        assert host.counters()["hit_leases_granted"] == 1
+        assert sum(info[2] for info in host.slot_info(0)) == 1
+        # The next demand sees the posted bitmap before its victim census and serve.
+        # Expert 0 is the oldest resident, but must survive the read of expert 3.
+        slot = host.mapping(0)[0]
+        generation = host.slot_info(0)[slot][3]
+        ack = host.lease_layout.d_offset + lease.LANE_ACK + (seq - 1) % lease.RING * lease.LANES * lease.LANE_ACK_BYTES
+        host.lease_block[ack : ack + 8].view(torch.int64)[0] = lease.tagged(lease.CONSUMED, seq)
+        seq = _post_gpu_hot(page, host, hot_page, need=[3], protect=[3], hot=[0])
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        assert host.counters()["leases_acked"] == 1
+        assert host.contains(0, 0) and host.contains(0, 3)
+        assert host.slot_info(0)[slot][3] == generation
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("fault", ["stale", "malformed"])
+def test_gpu_hot_sidecar_fails_closed_on_stale_bitmap_and_wraps(tmp_path, fault):
+    s = ram_miss_setup(tmp_path, capacity=3)
+    page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
+    slot_map = torch.full((2, 6), -1, dtype=torch.int32)
+    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    try:
+        host.enable_lease_mode()
+        host.enable_gpu_hot()
+        for _ in range(DEMAND_RECORDS + 1):
+            seq = _post_gpu_hot(page, host, hot_page, hot=[0])
+            assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        seq = _post_gpu_hot(page, host, hot_page, need=[3], protect=[3],
+                            hot_seq=1 if fault == "stale" else None)
+        if fault == "malformed":
+            stride = hot_record_bytes(host.experts)
+            start = (seq - 1) % DEMAND_RECORDS * stride
+            hot_page[start + 4 : start + 8].view(torch.int32)[0] = host.experts + 1
+        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 2
+        assert not host.contains(0, 3)
+    finally:
+        host.stop()
 
 
 def test_a_demand_is_read_split_and_published(tier):

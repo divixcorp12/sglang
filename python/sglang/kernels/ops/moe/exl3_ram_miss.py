@@ -351,6 +351,19 @@ PAGE_BYTES = 10304
 RECORD_BYTES = 128
 DEMAND_RING = 64
 DEMAND_RECORDS = 16
+HOT_HEADER_BYTES = 8
+HOT_ALIGNMENT = 64
+HOT_RECORDS = DEMAND_RECORDS
+
+
+def hot_record_bytes(experts: int) -> int:
+    if experts <= 0 or experts > 65535:
+        raise ValueError(f"EXL3 hot bitmap expert count {experts} is outside [1, 65535]")
+    return ((HOT_HEADER_BYTES + (experts + 7) // 8 + HOT_ALIGNMENT - 1) // HOT_ALIGNMENT) * HOT_ALIGNMENT
+
+
+def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
+    return torch.zeros(HOT_RECORDS * hot_record_bytes(experts), dtype=torch.uint8, pin_memory=pin)
 ADVISE_RING = DEMAND_RING + DEMAND_RECORDS * RECORD_BYTES
 ADVISE_RECORDS = 64
 MAX_IDS = 8
@@ -465,6 +478,7 @@ class Exl3RamMissHost:
         slot_map: torch.Tensor,
         direct: bool,
         lease_block: Optional[torch.Tensor] = None,
+        hot_page: Optional[torch.Tensor] = None,
         pack_workers: int = 0,
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
@@ -486,6 +500,13 @@ class Exl3RamMissHost:
         else:
             exl3_lease_block.check_lease_block(lease_block, self.lease_layout, need_pinned=page.is_pinned())
         self.lease_block = lease_block
+        self.hot_page = hot_page
+        if hot_page is not None:
+            stride = hot_record_bytes(tables.starts.shape[1])
+            if (hot_page.dtype != torch.uint8 or hot_page.device.type != "cpu"
+                    or not hot_page.is_contiguous() or hot_page.numel() != HOT_RECORDS * stride
+                    or (page.is_pinned() and not hot_page.is_pinned())):
+                raise ValueError(f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes")
         # The C++ service writes through raw addresses of the page, the slot map and the
         # slabs (``tables.keepalive``): this object holds all three, and the finalizer
         # below closes the service before they can be released.
@@ -498,6 +519,7 @@ class Exl3RamMissHost:
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
                 tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
                 "\n".join(tables.source_paths), tables.slot_bytes, int(direct), self.lease_block, int(pack_workers),
+                self.hot_page if self.hot_page is not None else torch.empty(0, dtype=torch.uint8),
             )
         )
         if self.handle < 0:
@@ -605,6 +627,11 @@ class Exl3RamMissHost:
     def enable_lease_mode(self) -> None:
         """Lease every armed request's lanes and publish their row results (LEASE_PROTOCOL.md 7); before the thread starts."""
         self._module.exl3_ram_miss_set_lease_mode(self.handle, 1)
+
+    def enable_gpu_hot(self) -> None:
+        if self.hot_page is None:
+            raise ValueError("EXL3 DIRECT requires a hot bitmap sidecar")
+        self._module.exl3_ram_miss_set_gpu_hot(self.handle, 1)
 
     def enable_two_phase(self) -> None:
         """Grant the resident lanes inside the reservation hold, before read() (Task 6 V1); before the thread starts."""
@@ -795,7 +822,8 @@ class Exl3RamMissDevice:
     """
 
     def __init__(
-        self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None
+        self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None,
+        hot_page=None
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8:
             raise ValueError("page must be a uint8 tensor of PAGE_BYTES")
@@ -827,6 +855,17 @@ class Exl3RamMissDevice:
         if (lease_block is None) != (lease_layout is None):
             raise ValueError("lease_block and lease_layout go together")
         self.lease_block = lease_block
+        self.hot_page = hot_page
+        self._hot_address = 0
+        self._hot_stride = 0
+        if hot_page is not None:
+            stride = hot_record_bytes(slot_map.shape[1])
+            if (hot_page.dtype != torch.uint8 or hot_page.device.type != "cpu"
+                    or not hot_page.is_contiguous() or hot_page.numel() != HOT_RECORDS * stride
+                    or (torch.device(device).type == "cuda" and not hot_page.is_pinned())):
+                raise ValueError(f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes")
+            self._hot_address = int(hot_page.data_ptr())
+            self._hot_stride = stride
         self._lease_address = 0
         self._lease_d = 0
         self.go_count = None
@@ -889,13 +928,18 @@ class Exl3RamMissDevice:
             if tensor.dtype != dtype or tensor.device != self.state.device or not tensor.is_contiguous() or tensor.numel() < 1:
                 raise ValueError(f"{name} must be a non-empty contiguous {dtype} tensor on {self.state.device}")
 
-    def post(self, row: int, planned, count, routes, next_row: int) -> None:
+    def post(self, row: int, planned, count, routes, next_row: int, hot_slots=None, hot_capacity: int = 0) -> None:
         self._check_row("row", row)
         self._check_row("next_row", next_row, allow_none=True)
         self._check_buffers(planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64))
+        if hot_slots is not None:
+            self._check_buffers(hot_slots=(hot_slots, torch.int64))
+            if self._hot_address == 0 or not 0 < hot_capacity <= hot_slots.numel():
+                raise ValueError("EXL3 DIRECT needs a hot sidecar and a valid slot capacity")
         self._kernels().exl3_ram_miss_post(
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
-            self._lease_address, self._lease_d, self.timeout_ns,
+            self._lease_address, self._lease_d, self.timeout_ns, self._hot_address, self._hot_stride,
+            hot_slots if hot_slots is not None else self.state, hot_capacity,
         )
 
     def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:

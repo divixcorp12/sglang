@@ -167,6 +167,8 @@ def test_the_device_kernels_speak_the_host_page_layout():
             assert constants[name] == reference[name], (file, name, constants[name], reference[name])
         for name, value in python.items():
             assert constants[name] == value, (file, name, constants[name], value)
+
+
     device = files["exl3_ram_miss.cuh"]
     assert device["kAdviseRing"] + device["kAdviseRecords"] * device["kRecordBytes"] <= PAGE_BYTES
     state = {
@@ -191,6 +193,24 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kFailReason": "fail_reason",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
+
+
+def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
+    files = [_constants(CSRC / name) for name in ("exl3_ram_miss.cuh", "exl3_ram_miss_host.cpp")]
+    for constants in files:
+        assert constants["kHotHeaderBytes"] == ram_miss.HOT_HEADER_BYTES == 8
+        assert constants["kHotAlignment"] == ram_miss.HOT_ALIGNMENT == 64
+        assert constants["kHotRecords"] == ram_miss.HOT_RECORDS == ram_miss.DEMAND_RECORDS == 16
+    assert ram_miss.hot_record_bytes(384) == 64
+    assert ram_miss.new_hot_page(384, pin=False).numel() == 1024
+
+
+def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
+    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
+    slot_map = torch.full((1, 384), -1, dtype=torch.int32)
+    with pytest.raises(ValueError, match="hot_page"):
+        Exl3RamMissDevice(page, slot_map, device="cpu", layers=1, timeout_ms=10,
+                          advise=False, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
 
 
 def _lease_python_constants():

@@ -19,7 +19,13 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS, Exl3RamMissDevice, Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.exl3_ram_miss import (
+    MAX_IDS,
+    Exl3RamMissDevice,
+    Exl3RamMissHost,
+    new_hot_page,
+    new_page,
+)
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
@@ -263,7 +269,10 @@ class NativePinnedSlotTable:
         streamer = self.streamer_of()
         hot = None if streamer is None else getattr(streamer, "hot_cache", None)
         if hot is not None:
-            self.service.host.set_hot(self._row, hot.slot_to_expert)
+            self.service.host.set_hot(
+                self._row,
+                self.service.hot_experts(self.layer_id) if self.service.gpu_hot_enabled else hot.slot_to_expert,
+            )
 
 
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
@@ -291,6 +300,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         capacity: int,
         two_phase: bool = False,
         poll_bound: int = 64,
+        hot_slots: Optional[torch.Tensor] = None,
+        hot_capacity: int = 0,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -304,6 +315,14 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         # Stage 1's poll bound, in iterations of roughly 256 ns. Unmeasured: neither the per-stage cost nor the
         # store-to-poll latency it should be derived from has a measurement (checklist O4).
         self.poll_bound = poll_bound
+        self.hot_slots = hot_slots
+        self.hot_capacity = hot_capacity
+
+    @property
+    def delivered_count(self) -> torch.Tensor:
+        if self.device_side.go_count is None or self.two_phase:
+            raise RuntimeError("EXL3 DIRECT requires single-phase leased delivery")
+        return self.device_side.go_count
 
     def _stage_planned(self, plan) -> None:
         """Copy the plan's lane experts into the captured ``planned`` buffer, bounding the plan first.
@@ -325,7 +344,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 
     def translate(self, tag, plan) -> None:
         self._stage_planned(plan)
-        self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
+        self.device_side.post(
+            self.row, self.planned, plan.count, self.routes, self.next_row,
+            self.hot_slots, self.hot_capacity,
+        )
         self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
 
     def post(self, tag, plan) -> None:
@@ -348,7 +370,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         # stage copies its own compacted plan, so each copy takes that stage's source rows, destination slots and
         # committed count rather than the plan's lane-ordered arrays.
         self._stage_planned(plan)
-        self.device_side.post(self.row, self.planned, plan.count, self.routes, self.next_row)
+        self.device_side.post(
+            self.row, self.planned, plan.count, self.routes, self.next_row,
+            self.hot_slots, self.hot_capacity,
+        )
         self.device_side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.poll_bound)
         copy_expert_row_segments_gpu(
             self.segments[tag], self.device_side.host_rows_1, self.device_side.dst_slots_1, self.device_side.go_1
@@ -423,6 +448,11 @@ class Exl3RamMissService:
         # disagree about which chain this process runs.
         self.two_phase = False
         self.hit_poll_bound = 64
+        self.hot_page = None
+        self.gpu_hot_enabled = False
+        self._gpu_hot_updater = None
+        self._hot_snapshot = None
+        self._hot_lists: dict[int, list[int]] = {}
 
     def register(self, layer_id: int, table: NativePinnedSlotTable) -> None:
         if self.host is not None:
@@ -457,6 +487,7 @@ class Exl3RamMissService:
         )
         pin = torch.cuda.is_available()
         page = new_page(pin=pin)
+        hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
         host = Exl3RamMissHost(
@@ -464,6 +495,7 @@ class Exl3RamMissService:
             page=page,
             slot_map=slot_map,
             direct=fmt._resolve_direct(),
+            hot_page=hot_page,
             pack_workers=cfg.ram_miss_pack_workers,
         )
         try:
@@ -496,6 +528,7 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
+        self.hot_page = hot_page
         self.two_phase = two_phase
         self.hit_poll_bound = cfg.ram_miss_hit_poll_bound
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
@@ -514,6 +547,8 @@ class Exl3RamMissService:
         """Eager pinned-tier use: finish queued device work, then pause the thread (nesting counted)."""
         self.ensure_started()
         if self._pause_depth == 0:
+            if self.gpu_hot_enabled:
+                self._hot_snapshot.copy_(self._gpu_hot_updater.slot_to_expert, non_blocking=True)
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 with (
                     torch.cuda.nvtx.range("dsv41.ram_miss.before_host_use_stream_sync")
@@ -527,6 +562,8 @@ class Exl3RamMissService:
                 else nullcontext()
             ):
                 self.host.pause(2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0)
+            if self.gpu_hot_enabled:
+                self._refresh_hot_lists()
         self._pause_depth += 1
 
     def after_host_use(self) -> None:
@@ -540,7 +577,11 @@ class Exl3RamMissService:
         if self._manager is None:
             self._manager = manager
             manager.register_fail_stop_check(self.fail_stop_check)
-            manager.add_residency_listener(self.on_residency)
+            updater = getattr(manager, "gpu_residency", None)
+            if updater is None or not updater.insert_direct:
+                manager.add_residency_listener(self.on_residency)
+            else:
+                self._enable_gpu_hot(updater)
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
@@ -564,6 +605,7 @@ class Exl3RamMissService:
                 # The host owns the block (Exl3RamMissHost allocates it); the device reads the same one.
                 lease_block=self.host.lease_block if self.lease_mode else None,
                 lease_layout=self.host.lease_layout if self.lease_mode else None,
+                hot_page=self.hot_page if self.gpu_hot_enabled else None,
             )
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
@@ -572,7 +614,35 @@ class Exl3RamMissService:
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows,
             two_phase=self.two_phase, poll_bound=self.hit_poll_bound,
+            hot_slots=(manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)]
+                       if self.gpu_hot_enabled else None),
+            hot_capacity=cache.capacity if self.gpu_hot_enabled else 0,
         )
+
+    def _refresh_hot_lists(self) -> None:
+        updater = self._gpu_hot_updater
+        for row, layer_id in enumerate(updater.layer_ids):
+            capacity = updater.caches[row].capacity
+            self._hot_lists[layer_id] = [int(e) for e in self._hot_snapshot[row, :capacity].tolist() if e >= 0]
+
+    def _enable_gpu_hot(self, updater) -> None:
+        if not self.lease_mode or self.two_phase:
+            raise ValueError("EXL3 DIRECT requires single-phase RAM-miss leases")
+        self._gpu_hot_updater = updater
+        self._hot_snapshot = torch.empty_like(
+            updater.slot_to_expert, device="cpu", pin_memory=updater.device.type == "cuda"
+        )
+        self._hot_snapshot.copy_(updater.slot_to_expert, non_blocking=True)
+        if updater.device.type == "cuda":
+            torch.cuda.current_stream(updater.device).synchronize()
+        self._refresh_hot_lists()
+        for layer_id, experts in self._hot_lists.items():
+            self.host.set_hot(self.row_of(layer_id), experts)
+        self.host.enable_gpu_hot()
+        self.gpu_hot_enabled = True
+
+    def hot_experts(self, layer_id: int) -> list[int]:
+        return self._hot_lists.get(layer_id, [])
 
     def on_residency(self, layer_id: int, slot_to_expert: list[int]) -> None:
         self._refuse_if_shut_down()
@@ -813,6 +883,8 @@ class Exl3RamMissService:
         owned: list[torch.Tensor] = []
         if self.host is not None:
             owned += [self.host.page, self.host.slot_map, self.host.lease_block]
+            if self.host.hot_page is not None:
+                owned.append(self.host.hot_page)
         if self.device_side is not None:
             owned += [self.device_side.state, self.device_side.last_routes]
             owned += [t for t in (self.device_side.go_count, self.device_side.lane_ctx) if t is not None]
@@ -838,13 +910,17 @@ class Exl3RamMissService:
             # A copy can still be writing this pinned block when the device
             # barrier failed. Keep it alive with the other uncertain buffers.
             owned.append(self._trace_snapshot)
+        if self._hot_snapshot is not None:
+            owned.append(self._hot_snapshot)
+        if self._gpu_hot_updater is not None:
+            owned.append(self._gpu_hot_updater.slot_to_expert)
         for layer_id in sorted(self.tables):
             streamer = self.tables[layer_id].streamer_of()
             tier = getattr(streamer, "pinned_host_cache", None)
             if tier is not None:
                 tier.quarantine()
             backend = getattr(streamer, "row_backend", None)
-            for name in ("host_rows", "ram_miss", "keep", "routes", "planned"):
+            for name in ("host_rows", "ram_miss", "keep", "routes", "planned", "hot_slots"):
                 tensor = getattr(backend, name, None)
                 if isinstance(tensor, torch.Tensor):
                     owned.append(tensor)

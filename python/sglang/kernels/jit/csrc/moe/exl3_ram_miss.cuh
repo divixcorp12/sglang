@@ -48,6 +48,9 @@ constexpr int64_t kAdviseHead = 16;
 constexpr int64_t kRecordBytes = 128;
 constexpr int64_t kDemandRing = 64;
 constexpr uint32_t kDemandRecords = 16;
+constexpr int64_t kHotHeaderBytes = 8;
+constexpr int64_t kHotAlignment = 64;
+constexpr uint32_t kHotRecords = kDemandRecords;
 constexpr int64_t kAdviseRing = kDemandRing + kDemandRecords * kRecordBytes;
 constexpr uint32_t kAdviseRecords = 64;
 constexpr int kMaxIds = 8;
@@ -261,7 +264,11 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     int64_t next_row,
     uint8_t* __restrict__ lease,
     int64_t lease_d,
-    int64_t timeout_ns) {
+    int64_t timeout_ns,
+    uint8_t* __restrict__ hot_page,
+    int64_t hot_stride,
+    const int64_t* __restrict__ hot_slots,
+    int64_t hot_capacity) {
   using namespace exl3_ram_miss_device;
   if (threadIdx.x != 0) return;
   if (state[kSticky] != 0 || ld_acquire_sys(page + kFatal) != 0) {
@@ -295,6 +302,23 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   }
   state[kPosted] = static_cast<int32_t>(seq);
   uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
+  if (hot_page != nullptr) {
+    uint8_t* hot = hot_page + static_cast<int64_t>((seq - 1u) % kHotRecords) * hot_stride;
+    *reinterpret_cast<volatile uint32_t*>(hot) = 0;
+    __threadfence_system();
+    *reinterpret_cast<volatile uint32_t*>(hot + 4) = static_cast<uint32_t>(experts);
+    volatile uint8_t* bits = reinterpret_cast<volatile uint8_t*>(hot + kHotHeaderBytes);
+    for (int64_t byte = 0; byte < (experts + 7) / 8; ++byte) {
+      uint8_t mask = 0;
+      for (int64_t slot = 0; slot < hot_capacity; ++slot) {
+        const int64_t expert = hot_slots[slot];
+        if (expert >= byte * 8 && expert < byte * 8 + 8) mask |= static_cast<uint8_t>(1u << (expert - byte * 8));
+      }
+      bits[byte] = mask;
+    }
+    __threadfence_system();
+    st_release_sys(hot, seq);
+  }
   // Lease mode arms every request that has planned lanes, not only those with a miss (LEASE_PROTOCOL.md section 15:
   // the all-hit handshake is where the lease is granted, so an unarmed record is reachable only for count == 0). The
   // service leases RAM hits too (7.2) and reads a request's lanes only when the record is armed; an unarmed request
@@ -980,7 +1004,11 @@ void exl3_ram_miss_post(
     int64_t next_row,
     int64_t lease_address,
     int64_t lease_d,
-    int64_t timeout_ns) {
+    int64_t timeout_ns,
+    int64_t hot_address,
+    int64_t hot_stride,
+    tvm::ffi::TensorView hot_slots,
+    int64_t hot_capacity) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
   host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
       exl3_ram_miss_post_kernel,
@@ -998,7 +1026,11 @@ void exl3_ram_miss_post(
       next_row,
       reinterpret_cast<uint8_t*>(lease_address),  // zero: no lease block, today's protocol
       lease_d,
-      timeout_ns);
+      timeout_ns,
+      reinterpret_cast<uint8_t*>(hot_address),
+      hot_stride,
+      static_cast<const int64_t*>(hot_slots.data_ptr()),
+      hot_capacity);
 }
 
 void exl3_ram_miss_wait(

@@ -544,7 +544,11 @@ class GpuResidencyUpdater:
                 self._insert_misses(gate, routed)
             self.boundary_updates.add_(eligible.to(torch.long))
         else:
-            self._promote(eligible, width, phase)
+            # EXL3's sources are pinned-slot rows, not dense expert-ID rows. A
+            # prefill still updates scores and the next DIRECT victim ranking.
+            if not (self.insert_direct and phase == _PREFILL_PHASE
+                    and any(getattr(streamer.format, "key", None) == "exl3" for streamer in self.streamers)):
+                self._promote(eligible, width, phase)
             if self.insert_direct:
                 # A prefill boundary rewrote the mapping, so the shortlist it ranked is stale.
                 self._rank_victims(routed)
@@ -752,6 +756,10 @@ class GpuResidencyUpdater:
         """Commit the residency of the gather whose copies were just issued."""
         row, streamer, destinations, live = self._pending_commit
         self._pending_commit = None
+        backend = streamer.row_backend
+        if getattr(backend, "name", None) == "exl3_ram_miss":
+            delivered = backend.delivered_count.long()
+            live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
         self._commit_gather(row, streamer, destinations, live)
 
     def _commit_gather(
@@ -784,7 +792,13 @@ class GpuResidencyUpdater:
         self.slot_generations[row, slot_dump : slot_dump + 1].fill_(0)
         self.gather_insertions[row].add_(live.sum())
         self.gather_evictions[row].add_(evicted.sum())
-        self.insertion_truncated[row].add_((streamer._graph_miss_count.long() > live.sum()).long().sum())
+        backend = streamer.row_backend
+        if getattr(backend, "name", None) == "exl3_ram_miss":
+            delivered = backend.delivered_count.long()
+            good = backend.keep[0] > 0
+            self.insertion_truncated[row].add_(((delivered > live.sum()) & good).long().sum())
+        else:
+            self.insertion_truncated[row].add_((streamer._graph_miss_count.long() > live.sum()).long().sum())
 
     def _copy_promotions(self, width: int) -> None:
         """Copy each layer's promoted rows into its destination slots on the current stream."""

@@ -170,6 +170,12 @@ class Exl3ExpertFormat:
             # accepted for eager 3a; a framework-side resident set is a 3b item.
             streamer = expert_streamer_of(layer)
             hot = None if streamer is None else streamer.hot_cache
+            if hot is not None:
+                from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+
+                service = Exl3RamMissService.get()
+                if service.gpu_hot_enabled:
+                    return expert_id in service.hot_experts(self.layer_id)
             return hot is not None and expert_id in hot.slot_to_expert
 
         options = {"is_pinned": is_pinned}

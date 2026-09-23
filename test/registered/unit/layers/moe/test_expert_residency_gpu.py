@@ -1290,6 +1290,53 @@ class TestInsertOnMissDirect(unittest.TestCase):
             self.assertIs(streamer.row_plan.slots, streamer._graph_destination_slots)
             self.assertIs(streamer.row_plan.expert_ids, streamer._graph_source_rows)
 
+    def test_exl3_direct_ack_violation_cannot_publish_a_resident(self):
+        """The copy may have started (go_count > 0) before ack detects a
+        source generation violation. Only the post-ack keep word permits commit."""
+        manager = _manager(_model(), gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        streamer = updater.streamers[0]
+        row = 0
+        target = 0
+        before = updater.slot_to_expert[row].clone()
+        mapping_before = updater.mapping[row].clone()
+        new_expert = next(e for e in range(EXPERTS) if mapping_before[e].item() < 0)
+        streamer._graph_source_rows[0] = new_expert
+        delivered = torch.tensor([1], dtype=torch.int32, device="cuda")
+        keep = torch.tensor([0.0], dtype=torch.float32, device="cuda")
+        streamer.row_backend = SimpleNamespace(
+            name="exl3_ram_miss", delivered_count=delivered, keep=keep,
+        )
+        destinations = torch.zeros(updater.miss_rows, dtype=torch.long, device="cuda")
+        live = torch.zeros(updater.miss_rows, dtype=torch.bool, device="cuda")
+        live[0] = True
+        updater._pending_commit = (row, streamer, destinations, live)
+        updater.commit_gather()
+        self.assertTrue(torch.equal(updater.slot_to_expert[row], before))
+        self.assertTrue(torch.equal(updater.mapping[row], mapping_before))
+        self.assertEqual(updater.insertion_truncated[row].item(), 0)
+        keep.fill_(1.0)
+        updater._pending_commit = (row, streamer, destinations, live)
+        updater.commit_gather()
+        self.assertEqual(updater.slot_to_expert[row, target].item(), new_expert)
+        self.assertEqual(updater.mapping[row, new_expert].item(), target)
+
+    def test_exl3_prefill_boundary_scores_without_dense_promotion(self):
+        from sglang.srt.layers.moe.expert_residency_gpu import _PREFILL_PHASE
+
+        manager = _manager(_model(), gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        for streamer in updater.streamers:
+            streamer.format = SimpleNamespace(key="exl3")
+        updater.enabled.fill_(True)
+        updater.route_counts[:, 3].fill_(4.0)
+        before = updater.scores[:, 3].clone()
+        updater._promote = lambda *args: self.fail("EXL3 prefill cannot index dense host rows")
+        updater._apply(updater.enabled.clone(), updater.prefill_promotions, _PREFILL_PHASE)
+        self.assertTrue(bool((updater.scores[:, 3] > before).all()))
+        self.assertTrue(bool((updater.route_counts == 0).all()))
+        self.assertTrue(updater.victims_fresh)
+
     # ----- the capacity proof, exercised -----
 
     def test_no_forward_ever_lands_a_copy_in_a_row_it_reads(self):
