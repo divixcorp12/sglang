@@ -130,7 +130,8 @@ REPLAY_STEPS = 4
 
 
 @pytest.mark.parametrize("fused", [False, True], ids=["generic_routes", "fused_routes"])
-def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused):
+@pytest.mark.parametrize("failure", ["timeout", "generation_violation"])
+def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused, failure):
     """Runs only on divix01: actual EXL3 bytes, native leases, and captured
     MoE output across a DIRECT insertion and an eager pinned-tier eviction."""
     from sglang.srt.environ import envs
@@ -238,15 +239,67 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             replay([evicted, 30, 31, 32, 33, 34])  # refetch into GPU residency
             assert manager.gpu_residency.insertion_truncated[0].item() == 0
             before_failure = manager.gpu_residency.mapping[0].clone()
-            cold = next(e for e in range(experts) if not service.host.contains(0, e)
-                        and before_failure[e].item() < 0)
-            service.host.inject(delay_s=10.0)
-            ids.copy_(torch.tensor([[cold, 30, 31, 32, 33, 34]], device="cuda", dtype=torch.int32))
-            graph.replay()
-            torch.cuda.synchronize()
-            assert streamer.row_backend.delivered_count.item() == 0
-            assert streamer.row_backend.keep.item() == 0.0
-            assert torch.equal(manager.gpu_residency.mapping[0], before_failure)
+            if failure == "timeout":
+                cold = next(e for e in range(experts) if not service.host.contains(0, e)
+                            and before_failure[e].item() < 0)
+                service.host.inject(delay_s=10.0)
+                ids.copy_(torch.tensor([[cold, 30, 31, 32, 33, 34]], device="cuda", dtype=torch.int32))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert streamer.row_backend.delivered_count.item() == 0
+                assert streamer.row_backend.keep.item() == 0.0
+                assert torch.equal(manager.gpu_residency.mapping[0], before_failure)
+            else:
+                # Run the real post -> lease wait -> row copy -> ack -> DIRECT
+                # commit chain with a synchronization gap after the copy. Only
+                # the test changes the mapped SlotGen word in that gap; the
+                # native service and GPU acknowledgment remain unmodified.
+                from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+                updater = manager.gpu_residency
+                backend = streamer.row_backend
+                cold = next(e for e in range(experts) if service.host.contains(0, e)
+                            and before_failure[e].item() < 0)
+                before_slots = updater.slot_to_expert[0].clone()
+                streamer._graph_source_rows[0] = cold
+                streamer._graph_miss_count.fill_(1)
+                backend.routes.fill_(-1)
+                backend.routes[0] = cold
+                route_slots = updater.mapping[0, cold : cold + 1]
+                scratch_remap = torch.tensor([manager.caches[0].capacity], device="cuda")
+                updater.gather_destinations(0, scratch_remap, route_slots, manager.caches[0].capacity)
+                plan = streamer.row_plan
+                backend._stage_planned(plan)
+                backend.device_side.post(
+                    backend.row, backend.planned, plan.count, backend.routes, backend.next_row,
+                    backend.hot_slots, backend.hot_capacity,
+                )
+                backend.device_side.wait(
+                    backend.row, backend.planned, plan.count, backend.host_rows,
+                    backend.keep, backend.ram_miss,
+                )
+                copy_expert_row_segments_gpu(
+                    backend.segments[streamer.row_tag], backend.host_rows,
+                    plan.slots, backend.delivered_count,
+                )
+                torch.cuda.synchronize()
+                assert backend.delivered_count.item() == 1
+                assert backend.keep.item() == 1.0
+                leased_row = int(backend.device_side.lane_ctx[2].item())
+                leased_slot = int(backend.device_side.lane_ctx[3].item())
+                layout = service.host.lease_layout
+                offset = layout.slot_gen_offset + 4 * (
+                    layout.slot_gen_base[leased_row] + leased_slot
+                )
+                slot_gen = service.host.lease_block[offset : offset + 4].view(torch.int32)
+                slot_gen[0] = int(slot_gen[0]) + 1
+                backend.device_side.ack(backend.keep)
+                updater.commit_gather()
+                torch.cuda.synchronize()
+                assert backend.delivered_count.item() == 1
+                assert backend.keep.item() == 0.0
+                assert torch.equal(updater.mapping[0, :experts], before_failure[:experts])
+                assert torch.equal(updater.slot_to_expert[0], before_slots)
             with pytest.raises(RuntimeError, match="exl3 RAM miss"):
                 service.fail_stop_check()  # no response can be served after fatal delivery
     finally:
