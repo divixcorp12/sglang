@@ -3046,6 +3046,67 @@ genuine GPU work and queueing. This is the measurement that
 the step should fall to one graph launch.
 
 
+## 22. Layer 14 in the decode graph: the break is gone, the time is not (2026-09-22)
+
+`d337301dd1` extends the captured host-node gate from `layer_id == 1` to `1, 14`. Two
+arms at that commit, both at `SGLANG_MOE_PINNED_HOST_MB=51200`, generation
+`engram-host-node-layer14`, uring reader, leases off, 8 sessions each.
+
+| arm | traced | mean | median | token-weighted | mean TTFT | verdict |
+|---|---|---:|---:|---:|---:|---|
+| `engram-on-chunked2` (layer 1 only) | no | 2.705 | - | **2.777** | - | failed (residency 5.53 GiB) |
+| `layer14-graph` | no | 2.625 | 2.613 | **2.724** | 40.5 s | failed (residency 3.03 GiB) |
+| `layer14-trace2` | yes | 2.608 | 2.621 | **2.720** | 39.5 s | **passed** (bar the step-latency gap) |
+
+### The structural change works, exactly
+
+`segments=1 breaks=0` on all three decode graph variants in the real server log, against
+`segments=2 breaks=1` before. Measured against generated tokens rather than inferred, the
+trace is unambiguous:
+
+| arm | completion tokens | cudaGraphLaunch | launches per token |
+|---|---:|---:|---:|
+| `engram-on-trace` (layer 1 only) | 110 | 220 | **2.000** |
+| `layer14-trace2` (layers 1 and 14) | 485 | 485 | **1.000** |
+
+One graph launch per decode token. The break is removed.
+
+### It buys nothing measurable, and section 21 says why
+
+2.777 -> 2.724 token-weighted is a 1.9% *decrease*, and it does not resolve: per-session
+values span 2.157-2.891 inside a single arm, every cell is n=1, and `layer14-graph` ran
+with `nimbus_beacon_node`, `tmux` and `htop` contending on server cores. Treat the three
+cells above as indistinguishable.
+
+That null is the predicted one. Section 21 measured decode as 98% host-blocked, 63% of it
+inside `cudaGraphLaunch` waiting on the GPU and 35% inside a 2 KB device-to-host sync.
+Removing a break removes *host-side launch overhead*, which was not the binding term, so
+merging two segments into one simply means the single launch blocks for what two used to.
+
+The two binding terms both reproduce at 4x the sample, unchanged:
+
+| | section 21 (110 tokens) | this arm (485 tokens) |
+|---|---|---|
+| gather kernel | 1,680 calls, 187.3 GB, **12.3 GB/s**, 91% of eager GPU time | 6,660 calls, 736.3 GB, **12.4 GB/s**, 91% of eager GPU time |
+| D2H sync readbacks | 20,017 calls, 31-41 B, 31.9 s blocked | 78,647 calls, 41 B avg, **64.1 s blocked** |
+| eager GPU busy | ~18% of wall | 65.3 s of 502.4 s = **13%** of wall |
+
+**Do not read this as "graphing layer 14 was not worth doing."** It removes a real graph
+break and is structurally correct; it is simply not where the time is. The next thing to
+try is on the list above, not on the graph: the `.item()` sync is 64 s of 502 s and is
+there only to order one chunk's admission against the previous chunk's copy.
+
+### Operational: divix01's /tmp is too small for a full-length capture
+
+The first traced attempt (`layer14-trace`) died mid-run. nsys warned that its temporary
+directory had 3 MiB free against the 200 MiB it wants, the driver then saw
+`RemoteDisconnected`, and the report came out at 361 KB. divix01's `/tmp` is on the root
+xfs volume, which sits at 88% full. A 2-session capture fits there; a full 8-session
+capture does not, and the failure kills the server rather than erroring cleanly. Set
+`NSYS_TMPDIR=/mnt/nvme1/nsys-tmp` for any full-length traced arm; the relaunch with it set
+produced a 164 MB report and a passing verdict.
+
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

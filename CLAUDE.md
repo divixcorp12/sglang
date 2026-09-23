@@ -13,6 +13,7 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
   - Cap memory for any local run: `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 <cmd>`. For DuckDB, also set `SET memory_limit='4GB'; SET threads=4`.
   - Narrow the data before loading it. Use `--filter-time`/`--filter-nvtx` or a short capture (`--duration`), and bound queries (`LIMIT`, pre-filtered CTEs).
   - Delete the skill cache and any copied report when done.
+  - **On divix01, set `NSYS_TMPDIR=/mnt/nvme1/nsys-tmp` for any full-length traced arm.** Its `/tmp` is on the root xfs volume at ~88% full; nsys wants 200 MiB of scratch and a full 8-session capture exhausts it. The failure is not a clean error -- nsys warns, the server is then killed mid-run, the benchmark driver reports `RemoteDisconnected`, and the report lands at ~361 KB. A short 2-session capture fits and hides the problem. Evidence: `DSV41_REFERENCE.md` section 22.
 
 ## GPU microbenchmarks on the RTX 5090
 
