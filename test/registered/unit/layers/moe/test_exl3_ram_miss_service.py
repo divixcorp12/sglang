@@ -335,6 +335,64 @@ def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monke
     service.fail_stop_check()
 
 
+def test_shutdown_freezes_native_reader_before_final_trace(monkeypatch):
+    service = module.Exl3RamMissService()
+    order = []
+
+    class Host:
+        rows = 1
+
+        def close_admission(self):
+            order.append("close_admission")
+
+        def pause(self, timeout_s):
+            order.append("pause")
+            self.rows = 2  # an in-flight demand completes before pause returns
+
+        def layer_rows(self):
+            return [self.rows]
+
+        def stop(self):
+            order.append("stop")
+
+    host = Host()
+    service.host = host
+    service._stages_traced = True
+    monkeypatch.setattr(service, "_establish_gpu_completion", lambda: order.append("gpu_barrier") or None)
+    monkeypatch.setattr(
+        service, "_trace_step", lambda *, final=False: order.append(("trace", host.layer_rows(), final))
+    )
+    service.shutdown()
+    assert order == ["close_admission", "gpu_barrier", "pause", ("trace", [2], True), "stop"]
+
+
+def test_shutdown_quarantines_after_native_stop_failure(monkeypatch):
+    service = module.Exl3RamMissService()
+    service._stages_traced = True
+    order = []
+
+    class Host:
+        def close_admission(self):
+            order.append("close_admission")
+
+        def pause(self, timeout_s):
+            order.append("pause")
+
+        def stop(self):
+            order.append("stop")
+            raise RuntimeError("join failed")
+
+    service.host = Host()
+    monkeypatch.setattr(service, "_establish_gpu_completion", lambda: None)
+    monkeypatch.setattr(service, "_trace_step", lambda *, final=False: order.append("trace"))
+    monkeypatch.setattr(service, "_quarantine", lambda reason: order.append(("quarantine", reason)))
+    service.shutdown()
+    assert order[:3] == ["close_admission", "pause", "trace"]
+    assert order[3] == "stop"
+    assert order[4][0] == "quarantine"
+    assert "join failed" in order[4][1]
+
+
 def test_graph_steps_are_traced_and_read_back_by_tier_sim(tmp_path):
     import os
     import sys
@@ -421,6 +479,98 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
         manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
     service.fail_stop_check()
     assert lines[2:] == [dict(layer_rows_delta=[0, 0], routed_rows=24, routed_misses=4, thread={"rows_read": 3}, steps=2)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA snapshot needs a GPU")
+def test_graph_trace_defers_cuda_readback_until_a_later_check(monkeypatch):
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    lines = []
+    monkeypatch.setattr(
+        exl3_stream_trace,
+        "get_exl3_stream_trace",
+        lambda: SimpleNamespace(enabled=True, record_graph_step=lambda **kw: lines.append(kw)),
+    )
+    graph_rows = torch.zeros((2, 2), dtype=torch.int64, device="cuda")
+    service = module.Exl3RamMissService()
+    service._manager = SimpleNamespace(_registers={"decode": {"graph_rows": graph_rows}})
+    service.routed_rows_per_step = 12
+    demand_rows = [[0, 0]]
+    service.host = SimpleNamespace(
+        fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: {"rows_read": 3}
+    )
+
+    service.fail_stop_check()  # enqueue baseline; no device readback on this call
+    torch.cuda.synchronize()
+    graph_rows.copy_(torch.tensor([[6, 2], [6, 1]], device="cuda"))
+    demand_rows[0] = [1, 1]
+    service.fail_stop_check()  # consume baseline, enqueue a fresh snapshot
+    assert lines == []
+    torch.cuda.synchronize()
+    service.fail_stop_check()
+    assert lines == [
+        dict(layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3, thread={"rows_read": 3}, steps=1)
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA snapshot needs a GPU")
+def test_graph_trace_coalesces_busy_slot_and_flushes_final_sample(monkeypatch):
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    lines = []
+    monkeypatch.setattr(
+        exl3_stream_trace,
+        "get_exl3_stream_trace",
+        lambda: SimpleNamespace(enabled=True, record_graph_step=lambda **kw: lines.append(kw)),
+    )
+    real_event = torch.cuda.Event
+
+    class DelayedEvent:
+        def __init__(self, **kwargs):
+            self.event = real_event(**kwargs)
+            self.allow_query = False
+
+        def record(self, stream):
+            self.event.record(stream)
+
+        def query(self):
+            return self.allow_query and self.event.query()
+
+        def synchronize(self):
+            self.event.synchronize()
+
+    delayed = DelayedEvent(enable_timing=False)
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: delayed)
+    graph_rows = torch.zeros((2, 2), dtype=torch.int64, device="cuda")
+    service = module.Exl3RamMissService()
+    service._manager = SimpleNamespace(_registers={"decode": {"graph_rows": graph_rows}})
+    service.routed_rows_per_step = 12
+    demand_rows = [[0, 0]]
+    service.host = SimpleNamespace(layer_rows=lambda: demand_rows[0], counters=lambda: {"rows_read": 7})
+
+    service._trace_step()  # baseline snapshot is in flight
+    for step in (1, 2):
+        graph_rows.copy_(torch.tensor([[6 * step, 2 * step], [6 * step, step]], device="cuda"))
+        demand_rows[0] = [step, step]
+        service._trace_step()
+    assert lines == []
+
+    delayed.allow_query = True
+    torch.cuda.synchronize()
+    service._trace_step()  # consume old baseline; queue current cumulative totals
+    torch.cuda.synchronize()
+    service._trace_step()
+    assert lines == [
+        dict(layer_rows_delta=[2, 2], routed_rows=24, routed_misses=6, thread={"rows_read": 7}, steps=2)
+    ]
+
+    graph_rows.copy_(torch.tensor([[18, 6], [18, 3]], device="cuda"))
+    demand_rows[0] = [3, 3]
+    torch.cuda.synchronize()  # orderly shutdown establishes GPU completion first
+    service._trace_step(final=True)
+    assert lines[-1] == dict(
+        layer_rows_delta=[1, 1], routed_rows=12, routed_misses=3, thread={"rows_read": 7}, steps=1
+    )
 
 
 def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():

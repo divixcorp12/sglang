@@ -933,6 +933,14 @@ def test_base_env_uses_the_declared_pinned_host_budget():
     assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_MB"] == arm_env.PINNED_HOST_MB
 
 
+def test_async_residency_score_candidate_is_opt_in():
+    assert arm_env.base_env()["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
+    candidate = arm_env.arm_env({"SGLANG_MOE_ASYNC_RESIDENCY_SCORES": "1"})
+    assert candidate["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "1"
+    assert candidate["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "0"
+    assert candidate["SGLANG_MOE_HOT_DYNAMIC"] == "1"
+
+
 def test_pinned_buffer_and_weights_fit_in_node_0s_free_memory():
     # The arithmetic that was skipped on 2026-09-22: at 71680 MiB the pinned buffer
     # ALONE exceeded node 0's 66619 MiB free, so the arm could never have started. It

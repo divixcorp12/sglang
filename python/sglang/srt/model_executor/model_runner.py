@@ -841,6 +841,7 @@ class ModelRunner:
             graph_gather_batch_size=graph_gather_batch_size,
             graph_gather_max_rows=envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS.get(),
             async_promotions=envs.SGLANG_MOE_HOT_ASYNC_PROMOTIONS.get(),
+            async_residency_scores=envs.SGLANG_MOE_ASYNC_RESIDENCY_SCORES.get(),
             gpu_residency_update=envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get(),
             gpu_residency_max_promotions=envs.SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS.get(),
             expert_doorbell=envs.SGLANG_MOE_EXPERT_DOORBELL.get(),

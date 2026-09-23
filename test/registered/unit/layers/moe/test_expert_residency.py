@@ -5,10 +5,32 @@ import torch
 from sglang.srt.layers.moe.expert_residency import (
     ExpertResidencyPolicy,
     TransferPriority,
+    decide_residency_policies_from_host_scores,
 )
 
 
 class TestExpertResidencyPolicy(unittest.TestCase):
+    def test_host_score_snapshot_uses_current_residents_without_device_readback(self):
+        policy = ExpertResidencyPolicy(num_experts=3, capacity=1, decay=1.0)
+        policy.record_counts(torch.tensor([1.0, 3.0, 0.0]))
+        policy.advance()
+        snapshot = policy._scores.clone()
+        policy.record_counts(torch.tensor([9.0, 0.0, 0.0]))
+        policy.advance()
+
+        decision = decide_residency_policies_from_host_scores(
+            [policy], [(0,)], [snapshot]
+        )[0]
+
+        self.assertEqual(decision.promotions, (1,))
+        self.assertEqual(decision.evictions, (0,))
+        self.assertEqual(decision.desired_experts, (1,))
+        current = decide_residency_policies_from_host_scores(
+            [policy], [(1,)], [snapshot]
+        )[0]
+        self.assertEqual(current.promotions, ())
+        self.assertEqual(current.evictions, ())
+
     def test_selects_deterministic_budgeted_topk_from_activation_counts(self):
         policy = ExpertResidencyPolicy(num_experts=5, capacity=2, decay=1.0)
         counter_address = policy.pending_counts.data_ptr()

@@ -697,6 +697,89 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(metrics["boundary_updates"], 1)
         self.assertEqual(metrics["background_promotion_experts"], 1)
 
+    def test_async_residency_scores_apply_after_event_without_sync_readback(self):
+        from sglang.srt.layers.moe import expert_hot_cache
+
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            min_residence_forwards=0,
+            benefit_ratio=0.0,
+            async_residency_scores=True,
+        )
+        challenger = [[0, 20, 0, 0], [0] * 4, [0, 20, 0, 0]]
+        with mock.patch.object(
+            expert_hot_cache,
+            "decide_residency_policies",
+            side_effect=AssertionError("synchronous score readback"),
+        ):
+            self.observe(manager, challenger, record_routes=True)
+            self.assertEqual(manager.caches[0].slot_to_expert, [0])
+            torch.cuda.synchronize()
+            self.observe(manager, [[0] * 4] * 3, mode=self.mode.DECODE)
+        self.assertEqual(manager.caches[0].slot_to_expert, [1])
+        self.assertEqual(manager.caches[2].slot_to_expert, [1])
+
+    def test_async_residency_scores_refresh_after_two_pending_boundaries(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            min_residence_forwards=0,
+            benefit_ratio=0.0,
+            async_residency_scores=True,
+        )
+        toward_one = [[0, 20, 0, 0], [0] * 4, [0, 20, 0, 0]]
+        toward_zero = [[40, 0, 0, 0], [0] * 4, [40, 0, 0, 0]]
+        self.observe(manager, toward_one, record_routes=True)
+        backend = manager._async_residency_backend
+        with mock.patch.object(backend, "ready", return_value=False):
+            self.observe(manager, toward_zero, record_routes=True)
+        self.assertIsNotNone(manager._async_residency_refresh)
+        torch.cuda.synchronize()
+        self.observe(manager, [[0] * 4] * 3, mode=self.mode.DECODE)
+        self.assertEqual(manager.caches[0].slot_to_expert, [1])
+        self.assertIsNone(manager._async_residency_refresh)
+        torch.cuda.synchronize()
+        self.observe(manager, [[0] * 4] * 3, mode=self.mode.DECODE)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+
+    def test_async_residency_uses_the_boundary_forward_for_residence_gate(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            min_residence_forwards=2,
+            benefit_ratio=0.0,
+            async_residency_scores=True,
+        )
+        challenger = [[0, 20, 0, 0], [0] * 4, [0, 20, 0, 0]]
+        self.observe(manager, challenger, record_routes=True)
+        torch.cuda.synchronize()
+        self.observe(manager, [[0] * 4] * 3, mode=self.mode.DECODE)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+        self.assertEqual(manager.residency_policies[0]._metrics.boundary_updates, 0)
+
+    def test_capture_reset_discards_pending_async_residency_decision(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            min_residence_forwards=0,
+            benefit_ratio=0.0,
+            async_residency_scores=True,
+        )
+        challenger = [[0, 20, 0, 0], [0] * 4, [0, 20, 0, 0]]
+        self.observe(manager, challenger, record_routes=True)
+        self.assertIsNotNone(manager._async_residency_pending)
+        manager._async_residency_refresh = ("prefill", manager._boundary_clock.forwards)
+        event = manager._async_residency_event
+        with mock.patch.object(
+            manager._async_residency_backend,
+            "synchronize",
+            wraps=manager._async_residency_backend.synchronize,
+        ) as sync:
+            manager.discard_graph_capture_routes()
+            sync.assert_called_once_with(event)
+        self.assertIsNone(manager._async_residency_pending)
+        self.assertIsNone(manager._async_residency_refresh)
+        self.observe(manager, [[0] * 4] * 3, mode=self.mode.DECODE)
+        self.assertEqual(manager.caches[0].slot_to_expert, [0])
+
+
     def test_dynamic_scores_start_from_frequency_seed(self):
         manager = self.manager(
             {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},

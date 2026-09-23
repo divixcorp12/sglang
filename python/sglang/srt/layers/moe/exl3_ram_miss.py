@@ -402,6 +402,11 @@ class Exl3RamMissService:
         self._pause_depth = 0
         self._trace_rows: Optional[list[int]] = None
         self._trace_graph: Optional[list[int]] = None
+        # One reusable, pinned snapshot. A busy slot coalesces later cumulative
+        # register values; neither the scheduler nor the CUDA graph waits for it.
+        self._trace_snapshot: Optional[torch.Tensor] = None
+        self._trace_event: Optional[torch.cuda.Event] = None
+        self._trace_pending_rows: Optional[list[int]] = None
         self._stages_traced = False  # the host records a stage line per request (trace runs only)
         self._stages_dropped = 0
         # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
@@ -595,38 +600,46 @@ class Exl3RamMissService:
             logger.warning("exl3 RAM miss: %d stage records dropped (ring full)", dropped - self._stages_dropped)
             self._stages_dropped = dropped
 
-    def _graph_rows(self) -> Optional[list[int]]:
-        """Routed rows and routed misses of every decode graph gather so far, from the
-        manager's registers (the streamers' own graph_counters are zeroed every forward
-        by the forward observer, before this per-batch check runs; plan D23).
+    def _graph_rows(self, rows: list[int], *, final: bool = False) -> Optional[tuple[list[int], list[int]]]:
+        """Poll a pinned graph-counter readback and queue the next one without waiting.
 
-        Overlap scheduling stays on with option C (plan D2, D21). ``tolist()`` then
-        orders only after this thread's current stream, not the forward stream that
-        adds to the registers, so a line may pair one step's demand rows with the
-        previous step's routed rows. Sums over a run are exact; single lines are not.
+        The manager's registers survive the forward observer's zeroing of each
+        streamer's graph counters. Cumulative snapshots may coalesce while the
+        sole pinned slot is in flight. ``final`` runs only after shutdown's GPU
+        barrier; it drains the slot and takes the last register value.
         """
         registers = getattr(self._manager, "_registers", None) or {}
         decode = registers.get("decode")
         if decode is None:
             return None
-        return [int(value) for value in decode["graph_rows"].sum(dim=0).tolist()]
+        source = decode["graph_rows"]
+        if not source.is_cuda:
+            return [int(value) for value in source.sum(dim=0).tolist()], rows
 
-    def _trace_step(self) -> None:
-        """One graph decode step's G and RAM misses into the stream trace (trace runs only)."""
-        from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+        if not final and torch.cuda.is_current_stream_capturing():
+            return None
+        ready = None
+        if self._trace_pending_rows is not None:
+            if final:
+                self._trace_event.synchronize()
+            elif not self._trace_event.query():
+                return None
+            ready = ([int(value) for value in self._trace_snapshot.tolist()], self._trace_pending_rows)
+            self._trace_pending_rows = None
+        if not final:
+            if self._trace_snapshot is None:
+                self._trace_snapshot = torch.empty(2, dtype=torch.int64, pin_memory=True)
+                self._trace_event = torch.cuda.Event(enable_timing=False)
+            self._trace_snapshot.copy_(source.sum(dim=0), non_blocking=True)
+            self._trace_event.record(torch.cuda.current_stream(source.device))
+            self._trace_pending_rows = rows
+        return ready
 
-        trace = get_exl3_stream_trace()
-        if not trace.enabled:
-            return
-        graph = self._graph_rows()
-        if graph is None:
-            return
-        rows = self.host.layer_rows()  # demand rows only: advisory reads are not misses
+    def _record_graph_snapshot(self, trace, graph: list[int], rows: list[int]) -> None:
         # A register reset (discard_graph_capture_routes) moves the totals back: re-baseline.
         if self._trace_graph is not None and graph[0] > self._trace_graph[0]:
             routed = graph[0] - self._trace_graph[0]
-            # A lagged read (see _graph_rows) leaves one step for the next line: count
-            # the steps a line covers from its routed rows (decode graphs are bs 1).
+            # A lagged read can fold multiple bs-1 decode graph steps into one line.
             steps = max(1, round(routed / self.routed_rows_per_step)) if self.routed_rows_per_step else 1
             trace.record_graph_step(
                 layer_rows_delta=[a - b for a, b in zip(rows, self._trace_rows)],
@@ -636,6 +649,24 @@ class Exl3RamMissService:
                 steps=steps,
             )
         self._trace_rows, self._trace_graph = rows, graph
+
+    def _trace_step(self, *, final: bool = False) -> None:
+        """One graph decode step's G and RAM misses into the stream trace (trace runs only)."""
+        from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+        trace = get_exl3_stream_trace()
+        if not trace.enabled:
+            return
+        rows = self.host.layer_rows()  # demand rows only: advisory reads are not misses
+        sample = self._graph_rows(rows, final=final)
+        if sample is not None:
+            self._record_graph_snapshot(trace, *sample)
+        if final and self._trace_snapshot is not None:
+            # The orderly shutdown barrier already finished all graph work. This
+            # last copy captures registers updated after the prior snapshot.
+            registers = self._manager._registers["decode"]
+            final_graph = [int(value) for value in registers["graph_rows"].sum(dim=0).tolist()]
+            self._record_graph_snapshot(trace, final_graph, rows)
 
     def _cuda_active(self) -> bool:
         return torch.cuda.is_available() and torch.cuda.is_initialized()
@@ -720,6 +751,12 @@ class Exl3RamMissService:
                     uncertain = (
                         "process exit: no device barrier is attempted" if at_exit else self._establish_gpu_completion()
                     )
+                if uncertain is None and self._stages_traced:
+                    # host.stop() closes its native handle, so freeze the reader
+                    # between requests before taking its final demand counters.
+                    # The GPU barrier above has retired every demand and lease.
+                    self.host.pause(2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0)
+                    self._trace_step(final=True)
         except BaseException as error:  # noqa: BLE001 - a failure to even close admission is an uncertain state
             uncertain = f"closing admission or the barrier failed: {error!r}"
             if not isinstance(error, Exception):
@@ -785,6 +822,10 @@ class Exl3RamMissService:
                 )
                 if t is not None
             ]
+        if self._trace_snapshot is not None:
+            # A copy can still be writing this pinned block when the device
+            # barrier failed. Keep it alive with the other uncertain buffers.
+            owned.append(self._trace_snapshot)
         for layer_id in sorted(self.tables):
             streamer = self.tables[layer_id].streamer_of()
             tier = getattr(streamer, "pinned_host_cache", None)

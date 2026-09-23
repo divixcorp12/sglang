@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.expert_residency import (
     ExpertResidencyPolicy,
     advance_residency_policies,
     decide_residency_policies,
+    decide_residency_policies_from_host_scores,
 )
 from sglang.srt.layers.moe.expert_residency_clock import (
     ForwardKind,
@@ -986,6 +987,7 @@ class ExpertHotCacheManager:
         promotion_sigmas: float = 0.0,
         graph_gather_max_rows: int = 0,
         async_promotions: bool = False,
+        async_residency_scores: bool = False,
         gpu_residency_update: bool = False,
         gpu_residency_max_promotions: int = 64,
         expert_doorbell: bool = False,
@@ -1248,6 +1250,12 @@ class ExpertHotCacheManager:
         )
         manager.min_residence_forwards = min_residence_forwards
         manager.async_promotions = bool(async_promotions)
+        manager._async_residency_scores = bool(async_residency_scores)
+        manager._async_residency_backend = None
+        manager._async_residency_buffers = None
+        manager._async_residency_event = None
+        manager._async_residency_pending = None
+        manager._async_residency_refresh = None
         manager._inflight_promotions = []
         manager.deferred_residency_updates = 0
         manager.benefit_ratio = benefit_ratio
@@ -1348,6 +1356,10 @@ class ExpertHotCacheManager:
         if gpu_residency_update:
             if not dynamic:
                 raise ValueError("GPU residency update requires dynamic residency")
+            if async_residency_scores:
+                raise ValueError(
+                    "async CPU residency scores cannot run with GPU residency update"
+                )
             from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
 
             manager.gpu_residency = GpuResidencyUpdater(
@@ -1548,6 +1560,13 @@ class ExpertHotCacheManager:
         gets the same treatment: its warmup replay posts and joins a dummy pull
         exactly like a real forward's, so it is purged here too.
         """
+        if getattr(self, "_async_residency_pending", None) is not None:
+            # Capture reset is outside serving. Keep the pinned buffer alive
+            # until its queued D2H copy finishes, then discard both the captured
+            # score decision and any newer boundary waiting to be resampled.
+            self._async_residency_backend.synchronize(self._async_residency_event)
+            self._async_residency_pending = None
+        self._async_residency_refresh = None
         if self._graph_counters is not None:
             self._graph_counters.zero_()
             self._graph_unique_counters.zero_()
@@ -1875,11 +1894,10 @@ class ExpertHotCacheManager:
     def _update_residency(self, boundary_tokens: int | None, mode: str) -> None:
         """Advance every layer's scores, decide together and copy all promotions at once.
 
-        Scores advance by fused launches and are read back once; changed layers
-        stage their slot changes and submit every promoted row behind one
-        transfer ticket. Synchronously the current stream then waits for the
-        copies and the slots are published behind them without blocking the
-        host; with ``async_promotions`` publication waits for a later forward.
+        Scores advance by fused launches. The ordinary path reads them on the
+        host at this boundary; the async path queues a pinned snapshot and
+        applies its decision after a later event query. Promotion copies are
+        ordered behind one transfer ticket in either path.
         """
         clock = self._boundary_clock
         layers = [
@@ -1888,18 +1906,85 @@ class ExpertHotCacheManager:
             if layer_id in self.caches and layer_id in self.residency_policies
         ]
         advance_residency_policies([policy for _, _, policy in layers], boundary_tokens)
+        if getattr(self, "_async_residency_scores", False):
+            if self._async_residency_pending is None:
+                self._enqueue_residency_scores(mode, clock.forwards)
+            else:
+                # Every boundary still advances device scores. A single owned
+                # pinned buffer stays with the earlier copy until it is used;
+                # the later boundary is then resampled from the latest scores.
+                self._async_residency_refresh = (mode, clock.forwards)
+            return
+        self._apply_residency_decisions(layers, mode, clock.forwards)
+
+    def _enqueue_residency_scores(self, mode: str, boundary_forward: int) -> None:
+        policies = [
+            self.residency_policies[layer_id]
+            for layer_id in self._layer_ids
+            if layer_id in self.caches and layer_id in self.residency_policies
+        ]
+        if not policies:
+            return
+        scores = torch.stack([policy._scores for policy in policies])
+        backend = self._async_residency_backend
+        if backend is None:
+            backend = TorchTelemetryBackend({"scores": scores})
+            self._async_residency_backend = backend
+            self._async_residency_buffers = backend.allocate({"scores": scores})
+            self._async_residency_event = backend.event()
+        backend.enqueue(
+            self._async_residency_buffers, {"scores": scores}, self._async_residency_event
+        )
+        self._async_residency_pending = (mode, boundary_forward)
+
+    def _poll_async_residency_scores(self) -> None:
+        pending = self._async_residency_pending
+        if pending is None or not self._async_residency_backend.ready(
+            self._async_residency_event
+        ):
+            return
+        mode, boundary_forward = pending
+        layers = [
+            (layer_id, self.caches[layer_id], self.residency_policies[layer_id])
+            for layer_id in self._layer_ids
+            if layer_id in self.caches and layer_id in self.residency_policies
+        ]
+        score_rows = list(self._async_residency_buffers["scores"].unbind(0))
+        self._async_residency_pending = None
+        self._apply_residency_decisions(layers, mode, boundary_forward, score_rows)
+        self._notify_residency_listeners()
+        refresh = self._async_residency_refresh
+        self._async_residency_refresh = None
+        if refresh is not None:
+            self._enqueue_residency_scores(*refresh)
+
+    def _apply_residency_decisions(
+        self,
+        layers: list[tuple[int, ExpertHotCache, ExpertResidencyPolicy]],
+        mode: str,
+        boundary_forward: int,
+        score_rows: list[torch.Tensor] | None = None,
+    ) -> None:
         deciding = []
-        for layer in layers:
+        deciding_scores = []
+        for position, layer in enumerate(layers):
             layer_id, cache, _ = layer
-            if clock.forwards - self._last_update[layer_id] < self.min_residence_forwards:
+            if boundary_forward - self._last_update[layer_id] < self.min_residence_forwards:
                 continue
             if cache.promotion_in_flight is not None:
                 self.deferred_residency_updates += 1
                 continue
             deciding.append(layer)
-        decisions = decide_residency_policies(
-            [policy for _, _, policy in deciding],
-            [cache.resident_experts() for _, cache, _ in deciding],
+            if score_rows is not None:
+                deciding_scores.append(score_rows[position])
+        policies = [policy for _, _, policy in deciding]
+        residents = [cache.resident_experts() for _, cache, _ in deciding]
+        decisions = (
+            decide_residency_policies(policies, residents)
+            if score_rows is None
+            else decide_residency_policies_from_host_scores(
+                policies, residents, deciding_scores
+            )
         )
         staged = []
         try:
@@ -1910,7 +1995,7 @@ class ExpertHotCacheManager:
                 update, promotion = cache.stage_reassign(
                     decision.desired_experts, publish=self.async_promotions
                 )
-                self._last_update[layer_id] = clock.forwards
+                self._last_update[layer_id] = boundary_forward
                 if promotion is None:
                     self._record_update(layer_id, update, mode)
                 else:
@@ -2658,6 +2743,8 @@ class ExpertHotCacheManager:
             return
         if self._inflight_promotions:
             self._publish_completed_promotions(wait=False)
+        if getattr(self, "_async_residency_scores", False):
+            self._poll_async_residency_scores()
         counts = single_pass_data.get("global_physical_count")
         if counts is None:
             return
@@ -2732,7 +2819,8 @@ class ExpertHotCacheManager:
             )
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
-            self._notify_residency_listeners()
+            if not getattr(self, "_async_residency_scores", False):
+                self._notify_residency_listeners()
         if clock.forwards % self.log_interval == 0:
             self._schedule_trace(mode)
             self._log_doorbell()

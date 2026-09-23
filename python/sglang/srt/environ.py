@@ -400,6 +400,9 @@ class Envs:
     # Return from a residency boundary once promotion copies are submitted and
     # publish the promoted slots on a later forward after the copies complete.
     SGLANG_MOE_HOT_ASYNC_PROMOTIONS = EnvBool(False)
+    # Copy CPU-policy scores to a pinned host buffer at residency boundaries
+    # and apply decisions only after a nonblocking CUDA event query succeeds.
+    SGLANG_MOE_ASYNC_RESIDENCY_SCORES = EnvBool(False)
     # Run the decode residency update as device ops inside the captured decode
     # graph; requires SGLANG_MOE_HOT_DYNAMIC and SGLANG_MOE_EXPERT_GRAPH_GATHER.
     SGLANG_MOE_GPU_RESIDENCY_UPDATE = EnvBool(False)

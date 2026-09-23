@@ -472,14 +472,45 @@ def decide_residency_policies(
             .numpy()
             .astype(np.float64)
         )
-        order = np.argsort(-scores, axis=1, kind="stable")
-        rank = np.empty_like(order)
-        np.put_along_axis(rank, order, np.arange(order.shape[1]), axis=1)
-        for row, (score_values, ranked, ranks) in enumerate(
-            zip(scores.tolist(), order.tolist(), rank.tolist())
-        ):
-            position = positions[row]
-            decisions[position] = policies[position]._decide_from_host(
-                score_values, ranked, ranks, residents[position]
+        group_decisions = decide_residency_policies_from_host_scores(
+            [policies[position] for position in positions],
+            [residents[position] for position in positions],
+            [scores[row] for row in range(len(positions))],
+        )
+        for position, decision in zip(positions, group_decisions):
+            decisions[position] = decision
+    return decisions
+
+
+def decide_residency_policies_from_host_scores(
+    policies: Sequence[ExpertResidencyPolicy],
+    resident_experts: Sequence[Iterable[int]],
+    host_scores: Sequence[torch.Tensor | np.ndarray],
+) -> list[ResidencyDecision]:
+    """Decide from an already-completed CPU snapshot, without reading the device.
+
+    The resident sets are sampled when this function runs. A score copy may
+    finish after another slot update; using the current residents prevents a
+    stale snapshot from evicting or preserving a slot by an outdated mapping.
+    """
+    if not len(policies) == len(resident_experts) == len(host_scores):
+        raise ValueError("each policy needs one resident set and host score row")
+    decisions = []
+    for policy, residents, row in zip(policies, resident_experts, host_scores):
+        if isinstance(row, torch.Tensor):
+            if row.device.type != "cpu":
+                raise ValueError("score snapshots must already be on the CPU")
+            values = row.numpy().astype(np.float64, copy=False)
+        else:
+            values = np.asarray(row, dtype=np.float64)
+        if values.shape != (policy.num_experts,):
+            raise ValueError("score snapshot shape does not match policy")
+        ranked = np.argsort(-values, kind="stable")
+        inverse = np.empty_like(ranked)
+        inverse[ranked] = np.arange(policy.num_experts)
+        decisions.append(
+            policy._decide_from_host(
+                values.tolist(), ranked.tolist(), inverse.tolist(), residents
             )
+        )
     return decisions
