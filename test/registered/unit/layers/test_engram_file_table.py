@@ -140,6 +140,75 @@ def test_native_store_packed_rows_cold_warm_and_eviction(table):
     assert store.stats()["evictions"] > 0
 
 
+# A row per 4 KiB page, so the page count equals the row count and the arithmetic below
+# is readable. 4200 rows is 16.4 MiB of weight pages, just past the 16 MiB bounce buffer.
+WIDE_DIM, WIDE_ROWS = 4096, 4200
+
+
+@pytest.fixture
+def wide_table(tmp_path):
+    torch.manual_seed(0)
+    weight = (torch.randn(WIDE_ROWS, WIDE_DIM) * 4).to(torch.float8_e4m3fn)
+    scale = torch.randint(
+        118, 130, (WIDE_ROWS, WIDE_DIM // BLOCK), dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
+    _write(
+        tmp_path / "model-00047-of-00048.safetensors",
+        {
+            "layers.1.engram.embed.weight": ("F8_E4M3", weight),
+            "layers.1.engram.embed.scale": ("F8_E8M0", scale),
+        },
+    )
+    return tmp_path, weight, scale
+
+
+def test_a_lookup_larger_than_the_bounce_buffer_is_chunked_not_refused(wide_table):
+    # Before this was chunked, one request had to fit every miss in the fixed 16 MiB
+    # bounce buffer or return -E2BIG. That is a batch-1 decode assumption: eager layer 14
+    # drives this same store with prefill-sized batches, and on 2026-09-22 the overflow
+    # surfaced as "Engram io_uring lookup failed: -7" and killed the scheduler mid-warmup.
+    directory, *_ = wide_table
+    file_table = EngramFileTable(
+        str(directory / "model-00047-of-00048.safetensors"),
+        "layers.1.engram.embed.weight",
+        "layers.1.engram.embed.scale",
+        WIDE_ROWS,
+        WIDE_DIM,
+    )
+    store = _create_native_store(file_table, capacity_rows=WIDE_ROWS)
+    ids = np.arange(WIDE_ROWS, dtype=np.int64)
+    assert WIDE_ROWS * WIDE_DIM > (16 << 20), "fixture no longer overflows the buffer"
+
+    packed = store.lookup(ids, file_table._tag)
+
+    expected = np.concatenate((file_table.weight[ids], file_table.scale[ids]), axis=1)
+    assert np.array_equal(packed, expected)
+    stats = store.stats()
+    # The point of the test: it took more than one pass, and every pass stayed in budget.
+    assert stats["read_chunks"] > 1, stats["read_chunks"]
+    assert stats["bounce_bytes_peak"] <= stats["bounce_bytes_allocated"]
+    assert stats["unique_misses"] == WIDE_ROWS
+
+
+def test_chunking_still_serves_a_request_that_fits_in_one_pass(table):
+    # The small path must not regress into needless splitting.
+    directory, *_ = table
+    file_table = EngramFileTable(
+        str(directory / "model-00047-of-00048.safetensors"),
+        "layers.1.engram.embed.weight",
+        "layers.1.engram.embed.scale",
+        ROWS,
+        DIM,
+    )
+    store = _create_native_store(file_table, capacity_rows=ROWS)
+    ids = np.arange(8, dtype=np.int64)
+    got = store.lookup(ids, file_table._tag)
+    assert np.array_equal(
+        got, np.concatenate((file_table.weight[ids], file_table.scale[ids]), axis=1)
+    )
+    assert store.stats()["read_chunks"] == 1
+
+
 def test_native_host_node_truncated_file_fails_closed(table, tmp_path):
     directory, *_ = table
     path = str(directory / "model-00047-of-00048.safetensors")

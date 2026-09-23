@@ -60,6 +60,7 @@ struct Counters {
   uint64_t queue_wait_ns=0, worker_wait_ns=0;
   uint64_t evictions=0, filled_rows=0;
   uint64_t bounce_bytes_peak=0;
+  uint64_t chunks=0;  // read passes; >1 means a request outgrew the bounce buffer
   int64_t pinned_staging_bytes=0, device_staging_bytes=0;
 };
 
@@ -104,6 +105,7 @@ class Store {
     d["evictions"]=stats_.evictions; d["filled_rows"]=stats_.filled_rows;
     d["bounce_bytes_peak"]=stats_.bounce_bytes_peak;
     d["bounce_bytes_allocated"]=kBounceBytes;
+    d["read_chunks"]=stats_.chunks;
     d["pinned_staging_bytes"]=stats_.pinned_staging_bytes;
     d["device_staging_bytes"]=stats_.device_staging_bytes;
     d["lookups"]=clock_; d["hit_rate"]=stats_.accesses?double(stats_.hits)/stats_.accesses:0.0;
@@ -207,111 +209,132 @@ class Store {
     }
     if(!misses.empty()) {
       stats_.unique_misses+=misses.size(); int fd=get_fd(t.path); if(fd<0) return fd;
-      // Resolve miss rows to distinct 4 KiB pages; O_DIRECT extents are aligned.
-      std::map<uint64_t,PageRun> pages;
-      for(size_t i=0;i<misses.size();i++) {
+      // The 4 KiB pages one miss row needs; O_DIRECT extents are aligned.
+      auto for_each_page=[&](int64_t id,auto&& fn){
         auto add_range=[&](uint64_t off,uint64_t length){
           uint64_t first=off&~uint64_t(4095), last=(off+length-1)&~uint64_t(4095);
-          for(uint64_t p=first;;p+=4096){pages.emplace(p,PageRun{p,1,nullptr,0});if(p==last)break;}
+          for(uint64_t p=first;;p+=4096){fn(p);if(p==last)break;}
         };
-        add_range(t.weight_offset+misses[i]*t.dim,t.dim);
-        add_range(t.scale_offset+misses[i]*t.scale_dim,t.scale_dim);
-      }
-      std::vector<uint64_t> pvec; for(auto& [p,v]:pages) pvec.push_back(p);
-      std::vector<PageRun> runs;
-      for(uint64_t p:pvec) { if(!runs.empty()&&runs.back().page+runs.back().pages*4096==p)runs.back().pages++; else runs.push_back(PageRun{p,1,nullptr,0}); }
-      uint64_t bounce_bytes=0; for(const auto& run:runs) bounce_bytes+=run.pages*4096;
-      stats_.bounce_bytes_peak=std::max(stats_.bounce_bytes_peak,bounce_bytes);
-      if(bounce_bytes>kBounceBytes) return -E2BIG;
-      size_t bounce_used=0;
-      for(auto& run:runs) {
-        run.buf=bounce_+bounce_used;
-        bounce_used+=run.pages*4096;
-      }
-      int err=0;
-      constexpr size_t kBatchRuns=96;
-      for(size_t begin=0;!err&&begin<runs.size();) {
-        const size_t end=std::min(runs.size(),begin+kBatchRuns);
-        size_t prepared=0;
-        for(size_t i=begin;i<end;i++) {
-          auto& run=runs[i]; io_uring_sqe* sqe=io_uring_get_sqe(&ring_);
-          if(!sqe) { err=-ENOBUFS; break; }
-          io_uring_prep_read(sqe,fd,run.buf,run.pages*4096,run.page);
-          io_uring_sqe_set_data64(sqe,reinterpret_cast<uint64_t>(&run)); stats_.sqes++; ++prepared;
-        }
-        if(err) { drain(prepared); break; }
-        int submitted=submit_pending(&ring_);
-        if(submitted<0) { drain(end-begin); err=submitted; break; }
-        for(size_t i=begin;i<end;i++) {
-          io_uring_cqe* cqe=nullptr; int rc=wait_cqe_intr(&ring_,&cqe);
-          if(rc<0) { drain(end-i); err=rc; break; }
-          auto* run=reinterpret_cast<PageRun*>(io_uring_cqe_get_data64(cqe));
-          run->result=cqe->res; stats_.cqes++;
-          if(cqe->res>0) stats_.direct_bytes+=cqe->res;
-          else if(cqe->res!=-EINTR&&cqe->res!=-EAGAIN) err=cqe->res;
-          io_uring_cqe_seen(&ring_,cqe);
-        }
-        // A short aligned completion can be resumed. EINTR/EAGAIN retries the
-        // unchanged aligned extent. A non-aligned tail is accepted only if all
-        // requested row bytes lie inside the bytes returned by the kernel.
-        for(size_t i=begin;!err&&i<end;i++) {
-          auto& run=runs[i]; const size_t expected=run.pages*4096;
-          size_t completed=run.result>0?static_cast<size_t>(run.result):0;
-          unsigned attempts=0;
-          while((run.result==-EINTR||run.result==-EAGAIN||
-                 (completed>0&&completed<expected&&completed%4096==0))&&attempts++<8) {
-            size_t remain=expected-completed;
-            auto* buffer=static_cast<uint8_t*>(run.buf)+completed;
-            uint64_t offset=run.page+completed;
-            io_uring_sqe* sqe=io_uring_get_sqe(&ring_); if(!sqe) {err=-ENOBUFS;break;}
-            io_uring_prep_read(sqe,fd,buffer,remain,offset);
-            io_uring_sqe_set_data64(sqe,reinterpret_cast<uint64_t>(&run)); stats_.sqes++;
-            int submitted_retry=submit_pending(&ring_);
-            if(submitted_retry<0) {drain(1);err=submitted_retry;break;}
-            io_uring_cqe* cqe=nullptr; int rc=wait_cqe_intr(&ring_,&cqe);
-            if(rc<0) {drain(1);err=rc;break;}
-            int result=cqe->res; stats_.cqes++; if(result>0) stats_.direct_bytes+=result;
-            io_uring_cqe_seen(&ring_,cqe);
-            if(result==-EINTR||result==-EAGAIN) {run.result=result;continue;}
-            if(result<0) {err=result;break;}
-            if(result==0) {run.result=static_cast<int>(completed);break;}
-            completed+=static_cast<size_t>(result); run.result=static_cast<int>(completed);
-            if(static_cast<size_t>(result)<remain && static_cast<size_t>(result)%4096!=0) break;
-          }
-          if(!err&&(run.result==-EINTR||run.result==-EAGAIN)) err=run.result;
-        }
-        begin=end;
-      }
-      if(err) return err;
-      auto find_run=[&](uint64_t p)->PageRun* {
-        auto it=std::upper_bound(runs.begin(),runs.end(),p,[](uint64_t page,const PageRun& run){return page<run.page;});
-        if(it==runs.begin())return nullptr; --it;
-        return p<it->page+it->pages*4096?&*it:nullptr;
+        add_range(t.weight_offset+id*t.dim,t.dim);
+        add_range(t.scale_offset+id*t.scale_dim,t.scale_dim);
       };
-      for(size_t j=0;j<misses.size();j++) {
-        int64_t id=misses[j]; uint8_t* dst=q.out+miss_positions[j][0]*rb;
-        uint64_t wo=t.weight_offset+id*t.dim, so=t.scale_offset+id*t.scale_dim;
-        auto scatter=[&](uint64_t off,size_t len,uint8_t* out)->bool {
-          size_t done=0;
-          while(done<len) {
-            const uint64_t pos=off+done,page=pos&~uint64_t(4095);
-            PageRun* run=find_run(page); if(!run)return false;
-            const size_t within=pos-page,run_offset=page-run->page+within;
-            if(run_offset>=static_cast<size_t>(std::max(run->result,0)))return false;
-            const size_t available=static_cast<size_t>(run->result)-run_offset;
-            const size_t take=std::min({len-done,size_t(4096-within),available});
-            if(!take)return false;
-            memcpy(out+done,static_cast<uint8_t*>(run->buf)+run_offset,take); done+=take;
+      // One chunk's reads must fit the fixed bounce buffer, so a request whose misses do
+      // not all fit is split into several chunks rather than refused. Reading every miss
+      // in one pass was a batch-1 decode assumption: eager layer 14 drives this same
+      // store with prefill-sized batches, which overflowed the buffer, returned -E2BIG
+      // and killed the scheduler (2026-09-22). A single row too large for the whole
+      // buffer is still refused, because no chunking can make that one fit.
+      for(size_t chunk_begin=0;chunk_begin<misses.size();) {
+        std::map<uint64_t,PageRun> pages;
+        uint64_t chunk_bytes=0;
+        size_t chunk_end=chunk_begin;
+        while(chunk_end<misses.size()) {
+          std::vector<uint64_t> row_pages;
+          for_each_page(misses[chunk_end],[&](uint64_t p){row_pages.push_back(p);});
+          // A row's weight and scale ranges can share a page, so dedupe before costing it.
+          std::sort(row_pages.begin(),row_pages.end());
+          row_pages.erase(std::unique(row_pages.begin(),row_pages.end()),row_pages.end());
+          uint64_t added=0; for(uint64_t p:row_pages) if(!pages.count(p)) added+=4096;
+          if(chunk_bytes+added>kBounceBytes) { if(chunk_end==chunk_begin) return -E2BIG; break; }
+          for(uint64_t p:row_pages) if(pages.emplace(p,PageRun{p,1,nullptr,0}).second) chunk_bytes+=4096;
+          ++chunk_end;
+        }
+        stats_.bounce_bytes_peak=std::max(stats_.bounce_bytes_peak,chunk_bytes);
+        stats_.chunks++;
+        std::vector<uint64_t> pvec; for(auto& [p,v]:pages) pvec.push_back(p);
+        std::vector<PageRun> runs;
+        for(uint64_t p:pvec) { if(!runs.empty()&&runs.back().page+runs.back().pages*4096==p)runs.back().pages++; else runs.push_back(PageRun{p,1,nullptr,0}); }
+        size_t bounce_used=0;
+        for(auto& run:runs) {
+          run.buf=bounce_+bounce_used;
+          bounce_used+=run.pages*4096;
+        }
+        int err=0;
+        constexpr size_t kBatchRuns=96;
+        for(size_t begin=0;!err&&begin<runs.size();) {
+          const size_t end=std::min(runs.size(),begin+kBatchRuns);
+          size_t prepared=0;
+          for(size_t i=begin;i<end;i++) {
+            auto& run=runs[i]; io_uring_sqe* sqe=io_uring_get_sqe(&ring_);
+            if(!sqe) { err=-ENOBUFS; break; }
+            io_uring_prep_read(sqe,fd,run.buf,run.pages*4096,run.page);
+            io_uring_sqe_set_data64(sqe,reinterpret_cast<uint64_t>(&run)); stats_.sqes++; ++prepared;
           }
-          return true;
+          if(err) { drain(prepared); break; }
+          int submitted=submit_pending(&ring_);
+          if(submitted<0) { drain(end-begin); err=submitted; break; }
+          for(size_t i=begin;i<end;i++) {
+            io_uring_cqe* cqe=nullptr; int rc=wait_cqe_intr(&ring_,&cqe);
+            if(rc<0) { drain(end-i); err=rc; break; }
+            auto* run=reinterpret_cast<PageRun*>(io_uring_cqe_get_data64(cqe));
+            run->result=cqe->res; stats_.cqes++;
+            if(cqe->res>0) stats_.direct_bytes+=cqe->res;
+            else if(cqe->res!=-EINTR&&cqe->res!=-EAGAIN) err=cqe->res;
+            io_uring_cqe_seen(&ring_,cqe);
+          }
+          // A short aligned completion can be resumed. EINTR/EAGAIN retries the
+          // unchanged aligned extent. A non-aligned tail is accepted only if all
+          // requested row bytes lie inside the bytes returned by the kernel.
+          for(size_t i=begin;!err&&i<end;i++) {
+            auto& run=runs[i]; const size_t expected=run.pages*4096;
+            size_t completed=run.result>0?static_cast<size_t>(run.result):0;
+            unsigned attempts=0;
+            while((run.result==-EINTR||run.result==-EAGAIN||
+                   (completed>0&&completed<expected&&completed%4096==0))&&attempts++<8) {
+              size_t remain=expected-completed;
+              auto* buffer=static_cast<uint8_t*>(run.buf)+completed;
+              uint64_t offset=run.page+completed;
+              io_uring_sqe* sqe=io_uring_get_sqe(&ring_); if(!sqe) {err=-ENOBUFS;break;}
+              io_uring_prep_read(sqe,fd,buffer,remain,offset);
+              io_uring_sqe_set_data64(sqe,reinterpret_cast<uint64_t>(&run)); stats_.sqes++;
+              int submitted_retry=submit_pending(&ring_);
+              if(submitted_retry<0) {drain(1);err=submitted_retry;break;}
+              io_uring_cqe* cqe=nullptr; int rc=wait_cqe_intr(&ring_,&cqe);
+              if(rc<0) {drain(1);err=rc;break;}
+              int result=cqe->res; stats_.cqes++; if(result>0) stats_.direct_bytes+=result;
+              io_uring_cqe_seen(&ring_,cqe);
+              if(result==-EINTR||result==-EAGAIN) {run.result=result;continue;}
+              if(result<0) {err=result;break;}
+              if(result==0) {run.result=static_cast<int>(completed);break;}
+              completed+=static_cast<size_t>(result); run.result=static_cast<int>(completed);
+              if(static_cast<size_t>(result)<remain && static_cast<size_t>(result)%4096!=0) break;
+            }
+            if(!err&&(run.result==-EINTR||run.result==-EAGAIN)) err=run.result;
+          }
+          begin=end;
+        }
+        if(err) return err;
+        auto find_run=[&](uint64_t p)->PageRun* {
+          auto it=std::upper_bound(runs.begin(),runs.end(),p,[](uint64_t page,const PageRun& run){return page<run.page;});
+          if(it==runs.begin())return nullptr; --it;
+          return p<it->page+it->pages*4096?&*it:nullptr;
         };
-        if(!scatter(wo,t.dim,dst)||!scatter(so,t.scale_dim,dst+t.dim))return -EIO;
-        int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_,base=set*ways_,way=ways_;
-        for(size_t w=0;w<ways_;w++)if(tags_[base+w]==key){way=w;break;}
-        if(way==ways_) way=std::min_element(ages_.begin()+base,ages_.begin()+base+ways_)-(ages_.begin()+base);
-        if(tags_[base+way]<0)stats_.filled_rows++;else stats_.evictions++;
-        tags_[base+way]=key; ages_[base+way]=clock_; memcpy(data_+(base+way)*rb,dst,rb);
-        for(size_t k=1;k<miss_positions[j].size();k++) memcpy(q.out+miss_positions[j][k]*rb,dst,rb);
+        for(size_t j=chunk_begin;j<chunk_end;j++) {
+          int64_t id=misses[j]; uint8_t* dst=q.out+miss_positions[j][0]*rb;
+          uint64_t wo=t.weight_offset+id*t.dim, so=t.scale_offset+id*t.scale_dim;
+          auto scatter=[&](uint64_t off,size_t len,uint8_t* out)->bool {
+            size_t done=0;
+            while(done<len) {
+              const uint64_t pos=off+done,page=pos&~uint64_t(4095);
+              PageRun* run=find_run(page); if(!run)return false;
+              const size_t within=pos-page,run_offset=page-run->page+within;
+              if(run_offset>=static_cast<size_t>(std::max(run->result,0)))return false;
+              const size_t available=static_cast<size_t>(run->result)-run_offset;
+              const size_t take=std::min({len-done,size_t(4096-within),available});
+              if(!take)return false;
+              memcpy(out+done,static_cast<uint8_t*>(run->buf)+run_offset,take); done+=take;
+            }
+            return true;
+          };
+          if(!scatter(wo,t.dim,dst)||!scatter(so,t.scale_dim,dst+t.dim))return -EIO;
+          int64_t key=id+t.tag; size_t set=static_cast<uint64_t>(key)%nsets_,base=set*ways_,way=ways_;
+          for(size_t w=0;w<ways_;w++)if(tags_[base+w]==key){way=w;break;}
+          if(way==ways_) way=std::min_element(ages_.begin()+base,ages_.begin()+base+ways_)-(ages_.begin()+base);
+          if(tags_[base+way]<0)stats_.filled_rows++;else stats_.evictions++;
+          tags_[base+way]=key; ages_[base+way]=clock_; memcpy(data_+(base+way)*rb,dst,rb);
+          for(size_t k=1;k<miss_positions[j].size();k++) memcpy(q.out+miss_positions[j][k]*rb,dst,rb);
+        }
+        chunk_begin=chunk_end;
       }
     }
     if(q.status) *q.status=0; return 0;
