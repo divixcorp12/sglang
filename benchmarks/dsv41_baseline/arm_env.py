@@ -66,6 +66,21 @@ SERVER_CORES = "0-7,16-17,36-53"
 DRIVER_CORES = "8-15"
 FREE_CORES = "64-71"  # never touched; core 71 is production's doorbell spin core.
 
+# Host-memory budget, resized 2026-09-22. The server's threads all sit on NUMA node 0
+# (see SERVER_CORES), so the pinned buffer plus the weights must fit in node 0's free
+# memory -- the whole box's free memory is the wrong number to reason with. Node 0 had
+# 66619 MiB free immediately before a launch on 2026-09-22, and the previous 71680 MiB
+# pinned budget alone already exceeded that, so the arm exhausted node 0 (down to
+# 0.77 GB free) and spun in direct compaction instead of starting. 50 GiB leaves room
+# for the ~10 GiB of weights and slack.
+#
+# This is a recorded constant of the measured recipe. An arm run at this size is NOT
+# comparable to the 2.741 / 2.102 cells, which were measured at 71680 MiB; a valid A/B
+# needs both of its arms run at the same value.
+PINNED_HOST_MB = "51200"  # 50 GiB
+NODE0_FREE_MIB = 66619  # measured 2026-09-22 19:04, before an arm launched
+WEIGHTS_AND_OVERHEAD_MIB = 12288  # ~9.94 GiB of weights, plus slack
+
 HEALTH_TIMEOUT_S = 900  # /health runs a real generation; slow cold. Never shorten this.
 
 
@@ -87,7 +102,7 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_ROW_SOURCE": "shards",
         "SGLANG_MOE_EXPERT_MIRROR_DIRS": EXPERT_MIRROR_DIRS,
         "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
-        "SGLANG_MOE_PINNED_HOST_MB": "71680",
+        "SGLANG_MOE_PINNED_HOST_MB": PINNED_HOST_MB,
         "SGLANG_MOE_HOT_GPU_MB": "14336",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",

@@ -118,6 +118,15 @@ Which cell depends on mirroring, which is **on by default** since 2026-09-22:
 | default (mirrors on, leases off) | **2.741** | 2.775 |
 | `SGLANG_MOE_EXPERT_MIRROR_DIRS=` (mirrors off) | **2.102** | 2.003 |
 
+> **Stale as of 2026-09-22: both cells were measured at `SGLANG_MOE_PINNED_HOST_MB=71680`,
+> and the harness now runs 51200.** The old budget could no longer start on divix01 — the
+> pinned buffer alone exceeded NUMA node 0's free memory, so the server exhausted node 0
+> and spun in direct compaction until the 900s abort (three arms lost this way; see
+> `analysis/engram-sync/HANG-FINDINGS.md`). Host pinning is a recorded constant of the
+> recipe, so an arm run at 51200 is **not** comparable to these numbers. Re-baseline the
+> cell you need at the current budget before reading any delta against it, and make sure
+> both arms of an A/B share one value.
+
 Do **not** compare a served-path arm against §19's 3.905-3.933 or §17's 2.781. Those are
 Engine-path cells, and the served path sits at a consistent 0.69-0.71 fraction of them
 for reasons not yet explained (§20) — an offset that is present with mirrors both on and

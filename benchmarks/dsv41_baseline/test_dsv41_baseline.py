@@ -924,3 +924,23 @@ def test_run_arm_pins_the_server_with_arm_envs_core_list_not_a_literal():
     assert len(launch) == 1, launch
     assert 'taskset -c "$server_cores"' in launch[0], launch[0]
     assert "arm_env.SERVER_CORES" in script
+
+
+# --- arm_env: the pinned host buffer must fit in node 0, not in the whole box ---
+
+
+def test_base_env_uses_the_declared_pinned_host_budget():
+    assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_MB"] == arm_env.PINNED_HOST_MB
+
+
+def test_pinned_buffer_and_weights_fit_in_node_0s_free_memory():
+    # The arithmetic that was skipped on 2026-09-22: at 71680 MiB the pinned buffer
+    # ALONE exceeded node 0's 66619 MiB free, so the arm could never have started. It
+    # exhausted node 0 to 0.77 GB and spun in direct compaction for the full 900s.
+    need = int(arm_env.PINNED_HOST_MB) + arm_env.WEIGHTS_AND_OVERHEAD_MIB
+    assert need <= arm_env.NODE0_FREE_MIB, f"needs {need} MiB, node 0 has {arm_env.NODE0_FREE_MIB}"
+
+
+def test_the_pinned_budget_is_not_silently_the_old_unbootable_value():
+    # Guards the specific regression: 71680 is the value that cannot start on this box.
+    assert int(arm_env.PINNED_HOST_MB) != 71680
