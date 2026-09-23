@@ -322,8 +322,9 @@ the Qwen campaign's split, and caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 - `report_builder.py` — shapes this campaign's HTTP results into the report schema
   `task1_arm_verdict`'s functions expect; documents the one field (`step_latency`)
   that is honestly unavailable rather than faked, and the server-provenance ceiling.
-- `verdict.py` — judges one arm by calling Task 1's `check_arm`/`check_cache`/
-  `contention`/`generation`/`session_outliers`/`cross_arm_outliers` (imported, never reimplemented)
+- `verdict.py` — judges one arm by calling Task 1's `check_arm`, `check_timed_phase`,
+  `boot_growth`, `contention`, `generation`, `session_outliers`, and `cross_arm_outliers`
+  (imported, never reimplemented)
   plus this campaign's two additions (compile-contamination, the clock-readiness
   note), each labeled as absent from Task 1's own checks and why it was added.
 - `run_arm.sh` — preflight (clean tree, optionally pinned to `EXPECT_SHA`), the
@@ -432,16 +433,14 @@ absent.** Two things closed part of the gap without substituting into that field
    two arms' decode tok/s per session (`arm_env.ServerArgs.decode_log_interval`, opt-in,
    off by default) — written for the team lead to run, not run here.
 
-**Whole-arm, not per-session, page-cache residency — wired in.** Task 1's finer
-per-session residency check (`phase_residency`/`check_timed_phase`) comes from
-instrumentation inside `trace_corpus.py` that has no HTTP equivalent (the server is a
-separate process). `run_arm.sh` instead samples `provenance.resident_bytes()`
-externally at three boundaries (before the server starts, once it's ready, after the
-timed set); `verdict.residency_cache_dict()` reshapes those into the
-`{dir: bytes}`-before/after form `task1_arm_verdict.check_cache()` — Task 1's own
-coarser, whole-arm variant, called unmodified — expects. On a storage campaign, an
-arm that cannot show it read from disk is not evidence; this check is now part of
-every verdict, not an unwired README promise.
+**Timed-phase page-cache residency — wired in.** `run_arm.sh` samples
+`provenance.resident_bytes()` externally before the server starts, once it is ready,
+and after the timed set. `verdict.residency_cache_dict()` maps these to Task 1's
+`before`/`ready`/`last` phase shape. Task 1's unmodified `check_timed_phase()` gates
+growth from server ready through the timed sessions; `boot_growth()` records startup
+growth separately in verdict notes. Sampling is whole timed set rather than per
+session, because the HTTP server is a separate process. A missing directory or any
+missing boundary is an unacknowledged verdict problem.
 
 **Server-side provenance is capped at `/proc/<pid>/environ`, named explicitly** in
 every report (`report["provenance"]["server_provenance_ceiling"]`), per the same

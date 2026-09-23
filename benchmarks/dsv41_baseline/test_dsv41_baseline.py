@@ -582,8 +582,11 @@ class _FakeTask1Verdict:
     def check_arm(self, report, *, root, head, mirror, traced, sessions=4):
         return list(self._problems), list(self._notes)
 
-    def check_cache(self, cache):
+    def check_timed_phase(self, phases):
         return []
+
+    def boot_growth(self, phases):
+        return {d: phases["ready"][d] - phases["before"][d] for d in phases["ready"]}
 
     def contention(self, report):
         return self._contended
@@ -601,6 +604,8 @@ class _FakeTask1Verdict:
 def _sample_report(*, compiled_during_session=(False, False)):
     return {
         "provenance": {"git": {"head": "abc"}, "sglang_env": dict(SERVER_ENV)},
+        "residency": {"dir": "/d", "before_server": 1, "server_ready": 1,
+                      "after_timed_set": 1},
         "per_session": [
             {"session_id": f"s{i}", "clock_sm_start_mhz": 2570, "compiled_during_session": c, "compile_events": int(c)}
             for i, c in enumerate(compiled_during_session)
@@ -797,36 +802,78 @@ def test_merge_sessions_tolerates_missing_chunk_times():
     assert "unavailable" in merged["client_inter_token_latency_s"]
 
 
-# --- verdict.py: check_cache (Task 1's own whole-arm residency check) wired in ---
+# --- verdict.py: Task 1's timed-phase residency check wired in ---
 
 
 def test_residency_cache_dict_reshapes_this_campaigns_residency_section():
     report = {"residency": {"dir": "/mnt/nvme2/x", "before_server": 100, "server_ready": 100, "after_timed_set": 105}}
     cache = verdict.residency_cache_dict(report)
-    assert cache == {
-        "expert_resident_by_dir_before": {"/mnt/nvme2/x": 100},
-        "expert_resident_by_dir_after": {"/mnt/nvme2/x": 105},
-    }
+    assert cache == {"before": {"/mnt/nvme2/x": 100},
+                     "ready": {"/mnt/nvme2/x": 100},
+                     "last": {"/mnt/nvme2/x": 105}}
 
 
 def test_residency_cache_dict_none_when_no_residency_section():
     assert verdict.residency_cache_dict({}) is None
     assert verdict.residency_cache_dict({"residency": {"dir": None}}) is None
+    assert verdict.residency_cache_dict({"residency": {"dir": "/d", "before_server": 1,
+                                                       "after_timed_set": 2}}) is None
 
 
-def test_judge_calls_check_cache_when_residency_is_present():
+def test_judge_calls_task1_timed_phase_with_ready_and_last():
     report = _sample_report()
-    report["residency"] = {"dir": "/d", "before_server": 1, "server_ready": 1, "after_timed_set": 2}
+    report["residency"] = {"dir": "/d", "before_server": 1, "server_ready": 2, "after_timed_set": 2}
     calls = []
 
     class FakeWithCache(_FakeTask1Verdict):
-        def check_cache(self, cache):
-            calls.append(cache)
-            return ["FAKE residency problem"]
+        def check_timed_phase(self, phases):
+            calls.append(phases)
+            return []
 
     result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=FakeWithCache())
-    assert calls == [{"expert_resident_by_dir_before": {"/d": 1}, "expert_resident_by_dir_after": {"/d": 2}}]
-    assert "FAKE residency problem" in result["unacknowledged_problems"]
+    assert calls == [{"before": {"/d": 1}, "ready": {"/d": 2}, "last": {"/d": 2}}]
+    assert not result["unacknowledged_problems"]
+    assert any("startup" in note for note in result["notes"])
+
+
+def test_judge_gates_timed_growth_not_startup_growth():
+    report = _sample_report()
+    report["residency"] = {"dir": "/d", "before_server": 1, "server_ready": 3 << 30,
+                            "after_timed_set": 3 << 30}
+    task1 = task1_verdict.load_task1_verdict(
+        path=os.path.join(os.path.dirname(__file__), "..", "..", "analysis", "dsv41-drive",
+                          "task1_arm_verdict.py")
+    )
+
+    class TimedGate(_FakeTask1Verdict):
+        def check_timed_phase(self, phases):
+            return task1.check_timed_phase(phases)
+
+    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=TimedGate())
+    assert not result["unacknowledged_problems"]
+
+    report["residency"]["after_timed_set"] += 2 << 30
+    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=TimedGate())
+    assert any("during the timed sessions" in problem for problem in result["unacknowledged_problems"])
+
+
+@pytest.mark.parametrize("residency", [
+    None,
+    {"before_server": 1, "server_ready": 2, "after_timed_set": 2},
+    {"dir": "/d", "server_ready": 2, "after_timed_set": 2},
+    {"dir": "/d", "before_server": 1, "after_timed_set": 2},
+    {"dir": "/d", "before_server": 1, "server_ready": 2, "after_timed_set": None},
+])
+def test_judge_missing_residency_sample_is_unacknowledged_problem(residency):
+    report = _sample_report()
+    if residency is None:
+        del report["residency"]
+    else:
+        report["residency"] = residency
+    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False,
+                           task1_module=_FakeTask1Verdict())
+    assert any("residency" in problem for problem in result["unacknowledged_problems"])
+    assert not result["valid_except_acknowledged_gaps"]
 
 
 # --- arm_env.ServerArgs: decode_log_interval is opt-in, off by default ---

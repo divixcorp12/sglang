@@ -1,6 +1,7 @@
 """Judge one HTTP-driven arm with Task 1's own `check_arm` and friends, not a second copy.
 
-Calls `task1_arm_verdict.check_arm` / `check_cache` / `contention` / `generation` /
+Calls `task1_arm_verdict.check_arm` / `check_timed_phase` / `boot_growth` /
+`contention` / `generation` /
 `session_outliers` / `cross_arm_outliers` (via `task1_verdict.load_task1_verdict`)
 against a report built by `report_builder.build_report`, and appends this campaign's
 own checks (compile-contamination, the measured server-env stand-ins, the SM-clock readiness
@@ -107,20 +108,21 @@ def compile_contamination_problems(report: dict) -> list[str]:
 
 
 def residency_cache_dict(report: dict) -> dict | None:
-    """This campaign's `residency` (three named boundaries, one dir) reshaped into the
-    `{"expert_resident_by_dir_before": {dir: bytes}, "expert_resident_by_dir_after": {dir: bytes}}`
-    shape `task1_arm_verdict.check_cache` expects — Task 1's own whole-arm residency check,
-    the coarser variant it already has for when per-session residency (an offline-Engine-only
-    instrumentation) is unavailable. None if this report has no residency section to check.
+    """Convert the HTTP harness's three boundaries to Task 1's phase shape.
+
+    Return None when any required measurement is absent; judge then fails closed.
     """
     residency = report.get("residency")
-    if not residency or residency.get("dir") is None:
+    if not isinstance(residency, dict) or not isinstance(residency.get("dir"), str) or not residency["dir"]:
         return None
-    before, after = residency.get("before_server"), residency.get("after_timed_set")
-    if before is None or after is None:
+    before = residency.get("before_server")
+    ready = residency.get("server_ready")
+    last = residency.get("after_timed_set")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+           for value in (before, ready, last)):
         return None
     d = residency["dir"]
-    return {"expert_resident_by_dir_before": {d: before}, "expert_resident_by_dir_after": {d: after}}
+    return {"before": {d: before}, "ready": {d: ready}, "last": {d: last}}
 
 
 def clock_readiness_note(report: dict) -> str:
@@ -161,11 +163,15 @@ def judge(
     )
     cache = residency_cache_dict(report)
     if cache is not None:
-        problems += task1_module.check_cache(cache)
-        notes.append("RESIDENCY whole-arm (before_server -> after_timed_set); no per-session "
-                     "instrumentation exists over HTTP, see report_builder.py")
+        problems += task1_module.check_timed_phase(cache)
+        for directory, growth in task1_module.boot_growth(cache).items():
+            notes.append(f"RESIDENCY startup growth in {directory}: {growth / (1 << 20):+.1f} MiB "
+                         "(before_server -> server_ready; recorded, not gated)")
+        notes.append("RESIDENCY timed gate (server_ready -> after_timed_set); "
+                     "no per-session instrumentation exists over HTTP, see report_builder.py")
     else:
-        notes.append("RESIDENCY not judged: no residency section in this report")
+        problems.append("residency phase measurements missing or invalid: need directory and "
+                        "before_server, server_ready, after_timed_set byte counts")
     problems += compile_contamination_problems(report)
     problems += server_env_problems(report, root=root)
     notes.append(clock_readiness_note(report))

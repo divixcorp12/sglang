@@ -55,11 +55,22 @@ the first two arms do not meet the harness's formal whole-arm gate.
 
 The HTTP harness has an acknowledged absence of engine-side per-step latency in all
 three arms. Warm-up reached the stability gate after three, five, and four rounds;
-this difference could affect state at the start of timing. For a formal go/no-go
-decision on enabling the flag by default, repair the page-cache gate to judge the
-timed window (while still recording startup growth), then repeat a matched run.
+this difference could affect state at the start of timing. A fresh matched run with
+the corrected gate would strengthen a default-on decision.
 
 The original run files (`results.jsonl`, `clocks.jsonl`, `compile.jsonl`,
 `expected-env.json`, `report.json`, `verdict.txt`, and `server.log`) remain in the
 directories above. The verdict failure prevented the first two arms from writing
 `run-manifest.json`; the raw results and reports were preserved.
+
+## Harness correction and historical replay
+
+The verdict adapter now passes `before_server`, `server_ready`, and `after_timed_set`
+to Task 1's pinned `check_timed_phase()` as `before`, `ready`, and `last`. The check
+gates ready-to-last growth, while `boot_growth()` records startup growth in notes.
+Missing measurements fail the verdict. Replaying the revised adapter against each
+unchanged `report.json` above produced **no unacknowledged problems** and
+`valid_except_acknowledged_gaps: True` for all three arms. The original
+`verdict.txt` files were not overwritten; their first two failures document the
+old gate. Task 1's strict `valid` remains false because HTTP cannot provide the
+acknowledged engine-side per-step latency field.
