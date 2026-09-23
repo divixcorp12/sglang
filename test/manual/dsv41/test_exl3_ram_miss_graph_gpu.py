@@ -285,8 +285,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
                 torch.cuda.synchronize()
                 assert backend.delivered_count.item() == 1
                 assert backend.keep.item() == 1.0
-                leased_row = int(backend.device_side.lane_ctx[2].item())
-                leased_slot = int(backend.device_side.lane_ctx[3].item())
+                leased_row = int(backend.device_side.lane_ctx[0, 2].item())
+                leased_slot = int(backend.device_side.lane_ctx[0, 3].item())
                 layout = service.host.lease_layout
                 offset = layout.slot_gen_offset + 4 * (
                     layout.slot_gen_base[leased_row] + leased_slot
