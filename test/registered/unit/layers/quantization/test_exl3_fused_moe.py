@@ -105,6 +105,37 @@ def test_the_fused_moe_refuses_shapes_its_tables_do_not_cover(streamer_changes, 
         exl3_fused_moe_for(layer, _stub_streamer(None, **streamer_changes))
 
 
+def test_direct_fused_moe_covers_resident_slots_with_zero_scratch(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.quantization import exl3_fused_moe as module
+
+    calls = []
+    monkeypatch.setattr(module, "Exl3FusedMoE", lambda tensors, slots, **kw: calls.append(slots) or object())
+    layer = torch.nn.Module()
+    layer.top_k = 6
+    backend = SimpleNamespace(name="exl3_ram_miss")
+    streamer = _stub_streamer(backend, scratch_rows=0)
+    streamer.hot_cache.capacity = 6
+    streamer.hot_cache.device_residency = SimpleNamespace(insert_on_miss=2)
+    streamer.hot_cache.reserves_prefetch_pull_row = False
+    streamer.hot_cache.device = torch.device("cpu")
+    streamer.hot_cache.tensors = {
+        "w13_suh": torch.zeros((6, 2, 8)),
+        "w2_suh": torch.zeros((6, 1, 8)),
+    }
+    assert module.exl3_fused_moe_for(layer, streamer) is layer._exl3_fused_moe
+    assert calls == [6]
+    streamer.hot_cache.capacity = 5
+    del layer._exl3_fused_moe
+    with pytest.raises(ValueError, match="DIRECT needs at least top_k"):
+        module.exl3_fused_moe_for(layer, streamer)
+    streamer.hot_cache.capacity = 6
+    streamer.row_backend = SimpleNamespace(name="other")
+    with pytest.raises(ValueError, match="scratch"):
+        module.exl3_fused_moe_for(layer, streamer)
+
+
 if __name__ == "__main__":
     import sys
 

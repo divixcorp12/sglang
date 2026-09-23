@@ -1313,7 +1313,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
         updater._pending_commit = (row, streamer, destinations, live)
         updater.commit_gather()
         self.assertTrue(torch.equal(updater.slot_to_expert[row], before))
-        self.assertTrue(torch.equal(updater.mapping[row], mapping_before))
+        # The sentinel column is scratch space for masked scatter; real expert
+        # columns must remain unchanged when the ack refuses the commit.
+        self.assertTrue(torch.equal(updater.mapping[row, :EXPERTS], mapping_before[:EXPERTS]))
         self.assertEqual(updater.insertion_truncated[row].item(), 0)
         keep.fill_(1.0)
         updater._pending_commit = (row, streamer, destinations, live)

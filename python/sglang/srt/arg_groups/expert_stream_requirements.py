@@ -287,7 +287,8 @@ register_expert_stream_requirements(NVFP4_QUANT_METHODS, NVFP4_EXPERT_STREAM_REQ
 
 
 def eager_expert_stream_requirements(
-    label: str, *, enabled: Callable[[], bool], enable_hint: str
+    label: str, *, enabled: Callable[[], bool], enable_hint: str,
+    allow_gpu_residency_update: Callable[[], bool] = lambda: False,
 ) -> ExpertStreamRequirements:
     """Requirements of a format that streams experts eagerly only.
 
@@ -318,7 +319,7 @@ def eager_expert_stream_requirements(
                 f"{label} expert caching does not support expert prefetch; "
                 "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
             )
-        if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get():
+        if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get() and not allow_gpu_residency_update():
             raise ValueError(
                 f"{label} expert caching does not support "
                 "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"

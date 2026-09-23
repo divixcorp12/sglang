@@ -29,6 +29,12 @@ _EAGER = eager_expert_stream_requirements(
     "EXL3",
     enabled=lambda: envs.SGLANG_DSV41_EXPERT_STREAM.get(),
     enable_hint="SGLANG_DSV41_EXPERT_STREAM=1",
+    # The shared eager checks still apply to EXL3. Its sole GPU residency
+    # exception is the captured DIRECT path, with the graph gather as source.
+    allow_gpu_residency_update=lambda: (
+        envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
+        and envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
+    ),
 )
 
 

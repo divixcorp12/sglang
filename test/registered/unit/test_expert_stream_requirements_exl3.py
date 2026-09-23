@@ -196,6 +196,21 @@ def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_HOT_GPU_MB=0)
 
 
+def test_only_exl3_direct_graph_gather_admits_gpu_residency_update(model_dir):
+    direct = dict(
+        SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
+        SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
+        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+    )
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **direct)
+    with pytest.raises(ValueError, match="GPU_RESIDENCY_UPDATE"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1})
+    with pytest.raises(ValueError, match="GPU_RESIDENCY_UPDATE"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False})
+    with pytest.raises(ValueError, match="GRAPH_GATHER"):
+        _gate(_launch(model_dir), **direct)
+
+
 def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model_dir):
     # run_resolution_pipeline runs handle_offload_compatibility twice; the first pass
     # comes before parse_cuda_graph_config, while cuda_graph_config is still the raw

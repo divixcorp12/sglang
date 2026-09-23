@@ -101,7 +101,10 @@ def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path):
             host.assign(0, expert)
         seq = _post_gpu_hot(page, host, hot_page, protect=[0], lanes=[0], hot=[0])
         assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
-        assert host.counters()["hit_leases_granted"] == 1
+        # A resident lane is a touch-only lease: it needs no host row read.
+        assert host.counters()["leases_granted"] == 1
+        assert host.counters()["touch_only"] == 1
+        assert host.counters()["rows_read"] == 0
         assert sum(info[2] for info in host.slot_info(0)) == 1
         # The next demand sees the posted bitmap before its victim census and serve.
         # Expert 0 is the oldest resident, but must survive the read of expert 3.

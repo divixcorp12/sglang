@@ -147,12 +147,19 @@ def exl3_fused_moe_for(layer, streamer) -> Exl3FusedMoE:
     if fused is None:
         cache = streamer.hot_cache
         rows = streamer.graph_gather_rows
-        # The route buffers hold top_k routes of one token, and the pointer tables cover
-        # hot slots plus scratch rows only: a remap outside them would land in the
-        # expert_count sentinel bin and be skipped without an error.
+        # The route buffers hold top_k routes of one token. DIRECT resolves misses
+        # into resident hot slots before this kernel; other modes need scratch
+        # rows to hold every route that is not resident.
         if rows != layer.top_k:
             raise ValueError(f"exl3 in-graph MoE needs graph_gather_rows ({rows}) == top_k ({layer.top_k})")
-        if cache.scratch_rows < rows:
+        updater = getattr(cache, "device_residency", None)
+        direct = (
+            getattr(updater, "insert_on_miss", None) == 2
+            and getattr(streamer.row_backend, "name", None) == "exl3_ram_miss"
+        )
+        if direct and cache.capacity < rows:
+            raise ValueError(f"exl3 DIRECT needs at least top_k resident slots ({cache.capacity} < {rows})")
+        if not direct and cache.scratch_rows < rows:
             raise ValueError(f"exl3 in-graph MoE needs a scratch row per route ({cache.scratch_rows} < {rows})")
         if cache.reserves_prefetch_pull_row:
             raise ValueError("exl3 in-graph MoE does not cover a prefetch-pull row (expert prefetch is off for EXL3)")

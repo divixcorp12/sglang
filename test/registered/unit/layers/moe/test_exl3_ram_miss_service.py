@@ -675,7 +675,7 @@ def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
 
     calls = []
     device_side = SimpleNamespace(
-        post=lambda row, planned, count, routes, next_row: calls.append(("post", planned.clone())),
+        post=lambda row, planned, count, routes, next_row, hot_slots, hot_capacity: calls.append(("post", planned.clone())),
         wait=lambda row, planned, count, host_rows, keep, ram_miss: calls.append(("wait", planned.clone())),
     )
     backend = module.Exl3RamMissRowBackend({0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
