@@ -13,6 +13,7 @@ import os
 import threading
 import weakref
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -31,6 +32,7 @@ from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
 
 logger = logging.getLogger(__name__)
+_SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
 
 
 def _quarantine_service_at_exit(service: "weakref.ref[Exl3RamMissService]") -> None:
@@ -513,8 +515,18 @@ class Exl3RamMissService:
         self.ensure_started()
         if self._pause_depth == 0:
             if torch.cuda.is_available() and torch.cuda.is_initialized():
-                torch.cuda.current_stream().synchronize()
-            self.host.pause(2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0)
+                with (
+                    torch.cuda.nvtx.range("dsv41.ram_miss.before_host_use_stream_sync")
+                    if _SYNC_WAIT_NVTX
+                    else nullcontext()
+                ):
+                    torch.cuda.current_stream().synchronize()
+            with (
+                torch.cuda.nvtx.range("dsv41.ram_miss.before_host_use_thread_pause")
+                if _SYNC_WAIT_NVTX
+                else nullcontext()
+            ):
+                self.host.pause(2 * envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 1.0)
         self._pause_depth += 1
 
     def after_host_use(self) -> None:

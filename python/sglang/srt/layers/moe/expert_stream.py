@@ -6,6 +6,7 @@ import contextlib
 import functools
 import logging
 import json
+import os
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from operator import index
@@ -56,6 +57,7 @@ from sglang.srt.layers.moe.expert_row_plan import (
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
 logger = logging.getLogger(__name__)
+_SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
 
 _STAGING: Dict[Tuple, torch.Tensor] = {}
 _PINNED_STAGING: Dict[Tuple, torch.Tensor] = {}
@@ -675,7 +677,12 @@ def _copy_indices_to_cpu(source_ids: torch.Tensor, capacity: int) -> torch.Tenso
         _PINNED_INDEX[key] = buffer
     indices = buffer[: source_ids.numel()]
     indices.copy_(source_ids, non_blocking=True)
-    torch.cuda.current_stream(source_ids.device).synchronize()
+    with (
+        torch.cuda.nvtx.range("dsv41.expert_stream.copy_indices_stream_sync")
+        if _SYNC_WAIT_NVTX
+        else contextlib.nullcontext()
+    ):
+        torch.cuda.current_stream(source_ids.device).synchronize()
     return indices
 
 

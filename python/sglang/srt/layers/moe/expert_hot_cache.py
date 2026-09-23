@@ -10,7 +10,7 @@ import math
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from operator import index
@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+_SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
 
 
 def graph_gather_scratch_rows(tokens: int, top_k: int, max_rows: int = 0) -> int:
@@ -473,7 +474,11 @@ class ExpertHotCache:
             # One host use from sizing the chunk to its completed copy: a slot
             # table with an owner (a native reader thread) must not move the
             # chunk's pinned rows while the promotion reads them.
-            with pinned_cache.host_use():
+            with (
+                torch.cuda.nvtx.range("dsv41.hot_cache.host_use")
+                if _SYNC_WAIT_NVTX
+                else nullcontext()
+            ), pinned_cache.host_use():
                 chunk_rows = pinned_cache.evictable_rows()
                 if chunk_rows < 1:
                     self._cancel_tickets(tickets[start:])
@@ -492,7 +497,12 @@ class ExpertHotCache:
                     )
                     submitted = True
                     self._transfer_executor.wait(ticket, current_stream)
-                    current_stream.synchronize()
+                    with (
+                        torch.cuda.nvtx.range("dsv41.hot_cache.promotion_stream_sync")
+                        if _SYNC_WAIT_NVTX
+                        else nullcontext()
+                    ):
+                        current_stream.synchronize()
                     self.complete_promotion(promotion)
                 except BaseException:
                     if promotion is not None and self.promotion_in_flight is promotion:
