@@ -117,7 +117,7 @@ def test_direct_fused_moe_covers_resident_slots_with_zero_scratch(monkeypatch):
     backend = SimpleNamespace(name="exl3_ram_miss")
     streamer = _stub_streamer(backend, scratch_rows=0)
     streamer.hot_cache.capacity = 6
-    streamer.hot_cache.device_residency = SimpleNamespace(insert_on_miss=2)
+    streamer.hot_cache.device_residency = SimpleNamespace(insert_on_miss=True, insert_direct=True)
     streamer.hot_cache.reserves_prefetch_pull_row = False
     streamer.hot_cache.device = torch.device("cpu")
     streamer.hot_cache.tensors = {

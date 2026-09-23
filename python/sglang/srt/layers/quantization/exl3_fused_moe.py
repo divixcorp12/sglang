@@ -154,7 +154,7 @@ def exl3_fused_moe_for(layer, streamer) -> Exl3FusedMoE:
             raise ValueError(f"exl3 in-graph MoE needs graph_gather_rows ({rows}) == top_k ({layer.top_k})")
         updater = getattr(cache, "device_residency", None)
         direct = (
-            getattr(updater, "insert_on_miss", None) == 2
+            getattr(updater, "insert_direct", False)
             and getattr(streamer.row_backend, "name", None) == "exl3_ram_miss"
         )
         if direct and cache.capacity < rows:
