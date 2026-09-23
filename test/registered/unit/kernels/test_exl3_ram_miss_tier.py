@@ -74,7 +74,8 @@ def _post_gpu_hot(page, host, hot_page, *, row=0, need=(), protect=(), lanes=(),
     record[4:8].view(torch.int32)[0] = host.experts
     record[8 : 8 + (host.experts + 7) // 8].zero_()
     for expert in hot:
-        record[8 + expert // 8] |= 1 << (expert % 8)
+        offset = 8 + expert // 8
+        record[offset] = int(record[offset]) | (1 << (expert % 8))
     record[:4].view(torch.int32)[0] = seq if hot_seq is None else hot_seq
     start = host.lease_layout.d_offset + lease.LANE_REQUEST + (seq - 1) % lease.RING * lease.LANE_REQUEST_BYTES
     request = host.lease_block[start : start + lease.LANE_REQUEST_BYTES]

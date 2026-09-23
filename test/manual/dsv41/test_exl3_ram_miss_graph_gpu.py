@@ -180,7 +180,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             assert service.gpu_hot_enabled
             assert manager.caches[0].scratch_rows == 0
             assert manager.caches[0].capacity == 2 * TOP_K
-            x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
+            generator = torch.Generator(device="cpu").manual_seed(31)
+            x = (torch.randn((1, HIDDEN), generator=generator) * 0.5).to("cuda", torch.bfloat16)
             weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
             ids = torch.tensor([list(range(12, 18))], device="cuda", dtype=torch.int32)
             Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)
@@ -203,6 +204,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
                     for name, rows in manager.caches[0].tensors.items():
                         assert torch.equal(rows[slot].cpu(), source[name][expert]), (expert, slot, name)
                 ref = _reference(x, weights.reshape(-1), torch.tensor(slots), manager.caches[0].tensors)
+                assert torch.isfinite(ref).all()
+                assert ref.float().norm().item() > 0
                 assert _rel(out, ref) <= REL_BOUND
 
             first = list(range(12, 18))
