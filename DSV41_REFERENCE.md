@@ -2935,6 +2935,117 @@ outside the process are declared unavailable and re-asked of the measured enviro
 verdict printed before that commit should be re-read, not trusted.
 
 
+## 21. Nsight trace of the served engram arm: where the time goes (2026-09-22)
+
+Arm `engram-on-trace` at `6205f090ea`, generation `engram-host-node-uring-chunked`,
+`SGLANG_MOE_PINNED_HOST_MB=51200`, uring reader, leases off. Report:
+`/mnt/nvme1/dsv41-nsys/engram-on-trace-20260922-221602.nsys-rep` (42 MB), exported
+alongside as `.sqlite`. Run dir
+`cc-expert-prediction/dsv41-baseline/servers/engram-on-trace/run-20260922-221546`.
+
+**This arm's verdict is void and its throughput must not be quoted.** It ran with
+`DSV41_MAX_SESSIONS=2` to bound the report, so the result gate refused it
+(`2 records (expected 8)`), and the capture is traced. What survives is per-unit cost,
+which does not depend on how many sessions ran. The *ratio* of prefill to decode below
+is an artifact of the two-session cap and is not a property of the workload.
+
+138.1 s captured, one CUDA-calling thread. Two regimes that overlap:
+
+| | wall | GPU kernel busy | shape |
+|---|---:|---:|---|
+| eager / prefill | 1.3-92.4 s | ~18% | 308k eager launches, 19.8k host syncs |
+| decode | 42.3-138.2 s, 220 steps | n/a (in graph) | 203 graph launches after 95 s |
+
+### The pinned-host gather sits on the Gen3 wall, on a second kernel
+
+`_gather_host_rows_kernel` (the Triton byte-copy in `moe/expert_stream.py`) is **15.19 s
+of the 16.62 s** of all eager GPU kernel time -- 91% -- across 1,680 launches moving
+**187.3 GB** out of the pinned host buffer. Bucketed by row size, with bytes taken from
+the launch geometry (`gridX` rows x `gridY` x `BLOCK`=1024 B):
+
+| row bytes | launches | avg ms | GB/s |
+|---:|---:|---:|---:|
+| 5,120 | 280 | 0.02 | 11.9 |
+| 9,216 | 280 | 0.04 | 11.5 |
+| 10,240 | 280 | 0.04 | 11.6 |
+| 20,480 | 280 | 0.09 | 11.9 |
+| 4,423,680 | 280 | 18.02 | 12.3 |
+| 8,847,360 | 280 | 36.04 | 12.3 |
+
+Flat at 11.5-12.3 GB/s across a 1,700x range of transfer sizes, with no per-call fixed
+cost. **This is not a new finding.** It is the wall already recorded in
+[`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md), "The link is at line rate, and the
+host caps it at Gen3": `nvidia-smi` reports `gpumax=5, hostmax=3, current=3` on this
+RTX 5090, and Gen3 x16 is ~12.3 GB/s practical. What is new is only that a *second,
+independent* kernel on a *different* code path reproduces the same constant. Record it
+so the hope is not re-derived on this path either: batching, packing or coalescing the
+engram gather cannot win anything, because it is already at line rate.
+
+The GPU also sits on NUMA node 0 (`local_cpulist=0-17,36-53`), which is where
+`arm_env.SERVER_CORES` now pins the server. The node-0 pinning from `86b4bc19df` was
+made to stop the THP direct-compaction hang; it happens to also be the correct side of
+the board for the PCIe transfers.
+
+### The costly "memcpy" is not a transfer, it is a sync
+
+`cudaMemcpyAsync` is the single largest CUDA API cost in the trace (32.54 s over 23,832
+calls). Joining each call to its GPU-side memcpy record by `correlationId` shows what it
+actually is:
+
+| phase | n | avg bytes | GPU transfer | host blocked |
+|---|---:|---:|---:|---:|
+| prefill | 19,761 D2H | 31 B | negligible | 16.63 s (841 us each) |
+| decode | 256 D2H | 2 KB | 0.7 us each | 15.26 s (105 calls exceed 50 ms, averaging 145 ms) |
+
+A 31-byte readback that blocks the host for 841 microseconds is a stream
+synchronization wearing a transfer's name. `gather_rows` documents the mechanism in its
+own docstring -- "Each chunk's hit count (`.item()`) syncs the stream on the host, so the
+previous chunk's copy has run before its slots can be" reused. The cost of that
+`.item()` is 16.6 s of the 91 s prefill window.
+
+This is the one number in the trace that looks directly actionable: the sync is there to
+order chunk N+1's admission against chunk N's copy, which an event wait on the stream
+could do without returning to the host. Not attempted, and not costed.
+
+### Half the trace is host-side Python that this capture cannot name
+
+In the 91.1 s prefill window the CUDA thread spends 21.76 s inside CUDA API calls, and
+OSRT shows it blocking on OS primitives for 0.81 s. The remaining **~69 s -- 76% of
+prefill and 50% of the whole trace -- is that thread running host code with the GPU
+idle.** 307,995 eager kernel launches in that window is ~3,350 launches/s, which is a
+host-bound issue rate, not a GPU-bound one.
+
+The arm ran `--sample=none`, so there are no callstacks and **this 69 s is unattributed**.
+Re-running with `NSYS_SAMPLE=cpu` is the next step and has not been done. Do not assume
+it is the engram path; the eager expert gather is only 15.19 s of GPU time inside it.
+
+### Two measurement traps in this report
+
+**`CUPTI_ACTIVITY_KIND_GRAPH_TRACE` here describes the warm-up, not the capture.** All
+1,298 rows carry negative timestamps (-467.4 s to -0.8 s) and correlation IDs from
+157,965 to 1,090,103, strictly below the captured window's minimum of 1,090,415. They are
+flushed pre-capture events on a different time base. Read naively they yield a confident
+"1,298 graph executions averaging 181.7 ms", which describes nothing in the traced
+region and sums to 236 s inside a 138 s trace -- the impossibility is the tell.
+
+**The graph-mode kernel-table trap held exactly as `CLAUDE.md` describes it.** No kernel
+row has `graphId > 0`, so all 342,564 kernels and all 16.62 s of kernel time are eager
+work; the decode graph body is absent. Nothing above ranks a kernel inside decode. The
+memcpy table is unaffected, but see the previous section -- its *totals* were fine while
+being badly misleading about what the cost was.
+
+### Decode, to the extent this trace can see it
+
+203 graph launches after 95 s against 220 `alloc_decode_kernel` launches over the whole
+trace, i.e. two graph launches per decode step: the `segments=2 breaks=1` shape of the
+breakable decode graph with layer 1 captured and layer 14 eager. The host thread is
+blocked 98% of decode wall, 63% in `cudaGraphLaunch` and 35% in the 2 KB D2H sync above.
+Because the graph body is invisible, this trace cannot say how that 63% divides between
+genuine GPU work and queueing. This is the measurement that
+`analysis/dsv41-drive/ENGRAM_LAYER14_GRAPH_PLAN.md` should move: with layer 14 captured,
+the step should fall to one graph launch.
+
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
