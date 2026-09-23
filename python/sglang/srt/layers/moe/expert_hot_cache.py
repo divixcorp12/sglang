@@ -59,6 +59,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
+_PREFORWARD_READINESS_DIAGNOSTIC = (
+    os.environ.get("SGLANG_MOE_PREFORWARD_READINESS_DIAGNOSTIC") == "1"
+)
 
 
 def graph_gather_scratch_rows(tokens: int, top_k: int, max_rows: int = 0) -> int:
@@ -1266,6 +1269,30 @@ class ExpertHotCacheManager:
         manager._async_residency_event = None
         manager._async_residency_pending = None
         manager._async_residency_refresh = None
+        manager._pre_forward_readiness_path = os.environ.get(
+            "SGLANG_MOE_PREFORWARD_READINESS_PATH"
+        )
+        manager._pre_forward_readiness_enabled = (
+            _PREFORWARD_READINESS_DIAGNOSTIC
+            and async_residency_scores
+            and manager._pre_forward_readiness_path is not None
+        )
+        manager._pre_forward_readiness_bins: dict[int, dict[str, int]] = {}
+        manager._pre_forward_readiness_bucket_limit = 36000
+        manager._pre_forward_readiness_file_lock = threading.Lock()
+        manager._pre_forward_pending_key = None
+        manager._pre_forward_pending_polls = 0
+        manager._pre_forward_pending_first_ready = False
+        manager._pre_forward_diagnostic_error_logged = False
+        if manager._pre_forward_readiness_enabled and manager._pre_forward_readiness_path:
+            atexit.register(manager.write_pre_forward_readiness)
+            manager._pre_forward_readiness_stop = threading.Event()
+            manager._pre_forward_readiness_writer = threading.Thread(
+                target=manager._periodic_pre_forward_readiness_flush,
+                name="pre-forward-readiness-writer",
+                daemon=True,
+            )
+            manager._pre_forward_readiness_writer.start()
         manager._inflight_promotions = []
         manager.deferred_residency_updates = 0
         manager.benefit_ratio = benefit_ratio
@@ -1424,6 +1451,198 @@ class ExpertHotCacheManager:
         )
         manager._attach_formats()
         return manager
+
+    def on_pre_forward(self, forward_pass_id: int, forward_batch: "ForwardBatch") -> None:
+        """Run the opt-in diagnostic without allowing it to affect serving."""
+        if not getattr(self, "_pre_forward_readiness_enabled", False):
+            return
+        try:
+            self._sample_pre_forward_readiness(forward_pass_id, forward_batch)
+        except Exception:
+            if not self._pre_forward_diagnostic_error_logged:
+                self._pre_forward_diagnostic_error_logged = True
+                logger.exception("Pre-forward readiness diagnostic failed; continuing")
+
+    def _sample_pre_forward_readiness(
+        self, forward_pass_id: int, forward_batch: "ForwardBatch"
+    ) -> None:
+        """Sample serving-stream readiness without waiting or changing policy state.
+
+        100 ms CPU aggregate buckets keep the diagnostic bounded. File output
+        comes from a background writer, never from the forward path.
+        """
+        if not getattr(self, "_pre_forward_readiness_enabled", False):
+            return
+        bucket = time.monotonic_ns() // 100_000_000
+        kind, _ = classify_forward(forward_batch)
+        values = self._pre_forward_readiness_bins.get(bucket)
+        if values is None:
+            values = {
+                "samples": 0,
+                "ready": 0,
+                "busy": 0,
+                "prefill_samples": 0,
+                "prefill_ready": 0,
+                "prefill_busy": 0,
+                "decode_samples": 0,
+                "decode_ready": 0,
+                "decode_busy": 0,
+                "verify_samples": 0,
+                "verify_ready": 0,
+                "verify_busy": 0,
+                "idle_samples": 0,
+                "idle_ready": 0,
+                "idle_busy": 0,
+                "draft_skipped": 0,
+                "query_errors": 0,
+                "capture_skipped": 0,
+                "pending_samples": 0,
+                "pending_ready": 0,
+                "pending_age_forwards_sum": 0,
+                "pending_age_forwards_max": 0,
+                "pending_ready_decisions": 0,
+                "pending_ready_poll_sum": 0,
+                "pending_ready_poll_max": 0,
+                "pending_ready_age_forwards_sum": 0,
+                "pending_ready_age_forwards_max": 0,
+                "pending_event_query_errors": 0,
+                "pending_event_ready_samples": 0,
+                "pending_event_ready": 0,
+                "pending_event_and_stream_ready": 0,
+                "refresh_samples": 0,
+                "refresh_ready": 0,
+            }
+            self._pre_forward_readiness_bins[bucket] = values
+            if len(self._pre_forward_readiness_bins) > self._pre_forward_readiness_bucket_limit:
+                del self._pre_forward_readiness_bins[
+                    min(self._pre_forward_readiness_bins)
+                ]
+        if kind is ForwardKind.DRAFT:
+            values["draft_skipped"] += 1
+            return
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                values["capture_skipped"] += 1
+                return
+            cache = next(iter(self.caches.values()), None)
+            if cache is None:
+                return
+            ready = bool(torch.cuda.current_stream(cache.device).query())
+        except Exception:
+            # Diagnostics must not change serving behavior when the query is
+            # unavailable (for example during stream teardown).
+            values["query_errors"] += 1
+            return
+        values["samples"] += 1
+        values["ready" if ready else "busy"] += 1
+        phase = kind.value
+        values[f"{phase}_samples"] += 1
+        values[f"{phase}_{'ready' if ready else 'busy'}"] += 1
+        pending = self._async_residency_pending
+        refresh = self._async_residency_refresh
+        if pending is not None:
+            key = (pending[0], pending[1])
+            if key != self._pre_forward_pending_key:
+                self._pre_forward_pending_key = key
+                self._pre_forward_pending_polls = 0
+                self._pre_forward_pending_first_ready = False
+            self._pre_forward_pending_polls += 1
+            age = max(0, self._boundary_clock.forwards - pending[1])
+            values["pending_samples"] += 1
+            values["pending_ready"] += int(ready)
+            values["pending_age_forwards_sum"] += age
+            values["pending_age_forwards_max"] = max(
+                values["pending_age_forwards_max"], age
+            )
+            event_ready = None
+            try:
+                backend = self._async_residency_backend
+                if backend is not None and self._async_residency_event is not None:
+                    event_ready = bool(
+                        backend.ready(self._async_residency_event)
+                    )
+                    values["pending_event_ready_samples"] += 1
+                    values["pending_event_ready"] += int(event_ready)
+                    values["pending_event_and_stream_ready"] += int(
+                        event_ready and ready
+                    )
+            except Exception:
+                # An event query is diagnostic only; retain the actual serving
+                # stream sample and leave async-residency state untouched.
+                values["pending_event_query_errors"] += 1
+            if event_ready and ready and not self._pre_forward_pending_first_ready:
+                polls = self._pre_forward_pending_polls
+                values["pending_ready_decisions"] += 1
+                values["pending_ready_poll_sum"] += polls
+                values["pending_ready_poll_max"] = max(
+                    values["pending_ready_poll_max"], polls
+                )
+                values["pending_ready_age_forwards_sum"] += age
+                values["pending_ready_age_forwards_max"] = max(
+                    values["pending_ready_age_forwards_max"], age
+                )
+                self._pre_forward_pending_first_ready = True
+            phase_prefix = f"pending_{kind.value}"
+            values[f"{phase_prefix}_samples"] = (
+                values.get(f"{phase_prefix}_samples", 0) + 1
+            )
+            values[f"{phase_prefix}_stream_ready"] = (
+                values.get(f"{phase_prefix}_stream_ready", 0) + int(ready)
+            )
+            if event_ready is not None:
+                values[f"{phase_prefix}_event_ready_samples"] = (
+                    values.get(f"{phase_prefix}_event_ready_samples", 0) + 1
+                )
+                values[f"{phase_prefix}_event_ready"] = (
+                    values.get(f"{phase_prefix}_event_ready", 0) + int(event_ready)
+                )
+                values[f"{phase_prefix}_event_and_stream_ready"] = (
+                    values.get(f"{phase_prefix}_event_and_stream_ready", 0)
+                    + int(event_ready and ready)
+                )
+        else:
+            self._pre_forward_pending_key = None
+            self._pre_forward_pending_polls = 0
+            self._pre_forward_pending_first_ready = False
+        if refresh is not None:
+            values["refresh_samples"] += 1
+            values["refresh_ready"] += int(ready)
+
+    def write_pre_forward_readiness(self) -> None:
+        """Atomically snapshot bounded aggregates from a background context."""
+        path = getattr(self, "_pre_forward_readiness_path", None)
+        if not path:
+            return
+        try:
+            snapshot_started_monotonic_ns = time.monotonic_ns()
+            buckets = [
+                {"monotonic_100ms": bucket, **values.copy()}
+                for bucket, values in sorted(list(self._pre_forward_readiness_bins.items()))
+            ]
+            payload = {
+                "schema": 1,
+                "snapshot_started_monotonic_ns": snapshot_started_monotonic_ns,
+                "snapshot_monotonic_ns": time.monotonic_ns(),
+                "flush_interval_seconds": 1,
+                "time_bucket": "monotonic_100ms",
+                "stream": "current CUDA stream at pre-forward",
+                "query_semantics": "nonblocking; ready means no queued work at query time",
+                "bucket_limit_seconds": self._pre_forward_readiness_bucket_limit // 10,
+                "buckets": buckets,
+            }
+            destination = Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + ".tmp")
+            with self._pre_forward_readiness_file_lock:
+                temporary.write_text(json.dumps(payload, sort_keys=True) + "\n")
+                os.replace(temporary, destination)
+        except Exception:
+            logger.exception("Failed to write pre-forward readiness diagnostic")
+
+    def _periodic_pre_forward_readiness_flush(self) -> None:
+        """Persist aggregates off the forward path in case engine children are SIGKILLed."""
+        while not self._pre_forward_readiness_stop.wait(1.0):
+            self.write_pre_forward_readiness()
 
     def enable_next_layer_prefetch(self, max_candidates: int) -> None:
         """Attach default-off sparse prefetch callbacks between adjacent layers."""

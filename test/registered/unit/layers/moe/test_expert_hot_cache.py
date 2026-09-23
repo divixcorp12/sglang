@@ -719,6 +719,92 @@ class TestExpertHotCacheManager(unittest.TestCase):
         self.assertEqual(manager.caches[0].slot_to_expert, [1])
         self.assertEqual(manager.caches[2].slot_to_expert, [1])
 
+    def test_pre_forward_readiness_counts_without_changing_pending_decision(self):
+        from sglang.srt.layers.moe import expert_hot_cache
+
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            async_residency_scores=True,
+        )
+        manager._pre_forward_readiness_enabled = True
+        manager._async_residency_pending = ("decode", manager._boundary_clock.forwards)
+        manager._async_residency_backend = mock.Mock()
+        manager._async_residency_backend.ready.return_value = True
+        manager._async_residency_event = object()
+        pending = manager._async_residency_pending
+        stream = mock.Mock()
+        with (
+            mock.patch.object(
+                expert_hot_cache,
+                "classify_forward",
+                return_value=(expert_hot_cache.ForwardKind.DECODE, 1),
+            ),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(torch.cuda, "current_stream", return_value=stream),
+        ):
+            stream.query.side_effect = [True, False, RuntimeError("query unavailable")]
+            manager.on_pre_forward(1, None)
+            manager.on_pre_forward(2, None)
+            manager.on_pre_forward(3, None)
+
+        totals = {
+            key: sum(values[key] for values in manager._pre_forward_readiness_bins.values())
+            for key in (
+                "samples",
+                "ready",
+                "busy",
+                "decode_samples",
+                "decode_ready",
+                "decode_busy",
+                "query_errors",
+                "pending_samples",
+                "pending_ready",
+                "pending_ready_decisions",
+                "pending_ready_poll_sum",
+                "pending_event_ready_samples",
+                "pending_event_ready",
+                "pending_event_and_stream_ready",
+            )
+        }
+        self.assertEqual(
+            totals,
+            {
+                "samples": 2,
+                "ready": 1,
+                "busy": 1,
+                "decode_samples": 2,
+                "decode_ready": 1,
+                "decode_busy": 1,
+                "query_errors": 1,
+                "pending_samples": 2,
+                "pending_ready": 1,
+                "pending_ready_decisions": 1,
+                "pending_ready_poll_sum": 1,
+                "pending_event_ready_samples": 2,
+                "pending_event_ready": 2,
+                "pending_event_and_stream_ready": 1,
+            },
+        )
+        self.assertIs(manager._async_residency_pending, pending)
+
+    def test_pre_forward_snapshot_records_copy_start_and_completion(self):
+        manager = self.manager(
+            {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},
+            async_residency_scores=True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "readiness.json")
+            manager._pre_forward_readiness_path = path
+            manager.write_pre_forward_readiness()
+
+            with open(path) as snapshot_file:
+                snapshot = json.load(snapshot_file)
+
+        self.assertLessEqual(
+            snapshot["snapshot_started_monotonic_ns"],
+            snapshot["snapshot_monotonic_ns"],
+        )
+
     def test_async_residency_scores_refresh_after_two_pending_boundaries(self):
         manager = self.manager(
             {"count": [[10, 0, 0, 0], [0] * 4, [10, 0, 0, 0]]},

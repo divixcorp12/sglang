@@ -124,6 +124,12 @@ class ExpertDistributionRecorder(ABC):
         """Observe shared forward statistics; no-op recorders ignore registration."""
         pass
 
+    def register_pre_forward_observer(
+        self, callback: Callable[[int, ForwardBatch], None]
+    ) -> None:
+        """Observe a forward immediately before model work is queued."""
+        pass
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -171,6 +177,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
         self._recording = False
         self._forward_observers = []
+        self._pre_forward_observers = []
         self._disable_all = False
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
@@ -198,6 +205,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
+            if self._pre_forward_observers:
+                for callback in self._pre_forward_observers:
+                    callback(forward_pass_id, forward_batch)
             self._on_forward_pass_start(forward_batch)
             try:
                 yield outputs
@@ -214,6 +224,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         """
         if callback not in self._forward_observers:
             self._forward_observers.append(callback)
+
+    def register_pre_forward_observer(
+        self, callback: Callable[[int, ForwardBatch], None]
+    ) -> None:
+        if callback not in self._pre_forward_observers:
+            self._pre_forward_observers.append(callback)
 
     @contextmanager
     def disable_this_region(self):

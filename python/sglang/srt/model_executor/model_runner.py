@@ -854,6 +854,10 @@ class ModelRunner:
         )
         self.expert_hot_cache_manager = manager
         if manager is not None:
+            if getattr(manager, "_pre_forward_readiness_enabled", False):
+                get_global_expert_distribution_recorder().register_pre_forward_observer(
+                    manager.on_pre_forward
+                )
             get_global_expert_distribution_recorder().register_forward_observer(
                 manager.on_expert_distribution
             )
