@@ -871,3 +871,56 @@ def test_the_verdicts_mirror_flag_follows_the_value_not_the_key():
     mirror = lambda env: bool(env.get("SGLANG_MOE_EXPERT_MIRROR_DIRS"))
     assert mirror(arm_env.base_env()) is True
     assert mirror(arm_env.arm_env({"SGLANG_MOE_EXPERT_MIRROR_DIRS": ""})) is False
+
+
+# --- arm_env: the server's cores stay on NUMA node 0 (the 2026-09-22 startup hang) ---
+
+# divix01's topology, from `numactl --hardware`. Node 1 is where the box's reth/nimbus
+# stack lives, so a server thread that lands there first-touches memory into a node with
+# ~9 GB free and the allocator spins in direct compaction instead of failing over.
+NODE0_CPUS = frozenset(range(0, 18)) | frozenset(range(36, 54))
+NODE1_CPUS = frozenset(range(18, 36)) | frozenset(range(54, 72))
+
+
+def _cores(spec: str) -> set[int]:
+    """Expand a taskset list like "0-7,16-17,36-53" into core numbers."""
+    out: set[int] = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def test_core_spec_expansion_handles_ranges_and_singletons():
+    # _cores is the test's own parser, so prove it before trusting the assertions below.
+    assert _cores("3") == {3}
+    assert _cores("0-2,7") == {0, 1, 2, 7}
+
+
+def test_server_cores_are_entirely_on_numa_node_0():
+    cores = _cores(arm_env.SERVER_CORES)
+    assert cores, arm_env.SERVER_CORES
+    assert cores <= NODE0_CPUS, sorted(cores - NODE0_CPUS)
+
+
+def test_server_cores_touch_no_node_1_core():
+    # Stated separately from the subset check: this is the property that actually caused
+    # the hang, and it must fail loudly if NODE0_CPUS is ever widened by mistake.
+    assert not (_cores(arm_env.SERVER_CORES) & NODE1_CPUS)
+
+
+def test_server_cores_do_not_overlap_the_driver_or_the_reserved_cores():
+    server = _cores(arm_env.SERVER_CORES)
+    assert not (server & _cores(arm_env.DRIVER_CORES)), "server and driver share cores"
+    # Core 71 is production's doorbell spin core; 64-71 stay free for every CPU job.
+    assert not (server & _cores(arm_env.FREE_CORES)), "server touches the reserved cores"
+
+
+def test_run_arm_pins_the_server_with_arm_envs_core_list_not_a_literal():
+    # The launch line and arm_env.SERVER_CORES were two copies of "32-63" that drifted
+    # apart silently; a literal core list here is the bug, not a style choice.
+    script = open(os.path.join(os.path.dirname(__file__), "run_arm.sh")).read()
+    launch = [l for l in script.splitlines() if "taskset" in l and "nsys_prefix" in l]
+    assert len(launch) == 1, launch
+    assert 'taskset -c "$server_cores"' in launch[0], launch[0]
+    assert "arm_env.SERVER_CORES" in script

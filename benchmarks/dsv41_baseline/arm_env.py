@@ -53,7 +53,16 @@ MAX_RUNNING_REQUESTS = 1
 
 MAX_TOKENS = 128
 
-SERVER_CORES = "32-63"
+# Node-0 cores only, since 2026-09-22. divix01 is two NUMA nodes of ~96 GB:
+# node 0 is cpus 0-17,36-53 and node 1 is 18-35,54-71. The old "32-63" spanned both,
+# so first-touch put part of the 70 GiB pinned host buffer on node 1 -- which the
+# box's reth/nimbus stack keeps at ~9 GB free. Huge-page allocations there fail, and
+# with THP enabled=always the allocator does not fail over, it spins in direct
+# compaction: three threads at 100% system time, zero completed syscalls, GPU idle,
+# and no server log line after "Load weight end" until the 900s abort. Keeping every
+# server thread on node 0 keeps its memory on node 0's free ~70 GiB.
+# Driver cores 8-15 are node 0 too and are excluded here so the two never overlap.
+SERVER_CORES = "0-7,16-17,36-53"
 DRIVER_CORES = "8-15"
 FREE_CORES = "64-71"  # never touched; core 71 is production's doorbell spin core.
 

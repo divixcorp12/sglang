@@ -37,6 +37,13 @@ overrides=("$@")
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 worktree=${DSV41_WORKTREE:-$(cd "$here/../.." && pwd)}
 py=/data/models/slang/.venv/bin/python
+# Read the server's core list from arm_env rather than repeating it: this line and
+# arm_env.SERVER_CORES were two copies of "32-63" that could drift, and a taskset
+# spanning both NUMA nodes is exactly the startup hang of 2026-09-22. The command
+# substitution finishes long before the launch below, so it does not break the
+# "nothing may fork between the shell and python" rule that keeps $! the server.
+server_cores=$("$py" -c "import sys; sys.path.insert(0, '$here'); import arm_env; print(arm_env.SERVER_CORES)") \
+    || { echo "cannot read arm_env.SERVER_CORES" >&2; exit 1; }
 gpu_lock=/data/models/slang/nvfp4-work/cc-gpu.lock
 out_root=${DSV41_RUN_ROOT:-/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-baseline}
 run_dir=$out_root/servers/$arm/run-$(date +%Y%m%d-%H%M%S)
@@ -218,7 +225,7 @@ cd "$worktree"
 # DECODE_LOG_INTERVAL overrides ServerArgs' default (unset here); see
 # decode_log_interval_compare.sh, which is the only caller that sets it.
 decode_log_interval_py=${DECODE_LOG_INTERVAL:-None}
-taskset -c 32-63 "${nsys_prefix[@]}" env "${env_argv[@]}" \
+taskset -c "$server_cores" "${nsys_prefix[@]}" env "${env_argv[@]}" \
     PYTHONPATH="$worktree/python" PYTHONUNBUFFERED=1 \
     "$py" -c "
 import sys
