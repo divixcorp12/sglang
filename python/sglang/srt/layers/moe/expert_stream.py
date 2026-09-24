@@ -499,9 +499,12 @@ def _placement_report(placement: "Placement", caches) -> dict | None:
     from sglang.srt.layers.moe.host_numa import page_nodes
 
     sampled = Counter()
-    for cache in caches:
-        for slab in cache.tensors.values():
-            sampled.update(page_nodes(slab, samples=16))
+    try:
+        for cache in caches:
+            for slab in cache.tensors.values():
+                sampled.update(page_nodes(slab, samples=16))
+    except OSError as error:  # a diagnostic; the tier is already bound and registered
+        sampled = Counter({f"unavailable: {error.strerror}": 0})
     return {
         "mib": {str(node): nbytes >> 20 for node, nbytes in placement},
         "sampled_pages": {str(node): count for node, count in sorted(sampled.items())},
@@ -530,6 +533,7 @@ class ExpertPinnedHostCacheManager:
                     "pinned host cache requires unique nonnegative layer IDs"
                 )
             streamers[layer_id] = streamer
+        placement = pinned_host_placement(budget_bytes)
         if not streamers:
             return None
         capacities = {layer_id: 0 for layer_id in streamers}
@@ -548,7 +552,6 @@ class ExpertPinnedHostCacheManager:
                 progress = True
         if not any(capacities.values()):
             return None
-        placement = pinned_host_placement(budget_bytes)
         manager = cls()
         # The format supplies tier options such as an is_pinned filter; the dense
         # format supplies none, so NVFP4 tiers are built exactly as before.

@@ -1,5 +1,6 @@
 """CPU tests of the pinned tier's NUMA placement: parsing, row split, capacity check, binding, manager wiring."""
 
+import errno
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from sglang.srt.layers.moe.expert_host_tier import PAGE_BYTES, allocate_host_sla
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCacheManager, ExpertStreamer
 from sglang.srt.layers.moe.host_numa import (
     MIB,
+    address_policy,
     allocate_bound,
     check_capacity,
     page_nodes,
@@ -94,14 +96,44 @@ class TestCheckCapacity(unittest.TestCase):
             check_capacity(((7, MIB),), root=self._root({0: (1, 0, 0)}))
 
 
+def _mbind_permitted() -> bool:
+    try:
+        allocate_bound(PAGE_BYTES, [(0, 0, 1)], PAGE_BYTES)
+    except OSError as error:
+        if error.errno in (errno.EPERM, errno.ENOSYS):
+            return False
+        raise
+    return True
+
+
+MBIND_PERMITTED = _mbind_permitted()
+MPOL_DEFAULT, MPOL_BIND = 0, 2
+
+
+@unittest.skipUnless(MBIND_PERMITTED, "mbind is not permitted here (seccomp without CAP_SYS_NICE)")
 class TestBinding(unittest.TestCase):
-    def test_a_slab_bound_to_node0_lives_there(self):
+    def test_every_page_of_a_run_is_bound_and_plain_memory_is_not(self):
         rows, row_bytes = 16, 3 * PAGE_BYTES
         slab = allocate_bound(rows * row_bytes, [(0, 0, rows)], row_bytes)
-        self.assertEqual(slab.data_ptr() % PAGE_BYTES, 0)
-        self.assertEqual(slab.numel(), rows * row_bytes)
-        slab.fill_(1)
-        self.assertEqual(page_nodes(slab, samples=32), {0: 32})
+        for address in (slab.data_ptr(), slab.data_ptr() + rows * row_bytes - PAGE_BYTES):
+            self.assertEqual(address_policy(address), (MPOL_BIND, frozenset({0})))
+        plain = torch.empty(4 << 20, dtype=torch.uint8)
+        self.assertEqual(address_policy(plain.data_ptr())[0], MPOL_DEFAULT)
+
+    def test_unaligned_row_runs_tile_the_slab_with_the_boundary_page_bound_last_to_the_later_run(self):
+        rows, row_bytes = 10, 3 * PAGE_BYTES + 100
+        runs = [(0, 0, 6), (1, 6, 4)]
+        calls = []
+        with patch.object(host_numa, "_mbind", side_effect=lambda a, n, node: calls.append((a, n, node))):
+            slab = allocate_bound(rows * row_bytes, runs, row_bytes)
+        base, nbytes, boundary = slab.data_ptr(), rows * row_bytes, 6 * row_bytes
+        (a0, n0, node0), (a1, n1, node1) = calls
+        self.assertEqual((node0, node1), (0, 1))
+        self.assertEqual(a0, base)
+        self.assertEqual(a1, base + boundary // PAGE_BYTES * PAGE_BYTES)
+        self.assertEqual(a0 + n0, base + -(-boundary // PAGE_BYTES) * PAGE_BYTES)
+        self.assertEqual(a1 + n1, base + -(-nbytes // PAGE_BYTES) * PAGE_BYTES)
+        self.assertEqual((a0 + n0) - a1, PAGE_BYTES)  # exactly the shared page, rebound by the later run
 
     def test_pages_are_not_touched_by_allocation(self):
         slab = allocate_bound(8 * PAGE_BYTES, [(0, 0, 8)], PAGE_BYTES)
@@ -120,11 +152,10 @@ class TestBinding(unittest.TestCase):
     def test_allocate_host_slab_with_a_placement_keeps_shape_and_bytes(self):
         slab = allocate_host_slab(6, (5, 7), torch.int16, register=False, placement=((0, MIB),))
         self.assertEqual(tuple(slab.shape), (6, 5, 7))
-        self.assertEqual(slab.dtype, torch.int16)
         self.assertEqual(slab.data_ptr() % PAGE_BYTES, 0)
+        self.assertEqual(address_policy(slab.data_ptr()), (MPOL_BIND, frozenset({0})))
         slab.copy_(torch.arange(6 * 35, dtype=torch.int16).view(6, 5, 7))
         self.assertEqual(int(slab[5, 4, 6]), 6 * 35 - 1)
-        self.assertEqual(set(page_nodes(slab)), {0})
 
 
 def _cpu_model():
@@ -165,6 +196,7 @@ class TestManagerPlacement(unittest.TestCase):
                 ExpertPinnedHostCacheManager.from_model(self.model, budget_bytes=4 * MIB)
             allocate.assert_not_called()
 
+    @unittest.skipUnless(MBIND_PERMITTED, "mbind is not permitted here")
     def test_the_manager_binds_every_slab_and_logs_the_placement(self):
         with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(host_numa, "check_capacity"):
             with self.assertLogs(expert_stream.logger, "INFO") as logs:
@@ -172,8 +204,7 @@ class TestManagerPlacement(unittest.TestCase):
         self.assertTrue(manager.caches)
         for cache in manager.caches.values():
             for slab in cache.tensors.values():
-                slab.fill_(0)
-                self.assertEqual(set(page_nodes(slab)), {0})
+                self.assertEqual(address_policy(slab.data_ptr()), (MPOL_BIND, frozenset({0})))
         self.assertIn('"numa": {"mib": {"0": 4}', "\n".join(logs.output))
 
 

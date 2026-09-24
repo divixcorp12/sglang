@@ -28,7 +28,11 @@ MIB = 1 << 20
 # CUDA's host-side state) with the default local policy, so a node filled to the byte would push those elsewhere.
 NODE_HEADROOM_BYTES = 4 << 30
 _MPOL_BIND = 2
-_SYSCALLS = {"x86_64": {"mbind": 237, "move_pages": 279}, "aarch64": {"mbind": 235, "move_pages": 239}}
+_MPOL_F_ADDR = 1 << 1
+_SYSCALLS = {
+    "x86_64": {"mbind": 237, "move_pages": 279, "get_mempolicy": 239},
+    "aarch64": {"mbind": 235, "move_pages": 239, "get_mempolicy": 236},
+}
 _NODE_ROOT = "/sys/devices/system/node"
 
 Placement = tuple[tuple[int, int], ...]  # ((node, bytes), ...), in binding order
@@ -125,7 +129,7 @@ def _mbind(address: int, length: int, node: int) -> None:
         ctypes.c_long(_syscall("mbind")),
         ctypes.c_void_p(address),
         ctypes.c_ulong(length),
-        ctypes.c_int(_MPOL_BIND),
+        ctypes.c_ulong(_MPOL_BIND),
         mask,
         ctypes.c_ulong(mask_words * 64 + 1),
         ctypes.c_uint(0),
@@ -152,6 +156,24 @@ def allocate_bound(nbytes: int, runs: Sequence[tuple[int, int, int]], row_bytes:
         if hi > lo:
             _mbind(base + lo, -(-(hi - lo) // PAGE_BYTES) * PAGE_BYTES, node)
     return tensor
+
+
+def address_policy(address: int) -> tuple[int, frozenset[int]]:
+    """The memory policy governing ``address`` (mode, nodes), without faulting its page in."""
+    mode = ctypes.c_int()
+    mask = (ctypes.c_ulong * 16)()
+    rc = _libc.syscall(
+        ctypes.c_long(_syscall("get_mempolicy")),
+        ctypes.byref(mode),
+        mask,
+        ctypes.c_ulong(16 * 64),
+        ctypes.c_void_p(address),
+        ctypes.c_ulong(_MPOL_F_ADDR),
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"get_mempolicy failed: {os.strerror(err)}")
+    return mode.value, frozenset(i for i in range(16 * 64) if mask[i // 64] >> (i % 64) & 1)
 
 
 def page_nodes(tensor: torch.Tensor, samples: int = 64) -> Counter:
