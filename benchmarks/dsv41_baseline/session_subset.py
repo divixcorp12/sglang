@@ -3,33 +3,32 @@
 The corpus is the real one behind the recorded phase 3a/3b arms
 (`divix01:/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl`, produced by
 `build_sessions.py`, generated 2026-09-15) — NOT the Qwen3.8 "prefetch-shadow" pinned
-corpus, whose multi-turn contexts run past DSV4.1's 4096-token `context_length` and
-would be rejected outright, not merely slow. `analysis/dsv41-phase3a/wc-step7.sh` is
+corpus. `analysis/dsv41-phase3a/wc-step7.sh` is
 the exact command that produced `corpus-cold.json`: `trace_corpus.py --n 8 --skip 0
 --prompt-tokens 256 --new-tokens 128`. `synthetic_corpus.py` reuses that recipe — the
 first-turn text of each of these 8 sessions, truncated to 256 tokens — but re-encodes
 it as a one-turn chat session so it can be driven over `/v1/chat/completions` like the
 Qwen campaign, instead of fed as raw token ids to an offline Engine.
 
-`context_length=4096` is a measurement decision, not a launch-sizing detail: raising it
-grows the KV pool against a fixed `mem_fraction_static`, which shrinks the hot expert
-cache, which changes the RAM-miss rate this campaign exists to reduce. A baseline at a
-different context length would not be comparable to the recorded 2.781 tok/s or to the
-step breakdown the V2 storage plan is written against. `CONTEXT_LENGTH` here is fixed
-at 4096 for that reason, not because a longer context would fail to launch.
+The serving context length comes from `arm_env.CONTEXT_LENGTH`, currently 32,768 to
+match production. The corpus still uses short first-turn prompts and 128 generated
+tokens. Historical 4,096-token results are not directly comparable: the longer
+context changes memory allocation, and the current launch also enables prefix caching.
 
 `corpus-c.json` (the recorded 2.781 tok/s baseline, DSV41_REFERENCE.md section 17.6)
 used only the first 4 of these 8 sessions. `N_SESSIONS=8` keeps those 4 first and
-unchanged, so a comparable 4-session subtotal can be cross-checked against 2.781
-directly, while the extra 4 sessions buy statistical power for the paired sign test (8
-sessions of a clean sweep gives p ~= 0.0039 vs 4 sessions' p = 0.0625, short of
-conventional significance).
+unchanged, preserving corpus overlap, but the new launch settings require a fresh
+throughput baseline. The extra 4 sessions buy statistical power for the paired sign
+test (8 sessions of a clean sweep gives p ~= 0.0039 vs 4 sessions' p = 0.0625,
+short of conventional significance).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+
+from arm_env import CONTEXT_LENGTH
 
 CORPUS_PATH = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
 CORPUS_SHA256 = "249e8a73a32b69aff563471dbae2f4f3a2a9beaa1a3ae5cb03b4c2c549c16c72"
@@ -38,7 +37,6 @@ N_SESSIONS = 8
 SKIP = 0
 PROMPT_TOKENS = 256
 NEW_TOKENS = 128
-CONTEXT_LENGTH = 4096
 
 # The 8 session_ids at (skip=0, n=8) in this corpus. The first 4 are exactly
 # `corpus-c.json`'s sessions.

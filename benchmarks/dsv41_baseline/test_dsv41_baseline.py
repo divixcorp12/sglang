@@ -879,6 +879,15 @@ def test_judge_missing_residency_sample_is_unacknowledged_problem(residency):
 # --- arm_env.ServerArgs: decode_log_interval is opt-in, off by default ---
 
 
+def test_server_args_matches_current_context_and_prefix_cache_mode():
+    argv = arm_env.ServerArgs(port=31050).argv()
+    context_index = argv.index("--context-length")
+    assert arm_env.CONTEXT_LENGTH == 32768
+    assert argv[context_index + 1] == str(arm_env.CONTEXT_LENGTH)
+    assert "--disable-radix-cache" not in argv
+    assert session_subset.CONTEXT_LENGTH == arm_env.CONTEXT_LENGTH
+
+
 def test_server_args_omits_decode_log_interval_by_default():
     argv = arm_env.ServerArgs(port=31050).argv()
     assert "--decode-log-interval" not in argv

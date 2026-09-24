@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs one DSV4.1 baseline arm end to end: preflight (clean tree, registered code
-# generation), corpus checksum, synthetic-session build, cold HTTP server (smoke.sh's
-# exact flags), health gate, env verification, a readiness gate (SM clock stable AND
-# no further JIT compilation), the 8-session timed set (aborting hard on any
+# generation), corpus checksum, synthetic-session build, cold HTTP server (production
+# context length and prefix-cache settings), health gate, env verification, a
+# readiness gate (SM clock stable and no further JIT compilation), the 8-session
+# timed set (aborting hard on any
 # mid-session compile event; provenance, clocks, cpu_s and page-cache residency
 # sampled throughout), a verdict judged by Task 1's own `check_arm`/`contention`/
 # `generation`/`session_outliers` (imported, not reimplemented — see verdict.py), and

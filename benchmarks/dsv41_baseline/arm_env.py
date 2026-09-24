@@ -11,13 +11,16 @@ A V2 storage change under test is
 layered on top via `overrides`; the merged dict is both what launches the server and
 what `verify_env` checks against `/proc/<pid>/environ` afterwards.
 
-`ServerArgs.argv()` is copied verbatim from the working launch line in
+`ServerArgs.argv()` started from the working launch line in
 `divix01:/data/models/slang/nvfp4-work/cc-dsv41-base/analysis/baseline/smoke.sh`
 (2026-09-21: server came up, served `/v1/chat/completions` 200 OK, and ran the
 breakable decode CUDA graph at batch size 1 — `cuda graph: True` in the server log —
-which is the path every recorded DSV4.1 number describes). `smoke.sh` needed exactly
-two flags beyond the resolved `server_args`: `--expert-distribution-recorder-mode
-per_pass` (the EXL3 gate refuses dynamic hot caching without it) and
+which is the path every recorded DSV4.1 number describes). The current benchmark
+uses production's 32,768-token context and enabled prefix cache; those differ from
+the smoke launch and make historical throughput numbers non-comparable. `smoke.sh`
+needed exactly two flags beyond the resolved `server_args`:
+`--expert-distribution-recorder-mode per_pass` (the EXL3 gate refuses dynamic hot
+caching without it) and
 `--disable-shared-experts-fusion`, both included below.
 
 `--reasoning-parser` / `--tool-call-parser` are deliberately NOT passed: the smoke
@@ -46,8 +49,8 @@ CUDA_HOME = "/usr/local/cuda-13.2"
 PYTHON = "/data/models/slang/.venv/bin/python"
 GPU_LOCK = f"{NVFP4_WORK}/cc-gpu.lock"
 
-# smoke.sh's exact flag set (see module docstring).
-CONTEXT_LENGTH = 4096
+# Match the current production launcher; older benchmark arms used 4096.
+CONTEXT_LENGTH = 32768
 MEM_FRACTION_STATIC = 0.80
 CHUNKED_PREFILL_SIZE = 512
 MAX_PREFILL_TOKENS = 16384
@@ -145,9 +148,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     decode_log_interval: int | None = None
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
-        """`smoke.sh`'s exact flag set, copied rather than re-derived (team lead's
-        2026-09-21 smoke confirmed this launches, serves 200s, and runs the breakable
-        decode graph)."""
+        """The smoke-validated launch, updated to production's context and cache mode."""
         argv = [
             python,
             "-m",
@@ -168,7 +169,6 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             str(MAX_PREFILL_TOKENS),
             "--max-running-requests",
             str(MAX_RUNNING_REQUESTS),
-            "--disable-radix-cache",
             "--cuda-graph-backend-decode",
             "breakable",
             "--cuda-graph-bs-decode",

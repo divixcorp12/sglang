@@ -8,15 +8,13 @@ comparing V2 storage changes one arm at a time, over the real HTTP server
 
 ## Corpus: real text, truncated to a fixed short shape
 
-DSV4.1's `context_length` is fixed at **4096**, and that is a measurement decision, not
-a launch-sizing detail: the KV pool is sized from `context_length` against
-`mem_fraction_static=0.80`, so raising it shrinks the VRAM left for the hot expert
-cache (`SGLANG_MOE_HOT_GPU_MB=14336`), which changes the hot-cache hit rate, which
-changes the RAM-miss rate — the exact quantity this campaign exists to reduce. A
-baseline at a longer context would not be comparable to the recorded 2.781 tok/s or to
-the step breakdown the V2 storage plan is written against, even if it launched cleanly.
-That ruled out the Qwen3.8 "prefetch-shadow" corpus outright (its multi-turn contexts
-run past 4096 tokens and would be rejected, not merely slow).
+The current benchmark uses a **32,768-token context and prefix caching**, matching the
+saved production launcher. Earlier arms used a 4,096-token context with prefix caching
+disabled. The larger context can change KV-pool sizing and the VRAM available for the
+hot expert cache (`SGLANG_MOE_HOT_GPU_MB=14336`); prefix caching can also change
+prefill work. Treat this as a new benchmark recipe and compare only matched arms.
+Historical 2.781 tok/s and V2 storage step breakdowns are useful context, not a
+same-configuration baseline. The short corpus below is retained for continuity.
 
 This harness instead reuses the corpus and shape the phase 3a/3b DSV4.1 arms
 themselves used: `analysis/dsv41-phase3a/wc-step7.sh` (the command that produced
@@ -31,11 +29,13 @@ driven over `/v1/chat/completions` (`trace_corpus.py` instead fed raw token ids
 straight to an offline `sglang.Engine`, which is not this campaign's serving path).
 `run_arm.sh` checks the real corpus's checksum at the start of every run and aborts on
 mismatch; it never regenerates or modifies the corpus, and `assert_fits_context`
-refuses any prompt+generation that would exceed 4096 tokens before it is ever sent.
+refuses any prompt+generation that would exceed the configured context before it is
+ever sent.
 
 **8 sessions, and the first 4 are exactly `corpus-c.json`'s sessions** (the recorded
-2.781 tok/s baseline), so this campaign's 4-session subtotal can be cross-checked
-against that number. The extra 4 buy statistical power: 8 sessions gives a clean-sweep
+2.781 tok/s baseline). The corpus overlap aids workload comparisons, but the new
+launch settings prevent a direct throughput comparison with that number. The extra
+4 buy statistical power: 8 sessions gives a clean-sweep
 sign test p ~= 0.0039 (1/256); 4 alone only reaches p = 0.0625.
 
 A 9th real corpus session (index 8, `fb-financebench_id_04209`, not one of the 8 timed
@@ -48,10 +48,11 @@ ones) is the warm-up session — discarded from timing and reused each warm-up r
 `divix01:/data/models/slang/nvfp4-work/cc-dsv41-base/analysis/baseline/smoke.sh`):
 `/v1/chat/completions` returned 200, and the server log showed `cuda graph: True` at
 `#running-req: 1` — the breakable decode CUDA graph, the path every recorded DSV4.1
-number describes, not an eager fallback. `arm_env.ServerArgs.argv()` copies that launch
-line verbatim rather than re-deriving it: `context_length=4096`,
+number describes, not an eager fallback. `arm_env.ServerArgs.argv()` starts from that
+smoke launch, with the current production context and cache mode:
+`context_length=32768`, prefix caching enabled,
 `mem_fraction_static=0.80`, `chunked_prefill_size=512`, `max_prefill_tokens=16384`,
-`disable_radix_cache`, decode CUDA graph `backend=breakable, bs=[1], max_bs=1`, prefill
+decode CUDA graph `backend=breakable, bs=[1], max_bs=1`, prefill
 CUDA graph disabled, `expert_distribution_recorder_mode=per_pass` (the EXL3 gate
 refuses dynamic hot caching without it), `disable_shared_experts_fusion`.
 **`max_running_requests=1`**, not the 4 in `corpus-c.log`'s Engine dump: decode graphs
@@ -498,5 +499,5 @@ from a document, and is independent of the still-open commit-pinning question ab
   discarded, twice — first because prefill is 55-99 s per 256-token prompt and a
   multi-thousand-token session would blow the time budget, then (the sharper reason)
   because raising `context_length` changes the hot-cache/RAM-miss behavior this
-  campaign measures, which would make the baseline not comparable to the number it
-  exists to be checked against, independent of whether it launched cleanly.
+  campaign measures. That design remains unused; the short corpus is now run with a
+  longer context to match production, so its new results require a new baseline.

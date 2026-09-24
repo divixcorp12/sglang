@@ -55,9 +55,8 @@ Tracing-only knobs such as `SGLANG_DSV41_EXPERT_TRACE_PATH` and
 
 ## Production and benchmark argument differences
 
-The saved production launcher enables prefix caching and sets context length to
-32,768 tokens. The benchmark `ServerArgs.argv()` still contains
-`--disable-radix-cache` and a 4,096-token context, preserving its historical
-measurement setup. Compare throughput only between runs with matching launch
-arguments and environment values. The production server was shut down when this
-ledger was written; this change does not start it.
+The saved production launcher and current benchmark `ServerArgs.argv()` both enable
+prefix caching and set context length to 32,768 tokens. Earlier benchmark arms used
+`--disable-radix-cache` and a 4,096-token context. Compare throughput only between
+runs with matching launch arguments and environment values. This benchmark change
+does not start the production server.
