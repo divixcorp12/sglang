@@ -66,7 +66,6 @@ struct Options {
   int64_t src_mb = 1024;
   int64_t dst_mb = 4096;
   int dst_node = -1;
-  int spin = 1;  // hold the pool active across each read, as RowReader::read does; 0 parks between pieces
   const char* csv = nullptr;
 };
 
@@ -86,7 +85,6 @@ Options parse(int argc, char** argv) {
     else if (k == "--src-mb") o.src_mb = atoll(v);
     else if (k == "--dst-mb") o.dst_mb = atoll(v);
     else if (k == "--dst-node") o.dst_node = atoi(v);
-    else if (k == "--spin") o.spin = atoi(v);
     else if (k == "--csv") o.csv = v;
     else {
       fprintf(stderr, "unknown option %s\n", k.c_str());
@@ -152,9 +150,9 @@ int main(int argc, char** argv) {
   pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited);
   const int64_t chunk = o.piece_bytes / o.split;
   printf("workers %u split %u piece %lld B (chunk ~%lld B) runs %d | %d pieces per read, gap %lld us, read gap %lld us,"
-         " %d reads | dst node %d | spin %d | %d allowed cpus\n",
+         " %d reads | dst node %d | %d allowed cpus\n",
          o.workers, o.split, static_cast<long long>(o.piece_bytes), static_cast<long long>(chunk), o.runs, o.pieces,
-         static_cast<long long>(o.gap_us), static_cast<long long>(o.read_gap_us), o.reads, o.dst_node, o.spin,
+         static_cast<long long>(o.gap_us), static_cast<long long>(o.read_gap_us), o.reads, o.dst_node,
          CPU_COUNT(&inherited));
   printf("one-core cold memcpy: chunk %.2f GB/s, piece %.2f GB/s\n",
          memcpy_gbps(src, src_bytes, dst, dst_bytes, chunk, 2000),
@@ -173,7 +171,6 @@ int main(int argc, char** argv) {
   int64_t s_at = 0, d_at = 0;
   int64_t next = now_ns() + 1000000;
   for (int r = 0; r < o.reads; ++r) {
-    if (o.spin) pool.set_active(true);
     for (int p = 0; p < o.pieces; ++p) {
       int64_t left = o.piece_bytes, at = 0;
       for (int i = 0; i < o.runs; ++i) {
@@ -214,7 +211,6 @@ int main(int argc, char** argv) {
       next += (p + 1 == o.pieces ? o.read_gap_us : o.gap_us) * 1000;
       next = std::max(next, now_ns());
     }
-    if (o.spin) pool.set_active(false);
   }
   if (csv) fclose(csv);
   const char* kinds[2] = {"first piece of a read (after the read gap)", "later pieces (after the piece gap)"};

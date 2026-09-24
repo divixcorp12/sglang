@@ -16,7 +16,6 @@
 #include <pthread.h>
 #include <sched.h>
 #include <immintrin.h>
-#include <time.h>
 
 #include <algorithm>
 #include <atomic>
@@ -143,10 +142,10 @@ inline std::vector<int> pick_worker_cpus(const cpu_set_t& allowed, unsigned work
   return picked;
 }
 
-// Workers are pinned one per CPU (pick_worker_cpus). While the owner holds the pool active (set_active, for the span
-// of a read), an idle worker spins on its CPU for the next post instead of parking. A parked worker pays a futex
-// wake and the exit from whatever idle state its core reached, per job; under piece streaming a job is one piece
-// every few hundred microseconds, right where the cores reach their deepest state.
+// Workers are pinned one per CPU (pick_worker_cpus) and park between jobs. Spinning while a read is in service was
+// built and measured (PACK_WORKERS.md, 2026-09-24): it bought nothing in serving, since a piece's tail is the
+// socket's copy bandwidth rather than the wake, and with the service thread kept off the spinners it stalled the
+// SPCC mirror's completions for milliseconds.
 class PackPool {
  public:
   // Throws, with every thread already joined, when there is no allowed core, fewer allowed cores than workers, or a
@@ -184,7 +183,7 @@ class PackPool {
 
   size_t workers() const { return threads_.size(); }
 
-  // Worker i's CPU. Anything that must keep running while a read is in service stays off these.
+  // Worker i's CPU. The service thread keeps off these, so a piece's copy never waits behind the thread that posts it.
   const std::vector<int>& cpus() const { return cpus_; }
 
   // The affinity of worker `index` as the kernel reports it (tests).
@@ -193,19 +192,6 @@ class PackPool {
     CPU_ZERO(&set);
     pthread_getaffinity_np(threads_.at(index).native_handle(), sizeof(set), &set);
     return set;
-  }
-
-  // The CPU time every worker has used so far, ns (tests: a pool that is not active must not be spinning).
-  int64_t worker_cpu_ns() {
-    int64_t total = 0;
-    for (auto& thread : threads_) {
-      clockid_t clock;
-      timespec ts;
-      if (pthread_getcpuclockid(thread.native_handle(), &clock) == 0 && clock_gettime(clock, &ts) == 0) {
-        total += static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
-      }
-    }
-    return total;
   }
 
   // Resize the queue of an idle pool (nothing posted): the reader posts a job per piece with piece streaming.
@@ -223,22 +209,9 @@ class PackPool {
       if (count_ == queue_.size()) throw std::runtime_error("exl3 RAM miss: the packing queue overflowed its slot count");
       queue_[(head_ + count_) % queue_.size()] = job;
       ++count_;
-      posted_.fetch_add(1, std::memory_order_release);
     }
-    work_cv_.notify_all();  // no syscall when nobody is parked
+    work_cv_.notify_all();
   }
-
-  // Spin (true) or park (false) the idle workers. Written under the mutex, so a worker that checks the park
-  // condition under it cannot miss the switch; turning it on wakes the parked workers.
-  void set_active(bool on) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      active_.store(on, std::memory_order_relaxed);
-    }
-    if (on) work_cv_.notify_all();
-  }
-
-  bool active() const { return active_.load(std::memory_order_relaxed); }
 
  private:
   void run(unsigned index) {
@@ -254,27 +227,13 @@ class PackPool {
     }
     started_cv_.notify_all();
     if (error != 0) return;
-    uint64_t seen = 0;  // posted_ when this worker last found the queue empty
     while (true) {
-      // Spinning: take the mutex only once something was posted since the queue was last seen empty, so idle
-      // spinners never touch its line.
-      if (active_.load(std::memory_order_relaxed) && !stop_.load(std::memory_order_relaxed) &&
-          posted_.load(std::memory_order_acquire) == seen) {
-        _mm_pause();
-        continue;
-      }
       PackJob* job = nullptr;
       unsigned chunk = 0;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        work_cv_.wait(lock, [&] {
-          return stop_.load(std::memory_order_relaxed) || count_ > 0 || active_.load(std::memory_order_relaxed);
-        });
-        if (count_ == 0) {
-          if (stop_.load(std::memory_order_relaxed)) return;  // stopping, and nothing is posted
-          seen = posted_.load(std::memory_order_relaxed);  // active with nothing queued: back to spinning
-          continue;
-        }
+        work_cv_.wait(lock, [&] { return stop_ || count_ > 0; });
+        if (count_ == 0) return;  // stopping, and nothing is posted
         job = queue_[head_];
         chunk = job->claimed.fetch_add(1, std::memory_order_relaxed);
         if (chunk + 1 == job->chunks) {  // the last chunk is claimed: nobody else needs this job
@@ -323,7 +282,7 @@ class PackPool {
   void shutdown() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      stop_.store(true, std::memory_order_relaxed);  // a spinning worker reads it too, so it cannot spin past this
+      stop_ = true;
     }
     work_cv_.notify_all();
     for (auto& thread : threads_) {
@@ -338,9 +297,7 @@ class PackPool {
   size_t head_ = 0;
   size_t count_ = 0;
   size_t started_ = 0;
-  std::atomic<bool> stop_{false};    // written under mutex_
-  std::atomic<bool> active_{false};  // written under mutex_
-  std::atomic<uint64_t> posted_{0};  // jobs ever posted; written under mutex_
+  bool stop_ = false;
   std::atomic<int> pin_error_{0};
   std::mutex mutex_;
   std::condition_variable work_cv_;
