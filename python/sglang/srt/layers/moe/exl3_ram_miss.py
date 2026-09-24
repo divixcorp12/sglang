@@ -34,6 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
+from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_row_reader import mirror_path
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
@@ -67,6 +68,10 @@ class Exl3RamMissTables:
     row_bytes: torch.Tensor  # int64 [6]
     capacity: torch.Tensor  # int64 [L]
     slot_bytes: int
+    # Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES): the files are exl3_row_image layer files, a row's parts
+    # tile its image (``starts`` 0, extents' destination = position in the image), the segments are the six identity
+    # segments and the C++ reader reads straight into the slabs (its direct mode). ``slot_bytes`` is the image size.
+    row_images: bool = False
     # The slab tensors whose addresses are in ``slabs``: the C++ reader writes through
     # those raw addresses, so the tables own a reference to every slab (M5).
     keepalive: tuple = field(default=(), repr=False, compare=False)
@@ -80,6 +85,7 @@ def exl3_ram_miss_tables(
     roots: Sequence[str] = (),
     policy: Optional[SplitPolicy] = None,
     source_root: Optional[str] = None,
+    row_images: Optional[RowImageSet] = None,
 ) -> Exl3RamMissTables:
     """Tables for the streamed layers in ``slabs_by_layer`` (ascending layer id = row order).
 
@@ -88,7 +94,12 @@ def exl3_ram_miss_tables(
     ``read_split`` uses. ``paths`` is then shard-major, root-minor: part ``p`` of the shard with
     source index ``s`` is file ``s * parts + p``. With no roots ``parts == 1``, the files are the
     source shards and every extent starts at destination offset 0.
+
+    With ``row_images`` (an ``open_row_images`` set over the same roots) the tables read the images instead:
+    see ``_row_image_tables``.
     """
+    if row_images is not None:
+        return _row_image_tables(layout, segments, slabs_by_layer, row_images, roots=roots, policy=policy)
     roots = tuple(roots)
     if roots:
         if policy is None or source_root is None:
@@ -143,6 +154,27 @@ def exl3_ram_miss_tables(
     row_bytes = torch.tensor(
         [sum(s.nbytes for s in segments if s.name == name) for name in EXL3_STREAMED_NAMES], dtype=torch.int64
     )
+    slabs, capacity = _slab_table(layer_ids, slabs_by_layer, row_bytes.tolist(), names)
+    return Exl3RamMissTables(
+        layer_ids=layer_ids,
+        paths=paths,
+        source_paths=copied,
+        file_sizes=torch.tensor([size for size in source_sizes for _ in range(parts)], dtype=torch.int64),
+        extents=extents,
+        starts=starts,
+        parts=parts,
+        segments=segment_table,
+        slabs=slabs,
+        row_bytes=row_bytes,
+        capacity=capacity,
+        slot_bytes=-(-widest // PAGE_BYTES) * PAGE_BYTES,
+        keepalive=tuple(slabs_by_layer[layer_id][name] for layer_id in layer_ids for name in EXL3_STREAMED_NAMES),
+    )
+
+
+def _slab_table(layer_ids, slabs_by_layer, row_bytes, names) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every streamed layer's slab base addresses (int64 ``[L, 6]``) and row count, refusing a slab the reader
+    could not write through its raw address."""
     slabs = torch.empty((len(layer_ids), len(EXL3_STREAMED_NAMES)), dtype=torch.int64)
     capacity = torch.empty(len(layer_ids), dtype=torch.int64)
     for row, layer_id in enumerate(layer_ids):
@@ -159,21 +191,120 @@ def exl3_ram_miss_tables(
             if per_row != int(row_bytes[index]):
                 raise ValueError(f"layer {layer_id} {name}: slab rows hold {per_row} B, expected {int(row_bytes[index])}")
             slabs[row, index] = slab.data_ptr()
+    return slabs, capacity
+
+
+def _row_image_tables(
+    layout: Exl3ExpertLayout,
+    segments: Sequence[RowSegment],
+    slabs_by_layer: Mapping[int, Mapping[str, torch.Tensor]],
+    images: RowImageSet,
+    *,
+    roots: Sequence[str],
+    policy: Optional[SplitPolicy],
+) -> Exl3RamMissTables:
+    """The native reader's tables over row images (plan 2026-09-24-dsv41-row-images, Part B.1).
+
+    File ``row * parts + p`` is root ``p``'s image file of streamed row ``row``. Expert ``e``'s image is split across
+    the roots as ``policy`` splits its page-rounded ``row_stride`` (the mirrors' split), each part clipped at
+    ``image_bytes``: the last part ends exactly at the image's end, because the padding after it is never read (a
+    readv of it would run past the last slab row). Part ``p`` is ``(file, e * row_stride + start, bytes, start)`` with
+    ``start`` its position in the image; ``starts`` is 0 and the segments are the identity (name ``n``'s slab row is
+    image bytes ``[name_offsets[n], + row_bytes[n])``), so piece ``j`` of the reader's geometry is exactly sub-read
+    ``j``. Every length and offset is a multiple of 512 (the image layout's names are), which the reader re-checks at
+    open against O_DIRECT's alignment."""
+    parts = len(images.roots)
+    if tuple(roots) and tuple(roots) != tuple(images.roots):
+        raise ValueError(f"row images are on {images.roots}, the tables were asked for roots {tuple(roots)}")
+    if policy is None:
+        if parts != 1:
+            raise ValueError("row images on several roots need the split policy the mirrors use")
+        policy = StaticSplitPolicy((1.0,))
+    image = images.layout
+    if images.num_experts != layout.num_experts:
+        raise ValueError(f"row images hold {images.num_experts} experts per layer, the layout {layout.num_experts}")
+    if image.segments != tuple(segments):
+        raise ValueError("row images were opened for a different segment map than the tables are built from")
+    split = policy.plan(image.row_stride)
+    if len(split.part_bytes) != parts:
+        raise ValueError(f"split policy plans {len(split.part_bytes)} parts for {parts} row-image roots")
+    clipped = [
+        (min(start, image.image_bytes), min(start + nbytes, image.image_bytes))
+        for start, nbytes in zip(split.starts, split.part_bytes)
+    ]
+    layer_ids = sorted(slabs_by_layer)
+    missing = [layer for layer in layer_ids if layer not in images.paths]
+    if missing:
+        raise ValueError(f"row images were not opened for streamed layers {missing}")
+    extents = torch.empty((len(layer_ids), layout.num_experts, parts, 4), dtype=torch.int64)
+    experts = torch.arange(layout.num_experts, dtype=torch.int64) * image.row_stride
+    for row in range(len(layer_ids)):
+        for part, (lo, hi) in enumerate(clipped):
+            extents[row, :, part, 0] = row * parts + part
+            extents[row, :, part, 1] = experts + lo
+            extents[row, :, part, 2] = hi - lo
+            extents[row, :, part, 3] = lo
+    paths = [images.paths[layer][part] for layer in layer_ids for part in range(parts)]
+    # "Source" is what the reader's open-time size check names: every root's file of a layer is a copy of root 0's.
+    copied = [images.paths[layer][0] for layer in layer_ids for _ in range(parts)]
+    file_bytes = layout.num_experts * image.row_stride
+    names = {name: index for index, name in enumerate(EXL3_STREAMED_NAMES)}
+    segment_table = torch.tensor(
+        [[n, 0, image.name_offsets[n], image.row_bytes[n]] for n in range(len(EXL3_STREAMED_NAMES))], dtype=torch.int64
+    )
+    slabs, capacity = _slab_table(layer_ids, slabs_by_layer, image.row_bytes, names)
     return Exl3RamMissTables(
         layer_ids=layer_ids,
         paths=paths,
         source_paths=copied,
-        file_sizes=torch.tensor([size for size in source_sizes for _ in range(parts)], dtype=torch.int64),
+        file_sizes=torch.full((len(paths),), file_bytes, dtype=torch.int64),
         extents=extents,
-        starts=starts,
+        starts=torch.zeros((len(layer_ids), layout.num_experts), dtype=torch.int64),
         parts=parts,
         segments=segment_table,
         slabs=slabs,
-        row_bytes=row_bytes,
+        row_bytes=torch.tensor(image.row_bytes, dtype=torch.int64),
         capacity=capacity,
-        slot_bytes=-(-widest // PAGE_BYTES) * PAGE_BYTES,
+        slot_bytes=image.image_bytes,
+        row_images=True,
         keepalive=tuple(slabs_by_layer[layer_id][name] for layer_id in layer_ids for name in EXL3_STREAMED_NAMES),
     )
+
+
+def check_piece_stream(cfg: Dsv41Config, *, row_images: bool) -> None:
+    """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM without what it needs. It is a mode of two-phase (itself a mode
+    of lease mode), and the inline no-pool pack path (pack_workers == 0) has no publisher for a piece job, so it is
+    refused rather than silently packing whole rows. Row images copy nothing: the reader publishes each piece on its
+    own thread, so they need no workers."""
+    if not cfg.enable_ram_miss_piece_stream:
+        return
+    publisher = cfg.ram_miss_pack_workers > 0 or row_images
+    if not (cfg.enable_ram_miss_two_phase and cfg.enable_ram_miss_leases and publisher):
+        raise RuntimeError(
+            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs "
+            "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES and "
+            "SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0 (or SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES)"
+        )
+
+
+def open_service_row_images(cfg: Dsv41Config, layout, segments, mirrors: dict, direct: bool, streamers) -> Optional[RowImageSet]:
+    """The row images the service reads with (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES), or None with the flag off.
+
+    The images live beside the mirrored shards, one set per mirror root, and are split across the roots exactly as the
+    mirrors are (``mirrors`` is ``mirror_table_args()``). Refused without mirror dirs (there is nowhere to read them
+    from) and without O_DIRECT reads (the point is a readv straight into the pinned slabs), and by ``open_row_images``
+    unless every root holds a complete set matching this checkpoint for every streamed layer."""
+    if not cfg.enable_ram_miss_row_images:
+        return None
+    if not mirrors:
+        raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_MOE_EXPERT_MIRROR_DIRS")
+    if not direct:
+        raise RuntimeError(
+            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_MOE_EXPERT_FILE_READER=uring_direct"
+        )
+    from sglang.srt.layers.moe.exl3_row_image import open_row_images
+
+    return open_row_images(mirrors["roots"], layout, segments, mirrors["source_root"], list(streamers))
 
 
 class NativePinnedSlotTable:
@@ -498,11 +629,14 @@ class Exl3RamMissService:
             raise RuntimeError(f"exl3 RAM miss: layers {missing} have no pinned tier yet")
         fmt = next(iter(streamers.values())).format
         # The mirror roots and weights the eager row source reads with, validated by the same code.
+        mirrors = fmt.mirror_table_args()
+        direct = fmt._resolve_direct()
         tables = exl3_ram_miss_tables(
             fmt.layout,
             fmt.segment_map(),
             {layer_id: s.pinned_host_cache.tensors for layer_id, s in streamers.items()},
-            **fmt.mirror_table_args(),
+            **mirrors,
+            row_images=open_service_row_images(cfg, fmt.layout, fmt.segment_map(), mirrors, direct, streamers),
         )
         pin = torch.cuda.is_available()
         page = new_page(pin=pin)
@@ -513,7 +647,7 @@ class Exl3RamMissService:
             tables,
             page=page,
             slot_map=slot_map,
-            direct=fmt._resolve_direct(),
+            direct=direct,
             hot_page=hot_page,
             pack_workers=cfg.ram_miss_pack_workers,
         )
@@ -528,15 +662,8 @@ class Exl3RamMissService:
                 raise RuntimeError(
                     "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
                 )
-            # Piece streaming is a mode of two-phase: the inline no-pool pack path (pack_workers == 0) has no
-            # publisher for a piece job, so it is refused rather than silently packing whole rows.
             piece_stream = cfg.enable_ram_miss_piece_stream
-            if piece_stream and not (two_phase and lease_mode and cfg.ram_miss_pack_workers > 0):
-                raise RuntimeError(
-                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs "
-                    "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES and "
-                    "SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0"
-                )
+            check_piece_stream(cfg, row_images=tables.row_images)
             if lease_mode:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if two_phase:
@@ -569,9 +696,10 @@ class Exl3RamMissService:
         atexit.register(_quarantine_service_at_exit, weakref.ref(self))
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
-            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s",
+            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s, "
+            "row images %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
-            "on" if lease_mode else "off",
+            "on" if lease_mode else "off", "on" if tables.row_images else "off",
         )
 
     def before_host_use(self) -> None:
