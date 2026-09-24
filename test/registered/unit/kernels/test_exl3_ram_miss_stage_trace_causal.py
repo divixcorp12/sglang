@@ -233,6 +233,10 @@ NON_TRACE_CLOCK_READS = {
     # ram-miss-progress-phase1): only reached when a `progress` callback was passed, so the disabled
     # (production-off) path still reads no clock when nothing is registered to run periodically.
     "const int64_t now = now_ns();": 2,
+    # The hold_until_probe_ms test fault (piece streaming, G2): read only when that fault is set; the second
+    # line's `c.hold_until == 0` short-circuits before the clock read otherwise.
+    "c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;": 1,
+    "if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;": 1,
 }
 
 
