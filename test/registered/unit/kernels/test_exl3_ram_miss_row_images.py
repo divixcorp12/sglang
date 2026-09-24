@@ -190,6 +190,15 @@ _reuse(thread, lambda name: "row_images_without_pieces")
 _reuse(piece_stream, lambda name: "row_images_without_pieces" if "flag_off" in name else "row_images_with_pieces")
 
 
+def test_the_fixture_puts_a_reused_test_on_row_images_read_with_o_direct(tmp_path, row_images):
+    """Bookkeeping: without the fixture's patches every reused test above is a plain rerun of the bounce path."""
+    s = split.ram_miss_setup(tmp_path)
+    assert s.tables.row_images and all(path.endswith(".rows") for path in s.tables.paths)
+    assert ops._table_args(s.tables, False)[-1] == 1  # a test's direct=False still reads with O_DIRECT
+    result, record = read_rows_traced(s.tables, 0, [1], [0], direct=False)
+    assert result == 1 and record["piece_stream"] == int(row_images) and record["pack_workers"] == 0
+
+
 # ---- The direct mode lands the same bytes as the bounce path ----
 
 
