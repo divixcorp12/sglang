@@ -13,7 +13,8 @@ def test_the_areas_are_where_the_protocol_puts_them():
     assert lease.ROW_TABLE == 0x80 and lease.ROW_RESULT == 0x1000
     assert lease.SLOT_GEN == 0x2000, "RowResult[16][8] at 32 bytes each fills 4096 bytes from 0x1000"
     assert (lease.LANE_REQUEST, lease.LANE_ACK, lease.TERMINAL) == (0, 0x400, 0x800)
-    assert lease.AREA_D_BYTES == 0x900
+    assert lease.STREAM_PROBE == 0x900, "StreamProbe[16] (piece streaming) follows Terminal[16] at 16 bytes each"
+    assert lease.AREA_D_BYTES == 0x980
 
 
 def test_service_written_and_device_written_words_never_share_a_128_byte_line():

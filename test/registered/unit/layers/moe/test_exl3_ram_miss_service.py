@@ -407,18 +407,79 @@ def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on
     assert order == (["piece", "thread"] if piece_stream else ["thread"])
 
 
-def test_piece_stream_is_refused_at_device_side_construction_until_the_stream_kernel_exists(tiers):
-    """R3 (piece-streaming plan ledger): the config refusal only gates the combination of switches, so the
-    device chain itself must still refuse piece streaming (task 5 removes this once kernel S exists)."""
-    service, streamers, caches = tiers
-    with (
+def _attach_with_copy_tables(service, streamers, *, drop_name=None):
+    """``_attach_all`` with a copy table per layer whose sources are that row's slabs, as a real graph gather's
+    are: the stream kernel's segment map is built from them. ``drop_name`` leaves one streamed name out."""
+    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+
+    service.ensure_started()
+    tables = service.host.tables
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+    for layer_id, streamer in streamers.items():
+        row = service.row_of(layer_id)
+        entries = [
+            [int(tables.slabs[row, n]), 4096 * (n + 1), int(tables.row_bytes[n])]
+            for n in range(len(EXL3_STREAMED_NAMES))
+            if n != drop_name
+        ]
+        streamer._graph_pinned_tier = True
+        streamer.hot_cache = SimpleNamespace(device="cpu")
+        streamer.graph_gather_rows = 6
+        streamer.row_backend = SimpleNamespace(
+            segments={0: SimpleNamespace(table=torch.tensor(entries, dtype=torch.int64))},
+            host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64),
+        )
+        streamer.format.attach_hot_cache_manager(manager, streamer)
+    return tables
+
+
+def _piece_stream_env():
+    return (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
         envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
+    )
+
+
+def test_piece_stream_builds_the_stream_chain_on_the_device_side_and_every_backend(tiers):
+    """Flag on, the device side carries the host's piece table and the stream kernel's words, and every layer's
+    backend streams, with a segment map per copy table naming each row segment's entry. (The chain's kernels and
+    graph shape are the GPU tests' business: test/manual/dsv41/test_exl3_piece_stream_cuda.py.)"""
+    service, streamers, caches = tiers
+    a, b, c, d = _piece_stream_env()
+    with a, b, c, d:
+        tables = _attach_with_copy_tables(service, streamers)
+    dev = service.device_side
+    assert dev.piece_stream is True
+    assert torch.equal(dev.piece_runs, service.host.piece_runs())
+    assert tuple(dev.piece_runs.shape) == (LAYERS, EXPERTS, 8, int(tables.segments.shape[0]), 2)
+    assert dev.piece_runs.abs().sum() > 0, "the piece table must cut the rows, not be all empty"
+    for words in (dev.stream_count, dev.stream_abort, dev.stream_fault):
+        assert int(words.abs().sum()) == 0
+    names = [int(n) for n in tables.segments[:, 0].tolist()]
+    for streamer in streamers.values():
+        backend = streamer.row_backend
+        assert backend.piece_stream is True
+        assert backend.stream_maps[0].tolist() == names + [0] * 6, "every entry is a named slab: none copied whole"
+
+
+def test_piece_stream_refuses_a_copy_table_missing_a_streamed_name(tiers):
+    service, streamers, caches = tiers
+    a, b, c, d = _piece_stream_env()
+    with a, b, c, d, pytest.raises(ValueError, match="no entry for streamed names"):
+        _attach_with_copy_tables(service, streamers, drop_name=2)
+
+
+def test_without_piece_stream_the_backends_do_not_stream(tiers):
+    service, streamers, caches = tiers
+    with (
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
     ):
-        with pytest.raises(RuntimeError, match="piece streaming needs the stream kernel"):
-            _attach_all(service, streamers)
+        _attach_with_copy_tables(service, streamers)
+    assert service.device_side.piece_stream is False and service.device_side.piece_runs is None
+    assert all(s.row_backend.piece_stream is False and s.row_backend.stream_maps is None for s in streamers.values())
 
 
 def _backend_calls(monkeypatch, *, lease):

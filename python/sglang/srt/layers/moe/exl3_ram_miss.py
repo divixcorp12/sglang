@@ -19,12 +19,14 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.moe import exl3_lease_block
 from sglang.kernels.ops.moe.exl3_ram_miss import (
     MAX_IDS,
     Exl3RamMissDevice,
     Exl3RamMissHost,
     new_hot_page,
     new_page,
+    stream_segment_map,
 )
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 from sglang.srt.dsv41_config import Dsv41Config
@@ -302,6 +304,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         hit_wait_ns: int = 100_000,
         hot_slots: Optional[torch.Tensor] = None,
         hot_capacity: int = 0,
+        stream_maps: Optional[Mapping[int, torch.Tensor]] = None,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -315,6 +318,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.hit_wait_ns = hit_wait_ns
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
+        # Piece streaming: per tag, the stream kernel's map of that tag's copy table (stream_segment_map).
+        self.piece_stream = two_phase and device_side.piece_stream
+        if self.piece_stream and (stream_maps is None or set(stream_maps) != set(self.segments)):
+            raise ValueError("piece streaming needs a stream segment map for every copy table")
+        self.stream_maps = dict(stream_maps) if self.piece_stream else None
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -377,6 +385,16 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             self.segments[tag], self.device_side.host_rows_1, self.device_side.dst_slots_1, self.device_side.go_1
         )
         self.device_side.stage_ack(1)
+        if self.piece_stream:
+            # Piece streaming (plan 5): post -> W1 -> C1 -> A1 -> S -> A2 -> F. S copies the rest piece by piece
+            # while the read runs, in place of W2 and C2, and commits go_2 only for a served request.
+            self.device_side.stream(
+                self.row, self.planned, plan.count, plan.slots, self.ram_miss, self.segments[tag], self.stream_maps[tag]
+            )
+            self.device_side.stage_ack(2)
+            self.device_side.finalize(plan.count, self.keep)
+            torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
+            return
         self.device_side.rest_wait(self.row, self.planned, plan.count, plan.slots, self.ram_miss)
         copy_expert_row_segments_gpu(
             self.segments[tag], self.device_side.host_rows_2, self.device_side.dst_slots_2, self.device_side.go_2
@@ -608,6 +626,11 @@ class Exl3RamMissService:
         if self.device_side is None:
             from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
 
+            if self.lease_mode and self.host.lease_header()["abi_version"] != exl3_lease_block.ABI_VERSION:
+                raise RuntimeError(
+                    f"exl3 RAM miss: the lease block's ABI version is {self.host.lease_header()['abi_version']}, "
+                    f"the device kernels speak {exl3_lease_block.ABI_VERSION}"
+                )
             self.device_side = Exl3RamMissDevice(
                 self.page,
                 self.slot_map,
@@ -620,6 +643,7 @@ class Exl3RamMissService:
                 lease_layout=self.host.lease_layout if self.lease_mode else None,
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,
                 piece_stream=self.piece_stream,
+                piece_runs=self.host.piece_runs() if self.piece_stream else None,
             )
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
@@ -631,6 +655,11 @@ class Exl3RamMissService:
             hot_slots=(manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)]
                        if self.gpu_hot_enabled else None),
             hot_capacity=cache.capacity if self.gpu_hot_enabled else 0,
+            stream_maps=(
+                {tag: stream_segment_map(segments, self.host.tables, row) for tag, segments in previous.segments.items()}
+                if self.piece_stream
+                else None
+            ),
         )
 
     def _refresh_hot_lists(self) -> None:
@@ -918,6 +947,10 @@ class Exl3RamMissService:
                     self.device_side.origin_2,
                     self.device_side.claimed,
                     self.device_side.violated,
+                    self.device_side.piece_runs,
+                    self.device_side.stream_count,
+                    self.device_side.stream_abort,
+                    self.device_side.stream_fault,
                 )
                 if t is not None
             ]

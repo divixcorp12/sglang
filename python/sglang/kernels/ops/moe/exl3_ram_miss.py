@@ -112,6 +112,8 @@ def _fault_tensor(
     sub: int = -1,
     publish_twice: int = 0,
     short_is_eof: bool = False,
+    hold_until_probe_ms: int = 0,
+    last_publish_delay_ns: int = 0,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -141,6 +143,8 @@ def _fault_tensor(
             sub,
             publish_twice,
             int(short_is_eof),
+            hold_until_probe_ms,
+            last_publish_delay_ns,
         ],
         dtype=torch.int64,
     )
@@ -858,6 +862,16 @@ class Exl3RamMissHost:
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands, abandon_after_batches
         )
 
+    def piece_runs(self) -> torch.Tensor:
+        """The stream kernel's piece table: int32 ``[layers, experts, STAGE_PIECES, segments, 2]``, each run a
+        ``(lo, hi)`` byte range of its segment's name row, cut by the reader's own row geometry."""
+        tables = self.tables
+        runs = torch.zeros(
+            (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2), dtype=torch.int32
+        )
+        self._module.exl3_ram_miss_piece_runs(*_table_args(tables, False)[:-1], runs)
+        return runs
+
     def inject_fault(self, **faults) -> None:
         """Test only: hand the tier's reader a whole ``ReadFault`` (the keywords of ``_fault_tensor``, the same
         vocabulary ``read_rows_faulted`` takes). Unlike ``inject(fail_reads=True)`` the read still runs, so
@@ -944,7 +958,13 @@ STATE_WORDS = {
     # D6: an earlier stage of THIS request failed, cleared per request by post. Not kSticky, which never clears.
     "req_failed": 13,
     "fail_reason": 14,
+    # Piece streaming's stream kernel: piece slices its block 0 copied, and its leader passes over every block.
+    "stream_pieces": 15,
+    "stream_polls": 16,
 }
+
+# The stream kernel's test-only fault words (kStreamFault* in exl3_ram_miss.cuh): all zero in production.
+STREAM_FAULT_WORDS = {"abort_block": 0, "abort_delay_ns": 1, "stall_ns": 2, "count_delay_ns": 3}
 
 
 @cache_once
@@ -958,12 +978,39 @@ def _device_module() -> Module:
         "exl3_ram_miss_lease_rest_wait",
         "exl3_ram_miss_lease_stage_ack",
         "exl3_ram_miss_lease_finalize",
+        "exl3_ram_miss_lease_stream_hit_wait",
+        "exl3_ram_miss_lease_stream",
     )
     return load_jit(
         "exl3_ram_miss",
         cuda_files=["moe/exl3_ram_miss.cuh"],
         cuda_wrappers=[(name, name) for name in names],
     )
+
+
+def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
+    """The stream kernel's view of a copy table (``ExpertRowSegments``) for streamed row ``row``: int32
+    ``[S + n]``, first each of ``tables``' S row segments' entry in the table (the pair whose source is that
+    segment's name slab), then one flag per table entry, 1 for an entry no row segment names. Such an entry holds
+    no host-read bytes and is copied whole with piece 0, as the two-phase copy kernel copied every entry."""
+    table = segments.table.cpu().tolist()
+    slabs = [int(address) for address in tables.slabs[row].tolist()]
+    entry_of: dict[int, int] = {}
+    for name, address in enumerate(slabs):
+        hits = [k for k, entry in enumerate(table) if entry[0] == address]
+        if len(hits) > 1:
+            raise ValueError(f"streamed name {name}'s slab is the source of {len(hits)} copy-table entries")
+        if hits:
+            if table[hits[0]][2] != int(tables.row_bytes[name]):
+                raise ValueError(f"streamed name {name}: the copy table's rows hold {table[hits[0]][2]} B, "
+                                 f"the slab's {int(tables.row_bytes[name])} B")
+            entry_of[name] = hits[0]
+    names = [int(name) for name in tables.segments[:, 0].tolist()]
+    missing = sorted(set(names) - set(entry_of))
+    if missing:
+        raise ValueError(f"the copy table has no entry for streamed names {missing} of row {row}")
+    whole = [0 if k in entry_of.values() else 1 for k in range(len(table))]
+    return torch.tensor([entry_of[name] for name in names] + whole, dtype=torch.int32, device=segments.table.device)
 
 
 class Exl3RamMissDevice:
@@ -983,12 +1030,10 @@ class Exl3RamMissDevice:
 
     def __init__(
         self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None,
-        hot_page=None, piece_stream: bool = False
+        hot_page=None, piece_stream: bool = False, piece_runs: Optional[torch.Tensor] = None,
     ) -> None:
-        if piece_stream:
-            # R3 (piece-streaming plan): until the streaming kernel S exists (task 5), this chain cannot serve a
-            # piece-stream request; W2/C2 still copy whole rows and nothing publishes area P's piece masks.
-            raise RuntimeError("exl3 RAM miss: piece streaming needs the stream kernel")
+        if piece_stream and (lease_block is None or piece_runs is None):
+            raise ValueError("piece streaming needs the lease block and the host's piece table (host.piece_runs())")
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8:
             raise ValueError("page must be a uint8 tensor of PAGE_BYTES")
         if slot_map.dtype != torch.int32 or slot_map.dim() != 2 or slot_map.shape[0] != layers:
@@ -1078,6 +1123,24 @@ class Exl3RamMissDevice:
             self.origin_2 = torch.zeros(lanes, dtype=torch.int32, device=device)
             self.claimed = torch.zeros(lanes, dtype=torch.int32, device=device)
             self.violated = torch.zeros(1, dtype=torch.int32, device=device)
+        # Piece streaming (plan 5): the stream kernel S replaces W2 and C2. Its one counter word and abort word are
+        # reset by the stream W1 every replay; `stream_fault` is the test-only fault tensor, zero in production.
+        self.piece_stream = bool(piece_stream)
+        self.piece_runs = None
+        self.stream_count = None
+        self.stream_abort = None
+        self.stream_fault = None
+        self._lease_p = 0
+        if self.piece_stream:
+            if piece_runs.dtype != torch.int32 or piece_runs.dim() != 5 or piece_runs.shape[0] != layers:
+                raise ValueError("piece_runs must be int32 [layers, experts, pieces, segments, 2] (host.piece_runs())")
+            if piece_runs.shape[1] != slot_map.shape[1] or piece_runs.shape[2] != STAGE_PIECES or piece_runs.shape[4] != 2:
+                raise ValueError(f"piece_runs has shape {tuple(piece_runs.shape)} for {slot_map.shape[1]} experts")
+            self.piece_runs = piece_runs.to(device).contiguous()
+            self.stream_count = torch.zeros(1, dtype=torch.int32, device=device)
+            self.stream_abort = torch.zeros(1, dtype=torch.int32, device=device)
+            self.stream_fault = torch.zeros(len(STREAM_FAULT_WORDS), dtype=torch.int32, device=device)
+            self._lease_p = int(lease_layout.piece_offset)
 
     def _kernels(self):
         if self._module is None:
@@ -1155,6 +1218,14 @@ class Exl3RamMissDevice:
         )
         if self.lease_block is None:
             raise RuntimeError("this device was built without a lease block")
+        if self.piece_stream:
+            # The same stage 1, which also resets go_2 and the stream kernel's counter and abort words (plan 5, C1).
+            self._kernels().exl3_ram_miss_lease_stream_hit_wait(
+                self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
+                self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
+                self.violated, budget_ns, self.go_2, self.stream_count, self.stream_abort,
+            )
+            return
         self._kernels().exl3_ram_miss_lease_hit_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
             self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
@@ -1178,6 +1249,35 @@ class Exl3RamMissDevice:
         self._kernels().exl3_ram_miss_lease_rest_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_2, self.dst_slots_2, ram_miss,
             self._lease_address, self._lease_d, self.claimed, self.go_2, self.lane_ctx_2, self.origin_2,
+        )
+
+    def stream(self, row: int, planned, count, dst_slots, ram_miss, segments, segment_map) -> None:
+        """Piece streaming's stage 2, kernel S (plan 5): in place of ``rest_wait`` and the stage-2 copy.
+
+        It admits the lanes stage 1 did not claim, copies each piece into ``segments``' destinations as its bit is
+        published, and commits ``go_2`` (and the compacted stage-2 plan ``stage_ack(2)`` reads) only once the
+        request is served and every piece is copied. ``segment_map`` is ``stream_segment_map(segments, ...)``.
+        Like ``rest_wait`` it writes neither ``keep`` nor a terminal.
+        """
+        if not self.piece_stream:
+            raise RuntimeError("this device was built without piece streaming")
+        self._check_row("row", row)
+        self._check_buffers(
+            planned=(planned, torch.int64),
+            count=(count, torch.int32),
+            dst_slots=(dst_slots, torch.int32),
+            ram_miss=(ram_miss, torch.int64),
+            segment_map=(segment_map, torch.int32),
+        )
+        row_segments = int(self.piece_runs.shape[3])
+        if segment_map.numel() != row_segments + segments.table.shape[0]:
+            raise ValueError(f"segment_map has {segment_map.numel()} entries, the kernel reads "
+                             f"{row_segments} + {segments.table.shape[0]}")
+        self._kernels().exl3_ram_miss_lease_stream(
+            self.page, self.state, planned, count, dst_slots, row, int(self.piece_runs.shape[1]), self.host_rows_2,
+            self.dst_slots_2, ram_miss, self._lease_address, self._lease_d, self._lease_p, self.claimed, self.go_2,
+            self.lane_ctx_2, self.origin_2, self.stream_count, self.stream_abort, segments.table, segment_map,
+            row_segments, self.piece_runs, self.stream_fault,
         )
 
     def stage_ack(self, stage: int) -> None:

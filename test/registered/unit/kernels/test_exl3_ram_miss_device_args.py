@@ -191,11 +191,27 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kDeadlineHi": "deadline_hi",
         "kReqFailed": "req_failed",
         "kFailReason": "fail_reason",
+        "kStreamPieces": "stream_pieces",
+        "kStreamPolls": "stream_polls",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
     # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.
     counters = re.search(r"enum Counter : int \{(.*?)\bkCounterCount\b", (CSRC / "exl3_ram_miss_host.cpp").read_text(), re.S)
     assert len(re.findall(r"^\s*(k\w+)", re.sub(r"//[^\n]*", "", counters.group(1)), re.M)) == len(ram_miss.COUNTERS)
+
+
+def test_the_stream_kernels_fault_words_are_the_device_sources():
+    """The stream kernel reads its test-only fault tensor by these indices; a word moved on one side only would
+    silently inject a different fault (or none) in the GPU tests that kill M13, M15 and M16."""
+    device = _constants(CSRC / "exl3_ram_miss.cuh")
+    names = {
+        "abort_block": "kStreamFaultAbortBlock",
+        "abort_delay_ns": "kStreamFaultAbortDelay",
+        "stall_ns": "kStreamFaultStall",
+        "count_delay_ns": "kStreamFaultCountDelay",
+    }
+    assert {word: device[name] for word, name in names.items()} == ram_miss.STREAM_FAULT_WORDS
+    assert device["kStreamFaultWords"] == len(ram_miss.STREAM_FAULT_WORDS)
 
 
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
@@ -249,6 +265,8 @@ def _lease_python_constants():
         "kLeaseTermSkippedMask": lease.TERMINAL_FIELDS["skipped_mask"],
         "kLeaseTermReason": lease.TERMINAL_FIELDS["reason"],
         "kLeaseTermGen": lease.TERMINAL_FIELDS["gen"],
+        "kLeaseStreamProbe": lease.STREAM_PROBE,
+        "kLeaseStreamProbeBytes": lease.STREAM_PROBE_BYTES,
         "kLeaseRowTableBytes": lease.ROW_TABLE_ENTRY_BYTES,
         "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
         "kLeasePieceMaskBytes": lease.PIECE_MASK_BYTES,
@@ -268,6 +286,7 @@ def _lease_device_only_constants():
         "kLeaseTagConsumed": lease.CONSUMED,
         "kLeaseTagViolated": lease.VIOLATED,
         "kLeaseTagTerminal": lease.TERMINAL_TAG,
+        "kLeaseTagStreamed": lease.STREAM_PROBE_TAG,
         "kLeaseReasonTimeout": lease.TERMINAL_REASONS["timeout"],
         "kLeaseReasonAborted": lease.TERMINAL_REASONS["aborted"],
         "kLeaseReasonFailed": lease.TERMINAL_REASONS["failed"],

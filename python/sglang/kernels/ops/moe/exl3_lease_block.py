@@ -33,7 +33,8 @@ HEADER = {
     "piece_offset": 40,
 }
 MAGIC = 0x4C534531  # "LSE1"
-ABI_VERSION = 1
+# 2: StreamProbe appended to area D (piece streaming). A block of another version is refused at attach.
+ABI_VERSION = 2
 
 ROW_TABLE = HEADER_BYTES  # rows * {u32 slot_gen_base; u32 capacity}
 ROW_TABLE_ENTRY_BYTES = 8
@@ -46,7 +47,7 @@ ROW_RESULT_BYTES = 32
 ROW_RESULT_FIELDS = {"ready": 0, "slot_generation": 8, "host_slot": 12, "expert": 16, "row": 20, "lane": 22}
 SLOT_GEN = ROW_RESULT + RING * LANES * ROW_RESULT_BYTES
 
-# Area D, device-written, at d_offset: LaneRequest[RING], LaneAck[RING][LANES], Terminal[RING].
+# Area D, device-written, at d_offset: LaneRequest[RING], LaneAck[RING][LANES], Terminal[RING], StreamProbe[RING].
 LANE_REQUEST = 0
 LANE_REQUEST_BYTES = 64
 LANE_REQUEST_FIELDS = {"gen": 0, "count": 8, "row": 12, "expert": 16}
@@ -55,7 +56,11 @@ LANE_ACK_BYTES = 8
 TERMINAL = LANE_ACK + RING * LANES * LANE_ACK_BYTES
 TERMINAL_BYTES = 16
 TERMINAL_FIELDS = {"skipped_mask": 0, "reason": 4, "gen": 8}
-AREA_D_BYTES = TERMINAL + RING * TERMINAL_BYTES
+# tagged(STREAM_PROBE_TAG, generation) once the stream kernel has copied a piece of that request: piece streaming's
+# one device-to-host progress word (the kernels' state words live in device memory).
+STREAM_PROBE = TERMINAL + RING * TERMINAL_BYTES
+STREAM_PROBE_BYTES = 8
+AREA_D_BYTES = STREAM_PROBE + RING * STREAM_PROBE_BYTES
 
 # Area P, service-written, at a new header offset (piece_offset): PieceMask[RING][LANES], a per-lane
 # generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment). Each
@@ -71,6 +76,7 @@ LOADING = 2  # RowResult.ready: leased, still loading (piece-streaming plan; tas
 CONSUMED, VIOLATED = 1, 2  # LaneAck
 DEMAND_TAG = 1  # LaneRequest.gen, written by the post kernel
 TERMINAL_TAG = 1  # Terminal.gen, written by the wait kernel
+STREAM_PROBE_TAG = 1  # StreamProbe, written by the stream kernel
 # Terminal.reason, written by the wait kernel (the service does not interpret it; it is for the trace and the tests).
 TERMINAL_REASONS = {"timeout": 1, "aborted": 2, "failed": 3, "identity": 4, "count": 5}
 TAG_SHIFT = 56

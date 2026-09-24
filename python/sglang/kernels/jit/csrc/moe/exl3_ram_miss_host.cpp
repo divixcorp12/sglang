@@ -454,6 +454,12 @@ struct ReadFault {
   // than its pieces need.
   int64_t publish_twice = 0;
   bool short_is_eof = false;
+  // Piece streaming, device tests. hold_until_probe_ms: pieces 1..7 of every row stay collected-but-unpublished until
+  // the request's StreamProbe word reads tagged(1, generation) -- the stream kernel copied piece 0 -- or this many ms
+  // pass (G2). last_publish_delay_ns: the read's last piece publish sleeps this long first, so it lands just before
+  // kDemandDone (G11).
+  int64_t hold_until_probe_ms = 0;
+  int64_t last_publish_delay_ns = 0;
 };
 
 // A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
@@ -467,9 +473,9 @@ inline int64_t worker_stamp(const void* trace) {
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and pack_workers / pack_split
 // configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
 // one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
-// streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof. Keep the layout in step with
-// _fault_tensor in ops/moe/exl3_ram_miss.py.
-constexpr int64_t kFaultWords = 26;
+// streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
+// last_publish_delay_ns. Keep the layout in step with _fault_tensor in ops/moe/exl3_ram_miss.py.
+constexpr int64_t kFaultWords = 28;
 
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;
@@ -494,6 +500,8 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.sub = f[23];
   fault.publish_twice = f[24];
   fault.short_is_eof = f[25] != 0;
+  fault.hold_until_probe_ms = f[26];
+  fault.last_publish_delay_ns = f[27];
   return fault;
 }
 
@@ -620,6 +628,7 @@ struct PieceTarget {
 struct PiecePublish {
   uint64_t generation = 0;
   const PieceTarget* rows = nullptr;
+  const uint64_t* probe = nullptr;  // the request's StreamProbe word (read only by the hold_until_probe_ms fault)
 };
 
 // io_uring superset reads of whole expert rows into page-aligned bounce banks, then the
@@ -867,6 +876,9 @@ class RowReader {
     c.trace = trace;
     c.packed = packed;
     c.publish = piece_stream_ ? publish : nullptr;
+    if (c.publish != nullptr && c.publish->probe != nullptr && fault_.hold_until_probe_ms > 0) {
+      c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;
+    }
     if (packed) packed->assign(c.total, 0);
     if (trace) {
       trace->rows_asked = static_cast<int64_t>(c.total);
@@ -1023,6 +1035,8 @@ class RowReader {
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
     int64_t events = 0;  // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
+    size_t published = 0;     // piece streaming: pieces published so far (the last_publish_delay_ns fault)
+    int64_t hold_until = 0;   // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
   };
 
   // How many reads may be outstanding at once. Credit-based preparation in refill() means
@@ -1685,6 +1699,9 @@ class RowReader {
     BounceRow& r = rows_[slot];
     const uint8_t bit = static_cast<uint8_t>(1u << j);
     const bool twice = ++publishes_ == fault_.publish_twice;  // fault: publish_twice is 0 when off
+    if (++c.published == c.total * kPieces && fault_.last_publish_delay_ns > 0) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.last_publish_delay_ns));
+    }
     if (c.publish != nullptr && c.publish->rows != nullptr) {
       const PieceTarget& target = c.publish->rows[r.ordinal];
       for (int w = 0; w < target.count; ++w) {
@@ -1718,6 +1735,7 @@ class RowReader {
         if ((held >> j & 1u) == 0) continue;
         const PackJob& job = jobs_[s * kPieces + static_cast<size_t>(j)];
         if (!job.done()) continue;
+        if (j >= 1 && holding_for_probe()) continue;
         r.pack_first = std::min(r.pack_first, job.first_start.load(std::memory_order_relaxed));
         r.pack_last = std::max(r.pack_last, job.last_end.load(std::memory_order_relaxed));
         --c.packing;
@@ -1727,6 +1745,15 @@ class RowReader {
         finish_row(s, r.pack_first == INT64_MAX ? 0 : r.pack_first, r.pack_last);
       }
     }
+  }
+
+  // The hold_until_probe_ms fault: true while the request's StreamProbe does not yet read tagged(1, generation) and
+  // the hold has not timed out. A failing read is never held: quiesce() must collect every piece.
+  bool holding_for_probe() const {
+    const Call& c = c_;
+    if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;
+    const uint64_t want = (uint64_t{1} << 56) | (c.publish->generation & ((uint64_t{1} << 56) - 1));
+    return __atomic_load_n(c.publish->probe, __ATOMIC_ACQUIRE) != want;
   }
 
   // Finish every row whose copy the workers have completed: the bank's packing reference is released
@@ -2278,6 +2305,51 @@ int64_t exl3_ram_miss_piece_geometry(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_piece_geometry, exl3_ram_miss_piece_geometry);
 
+// The stream kernel's piece table (piece-streaming plan 4.2, open question 6: one entry per (row, expert), computed by
+// the reader's own row_geometry so the device cannot disagree with it). `runs`: int32 [layers, experts, kPieces,
+// segments, 2], each run as (dst_lo, dst_hi) byte offsets into the segment's name row. A row the reader refuses to
+// cut gets empty runs; its read fails, so no device copy ever uses them. Returns how many rows were refused.
+int64_t exl3_ram_miss_piece_runs(
+    TensorView extents,
+    TensorView starts,
+    TensorView file_sizes,
+    TensorView segments,
+    TensorView slabs,
+    TensorView row_bytes,
+    std::string paths,
+    std::string source_paths,
+    int64_t slot_bytes,
+    TensorView runs) {
+  using namespace exl3_ram_miss;
+  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes);
+  const size_t count = t.segments.size();
+  const size_t rows = static_cast<size_t>(t.layers * t.experts);
+  if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
+      runs.size(3) != static_cast<int64_t>(count) || runs.size(4) != 2) {
+    throw std::runtime_error("exl3 RAM miss: the piece-run table has the wrong shape");
+  }
+  auto* out = static_cast<int32_t*>(runs.data_ptr());
+  std::vector<PieceRun> piece(static_cast<size_t>(kPieces) * count);
+  int64_t refused = 0;
+  for (size_t row = 0; row < rows; ++row) {
+    RowGeometry g;
+    int32_t* line = out + row * kPieces * count * 2;
+    if (!row_geometry(t, row, g, piece.data())) {
+      std::fill(line, line + kPieces * count * 2, 0);
+      ++refused;
+      continue;
+    }
+    for (size_t k = 0; k < static_cast<size_t>(kPieces) * count; ++k) {
+      const Segment& segment = t.segments[k % count];
+      line[2 * k] = static_cast<int32_t>(segment.dst + piece[k].lo);
+      line[2 * k + 1] = static_cast<int32_t>(segment.dst + piece[k].hi);
+    }
+  }
+  return refused;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_piece_runs, exl3_ram_miss_piece_runs);
+
 // Test only: build a packing pool as if the creating thread could run on the cores set in `inherited`
 // (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
 // (two words per worker). Throws, like the pool, when no core is left.
@@ -2390,6 +2462,9 @@ constexpr int64_t kLeaseTerminalBytes = 16;
 constexpr int64_t kLeaseTermSkippedMask = 0;
 constexpr int64_t kLeaseTermReason = 4;
 constexpr int64_t kLeaseTermGen = 8;
+// StreamProbe[kLeaseRing], device-written: the stream kernel's tagged(1, generation) once it has copied a piece.
+constexpr int64_t kLeaseStreamProbe = kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes;
+constexpr int64_t kLeaseStreamProbeBytes = 8;
 constexpr int64_t kLeaseRowTableBytes = 8;
 
 // Area P, service-written, at a new header offset (kLeaseHeaderPieceOffset): PieceMask[kLeaseRing][kLeaseLanes],
@@ -3372,7 +3447,7 @@ class RamTier {
     }
     const int64_t d_offset = round_up_page(kLeaseSlotGen + 4 * total_slots);
     lease_d_ = d_offset;
-    const int64_t piece_offset = round_up_page(d_offset + kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes);
+    const int64_t piece_offset = round_up_page(d_offset + kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes);
     lease_p_ = piece_offset;
     const int64_t needed = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
     if (lease_bytes < needed) {
@@ -3382,7 +3457,7 @@ class RamTier {
     }
     auto put_u32 = [&](int64_t offset, uint32_t value) { std::memcpy(lease_ + offset, &value, 4); };
     put_u32(0, 0x4C534531u);  // "LSE1"
-    put_u32(4, 1u);           // ABI version
+    put_u32(4, 2u);           // ABI version (exl3_lease_block.ABI_VERSION; 2 added StreamProbe)
     put_u32(kLeaseHeaderRing, static_cast<uint32_t>(kLeaseRing));
     put_u32(kLeaseHeaderLanes, static_cast<uint32_t>(kLeaseLanes));
     put_u32(16, static_cast<uint32_t>(layers_));
@@ -3783,7 +3858,9 @@ class RamTier {
       any = true;
     }
     _mm_sfence();
-    piece_publish_ = PiecePublish{request.gen, piece_targets_.data()};
+    piece_publish_ = PiecePublish{
+        request.gen, piece_targets_.data(),
+        reinterpret_cast<const uint64_t*>(lease_ + lease_d_ + kLeaseStreamProbe + idx * kLeaseStreamProbeBytes)};
     return any;
   }
 

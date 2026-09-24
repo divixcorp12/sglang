@@ -407,10 +407,11 @@ tens of KiB at most for any plausible tier.
 | 0x000 | 16 x 64 B | `LaneRequest[R]`: `{u64 gen (tagged word, tag 1); u32 count; u32 row; i32 expert[8]; u32 reserved[4]}` = 8+4+4+32+16 = 64 B | device post kernel |
 | 0x400 | 16 x 8 x 8 B | `LaneAck[R][L]`: one tagged u64 per lane; tag 1 = CONSUMED, 2 = VIOLATED | device ack kernel |
 | 0x800 | 16 x 16 B | `Terminal[R]`: `{u32 skipped_mask; u32 reason; u64 gen (tagged word)}`; the tagged word is stored last (offset 8) | device wait/finalize kernel |
+| 0x900 | 16 x 8 B | `StreamProbe[R]` [piece-streaming plan, ABI 2]: tagged u64 (tag 1) stored with `st.release.sys` once the stream kernel has copied a piece of that request; the host's only view of streaming progress (read by the G2 test hook only) | device stream kernel |
 
 `LaneAck[idx]` is exactly one 64-byte line (8 lanes x 8 bytes); two request slots share a
 128-byte line, which is fine because both halves have the same single writer (the
-device). Area D is `D0 + 0x900` rounded up to 4096; total block size is that plus area P
+device). Area D is `D0 + 0x980` rounded up to 4096; total block size is that plus area P
 below, rounded up to 4096 again.
 
 **Area P (piece-streaming plan): service-written, at a new header offset
