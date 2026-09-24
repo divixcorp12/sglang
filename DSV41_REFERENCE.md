@@ -1,11 +1,19 @@
 # DeepSeek V4.1 Flash — scoping reference
 
-**Status (2026-09-19): Phases 0 to 3b are built and measured on divix01.** Decode runs
-under breakable CUDA graphs with option C's in-graph RAM-miss service at 2.781 tok/s on
-four cold sessions (§17). §18 records where a decode step's time goes, what overlap and
-prefetch can buy, and why DSpark does not run yet. Sections 1 to 15 are the original
-scoping (revised 2026-09-18 after review); later sections supersede them where they
-disagree. The work is on `codex/nvfp4-expert-stream-main` since 2026-09-19 (§18.1).
+**Current status (2026-09-23):** DSV4.1 serves on divix01 from
+`codex/nvfp4-expert-stream-main`; the latest measured code commit is `e36fa2530c`.
+The saved production launcher uses
+DIRECT stage-2 GPU expert insertion, RAM-miss leases, eight row-packing workers, and
+io_uring Engram host nodes for **both** Engram layers. Batch-1 decode has one captured
+CUDA graph segment with zero Engram breaks (§22). The current HTTP benchmark uses a
+32,768-token context, prefix caching, and **two timed sessions** (§23); older eight-session
+and Engine-path results are historical measurements of different recipes. A node-level
+decode profile found MoE wait and pinned-row copy dominant, with Engram callbacks small
+(§23). The production server on port 7867 is currently stopped at the owner's request.
+
+Sections 1 to 15 preserve the original September 18 scoping. Sections 16 to 22 record
+dated experiments; **§23 is the current recipe and progress ledger** and supersedes
+earlier present-tense plans or defaults where they disagree.
 This doc records what the model is, what it costs in bytes, what exists upstream / in
 exllamav3 / in our fork, and what has to be built to serve it with our expert-streaming
 stack on divix01. Companion to [`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md), whose
@@ -15,28 +23,31 @@ Every number is tagged **[measured]** (read from checkpoint headers, files or sy
 **[source]** (quoted from code, docs or the tech report), or **[estimate]** (derived;
 needs a measurement before anyone quotes it).
 
-**Owner decisions (2026-09-18):**
+**Original owner decisions (2026-09-18; current layout is in §23):**
 - EXL3 3.0 bpw experts.
 - **DSpark in scope.**
 - **~90 GB host RAM**, used as a *cache* tier.
 - Expert weights and Engram tables read from NVMe with our io_uring reader.
-- **Experts move to `/mnt/nvme1`** (Gen3 x4); **Engram tables stay on `/mnt/nvme2`**
-  (Gen3 x2). The owner will do the copy later.
+- The original plan was to move experts to `/mnt/nvme1` (Gen3 x4) and keep Engram
+  tables on `/mnt/nvme2` (Gen3 x2). The live recipe instead reads the EXL3 shards on
+  `/mnt/nvme2` and uses expert-row mirrors on `/mnt/nvme0` and `/mnt/nvme4`.
 
-The design that follows is in §9. Decisions still open are in §12.
+The original design follows in §9 and its then-open decisions are in §12. Current
+settings and remaining measurements are in §23.
 
 ---
 
 ## Running the benchmark server
 
-The served-path arms all go through `benchmarks/dsv41_baseline/run_arm.sh`, which takes
-`cc-gpu.lock` itself — never launch a bare server for a measured number. One arm is
-~20-25 min wall: ~200 s startup, a readiness gate (SM clock stability + JIT settling),
-then 8 sessions x 128 tokens. Usage is `run_arm.sh <arm_name> <port> [KEY=VAL ...]`,
+The served-path arms go through `benchmarks/dsv41_baseline/run_arm.sh`, which takes
+`cc-gpu.lock` itself. One arm includes cold server startup, a readiness gate (SM clock
+stability + JIT settling), **two timed sessions** of up to 128 generated tokens, and a
+discarded warm-up session. Usage is `run_arm.sh <arm_name> <port> [KEY=VAL ...]`,
 where the `KEY=VAL` overrides are layered onto `arm_env.py`'s base recipe **and verified
 afterwards against the live server's `/proc/<pid>/environ`**.
 
-Production holds 7867. Pick another port.
+The saved production port is 7867; the server is currently stopped. Use a separate
+benchmark port (7878 in the latest run).
 
 **1. Laptop: commit and push.** The harness refuses a dirty tree, so unpushed work
 cannot be run. Never copy a tree to divix01 by other means
@@ -46,30 +57,27 @@ cannot be run. Never copy a tree to divix01 by other means
 git push shared codex/nvfp4-expert-stream-main
 ```
 
-**2. divix01: move the bench worktree onto the new commit.** No fetch is needed. The
-`shared` remote *is* divix01's bare repo
-(`/data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git`), and every divix01 checkout —
-`wt-p1bench`, `cc-dsv41-base`, `cc-engram-host-node-poc`, `wt-audit2` — is a linked
-worktree of it. Step 1's push therefore already updated the branch ref they all share.
+**2. divix01: move the serving checkout onto the new commit.** The `shared` remote
+points to divix01's bare repo at
+`/data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git`. The current production and
+benchmark checkout is `dsv41-direct-prod`:
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench \
-  && git checkout --detach codex/nvfp4-expert-stream-main && git log -1 --oneline'
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod \
+  && git fetch origin codex/nvfp4-expert-stream-main \
+  && git merge --ff-only FETCH_HEAD && git log -1 --oneline'
 ```
 
-**Every divix01 worktree stays detached, and this is load-bearing.** Git refuses a push
-to a branch that any worktree has checked out (`receive.denyCurrentBranch`). Check the
-branch out in `wt-p1bench` and the laptop's next `git push shared` fails with
-`! [remote rejected] ... (branch is currently checked out)`. Detached HEAD does not mean
-the work is off the branch: the commits are on `codex/nvfp4-expert-stream-main`, and the
-worktree simply points at the same commit without holding the ref.
+The current `dsv41-direct-prod` checkout tracks `origin/codex/nvfp4-expert-stream-main`.
+Older linked diagnostic worktrees may be detached; inspect each checkout before updating
+it. Do not assume the old `wt-p1bench` path is the benchmark target.
 
 **3. Register the code generation.** Any change under `python/` is a new generation, and
 the gate refuses an unregistered tree so a new generation can never be silently compared
 against an old one. `generations.json` lives untracked in the worktree.
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench/benchmarks/dsv41_baseline \
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod/benchmarks/dsv41_baseline \
   && PYTHONPATH=$PWD:$PWD/../../python:$PWD/../../scripts/dsv41 OMP_NUM_THREADS=8 taskset -c 0-63 \
      /data/models/slang/.venv/bin/python -c "
 import generations, subprocess
@@ -84,60 +92,60 @@ builds lazily on first call — i.e. inside decode. Force the build first. For t
 host node (`SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING`):
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench && OMP_NUM_THREADS=8 taskset -c 0-63 \
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod && OMP_NUM_THREADS=8 taskset -c 0-7,16-17,36-53 \
   PYTHONPATH=$PWD/python /data/models/slang/.venv/bin/python -c "
 from sglang.srt.layers.engram_host_node import native_engram_host_node
 print(\"built\", native_engram_host_node())"'
 ```
 
-A link failure on `-luring` here means liburing's headers are missing, not that the code
-is wrong.
+A compile error for `liburing.h` indicates missing headers; a `-luring` link failure
+indicates the library or link path is missing.
 
 **5. Run the arm.**
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/wt-p1bench/benchmarks/dsv41_baseline \
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod/benchmarks/dsv41_baseline \
   && EXPECT_SHA=$(git rev-parse HEAD) \
-     ./run_arm.sh engram-hostnode 7877 \
-       SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=1 \
-       SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=0'
+     ./run_arm.sh fused-plan-on-2timed 7878 SGLANG_MOE_EXPERT_FUSED_PLAN=1'
 ```
 
 `EXPECT_SHA` pins the tree: the arm refuses if the worktree is not at that exact commit.
-Expert-row mirroring needs no override — it is in `base_env()`. Note that mirroring
+Expert-row mirroring, Engram host-node io_uring, leases, DIRECT insertion, and eight
+pack workers need no override — they are in `base_env()`. The command above is a
+single **fused-plan-on** arm, not an A/B test. Note that mirroring
 applies to *expert rows* (`SGLANG_MOE_EXPERT_MIRROR_DIRS`), not to the Engram tables,
 which are read from `SGLANG_DSV41_ENGRAM_TABLE_DIR` on `/mnt/nvme2` and are unmirrored.
 
 ### What to compare against
 
-Section 20's served-path cells, which are the only matched comparator for this harness.
-Which cell depends on mirroring, which is **on by default** since 2026-09-22:
+Section 20's served-path cells are historical comparators from an older launch. They
+cannot serve as a matched baseline for the current recipe:
 
 | arm shape | token-weighted | mean |
 |---|---:|---:|
 | default (mirrors on, leases off) | **2.741** | 2.775 |
 | `SGLANG_MOE_EXPERT_MIRROR_DIRS=` (mirrors off) | **2.102** | 2.003 |
 
-> **Stale as of 2026-09-22: both cells were measured at `SGLANG_MOE_PINNED_HOST_MB=71680`,
-> and the harness now runs 51200.** The old budget could no longer start on divix01 — the
+> **Both cells used `SGLANG_MOE_PINNED_HOST_MB=71680`; the current harness uses 51200
+> and also changes DIRECT insertion, leases, row workers, context length, and prefix
+> caching.** The old budget could no longer start on divix01 — the
 > pinned buffer alone exceeded NUMA node 0's free memory, so the server exhausted node 0
 > and spun in direct compaction until the 900s abort (three arms lost this way; see
 > `analysis/engram-sync/HANG-FINDINGS.md`). Host pinning is a recorded constant of the
-> recipe, so an arm run at 51200 is **not** comparable to these numbers. Re-baseline the
-> cell you need at the current budget before reading any delta against it, and make sure
-> both arms of an A/B share one value.
+> recipe, so an arm run with the current settings is **not** directly comparable to
+> these numbers. Re-baseline with matching settings before reading a delta.
 
-Do **not** compare a served-path arm against §19's 3.905-3.933 or §17's 2.781. Those are
-Engine-path cells, and the served path sits at a consistent 0.69-0.71 fraction of them
-for reasons not yet explained (§20) — an offset that is present with mirrors both on and
-off, so it is not a mirroring artifact.
+Do **not** compare a current served-path arm against §19's 3.905-3.933 or §17's 2.781.
+Those are Engine-path cells. The **older §20 recipe** measured served/Engine ratios of
+0.69-0.71 with mirrors both on and off; that ratio has not been established for the
+current DIRECT, eight-worker, 32,768-token recipe.
 
 ### Knobs worth knowing
 
 | var | effect |
 |---|---|
 | `EXPECT_SHA` | refuse unless the worktree is at this commit |
-| `DSV41_MAX_SESSIONS=N` | stop after N timed sessions; fails the result gate by design (`N records (expected 8)`), but the report is written first, so the abort is harmless |
+| `DSV41_MAX_SESSIONS=N` | diagnostic cutoff before the default two sessions finish; `N=1` fails the two-record result gate by design |
 | `NSYS_TRACE=1` | wrap the server in Nsight; always graph-mode (`--cuda-graph-trace=graph`), so its kernel table omits the graph body (`CLAUDE.md`) |
 | `NSYS_SAMPLE=process-tree` | enable CPU sampling — required, or `--cudabacktrace`/`--python-backtrace` are silently inert |
 | `NSYS_LAUNCH_ARGS=...` | extra args for `nsys launch`; application-scope flags go here, not on `nsys start` |
@@ -149,29 +157,29 @@ not overrides and should not be passed on the command line.
 
 ---
 
-## TL;DR
+## TL;DR — original scope, with current corrections
 
 1. **The model is much bigger than Qwen3.8, in every byte dimension that matters.**
    552B backbone + 196B Engram params [source]. The EXL3 routed expert is
    **13,315,596 B** [measured], 4.8x the Qwen3.8 NVFP4 row. Routed experts total
    204.5 GB and the Engram tables 203 GB [measured].
-2. **The design is three tiers: NVMe → ~90 GB host-RAM cache → VRAM hot cache**, for
-   both experts and Engram rows (§9).
+2. **The original design was three tiers: NVMe → ~90 GB host RAM → VRAM hot cache**
+   (§9). The current recipe allocates 50 GiB to the pinned MoE tier, 5 GiB to the
+   native Engram row cache, and 14 GiB to the GPU expert hot cache (§23).
    - Experts are read **straight from the original EXL3 shards**, with one aligned read
      per expert and no on-disk re-layout. Every expert's 12 tensors are byte-contiguous,
      and none spans a file [measured].
-   - **But a raw row is not a kernel-ready slot.** `w1.trellis` starts at byte 14,852
+   - **A raw row is not a kernel-ready slot.** `w1.trellis` starts at byte 14,852
      of the row, which is not 16 B-aligned, and exllamav3 loads trellis with 128-bit
-     `cp.async`. The slot layout and where the padding happens are a Phase 0 decision
-     (§9.2).
-3. **The one hard problem is shared by both tiers: a RAM miss inside a CUDA-graph
-   decode.**
-   - Today's in-graph gather reads host RAM via `ld.global.nc` and has no miss path.
-   - Four mechanisms are compared in §9.3. **Option C (CPU io_uring thread + device-side
+     `cp.async`. The original slot-layout decision and its implementation are recorded
+     in §§9.2 and 16–17.
+3. **A RAM miss inside CUDA-graph decode was the main implementation problem.**
+   - Four mechanisms were compared in §9.3. **Option C (CPU io_uring thread + device-side
      wait) was built and measured in Phase 3b (§17):** 2.781 tok/s under breakable CUDA
      graphs against 1.664 eager on the same four cold sessions. Caveats: R4 fails against
      the eager loop (fused-kernel numerics, §17.4), and graph gather's scratch cuts the hot
-     cache to 888 slots against the eager run's 1,128 (§17.6).
+     cache to 888 slots against the eager run's 1,128 (§17.6). Current DIRECT insertion
+     removes that scratch and provides 1,128 resident slots (§23).
    - Each needs a bounded wait and a defined failure path; a stuck NVMe read must not
      wedge the stream.
    - For experts the NVMe read is on the critical path whatever the mechanism (the
@@ -180,12 +188,14 @@ not overrides and should not be passed on the command line.
 4. **Drives.** `/mnt/nvme2` is Gen3 x2, ~1.9 GB/s, ~7 ms per expert [measured link].
    `/mnt/nvme1` is Gen3 x4, ~3.4 ms per expert on an *idle* drive [estimate]. It is not
    idle: an `op-reth` node's datadir lives on it, alongside other workloads, and the
-   P310 is a DRAM-less QLC drive. The x4 figure needs a loaded fio measurement.
-5. **Engram caches well on our corpus, and 5 GB is enough.** Exact-LRU simulation over
+   P310 is a DRAM-less QLC drive. The live EXL3 source remains on `/mnt/nvme2`, with
+   row mirrors on `/mnt/nvme0` and `/mnt/nvme4` (§23).
+5. **Five GB was enough in the original Engram corpus simulation.** Exact-LRU over
    1.5M tokens puts the ceiling at 71.70% (unique set 5.38 GB); 5 GB already reaches
    71.68%, 2 GB reaches 66.30%, 1 GB reaches 60.82%, and 35.18% of accesses hit within
-   their own session. The Engram RAM tier does not need more than 5 GB on this corpus;
-   larger budgets buy almost nothing (§5).
+   their own session. Larger budgets bought almost nothing **on that corpus** (§5).
+   A proposed 20 GiB pinned native cache is still unimplemented and has no live
+   throughput measurement (§23).
 6. **DSpark changes the budget:**
    - Resident draft weights (6.75 GiB) cost ~544 target-expert slots, **~31% of the
      VRAM hot cache**.
@@ -195,7 +205,7 @@ not overrides and should not be passed on the command line.
    - On the Qwen stand-in, speculation moves ~35% more expert bytes per accepted token at
      α=0.7, with break-even at α≈0.84–0.93.
    - **Rule: ship DSpark only if measured α clears the DSV4.1 break-even** (§10, §12).
-   - **It does not run on the EXL3 stack yet** (2026-09-19, §18.5): the full-model dir
+   - **It did not run on the EXL3 stack in the September 19 assessment** (§18.5): the full-model dir
      has no draft, the draft loader has no EXL3 path, and the EXL3 streamer refuses the
      draft's 128-expert layers.
 7. **Throughput envelope** [estimate]: ~3–8 tok/s, link plus NVMe only, before compute
@@ -209,10 +219,10 @@ not overrides and should not be passed on the command line.
    (§6). **Done**, twice over: the pre-squash PR branch merged first (`c64b2bd653`),
    then upstream's final squash `a6cf05817f` (#38798) landed via an `origin/main` merge
    (`c55f1572b0`, 2026-09-18, §6.1) — the streaming-file claim was reverified against
-   both. No stack runs EXL3 in SGLang. exllamav3 (MIT) has a fused, sm_120-tuned EXL3
-   MoE kernel to vendor (§7).
-9. **A decode step is half NVMe wait, a third PCIe gather, and 4% compute** (§18.2,
-   node-mode trace of option C, 391 ms/step under tracing): 190 ms waiting for NVMe reads
+   both. The current fork now runs EXL3 in SGLang; exllamav3 (MIT) supplies its fused,
+   sm_120-tuned EXL3 MoE kernel (§§17, 23).
+9. **The September 19 option-C trace split a decode step into NVMe wait, PCIe gather,
+   and compute** (§18.2; 391 ms/step under node-level tracing): 190 ms waiting for NVMe reads
    (10.2 ms per row), 128 ms gathering rows over PCIe (1.06 ms per row), 17 ms of
    compute and ~11 ms in the two Engram breaks, all serialized. The remaining ~41 ms/step
    in that window is one outlier residency-boundary stall (2.1 s). On the corpus sessions a
@@ -222,9 +232,10 @@ not overrides and should not be passed on the command line.
    next layer's gate catches 48% of NVMe rows at top-6 but wastes 2.5 reads per useful
    one; a confidence-gated set is estimated at ~6% (one layer ahead) to ~10% (two) of the
    step (§18.4). The previous token's routes, the predictor 3b used, catch none.
-10. **It cannot coexist with production.** It needs the whole 32 GB card and most of
-   the RAM budget. Every GPU session means production downtime, which crypto-c9
-   schedules and the owner approves.
+   The newer graph-node profile and MoE service breakdown are in §23; use those to
+   prioritize current decode work.
+10. **A benchmark arm needs exclusive GPU use.** The harness checks GPU tenancy and
+    takes `cc-gpu.lock`; it will not start while the production server is on port 7867.
 
 ---
 
@@ -437,7 +448,8 @@ row sizes in one io_uring submission.
 - Layer 14 has ~13 layers of slack.
 - §9.3 covers which mechanisms can overlap the layer-1 fetch with layer 0.
 
-**Our fork has no Engram code** (0 matches in `models/deepseek_v4.py`, 32 in upstream).
+**Historical scoping observation:** the fork had no Engram code at this point. The
+current branch has native Engram host nodes for layers 1 and 14 (§§22–23).
 
 ---
 
@@ -641,6 +653,10 @@ codebook `mul1`, `out_scales=always`, `--hq`.
 
 (`codex/nvfp4-expert-stream-main` @ `557c1fbaec`; line numbers are jump targets.)
 
+> **Historical code snapshot.** This section describes the fork at `557c1fbaec`,
+> before the EXL3 and Engram implementation. Its present-tense gaps and line numbers
+> do not describe current HEAD. See §§17 and 23 for the implemented path.
+
 **Hook point: the quant method.** `ModelOptFp4MoEMethod.process_weights_after_loading`
 sets `layer._nvfp4_expert_streamer` (`modelopt_quant.py:2963`). Consumers discover it by
 `getattr` walk: `model_runner.py:718,745,747`, `qwen2_moe.py:772`,
@@ -682,6 +698,9 @@ Expert count, bytes/row and top-k are derived from shapes (`_validate_sources`, 
 ---
 
 ## 9. Three-tier design: NVMe → ~90 GB RAM → VRAM
+
+> **Original design budget, not the current allocation.** Current values are 50 GiB
+> pinned MoE host memory, 5 GiB native Engram cache, and 14 GiB GPU hot budget (§23).
 
 ### 9.1 RAM budget split [estimate]
 
@@ -943,13 +962,11 @@ up first. `Exl3MoEMethod` (trellis-resident routed experts) and the EXL3 linear 
 therefore landed together with model bring-up in this window; the remaining EXL3 MoE
 performance work (below) is the only piece deferred.
 
-**Phase 2b — EXL3 performance (open):**
-- Vendor the fused `exl3_moe.cu`/`exl3_gemv.cu` (bincount layout) behind `Exl3MoEMethod`
-  and the coop decode kernel, using the pointer-array interface and the slot layout from
-  Phase 0, checking parity against `exl3_moe_loop`.
-- Add CUDA-graph capture.
-- Microbenchmark BS1 decode, including SM contention with a concurrent copy.
-- Vendor the proven exllamav3 subset.
+**Phase 2b — original EXL3 performance checklist:** the fused EXL3 MoE/GEMV path,
+exllamav3 subset, and batch-1 CUDA-graph capture were implemented by Phase 3b (§17).
+The proposed standalone BS1 microbenchmark with a concurrent copy has no result
+recorded in this reference; the serving measurements in §§17–23 supersede the
+earlier “open” implementation bullets.
 
 **Phase 3a — EXL3 streaming on the expert framework — done, 2026-09-19 (§16).** Landed and
 measured in eager mode on the full 40-layer model:
@@ -963,7 +980,7 @@ measured in eager mode on the full 40-layer model:
   the full model, and the go/no-go check (open, §12.1: the owner decides whether 3b is
   worth building).
 
-**Phase 3b — graph-mode three-tier streaming (open):**
+**Phase 3b — graph-mode three-tier streaming (original checklist; implemented portions in §17):**
 - **Option C built and measured (§17):** decode under breakable CUDA graphs at bs 1 with the
   MoE in-graph (pinned-tier graph gather + fused `exl3_moe`), NVMe misses served by the
   io_uring thread with a bounded in-graph wait and fail-stop; next-layer advisory prefetch
@@ -2937,6 +2954,13 @@ verdict printed before that commit should be re-read, not trusted.
 
 ## 21. Nsight trace of the served engram arm: where the time goes (2026-09-22)
 
+> **Historical interpretation.** The later sampled and graph-node captures in §23
+> separate prefill from decode. The long visible `.tolist()` readback is in prefill;
+> decode graph time is dominated by MoE expert service and pinned-row copy. The
+> `_gather_host_rows_kernel` discussed below is a **MoE expert** gather, not an
+> Engram table gather. Keep the timings below as trace observations, not the current
+> decode optimization ranking.
+
 Arm `engram-on-trace` at `6205f090ea`, generation `engram-host-node-uring-chunked`,
 `SGLANG_MOE_PINNED_HOST_MB=51200`, uring reader, leases off. Report:
 `/mnt/nvme1/dsv41-nsys/engram-on-trace-20260922-221602.nsys-rep` (42 MB), exported
@@ -2978,8 +3002,9 @@ cost. **This is not a new finding.** It is the wall already recorded in
 host caps it at Gen3": `nvidia-smi` reports `gpumax=5, hostmax=3, current=3` on this
 RTX 5090, and Gen3 x16 is ~12.3 GB/s practical. What is new is only that a *second,
 independent* kernel on a *different* code path reproduces the same constant. Record it
-so the hope is not re-derived on this path either: batching, packing or coalescing the
-engram gather cannot win anything, because it is already at line rate.
+so the hope is not re-derived on this path either: this **eager MoE expert gather**
+already reaches the host-link limit. Row packing before the copy is a separate
+service stage and later improved throughput (§23).
 
 The GPU also sits on NUMA node 0 (`local_cpulist=0-17,36-53`), which is where
 `arm_env.SERVER_CORES` now pins the server. The node-0 pinning from `86b4bc19df` was
@@ -3048,6 +3073,12 @@ the step should fall to one graph launch.
 
 ## 22. Layer 14 in the decode graph: the break is gone, the time is not (2026-09-22)
 
+> **Updated diagnosis (2026-09-23):** the structural result below still holds: both
+> Engram layers run inside one decode graph. The recommendation below to attack the
+> visible `.item()` sync as the next *decode* fix was superseded by sampled stacks and
+> graph-node attribution (§23). Those syncs belong to prefill or instrumentation;
+> decode is chiefly MoE wait and expert-row copy.
+
 `d337301dd1` extends the captured host-node gate from `layer_id == 1` to `1, 14`. Two
 arms at that commit, both at `SGLANG_MOE_PINNED_HOST_MB=51200`, generation
 `engram-host-node-layer14`, uring reader, leases off, 8 sessions each.
@@ -3083,7 +3114,8 @@ inside `cudaGraphLaunch` waiting on the GPU and 35% inside a 2 KB device-to-host
 Removing a break removes *host-side launch overhead*, which was not the binding term, so
 merging two segments into one simply means the single launch blocks for what two used to.
 
-The two binding terms both reproduce at 4x the sample, unchanged:
+The following all-process trace totals reproduce at 4x the sample. They mix prefill
+and decode and cannot by themselves rank costs inside decode:
 
 | | section 21 (110 tokens) | this arm (485 tokens) |
 |---|---|---|
@@ -3092,20 +3124,127 @@ The two binding terms both reproduce at 4x the sample, unchanged:
 | eager GPU busy | ~18% of wall | 65.3 s of 502.4 s = **13%** of wall |
 
 **Do not read this as "graphing layer 14 was not worth doing."** It removes a real graph
-break and is structurally correct; it is simply not where the time is. The next thing to
-try is on the list above, not on the graph: the `.item()` sync is 64 s of 502 s and is
-there only to order one chunk's admission against the previous chunk's copy.
+break and is structurally correct; it is simply not where the time is. The original
+next-step suggestion was to remove the `.item()` sync (64 s in this whole-process
+trace). Subsequent sampled stacks placed the long readbacks in prefill, and §23's
+graph-node trace made MoE service and pinned-row copy the decode targets.
 
 ### Operational: divix01's /tmp is too small for a full-length capture
 
 The first traced attempt (`layer14-trace`) died mid-run. nsys warned that its temporary
 directory had 3 MiB free against the 200 MiB it wants, the driver then saw
 `RemoteDisconnected`, and the report came out at 361 KB. divix01's `/tmp` is on the root
-xfs volume, which sits at 88% full. A 2-session capture fits there; a full 8-session
-capture does not, and the failure kills the server rather than erroring cleanly. Set
-`NSYS_TMPDIR=/mnt/nvme1/nsys-tmp` for any full-length traced arm; the relaunch with it set
-produced a 164 MB report and a passing verdict.
+xfs volume, which was 88% full in this historical run. Its two-session trace fitted at
+the time, while the then-full eight-session capture did not; the failure killed the
+server rather than erroring cleanly. The current benchmark has **two** timed sessions.
+Set `NSYS_TMPDIR=/mnt/nvme1/nsys-tmp` for traced arms rather than relying on `/tmp`;
+the historical relaunch with it set produced a 164 MB report and a passing verdict.
 
+
+## 23. Current serving state and next decode work (2026-09-23)
+
+### 23.1 Checkout, launch, and cache budgets
+
+The latest measured serving code is `e36fa2530c` on the shared branch. The saved launcher
+is `/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live/launch.sh`;
+the checkout it uses is `dsv41-direct-prod`. Port 7867 is **stopped** at the owner's
+request. The launcher and the benchmark both read
+[`benchmarks/dsv41_baseline/arm_env.py`](benchmarks/dsv41_baseline/arm_env.py), so the
+following are **DSV4.1 recipe defaults**, not general SGLang defaults:
+
+| Setting | Current value | Status |
+|---|---:|---|
+| EXL3 expert source | `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw` | `uring_direct`; mirrors on `/mnt/nvme0` and `/mnt/nvme4` |
+| MoE pinned host tier | 50 GiB (`SGLANG_MOE_PINNED_HOST_MB=51200`) | Fits NUMA node 0 with model weights; the earlier 70 GiB setting stalled during allocation |
+| Native Engram row cache | 5 GiB | Ordinary `mmap` slab; pinned transfer buffers are separate. A proposed 20 GiB pinned row cache is **not implemented**. `SGLANG_DSV41_ENGRAM_RAM_GIB` sizes the Python cache, not this native slab |
+| GPU hot expert budget | 14 GiB (`SGLANG_MOE_HOT_GPU_MB=14336`) | DIRECT mode observed 1,128 resident slots and zero graph-gather scratch bytes |
+| MoE miss path | leases=1, GPU residency update=1, DIRECT insert stage=2, decode update interval=1 | Current launch defaults; prefetch and doorbell off |
+| Row packing | 8 workers | Current default; eight versus four has not had a matched served-path comparison |
+| Engram lookup | host-node cache with io_uring=1 | Layers 1 and 14 are in the single batch-1 decode graph |
+| Context and prefix | 32,768 tokens; prefix caching enabled | Production and current benchmark match |
+| Async CPU residency scores | 0 | Conflicts with the selected GPU residency update mode; the older async-score win was measured in a different mode |
+| Expert fused plan | off by default | The one-arm opt-in measurement below used `SGLANG_MOE_EXPERT_FUSED_PLAN=1` |
+
+The exact option ledger, including incompatible modes, is
+[`analysis/dsv41-drive/DSV41_LAUNCH_OPTIONS_20260923.md`](analysis/dsv41-drive/DSV41_LAUNCH_OPTIONS_20260923.md).
+The old §9.1 allocation, the proposed `/mnt/nvme1` expert move, and §17's 888-slot
+scratch budget are historical configurations.
+
+### 23.2 What decode currently costs
+
+The [110-replay graph-node capture](analysis/dsv41-drive/ENGRAM_DECODE_GRAPH_NODE_MEASUREMENT_20260923.md)
+measured **19.418 s** in the MoE RAM-miss wait kernel and **18.213 s** in the pinned
+expert-row copy kernel. Together they were 95.3% of summed graph-kernel duration.
+Both Engram host callbacks took **0.687 s** in total, about 1.7% of summed replay
+spans. This is an attribution trace with node-level tracing overhead, not an
+unprofiled throughput number; it used the earlier leases-off, pre-DIRECT recipe, so
+its percentages are not a measurement of the current launch. The graph has **one
+segment and zero Engram breaks**;
+the hash-ID readback is a graph D2H node feeding the native host callback, not a
+per-token Python `.cpu()` call. The
+[sampled capture](analysis/dsv41-drive/ENGRAM_DECODE_SAMPLED_MEASUREMENT_20260923.md)
+located the long visible `.tolist()` readbacks in **prefill**, not decode.
+
+A [matched native service trace](analysis/dsv41-drive/MOE_SERVICE_TRACE_MEASUREMENT_20260923.md)
+measured 19.550 s of GPU wait against 19.482 s of CPU service over 2,598 demand
+layers. It split service into an 11.893 s read-completion window and a 7.560 s
+exposed row-packing tail. A separate [four-worker measurement](analysis/dsv41-drive/MOE_PACK4_SERVING_MEASUREMENT_20260923.md)
+cut the exposed tail from 7.453 s to 2.574 s and improved the median paired
+decode rate by **16.6% across eight sessions**. That comparison used an older
+leases-off, pre-DIRECT recipe; its original formal verdict failed a page-cache gate
+later corrected in the harness. It supports row packing as a useful lever, but does
+not measure the current eight-worker default against four.
+
+The [DIRECT insertion served comparison](analysis/dsv41-drive/DSV41_DIRECT_INSERT_MEASUREMENT_20260923.md)
+found a **1.1631 median paired rate ratio, eight wins in eight sessions** against
+its then-current control and raised the resident set from 888 to 1,128 slots by
+removing scratch. It was measured before the current eight-worker and production
+context/prefix recipe. The [live 100-token trace](analysis/dsv41-drive/DECODE_LIVE_NSYS_20260923.md)
+under DIRECT still measured 18.155 s MoE wait and 9.826 s pinned-row copy. Its
+native records had 2,314 NVMe-read demands (54.810 GB), an 11.190 s read window,
+and 6.866 s exposed packing tail, with inline packing at that time. These traces
+show why the next decode work is MoE demand count, read/pack service, and pinned
+row-copy throughput; they do not establish the current unprofiled rate.
+
+### 23.3 Latest benchmark and its limits
+
+Commit `e36fa2530c` changed the HTTP benchmark default from eight to **two timed
+sessions** plus warm-up. The result gate, expected IDs, manifest, and paired-run
+checks use that shape; pairing a two-session arm with an older eight-session arm is
+rejected. Two sessions make a quick diagnostic, but a clean sweep in a paired sign
+test only reaches p=0.25. Historical eight-session results in §§20–22 retain their
+original meaning.
+
+On divix01, a **single fused-plan-on arm** ran at that commit with
+`SGLANG_MOE_EXPERT_FUSED_PLAN=1` and every other current recipe value unchanged:
+
+| Timed session | Generated tokens | Decode rate | TTFT |
+|---|---:|---:|---:|
+| CDW | 7 | 2.862 tok/s | 37.67 s |
+| ETR | 103 | 4.297 tok/s | 37.81 s |
+
+The two-rate median is **3.579 tok/s**. The run passed preflight, live environment
+verification (35 variables), warm-up stability, and the two-record/no-error result
+gate. The verdict reported **no unacknowledged problems** and
+`valid_except_acknowledged_gaps=True`. Its strict `valid=False` reflects missing
+engine-side step latency and unavailable internal server provenance: the imported
+`sglang` path and resolved `uring_direct`/graph-gather settings cannot be observed
+inside the HTTP server by this harness. The actual server environment was checked
+through `/proc`, and the gaps are labeled explicitly. CPU contention from `tmux` and
+`htop` was noted. This is one arm with no same-recipe fused-plan-off control, so
+**no speedup is established**.
+The run directory is
+`/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-baseline/servers/fused-plan-on-2timed-20260923/run-20260923-224033`.
+The harness verified the flag in the server environment, but this run did not
+independently trace whether every layer selected the fused route rather than its
+supported generic fallback.
+
+The near-term decode measurement is a same-recipe comparison of expert demand,
+io_uring completion, row-packing tail, doorbell signal, and GPU row-copy duration,
+followed by a pinned-copy bandwidth experiment. Keep the current 50 GiB MoE tier,
+DIRECT mode, and eight workers fixed while isolating those costs. A larger pinned
+Engram cache requires allocator and NUMA-budget work and should be evaluated
+separately from decode MoE service.
 
 ## Sources
 
