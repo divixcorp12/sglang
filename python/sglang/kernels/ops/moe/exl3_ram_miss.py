@@ -66,7 +66,7 @@ def _table_args(tables, direct: bool) -> tuple:
         "\n".join(tables.paths),
         "\n".join(tables.source_paths),
         tables.slot_bytes,
-        int(tables.row_images),
+        int(getattr(tables, "row_images", False)),  # duck-typed test tables predate the field
         int(direct),
     )
 
