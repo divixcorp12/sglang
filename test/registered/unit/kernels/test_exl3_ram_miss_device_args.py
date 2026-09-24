@@ -214,6 +214,29 @@ def test_the_stream_kernels_fault_words_are_the_device_sources():
     assert device["kStreamFaultWords"] == len(ram_miss.STREAM_FAULT_WORDS)
 
 
+def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
+    """stream_copy_slice falls back to 1-byte copies when a destination or row size is off 16-byte alignment, which
+    would silently slow every piece; the segment map refuses such a copy table instead (plan 4.2)."""
+    from types import SimpleNamespace
+
+    tables = SimpleNamespace(
+        slabs=torch.tensor([[0x10000, 0x20000]]),
+        row_bytes=torch.tensor([32, 64]),
+        segments=torch.tensor([[0, 0, 0, 32], [1, 0, 32, 64]]),
+    )
+
+    def table(*rows):
+        return SimpleNamespace(table=torch.tensor(rows, dtype=torch.int64))
+
+    good = ram_miss.stream_segment_map(table([0x10000, 0x40000, 32], [0x20000, 0x80000, 64]), tables, 0)
+    assert good.tolist() == [0, 1, 0, 0]
+    with pytest.raises(ValueError, match="16-byte"):
+        ram_miss.stream_segment_map(table([0x10000, 0x40008, 32], [0x20000, 0x80000, 64]), tables, 0)
+    tables.row_bytes = torch.tensor([40, 64])
+    with pytest.raises(ValueError, match="16-byte"):
+        ram_miss.stream_segment_map(table([0x10000, 0x40000, 40], [0x20000, 0x80000, 64]), tables, 0)
+
+
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
     files = [_constants(CSRC / name) for name in ("exl3_ram_miss.cuh", "exl3_ram_miss_host.cpp")]
     for constants in files:

@@ -2341,6 +2341,9 @@ int64_t exl3_ram_miss_piece_runs(
     }
     for (size_t k = 0; k < static_cast<size_t>(kPieces) * count; ++k) {
       const Segment& segment = t.segments[k % count];
+      if (segment.dst + piece[k].hi > INT32_MAX) {
+        throw std::runtime_error("exl3 RAM miss: a piece run ends past the int32 range of the stream kernel's table");
+      }
       line[2 * k] = static_cast<int32_t>(segment.dst + piece[k].lo);
       line[2 * k + 1] = static_cast<int32_t>(segment.dst + piece[k].hi);
     }

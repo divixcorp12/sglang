@@ -957,6 +957,18 @@ constexpr int kStreamFaultStall = 2;       // ns every leader pass stalls betwee
 constexpr int kStreamFaultCountDelay = 3;  // ns a completing block spins before its count
 constexpr int kStreamFaultWords = 4;
 
+// state[*word] += value, clamped at INT32_MAX like W2's kPolls, from any number of blocks at once.
+__device__ __forceinline__ void saturating_add(int32_t* word, int64_t value) {
+  int32_t old = *reinterpret_cast<volatile int32_t*>(word);
+  while (true) {
+    const int64_t sum = static_cast<int64_t>(old) + value;
+    const int32_t next = static_cast<int32_t>(sum < 0x7fffffffLL ? sum : 0x7fffffffLL);
+    const int32_t seen = atomicCAS(word, old, next);
+    if (seen == old) return;
+    old = seen;
+  }
+}
+
 __device__ __forceinline__ void spin_ns(int64_t ns) {
   if (ns <= 0) return;
   const uint64_t until = global_ns() + static_cast<uint64_t>(ns);
@@ -1125,6 +1137,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
   __shared__ uint32_t seq;
   __shared__ uint64_t generation;
   __shared__ uint32_t capacity;
+  __shared__ int started;         // W2's `ok && seq != 0` at entry: the requests W2 counts in kWaits
+  __shared__ int64_t unclaimed;   // planned lanes W1 did not claim: W2's `unclaimed`, whatever path S takes
   const int tid = threadIdx.x;
 
   if (tid == 0) {
@@ -1149,6 +1163,11 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
       if (blockIdx.x == 0) state[kFailures] += 1;
       ok = false;
       reason = 0;
+    }
+    started = ok && seq != 0 ? 1 : 0;
+    unclaimed = 0;
+    for (int64_t i = 0; i < min(planned_count, static_cast<int64_t>(kLeaseLanes)); ++i) {
+      if (claimed[i] == 0) ++unclaimed;
     }
     if (ok && fault[kStreamFaultAbortBlock] == static_cast<int32_t>(blockIdx.x) + 1) {
       ok = false;
@@ -1285,10 +1304,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
   }
 
   if (tid != 0) return;
-  atomicAdd(&state[kStreamPolls], static_cast<int32_t>(polls));
+  saturating_add(&state[kStreamPolls], polls);
   if (blockIdx.x == 0) atomicAdd(&state[kStreamPieces], static_cast<int32_t>(pieces));
-  int64_t unclaimed = 0;
-  for (int lane = 0; lane < kLeaseLanes; ++lane) unclaimed += sh.mine[lane];
   uint32_t increment;
   if (sh.aborting != 0) {
     if (fault[kStreamFaultAbortBlock] == static_cast<int32_t>(blockIdx.x) + 1) spin_ns(fault[kStreamFaultAbortDelay]);
@@ -1314,7 +1331,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
   __threadfence();
   int32_t aborted;
   asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(aborted) : "l"(stream_abort) : "memory");
-  if (seq != 0) state[kWaits] += 1;
+  if (started != 0) state[kWaits] += 1;
   const bool commit = now / kStreamCompleted == gridDim.x && aborted == 0 && sh.aborting == 0 && sh.served != 0;
   if (!commit) {
     ram_miss[0] += unclaimed;  // nothing was served for the lanes W1 did not claim

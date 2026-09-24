@@ -869,7 +869,10 @@ class Exl3RamMissHost:
         runs = torch.zeros(
             (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2), dtype=torch.int32
         )
-        self._module.exl3_ram_miss_piece_runs(*_table_args(tables, False)[:-1], runs)
+        refused = int(self._module.exl3_ram_miss_piece_runs(*_table_args(tables, False)[:-1], runs))
+        if refused:
+            # A refused row's runs are empty: S would admit a READY hit of it, copy nothing and commit.
+            raise RuntimeError(f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces")
         return runs
 
     def inject_fault(self, **faults) -> None:
@@ -994,6 +997,11 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
     segment's name slab), then one flag per table entry, 1 for an entry no row segment names. Such an entry holds
     no host-read bytes and is copied whole with piece 0, as the two-phase copy kernel copied every entry."""
     table = segments.table.cpu().tolist()
+    for source, destination, row_bytes in table:
+        # stream_copy_slice falls back to 1-byte copies off 16-byte alignment (plan 4.2 refuses it instead).
+        if destination % 16 or row_bytes % 16:
+            raise ValueError(f"the stream kernel copies 16-byte units: destination {destination:#x} with rows of "
+                             f"{row_bytes} B is not 16-byte aligned")
     slabs = [int(address) for address in tables.slabs[row].tolist()]
     entry_of: dict[int, int] = {}
     for name, address in enumerate(slabs):

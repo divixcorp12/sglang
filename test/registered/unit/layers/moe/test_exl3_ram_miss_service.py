@@ -471,6 +471,32 @@ def test_piece_stream_refuses_a_copy_table_missing_a_streamed_name(tiers):
         _attach_with_copy_tables(service, streamers, drop_name=2)
 
 
+def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
+    """A refused row's runs are empty, so S would admit a READY hit of it, copy nothing and commit: the host must
+    refuse the table rather than hand the device one with a hole."""
+    service, streamers, caches = tiers
+    service.ensure_started()
+    host = service.host
+    real = host._module
+
+    class OneRowRefused:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @staticmethod
+        def exl3_ram_miss_piece_runs(*args):
+            real.exl3_ram_miss_piece_runs(*args)
+            return 1
+
+    host._module = OneRowRefused()
+    try:
+        with pytest.raises(RuntimeError, match="cannot cut 1"):
+            host.piece_runs()
+    finally:
+        host._module = real
+    assert host.piece_runs().abs().sum() > 0, "the real tables cut every row"
+
+
 def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch):
     """The device kernels read area D at the offsets of lease ABI 2 (StreamProbe appended); a block the host wrote
     under any other version is refused at attach, not read at the wrong offsets."""
