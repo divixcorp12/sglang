@@ -2405,8 +2405,10 @@ void exl3_ram_miss_pack_pool_handoff(TensorView inherited, int64_t workers, Tens
   const auto complete = [&](PackPool& pool) {
     job.arm(&run, 1, static_cast<unsigned>(workers), 0, nullptr, nullptr);
     pool.post(&job);
-    const int64_t deadline = now_ns() + 5000000000;
-    while (!job.done() && now_ns() < deadline) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!job.done() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
     return job.done() ? int64_t{1} : int64_t{0};
   };
   const auto cpu_over = [](PackPool& pool, int ms) {
