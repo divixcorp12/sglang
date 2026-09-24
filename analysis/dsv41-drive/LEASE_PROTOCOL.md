@@ -419,11 +419,12 @@ below, rounded up to 4096 again.
 `(idx, lane)`, `generation56 << 8 | bits8`, each on its own 128-byte line (`R * L * 128 =
 16 KiB`, one line per lane so the device's per-lane poll never shares a line with a lane it
 did not ask for). Only the service thread writes it, with a generation-checked CAS
-(piece-streaming plan Sec 3.4). No behaviour writes or reads it yet; the reservation-time
-initialisation (storing `gen<<8` per miss lane, fenced before the tag-LOADING ready word)
-and the owner-side publish (the CAS above, run from `collect_packed` once a piece job's
-`done()` holds) both come later in the plan. This 16 KiB is allocated for every lease-mode
-service regardless of whether the flag is on.
+(piece-streaming plan Sec 3.4). The service initialises each miss lane's word to `gen<<8` at
+reservation, fenced before the tag-LOADING ready word; the reader's owner then publishes each
+piece with the CAS above, from `collect_packed`, once that piece job's `done()` holds. The stream
+kernel S reads the words with `ld.acquire.sys`, and re-reads them after acquiring `kDemandDone`
+before it judges a request complete. This 16 KiB is allocated for every lease-mode service
+regardless of whether the flag is on; with the flag off nothing writes or reads it.
 
 ### 4.4 Which of `{request_generation, slot_generation, host_slot, status}` lives where
 

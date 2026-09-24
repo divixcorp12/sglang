@@ -16,6 +16,7 @@ test_exl3_two_phase_timing_cuda.py (the real-service chain), test_exl3_two_phase
 the fused harness) and test_exl3_lease_kernels_cuda.py (the hand-driven lease block).
 """
 
+import inspect
 import os
 import threading
 import time
@@ -137,32 +138,37 @@ def _close(host, slabs):
 class StreamService:
     """The real chain one call at a time against the real C++ service thread: lease mode, two-phase and (unless
     ``piece_stream`` is False) piece streaming with ``pack_workers`` packing workers. Flag on, the chain is
-    post -> W1 -> C1 -> A1 -> S -> A2 -> F; flag off, today's post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F."""
+    post -> W1 -> C1 -> A1 -> S -> A2 -> F; flag off, today's post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F.
+    ``layers`` streamed layers are built and every request goes to streamed row ``row``."""
 
-    def __init__(self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2):
+    def __init__(
+        self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2, layers=LAYERS,
+        row=0,
+    ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
         from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
-        write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
+        self.layers, self.row = layers, row
+        write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
         self.layout = build_exl3_expert_layout(str(tmp_path))
-        self.fmt = Exl3ExpertFormat(self.layout, 0, direct=False)
+        self.fmt = Exl3ExpertFormat(self.layout, row, direct=False)
         self.specs = {s.name: s for s in self.fmt.tensor_specs(None)}
         self.names = EXL3_STREAMED_NAMES
-        self.slabs = {lid: {} for lid in range(LAYERS)}
+        self.slabs = {lid: {} for lid in range(layers)}
         self.host = None
         self.hit_wait_ns = hit_wait_ns
         self.timeout_ms = timeout_ms
         self.piece_stream = piece_stream
         try:
-            for lid in range(LAYERS):
+            for lid in range(layers):
                 for n in self.names:
                     self.slabs[lid][n] = allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
             self.tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
             self.page = new_page(pin=True)
-            self.slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
+            self.slot_map = torch.full((layers, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.host = Exl3RamMissHost(
                 self.tables, page=self.page, slot_map=self.slot_map, direct=False, pack_workers=pack_workers
             )
@@ -172,7 +178,7 @@ class StreamService:
                 self.host.enable_piece_stream()
             self.host.start_thread(fatal_wait_s=60.0)
             self.dev = Exl3RamMissDevice(
-                self.page, self.slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=False,
+                self.page, self.slot_map, device="cuda", layers=layers, timeout_ms=timeout_ms, advise=False,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
                 piece_stream=piece_stream, piece_runs=self.host.piece_runs() if piece_stream else None,
             )
@@ -189,8 +195,8 @@ class StreamService:
             n: torch.zeros((TOP_K,) + self.specs[n].row_shape, dtype=self.specs[n].dtype, device="cuda") for n in self.names
         }
         self.dest_slots = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
-        self.segments = expert_row_segments([(self.slabs[0][n], self.dest[n]) for n in self.names])
-        self.segment_map = stream_segment_map(self.segments, self.tables, 0) if piece_stream else None
+        self.segments = expert_row_segments([(self.slabs[row][n], self.dest[n]) for n in self.names])
+        self.segment_map = stream_segment_map(self.segments, self.tables, row) if piece_stream else None
         if piece_stream:
             # One empty (unarmed) request through the whole chain: JIT-compiles every kernel before a test times one.
             self.plan([])
@@ -209,10 +215,10 @@ class StreamService:
 
     # --- the stages ------------------------------------------------------------------------------------------
     def post(self):
-        self.dev.post(0, self.planned, self.count, self.routes, -1)
+        self.dev.post(self.row, self.planned, self.count, self.routes, -1)
 
     def hit_wait(self):
-        self.dev.hit_wait(0, self.planned, self.count, self.dest_slots, self.hit_wait_ns)
+        self.dev.hit_wait(self.row, self.planned, self.count, self.dest_slots, self.hit_wait_ns)
 
     def copy1(self):
         copy_expert_row_segments_gpu(self.segments, self.dev.host_rows_1, self.dev.dst_slots_1, self.dev.go_1)
@@ -221,13 +227,19 @@ class StreamService:
         self.dev.stage_ack(1)
 
     def stream(self):
-        """S. Tries a ``keep`` kwarg first, as the two-phase T6 harness does for W2: the M10 mutant (S writes keep)
-        needs a real pointer to write through, and production's stream() takes none."""
-        args = (0, self.planned, self.count, self.dest_slots, self.ram_miss, self.segments, self.segment_map)
-        try:
+        """S. Hands S this harness's ``keep`` only when stream() declares that parameter: production's does not, and
+        the M10 mutant (S writes keep) adds it so there is a real pointer to write through."""
+        args = (self.row, self.planned, self.count, self.dest_slots, self.ram_miss, self.segments, self.segment_map)
+        if "keep" in inspect.signature(self.dev.stream).parameters:
             self.dev.stream(*args, keep=self.keep)
-        except TypeError:
+        else:
             self.dev.stream(*args)
+
+    def rest_wait(self):
+        self.dev.rest_wait(self.row, self.planned, self.count, self.dest_slots, self.ram_miss)
+
+    def copy2(self):
+        copy_expert_row_segments_gpu(self.segments, self.dev.host_rows_2, self.dev.dst_slots_2, self.dev.go_2)
 
     def ack2(self):
         self.dev.stage_ack(2)
@@ -239,12 +251,16 @@ class StreamService:
         torch.add(self.dev.go_1, self.dev.go_2, out=self.dev.go_total)
 
     def step(self):
-        """The whole flag-on chain, production order. Returns the request's seq."""
+        """The whole chain in production order (flag off: W2 and C2 in place of S). Returns the request's seq."""
         self.post()
         self.hit_wait()
         self.copy1()
         self.ack1()
-        self.stream()
+        if self.piece_stream:
+            self.stream()
+        else:
+            self.rest_wait()
+            self.copy2()
         self.ack2()
         self.finalize()
         self.total()
@@ -275,7 +291,7 @@ class StreamService:
     def expected(self, experts):
         from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 
-        source = Exl3ShardRowSource.for_layer(self.layout, 0, self.fmt.segment_map(), direct=False)
+        source = Exl3ShardRowSource.for_layer(self.layout, self.row, self.fmt.segment_map(), direct=False)
         rows = {}
         for expert in sorted(set(experts)):
             rows[expert] = {n: torch.empty(self.specs[n].row_shape, dtype=self.specs[n].dtype) for n in self.names}
@@ -295,9 +311,9 @@ class StreamService:
 
         return Exl3RamMissRowBackend(
             segments={0: self.segments},
-            host_row_map=self.slot_map[0].to("cuda"),
+            host_row_map=self.slot_map[self.row].to("cuda"),
             device_side=self.dev,
-            row=0,
+            row=self.row,
             next_row=-1,
             capacity=TOP_K,
             two_phase=True,
@@ -561,8 +577,10 @@ def test_g6_the_flag_on_chain_is_post_w1_c1_a1_s_a2_f_add(service):
 
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
 def test_g6_the_flag_off_chain_is_todays_node_for_node(tmp_path):
-    """Flag off: 10 nodes, 9 edges, and every node's kernel, grid, block and shared memory is the two-phase stage's.
-    None of them is the stream kernel or the stream W1 (learned from a flag-on device in the same process)."""
+    """Flag off: 10 nodes and 9 edges, and every node's kernel, grid, block and shared memory is the two-phase
+    stage's; none is the stream kernel or the stream W1 (learned from a flag-on device in the same process). It does
+    not compare kernel arguments: that the flag-off kernels take today's parameters rests on their unchanged C++
+    signatures and the flag-off API, which this learns the stage signatures from."""
     (tmp_path / "on").mkdir()
     (tmp_path / "off").mkdir()
     on = StreamService(tmp_path / "on")
@@ -900,6 +918,35 @@ def test_g1_piece_streaming_output_is_bitwise_equal_to_the_two_phase_arm(tmp_pat
                 ), (route, k, name)
 
 
+def test_g1_a_second_layer_streams_its_own_rows_equal_to_the_flag_off_arm(tmp_path):
+    """G1 through streamed row 1 of 2: S indexes its piece table by (row, expert), so a wrong row index copies row 0's
+    cuts over row 1's bytes. The precondition checks the two rows' cuts differ for the planned experts, so the
+    comparison can see that; the bytes must equal the flag-off (two-phase) arm and the checkpoint."""
+    experts = [3, 5, 9, 12]
+    delivered = {}
+    for piece_stream in (False, True):
+        directory = tmp_path / ("on" if piece_stream else "off")
+        directory.mkdir()
+        s = StreamService(directory, layers=2, row=1, piece_stream=piece_stream)
+        try:
+            if piece_stream:
+                runs = s.dev.piece_runs.cpu()
+                assert all(not torch.equal(runs[0, e], runs[1, e]) for e in experts), "rows 0 and 1 cut alike"
+            s.host.inject_fault(pack_delay_ns=PIECE_DELAY_NS, poison=True)
+            s.plan(experts)
+            s.step()
+            assert s.keep.item() == 1.0, (piece_stream, s.counters(), s.stats())
+            if piece_stream:
+                assert int(s.dev.go_2.item()) == len(experts) and s.stats()["stream_pieces"] > 0
+            assert s.delivered(experts), piece_stream
+            delivered[piece_stream] = {n: s.dest[n][: len(experts)].cpu().view(torch.uint8).clone() for n in s.names}
+        finally:
+            s.quiet()
+            s.close()
+    for name, rows in delivered[False].items():
+        assert torch.equal(rows, delivered[True][name]), name
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # G9 and G10: the hand-driven lease block (no service): the test writes the RowResults, the masks and the page.
 # ---------------------------------------------------------------------------------------------------------------
@@ -1003,9 +1050,10 @@ def test_g9_control_a_valid_loading_row_result_is_streamed_and_committed():
 
 @pytest.mark.parametrize("aborter", ["counts_last", "counts_first"])
 def test_g10_one_aborting_block_leaves_go_2_zero_and_the_request_failed(aborter):
-    """Block 2 takes the abort path. counts_last: it stores late, after the others counted (the race a missing fence
-    would open, M13). counts_first: the completing blocks count late, so a completing block is last and must refuse
-    to commit on the counts alone (a last block that ignores the completed count and the abort word, M13)."""
+    """Block 2 takes the abort path. counts_last: it stores late, after the others counted, so the aborting block is
+    itself the last one and its refusal rests on its own ``sh.aborting``, not on the counter decision (it is the
+    race a missing fence would open, M13b). counts_first: the completing blocks count late, so a completing block
+    is last; only this case tests the counter decision (completed count and abort word, M13a)."""
     rig = Rig()
     rig.dev.stream_fault[STREAM_FAULT_WORDS["abort_block"]] = 3
     delay = "abort_delay_ns" if aborter == "counts_last" else "count_delay_ns"

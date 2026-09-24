@@ -471,6 +471,20 @@ def test_piece_stream_refuses_a_copy_table_missing_a_streamed_name(tiers):
         _attach_with_copy_tables(service, streamers, drop_name=2)
 
 
+def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch):
+    """The device kernels read area D at the offsets of lease ABI 2 (StreamProbe appended); a block the host wrote
+    under any other version is refused at attach, not read at the wrong offsets."""
+    from sglang.kernels.ops.moe import exl3_lease_block as lease
+
+    service, streamers, caches = tiers
+    header = module.Exl3RamMissHost.lease_header
+    monkeypatch.setattr(
+        module.Exl3RamMissHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
+    )
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True), pytest.raises(RuntimeError, match="ABI version"):
+        _attach_with_copy_tables(service, streamers)
+
+
 def test_without_piece_stream_the_backends_do_not_stream(tiers):
     service, streamers, caches = tiers
     with (

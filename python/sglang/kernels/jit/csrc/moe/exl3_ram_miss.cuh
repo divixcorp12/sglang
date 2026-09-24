@@ -1271,6 +1271,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
           __nanosleep(256);
         }
       }
+      // Once served there is no D5 check: termination rests on the masks staying final until the ring slot's reuse
+      // re-initialises them, 16 requests later, which cannot happen while this request is still in the chain.
       if (sh.aborting == 0 && sh.served != 0) {
         bool all = true;
         for (int lane = 0; lane < kLeaseLanes; ++lane) {
