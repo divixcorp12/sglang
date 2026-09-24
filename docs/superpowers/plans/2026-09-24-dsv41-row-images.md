@@ -29,7 +29,7 @@ stores each row as its six slab rows back to back; every slab row is a multiple 
 - `open_row_images(roots, layout, segments, source_root, layer_ids)` -> `RowImageSet` (validated paths per layer
   per root), refusing incomplete, mismatched, short or cross-root-inconsistent sets.
 
-dsv41-full40: image_bytes 13,315,584 (26,007 x 512), row_stride 13,320,192, 40 layers x 384 experts,
+dsv41-full40: image_bytes 13,315,584 (26,007 x 512), row_stride 13,316,096, 40 layers x 384 experts,
 ~205 GB per root. Space: nvme0 757 GB free, nvme4 1.4 TB free.
 
 ## Shared decisions
