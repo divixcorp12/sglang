@@ -199,6 +199,19 @@
       "keyFiles": []
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "docs/superpowers/plans/2026-09-24-dsv41-row-images.md",
+      "accessCount": 1,
+      "lastAccessed": 1790290312862,
+      "type": "file"
+    },
+    {
+      "path": "analysis/dsv41-drive/row-images/compare_arms.py",
+      "accessCount": 1,
+      "lastAccessed": 1790290481283,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }

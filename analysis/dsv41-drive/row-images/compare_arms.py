@@ -8,7 +8,9 @@ Each DIR is one smoke arm's output: ``stages.jsonl`` (SGLANG_DSV41_EXPERT_TRACE_
 What is measured, and from which fields (every clock is the host CLOCK_MONOTONIC):
 
   demands      ``ram_miss_request`` records with status ``served`` and rows_asked > 0, in a decode forward
-               (a forward some ``graph_step`` record carries). Prefill demands are left out.
+               of a request (a forward some request block's ``graph_step`` record carries). Prefill and
+               warm-up demands are left out; ``--include-warmup`` keeps the warm-up graph steps, which
+               reproduces wake.py's ``forward > 1`` filter.
   host tail    per demand, ``done - last_cqe``: what the host still did after the final completion.
   pack tail    per demand, ``pack_end - last_cqe``. Bounce mode: the pack workers' copy left after the last
                completion. Direct mode (row images): the reader writes pack stamps = publish clocks
@@ -81,7 +83,7 @@ def graph_blocks(path):
     return blocks
 
 
-def analyse(arm_dir):
+def analyse(arm_dir, include_warmup=False):
     stages = os.path.join(arm_dir, "stages.jsonl")
     responses = [json.loads(l) for l in open(os.path.join(arm_dir, "responses.jsonl"))]
 
@@ -95,14 +97,21 @@ def analyse(arm_dir):
         dropped_final = True
 
     decode_fwds, steps, graph_ram_rows = set(), 0, 0
+    if include_warmup:  # every graph step counts, as wake.py's `forward > 1` filter does
+        for i in gblocks:
+            for r in blocks[i]["recs"]:
+                decode_fwds.add(r["forward"])
+                steps += r.get("steps", 1)
+                graph_ram_rows += r.get("ram_miss", 0)
     per_request = []
     intervals = []
     for n, bi in enumerate(request_blocks):
         recs = blocks[bi]["recs"]
-        for r in recs:
-            decode_fwds.add(r["forward"])
-            steps += r.get("steps", 1)
-            graph_ram_rows += r.get("ram_miss", 0)
+        if not include_warmup:
+            for r in recs:
+                decode_fwds.add(r["forward"])
+                steps += r.get("steps", 1)
+                graph_ram_rows += r.get("ram_miss", 0)
         ts = [r["t"] for r in recs]
         intervals += [(b - a) * 1e3 for a, b in zip(ts, ts[1:])]
         ms_trace = (ts[-1] - ts[0]) * 1e3 / max(1, len(ts) - 1)
@@ -195,12 +204,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("arms", nargs="+", help="NAME=DIR")
     ap.add_argument("--json", help="write the full per-arm results here")
+    ap.add_argument("--include-warmup", action="store_true",
+                    help="count the warm-up graph steps' demands too (wake.py's filter, which the plan's "
+                    "184 us / 13.6 per step used); ms/token always uses the request blocks only")
     ap.add_argument("--per-request", action="store_true", help="print ms/token per request")
     a = ap.parse_args()
     res = {}
     for spec in a.arms:
         name, _, d = spec.partition("=")
-        res[name] = analyse(d)
+        res[name] = analyse(d, a.include_warmup)
 
     for name, r in res.items():
         print(f"== {name}  ({r['dir']})")
