@@ -36,6 +36,8 @@ def row_images(monkeypatch):
     tables_of, host_init = ram_miss.exl3_ram_miss_tables, Exl3RamMissHost.__init__
 
     def image_tables(layout, segments, slabs, **mirrors):
+        # G1's real service passes row_images=None (the flag is off in its environment); nothing else is passed.
+        mirrors = {key: value for key, value in mirrors.items() if value is not None}
         assert not mirrors, "the CUDA suite builds its tables without mirror roots"
         source = os.path.dirname(next(iter(layout.records.values())).path)
         root = source.rstrip("/") + "_images"
