@@ -557,6 +557,8 @@ def test_g6_the_flag_on_chain_is_post_w1_c1_a1_s_a2_f_add(service):
 def test_g6_the_flag_off_chain_is_todays_node_for_node(tmp_path):
     """Flag off: 10 nodes, 9 edges, and every node's kernel, grid, block and shared memory is the two-phase stage's.
     None of them is the stream kernel or the stream W1 (learned from a flag-on device in the same process)."""
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
     on = StreamService(tmp_path / "on")
     try:
         on_stages = _stage_signatures(on, stream=True)
