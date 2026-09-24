@@ -254,7 +254,8 @@ def _lease_python_constants():
 
 
 def _lease_device_only_constants():
-    """Words only the device kernels write or name: the tags and the Terminal reasons (the host never interprets them)."""
+    """Tags and Terminal reasons: every one is in the device source; the host may name some (the RowResult ready tags
+    it writes), and then must agree, but is not required to define any."""
     from sglang.kernels.ops.moe import exl3_lease_block as lease
 
     return {
@@ -299,9 +300,10 @@ def _check_host_lease_layout(host_source: str, host_constants: dict[str, int], p
                 "would match nothing. Define the layout as kLease* constants (mirroring exl3_lease_block.py)."
             )
         return "skip"
+    mirrored = {**_lease_device_only_constants(), **python}
     for name, value in defined.items():
-        assert name in python, f"{name} is defined in the host source but not mirrored in Python"
-        assert value == python[name], (name, value, python[name])
+        assert name in mirrored, f"{name} is defined in the host source but not mirrored in Python"
+        assert value == mirrored[name], (name, value, mirrored[name])
     missing = sorted(set(python) - set(defined))
     assert not missing, f"the host source defines some lease constants but not {missing}"
     return "agreed"
@@ -329,6 +331,9 @@ def test_the_host_lease_guard_can_fail():
         _check_host_lease_layout("x", {**python, "kLeaseSlotGen": python["kLeaseSlotGen"] + 4}, python)  # drifted
     with pytest.raises(AssertionError, match="not mirrored"):
         _check_host_lease_layout("x", {**python, "kLeaseInvented": 1}, python)
+    assert _check_host_lease_layout("x", {**python, "kLeaseTagLoading": 2}, python) == "agreed"  # a tag the host writes
+    with pytest.raises(AssertionError):
+        _check_host_lease_layout("x", {**python, "kLeaseTagLoading": 3}, python)  # a tag the host got wrong
 
 
 if __name__ == "__main__":
