@@ -964,6 +964,8 @@ STATE_WORDS = {
     # Piece streaming's stream kernel: piece slices its block 0 copied, and its leader passes over every block.
     "stream_pieces": 15,
     "stream_polls": 16,
+    # Stage 1's (W1's) polling passes, cumulative: under piece streaming it stops once every lane is claimed or LOADING.
+    "w1_passes": 17,
 }
 
 # The stream kernel's test-only fault words (kStreamFault* in exl3_ram_miss.cuh): all zero in production.

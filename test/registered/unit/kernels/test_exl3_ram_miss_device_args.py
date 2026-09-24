@@ -193,6 +193,7 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kFailReason": "fail_reason",
         "kStreamPieces": "stream_pieces",
         "kStreamPolls": "stream_polls",
+        "kW1Passes": "w1_passes",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
     # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.

@@ -145,7 +145,8 @@ constexpr int kReqFailed = 13;
 constexpr int kFailReason = 14;  // the kLeaseReason* the failing stage recorded, for the terminal F publishes
 constexpr int kStreamPieces = 15;  // piece slices the stream kernel's block 0 copied, cumulative
 constexpr int kStreamPolls = 16;   // stream-kernel leader passes, summed over its blocks, cumulative
-constexpr int kStateWords = 17;
+constexpr int kW1Passes = 17;      // stage 1's polling passes over its unclaimed lanes, cumulative
+constexpr int kStateWords = 18;
 
 __device__ __forceinline__ uint32_t ld_acquire_sys(const uint8_t* address) {
   uint32_t value;
@@ -239,8 +240,9 @@ __device__ __forceinline__ void raise_fatal(uint8_t* page, uint32_t seq) {
 // while a published-but-invalid one is a protocol violation. A caller that conflates them fails every mixed
 // request, or turns a genuine identity violation into a silent retry.
 // `accept_loading` also accepts tag LOADING (piece streaming, LEASE_PROTOCOL.md E1 amendment) under the same
-// contract, and `loading` then reports which tag it was. Only the stream kernel passes it: a tag-2 lane's bytes are
-// final piece by piece, so every other caller must go on seeing it as unpublished.
+// contract. Only the stream kernel passes it: a tag-2 lane's bytes are final piece by piece, so every other caller
+// must go on seeing it as unpublished. `loading` reports a LOADING tag of THIS generation whether or not it was
+// accepted, so stage 1 can tell a lane it will never be able to claim from one not yet published.
 __device__ __forceinline__ bool lane_result_valid(
     const uint8_t* result,
     uint64_t generation,
@@ -259,9 +261,9 @@ __device__ __forceinline__ bool lane_result_valid(
   const uint64_t again = ld_acquire_sys64(result + kLeaseRrReady);
   const uint64_t generation_mask = (1ull << 56) - 1;
   const uint64_t tag = ready >> 56;
-  if (loading != nullptr) *loading = tag == kLeaseTagLoading;
-  *ready_seen = (tag == kLeaseTagReady || (accept_loading && tag == kLeaseTagLoading)) &&
-                (ready & generation_mask) == generation;
+  const bool current = (ready & generation_mask) == generation;
+  if (loading != nullptr) *loading = tag == kLeaseTagLoading && current;
+  *ready_seen = (tag == kLeaseTagReady || (accept_loading && tag == kLeaseTagLoading)) && current;
   const bool valid = *ready_seen && again == ready && static_cast<int64_t>(expert) == expected_expert &&
                      host_slot >= 0 && static_cast<uint32_t>(host_slot) < capacity;  // also bounds the ack SlotGen read
   if (valid) {
@@ -690,20 +692,28 @@ __device__ __forceinline__ void lease_hit_wait_body(
   // Bounded poll. Without a bound an all-miss request would spin here until the request was served and so pay the
   // read wait twice (T10). The bound is time, not iterations: each pass reads every unclaimed lane's result across
   // PCIe, so a pass costs microseconds that grow with the lane count, and 8 passes measured up to 212 us.
+  int64_t passes = 0;
   for (;;) {
+    ++passes;
+    int64_t streaming = 0;
     for (int64_t i = 0; i < planned_count && !hard_fail; ++i) {
       if (claimed[i] != 0) continue;
       bool ready_seen = false;
+      bool loading = false;
       if (lane_result_valid(
               results + i * kLeaseRowResultBytes, generation, planned[i], capacity, &slots[i], &slot_generations[i],
-              &ready_seen)) {
+              &ready_seen, /*accept_loading=*/false, &loading)) {
         claimed[i] = 1;
         ++taken;
       } else if (ready_seen) {
         hard_fail = true;  // published and invalid: a protocol violation, not a lane for stage 2
+      } else if (loading) {
+        ++streaming;
       }
     }
-    if (hard_fail || taken == planned_count) break;
+    // A LOADING lane is stage 2's for good: it never turns READY, so once every lane is claimed or LOADING a further
+    // pass can claim nothing.
+    if (hard_fail || taken + streaming == planned_count) break;
     // Once the request is served every lane is published, so a later poll can discover nothing new.
     if (reached(ld_acquire_sys(page + kDemandDone), seq)) break;
     const uint64_t now = global_ns();
@@ -712,6 +722,8 @@ __device__ __forceinline__ void lease_hit_wait_body(
     if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) break;
     __nanosleep(256);
   }
+  const int64_t total_passes = static_cast<int64_t>(state[kW1Passes]) + passes;
+  state[kW1Passes] = static_cast<int32_t>(total_passes < 0x7fffffffLL ? total_passes : 0x7fffffffLL);
 
   if (hard_fail) {
     state[kReqFailed] = 1;

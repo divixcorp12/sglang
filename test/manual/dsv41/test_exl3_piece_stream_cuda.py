@@ -9,7 +9,7 @@ the real copy tables and, for G1, the real fused MoE consumer. GPU only.
 - G6 (= T8) the flag-on chain is post -> W1 -> C1 -> A1 -> S -> A2 -> F -> add, 9 nodes and 8 edges; the flag-off chain
   is today's, node for node.
 - G7 replay freshness; G8 masks full but a protect row fails; G9 S identity; G10 abort/commit race; G11 late last
-  publish; T6 S never writes keep; T10 all-miss; T11 all-hit.
+  publish; T6 S never writes keep; T10 all-miss; T11 all-hit; T12 W1 stops once every lane is claimed or LOADING.
 
 Run on divix01 holding cc-gpu.lock, with PYTHONPATH pointing at the tree under test. Harness shapes are copied from
 test_exl3_two_phase_timing_cuda.py (the real-service chain), test_exl3_two_phase_parity_cuda.py (graph topology and
@@ -699,6 +699,40 @@ def test_t10_all_miss_w1_stays_bounded(tmp_path):
         assert int(s.dev.go_1.item()) == 0
         assert elapsed < 0.3, elapsed
         # The miss lanes were granted LOADING at reservation: close the request so the terminal voids them.
+        s.copy1()
+        s.ack1()
+        s.stream()
+        s.ack2()
+        s.finalize()
+        _cuda_ready()
+        assert s.keep.item() == 0.0
+    finally:
+        s.quiet()
+        s.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# T12: W1 stops once every lane is claimed or LOADING. A LOADING lane never turns READY, and W1 used to read it as
+# unpublished, so it polled it to the end of its budget on every read layer (DSV41_REFERENCE.md 24.7, item 3).
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("hits", [[], [1, 2]], ids=["all-miss", "mixed"])
+def test_t12_w1_stops_once_every_lane_is_claimed_or_loading(tmp_path, hits):
+    s = StreamService(tmp_path, timeout_ms=500, hit_wait_ns=50_000_000)  # a budget the old W1 ran out visibly
+    try:
+        if hits:
+            _warm(s, hits)
+        misses = [13, 14]
+        s.host.inject(delay_s=5.0)  # the misses' read stays in flight: their lanes stay LOADING throughout
+        s.plan(hits + misses)
+        granted = s.counters()["leases_granted"]
+        s.post()
+        assert s.until(lambda: s.counters()["leases_granted"] == granted + len(hits) + len(misses)), s.counters()
+        passes = s.stats()["w1_passes"]
+        s.hit_wait()
+        _cuda_ready()
+        assert s.stats()["w1_passes"] - passes <= 2, s.stats()
+        assert int(s.dev.go_1.item()) == len(hits), "W1 left before claiming a READY lane"
+        # Close the request as T10 does: S times out on the held misses and F voids them.
         s.copy1()
         s.ack1()
         s.stream()
