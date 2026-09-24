@@ -646,7 +646,7 @@ struct PiecePublish {
 // have all completed, so a failure leaves at most fully packed rows in unpublished slots, never a
 // half-packed one, and the caller releases them. With piece streaming the unit is the piece: a piece is
 // packed only once the sub-reads it depends on have landed and is published only once its job is done,
-// so a failure leaves whole published pieces, never a torn one, in slots the caller has not mapped. The
+// so a failure leaves whole published pieces, never a torn one, in slots whose map the caller has not published. The
 // caller quarantines each such slot a lane still leases (its lanes may be copying those pieces) and
 // releases the rest.
 class RowReader {
@@ -3597,12 +3597,6 @@ class RamTier {
         tier.expert_slot[missing[i]] = static_cast<int32_t>(slot);
         slots.push_back(slot);
       }
-      // Piece streaming: each miss lane's readiness word starts this request's generation with no piece bit, fenced
-      // before the first ready word of the request (the hit grant below) is stored. The owner's publish refuses a
-      // word of any other generation, so without this every piece of the request would be refused.
-      if (ok && piece_stream && !advisory && !request.lane_experts.empty()) {
-        publishing = init_piece_words_locked(request, missing);
-      }
       // S2. Grant and publish the HIT lanes here: in the same mutex_ hold as the reservation, after the take loop
       // has completed with ok still true, and before the hold is dropped for read(). A lane is a hit iff its
       // expert is not in `missing`. This is the whole of V1: these row results become visible to the device while
@@ -3619,13 +3613,19 @@ class RamTier {
       if (ok && two_phase_ && lease_mode_ && !advisory && !request.lane_experts.empty()) {
         if (!open_lease_entry_locked(request, !piece_stream)) {
           ok = false;
-        } else if (!(piece_stream ? grant_lane_group_locked(request, [](size_t) { return true; }, true, &slots)
-                                  : grant_lane_group_locked(
-                                        request,
-                                        [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); },
-                                        true))) {
-          close_pending_grants_locked(request);  // granted nothing: retire the entry rather than leak the ring slot
-          ok = false;
+        } else {
+          // Piece streaming: each miss lane's readiness word starts this request's generation with no piece bit,
+          // fenced before any ready word of the request. Only after the entry opened: an active entry means an
+          // older request may still be reading this ring index's words, and opening refuses it.
+          if (piece_stream) publishing = init_piece_words_locked(request, missing);
+          if (!(piece_stream ? grant_lane_group_locked(request, [](size_t) { return true; }, true, &slots)
+                             : grant_lane_group_locked(
+                                   request,
+                                   [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); },
+                                   true))) {
+            close_pending_grants_locked(request);  // granted nothing: retire the entry rather than leak the ring slot
+            ok = false;
+          }
         }
       }
       if (!ok) {
