@@ -3476,19 +3476,74 @@ all 40 layers, so the VRAM set also changes and G rises to 131.7.
   5,000 rows up (the ✓ rows beat the ✗ rows).
 - **Output:** `divix01:.../direct-two-phase-tests/tier-sim/cold.json` and `cold.tab`.
 
-### 24.6 Next decode work, in order
+### 24.6 NUMA-placed pinned tier, and the link becomes the wall (2026-09-24)
 
-1. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
-2. **Compare against production.** Before piece streaming becomes a default, compare it
+**Code.** Branch `cc/dsv41-pinned-numa` at `e0ce02579f`, not yet merged.
+- `SGLANG_MOE_PINNED_HOST_NUMA_MB="0:61440,1:40960"` binds each layer's slab rows to NUMA
+  nodes in proportion, with `mbind` applied before first touch.
+- Startup refuses a node that cannot hold its share: free memory plus page cache, less
+  4 GiB of headroom.
+- Readers are unchanged, because each slab stays one contiguous range.
+- Placed memory is still 100% on 2 MB transparent huge pages. On one thread, memcpy into
+  it runs at 7.2 GB/s, against 6.1–6.3 GB/s on 4 KB pages.
+
+**Smokes** (flag on, stage-traced, 584 decode tokens each). All four had byte-identical
+responses and 0 refusals or quarantined slots.
+
+| Tier | NVMe rows/token | f | Σ read+pack per step | Step p50 / mean |
+|---|---:|---:|---:|---:|
+| 50 GiB, unplaced | 36.9 | 0.405 | 97.3 ms | 153.5 / 160.6 ms |
+| 50 GiB on node 0 | 36.7 | 0.404 | 98.9 ms | 155.0 / 161.5 ms |
+| 60 GiB on node 0 | 31.9 | 0.352 | 85.5 ms | 147.7 / 156.1 ms |
+| 90 GiB (60 + 30 on node 1) | 20.8 | 0.230 | 57.0 ms | 134.8 / 139.3 ms |
+
+- Binding the 50 GiB tier to node 0 made no difference; the two 50 GiB rows are within
+  noise.
+- At 90 GiB, placing the tier took 57 s against about 20 s for the node-0 tiers, because
+  node 1 reclaims page cache first.
+
+**Node-mode trace at 100 GiB** (60 + 40, 8,063 rows).
+- Report: `/mnt/nvme1/dsv41-nsys/numa100-node-20260924-144026.nsys-rep`.
+- Same prompt and token count as §24.2's node trace.
+
+| GPU time per token | 50 GiB | 100 GiB |
+|---|---:|---:|
+| Pinned-row copy C1 (`copy_expert_row_segments`) | 51.2 ms | **75.0 ms** |
+| Stream kernel S (NVMe wait plus copy) | 64.8 ms | 16.4 ms |
+| Read layers per token | 18.0 | 4.2 |
+| RAM-miss chain W1..F | 118.9 ms | 92.7 ms |
+| All graph kernels | 136.0 ms | 110.1 ms |
+| Expert GEMMs, attention, norms, other | about 17 ms | about 17 ms |
+
+**The host-to-GPU link is now the wall.**
+- **C1 runs at line rate.** It moves 49.1 → 74.1 rows per token at **12.8 → 13.2 GB/s**,
+  which is Gen3 x16 line rate. Rows on node 1 do not slow it.
+- **The floor is fixed by the rows per token.** Each token needs G ≈ 79 VRAM-miss rows
+  over the link: 1.06 GB, about **84.5 ms at 12.5 GB/s**, whatever the RAM tier size.
+- **What can still move:**
+  - fewer VRAM misses per token (G);
+  - the link's idle time: about 85 ms busy in a step of about 135 ms, so copies could
+    overlap compute if the rows were known a layer ahead.
+
+### 24.7 Next decode work, in order
+
+1. **Fewer VRAM misses per token (G ≈ 79).** Each row avoided saves about 1.07 ms of link
+   time.
+   - The hot cache is 14 GiB, 1,128 slots of 15,360. Look for VRAM to return to it: the
+     2.8 GiB of dense dequantized modules (§4) and the 1.23 GiB embedding.
+   - Retune the residency policy for the DIRECT recipe. This needs routing traces with
+     expert IDs, which today only eager decode records.
+2. **Overlap the link with compute:** fetch the next layer's likely experts during the
+   current layer. The link idles about 40% of the step, so it has spare capacity, but a
+   wrong guess costs link time. Prefetch is currently refused under DIRECT.
+3. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
+4. **Merge the NUMA placement and set the recipe tier.**
+   - 60 GiB on node 0 needs nothing from co-tenants.
+   - 90–100 GiB takes op-reth's page cache on node 1 and exceeds the ~90 GB host budget.
+     That is the owner's call.
+5. **Compare against production.** Before piece streaming becomes a default, compare it
    in the same sessions against the saved production recipe, which has two-phase off.
-3. **A bigger pinned RAM tier** (§24.5). This is the largest modelled lever.
-   - **Node 0 first:** about 82 GB is free on the GPU-local node with the server stopped.
-     The 70 GiB attempt stalled in THP compaction, not for lack of memory. This needs an
-     allocator change to fault the tier in without that stall.
-   - **Then span to node 1:** its memory is mostly reclaimable page cache belonging to
-     co-tenants, and using it goes beyond the ~90 GB host budget.
-   - **Before spanning:** measure pinned host-to-GPU bandwidth from node-1 memory.
-4. **Dropped:**
+6. **Dropped:**
    - Removing CPU–GPU syncs from decode (§24.3).
    - Retuning credit, and static mirror weights (§24.4).
    - Moving the swapfile off nvme4. It is idle during decode, so this is housekeeping at
