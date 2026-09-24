@@ -308,8 +308,8 @@ FAILURES = [
     dict(submit_error=EIO, submit_call=3, submit_first=True, max_outstanding=4),
     dict(submit_error=EIO, submit_call=3, submit_first=False, max_outstanding=4),
     dict(cqe_error=EIO, cqe_call=9, max_outstanding=3, reverse_cqes=True),
-    dict(stale_cqe_call=1),
-    dict(part=1, sub=3, part_error=EIO, ordinal=1),
+    dict(stale_cqe_call=1, step=4),  # four batches: a descriptor is recycled within the read
+    dict(part=1, sub=2, part_error=EIO, ordinal=1),  # the last of part 1's three sub-reads
 ]
 
 
@@ -321,6 +321,8 @@ def test_a_failed_read_publishes_only_whole_exact_pieces(tmp_path, fault):
     every bit it sees, as the device would copy them). The faults are the split suite's both-banks errors, a stale
     completion and a failed sub-read, over 16 rows in two banks with the destination poisoned at admission."""
     s = _images_setup(tmp_path, capacity=32, experts=16, mirror_weights=(1.0, 1.0))
+    fault = dict(fault)
+    step = fault.pop("step", 8)
     experts, slots, ref_slots = list(range(16)), list(range(16)), list(range(16, 32))
     assert read_rows_traced(s.tables, 1, experts, ref_slots, direct=True)[0] == 1
     split._assert_rows(s, 1, experts, ref_slots)
@@ -328,7 +330,7 @@ def test_a_failed_read_publishes_only_whole_exact_pieces(tmp_path, fault):
         split._sentinel(s, 1, slot)
     result, record, masks, info = read_rows_pieces(
         s.tables, 1, experts, slots, direct=True, generation=9, reference=s.tables.slabs, ref_slots=ref_slots,
-        piece_stream=True, step=8, poison=True, **fault,
+        piece_stream=True, step=step, poison=True, **fault,
     )
     assert result == 0
     published = sum(bin(int(word) & 0xFF).count("1") for word in masks.view(-1).tolist())
