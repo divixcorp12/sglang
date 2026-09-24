@@ -3,8 +3,9 @@
 **Current status (2026-09-23):** DSV4.1 serves on divix01 from
 `codex/nvfp4-expert-stream-main`; the latest measured code commit is `e36fa2530c`.
 The saved production launcher uses
-DIRECT stage-2 GPU expert insertion, RAM-miss leases, eight row-packing workers, and
-io_uring Engram host nodes for **both** Engram layers. Batch-1 decode has one captured
+DIRECT stage-2 GPU expert insertion, RAM-miss leases, eight row-packing workers, the
+fused expert planner, and io_uring Engram host nodes for **both** Engram layers.
+Batch-1 decode has one captured
 CUDA graph segment with zero Engram breaks (§22). The current HTTP benchmark uses a
 32,768-token context, prefix caching, and **two timed sessions** (§23); older eight-session
 and Engine-path results are historical measurements of different recipes. A node-level
@@ -106,13 +107,13 @@ indicates the library or link path is missing.
 ```bash
 ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod/benchmarks/dsv41_baseline \
   && EXPECT_SHA=$(git rev-parse HEAD) \
-     ./run_arm.sh fused-plan-on-2timed 7878 SGLANG_MOE_EXPERT_FUSED_PLAN=1'
+     ./run_arm.sh dsv41-current 7878'
 ```
 
 `EXPECT_SHA` pins the tree: the arm refuses if the worktree is not at that exact commit.
-Expert-row mirroring, Engram host-node io_uring, leases, DIRECT insertion, and eight
-pack workers need no override — they are in `base_env()`. The command above is a
-single **fused-plan-on** arm, not an A/B test. Note that mirroring
+Expert-row mirroring, Engram host-node io_uring, leases, DIRECT insertion, eight
+pack workers, and the fused expert planner need no override — they are in
+`base_env()`. Note that mirroring
 applies to *expert rows* (`SGLANG_MOE_EXPERT_MIRROR_DIRS`), not to the Engram tables,
 which are read from `SGLANG_DSV41_ENGRAM_TABLE_DIR` on `/mnt/nvme2` and are unmirrored.
 
@@ -3163,7 +3164,7 @@ following are **DSV4.1 recipe defaults**, not general SGLang defaults:
 | Engram lookup | host-node cache with io_uring=1 | Layers 1 and 14 are in the single batch-1 decode graph |
 | Context and prefix | 32,768 tokens; prefix caching enabled | Production and current benchmark match |
 | Async CPU residency scores | 0 | Conflicts with the selected GPU residency update mode; the older async-score win was measured in a different mode |
-| Expert fused plan | off by default | The one-arm opt-in measurement below used `SGLANG_MOE_EXPERT_FUSED_PLAN=1` |
+| Expert fused plan | 1 by default | Enabled in `arm_env.base_env()` after the one-arm opt-in measurement below; compatible with DIRECT stage 2 |
 
 The exact option ledger, including incompatible modes, is
 [`analysis/dsv41-drive/DSV41_LAUNCH_OPTIONS_20260923.md`](analysis/dsv41-drive/DSV41_LAUNCH_OPTIONS_20260923.md).
@@ -3215,8 +3216,9 @@ rejected. Two sessions make a quick diagnostic, but a clean sweep in a paired si
 test only reaches p=0.25. Historical eight-session results in §§20–22 retain their
 original meaning.
 
-On divix01, a **single fused-plan-on arm** ran at that commit with
-`SGLANG_MOE_EXPERT_FUSED_PLAN=1` and every other current recipe value unchanged:
+On divix01, a **single fused-plan-on arm** ran at that commit with an explicit
+`SGLANG_MOE_EXPERT_FUSED_PLAN=1` override and every other recipe value unchanged.
+The flag was then promoted into the DSV4.1 defaults:
 
 | Timed session | Generated tokens | Decode rate | TTFT |
 |---|---:|---:|---:|

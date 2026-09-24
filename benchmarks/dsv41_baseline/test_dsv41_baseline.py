@@ -926,6 +926,15 @@ def test_base_env_mirrors_expert_rows_by_default():
     assert arm_env.base_env()["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == arm_env.EXPERT_MIRROR_DIRS
 
 
+def test_base_env_enables_fused_expert_plan_with_direct_insertion():
+    defaults = arm_env.base_env()
+    assert defaults["SGLANG_MOE_EXPERT_FUSED_PLAN"] == "1"
+    assert defaults["SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"] == "2"
+    assert arm_env.arm_env({"SGLANG_MOE_EXPERT_FUSED_PLAN": "0"})[
+        "SGLANG_MOE_EXPERT_FUSED_PLAN"
+    ] == "0"
+
+
 def test_default_mirror_roots_are_two_absolute_paths_on_distinct_drives():
     roots = arm_env.EXPERT_MIRROR_DIRS.split(os.pathsep)
     assert len(roots) == 2, roots

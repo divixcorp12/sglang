@@ -66,8 +66,9 @@ either flag and `/v1/chat/completions` returned 200 with correct generation.
 
 The current `arm_env.base_env()` defaults also enable RAM miss leases, GPU residency
 updates, DIRECT insert on miss at stage 2, decode cache updates every forward, and
-eight RAM miss pack workers. `arm_env(overrides)` can change any of these for an arm.
-It also enables Engram graph host-node lookups using io_uring. Async CPU
+eight RAM miss pack workers, and the fused expert graph planner.
+`arm_env(overrides)` can change any of these for an arm. It also enables Engram
+graph host-node lookups using io_uring. Async CPU
 residency scores remain off because the GPU residency update path rejects them.
 The native Engram host-node cache still has a separate 5 GiB budget;
 `SGLANG_DSV41_ENGRAM_RAM_GIB=5` controls the Python row cache.

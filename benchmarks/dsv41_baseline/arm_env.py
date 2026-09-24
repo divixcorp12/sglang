@@ -5,7 +5,7 @@ measured DSV4.1 recipe, DSV41_REFERENCE.md section 17.6) originally came from
 `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/
 env-full.sh` (layered onto phase 3a's `env.sh`). The current default additionally
 enables DIRECT insert on miss, RAM miss leases, eight RAM miss pack workers,
-and Engram host-node io_uring lookups; it
+the fused expert graph planner, and Engram host-node io_uring lookups; it
 must be measured as a new recipe, not compared as a historical phase-3b baseline.
 A V2 storage change under test is
 layered on top via `overrides`; the merged dict is both what launches the server and
@@ -124,6 +124,7 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_DOORBELL": "0",
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
         "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
+        "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
         "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES": "1",
         "SGLANG_DSV41_RAM_MISS_PACK_WORKERS": "8",
