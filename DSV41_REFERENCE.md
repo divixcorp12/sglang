@@ -3427,14 +3427,67 @@ byte-identical responses and 0 refusals, quarantines, read errors or voided leas
   task 6 smokes: the m=1 slow-half mean is 2.58–2.72 ms, against 3.32 then. That day's
   +15.7% mean read-wall regression was therefore partly the environment of that run.
 
-### 24.5 Next decode work, in order
+### 24.5 Tier simulator at today's recipe: RAM tier size (2026-09-24)
+
+**Input.** Graph-mode decode traces carry no routed expert IDs (`graph_step` has
+`"experts": []`, and RAM-miss request records carry no IDs either), so `tier_sim.py`
+cannot replay them. The simulation instead replays the eager 8-session corpus trace
+`analysis/dsv41-phase3a/trace-cold.jsonl` (41,320 calls, 1,024 decode tokens). Routing
+depends only on the model and the prompts, so this is valid input.
+
+**Settings.** Today's VRAM is 1,128 slots and today's RAM tier is 4,031 rows (50 GiB, from
+the server log). Residency updates every decode forward; prefill updates every 256 tokens.
+
+**Fidelity.** The native RAM tier is a per-layer LRU that skips VRAM-resident experts,
+which matches the simulator's inclusive per-layer LRU. The simulator does **not** model
+DIRECT insert-on-miss into VRAM.
+
+| Source, at 4,031 RAM rows | G | f | NVMe rows/token |
+|---|---:|---:|---:|
+| Simulator, corpus trace | 93.6 | 0.344 | 32.2 |
+| Measured today, 50:50 smoke (graph decode) | 91.2 | 0.405 | 36.9 |
+| Measured, task 6 stage trace | — | — | 36.8 |
+
+G agrees closely. The simulator puts about 13% fewer rows on NVMe than measured, so read
+the curve as somewhat optimistic.
+
+| RAM rows (≈ GiB) | f | NVMe rows/token | vs today |
+|---:|---:|---:|---:|
+| 3,000 (37) | 0.332 | 43.7 | +36% |
+| **4,031 (50, today)** | 0.344 | **32.2** | — |
+| 5,000 (62) | 0.275 | 25.7 | −20% |
+| 6,000 (74) | 0.215 | 20.2 | −37% |
+| 7,000 (87) | 0.160 | 14.9 | −54% |
+| 8,000 (99) | 0.114 | 10.7 | −67% |
+| 10,000 (124) | 0.053 | 5.0 | −85% |
+
+The 3,000-row row is not comparable to the rest: at that size the inclusive clamp limits
+all 40 layers, so the VRAM set also changes and G rises to 131.7.
+
+- **The curve does not flatten** up to 8,000 rows. Each extra 1,000 rows (13.3 GB)
+  removes about 5.5–6.5 NVMe rows per token.
+- **Rough value** [estimate]: 1.2–1.6 ms saved per row converted from an NVMe read to a
+  pinned-memory hit. That is about **8–10 ms/token per extra 13 GB**.
+  - Growing to about 65 GiB on node 0 would save about 10–13 ms/token.
+  - About 100 GiB across both nodes would save about 25–35 ms/token.
+  - Not measured. The corpus prompts are shorter than the benchmark's 32k-token
+    prefills, which likely flush the tier more.
+- **Prefill admission:** letting prefill admit rows into RAM helps at every size from
+  5,000 rows up (the ✓ rows beat the ✗ rows).
+- **Output:** `divix01:.../direct-two-phase-tests/tier-sim/cold.json` and `cold.tab`.
+
+### 24.6 Next decode work, in order
 
 1. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
 2. **Compare against production.** Before piece streaming becomes a default, compare it
    in the same sessions against the saved production recipe, which has two-phase off.
-3. **The per-demand cost itself.** Summed decode read-plus-pack is 96–99 ms of a
-   153–156 ms step. Fewer RAM-miss rows per token (residency or prediction) and faster
-   pinned-row copies remain the large levers; the read path's shape is not.
+3. **A bigger pinned RAM tier** (§24.5). This is the largest modelled lever.
+   - **Node 0 first:** about 82 GB is free on the GPU-local node with the server stopped.
+     The 70 GiB attempt stalled in THP compaction, not for lack of memory. This needs an
+     allocator change to fault the tier in without that stall.
+   - **Then span to node 1:** its memory is mostly reclaimable page cache belonging to
+     co-tenants, and using it goes beyond the ~90 GB host budget.
+   - **Before spanning:** measure pinned host-to-GPU bandwidth from node-1 memory.
 4. **Dropped:**
    - Removing CPU–GPU syncs from decode (§24.3).
    - Retuning credit, and static mirror weights (§24.4).
