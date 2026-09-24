@@ -66,6 +66,7 @@ def _table_args(tables, direct: bool) -> tuple:
         "\n".join(tables.paths),
         "\n".join(tables.source_paths),
         tables.slot_bytes,
+        int(tables.row_images),
         int(direct),
     )
 
@@ -358,6 +359,11 @@ def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], 
 # to the last row's, which overlaps the reads (see StageRecord).
 # The byte split, terminal status, per-row packing and per-extent CQE stamps are defined at StageRecord.
 # STAGE_TRACE_ROWS / STAGE_TRACE_EXTENTS are its kTraceRows / kTraceExtents.
+# Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, the reader's direct mode) copy nothing: the drive writes the
+# slab rows. The pack stamps then mean publish time: with piece streaming row_pack_start/end are the clocks of the
+# row's first and last piece publish, without it both are the clock the row's reads were vetted and it was finished;
+# pack_start/pack_end/pack_ns are built from them as for packing. pack_workers is 0 (no pool) and useful_bytes still
+# counts the segment bytes that landed in the slabs. The schema is unchanged.
 STAGE_DRIVES = 4
 STAGE_TRACE_ROWS = 16
 STAGE_TRACE_EXTENTS = 32
@@ -662,7 +668,8 @@ class Exl3RamMissHost:
             self._module.exl3_ram_miss_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
                 tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
-                "\n".join(tables.source_paths), tables.slot_bytes, int(direct), self.lease_block, int(pack_workers),
+                "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), int(direct), self.lease_block,
+                int(pack_workers),
                 self.hot_page if self.hot_page is not None else torch.empty(0, dtype=torch.uint8),
             )
         )

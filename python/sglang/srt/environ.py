@@ -1869,6 +1869,12 @@ class Envs:
     # fixed W1/W2 stages. Needs SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES
     # and SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0 (the inline pack path has no publisher). Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM = EnvBool(False)
+    # Row images (plan 2026-09-24-dsv41-row-images): the native RAM-miss reader reads <root>/exl3_row_images of every
+    # SGLANG_MOE_EXPERT_MIRROR_DIRS root (split by SGLANG_MOE_EXPERT_MIRROR_WEIGHTS, as the mirrors are) with one
+    # O_DIRECT readv per read straight into the pinned slab rows: no bounce buffer, no packing workers, no copy.
+    # Needs mirror dirs holding images built by scripts/dsv41/build_row_images.py and
+    # SGLANG_MOE_EXPERT_FILE_READER=uring_direct. The eager row source keeps reading the mirrored shards. Off by default.
+    SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

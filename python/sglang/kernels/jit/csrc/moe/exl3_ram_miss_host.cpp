@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -64,6 +65,9 @@ constexpr int kSubReads = 4;
 constexpr int kPieces = 8;
 constexpr uint8_t kAllPieces = 0xFF;
 constexpr int64_t kPieceAlign = 128;
+// Row images (direct mode): O_DIRECT's file offset and segment length alignment on the mirror drives (XFS and ext4,
+// 512 B logical blocks; exl3_row_image.IO_ALIGN). Slab rows are held to it too, which covers dio_mem_align (4).
+constexpr int64_t kImageAlign = 512;
 static_assert(kPieces <= 8, "a row's piece and sub-read masks are one byte each");
 
 inline int64_t now_ns() {
@@ -301,11 +305,48 @@ struct Tables {
   int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
   std::vector<std::vector<uint8_t*>> slabs;
   std::vector<int64_t> row_bytes;
+  // Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, plan 2026-09-24-dsv41-row-images): the files are
+  // exl3_row_image layer files, not checkpoint shards. A row's needed bytes are then its image, [0, need_end) of
+  // the extents' destination coordinates, and the segments tile it in source order, so every image byte has
+  // exactly one slab destination. The reader reads straight into the slab rows (RowReader, direct mode): no bounce.
+  bool images = false;
 };
 
 inline std::vector<int32_t> ids_of(TensorView tensor) {
   const auto* data = static_cast<const int64_t*>(tensor.data_ptr());
   return std::vector<int32_t>(data, data + tensor.size(0));
+}
+
+// Row images: the reader scatters each read straight into slab rows (RowReader::image_iovecs), which is only right
+// when every byte a read returns has exactly one destination and the row's reads return exactly its image. So: the
+// row starts at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and
+// each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is RowReader::open's.
+inline void check_image_tables(const Tables& t) {
+  for (int64_t start : t.starts) {
+    if (start != 0) throw std::runtime_error("exl3 RAM miss: row images start every row at 0 of its reads");
+  }
+  int64_t cursor = 0;
+  for (const Segment& s : t.segments) {
+    if (s.name < 0 || s.name >= static_cast<int64_t>(t.row_bytes.size()) || s.src != cursor || s.bytes <= 0 ||
+        s.dst < 0 || s.dst + s.bytes > t.row_bytes[s.name]) {
+      throw std::runtime_error(
+          "exl3 RAM miss: row-image segments must tile the image in source order, each inside its slab row");
+    }
+    cursor += s.bytes;
+  }
+  const size_t parts = static_cast<size_t>(t.parts);
+  for (size_t base = 0; base < t.extents.size(); base += parts) {
+    int64_t at = 0;
+    for (size_t p = 0; p < parts; ++p) {
+      const Read& e = t.extents[base + p];
+      if (e.length <= 0) continue;
+      if (e.dest != at) throw std::runtime_error("exl3 RAM miss: a row image's parts must tile it in part order");
+      at += e.length;
+    }
+    if (at != t.need_end) {
+      throw std::runtime_error("exl3 RAM miss: a row image's parts must read exactly its image, never its padding");
+    }
+  }
 }
 
 inline Tables tables_from(
@@ -317,8 +358,10 @@ inline Tables tables_from(
     TensorView row_bytes,
     const std::string& paths,
     const std::string& source_paths,
-    int64_t slot_bytes) {
+    int64_t slot_bytes,
+    int64_t row_images) {
   Tables t;
+  t.images = row_images != 0;
   t.layers = extents.size(0);
   t.experts = extents.size(1);
   t.parts = extents.size(2);
@@ -399,6 +442,7 @@ inline Tables tables_from(
   }
   const auto* rows = static_cast<const int64_t*>(row_bytes.data_ptr());
   t.row_bytes.assign(rows, rows + row_bytes.size(0));
+  if (t.images) check_image_tables(t);
   return t;
 }
 
@@ -658,6 +702,17 @@ struct PiecePublish {
 // so a failure leaves whole published pieces, never a torn one, in slots whose map the caller has not published. The
 // caller quarantines each such slot a lane still leases (its lanes may be copying those pieces) and
 // releases the rest.
+//
+// Direct mode (row images, Tables::images): there is no bounce and no packing pool. Each read (a part, or with piece
+// streaming a sub-read) is ONE O_DIRECT readv whose iovecs are the destination slab rows its image bytes belong in
+// (image_iovecs), so the drive writes the caller's unpublished slot directly and nothing is copied. A bounce slot
+// index still names the row's pipeline state (rows_, descriptors, banks) but no memory. A row is finished once its
+// reads have landed and been vetted; with piece streaming piece j is sub-read j, published as soon as it is vetted
+// (publish_landed). The failure rules are the bounce path's, with the unit being the slab bytes themselves: I/O lands
+// only in slots the caller has not published, the ring is drained before read() returns, and a failed read leaves
+// published whole pieces (never a torn one) and otherwise bytes of unpublished slots the caller releases.
+// Trace: with no packing, row_pack_start/end are the clocks of a row's first and last publish (piece streaming)
+// or both the clock it was finished (without), pack_workers is 0, and useful_bytes still counts its segments.
 class RowReader {
  public:
   RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
@@ -684,7 +739,8 @@ class RowReader {
   // `split` byte-range chunks (0: one per worker); with piece streaming each piece, about an eighth of a
   // row, is cut that way instead. Takes effect at open().
   void set_pack(int64_t workers, int64_t split) {
-    pack_workers_ = static_cast<unsigned>(std::max<int64_t>(0, workers));
+    // Direct mode copies nothing, so it never starts a pool: the setting is ignored (and traced as 0).
+    pack_workers_ = t_.images ? 0u : static_cast<unsigned>(std::max<int64_t>(0, workers));
     pack_split_ = split > 0 ? static_cast<unsigned>(split) : pack_workers_;
   }
   unsigned pack_workers() const { return pack_workers_; }
@@ -698,7 +754,9 @@ class RowReader {
   // (a piece's cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
-      if (pack_workers_ == 0) throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+      if (pack_workers_ == 0 && !t_.images) {
+        throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+      }
       if (t_.parts * kSubReads > kPieces) {
         throw std::runtime_error("exl3 RAM miss: piece streaming reads at most kPieces / kSubReads mirror parts");
       }
@@ -794,7 +852,9 @@ class RowReader {
       const size_t slot = std::min<size_t>(drive, kMaxDrives - 1);
       drive_dev_[slot] = drive < kMaxDrives ? devs_[drive] : -1;
     }
-    if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) != 0) {
+    if (t_.images) {
+      check_image_alignment();
+    } else if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) != 0) {
       bounce_ = nullptr;
       return false;
     }
@@ -815,7 +875,9 @@ class RowReader {
       }
       owner_pinned_ = true;
     }
-    if (piece_stream_ && pack_workers_ == 0) throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+    if (piece_stream_ && pack_workers_ == 0 && !t_.images) {
+      throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+    }
     if (pack_workers_ > 0) {
       // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
       runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
@@ -1073,6 +1135,9 @@ class RowReader {
     held_.reserve(extents);
     again_.reserve(extents);
     sub_reads_.assign(piece_stream_ ? extents : 0, Read{});
+    // Direct mode: each descriptor's iovecs, rebuilt from its `done` whenever it is prepared (image_iovecs). A read
+    // lies inside the image and the segments tile it, so it touches at most one run per segment.
+    iovecs_.assign(t_.images ? extents * t_.segments.size() : 0, iovec{});
     piece_runs_.assign(piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
     return true;
   }
@@ -1203,7 +1268,7 @@ class RowReader {
       rows_[slot].needed = t_.starts[row_index] + t_.need_end;
       ++rows_busy_[bank];
       ++c.reading_rows;
-      if (fault_.poison) std::memset(bounce_slot(slot), kPoisonFill, static_cast<size_t>(t_.slot_bytes));
+      if (fault_.poison) poison_slot(slot, kPoisonFill);
       if (piece_stream_) {
         queue_sub_reads(slot, ordinal, geometry_[i], admitted);
         continue;
@@ -1374,9 +1439,19 @@ class RowReader {
       --c.queue_count;
       ExtentDesc& d = descs_[index];
       const int64_t remaining = d.read->length - d.done;
-      io_uring_prep_read(
-          sqe, fds_[d.read->file], bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
-          static_cast<unsigned>(remaining), static_cast<uint64_t>(d.read->offset + d.done));
+      if (t_.images) {
+        // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: the iovecs are rebuilt from
+        // `done`, which a mid-file O_DIRECT short read leaves on a block boundary. The kernel is not holding this
+        // descriptor's iovecs now: it was either never submitted or its completion was reaped.
+        iovec* iov = &iovecs_[static_cast<size_t>(index) * t_.segments.size()];
+        const unsigned count =
+            image_iovecs(static_cast<size_t>(d.slot), d.read->dest + d.done, d.read->dest + d.read->length, iov);
+        io_uring_prep_readv(sqe, fds_[d.read->file], iov, count, static_cast<uint64_t>(d.read->offset + d.done));
+      } else {
+        io_uring_prep_read(
+            sqe, fds_[d.read->file], bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
+            static_cast<unsigned>(remaining), static_cast<uint64_t>(d.read->offset + d.done));
+      }
       io_uring_sqe_set_data64(sqe, (static_cast<uint64_t>(d.generation) << 32) | index);
       ++c.pending;
       if (sqe_log_) {
@@ -1596,6 +1671,7 @@ class RowReader {
   // keeps packing bounded: the loop refills and reaps between rows. With a packing pool, every ready row
   // is handed to the workers instead, and the loop finishes each one when its copy is done.
   bool pack_one() {
+    if (t_.images) return publish_landed();
     if (pool_) return piece_stream_ ? dispatch_ready_pieces() : dispatch_ready_rows();
     const size_t best = take_ready_row();
     if (best == static_cast<size_t>(kBounceSlots)) return false;
@@ -1614,6 +1690,102 @@ class RowReader {
     }
     finish_row(best, start, stamp(c.trace));
     return true;
+  }
+
+  // Direct mode's "packing": nothing to copy, the drive already wrote the slab rows. Without piece streaming, finish
+  // every row whose reads have landed and whose bytes take_ready_row vetted. With it, publish every vetted piece at
+  // once (piece j is exactly sub-read j's bytes, vetted when it landed, and the reap's acquire of the CQ tail orders
+  // the drive's writes before the release that sets the bit), and finish a row once all its pieces are published and
+  // its sub-reads retired. One clock read per turn stamps what it published (pack stamps = publish time).
+  bool publish_landed() {
+    Call& c = c_;
+    bool any = false;
+    int64_t now = -1;
+    const auto clock = [&] {
+      if (now < 0) now = stamp(c.trace);
+      return now;
+    };
+    if (!piece_stream_) {
+      while (true) {
+        const size_t best = take_ready_row();
+        if (best == static_cast<size_t>(kBounceSlots)) return any;
+        finish_row(best, clock(), clock());
+        any = true;
+      }
+    }
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots) && !c.failed; ++s) {
+      BounceRow& r = rows_[s];
+      if (r.state == RowState::Free) continue;
+      const uint8_t todo = r.vetted & static_cast<uint8_t>(~r.dispatched);
+      for (int j = 0; j < kPieces && !c.failed && todo != 0; ++j) {
+        const uint8_t bit = static_cast<uint8_t>(1u << j);
+        if ((todo & bit) == 0) continue;
+        if (j >= 1 && holding_for_probe()) continue;
+        r.dispatched |= bit;
+        r.pack_first = std::min(r.pack_first, clock());
+        r.pack_last = std::max(r.pack_last, clock());
+        publish_collected(s, j);
+        any = true;
+      }
+      if (!c.failed && r.state == RowState::Ready && r.published == kAllPieces) {
+        finish_row(s, r.pack_first == INT64_MAX ? 0 : r.pack_first, r.pack_last);
+      }
+    }
+    return any;
+  }
+
+  // Direct mode: the iovecs that land image bytes [from, to) of the row in `slot` in its destination slab rows, one
+  // per segment the range meets (the segments tile the image in source order: check_image_tables). Returns how many.
+  unsigned image_iovecs(size_t slot, int64_t from, int64_t to, iovec* out) const {
+    const Call& c = c_;
+    const int64_t dest = (*c.slots)[rows_[slot].ordinal];
+    unsigned count = 0;
+    for (const Segment& s : t_.segments) {
+      const int64_t lo = std::max(from, s.src), hi = std::min(to, s.src + s.bytes);
+      if (lo >= hi) continue;
+      out[count++] = iovec{
+          t_.slabs[c.layer][s.name] + dest * t_.row_bytes[s.name] + s.dst + (lo - s.src), static_cast<size_t>(hi - lo)};
+    }
+    return count;
+  }
+
+  // The poison fault: fill the memory the row in `slot` is read into, the bounce slot or (direct mode) the
+  // destination slab rows, so a byte published without having been read shows.
+  void poison_slot(size_t slot, uint8_t fill) {
+    if (!t_.images) {
+      std::memset(bounce_slot(slot), fill, static_cast<size_t>(t_.slot_bytes));
+      return;
+    }
+    const Call& c = c_;
+    const int64_t dest = (*c.slots)[rows_[slot].ordinal];
+    for (size_t name = 0; name < t_.slabs[c.layer].size(); ++name) {
+      std::memset(t_.slabs[c.layer][name] + dest * t_.row_bytes[name], fill, static_cast<size_t>(t_.row_bytes[name]));
+    }
+  }
+
+  // Direct mode, at open: O_DIRECT refuses (EINVAL) a file offset or segment length off the logical block, so a
+  // table that would ask for one is refused here instead of failing reads at run time. Every slab row base, every
+  // segment's bounds (the iovec cuts) and every reading extent's offset, length and image position must be
+  // kImageAlign multiples; the sub-read cuts inside a part are pages (split_part), so they follow.
+  void check_image_alignment() const {
+    const auto off = [](int64_t v) { return v % kImageAlign != 0; };
+    for (size_t row = 0; row < t_.slabs.size(); ++row) {
+      for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
+        if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kImageAlign != 0 || off(t_.row_bytes[name])) {
+          throw std::runtime_error("exl3 RAM miss: row images need every slab row 512 B aligned");
+        }
+      }
+    }
+    for (const Segment& s : t_.segments) {
+      if (off(s.src) || off(s.dst) || off(s.bytes)) {
+        throw std::runtime_error("exl3 RAM miss: row images need every segment 512 B aligned");
+      }
+    }
+    for (const Read& e : t_.extents) {
+      if (e.length > 0 && (off(e.offset) || off(e.length) || off(e.dest))) {
+        throw std::runtime_error("exl3 RAM miss: row images need every extent's offset and length 512 B aligned");
+      }
+    }
   }
 
   // Hand every ready row to the packing workers. The row was vetted by take_ready_row on this thread; from
@@ -1811,7 +1983,8 @@ class RowReader {
       c.trace->pack_ns += end - start;
     }
     if (c.packed) (*c.packed)[ordinal] = 1;
-    if (fault_.poison) std::memset(bounce_slot(best), kPoisonFill ^ 0xFF, static_cast<size_t>(t_.slot_bytes));
+    // Direct mode: the bytes are the slot's own now, and the caller publishes them.
+    if (fault_.poison && !t_.images) poison_slot(best, kPoisonFill ^ 0xFF);
     rows_[best] = BounceRow{};
     --rows_busy_[best / kBounceRows];
   }
@@ -1914,6 +2087,7 @@ class RowReader {
   size_t subs_ = 1;
   std::vector<Read> sub_reads_;
   std::vector<PieceRun> piece_runs_;
+  std::vector<iovec> iovecs_;  // direct mode: segments.size() per descriptor (size_extents)
   RowGeometry geometry_[kBounceRows];
   std::vector<SqeRecord>* sqe_log_ = nullptr;  // test only (set_sqe_log)
   int64_t publishes_ = 0;        // pieces published over the reader's life (the publish_twice fault counts them)
@@ -1955,13 +2129,14 @@ int64_t exl3_ram_miss_read_rows(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t direct,
     int64_t row,
     TensorView experts,
     TensorView slots,
     int64_t step) {
   using namespace exl3_ram_miss;
-  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes), direct != 0);
+  RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
 }
@@ -1985,6 +2160,7 @@ int64_t exl3_ram_miss_read_rows_traced(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t direct,
     int64_t row,
     TensorView experts,
@@ -1997,7 +2173,7 @@ int64_t exl3_ram_miss_read_rows_traced(
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   RowReader reader(
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   reader.set_owner_core(owner_core);
   if (f[22] != 0) reader.set_piece_stream(true);
@@ -2030,6 +2206,7 @@ void exl3_ram_miss_read_rows_faulted(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t direct,
     int64_t row,
     TensorView experts,
@@ -2043,7 +2220,7 @@ void exl3_ram_miss_read_rows_faulted(
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   RowReader reader(
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) {
@@ -2080,6 +2257,7 @@ void exl3_ram_miss_read_rows_sqes(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t direct,
     int64_t row,
     TensorView experts,
@@ -2095,7 +2273,7 @@ void exl3_ram_miss_read_rows_sqes(
   auto* out = static_cast<int64_t*>(info.data_ptr());
   out[0] = out[1] = out[2] = out[3] = out[4] = 0;
   RowReader reader(
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) return;
@@ -2153,6 +2331,7 @@ void exl3_ram_miss_read_rows_pieces(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t direct,
     int64_t row,
     TensorView experts,
@@ -2170,7 +2349,7 @@ void exl3_ram_miss_read_rows_pieces(
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
   std::fill(out, out + 5, 0);
-  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes);
+  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const std::vector<int32_t> ids = ids_of(experts);
   const std::vector<int64_t> dest = slots_of(slots);
   const size_t lanes = static_cast<size_t>(masks.size(1));
@@ -2275,12 +2454,13 @@ int64_t exl3_ram_miss_piece_geometry(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t row,
     int64_t expert,
     TensorView subs,
     TensorView pieces) {
   using namespace exl3_ram_miss;
-  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes);
+  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   RowGeometry g;
   std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
@@ -2320,9 +2500,10 @@ int64_t exl3_ram_miss_piece_runs(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     TensorView runs) {
   using namespace exl3_ram_miss;
-  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes);
+  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   const size_t rows = static_cast<size_t>(t.layers * t.experts);
   if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
@@ -3992,6 +4173,7 @@ int64_t exl3_ram_miss_open(
     std::string paths,
     std::string source_paths,
     int64_t slot_bytes,
+    int64_t row_images,
     int64_t direct,
     TensorView lease,
     int64_t pack_workers,
@@ -4003,7 +4185,7 @@ int64_t exl3_ram_miss_open(
       static_cast<int32_t*>(slot_map.data_ptr()),
       static_cast<uint8_t*>(lease.data_ptr()),
       lease.size(0),
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0,
       pack_workers,
