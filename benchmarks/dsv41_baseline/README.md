@@ -63,6 +63,12 @@ a time.
 predicted from reading `resolve_chat_encoding_spec`: the smoke launch ran without
 either flag and `/v1/chat/completions` returned 200 with correct generation.
 
+The current `arm_env.base_env()` defaults also enable RAM miss leases, GPU residency
+updates, DIRECT insert on miss at stage 2, decode cache updates every forward, and
+eight RAM miss pack workers. `arm_env(overrides)` can change any of these for an arm.
+These newer defaults are a new serving recipe; historical throughput cells above
+used earlier settings and are not directly comparable.
+
 ## Signals that say ready and are not
 
 Three separate systems reported success today while in a state the campaign could not

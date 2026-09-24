@@ -1,9 +1,12 @@
 """The DSV4.1 EXL3 serving recipe: environment and `sglang serve` flags for every arm.
 
 Env names and the option-C EXL3 budget (graph gather on, prefetch off, the fastest
-measured DSV4.1 recipe, DSV41_REFERENCE.md section 17.6) come from
+measured DSV4.1 recipe, DSV41_REFERENCE.md section 17.6) originally came from
 `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/
-env-full.sh` (layered onto phase 3a's `env.sh`). A V2 storage change under test is
+env-full.sh` (layered onto phase 3a's `env.sh`). The current default additionally
+enables DIRECT insert on miss, RAM miss leases, and eight RAM miss pack workers; it
+must be measured as a new recipe, not compared as a historical phase-3b baseline.
+A V2 storage change under test is
 layered on top via `overrides`; the merged dict is both what launches the server and
 what `verify_env` checks against `/proc/<pid>/environ` afterwards.
 
@@ -106,16 +109,19 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_HOT_GPU_MB": "14336",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
-        "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "32",
+        "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
         "SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS": "8",
         "SGLANG_MOE_HOT_ASYNC_PROMOTIONS": "0",
         "SGLANG_MOE_ASYNC_RESIDENCY_SCORES": "0",
         "SGLANG_MOE_HOT_LOG_INTERVAL": "64",
-        "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "0",
+        "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "1",
+        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "2",
         "SGLANG_MOE_EXPERT_DOORBELL": "0",
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
         "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
+        "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES": "1",
+        "SGLANG_DSV41_RAM_MISS_PACK_WORKERS": "8",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 

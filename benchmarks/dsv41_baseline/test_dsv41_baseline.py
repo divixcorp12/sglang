@@ -984,7 +984,7 @@ def test_async_residency_score_candidate_is_opt_in():
     assert arm_env.base_env()["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
     candidate = arm_env.arm_env({"SGLANG_MOE_ASYNC_RESIDENCY_SCORES": "1"})
     assert candidate["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "1"
-    assert candidate["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "0"
+    assert candidate["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "1"
     assert candidate["SGLANG_MOE_HOT_DYNAMIC"] == "1"
 
 
