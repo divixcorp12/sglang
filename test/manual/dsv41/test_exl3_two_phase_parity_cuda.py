@@ -324,7 +324,8 @@ class TestGraphTopology:
         assert s.dev.go_count.item() == 2, "both experts must be resident before stage 1 has anything to claim"
 
         # Learn each stage's kernel identity from a graph that captures only that one call.
-        expected_names = ["post", "W1", "C1", "A1", "W2", "C2", "A2", "F"]
+        # D sums the stages' copy counts into go_total, the count a DIRECT residency commit reads.
+        expected_names = ["post", "W1", "C1", "A1", "W2", "C2", "A2", "F", "D"]
         expected_funcs = {
             "post": _kernel_func(lambda: s.dev.post(0, s.planned, s.count, s.routes, -1)),
             "W1": _kernel_func(lambda: s.dev.hit_wait(0, s.planned, s.count, s.dest_slots, 64)),
@@ -338,6 +339,7 @@ class TestGraphTopology:
             ),
             "A2": _kernel_func(lambda: s.dev.stage_ack(2)),
             "F": _kernel_func(lambda: s.dev.finalize(s.count, s.keep)),
+            "D": _kernel_func(lambda: torch.add(s.dev.go_1, s.dev.go_2, out=s.dev.go_total)),
         }
         # C1 and C2 are the same kernel (copy_expert_row_segments_gpu_kernel): confirm that identity assumption
         # rather than let it silently make the chain assertion below vacuous.
@@ -357,8 +359,8 @@ class TestGraphTopology:
         del graph
 
         # post's _stage_planned is a device-to-device tensor copy (a MEMCPY node, not a kernel launch); it leads
-        # the chain every replay refreshes it from the plan. Everything after it must be the 8-kernel chain.
-        assert node_count == 9 and edge_count == 8, (node_count, edge_count)
+        # the chain every replay refreshes it from the plan. Everything after it must be the 9-kernel chain.
+        assert node_count == 10 and edge_count == 9, (node_count, edge_count)
         assert typed[0][0] == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, typed[0]
         kernel_nodes = typed[1:]
         assert all(t == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL for t, _ in kernel_nodes), typed
@@ -383,7 +385,7 @@ class TestGraphTopology:
     def test_finalize_precedes_the_fused_moe_consumer(self, tmp_path):
         """T8's "-> fused" clause: the checklist row is ``post -> ... -> F -> fused``, not ``... -> F``.
 
-        The sibling test above captures ``backend.post`` alone and pins the 9-node RAM-miss chain
+        The sibling test above captures ``backend.post`` alone and pins the 10-node RAM-miss chain
         exactly; it says nothing about the fused MoE kernel that reads the rows F's success gates,
         because that kernel is not in that capture. This test captures the real production apply
         (``Exl3MoEMethod._apply_graph``, the same shape T9 uses) and checks that nothing in that larger
