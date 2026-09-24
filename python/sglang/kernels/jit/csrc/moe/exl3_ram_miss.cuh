@@ -2,8 +2,8 @@
 //
 // post: one block; thread 0 builds the layer's request (need = planned VRAM misses
 // whose host-mapped slot map entry is -1; protect = every routed expert), writes it
-// into the page's demand ring with volatile stores, fences system-wide and
-// release-stores demand_head. The record is posted for every MoE layer (the thread
+// into the page's demand ring as a seqlock (seq cleared and fenced, volatile payload,
+// seq release-stored) and release-stores demand_head. The record is posted for every MoE layer (the thread
 // uses touch-only records for LRU recency); the wait is armed only when something is
 // needed or advisories are on, and the record says so (kRecArmed): the thread only
 // touches for an unarmed record, since nothing orders it before the next gathers. With `advise`, it also remembers this token's routes
@@ -225,9 +225,9 @@ __device__ __forceinline__ void write_record(
     need_out[i] = i < need_count ? need[i] : -1;
     protect_out[i] = i < protect_count ? protect[i] : -1;
   }
-  // The seqlock order the thread's read_record relies on: seq=0, fence, payload, fence, seq last.
-  __threadfence_system();
-  words[kRecSeq / 4] = seq;
+  // The seqlock order the thread's read_record relies on: seq=0, fence, payload, seq last. The release store is the
+  // second fence: it orders every payload store above before the seq.
+  st_release_sys(record + kRecSeq, seq);
 }
 
 __device__ __forceinline__ void raise_fatal(uint8_t* page, uint32_t seq) {
@@ -381,8 +381,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
       }
       bits[byte] = mask;
     }
-    __threadfence_system();
-    st_release_sys(hot, seq);
+    st_release_sys(hot, seq);  // orders the bitmap before the seq; no separate fence
   }
   // Lease mode arms every request that has planned lanes, not only those with a miss (LEASE_PROTOCOL.md section 15:
   // the all-hit handshake is where the lease is granted, so an unarmed record is reachable only for count == 0). The
@@ -400,11 +399,11 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     *reinterpret_cast<volatile uint32_t*>(request + kLeaseLrRow) = static_cast<uint32_t>(row);
     volatile int32_t* lane_experts = reinterpret_cast<volatile int32_t*>(request + kLeaseLrExpert);
     for (int i = 0; i < kMaxIds; ++i) lane_experts[i] = i < planned_count ? static_cast<int32_t>(planned[i]) : -1;
-    __threadfence_system();
     st_release_sys64(request + kLeaseLrGen, tagged_word(kLeaseTagDemand, generation));
   }
   write_record(record, seq, row, need, need_count, protect, protect_count, 0, armed ? 1u : 0u, lanes);
-  __threadfence_system();
+  // A release store orders every earlier store of this thread, so demand_head is published after the hot page, the
+  // LaneRequest and the record.
   st_release_sys(page + kDemandHead, seq);
   state[kPending] = armed ? static_cast<int32_t>(seq) : 0;
   state[kPendingEpoch] = state[kEpoch];
@@ -429,7 +428,6 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   state[kAdvised] = static_cast<int32_t>(advice);
   uint8_t* advice_record = page + kAdviseRing + static_cast<int64_t>((advice - 1u) % kAdviseRecords) * kRecordBytes;
   write_record(advice_record, advice, next_row, ahead, ahead_count, ahead, ahead_count, seq, 1u, ahead_count);
-  __threadfence_system();
   st_release_sys(page + kAdviseHead, advice);
 }
 

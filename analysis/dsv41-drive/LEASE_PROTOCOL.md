@@ -549,15 +549,17 @@ introduced.
 *Post kernel* (`exl3_ram_miss_post_kernel`), for a request with `count > 0` **[P]**:
 
 1. write `LaneRequest[idx]` as the existing `write_record` does: `gen = 0` (invalidate),
-   `__threadfence_system()`, payload `{count, row, expert[]}`, `__threadfence_system()`,
-   tagged `gen` word last;
+   `__threadfence_system()`, payload `{count, row, expert[]}`, tagged `gen` word last
+   with `st.release.sys`;
 2. the existing `write_record` for the demand record and the `st_release_sys(demand_head)`.
 
 The `LaneRequest` seqlock is the same shape as `write_record` and is read by the same
 pattern as `read_record`: acquire `gen`, read payload, `atomic_thread_fence(acquire)`,
-re-read `gen`, and treat a change as a lapped record. Cost: two more
-`__threadfence_system()` per post. I have not measured it **[OPEN 5]**; the existing post
-already pays three or four.
+re-read `gen`, and treat a change as a lapped record. The invalidating fence is the only
+fence each seqlock needs: a release store already orders every earlier store of the
+thread, so the second fence before it (and the one before `demand_head`) added nothing and
+was removed on 2026-09-24. The post now pays three `membar.sys` (record, hot page,
+`LaneRequest` invalidates) where it paid seven. Cost per fence still unmeasured **[OPEN 5]**.
 
 *Wait kernel*, described in section 7.3. *Acknowledgement kernel*, section 7.4.
 
