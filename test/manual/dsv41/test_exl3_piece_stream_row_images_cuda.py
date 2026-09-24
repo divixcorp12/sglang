@@ -81,8 +81,27 @@ def _threads():
 
 # Its precondition is that two streamed rows are cut differently, so a wrong row index in S's piece table shows. Row
 # images cut every (row, expert) alike (identity segments, one image layout), so the precondition cannot hold and a
-# wrong row index is harmless for the table; the slab row index S copies from is still covered by every other test.
+# wrong row index is harmless for the table. What it also covers, a second layer's image file and slabs reaching S,
+# is test_a_second_layer_streams_its_own_image_rows below.
 NOT_REUSED = {"test_g1_a_second_layer_streams_its_own_rows_equal_to_the_flag_off_arm"}
+
+
+def test_a_second_layer_streams_its_own_image_rows(tmp_path):
+    """Streamed row 1 of 2 in the direct mode: the reader must read layer 1's image file into layer 1's slabs and S
+    copy them; reading layer 0's file (the same experts, other bytes) or copying layer 0's slabs shows in the bytes."""
+    experts = [3, 5, 9, 12]
+    s = cuda_suite.StreamService(tmp_path, layers=2, row=1)
+    try:
+        assert s.tables.paths[1].endswith("layer-001.rows")
+        s.host.inject_fault(pack_delay_ns=cuda_suite.PIECE_DELAY_NS, poison=True)
+        s.plan(experts)
+        s.step()
+        assert s.keep.item() == 1.0, (s.counters(), s.stats())
+        assert int(s.dev.go_2.item()) == len(experts) and s.stats()["stream_pieces"] > 0
+        assert s.delivered(experts)
+    finally:
+        s.quiet()
+        s.close()
 
 for _name, _test in list(vars(cuda_suite).items()):
     if _name.startswith("test_") and inspect.isfunction(_test) and _name not in NOT_REUSED:
