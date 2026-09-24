@@ -980,12 +980,17 @@ def test_base_env_uses_the_declared_pinned_host_budget():
     assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_MB"] == arm_env.PINNED_HOST_MB
 
 
-def test_async_residency_score_candidate_is_opt_in():
-    assert arm_env.base_env()["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
-    candidate = arm_env.arm_env({"SGLANG_MOE_ASYNC_RESIDENCY_SCORES": "1"})
-    assert candidate["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "1"
-    assert candidate["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "1"
-    assert candidate["SGLANG_MOE_HOT_DYNAMIC"] == "1"
+def test_engram_host_node_defaults_on_while_async_scores_stay_off_in_gpu_residency_mode():
+    defaults = arm_env.base_env()
+    assert defaults["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
+    assert defaults["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] == "1"
+    off_arm = arm_env.arm_env(
+        {"SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "0"}
+    )
+    assert off_arm["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
+    assert off_arm["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] == "0"
+    assert off_arm["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "1"
+    assert off_arm["SGLANG_MOE_HOT_DYNAMIC"] == "1"
 
 
 def test_pinned_buffer_and_weights_fit_in_node_0s_free_memory():

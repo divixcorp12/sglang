@@ -4,7 +4,8 @@ Env names and the option-C EXL3 budget (graph gather on, prefetch off, the faste
 measured DSV4.1 recipe, DSV41_REFERENCE.md section 17.6) originally came from
 `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/
 env-full.sh` (layered onto phase 3a's `env.sh`). The current default additionally
-enables DIRECT insert on miss, RAM miss leases, and eight RAM miss pack workers; it
+enables DIRECT insert on miss, RAM miss leases, eight RAM miss pack workers,
+and Engram host-node io_uring lookups; it
 must be measured as a new recipe, not compared as a historical phase-3b baseline.
 A V2 storage change under test is
 layered on top via `overrides`; the merged dict is both what launches the server and
@@ -100,6 +101,7 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_ENGRAM_TABLE_DIR": ENGRAM_TABLE_DIR,
         "SGLANG_DSV41_TORCH_PREFILL_INDEXER": "1",
         "SGLANG_DSV41_ENGRAM_RAM_GIB": "5",
+        "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "1",
         "SGLANG_DSV41_EXPERT_STREAM": "1",
         "SGLANG_DSV41_EXPERT_DIR": EXPERT_DIR,
         "SGLANG_MOE_EXPERT_ROW_SOURCE": "shards",
