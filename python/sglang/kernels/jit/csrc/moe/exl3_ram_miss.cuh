@@ -466,7 +466,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
       raise_fatal(page, seq);
       ok = false;
     } else {
-      __threadfence_system();
+      // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
       const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
       if (status != kServed) {
@@ -581,7 +581,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
         fatal_word = seq;
       }
     } else {
-      __threadfence_system();
+      // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
       const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
       if (status != kServed) {
@@ -932,7 +932,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
         reason = kLeaseReasonTimeout;
       }
     } else {
-      __threadfence_system();
+      // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
       const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
       if (status != kServed) {
@@ -1310,7 +1310,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
           sh.aborting = 1;
           sh.reason = kLeaseReasonAborted;
         } else if (reached(ld_acquire_sys(page + kDemandDone), seq)) {
-          __threadfence_system();
+          // The acquire orders this thread's status and mask loads below after it; the other threads' copies follow
+          // through the block barrier at the end of the pass. No fence needed.
           const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
           const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
           if (status != kServed) {
@@ -1443,6 +1444,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kLeaseLanes, 1) void exl3_ram
         tagged_word(consumed ? kLeaseTagConsumed : kLeaseTagViolated, generation));
     if (!consumed) any_violated = 1;
   }
+  // Also orders every lane's LaneAck store before thread 0's fatal release; a warp vote would not document that.
   __syncthreads();
   if (threadIdx.x == 0 && any_violated != 0) {
     violated[0] = 1;
@@ -1544,7 +1546,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kLeaseLanes, 1) void exl3_ram
         tagged_word(consumed ? kLeaseTagConsumed : kLeaseTagViolated, generation));
     if (!consumed) violated = 1;
   }
-  __syncthreads();
+  __syncthreads();  // as in the stage ack: also orders the lanes' LaneAck stores before the fatal release
   if (threadIdx.x == 0 && violated != 0) {
     keep[0] = 0.0f;
     raise_fatal(page, static_cast<uint32_t>(lane_ctx[0]));
