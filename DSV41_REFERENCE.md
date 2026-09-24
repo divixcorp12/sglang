@@ -12,9 +12,16 @@ and Engine-path results are historical measurements of different recipes. A node
 decode profile found MoE wait and pinned-row copy dominant, with Engram callbacks small
 (§23). The production server on port 7867 is currently stopped at the owner's request.
 
+**Update (2026-09-24):** RAM-miss piece streaming is merged into
+`codex/nvfp4-expert-stream-main` at `a082278187`, with its flag off by default. With
+two-phase on in both arms, it won 8 of 8 paired sessions (p=0.0039) with byte-identical
+output, and the robust gain is about **40 ms/token** (§24). §24 also lists the next
+decode work.
+
 Sections 1 to 15 preserve the original September 18 scoping. Sections 16 to 22 record
-dated experiments; **§23 is the current recipe and progress ledger** and supersedes
-earlier present-tense plans or defaults where they disagree.
+dated experiments; **§23 is the current recipe and progress ledger**, with §24 its
+2026-09-24 addendum. Together they supersede earlier present-tense plans or defaults
+where they disagree.
 This doc records what the model is, what it costs in bytes, what exists upstream / in
 exllamav3 / in our fork, and what has to be built to serve it with our expert-streaming
 stack on divix01. Companion to [`MOE_EXPERT_TRANSFER.md`](MOE_EXPERT_TRANSFER.md), whose
@@ -3247,6 +3254,126 @@ followed by a pinned-copy bandwidth experiment. Keep the current 50 GiB MoE tier
 DIRECT mode, and eight workers fixed while isolating those costs. A larger pinned
 Engram cache requires allocator and NUMA-budget work and should be evaluated
 separately from decode MoE service.
+
+## 24. RAM-miss piece streaming (2026-09-24)
+
+### 24.1 What it is and where it lives
+
+Plan: [`docs/superpowers/plans/2026-09-24-dsv41-piece-streaming.md`](docs/superpowers/plans/2026-09-24-dsv41-piece-streaming.md).
+Protocol: [`analysis/dsv41-drive/LEASE_PROTOCOL.md`](analysis/dsv41-drive/LEASE_PROTOCOL.md),
+area P and the E1, §2, §4.3 and §4.4 amendments.
+
+- **Flag:** `SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM`, default off.
+  - Startup refuses it unless two-phase is on, leases are on, and there are one or more
+    pack workers.
+- **What changes:** each RAM-miss row (13,320,192 B) is read as two mirror halves of four
+  sub-reads each: 8 pieces.
+  - Each piece has its own pack job.
+  - The owner publishes each packed piece to the lease block's per-lane mask words
+    (area P) with a generation-checked CAS.
+  - A new stream kernel **S** replaces the two-phase W2 + C2 pair. It copies each piece
+    to the GPU as soon as the piece is published.
+  - A slot whose stream was refused goes to quarantine.
+- **Flag off:** the two-phase chain is unchanged (10 nodes, 9 edges). Two-phase GPU tests:
+  67/67.
+- **Branch history:** built on `cc/dsv41-piece-stream` (tasks 0b and 1–6, each
+  task-reviewed, plus a final whole-branch review). It was fast-forwarded into
+  `cc/dsv41-direct-two-phase` and then into `codex/nvfp4-expert-stream-main` on `shared`.
+  The merged tree is the tree benchmarked below.
+- **Tests at merge:** kernels plus MoE RAM-miss 1,474 passed and 0 failed; piece-stream
+  CPU tests 82/82; piece-stream GPU tests 22/22.
+- **Correction:** two-phase **does** run under EXL3 DIRECT stage 2, since `9c64bac755`.
+  The "DIRECT insertion rejects two-phase" line in the launch-options ledger was stale.
+  Both arms below ran the DIRECT recipe.
+
+### 24.2 Benchmark: 8 of 8 paired sessions
+
+Setup:
+- Graph mode, one cold server per invocation, all at `a082278187`.
+- Order A B B A A B B A, two sessions per invocation, covering all eight corpus sessions.
+  This uses the new `DSV41_SESSION_INDICES` override; `concat_arms.py` joins the four
+  runs of each arm for `paired.py`.
+- **A** = `arm_env` base + `TWO_PHASE=1` + `HIT_WAIT_US=100`. **B** = A + the piece flag.
+- The environment diff between the arms is exactly the flag.
+
+| Measure | Result |
+|---|---|
+| Wins, one-sided sign test | **8/8, p = 0.0039** (the pre-registered bar was 7 of 8) |
+| Paired median gain | 55.7 ms/token (mean 91.6); rate ratio median 1.328 |
+| Own medians | A 4.278 tok/s, B 5.588 tok/s |
+| Robust gain estimate | **about 40 ms/token** |
+| Output | byte-identical, 12/12 greedy responses across two smoke pairs |
+| Error counters | 0 refusals, 0 quarantined slots, 0 fatals |
+
+- **Why the robust estimate is lower than the median:**
+  - The median is inflated by short sessions: one decodes only 6 intervals.
+  - It is also inflated by one flag-off outlier, a session at 516.5 ms/token.
+  - The 40 ms/token figure comes from two same-prompt, stage-traced smokes (about 40 each)
+    and from the warm-up request, which was the same in all 8 servers (37.6).
+- **Why the gain beats Stage 0b's 28.9 ms/token ceiling:**
+  - The ceiling modelled only the GPU copy overlapping the read.
+  - Per-piece packing also removes the host pack tail, the time from the last read
+    completion to `done`. Per step it drops from **24–25 ms to 4.3 ms**.
+- **Node-mode GPU chain:** 150.6 → 118.7 ms/token, a saving of 31.9.
+  - S starts 3.1 µs (p50) after C1.
+  - From the last piece publish to the end of S: 186 µs at p50.
+- **Scope limit:** this is not a comparison with the saved production recipe. Production
+  runs with two-phase **off**, and both arms had it on. No same-session result against the
+  production recipe exists yet.
+
+**Read-wall regression (open):**
+- At credit 32, reads are four times smaller, so the pure disk window per demand grows.
+- **6-row demands:** the median rises 3.5%, but the mean rises **15.7%**. The plan's 10%
+  kill line did not name a statistic; it was judged on the median.
+- **1-row demands:** the median rises 12.5%.
+- Read plus pack still finishes earlier at the median: −2.9% at 6 rows, −16.9% at 1 row.
+
+**Other measured costs:**
+- **W1 always runs out its budget:** on every read layer W1 spends its full 100 µs budget
+  (104 µs p50), about 1.9 ms/token.
+
+Evidence on divix01:
+- Scripts and logs: `/data/models/slang/nvfp4-work/direct-two-phase-tests/piece-stream/t6/`.
+  The paired verdict is in `abba/paired.json`; smoke checks are in `smoke_both.log` and
+  `smoke2_check.out`.
+- Node trace: `/mnt/nvme1/dsv41-nsys/ps-on-t100-node-20260924-105604.nsys-rep`.
+
+### 24.3 Nsight graph-mode trace of the flag-on arm
+
+Report: `/mnt/nvme1/dsv41-nsys/ps-B-nsys-graph-20260924-105920.nsys-rep` (46 MB), with a
+`.sqlite` export alongside. Tracing cost nothing in steady state: 158.4 ms/token traced
+against 158.8 untraced.
+
+- **Step time:** `cudaGraphLaunch` to launch, p50 **155.8 ms** (p10 108.6, p90 225.6).
+- **Host gap between launches:** p50 **4.06 ms** (p90 5.14). This is sampling and the
+  scheduler; it bounds the GPU-idle gap *between* steps.
+- **Eager segments:** each step also runs 1,526 eager kernels totalling 70.5 ms of GPU
+  time. These are the breakable graph's eager segments.
+- **The biggest host cost is a sync, not a transfer:**
+  - `cudaMemcpyAsync` costs 65.8 ms of host time per step over 102 calls.
+  - Almost all of it is 256-byte device-to-host readbacks that each **block about
+    64–66 ms**. The sizes come from joining each call to its GPU record by correlation ID.
+  - This is §21's pattern again: the host waits on the stream; nothing is transferred.
+- **Not measurable from this report:** GPU idle inside a step.
+  - The graph body is hidden in graph mode.
+  - `GRAPH_TRACE` holds only pre-capture warm-up rows (negative timestamps, correlation
+    IDs below the runtime table's minimum), per the project notes.
+  - The kernel table's 86% "idle" covers eager work only and means nothing.
+
+### 24.4 Next decode work, in order
+
+1. **Attribute the 256-byte readback before trying to remove it.**
+   - Name its call site.
+   - In a short node-mode capture, check whether the GPU goes idle around it. Idle inside
+     a step is valid in node mode; step-tail idle and ms/token are not.
+   - If the GPU stays busy through the wait, the sync costs only the ~4 ms between-launch
+     gap and is not worth removing.
+2. **Retune read credit for piece streaming.** Aim: recover the read-wall tail above. At
+   credit 32 the reads are four times smaller than before.
+3. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
+4. **Remove or defer the sync**, only if step 1 shows the GPU going idle on it.
+5. **Compare against production.** Before piece streaming becomes a default, compare it
+   in the same sessions against the saved production recipe, which has two-phase off.
 
 ## Sources
 
