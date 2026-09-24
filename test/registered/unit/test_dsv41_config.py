@@ -26,6 +26,9 @@ def test_defaults_match_the_env_declarations():
         ram_miss_fault="",
         enable_expert_prefetch=False,
         enable_ram_miss_leases=False,
+        enable_ram_miss_two_phase=False,
+        ram_miss_hit_wait_us=100,
+        enable_ram_miss_piece_stream=False,
         torch_prefill_indexer=False,
     )
 

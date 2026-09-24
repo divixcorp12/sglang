@@ -27,6 +27,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_ram_miss_leases: bool
     enable_ram_miss_two_phase: bool
     ram_miss_hit_wait_us: int
+    enable_ram_miss_piece_stream: bool
     torch_prefill_indexer: bool
 
     @classmethod
@@ -48,5 +49,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_ram_miss_leases=envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get(),
             enable_ram_miss_two_phase=envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.get(),
             ram_miss_hit_wait_us=envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.get(),
+            enable_ram_miss_piece_stream=envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
         )

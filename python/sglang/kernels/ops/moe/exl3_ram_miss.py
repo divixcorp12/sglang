@@ -823,8 +823,12 @@ class Exl3RamMissDevice:
 
     def __init__(
         self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None,
-        hot_page=None
+        hot_page=None, piece_stream: bool = False
     ) -> None:
+        if piece_stream:
+            # R3 (piece-streaming plan): until the streaming kernel S exists (task 5), this chain cannot serve a
+            # piece-stream request; W2/C2 still copy whole rows and nothing publishes area P's piece masks.
+            raise RuntimeError("exl3 RAM miss: piece streaming needs the stream kernel")
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8:
             raise ValueError("page must be a uint8 tensor of PAGE_BYTES")
         if slot_map.dtype != torch.int32 or slot_map.dim() != 2 or slot_map.shape[0] != layers:

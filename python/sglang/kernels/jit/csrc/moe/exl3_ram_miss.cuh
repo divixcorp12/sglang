@@ -76,6 +76,7 @@ constexpr int64_t kLeaseHeaderLanes = 12;
 constexpr int64_t kLeaseHeaderShutdown = 20;
 constexpr int64_t kLeaseHeaderSlotGenOffset = 32;
 constexpr int64_t kLeaseHeaderDOffset = 36;
+constexpr int64_t kLeaseHeaderPieceOffset = 40;
 constexpr int64_t kLeaseRowTable = 128;
 constexpr int64_t kLeaseRowResult = 4096;
 constexpr int64_t kLeaseRowResultBytes = 32;
@@ -98,9 +99,17 @@ constexpr int64_t kLeaseTermSkippedMask = 0;
 constexpr int64_t kLeaseTermReason = 4;
 constexpr int64_t kLeaseTermGen = 8;
 constexpr int64_t kLeaseRowTableBytes = 8;
+// Area P, service-written, at kLeaseHeaderPieceOffset: PieceMask[kLeaseRing][kLeaseLanes], a per-lane
+// generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment). Each word
+// gets its own 128 B line, so the device's per-lane poll never shares a line with a lane it did not ask for.
+// No behaviour reads or writes it yet.
+constexpr int64_t kLeasePieceMaskLineBytes = 128;
+constexpr int64_t kLeasePieceMaskBytes = 8;  // one uint64 per word
+constexpr int64_t kLeaseAreaPieceMaskBytes = kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
 // Tags of the byte above the 56-bit request generation, and the reasons a Terminal record carries (section 4.3, 13).
 constexpr uint64_t kLeaseTagDemand = 1;
 constexpr uint64_t kLeaseTagReady = 1;
+constexpr uint64_t kLeaseTagLoading = 2;  // RowResult.ready: leased, still loading (piece-streaming plan; task 1)
 constexpr uint64_t kLeaseTagConsumed = 1;
 constexpr uint64_t kLeaseTagViolated = 2;
 constexpr uint64_t kLeaseTagTerminal = 1;

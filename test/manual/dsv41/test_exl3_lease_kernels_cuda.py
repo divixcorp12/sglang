@@ -293,7 +293,7 @@ class TestHandDriven:
     REFUSALS = {
         # name: the keyword arguments that make lane 1 wrong
         "stale_generation": dict(gen_delta=1 << 32),
-        "failed_tag": dict(tag=lease.FAILED),
+        "failed_tag": dict(tag=lease.LOADING),
         "unpublished_ready": dict(tag=0),
         "wrong_expert": dict(expert=4),
         "negative_slot": dict(slot=-1),

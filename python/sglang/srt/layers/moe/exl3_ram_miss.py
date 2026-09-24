@@ -447,6 +447,7 @@ class Exl3RamMissService:
         # Task 6 V1, fixed in ensure_started beside lease_mode so the host, the device and every backend cannot
         # disagree about which chain this process runs.
         self.two_phase = False
+        self.piece_stream = False
         self.hit_wait_ns = 100_000
         self.hot_page = None
         self.gpu_hot_enabled = False
@@ -509,6 +510,15 @@ class Exl3RamMissService:
                 raise RuntimeError(
                     "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
                 )
+            # Piece streaming is a mode of two-phase: the inline no-pool pack path (pack_workers == 0) has no
+            # publisher for a piece job, so it is refused rather than silently packing whole rows.
+            piece_stream = cfg.enable_ram_miss_piece_stream
+            if piece_stream and not (two_phase and lease_mode and cfg.ram_miss_pack_workers > 0):
+                raise RuntimeError(
+                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs "
+                    "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES and "
+                    "SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0"
+                )
             if lease_mode:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if two_phase:
@@ -530,6 +540,7 @@ class Exl3RamMissService:
         self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
         self.hot_page = hot_page
         self.two_phase = two_phase
+        self.piece_stream = piece_stream
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
@@ -606,6 +617,7 @@ class Exl3RamMissService:
                 lease_block=self.host.lease_block if self.lease_mode else None,
                 lease_layout=self.host.lease_layout if self.lease_mode else None,
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,
+                piece_stream=self.piece_stream,
             )
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)

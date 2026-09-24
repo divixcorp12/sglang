@@ -1859,6 +1859,11 @@ class Envs:
     # served, so this trades a fuller first stage against a later one. Time, not polls: a poll pass reads each lane
     # across PCIe, so its cost depends on the lane count. At 8 passes the wait measured p50 13 us, p90 93 us.
     SGLANG_DSV41_RAM_MISS_HIT_WAIT_US = EnvInt(100)
+    # Per-piece streaming of NVMe-read expert rows on top of two-phase (piece-streaming plan):
+    # the read splits into pieces and the device streams each as it lands, instead of the two
+    # fixed W1/W2 stages. Needs SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES
+    # and SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0 (the inline pack path has no publisher). Off by default.
+    SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

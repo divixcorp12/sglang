@@ -224,6 +224,7 @@ def _lease_python_constants():
         "kLeaseHeaderShutdown": lease.HEADER["shutdown"],
         "kLeaseHeaderSlotGenOffset": lease.HEADER["slot_gen_offset"],
         "kLeaseHeaderDOffset": lease.HEADER["d_offset"],
+        "kLeaseHeaderPieceOffset": lease.HEADER["piece_offset"],
         "kLeaseRowTable": lease.ROW_TABLE,
         "kLeaseRowResult": lease.ROW_RESULT,
         "kLeaseRowResultBytes": lease.ROW_RESULT_BYTES,
@@ -246,6 +247,9 @@ def _lease_python_constants():
         "kLeaseTermReason": lease.TERMINAL_FIELDS["reason"],
         "kLeaseTermGen": lease.TERMINAL_FIELDS["gen"],
         "kLeaseRowTableBytes": lease.ROW_TABLE_ENTRY_BYTES,
+        "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
+        "kLeasePieceMaskBytes": lease.PIECE_MASK_BYTES,
+        "kLeaseAreaPieceMaskBytes": lease.AREA_PIECE_MASK_BYTES,
     }
 
 
@@ -256,6 +260,7 @@ def _lease_device_only_constants():
     return {
         "kLeaseTagDemand": lease.DEMAND_TAG,
         "kLeaseTagReady": lease.READY,
+        "kLeaseTagLoading": lease.LOADING,
         "kLeaseTagConsumed": lease.CONSUMED,
         "kLeaseTagViolated": lease.VIOLATED,
         "kLeaseTagTerminal": lease.TERMINAL_TAG,

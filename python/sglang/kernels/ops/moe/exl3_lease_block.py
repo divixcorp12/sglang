@@ -30,6 +30,7 @@ HEADER = {
     "shutdown": 20,
     "slot_gen_offset": 32,
     "d_offset": 36,
+    "piece_offset": 40,
 }
 MAGIC = 0x4C534531  # "LSE1"
 ABI_VERSION = 1
@@ -56,8 +57,17 @@ TERMINAL_BYTES = 16
 TERMINAL_FIELDS = {"skipped_mask": 0, "reason": 4, "gen": 8}
 AREA_D_BYTES = TERMINAL + RING * TERMINAL_BYTES
 
+# Area P, service-written, at a new header offset (piece_offset): PieceMask[RING][LANES], a per-lane
+# generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment). Each
+# word gets its own 128 B line rather than packing densely, so the device's per-lane poll never shares a
+# line with a lane it did not ask for.
+PIECE_MASK_LINE_BYTES = 128
+PIECE_MASK_BYTES = 8  # one uint64 per word
+AREA_PIECE_MASK_BYTES = RING * LANES * PIECE_MASK_LINE_BYTES
+
 # Tags of the 8-bit field above the 56-bit generation.
-READY, FAILED = 1, 2  # RowResult.ready
+READY = 1  # RowResult.ready
+LOADING = 2  # RowResult.ready: leased, still loading (piece-streaming plan; task 1)
 CONSUMED, VIOLATED = 1, 2  # LaneAck
 DEMAND_TAG = 1  # LaneRequest.gen, written by the post kernel
 TERMINAL_TAG = 1  # Terminal.gen, written by the wait kernel
@@ -90,6 +100,7 @@ class LeaseLayout:
     slot_gen_base: tuple[int, ...]  # first SlotGen word of each row, in words
     slot_gen_offset: int  # bytes from the block base
     d_offset: int  # bytes from the block base to area D
+    piece_offset: int  # bytes from the block base to area P (PieceMask)
     total_bytes: int
 
 
@@ -105,13 +116,15 @@ def lease_layout(capacities: Sequence[int]) -> LeaseLayout:
         bases.append(total_slots)
         total_slots += capacity
     d_offset = _align(SLOT_GEN + 4 * total_slots)
+    piece_offset = _align(d_offset + AREA_D_BYTES)
     return LeaseLayout(
         rows=len(capacities),
         capacities=capacities,
         slot_gen_base=tuple(bases),
         slot_gen_offset=SLOT_GEN,
         d_offset=d_offset,
-        total_bytes=_align(d_offset + AREA_D_BYTES),
+        piece_offset=piece_offset,
+        total_bytes=_align(piece_offset + AREA_PIECE_MASK_BYTES),
     )
 
 

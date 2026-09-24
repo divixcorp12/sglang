@@ -20,7 +20,22 @@ def test_service_written_and_device_written_words_never_share_a_128_byte_line():
     layout = lease.lease_layout([5, 7])
     assert layout.slot_gen_offset + 4 * sum(layout.capacities) <= layout.d_offset
     assert layout.d_offset % lease.BLOCK_ALIGN == 0 and layout.d_offset % 128 == 0
-    assert layout.total_bytes % lease.BLOCK_ALIGN == 0 and layout.d_offset + lease.AREA_D_BYTES <= layout.total_bytes
+    assert layout.total_bytes % lease.BLOCK_ALIGN == 0 and layout.d_offset + lease.AREA_D_BYTES <= layout.piece_offset
+
+
+def test_area_p_is_one_word_per_128_byte_line_after_area_d():
+    """PieceMask[kLeaseRing][kLeaseLanes] (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment): each of the
+    RING*LANES words gets its own cache line rather than packing densely, so 128 lines, 16 KiB total."""
+    layout = lease.lease_layout([5, 7])
+    assert layout.piece_offset % lease.BLOCK_ALIGN == 0
+    assert layout.d_offset + lease.AREA_D_BYTES <= layout.piece_offset
+    assert lease.AREA_PIECE_MASK_BYTES == lease.RING * lease.LANES * lease.PIECE_MASK_LINE_BYTES == 16 * 1024
+    assert layout.piece_offset + lease.AREA_PIECE_MASK_BYTES <= layout.total_bytes
+
+
+def test_area_p_header_offset_is_a_new_header_word_beside_d_offset():
+    assert lease.HEADER["piece_offset"] == lease.HEADER["d_offset"] + 4
+    assert lease.HEADER["piece_offset"] < lease.HEADER_BYTES
 
 
 def test_a_row_table_entry_fits_before_the_row_results_and_rows_are_bounded():
@@ -80,6 +95,14 @@ def test_a_publication_word_carries_the_tag_over_a_56_bit_generation():
     word = lease.tagged(lease.READY, generation)
     assert lease.untag(word) == (lease.READY, generation) and word >> 56 == lease.READY
     assert lease.untag(lease.tagged(lease.CONSUMED, 1)) == (lease.CONSUMED, 1)
+
+
+def test_row_result_tag_2_is_loading_not_ready():
+    """RowResult.ready tag 2 (piece-streaming plan; LEASE_PROTOCOL.md E1 amendment): a lane granted at
+    reservation, still loading. It is not READY, so a reader that only checks tag == READY must reject it."""
+    assert (lease.READY, lease.LOADING) == (1, 2)
+    word = lease.tagged(lease.LOADING, 7)
+    assert lease.untag(word) == (lease.LOADING, 7) and word >> 56 == lease.LOADING != lease.READY
 
 
 def test_generation_zero_and_generations_past_56_bits_are_refused():

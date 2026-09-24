@@ -1605,6 +1605,7 @@ constexpr int64_t kLeaseHeaderLanes = 12;
 constexpr int64_t kLeaseHeaderShutdown = 20;
 constexpr int64_t kLeaseHeaderSlotGenOffset = 32;
 constexpr int64_t kLeaseHeaderDOffset = 36;
+constexpr int64_t kLeaseHeaderPieceOffset = 40;
 constexpr int64_t kLeaseRowTable = 128;
 constexpr int64_t kLeaseRowResult = 4096;
 constexpr int64_t kLeaseRowResultBytes = 32;
@@ -1627,6 +1628,14 @@ constexpr int64_t kLeaseTermSkippedMask = 0;
 constexpr int64_t kLeaseTermReason = 4;
 constexpr int64_t kLeaseTermGen = 8;
 constexpr int64_t kLeaseRowTableBytes = 8;
+
+// Area P, service-written, at a new header offset (kLeaseHeaderPieceOffset): PieceMask[kLeaseRing][kLeaseLanes],
+// a per-lane generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment).
+// Each word gets its own 128 B line, so the device's per-lane poll never shares a line with a lane it did not
+// ask for. No behaviour writes it yet.
+constexpr int64_t kLeasePieceMaskLineBytes = 128;
+constexpr int64_t kLeasePieceMaskBytes = 8;  // one uint64 per word
+constexpr int64_t kLeaseAreaPieceMaskBytes = kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
 
 enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2 };
 
@@ -2539,7 +2548,8 @@ class RamTier {
     }
     const int64_t d_offset = round_up_page(kLeaseSlotGen + 4 * total_slots);
     lease_d_ = d_offset;
-    const int64_t needed = round_up_page(d_offset + kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes);
+    const int64_t piece_offset = round_up_page(d_offset + kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes);
+    const int64_t needed = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
     if (lease_bytes < needed) {
       throw std::runtime_error(
           "exl3 RAM miss: the lease block has " + std::to_string(lease_bytes) + " bytes, its layout needs " +
@@ -2554,6 +2564,7 @@ class RamTier {
     put_u32(kLeaseHeaderShutdown, 0u);
     put_u32(kLeaseHeaderSlotGenOffset, static_cast<uint32_t>(kLeaseSlotGen));
     put_u32(kLeaseHeaderDOffset, static_cast<uint32_t>(d_offset));
+    put_u32(kLeaseHeaderPieceOffset, static_cast<uint32_t>(piece_offset));
     for (int64_t row = 0; row < layers_; ++row) {
       put_u32(kLeaseRowTable + 8 * row, static_cast<uint32_t>(slot_gen_base_[row]));
       put_u32(kLeaseRowTable + 8 * row + 4, static_cast<uint32_t>(capacity[row]));

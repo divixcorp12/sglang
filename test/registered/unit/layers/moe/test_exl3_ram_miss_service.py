@@ -357,6 +357,53 @@ def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_w
     assert service.lease_mode is True
 
 
+@pytest.mark.parametrize(
+    "lease_mode,two_phase,pack_workers",
+    [(False, False, 0), (True, False, 0), (True, True, 0)],
+    ids=["no_lease", "no_two_phase", "no_pack_workers"],
+)
+def test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold(
+    tiers, lease_mode, two_phase, pack_workers
+):
+    """Config/env refusal (piece-streaming plan Sec 4.4): the inline no-pool pack path has no publisher, so
+    piece streaming needs two-phase, lease mode and pack_workers > 0 together, not any two of the three."""
+    service, streamers, caches = tiers
+    with (
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(lease_mode),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
+        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(pack_workers),
+    ):
+        with pytest.raises(RuntimeError, match="PIECE_STREAM needs"):
+            service.ensure_started()
+
+
+def test_piece_stream_is_accepted_by_the_config_refusal_once_all_three_hold(tiers):
+    service, streamers, caches = tiers
+    with (
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
+        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
+    ):
+        service.ensure_started()
+    assert service.piece_stream is True
+
+
+def test_piece_stream_is_refused_at_device_side_construction_until_the_stream_kernel_exists(tiers):
+    """R3 (piece-streaming plan ledger): the config refusal only gates the combination of switches, so the
+    device chain itself must still refuse piece streaming (task 5 removes this once kernel S exists)."""
+    service, streamers, caches = tiers
+    with (
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
+        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
+    ):
+        with pytest.raises(RuntimeError, match="piece streaming needs the stream kernel"):
+            _attach_all(service, streamers)
+
+
 def _backend_calls(monkeypatch, *, lease):
     calls = []
     device_side = SimpleNamespace(
