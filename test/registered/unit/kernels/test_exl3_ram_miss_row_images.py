@@ -159,6 +159,9 @@ NOT_REUSED = {
     "test_the_reader_refuses_piece_streaming_without_packing_workers": "the direct mode needs none",
     "test_the_tier_refuses_the_flag_without_packing_workers": "the direct mode needs none",
     "test_the_reader_refuses_more_mirror_parts_than_the_pieces_can_name": "needs three mirror parts of shards",
+    "test_the_reader_refuses_a_slab_row_base_that_is_not_128_byte_aligned": (
+        "its row_bytes edit is refused first by the image tables' own check that segments tile each slab row"
+    ),
 }
 
 # As in test_exl3_ram_miss_pack_workers: a part's single read faulted or counted, which with piece streaming is a
@@ -446,11 +449,20 @@ def test_pack_stamps_are_publish_times_and_no_pool_is_started(tmp_path):
     image = len(experts) * int(s.tables.slot_bytes)
     assert record["useful_bytes"] == record["bytes"] == record["submitted_bytes"] == image
     assert sum(drive["bytes"] for drive in record["drives"]) == image
+    checked = 0
     for row in record["row_pack"]:
         cqes = [e["cqe"] for e in record["extent_cqe"] if e["row"] == row["row"]]
+        if len(cqes) < len(_sub_reads(s, 1, experts[row["row"]])):
+            continue  # past STAGE_TRACE_EXTENTS: the row's extents are not all stamped
+        checked += 1
         assert 0 < min(cqes) <= row["start"] <= row["end"] and max(cqes) <= row["end"], (row, cqes)
+    assert checked >= 3
     assert record["pieces_published"] == len(experts) * ops.STAGE_PIECES
     split._assert_rows(s, 1, experts, slots)
+
+
+def _sub_reads(s, row, expert):
+    return ops.piece_geometry(s.tables, row, expert)[0]
 
 
 # ---- The service ----
