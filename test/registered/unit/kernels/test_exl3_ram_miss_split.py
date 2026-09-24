@@ -16,6 +16,32 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
+# True while test_exl3_ram_miss_pack_workers reruns these tests with SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM's
+# reader, which issues a nonzero part as its sub-reads: a count of reads is then a count of sub-reads.
+PIECE_STREAM = False
+
+
+def _reads(s, layer, experts, parts=None):
+    """The reads a read of ``experts`` issues (of ``parts`` only, when given): one per nonzero part, or with piece
+    streaming one per sub-read."""
+    total = 0
+    for expert in experts:
+        for part in range(s.tables.parts) if parts is None else parts:
+            if PIECE_STREAM:
+                total += sum(sub["part"] == part for sub in ops.piece_geometry(s.tables, layer, expert)[0])
+            else:
+                total += int(s.tables.extents[layer, expert, part, 2] > 0)
+    return total
+
+
+def _n(flag_off, s, layer, experts, *, parts=None, extra=0):
+    """A read count the test states as ``flag_off`` for the one-read-per-part reader (checked against the tables);
+    under piece streaming the same reads counted as sub-reads. ``extra``: resubmissions, in both."""
+    count = _reads(s, layer, experts, parts) + extra
+    if not PIECE_STREAM:
+        assert count == flag_off, (count, flag_off)
+    return count
+
 
 def test_tables_describe_every_row(tmp_path):
     s = ram_miss_setup(tmp_path)
@@ -174,7 +200,7 @@ def test_a_batch_needing_more_reads_than_its_credit_completes_through_refill(tmp
         max_outstanding=credit, cqes=cqes,
     ) == (1, 1)
     # Every extent still reads exactly once, however few were in flight at a time.
-    assert cqes[0] == 16
+    assert cqes[0] == _n(16, s, 1, first)
     _assert_rows(s, 1, first, list(range(8)))
     _assert_rows(s, 1, then, [8, 9])
 
@@ -193,7 +219,7 @@ def test_completions_processed_back_to_front_land_the_same_bytes(tmp_path, credi
         s.tables, 1, first, list(range(8)), then, [8, 9], direct=False,
         reverse_cqes=True, max_outstanding=credit, cqes=cqes,
     ) == (1, 1)
-    assert cqes[0] == 16
+    assert cqes[0] == _n(16, s, 1, first)
     _assert_rows(s, 1, first, list(range(8)))
     _assert_rows(s, 1, then, [8, 9])
 
@@ -222,7 +248,8 @@ def test_a_zero_length_part_issues_no_read(tmp_path, weights, extents_per_row):
         s.tables, 1, first, [0, 1, 2], then, [3, 4], direct=False, cqes=cqes
     ) == (1, 1)
     # One completion per non-empty extent, so an empty part neither reads nor is waited for.
-    assert cqes == [3 * extents_per_row, 3 * extents_per_row + 2 * extents_per_row]
+    first_reads = _n(3 * extents_per_row, s, 1, first)
+    assert cqes == [first_reads, first_reads + _n(2 * extents_per_row, s, 1, then)]
     _assert_rows(s, 1, first, [0, 1, 2])
     _assert_rows(s, 1, then, [3, 4])
 
@@ -517,9 +544,9 @@ def test_mirrored_reads_are_accounted_per_drive(tmp_path):
         experts = [0, 1, 2]
         result, record = read_rows_traced(s.tables, 1, experts, [0, 1, 2], direct=False)
         assert result == 1
-        assert record["extents"] == 6 and len(record["drives"]) == 2
+        assert record["extents"] == _n(6, s, 1, experts) and len(record["drives"]) == 2
         assert {d["dev"] for d in record["drives"]} == {os.stat(p).st_dev for p in s.tables.paths}
-        assert [d["extents"] for d in record["drives"]] == [3, 3]
+        assert [d["extents"] for d in record["drives"]] == [_n(3, s, 1, experts, parts=[p]) for p in (0, 1)]
         assert sum(d["bytes"] for d in record["drives"]) == record["bytes"] == _bytes_read(s, 1, experts)
         assert all(d["bytes"] > 0 for d in record["drives"])
     finally:
@@ -529,7 +556,7 @@ def test_mirrored_reads_are_accounted_per_drive(tmp_path):
 def test_an_empty_part_is_not_an_extent_and_reads_no_drive(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 0.0))
     result, record = read_rows_traced(s.tables, 1, [0, 1, 2], [0, 1, 2], direct=False)
-    assert result == 1 and record["extents"] == 3
+    assert result == 1 and record["extents"] == _n(3, s, 1, [0, 1, 2])
     assert sum(d["bytes"] for d in record["drives"]) == record["bytes"] == _bytes_read(s, 1, [0, 1, 2])
 
 
@@ -639,7 +666,8 @@ def test_a_batch_that_fails_after_a_success_cancels_only_its_own_bytes(tmp_path)
     # so completion 9 is the second batch's only read and every row of the first batch has packed by then:
     # without the cap the order in which rows landed and packed would decide what the failure found.
     result, record = read_rows_traced(
-        s.tables, 1, experts, list(range(9)), direct=False, cqe_error=EIO, cqe_call=9, max_outstanding=1
+        s.tables, 1, experts, list(range(9)), direct=False, cqe_error=EIO, cqe_call=_n(9, s, 1, experts[:8], extra=1),
+        max_outstanding=1,
     )
     assert result == 0 and record["batches"] == 2
     assert record["useful_bytes"] == 8 * _segment_bytes(s)  # the first batch packed and counted
@@ -651,15 +679,20 @@ def test_a_batch_that_fails_after_a_success_cancels_only_its_own_bytes(tmp_path)
     assert (failed_row["row"], failed_row["start"], failed_row["end"]) == (8, 0, 0) and failed_row["admit"] > 0
 
 
-def _assert_row_causality(record, tables_parts):
+def _assert_row_causality(record, reads_per_row):
     """Per row only. Another row's extents may complete after this row packs (Task 4 overlaps them),
-    so no ordering across rows is asserted, and the stamps as a whole are not required to be sorted."""
+    so no ordering across rows is asserted, and the stamps as a whole are not required to be sorted.
+    ``reads_per_row[k]``: the extents row k issues; a row whose extents ran past the record's extent slots
+    (only possible with piece streaming's sub-reads) has no complete set to check."""
     by_row = {}
     for extent in record["extent_cqe"]:
         by_row.setdefault(extent["row"], []).append(extent)
     for row in record["row_pack"]:
+        if sum(reads_per_row[: row["row"] + 1]) > ops.STAGE_TRACE_EXTENTS:
+            assert PIECE_STREAM
+            continue
         extents = by_row[row["row"]]
-        assert len(extents) == tables_parts
+        assert len(extents) == reads_per_row[row["row"]]
         assert all(record["submit"] > 0 and extent["cqe"] > 0 for extent in extents), record
         assert row["start"] > 0 and row["end"] >= row["start"], row
         # A row's packing starts after all of ITS extents completed.
@@ -684,8 +717,9 @@ def test_each_rows_stamps_are_causally_ordered_over_several_batches(tmp_path, we
     experts = list(range(11))[::-1]  # a batch of 8 rows, then 3
     result, record = read_rows_traced(s.tables, 1, experts, list(range(11)), direct=False, **fault)
     assert result == 1 and record["batches"] == 2
-    assert len(record["row_pack"]) == 11 and len(record["extent_cqe"]) == 11 * s.tables.parts
-    _assert_row_causality(record, s.tables.parts)
+    reads = _n(11 * s.tables.parts, s, 1, experts)
+    assert len(record["row_pack"]) == 11 and len(record["extent_cqe"]) == min(reads, ops.STAGE_TRACE_EXTENTS)
+    _assert_row_causality(record, [_n(s.tables.parts, s, 1, [e]) for e in experts])
     # The aggregate is the rows': it starts with the first row to pack, ends with the last, adds their spans.
     rows = record["row_pack"]
     assert record["pack_start"] == min(r["start"] for r in rows) and record["pack_end"] == max(r["end"] for r in rows)
@@ -699,8 +733,8 @@ def test_per_row_and_per_extent_stamps_are_bounded_and_the_overflow_counted(tmp_
     result, record = read_rows_traced(s.tables, 1, experts, list(range(18)), direct=False)
     assert result == 1
     assert len(record["row_pack"]) == ops.STAGE_TRACE_ROWS and record["rows_untraced"] == 2
-    assert record["extents"] == 36 and len(record["extent_cqe"]) == ops.STAGE_TRACE_EXTENTS
-    assert record["extents_untraced"] == 4
+    assert record["extents"] == _n(36, s, 1, experts) and len(record["extent_cqe"]) == ops.STAGE_TRACE_EXTENTS
+    assert record["extents_untraced"] == _n(36, s, 1, experts) - ops.STAGE_TRACE_EXTENTS
     assert record["useful_bytes"] == 18 * _segment_bytes(s)  # the totals still cover every row
     assert record["submitted_bytes"] == _lengths(s, 1, experts)
     _assert_rows(s, 1, experts, list(range(18)))
@@ -782,7 +816,7 @@ def test_a_row_packs_while_another_rows_read_is_still_outstanding(tmp_path, weig
     assert result == 1 and record["rows_reading_max"] == 6
     packs = _row_packs(record)
     held = _extent_cqes(record, 5)
-    assert len(held) == s.tables.parts and all(held)
+    assert len(held) == _n(s.tables.parts, s, 1, [experts[5]]) and all(held)
     for k in range(5):
         assert record["submit"] < packs[k]["start"] < max(held), (k, packs[k], held)
     # Row 5 itself packs only after ALL of its own extents completed, and after the others.
@@ -998,7 +1032,7 @@ def test_cancellation_reaps_what_was_submitted_and_reads_nothing_more(tmp_path, 
     assert result == -1 and record["status"] == "cancelled" and record["batches"] == 3
     packed = [row["row"] for row in record["row_pack"] if row["end"]]
     assert packed == [0, 1, 2]  # every row admitted before the stop was completed, the rest never started
-    assert record["extents"] == 6 and record["submitted_bytes"] == _lengths(s, 1, experts[:3])
+    assert record["extents"] == _n(6, s, 1, experts[:3]) and record["submitted_bytes"] == _lengths(s, 1, experts[:3])
     assert record["cancelled_bytes"] == 0  # nothing was abandoned mid-flight: it was all reaped
     _assert_rows(s, 1, experts[:3], slots[:3])
     assert all(_untouched(s, 1, slot) for slot in slots[3:])

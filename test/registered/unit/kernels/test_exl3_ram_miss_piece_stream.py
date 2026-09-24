@@ -329,6 +329,48 @@ def test_u10_a_sub_read_takes_one_credit_like_a_part(tmp_path, credit):
         split._assert_rows(s, 1, experts, slots)
 
 
+# ---- Fault hooks name a part and a sub-read (the split suite's part_short / EINTR tests, per sub-read) ----
+
+
+def _sub_read(s, row, expert, part, k):
+    return next(sub for sub in piece_geometry(s.tables, row, expert)[0] if (sub["part"], sub["k"]) == (part, k))
+
+
+@pytest.mark.parametrize("ordinal, part, k", [(2, 1, 0), (9, 0, 2), (15, 1, 3)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_a_short_sub_read_resubmits_only_its_own_sub_read(tmp_path, ordinal, part, k, reverse):
+    """Sub-read k of part `part` of one row, in either bank, returns one page. Only the rest of that sub-read is
+    read again (one extra completion, its length minus a page of retried bytes), under a tight credit and reversed
+    completions, and every row still lands byte-exact."""
+    s = ram_miss_setup(tmp_path, capacity=16, experts=16, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    experts, slots = list(range(16)), list(range(16))
+    sub = _sub_read(s, 1, experts[ordinal], part, k)
+    assert sub["length"] > PAGE  # the fault can fire
+    result, log, info, record = read_rows_sqes(
+        s.tables, 1, experts, slots, direct=False, piece_stream=True, pack_workers=2, step=8, part=part, sub=k,
+        ordinal=ordinal, part_short=PAGE, reverse_cqes=reverse, max_outstanding=4,
+    )
+    assert result == 1
+    reads = sum(len(piece_geometry(s.tables, 1, e)[0]) for e in experts)
+    assert info["cqes"] == info["sqes"] == reads + 1 and record["extents"] == reads
+    assert record["retried_bytes"] == sub["length"] - PAGE
+    bounce = (ordinal // 8 * 8 + ordinal % 8) * s.tables.slot_bytes + sub["dest"]
+    assert log.count((sub["file"], sub["offset"] + PAGE, sub["length"] - PAGE, bounce + PAGE)) == 1  # the resubmit
+    split._assert_rows(s, 1, experts, slots)
+
+
+def test_an_interrupted_sub_read_is_resubmitted_whole_and_counted_as_retried(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    sub = _sub_read(s, 1, 0, 1, 2)
+    result, record = read_rows_traced(
+        s.tables, 1, [0], [0], direct=False, piece_stream=True, pack_workers=1, part=1, sub=2, part_error=4  # EINTR
+    )
+    total = sum(e["length"] for e in piece_geometry(s.tables, 1, 0)[0])
+    assert result == 1 and record["retried_bytes"] == sub["length"]
+    assert record["submitted_bytes"] == total + sub["length"]
+    split._assert_rows(s, 1, [0], [0])
+
+
 # ---- The flag's refusals, and how it reaches the reader ----
 
 

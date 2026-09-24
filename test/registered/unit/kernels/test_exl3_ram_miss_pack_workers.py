@@ -44,12 +44,27 @@ PAGE = split.PAGE
 MODES = [(1, 1, False), (3, 1, False), (3, 3, False), (1, 1, True), (3, 3, True)]
 
 
-@pytest.fixture(params=MODES, ids=lambda mode: f"w{mode[0]}c{mode[1]}" + ("ps" if mode[2] else ""))
+def _mode_id(mode):
+    return f"w{mode[0]}c{mode[1]}" + ("ps" if mode[2] else "")
+
+
+@pytest.fixture(params=MODES, ids=_mode_id)
 def packing(request, monkeypatch):
     """Every reader a reused test builds packs on workers, unless the test names its own ``pack_workers``, and
     streams pieces in the piece-stream modes whenever it has workers (the flag needs them)."""
-    workers, chunks, piece_stream = request.param
+    yield from _packing(request.param, monkeypatch)
+
+
+@pytest.fixture(params=[mode for mode in MODES if not mode[2]], ids=_mode_id)
+def packing_without_pieces(request, monkeypatch):
+    """``packing``'s modes without piece streaming, for the tests in ONE_READ_PER_PART."""
+    yield from _packing(request.param, monkeypatch)
+
+
+def _packing(mode, monkeypatch):
+    workers, chunks, piece_stream = mode
     fault_tensor, host_init = ops._fault_tensor, Exl3RamMissHost.__init__
+    monkeypatch.setattr(split, "PIECE_STREAM", piece_stream)
 
     def with_workers(**faults):
         faults.setdefault("pack_workers", workers)
@@ -65,17 +80,17 @@ def packing(request, monkeypatch):
 
     monkeypatch.setattr(ops, "_fault_tensor", with_workers)
     monkeypatch.setattr(Exl3RamMissHost, "__init__", init)
-    yield request.param
+    yield mode
     gc.collect()  # a host the test dropped closes its files and joins its workers now, not at exit
 
 
-def _with_packing(test):
-    """A copy of ``test`` that runs under the ``packing`` fixture; the original, still collected from its own
-    module, is left as it is."""
+def _with_packing(test, fixture="packing"):
+    """A copy of ``test`` that runs under the ``packing`` fixture (or ``fixture``); the original, still collected
+    from its own module, is left as it is."""
     clone = types.FunctionType(test.__code__, test.__globals__, test.__name__, test.__defaults__, test.__closure__)
     clone.__kwdefaults__ = test.__kwdefaults__
     clone.__dict__.update({k: list(v) if k == "pytestmark" else v for k, v in test.__dict__.items()})
-    return pytest.mark.usefixtures("packing")(clone)
+    return pytest.mark.usefixtures(fixture)(clone)
 
 
 # Tests whose assertions state something only the inline reader guarantees, each replaced below.
@@ -87,11 +102,25 @@ NOT_REUSED = {
 }
 
 
+# Tests that fault or count one part's single read: a short read (part_short) or an interrupted one of a part. With
+# piece streaming a part is up to four sub-reads, and on these tests' rows each is one page, so part_short=PAGE
+# never fires. They run in the modes without it; test_exl3_ram_miss_piece_stream has their sub-read counterparts
+# (test_a_short_sub_read_*, test_an_interrupted_sub_read_*).
+ONE_READ_PER_PART = {
+    "test_a_short_read_resubmits_its_own_extent_under_reversed_completions",
+    "test_a_short_read_resubmits_only_its_own_extent",
+    "test_a_short_read_is_retried_bytes_and_adds_nothing_to_useful",
+    "test_a_short_read_in_either_bank_resubmits_only_its_own_extent",
+    "test_an_interrupted_read_is_resubmitted_whole_and_counted_as_retried",
+}
+
+
 def _reuse(module, wanted):
     for name, test in vars(module).items():
         if name.startswith("test_") and name not in NOT_REUSED and inspect.isfunction(test):
             if wanted(inspect.getsource(test)):
-                globals()[name] = _with_packing(test)
+                fixture = "packing_without_pieces" if name in ONE_READ_PER_PART else "packing"
+                globals()[name] = _with_packing(test, fixture)
 
 
 _reuse(split, lambda source: "read_rows_traced(" in source or "read_rows_with_fault(" in source)
@@ -234,12 +263,14 @@ def test_a_failure_returns_only_when_no_copy_is_still_running(tmp_path, packing)
     for slot in slots:
         split._sentinel(s, 1, slot)
     stats = {}
-    # A credit of 2 spreads the completions over several reaps, so the error at the 8th completion comes
-    # after rows have been handed to workers whose copies take 150 ms.
+    # A credit of 2 spreads the completions over several reaps, so the error at the 8th completion (the last read
+    # of row 3; with piece streaming, its last sub-read) comes after rows have been handed to workers whose copies
+    # take 150 ms.
+    cqe_call = split._n(8, s, 1, experts[:4])
     (results, took) = _elapsed(
         lambda: ops.read_rows_with_fault(
             s.tables, 1, experts, slots, [], [], direct=False, max_outstanding=2,
-            cqe_error=EIO, cqe_call=8, pack_delay_ns=DELAY_NS, stats=stats,
+            cqe_error=EIO, cqe_call=cqe_call, pack_delay_ns=DELAY_NS, stats=stats,
         )
     )
     assert results == (0, 0)  # the failed read, and no second one
@@ -324,12 +355,15 @@ def test_pack_ns_is_the_sum_of_the_rows_spans(tmp_path, packing):
 
 def test_credit_and_rows_in_flight_do_not_depend_on_where_the_copy_runs(tmp_path, packing):
     """The reader's admission and credit accounting are the owner's alone: the high-water marks match
-    the inline reader's for the same read."""
+    the inline reader's for the same read. Piece streaming has no inline reader, so there the reference is
+    one worker copying each row whole."""
     s = ram_miss_setup(tmp_path, capacity=16, experts=16, mirror_weights=(1.0, 1.0))
     experts, slots = list(range(16)), list(range(16))
     kwargs = dict(direct=False, max_outstanding=5)
-    _, inline = read_rows_traced(s.tables, 1, experts, slots, pack_workers=0, **kwargs)
+    reference = dict(pack_workers=1, pack_split=1) if packing[2] else dict(pack_workers=0)
+    _, inline = read_rows_traced(s.tables, 1, experts, slots, **reference, **kwargs)
     _, workers = read_rows_traced(s.tables, 1, experts, slots, **kwargs)
+    assert inline["piece_stream"] == workers["piece_stream"] == int(packing[2])
     for field in ("rows_reading_max", "pending_max", "batches", "extents", "submitted_bytes", "useful_bytes", "bytes"):
         assert workers[field] == inline[field], field
 
