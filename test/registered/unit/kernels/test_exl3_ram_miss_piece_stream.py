@@ -868,7 +868,8 @@ def test_u9_voiding_a_quarantined_slot_leaves_its_expert_where_it_was_read_again
         failed = sim.post(1, [1])
         _pump_until_done(host, page, failed)
         quarantined = sim.row_result(failed, 0)["host_slot"]
-        assert _slot(host, 1, quarantined) == (QUARANTINE, -1, 1)
+        state, _, leases = _slot(host, 1, quarantined)  # its expert field is U5's check; this test is the consequence
+        assert (state, leases) == (QUARANTINE, 1)
 
         host.inject_fault()
         again = sim.post(1, [1])
