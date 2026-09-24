@@ -804,11 +804,31 @@ def _extent_cqes(record, row):
 
 
 def _exact_or_untouched(s, layer, experts, slots):
-    """Every slot is either still the sentinel or a WHOLE byte-exact row: never a half-packed one."""
+    """Every slot is either still the sentinel or a WHOLE byte-exact row: never a half-packed one. With piece
+    streaming a failed read may leave a row's published pieces behind (the device may already hold them), so the
+    unit is the piece: each is either all sentinel or all the row's bytes, never a half-copied one."""
     reference = s.reference(layer, experts)
     for i, slot in enumerate(slots):
         whole = all(same_bytes(s.slabs[layer][name][slot], reference[name][i]) for name in EXL3_STREAMED_NAMES)
+        if PIECE_STREAM and not whole:
+            _assert_pieces_exact_or_untouched(s, layer, experts[i], slot, {n: reference[n][i] for n in reference})
+            continue
         assert whole or _untouched(s, layer, slot), (experts[i], slot)
+
+
+def _assert_pieces_exact_or_untouched(s, layer, expert, slot, reference):
+    _, pieces = ops.piece_geometry(s.tables, layer, expert)
+    segments = s.tables.segments.tolist()
+    for j, piece in enumerate(pieces):
+        states = set()
+        for (name_index, _dst, _src, _n), (lo, hi) in zip(segments, piece["runs"]):
+            if lo == hi:
+                continue
+            name = EXL3_STREAMED_NAMES[name_index]
+            got = s.slabs[layer][name][slot].contiguous().view(torch.uint8)[lo:hi]
+            want = reference[name].contiguous().view(torch.uint8)[lo:hi]
+            states.add("exact" if torch.equal(got, want) else "untouched" if bool((got == 0xAB).all()) else "torn")
+        assert len(states) <= 1 and "torn" not in states, (expert, slot, j, states)
 
 
 @pytest.mark.parametrize("weights", [None, (1.0, 1.0)])
