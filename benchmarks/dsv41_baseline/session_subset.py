@@ -58,6 +58,43 @@ WARMUP_SESSION_INDEX = 8
 WARMUP_SESSION_ID = "fb-financebench_id_04209"
 
 
+# Per-arm override of the timed set, for a run that interleaves several short invocations
+# of each arm (piece-streaming task 6: A B B A A B B A, session pairs {0,1} {2,3} {4,5}
+# {6,7}). It names indices into CORPUS_8_SESSION_IDS, e.g. "2,3". Unset or empty means
+# the shared default, EXPECTED_SESSION_IDS; N_SESSIONS itself is never changed, because
+# every other verdict depends on it. run_arm.sh records the resolved indices and ids in
+# the run manifest, which is what paired.py and concat_arms.py read.
+SESSION_INDICES_ENV = "DSV41_SESSION_INDICES"
+
+
+def timed_session_indices(spec: str | None) -> tuple[int, ...]:
+    """Parse a `DSV41_SESSION_INDICES` value into indices of CORPUS_8_SESSION_IDS.
+
+    None or "" gives the default `range(N_SESSIONS)`. Refuses anything else that is not
+    a comma-separated list of distinct in-range indices: a typo must not silently run
+    the default set and be paired as if it were the requested one.
+    """
+    if spec is None or not spec.strip():
+        return tuple(range(N_SESSIONS))
+    try:
+        indices = tuple(int(part) for part in spec.split(","))
+    except ValueError:
+        raise ValueError(f"{SESSION_INDICES_ENV}={spec!r}: expected comma-separated integers") from None
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"{SESSION_INDICES_ENV}={spec!r}: repeated index")
+    bad = [i for i in indices if not 0 <= i < len(CORPUS_8_SESSION_IDS)]
+    if bad:
+        raise ValueError(
+            f"{SESSION_INDICES_ENV}={spec!r}: indices {bad} outside 0..{len(CORPUS_8_SESSION_IDS) - 1}"
+            f" (index {WARMUP_SESSION_INDEX} is the warm-up session and is never timed)"
+        )
+    return indices
+
+
+def timed_session_ids(indices: tuple[int, ...]) -> tuple[str, ...]:
+    return tuple(CORPUS_8_SESSION_IDS[i] for i in indices)
+
+
 class CorpusChecksumError(RuntimeError):
     pass
 

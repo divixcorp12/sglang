@@ -38,6 +38,15 @@ settings prevent a direct throughput comparison with that number. Two sessions k
 each arm short; a clean-sweep paired sign test only reaches p = 0.25, so treat the
 result as directional rather than statistically decisive.
 
+**A per-arm override replaces the timed set without touching `N_SESSIONS`.**
+`DSV41_SESSION_INDICES=2,3` (bash env var) times those indices of the 8-session corpus
+instead; the resolved `session_indices` and `session_ids` are recorded in
+`run-manifest.json`, and a malformed value, a repeat, or index 8 aborts the arm. It
+exists for interleaved comparisons (A B B A A B B A, one session pair per A/B pair):
+`concat_arms.py <out> <run_dir>...` merges one arm's invocations into a single directory
+for `paired.py`, refusing members that differ in commit or server env, overlap in
+sessions, or ran under incompatible tenancy.
+
 A 9th real corpus session (index 8, `fb-financebench_id_04209`, not one of the 2 timed
 ones) is the warm-up session — discarded from timing and reused each warm-up round
 (see below).

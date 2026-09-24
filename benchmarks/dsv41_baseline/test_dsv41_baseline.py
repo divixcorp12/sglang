@@ -13,6 +13,7 @@ import arm_env
 import client_latency
 import clock_ramp
 import compile_watch
+import concat_arms
 import generations
 import metrics
 import paired
@@ -407,6 +408,81 @@ def test_paired_compare_refuses_a_compile_contaminated_session(tmp_path):
     b = _write_arm(tmp_path, "b", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS)
     with pytest.raises(paired.CompileContaminationError):
         paired.compare(a, b)
+
+
+# --- per-arm session override (DSV41_SESSION_INDICES) and concatenating an arm's invocations ---
+
+
+def test_timed_session_indices_default_is_the_shared_n_sessions():
+    assert session_subset.timed_session_indices(None) == (0, 1)
+    assert session_subset.timed_session_indices("") == (0, 1)
+    assert session_subset.timed_session_ids((0, 1)) == session_subset.EXPECTED_SESSION_IDS
+
+
+def test_timed_session_indices_override_picks_those_corpus_sessions():
+    indices = session_subset.timed_session_indices("6,7")
+    assert indices == (6, 7)
+    assert session_subset.timed_session_ids(indices) == session_subset.CORPUS_8_SESSION_IDS[6:8]
+    assert session_subset.N_SESSIONS == 2  # the override never touches the shared count
+
+
+@pytest.mark.parametrize("spec", ["8", "-1", "1,1", "a", "1;2", "0,,1"])
+def test_timed_session_indices_refuses_a_malformed_or_warmup_spec(spec):
+    with pytest.raises(ValueError):
+        session_subset.timed_session_indices(spec)
+
+
+def test_run_arm_times_and_records_the_resolved_override():
+    script = open(os.path.join(os.path.dirname(__file__), "run_arm.sh")).read()
+    assert "ss.timed_session_indices(os.environ.get(ss.SESSION_INDICES_ENV))" in script
+    assert "ss.EXPECTED_SESSION_IDS" not in script
+    assert "'session_indices': timed['indices']" in script
+    assert "check_result_gate(load_results('$run_dir/results.jsonl'), expected_count=n)" in script
+
+
+def _write_member(tmp_path, name, *, indices, tok_s, env=None, commit="c0"):
+    ids = [session_subset.CORPUS_8_SESSION_IDS[i] for i in indices]
+    arm = _write_arm(tmp_path, name, tok_s_by_session=[tok_s] * len(ids), tenancy_fields=_TENANCY_FIELDS, session_ids=ids)
+    path = os.path.join(arm, "run-manifest.json")
+    manifest = json.load(open(path))
+    manifest.update(commit=commit, env=env or {"SGLANG_X": "1"}, session_indices=list(indices))
+    json.dump(manifest, open(path, "w"))
+    return arm
+
+
+def test_concat_arms_feeds_paired_the_interleaved_eight_sessions(tmp_path):
+    pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
+    a_runs = [_write_member(tmp_path, f"a{k}", indices=p, tok_s=2.0) for k, p in enumerate(pairs)]
+    b_runs = [_write_member(tmp_path, f"b{k}", indices=p, tok_s=3.0, env={"SGLANG_X": "2"}) for k, p in enumerate(pairs)]
+    concat_arms.concat_arms(str(tmp_path / "A"), a_runs)
+    manifest = concat_arms.concat_arms(str(tmp_path / "B"), b_runs)
+    assert manifest["session_ids"] == list(session_subset.CORPUS_8_SESSION_IDS)
+    assert len(manifest["sources"]) == 4
+    result = paired.compare(str(tmp_path / "A"), str(tmp_path / "B"))
+    assert result["paired_sessions"] == 8
+    assert result["b_wins"] == 8
+    assert result["sign_test_p_value"] == pytest.approx(1 / 256)
+
+
+def test_concat_arms_refuses_members_with_different_server_env(tmp_path):
+    a = _write_member(tmp_path, "a0", indices=(0, 1), tok_s=2.0)
+    b = _write_member(tmp_path, "a1", indices=(2, 3), tok_s=2.0, env={"SGLANG_X": "2"})
+    with pytest.raises(ValueError, match="SGLANG_X"):
+        concat_arms.concat_arms(str(tmp_path / "A"), [a, b])
+
+
+def test_concat_arms_refuses_members_at_different_commits(tmp_path):
+    a = _write_member(tmp_path, "a0", indices=(0, 1), tok_s=2.0)
+    b = _write_member(tmp_path, "a1", indices=(2, 3), tok_s=2.0, commit="c1")
+    with pytest.raises(ValueError, match="commit"):
+        concat_arms.concat_arms(str(tmp_path / "A"), [a, b])
+
+
+def test_concat_arms_refuses_overlapping_sessions(tmp_path):
+    a = _write_member(tmp_path, "a0", indices=(0, 1), tok_s=2.0)
+    b = _write_member(tmp_path, "a1", indices=(1, 2), tok_s=2.0)
+    with pytest.raises(ValueError, match="overlapping"):
+        concat_arms.concat_arms(str(tmp_path / "A"), [a, b])
 
 
 # --- provenance.py: the pid parameter added for sampling a separate server process ---

@@ -17,6 +17,9 @@
 #               same overrides are what run_arm.sh verifies against the live server's
 #               /proc/<pid>/environ afterwards.
 #
+# Env: DSV41_SESSION_INDICES=<i,j,...> times those indices of CORPUS_8_SESSION_IDS
+# instead of the shared default (session_subset.timed_session_indices); the resolved
+# indices and ids are recorded in run-manifest.json.
 # Env: EXPECT_SHA=<sha> to pin the worktree to an exact commit (refuse otherwise); the
 # worktree must always be clean (preflight). The python/ tree must be registered in
 # generations.json first (`python -c "import generations; generations.register(TREE,
@@ -93,23 +96,38 @@ echo "generation ok: $python_tree = $generation_label"
 got_checksum=$(sha256sum "$corpus" | awk '{print $1}')
 [ "$got_checksum" = "$corpus_checksum" ] || abort "corpus checksum mismatch: got $got_checksum expected $corpus_checksum"
 
-# --- build the 2 timed + 1 warm-up synthetic sessions (real text, truncated to 256
+# --- the timed set: the shared default, or this arm's DSV41_SESSION_INDICES override.
+#     Resolved once, here, and refused on a malformed value before anything starts. ---
+timed_ids_path=$run_dir/timed-session-ids.json
+pyrun -c "
+import json, os
+import session_subset as ss
+indices = ss.timed_session_indices(os.environ.get(ss.SESSION_INDICES_ENV))
+ids = ss.timed_session_ids(indices)
+json.dump({'indices': list(indices), 'session_ids': list(ids)}, open('$timed_ids_path', 'w'))
+print(f'timed sessions: indices={list(indices)} ids={list(ids)}')
+" || abort "bad ${DSV41_SESSION_INDICES:+DSV41_SESSION_INDICES=$DSV41_SESSION_INDICES}"
+
+# --- build the timed + 1 warm-up synthetic sessions (real text, truncated to 256
 #     tokens, re-decoded); asserts each fits context_length before anything is sent ---
 synthetic_sessions=$run_dir/synthetic-sessions.jsonl
 pyrun -c "
+import json
 from transformers import AutoTokenizer
 import arm_env, session_subset as ss, synthetic_corpus as sc
 
 tokenizer = AutoTokenizer.from_pretrained(arm_env.MODEL_PATH)
-raw = ss.load_raw_sessions(n=ss.N_SESSIONS, skip=ss.SKIP)
+timed = json.load(open('$timed_ids_path'))
+corpus8 = ss.load_raw_sessions(n=len(ss.CORPUS_8_SESSION_IDS), skip=ss.SKIP)
+raw = [corpus8[i] for i in timed['indices']]
 raw += ss.load_raw_sessions(n=1, skip=ss.WARMUP_SESSION_INDEX)
 sessions = sc.build_synthetic_sessions(
     raw,
     tokenize=lambda t: tokenizer(t).input_ids,
     detokenize=lambda ids: tokenizer.decode(ids),
 )
-got_ids = tuple(s['session_id'] for s in sessions[:ss.N_SESSIONS])
-assert got_ids == ss.EXPECTED_SESSION_IDS, (got_ids, ss.EXPECTED_SESSION_IDS)
+got_ids = [s['session_id'] for s in sessions[:-1]]
+assert got_ids == timed['session_ids'], (got_ids, timed['session_ids'])
 assert sessions[-1]['session_id'] == ss.WARMUP_SESSION_ID, sessions[-1]['session_id']
 sc.write_jsonl('$synthetic_sessions', sessions)
 print(f'wrote {len(sessions)} synthetic sessions to $synthetic_sessions')
@@ -413,7 +431,7 @@ cpu_path=$run_dir/cpu.jsonl
 # is given, so a shortened arm is a diagnostic capture, never a baseline number.
 timed_sessions_done=0
 timed_rc=0
-mapfile -t timed_session_ids < <(pyrun -c "import session_subset as ss; print(*ss.EXPECTED_SESSION_IDS, sep=chr(10))")
+mapfile -t timed_session_ids < <(pyrun -c "import json; print(*json.load(open('$timed_ids_path'))['session_ids'], sep=chr(10))")
 for session_id in "${timed_session_ids[@]}"
 do
     before_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
@@ -482,12 +500,13 @@ print(json.dumps(msgspec.to_builtins(tenancy.capture_tenancy())))
 stop_server
 [ "$timed_rc" = 0 ] || abort "$arm driver rc=$timed_rc"
 
-# --- result gate: exactly N_SESSIONS records, 0 errors, or abort ---
+# --- result gate: exactly one record per timed session, 0 errors, or abort ---
 pyrun -c "
+import json
 from results_gate import load_results, check_result_gate
-from session_subset import N_SESSIONS
-check_result_gate(load_results('$run_dir/results.jsonl'))
-print(f'result gate OK: {N_SESSIONS} records, 0 errors')
+n = len(json.load(open('$timed_ids_path'))['session_ids'])
+check_result_gate(load_results('$run_dir/results.jsonl'), expected_count=n)
+print(f'result gate OK: {n} records, 0 errors')
 " || abort "$arm result gate failed"
 
 # --- build the Task-1-shaped report, judge it with Task 1's own check_arm/contention/
@@ -558,9 +577,9 @@ if result['unacknowledged_problems']:
 # --- manifest ---
 pyrun -c "
 import json
-import session_subset as ss
 
 env = json.load(open('$expected_env_path'))
+timed = json.load(open('$timed_ids_path'))
 manifest = {
     'arm': '$arm',
     'port': $port,
@@ -569,7 +588,9 @@ manifest = {
     'generation_label': '$generation_label',
     'corpus_path': '$corpus',
     'corpus_sha256': '$corpus_checksum',
-    'session_ids': list(ss.EXPECTED_SESSION_IDS),
+    'session_ids': timed['session_ids'],
+    'session_indices': timed['indices'],
+    'session_indices_override': '${DSV41_SESSION_INDICES:-}' or None,
     'warmup_session_id': '$warmup_session_id',
     'max_tokens': $max_tokens,
     'env': env,
