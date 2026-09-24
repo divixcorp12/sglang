@@ -689,6 +689,7 @@ class RowReader {
   }
   unsigned pack_workers() const { return pack_workers_; }
   unsigned pack_split() const { return pack_split_; }
+  bool pack_pool_active() const { return pool_ && pool_->active(); }
 
   // Piece streaming (kSubReads sub-reads per part, per-piece vetting, packing and publishing); off by default. Before
   // open(), or on an idle reader after it (the tier sets it before its service thread starts), since it resizes the
@@ -889,11 +890,16 @@ class RowReader {
     reset_pipeline();
     held_.clear();
     // Whatever way this call ends, no packing worker may still be copying when it does: the caller
-    // releases the slots on return and the next read reuses the bounce. Runs on exceptions too.
+    // releases the slots on return and the next read reuses the bounce. Runs on exceptions too, and
+    // parks the workers again, so none spins between reads.
     struct Quiesce {
       RowReader* reader;
-      ~Quiesce() { reader->quiesce(); }
+      ~Quiesce() {
+        reader->quiesce();
+        if (reader->pool_) reader->pool_->set_active(false);
+      }
     } quiesce_on_exit{this};
+    if (pool_) pool_->set_active(true);  // workers wait for this read's jobs on their cores, not in the kernel
     // 0 forces the first turn to fire immediately, so a short read still gets one call before it
     // returns rather than waiting a full interval that may outlast the whole request.
     int64_t next_progress_ns = 0;
@@ -2016,9 +2022,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_traced, exl3_ram_miss_read
 // Test only: one reader reads `experts` into `slots` with `fault` injected
 // (see ReadFault and fault_from), then reads `then_experts` into `then_slots` with no fault (no second read when
 // there are none). Results go to
-// `results[0..7]`: the two reads' results, the completions the reader had reaped after each, then its
-// stale completions, generation wraps, the packing jobs still open when the first read returned and the
-// number of packing workers the reader has.
+// `results[0..8]`: the two reads' results, the completions the reader had reaped after each, then its
+// stale completions, generation wraps, the packing jobs still open when the first read returned, the
+// number of packing workers the reader has, and whether its pool was still active (spinning) then.
 void exl3_ram_miss_read_rows_faulted(
     TensorView extents,
     TensorView starts,
@@ -2046,7 +2052,7 @@ void exl3_ram_miss_read_rows_faulted(
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) {
-    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = 0;
+    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = out[8] = 0;
     return;
   }
   reader.set_fault(fault_from(f));
@@ -2057,6 +2063,7 @@ void exl3_ram_miss_read_rows_faulted(
   out[5] = reader.generation_wraps();
   out[6] = reader.unfinished_jobs();
   out[7] = reader.pack_workers();
+  out[8] = reader.pack_pool_active() ? 1 : 0;
   reader.set_fault(ReadFault{});
   if (then_experts.size(0) == 0) return;  // a test that only wants the first read's state
   out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, abandon_after(0));
@@ -2376,6 +2383,56 @@ void exl3_ram_miss_pack_pool_affinity(TensorView inherited, int64_t workers, Ten
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pack_pool_affinity, exl3_ram_miss_pack_pool_affinity);
+
+// Test only: the packing pool's switches between parked and spinning workers, on the cores set in `inherited`.
+// `out` (6 int64): [0] a post to a pool never made active completes (1/0); [1] the workers' CPU time over 30 ms
+// active and idle, ns; [2] a post while active completes; [3] their CPU time over 30 ms after the pool was made
+// inactive again (after a 30 ms settle), ns; [4] a post to that cold pool completes; [5] a pool destroyed while
+// active joins (1; a pool that did not would hang here). A post "completes" when its job reads done within 5 s.
+void exl3_ram_miss_pack_pool_handoff(TensorView inherited, int64_t workers, TensorView out) {
+  using namespace exl3_ram_miss;
+  const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  for (int core = 0; core < 128; ++core) {
+    if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
+  }
+  auto* o = static_cast<int64_t*>(out.data_ptr());
+  std::vector<uint8_t> src(1 << 16, 7), dst(1 << 16, 0);
+  const CopyRun run{dst.data(), src.data(), static_cast<int64_t>(src.size())};
+  PackJob job;
+  const auto complete = [&](PackPool& pool) {
+    job.arm(&run, 1, static_cast<unsigned>(workers), 0, nullptr, nullptr);
+    pool.post(&job);
+    const int64_t deadline = now_ns() + 5000000000;
+    while (!job.done() && now_ns() < deadline) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    return job.done() ? int64_t{1} : int64_t{0};
+  };
+  const auto cpu_over = [](PackPool& pool, int ms) {
+    const int64_t before = pool.worker_cpu_ns();
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    return pool.worker_cpu_ns() - before;
+  };
+  {
+    PackPool pool(static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots));
+    o[0] = complete(pool);
+    pool.set_active(true);
+    o[1] = cpu_over(pool, 30);
+    o[2] = complete(pool);
+    pool.set_active(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    o[3] = cpu_over(pool, 30);
+    o[4] = complete(pool);
+  }
+  {
+    PackPool pool(static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots));
+    pool.set_active(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  o[5] = 1;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pack_pool_handoff, exl3_ram_miss_pack_pool_handoff);
 
 // Test only: the cores a packing worker may use when the creating thread may use those set in `inherited`
 // (two int64 words, cores 0-127), as two words in `out`. Starts no thread.

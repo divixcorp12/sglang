@@ -66,7 +66,7 @@ struct Options {
   int64_t src_mb = 1024;
   int64_t dst_mb = 4096;
   int dst_node = -1;
-  int spin = 0;  // hold the pool active across each read (PackPool::set_active), when the pool has it
+  int spin = 1;  // hold the pool active across each read, as RowReader::read does; 0 parks between pieces
   const char* csv = nullptr;
 };
 
@@ -173,9 +173,7 @@ int main(int argc, char** argv) {
   int64_t s_at = 0, d_at = 0;
   int64_t next = now_ns() + 1000000;
   for (int r = 0; r < o.reads; ++r) {
-#ifdef PACK_POOL_HAS_ACTIVE
     if (o.spin) pool.set_active(true);
-#endif
     for (int p = 0; p < o.pieces; ++p) {
       int64_t left = o.piece_bytes, at = 0;
       for (int i = 0; i < o.runs; ++i) {
@@ -216,9 +214,7 @@ int main(int argc, char** argv) {
       next += (p + 1 == o.pieces ? o.read_gap_us : o.gap_us) * 1000;
       next = std::max(next, now_ns());
     }
-#ifdef PACK_POOL_HAS_ACTIVE
     if (o.spin) pool.set_active(false);
-#endif
   }
   if (csv) fclose(csv);
   const char* kinds[2] = {"first piece of a read (after the read gap)", "later pieces (after the piece gap)"};

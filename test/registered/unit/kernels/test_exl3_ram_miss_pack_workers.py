@@ -194,15 +194,63 @@ def test_a_worker_may_not_use_cores_64_to_71():
     assert _cores(out) == {3, 72, 100}
 
 
-def test_the_pool_pins_its_workers_to_the_allowed_cores_and_refuses_when_none_is_left():
+def test_the_pool_pins_each_worker_to_its_own_allowed_core_and_refuses_when_too_few_are_left():
     module = ops._host_module()
     mine = sorted(os.sched_getaffinity(0) - set(range(64, 72)))[:4]
     out = torch.zeros(4, dtype=torch.int64)
     module.exl3_ram_miss_pack_pool_affinity(_words(mine), 2, out)
-    assert _cores(out[0:2]) == set(mine) and _cores(out[2:4]) == set(mine)
+    pinned = [_cores(out[0:2]), _cores(out[2:4])]
+    # A worker spins on its core while a read is in service, so it must own one: one CPU each, distinct, allowed.
+    assert [len(p) for p in pinned] == [1, 1] and len(pinned[0] | pinned[1]) == 2, pinned
+    assert pinned[0] | pinned[1] <= set(mine)
     # Only reserved cores: refused before a thread starts.
     with pytest.raises(RuntimeError, match="no core is left"):
         module.exl3_ram_miss_pack_pool_affinity(_words(range(64, 72)), 2, out)
+    # Fewer allowed cores than workers: two spinners would share one, each at half speed.
+    with pytest.raises(RuntimeError, match="need a core each"):
+        module.exl3_ram_miss_pack_pool_affinity(_words(mine[:1]), 2, out)
+
+
+def _physical_core(cpu):
+    base = f"/sys/devices/system/cpu/cpu{cpu}/topology/"
+    try:
+        with open(base + "physical_package_id") as package, open(base + "core_id") as core:
+            return int(package.read()), int(core.read())
+    except OSError:
+        return None
+
+
+def test_workers_take_separate_physical_cores_before_hyperthread_siblings():
+    """Two workers spinning on one core's two hyperthreads share its execution units and each copies at about half
+    speed, so while the allowed set has enough cores the pool gives each worker a whole one."""
+    by_core = {}
+    for cpu in sorted(os.sched_getaffinity(0) - set(range(64, 72))):
+        by_core.setdefault(_physical_core(cpu), []).append(cpu)
+    siblings = next((cpus[:2] for core, cpus in by_core.items() if core is not None and len(cpus) >= 2), None)
+    others = [cpus[0] for core, cpus in by_core.items() if core is not None and siblings and siblings[0] not in cpus]
+    other = others[0] if others else None
+    if siblings is None or other is None:
+        pytest.skip("needs a core with two allowed hyperthreads, and another core")
+    out = torch.zeros(4, dtype=torch.int64)
+    ops._host_module().exl3_ram_miss_pack_pool_affinity(_words(siblings + [other]), 2, out)
+    pinned = _cores(out[0:2]) | _cores(out[2:4])
+    assert len({_physical_core(cpu) for cpu in pinned}) == 2, (siblings, other, pinned)
+
+
+def test_workers_spin_only_while_the_pool_is_active_and_every_switch_hands_off():
+    """While a read is in service the workers spin on their cores, so a piece's chunks start without a futex wake or
+    an idle-state exit; otherwise they park. A post must reach them parked, spinning, and parked again (a lost wakeup
+    leaves a job queued with every worker asleep); a pool that is not active must burn no CPU (a missed switch-off
+    holds every worker's core at 100% for the life of the process); a pool destroyed while spinning must join."""
+    mine = sorted(os.sched_getaffinity(0) - set(range(64, 72)))[:2]
+    if len(mine) < 2:
+        pytest.skip("needs two allowed cores")
+    out = torch.zeros(6, dtype=torch.int64)
+    ops._host_module().exl3_ram_miss_pack_pool_handoff(_words(mine), 2, out)
+    cold_post, active_cpu_ns, active_post, inactive_cpu_ns, recold_post, joined = out.tolist()
+    assert (cold_post, active_post, recold_post, joined) == (1, 1, 1, 1)
+    assert active_cpu_ns > 30_000_000, active_cpu_ns  # two spinners over 30 ms: well over one core's worth
+    assert inactive_cpu_ns < 3_000_000, inactive_cpu_ns  # parked
 
 
 # ---- Workers copy concurrently, and they copy what the owner vetted ----
@@ -277,6 +325,7 @@ def test_a_failure_returns_only_when_no_copy_is_still_running(tmp_path, packing)
     )
     assert results == (0, 0)  # the failed read, and no second one
     assert stats["unfinished_jobs"] == 0
+    assert stats["pool_active"] == 0  # the workers park again on the way out, failure included
     assert took >= 0.9 * DELAY_NS / 1e9  # it waited for the copies it had started
     split._exact_or_untouched(s, 1, experts, slots)
 

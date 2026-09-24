@@ -236,13 +236,13 @@ def read_rows_with_fault(
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
-    ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0) and
-    ``pack_workers``.
+    ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0),
+    ``pack_workers`` and ``pool_active`` (whether the workers were still spinning then: always 0).
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
-    results = torch.zeros(8, dtype=torch.int64)
+    results = torch.zeros(9, dtype=torch.int64)
     _host_module().exl3_ram_miss_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
@@ -251,7 +251,7 @@ def read_rows_with_fault(
     if stats is not None:
         stats.update(
             stale_cqes=int(results[4]), generation_wraps=int(results[5]), unfinished_jobs=int(results[6]),
-            pack_workers=int(results[7]),
+            pack_workers=int(results[7]), pool_active=int(results[8]),
         )
     return int(results[0]), int(results[1])
 
