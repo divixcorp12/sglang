@@ -76,14 +76,15 @@ def test_sign_test_rejects_out_of_range_wins():
 
 
 def test_expected_session_ids_match_n_sessions():
-    assert len(session_subset.EXPECTED_SESSION_IDS) == session_subset.N_SESSIONS == 8
+    assert len(session_subset.EXPECTED_SESSION_IDS) == session_subset.N_SESSIONS == 2
+    assert session_subset.EXPECTED_SESSION_IDS == session_subset.CORPUS_8_SESSION_IDS[:2]
 
 
 def test_baseline_4_session_subset_is_the_first_4_and_unchanged():
-    assert session_subset.BASELINE_4_SESSION_IDS == session_subset.EXPECTED_SESSION_IDS[:4]
+    assert session_subset.BASELINE_4_SESSION_IDS == session_subset.CORPUS_8_SESSION_IDS[:4]
 
 
-def test_warmup_session_is_not_one_of_the_8_timed_sessions():
+def test_warmup_session_is_not_one_of_the_timed_sessions():
     assert session_subset.WARMUP_SESSION_ID not in session_subset.EXPECTED_SESSION_IDS
 
 
@@ -180,10 +181,10 @@ def test_parse_proc_environ_splits_nul_separated_kv():
 # --- result gate (rule 5) ---
 
 
-def test_result_gate_passes_on_exactly_8_clean_records(tmp_path):
+def test_result_gate_passes_on_exactly_2_clean_records(tmp_path):
     path = tmp_path / "results.jsonl"
     with open(path, "w") as f:
-        for i in range(8):
+        for i in range(2):
             f.write(json.dumps({"session_id": f"s{i}"}) + "\n")
     results_gate.check_result_gate(results_gate.load_results(str(path)))
 
@@ -191,7 +192,7 @@ def test_result_gate_passes_on_exactly_8_clean_records(tmp_path):
 def test_result_gate_rejects_wrong_record_count(tmp_path):
     path = tmp_path / "results.jsonl"
     with open(path, "w") as f:
-        for i in range(7):
+        for i in range(1):
             f.write(json.dumps({"session_id": f"s{i}"}) + "\n")
     with pytest.raises(results_gate.ResultGateError):
         results_gate.check_result_gate(results_gate.load_results(str(path)))
@@ -200,9 +201,9 @@ def test_result_gate_rejects_wrong_record_count(tmp_path):
 def test_result_gate_rejects_any_error_record(tmp_path):
     path = tmp_path / "results.jsonl"
     with open(path, "w") as f:
-        for i in range(7):
+        for i in range(1):
             f.write(json.dumps({"session_id": f"s{i}"}) + "\n")
-        f.write(json.dumps({"session_id": "s7", "error": "timeout"}) + "\n")
+        f.write(json.dumps({"session_id": "s1", "error": "timeout"}) + "\n")
     with pytest.raises(results_gate.ResultGateError):
         results_gate.check_result_gate(results_gate.load_results(str(path)))
 
@@ -313,7 +314,7 @@ def _write_arm(
 ):
     arm_dir = tmp_path / name
     arm_dir.mkdir()
-    ids = session_ids or list(session_subset.EXPECTED_SESSION_IDS[: len(tok_s_by_session)])
+    ids = session_ids or list(session_subset.CORPUS_8_SESSION_IDS[: len(tok_s_by_session)])
     with open(arm_dir / "results.jsonl", "w") as f:
         for sid, tok_s in zip(ids, tok_s_by_session):
             f.write(json.dumps({"session_id": sid, "decode_tokens_per_sec": tok_s, "ttft": 60.0}) + "\n")
@@ -328,7 +329,7 @@ def _write_arm(
                 )
                 + "\n"
             )
-    manifest = {"tenancy_start": tenancy_fields, "tenancy_end": tenancy_fields}
+    manifest = {"tenancy_start": tenancy_fields, "tenancy_end": tenancy_fields, "session_ids": ids}
     (arm_dir / "run-manifest.json").write_text(json.dumps(manifest))
     return str(arm_dir)
 
@@ -366,6 +367,25 @@ def test_paired_compare_reports_the_headline_statistics(tmp_path):
     assert result["ratio_median"] == pytest.approx(1.5)
 
 
+def test_paired_compare_refuses_two_vs_eight_session_arms(tmp_path):
+    a = _write_arm(tmp_path, "a", tok_s_by_session=[2.0] * 2, tenancy_fields=_TENANCY_FIELDS)
+    b = _write_arm(tmp_path, "b", tok_s_by_session=[3.0] * 8, tenancy_fields=_TENANCY_FIELDS)
+    with pytest.raises(ValueError, match="different timed session sets"):
+        paired.compare(a, b)
+
+
+def test_paired_load_refuses_results_not_matching_manifest(tmp_path):
+    arm = _write_arm(tmp_path, "a", tok_s_by_session=[2.0] * 2, tenancy_fields=_TENANCY_FIELDS)
+    manifest_path = os.path.join(arm, "run-manifest.json")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    manifest["session_ids"] = list(reversed(manifest["session_ids"]))
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f)
+    with pytest.raises(ValueError, match="do not match the run manifest"):
+        paired.load_arm(arm)
+
+
 def test_paired_compare_raises_on_missing_clock_samples(tmp_path):
     a_dir = tmp_path / "a"
     a_dir.mkdir()
@@ -374,7 +394,7 @@ def test_paired_compare_raises_on_missing_clock_samples(tmp_path):
             f.write(json.dumps({"session_id": f"s{i}", "decode_tokens_per_sec": 2.0}) + "\n")
     (a_dir / "clocks.jsonl").write_text("")
     (a_dir / "compile.jsonl").write_text("")
-    (a_dir / "run-manifest.json").write_text(json.dumps({"tenancy_start": _TENANCY_FIELDS}))
+    (a_dir / "run-manifest.json").write_text(json.dumps({"tenancy_start": _TENANCY_FIELDS, "session_ids": [f"s{i}" for i in range(8)]}))
     b = _write_arm(tmp_path, "b", tok_s_by_session=[2.0] * 8, tenancy_fields=_TENANCY_FIELDS, session_ids=[f"s{i}" for i in range(8)])
     with pytest.raises(ValueError):
         paired.compare(str(a_dir), b)
@@ -382,7 +402,7 @@ def test_paired_compare_raises_on_missing_clock_samples(tmp_path):
 
 def test_paired_compare_refuses_a_compile_contaminated_session(tmp_path):
     tok_s = [2.0] * 8
-    ids = list(session_subset.EXPECTED_SESSION_IDS)
+    ids = list(session_subset.CORPUS_8_SESSION_IDS)
     a = _write_arm(tmp_path, "a", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS, contaminated_ids=[ids[3]])
     b = _write_arm(tmp_path, "b", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS)
     with pytest.raises(paired.CompileContaminationError):

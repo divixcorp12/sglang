@@ -16,7 +16,7 @@ acknowledging the unknowable form of the check does not drop the check.
 **Known, currently-unresolved consequence: every arm reads INVALID.**
 `check_arm` requires `per_session[i]["step_latency"]` to carry real percentiles;
 `report_builder.STEP_LATENCY_UNAVAILABLE` is honest about not having them (see that
-module's docstring for why). `judge()` therefore always returns at least 8 PROBLEM
+module's docstring for why). `judge()` therefore returns a PROBLEM for each session
 lines of the form "session N: no step latency (...)" until that gap closes. This is
 surfaced, not hidden: `judge()` returns them like any other problem, and
 `compile_and_clock_are_the_only_problems` tells a caller whether the remaining,

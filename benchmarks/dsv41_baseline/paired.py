@@ -27,6 +27,7 @@ from pathlib import Path
 from clock_ramp import clock_profiles_compatible
 from metrics import median_tok_s, one_sided_sign_test
 from results_gate import check_result_gate, load_results
+from session_subset import N_SESSIONS
 from tenancy import parse_tenancy, tenancy_compatible
 
 
@@ -59,8 +60,12 @@ def _load_jsonl_by_session(path: str) -> dict[str, dict]:
 
 def load_arm(arm_dir: str) -> tuple[list[dict], dict[str, dict], dict]:
     arm_dir = Path(arm_dir)
+    manifest = json.loads((arm_dir / "run-manifest.json").read_text())
     records = load_results(str(arm_dir / "results.jsonl"))
-    check_result_gate(records)
+    expected_count = len(manifest["session_ids"]) if "session_ids" in manifest else N_SESSIONS
+    check_result_gate(records, expected_count=expected_count)
+    if "session_ids" in manifest and [r["session_id"] for r in records] != manifest["session_ids"]:
+        raise ValueError(f"{arm_dir}: result sessions do not match the run manifest")
     clocks = _load_jsonl_by_session(str(arm_dir / "clocks.jsonl"))
     missing_clocks = [r["session_id"] for r in records if r["session_id"] not in clocks]
     if missing_clocks:
@@ -74,7 +79,6 @@ def load_arm(arm_dir: str) -> tuple[list[dict], dict[str, dict], dict]:
             f"{arm_dir}: JIT compilation occurred during these sessions' timed window: "
             f"{contaminated}; their timing is not usable"
         )
-    manifest = json.loads((arm_dir / "run-manifest.json").read_text())
     return records, clocks, manifest
 
 
@@ -105,9 +109,9 @@ def compare(a_dir: str, b_dir: str, *, a_name: str = "A", b_name: str = "B") -> 
             f"{statistics.fmean(b_clock_samples):.0f} MHz); not comparable"
         )
 
+    if {r["session_id"] for r in a_records} != {r["session_id"] for r in b_records}:
+        raise ValueError(f"{a_name} and {b_name} used different timed session sets")
     pairs = pair_sessions(a_records, b_records)
-    if not pairs:
-        raise ValueError(f"no paired sessions between {a_name} and {b_name}")
 
     per_session = []
     wins = 0

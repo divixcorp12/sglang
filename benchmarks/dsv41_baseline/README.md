@@ -22,7 +22,7 @@ themselves used: `analysis/dsv41-phase3a/wc-step7.sh` (the command that produced
 256 --new-tokens 128` against
 `divix01:/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl`
 (sha256 `249e8a73a32b69aff563471dbae2f4f3a2a9beaa1a3ae5cb03b4c2c549c16c72`), a real
-corpus, unchanged. `synthetic_corpus.py` reuses that recipe — the same 8 sessions, the
+corpus, unchanged. `synthetic_corpus.py` reuses that recipe — the first 2 sessions, the
 same 256-token truncation of each one's real first-turn text — but re-decodes the
 truncated tokens back to text and wraps each as a one-turn chat session, so it can be
 driven over `/v1/chat/completions` (`trace_corpus.py` instead fed raw token ids
@@ -32,13 +32,13 @@ mismatch; it never regenerates or modifies the corpus, and `assert_fits_context`
 refuses any prompt+generation that would exceed the configured context before it is
 ever sent.
 
-**8 sessions, and the first 4 are exactly `corpus-c.json`'s sessions** (the recorded
-2.781 tok/s baseline). The corpus overlap aids workload comparisons, but the new
-launch settings prevent a direct throughput comparison with that number. The extra
-4 buy statistical power: 8 sessions gives a clean-sweep
-sign test p ~= 0.0039 (1/256); 4 alone only reaches p = 0.0625.
+**The timed set is the first 2 sessions of the pinned 8-session corpus.** They overlap
+`corpus-c.json`'s sessions (the recorded 2.781 tok/s baseline), but the new launch
+settings prevent a direct throughput comparison with that number. Two sessions keep
+each arm short; a clean-sweep paired sign test only reaches p = 0.25, so treat the
+result as directional rather than statistically decisive.
 
-A 9th real corpus session (index 8, `fb-financebench_id_04209`, not one of the 8 timed
+A 9th real corpus session (index 8, `fb-financebench_id_04209`, not one of the 2 timed
 ones) is the warm-up session — discarded from timing and reused each warm-up round
 (see below).
 
@@ -233,9 +233,10 @@ is compile-quiet-and-clock-stable rather than "wait N seconds": it does not assu
 fixed startup time, on purpose.
 
 Budget accordingly: startup (128-430 s, observed range) + clock/compile
-stabilization (a handful of warm-up rounds) + 8 sessions x (TTFT ~55-99 s + 127 decode
+stabilization (a handful of warm-up rounds) + 2 sessions x (TTFT ~55-99 s + 127 decode
 tokens at ~2.2-3.5 tok/s — **prefill is roughly half the wall clock**, not a rounding
-error on decode). Call it 20-30 minutes wall time per arm, not a fixed 20-25.
+error on decode). Allow for several minutes of startup and warm-up in addition to
+the two timed sessions.
 
 ## THE NOISE FLOOR IS UNMEASURED FOR THIS PROTOCOL
 
@@ -255,7 +256,7 @@ per session, without saying so explicitly.
 
 ## The comparison is always per-session, never arm-mean-vs-arm-mean
 
-Per-session tok/s varies more than 60% across this corpus's 8 different prompts
+Historical per-session tok/s varied more than 60% across this corpus's prompts
 (2.18-3.53 tok/s in the recorded 4-session arms) because prompt content — not whatever
 changed between arms — dominates it. `paired.py` therefore only ever joins two arms
 **by session_id** and reports **per-session** deltas, ratios, win count, and a
@@ -273,7 +274,7 @@ sessions as context.
 3. **Verify env from `/proc/<pid>/environ`**, string-compared against a per-condition
    expected literal; abort on mismatch (`run_arm.sh`, `tenancy.verify_env`) — the live
    server process's real environment, not what the launcher thinks it set.
-4. **Result gate**: exactly 8 records and 0 errors, or abort (`results_gate.py`).
+4. **Result gate**: exactly 2 records and 0 errors, or abort (`results_gate.py`).
 5. **Health gate**: up to 900 s of `curl -sf /health`. `/health` runs a real
    generation and is slow cold; never shorten this.
 6. **A warm-up before the timed set is mandatory**, not optional — extended into as
@@ -309,8 +310,8 @@ the Qwen campaign's split, and caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 - `arm_env.py` — the DSV4.1 EXL3 recipe (env vars from phase 3b's `env-full.sh`) and
   the `sglang serve` CLI flags. `arm_env(overrides)` layers a V2 storage-change arm's
   overrides onto the base env; `ServerArgs.argv()` builds the server command line.
-- `session_subset.py` — the pinned real corpus path/checksum, the 8-session shape
-  (`--n 8 --skip 0 --prompt-tokens 256 --new-tokens 128`), the expected session_id
+- `session_subset.py` — the pinned real corpus path/checksum, the 2-session shape
+  (`--n 2 --skip 0 --prompt-tokens 256 --new-tokens 128`), the expected session_id
   order, and the dedicated warm-up session.
 - `synthetic_corpus.py` — truncates each real session's first turn to 256 tokens and
   re-decodes it into a one-turn chat session; `assert_fits_context` refuses an
@@ -322,7 +323,7 @@ the Qwen campaign's split, and caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 - `metrics.py` — tok/s formula, median (context only), one-sided sign test. Pure, no I/O.
 - `tenancy.py` — tenancy capture/comparison, `/proc/<pid>/environ` parsing and
   verification. Pure except `capture_tenancy`, which shells out to `nvidia-smi`/`ss`.
-- `results_gate.py` — the exactly-8-records-0-errors gate.
+- `results_gate.py` — the exactly-2-records-0-errors gate.
 - `task1_verdict.py` — sha256-pinned loader for the real `task1_arm_verdict.py`
   (divix01, outside any repo — see "One harness, not two" below).
 - `generations.py` — this campaign's `{python tree: label}` registry, checked with
@@ -341,7 +342,7 @@ the Qwen campaign's split, and caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 - `run_arm.sh` — preflight (clean tree, optionally pinned to `EXPECT_SHA`), the
   generation gate, builds the synthetic corpus, launches one cold server, runs the
   health gate, verifies env, runs the readiness gate (SM clock stable + JIT compile
-  quiet), then the 8-session timed set with per-session clock/cpu_s/compile-status
+  quiet), then the 2-session timed set with per-session clock/cpu_s/compile-status
   samples and boundary samples (hard-aborting on a mid-session compile event), the
   result gate, builds `report.json` and judges it (`verdict.txt`), and writes
   `run-manifest.json`. Usage: `run_arm.sh <arm_name> <port> [KEY=VAL ...]`. Accepts

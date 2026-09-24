@@ -2,7 +2,7 @@
 # Runs one DSV4.1 baseline arm end to end: preflight (clean tree, registered code
 # generation), corpus checksum, synthetic-session build, cold HTTP server (production
 # context length and prefix-cache settings), health gate, env verification, a
-# readiness gate (SM clock stable and no further JIT compilation), the 8-session
+# readiness gate (SM clock stable and no further JIT compilation), the 2-session
 # timed set (aborting hard on any
 # mid-session compile event; provenance, clocks, cpu_s and page-cache residency
 # sampled throughout), a verdict judged by Task 1's own `check_arm`/`contention`/
@@ -25,8 +25,8 @@
 #
 # Cost: ~200 s server startup + a readiness loop (clock stability + JIT compile
 # settling; the smoke launch saw a 34 s Triton compile land mid-decode after /health
-# was already 200) + 8 sessions x (TTFT ~55-99 s + 127 decode tokens at ~2.2-3.5
-# tok/s). Call it 20-25 minutes wall time. The mandatory warm-up means this number may
+# was already 200) + 2 sessions x (TTFT ~55-99 s + 127 decode tokens at ~2.2-3.5
+# tok/s). The mandatory warm-up means this number may
 # differ slightly from the recorded 2.781 tok/s by construction; see README.md.
 set -uo pipefail
 
@@ -93,7 +93,7 @@ echo "generation ok: $python_tree = $generation_label"
 got_checksum=$(sha256sum "$corpus" | awk '{print $1}')
 [ "$got_checksum" = "$corpus_checksum" ] || abort "corpus checksum mismatch: got $got_checksum expected $corpus_checksum"
 
-# --- build the 8 timed + 1 warm-up synthetic sessions (real text, truncated to 256
+# --- build the 2 timed + 1 warm-up synthetic sessions (real text, truncated to 256
 #     tokens, re-decoded); asserts each fits context_length before anything is sent ---
 synthetic_sessions=$run_dir/synthetic-sessions.jsonl
 pyrun -c "
@@ -413,15 +413,8 @@ cpu_path=$run_dir/cpu.jsonl
 # is given, so a shortened arm is a diagnostic capture, never a baseline number.
 timed_sessions_done=0
 timed_rc=0
-for session_id in \
-    'cfq-train-Single_CDW/2015/page_35.pdf-2' \
-    'cfq-train-Single_ETR/2004/page_261.pdf-1' \
-    'cfq-train-Single_TSCO/2018/page_31.pdf-1' \
-    'cfq-train-Double_BKR/2017/page_47.pdf' \
-    'cfq-val-Single_K/2013/page_62.pdf-1' \
-    'cfq-train-Single_DISCA/2016/page_11.pdf-1' \
-    'cfq-train-Single_WRK/2019/page_49.pdf-1' \
-    'cfq-train-Single_VLO/2012/page_27.pdf-2'
+mapfile -t timed_session_ids < <(pyrun -c "import session_subset as ss; print(*ss.EXPECTED_SESSION_IDS, sep=chr(10))")
+for session_id in "${timed_session_ids[@]}"
 do
     before_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
     clock_start=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
@@ -489,11 +482,12 @@ print(json.dumps(msgspec.to_builtins(tenancy.capture_tenancy())))
 stop_server
 [ "$timed_rc" = 0 ] || abort "$arm driver rc=$timed_rc"
 
-# --- result gate: exactly 8 records, 0 errors, or abort ---
+# --- result gate: exactly N_SESSIONS records, 0 errors, or abort ---
 pyrun -c "
 from results_gate import load_results, check_result_gate
+from session_subset import N_SESSIONS
 check_result_gate(load_results('$run_dir/results.jsonl'))
-print('result gate OK: 8 records, 0 errors')
+print(f'result gate OK: {N_SESSIONS} records, 0 errors')
 " || abort "$arm result gate failed"
 
 # --- build the Task-1-shaped report, judge it with Task 1's own check_arm/contention/

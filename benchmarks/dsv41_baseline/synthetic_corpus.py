@@ -1,4 +1,4 @@
-"""Build the 8 (+1 warm-up) synthetic single-turn sessions the HTTP driver runs.
+"""Build the timed (+1 warm-up) synthetic single-turn sessions the HTTP driver runs.
 
 Each real corpus session's first-turn text is truncated to `PROMPT_TOKENS` by the
 DSV4.1 tokenizer and re-decoded to a string, then wrapped as a one-turn session in

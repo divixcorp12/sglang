@@ -16,11 +16,9 @@ tokens. Historical 4,096-token results are not directly comparable: the longer
 context changes memory allocation, and the current launch also enables prefix caching.
 
 `corpus-c.json` (the recorded 2.781 tok/s baseline, DSV41_REFERENCE.md section 17.6)
-used only the first 4 of these 8 sessions. `N_SESSIONS=8` keeps those 4 first and
-unchanged, preserving corpus overlap, but the new launch settings require a fresh
-throughput baseline. The extra 4 sessions buy statistical power for the paired sign
-test (8 sessions of a clean sweep gives p ~= 0.0039 vs 4 sessions' p = 0.0625,
-short of conventional significance).
+used the first 4 of these 8 sessions. The quick serving benchmark times the first
+2 sessions. The full 8-session order remains pinned here for historical reports.
+Two sessions keep each arm short but provide limited power for paired comparisons.
 """
 
 from __future__ import annotations
@@ -33,14 +31,14 @@ from arm_env import CONTEXT_LENGTH
 CORPUS_PATH = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
 CORPUS_SHA256 = "249e8a73a32b69aff563471dbae2f4f3a2a9beaa1a3ae5cb03b4c2c549c16c72"
 
-N_SESSIONS = 8
+N_SESSIONS = 2
 SKIP = 0
 PROMPT_TOKENS = 256
 NEW_TOKENS = 128
 
 # The 8 session_ids at (skip=0, n=8) in this corpus. The first 4 are exactly
 # `corpus-c.json`'s sessions.
-EXPECTED_SESSION_IDS = (
+CORPUS_8_SESSION_IDS = (
     "cfq-train-Single_CDW/2015/page_35.pdf-2",
     "cfq-train-Single_ETR/2004/page_261.pdf-1",
     "cfq-train-Single_TSCO/2018/page_31.pdf-1",
@@ -50,10 +48,11 @@ EXPECTED_SESSION_IDS = (
     "cfq-train-Single_WRK/2019/page_49.pdf-1",
     "cfq-train-Single_VLO/2012/page_27.pdf-2",
 )
-BASELINE_4_SESSION_IDS = EXPECTED_SESSION_IDS[:4]
+EXPECTED_SESSION_IDS = CORPUS_8_SESSION_IDS[:N_SESSIONS]
+BASELINE_4_SESSION_IDS = CORPUS_8_SESSION_IDS[:4]
 
 # Session 8 (the 9th row) of the same real corpus: a real, un-invented session that is
-# not one of the 8 timed ones, used only to discard the first request's one-time cost
+# not one of the timed ones, used only to discard the first request's one-time cost
 # and to bring the idle card's SM clock up before timing starts (see clock_ramp.py).
 WARMUP_SESSION_INDEX = 8
 WARMUP_SESSION_ID = "fb-financebench_id_04209"
