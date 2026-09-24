@@ -461,7 +461,7 @@ makes the word visible, and nothing else.
 | `LaneRequest[idx]` | device post kernel | before `demand_head` is stored | service | after acquiring `demand_head` and passing the seqlock re-check, lane `i`'s expert is `expert[i]` for request `G` |
 | `LaneAck[idx][lane]` | device ack kernel | after the copy kernel for that lane completed | service | tag CONSUMED / VIOLATED with `gen == G`: that lane's copy finished; nothing else. Not an ordering statement about any other word |
 | `Terminal[idx]` | device wait/finalize kernel | once per request, only if some lane is skipped | service | `skipped_mask` lanes will never read a source. Lanes not in the mask may still be copying, and will acknowledge |
-| `PieceMask[idx][lane]` [piece-streaming plan] | service | one CAS per piece, in `collect_packed`, once that piece job's `done()` holds | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above. The service stores `G << 8` (no bits) at reservation, fenced before the request's first ready word |
+| `PieceMask[idx][lane]` [piece-streaming plan] | service | one CAS per piece: in `collect_packed` once that piece job's `done()` holds, or in `dispatch_ready_pieces` for a piece with no bytes (nothing to store) | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above. The service stores `G << 8` (no bits) at reservation, fenced before the request's first ready word |
 
 **E1 amendment (piece-streaming plan).** E1 (the row above and 6.6's `.nc` argument)
 says a leased slot's bytes are final and immutable from readiness. That holds unchanged for
@@ -486,8 +486,9 @@ read is released as before. With the flag off, no miss slot is leased before the
 and a failed read releases its slots exactly as it always has.
 
 Nothing in the lease block is ever written by Python, and nothing is written by two
-actors. **Words are write-once per generation.** They are never cleared; validity is the
-generation compare, not a flag.
+actors. **Words are write-once per generation**, with one exception: a `PieceMask` word is
+written up to 9 times per generation, all by the service (the reservation-time `G << 8`, then
+one CAS per piece). They are never cleared; validity is the generation compare, not a flag.
 
 The existing page words keep their owners **[E]**: `demand_head`, `fatal` and the
 demand-ring records by the device; `demand_done`, `advise_done`, `busy_seq`,
