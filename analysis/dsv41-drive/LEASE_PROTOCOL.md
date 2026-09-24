@@ -1216,6 +1216,13 @@ Everything a still-running or possibly-running GPU kernel may read *or write*:
 Not quarantined: the C++ `RamTier` and its io_uring, file descriptors and bounce buffer.
 Nothing GPU-side touches them. (Whether io_uring teardown waits for an in-flight O_DIRECT
 read into a slab is a *storage-side* question this document does not settle: **[OPEN 10]**.)
+With row images (`SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES`) every read is an O_DIRECT readv into the slabs
+themselves, so the question is no longer hypothetical; what answers it is the reader, not io_uring teardown:
+`RowReader::read()` never returns with a read in flight (a failed read drains the ring first, and a drain that cannot
+complete terminates the process), and the service thread is joined before the tier closes. A slab write by the drive
+therefore always happens inside a `read()` whose slots the caller has not published, as a bounce-path memcpy did;
+what changes is that a failed read may leave part of a row in such a slot, which the caller releases or quarantines
+exactly as before.
 
 ### 14.2 How
 

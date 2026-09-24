@@ -953,10 +953,16 @@ class RowReader {
     held_.clear();
     // Whatever way this call ends, no packing worker may still be copying when it does: the caller
     // releases the slots on return and the next read reuses the bounce. Runs on exceptions too.
+    // An exception (one of the accounting guards) leaves reads in flight: drain them too before unwinding past the
+    // caller, which releases the slots. In direct mode those reads write the slab rows themselves.
     struct Quiesce {
       RowReader* reader;
-      ~Quiesce() { reader->quiesce(); }
-    } quiesce_on_exit{this};
+      int exceptions;
+      ~Quiesce() {
+        reader->quiesce();
+        if (std::uncaught_exceptions() > exceptions) reader->drain(reader->c_.pending);
+      }
+    } quiesce_on_exit{this, std::uncaught_exceptions()};
     // 0 forces the first turn to fire immediately, so a short read still gets one call before it
     // returns rather than waiting a full interval that may outlast the whole request.
     int64_t next_progress_ns = 0;
