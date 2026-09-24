@@ -184,6 +184,9 @@ class PackPool {
 
   size_t workers() const { return threads_.size(); }
 
+  // Worker i's CPU. Anything that must keep running while a read is in service stays off these.
+  const std::vector<int>& cpus() const { return cpus_; }
+
   // The affinity of worker `index` as the kernel reports it (tests).
   cpu_set_t worker_affinity(size_t index) {
     cpu_set_t set;

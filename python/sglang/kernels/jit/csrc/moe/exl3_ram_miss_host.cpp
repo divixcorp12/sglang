@@ -690,6 +690,7 @@ class RowReader {
   unsigned pack_workers() const { return pack_workers_; }
   unsigned pack_split() const { return pack_split_; }
   bool pack_pool_active() const { return pool_ && pool_->active(); }
+  std::vector<int> packing_cpus() const { return pool_ ? pool_->cpus() : std::vector<int>{}; }
 
   // Piece streaming (kSubReads sub-reads per part, per-piece vetting, packing and publishing); off by default. Before
   // open(), or on an idle reader after it (the tier sets it before its service thread starts), since it resizes the
@@ -2796,6 +2797,8 @@ class RamTier {
     return true;
   }
 
+  std::vector<int> packing_cpus() const { return reader_.packing_cpus(); }
+
   uint8_t* page() const {
     return page_;
   }
@@ -4454,12 +4457,23 @@ class RamThread {
 
  private:
   void run() {
+    pthread_setname_np(pthread_self(), "exl3-ram-miss");
     int error = 0;
     if (cpu_core_ >= 0) {
       cpu_set_t cpus;
       CPU_ZERO(&cpus);
       CPU_SET(cpu_core_, &cpus);
       error = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+    } else {
+      // Unpinned, it still keeps off the packing workers' CPUs: they spin at 100% while a read is in service, and
+      // this is the thread that feeds them. Left alone, CFS may time-slice it against one of them for milliseconds.
+      cpu_set_t cpus;
+      CPU_ZERO(&cpus);
+      if (pthread_getaffinity_np(pthread_self(), sizeof(cpus), &cpus) == 0) {
+        for (int cpu : tier_->packing_cpus()) CPU_CLR(cpu, &cpus);
+        // Best effort: a narrowing that fails leaves the thread as it was, which is how it ran before.
+        if (CPU_COUNT(&cpus) > 0) pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+      }
     }
     tier_->set_counter(kSpinCpu, error != 0 ? -error : sched_getcpu());
     pin_error_.store(error);

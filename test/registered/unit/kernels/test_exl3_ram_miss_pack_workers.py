@@ -237,6 +237,49 @@ def test_workers_take_separate_physical_cores_before_hyperthread_siblings():
     assert len({_physical_core(cpu) for cpu in pinned}) == 2, (siblings, other, pinned)
 
 
+def _cpu_list(text):
+    cpus = set()
+    for part in text.split(","):
+        first, _, last = part.partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return cpus
+
+
+def _allowed_cpus_of(name):
+    """The allowed CPUs of each thread of this process named ``name``."""
+    found = []
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as comm:
+                if comm.read().strip() != name:
+                    continue
+            with open(f"/proc/self/task/{tid}/status") as status:
+                line = next(line for line in status if line.startswith("Cpus_allowed_list:"))
+        except OSError:
+            continue  # the thread ended between the listing and the read
+        found.append(_cpu_list(line.split(":", 1)[1].strip()))
+    return found
+
+
+def test_the_unpinned_service_thread_keeps_off_the_packing_workers_cpus(tmp_path):
+    """The workers spin at 100% on their CPUs while a read is in service, and the service thread is the one that
+    feeds them: sharing a CPU with one would halve it for as long as the scheduler takes to move it."""
+    if len(os.sched_getaffinity(0) - set(range(64, 72))) < 3:
+        pytest.skip("needs three allowed cores")
+    s = ram_miss_setup(tmp_path)
+    host = Exl3RamMissHost(
+        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False,
+        pack_workers=2,
+    )
+    try:
+        host.start_thread()
+        workers, service = _allowed_cpus_of("exl3-pack"), _allowed_cpus_of("exl3-ram-miss")
+        assert len(workers) == 2 and len(service) == 1, (workers, service)
+        assert service[0] and not service[0] & (workers[0] | workers[1]), (workers, service)
+    finally:
+        host.stop()
+
+
 def test_workers_spin_only_while_the_pool_is_active_and_every_switch_hands_off():
     """While a read is in service the workers spin on their cores, so a piece's chunks start without a futex wake or
     an idle-state exit; otherwise they park. A post must reach them parked, spinning, and parked again (a lost wakeup

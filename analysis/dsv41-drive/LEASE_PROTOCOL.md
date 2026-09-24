@@ -559,7 +559,8 @@ re-read `gen`, and treat a change as a lapped record. The invalidating fence is 
 fence each seqlock needs: a release store already orders every earlier store of the
 thread, so the second fence before it (and the one before `demand_head`) added nothing and
 was removed on 2026-09-24. The post now pays three `membar.sys` (record, hot page,
-`LaneRequest` invalidates) where it paid seven. Cost per fence still unmeasured **[OPEN 5]**.
+`LaneRequest` invalidates) where it paid seven; four with advisories on (the advisory
+record's invalidate). Cost per fence still unmeasured **[OPEN 5]**.
 
 *Wait kernel*, described in section 7.3. *Acknowledgement kernel*, section 7.4.
 
