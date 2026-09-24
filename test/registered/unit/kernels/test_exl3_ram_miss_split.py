@@ -695,6 +695,12 @@ def _assert_row_causality(record, reads_per_row):
         assert len(extents) == reads_per_row[row["row"]]
         assert all(record["submit"] > 0 and extent["cqe"] > 0 for extent in extents), record
         assert row["start"] > 0 and row["end"] >= row["start"], row
+        if PIECE_STREAM:
+            # Each piece packs once its own sub-reads landed: the row's first piece after its first sub-read, and
+            # the piece that needs its last sub-read after that one.
+            assert min(extent["cqe"] for extent in extents) <= row["start"], (row, extents)
+            assert max(extent["cqe"] for extent in extents) <= row["end"], (row, extents)
+            continue
         # A row's packing starts after all of ITS extents completed.
         assert max(extent["cqe"] for extent in extents) <= row["start"], (row, extents)
     for extent in record["extent_cqe"]:

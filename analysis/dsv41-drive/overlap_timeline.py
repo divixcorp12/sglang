@@ -17,6 +17,9 @@ What a schema allows (Exl3StreamTrace.RAM_MISS_TRACE_SCHEMA; spans are NOT compa
   4: adds ``request.lanes``. 5: adds ``request.pack_workers`` / ``request.pack_split``, the packing mode.
   6: adds ``request.piece_stream``, ``extent_cqe_ns[].sub`` and ``pieces``; with piece streaming an extent is one
     sub-read of a part, and a row is still ready at its last extent's cqe.
+  7: adds ``pieces[].publish`` and ``piece_publish``. With piece streaming each piece packs on its own job, so a
+    row's pack start can precede its last extent's cqe: the per-row chain ``extent cqe <= row pack start`` does not
+    hold for such a row.
 
 Packing mode. With packing workers (SGLANG_DSV41_RAM_MISS_PACK_WORKERS) a row's pack start is when a worker
 woke and took a chunk, and the rows' spans overlap, so five inline metrics mean something else and are

@@ -1,24 +1,45 @@
-"""Piece streaming in the C++ row reader (CPU): sub-reads, piece geometry and per-piece vetting.
+"""Piece streaming in the C++ row reader and tier (CPU): sub-reads, piece geometry, per-piece vetting, packing
+and publishing.
 
 SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM reads each part of a row as up to 4 page-aligned sub-reads and cuts the
-row's needed bytes into 8 pieces, each vetted once the sub-reads it depends on have landed. Rows are still packed
-whole and nothing is published to the device yet. U1 (geometry), U2 (vetting under reordered completions) and U10
-(the flag off leaves the reader's SQE stream as it was) are the plan's names for these tests.
+row's needed bytes into 8 pieces. Each piece is vetted once the sub-reads it depends on have landed, packed by its
+own job, and published by the reader's owner into the readiness words (lease area P) of the lanes that name its row,
+with a generation-checked compare-and-swap. The tier initialises those words at reservation. U1 (geometry), U2
+(order under reordered completions), U3 (a bit implies its bytes), U6 (a double publish), U8 (the publish primitive)
+and U10 (the flag off leaves the reader as it was) are the plan's names for these tests.
 """
 
 import random
+import threading
+import time
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import test_exl3_ram_miss_split as split
+import test_exl3_ram_miss_two_phase as two_phase
+from sglang.kernels.ops.moe import exl3_lease_block as lease
 from sglang.kernels.ops.moe import exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, piece_geometry, read_rows_sqes, read_rows_traced
+from sglang.kernels.ops.moe.exl3_ram_miss import (
+    Exl3RamMissHost,
+    new_page,
+    page_word,
+    piece_geometry,
+    piece_word,
+    publish_piece,
+    read_rows_pieces,
+    read_rows_sqes,
+    read_rows_traced,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+
+from test_exl3_ram_miss_two_phase import hang_guard, running  # noqa: E402,F401  (the reused two-phase tests' fixtures)
 
 PAGE = 4096
 SUB_READS = 4
@@ -259,6 +280,127 @@ def test_u2_a_failed_sub_read_leaves_its_pieces_unvetted_and_its_row_unpacked(tm
     assert all(row1["seq"][j] == 0 for j, piece in enumerate(pieces) if piece["deps"] >> failed & 1)
 
 
+# ---- Publishing: U2's order, U3 (a bit implies its bytes), U6 (twice), U8 (the primitive) ----
+
+FULL = 0xFF
+GEN = (7 << 32) | 12345  # a request generation: an epoch over a sequence number
+MASK64 = (1 << 64) - 1
+
+
+def _words(masks):
+    return [int(word) & MASK64 for word in masks[:, 0]]
+
+
+@pytest.mark.parametrize("workers, chunks", [(1, 1), (3, 3)])
+def test_u2_pieces_publish_in_dependency_order_under_reversed_cqes_and_a_held_sub_read(tmp_path, workers, chunks):
+    """The same read as U2's, now publishing. Every piece is published after it is vetted, the pieces that depend on
+    the held sub-read after every other piece of the read, and each row's readiness word ends full under its
+    generation. The reversal is shown to have taken effect, not assumed: in a row that was not held, a later sub-read
+    landed before an earlier one."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    experts, slots = [4, 1, 2], [0, 1, 2]
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=workers,
+        pack_split=chunks, reverse_cqes=True, hold_ordinal=0, part=0, sub=1, poison=True,
+    )
+    assert result == 1 and info["refused"] == 0 and record["piece_publish_refused"] == 0
+    assert _words(masks) == [piece_word(GEN, FULL)] * len(experts)
+    assert record["pieces_published"] == PIECES * len(experts)
+    split._assert_rows(s, 1, experts, slots)
+    assert any(
+        row["sub_seq"][later] < row["sub_seq"][earlier]
+        for row in record["pieces"][1:]
+        for earlier in range(PIECES)
+        for later in range(earlier + 1, PIECES)
+    ), "no row that was not held landed its sub-reads out of order: the reversal did nothing"
+    for row in record["pieces"]:
+        assert all(row["publish"][j] > row["seq"][j] > 0 for j in range(PIECES)), row
+    sub_reads, pieces = piece_geometry(s.tables, 1, experts[0])
+    held = next(k for k, sub in enumerate(sub_reads) if (sub["part"], sub["k"]) == (0, 1))
+    dependent = [j for j, piece in enumerate(pieces) if piece["deps"] >> held & 1]
+    row0 = record["pieces"][0]
+    others = [row["publish"][j] for row in record["pieces"] for j in range(PIECES) if row["row"] or j not in dependent]
+    assert dependent and min(row0["publish"][j] for j in dependent) > max(others)
+    by_publish = [j for _, j in sorted((row0["publish"][j], j) for j in range(PIECES))]
+    assert by_publish != list(range(PIECES)) and record["pieces_out_of_order"] >= 1
+
+
+@pytest.mark.parametrize("workers, chunks", [(2, 1), (3, 3)])
+def test_u3_every_bit_a_reader_can_see_names_bytes_already_stored(tmp_path, workers, chunks):
+    """A thread polls each row's readiness word while the read runs (as the device will) and, for every bit it sees,
+    compares that piece's destination bytes with a reference copy. The slabs start as a sentinel, the bounce is
+    poisoned and every piece's copy is slow, so a bit published before its job stored the bytes (at dispatch, say)
+    is seen with the sentinel behind it."""
+    s = ram_miss_setup(tmp_path, capacity=8, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    experts, slots, ref_slots = [4, 1, 2], [0, 1, 2], [5, 6, 7]
+    assert read_rows_traced(s.tables, 1, experts, ref_slots, direct=False)[0] == 1
+    split._assert_rows(s, 1, experts, ref_slots)
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, reference=s.tables.slabs, ref_slots=ref_slots,
+        piece_stream=True, pack_workers=workers, pack_split=chunks, pack_delay_ns=10_000_000, poison=True,
+    )
+    assert result == 1 and info["refused"] == 0
+    assert info["checked"] == PIECES * len(experts) and info["differed"] == 0
+    assert info["early"] > 0  # the checker saw bits while the read was still running
+    assert _words(masks) == [piece_word(GEN, FULL)] * len(experts)
+    split._assert_rows(s, 1, experts, slots)
+
+
+def test_u6_a_piece_published_twice_is_refused_and_fails_the_read(tmp_path):
+    """A re-dispatched piece would be published a second time. The readiness word refuses it, the refusal is
+    counted, and the read fails rather than reporting a row whose piece was handled twice."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    experts, slots = [4, 1, 2], [0, 1, 2]
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=2, publish_twice=3
+    )
+    assert result == 0
+    assert info["refused"] == 1 and record["piece_publish_refused"] == 1
+    # The refused attempt changed nothing: every word still carries the generation, and only bits once each.
+    assert all(word >> 8 == GEN for word in _words(masks))
+    assert record["pieces_published"] == sum(bin(word & FULL).count("1") for word in _words(masks))
+
+
+def test_u8_the_publish_primitive_refuses_another_generation_and_a_set_bit():
+    """The owner's compare-and-swap, directly: the single-threaded reader never meets a stale publisher, so the
+    two refusals are tested here. A plain fetch_or passes neither."""
+    other = GEN + 1
+    for word in (piece_word(other), piece_word(other, 0x03)):
+        assert publish_piece(word, GEN, 0x04) == (False, word)
+    for word in (piece_word(GEN, 0x04), piece_word(GEN, FULL)):
+        assert publish_piece(word, GEN, 0x04) == (False, word)
+    assert publish_piece(piece_word(GEN), GEN, 0x04) == (True, piece_word(GEN, 0x04))
+    assert publish_piece(piece_word(GEN, 0x81), GEN, 0x04) == (True, piece_word(GEN, 0x85))
+    # The generation is 56 bits: the top one sets the word's sign bit, and nothing above it is compared.
+    top = (1 << 56) - 1
+    assert publish_piece(piece_word(top), top, 0x80) == (True, piece_word(top, 0x80))
+    assert publish_piece(piece_word(top), top | 1 << 60, 0x80) == (True, piece_word(top, 0x80))
+
+
+def test_a_sub_read_that_ends_short_leaves_its_pieces_unvetted_unpublished_and_fails_the_read(tmp_path):
+    """Sub-read 2 of part 0 of row 1 ends one page in, as a file ending there would: it retires with fewer bytes than
+    the pieces that depend on it need. Those pieces are never vetted or published and the read fails; without the
+    per-piece coverage check the bounce's poison behind them would be packed and published."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    experts, slots = [4, 1, 2], [0, 1, 2]
+    sub_reads, pieces = piece_geometry(s.tables, 1, experts[1])
+    short = next(k for k, sub in enumerate(sub_reads) if (sub["part"], sub["k"]) == (0, 2))
+    assert sub_reads[short]["length"] > PAGE
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=2, part=0, sub=2,
+        ordinal=1, part_short=PAGE, short_is_eof=True, poison=True,
+    )
+    assert result == 0 and info["refused"] == 0
+    row1, bits = record["pieces"][1], _words(masks)[1] & FULL
+    assert row1["sub_seq"][short] > 0  # it landed, short
+    dependent = [j for j, piece in enumerate(pieces) if piece["deps"] >> short & 1]
+    assert dependent and all(row1["seq"][j] == 0 and not bits >> j & 1 for j in dependent)
+
+
 # ---- U10: with the flag off the reader is today's ----
 
 
@@ -299,6 +441,10 @@ def test_u10_flag_off_issues_todays_sqes_and_credit_and_packs_the_same_bytes(tmp
     assert info == dict(sqes=len(baseline), descriptors=16 * parts, credit=16 * parts, cqes=len(baseline))
     assert record["extents"] == len(baseline) and record["submitted_bytes"] == sum(e[2] for e in baseline)
     assert all(e["sub"] == 0 for e in record["extent_cqe"]) and record["pieces_vetted"] == 0
+    assert record["pieces_published"] == record["pieces_out_of_order"] == record["piece_publish_refused"] == 0
+    # Every row packed whole, as one copy: its span is one job's, and useful bytes count each row once.
+    assert all(0 < row["start"] <= row["end"] for row in record["row_pack"])
+    assert record["useful_bytes"] == len(experts) * int(s.tables.segments[:, 3].sum())
     split._assert_rows(s, 1, experts, slots)
     if workers == 0:
         return  # piece streaming needs workers
@@ -312,6 +458,8 @@ def test_u10_flag_off_issues_todays_sqes_and_credit_and_packs_the_same_bytes(tmp
     assert _merged(on_log) == _merged(baseline) and len(on_log) > len(baseline)
     assert on_info["descriptors"] == 16 * parts * SUB_READS and on_info["credit"] == info["credit"]
     assert on_record["pending_max"] <= on_info["credit"]
+    assert on_record["pieces_published"] == PIECES * len(experts) and on_record["piece_publish_refused"] == 0
+    assert on_record["useful_bytes"] == record["useful_bytes"]
     split._assert_rows(s, 1, experts, slots)
 
 
@@ -397,30 +545,60 @@ def test_the_reader_refuses_a_slab_row_base_that_is_not_128_byte_aligned(tmp_pat
         read_rows_traced(tables, 1, [0], [0], direct=False, piece_stream=True, pack_workers=1)
 
 
-def _host(tmp_path, workers):
-    s = ram_miss_setup(tmp_path, capacity=3, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+def _host(tmp_path, workers, *, lease_mode=True, two_phase=True, piece_stream=True):
+    """A tier as the service builds it for piece streaming: lease mode, two-phase, packing workers, the flag."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False)
     host = Exl3RamMissHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=workers
     )
-    return s, page, host
-
-
-def test_the_tier_passes_the_flag_to_its_reader_before_the_thread_and_refuses_it_after(tmp_path):
-    s, page, host = _host(tmp_path, 2)
-    try:
+    if lease_mode:
+        host.enable_lease_mode()
+    if two_phase:
+        host.enable_two_phase()
+    if piece_stream:
         host.enable_piece_stream()
+    return s, page, host, LeaseSim(host, page, s.slabs)
+
+
+def _piece_word_of(sim, req, lane):
+    return sim.read_u64(sim.layout.piece_offset + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
+
+
+def _area_p(host):
+    start = host.lease_layout.piece_offset
+    return host.lease_block[start : start + lease.AREA_PIECE_MASK_BYTES]
+
+
+def _assert_mapped(s, host, experts):
+    mapping = host.mapping(1)
+    reference = s.reference(1, list(experts))
+    for i, expert in enumerate(experts):
+        for name in reference:
+            assert torch.equal(s.slabs[1][name][mapping[expert]].view(torch.uint8), reference[name][i].view(torch.uint8))
+
+
+def _serve(host, sim, lanes, timeout_s=5.0):
+    req = sim.post(1, lanes)
+    assert host.pump() == 1
+    return req, sim.wait(req, timeout_s=timeout_s)
+
+
+def test_the_tier_publishes_every_piece_of_a_read_row_into_each_lane_that_names_it(tmp_path):
+    """Expert 3 is resident (a hit); 4 and 5 are read, and 4 is named by two lanes. Every lane that names a row read
+    ends with all eight bits under the request's generation; the hit lane's word is never written."""
+    s, page, host, sim = _host(tmp_path, 2)
+    try:
+        _serve(host, sim, [3])
         host.enable_trace()
-        seq = ops.sim_post(page, 1, need=[4, 1], protect=[4, 1])
-        assert host.pump() == 1 and ops.sim_wait(page, seq, timeout_s=1.0) == 1
+        req, waited = _serve(host, sim, [3, 4, 5, 4])
+        assert waited.status == 1 and waited.go == 4
+        assert [_piece_word_of(sim, req, lane) for lane in range(4)] == [0] + [piece_word(req.gen, FULL)] * 3
         (record,) = host.drain_trace()
-        assert record["piece_stream"] == 1 and record["pieces_vetted"] == 2 * PIECES
-        assert record["extents"] == 2 * 2 * SUB_READS  # two rows, two parts, four sub-reads each
-        mapping = host.mapping(1)
-        reference = s.reference(1, [4, 1])
-        for i, expert in enumerate((4, 1)):
-            for name in reference:
-                assert torch.equal(s.slabs[1][name][mapping[expert]].view(torch.uint8), reference[name][i].view(torch.uint8))
+        assert record["piece_stream"] == 1 and record["pieces_vetted"] == record["pieces_published"] == 2 * PIECES
+        assert record["extents"] == 2 * 2 * SUB_READS and record["piece_publish_refused"] == 0
+        assert host.counters()["piece_publish_refused"] == 0
+        _assert_mapped(s, host, [4, 5])
         host.start_thread()
         with pytest.raises(RuntimeError, match="before the service thread starts"):
             host.enable_piece_stream()
@@ -428,13 +606,129 @@ def test_the_tier_passes_the_flag_to_its_reader_before_the_thread_and_refuses_it
         host.stop()
 
 
+def _serve_threaded(sim, lanes):
+    req = sim.post(1, lanes)
+    return req, sim.wait(req, timeout_s=5.0)
+
+
+def test_the_miss_lanes_words_carry_the_generation_from_reservation_while_the_read_runs(tmp_path):
+    """The words are initialised in the reservation hold, before the hit grant, not after the read: while the read
+    is held up, the hit lane's row result is already READY and each miss lane's word is the request's generation with
+    no bit. Without that initialisation every publish would be refused (another generation) and the request fail."""
+    s, page, host, sim = _host(tmp_path, 2)
+    host.start_thread(fatal_wait_s=60.0, spin_us=200)
+    try:
+        _, first = _serve_threaded(sim, [3])
+        assert first.status == 1
+        host.inject(delay_s=1.0)
+        req = sim.post(1, [3, 4])
+        seen = {}
+
+        def observe():
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline and sim.row_result(req, 0)["tag"] != lease.READY:
+                time.sleep(0.001)
+            seen["hit"] = sim.row_result(req, 0)["tag"]
+            seen["miss"] = _piece_word_of(sim, req, 1)
+            seen["done"] = page_word(page, "demand_done")
+
+        watcher = threading.Thread(target=observe)
+        watcher.start()
+        waited = sim.wait(req, timeout_s=10.0)
+        watcher.join()
+        assert seen["hit"] == lease.READY and seen["done"] != req.seq  # observed inside the read's delay
+        assert seen["miss"] == piece_word(req.gen)
+        assert waited.status == 1 and _piece_word_of(sim, req, 1) == piece_word(req.gen, FULL)
+    finally:
+        host.stop()
+
+
+def test_a_double_publish_inside_the_tier_fails_the_request_and_is_counted(tmp_path):
+    """U6 through the service: the refused publish fails the read, so the request answers failed, and the tier's
+    counter says why."""
+    s, page, host, sim = _host(tmp_path, 2)
+    try:
+        host.inject_fault(publish_twice=2)
+        req, waited = _serve(host, sim, [4, 5])
+        assert waited.status == 2
+        counters = host.counters()
+        assert counters["piece_publish_refused"] == 1 and counters["read_errors"] == 1 and counters["rows_read"] == 0
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("lease_mode, two_phase", [(False, False), (True, False)], ids=["no_leases", "no_two_phase"])
+def test_the_tier_refuses_piece_streaming_without_two_phase_and_leases(tmp_path, lease_mode, two_phase):
+    """The service refuses the flag unless two-phase and lease mode are on; the tier refuses too, per request and
+    before any slot is taken, so a misconfigured tier reads nothing and publishes nothing."""
+    s, page, host, sim = _host(tmp_path, 2, lease_mode=lease_mode, two_phase=two_phase)
+    try:
+        if lease_mode:
+            req, waited = _serve(host, sim, [4])
+            status = waited.status
+        else:
+            seq = ops.sim_post(page, 1, need=[4], protect=[4])
+            assert host.pump() == 1
+            status = ops.sim_wait(page, seq, timeout_s=1.0)
+        assert status == 2
+        counters = host.counters()
+        assert counters["piece_stream_refused"] == 1 and counters["rows_read"] == 0 and counters["read_errors"] == 0
+        assert host.mapping(1)[4] == -1 and all(state == 0 for state, *_ in host.slot_info(1))
+        assert not _area_p(host).any()
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_flag_off_a_lease_two_phase_tier_never_writes_the_readiness_words(tmp_path, workers):
+    """U10 for the tier: with the flag off, hits and misses are served as before and area P stays all zero."""
+    s, page, host, sim = _host(tmp_path, workers, piece_stream=False)
+    try:
+        for lanes in ([3], [3, 4, 5], [4, 0]):
+            _, waited = _serve(host, sim, lanes)
+            assert waited.status == 1
+        counters = host.counters()
+        assert counters["piece_stream_refused"] == counters["piece_publish_refused"] == 0
+        assert not _area_p(host).any()
+        _assert_mapped(s, host, [3, 4, 5, 0])
+    finally:
+        host.stop()
+
+
 def test_the_tier_refuses_the_flag_without_packing_workers(tmp_path):
-    _, _, host = _host(tmp_path, 0)
+    _, _, host, _ = _host(tmp_path, 0, piece_stream=False)
     try:
         with pytest.raises(RuntimeError, match="needs packing workers"):
             host.enable_piece_stream()
     finally:
         host.stop()
+
+
+# ---- The two-phase suite, served with the flag on ----
+# Its tests drive a lease-mode, two-phase tier through the Python device stand-in; here every host they build packs
+# on workers and streams pieces, so each grant and release rule they check is checked with publishing in the read.
+
+
+@pytest.fixture
+def piece_streaming_hosts(monkeypatch):
+    init = Exl3RamMissHost.__init__
+
+    def with_pieces(self, *args, pack_workers=None, **kwargs):
+        init(self, *args, pack_workers=2 if pack_workers is None else pack_workers, **kwargs)
+        self.enable_piece_stream()
+
+    monkeypatch.setattr(Exl3RamMissHost, "__init__", with_pieces)
+
+
+def _reuse_two_phase():
+    for name, test in vars(two_phase).items():
+        if name.startswith("test_") and callable(test):
+            clone = types.FunctionType(test.__code__, test.__globals__, name, test.__defaults__, test.__closure__)
+            clone.__dict__.update(test.__dict__)
+            globals()[f"{name}_with_piece_streaming"] = pytest.mark.usefixtures("piece_streaming_hosts")(clone)
+
+
+_reuse_two_phase()
 
 
 if __name__ == "__main__":

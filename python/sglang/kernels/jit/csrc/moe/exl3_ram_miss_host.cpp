@@ -194,6 +194,14 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // The sequence numbers count landings and vettings together, 1-based, per read, in the order the owner saw them, so
 // they order events that share one reap's stamp. 0: never happened. pieces_vetted counts every vetting of the read.
 // All of these are 0 with the flag off. Vetting is not publishing: nothing here is visible to the device.
+//
+// Publishing (schema 7). Each piece is packed by its own job, and the owner publishes it once that job is done:
+//   piece_publish[k][j]    when piece j of row k was published, on the same sequence as the landings and vettings;
+//   pieces_published       pieces published (each once, however many readiness words name its row);
+//   pieces_out_of_order    of those, the pieces published after a higher-numbered piece of their row;
+//   piece_publish_refused  publish attempts a readiness word refused (another generation, or the bit already set).
+// With piece streaming a row's row_pack_start/end span its pieces' jobs, so a row can start packing before its last
+// sub-read lands.
 struct StageRecord {
   int64_t seq = 0;
   int64_t kind = 0;  // kStageDemand, kStageAdvisory, kStageTouch
@@ -249,6 +257,10 @@ struct StageRecord {
   int64_t sub_land_seq[kTraceRows][kPieces] = {};
   int64_t piece_cqe[kTraceRows][kPieces] = {};
   int64_t piece_seq[kTraceRows][kPieces] = {};
+  int64_t piece_publish[kTraceRows][kPieces] = {};
+  int64_t pieces_published = 0;
+  int64_t pieces_out_of_order = 0;
+  int64_t piece_publish_refused = 0;
 };
 static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
 // A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
@@ -436,6 +448,12 @@ struct ReadFault {
   // With hold_ordinal set it also narrows the hold to that sub-read (of part `part`, or of any part when part is
   // -1), so one sub-read of a row lands last while the row's others land. With the flag off every extent is sub 0.
   int64_t sub = -1;
+  // Piece streaming only. publish_twice: the k-th piece the reader publishes (1-based, over its life) is published a
+  // second time, as a re-dispatch would; the readiness word must refuse it. short_is_eof: the part_short completion
+  // is also the end of its sub-read, as a file ending there would make it, so the sub-read retires with fewer bytes
+  // than its pieces need.
+  int64_t publish_twice = 0;
+  bool short_is_eof = false;
 };
 
 // A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
@@ -449,8 +467,9 @@ inline int64_t worker_stamp(const void* trace) {
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and pack_workers / pack_split
 // configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
 // one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
-// streaming on before it opens; word 23 is sub. Keep the layout in step with _fault_tensor in ops/moe/exl3_ram_miss.py.
-constexpr int64_t kFaultWords = 24;
+// streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof. Keep the layout in step with
+// _fault_tensor in ops/moe/exl3_ram_miss.py.
+constexpr int64_t kFaultWords = 26;
 
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;
@@ -473,6 +492,8 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.hold_ordinal = f[16];
   fault.hold_rest = f[21] != 0;
   fault.sub = f[23];
+  fault.publish_twice = f[24];
+  fault.short_is_eof = f[25] != 0;
   return fault;
 }
 
@@ -570,6 +591,37 @@ inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, Piec
   return true;
 }
 
+// Piece streaming, publishing (plan §3.4). A readiness word (lease area P) is generation56 << 8 | bits8. The service
+// initialises it to piece_word(generation) at reservation; the reader's owner then sets one bit per packed piece.
+inline uint64_t piece_word(uint64_t generation) {
+  return (generation & ((uint64_t{1} << 56) - 1)) << 8;
+}
+
+// Set `bit` in `word` only while the word still carries `generation` and does not have the bit: false (the word
+// untouched) otherwise. A late publish from an older request fails the generation check instead of setting a bit
+// under the new one, and a piece published twice fails the bit check. Release: the caller acquired the piece's
+// packing (PackJob::done) before calling, so the device that acquires the bit sees the bytes.
+inline bool publish_piece(uint64_t* word, uint64_t generation, uint8_t bit) {
+  const uint64_t expected = generation & ((uint64_t{1} << 56) - 1);
+  uint64_t old = __atomic_load_n(word, __ATOMIC_RELAXED);
+  while (true) {
+    if ((old >> 8) != expected || (old & bit) != 0) return false;
+    if (__atomic_compare_exchange_n(word, &old, old | bit, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return true;
+  }
+}
+
+// Where the owner publishes a row's pieces: every readiness word naming the row, one per lane (at most kLeaseLanes,
+// checked where the lease block is laid out). `rows` is indexed by the row's ordinal in the read.
+constexpr int kPieceTargets = 8;
+struct PieceTarget {
+  uint64_t* words[kPieceTargets] = {};
+  int count = 0;
+};
+struct PiecePublish {
+  uint64_t generation = 0;
+  const PieceTarget* rows = nullptr;
+};
+
 // io_uring superset reads of whole expert rows into page-aligned bounce banks, then the
 // per-name split into the pinned slabs (Exl3ShardRowSource.read's copies).
 //
@@ -586,8 +638,10 @@ inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, Piec
 //                    gone before the kernel may write into it again.
 //   * reading rows   at most `max_reading_rows` rows with I/O outstanding (an advisory reads one).
 // A row is packed as soon as ITS extents have completed, while other rows are still in flight, and
-// every completed row is packed before the call returns. read() itself publishes nothing: the caller
+// every completed row is packed before the call returns. read() itself publishes no row: the caller
 // keeps the slots LOADING until read() returns 1, so no row is visible before the whole request is.
+// With piece streaming each vetted piece is packed by its own job, and the owner publishes it into the
+// caller's readiness words (PiecePublish) once that job is done; the slot map is still the caller's.
 // Packing writes only into the caller's not-yet-published slots and only from a slot whose extents
 // have all completed, so a failure leaves at most fully packed rows in unpublished slots, never a
 // half-packed one, and the caller releases them.
@@ -614,7 +668,8 @@ class RowReader {
   const Tables& tables() const { return t_; }
 
   // Pack on `workers` copy threads instead of the owner (0: on the owner, the default), each row in
-  // `split` byte-range chunks (0: one per worker). Takes effect at open().
+  // `split` byte-range chunks (0: one per worker); with piece streaming each piece, about an eighth of a
+  // row, is cut that way instead. Takes effect at open().
   void set_pack(int64_t workers, int64_t split) {
     pack_workers_ = static_cast<unsigned>(std::max<int64_t>(0, workers));
     pack_split_ = split > 0 ? static_cast<unsigned>(split) : pack_workers_;
@@ -622,10 +677,11 @@ class RowReader {
   unsigned pack_workers() const { return pack_workers_; }
   unsigned pack_split() const { return pack_split_; }
 
-  // Piece streaming (kSubReads sub-reads per part, per-piece vetting); off by default. Before open(), or on an idle
-  // reader after it (the tier sets it before its service thread starts), since it resizes the descriptor arrays.
-  // Refused without packing workers (the inline path has no piece publisher), with more mirror parts than the
-  // pieces can name, or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
+  // Piece streaming (kSubReads sub-reads per part, per-piece vetting, packing and publishing); off by default. Before
+  // open(), or on an idle reader after it (the tier sets it before its service thread starts), since it resizes the
+  // descriptor arrays and the packing queue. Refused without packing workers (the inline path has no piece
+  // publisher), with more mirror parts than the pieces can name, or when a slab row base is not kPieceAlign-aligned
+  // (a piece's cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
       if (pack_workers_ == 0) throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
@@ -643,8 +699,11 @@ class RowReader {
     piece_stream_ = on;
     subs_ = on ? kSubReads : 1;
     if (ring_ready_ && !size_extents()) throw std::runtime_error("exl3 RAM miss: too many descriptors for piece streaming");
+    if (pool_) size_jobs();
   }
   bool piece_stream() const { return piece_stream_; }
+  // Pieces a readiness word refused to publish, over the reader's life (each also failed its read).
+  int64_t publish_refused() const { return publish_refused_; }
   // Test only (U10): the descriptor count and the ring credit this reader runs with.
   size_t descriptors() const { return descs_.size(); }
   unsigned credit() const { return queue_depth(); }
@@ -663,6 +722,13 @@ class RowReader {
   int64_t unfinished_jobs() const {
     int64_t open_jobs = 0;
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      if (piece_stream_) {
+        const uint8_t held = rows_[s].dispatched & static_cast<uint8_t>(~rows_[s].published);
+        for (int j = 0; j < kPieces; ++j) {
+          if ((held >> j & 1u) && !jobs_[s * kPieces + static_cast<size_t>(j)].done()) ++open_jobs;
+        }
+        continue;
+      }
       if (rows_[s].state == RowState::Packing && !jobs_[s].done()) ++open_jobs;
     }
     return open_jobs;
@@ -735,10 +801,12 @@ class RowReader {
       }
       owner_pinned_ = true;
     }
+    if (piece_stream_ && pack_workers_ == 0) throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
     if (pack_workers_ > 0) {
       // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
       runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
       pool_ = std::make_unique<PackPool>(pack_workers_, inherited, static_cast<size_t>(kBounceSlots));
+      if (piece_stream_) size_jobs();
     }
     return true;
   }
@@ -775,7 +843,8 @@ class RowReader {
       StageRecord* trace = nullptr,
       std::vector<uint8_t>* packed = nullptr,
       size_t max_reading_rows = SIZE_MAX,
-      const std::function<void()>& progress = nullptr) {
+      const std::function<void()>& progress = nullptr,
+      const PiecePublish* publish = nullptr) {
     if (!ring_ready_) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
@@ -793,6 +862,7 @@ class RowReader {
                      : queue_depth();
     c.trace = trace;
     c.packed = packed;
+    c.publish = piece_stream_ ? publish : nullptr;
     if (packed) packed->assign(c.total, 0);
     if (trace) {
       trace->rows_asked = static_cast<int64_t>(c.total);
@@ -910,6 +980,12 @@ class RowReader {
     uint8_t deps[kPieces] = {};
     int64_t sub_dest[kPieces] = {};
     int64_t sub_done[kPieces] = {};
+    // Bit j: piece j handed to a packing job (or, with no bytes, published at once), and collected and published by
+    // the owner. The row is finished once every piece is published and every sub-read retired.
+    uint8_t dispatched = 0;
+    uint8_t published = 0;
+    int64_t pack_first = INT64_MAX;  // the earliest start and latest end of its pieces' jobs (traced reads only)
+    int64_t pack_last = 0;
   };
 
   struct Completion {
@@ -938,7 +1014,8 @@ class RowReader {
     bool failed = false;
     bool abandoned = false;
     bool stalled = false;  // a batch is waiting for its bank to retire
-    size_t packing = 0;    // rows handed to the packing workers and not yet finished by the owner
+    size_t packing = 0;    // jobs handed to the packing workers and not yet collected by the owner (rows, or pieces)
+    const PiecePublish* publish = nullptr;  // piece streaming: where the owner publishes (null: nowhere)
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
     int64_t events = 0;  // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
@@ -989,11 +1066,20 @@ class RowReader {
     for (int b = 0; b < kBanks; ++b) rows_busy_[b] = bank_live_[b] = 0;
   }
 
+  // A row to pack; with piece streaming, a vetted piece not yet handed to a job, whatever its row's state.
   bool has_ready() const {
     for (const auto& r : rows_) {
-      if (r.state == RowState::Ready) return true;
+      if (piece_stream_ ? (r.vetted & static_cast<uint8_t>(~r.dispatched)) != 0 : r.state == RowState::Ready) return true;
     }
     return false;
+  }
+
+  // Piece streaming packs a piece per job: a job and a run list per (bounce slot, piece), and a packing queue that
+  // holds every one of them. With the flag off, a job and a run list per bounce slot, as open() sizes them.
+  void size_jobs() {
+    const size_t jobs = static_cast<size_t>(kBounceSlots) * (piece_stream_ ? kPieces : 1);
+    runs_.assign(jobs * t_.segments.size(), CopyRun{});
+    pool_->set_capacity(jobs);
   }
 
   void queue_push(uint32_t index) {
@@ -1386,6 +1472,7 @@ class RowReader {
     // A fault's part is the descriptor's part whatever the sub-read count (subs_ is 1 with the flag off).
     const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
     int res = completion.res;
+    bool eof = false;  // fault (short_is_eof): this completion ends the sub-read
     ++cqes_;
     if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
     if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(part) == fault_.part &&
@@ -1397,6 +1484,7 @@ class RowReader {
       } else if (fault_.part_short > 0 && res > fault_.part_short) {
         part_fired_ = true;
         res = static_cast<int>(fault_.part_short);
+        eof = fault_.short_is_eof;
       }
     }
     // The extent, not the row: two parts of one row complete independently.
@@ -1413,6 +1501,7 @@ class RowReader {
       return;
     }
     d.done += res;
+    if (eof) d.expected = d.done;
     // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
     // offset + done, bounce + dest + done and length - done stay block-aligned (an
     // extent's offset, dest and length are whole pages) and the resubmit is a legal
@@ -1476,9 +1565,8 @@ class RowReader {
     // not behind the trace flag. Extents fill the slot contiguously from dest 0 and only a tail extent
     // can stop short without being resubmitted (a short read retries; only the EOF clamp shortens an
     // expectation), so a total at least `needed` means the needed prefix is whole.
-    // With piece streaming every piece must be vetted instead (vet_pieces): the same guarantee per piece, and
-    // stronger, since a piece is checked against what its own sub-reads delivered.
-    if (piece_stream_ ? rows_[best].vetted != kAllPieces : rows_[best].filled < rows_[best].needed) {
+    // Piece streaming never takes a whole row: vet_pieces makes the same check per piece (dispatch_ready_pieces).
+    if (rows_[best].filled < rows_[best].needed) {
       c.failed = true;
       return static_cast<size_t>(kBounceSlots);
     }
@@ -1489,7 +1577,7 @@ class RowReader {
   // keeps packing bounded: the loop refills and reaps between rows. With a packing pool, every ready row
   // is handed to the workers instead, and the loop finishes each one when its copy is done.
   bool pack_one() {
-    if (pool_) return dispatch_ready_rows();
+    if (pool_) return piece_stream_ ? dispatch_ready_pieces() : dispatch_ready_rows();
     const size_t best = take_ready_row();
     if (best == static_cast<size_t>(kBounceSlots)) return false;
     Call& c = c_;
@@ -1540,10 +1628,108 @@ class RowReader {
     }
   }
 
+  // Piece streaming: hand every vetted piece to its own packing job, whatever its row's state; the sub-reads it
+  // depends on have landed (vet_pieces), and no read in flight writes its bounce bytes, since any that did would be
+  // one of them. A piece with no bytes has nothing to store, so it is published at once. From here until its job is
+  // done the workers own the copy.
+  bool dispatch_ready_pieces() {
+    Call& c = c_;
+    const size_t segments = t_.segments.size();
+    bool any = false;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots) && !c.failed; ++s) {
+      BounceRow& r = rows_[s];
+      const uint8_t todo = r.vetted & static_cast<uint8_t>(~r.dispatched);
+      if (todo == 0) continue;
+      const uint8_t* base = bounce_slot(s) + r.start;
+      const int64_t slot = (*c.slots)[r.ordinal];
+      for (int j = 0; j < kPieces && !c.failed; ++j) {
+        const uint8_t bit = static_cast<uint8_t>(1u << j);
+        if ((todo & bit) == 0) continue;
+        const size_t job_index = s * kPieces + static_cast<size_t>(j);
+        const PieceRun* piece = &piece_runs_[job_index * segments];
+        CopyRun* runs = &runs_[job_index * segments];
+        int64_t bytes = 0;
+        for (size_t i = 0; i < segments; ++i) {
+          const Segment& segment = t_.segments[i];
+          runs[i] = CopyRun{
+              t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst + piece[i].lo,
+              base + segment.src + piece[i].lo, piece[i].hi - piece[i].lo};
+          bytes += runs[i].bytes;
+        }
+        r.dispatched |= bit;
+        if (bytes == 0) {
+          publish_collected(s, j);
+          continue;
+        }
+        PackJob& job = jobs_[job_index];
+        if (!job.done()) throw std::runtime_error("exl3 RAM miss: a packing job was re-armed while a worker still holds it");
+        job.arm(runs, segments, pack_split_, fault_.pack_delay_ns, c.trace ? &worker_stamp : nullptr, c.trace);
+        pool_->post(&job);  // throws before queueing
+        ++c.packing;
+        any = true;
+      }
+    }
+    return any;
+  }
+
+  // Piece streaming, the owner's publish (plan §3.4 H1): piece j of the row in `slot` is stored and fenced (its job
+  // read done, or it had no bytes), so set its bit on every readiness word naming the row. A word that refuses
+  // (another generation, or the bit already set) fails the call. The bit is marked published either way: the piece
+  // was collected, and nothing else may wait on it.
+  void publish_collected(size_t slot, int j) {
+    Call& c = c_;
+    BounceRow& r = rows_[slot];
+    const uint8_t bit = static_cast<uint8_t>(1u << j);
+    const bool twice = ++publishes_ == fault_.publish_twice;  // fault: publish_twice is 0 when off
+    if (c.publish != nullptr && c.publish->rows != nullptr) {
+      const PieceTarget& target = c.publish->rows[r.ordinal];
+      for (int w = 0; w < target.count; ++w) {
+        for (int attempt = 0; attempt < (twice ? 2 : 1); ++attempt) {
+          if (publish_piece(target.words[w], c.publish->generation, bit)) continue;
+          ++publish_refused_;
+          if (c.trace) ++c.trace->piece_publish_refused;
+          c.failed = true;
+        }
+      }
+    }
+    const int64_t seq = ++c.events;
+    if (c.trace) {
+      ++c.trace->pieces_published;
+      if ((r.published >> (j + 1)) != 0) ++c.trace->pieces_out_of_order;  // a higher-numbered piece went first
+      if (r.ordinal < static_cast<size_t>(kTraceRows)) c.trace->piece_publish[r.ordinal][j] = seq;
+    }
+    r.published |= bit;
+  }
+
+  // Piece streaming: collect every piece whose job is done (acquire), publish it, and finish each row whose pieces
+  // are all published and whose sub-reads have all retired. Runs every turn, packing or not: a row whose last
+  // sub-read retires after its pieces were published (one no piece depends on) is finished here too.
+  void collect_pieces() {
+    Call& c = c_;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      BounceRow& r = rows_[s];
+      if (r.state == RowState::Free) continue;
+      const uint8_t held = r.dispatched & static_cast<uint8_t>(~r.published);
+      for (int j = 0; j < kPieces && held != 0; ++j) {
+        if ((held >> j & 1u) == 0) continue;
+        const PackJob& job = jobs_[s * kPieces + static_cast<size_t>(j)];
+        if (!job.done()) continue;
+        r.pack_first = std::min(r.pack_first, job.first_start.load(std::memory_order_relaxed));
+        r.pack_last = std::max(r.pack_last, job.last_end.load(std::memory_order_relaxed));
+        --c.packing;
+        publish_collected(s, j);
+      }
+      if (r.state == RowState::Ready && r.published == kAllPieces) {
+        finish_row(s, r.pack_first == INT64_MAX ? 0 : r.pack_first, r.pack_last);
+      }
+    }
+  }
+
   // Finish every row whose copy the workers have completed: the bank's packing reference is released
   // here, on the owner, and only after its job reads done.
   void collect_packed() {
     Call& c = c_;
+    if (piece_stream_) return collect_pieces();
     if (c.packing == 0) return;
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
       if (rows_[s].state != RowState::Packing || !jobs_[s].done()) continue;
@@ -1555,9 +1741,18 @@ class RowReader {
   // Wait for every copy the workers still hold, and finish those rows like any other: they were copied
   // whole, and the accounting says so. On a failure the caller still releases every slot; this
   // guarantees nothing writes into them, or reads the bounce, afterwards.
+  // With piece streaming every piece job is waited for, then collected and published like any other.
   void quiesce() {
     Call& c = c_;
     if (c.packing == 0) return;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots) && piece_stream_; ++s) {
+      const uint8_t held = rows_[s].dispatched & static_cast<uint8_t>(~rows_[s].published);
+      for (int j = 0; j < kPieces; ++j) {
+        if (held >> j & 1u) {
+          while (!jobs_[s * kPieces + static_cast<size_t>(j)].done()) _mm_pause();
+        }
+      }
+    }
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
       if (rows_[s].state != RowState::Packing) continue;
       while (!jobs_[s].done()) _mm_pause();
@@ -1676,7 +1871,8 @@ class RowReader {
   bool owner_pinned_ = false;
   cpu_set_t unpinned_affinity_{};
   std::unique_ptr<PackPool> pool_;
-  PackJob jobs_[kBounceSlots];
+  // Indexed by bounce slot with the flag off, by (slot, piece) with piece streaming (size_jobs).
+  PackJob jobs_[kBounceSlots * kPieces];
   std::vector<CopyRun> runs_;
   // Piece streaming (set_piece_stream; off by default). subs_ is sub-reads per part: 1 with the flag off, which
   // makes descriptor (slot, part, sub) the old (slot, part). sub_reads_ holds each live sub-read's Read (a
@@ -1688,6 +1884,8 @@ class RowReader {
   std::vector<PieceRun> piece_runs_;
   RowGeometry geometry_[kBounceRows];
   std::vector<SqeRecord>* sqe_log_ = nullptr;  // test only (set_sqe_log)
+  int64_t publishes_ = 0;        // pieces published over the reader's life (the publish_twice fault counts them)
+  int64_t publish_refused_ = 0;  // publish attempts a readiness word refused
   size_t rows_busy_[kBanks] = {};   // rows not yet packed, per bank: the packing references
   size_t bank_live_[kBanks] = {};   // extents not yet retired, per bank: the I/O references
   uint32_t generation_ = 0;
@@ -1895,6 +2093,142 @@ void exl3_ram_miss_read_rows_sqes(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_sqes, exl3_ram_miss_read_rows_sqes);
 
+// Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
+int64_t exl3_ram_miss_publish_piece(TensorView word, int64_t generation, int64_t bit) {
+  using namespace exl3_ram_miss;
+  return publish_piece(
+             static_cast<uint64_t*>(word.data_ptr()), static_cast<uint64_t>(generation), static_cast<uint8_t>(bit))
+             ? 1
+             : 0;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_publish_piece, exl3_ram_miss_publish_piece);
+
+// Test only (U2, U3, U6): exl3_ram_miss_read_rows_traced's read, publishing each row's pieces into its readiness
+// words: row ordinal o's are masks[o][0 .. masks.size(1)), under `generation` (the caller initialises them). When
+// `reference` is not empty (a slab pointer table shaped like `slabs`, holding row o at ref_slots[o]), a checker
+// thread polls the first word of every row while the read runs and, for each bit it sees set, compares the piece's
+// bytes in the destination slab with the reference: what a device that acquired the bit would copy. `info` 5 int64:
+// the result, the reader's refused publishes, the pieces checked, the pieces whose bytes differed, and the bits the
+// checker saw set before the read returned.
+void exl3_ram_miss_read_rows_pieces(
+    TensorView extents,
+    TensorView starts,
+    TensorView file_sizes,
+    TensorView segments,
+    TensorView slabs,
+    TensorView row_bytes,
+    std::string paths,
+    std::string source_paths,
+    int64_t slot_bytes,
+    int64_t direct,
+    int64_t row,
+    TensorView experts,
+    TensorView slots,
+    int64_t step,
+    TensorView fault,
+    TensorView record,
+    TensorView masks,
+    int64_t generation,
+    TensorView reference,
+    TensorView ref_slots,
+    TensorView info) {
+  using namespace exl3_ram_miss;
+  check_fault_words(fault);
+  const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+  auto* out = static_cast<int64_t*>(info.data_ptr());
+  std::fill(out, out + 5, 0);
+  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes);
+  const std::vector<int32_t> ids = ids_of(experts);
+  const std::vector<int64_t> dest = slots_of(slots);
+  const size_t lanes = static_cast<size_t>(masks.size(1));
+  if (static_cast<size_t>(masks.size(0)) != ids.size() || lanes == 0 || lanes > static_cast<size_t>(kPieceTargets)) {
+    throw std::runtime_error("exl3 RAM miss: masks must be [rows, 1..8] readiness words");
+  }
+  auto* words = static_cast<uint64_t*>(masks.data_ptr());
+  std::vector<PieceTarget> targets(ids.size());
+  for (size_t o = 0; o < ids.size(); ++o) {
+    for (size_t l = 0; l < lanes; ++l) targets[o].words[targets[o].count++] = words + o * lanes + l;
+  }
+  const PiecePublish publish{static_cast<uint64_t>(generation), targets.data()};
+  RowReader reader(Tables(t), direct != 0, f[19], f[20]);
+  if (f[22] != 0) reader.set_piece_stream(true);
+  if (!reader.open()) return;
+  reader.set_fault(fault_from(f));
+
+  // The checker: the pieces' runs per row, then poll until the read returns, and once more after.
+  const bool checking = reference.numel() > 0;
+  const size_t count = t.segments.size();
+  std::vector<PieceRun> runs(ids.size() * kPieces * count);
+  const auto* ref_table = checking ? static_cast<const int64_t*>(reference.data_ptr()) : nullptr;
+  const auto* ref_slot = checking ? static_cast<const int64_t*>(ref_slots.data_ptr()) : nullptr;
+  if (checking) {
+    for (size_t o = 0; o < ids.size(); ++o) {
+      RowGeometry g;
+      if (!row_geometry(t, static_cast<size_t>(row * t.experts + ids[o]), g, &runs[o * kPieces * count])) {
+        throw std::runtime_error("exl3 RAM miss: the checker cannot cut a row");
+      }
+    }
+  }
+  std::vector<uint8_t> seen(ids.size(), 0);
+  int64_t checked = 0, differed = 0, early = 0;
+  const auto check_pass = [&](bool during) {
+    for (size_t o = 0; o < ids.size(); ++o) {
+      const uint64_t word = __atomic_load_n(words + o * lanes, __ATOMIC_ACQUIRE);
+      if ((word >> 8) != (static_cast<uint64_t>(generation) & ((uint64_t{1} << 56) - 1))) continue;
+      const uint8_t fresh = static_cast<uint8_t>(word & 0xFF) & static_cast<uint8_t>(~seen[o]);
+      for (int j = 0; j < kPieces; ++j) {
+        if ((fresh >> j & 1u) == 0) continue;
+        bool same = true;
+        for (size_t i = 0; i < count; ++i) {
+          const Segment& s = t.segments[i];
+          const PieceRun& run = runs[(o * kPieces + static_cast<size_t>(j)) * count + i];
+          if (run.lo >= run.hi) continue;
+          const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst + run.lo;
+          const auto* ref_base = reinterpret_cast<const uint8_t*>(static_cast<intptr_t>(
+              ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
+          const uint8_t* want = ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst + run.lo;
+          same = same && std::memcmp(got, want, static_cast<size_t>(run.hi - run.lo)) == 0;
+        }
+        ++checked;
+        if (!same) ++differed;
+        if (during) ++early;
+      }
+      seen[o] |= fresh;
+    }
+  };
+  std::atomic<bool> reading{true};
+  std::thread checker;
+  if (checking) {
+    checker = std::thread([&] {
+      while (reading.load(std::memory_order_acquire)) check_pass(true);
+    });
+  }
+  StageRecord stage;
+  int result = 0;
+  try {
+    result = reader.read(
+        row, ids, dest, static_cast<size_t>(step), abandon_after(f[17]), &stage, nullptr, SIZE_MAX, nullptr, &publish);
+  } catch (...) {
+    reading.store(false, std::memory_order_release);
+    if (checker.joinable()) checker.join();
+    throw;
+  }
+  reading.store(false, std::memory_order_release);
+  if (checker.joinable()) checker.join();
+  if (checking) check_pass(false);
+  stage.ok = result == 1 ? 1 : 0;
+  stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
+  std::memcpy(record.data_ptr(), &stage, sizeof(stage));
+  out[0] = result;
+  out[1] = reader.publish_refused();
+  out[2] = checked;
+  out[3] = differed;
+  out[4] = early;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_pieces, exl3_ram_miss_read_rows_pieces);
+
 // Test only (U1): the sub-reads and pieces the reader computes when it admits expert `expert` of streamed row `row`
 // (row_geometry). `subs`: kPieces rows of 6 int64 (file, offset, length, dest, part, k), in file order; `pieces`:
 // kPieces rows of 1 + 2 * segments int64: the dependency mask, then (dst_lo, dst_hi) per segment in segment
@@ -2061,6 +2395,7 @@ constexpr int64_t kLeaseRowTableBytes = 8;
 constexpr int64_t kLeasePieceMaskLineBytes = 128;
 constexpr int64_t kLeasePieceMaskBytes = 8;  // one uint64 per word
 constexpr int64_t kLeaseAreaPieceMaskBytes = kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
+static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
 
 enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2 };
 
@@ -2090,6 +2425,8 @@ enum Counter : int {
   // kLeasesGranted cannot distinguish the groups, so a build that publishes nothing early -- falling through to
   // the batched grant -- would satisfy every timing assertion by accident. Zero on the single-phase path.
   kHitLeasesGranted,
+  kPieceStreamRefused,   // requests refused because piece streaming is on without two-phase and lease mode
+  kPiecePublishRefused,  // piece publishes a readiness word refused, over the reader's life (each failed its read)
   kCounterCount,
 };
 
@@ -2983,6 +3320,7 @@ class RamTier {
     const int64_t d_offset = round_up_page(kLeaseSlotGen + 4 * total_slots);
     lease_d_ = d_offset;
     const int64_t piece_offset = round_up_page(d_offset + kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes);
+    lease_p_ = piece_offset;
     const int64_t needed = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
     if (lease_bytes < needed) {
       throw std::runtime_error(
@@ -3137,6 +3475,15 @@ class RamTier {
     std::vector<int32_t> missing;
     std::vector<int64_t> slots;
     bool ok = request.row >= 0 && request.row < layers_;
+    // Piece streaming publishes into the lease block's readiness words, initialised in the reservation hold below
+    // before the two-phase hit grant. Without two-phase and lease mode there is neither, so refuse before any slot
+    // is taken (the service refuses the flag too; this is the tier's own guard).
+    const bool piece_stream = reader_.piece_stream();
+    if (ok && piece_stream && !(two_phase_ && lease_mode_)) {
+      counters_[kPieceStreamRefused].fetch_add(1);
+      ok = false;
+    }
+    bool publishing = false;  // piece streaming: this request's miss lanes have readiness words to publish into
     if (ok) {
       std::lock_guard<std::mutex> guard(mutex_);
       Tier& tier = tiers_[request.row];
@@ -3179,6 +3526,12 @@ class RamTier {
         tier.state[slot] = kLoading;
         tier.expert_slot[missing[i]] = static_cast<int32_t>(slot);
         slots.push_back(slot);
+      }
+      // Piece streaming: each miss lane's readiness word starts this request's generation with no piece bit, fenced
+      // before the first ready word of the request (the hit grant below) is stored. The owner's publish refuses a
+      // word of any other generation, so without this every piece of the request would be refused.
+      if (ok && piece_stream && !advisory && !request.lane_experts.empty()) {
+        publishing = init_piece_words_locked(request, missing);
       }
       // S2. Grant and publish the HIT lanes here: in the same mutex_ hold as the reservation, after the take loop
       // has completed with ok still true, and before the hold is dropped for read(). A lane is a hit iff its
@@ -3252,7 +3605,9 @@ class RamTier {
             // retire_leases() takes mutex_ itself, so this is deadlock-free today. That is a property
             // of the code as it stands, not a guarantee: if a future yield point is ever added to
             // read()'s drain loop under a lock, this callback would deadlock against it.
-            [this] { retire_leases(); });
+            [this] { retire_leases(); },
+            publishing ? &piece_publish_ : nullptr);
+        if (piece_stream) counters_[kPiecePublishRefused].store(reader_.publish_refused());
         if (result == 0) counters_[kReadErrors].fetch_add(1);
         ok = result == 1;
         cancelled = result == -1;
@@ -3322,6 +3677,27 @@ class RamTier {
     return ok;
   }
 
+  // Store piece_word(gen) into the readiness word of every lane whose expert is read (in `missing`), then fence,
+  // and record those words as the owner's publish targets, by the row's ordinal in the read. Service thread only:
+  // it is the only writer of area P. False when no lane names a missing row (nothing to publish).
+  bool init_piece_words_locked(const Request& request, const std::vector<int32_t>& missing) {
+    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    piece_targets_.assign(missing.size(), PieceTarget{});
+    bool any = false;
+    for (size_t lane = 0; lane < request.lane_experts.size() && lane < static_cast<size_t>(kLeaseLanes); ++lane) {
+      const auto found = std::find(missing.begin(), missing.end(), request.lane_experts[lane]);
+      if (found == missing.end()) continue;
+      uint8_t* word = lease_ + lease_p_ + (idx * kLeaseLanes + static_cast<int64_t>(lane)) * kLeasePieceMaskLineBytes;
+      store_release64(word, piece_word(request.gen));
+      PieceTarget& target = piece_targets_[static_cast<size_t>(found - missing.begin())];
+      target.words[target.count++] = reinterpret_cast<uint64_t*>(word);
+      any = true;
+    }
+    _mm_sfence();
+    piece_publish_ = PiecePublish{request.gen, piece_targets_.data()};
+    return any;
+  }
+
   void handle_demand(const Request& request, uint8_t* record) {
     busy_since_.store(now_ns());
     store_release(page_ + kBusySeq, request.seq);
@@ -3352,6 +3728,10 @@ class RamTier {
   uint32_t* slot_gen_ = nullptr;  // SlotGen[] inside it
   std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
   int64_t lease_d_ = 0;                 // byte offset of area D (the device-written words)
+  int64_t lease_p_ = 0;                 // byte offset of area P (the piece readiness words)
+  // Piece streaming: serve()'s readiness words per row it reads, reused every request (like packed_).
+  std::vector<PieceTarget> piece_targets_;
+  PiecePublish piece_publish_;
   bool lease_mode_ = false;             // set before the service thread starts; off is today's protocol
   bool two_phase_ = false;              // Task 6 V1: hit lanes granted before read(); off is the Task 5 batched grant
   Outstanding outstanding_[kDemandRecords];  // by request slot; guarded by mutex_

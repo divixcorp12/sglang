@@ -125,6 +125,14 @@ class PackPool {
     return set;
   }
 
+  // Resize the queue of an idle pool (nothing posted): the reader posts a job per piece with piece streaming.
+  void set_capacity(size_t capacity) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (count_ != 0) throw std::runtime_error("exl3 RAM miss: the packing queue was resized while jobs were posted");
+    queue_.assign(capacity, nullptr);
+    head_ = 0;
+  }
+
   // Hand `job` (armed) to the workers. Jobs are served in the order posted.
   void post(PackJob* job) {
     {

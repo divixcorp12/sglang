@@ -115,16 +115,18 @@ ONE_READ_PER_PART = {
 }
 
 
-def _reuse(module, wanted):
+def _reuse(module, wanted, pieces=True):
     for name, test in vars(module).items():
         if name.startswith("test_") and name not in NOT_REUSED and inspect.isfunction(test):
             if wanted(inspect.getsource(test)):
-                fixture = "packing_without_pieces" if name in ONE_READ_PER_PART else "packing"
+                fixture = "packing_without_pieces" if name in ONE_READ_PER_PART or not pieces else "packing"
                 globals()[name] = _with_packing(test, fixture)
 
 
 _reuse(split, lambda source: "read_rows_traced(" in source or "read_rows_with_fault(" in source)
-_reuse(thread, lambda source: ("_host(" in source or "_tier(" in source) and "_run_script" not in source)
+# The thread suite's tiers run without lease mode, which a piece-streaming tier refuses per request: they run in the
+# modes without it. test_exl3_ram_miss_piece_stream reruns the two-phase suite, whose tiers have leases, with the flag.
+_reuse(thread, lambda source: ("_host(" in source or "_tier(" in source) and "_run_script" not in source, pieces=False)
 
 
 # ---- The flag: off means no thread, and the workers stay off the reserved cores ----

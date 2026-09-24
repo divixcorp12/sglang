@@ -16,7 +16,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 # Changing the native record layout changes this digest. When it fails: bump RAM_MISS_TRACE_SCHEMA,
 # then paste the new pair. A JSONL file has no field check of its own, so the schema integer is the
 # only way a consumer learns which fields a file has.
-LAYOUT_PIN = (6, "b7579f89dc55d2a8")
+LAYOUT_PIN = (7, "71405562602a9b5f")
 
 
 def _layout_digest():

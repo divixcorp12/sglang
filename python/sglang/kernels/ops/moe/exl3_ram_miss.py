@@ -110,6 +110,8 @@ def _fault_tensor(
     hold_rest: bool = False,
     piece_stream: bool = False,
     sub: int = -1,
+    publish_twice: int = 0,
+    short_is_eof: bool = False,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -137,6 +139,8 @@ def _fault_tensor(
             int(hold_rest),
             int(piece_stream),
             sub,
+            publish_twice,
+            int(short_is_eof),
         ],
         dtype=torch.int64,
     )
@@ -222,7 +226,9 @@ def read_rows_with_fault(
     ``pack_workers`` packs on that many copy threads instead of the owner (0: inline, the default),
     each row in ``pack_split`` byte-range chunks (0: one per worker). ``piece_stream`` reads each part as
     sub-reads and vets rows piece by piece (it needs ``pack_workers``); ``sub`` then narrows the ``part``
-    faults, and ``hold_ordinal``, to that sub-read of the part.
+    faults, and ``hold_ordinal``, to that sub-read of the part. ``publish_twice`` publishes the k-th piece the
+    reader publishes a second time (the readiness word must refuse it); ``short_is_eof`` makes the ``part_short``
+    completion the end of its sub-read, as a file ending there would.
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
@@ -267,6 +273,58 @@ def read_rows_sqes(
     return result, log, dict(sqes=count, descriptors=descriptors, credit=credit, cqes=cqes), stage_records(
         record.unsqueeze(0)
     )[0]
+
+
+def publish_piece(word: int, generation: int, bit: int) -> tuple[bool, int]:
+    """Test only: the reader owner's publish primitive on one readiness word holding ``word`` (``generation << 8 |
+    bits``): whether it set ``bit``, and the word afterwards."""
+    cell = torch.tensor([word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64)
+    done = int(_host_module().exl3_ram_miss_publish_piece(cell, int(generation), int(bit)))
+    return bool(done), int(cell[0]) & 0xFFFFFFFFFFFFFFFF
+
+
+def piece_word(generation: int, bits: int = 0) -> int:
+    """A readiness word (lease area P): the request generation's low 56 bits over an 8-bit piece mask."""
+    return ((generation & ((1 << 56) - 1)) << 8) | bits
+
+
+def read_rows_pieces(
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    direct: bool,
+    generation: int,
+    masks: Optional[torch.Tensor] = None,
+    reference: Optional[torch.Tensor] = None,
+    ref_slots=None,
+    step: int = BOUNCE_ROWS,
+    **faults,
+) -> tuple[int, dict, torch.Tensor, dict]:
+    """Test only: ``read_rows_traced``'s read with piece streaming's publishing: row ordinal o's pieces are published
+    into ``masks[o]`` (int64 ``[rows, lanes]``; default one word per row, initialised to ``piece_word(generation)``).
+    With ``reference`` (a slab pointer table like ``tables.slabs``, holding row o at ``ref_slots[o]``) a C++ thread
+    checks, while the read runs, the destination bytes behind every bit it sees set on each row's first word.
+    Returns the result, the stage record, ``masks`` and ``info``: ``refused`` (the reader's refused publishes),
+    ``checked`` / ``differed`` (pieces the checker compared, and those whose bytes were not the reference's) and
+    ``early`` (bits it saw before the read returned)."""
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    if masks is None:
+        masks = torch.full((len(expert_ids), 1), piece_word(generation), dtype=torch.int64)
+    fault = _fault_tensor(**faults)
+    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    info = torch.zeros(5, dtype=torch.int64)
+    ref = reference if reference is not None else torch.zeros(0, dtype=torch.int64)
+    ref_ids = _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
+    _host_module().exl3_ram_miss_read_rows_pieces(
+        *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
+        ref_ids, info,
+    )
+    result, refused, checked, differed, early = info.tolist()
+    return result, stage_records(record.unsqueeze(0))[0], masks, dict(
+        refused=refused, checked=checked, differed=differed, early=early
+    )
 
 
 def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], list[dict]]]:
@@ -324,6 +382,8 @@ STAGE_FIELDS = (
     *(f"sub_land_seq_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
     *(f"piece_cqe_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
     *(f"piece_seq_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
+    *(f"piece_publish_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
+    "pieces_published", "pieces_out_of_order", "piece_publish_refused",
 )
 STAGE_KINDS = ("demand", "advisory", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
@@ -358,6 +418,8 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     ``pieces`` (schema 6, empty unless ``piece_stream``) has one ``{"row", "sub_seq", "seq", "cqe"}`` per row asked
     for (first ``STAGE_TRACE_ROWS``), each a list over ``STAGE_PIECES``: when sub-read j (row file order) landed and
     when piece j was vetted, as sequence numbers shared by both (1-based, 0 never), and the vetting's clock.
+    Schema 7 adds ``publish``, when piece j was published on the same sequence, and the read's ``pieces_published``,
+    ``pieces_out_of_order`` (published after a higher-numbered piece of their row) and ``piece_publish_refused``.
     ``dropped_before`` counts the records the ring dropped just before this one. ``lanes`` is the planned
     lane count the device posted with the request (schema 4). ``pack_workers`` / ``pack_split`` are the
     packing mode the reader ran the request in (schema 5): 0 workers is the inline reader, and a worker-mode
@@ -398,6 +460,7 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                 "sub_seq": [record[f"sub_land_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
                 "seq": [record[f"piece_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
                 "cqe": [record[f"piece_cqe_{k}_{j}"] for j in range(STAGE_PIECES)],
+                "publish": [record[f"piece_publish_{k}_{j}"] for j in range(STAGE_PIECES)],
             }
             for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
         ] if record["piece_stream"] else []
@@ -407,6 +470,7 @@ def stage_records(words: torch.Tensor) -> list[dict]:
         for k in range(STAGE_TRACE_ROWS):
             for j in range(STAGE_PIECES):
                 del record[f"sub_land_seq_{k}_{j}"], record[f"piece_seq_{k}_{j}"], record[f"piece_cqe_{k}_{j}"]
+                del record[f"piece_publish_{k}_{j}"]
         record["drives"] = [
             {
                 "dev": record.pop(f"drive_dev_{d}"),
@@ -479,6 +543,8 @@ COUNTERS = (
     "late_after_terminal",
     "deferred_reuse",
     "hit_leases_granted",
+    "piece_stream_refused",
+    "piece_publish_refused",
 )
 
 
