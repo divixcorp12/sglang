@@ -12,11 +12,13 @@ and Engine-path results are historical measurements of different recipes. A node
 decode profile found MoE wait and pinned-row copy dominant, with Engram callbacks small
 (§23). The production server on port 7867 is currently stopped at the owner's request.
 
-**Update (2026-09-24):** RAM-miss piece streaming is merged into
-`codex/nvfp4-expert-stream-main` at `a082278187`, with its flag off by default. With
-two-phase on in both arms, it won 8 of 8 paired sessions (p=0.0039) with byte-identical
-output, and the robust gain is about **40 ms/token** (§24). §24 also lists the next
-decode work.
+**Update (2026-09-24):** RAM-miss piece streaming and a NUMA-placed 100 GiB pinned tier
+are merged into `codex/nvfp4-expert-stream-main`. Two-phase and piece streaming are
+recipe defaults, and the tier is 60 GiB on node 0 plus 40 GiB on node 1 (§23.1, §24.6).
+- **Piece streaming:** with two-phase on in both arms, it won 8 of 8 paired sessions
+  (p=0.0039) with byte-identical output, a gain of about **40 ms/token**.
+- **The 100 GiB tier:** it moved the decode bottleneck to the host-to-GPU link (§24.6).
+- §24 also lists the next decode work.
 
 Sections 1 to 15 preserve the original September 18 scoping. Sections 16 to 22 record
 dated experiments; **§23 is the current recipe and progress ledger**, with §24 its
@@ -3163,10 +3165,10 @@ following are **DSV4.1 recipe defaults**, not general SGLang defaults:
 | Setting | Current value | Status |
 |---|---:|---|
 | EXL3 expert source | `/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw` | `uring_direct`; mirrors on `/mnt/nvme0` and `/mnt/nvme4` |
-| MoE pinned host tier | 50 GiB (`SGLANG_MOE_PINNED_HOST_MB=51200`) | Fits NUMA node 0 with model weights; the earlier 70 GiB setting stalled during allocation |
+| MoE pinned host tier | 100 GiB (`SGLANG_MOE_PINNED_HOST_MB=102400`, `SGLANG_MOE_PINNED_HOST_NUMA_MB=0:61440,1:40960`) | Since 2026-09-24 (§24.6): 60 GiB bound to node 0, 40 GiB to node 1; earlier 50 GiB unplaced |
 | Native Engram row cache | 5 GiB | Ordinary `mmap` slab; pinned transfer buffers are separate. A proposed 20 GiB pinned row cache is **not implemented**. `SGLANG_DSV41_ENGRAM_RAM_GIB` sizes the Python cache, not this native slab |
 | GPU hot expert budget | 14 GiB (`SGLANG_MOE_HOT_GPU_MB=14336`) | DIRECT mode observed 1,128 resident slots and zero graph-gather scratch bytes |
-| MoE miss path | leases=1, GPU residency update=1, DIRECT insert stage=2, decode update interval=1 | Current launch defaults; prefetch and doorbell off |
+| MoE miss path | leases=1, GPU residency update=1, DIRECT insert stage=2, decode update interval=1, two-phase=1, hit-wait 100 µs, piece streaming=1 | Two-phase and piece streaming default since 2026-09-24 (§24); prefetch and doorbell off |
 | Row packing | 8 workers | Current default; eight versus four has not had a matched served-path comparison |
 | Engram lookup | host-node cache with io_uring=1 | Layers 1 and 14 are in the single batch-1 decode graph |
 | Context and prefix | 32,768 tokens; prefix caching enabled | Production and current benchmark match |
@@ -3537,13 +3539,10 @@ responses and 0 refusals or quarantined slots.
    current layer. The link idles about 40% of the step, so it has spare capacity, but a
    wrong guess costs link time. Prefetch is currently refused under DIRECT.
 3. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
-4. **Merge the NUMA placement and set the recipe tier.**
-   - 60 GiB on node 0 needs nothing from co-tenants.
-   - 90–100 GiB takes op-reth's page cache on node 1 and exceeds the ~90 GB host budget.
-     That is the owner's call.
-5. **Compare against production.** Before piece streaming becomes a default, compare it
-   in the same sessions against the saved production recipe, which has two-phase off.
-6. **Dropped:**
+4. **Done 2026-09-24, on the owner's instruction:** the NUMA placement is merged, and the
+   recipe runs at 100 GiB with two-phase and piece streaming on, matching §24.6's trace.
+   No same-session comparison against the old 50 GiB recipe with two-phase off was run.
+5. **Dropped:**
    - Removing CPU–GPU syncs from decode (§24.3).
    - Retuning credit, and static mirror weights (§24.4).
    - Moving the swapfile off nvme4. It is idle during decode, so this is housekeeping at

@@ -19,6 +19,10 @@ file or recipe does not change an already running server.
 | `SGLANG_DSV41_RAM_MISS_PACK_WORKERS` | `8` | Use eight expert-row packing workers. |
 | `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING` | `1` | Use Engram graph host-node lookup with io_uring for both Engram layers. |
 | `SGLANG_MOE_EXPERT_FUSED_PLAN` | `1` | Enable the fused expert route planner with DIRECT stage 2. |
+| `SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE` | `1` | Two-phase RAM-miss copies: resident rows copy while the misses are read. Compatible with DIRECT stage 2 since `9c64bac755`. Default since 2026-09-24. |
+| `SGLANG_DSV41_RAM_MISS_HIT_WAIT_US` | `100` | Stage 1's wait budget for the service to publish resident rows. |
+| `SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM` | `1` | Piece streaming: each RAM-miss row is read and published in 8 pieces, and the stream kernel S copies each piece as it lands. Needs two-phase, leases and pack workers. 8/8 paired wins, about 40 ms/token, against two-phase alone (DSV41_REFERENCE section 24.2). Default since 2026-09-24. |
+| `SGLANG_MOE_PINNED_HOST_MB` / `SGLANG_MOE_PINNED_HOST_NUMA_MB` | `102400` / `0:61440,1:40960` | 100 GiB pinned tier, bound 60 GiB to node 0 and 40 GiB to node 1 (section 24.6). Node 1's share comes from reclaiming co-tenants' page cache; startup refuses a node that cannot hold its share. |
 
 The production launcher explicitly supplies the first six values and inherits the
 fused planner from `arm_env.base_env()`. The eight-worker
@@ -32,7 +36,7 @@ median is not an established speedup. Older benchmark numbers used other launch
 options and are not a performance claim for the current recipe.
 
 Previously enabled recipe settings include `uring_direct` expert reads, expert-row
-mirrors, 50 GiB of pinned MoE host memory, a 14 GiB GPU hot cache, dynamic hot caching,
+mirrors, a 14 GiB GPU hot cache, dynamic hot caching,
 and expert graph gather. These are listed in `arm_env.base_env()` with their exact
 values.
 
@@ -47,8 +51,6 @@ values.
 | Option | Current value | Reason |
 | --- | ---: | --- |
 | `SGLANG_MOE_ASYNC_RESIDENCY_SCORES` | `0` | The current `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` path explicitly raises `ValueError` when async CPU residency scores are enabled (`expert_hot_cache.py`). A prior matched off/on/off HTTP run favored async scores with four pack workers and leases off, but that was a different residency mode; see [throughput measurement](ASYNC_RESIDENCY_THROUGHPUT_20260923.md). Enabling this requires changing or reconciling the residency update paths first. |
-| `SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE` | off | Compatible with DIRECT stage 2 since `9c64bac755`. It is off in the saved production recipe, and no same-session measurement of it against that recipe exists. It is required by piece streaming. |
-| `SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM` | off | Piece streaming (docs/superpowers/plans/2026-09-24-dsv41-piece-streaming.md): each RAM-miss row is read and published in 8 pieces, and the stream kernel S copies each piece as it lands, in place of W2 and C2. Refused at startup unless `SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE`, `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES` and `SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0` all hold. Task 6 verdict (DSV41_REFERENCE §24): with two-phase on in both arms, it won 8 of 8 paired sessions (p=0.0039), about 40 ms/token, with identical output. It stays off until it is compared against the production recipe, which has two-phase off, and until read credit is retuned. |
 | `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH` and `SGLANG_MOE_PREFETCH_MAX_CANDIDATES` | `0` | DIRECT insertion rejects the expert prefetch path. |
 | `SGLANG_MOE_EXPERT_DOORBELL` | `0` | DIRECT stage 2 rejects doorbell mode. |
 | `SGLANG_MOE_HOT_ASYNC_PROMOTIONS` | `0` | The EXL3 path does not currently benefit from this mode. |

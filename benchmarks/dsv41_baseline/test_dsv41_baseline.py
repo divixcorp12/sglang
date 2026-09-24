@@ -1107,14 +1107,34 @@ def test_engram_host_node_defaults_on_while_async_scores_stay_off_in_gpu_residen
     assert off_arm["SGLANG_MOE_HOT_DYNAMIC"] == "1"
 
 
-def test_pinned_buffer_and_weights_fit_in_node_0s_free_memory():
+def _placement():
+    return {
+        int(node): int(mib)
+        for node, mib in (entry.split(":") for entry in arm_env.PINNED_HOST_NUMA_MB.split(","))
+    }
+
+
+def test_pinned_buffer_share_and_weights_fit_in_node_0s_free_memory():
     # The arithmetic that was skipped on 2026-09-22: at 71680 MiB the pinned buffer
     # ALONE exceeded node 0's 66619 MiB free, so the arm could never have started. It
     # exhausted node 0 to 0.77 GB and spun in direct compaction for the full 900s.
-    need = int(arm_env.PINNED_HOST_MB) + arm_env.WEIGHTS_AND_OVERHEAD_MIB
+    # With the tier placed, node 0 must hold its share plus the weights and the
+    # loader's 4 GiB headroom.
+    need = _placement()[0] + arm_env.WEIGHTS_AND_OVERHEAD_MIB + 4096
     assert need <= arm_env.NODE0_FREE_MIB, f"needs {need} MiB, node 0 has {arm_env.NODE0_FREE_MIB}"
 
 
-def test_the_pinned_budget_is_not_silently_the_old_unbootable_value():
-    # Guards the specific regression: 71680 is the value that cannot start on this box.
-    assert int(arm_env.PINNED_HOST_MB) != 71680
+def test_the_numa_placement_is_in_the_env_and_sums_to_the_budget():
+    # The loader refuses a placement that disagrees with the budget, so a recipe
+    # edit that changes one without the other could not start.
+    assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_NUMA_MB"] == arm_env.PINNED_HOST_NUMA_MB
+    assert sum(_placement().values()) == int(arm_env.PINNED_HOST_MB)
+
+
+def test_piece_streaming_defaults_carry_their_prerequisites():
+    # The server refuses piece streaming without two-phase, leases and pack workers.
+    env = arm_env.base_env()
+    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"] == "1"
+    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE"] == "1"
+    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"] == "1"
+    assert int(env["SGLANG_DSV41_RAM_MISS_PACK_WORKERS"]) > 0

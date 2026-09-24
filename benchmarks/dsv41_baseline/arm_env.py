@@ -5,6 +5,7 @@ measured DSV4.1 recipe, DSV41_REFERENCE.md section 17.6) originally came from
 `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/
 env-full.sh` (layered onto phase 3a's `env.sh`). The current default additionally
 enables DIRECT insert on miss, RAM miss leases, eight RAM miss pack workers,
+two-phase RAM-miss copies with piece streaming, a NUMA-placed 100 GiB pinned tier,
 the fused expert graph planner, and Engram host-node io_uring lookups; it
 must be measured as a new recipe, not compared as a historical phase-3b baseline.
 A V2 storage change under test is
@@ -84,8 +85,15 @@ FREE_CORES = "64-71"  # never touched; core 71 is production's doorbell spin cor
 # This is a recorded constant of the measured recipe. An arm run at this size is NOT
 # comparable to the 2.741 / 2.102 cells, which were measured at 71680 MiB; a valid A/B
 # needs both of its arms run at the same value.
-PINNED_HOST_MB = "51200"  # 50 GiB
-NODE0_FREE_MIB = 66619  # measured 2026-09-22 19:04, before an arm launched
+#
+# Since 2026-09-24 the tier is 100 GiB, bound explicitly with SGLANG_MOE_PINNED_HOST_NUMA_MB
+# rather than placed by first touch: 60 GiB on node 0, the most that fits beside the
+# weights with 4 GiB of headroom, and 40 GiB on node 1. That node's share comes from reclaiming
+# co-tenants' page cache (DSV41_REFERENCE.md section 24.6). Startup refuses a node that
+# cannot hold its share instead of spilling and stalling.
+PINNED_HOST_MB = "102400"  # 100 GiB
+PINNED_HOST_NUMA_MB = "0:61440,1:40960"
+NODE0_FREE_MIB = 81869  # measured 2026-09-24 14:08, production and every arm down
 WEIGHTS_AND_OVERHEAD_MIB = 12288  # ~9.94 GiB of weights, plus slack
 
 HEALTH_TIMEOUT_S = 900  # /health runs a real generation; slow cold. Never shorten this.
@@ -111,6 +119,7 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_MIRROR_DIRS": EXPERT_MIRROR_DIRS,
         "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
         "SGLANG_MOE_PINNED_HOST_MB": PINNED_HOST_MB,
+        "SGLANG_MOE_PINNED_HOST_NUMA_MB": PINNED_HOST_NUMA_MB,
         "SGLANG_MOE_HOT_GPU_MB": "14336",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
@@ -128,6 +137,10 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
         "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES": "1",
         "SGLANG_DSV41_RAM_MISS_PACK_WORKERS": "8",
+        # Two-phase RAM-miss copies with piece streaming (DSV41_REFERENCE.md section 24).
+        "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE": "1",
+        "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
+        "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM": "1",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 
