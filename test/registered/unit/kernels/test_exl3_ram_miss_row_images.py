@@ -472,14 +472,19 @@ def _cfg(**overrides):
     return Dsv41Config(**{**{f: getattr(Dsv41Config.from_envs(), f) for f in Dsv41Config.__struct_fields__}, **overrides})
 
 
-def test_the_service_opens_images_only_with_the_flag_mirrors_and_o_direct(tmp_path):
+def test_the_service_opens_images_only_with_the_flag_mirrors_o_direct_and_leases(tmp_path):
     """Negative-branch contract of the wiring: off means the shard tables (None), and on is refused without mirror
-    dirs (nowhere to read) or without O_DIRECT (the readv into the slabs is the point), naming the missing setting."""
+    dirs (nowhere to read), without O_DIRECT (the readv into the slabs is the point) or without leases (only the lease
+    check keeps a direct read from overwriting a slot a GPU copy may still read), naming the missing setting."""
     s = _images_setup(tmp_path, capacity=3)
     mirrors = dict(roots=s.roots, policy=StaticSplitPolicy((1.0,)), source_root=str(tmp_path))
     segments, layers = s.fmt.segment_map(), {0: None, 1: None}
     assert open_service_row_images(_cfg(enable_ram_miss_row_images=False), s.layout, segments, mirrors, True, layers) is None
-    on = _cfg(enable_ram_miss_row_images=True)
+    with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"):
+        open_service_row_images(
+            _cfg(enable_ram_miss_row_images=True, enable_ram_miss_leases=False), s.layout, segments, mirrors, True, layers
+        )
+    on = _cfg(enable_ram_miss_row_images=True, enable_ram_miss_leases=True)
     with pytest.raises(RuntimeError, match="SGLANG_MOE_EXPERT_MIRROR_DIRS"):
         open_service_row_images(on, s.layout, segments, {}, True, layers)
     with pytest.raises(RuntimeError, match="uring_direct"):

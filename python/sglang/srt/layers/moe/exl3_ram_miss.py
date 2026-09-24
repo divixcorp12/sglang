@@ -292,10 +292,14 @@ def open_service_row_images(cfg: Dsv41Config, layout, segments, mirrors: dict, d
 
     The images live beside the mirrored shards, one set per mirror root, and are split across the roots exactly as the
     mirrors are (``mirrors`` is ``mirror_table_args()``). Refused without mirror dirs (there is nowhere to read them
-    from) and without O_DIRECT reads (the point is a readv straight into the pinned slabs), and by ``open_row_images``
-    unless every root holds a complete set matching this checkpoint for every streamed layer."""
+    from), without O_DIRECT reads (the point is a readv straight into the pinned slabs), without leases, and by
+    ``open_row_images`` unless every root holds a complete set matching this checkpoint for every streamed layer."""
     if not cfg.enable_ram_miss_row_images:
         return None
+    if not cfg.enable_ram_miss_leases:
+        # A direct read overwrites its victim slot from submission, not after the read as packing did; only the lease
+        # check in victim selection is known to keep a slot a GPU copy may still be reading from being chosen.
+        raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES")
     if not mirrors:
         raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_MOE_EXPERT_MIRROR_DIRS")
     if not direct:
