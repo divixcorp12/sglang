@@ -556,7 +556,8 @@ class ExpertPinnedHostCacheManager:
             layer_id: ExpertPinnedHostCache(
                 streamers[layer_id],
                 capacity,
-                placement=placement,
+                # Only when set: an unplaced tier is built with the same arguments as before.
+                **({"placement": placement} if placement else {}),
                 **pinned_tier_options_of(
                     streamers[layer_id].format, streamers[layer_id].layer
                 ),
