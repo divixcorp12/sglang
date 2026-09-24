@@ -3167,6 +3167,13 @@ class RamTier {
     }
     if (taken == 0) return true;
     uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
+    // The writer half of the 11.4 re-read: a ready word is cleared before its payload is rewritten, so a device
+    // reader whose payload loads overlap the rewrite finds the word changed when it re-reads it. Without the clear
+    // the word would still read the old generation until the store below, and a torn payload would pass.
+    for (size_t lane = 0; lane < count; ++lane) {
+      if (take[lane]) store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, 0);
+    }
+    _mm_sfence();
     for (size_t lane = 0; lane < count; ++lane) {
       if (!take[lane]) continue;
       const int32_t slot = slots[lane];

@@ -243,6 +243,58 @@ __device__ __forceinline__ void raise_fatal(uint8_t* page, uint32_t seq) {
 // contract. Only the stream kernel passes it: a tag-2 lane's bytes are final piece by piece, so every other caller
 // must go on seeing it as unpublished. `loading` reports a LOADING tag of THIS generation whether or not it was
 // accepted, so stage 1 can tell a lane it will never be able to claim from one not yet published.
+//
+// The belt of 11.4 is a seqlock re-read of the ready word, and it has two halves. The host clears a lane's ready
+// word before rewriting its payload (grant_lane_group_locked). The reader must order its payload loads before the
+// re-read with a system fence: an acquire orders only what follows it, so without the fence the re-read may be
+// served before the payload and a rewrite caught half-way passes. Hence read, fence, re-read, judge; a caller that
+// polls several lanes reads them all and pays one fence (stage 1).
+struct LaneRead {
+  uint64_t ready;
+  uint32_t slot_generation;
+  int32_t host_slot;
+  int32_t expert;
+};
+
+__device__ __forceinline__ LaneRead lane_result_read(const uint8_t* result) {
+  LaneRead r;
+  r.ready = ld_acquire_sys64(result + kLeaseRrReady);
+  r.slot_generation = *reinterpret_cast<const volatile uint32_t*>(result + kLeaseRrSlotGeneration);
+  r.host_slot = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrHostSlot);
+  r.expert = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrExpert);
+  return r;
+}
+
+// Relaxed: the caller's fence already orders it after the payload loads, and nothing after it depends on it.
+__device__ __forceinline__ uint64_t lane_result_reread(const uint8_t* result) {
+  return *reinterpret_cast<const volatile uint64_t*>(result + kLeaseRrReady);
+}
+
+__device__ __forceinline__ bool lane_result_judge(
+    const LaneRead& r,
+    uint64_t again,
+    uint64_t generation,
+    int64_t expected_expert,
+    uint32_t capacity,
+    int32_t* out_slot,
+    uint32_t* out_slot_generation,
+    bool* ready_seen,
+    bool accept_loading,
+    bool* loading) {
+  const uint64_t generation_mask = (1ull << 56) - 1;
+  const uint64_t tag = r.ready >> 56;
+  const bool current = (r.ready & generation_mask) == generation;
+  if (loading != nullptr) *loading = tag == kLeaseTagLoading && current;
+  *ready_seen = (tag == kLeaseTagReady || (accept_loading && tag == kLeaseTagLoading)) && current;
+  const bool valid = *ready_seen && again == r.ready && static_cast<int64_t>(r.expert) == expected_expert &&
+                     r.host_slot >= 0 && static_cast<uint32_t>(r.host_slot) < capacity;  // also bounds the ack SlotGen read
+  if (valid) {
+    *out_slot = r.host_slot;
+    *out_slot_generation = r.slot_generation;
+  }
+  return valid;
+}
+
 __device__ __forceinline__ bool lane_result_valid(
     const uint8_t* result,
     uint64_t generation,
@@ -253,24 +305,11 @@ __device__ __forceinline__ bool lane_result_valid(
     bool* ready_seen,
     bool accept_loading = false,
     bool* loading = nullptr) {
-  const uint64_t ready = ld_acquire_sys64(result + kLeaseRrReady);
-  const uint32_t slot_generation = *reinterpret_cast<const volatile uint32_t*>(result + kLeaseRrSlotGeneration);
-  const int32_t host_slot = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrHostSlot);
-  const int32_t expert = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrExpert);
-  // The belt of 11.4: a ready word that changed while the payload was read is a protocol violation.
-  const uint64_t again = ld_acquire_sys64(result + kLeaseRrReady);
-  const uint64_t generation_mask = (1ull << 56) - 1;
-  const uint64_t tag = ready >> 56;
-  const bool current = (ready & generation_mask) == generation;
-  if (loading != nullptr) *loading = tag == kLeaseTagLoading && current;
-  *ready_seen = (tag == kLeaseTagReady || (accept_loading && tag == kLeaseTagLoading)) && current;
-  const bool valid = *ready_seen && again == ready && static_cast<int64_t>(expert) == expected_expert &&
-                     host_slot >= 0 && static_cast<uint32_t>(host_slot) < capacity;  // also bounds the ack SlotGen read
-  if (valid) {
-    *out_slot = host_slot;
-    *out_slot_generation = slot_generation;
-  }
-  return valid;
+  const LaneRead r = lane_result_read(result);
+  __threadfence_system();
+  return lane_result_judge(
+      r, lane_result_reread(result), generation, expected_expert, capacity, out_slot, out_slot_generation, ready_seen,
+      accept_loading, loading);
 }
 
 }  // namespace exl3_ram_miss_device
@@ -695,14 +734,19 @@ __device__ __forceinline__ void lease_hit_wait_body(
   int64_t passes = 0;
   for (;;) {
     ++passes;
+    LaneRead reads[kMaxIds];
+    for (int64_t i = 0; i < planned_count; ++i) {
+      if (claimed[i] == 0) reads[i] = lane_result_read(results + i * kLeaseRowResultBytes);
+    }
+    __threadfence_system();  // one per pass: every lane's payload loads before any lane's re-read
     int64_t streaming = 0;
     for (int64_t i = 0; i < planned_count && !hard_fail; ++i) {
       if (claimed[i] != 0) continue;
       bool ready_seen = false;
       bool loading = false;
-      if (lane_result_valid(
-              results + i * kLeaseRowResultBytes, generation, planned[i], capacity, &slots[i], &slot_generations[i],
-              &ready_seen, /*accept_loading=*/false, &loading)) {
+      if (lane_result_judge(
+              reads[i], lane_result_reread(results + i * kLeaseRowResultBytes), generation, planned[i], capacity,
+              &slots[i], &slot_generations[i], &ready_seen, /*accept_loading=*/false, &loading)) {
         claimed[i] = 1;
         ++taken;
       } else if (ready_seen) {

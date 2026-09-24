@@ -1084,6 +1084,15 @@ Why this is safe and cannot deadlock or lap:
   because the service writes it only after G retired, and the tagged `ready` is stored
   last. As a belt, the wait kernel re-reads `ready` after reading the payload and treats a
   changed generation as a protocol violation (fatal), the same seqlock check as 6.3.
+  Both halves are needed for that check to mean anything (fixed 2026-09-24; before, neither
+  was present):
+  - **Writer:** `grant_lane_group_locked` clears each lane's `ready` word, `sfence`s,
+    writes the payload, `sfence`s, and release-stores the tagged word. Without the clear the
+    word keeps reading `G` while `G + 16`'s payload lands, and the re-read cannot tell.
+  - **Reader:** a system fence between the payload loads and the re-read
+    (`lane_result_valid`; stage 1 pays one per pass for all its lanes). An acquire orders
+    only the loads after it, so without the fence the re-read may be served before the
+    payload loads.
 
 ### 11.5 Guard for concurrent graphs [OPEN 9]
 
