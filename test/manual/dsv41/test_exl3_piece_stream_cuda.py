@@ -1001,10 +1001,15 @@ def test_g9_control_a_valid_loading_row_result_is_streamed_and_committed():
     assert torch.equal(rig.dest[0].cpu(), rig.slab[3])
 
 
-def test_g10_one_aborting_block_leaves_go_2_zero_and_the_request_failed():
+@pytest.mark.parametrize("aborter", ["counts_last", "counts_first"])
+def test_g10_one_aborting_block_leaves_go_2_zero_and_the_request_failed(aborter):
+    """Block 2 takes the abort path. counts_last: it stores late, after the others counted (the race a missing fence
+    would open, M13). counts_first: the completing blocks count late, so a completing block is last and must refuse
+    to commit on the counts alone (a last block that ignores the completed count and the abort word, M13)."""
     rig = Rig()
-    rig.dev.stream_fault[STREAM_FAULT_WORDS["abort_block"]] = 3  # block 2 takes the abort path...
-    rig.dev.stream_fault[STREAM_FAULT_WORDS["abort_delay_ns"]] = 200_000  # ...late, after the others have counted
+    rig.dev.stream_fault[STREAM_FAULT_WORDS["abort_block"]] = 3
+    delay = "abort_delay_ns" if aborter == "counts_last" else "count_delay_ns"
+    rig.dev.stream_fault[STREAM_FAULT_WORDS[delay]] = 200_000
     rig.plan([4])
     seq, gen = rig.post()
     rig.serve_loading(seq, gen, [(4, 3)])
