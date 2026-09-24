@@ -317,17 +317,12 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.poll_bound = poll_bound
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
-        self._two_phase_delivered = (
-            torch.zeros(1, dtype=torch.int32, device=host_row_map.device) if two_phase else None
-        )
 
     @property
     def delivered_count(self) -> torch.Tensor:
         if self.device_side.go_count is None:
             raise RuntimeError("EXL3 DIRECT requires leased delivery")
-        if self._two_phase_delivered is not None:
-            return self._two_phase_delivered
-        return self.device_side.go_count
+        return self.device_side.go_total if self.two_phase else self.device_side.go_count
 
     def _stage_planned(self, plan) -> None:
         """Copy the plan's lane experts into the captured ``planned`` buffer, bounding the plan first.
@@ -391,7 +386,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.device_side.stage_ack(2)
         self.device_side.finalize(plan.count, self.keep)
         # Lanes each stage copied into plan.slots; finalize keeps only a request whose stages copied every lane.
-        torch.add(self.device_side.go_1, self.device_side.go_2, out=self._two_phase_delivered)
+        torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
 
 
 def watchdog_wait_s(timeout_ms: int) -> float:
@@ -900,6 +895,7 @@ class Exl3RamMissService:
                 for t in (
                     self.device_side.go_1,
                     self.device_side.go_2,
+                    self.device_side.go_total,
                     self.device_side.lane_ctx_1,
                     self.device_side.lane_ctx_2,
                     self.device_side.host_rows_1,

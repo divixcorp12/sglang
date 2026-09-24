@@ -872,6 +872,7 @@ class Exl3RamMissDevice:
         self.lane_ctx = None
         self.go_1 = None
         self.go_2 = None
+        self.go_total = None
         self.lane_ctx_1 = None
         self.lane_ctx_2 = None
         self.host_rows_1 = None
@@ -901,6 +902,8 @@ class Exl3RamMissDevice:
             lanes = exl3_lease_block.LANES
             self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
             self.go_2 = torch.zeros(1, dtype=torch.int32, device=device)
+            # go_1 + go_2, written after finalize: the count a DIRECT residency commit reads.
+            self.go_total = torch.zeros(1, dtype=torch.int32, device=device)
             self.lane_ctx_1 = torch.zeros((lanes, 4), dtype=torch.int64, device=device)
             self.lane_ctx_2 = torch.zeros((lanes, 4), dtype=torch.int64, device=device)
             self.host_rows_1 = torch.zeros(lanes, dtype=torch.int64, device=device)

@@ -948,7 +948,13 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     publish_terminal(lease, lease_d, seq, generation, mask, reason);
   }
   // Terminal first, then the fatal word (F2): the service must be able to tell a give-up from a slow serve.
-  if (seq != 0) raise_fatal(page, seq);
+  // With no armed request there is no seq to name; a protocol error must still fail stop, as the batched wait does,
+  // while an abort (shutdown, or a fatal already raised) raises nothing new.
+  if (seq != 0) {
+    raise_fatal(page, seq);
+  } else if (state[kFailReason] != static_cast<int32_t>(kLeaseReasonAborted)) {
+    raise_fatal(page, 0xFFFFFFFFu);
+  }
   state[kSticky] = 1;
   keep[0] = 0.0f;
 }

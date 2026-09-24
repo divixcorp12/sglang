@@ -89,13 +89,17 @@ def _post_gpu_hot(page, host, hot_page, *, row=0, need=(), protect=(), lanes=(),
     return seq
 
 
-def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path):
+@pytest.mark.parametrize("two_phase", [False, True], ids=["single_phase", "two_phase"])
+def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path, two_phase):
+    """EXL3 DIRECT runs with either lease chain; two-phase grants hit lanes before read(), after the hot set applies."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
     try:
         host.enable_lease_mode()
+        if two_phase:
+            host.enable_two_phase()
         host.enable_gpu_hot()
         for expert in (0, 1, 2):
             host.assign(0, expert)

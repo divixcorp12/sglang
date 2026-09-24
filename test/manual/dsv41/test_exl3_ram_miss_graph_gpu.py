@@ -160,8 +160,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
-            # Large enough that stage 1 always sees the hit grant, so the stage split below is deterministic.
-            envs.SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND.override(1 << 20),
+            # Long enough for stage 1 to see the hit grant, and far shorter than the 1 s read hold below.
+            envs.SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND.override(1 << 16),
             envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(False),
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
             envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
@@ -251,7 +251,10 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
                 mapping = manager.gpu_residency.mapping[0, :experts].cpu()
                 ram_hit = next(e for e in range(experts) if service.host.contains(0, e) and mapping[e] < 0)
                 cold = next(e for e in range(experts) if not service.host.contains(0, e) and mapping[e] < 0)
+                # Hold the NVMe read past stage 1's poll bound so the cold lane cannot publish during stage 1.
+                service.host.inject(delay_s=1.0)
                 replay([ram_hit, cold, 30, 31, 32, 33])
+                service.host.inject(delay_s=0.0)
                 assert device_side.go_1.item() >= 1 and device_side.go_2.item() >= 1
                 assert streamer.row_backend.delivered_count.item() == (
                     device_side.go_1.item() + device_side.go_2.item()

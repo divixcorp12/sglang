@@ -2084,7 +2084,7 @@ class RamTier {
 
   void set_gpu_hot(bool on) {
     if (hot_page_ == nullptr) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs a sidecar");
-    if (!lease_mode_ || two_phase_) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs single-phase leases");
+    if (!lease_mode_) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs leases");
     gpu_hot_mode_.store(on);
   }
 
