@@ -825,8 +825,8 @@ def _assert_pieces_exact_or_untouched(s, layer, expert, slot, reference):
             if lo == hi:
                 continue
             name = EXL3_STREAMED_NAMES[name_index]
-            got = s.slabs[layer][name][slot].contiguous().view(torch.uint8)[lo:hi]
-            want = reference[name].contiguous().view(torch.uint8)[lo:hi]
+            got = s.slabs[layer][name][slot].contiguous().view(torch.uint8).reshape(-1)[lo:hi]
+            want = reference[name].contiguous().view(torch.uint8).reshape(-1)[lo:hi]
             states.add("exact" if torch.equal(got, want) else "untouched" if bool((got == 0xAB).all()) else "torn")
         assert len(states) <= 1 and "torn" not in states, (expert, slot, j, states)
 
