@@ -40,6 +40,15 @@ struct CopyRun {
   int64_t bytes = 0;
 };
 
+// One chunk's copy as a worker ran it: the clock at the copy's start (after the claim) and end, the
+// worker's index and the CPU it ran on. Filled only for a job armed with a stamp array.
+struct ChunkStamp {
+  int64_t start = 0;
+  int64_t end = 0;
+  int32_t worker = -1;
+  int32_t cpu = -1;
+};
+
 // One row's copy, split into `chunks` byte ranges of the concatenation of its runs. Chunks are
 // disjoint, so workers never write the same byte.
 struct PackJob {
@@ -52,6 +61,7 @@ struct PackJob {
   // Stamps chunk start and end when set (only for a traced read): `clock(clock_arg)`.
   int64_t (*clock)(const void*) = nullptr;
   const void* clock_arg = nullptr;
+  ChunkStamp* chunk_stamps = nullptr;  // `chunks` entries, written only when `clock` is set too
   // Worker-shared.
   std::atomic<unsigned> claimed{0};
   std::atomic<unsigned> finished{1};  // starts done: a job nobody holds reads done()
@@ -60,7 +70,7 @@ struct PackJob {
 
   void arm(
       const CopyRun* run_list, size_t count, unsigned chunk_count, int64_t delay, int64_t (*clock_fn)(const void*),
-      const void* clock_argument) {
+      const void* clock_argument, ChunkStamp* stamps = nullptr) {
     runs = run_list;
     run_count = count;
     total = 0;
@@ -69,6 +79,7 @@ struct PackJob {
     delay_ns = delay;
     clock = clock_fn;
     clock_arg = clock_argument;
+    chunk_stamps = stamps;
     claimed.store(0, std::memory_order_relaxed);
     finished.store(0, std::memory_order_relaxed);
     first_start.store(INT64_MAX, std::memory_order_relaxed);
@@ -97,7 +108,7 @@ class PackPool {
     }
     if (workers == 0) throw std::runtime_error("exl3 RAM miss: a packing pool needs at least one worker");
     try {
-      for (unsigned i = 0; i < workers; ++i) threads_.emplace_back([this] { run(); });
+      for (unsigned i = 0; i < workers; ++i) threads_.emplace_back([this, i] { run(i); });
       std::unique_lock<std::mutex> lock(mutex_);
       started_cv_.wait(lock, [&] { return started_ == threads_.size(); });
     } catch (...) {
@@ -145,7 +156,7 @@ class PackPool {
   }
 
  private:
-  void run() {
+  void run(unsigned index) {
     const int error = pthread_setaffinity_np(pthread_self(), sizeof(allowed_), &allowed_);
     pthread_setname_np(pthread_self(), "exl3-pack");
     {
@@ -169,11 +180,11 @@ class PackPool {
           --count_;
         }
       }
-      copy_chunk(job, chunk);
+      copy_chunk(job, chunk, index);
     }
   }
 
-  void copy_chunk(PackJob* job, unsigned chunk) {
+  void copy_chunk(PackJob* job, unsigned chunk, unsigned worker) {
     const int64_t start = job->clock ? job->clock(job->clock_arg) : 0;
     if (job->delay_ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(job->delay_ns / job->chunks));
     // Byte range of the concatenated runs, its inner boundaries on 64 B so two workers never share a line.
@@ -199,6 +210,9 @@ class PackPool {
       }
       seen = job->last_end.load(std::memory_order_relaxed);
       while (end > seen && !job->last_end.compare_exchange_weak(seen, end, std::memory_order_relaxed)) {
+      }
+      if (job->chunk_stamps != nullptr) {
+        job->chunk_stamps[chunk] = ChunkStamp{start, end, static_cast<int32_t>(worker), sched_getcpu()};
       }
     }
     job->finished.fetch_add(1, std::memory_order_release);  // the worker's last access to the job
