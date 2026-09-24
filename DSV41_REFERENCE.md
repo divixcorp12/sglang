@@ -3381,17 +3381,65 @@ prefill are excluded.
 
   Each has a matching `.out` file.
 
-### 24.4 Next decode work, in order
+### 24.4 The read wall: not the credit, not the mirror split (2026-09-24)
 
-1. **Retune read credit for piece streaming.** Aim: recover the read-wall tail above. At
-   credit 32 the reads are four times smaller than before, and the S wait on the read is
-   now the largest cost in the step.
-2. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
-3. **Compare against production.** Before piece streaming becomes a default, compare it
+**Credit cannot bind in most decode demands.** Credit is `kQueueDepth` (16) × parts
+(2) = 32 SQEs. With pieces, a demand for m rows issues 8m SQEs, so the credit binds only at
+m ≥ 5. That is 16 of the node trace's 1,155 read layers.
+
+**The read-window growth is on one drive.** From the task 6 smokes (per-sub-read
+completion stamps in the stage trace):
+- The faster half is unchanged: 2.07 → 2.14 ms p50 at m=1, with the mean flat. So one
+  6.66 MB read and four 1.66 MB reads cost the same on one drive.
+- Half 1, from the second mirror root `/mnt/nvme4`, finishes last in about 99% of demands.
+- The gap between the halves grew from p50 0.20 → 0.53 ms at m=1.
+- It is not a reap delay: in decode, the four sub-reads of a half carry four distinct reap
+  stamps in 99% of demands.
+
+**Why nvme4 is slower.** It is an SPCC drive with a 256 KB maximum transfer, against the
+Samsung's 512 KB on nvme0. Live `iostat` showed:
+- equal 910 MB/s on each drive;
+- 3,896 reads/s at 239 KB on nvme4, against 2,059 reads/s at 453 KB on nvme0;
+- similar average wait on both: 8.0 vs 7.8 ms.
+
+**Swap is not the cause.** The swapfile on nvme4 held 9.5 GB but was idle during decode:
+swap-in 0–16 KB/s, swap-out 0, and 0.05 MB/s of writes to the drive.
+
+**Mirror-weight sweep.** Four flag-on stage-traced smokes, in order, at `a082278187`.
+Scripts are in `divix01:.../direct-two-phase-tests/mirror-weights/`. Every run had
+byte-identical responses and 0 refusals, quarantines, read errors or voided leases.
+
+| nvme0:nvme4 weight | m=1 gap (nvme4 − nvme0) p50 | m=4+ gap p50 | all-m pack_end mean | Σ decode pack_end per step | step wall p50 |
+|---|---:|---:|---:|---:|---:|
+| 1:1 (first) | +0.42 ms | +0.67 | 4.10 ms | 96.3 ms | 153.3 ms |
+| 55:45 | +0.16 | −0.94 | 4.24 | 99.6 | 156.2 |
+| 60:40 | −0.35 | −2.48 | 4.22 | 99.1 | 156.2 |
+| 1:1 (repeat) | +0.58 | +0.73 | 4.23 | 99.2 | 154.8 |
+
+- **No weight is better than 1:1.** The spread between weights is inside the spread
+  between the two 1:1 runs.
+- **Why a fixed weight can't help:** nvme4's disadvantage behaves like a fixed extra
+  **~0.4–0.7 ms per demand**, not a lower bandwidth. At 55:45, m=1 balances but nvme0
+  becomes the late drive from m=2 up.
+- **Upper bound for a split that varies with m:** half the gap, about 0.2–0.35 ms per
+  demand. It has not been shown to move pack_end.
+- **The tail was an environment effect.** Today's nvme4 tail is much smaller than in the
+  task 6 smokes: the m=1 slow-half mean is 2.58–2.72 ms, against 3.32 then. That day's
+  +15.7% mean read-wall regression was therefore partly the environment of that run.
+
+### 24.5 Next decode work, in order
+
+1. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
+2. **Compare against production.** Before piece streaming becomes a default, compare it
    in the same sessions against the saved production recipe, which has two-phase off.
-4. **Dropped: removing CPU–GPU syncs from decode.** §24.3 shows none that block per step,
-   and the host tail is hidden behind the GPU. Prefill's roughly 59 ms readbacks are
-   per-chunk waits on the chunk's own work; they are a prefill question, not a decode one.
+3. **The per-demand cost itself.** Summed decode read-plus-pack is 96–99 ms of a
+   153–156 ms step. Fewer RAM-miss rows per token (residency or prediction) and faster
+   pinned-row copies remain the large levers; the read path's shape is not.
+4. **Dropped:**
+   - Removing CPU–GPU syncs from decode (§24.3).
+   - Retuning credit, and static mirror weights (§24.4).
+   - Moving the swapfile off nvme4. It is idle during decode, so this is housekeeping at
+     most.
 
 ## Sources
 
