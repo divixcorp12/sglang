@@ -816,7 +816,9 @@ def test_a_row_packs_while_another_rows_read_is_still_outstanding(tmp_path, weig
     assert result == 1 and record["rows_reading_max"] == 6
     packs = _row_packs(record)
     held = _extent_cqes(record, 5)
-    assert len(held) == _n(s.tables.parts, s, 1, [experts[5]]) and all(held)
+    # All of row 5's extents, as far as the record's extent slots reach (sub-reads can run past them).
+    traced = min(_n(s.tables.parts, s, 1, [experts[5]]), ops.STAGE_TRACE_EXTENTS - _reads(s, 1, experts[:5]))
+    assert len(held) == traced and all(held)
     for k in range(5):
         assert record["submit"] < packs[k]["start"] < max(held), (k, packs[k], held)
     # Row 5 itself packs only after ALL of its own extents completed, and after the others.
