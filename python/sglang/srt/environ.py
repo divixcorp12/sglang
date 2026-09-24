@@ -381,6 +381,11 @@ class Envs:
     SGLANG_MOE_EXPERT_STREAM = EnvBool(False)
     SGLANG_MOE_EXPERT_FILE_DIR = EnvStr("")
     SGLANG_MOE_PINNED_HOST_MB = EnvInt(0)
+    # Where the pinned host tier lives: "node:MiB,node:MiB" (e.g. "0:65536,1:30720"),
+    # summing to SGLANG_MOE_PINNED_HOST_MB. Every layer's rows are bound to the nodes
+    # in that proportion, and startup refuses a node without the memory. Empty keeps
+    # first-touch placement.
+    SGLANG_MOE_PINNED_HOST_NUMA_MB = EnvStr("")
     SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
     SGLANG_MOE_HOT_GPU_MB = EnvInt(0)
     SGLANG_MOE_HOT_SEED = EnvStr("")

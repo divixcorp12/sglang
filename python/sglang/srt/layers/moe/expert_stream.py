@@ -10,7 +10,7 @@ import os
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from operator import index
-from typing import Callable, Dict, Iterable, Iterator, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, Sequence, Tuple
 
 import torch
 import triton
@@ -55,6 +55,9 @@ from sglang.srt.layers.moe.expert_row_plan import (
     PinnedTierRowBackend,
 )
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.host_numa import Placement
 
 logger = logging.getLogger(__name__)
 _SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
@@ -166,6 +169,7 @@ class ExpertPinnedHostCache:
         device: torch.device | str | None = None,
         is_pinned: Callable[[int], bool] | None = None,
         slot_table: PinnedSlotTable | None = None,
+        placement: "Placement" = (),
     ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
@@ -200,7 +204,11 @@ class ExpertPinnedHostCache:
             for name in self.cached_names:
                 spec = streamer.spec(name)
                 slab = allocate_host_slab(
-                    capacity, spec.row_shape, spec.dtype, register=register
+                    capacity,
+                    spec.row_shape,
+                    spec.dtype,
+                    register=register,
+                    placement=placement,
                 )
                 self.tensors[name] = slab
                 if register and slab.numel():
@@ -465,6 +473,41 @@ class ExpertPinnedHostCache:
         )
 
 
+def pinned_host_placement(budget_bytes: int) -> "Placement":
+    """SGLANG_MOE_PINNED_HOST_NUMA_MB, checked against the budget and the nodes; () when unset."""
+    from sglang.srt.layers.moe.host_numa import check_capacity, parse_placement
+
+    placement = parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get())
+    if not placement:
+        return ()
+    placed = sum(nbytes for _, nbytes in placement)
+    if placed != budget_bytes:
+        raise ValueError(
+            f"SGLANG_MOE_PINNED_HOST_NUMA_MB places {placed >> 20} MiB but "
+            f"SGLANG_MOE_PINNED_HOST_MB is {budget_bytes >> 20} MiB; they must agree"
+        )
+    check_capacity(placement)
+    return placement
+
+
+def _placement_report(placement: "Placement", caches) -> dict | None:
+    """The requested MiB per node and, per node, how many sampled tier pages it holds (-2: not yet resident)."""
+    if not placement:
+        return None
+    from collections import Counter
+
+    from sglang.srt.layers.moe.host_numa import page_nodes
+
+    sampled = Counter()
+    for cache in caches:
+        for slab in cache.tensors.values():
+            sampled.update(page_nodes(slab, samples=16))
+    return {
+        "mib": {str(node): nbytes >> 20 for node, nbytes in placement},
+        "sampled_pages": {str(node): count for node, count in sorted(sampled.items())},
+    }
+
+
 class ExpertPinnedHostCacheManager:
     """Allocate a global complete-row budget across streamed expert layers."""
 
@@ -505,6 +548,7 @@ class ExpertPinnedHostCacheManager:
                 progress = True
         if not any(capacities.values()):
             return None
+        placement = pinned_host_placement(budget_bytes)
         manager = cls()
         # The format supplies tier options such as an is_pinned filter; the dense
         # format supplies none, so NVFP4 tiers are built exactly as before.
@@ -512,6 +556,7 @@ class ExpertPinnedHostCacheManager:
             layer_id: ExpertPinnedHostCache(
                 streamers[layer_id],
                 capacity,
+                placement=placement,
                 **pinned_tier_options_of(
                     streamers[layer_id].format, streamers[layer_id].layer
                 ),
@@ -529,6 +574,7 @@ class ExpertPinnedHostCacheManager:
                     "residency_bytes": manager.residency_bytes,
                     "rows": sum(cache.capacity for cache in manager.caches.values()),
                     "layers": len(manager.caches),
+                    "numa": _placement_report(placement, manager.caches.values()),
                 },
                 sort_keys=True,
             ),

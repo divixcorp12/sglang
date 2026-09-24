@@ -14,6 +14,7 @@ import math
 import weakref
 from collections import OrderedDict
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Collection,
@@ -28,6 +29,9 @@ from typing import (
 import torch
 
 from sglang.srt.layers.engram_row_cache import cache_stats_sink
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.host_numa import Placement
 
 PAGE_BYTES = 4096
 _LRU_INDEX = itertools.count()
@@ -227,7 +231,12 @@ def tier_snapshot() -> dict:
 
 
 def allocate_host_slab(
-    rows: int, row_shape: tuple[int, ...], dtype: torch.dtype, *, register: bool
+    rows: int,
+    row_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    register: bool,
+    placement: "Placement" = (),
 ) -> torch.Tensor:
     """A page-aligned ``[rows, *row_shape]`` host tensor of exactly its size.
 
@@ -236,11 +245,21 @@ def allocate_host_slab(
     memory plus one page of alignment slack, and ``register`` pins it with
     ``cudaHostRegister`` in row-aligned chunks, as the host arena does.
     Page alignment also lets io_uring fill it with ``O_DIRECT``.
+
+    A non-empty ``placement`` (host_numa) maps the slab on its own and binds
+    its rows to NUMA nodes in proportion before any page is touched.
     """
     shape = (int(rows),) + tuple(int(dimension) for dimension in row_shape)
     nbytes = math.prod(shape) * dtype.itemsize
-    storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
-    start = (-storage.data_ptr()) % PAGE_BYTES
+    if placement:
+        from sglang.srt.layers.moe.host_numa import allocate_bound, split_rows
+
+        row_bytes = nbytes // shape[0] if shape[0] else 0
+        storage = allocate_bound(nbytes, split_rows(shape[0], placement), row_bytes)
+        start = 0
+    else:
+        storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
+        start = (-storage.data_ptr()) % PAGE_BYTES
     slab = storage[start : start + nbytes].view(dtype).view(shape)
     if register and nbytes:
         # Imported here: expert_stream imports this module while the model
