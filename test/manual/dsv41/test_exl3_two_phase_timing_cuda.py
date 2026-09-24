@@ -80,7 +80,7 @@ class TwoPhaseService:
     time, against the real C++ service thread with two-phase enabled.
     """
 
-    def __init__(self, tmp_path, *, timeout_ms=2000, poll_bound=64, advise=False):
+    def __init__(self, tmp_path, *, timeout_ms=2000, hit_wait_ns=100_000, advise=False):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
         from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
@@ -94,7 +94,7 @@ class TwoPhaseService:
         self.names = EXL3_STREAMED_NAMES
         self.slabs = {lid: {} for lid in range(LAYERS)}
         self.host = None
-        self.poll_bound = poll_bound
+        self.hit_wait_ns = hit_wait_ns
         try:
             for lid in range(LAYERS):
                 for n in self.names:
@@ -143,7 +143,7 @@ class TwoPhaseService:
         self.dev.post(row, self.planned, self.count, self.routes, -1)
 
     def hit_wait(self, row=0):
-        self.dev.hit_wait(row, self.planned, self.count, self.dest_slots, self.poll_bound)
+        self.dev.hit_wait(row, self.planned, self.count, self.dest_slots, self.hit_wait_ns)
 
     def copy1(self):
         from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
@@ -297,13 +297,13 @@ def test_t6_stage2_wait_never_writes_keep_so_a_stage1_violation_is_not_overwritt
 def test_t7_one_request_deadline_not_one_per_stage(tmp_path):
     """T7: one absolute request deadline (D5), computed once by the post kernel, not one per stage.
 
-    ``poll_bound`` is set far above any real deployment value so stage 1's own poll loop is bounded
-    by the deadline rather than by the iteration cap -- with a realistic bound (T10's concern)
+    ``hit_wait_ns`` is set far above any real deployment value so stage 1's own poll loop is bounded
+    by the deadline rather than by its own budget -- with a realistic budget (T10's concern)
     stage 1 always returns in microseconds regardless of the deadline, and this test would not
     exercise D5 at all.
     """
     timeout_ms = 400
-    s = TwoPhaseService(tmp_path, timeout_ms=timeout_ms, poll_bound=100_000_000)
+    s = TwoPhaseService(tmp_path, timeout_ms=timeout_ms, hit_wait_ns=10_000_000_000)
     try:
         s.host.inject(delay_s=5.0)  # the demand read must not complete inside this test's window
         s.plan([11])  # never loaded: a miss in both stages
@@ -338,12 +338,12 @@ def test_t10_all_miss_request_does_not_pay_the_read_wait_twice(tmp_path):
     """T10: stage 1's poll is bounded (D1), so an all-miss request commits go_1 == 0 promptly
     instead of also spinning through the full demand-read wait inside stage 1's own poll loop.
 
-    ``poll_bound`` is the real default (``SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND`` defaults to 64)
+    ``hit_wait_ns`` is the real default (``SGLANG_DSV41_RAM_MISS_HIT_WAIT_US`` defaults to 100)
     rather than an inflated one, because this test is about that bound doing its job, not about
     the deadline sharing T7 covers.
     """
     timeout_ms = 2000
-    s = TwoPhaseService(tmp_path, timeout_ms=timeout_ms, poll_bound=64)
+    s = TwoPhaseService(tmp_path, timeout_ms=timeout_ms, hit_wait_ns=100_000)
     try:
         s.host.inject(delay_s=5.0)  # the demand read must not complete inside this test's window
         s.plan([13])  # never loaded: a miss
@@ -377,7 +377,7 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
     a lane the poll has not yet observed by the time it gives up correctly and safely falls
     through to stage 2, so a race between ``post`` and ``hit_wait`` can legitimately split an
     all-hit request across both stages even at a generous poll bound (confirmed empirically: 1 of
-    7 runs at poll_bound=10_000_000 read only 2 of 3 lanes as hits). That race is not what T11 is
+    7 runs at a 10_000_000-poll bound read only 2 of 3 lanes as hits). That race is not what T11 is
     about, so the test waits on the host's own ``hit_leases_granted`` counter -- incremented
     synchronously inside the reservation hold that publishes the RowResults -- before launching
     stage 1's kernel at all, removing it from this test's scope entirely.
@@ -393,7 +393,7 @@ def test_t11_all_hit_request_is_entirely_stage1_and_stage2_acknowledges_nothing(
     at the ``leases_acked`` assertion the checklist names. The batched chain shares no kernel with
     stage_ack, so it cannot trip that mutant.
     """
-    s = TwoPhaseService(tmp_path, poll_bound=64)
+    s = TwoPhaseService(tmp_path, hit_wait_ns=100_000)
     try:
         experts = [1, 2, 3]
         s.plan(experts)

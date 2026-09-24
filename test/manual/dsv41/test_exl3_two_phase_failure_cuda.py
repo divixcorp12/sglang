@@ -113,13 +113,13 @@ class TwoPhaseService:
         self.routes.fill_(-1)
         self.routes[: len(experts)] = torch.tensor(experts, dtype=torch.int64)
 
-    def step(self, row=0, *, poll_bound=256):
+    def step(self, row=0, *, hit_wait_ns=100_000):
         """post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F, one request, one stream. Returns the request's seq."""
         from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 
         self.dev.post(row, self.planned, self.count, self.routes, -1)
         seq = int(self.dev.stats()["posted"]) & 0xFFFFFFFF
-        self.dev.hit_wait(row, self.planned, self.count, self.dest_slots, poll_bound)
+        self.dev.hit_wait(row, self.planned, self.count, self.dest_slots, hit_wait_ns)
         copy_expert_row_segments_gpu(self.segments, self.dev.host_rows_1, self.dev.dst_slots_1, self.dev.go_1)
         self.dev.stage_ack(1)
         self.dev.rest_wait(row, self.planned, self.count, self.dest_slots, self.ram_miss)
@@ -171,7 +171,7 @@ def test_the_partial_terminal_mask_names_only_unacknowledged_lanes(service):
     # 2e4f2f0e3c, with go_1 == 0 and leases_voided == 1, because the host reached demand_done before stage 1
     # ever polled and W1 then broke out of its poll on the "request served, nothing left to discover" exit.
     # That exit's premise does not hold for a FAILED request, whose hit lanes are voided rather than
-    # published. Raising poll_bound does not help (verified at 2000000: still 1 in 12); only holding the
+    # published. Lengthening stage 1's wait does not help (verified at a 2000000-poll bound: still 1 in 12); only holding the
     # request open does.
     s.host.inject(delay_s=0.2, fail_reads=True)
     s.plan([3, 9])  # lane 0 hits (resident above), lane 1 misses and the read fails

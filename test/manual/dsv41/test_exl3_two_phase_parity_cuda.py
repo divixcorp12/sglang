@@ -138,7 +138,7 @@ class Service:
         self.routes.fill_(-1)
         self.routes[: len(experts)] = torch.tensor(experts, dtype=torch.int64)
 
-    def make_backend(self, row=0, poll_bound=64):
+    def make_backend(self, row=0, hit_wait_ns=100_000):
         """The real D7 orchestration (``Exl3RamMissRowBackend``), built once and reused across warm-up and
         capture -- exactly how ``post`` is used in production (constructed at attach time, replayed every
         step). Building a fresh one per call, inside a capture, allocates tensors mid-capture and is not
@@ -153,7 +153,7 @@ class Service:
             next_row=-1,
             capacity=TOP_K,
             two_phase=True,
-            poll_bound=poll_bound,
+            hit_wait_ns=hit_wait_ns,
         )
 
     def make_plan(self):
@@ -328,7 +328,7 @@ class TestGraphTopology:
         expected_names = ["post", "W1", "C1", "A1", "W2", "C2", "A2", "F", "D"]
         expected_funcs = {
             "post": _kernel_func(lambda: s.dev.post(0, s.planned, s.count, s.routes, -1)),
-            "W1": _kernel_func(lambda: s.dev.hit_wait(0, s.planned, s.count, s.dest_slots, 64)),
+            "W1": _kernel_func(lambda: s.dev.hit_wait(0, s.planned, s.count, s.dest_slots, 100_000)),
             "C1": _kernel_func(
                 lambda: copy_expert_row_segments_gpu(s.segments, s.dev.host_rows_1, s.dev.dst_slots_1, s.dev.go_1)
             ),
@@ -557,8 +557,8 @@ class TestOutputParity:
                     ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
                     inject_this_call = two_phase and route == routes[1]
                     if inject_this_call:
-                        # Force this call's reads to take far longer than stage 1's poll bound (tens of
-                        # us at the default poll_bound), so the claim check below is deterministic, not a
+                        # Force this call's reads to take far longer than stage 1's wait budget (100
+                        # us by default), so the claim check below is deterministic, not a
                         # race. Without an injected delay this is NOT a safe property to assert: verified
                         # empirically that a lane whose expert was never resident before (12, here) can
                         # still show claimed == 1 on its very first read, because stage 1 does not

@@ -979,11 +979,11 @@ class Exl3RamMissDevice:
             self.page, self.state, self._lease_address, self._lease_d, self.go_count, self.lane_ctx, keep
         )
 
-    def hit_wait(self, row: int, planned, count, dst_slots, poll_bound: int) -> None:
+    def hit_wait(self, row: int, planned, count, dst_slots, budget_ns: int) -> None:
         """Stage 1 (D1): claim and compact the lanes the service published before read() returned.
 
-        It never waits on ``demand_done``; the bound caps how long it polls for a publish that may not be coming,
-        so an all-miss request does not pay the read wait twice.
+        It never waits on ``demand_done``; ``budget_ns`` of %globaltimer from kernel entry caps how long it polls for a
+        publish that may not be coming, so an all-miss request does not pay the read wait twice.
         """
         self._check_row("row", row)
         self._check_buffers(
@@ -994,7 +994,7 @@ class Exl3RamMissDevice:
         self._kernels().exl3_ram_miss_lease_hit_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
             self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
-            self.violated, poll_bound,
+            self.violated, budget_ns,
         )
 
     def rest_wait(self, row: int, planned, count, dst_slots, ram_miss) -> None:

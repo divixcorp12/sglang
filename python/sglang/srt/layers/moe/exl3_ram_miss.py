@@ -299,7 +299,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         next_row: int,
         capacity: int,
         two_phase: bool = False,
-        poll_bound: int = 64,
+        hit_wait_ns: int = 100_000,
         hot_slots: Optional[torch.Tensor] = None,
         hot_capacity: int = 0,
     ) -> None:
@@ -312,9 +312,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         # Task 6 V1. Off builds the Task 5 batched chain, which is the A1 arm every V1 measurement is reported
         # against, so both chains have to exist in one build.
         self.two_phase = two_phase
-        # Stage 1's poll bound, in iterations of roughly 256 ns. Unmeasured: neither the per-stage cost nor the
-        # store-to-poll latency it should be derived from has a measurement (checklist O4).
-        self.poll_bound = poll_bound
+        self.hit_wait_ns = hit_wait_ns
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
 
@@ -374,7 +372,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             self.row, self.planned, plan.count, self.routes, self.next_row,
             self.hot_slots, self.hot_capacity,
         )
-        self.device_side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.poll_bound)
+        self.device_side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.hit_wait_ns)
         copy_expert_row_segments_gpu(
             self.segments[tag], self.device_side.host_rows_1, self.device_side.dst_slots_1, self.device_side.go_1
         )
@@ -449,7 +447,7 @@ class Exl3RamMissService:
         # Task 6 V1, fixed in ensure_started beside lease_mode so the host, the device and every backend cannot
         # disagree about which chain this process runs.
         self.two_phase = False
-        self.hit_poll_bound = 64
+        self.hit_wait_ns = 100_000
         self.hot_page = None
         self.gpu_hot_enabled = False
         self._gpu_hot_updater = None
@@ -532,7 +530,7 @@ class Exl3RamMissService:
         self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
         self.hot_page = hot_page
         self.two_phase = two_phase
-        self.hit_poll_bound = cfg.ram_miss_hit_poll_bound
+        self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
         # later is refused by register()), makes this run before that hook, so the slabs are quarantined and their
@@ -615,7 +613,7 @@ class Exl3RamMissService:
         previous = streamer.row_backend
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows,
-            two_phase=self.two_phase, poll_bound=self.hit_poll_bound,
+            two_phase=self.two_phase, hit_wait_ns=self.hit_wait_ns,
             hot_slots=(manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)]
                        if self.gpu_hot_enabled else None),
             hot_capacity=cache.capacity if self.gpu_hot_enabled else 0,

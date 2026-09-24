@@ -161,7 +161,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
             # Long enough for stage 1 to see the hit grant, and far shorter than the 1 s read hold below.
-            envs.SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND.override(1 << 16),
+            envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.override(50_000),
             envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(False),
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
             envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),

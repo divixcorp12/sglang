@@ -623,9 +623,10 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     int32_t* __restrict__ origin_1,
     int32_t* __restrict__ claimed,
     int32_t* __restrict__ violated,
-    int64_t poll_bound) {
+    int64_t budget_ns) {
   using namespace exl3_ram_miss_device;
   if (threadIdx.x != 0) return;
+  const uint64_t start = global_ns();
   go_1[0] = 0;      // fail closed: the single commit point is the last store of this kernel
   violated[0] = 0;  // stage 1 opens the chain, so it is where the shared violation flag is cleared
   for (int64_t i = 0; i < lanes; ++i) {
@@ -662,9 +663,9 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   bool hard_fail = false;
 
   // Bounded poll. Without a bound an all-miss request would spin here until the request was served and so pay the
-  // read wait twice (T10). The bound is a guess: neither the per-stage cost nor the store-to-poll latency it should
-  // be derived from has been measured (checklist O4).
-  for (int64_t iter = 0;; ++iter) {
+  // read wait twice (T10). The bound is time, not iterations: each pass reads every unclaimed lane's result across
+  // PCIe, so a pass costs microseconds that grow with the lane count, and 8 passes measured up to 212 us.
+  for (;;) {
     for (int64_t i = 0; i < planned_count && !hard_fail; ++i) {
       if (claimed[i] != 0) continue;
       bool ready_seen = false;
@@ -680,8 +681,9 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     if (hard_fail || taken == planned_count) break;
     // Once the request is served every lane is published, so a later poll can discover nothing new.
     if (reached(ld_acquire_sys(page + kDemandDone), seq)) break;
-    if (iter >= poll_bound) break;
-    if (static_cast<int64_t>(global_ns() - deadline) >= 0) break;
+    const uint64_t now = global_ns();
+    if (static_cast<int64_t>(now - start) >= budget_ns) break;
+    if (static_cast<int64_t>(now - deadline) >= 0) break;
     if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) break;
     __nanosleep(256);
   }
@@ -1135,7 +1137,7 @@ void exl3_ram_miss_lease_hit_wait(
     tvm::ffi::TensorView origin_1,
     tvm::ffi::TensorView claimed,
     tvm::ffi::TensorView violated,
-    int64_t poll_bound) {
+    int64_t budget_ns) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
   host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
       exl3_ram_miss_lease_hit_wait_kernel,
@@ -1160,7 +1162,7 @@ void exl3_ram_miss_lease_hit_wait(
       static_cast<int32_t*>(origin_1.data_ptr()),
       static_cast<int32_t*>(claimed.data_ptr()),
       static_cast<int32_t*>(violated.data_ptr()),
-      poll_bound);
+      budget_ns);
 }
 
 void exl3_ram_miss_lease_rest_wait(

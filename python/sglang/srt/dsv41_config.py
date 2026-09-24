@@ -26,7 +26,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_expert_prefetch: bool
     enable_ram_miss_leases: bool
     enable_ram_miss_two_phase: bool
-    ram_miss_hit_poll_bound: int
+    ram_miss_hit_wait_us: int
     torch_prefill_indexer: bool
 
     @classmethod
@@ -47,6 +47,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_expert_prefetch=envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get(),
             enable_ram_miss_leases=envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get(),
             enable_ram_miss_two_phase=envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.get(),
-            ram_miss_hit_poll_bound=envs.SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND.get(),
+            ram_miss_hit_wait_us=envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
         )

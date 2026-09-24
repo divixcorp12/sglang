@@ -1854,11 +1854,11 @@ class Envs:
     # read is still running instead of after it. Needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES. Read once when the
     # service starts; off leaves lease mode exactly as it shipped, which is the arm V1 is measured against.
     SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE = EnvBool(False)
-    # Two-phase stage 1: how many poll iterations (roughly 256 ns each) it waits for the service to publish the
-    # resident lanes before copying whatever has arrived. It never waits for the request to be served, so this only
-    # trades a longer look for a fuller first stage. Unmeasured: neither the per-stage cost nor the store-to-poll
-    # latency this should be derived from has a measurement.
-    SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND = EnvInt(64)
+    # Two-phase stage 1: how long, in microseconds of %globaltimer from the kernel's start, it waits for the service
+    # to publish the resident lanes before copying whatever has arrived. It never waits for the request to be
+    # served, so this trades a fuller first stage against a later one. Time, not polls: a poll pass reads each lane
+    # across PCIe, so its cost depends on the lane count. At 8 passes the wait measured p50 13 us, p90 93 us.
+    SGLANG_DSV41_RAM_MISS_HIT_WAIT_US = EnvInt(100)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
