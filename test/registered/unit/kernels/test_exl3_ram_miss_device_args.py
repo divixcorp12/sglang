@@ -193,6 +193,9 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kFailReason": "fail_reason",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
+    # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.
+    counters = re.search(r"enum Counter : int \{(.*?)\bkCounterCount\b", (CSRC / "exl3_ram_miss_host.cpp").read_text(), re.S)
+    assert len(re.findall(r"^\s*(k\w+)", re.sub(r"//[^\n]*", "", counters.group(1)), re.M)) == len(ram_miss.COUNTERS)
 
 
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():

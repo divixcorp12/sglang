@@ -742,12 +742,13 @@ def test_u4_miss_lanes_are_granted_loading_and_hit_lanes_ready_before_the_read(t
     """U4. While the read is held up, the hit lane's row result is READY and each miss lane's is LOADING with its
     final payload (this request's generation, its expert, the slot reserved for it and that slot's generation); the
     miss slots are leased while still kLoading, and the ring entry owes no further grant. A tight observer reads each
-    miss lane as the stream kernel will -- the ready word, then its PieceMask word -- and must never see a LOADING
-    word of this generation over a PieceMask word of another: the mask is initialised before the ready word. After
+    miss lane as the stream kernel will -- the ready word, then its PieceMask word -- and requires that the mask
+    carries this generation by the time the LOADING word is observed. It cannot detect an initialisation that lands
+    after the ready word but before the observer's next read; that ordering rests on inspection. After
     the read the miss lanes are still LOADING: there is no second grant.
 
     Mutants: grant the miss lanes after the read (today's S3) -- red on the LOADING tags; grant a miss lane READY --
-    red on the tag; drop the PieceMask init (task 3's no_mask_init) -- red on the ordering check and on the result."""
+    red on the tag; drop the PieceMask init (task 3's no_mask_init) -- red on the mask check and on the result."""
     s, page, host, sim = _host(tmp_path, 2)
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     try:
