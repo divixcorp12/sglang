@@ -409,8 +409,10 @@ class TestGraphTopology:
             # F's kernel identity, learned from the exact device_side instance the capture below drives
             # (not a separate harness): an isolated single-op capture of the same finalize() call.
             dev = streamer.row_backend.device_side
-            probe_count = torch.zeros(1, dtype=torch.int32, device="cuda")  # allocated outside the probe: a fresh
-            # allocation inside it would itself add a node (an allocator fill/memset), miscounting the kernel probe.
+            # Allocated outside the probe: a fresh allocation inside it would itself add a node (an allocator
+            # fill/memset), miscounting the kernel probe. It equals the warm-up's copies so the probe's one eager
+            # finalize runs as a served request; any other count is a failed unarmed request, which fail-stops.
+            probe_count = dev.go_1 + dev.go_2
             f_func = _kernel_func(lambda: dev.finalize(probe_count, streamer.row_backend.keep))
 
             graph = torch.cuda.CUDAGraph(keep_graph=True)
