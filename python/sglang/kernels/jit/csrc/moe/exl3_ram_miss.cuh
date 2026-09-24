@@ -945,7 +945,7 @@ namespace exl3_ram_miss_device {
 constexpr int kStreamBlocks = 8;
 constexpr int kStreamThreads = 256;
 constexpr int kRowPieces = 8;  // the host's kPieces: one readiness bit per piece of a row
-constexpr uint32_t kAllPieces = 0xFFu;
+constexpr uint32_t kAllPieces = 255u;
 // S's one counter word: finished blocks in the low 16 bits, completed blocks in units of kStreamCompleted above them.
 // One word, so the last block reads both counts in the atomic that makes it last.
 constexpr uint32_t kStreamCompleted = 65536u;
