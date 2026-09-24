@@ -199,6 +199,25 @@
       "keyFiles": []
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp",
+      "accessCount": 3,
+      "lastAccessed": 1790291143430,
+      "type": "file"
+    },
+    {
+      "path": "python/sglang/kernels/ops/moe/exl3_ram_miss.py",
+      "accessCount": 1,
+      "lastAccessed": 1790290697529,
+      "type": "file"
+    },
+    {
+      "path": "test/registered/unit/kernels/test_exl3_ram_miss_row_images.py",
+      "accessCount": 1,
+      "lastAccessed": 1790290929620,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }

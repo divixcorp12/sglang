@@ -1696,7 +1696,9 @@ class RowReader {
   // every row whose reads have landed and whose bytes take_ready_row vetted. With it, publish every vetted piece at
   // once (piece j is exactly sub-read j's bytes, vetted when it landed, and the reap's acquire of the CQ tail orders
   // the drive's writes before the release that sets the bit), and finish a row once all its pieces are published and
-  // its sub-reads retired. One clock read per turn stamps what it published (pack stamps = publish time).
+  // its sub-reads retired. One clock read per turn stamps what it published (pack stamps = publish time); a piece with
+  // no bytes (past the row's sub-reads) is published at admission like the bounce path's, and stamps nothing, so a
+  // row's stamps are those of its landed bytes. The pack_delay_ns fault delays each publish (a slow publisher).
   bool publish_landed() {
     Call& c = c_;
     bool any = false;
@@ -1705,14 +1707,21 @@ class RowReader {
       if (now < 0) now = stamp(c.trace);
       return now;
     };
+    const auto delay = [&] {
+      if (fault_.pack_delay_ns <= 0) return;
+      std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.pack_delay_ns));
+      now = -1;
+    };
     if (!piece_stream_) {
       while (true) {
         const size_t best = take_ready_row();
         if (best == static_cast<size_t>(kBounceSlots)) return any;
+        delay();
         finish_row(best, clock(), clock());
         any = true;
       }
     }
+    const size_t segments = t_.segments.size();
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots) && !c.failed; ++s) {
       BounceRow& r = rows_[s];
       if (r.state == RowState::Free) continue;
@@ -1721,9 +1730,15 @@ class RowReader {
         const uint8_t bit = static_cast<uint8_t>(1u << j);
         if ((todo & bit) == 0) continue;
         if (j >= 1 && holding_for_probe()) continue;
+        const PieceRun* runs = &piece_runs_[(s * kPieces + static_cast<size_t>(j)) * segments];
+        bool bytes = false;
+        for (size_t i = 0; i < segments && !bytes; ++i) bytes = runs[i].lo < runs[i].hi;
         r.dispatched |= bit;
-        r.pack_first = std::min(r.pack_first, clock());
-        r.pack_last = std::max(r.pack_last, clock());
+        if (bytes) {
+          delay();
+          r.pack_first = std::min(r.pack_first, clock());
+          r.pack_last = std::max(r.pack_last, clock());
+        }
         publish_collected(s, j);
         any = true;
       }

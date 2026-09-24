@@ -138,6 +138,14 @@ NOT_REUSED = {
     "test_a_row_packs_while_another_rows_read_is_still_outstanding": "asserts a pack span of the pack_delay fault",
     "test_a_bank_is_not_reused_until_every_row_in_it_has_packed": "a bank holds no memory: nothing to wait for",
     "test_refill_submits_a_credit_freed_read_before_the_next_rows_blocking_pack": "no blocking pack to overtake",
+    # The bounce's failure rule: a slot is untouched or a whole row, since nothing reaches it before its row landed.
+    # The drive writes a direct-mode slot as each read lands, so after a failure an unpublished slot may hold part
+    # of a row (and the poison fault's fill); the caller releases it. What must hold instead, that every published
+    # piece is whole and exact, is test_a_failed_read_publishes_only_whole_exact_pieces below.
+    "test_a_failed_part_fails_the_row_and_never_leaves_a_half_packed_one": "the bounce's untouched-slot rule",
+    "test_a_completion_of_a_retired_extent_cannot_finish_the_extent_that_recycled_its_descriptor": "as above",
+    "test_a_hard_error_with_both_banks_in_flight_leaves_no_half_packed_row_and_a_clean_ring": "as above",
+    "test_u2_a_failed_sub_read_leaves_its_pieces_unvetted_and_its_row_unpacked": "as above",
     # Piece streaming with packing workers, or the bounce's geometry.
     "test_u1_geometry_of_every_row_of_a_random_layout": "synthetic shard tables",
     "test_u1_geometry_of_every_row_of_a_real_layout": "shard geometry",
@@ -204,6 +212,8 @@ def test_the_direct_mode_leaves_every_slab_byte_as_the_bounce_path_does(tmp_path
     direct read equal the slabs after a bounce read, byte for byte, including every slot the request does not name.
     The requests are the split suite's shapes: one row, rows over several batches (11 rows, 8 + 3), one row per
     batch, and every mirror split; the image's last part ends inside a page, so the padding is never read."""
+    for name in ("bounce", "direct"):
+        (tmp_path / name).mkdir()
     bounce = ram_miss_setup(tmp_path / "bounce", capacity=12, experts=12, mirror_weights=weights, hidden=256, inter=256)
     direct = _images_setup(tmp_path / "direct", capacity=12, experts=12, mirror_weights=weights)
     assert direct.tables.slot_bytes % PAGE != 0  # the image ends inside its last page
@@ -222,14 +232,14 @@ def test_the_direct_mode_leaves_every_slab_byte_as_the_bounce_path_does(tmp_path
 # ---- A resubmission resumes inside the iovec list ----
 
 
-def _image_offsets(s):
-    return [int(o) for o in s.tables.segments[:, 2].tolist()]
+# The fake image's slab rows (EXL3_STREAMED_NAMES order): 49152, 1024, 1024, 24576, 512, 512 bytes.
+IMAGE_ROW_STARTS = [0, 49152, 50176, 51200, 75776, 76288]
 
 
 @pytest.mark.parametrize(
     "short, where",
-    [(512, "inside the first slab row"), (2048, "exactly at a slab row boundary"), (5 * 512, "one block past a boundary"),
-     (51200 - 512, "one block before a boundary")],
+    [(512, "inside the first slab row"), (49152, "exactly at a slab row boundary"),
+     (49152 + 512, "one block past a boundary"), (51200 - 512, "one block before a boundary")],
 )
 def test_a_short_read_resumes_at_the_byte_it_stopped_even_mid_row(tmp_path, short, where):
     """Derived property: after a short O_DIRECT read of ``done`` bytes, the resubmission must scatter the rest of the
@@ -237,8 +247,7 @@ def test_a_short_read_resumes_at_the_byte_it_stopped_even_mid_row(tmp_path, shor
     holding that offset, and the later iovecs are whole rows. An off-by-one-segment (or restarting the iovecs from the
     part's start at the new file offset) lands every later byte in the wrong row, which the byte check shows."""
     s = _images_setup(tmp_path, capacity=6)
-    offsets = _image_offsets(s)
-    assert 2048 in offsets and 51200 in offsets, offsets  # the fake image's boundaries the cases are placed around
+    assert s.tables.segments[:, 2].tolist() == IMAGE_ROW_STARTS  # the boundaries the cases are placed around
     experts, slots = [3, 0, 5], [0, 1, 2]
     result, sqes, info, record = read_rows_sqes(
         s.tables, 1, experts, slots, direct=True, part=0, part_short=short, ordinal=1
@@ -253,9 +262,9 @@ def test_a_short_read_resumes_at_the_byte_it_stopped_even_mid_row(tmp_path, shor
 
 def test_a_short_sub_read_resumes_mid_sub_read_across_slab_rows(tmp_path):
     """The same with piece streaming, where a sub-read spans several slab rows: sub-read 0 of the only part is the
-    image's first 20480 bytes (a quarter, page-rounded), the first two names' rows and the start of the third's. A
-    short read of 1536 bytes leaves a resubmission that starts 512 bytes into the second name's row and runs on into
-    the third; every piece is still published once, and every byte is exact."""
+    image's first 20480 bytes (a quarter, page-rounded), inside the first name's row; sub-read 2 spans three rows. A
+    short read of 1536 bytes leaves a resubmission that starts 1536 bytes into the first name's row and runs on
+    across the next ones; every piece is still published once, and every byte is exact."""
     s = _images_setup(tmp_path, capacity=6)
     experts, slots = [2, 4], [1, 0]
     result, record, masks, info = read_rows_pieces(
@@ -289,6 +298,41 @@ def test_an_io_error_fails_the_read_leaves_the_ring_clean_and_the_next_read_land
     )
     assert results == (0, 1)
     split._assert_rows(s, 1, [6, 7, 0], [6, 7, 0])
+
+
+FAILURES = [
+    dict(cqe_error=EIO, cqe_call=1),
+    dict(cqe_error=EIO, cqe_call=13),
+    dict(part=1, part_error=EIO, ordinal=11),
+    dict(part=0, part_error=EIO, ordinal=3, hold_ordinal=12),
+    dict(submit_error=EIO, submit_call=3, submit_first=True, max_outstanding=4),
+    dict(submit_error=EIO, submit_call=3, submit_first=False, max_outstanding=4),
+    dict(cqe_error=EIO, cqe_call=9, max_outstanding=3, reverse_cqes=True),
+    dict(stale_cqe_call=1),
+    dict(part=1, sub=3, part_error=EIO, ordinal=1),
+]
+
+
+@pytest.mark.parametrize("fault", FAILURES)
+def test_a_failed_read_publishes_only_whole_exact_pieces(tmp_path, fault):
+    """The direct mode's failure rule (the replacement of the bounce's untouched-slot rule): the drive writes the
+    slot itself, so a failed read may leave any unpublished bytes behind, but every piece whose bit a device could
+    see must be whole and exact, while the read runs and after it returns (a C++ thread checks the bytes behind
+    every bit it sees, as the device would copy them). The faults are the split suite's both-banks errors, a stale
+    completion and a failed sub-read, over 16 rows in two banks with the destination poisoned at admission."""
+    s = _images_setup(tmp_path, capacity=32, experts=16, mirror_weights=(1.0, 1.0))
+    experts, slots, ref_slots = list(range(16)), list(range(16)), list(range(16, 32))
+    assert read_rows_traced(s.tables, 1, experts, ref_slots, direct=True)[0] == 1
+    split._assert_rows(s, 1, experts, ref_slots)
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=True, generation=9, reference=s.tables.slabs, ref_slots=ref_slots,
+        piece_stream=True, step=8, poison=True, **fault,
+    )
+    assert result == 0
+    published = sum(bin(int(word) & 0xFF).count("1") for word in masks.view(-1).tolist())
+    assert info["differed"] == 0 and info["checked"] == published == record["pieces_published"]
 
 
 # ---- Refusals ----
@@ -327,12 +371,14 @@ def _moved(extents, *, offset=0, cut=0, gap=0):
         (lambda t: dict(extents=_moved(t.extents, cut=-256)), "offset and length 512 B aligned"),
         (lambda t: dict(slabs=_shifted(t.slabs, (1, 3), 128)), "slab row 512 B aligned"),
         # A table the direct mode could not land exactly: refused when the tables are read.
-        (lambda t: dict(extents=_shifted(t.extents, (1, 2, 1, 2), 512)), "never its padding"),
+        # Past the image into its padding: the image-sized slot refuses it before the image check can.
+        (lambda t: dict(extents=_shifted(t.extents, (1, 2, 1, 2), 512)), "outside its bounce slot"),
+        (lambda t: dict(extents=_shifted(t.extents, (1, 2, 1, 2), -512)), "exactly its image"),
         (lambda t: dict(starts=_shifted(t.starts, (0, 0), 512)), "start every row at 0"),
         (lambda t: dict(segments=_shifted(t.segments, (2, 2), 512)), "tile the image"),
         (lambda t: dict(extents=_moved(t.extents, gap=512)), "tile it in part order"),
     ],
-    ids=["offset", "length", "slab", "padding", "start", "segment_gap", "part_gap"],
+    ids=["offset", "length", "slab", "padding", "short", "start", "segment_gap", "part_gap"],
 )
 def test_open_refuses_a_table_the_direct_mode_cannot_read(tmp_path, edit, message):
     """Completeness of the refusals: each edit makes one read land wrong or be refused by the kernel, and each must
