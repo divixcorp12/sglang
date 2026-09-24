@@ -221,7 +221,13 @@ class StreamService:
         self.dev.stage_ack(1)
 
     def stream(self):
-        self.dev.stream(0, self.planned, self.count, self.dest_slots, self.ram_miss, self.segments, self.segment_map)
+        """S. Tries a ``keep`` kwarg first, as the two-phase T6 harness does for W2: the M10 mutant (S writes keep)
+        needs a real pointer to write through, and production's stream() takes none."""
+        args = (0, self.planned, self.count, self.dest_slots, self.ram_miss, self.segments, self.segment_map)
+        try:
+            self.dev.stream(*args, keep=self.keep)
+        except TypeError:
+            self.dev.stream(*args)
 
     def ack2(self):
         self.dev.stage_ack(2)
