@@ -644,7 +644,11 @@ struct PiecePublish {
 // caller's readiness words (PiecePublish) once that job is done; the slot map is still the caller's.
 // Packing writes only into the caller's not-yet-published slots and only from a slot whose extents
 // have all completed, so a failure leaves at most fully packed rows in unpublished slots, never a
-// half-packed one, and the caller releases them.
+// half-packed one, and the caller releases them. With piece streaming the unit is the piece: a piece is
+// packed only once the sub-reads it depends on have landed and is published only once its job is done,
+// so a failure leaves whole published pieces, never a torn one, in slots the caller has not mapped. The
+// caller quarantines each such slot a lane still leases (its lanes may be copying those pieces) and
+// releases the rest.
 class RowReader {
  public:
   RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
@@ -2391,13 +2395,22 @@ constexpr int64_t kLeaseRowTableBytes = 8;
 // Area P, service-written, at a new header offset (kLeaseHeaderPieceOffset): PieceMask[kLeaseRing][kLeaseLanes],
 // a per-lane generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment).
 // Each word gets its own 128 B line, so the device's per-lane poll never shares a line with a lane it did not
-// ask for. No behaviour writes it yet.
+// ask for. Under piece streaming the tier stores `gen << 8` into each miss lane's word at reservation, and the
+// reader's owner sets one bit per packed piece (publish_piece); with the flag off nothing writes it.
 constexpr int64_t kLeasePieceMaskLineBytes = 128;
 constexpr int64_t kLeasePieceMaskBytes = 8;  // one uint64 per word
 constexpr int64_t kLeaseAreaPieceMaskBytes = kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
 static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
 
-enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2 };
+// kQuarantine (piece streaming only): a slot whose read failed while a lane still leased it under tag LOADING. Its
+// mapping is cleared on entry, it is never taken, evicted or counted as a victim, and it becomes kFree when its last
+// lease is retired (retire_leases). A leased slot is never released: that is the S6 rule under piece streaming.
+enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2, kQuarantine = 3 };
+
+// RowResult.ready tags (LEASE_PROTOCOL.md 4.3): READY for a lane whose row is resident, LOADING (piece streaming) for
+// a miss lane granted at reservation, whose pieces become readable bit by bit through its PieceMask word.
+constexpr uint64_t kLeaseTagReady = 1;
+constexpr uint64_t kLeaseTagLoading = 2;
 
 enum Counter : int {
   kServedRequests = 0,
@@ -2427,6 +2440,7 @@ enum Counter : int {
   kHitLeasesGranted,
   kPieceStreamRefused,   // requests refused because piece streaming is on without two-phase and lease mode
   kPiecePublishRefused,  // piece publishes a readiness word refused, over the reader's life (each failed its read)
+  kSlotsQuarantined,     // piece streaming: leased slots of a failed read put in kQuarantine instead of released
   kCounterCount,
 };
 
@@ -2988,7 +3002,10 @@ class RamTier {
   // whose second grant has not run, or grant_lane_group_locked's `entry.active` guard stops protecting it.
   //
   // False on a still-active ring entry, exactly as the single-phase granter was: nothing is opened then.
-  bool open_lease_entry_locked(const Request& request) {
+  //
+  // `grants_pending` is false under piece streaming: the loading grant leases every lane, hit and miss, in the one
+  // call that follows, so no second grant is ever owed and S4 has nothing to hold open.
+  bool open_lease_entry_locked(const Request& request, bool grants_pending = true) {
     if (request.lane_experts.empty()) return true;
     const size_t count = request.lane_experts.size();
     if (count > kLeaseLanes) return false;
@@ -3000,7 +3017,7 @@ class RamTier {
     entry.gen = request.gen;
     entry.row = request.row;
     entry.count = static_cast<uint32_t>(count);
-    entry.grants_pending = true;
+    entry.grants_pending = grants_pending;
     return true;
   }
 
@@ -3033,8 +3050,16 @@ class RamTier {
   // group's ready words have to become visible to the device while the miss group's payloads do not yet exist.
   // Hoisting one fence to cover both groups would either publish hit lanes late (losing the entire mechanism) or
   // publish miss lanes whose payloads have not been written (handing the device a torn row result).
+  //
+  // The loading grant (piece streaming, plan 3.2): `loading` names this request's newly reserved slots, and a lane
+  // whose slot is kLoading and among them is granted too, under tag LOADING rather than READY. Hit lanes still need
+  // kReady. Both groups' payloads exist at reservation, so one call, one fence covers them without breaking the rule
+  // above: nothing is published whose payload is not written. The caller has stored and fenced each miss lane's
+  // PieceMask word (init_piece_words_locked) before this call, so the word carries the request's generation before
+  // any ready word of the request is visible. Null `loading` is the two-phase grant exactly as it was.
   template <typename Select>
-  bool grant_lane_group_locked(const Request& request, Select select, bool hit_phase = false) {
+  bool grant_lane_group_locked(
+      const Request& request, Select select, bool hit_phase = false, const std::vector<int64_t>* loading = nullptr) {
     if (request.lane_experts.empty()) return true;
     const size_t count = request.lane_experts.size();
     const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
@@ -3043,17 +3068,24 @@ class RamTier {
     Tier& tier = tiers_[request.row];
     int32_t slots[kLeaseLanes];
     bool take[kLeaseLanes] = {};
+    uint64_t tags[kLeaseLanes] = {};
     size_t taken = 0;
+    size_t hits = 0;
     for (size_t lane = 0; lane < count; ++lane) {
       if (!select(lane)) continue;
       if (entry.lane[lane].state != 0) return false;  // granted already: the two groups must be disjoint
       const int32_t expert = request.lane_experts[lane];
       if (expert < 0 || expert >= experts_) return false;
       const int32_t slot = tier.expert_slot[expert];
-      if (slot < 0 || tier.state[slot] != kReady || tier.slot_to_expert[slot] != expert) return false;
+      if (slot < 0 || tier.slot_to_expert[slot] != expert) return false;
+      const bool still_loading = loading != nullptr && tier.state[slot] == kLoading &&
+                                 std::find(loading->begin(), loading->end(), slot) != loading->end();
+      if (tier.state[slot] != kReady && !still_loading) return false;
       slots[lane] = slot;
       take[lane] = true;
+      tags[lane] = still_loading ? kLeaseTagLoading : kLeaseTagReady;
       ++taken;
+      if (!still_loading) ++hits;
     }
     if (taken == 0) return true;
     uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
@@ -3075,11 +3107,11 @@ class RamTier {
     _mm_sfence();  // THIS group's payloads land before THIS group's ready words -- see the note above
     for (size_t lane = 0; lane < count; ++lane) {
       if (!take[lane]) continue;
-      store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(1, request.gen));
+      store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(tags[lane], request.gen));
     }
     lanes_outstanding_.fetch_add(static_cast<int64_t>(taken));
     counters_[kLeasesGranted].fetch_add(static_cast<int64_t>(taken));
-    if (hit_phase) counters_[kHitLeasesGranted].fetch_add(static_cast<int64_t>(taken));  // S7
+    if (hit_phase) counters_[kHitLeasesGranted].fetch_add(static_cast<int64_t>(hits));  // S7: tag-READY lanes only
     return true;
   }
 
@@ -3120,6 +3152,12 @@ class RamTier {
             release_lease_locked(tier, held, kLeasesAcked);
           } else if (voided) {
             release_lease_locked(tier, held, kLeasesVoided);
+          }
+          // Plan 3.3: the last lease of a quarantined slot frees it. Its mapping was cleared on entry, so
+          // release_locked unmaps nothing -- the expert may already live in another slot (M3). A kLoading slot only
+          // loses the lease here; serve()'s post-read step decides it.
+          if (held.state != 1 && tier.state[held.slot] == kQuarantine && !leased_locked(tier, held.slot)) {
+            release_locked(entry.row, held.slot);
           }
         }
         // A second signal for a lane already released: counted once, and it releases nothing.
@@ -3164,6 +3202,21 @@ class RamTier {
       out[4 * slot + 1] = tier.slot_to_expert[slot];
       out[4 * slot + 2] = tier.leases[slot];
       out[4 * slot + 3] = tier.generation[slot];
+    }
+  }
+
+  // Test only: the service's account of request slot `idx`: [active, grants_pending, count, gen, then per lane
+  // (kLeaseLanes) its state, then per lane its slot].
+  void lease_entry(int64_t idx, int64_t* out) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const Outstanding& entry = outstanding_[idx];
+    out[0] = entry.active;
+    out[1] = entry.grants_pending;
+    out[2] = entry.count;
+    out[3] = static_cast<int64_t>(entry.gen);
+    for (int64_t lane = 0; lane < kLeaseLanes; ++lane) {
+      out[4 + lane] = entry.lane[lane].state;
+      out[4 + kLeaseLanes + lane] = entry.lane[lane].slot;
     }
   }
 
@@ -3361,6 +3414,8 @@ class RamTier {
     return tier.leases[slot] > 0;
   }
 
+  // A kQuarantine slot is counted as none of free, evictable or leased: it can never help a deferred request, so it
+  // must not make one wait (plan 3.2).
   VictimCensus census_locked(int64_t row, const std::vector<int32_t>& wanted) const {
     const Tier& tier = tiers_[row];
     VictimCensus census;
@@ -3384,6 +3439,7 @@ class RamTier {
     __atomic_store_n(map_ + row * experts_ + expert, slot, __ATOMIC_RELEASE);
   }
 
+  // Takes only a kFree slot or evicts an unleased kReady one: kLoading and kQuarantine slots are never taken.
   int64_t take_slot_locked(int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
     *evicted = -1;
@@ -3427,6 +3483,20 @@ class RamTier {
     }
     tier.slot_to_expert[slot] = -1;
     tier.state[slot] = kFree;
+  }
+
+  // Plan 3.2: a leased kLoading slot whose read failed. The mapping is cleared at once, both ways, so the expert can
+  // be read into another slot by the next request, and the later release_locked (retire_leases, on the last lease)
+  // finds no expert to unmap: it cannot unmap the expert from the slot it was re-read into (M3). Nothing is
+  // published, because the map was never published for a kLoading slot. The lease is kept: this slot's bytes may be
+  // under a device copy until the lane is acknowledged or voided.
+  void quarantine_locked(int64_t row, int64_t slot) {
+    Tier& tier = tiers_[row];
+    const int32_t expert = tier.slot_to_expert[slot];
+    if (expert >= 0 && tier.expert_slot[expert] == slot) tier.expert_slot[expert] = -1;
+    tier.slot_to_expert[slot] = -1;
+    tier.state[slot] = kQuarantine;
+    counters_[kSlotsQuarantined].fetch_add(1);
   }
 
   bool demand_pending() const {
@@ -3542,11 +3612,18 @@ class RamTier {
       // unwind, and the deferral branch above sets ok = false for a request that is retried under the same seq --
       // either way leases outlive a request that never ran. After the hold is dropped, the hit slot can be
       // evicted in exactly the window this task exists to close, and the grant buys nothing.
+      //
+      // Piece streaming grants the MISS lanes here too (plan 3.2): under tag LOADING, into the slots just reserved,
+      // in the same all-or-nothing call and behind the same one fence, after init_piece_words_locked has stored and
+      // fenced their PieceMask words. No grant is then owed after the read, so the entry opens with none pending.
       if (ok && two_phase_ && lease_mode_ && !advisory && !request.lane_experts.empty()) {
-        if (!open_lease_entry_locked(request)) {
+        if (!open_lease_entry_locked(request, !piece_stream)) {
           ok = false;
-        } else if (!grant_lane_group_locked(
-                       request, [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); }, true)) {
+        } else if (!(piece_stream ? grant_lane_group_locked(request, [](size_t) { return true; }, true, &slots)
+                                  : grant_lane_group_locked(
+                                        request,
+                                        [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); },
+                                        true))) {
           close_pending_grants_locked(request);  // granted nothing: retire the entry rather than leak the ring slot
           ok = false;
         }
@@ -3556,7 +3633,9 @@ class RamTier {
           // S6. §2's first fact as an assertion rather than an argument: `slots` holds only newly taken slots for
           // experts in `missing`, and a hit lane's expert is by definition not in `missing`, so no slot released
           // here is ever leased. release_locked checks nothing, and a leased slot through it is silent
-          // corruption -- the next request is handed a slot the GPU may still be reading.
+          // corruption -- the next request is handed a slot the GPU may still be reading. Piece streaming leases
+          // miss slots in this hold, but only through the grant above, which is all-or-nothing and the last step
+          // that can set ok = false: a request that reaches this branch granted nothing, so the rule holds as is.
           assert(!leased_locked(tiers_[request.row], slot));
           release_locked(request.row, slot);
         }
@@ -3629,8 +3708,15 @@ class RamTier {
             tier.stamp[slots[i]] = ++tick_;
             publish_map(request.row, missing[i], static_cast<int32_t>(slots[i]));
             ++published;
+          } else if (piece_stream && leased_locked(tier, slots[i])) {
+            // Plan 3.3: a miss lane still leases this slot under tag LOADING, and the device may have copied
+            // (or be copying) its published pieces. It is quarantined, never released; its last lease frees it.
+            quarantine_locked(request.row, slots[i]);
           } else {
-            assert(!leased_locked(tier, slots[i]));  // S6, the same fact on the post-read path
+            // S6 on the post-read path. With the flag off no miss slot is leased before the S3 grant below. Under
+            // piece streaming a leased slot took the branch above, so what reaches here is unleased: its lanes
+            // were already voided (a timeout while reading) and nothing can read it any more.
+            assert(!leased_locked(tier, slots[i]));
             release_locked(request.row, slots[i]);
           }
         }
@@ -3651,9 +3737,12 @@ class RamTier {
       // They are retired by the device's stage-1 acknowledgement or voided by its terminal. Releasing them on the
       // host is the silent-corruption path: release_locked checks no lease and take_slot_locked's free-slot loop
       // consults none, so the slot goes straight to the next request while the GPU may still be reading it.
+      //
+      // Piece streaming has no S3: the miss lanes were granted under tag LOADING at reservation, and their readiness
+      // is the PieceMask words plus the request's status, not a second grant.
       std::lock_guard<std::mutex> guard(mutex_);
       if (two_phase_) {
-        if (ok) {
+        if (ok && !piece_stream) {
           if (!grant_lane_group_locked(request, [&](size_t lane) { return listed(missing, request.lane_experts[lane]); }))
             ok = false;
         }
@@ -3870,6 +3959,11 @@ void exl3_ram_miss_release(int64_t handle, int64_t row, int64_t slot) {
 
 void exl3_ram_miss_slot_info(int64_t handle, int64_t row, TensorView out) {
   exl3_ram_miss::find(handle)->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
+}
+
+void exl3_ram_miss_lease_entry(int64_t handle, int64_t idx, TensorView out) {
+  if (idx < 0 || idx >= exl3_ram_miss::kDemandRecords) throw std::runtime_error("exl3 RAM miss: request slot out of range");
+  exl3_ram_miss::find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_inject_lease(int64_t handle, int64_t row, int64_t slot, int64_t delta) {
@@ -4104,6 +4198,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_assign, exl3_ram_miss_assign);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_release, exl3_ram_miss_release);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_lease_entry, exl3_ram_miss_lease_entry);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_victim_census, exl3_ram_miss_victim_census);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_busy_since, exl3_ram_miss_busy_since);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close_admission, exl3_ram_miss_close_admission);

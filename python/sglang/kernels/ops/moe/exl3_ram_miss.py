@@ -545,6 +545,7 @@ COUNTERS = (
     "hit_leases_granted",
     "piece_stream_refused",
     "piece_publish_refused",
+    "slots_quarantined",
 )
 
 
@@ -736,12 +737,28 @@ class Exl3RamMissHost:
         self._module.exl3_ram_miss_release(self.handle, row, slot)
 
     def slot_info(self, row: int) -> list[tuple[int, int, int, int]]:
-        """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY."""
+        """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY, 3 QUARANTINE (piece
+        streaming: a failed read's slot a lane still leases; its expert reads -1)."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 4, dtype=torch.int64)
         self._module.exl3_ram_miss_slot_info(self.handle, row, out)
         values = out.tolist()
         return [tuple(values[i : i + 4]) for i in range(0, len(values), 4)]
+
+    def lease_entry(self, idx: int) -> dict:
+        """Test only: the service's lease account of request slot ``idx`` (``(seq - 1) % DEMAND_RECORDS``)."""
+        lanes = exl3_lease_block.LANES
+        out = torch.zeros(4 + 2 * lanes, dtype=torch.int64)
+        self._module.exl3_ram_miss_lease_entry(self.handle, idx, out)
+        values = out.tolist()
+        return {
+            "active": bool(values[0]),
+            "grants_pending": bool(values[1]),
+            "count": values[2],
+            "gen": values[3] & 0xFFFFFFFFFFFFFFFF,
+            "lane_state": values[4 : 4 + lanes],
+            "lane_slot": values[4 + lanes :],
+        }
 
     def inject_lease(self, row: int, slot: int, delta: int) -> None:
         """Test only: stand in for a GPU reader's lease (the service grants its own from step 3)."""

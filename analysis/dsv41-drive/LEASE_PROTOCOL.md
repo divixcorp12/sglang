@@ -459,7 +459,7 @@ makes the word visible, and nothing else.
 | `LaneRequest[idx]` | device post kernel | before `demand_head` is stored | service | after acquiring `demand_head` and passing the seqlock re-check, lane `i`'s expert is `expert[i]` for request `G` |
 | `LaneAck[idx][lane]` | device ack kernel | after the copy kernel for that lane completed | service | tag CONSUMED / VIOLATED with `gen == G`: that lane's copy finished; nothing else. Not an ordering statement about any other word |
 | `Terminal[idx]` | device wait/finalize kernel | once per request, only if some lane is skipped | service | `skipped_mask` lanes will never read a source. Lanes not in the mask may still be copying, and will acknowledge |
-| `PieceMask[idx][lane]` [piece-streaming plan] | service | one CAS per piece, in `collect_packed`, once that piece job's `done()` holds | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above; no behaviour writes this word yet |
+| `PieceMask[idx][lane]` [piece-streaming plan] | service | one CAS per piece, in `collect_packed`, once that piece job's `done()` holds | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above. The service stores `G << 8` (no bits) at reservation, fenced before the request's first ready word |
 
 **E1 amendment (piece-streaming plan).** E1 (the row above and 6.6's `.nc` argument)
 says a leased slot's bytes are final and immutable from readiness. That holds unchanged for
@@ -470,6 +470,18 @@ bit names are covered; the rest of the slot is unspecified until its own bit is 
 READY, whose bytes are already final when the kernel starts; a piece copied under tag LOADING
 is read while the host may still be writing other pieces of the same slot, so the stream
 kernel uses `ld.global.cv`, not `.nc`, for tag-LOADING copies.
+
+**Quarantine (piece-streaming plan 3.2-3.3).** A tag-LOADING lease can outlive a failed read:
+the lane was granted before the read, and the device may already have copied published pieces.
+Such a slot is never released. The service's post-read step puts every failed slot that is
+still leased into tier state `kQuarantine` (3), clearing its mapping both ways at once
+(`expert_slot[e] = -1`, `slot_to_expert[slot] = -1`; the map was never published for it). A
+quarantined slot is never taken, evicted, or counted by the victim census. It leaves
+quarantine only to `kFree`, when `retire_leases` drops its last lease (an acknowledgement or a
+terminal); because the mapping was cleared on entry, that release cannot unmap the expert from
+another slot it has since been read into. A failed slot whose leases were all voided during the
+read is released as before. With the flag off, no miss slot is leased before the read ends,
+and a failed read releases its slots exactly as it always has.
 
 Nothing in the lease block is ever written by Python, and nothing is written by two
 actors. **Words are write-once per generation.** They are never cleared; validity is the

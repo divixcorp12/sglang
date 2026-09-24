@@ -15,9 +15,10 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, page_word, sim_post, sim_wait
+from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, page_word, piece_word, sim_post, sim_wait
 
 DEMAND_TAG = 1  # the tag of a LaneRequest generation word
+ALL_PIECES = 0xFF  # a PieceMask word's bits once every piece of the row is published
 
 
 @dataclass
@@ -74,6 +75,10 @@ class LeaseSim:
             "expert": int(self._i32(base + fields["expert"])[0]),
         }
 
+    def piece_word(self, req: SimRequest, lane: int) -> int:
+        """The lane's PieceMask word (area P): ``generation << 8 | bits``, written only by the service."""
+        return self.read_u64(self.layout.piece_offset + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
+
     def ack_offset(self, req: SimRequest, lane: int) -> int:
         return self._d(lease.LANE_ACK + (req.idx * lease.LANES + lane) * lease.LANE_ACK_BYTES)
 
@@ -117,14 +122,19 @@ class LeaseSim:
         return SimRequest(seq, gen, idx, row, lanes)
 
     def wait(self, req: SimRequest, timeout_s: float = 1.0, *, publish_terminal: bool = True) -> SimWait:
-        """The wait kernel's decisions: validate every lane's row result; commit or fail closed."""
+        """The wait kernel's decisions: validate every lane's row result; commit or fail closed.
+
+        A lane granted under tag LOADING (piece streaming) is accepted as the stream kernel judges it once it has
+        acquired a served ``demand_done``: its PieceMask word, re-read now, must carry every piece under the
+        request's generation (piece-streaming plan section 5); anything less fails closed, as an identity failure."""
         status = sim_wait(self.page, req.seq, timeout_s)
         if status != 1:
             return self._fail(req, status, f"status {status}", publish_terminal)
         ctx = []
         for lane, expert in enumerate(req.lanes):
             result = self.row_result(req, lane)
-            if result["gen"] != req.gen or result["tag"] != lease.READY or result["expert"] != expert or result["host_slot"] < 0:
+            loaded = result["tag"] == lease.LOADING and self.piece_word(req, lane) == piece_word(req.gen, ALL_PIECES)
+            if result["gen"] != req.gen or not (result["tag"] == lease.READY or loaded) or result["expert"] != expert or result["host_slot"] < 0:
                 return self._fail(req, status, f"lane {lane}: {result}", publish_terminal)
             ctx.append((result["host_slot"], result["slot_generation"]))
         return SimWait(status, len(req.lanes), ctx)
