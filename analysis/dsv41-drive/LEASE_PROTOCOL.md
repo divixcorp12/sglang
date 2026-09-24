@@ -266,7 +266,7 @@ section 18:
 | E5 | If completion cannot be established (CUDA error, synchronization timeout), leases are never decremented and the memory is quarantined until process teardown. | 14 |
 | E6 | The acknowledgement kernel re-checks the slot generation after the copy. A mismatch makes the request fail and is counted; it cannot end as a success. | 6.5 |
 
-**Tag LOADING reader contract (piece-streaming plan; task 1).** I1 as stated is the tag-READY
+**Tag LOADING reader contract (piece-streaming plan).** I1 as stated is the tag-READY
 case: the whole slot is unchanged from readiness. A miss lane granted at reservation is
 readied under tag LOADING before its read starts, and I1 does not hold for it slot-wide; the
 5.1 E1 amendment states the per-piece contract that replaces it there. E2-E6 are unaffected:
@@ -381,7 +381,7 @@ them without ordering. The one mutable word is `shutdown`.
 
 | Offset in record | Size | Field |
 |---|---|---|
-| 0x00 | u64 | `ready`: tagged word. Tag 1 = READY. Tag 2 = LOADING (piece-streaming plan; task 1; superseding an earlier, never-implemented "2 = FAILED"): a lane granted at reservation, still loading -- see the 5.1 E1 amendment for what a reader may assume. **Stored last, with release.** |
+| 0x00 | u64 | `ready`: tagged word. Tag 1 = READY. Tag 2 = LOADING (piece-streaming plan; superseding an earlier, never-implemented "2 = FAILED"): a lane granted at reservation, still loading -- see the 5.1 E1 amendment for what a reader may assume. **Stored last, with release.** |
 | 0x08 | u32 | `slot_generation` at grant time |
 | 0x0C | i32 | `host_slot` (pinned slot index in the row's tier) |
 | 0x10 | i32 | `expert` |
@@ -413,13 +413,16 @@ tens of KiB at most for any plausible tier.
 device). Area D is `D0 + 0x900` rounded up to 4096; total block size is that plus area P
 below, rounded up to 4096 again.
 
-**Area P (piece-streaming plan; task 1): service-written, at a new header offset
+**Area P (piece-streaming plan): service-written, at a new header offset
 `piece_offset`, the next 4096 boundary after area D.** `PieceMask[R][L]`: one `u64` word per
 `(idx, lane)`, `generation56 << 8 | bits8`, each on its own 128-byte line (`R * L * 128 =
 16 KiB`, one line per lane so the device's per-lane poll never shares a line with a lane it
 did not ask for). Only the service thread writes it, with a generation-checked CAS
-(piece-streaming plan Sec 3.4). No behaviour writes or reads it yet; task 3 adds the
-reservation-time initialisation and task 4 the publish.
+(piece-streaming plan Sec 3.4). No behaviour writes or reads it yet; the reservation-time
+initialisation (storing `gen<<8` per miss lane, fenced before the tag-LOADING ready word)
+and the owner-side publish (the CAS above, run from `collect_packed` once a piece job's
+`done()` holds) both come later in the plan. This 16 KiB is allocated for every lease-mode
+service regardless of whether the flag is on.
 
 ### 4.4 Which of `{request_generation, slot_generation, host_slot, status}` lives where
 
@@ -451,14 +454,14 @@ makes the word visible, and nothing else.
 | `Header.shutdown` | service | once, at stop | device wait/post kernels | after seeing 1, the service issues no new leases and will not publish further `RowResult`s |
 | `RowResult[idx][lane]` payload | service | after the previous generation of that request slot retired, before `ready` | device | nothing, until it has acquired `ready` with the expected generation |
 | `RowResult[idx][lane].ready` | service | last store of the record | device (wait kernel) | if `gen == G` and tag == READY: payload is complete, the lease exists, and the slot's bytes are final and immutable until this lane's retirement |
-| `RowResult[idx][lane].ready`, tag LOADING (2) [piece-streaming plan; task 1] | service | last store of the record, at reservation (before the read starts) | device (wait/stream kernel) | if `gen == G` and tag == LOADING: the payload is complete and the lease exists; the bytes of piece `p` are final and immutable once the device has acquired bit `p` of `PieceMask[idx][lane]` under `G`; the other bytes are unspecified |
+| `RowResult[idx][lane].ready`, tag LOADING (2) [piece-streaming plan] | service | last store of the record, at reservation (before the read starts) | device (wait/stream kernel) | if `gen == G` and tag == LOADING: the payload is complete and the lease exists; the bytes of piece `p` are final and immutable once the device has acquired bit `p` of `PieceMask[idx][lane]` under `G`; the other bytes are unspecified |
 | `SlotGen[row, slot]` | service | before the first byte store that changes the slot | device (ack kernel) | a value different from the leased generation means the slot's bytes were, or are being, rewritten |
 | `LaneRequest[idx]` | device post kernel | before `demand_head` is stored | service | after acquiring `demand_head` and passing the seqlock re-check, lane `i`'s expert is `expert[i]` for request `G` |
 | `LaneAck[idx][lane]` | device ack kernel | after the copy kernel for that lane completed | service | tag CONSUMED / VIOLATED with `gen == G`: that lane's copy finished; nothing else. Not an ordering statement about any other word |
 | `Terminal[idx]` | device wait/finalize kernel | once per request, only if some lane is skipped | service | `skipped_mask` lanes will never read a source. Lanes not in the mask may still be copying, and will acknowledge |
-| `PieceMask[idx][lane]` [piece-streaming plan; task 1] | service | one CAS per piece, in `collect_packed`, once that piece job's `done()` holds | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above; no behaviour writes this word yet |
+| `PieceMask[idx][lane]` [piece-streaming plan] | service | one CAS per piece, in `collect_packed`, once that piece job's `done()` holds | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above; no behaviour writes this word yet |
 
-**E1 amendment (piece-streaming plan; task 1).** E1 (the row above and 6.6's `.nc` argument)
+**E1 amendment (piece-streaming plan).** E1 (the row above and 6.6's `.nc` argument)
 says a leased slot's bytes are final and immutable from readiness. That holds unchanged for
 tag READY. Tag LOADING is a new, weaker reader contract, stated in the row above: readiness
 is granted per-piece, not for the whole slot, so only the bytes a device-acquired `PieceMask`
@@ -466,7 +469,7 @@ bit names are covered; the rest of the slot is unspecified until its own bit is 
 6.6 `.nc` argument ("data...not modified during the kernel's lifetime") holds only for tag
 READY, whose bytes are already final when the kernel starts; a piece copied under tag LOADING
 is read while the host may still be writing other pieces of the same slot, so the stream
-kernel (Task 5) uses `ld.global.cv`, not `.nc`, for tag-LOADING copies.
+kernel uses `ld.global.cv`, not `.nc`, for tag-LOADING copies.
 
 Nothing in the lease block is ever written by Python, and nothing is written by two
 actors. **Words are write-once per generation.** They are never cleared; validity is the
@@ -614,11 +617,11 @@ kernel: from readiness until acknowledgement the slot's bytes are immutable (E1)
 intra-kernel contract of `.nc` is met by construction, and the protocol never asks any
 kernel to observe a host write that lands while it runs.
 
-**This argument holds only for tag READY (piece-streaming plan; task 1).** Under tag
+**This argument holds only for tag READY (piece-streaming plan).** Under tag
 LOADING, other pieces of the same slot are still being written while the kernel runs (the
 E1 amendment above): the intra-kernel "not modified during the kernel's lifetime" premise
 is false for the slot as a whole, only true per acquired `PieceMask` bit. The stream kernel
-(Task 5) therefore reads with `ld.global.cv`, never `.nc`, for a tag-LOADING lane.
+therefore reads with `ld.global.cv`, never `.nc`, for a tag-LOADING lane.
 
 **What the argument does not cover.** The cross-kernel case: the same slot address is
 read by kernel K1 (old expert), rewritten by the host (new expert), then read by kernel
