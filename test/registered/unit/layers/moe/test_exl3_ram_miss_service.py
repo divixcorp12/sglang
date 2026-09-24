@@ -220,9 +220,10 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
             with pytest.raises(ValueError, match="ENABLE_RAM_MISS_LEASES=1"):
                 updater.check_miss_plans()
         with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
+            # Two-phase copies hit lanes into the same DIRECT destinations before the NVMe rows land,
+            # and a failed request fail-stops the process, so it composes with DIRECT.
             with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
-                with pytest.raises(ValueError, match="TWO_PHASE=0"):
-                    updater.check_miss_plans()
+                updater.check_miss_plans()
             with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
                 with pytest.raises(ValueError, match="ENABLE_EXPERT_PREFETCH=0"):
                     updater.check_miss_plans()

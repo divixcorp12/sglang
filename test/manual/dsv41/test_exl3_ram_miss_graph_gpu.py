@@ -130,8 +130,13 @@ REPLAY_STEPS = 4
 
 
 @pytest.mark.parametrize("fused", [False, True], ids=["generic_routes", "fused_routes"])
-@pytest.mark.parametrize("failure", ["timeout", "generation_violation"])
-def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused, failure):
+@pytest.mark.parametrize(
+    ("failure", "two_phase"),
+    # The generation-violation case drives the single-phase wait/ack kernels by hand.
+    [("timeout", False), ("generation_violation", False), ("timeout", True)],
+    ids=["timeout", "generation_violation", "two_phase_timeout"],
+)
+def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused, failure, two_phase):
     """Runs only on divix01: actual EXL3 bytes, native leases, and captured
     MoE output across a DIRECT insertion and an eager pinned-tier eviction."""
     from sglang.srt.environ import envs
@@ -154,7 +159,9 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
             envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
-            envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(False),
+            envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
+            # Large enough that stage 1 always sees the hit grant, so the stage split below is deterministic.
+            envs.SGLANG_DSV41_RAM_MISS_HIT_POLL_BOUND.override(1 << 20),
             envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(False),
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
             envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
@@ -237,6 +244,18 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             mapping = manager.gpu_residency.mapping[0, :experts].cpu()
             evicted = next(expert for expert in first if mapping[expert] < 0)
             replay([evicted, 30, 31, 32, 33, 34])  # refetch into GPU residency
+            if two_phase:
+                # One request split across both stages: a RAM-resident miss copied while an NVMe miss is
+                # read. replay() checks both rows' bytes in their DIRECT slots and the committed mapping.
+                device_side = streamer.row_backend.device_side
+                mapping = manager.gpu_residency.mapping[0, :experts].cpu()
+                ram_hit = next(e for e in range(experts) if service.host.contains(0, e) and mapping[e] < 0)
+                cold = next(e for e in range(experts) if not service.host.contains(0, e) and mapping[e] < 0)
+                replay([ram_hit, cold, 30, 31, 32, 33])
+                assert device_side.go_1.item() >= 1 and device_side.go_2.item() >= 1
+                assert streamer.row_backend.delivered_count.item() == (
+                    device_side.go_1.item() + device_side.go_2.item()
+                )
             assert manager.gpu_residency.insertion_truncated[0].item() == 0
             before_failure = manager.gpu_residency.mapping[0].clone()
             if failure == "timeout":
@@ -246,7 +265,11 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
                 ids.copy_(torch.tensor([[cold, 30, 31, 32, 33, 34]], device="cuda", dtype=torch.int32))
                 graph.replay()
                 torch.cuda.synchronize()
-                assert streamer.row_backend.delivered_count.item() == 0
+                if two_phase:
+                    # Stage 1 may already have copied a RAM hit; nothing past the timed-out read is copied.
+                    assert streamer.row_backend.device_side.go_2.item() == 0
+                else:
+                    assert streamer.row_backend.delivered_count.item() == 0
                 assert streamer.row_backend.keep.item() == 0.0
                 assert torch.equal(manager.gpu_residency.mapping[0], before_failure)
             else:

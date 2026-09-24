@@ -317,11 +317,16 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.poll_bound = poll_bound
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
+        self._two_phase_delivered = (
+            torch.zeros(1, dtype=torch.int32, device=host_row_map.device) if two_phase else None
+        )
 
     @property
     def delivered_count(self) -> torch.Tensor:
-        if self.device_side.go_count is None or self.two_phase:
-            raise RuntimeError("EXL3 DIRECT requires single-phase leased delivery")
+        if self.device_side.go_count is None:
+            raise RuntimeError("EXL3 DIRECT requires leased delivery")
+        if self._two_phase_delivered is not None:
+            return self._two_phase_delivered
         return self.device_side.go_count
 
     def _stage_planned(self, plan) -> None:
@@ -385,6 +390,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         )
         self.device_side.stage_ack(2)
         self.device_side.finalize(plan.count, self.keep)
+        # Lanes each stage copied into plan.slots; finalize keeps only a request whose stages copied every lane.
+        torch.add(self.device_side.go_1, self.device_side.go_2, out=self._two_phase_delivered)
 
 
 def watchdog_wait_s(timeout_ms: int) -> float:
@@ -626,8 +633,8 @@ class Exl3RamMissService:
             self._hot_lists[layer_id] = [int(e) for e in self._hot_snapshot[row, :capacity].tolist() if e >= 0]
 
     def _enable_gpu_hot(self, updater) -> None:
-        if not self.lease_mode or self.two_phase:
-            raise ValueError("EXL3 DIRECT requires single-phase RAM-miss leases")
+        if not self.lease_mode:
+            raise ValueError("EXL3 DIRECT requires RAM-miss leases")
         self._gpu_hot_updater = updater
         self._hot_snapshot = torch.empty_like(
             updater.slot_to_expert, device="cpu", pin_memory=updater.device.type == "cuda"
