@@ -3344,36 +3344,54 @@ Report: `/mnt/nvme1/dsv41-nsys/ps-B-nsys-graph-20260924-105920.nsys-rep` (46 MB)
 `.sqlite` export alongside. Tracing cost nothing in steady state: 158.4 ms/token traced
 against 158.8 untraced.
 
-- **Step time:** `cudaGraphLaunch` to launch, p50 **155.8 ms** (p10 108.6, p90 225.6).
-- **Host gap between launches:** p50 **4.06 ms** (p90 5.14). This is sampling and the
-  scheduler; it bounds the GPU-idle gap *between* steps.
-- **Eager segments:** each step also runs 1,526 eager kernels totalling 70.5 ms of GPU
-  time. These are the breakable graph's eager segments.
-- **The biggest host cost is a sync, not a transfer:**
-  - `cudaMemcpyAsync` costs 65.8 ms of host time per step over 102 calls.
-  - Almost all of it is 256-byte device-to-host readbacks that each **block about
-    64–66 ms**. The sizes come from joining each call to its GPU record by correlation ID.
-  - This is §21's pattern again: the host waits on the stream; nothing is transferred.
+Decode steps below are the 106 launch intervals under 1 s. The capture has 110 launches:
+the 1.4 s first step after capture start and the 44 s interval holding session 2's
+prefill are excluded.
+
+- **Step time:** launch to launch, p50 **155.8 ms** (p10 108.6, p90 225.6).
+- **Inside the step:**
+  - The host spends p50 **151.6 ms inside `cudaGraphLaunch`**.
+  - It spends **4.06 ms** in the tail: sampling and the scheduler. Of that, 3.46 ms is
+    Python outside any CUDA call.
+- **The GPU does not wait for the host tail:**
+  - The host runs about one step ahead: `cudaGraphLaunch` returns while the GPU still has
+    about 148 ms of that step's graph to run.
+  - The tail's sampling kernels start on the GPU **148 ms** (p50) after the host launches
+    them, in all 106 steps.
+  - Each tail's 20 eager kernels (0.08 ms of GPU time) run during the next launch's host
+    span. The 4 ms host tail is therefore hidden.
+- **No per-step blocking sync in decode:**
+  - An earlier summary of this trace reported "65.8 ms per step of blocking 256-byte
+    readbacks". That figure spread the whole window's `cudaMemcpyAsync` time over the
+    decode launches.
+  - All 134 blocking readbacks (256 B and smaller, stream 13, about 59 ms each) fall in
+    the 44 s interval between the sessions. That interval also holds 164,462 eager
+    kernels: it is session 2's 32k-token **prefill**, not decode.
+  - 106 of the 106 decode steps have none.
+- **What this means:** decode is GPU-bound. The node trace (§24.2) puts the RAM-miss chain
+  at W1 1.9 + C1 23.9 + S 60.7 ms per token over read layers, and S is mostly waiting on
+  the NVMe read.
 - **Not measurable from this report:** GPU idle inside a step.
   - The graph body is hidden in graph mode.
-  - `GRAPH_TRACE` holds only pre-capture warm-up rows (negative timestamps, correlation
-    IDs below the runtime table's minimum), per the project notes.
-  - The kernel table's 86% "idle" covers eager work only and means nothing.
+  - `GRAPH_TRACE` holds only pre-capture warm-up rows, per the project notes.
+- **Scripts:** `divix01:/data/models/slang/nvfp4-work/direct-two-phase-tests/sync-attr/`:
+  - `step_timeline.py`: where the blocking copies fall.
+  - `tail.py`: step and tail split.
+  - `idle.py`: tail kernel queue delay.
+
+  Each has a matching `.out` file.
 
 ### 24.4 Next decode work, in order
 
-1. **Attribute the 256-byte readback before trying to remove it.**
-   - Name its call site.
-   - In a short node-mode capture, check whether the GPU goes idle around it. Idle inside
-     a step is valid in node mode; step-tail idle and ms/token are not.
-   - If the GPU stays busy through the wait, the sync costs only the ~4 ms between-launch
-     gap and is not worth removing.
-2. **Retune read credit for piece streaming.** Aim: recover the read-wall tail above. At
-   credit 32 the reads are four times smaller than before.
-3. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
-4. **Remove or defer the sync**, only if step 1 shows the GPU going idle on it.
-5. **Compare against production.** Before piece streaming becomes a default, compare it
+1. **Retune read credit for piece streaming.** Aim: recover the read-wall tail above. At
+   credit 32 the reads are four times smaller than before, and the S wait on the read is
+   now the largest cost in the step.
+2. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
+3. **Compare against production.** Before piece streaming becomes a default, compare it
    in the same sessions against the saved production recipe, which has two-phase off.
+4. **Dropped: removing CPU–GPU syncs from decode.** §24.3 shows none that block per step,
+   and the host tail is hidden behind the GPU. Prefill's roughly 59 ms readbacks are
+   per-chunk waits on the chunk's own work; they are a prefill question, not a decode one.
 
 ## Sources
 
