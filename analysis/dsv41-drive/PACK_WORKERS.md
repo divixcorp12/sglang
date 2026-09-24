@@ -377,3 +377,44 @@ one drive" caveat: the mechanism (a cold DRAM bounce shrinks under a split copy)
 drive topology, not just a plausibility argument that the source drive doesn't matter. It does not cover
 production contention (the packing workers here ran on otherwise-idle cores among `taskset -c 0-63`; the
 scheduler and tokenizer threads were not competing for those cores), and it does not touch the GPU or H2D path.
+
+## Per-piece packing on divix01: wake-up, copy bandwidth, and a spinning pool (2026-09-24)
+
+Under piece streaming a pack job is one piece: 1.66 MB, cut into 8 chunks of about 208 KB. The stage trace stamps
+only a row's earliest chunk start, so it could not tell the slowest worker's wake from the copy.
+`analysis/dsv41-drive/pack-pool-bench/pack_pool_bench.cpp` stamps every chunk (`ChunkStamp`). It drives the real
+`PackPool` the way a read does: 8 pieces 250 µs apart, then a 30 ms gap. It ran under the server's CPU set
+`0-7,16-17,36-53`, with the destination on node 0.
+
+| µs from post | Old pool (parked, unpinned) | Pinned, parked | Pinned, spinning |
+|---|---:|---:|---:|
+| Slowest worker starts, first piece of a read | 106 | 95 | 8 |
+| Pack tail, first piece of a read | 173 | 163 | 120 |
+| Slowest worker starts, later pieces | 14 | 13 | 8 |
+| Pack tail, later pieces | 126 | 110 | 117 |
+| Per-chunk rate | 2.4 GB/s | 2.4 GB/s | 2.0 GB/s |
+
+**Findings.**
+- The C6 wake the handoff predicted is real, but only after the gap between reads. That is
+  the first piece of a read, about 100 µs.
+- Later pieces are bound by copy bandwidth. With the source and destination both on node 0,
+  cold copies plateau at 13.7 GB/s from four threads on. One core alone does 4.9 GB/s.
+- So 2–2.5 GB/s per worker is that plateau shared eight ways. It is the socket's DRAM, with
+  4 RDIMMs on a 6-channel CPU, not a pool defect.
+- Copying into node-1 rows from node-0 cores plateaus at 7.8 GB/s. From node-1 cores it
+  reaches 24.6 GB/s.
+
+**Serving, 100 GiB tier, untraced smokes.** Figures are pack tail p50 (last piece landing → last chunk end) and
+multi-row demands whose reads stalled more than 10 ms:
+
+| Arm | Pack tail p50 | Stalled multi-row demands |
+|---|---:|---:|
+| Base `9183637f51`, two runs | 212 / 236 µs | 0 / 3 of ~2,000 |
+| Spinning, service thread kept off the workers' CPUs | 194 µs | **303 of 1,982** |
+| Spinning, service thread unrestricted | 196 µs | 1 of 1,975 |
+| Parked and pinned, service thread kept off (shipped, `92e588b20e`) | 185 / 184 µs | 3 / 0 |
+
+The stalls were SPCC-mirror sub-reads completing 10–25 ms late while the Samsung mirror's were on time. Only the
+combination produced them, most likely by crowding the CPUs that take the SPCC's completion interrupts (36-71)
+with the busy-polling service thread. Spinning was removed; pinning and the service thread's exclusion stay.
+Details and the next options are in `DSV41_REFERENCE.md` §24.8.

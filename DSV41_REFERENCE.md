@@ -3538,7 +3538,8 @@ responses and 0 refusals or quarantined slots.
 2. **Overlap the link with compute:** fetch the next layer's likely experts during the
    current layer. The link idles about 40% of the step, so it has spare capacity, but a
    wrong guess costs link time. Prefetch is currently refused under DIRECT.
-3. **Let W1 exit early** instead of always spending its 100 µs budget (~1.9 ms/token).
+3. **Done 2026-09-24 (§24.8):** W1 now exits once every lane is claimed or LOADING. On
+   read layers its p90 fell from 101 to 21 µs, saving 0.29 ms/token at 100 GiB.
 4. **Done 2026-09-24, on the owner's instruction:** the NUMA placement is merged, and the
    recipe runs at 100 GiB with two-phase and piece streaming on, matching §24.6's trace.
    No same-session comparison against the old 50 GiB recipe with two-phase off was run.
@@ -3547,6 +3548,71 @@ responses and 0 refusals or quarantined slots.
    - Retuning credit, and static mirror weights (§24.4).
    - Moving the swapfile off nvme4. It is idle during decode, so this is housekeeping at
      most.
+
+### 24.8 RAM-miss synchronization pass and host copy bandwidth (2026-09-24)
+
+**Code.**
+- Branch `cc/dsv41-pinned-numa`, commits `195dba659b` through `92e588b20e`, on top of
+  `9183637f51`. Not merged.
+- The starting point was an audit of every wait and fence in the RAM-miss path
+  (`RAM_MISS_SYNC_HANDOFF.md` in the main checkout).
+- Verification:
+  - CPU: `test/registered/unit/kernels -k "ram_miss or lease or piece"` under
+    `taskset -c 0-31`. 980 passed, against 979 at the base. The one skip, the sibling test,
+    passes under `taskset -c 0-63`.
+  - GPU: the six manual RAM-miss files. 74 passed, against 72 at the base; the difference
+    is T12.
+  - Every 100 GiB smoke gave byte-identical responses.
+
+| Change | Commit | Measured (100 GiB tier) |
+|---|---|---|
+| **W1 early exit:** under piece streaming a LOADING lane never turns READY, so W1 now stops once every lane is claimed or LOADING | `195dba659b` | Node trace: W1 p90 101 → 21 µs; 0.84 → 0.55 ms/token |
+| **The RowResult re-read is now a real seqlock** (LEASE_PROTOCOL.md 11.4). The host clears the ready word before it rewrites a payload, and the device fences between the payload loads and the re-read. Before, neither half was in place | `028210c696` | A correctness fix, with no visible cost |
+| **The post kernel drops four `membar.sys`** that sat right before a release store | `3ca3327c01` | post p50 20.7 → 20.0 µs. A fence straight before a release store is nearly free, so the post's 20 µs lies elsewhere (unexplained) |
+| **The waits drop the `membar.sys` after an acquire of `kDemandDone`**, S included | `c96a51d91d` | S 16.4 → 15.7 ms/token, W1's effect included |
+| **Packing workers are pinned one per physical core, and the service thread is kept off their CPUs** | `8f64630b03` … `92e588b20e` | Pack tail (last piece landing → last chunk end) p50 212 / 236 µs (two baseline runs) → 184 µs |
+
+**Why a piece takes ~200 µs to pack: the socket's DRAM, not the pool.**
+
+`pack_pool_bench` stamps every chunk. `memscale`, a scratch probe on divix01, measures
+cold copies with the source on node 0, where the bounce slots live:
+
+| Copy, 208 KB chunks | 1 thread | 4 threads | 8 threads |
+|---|---:|---:|---:|
+| Node-0 cores, node-0 destination | 4.9 GB/s | 13.4 GB/s | 13.7 GB/s |
+| Node-0 cores, node-1 destination | — | 7.8 GB/s | 7.3 GB/s |
+| Node-1 cores, node-1 destination | — | 15.7 GB/s | 24.6 GB/s |
+
+- **Node 0 saturates.** Its read ceiling is about 30 GB/s at 8 and at 16 threads. Each
+  socket holds 4 RDIMMs (32 + 16 + 32 + 16 GB) on a 6-channel CPU.
+- **Four workers already reach the copy ceiling.** A 1.66 MB piece at 13.7 GB/s is
+  ≥ 120 µs, which is the bench's pack tail.
+- **In serving the same DRAM is busier still.** It also carries C1's 13 GB/s of zero-copy
+  reads and the NVMe DMA, and node-1 rows copy across the link.
+- **The per-worker rate falls, the total doesn't.** Eight workers at 2–2.5 GB/s each is
+  the plateau split eight ways.
+
+**Spinning workers were built, measured and removed.**
+- **In the bench, spinning cut only the first piece of each read:** 163 → 120 µs, from
+  removing the ~100 µs C6 wake after the read gap. Later pieces were copy-bound either way.
+  With a node-1 destination, spinning was worse (157 → 220 µs).
+- **In serving, spinning plus the narrowed service thread stalled the SPCC mirror.** In
+  303 of 1,982 multi-row demands, its sub-reads completed 10–25 ms late while the Samsung
+  mirror's were on time.
+- **Each change alone was clean:** 3 and 1 stalls respectively.
+- **Likely mechanism:** the busy-polling service thread was pushed onto 16-17 and 36-53, the
+  same CPUs as the SPCC's completion interrupts (36-71). The spinners on 0-7 crowded them.
+- The shipped arm, no spin with the narrowed service thread, had 0 stalls in 1,999 at
+  `92e588b20e`.
+
+**Next, if packing is worth more:**
+- **Pack node-1 rows on node-1 cores.** That copy is 3× faster. It needs pack workers
+  outside the server's node-0 CPU set.
+- **Read straight into slab rows.** This would remove the copy, and its DRAM traffic,
+  altogether. Rows start mid-page and the segment layout differs from the file's, so it is
+  a layout change.
+- Either would be worth about 0.1–0.3 ms/token at 4.2 read layers per token. C1's 75 ms
+  on the link (§24.6) is still the wall.
 
 ## Sources
 
