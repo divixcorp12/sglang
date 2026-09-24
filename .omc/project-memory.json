@@ -201,15 +201,21 @@
   },
   "hotPaths": [
     {
+      "path": "analysis/dsv41-drive/row-images/compare_arms.py",
+      "accessCount": 3,
+      "lastAccessed": 1790293898329,
+      "type": "file"
+    },
+    {
       "path": "docs/superpowers/plans/2026-09-24-dsv41-row-images.md",
       "accessCount": 1,
       "lastAccessed": 1790290312862,
       "type": "file"
     },
     {
-      "path": "analysis/dsv41-drive/row-images/compare_arms.py",
+      "path": "analysis/dsv41-drive/row-images/smoke.sh",
       "accessCount": 1,
-      "lastAccessed": 1790290481283,
+      "lastAccessed": 1790290579461,
       "type": "file"
     }
   ],

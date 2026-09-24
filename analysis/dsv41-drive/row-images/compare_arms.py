@@ -18,7 +18,8 @@ What is measured, and from which fields (every clock is the host CLOCK_MONOTONIC
                publish), so the same subtraction is "last publish - last completion".
   piece publish  schema 7 has no per-piece publish CLOCK: ``pieces[].publish`` is an event sequence number.
                Two views are given. In clock time, the row's first piece is ``row_pack_start - min piece cqe``
-               and its last is ``row_pack_end - max piece cqe``. In events, every piece gets ``publish seq -
+               and its last is ``row_pack_end - max piece cqe``, over the pieces carrying bytes (a byte-less
+               piece's cqe is the row's admission clock, and direct mode stamps nothing for it). In events, every piece gets ``publish seq -
                vet seq``: the number of landings, vettings and publishes the owner handled in between. Bounce
                mode includes the piece's copy job; direct mode should publish in the vetting's owner turn.
   submit->done per demand, ``done - submit``, bucketed by rows asked (1, 2, 3+).
@@ -158,8 +159,11 @@ def analyse(arm_dir, include_warmup=False):
                 slow += 1
         packs = {p["row"]: p for p in r.get("row_pack_ns", [])}
         for pc in r.get("pieces", []):
-            cqes = [c for c in pc["cqe"] if c]
             rp = packs.get(pc["row"])
+            # A piece with no bytes is vetted (and, in direct mode, published) at the row's admission and its cqe
+            # is that admission clock; the row's pack/publish stamps cover only the pieces carrying bytes.
+            admit = rp.get("admit") if rp else None
+            cqes = [c for c in pc["cqe"] if c and c != admit]
             if cqes and rp and rp["start"] and rp["end"]:
                 first_pub.append((rp["start"] - min(cqes)) / 1e3)
                 last_pub.append((rp["end"] - max(cqes)) / 1e3)
