@@ -390,6 +390,23 @@ def test_piece_stream_is_accepted_by_the_config_refusal_once_all_three_hold(tier
     assert service.piece_stream is True
 
 
+@pytest.mark.parametrize("piece_stream", [False, True])
+def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on(tiers, monkeypatch, piece_stream):
+    service, streamers, caches = tiers
+    order = []
+    enable, start = module.Exl3RamMissHost.enable_piece_stream, module.Exl3RamMissHost.start_thread
+    monkeypatch.setattr(module.Exl3RamMissHost, "enable_piece_stream", lambda self: (order.append("piece"), enable(self))[1])
+    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    with (
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(piece_stream),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
+        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
+    ):
+        service.ensure_started()
+    assert order == (["piece", "thread"] if piece_stream else ["thread"])
+
+
 def test_piece_stream_is_refused_at_device_side_construction_until_the_stream_kernel_exists(tiers):
     """R3 (piece-streaming plan ledger): the config refusal only gates the combination of switches, so the
     device chain itself must still refuse piece streaming (task 5 removes this once kernel S exists)."""
