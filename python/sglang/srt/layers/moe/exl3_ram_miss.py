@@ -523,6 +523,8 @@ class Exl3RamMissService:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if two_phase:
                 host.enable_two_phase()
+            if piece_stream:
+                host.enable_piece_stream()
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True

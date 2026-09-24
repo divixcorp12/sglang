@@ -16,7 +16,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 # Changing the native record layout changes this digest. When it fails: bump RAM_MISS_TRACE_SCHEMA,
 # then paste the new pair. A JSONL file has no field check of its own, so the schema integer is the
 # only way a consumer learns which fields a file has.
-LAYOUT_PIN = (5, "d088b3511d047533")
+LAYOUT_PIN = (6, "b7579f89dc55d2a8")
 
 
 def _layout_digest():
@@ -57,7 +57,8 @@ def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path
     (row,) = first["row_pack_ns"]
     assert set(row) == {"row", "admit", "start", "end"} and 0 < row["admit"] <= row["start"] <= row["end"]
     (extent,) = first["extent_cqe_ns"]
-    assert set(extent) == {"row", "part", "submit", "attempts", "cqe"}
+    assert set(extent) == {"row", "part", "sub", "submit", "attempts", "cqe"}
+    assert extent["sub"] == 0 and first["pieces"] == [] and first["request"]["piece_stream"] == 0  # the flag is off
     assert row["admit"] <= extent["submit"] <= extent["cqe"] <= row["start"]
 
 

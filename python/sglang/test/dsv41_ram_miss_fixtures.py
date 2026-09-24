@@ -40,14 +40,16 @@ def same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def ram_miss_setup(
-    tmp_path, *, capacity: int = 3, layers: int = 2, experts: int = 6, mirror_weights=None
+    tmp_path, *, capacity: int = 3, layers: int = 2, experts: int = 6, mirror_weights=None, hidden=None, inter=None
 ) -> RamMissSetup:
     """``mirror_weights``: one weight per mirror root; copies are made beside ``tmp_path`` and the
-    tables split every row across them (``parts == len(mirror_weights)``)."""
+    tables split every row across them (``parts == len(mirror_weights)``). ``hidden``/``inter`` size the fake
+    experts (write_fake_exl3's defaults when None): larger ones give rows many pages long."""
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 
-    write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts)
+    dims = {k: v for k, v in (("hidden", hidden), ("inter", inter)) if v is not None}
+    write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=experts, **dims)
     layout = build_exl3_expert_layout(str(tmp_path))
     fmt = Exl3ExpertFormat(layout, 0, direct=False)
     specs = {spec.name: spec for spec in fmt.tensor_specs(None)}

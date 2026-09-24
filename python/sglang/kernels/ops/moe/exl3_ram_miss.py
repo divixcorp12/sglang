@@ -108,6 +108,8 @@ def _fault_tensor(
     pack_workers: int = 0,
     pack_split: int = 0,
     hold_rest: bool = False,
+    piece_stream: bool = False,
+    sub: int = -1,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -133,6 +135,8 @@ def _fault_tensor(
             pack_workers,
             pack_split,
             int(hold_rest),
+            int(piece_stream),
+            sub,
         ],
         dtype=torch.int64,
     )
@@ -216,7 +220,9 @@ def read_rows_with_fault(
     makes that submit consume nothing and report success; ``abandon_after`` stops admitting batches
     after that many; ``step`` is the faulted read's rows per batch (default ``BOUNCE_ROWS``).
     ``pack_workers`` packs on that many copy threads instead of the owner (0: inline, the default),
-    each row in ``pack_split`` byte-range chunks (0: one per worker).
+    each row in ``pack_split`` byte-range chunks (0: one per worker). ``piece_stream`` reads each part as
+    sub-reads and vets rows piece by piece (it needs ``pack_workers``); ``sub`` then narrows the ``part``
+    faults, and ``hold_ordinal``, to that sub-read of the part.
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
@@ -240,6 +246,50 @@ def read_rows_with_fault(
     return int(results[0]), int(results[1])
 
 
+def read_rows_sqes(
+    tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS, max_sqes: int = 4096, **faults
+) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
+    """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
+    ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
+    (the ring's) and ``cqes``. Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
+    expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
+    fault = _fault_tensor(**faults)
+    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
+    info = torch.zeros(5, dtype=torch.int64)
+    _host_module().exl3_ram_miss_read_rows_sqes(
+        *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
+    )
+    result, count, descriptors, credit, cqes = info.tolist()
+    if count > max_sqes:
+        raise RuntimeError(f"{count} SQEs, more than max_sqes {max_sqes}")
+    log = [tuple(entry) for entry in sqes[:count].tolist()]
+    return result, log, dict(sqes=count, descriptors=descriptors, credit=credit, cqes=cqes), stage_records(
+        record.unsqueeze(0)
+    )[0]
+
+
+def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], list[dict]]]:
+    """Test only: the sub-reads and pieces the C++ reader cuts expert ``expert`` of streamed row ``row`` into
+    under piece streaming, or None when it refuses the row. Sub-reads, in file order: ``{file, offset, length,
+    dest, part, k}``. Pieces (``STAGE_PIECES``): ``{deps, runs}``, ``deps`` the bitmask of sub-reads the piece
+    depends on and ``runs`` one ``(dst_lo, dst_hi)`` per segment in segment destination coordinates."""
+    segments = int(tables.segments.shape[0])
+    subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
+    pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
+    count = int(
+        _host_module().exl3_ram_miss_piece_geometry(*_table_args(tables, False)[:-1], row, expert, subs, pieces)
+    )
+    if count < 0:
+        return None
+    keys = ("file", "offset", "length", "dest", "part", "k")
+    sub_reads = [dict(zip(keys, line)) for line in subs[:count].tolist()]
+    out = []
+    for line in pieces.tolist():
+        out.append({"deps": line[0], "runs": [(line[1 + 2 * i], line[2 + 2 * i]) for i in range(segments)]})
+    return sub_reads, out
+
+
 # One request's stage record: the C++ StageRecord's int64 words, in order. Every time is the host's
 # CLOCK_MONOTONIC in ns (time.monotonic() reads the same clock); a stage never reached is 0.
 # submit/first_cqe/last_cqe span the whole read and pack_start..pack_end run from the first row's packing
@@ -249,6 +299,8 @@ def read_rows_with_fault(
 STAGE_DRIVES = 4
 STAGE_TRACE_ROWS = 16
 STAGE_TRACE_EXTENTS = 32
+# The C++ kPieces: pieces per row, and the most sub-reads a row issues under piece streaming.
+STAGE_PIECES = 8
 STAGE_FIELDS = (
     "seq", "kind", "row", "ok", "rows", "batches", "backlog", "prev_done",
     "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
@@ -268,6 +320,10 @@ STAGE_FIELDS = (
     *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     "lanes",
     "pack_workers", "pack_split",
+    "piece_stream", "pieces_vetted",
+    *(f"sub_land_seq_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
+    *(f"piece_cqe_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
+    *(f"piece_seq_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
 )
 STAGE_KINDS = ("demand", "advisory", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
@@ -298,6 +354,10 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     ``extent_cqe`` one ``{"row", "part", "submit", "attempts", "cqe"}`` per extent issued (first
     ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed, ``attempts`` its resubmissions.
     ``cqe`` is when the wait that reaped the extent returned: io_uring gives no per-completion time.
+    ``sub`` is the extent's sub-read within its part (always 0 unless ``piece_stream``).
+    ``pieces`` (schema 6, empty unless ``piece_stream``) has one ``{"row", "sub_seq", "seq", "cqe"}`` per row asked
+    for (first ``STAGE_TRACE_ROWS``), each a list over ``STAGE_PIECES``: when sub-read j (row file order) landed and
+    when piece j was vetted, as sequence numbers shared by both (1-based, 0 never), and the vetting's clock.
     ``dropped_before`` counts the records the ring dropped just before this one. ``lanes`` is the planned
     lane count the device posted with the request (schema 4). ``pack_workers`` / ``pack_split`` are the
     packing mode the reader ran the request in (schema 5): 0 workers is the inline reader, and a worker-mode
@@ -322,7 +382,8 @@ def stage_records(words: torch.Tensor) -> list[dict]:
         record["extent_cqe"] = [
             {
                 "row": record[f"extent_id_{k}"] >> 16,
-                "part": record[f"extent_id_{k}"] & 0xFFFF,
+                "part": record[f"extent_id_{k}"] & 0xFF,
+                "sub": (record[f"extent_id_{k}"] >> 8) & 0xFF,
                 "submit": record[f"extent_submit_{k}"],
                 "attempts": record[f"extent_attempts_{k}"],
                 "cqe": record[f"extent_cqe_{k}"],
@@ -331,9 +392,21 @@ def stage_records(words: torch.Tensor) -> list[dict]:
         ]
         for k in range(STAGE_TRACE_ROWS):
             del record[f"row_pack_start_{k}"], record[f"row_pack_end_{k}"], record[f"row_admit_{k}"]
+        record["pieces"] = [
+            {
+                "row": k,
+                "sub_seq": [record[f"sub_land_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
+                "seq": [record[f"piece_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
+                "cqe": [record[f"piece_cqe_{k}_{j}"] for j in range(STAGE_PIECES)],
+            }
+            for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+        ] if record["piece_stream"] else []
         for k in range(STAGE_TRACE_EXTENTS):
             del record[f"extent_id_{k}"], record[f"extent_cqe_{k}"]
             del record[f"extent_submit_{k}"], record[f"extent_attempts_{k}"]
+        for k in range(STAGE_TRACE_ROWS):
+            for j in range(STAGE_PIECES):
+                del record[f"sub_land_seq_{k}_{j}"], record[f"piece_seq_{k}_{j}"], record[f"piece_cqe_{k}_{j}"]
         record["drives"] = [
             {
                 "dev": record.pop(f"drive_dev_{d}"),
@@ -636,6 +709,10 @@ class Exl3RamMissHost:
     def enable_two_phase(self) -> None:
         """Grant the resident lanes inside the reservation hold, before read() (Task 6 V1); before the thread starts."""
         self._module.exl3_ram_miss_set_two_phase(self.handle, 1)
+
+    def enable_piece_stream(self) -> None:
+        """Read each part as sub-reads and vet rows piece by piece; before the thread starts, and needs pack workers."""
+        self._module.exl3_ram_miss_set_piece_stream(self.handle, 1)
 
     def inject_done_stall(self, seconds: float) -> None:
         """Test only: sleep between serving a demand and storing demand_done."""

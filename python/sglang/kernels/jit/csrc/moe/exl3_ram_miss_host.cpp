@@ -55,6 +55,17 @@ constexpr int kBounceSlots = kBanks * kBounceRows;
 constexpr unsigned kQueueDepth = 16;
 constexpr int64_t kPage = 4096;
 
+// Piece streaming (SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM, plan 2026-09-24-dsv41-piece-streaming §4.1-4.3). With
+// it on, each nonzero part of a row is read as up to kSubReads page-aligned sub-reads, and the row's needed bytes are
+// cut into kPieces pieces: piece j is sub-read j of the row (in file order) mapped into segment destination
+// coordinates, its inner cuts rounded down to kPieceAlign. These are fixed, not knobs: the device's readiness word
+// carries one bit per piece. With the flag off none of this is used and the reader issues one read per part.
+constexpr int kSubReads = 4;
+constexpr int kPieces = 8;
+constexpr uint8_t kAllPieces = 0xFF;
+constexpr int64_t kPieceAlign = 128;
+static_assert(kPieces <= 8, "a row's piece and sub-read masks are one byte each");
+
 inline int64_t now_ns() {
   timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -170,6 +181,19 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // Pipeline high-water marks: rows_reading_max is the most rows with I/O outstanding at once,
 // pending_max the most SQEs prepared and not yet reaped (never above the ring credit), bank_stalls the
 // number of times admitting the next batch had to wait for its bank's rows to pack.
+//
+// Piece streaming (schema 6). piece_stream is the reader's mode, carried like pack_workers. With it on, every
+// extent is a sub-read and extent_id carries its index within its part in bits 8-15:
+// (row ordinal << 16) | (sub << 8) | part; with it off sub is 0 and the id is the schema-5 one. Per row k (the first
+// kTraceRows) and index j (sub-read ordinal in the row's file order, or piece):
+//   sub_land_seq[k][j]  when sub-read j of row k retired (landed), as a sequence number (below);
+//   piece_seq[k][j]     when piece j of row k was vetted: every sub-read in its dependency mask had landed and its
+//                       bytes lie inside what they delivered;
+//   piece_cqe[k][j]     the clock at that vetting: the reap that landed its last dependency (CQEs reaped together
+//                       share it), or the row's admission for a piece with no bytes.
+// The sequence numbers count landings and vettings together, 1-based, per read, in the order the owner saw them, so
+// they order events that share one reap's stamp. 0: never happened. pieces_vetted counts every vetting of the read.
+// All of these are 0 with the flag off. Vetting is not publishing: nothing here is visible to the device.
 struct StageRecord {
   int64_t seq = 0;
   int64_t kind = 0;  // kStageDemand, kStageAdvisory, kStageTouch
@@ -220,6 +244,11 @@ struct StageRecord {
   int64_t lanes = 0;
   int64_t pack_workers = 0;
   int64_t pack_split = 0;
+  int64_t piece_stream = 0;
+  int64_t pieces_vetted = 0;
+  int64_t sub_land_seq[kTraceRows][kPieces] = {};
+  int64_t piece_cqe[kTraceRows][kPieces] = {};
+  int64_t piece_seq[kTraceRows][kPieces] = {};
 };
 static_assert(sizeof(StageRecord) % sizeof(int64_t) == 0, "StageRecord is int64 words only");
 // A function, not a constexpr: test_exl3_ram_miss_device_args reads every constexpr as a page constant.
@@ -403,6 +432,10 @@ struct ReadFault {
   // With hold_ordinal set: withhold every row from that ordinal on, not only that row. They are released
   // together, so they become ready in one reap (a burst of rows the packer meets at once).
   bool hold_rest = false;
+  // Piece streaming only: narrows the per-part faults to the sub-read with this index within its part (-1: any).
+  // With hold_ordinal set it also narrows the hold to that sub-read (of part `part`, or of any part when part is
+  // -1), so one sub-read of a row lands last while the row's others land. With the flag off every extent is sub 0.
+  int64_t sub = -1;
 };
 
 // A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
@@ -411,12 +444,13 @@ inline int64_t worker_stamp(const void* trace) {
   return stamp(static_cast<const StageRecord*>(trace));
 }
 
-// The fault tensor of the test entry points: 22 int64 words. Four of them are not reader faults:
+// The fault tensor of the test entry points: 24 int64 words. Five of them are not reader faults:
 // abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and pack_workers / pack_split
 // configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
-// one chunk per worker); word 21 is hold_rest. Keep the layout in step with _fault_tensor in ops/moe/exl3_ram_miss.py.
-constexpr int64_t kFaultWords = 22;
+// one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
+// streaming on before it opens; word 23 is sub. Keep the layout in step with _fault_tensor in ops/moe/exl3_ram_miss.py.
+constexpr int64_t kFaultWords = 24;
 
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;
@@ -438,6 +472,7 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.ordinal = f[15];
   fault.hold_ordinal = f[16];
   fault.hold_rest = f[21] != 0;
+  fault.sub = f[23];
   return fault;
 }
 
@@ -448,6 +483,91 @@ inline void check_fault_words(TensorView fault) {
 // Entry points' abandon callback: stop once `after` batches were admitted (0: never).
 inline std::function<bool(size_t)> abandon_after(int64_t after) {
   return [after](size_t admitted) { return after > 0 && admitted >= static_cast<size_t>(after); };
+}
+
+// Piece streaming, sub-reads (plan §4.1): part `e` as its sub-reads, in file order, into `out` (kSubReads entries);
+// returns how many. Each is len_k = round_up(ceil(length / kSubReads), kPage) bytes and the last takes what is left,
+// so a part tiles exactly, a small part gives fewer than kSubReads and no sub-read is empty. A zero-length part gives
+// none. The part's offset, dest and length are whole pages (the builder's), so every sub-read's are too.
+inline int split_part(const Read& e, Read* out) {
+  if (e.length <= 0) return 0;
+  const int64_t len_k = ((e.length + kSubReads - 1) / kSubReads + kPage - 1) / kPage * kPage;
+  int n = 0;
+  for (int64_t at = 0; at < e.length && n < kSubReads; at += len_k) {
+    out[n++] = Read{e.file, e.offset + at, std::min(len_k, e.length - at), e.dest + at};
+  }
+  return n;
+}
+
+// One segment's bytes [lo, hi), local to the segment: the same offsets in its source (src + lo) and its destination
+// row (dst + lo), since a segment is one contiguous copy.
+struct PieceRun {
+  int64_t lo = 0;
+  int64_t hi = 0;
+};
+
+// A row's sub-reads and pieces (plan §4.2), computed at admission from the row's start. Sub-read s (its ordinal in
+// the row's file order) is part part[s]'s sub-read k[s]; piece j covers, in each segment i, the run
+// runs[j * segments + i] of the caller's array, and depends on the sub-reads in deps[j].
+struct RowGeometry {
+  int subs = 0;
+  int64_t start = 0;  // where the row's needed bytes begin in its bounce slot
+  Read sub[kPieces] = {};
+  int part[kPieces] = {};
+  int k[kPieces] = {};
+  uint8_t deps[kPieces] = {};
+};
+
+// Fill `g` and `runs` (kPieces * segments entries) for the row at `row_index` of the tables. Piece j's cuts are the
+// row's sub-read boundaries: in every segment, piece j starts where sub-read j starts, mapped into the segment's
+// destination coordinates and rounded down to kPieceAlign there (clamped to the segment), and ends where piece j + 1
+// starts. Piece 0 starts at every segment's first byte and the last sub-read's piece ends at every segment's last,
+// so the pieces partition the needed bytes; pieces past the row's sub-read count are empty. Segments are sorted by
+// source offset (exl3_expert_format.py) and file order is dest order within a row (tables_from), so the cuts are
+// monotone. deps[j] is exactly the set of sub-reads whose file bytes the piece's bytes touch. Returns false for a
+// row that cannot be cut: more sub-reads than pieces, or a piece with bytes that no sub-read reads.
+inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, PieceRun* runs) {
+  const size_t parts = static_cast<size_t>(t.parts);
+  const size_t base = row_index * parts;
+  g = RowGeometry{};
+  g.start = t.starts[row_index];
+  for (size_t p = 0; p < parts; ++p) {
+    Read split[kSubReads];
+    const int n = split_part(t.extents[base + p], split);
+    if (g.subs + n > kPieces) return false;
+    for (int k = 0; k < n; ++k) {
+      g.sub[g.subs] = split[k];
+      g.part[g.subs] = static_cast<int>(p);
+      g.k[g.subs] = k;
+      ++g.subs;
+    }
+  }
+  // Where piece j begins in segment `s`, as an offset local to the segment.
+  const auto cut = [&](const Segment& s, int j) -> int64_t {
+    if (j <= 0) return 0;
+    if (j >= g.subs) return s.bytes;
+    const int64_t at = g.sub[j].dest - g.start - s.src;  // the boundary, local to the segment
+    if (at <= 0) return 0;
+    if (at >= s.bytes) return s.bytes;
+    return std::max<int64_t>(0, (s.dst + at) / kPieceAlign * kPieceAlign - s.dst);
+  };
+  const size_t segments = t.segments.size();
+  for (int j = 0; j < kPieces; ++j) {
+    bool bytes = false;
+    for (size_t i = 0; i < segments; ++i) {
+      const Segment& s = t.segments[i];
+      const PieceRun run{cut(s, j), cut(s, j + 1)};
+      runs[static_cast<size_t>(j) * segments + i] = run;
+      if (run.lo >= run.hi) continue;
+      bytes = true;
+      const int64_t lo = g.start + s.src + run.lo, hi = g.start + s.src + run.hi;  // the run's bounce bytes
+      for (int k = 0; k < g.subs; ++k) {
+        if (lo < g.sub[k].dest + g.sub[k].length && g.sub[k].dest < hi) g.deps[j] |= static_cast<uint8_t>(1u << k);
+      }
+    }
+    if (bytes && g.deps[j] == 0) return false;
+  }
+  return true;
 }
 
 // io_uring superset reads of whole expert rows into page-aligned bounce banks, then the
@@ -501,6 +621,38 @@ class RowReader {
   }
   unsigned pack_workers() const { return pack_workers_; }
   unsigned pack_split() const { return pack_split_; }
+
+  // Piece streaming (kSubReads sub-reads per part, per-piece vetting); off by default. Before open(), or on an idle
+  // reader after it (the tier sets it before its service thread starts), since it resizes the descriptor arrays.
+  // Refused without packing workers (the inline path has no piece publisher), with more mirror parts than the
+  // pieces can name, or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
+  void set_piece_stream(bool on) {
+    if (on) {
+      if (pack_workers_ == 0) throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+      if (t_.parts * kSubReads > kPieces) {
+        throw std::runtime_error("exl3 RAM miss: piece streaming reads at most kPieces / kSubReads mirror parts");
+      }
+      for (size_t row = 0; row < t_.slabs.size(); ++row) {
+        for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
+          if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kPieceAlign != 0 || t_.row_bytes[name] % kPieceAlign != 0) {
+            throw std::runtime_error("exl3 RAM miss: piece streaming needs every slab row base 128 B aligned");
+          }
+        }
+      }
+    }
+    piece_stream_ = on;
+    subs_ = on ? kSubReads : 1;
+    if (ring_ready_ && !size_extents()) throw std::runtime_error("exl3 RAM miss: too many descriptors for piece streaming");
+  }
+  bool piece_stream() const { return piece_stream_; }
+  // Test only (U10): the descriptor count and the ring credit this reader runs with.
+  size_t descriptors() const { return descs_.size(); }
+  unsigned credit() const { return queue_depth(); }
+  // Test only (U10): every SQE prepared is appended here, while set (null: nothing recorded, one branch per SQE).
+  struct SqeRecord {
+    int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
+  };
+  void set_sqe_log(std::vector<SqeRecord>* log) { sqe_log_ = log; }
 
   // Test-only scaffold (PACK_WORKERS.md owner-pinning measurement): pin the owner thread to `core`
   // at open() and build the packing pool's mask as the inherited set minus that core, so the owner and
@@ -566,20 +718,7 @@ class RowReader {
       bounce_ = nullptr;
       return false;
     }
-    // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part), a queue
-    // that can hold each descriptor once (an extent waits in it at most once at a time), and completion
-    // and resubmission lists bounded by the same count.
-    const size_t extents = static_cast<size_t>(kBounceSlots) * static_cast<size_t>(t_.parts);
-    // A completion carries its descriptor index in the low 32 bits of user_data and its generation in
-    // the high 32 (see prepare() and process()). process() rejects an index past descs_.size(), but a
-    // count that does not fit in 32 bits would truncate on the way OUT, so a completion would name a
-    // different live descriptor and pass that check: bytes would be credited to the wrong extent.
-    if (extents > 0xFFFFFFFFull) return false;
-    descs_.assign(extents, ExtentDesc{});
-    queue_.assign(extents, 0);
-    completions_.reserve(extents + 1);
-    held_.reserve(extents);
-    again_.reserve(extents);
+    if (!size_extents()) return false;
     if (io_uring_queue_init(queue_depth(), &ring_, 0) != 0) return false;
     ring_ready_ = true;
     cpu_set_t inherited;
@@ -659,6 +798,7 @@ class RowReader {
       trace->rows_asked = static_cast<int64_t>(c.total);
       trace->pack_workers = pack_workers_;
       trace->pack_split = pack_split_;
+      trace->piece_stream = piece_stream_ ? 1 : 0;
     }
     reset_pipeline();
     held_.clear();
@@ -749,6 +889,7 @@ class RowReader {
     int32_t retries = 0;
     int32_t slot = -1;        // bounce slot: bank * kBounceRows + row within the bank
     int32_t trace_slot = -1;  // index into the record's extent arrays, -1 when not stamped
+    int32_t sub = 0;          // piece streaming: the sub-read's ordinal in its row's file order
   };
 
   struct BounceRow {
@@ -759,6 +900,16 @@ class RowReader {
     // can read; `filled` is what the drives actually delivered into it. See pack_one().
     int64_t needed = 0;
     int64_t filled = 0;
+    // Piece streaming only (zero otherwise): the row's sub-reads by ordinal and its pieces. A piece is vetted once
+    // every sub-read in its dependency mask has landed and its bytes lie inside what they delivered; with the flag
+    // on this, not `filled`, is what take_ready_row checks.
+    int64_t start = 0;  // where the needed bytes begin in the slot
+    uint8_t subs = 0;
+    uint8_t landed = 0;  // bit s: sub-read s retired
+    uint8_t vetted = 0;  // bit j: piece j vetted
+    uint8_t deps[kPieces] = {};
+    int64_t sub_dest[kPieces] = {};
+    int64_t sub_done[kPieces] = {};
   };
 
   struct Completion {
@@ -790,6 +941,7 @@ class RowReader {
     size_t packing = 0;    // rows handed to the packing workers and not yet finished by the owner
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
+    int64_t events = 0;  // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
   };
 
   // How many reads may be outstanding at once. Credit-based preparation in refill() means
@@ -807,6 +959,27 @@ class RowReader {
   }
 
   uint8_t* bounce_slot(size_t slot) const { return bounce_ + slot * static_cast<size_t>(t_.slot_bytes); }
+
+  // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part, sub-read), a queue
+  // that can hold each descriptor once (an extent waits in it at most once at a time), and completion
+  // and resubmission lists bounded by the same count. With piece streaming off there is one sub-read per part,
+  // so this is a descriptor per (bounce slot, part) and nothing piece-related is allocated.
+  bool size_extents() {
+    const size_t extents = static_cast<size_t>(kBounceSlots) * static_cast<size_t>(t_.parts) * subs_;
+    // A completion carries its descriptor index in the low 32 bits of user_data and its generation in
+    // the high 32 (see prepare() and process()). process() rejects an index past descs_.size(), but a
+    // count that does not fit in 32 bits would truncate on the way OUT, so a completion would name a
+    // different live descriptor and pass that check: bytes would be credited to the wrong extent.
+    if (extents > 0xFFFFFFFFull) return false;
+    descs_.assign(extents, ExtentDesc{});
+    queue_.assign(extents, 0);
+    completions_.reserve(extents + 1);
+    held_.reserve(extents);
+    again_.reserve(extents);
+    sub_reads_.assign(piece_stream_ ? extents : 0, Read{});
+    piece_runs_.assign(piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
+    return true;
+  }
 
   // A new read() starts with every descriptor retired and every bank free. This is also what makes a
   // failed call safe to follow: drain() has already retired the kernel's side of everything.
@@ -910,6 +1083,8 @@ class RowReader {
         const Read& e = t_.extents[base + p];
         if (e.length > 0 && t_.file_sizes[e.file] - e.offset <= 0) return false;
       }
+      // The slot is Free (checked above), so its piece runs may be written before the batch is known good.
+      if (piece_stream_ && !plan_pieces(bank * kBounceRows + i, row_index, geometry_[i])) return false;
     }
     const int64_t admitted = stamp(c.trace);
     if (c.trace) ++c.trace->batches;
@@ -924,6 +1099,10 @@ class RowReader {
       ++rows_busy_[bank];
       ++c.reading_rows;
       if (fault_.poison) std::memset(bounce_slot(slot), kPoisonFill, static_cast<size_t>(t_.slot_bytes));
+      if (piece_stream_) {
+        queue_sub_reads(slot, ordinal, geometry_[i], admitted);
+        continue;
+      }
       for (size_t p = 0; p < parts; ++p) {
         // A zero-length extent is a root that serves none of this row: no read, not queued.
         const Read* extent = &t_.extents[base + p];
@@ -960,6 +1139,119 @@ class RowReader {
     return true;
   }
 
+  // Piece streaming: the row's sub-reads and pieces, into `g` and slot `slot`'s piece runs. False refuses the batch:
+  // the row cannot be cut, or a sub-read would start at or past end of file (the per-part check above, per sub-read;
+  // a builder table never gives one, so it fails loudly rather than expecting nothing).
+  bool plan_pieces(size_t slot, size_t row_index, RowGeometry& g) {
+    const size_t segments = t_.segments.size();
+    if (!row_geometry(t_, row_index, g, &piece_runs_[slot * kPieces * segments])) return false;
+    for (int s = 0; s < g.subs; ++s) {
+      if (t_.file_sizes[g.sub[s].file] - g.sub[s].offset <= 0) return false;
+    }
+    return true;
+  }
+
+  // Piece streaming: queue the row's sub-reads, one descriptor each, (slot, part, k) -> (slot * parts + part) *
+  // kSubReads + k. Credit is untouched: refill() takes it per SQE, so a sub-read costs one like a part did. Pieces
+  // with no bytes are vetted here, at admission.
+  void queue_sub_reads(size_t slot, size_t ordinal, const RowGeometry& g, int64_t admitted) {
+    Call& c = c_;
+    const size_t parts = static_cast<size_t>(t_.parts);
+    const size_t bank = slot / kBounceRows;
+    BounceRow& r = rows_[slot];
+    r.start = g.start;
+    r.subs = static_cast<uint8_t>(g.subs);
+    std::copy(g.deps, g.deps + kPieces, r.deps);
+    for (int s = 0; s < g.subs; ++s) {
+      const uint32_t index = static_cast<uint32_t>((slot * parts + static_cast<size_t>(g.part[s])) * kSubReads + g.k[s]);
+      sub_reads_[index] = g.sub[s];
+      const Read* extent = &sub_reads_[index];
+      ExtentDesc& d = descs_[index];
+      d = ExtentDesc{};
+      d.read = extent;
+      // Clamped at end of file per sub-read, as a part is; at least 1 byte (plan_pieces).
+      d.expected = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
+      d.generation = next_generation();
+      d.slot = static_cast<int32_t>(slot);
+      d.sub = s;
+      if (stale_waiting_ && index == stale_index_) stale_armed_ = true;  // the fault's descriptor was just recycled
+      r.sub_dest[s] = extent->dest;
+      ++r.extents_left;
+      ++bank_live_[bank];
+      queue_push(index);
+      if (c.trace) {
+        const size_t drive = file_drive_[extent->file];
+        c.trace->drive_dev[drive] = drive_dev_[drive];
+        c.trace->drive_extents[drive] += 1;
+        const int64_t trace_slot = c.trace->extents++;
+        if (trace_slot < kTraceExtents) {
+          c.trace->extent_id[trace_slot] =
+              (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) | static_cast<int64_t>(g.part[s]);
+          d.trace_slot = static_cast<int32_t>(trace_slot);
+        } else {
+          ++c.trace->extents_untraced;
+        }
+      }
+    }
+    vet_pieces(slot, admitted);
+  }
+
+  // Piece streaming: sub-read `sub` of the row in `slot` retired with `done` bytes. Vet every piece it completes.
+  void land_sub_read(size_t slot, int32_t sub, int64_t done, int64_t returned) {
+    Call& c = c_;
+    BounceRow& r = rows_[slot];
+    r.landed |= static_cast<uint8_t>(1u << sub);
+    r.sub_done[sub] = done;
+    const int64_t seq = ++c.events;
+    if (c.trace && r.ordinal < static_cast<size_t>(kTraceRows)) c.trace->sub_land_seq[r.ordinal][sub] = seq;
+    vet_pieces(slot, returned);
+  }
+
+  // Vet each piece of `slot` whose dependencies have all landed and that is not vetted yet. A piece whose bytes the
+  // landed sub-reads do not cover fails the call: its dependencies are final, so it can never be packed.
+  void vet_pieces(size_t slot, int64_t when) {
+    Call& c = c_;
+    BounceRow& r = rows_[slot];
+    for (int j = 0; j < kPieces; ++j) {
+      const uint8_t bit = static_cast<uint8_t>(1u << j);
+      if ((r.vetted & bit) != 0 || (r.deps[j] & ~r.landed) != 0) continue;
+      if (!piece_delivered(slot, j)) {
+        c.failed = true;
+        return;
+      }
+      r.vetted |= bit;
+      const int64_t seq = ++c.events;
+      if (c.trace) {
+        ++c.trace->pieces_vetted;
+        if (r.ordinal < static_cast<size_t>(kTraceRows)) {
+          c.trace->piece_cqe[r.ordinal][j] = when;
+          c.trace->piece_seq[r.ordinal][j] = seq;
+        }
+      }
+    }
+  }
+
+  // Every byte of piece j lies inside a landed sub-read's [dest, dest + done). Sub-reads are in dest order, so one
+  // pass per run suffices. This replaces the row's `filled >= needed`: a sub-read short at end of file is covered
+  // only up to what it returned.
+  bool piece_delivered(size_t slot, int j) const {
+    const BounceRow& r = rows_[slot];
+    const size_t segments = t_.segments.size();
+    const PieceRun* runs = &piece_runs_[(slot * kPieces + static_cast<size_t>(j)) * segments];
+    for (size_t i = 0; i < segments; ++i) {
+      if (runs[i].lo >= runs[i].hi) continue;
+      int64_t at = r.start + t_.segments[i].src + runs[i].lo;
+      const int64_t end = r.start + t_.segments[i].src + runs[i].hi;
+      for (int s = 0; s < r.subs; ++s) {
+        if (((r.landed >> s) & 1u) && r.sub_dest[s] <= at && at < r.sub_dest[s] + r.sub_done[s]) {
+          at = r.sub_dest[s] + r.sub_done[s];
+        }
+      }
+      if (at < end) return false;
+    }
+    return true;
+  }
+
   // Prepare as many queued extents as credit and SQ room allow. `pending` counts SQEs prepared and not
   // yet reaped (in the SQ ring or in the kernel) and never exceeds `capacity`. Credits are counted by
   // nonempty extents, not by rows, because rows do not all issue the same number of reads: a root
@@ -982,6 +1274,11 @@ class RowReader {
           static_cast<unsigned>(remaining), static_cast<uint64_t>(d.read->offset + d.done));
       io_uring_sqe_set_data64(sqe, (static_cast<uint64_t>(d.generation) << 32) | index);
       ++c.pending;
+      if (sqe_log_) {
+        sqe_log_->push_back(SqeRecord{
+            d.read->file, d.read->offset + d.done, remaining,
+            static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + d.done});
+      }
       if (c.trace) {
         c.trace->submitted_bytes += remaining;
         if (d.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
@@ -1051,7 +1348,8 @@ class RowReader {
         const bool live = index < descs_.size() && descs_[index].generation != 0 &&
                           descs_[index].generation == static_cast<uint32_t>(completions_[k].data >> 32);
         if (live && (fault_.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault_.hold_ordinal
-                                       : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal)) {
+                                       : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) &&
+            (fault_.sub < 0 || fault_matches_sub(index))) {
           held_.push_back(completions_[k]);
         } else {
           completions_[kept++] = completions_[k];
@@ -1085,11 +1383,13 @@ class RowReader {
       return;
     }
     ExtentDesc& d = descs_[index];
-    const size_t part = index % static_cast<size_t>(t_.parts);
+    // A fault's part is the descriptor's part whatever the sub-read count (subs_ is 1 with the flag off).
+    const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
     int res = completion.res;
     ++cqes_;
     if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
     if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(part) == fault_.part &&
+        (fault_.sub < 0 || static_cast<int64_t>(index % subs_) == fault_.sub) &&
         (fault_.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault_.ordinal)) {
       if (fault_.part_error != 0) {
         part_fired_ = true;
@@ -1124,6 +1424,12 @@ class RowReader {
     retire(index, completion, returned);
   }
 
+  // Fault (hold_ordinal with sub): the completion is of sub-read fault_.sub of part fault_.part (any part at -1).
+  bool fault_matches_sub(uint32_t index) const {
+    const int64_t part = static_cast<int64_t>((index / subs_) % static_cast<size_t>(t_.parts));
+    return static_cast<int64_t>(index % subs_) == fault_.sub && (fault_.part < 0 || part == fault_.part);
+  }
+
   // The extent's last completion: account it, retire the descriptor, and when it was its row's last
   // extent mark the row ready to pack. Nothing reads the descriptor afterwards.
   void retire(uint32_t index, const Completion& completion, int64_t returned) {
@@ -1137,6 +1443,7 @@ class RowReader {
     }
     const size_t slot = static_cast<size_t>(d.slot);
     rows_[slot].filled += d.done;
+    if (piece_stream_) land_sub_read(slot, d.sub, d.done, returned);
     --bank_live_[slot / kBounceRows];
     if (fault_.stale_cqe_call > 0 && ++retired_ == fault_.stale_cqe_call) {
       stale_ = completion;
@@ -1169,7 +1476,9 @@ class RowReader {
     // not behind the trace flag. Extents fill the slot contiguously from dest 0 and only a tail extent
     // can stop short without being resubmitted (a short read retries; only the EOF clamp shortens an
     // expectation), so a total at least `needed` means the needed prefix is whole.
-    if (rows_[best].filled < rows_[best].needed) {
+    // With piece streaming every piece must be vetted instead (vet_pieces): the same guarantee per piece, and
+    // stronger, since a piece is checked against what its own sub-reads delivered.
+    if (piece_stream_ ? rows_[best].vetted != kAllPieces : rows_[best].filled < rows_[best].needed) {
       c.failed = true;
       return static_cast<size_t>(kBounceSlots);
     }
@@ -1369,6 +1678,16 @@ class RowReader {
   std::unique_ptr<PackPool> pool_;
   PackJob jobs_[kBounceSlots];
   std::vector<CopyRun> runs_;
+  // Piece streaming (set_piece_stream; off by default). subs_ is sub-reads per part: 1 with the flag off, which
+  // makes descriptor (slot, part, sub) the old (slot, part). sub_reads_ holds each live sub-read's Read (a
+  // descriptor points into it), piece_runs_ each slot's piece runs, geometry_ a batch's rows between validation
+  // and admission. All sized at open() or set_piece_stream(), and empty with the flag off.
+  bool piece_stream_ = false;
+  size_t subs_ = 1;
+  std::vector<Read> sub_reads_;
+  std::vector<PieceRun> piece_runs_;
+  RowGeometry geometry_[kBounceRows];
+  std::vector<SqeRecord>* sqe_log_ = nullptr;  // test only (set_sqe_log)
   size_t rows_busy_[kBanks] = {};   // rows not yet packed, per bank: the packing references
   size_t bank_live_[kBanks] = {};   // extents not yet retired, per bank: the I/O references
   uint32_t generation_ = 0;
@@ -1451,6 +1770,7 @@ int64_t exl3_ram_miss_read_rows_traced(
       tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       direct != 0, f[19], f[20]);
   reader.set_owner_core(owner_core);
+  if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) return 0;
   reader.set_fault(fault_from(f));
   StageRecord stage;
@@ -1495,6 +1815,7 @@ void exl3_ram_miss_read_rows_faulted(
   RowReader reader(
       tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
       direct != 0, f[19], f[20]);
+  if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) {
     out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = 0;
     return;
@@ -1514,6 +1835,110 @@ void exl3_ram_miss_read_rows_faulted(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_faulted, exl3_ram_miss_read_rows_faulted);
+
+// Test only (U10): exl3_ram_miss_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
+// up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 5 int64:
+// the result, the SQE count, the descriptor count, the ring credit and the completions reaped. `fault` as the faulted
+// call's (word 22 turns piece streaming on).
+void exl3_ram_miss_read_rows_sqes(
+    TensorView extents,
+    TensorView starts,
+    TensorView file_sizes,
+    TensorView segments,
+    TensorView slabs,
+    TensorView row_bytes,
+    std::string paths,
+    std::string source_paths,
+    int64_t slot_bytes,
+    int64_t direct,
+    int64_t row,
+    TensorView experts,
+    TensorView slots,
+    int64_t step,
+    TensorView fault,
+    TensorView record,
+    TensorView sqes,
+    TensorView info) {
+  using namespace exl3_ram_miss;
+  check_fault_words(fault);
+  const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+  auto* out = static_cast<int64_t*>(info.data_ptr());
+  out[0] = out[1] = out[2] = out[3] = out[4] = 0;
+  RowReader reader(
+      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes),
+      direct != 0, f[19], f[20]);
+  if (f[22] != 0) reader.set_piece_stream(true);
+  if (!reader.open()) return;
+  reader.set_fault(fault_from(f));
+  std::vector<RowReader::SqeRecord> log;
+  reader.set_sqe_log(&log);
+  StageRecord stage;
+  const int result = reader.read(
+      row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
+  stage.ok = result == 1 ? 1 : 0;
+  stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
+  std::memcpy(record.data_ptr(), &stage, sizeof(stage));
+  auto* rows = static_cast<int64_t*>(sqes.data_ptr());
+  const size_t kept = std::min<size_t>(log.size(), static_cast<size_t>(sqes.size(0)));
+  for (size_t i = 0; i < kept; ++i) {
+    rows[4 * i] = log[i].file;
+    rows[4 * i + 1] = log[i].offset;
+    rows[4 * i + 2] = log[i].length;
+    rows[4 * i + 3] = log[i].bounce;
+  }
+  out[0] = result;
+  out[1] = static_cast<int64_t>(log.size());
+  out[2] = static_cast<int64_t>(reader.descriptors());
+  out[3] = reader.credit();
+  out[4] = reader.cqes();
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_sqes, exl3_ram_miss_read_rows_sqes);
+
+// Test only (U1): the sub-reads and pieces the reader computes when it admits expert `expert` of streamed row `row`
+// (row_geometry). `subs`: kPieces rows of 6 int64 (file, offset, length, dest, part, k), in file order; `pieces`:
+// kPieces rows of 1 + 2 * segments int64: the dependency mask, then (dst_lo, dst_hi) per segment in segment
+// destination coordinates (dst + the run's bounds). Returns the sub-read count, or -1 when the row cannot be cut.
+int64_t exl3_ram_miss_piece_geometry(
+    TensorView extents,
+    TensorView starts,
+    TensorView file_sizes,
+    TensorView segments,
+    TensorView slabs,
+    TensorView row_bytes,
+    std::string paths,
+    std::string source_paths,
+    int64_t slot_bytes,
+    int64_t row,
+    int64_t expert,
+    TensorView subs,
+    TensorView pieces) {
+  using namespace exl3_ram_miss;
+  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes);
+  const size_t count = t.segments.size();
+  RowGeometry g;
+  std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
+  if (!row_geometry(t, static_cast<size_t>(row * t.experts + expert), g, runs.data())) return -1;
+  auto* sub_out = static_cast<int64_t*>(subs.data_ptr());
+  for (int s = 0; s < g.subs; ++s) {
+    const int64_t words[6] = {g.sub[s].file, g.sub[s].offset, g.sub[s].length, g.sub[s].dest, g.part[s], g.k[s]};
+    std::copy(words, words + 6, sub_out + 6 * s);
+  }
+  auto* piece_out = static_cast<int64_t*>(pieces.data_ptr());
+  const size_t width = 1 + 2 * count;
+  for (int j = 0; j < kPieces; ++j) {
+    int64_t* line = piece_out + static_cast<size_t>(j) * width;
+    line[0] = g.deps[j];
+    for (size_t i = 0; i < count; ++i) {
+      const PieceRun& run = runs[static_cast<size_t>(j) * count + i];
+      line[1 + 2 * i] = t.segments[i].dst + run.lo;
+      line[2 + 2 * i] = t.segments[i].dst + run.hi;
+    }
+  }
+  return g.subs;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_piece_geometry, exl3_ram_miss_piece_geometry);
 
 // Test only: build a packing pool as if the creating thread could run on the cores set in `inherited`
 // (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
@@ -2129,6 +2554,14 @@ class RamTier {
     two_phase_ = on;
   }
 
+  // Piece streaming (SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM): the reader reads each part as sub-reads and vets
+  // rows piece by piece. Before the thread starts. The reader refuses it without packing workers; the service
+  // refuses it without two-phase and lease mode.
+  void set_piece_stream(bool on) {
+    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set piece streaming before the service thread starts");
+    reader_.set_piece_stream(on);
+  }
+
   // Shutdown, first step (LEASE_PROTOCOL.md 14.3 S1): the header word tells the device to stop waiting on the service,
   // and the service serves nothing new. Retirement goes on, so acknowledgements of work already in flight still land.
   void close_admission() {
@@ -2473,8 +2906,8 @@ class RamTier {
   // runs, so the fault's part errors, pack delay and the rest act on rows that have already packed. The
   // service thread applies it just before its next read (the reader is that thread's alone), and it then
   // stays until replaced; an all-default tensor clears it. Words 17-20 (abandon_after, step, pack_workers,
-  // pack_split) are not faults and are ignored: use inject() for the abandon point, and the tier's own
-  // constructor for the packing pool. The reader's counters (submit and completion calls) run over the
+  // pack_split) and 22 (piece_stream) are not faults and are ignored: use inject() for the abandon point, the
+  // tier's own constructor for the packing pool and set_piece_stream() for the mode. The reader's counters (submit and completion calls) run over the
   // reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to a fresh tier.
   void inject_fault(const int64_t* words) {
     std::lock_guard<std::mutex> guard(fault_mutex_);
@@ -2504,6 +2937,7 @@ class RamTier {
     stage_.prev_done = last_done_;
     stage_.pack_workers = reader_.pack_workers();
     stage_.pack_split = reader_.pack_split();
+    stage_.piece_stream = reader_.piece_stream() ? 1 : 0;
     cur_ = &stage_;
   }
 
@@ -3091,6 +3525,10 @@ void exl3_ram_miss_set_two_phase(int64_t handle, int64_t on) {
   exl3_ram_miss::find(handle)->set_two_phase(on != 0);
 }
 
+void exl3_ram_miss_set_piece_stream(int64_t handle, int64_t on) {
+  exl3_ram_miss::find(handle)->set_piece_stream(on != 0);
+}
+
 void exl3_ram_miss_inject_done_stall(int64_t handle, int64_t ns) {
   exl3_ram_miss::find(handle)->inject_done_stall(ns);
 }
@@ -3292,6 +3730,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close_admission, exl3_ram_miss_close
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_gpu_hot, exl3_ram_miss_set_gpu_hot);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_two_phase, exl3_ram_miss_set_two_phase);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_piece_stream, exl3_ram_miss_set_piece_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_to_expert, exl3_ram_miss_slot_to_expert);

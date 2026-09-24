@@ -51,7 +51,7 @@ def capturing_graphs() -> bool:
 # changed meaning, but a worker-mode record's pack stamps mean something else than an inline one's (a row's
 # pack_start is after the worker woke, its spans overlap). A file written before schema 5 does not say which
 # mode wrote it; it is ASSUMED inline, because the workers were barred from any run that writes a stage trace.
-RAM_MISS_TRACE_SCHEMA = 5
+RAM_MISS_TRACE_SCHEMA = 6
 
 
 class Exl3StreamTrace:
@@ -202,6 +202,10 @@ class Exl3StreamTrace:
         0 is the inline reader; above 0 the rows are packed by workers, and ``row_pack_ns`` starts, ``spans_ns.pack``
         and anything derived from the gap between an extent's reap and its row's pack start are then not
         comparable with an inline trace's (analysis/dsv41-drive/overlap_timeline.py refuses them).
+        ``schema`` 6 adds ``request.piece_stream``, ``extent_cqe_ns[].sub`` and ``pieces``. With piece streaming on each
+        extent is one sub-read of its part (``sub``), and ``pieces`` has one entry per row: when each sub-read landed and
+        each piece was vetted, as shared sequence numbers, and the vetting's clock (``stage_records``). Off, ``sub`` is
+        0 and ``pieces`` is empty, so every schema-5 field keeps its meaning.
         """
         if self._file is None or not records:
             return
@@ -223,6 +227,7 @@ class Exl3StreamTrace:
                     "lanes": record["lanes"],
                     "pack_workers": record["pack_workers"],
                     "pack_split": record["pack_split"],
+                    "piece_stream": record["piece_stream"],
                 },
                 "status": record["status"],
                 "rows_asked": record["rows_asked"],
@@ -244,6 +249,7 @@ class Exl3StreamTrace:
                 },
                 "row_pack_ns": record["row_pack"],
                 "extent_cqe_ns": record["extent_cqe"],
+                "pieces": record["pieces"],
                 "untraced": {"rows": record["rows_untraced"], "extents": record["extents_untraced"]},
                 "dropped_before": record["dropped_before"],
                 "extents": record["extents"],

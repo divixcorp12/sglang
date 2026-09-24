@@ -39,23 +39,29 @@ if _soft != resource.RLIM_INFINITY and _soft < 16384:
 EIO = errno.EIO
 PAGE = split.PAGE
 
-# (workers, chunks per row): pure offload, rows in parallel, and every row cut across the workers.
-MODES = [(1, 1), (3, 1), (3, 3)]
+# (workers, chunks per row, piece streaming): pure offload, rows in parallel, and every row cut across the workers;
+# then two of them again with SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM's reader (sub-reads, per-piece vetting).
+MODES = [(1, 1, False), (3, 1, False), (3, 3, False), (1, 1, True), (3, 3, True)]
 
 
-@pytest.fixture(params=MODES, ids=lambda mode: f"w{mode[0]}c{mode[1]}")
+@pytest.fixture(params=MODES, ids=lambda mode: f"w{mode[0]}c{mode[1]}" + ("ps" if mode[2] else ""))
 def packing(request, monkeypatch):
-    """Every reader a reused test builds packs on workers, unless the test names its own ``pack_workers``."""
-    workers, chunks = request.param
+    """Every reader a reused test builds packs on workers, unless the test names its own ``pack_workers``, and
+    streams pieces in the piece-stream modes whenever it has workers (the flag needs them)."""
+    workers, chunks, piece_stream = request.param
     fault_tensor, host_init = ops._fault_tensor, Exl3RamMissHost.__init__
 
     def with_workers(**faults):
         faults.setdefault("pack_workers", workers)
         faults.setdefault("pack_split", chunks)
+        if piece_stream and faults["pack_workers"] > 0:
+            faults.setdefault("piece_stream", True)
         return fault_tensor(**faults)
 
     def init(self, *args, pack_workers=None, **kwargs):
         host_init(self, *args, pack_workers=workers if pack_workers is None else pack_workers, **kwargs)
+        if piece_stream and (workers if pack_workers is None else pack_workers) > 0:
+            self.enable_piece_stream()
 
     monkeypatch.setattr(ops, "_fault_tensor", with_workers)
     monkeypatch.setattr(Exl3RamMissHost, "__init__", init)
