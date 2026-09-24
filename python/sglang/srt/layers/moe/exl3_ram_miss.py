@@ -271,6 +271,22 @@ def _row_image_tables(
     )
 
 
+def check_piece_stream(cfg: Dsv41Config, *, row_images: bool) -> None:
+    """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM without what it needs. It is a mode of two-phase (itself a mode
+    of lease mode), and the inline no-pool pack path (pack_workers == 0) has no publisher for a piece job, so it is
+    refused rather than silently packing whole rows. Row images copy nothing: the reader publishes each piece on its
+    own thread, so they need no workers."""
+    if not cfg.enable_ram_miss_piece_stream:
+        return
+    publisher = cfg.ram_miss_pack_workers > 0 or row_images
+    if not (cfg.enable_ram_miss_two_phase and cfg.enable_ram_miss_leases and publisher):
+        raise RuntimeError(
+            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs "
+            "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES and "
+            "SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0 (or SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES)"
+        )
+
+
 def open_service_row_images(cfg: Dsv41Config, layout, segments, mirrors: dict, direct: bool, streamers) -> Optional[RowImageSet]:
     """The row images the service reads with (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES), or None with the flag off.
 
@@ -646,17 +662,8 @@ class Exl3RamMissService:
                 raise RuntimeError(
                     "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
                 )
-            # Piece streaming is a mode of two-phase: the inline no-pool pack path (pack_workers == 0) has no
-            # publisher for a piece job, so it is refused rather than silently packing whole rows. Row images copy
-            # nothing, so they publish each piece on the reader's own thread and need no workers.
             piece_stream = cfg.enable_ram_miss_piece_stream
-            publisher = cfg.ram_miss_pack_workers > 0 or tables.row_images
-            if piece_stream and not (two_phase and lease_mode and publisher):
-                raise RuntimeError(
-                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs "
-                    "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES and "
-                    "SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0 (or SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES)"
-                )
+            check_piece_stream(cfg, row_images=tables.row_images)
             if lease_mode:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if two_phase:

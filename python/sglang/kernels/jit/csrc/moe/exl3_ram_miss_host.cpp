@@ -334,6 +334,21 @@ inline void check_image_tables(const Tables& t) {
     }
     cursor += s.bytes;
   }
+  // ... and on the destination side, each name's segments tile its slab row: two segments landing on the same slab
+  // bytes would pass the source check and silently keep whichever read landed last.
+  for (int64_t name = 0; name < static_cast<int64_t>(t.row_bytes.size()); ++name) {
+    std::vector<std::pair<int64_t, int64_t>> spans;
+    for (const Segment& s : t.segments) {
+      if (s.name == name) spans.emplace_back(s.dst, s.dst + s.bytes);
+    }
+    std::sort(spans.begin(), spans.end());
+    int64_t at = 0;
+    for (const auto& span : spans) {
+      if (span.first != at) throw std::runtime_error("exl3 RAM miss: row-image segments must tile each slab row once");
+      at = span.second;
+    }
+    if (at != t.row_bytes[name]) throw std::runtime_error("exl3 RAM miss: row-image segments must tile each slab row once");
+  }
   const size_t parts = static_cast<size_t>(t.parts);
   for (size_t base = 0; base < t.extents.size(); base += parts) {
     int64_t at = 0;
@@ -993,7 +1008,8 @@ class RowReader {
       // withheld completions of the slow-drive fault arrive only once every other row has packed.
       if (c.pending > 0 || (!ready && c.packing == 0 && !held_.empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
-      if (!pack_one() && c.packing > 0) _mm_pause();
+      // (The hold_until_probe_ms fault keeps direct-mode pieces vetted but unpublished with nothing to wait on.)
+      if (!pack_one() && (c.packing > 0 || c.hold_until != 0)) _mm_pause();
     }
     // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
     // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
@@ -1788,8 +1804,23 @@ class RowReader {
   // table that would ask for one is refused here instead of failing reads at run time. Every slab row base, every
   // segment's bounds (the iovec cuts) and every reading extent's offset, length and image position must be
   // kImageAlign multiples; the sub-read cuts inside a part are pages (split_part), so they follow.
+  // With O_DIRECT, each file's own alignment (statx STATX_DIOALIGN, where the kernel reports it) is checked too, so a
+  // drive with larger logical blocks than the 512 B the images are built for is refused at open, naming the file.
   void check_image_alignment() const {
     const auto off = [](int64_t v) { return v % kImageAlign != 0; };
+#ifdef STATX_DIOALIGN
+    for (size_t f = 0; f < fds_.size() && direct_; ++f) {
+      struct statx stx {};
+      if (statx(fds_[f], "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) != 0 || (stx.stx_mask & STATX_DIOALIGN) == 0) continue;
+      if (stx.stx_dio_offset_align == 0 || kImageAlign % stx.stx_dio_offset_align != 0 ||
+          stx.stx_dio_mem_align == 0 || kImageAlign % stx.stx_dio_mem_align != 0) {
+        throw std::runtime_error(
+            "exl3 RAM miss: " + t_.paths[f] + " needs O_DIRECT alignment of " +
+            std::to_string(stx.stx_dio_offset_align) + " B (offsets) and " + std::to_string(stx.stx_dio_mem_align) +
+            " B (memory); row images are built for 512 B");
+      }
+    }
+#endif
     for (size_t row = 0; row < t_.slabs.size(); ++row) {
       for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
         if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kImageAlign != 0 || off(t_.row_bytes[name])) {

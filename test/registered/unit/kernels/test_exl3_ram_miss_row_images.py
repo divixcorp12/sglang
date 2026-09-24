@@ -26,12 +26,10 @@ import test_exl3_ram_miss_two_phase_victim as two_phase_victim
 from sglang.kernels.ops.moe import exl3_ram_miss as ops
 from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, read_rows_pieces, read_rows_sqes, read_rows_traced
 from sglang.srt.dsv41_config import Dsv41Config
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables, open_service_row_images
+from sglang.srt.layers.moe.exl3_ram_miss import check_piece_stream, exl3_ram_miss_tables, open_service_row_images
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
-from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
@@ -49,23 +47,30 @@ PAGE = 4096
 SETUP_USERS = (split, thread, piece_stream, two_phase, two_phase_victim)
 
 
-def _o_direct_or_skip(path):
+def _o_direct(path):
+    """Whether ``path``'s filesystem takes O_DIRECT. Where it does not (tmpfs before 6.6, some overlays) the direct
+    mode is exercised with buffered readv, the same iovecs and publishing, rather than skipped: only O_DIRECT's own
+    alignment refusal goes unexercised there, and the refusals at open are the reader's, not the kernel's."""
     try:
         os.close(os.open(path, os.O_RDONLY | os.O_DIRECT))
-    except OSError as error:
-        pytest.skip(f"{path} does not support O_DIRECT: {error}")
+        return True
+    except OSError:
+        return False
+
+
+def _direct(s):
+    return _o_direct(s.tables.paths[0])
 
 
 def _images_setup(tmp_path, **kwargs):
-    s = ram_miss_setup(tmp_path, row_images=True, **kwargs)
-    _o_direct_or_skip(s.tables.paths[0])
-    return s
+    return ram_miss_setup(tmp_path, row_images=True, **kwargs)
 
 
 @pytest.fixture(params=[False, True], ids=["img", "img_pieces"])
 def row_images(request, monkeypatch):
-    """Every ``ram_miss_setup`` a reused test calls builds row-image tables, every read of them is O_DIRECT (the
-    production mode; a test's ``direct=False`` names the bounce path's buffered default), and in the piece-streaming
+    """Every ``ram_miss_setup`` a reused test calls builds row-image tables, every read of them is O_DIRECT where the
+    filesystem takes it (the production mode; a test's ``direct=False`` names the bounce path's buffered default), and
+    in the piece-streaming
     mode every reader streams pieces (which the direct mode does without packing workers)."""
     yield from _row_images(request.param, monkeypatch)
 
@@ -92,10 +97,10 @@ def _row_images(pieces, monkeypatch):
         return fault_tensor(**faults)
 
     def direct_table_args(tables, direct):
-        return table_args(tables, direct or tables.row_images)
+        return table_args(tables, direct or (getattr(tables, "row_images", False) and _o_direct(tables.paths[0])))
 
     def direct_host(self, tables, *args, direct, **kwargs):
-        host_init(self, tables, *args, direct=direct or tables.row_images, **kwargs)
+        host_init(self, tables, *args, direct=direct or (tables.row_images and _o_direct(tables.paths[0])), **kwargs)
 
     monkeypatch.setattr(ops, "_fault_tensor", faults_with_pieces)
     monkeypatch.setattr(ops, "_table_args", direct_table_args)
@@ -153,7 +158,6 @@ NOT_REUSED = {
     "test_u10_flag_off_issues_todays_sqes_and_credit_and_packs_the_same_bytes": "compares with the shard SQEs",
     "test_the_reader_refuses_piece_streaming_without_packing_workers": "the direct mode needs none",
     "test_the_tier_refuses_the_flag_without_packing_workers": "the direct mode needs none",
-    "test_the_reader_refuses_a_slab_row_base_that_is_not_128_byte_aligned": "the direct mode refuses 512 first",
     "test_the_reader_refuses_more_mirror_parts_than_the_pieces_can_name": "needs three mirror parts of shards",
 }
 
@@ -183,6 +187,9 @@ def _reuse(module, fixture_of, prefix=""):
             globals()[prefix + name] = _clone(test, fixture)
 
 
+# test_exl3_ram_miss_pack_workers' own tests are not reused: each is about the packing pool (worker threads, their
+# cores, chunking, copies still running at return, the pack-mode record), which the direct mode never starts; the
+# promises it reruns from the split and thread suites are reused here directly.
 _reuse(split, lambda name: "row_images_without_pieces" if name in ONE_READ_PER_PART else "row_images")
 # The thread suite's tiers run without lease mode, which a piece-streaming tier refuses per request.
 _reuse(thread, lambda name: "row_images_without_pieces")
@@ -194,7 +201,7 @@ def test_the_fixture_puts_a_reused_test_on_row_images_read_with_o_direct(tmp_pat
     """Bookkeeping: without the fixture's patches every reused test above is a plain rerun of the bounce path."""
     s = split.ram_miss_setup(tmp_path)
     assert s.tables.row_images and all(path.endswith(".rows") for path in s.tables.paths)
-    assert ops._table_args(s.tables, False)[-1] == 1  # a test's direct=False still reads with O_DIRECT
+    assert ops._table_args(s.tables, False)[-1] == int(_direct(s))  # direct=False still reads with O_DIRECT
     result, record = read_rows_traced(s.tables, 0, [1], [0], direct=False)
     assert result == 1 and record["piece_stream"] == int(row_images) and record["pack_workers"] == 0
 
@@ -231,7 +238,10 @@ def test_the_direct_mode_leaves_every_slab_byte_as_the_bounce_path_does(tmp_path
         _sentinel_all(s)
     for row, experts, slots, step in requests:
         extra = dict(piece_stream=True, pack_workers=2) if pieces else {}
-        got = [read_rows_traced(s.tables, row, experts, slots, direct=s is direct, step=step, **extra)[0] for s in (bounce, direct)]
+        got = [
+            read_rows_traced(s.tables, row, experts, slots, direct=s is direct and _direct(s), step=step, **extra)[0]
+            for s in (bounce, direct)
+        ]
         assert got == [1, 1]
     want, have = _all_slabs(bounce), _all_slabs(direct)
     for key in want:
@@ -259,7 +269,7 @@ def test_a_short_read_resumes_at_the_byte_it_stopped_even_mid_row(tmp_path, shor
     assert s.tables.segments[:, 2].tolist() == IMAGE_ROW_STARTS  # the boundaries the cases are placed around
     experts, slots = [3, 0, 5], [0, 1, 2]
     result, sqes, info, record = read_rows_sqes(
-        s.tables, 1, experts, slots, direct=True, part=0, part_short=short, ordinal=1
+        s.tables, 1, experts, slots, direct=_direct(s), part=0, part_short=short, ordinal=1
     )
     assert result == 1, where
     image = int(s.tables.slot_bytes)
@@ -277,7 +287,7 @@ def test_a_short_sub_read_resumes_mid_sub_read_across_slab_rows(tmp_path):
     s = _images_setup(tmp_path, capacity=6)
     experts, slots = [2, 4], [1, 0]
     result, record, masks, info = read_rows_pieces(
-        s.tables, 1, experts, slots, direct=True, generation=7, piece_stream=True, part=0, sub=0, part_short=3 * 512,
+        s.tables, 1, experts, slots, direct=_direct(s), generation=7, piece_stream=True, part=0, sub=0, part_short=3 * 512,
         ordinal=0,
     )
     assert result == 1 and info["refused"] == 0
@@ -293,20 +303,22 @@ def test_a_short_sub_read_resumes_mid_sub_read_across_slab_rows(tmp_path):
 def test_an_io_error_fails_the_read_leaves_the_ring_clean_and_the_next_read_lands_exact(tmp_path, pieces):
     """Bug-shaped guard for the direct mode's failure rule: the kernel writes the slab rows itself, so after an
     error nothing may still be in flight when read() returns (the caller releases the slots then). The next read on
-    the same reader lands byte-exact in the same slots, which it could not if a straggling DMA or a stale
-    descriptor from the failed read were still live; the failed rows' untouched slots keep their sentinel or hold
-    whole landed rows only."""
+    the same reader lands other experts byte-exact in the same slots, which it could not if a straggling write or a
+    stale descriptor from the failed read were still live. (What the failed read left in them is not asserted: in the
+    direct mode an unpublished slot may hold part of a failed row, and the caller releases it.)"""
     s = _images_setup(tmp_path, capacity=8, experts=8, mirror_weights=(1.0, 1.0))
     experts, slots = [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]
     for slot in slots:
         split._sentinel(s, 1, slot)
     extra = dict(piece_stream=True) if pieces else {}
+    # The clean read puts OTHER experts into the failed read's slots (its failed row's included), so a write of the
+    # failed read landing late would show as the wrong expert's bytes.
     results = ops.read_rows_with_fault(
-        s.tables, 1, experts, slots, [6, 7, 0], [6, 7, 0], direct=True, part=1, part_error=EIO, ordinal=2,
+        s.tables, 1, experts, slots, [6, 7, 0], [2, 0, 1], direct=_direct(s), part=1, part_error=EIO, ordinal=2,
         max_outstanding=2, **extra,
     )
     assert results == (0, 1)
-    split._assert_rows(s, 1, [6, 7, 0], [6, 7, 0])
+    split._assert_rows(s, 1, [6, 7, 0], [2, 0, 1])
 
 
 FAILURES = [
@@ -333,12 +345,12 @@ def test_a_failed_read_publishes_only_whole_exact_pieces(tmp_path, fault):
     fault = dict(fault)
     step = fault.pop("step", 8)
     experts, slots, ref_slots = list(range(16)), list(range(16)), list(range(16, 32))
-    assert read_rows_traced(s.tables, 1, experts, ref_slots, direct=True)[0] == 1
+    assert read_rows_traced(s.tables, 1, experts, ref_slots, direct=_direct(s))[0] == 1
     split._assert_rows(s, 1, experts, ref_slots)
     for slot in slots:
         split._sentinel(s, 1, slot)
     result, record, masks, info = read_rows_pieces(
-        s.tables, 1, experts, slots, direct=True, generation=9, reference=s.tables.slabs, ref_slots=ref_slots,
+        s.tables, 1, experts, slots, direct=_direct(s), generation=9, reference=s.tables.slabs, ref_slots=ref_slots,
         piece_stream=True, step=step, poison=True, **fault,
     )
     assert result == 0
@@ -398,7 +410,7 @@ def test_open_refuses_a_table_the_direct_mode_cannot_read(tmp_path, edit, messag
     s = _images_setup(tmp_path, capacity=3, mirror_weights=(1.0, 1.0))
     tables = _tables_with(s, **edit(s.tables))
     with pytest.raises(RuntimeError, match=message):
-        read_rows_traced(tables, 0, [1], [0], direct=True)
+        read_rows_traced(tables, 0, [1], [0], direct=_direct(s))
 
 
 def test_an_image_whose_names_are_not_512_byte_rows_is_refused(tmp_path):
@@ -424,13 +436,16 @@ def test_the_tables_refuse_images_opened_for_other_roots(tmp_path):
 def test_pack_stamps_are_publish_times_and_no_pool_is_started(tmp_path):
     """Critical-path bookkeeping (the measurement reads it): in the direct mode a row's first and last publish
     bracket its pieces' publishes and come after the landing that vetted them, the record says no packing workers
-    ran (asking for three starts none), and useful_bytes counts every image byte that landed in a slab."""
-    s = _images_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
-    experts, slots = [3, 0, 5, 1], [0, 1, 2, 3]
-    result, record = read_rows_traced(s.tables, 1, experts, slots, direct=True, piece_stream=True, pack_workers=3)
+    ran (asking for three starts none), and the byte split has no superset or padding in it: over two batches and two
+    drives every byte submitted, completed and useful is an image byte, once."""
+    s = _images_setup(tmp_path, capacity=12, experts=12, mirror_weights=(1.0, 1.0))
+    experts, slots = list(range(11))[::-1], list(range(11))
+    result, record = read_rows_traced(s.tables, 1, experts, slots, direct=_direct(s), piece_stream=True, pack_workers=3)
     assert result == 1
-    assert record["pack_workers"] == 0 and record["piece_stream"] == 1
-    assert record["useful_bytes"] == len(experts) * int(s.tables.slot_bytes) == record["bytes"]
+    assert record["pack_workers"] == 0 and record["piece_stream"] == 1 and record["batches"] == 2
+    image = len(experts) * int(s.tables.slot_bytes)
+    assert record["useful_bytes"] == record["bytes"] == record["submitted_bytes"] == image
+    assert sum(drive["bytes"] for drive in record["drives"]) == image
     for row in record["row_pack"]:
         cqes = [e["cqe"] for e in record["extent_cqe"] if e["row"] == row["row"]]
         assert 0 < min(cqes) <= row["start"] <= row["end"] and max(cqes) <= row["end"], (row, cqes)
@@ -461,8 +476,23 @@ def test_the_service_opens_images_only_with_the_flag_mirrors_and_o_direct(tmp_pa
     assert sorted(images.paths) == [0, 1] and images.roots == s.roots
 
 
-def test_the_flag_defaults_to_off():
-    assert envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES.get() is False
+@pytest.mark.parametrize(
+    "workers, images, refused",
+    [(0, False, True), (0, True, False), (2, False, False)],
+    ids=["no_publisher", "images_publish_inline", "workers"],
+)
+def test_the_service_refuses_piece_streaming_without_a_publisher_unless_it_reads_row_images(workers, images, refused):
+    """Negative-branch contract of the service gate: with two-phase and leases on, piece streaming still needs a
+    publisher, packing workers or the direct mode's own; without either it is refused, not run on the inline packer."""
+    cfg = _cfg(
+        enable_ram_miss_piece_stream=True, enable_ram_miss_two_phase=True, enable_ram_miss_leases=True,
+        ram_miss_pack_workers=workers,
+    )
+    if refused:
+        with pytest.raises(RuntimeError, match="PACK_WORKERS > 0"):
+            check_piece_stream(cfg, row_images=images)
+    else:
+        check_piece_stream(cfg, row_images=images)
 
 
 if __name__ == "__main__":

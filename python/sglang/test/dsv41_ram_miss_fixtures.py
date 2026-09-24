@@ -39,8 +39,9 @@ class RamMissSetup:
 
 
 # Fake-expert dimensions whose six streamed names' slab rows are all multiples of 512 bytes, as row images need
-# (dsv41's are; write_fake_exl3's defaults give 256-byte w2_suh/w2_svh rows): 1024, 1024, 49152, 512, 512, 24576,
-# an image of 76800 bytes (18.75 pages, so the last part ends inside a page) and a row stride of 77824.
+# (dsv41's are; write_fake_exl3's defaults give 256-byte w2_suh/w2_svh rows): trellis rows of 49152 (w13) and 24576
+# (w2) bytes and scale rows of 512 and 1024, an image of 76800 bytes (18.75 pages, so the last part ends inside a
+# page) and a row stride of 77824.
 ROW_IMAGE_DIM = 256
 
 

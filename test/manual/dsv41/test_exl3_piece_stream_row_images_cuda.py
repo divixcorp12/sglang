@@ -79,8 +79,13 @@ def _threads():
     return out
 
 
+# Its precondition is that two streamed rows are cut differently, so a wrong row index in S's piece table shows. Row
+# images cut every (row, expert) alike (identity segments, one image layout), so the precondition cannot hold and a
+# wrong row index is harmless for the table; the slab row index S copies from is still covered by every other test.
+NOT_REUSED = {"test_g1_a_second_layer_streams_its_own_rows_equal_to_the_flag_off_arm"}
+
 for _name, _test in list(vars(cuda_suite).items()):
-    if _name.startswith("test_") and inspect.isfunction(_test):
+    if _name.startswith("test_") and inspect.isfunction(_test) and _name not in NOT_REUSED:
         _clone = types.FunctionType(_test.__code__, _test.__globals__, _name, _test.__defaults__, _test.__closure__)
         _clone.__kwdefaults__ = _test.__kwdefaults__
         _clone.__dict__.update({k: list(v) if k == "pytestmark" else v for k, v in _test.__dict__.items()})
