@@ -171,6 +171,9 @@ class GpuResidencyUpdater:
         self.insert_tensors = None
         self.insert_active = None
         self.victims = None
+        # SGLANG_DSV41_ENABLE_NATIVE_PREFETCH: DIRECT's ranking continued past the shortlist, the prefetch's victims.
+        self.prefetch_victims = None
+        self.prefetch_victim_valid = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -324,6 +327,14 @@ class GpuResidencyUpdater:
         # Shortlisted slots per layer, and which of those columns name a real slot.
         self.victims = torch.zeros((layers, width), dtype=torch.long, device=device)
         self.victim_valid = torch.zeros((layers, width), dtype=torch.bool, device=device)
+        if envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get():
+            from sglang.srt.layers.moe.exl3_native_prefetch import PREFETCH_VICTIMS
+
+            # The next slots in the same order, past the demand shortlist: a prefetch never takes a slot the next
+            # forward's demand may take, as in the replay (prefetch_sim.PrefetchReplay).
+            extra = min(PREFETCH_VICTIMS, self.victim_columns - width)
+            self.prefetch_victims = torch.zeros((layers, extra), dtype=torch.long, device=device)
+            self.prefetch_victim_valid = torch.zeros((layers, extra), dtype=torch.bool, device=device)
         self.victims_fresh = False
         self.gather_lanes = torch.arange(width, dtype=torch.long, device=device)
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
@@ -723,6 +734,10 @@ class GpuResidencyUpdater:
         ranked = torch.sort(keys, dim=1)
         self.victims.copy_(ranked.indices[:, :width].clamp(max=slot_dump))
         self.victim_valid.copy_(ranked.values[:, :width] < never)
+        if self.prefetch_victims is not None:
+            extra = self.prefetch_victims.shape[1]
+            self.prefetch_victims.copy_(ranked.indices[:, width : width + extra].clamp(max=slot_dump))
+            self.prefetch_victim_valid.copy_(ranked.values[:, width : width + extra] < never)
         self.victims_fresh = True
 
     def gather_destinations(

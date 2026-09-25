@@ -466,12 +466,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             flat = topk_ids.reshape(-1)
             routes[: flat.numel()].copy_(flat)
             routes[flat.numel() :].fill_(-1)
-        remap, _ = streamer.gather(topk_ids)
         backend = streamer.row_backend
+        prefetch = getattr(backend.device_side, "native_prefetch", None) if isinstance(backend, Exl3RamMissRowBackend) else None
+        if prefetch is not None:
+            # Before the gather reads residency: wait for the previous layer's prefetch into this one and map it.
+            prefetch.commit(layer.layer_id, backend.routes)
+        remap, _ = streamer.gather(topk_ids)
         if isinstance(backend, Exl3RamMissRowBackend) and backend.route_log is not None:
             if backend.route_log.router is not None:
                 # After the gather: its post ran the layer's route_log.record, which row 0 used to take the slot.
                 backend.route_log.record_router(backend.row, x, topk_weights)
+        if prefetch is not None:
+            # After this layer's demand chain, before its MoE: the next layer's gate on this layer's router input.
+            prefetch.predict(layer.layer_id, x)
         fused = exl3_fused_moe_for(layer, streamer)
         out = fused.run(
             x,

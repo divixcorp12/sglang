@@ -240,8 +240,8 @@ NON_TRACE_CLOCK_READS = {
     # always-on copy_issue_ns and copy_latency_ns counters, which are how stages.jsonl times the copies.
     "int64_t last_active = now_ns();": 2,
     "last_active = now_ns();": 2,
-    "} else if (!in_flight.empty() || now_ns() - last_active < spin_ns_) {": 1,
-    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline)) break;": 1,
+    "} else if (!in_flight.empty() || !held.empty() || now_ns() - last_active < spin_ns_) {": 1,
+    "if (stopping && held.empty() && (in_flight.empty() || now_ns() > drain_deadline)) break;": 1,
     "drain_deadline_ = now_ns() + drain_ns;": 1,
     "if (now_ns() > deadline_ns) return false;": 1,
     "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
@@ -250,6 +250,10 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t start = now_ns();": 1,
     "counters_[kCopyIssueNs].fetch_add(now_ns() - start);": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
+    # Native prefetch (plan 2026-09-25-dsv41-native-prefetch), reached only with it enabled: two reads per request
+    # served, for the always-on prefetch_latency_ns counter.
+    "const int64_t read_ns = now_ns();": 1,
+    "counters_[kPrefetchLatencyNs].fetch_add(now_ns() - job.submit_ns);": 1,
 }
 
 

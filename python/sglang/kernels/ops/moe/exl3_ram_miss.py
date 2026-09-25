@@ -567,7 +567,32 @@ COUNTERS = (
     "copy_fallbacks",
     "copy_errors",
     "copy_generation_mismatches",
+    # Native prefetch (plan 2026-09-25-dsv41-native-prefetch).
+    "prefetch_requests",
+    "prefetch_issued",
+    "prefetch_copied",
+    "prefetch_skipped_unarmed",
+    "prefetch_skipped_not_ready",
+    "prefetch_skipped_invalid",
+    "prefetch_used",
+    "prefetch_wasted",
+    "prefetch_held",
+    "prefetch_latency_ns",
 )
+
+# The native-prefetch page (exl3_ram_miss_host.cpp kPf*, exl3_native_prefetch.cuh): the device's request line and
+# the service's done line. Tags sit in the top byte over a 56-bit request generation, as in the lease block.
+PREFETCH_PAGE_BYTES = 256
+PREFETCH_FIELDS = {"req_gen": 0, "req_row": 8, "req_expert": 12, "req_dst": 16, "done_gen": 128, "done_reason": 136}
+PREFETCH_TAG_REQUEST = 1
+PREFETCH_TAG_COPIED = 1
+PREFETCH_TAG_SKIPPED = 2
+PREFETCH_SKIP_REASONS = {"unarmed": 1, "not_ready": 2, "invalid": 3}
+
+
+def new_prefetch_page(pin: bool) -> torch.Tensor:
+    """A zeroed native-prefetch page; pinned (device-readable through UVA) for a real device."""
+    return torch.zeros(PREFETCH_PAGE_BYTES, dtype=torch.uint8, pin_memory=pin)
 
 
 def new_page(pin: bool) -> torch.Tensor:
@@ -837,6 +862,21 @@ class Exl3RamMissHost:
         if dst_rows < 1:
             raise ValueError("a copy table needs at least one destination row")
         self._module.exl3_ram_miss_set_copy_table(self.handle, row, entries, int(dst_rows))
+
+    def enable_native_prefetch(self, page: torch.Tensor) -> None:
+        """Serve native-prefetch requests posted into ``page`` (``new_prefetch_page``); needs the copy engine and must
+        precede the thread. The page must outlive the host: the service reads it by address."""
+        if page.dtype != torch.uint8 or page.numel() != PREFETCH_PAGE_BYTES or not page.is_contiguous():
+            raise ValueError(f"the native prefetch page is a contiguous uint8 tensor of {PREFETCH_PAGE_BYTES} bytes")
+        self._module.exl3_ram_miss_enable_native_prefetch(self.handle, page)
+        self.prefetch_page = page
+
+    def prefetch_lease(self) -> tuple[bool, int, int]:
+        """Test only: (active, row, slot) of the service's one native-prefetch lease."""
+        out = torch.zeros(3, dtype=torch.int64)
+        self._module.exl3_ram_miss_prefetch_lease(self.handle, out)
+        active, row, slot = out.tolist()
+        return bool(active), row, slot
 
     def arm_copy_engine(self, on: bool = True) -> None:
         """Let the service publish resident lanes COPYING and copy them itself, for requests whose post allows it."""
@@ -1178,6 +1218,8 @@ class Exl3RamMissDevice:
         self._lease_c = 0
         # Set by the row backend when it captures a post that lets the service copy (the service arms on it).
         self.copy_engine_captured = False
+        # The service's NativePrefetch when SGLANG_DSV41_ENABLE_NATIVE_PREFETCH is on (set at attach), else None.
+        self.native_prefetch = None
         if lease_block is not None:
             if lease_layout.rows != layers:
                 raise ValueError(f"the lease layout has {lease_layout.rows} rows for {layers} layers")
