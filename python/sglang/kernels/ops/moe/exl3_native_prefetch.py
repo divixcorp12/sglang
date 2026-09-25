@@ -19,8 +19,10 @@ if TYPE_CHECKING:
 
 # The device counters, in the order of exl3_native_prefetch.cuh's kPosted..kAborted.
 NATIVE_PREFETCH_COUNTERS = (
-    "posted", "no_candidate", "ram_filtered", "no_victim", "copied", "skipped", "used", "aborted",
+    "posted", "no_candidate", "ram_filtered", "no_victim", "copied", "skipped", "used", "aborted", "window_ns", "wait_ns",
 )
+# The pending record per target layer: {valid, expert, slot, generation, post %globaltimer ns, unused}.
+PENDING_WORDS = 6
 TOPK = 6
 
 
@@ -56,8 +58,8 @@ def plan(
     generation: torch.Tensor,
     counters: torch.Tensor,
 ) -> None:
-    """Post at most one prefetch for the target layer; ``pending`` (int64 [4]) records it as {valid, expert, slot,
-    generation}. ``ram_map_row`` is the pinned tier's host map row (int32, pinned, read through UVA); ``page`` the
+    """Post at most one prefetch for the target layer; ``pending`` (int64 [PENDING_WORDS]) records it as {valid,
+    expert, slot, generation, post time}. ``ram_map_row`` is the pinned tier's host map row (int32, pinned, read through UVA); ``page`` the
     RAM-miss request page (its fatal word); ``row`` the target's streamed row, which the service reads."""
     device = logits.device
     _check("logits", logits, torch.float32, device)
@@ -69,7 +71,8 @@ def plan(
     _check("victim_valid", victim_valid, torch.bool, device)
     if victims.numel() != victim_valid.numel():
         raise ValueError("native prefetch: victims and victim_valid differ in length")
-    if mapping.numel() < logits.shape[-1] or pending.numel() < 4 or counters.numel() < len(NATIVE_PREFETCH_COUNTERS):
+    if (mapping.numel() < logits.shape[-1] or pending.numel() < PENDING_WORDS
+            or counters.numel() < len(NATIVE_PREFETCH_COUNTERS)):
         raise ValueError("native prefetch: a buffer is too small")
     if ram_map_row.dtype != torch.int32 or ram_map_row.device.type != "cpu" or ram_map_row.numel() < logits.shape[-1]:
         raise ValueError("native prefetch: ram_map_row is the pinned tier's int32 host map row")

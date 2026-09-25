@@ -77,7 +77,7 @@ class NativePrefetch:
         self.updater = updater
         self.rows = {layer_id: row for row, layer_id in enumerate(updater.layer_ids)}
         self.logits = torch.zeros((1, updater.num_experts), dtype=torch.float32, device=device)
-        self.pending = torch.zeros((updater.num_layers, 4), dtype=torch.int64, device=device)
+        self.pending = torch.zeros((updater.num_layers, kernels.PENDING_WORDS), dtype=torch.int64, device=device)
         self.generation = torch.zeros(1, dtype=torch.int64, device=device)
         self.counters = torch.zeros(len(kernels.NATIVE_PREFETCH_COUNTERS), dtype=torch.int64, device=device)
         logger.info("exl3 native prefetch bound to %d layers", len(self.rows))

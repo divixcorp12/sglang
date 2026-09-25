@@ -64,7 +64,13 @@ def arm_stats(directory):
         armed = re.findall(r"copy engine armed after (\d+) decode forwards", text)
         out["copy_engine_armed_after"] = int(armed[-1]) if armed else None
         device = re.findall(r"native prefetch device counters (\{.*?\})", text)
-        out["prefetch_device_counters"] = ast.literal_eval(device[-1]) if device else None
+        dc = ast.literal_eval(device[-1]) if device else None
+        out["prefetch_device_counters"] = dc
+        if dc and dc.get("copied", 0) + dc.get("skipped", 0) and "window_ns" in dc:
+            commits = dc["copied"] + dc["skipped"] + dc.get("aborted", 0)
+            # Per commit: the compute between the post and the target's gather, and the copy time left exposed.
+            out["prefetch_window_us_per_commit"] = round(dc["window_ns"] / commits / 1e3, 1)
+            out["prefetch_wait_us_per_commit"] = round(dc["wait_ns"] / commits / 1e3, 1)
         out["fatal_in_log"] = "fail-stop" in text
     return out
 

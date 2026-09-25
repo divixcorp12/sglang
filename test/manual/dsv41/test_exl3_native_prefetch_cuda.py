@@ -64,7 +64,7 @@ class Buffers:
         self.victims = torch.zeros(extra, dtype=torch.int64, device=dev)
         self.valid = torch.zeros(extra, dtype=torch.bool, device=dev)
         self.ram = torch.full((experts,), -1, dtype=torch.int32).pin_memory()
-        self.pending = torch.zeros(4, dtype=torch.int64, device=dev)
+        self.pending = torch.zeros(kernels.PENDING_WORDS, dtype=torch.int64, device=dev)
         self.gen = torch.zeros(1, dtype=torch.int64, device=dev)
         self.counters = torch.zeros(len(kernels.NATIVE_PREFETCH_COUNTERS), dtype=torch.int64, device=dev)
         self.routes = torch.full((TOP_K,), -1, dtype=torch.int64, device=dev)
@@ -147,7 +147,7 @@ def _one_pending(b, expert=10, slot=4, old=33):
     b.slot_to_expert.fill_(-1)
     b.mapping[old] = slot
     b.slot_to_expert[slot] = old
-    b.pending.copy_(torch.tensor([1, expert, slot, 42]))
+    b.pending.copy_(torch.tensor([1, expert, slot, 42, 0, 0]))
 
 
 def test_commit_maps_a_copied_row_and_counts_it_used():
@@ -212,7 +212,7 @@ class Decode:
         self.bias = torch.zeros(EXPERTS, dtype=torch.bfloat16, device=dev)
         self.victims = torch.zeros(7, dtype=torch.int64, device=dev)
         self.valid = torch.zeros(7, dtype=torch.bool, device=dev)
-        self.pending = torch.zeros(4, dtype=torch.int64, device=dev)
+        self.pending = torch.zeros(kernels.PENDING_WORDS, dtype=torch.int64, device=dev)
         self.gen = torch.zeros(1, dtype=torch.int64, device=dev)
         self.counters = torch.zeros(len(kernels.NATIVE_PREFETCH_COUNTERS), dtype=torch.int64, device=dev)
         self.lru = list(range(SLOTS))  # host LRU of slots, oldest first

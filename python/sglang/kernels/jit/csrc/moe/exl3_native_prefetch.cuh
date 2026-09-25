@@ -57,7 +57,10 @@ constexpr int kCopied = 4;       // commits of a COPIED request
 constexpr int kSkipped = 5;      // commits of a SKIPPED request
 constexpr int kUsed = 6;         // COPIED experts the target layer routed
 constexpr int kAborted = 7;      // commits that timed out or saw the fatal / shutdown word
-constexpr int kCounters = 8;
+constexpr int kWindowNs = 8;     // %globaltimer ns from each post to its commit's entry: the compute the copy overlaps
+constexpr int kWaitNs = 9;       // ns each commit spent waiting for its done word: the copy time left exposed
+constexpr int kCounters = 10;
+constexpr int kPending = 6;      // pending record: {valid, expert, slot, generation, post ns, unused}
 
 __device__ __forceinline__ uint32_t ld_acquire_sys(const uint8_t* address) {
   uint32_t value;
@@ -210,6 +213,7 @@ __global__ __launch_bounds__(exl3_native_prefetch_device::kPlanBlock, 1) void ex
   pending[1] = candidate;
   pending[2] = victim;
   pending[3] = static_cast<int64_t>(generation);
+  pending[4] = static_cast<int64_t>(global_ns());
   counters[kPosted] += 1;
 }
 
@@ -233,7 +237,9 @@ __global__ __launch_bounds__(32, 1) void exl3_native_prefetch_commit_kernel(
   const int64_t slot = pending[2];
   const uint64_t generation = static_cast<uint64_t>(pending[3]);
   pending[0] = 0;
-  const uint64_t deadline = global_ns() + static_cast<uint64_t>(timeout_ns);
+  const uint64_t entry = global_ns();
+  counters[kWindowNs] += static_cast<int64_t>(entry - static_cast<uint64_t>(pending[4]));
+  const uint64_t deadline = entry + static_cast<uint64_t>(timeout_ns);
   uint64_t word = ld_acquire_sys64(pf_page + kPfDoneGen);
   bool aborted = false;
   while ((word & kGenerationMask) != generation) {
@@ -245,6 +251,7 @@ __global__ __launch_bounds__(32, 1) void exl3_native_prefetch_commit_kernel(
     __nanosleep(256);
     word = ld_acquire_sys64(pf_page + kPfDoneGen);
   }
+  counters[kWaitNs] += static_cast<int64_t>(global_ns() - entry);
   if (aborted) {
     // The copy may still land in the victim slot: take the slot out of residency for good and fail stop.
     const int64_t old = slot_to_expert[slot];
