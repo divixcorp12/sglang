@@ -36,6 +36,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_native_prefetch: bool
     enable_moe_side_stream: bool
     enable_layer_fusion: bool
+    enable_exl3_cast_fusion: bool
     torch_prefill_indexer: bool
     fused_wo_a: bool
 
@@ -67,6 +68,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_native_prefetch=envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get(),
             enable_moe_side_stream=envs.SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM.get(),
             enable_layer_fusion=envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
+            enable_exl3_cast_fusion=envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
             fused_wo_a=envs.SGLANG_DSV41_FUSED_WO_A.get(),
         )

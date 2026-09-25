@@ -1891,6 +1891,11 @@ class Envs:
     # gather_destinations and commit_gather and for the fused MoE's route tables, in place of their ~89 small torch
     # kernels per layer. Bit-identical to the torch chains. Read once when each layer's buffers are built. Off by default.
     SGLANG_DSV41_ENABLE_LAYER_FUSION = EnvBool(False)
+    # DSV4 EXL3 decode cast fusion (plan 2026-09-25-dsv41-decode-fusion-2): at BS1, the sublayer input's fp16 copy is
+    # written by hc_combine_norm and shared by the EXL3 linears that read it, merged linears cast once into one buffer,
+    # the shared expert keeps its gate/up/down activations in fp16, and the routed output is cast and scaled in one
+    # kernel. Bit-identical to the unfused casts. Read once when each module is built. Off by default.
+    SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
     # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md 7.6): the RAM-miss service copies
     # each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on its own
     # thread) instead of the in-graph SM copy C1, and the graph waits for its completion word. Needs piece streaming.
