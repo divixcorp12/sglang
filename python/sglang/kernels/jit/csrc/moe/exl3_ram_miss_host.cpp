@@ -3019,6 +3019,8 @@ class CopyBackend {
   virtual int mark(int64_t* token) = 0;
   virtual int query(int64_t token) = 0;  // kDone, kPending, or an error code (negative for the host backend)
   virtual void shutdown(bool idle) = 0;
+  // Diagnosis only (SGLANG_TEST_DSV41_COPY_PROBE_MS): probe copies on other streams while a job is stuck.
+  virtual std::string probe(int64_t) { return ""; }
 };
 
 // The CUDA driver, resolved from libcuda.so.1 when the copy engine is enabled, so this module still builds and loads
@@ -3073,7 +3075,48 @@ class CudaCopyBackend : public CopyBackend {
     for (auto& event : events_) {
       if (int r = cu_event_create_(&event, kDisableTiming)) return "cuEventCreate failed: " + std::to_string(r);
     }
+    if (const char* v = std::getenv("SGLANG_TEST_DSV41_COPY_PROBE_MS"); v != nullptr && std::atoi(v) > 0) {
+      cu_mem_alloc_ = reinterpret_cast<decltype(cu_mem_alloc_)>(dlsym(lib, "cuMemAlloc_v2"));
+      cu_mem_alloc_host_ = reinterpret_cast<decltype(cu_mem_alloc_host_)>(dlsym(lib, "cuMemAllocHost_v2"));
+      if (cu_mem_alloc_ == nullptr || cu_mem_alloc_host_ == nullptr) return "probe entry points missing";
+      if (int r = cu_stream_create_(&probe_hi_, kNonBlocking, greatest)) return "probe stream: " + std::to_string(r);
+      if (int r = cu_stream_create_(&probe_lo_, kNonBlocking, least)) return "probe stream: " + std::to_string(r);
+      for (auto& event : probe_events_) {
+        if (int r = cu_event_create_(&event, kDisableTiming)) return "probe event: " + std::to_string(r);
+      }
+      if (int r = cu_mem_alloc_(&probe_dev_, 1 << 20)) return "probe cuMemAlloc: " + std::to_string(r);
+      if (int r = cu_mem_alloc_host_(&probe_host_, 1 << 20)) return "probe cuMemAllocHost: " + std::to_string(r);
+      probe_ready_ = true;
+    }
     return "";
+  }
+
+  // Three 4 KiB copies, each on its own stream order: H2D on a second greatest-priority stream, H2D on a
+  // least-priority stream, D2D on the greatest one. Polls them and the stuck job's event for up to 500 ms.
+  std::string probe(int64_t token) override {
+    if (!probe_ready_) return "no probe";
+    const uint64_t host = reinterpret_cast<uint64_t>(probe_host_);
+    const uint64_t dev = probe_dev_;
+    int rc[3] = {0, 0, 0};
+    rc[0] = cu_memcpy_async_(dev, host, 4096, probe_hi_);
+    if (rc[0] == 0) rc[0] = cu_event_record_(probe_events_[0], probe_hi_);
+    rc[1] = cu_memcpy_async_(dev + 8192, host + 8192, 4096, probe_lo_);
+    if (rc[1] == 0) rc[1] = cu_event_record_(probe_events_[1], probe_lo_);
+    rc[2] = cu_memcpy_async_(dev + 65536, dev + 131072, 4096, probe_hi_);
+    if (rc[2] == 0) rc[2] = cu_event_record_(probe_events_[2], probe_hi_);
+    int64_t done_us[4] = {-1, -1, -1, -1};
+    const int64_t t0 = now_ns();
+    while (now_ns() - t0 < 500'000'000LL) {
+      for (int i = 0; i < 3; ++i) {
+        if (done_us[i] < 0 && rc[i] == 0 && cu_event_query_(probe_events_[i]) == 0) done_us[i] = (now_ns() - t0) / 1000;
+      }
+      if (done_us[3] < 0 && cu_event_query_(events_[token]) == 0) done_us[3] = (now_ns() - t0) / 1000;
+      if (done_us[0] >= 0 && done_us[1] >= 0 && done_us[2] >= 0) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return "h2d_hi rc=" + std::to_string(rc[0]) + " done_us=" + std::to_string(done_us[0]) + "; h2d_lo rc=" +
+           std::to_string(rc[1]) + " done_us=" + std::to_string(done_us[1]) + "; d2d_hi rc=" + std::to_string(rc[2]) +
+           " done_us=" + std::to_string(done_us[2]) + "; stuck job event done_us=" + std::to_string(done_us[3]);
   }
 
   int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
@@ -3124,6 +3167,14 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_event_record_)(void*, void*) = nullptr;
   int (*cu_event_query_)(void*) = nullptr;
   int (*cu_memcpy_async_)(uint64_t, uint64_t, size_t, void*) = nullptr;
+  int (*cu_mem_alloc_)(uint64_t*, size_t) = nullptr;
+  int (*cu_mem_alloc_host_)(void**, size_t) = nullptr;
+  bool probe_ready_ = false;
+  void* probe_hi_ = nullptr;
+  void* probe_lo_ = nullptr;
+  std::array<void*, 3> probe_events_{};
+  uint64_t probe_dev_ = 0;
+  void* probe_host_ = nullptr;
 };
 
 // Test only (CPU): "copies" between host buffers. A mark completes only once the test has released it, and its
@@ -3287,6 +3338,8 @@ class CopyEngine {
   }
 
  private:
+  int64_t probe_after_ns_ = 0;
+  int64_t probed_token_ = -1;
   struct Table {
     std::vector<CopyEntry> entries;
     int64_t dst_rows = 0;
@@ -3295,6 +3348,9 @@ class CopyEngine {
 
   void run() {
     pthread_setname_np(pthread_self(), "exl3-copy-eng");
+    if (const char* v = std::getenv("SGLANG_TEST_DSV41_COPY_PROBE_MS"); v != nullptr) {
+      probe_after_ns_ = static_cast<int64_t>(std::atoi(v)) * 1'000'000LL;
+    }
     const std::string error = backend_->init();
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -3354,6 +3410,28 @@ class CopyEngine {
         complete_(job);
         finish();
         progressed = true;
+      }
+      if (probe_after_ns_ > 0 && !in_flight.empty() && broken_ == 0 && in_flight.front().token != probed_token_ &&
+          now_ns() - in_flight.front().submit_ns > probe_after_ns_) {
+        probed_token_ = in_flight.front().token;
+        const CopyJob& stuck = in_flight.front();
+        const Table& table = tables_[stuck.row];
+        std::string lanes;
+        for (int i = 0; i < stuck.count; ++i) {
+          lanes += " [host_slot " + std::to_string(stuck.lanes[i].host_slot) + " dst_slot " +
+                   std::to_string(stuck.lanes[i].dst_slot) + "]";
+        }
+        std::string entries;
+        for (const CopyEntry& e : table.entries) {
+          entries += " {src " + std::to_string(e.src) + " dst " + std::to_string(e.dst) + " bytes " +
+                     std::to_string(e.bytes) + "}";
+        }
+        const std::string result = backend_->probe(stuck.token);
+        std::fprintf(stderr, "exl3 copy probe: job row %lld idx %lld pending %lld ms, in_flight %zu, lanes%s entries%s: %s\n",
+                     static_cast<long long>(stuck.row), static_cast<long long>(stuck.idx),
+                     static_cast<long long>((now_ns() - stuck.submit_ns) / 1000000), in_flight.size(), lanes.c_str(),
+                     entries.c_str(), result.c_str());
+        std::fflush(stderr);
       }
       if (broken_ != 0) {
         while (!in_flight.empty()) {
