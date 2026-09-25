@@ -150,6 +150,11 @@ def base_env() -> dict[str, str]:
         # Engram lookups by device post/wait instead of graph host nodes: no host nodes in the decode graph,
         # byte-identical (docs/superpowers/plans/2026-09-25-dsv41-engram-no-hostnode.md).
         "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT": "1",
+        # RAM-hit rows copied by the DMA engine instead of the SM kernel C1: 112.4 vs 119.3 ms/token, byte-identical
+        # (docs/superpowers/plans/2026-09-25-dsv41-final-arms.md). Needs the device wait above (no graph host nodes).
+        # A kernel module first loaded mid-step after arming can still fail-stop the server (LEASE_PROTOCOL.md 7.6),
+        # and graph-mode nsys must not be used with it on.
+        "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "1",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 
