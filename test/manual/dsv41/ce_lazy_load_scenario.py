@@ -44,6 +44,7 @@ def main() -> int:
     x = torch.zeros(32, dtype=torch.float32, device="cuda")
     side = torch.cuda.Stream()
 
+    (tmp / "svc").mkdir(exist_ok=True)
     s = StreamService(tmp / "svc", copy_engine=True, timeout_ms=3000)
     src = torch.empty(256 << 20, dtype=torch.uint8).pin_memory()
     dst = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
