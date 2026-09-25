@@ -85,7 +85,7 @@ def test_silu_mul_clamp_half_matches_the_cast_silu_cast_chain(rows, inter, scale
 def test_scale_to_bf16_matches_cast_then_multiply(n, factor):
     gen = torch.Generator(device="cuda").manual_seed(n)
     routed = torch.randn(n, device="cuda", generator=gen) * torch.logspace(-30, 30, n, device="cuda")
-    routed[:3] = torch.tensor([0.0, -0.0, 3.3e38], device="cuda")
+    routed[: min(n, 3)] = torch.tensor([0.0, -0.0, 3.3e38], device="cuda")[: min(n, 3)]
     assert_bits_equal(exl3_scale_to_bf16(routed, factor), routed.to(torch.bfloat16) * factor)
     shaped = routed[: n - n % 5].view(-1, 5) if n >= 5 else routed.view(1, -1)
     assert_bits_equal(exl3_scale_to_bf16(shaped, factor), shaped.to(torch.bfloat16) * factor)
@@ -125,7 +125,7 @@ def test_a_published_input_serves_only_the_same_unmodified_tensor_on_the_same_st
 
 @pytest.mark.parametrize(
     "in_features, out_features, parts",
-    [(5120, 1280, 1), (5120, 576, 1), (1280, 32768, 1), (5120, 2304, 2), (2304, 5120, 1), (256, 128, 3)],
+    [(5120, 1280, 1), (5120, 512, 1), (1280, 32768, 1), (5120, 2304, 2), (2304, 5120, 1), (256, 128, 3)],
 )
 @pytest.mark.parametrize("published", [False, True])
 def test_linear_apply_is_bit_identical_with_the_flag_on(in_features, out_features, parts, published):
@@ -143,7 +143,8 @@ def test_linear_apply_is_bit_identical_with_the_flag_on(in_features, out_feature
 def test_linear_apply_leaves_more_than_one_row_to_the_unfused_path(rows):
     layer = _linear(5120, 2304, 2, seed=5)
     x = torch.randn(rows, 5120, device="cuda").to(torch.bfloat16)
-    assert_bits_equal(_method(True).apply(layer, x), _method(False).apply(layer, x))
+    with torch.device("cuda"):  # the > 144-row path reconstructs the dense weight on the default device
+        assert_bits_equal(_method(True).apply(layer, x), _method(False).apply(layer, x))
 
 
 # ---- the shared expert
@@ -179,7 +180,7 @@ def test_swiglu_mlp_matches_the_unfused_shared_expert(published, scale):
 def test_the_fused_chain_captures_without_host_nodes_and_replays_bit_identically():
     gate_up, down = _shared_expert(seed=21)
     wq_a = _linear(5120, 1280, 1, seed=31)
-    wkv = _linear(5120, 576, 1, seed=41)
+    wkv = _linear(5120, 512, 1, seed=41)
     fused = _method(True)
     residual = torch.zeros(1, 20480, device="cuda", dtype=torch.bfloat16)
     pre = torch.zeros(1, 4, device="cuda")
