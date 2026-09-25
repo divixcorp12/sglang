@@ -1,0 +1,6 @@
+cmd: pytest -q -s -p no:randomly --basetemp=/mnt/nvme1/resident-first/run2/pytest-tmp test/manual/dsv41/test_exl3_moe_split_parity_cuda.py
+layer_fusion=False: 56 cases bitwise equal
+.layer_fusion=True: 56 cases bitwise equal
+..num_active=4 on a 4+2 split: 4/4 route sets differ from the single launch
+4 passed, 15 warnings in 10.65s
+EXIT=0

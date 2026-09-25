@@ -180,3 +180,115 @@ graph change:
 - **Launch overhead at M=1** may equal the gain (step 2).
 - **1a's precedent:** a measured overlap with no wall gain. Step 5's smoke is the only verdict that counts.
 - **Dropped-layer semantics** change subtly (3.3). The test must say which meaning holds.
+
+## 8. Gate results
+
+**Date:** 2026-09-25. **Branch:** `cc/resident-first`, from `e4f81ac774`. **Run:** divix01, RTX 5090, under
+`gpu-run.sh`, private worktree at `50cd50160e`, `sglang.__file__` in that worktree. exllamav3 at the pinned
+`02aef45cd6`. Commands and outputs: `analysis/dsv41-drive/resident-first/` (`run.sh`, `parity-run2.txt`,
+`bench-run2.txt`, `bench-run2.json`). An earlier run at `c1b54c0b99` gave the same numbers to within 1 us/layer.
+
+**Verdict: step 1 passes with two corrections to 3.2/3.3; step 2 fails the gate. Stop A.**
+
+### 8.1 Step 1: the kernel, from exllamav3's source
+
+Sources: `exllamav3_ext/quant/exl3_moe.cu` (host: `exl3_moe`, `exl3_moe_gather`, `exl3_moe_max_concurrency`),
+`exl3_moe_kernel.cuh` (the kernel), `exl3_gemm_inner.cuh` (the split-K GEMM it calls).
+
+1. **Count and start read independently? Only the scratch row does.** The kernel never reads a start table
+   for its inputs. It walks `expert_count` over every slot and keeps a running prefix (`start = end; end +=
+   expert_count[e]`), then reads `token_sorted[start + row]` and `weight_sorted[start + row]`. Only the output row
+   comes from `fused_base[e]` (`det[0]`). So a masked count keeps the placement where it is, but moves each route's
+   weight index. With the full-route `weight_sorted`, a masked route reads its neighbour's weight.
+   `test_full_weight_table_misplaces_masked_weights` shows the output changes.
+   - **Correction to 3.2:** each launch needs its own compacted weight table, holding the j-th masked route's
+     weight (slot order) at index j. `token_sorted` is all zeros at BS1, so it needs nothing.
+2. **Fewer than 6 active under NUM_ACTIVE = 6: yes, unchanged.** `num_active` only sizes the grid:
+   `num_groups = min(concurrency, 64, num_active)`, `group_size = min(num_sms / num_groups, 32)`. That is 6 groups
+   of 28 SMs on the 5090, whatever the mask. Groups whose ticket matches no active slot scan the slots and retire.
+   - **Trap:** `num_active` must stay 6 in both launches. A launch sized by its own active count gets wider groups.
+     The GEMM's split-K slicing follows the group width (`slice_beg = tiles * blockIdx.x / gridDim.x`), so the
+     partial sums reduce in a different grouping. Measured: `num_active = 4` on a 4+2 split changed the bytes in
+     4 of 4 route sets.
+3. **Writes only its own scratch rows: yes.** In the FUSED_DET path (`output_scratch` set), `had_d_out` writes only
+   `output_scratch[(fused_base[e] + row) * hidden]` for slots it processes. It never writes `output_state`; the
+   atomic add into `out` is the non-deterministic branch only. It also writes the per-group temps, the GEMM locks
+   and the self-resetting scheduler words. Two launches on one stream serialize, so sharing these is safe.
+   The parity test checks this directly: `out` stays zero after each launch, and the rows of routes a launch does
+   not own stay NaN-poisoned.
+4. **Per-slot work independent of concurrency index and scheduling: yes.** The group index offsets only the temp
+   buffers and lock rows. Tickets assign experts to groups dynamically, but an expert's arithmetic depends only on
+   `group_size` (the split-K slicing) and the lock-ordered reduction inside its group, which is fixed. See item 2
+   for the one dependence, the group width.
+5. **Does `exl3_moe` read `weight_sorted`? Yes; it applies the weight.** `had_d_out` scales by
+   `0.0884 * weight`. The gather with slot kind 1 uses weight 1.0; only kind 2 multiplies by `weight_sorted`.
+   - **Correction to 3.3:** keep cannot move into the gather's weights under kind 1. It goes into the gather's
+     slot kind: `kind = det[2] * (keep > 0)`. A dropped layer then reads no scratch row, which is what the zeroed
+     count gives today. The resident launch takes `fp16(w)` with no keep. For keep = 1 that is bit-for-bit today's
+     `fp16(w * 1.0f)`.
+   - The missed launch runs after F, so its count is multiplied by keep as today, and a dropped layer runs no
+     missed expert.
+6. **keep in {0, 1} only: yes.** Every write is a literal:
+   - `exl3_ram_miss.cuh:541` (`ok ? 1.0f : 0.0f`), `:674` and `:1536` (1.0f), `:688`, `:1566` (finalize, the sole
+     writer when F is on) and `:1663` (0.0f);
+   - `expert_row_plan.py:357` `torch.ones`, and `:365` a bool cast.
+   `go_total` only feeds the finalize kernel's `served` test. No other value is written.
+
+**Parity test** (`test/manual/dsv41/test_exl3_moe_split_parity_cuda.py`, real layer-3 EXL3 rows, 12 slots):
+- Reference: `Exl3FusedMoE.run`, with layer fusion off and on.
+- Split: full-route placement from `route_tables(keep = 1)`, resident launch, missed launch, one gather with the
+  keep-gated kind.
+- Coverage: every hit count 0-6, keep 0 and 1, 4 random route sets each. 56 cases per reference.
+- Result: all 112 cases bitwise equal in `out` (and in every scratch row for keep = 1). After each stage, `out`
+  was untouched and exactly the expected rows were written.
+- Command: `pytest -q -s -p no:randomly --basetemp=... test/manual/dsv41/test_exl3_moe_split_parity_cuda.py`,
+  4 passed, EXIT=0.
+
+### 8.2 Step 2: the cost of the split at M=1
+
+Bench: `analysis/dsv41-drive/resident-first/split_launch_bench.py`, `--replays 300`, one CUDA graph of 40 layers per
+arm, arms interleaved round-robin, medians.
+- Real 13.32 MB EXL3 rows, 8 distinct per layer behind 46-entry slot pointer tables.
+- A token touches 3.20 GB. That is far past L2, and the one-launch arm implies 790 GB/s, below the 5090's
+  ~1.8 TB/s HBM.
+
+| Arm | us/token | us/layer | vs one, us/layer | vs one, us/token |
+|---|---:|---:|---:|---:|
+| one (production `run`, layer fusion) | 4045 | 101.1 | - | - |
+| route tables + gather, no launch | 362 | 9.1 | -92.1 | -3683 |
+| two launches, static tables, 5+1 | 7725 | 193.1 | **+92.0** | **+3680** |
+| two launches, static tables, 4+2 | 7668 | 191.7 | **+90.6** | **+3623** |
+| two launches, static tables, 3+3 | 7624 | 190.6 | **+89.5** | **+3579** |
+| two launches, torch-built tables, 4+2 | 9435 | 235.9 | +134.7 | +5390 |
+| resident launch only, 4 experts | 4049 | 101.2 | +0.1 | +4 |
+| missed launch only, 2 experts | 4034 | 100.9 | -0.3 | -11 |
+| missed launch only, 1 expert (5+1) | 4014 | 100.4 | -0.8 | -31 |
+| missed launch, 2 experts, `num_active = 2` (not bitwise) | 3737 | 93.4 | -7.7 | -308 |
+
+- **An `exl3_moe` launch costs ~92 us at M=1 whether it holds 1 or 6 experts.** The six run in parallel, one per
+  28-SM group, and a launch lasts as long as one expert does. The "~16 us per expert GEMM" in section 1 is
+  3.85 ms / 240, a throughput average. It is not a latency that shrinks with fewer experts.
+- **Two launches cost +89.5 to +92.0 us per layer, +3.6 ms per token**, even with the masks free (static tables).
+  That is over the ~60 us gate in every split. Building the masks with torch ops adds another ~44 us per layer. An
+  extended route-tables kernel would remove that part, but not the launch.
+- **Even perfect overlap buys nothing.** Suppose the resident launch hid entirely under the copy. The critical
+  path after the wait is then the missed launch. That launch costs 100.4-100.9 us per layer against 101.1 for
+  today's single launch, a saving of at most ~0.8 us/layer, ~30 us/token. The ~2.6 ms/token ceiling in section 2
+  assumed launch time scales with the number of experts, and it does not.
+- Widening the missed launch's groups (`num_active = m`) saves ~7.7 us/layer, ~0.3 ms/token at best. That breaks
+  byte-identity (8.1, item 2) and is still below step 6's 1 ms/token bar.
+
+### 8.3 Verdicts
+
+- **Step 1: PASS.** A split can be bitwise identical, with two design changes:
+  - per-launch compacted weights;
+  - keep applied through the gather's slot kind, not its weights;
+  - plus `num_active` kept at 6 in both launches.
+- **Step 2: FAIL. Stop Design A.** The split costs ~90 us per layer (~3.6 ms per token) serially. Its best case,
+  full overlap of the resident launch, saves under 0.1 ms per token, because one launch's latency does not depend
+  on how many experts it holds.
+- **B and C inherit the problem.** B adds a third launch; C is a single persistent launch, so it avoids a second
+  launch's cost, but each expert still takes ~92 us from the moment it starts. After the last miss lands, the tail
+  is one expert's full latency either way.
+- **What could still pay** is a faster single-expert path: one expert on more than 28 SMs, or a smaller row tile.
+  That is exllamav3 kernel work, outside this plan.
