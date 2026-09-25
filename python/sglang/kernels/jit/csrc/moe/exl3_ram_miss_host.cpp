@@ -3461,6 +3461,10 @@ struct Tier {
   std::vector<uint8_t> hot;
   std::vector<uint32_t> leases;      // GPU-reader leases per slot (LEASE_PROTOCOL.md section 8); 0 frees a slot for eviction
   std::vector<uint32_t> generation;  // bumped before a slot's bytes change; mirrored into the lease block's SlotGen
+  // Prefill share (plan 2026-09-25-dsv41-prefill-eviction): 1 while a row a prefill admitted has not been used by
+  // decode. `owned` counts them. Only take_admit_slot_locked sets it, so it stays all zero with the share off.
+  std::vector<uint8_t> prefill_owned;
+  int64_t owned = 0;
   int64_t rows_demand = 0;
   int64_t rows_advisory = 0;
 };
@@ -3503,6 +3507,7 @@ class RamTier {
       tier.hot.assign(experts_, 0);
       tier.leases.assign(tier.capacity, 0);
       tier.generation.assign(tier.capacity, 0);
+      tier.prefill_owned.assign(tier.capacity, 0);
     }
     if (lease_ != nullptr) init_lease_block(capacity, lease_bytes);
   }
@@ -3685,7 +3690,10 @@ class RamTier {
     std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[row];
     const int32_t slot = tier.expert_slot[expert];
-    if (slot >= 0) tier.stamp[slot] = ++tick_;
+    if (slot >= 0) {
+      tier.stamp[slot] = ++tick_;
+      if (prefill_share_ == 0) disown_locked(tier, slot);  // under a share the touch is the prefill's own hit
+    }
   }
 
   // A slot for a Python-side read; the map entry is published at once (the device is idle
@@ -3697,7 +3705,7 @@ class RamTier {
       *evicted = -2;
       return tier.expert_slot[expert];
     }
-    const int64_t slot = take_slot_locked(row, protect, fallback, evicted);
+    const int64_t slot = take_admit_slot_locked(row, protect, fallback, evicted);
     if (slot < 0) return -1;
     bump_generation_locked(row, slot);  // the caller writes the bytes after this returns
     tier.slot_to_expert[slot] = static_cast<int32_t>(expert);
@@ -3728,6 +3736,14 @@ class RamTier {
     if (lease_ == nullptr) throw std::runtime_error("exl3 RAM miss: lease mode needs a lease block");
     if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set lease mode before the service thread starts");
     lease_mode_ = on;
+  }
+
+  // Rows a prefill may own per layer; 0 (the default, and always with SGLANG_DSV41_ENABLE_PREFILL_SHARE off) admits as
+  // take_slot_locked always has. The service sets it before each forward: the share for a prefill, 0 for decode.
+  void set_prefill_share(int64_t share) {
+    if (share < 0) throw std::runtime_error("exl3 RAM miss: a prefill share cannot be negative");
+    std::lock_guard<std::mutex> guard(mutex_);
+    prefill_share_ = share;
   }
 
   void set_gpu_hot(bool on) {
@@ -3863,6 +3879,7 @@ class RamTier {
       } else {
         tier.leases[slot] += 1;  // E1: the slot is neither evicted nor rewritten while the copy may read it
         tier.stamp[slot] = ++tick_;
+        disown_locked(tier, slot);
         prefetch_lease_ = PrefetchLease{true, gen, row, slot, tier.generation[slot], expert};
         job.gen = gen;
         job.idx = -1;
@@ -4582,6 +4599,43 @@ class RamTier {
     __atomic_store_n(map_ + row * experts_ + expert, slot, __ATOMIC_RELEASE);
   }
 
+  void disown_locked(Tier& tier, int64_t slot) {
+    if (tier.prefill_owned[slot]) {
+      tier.prefill_owned[slot] = 0;
+      --tier.owned;
+    }
+  }
+
+  // A slot for a row a Python-side read admits (assign; the prefill fill path). With a prefill share set and the layer
+  // already holding that many prefill-owned rows, the victim is the LRU owned row, under every exclusion of
+  // take_slot_locked, so a prefill displaces at most `share` of decode's rows. Otherwise, and whenever no owned row
+  // qualifies, it is take_slot_locked's choice. Under a share the slot becomes prefill-owned.
+  int64_t take_admit_slot_locked(int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
+    Tier& tier = tiers_[row];
+    int64_t slot = -1;
+    if (prefill_share_ > 0 && tier.owned >= prefill_share_) {
+      int64_t best = -1;
+      for (int64_t s = 0; s < tier.capacity; ++s) {
+        if (!tier.prefill_owned[s] || tier.state[s] != kReady || leased_locked(tier, s)) continue;
+        const int32_t expert = tier.slot_to_expert[s];
+        if (tier.hot[expert] || listed(protect, expert)) continue;
+        if (best < 0 || tier.stamp[s] < tier.stamp[best]) best = s;
+      }
+      if (best >= 0) {
+        *evicted = tier.slot_to_expert[best];
+        release_locked(row, best);  // unmaps it before its bytes are overwritten (D11) and ends its ownership
+        counters_[kEvictions].fetch_add(1);
+        slot = best;
+      }
+    }
+    if (slot < 0) slot = take_slot_locked(row, protect, fallback, evicted);
+    if (slot >= 0 && prefill_share_ > 0) {
+      tier.prefill_owned[slot] = 1;
+      ++tier.owned;
+    }
+    return slot;
+  }
+
   // Takes only a kFree slot or evicts an unleased kReady one: kLoading and kQuarantine slots are never taken.
   int64_t take_slot_locked(int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
@@ -4612,6 +4666,7 @@ class RamTier {
     tier.expert_slot[victim] = -1;
     tier.slot_to_expert[best] = -1;
     tier.state[best] = kFree;
+    disown_locked(tier, best);
     *evicted = victim;
     counters_[kEvictions].fetch_add(1);
     return best;
@@ -4626,6 +4681,7 @@ class RamTier {
     }
     tier.slot_to_expert[slot] = -1;
     tier.state[slot] = kFree;
+    disown_locked(tier, slot);
   }
 
   // Plan 3.2: a leased kLoading slot whose read failed. The mapping is cleared at once, both ways, so the expert can
@@ -4639,6 +4695,7 @@ class RamTier {
     if (expert >= 0 && tier.expert_slot[expert] == slot) tier.expert_slot[expert] = -1;
     tier.slot_to_expert[slot] = -1;
     tier.state[slot] = kQuarantine;
+    disown_locked(tier, slot);
     counters_[kSlotsQuarantined].fetch_add(1);
   }
 
@@ -4657,7 +4714,10 @@ class RamTier {
       for (int32_t expert : *ids) {
         if (expert < 0 || expert >= experts_) return false;
         const int32_t slot = tier.expert_slot[expert];
-        if (slot >= 0) tier.stamp[slot] = ++tick_;
+        if (slot >= 0) {
+          tier.stamp[slot] = ++tick_;
+          disown_locked(tier, slot);
+        }
       }
     }
     return true;
@@ -4708,6 +4768,7 @@ class RamTier {
         const int32_t slot = tier.expert_slot[expert];
         if (slot >= 0) {
           tier.stamp[slot] = ++tick_;
+          disown_locked(tier, slot);
         } else {
           missing.push_back(expert);
         }
@@ -5010,6 +5071,7 @@ class RamTier {
   std::vector<Tier> tiers_;
   std::mutex mutex_;
   uint64_t tick_ = 0;
+  int64_t prefill_share_ = 0;  // under mutex_; see set_prefill_share
   uint32_t next_demand_ = 1;
   uint32_t next_advice_ = 1;
   int64_t demands_read_ = 0;
@@ -5161,6 +5223,10 @@ void exl3_ram_miss_close_admission(int64_t handle) {
 
 void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
   exl3_ram_miss::find(handle)->set_lease_mode(on != 0);
+}
+
+void exl3_ram_miss_set_prefill_share(int64_t handle, int64_t share) {
+  exl3_ram_miss::find(handle)->set_prefill_share(share);
 }
 
 void exl3_ram_miss_set_gpu_hot(int64_t handle, int64_t on) {
@@ -5425,6 +5491,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_busy_since, exl3_ram_miss_busy_since
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_close_admission, exl3_ram_miss_close_admission);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_lease_mode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_gpu_hot, exl3_ram_miss_set_gpu_hot);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_prefill_share, exl3_ram_miss_set_prefill_share);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_two_phase, exl3_ram_miss_set_two_phase);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_piece_stream, exl3_ram_miss_set_piece_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_enable_copy_engine, exl3_ram_miss_enable_copy_engine);

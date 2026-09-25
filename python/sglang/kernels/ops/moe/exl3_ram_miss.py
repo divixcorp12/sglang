@@ -837,6 +837,10 @@ class Exl3RamMissHost:
             raise ValueError("EXL3 DIRECT requires a hot bitmap sidecar")
         self._module.exl3_ram_miss_set_gpu_hot(self.handle, 1)
 
+    def set_prefill_share(self, share: int) -> None:
+        """Rows a prefill may own per layer before its admissions evict its own rows instead of decode's; 0 is off."""
+        self._module.exl3_ram_miss_set_prefill_share(self.handle, int(share))
+
     def enable_two_phase(self) -> None:
         """Grant the resident lanes inside the reservation hold, before read() (Task 6 V1); before the thread starts."""
         self._module.exl3_ram_miss_set_two_phase(self.handle, 1)
