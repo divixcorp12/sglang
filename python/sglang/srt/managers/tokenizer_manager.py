@@ -2836,8 +2836,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.output_token_logprobs_idx[recv_obj_index]
             )
 
-        if top_logprobs_num > 0:
-            if len(recv_obj.input_top_logprobs_val) > 0:
+        # A batch that carries no logprobs (e.g. only a request refused at admission, which
+        # never ran a forward) has None for every logprob list, whatever the request asked for.
+        if top_logprobs_num > 0 and recv_obj.output_top_logprobs_val is not None:
+            if recv_obj.input_top_logprobs_val:
                 state.input_top_logprobs_val.extend(
                     recv_obj.input_top_logprobs_val[recv_obj_index]
                 )
@@ -2860,8 +2862,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.output_top_logprobs_idx[recv_obj_index]
             )
 
-        if token_ids_logprob is not None:
-            if len(recv_obj.input_token_ids_logprobs_val) > 0:
+        if (
+            token_ids_logprob is not None
+            and recv_obj.output_token_ids_logprobs_val is not None
+        ):
+            if recv_obj.input_token_ids_logprobs_val:
                 state.input_token_ids_logprobs_val.extend(
                     recv_obj.input_token_ids_logprobs_val[recv_obj_index]
                 )
