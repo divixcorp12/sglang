@@ -93,10 +93,12 @@ def main() -> int:
     ce_us = statistics.median(ce[2:])
 
     ptr = lambda ts: torch.tensor([t.data_ptr() for t in ts], dtype=torch.int64)
+    # Before the service starts: the lookups' first use loads kernel modules, which must not happen while a probe
+    # wait spins (a load waits for the device, and the service's copy that ends the spin waits for the load).
+    engram_lookups = engram_setup(a, dev) if a.engram_device_wait else None
     mod.ce_probe_start(post_word, done_word, gen_ring, ptr(src), ptr(dst), torch.tensor(SEGMENTS, dtype=torch.int64),
                        SRC_ROWS, a.rows, max(a.rows, 1), dev.index or 0)
 
-    engram_lookups = engram_setup(a, dev) if a.engram_device_wait else None
 
     def step():
         if engram_lookups is not None:
@@ -222,7 +224,12 @@ def engram_setup(a, dev):
     from sglang.srt.layers.engram_file_table import EngramFileTable
 
     tables = {layer: EngramFileTable.open(a.engram_dir, layer, rows, ENGRAM_DIM) for layer, rows in ENGRAM_ROWS.items()}
-    return EngramLookups(tables, dev)
+    lookups = EngramLookups(tables, dev)
+    lookups.post()
+    for layer in tables:
+        lookups.wait(layer)
+    torch.cuda.synchronize()
+    return lookups
 
 
 if __name__ == "__main__":
