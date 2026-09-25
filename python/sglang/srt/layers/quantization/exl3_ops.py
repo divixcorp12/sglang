@@ -99,6 +99,64 @@ def exl3_linear(
     return y.to(out_dtype).reshape(*lead, t.out_features)
 
 
+class Exl3HalfInput:
+    """The fp16 copy of the latest BS1 sublayer input, published by the kernel that wrote it.
+
+    SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION: hc_combine_norm writes the sublayer input and its fp16 copy, and every
+    EXL3 linear reading that input takes the copy instead of casting again. A consumer gets the copy only for the
+    same tensor object, unmodified since the publish, on the same stream. The slot holds the object, so its memory
+    cannot be reused while it is published; the next publish replaces it.
+    """
+
+    __slots__ = ("source", "version", "stream", "half")
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self) -> None:
+        self.source: Optional[torch.Tensor] = None
+        self.version = -1
+        self.stream: Optional[torch.cuda.Stream] = None
+        self.half: Optional[torch.Tensor] = None
+
+    def publish(self, source: torch.Tensor, half: torch.Tensor) -> None:
+        self.source, self.version, self.half = source, source._version, half
+        self.stream = torch.cuda.current_stream(source.device)
+
+    def take(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        if x is not self.source or x._version != self.version:
+            return None
+        if torch.cuda.current_stream(x.device) != self.stream:
+            return None
+        return self.half
+
+
+EXL3_HALF_INPUT = Exl3HalfInput()
+
+
+def exl3_half_input(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as one fp16 row: the published copy when there is one, else ``x.to(fp16)`` as exl3_linear casts it."""
+    half = EXL3_HALF_INPUT.take(x)
+    if half is not None:
+        return half
+    return x.reshape(1, -1).to(torch.float16).contiguous()
+
+
+def exl3_gemm_bs1(x16: torch.Tensor, parts: Sequence[Exl3Tensors]) -> torch.Tensor:
+    """One fp16 row through every part of a (merged) EXL3 linear, into one fp16 ``[1, parts * out]`` row.
+
+    Each part's output is a slice of one row, so it is contiguous, and the parts need no ``cat``.
+    """
+    ext = exl3_ext()
+    out = parts[0].out_features
+    y = torch.empty((1, len(parts) * out), dtype=torch.float16, device=x16.device)
+    for i, t in enumerate(parts):
+        ext.exl3_gemm(
+            x16, t.trellis, y[:, i * out : (i + 1) * out], t.suh, torch.empty_like(x16), t.svh, -1, False, t.mul1, 0
+        )
+    return y
+
+
 def exl3_linear_reference(x: torch.Tensor, t: Exl3Tensors) -> torch.Tensor:
     """exllamav3's reconstruct + had_r_128 composition with an fp32 matmul; fp32 [rows, out]."""
     ext = exl3_ext()

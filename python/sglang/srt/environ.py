@@ -1896,7 +1896,8 @@ class Envs:
     # DSV4 EXL3 decode cast fusion (plan 2026-09-25-dsv41-decode-fusion-2): at BS1, the sublayer input's fp16 copy is
     # written by hc_combine_norm and shared by the EXL3 linears that read it, merged linears cast once into one buffer,
     # the shared expert keeps its gate/up/down activations in fp16, and the routed output is cast and scaled in one
-    # kernel. Bit-identical to the unfused casts. Read once when each module is built. Off by default.
+    # kernel. Bit-identical to the unfused casts. Read once when each module is built, and per BS1 call where the
+    # sublayer input is combined. Off by default.
     SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
     # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md 7.6): the RAM-miss service copies
     # each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on its own
