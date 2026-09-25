@@ -1,7 +1,7 @@
 # DeepSeek V4.1 Flash — scoping reference
 
 **Current status (2026-09-23):** DSV4.1 serves on divix01 from
-`codex/nvfp4-expert-stream-main`; the latest measured code commit is `e36fa2530c`.
+`master`; the latest measured code commit is `e36fa2530c`.
 The saved production launcher uses
 DIRECT stage-2 GPU expert insertion, RAM-miss leases, eight row-packing workers, the
 fused expert planner, and io_uring Engram host nodes for **both** Engram layers.
@@ -13,7 +13,7 @@ decode profile found MoE wait and pinned-row copy dominant, with Engram callback
 (§23). The production server on port 7867 is currently stopped at the owner's request.
 
 **Update (2026-09-24):** RAM-miss piece streaming and a NUMA-placed 100 GiB pinned tier
-are merged into `codex/nvfp4-expert-stream-main`. Two-phase and piece streaming are
+are merged into `master`. Two-phase and piece streaming are
 recipe defaults, and the tier is 60 GiB on node 0 plus 40 GiB on node 1 (§23.1, §24.6).
 - **Piece streaming:** with two-phase on in both arms, it won 8 of 8 paired sessions
   (p=0.0039) with byte-identical output, a gain of about **40 ms/token**.
@@ -210,7 +210,7 @@ not overrides and should not be passed on the command line.
      VRAM hot cache**.
    - Its 6-token verify makes **Stage B (#14) mandatory**: per-layer miss scratch would
      be 17.9 GiB. Stage B is on our mainline since 2026-09-18 (`797be6f678`, merged into
-     `codex/nvfp4-expert-stream-main` @ `b59edf2dc4`).
+     `master` @ `b59edf2dc4`).
    - On the Qwen stand-in, speculation moves ~35% more expert bytes per accepted token at
      α=0.7, with break-even at α≈0.84–0.93.
    - **Rule: ship DSpark only if measured α clears the DSV4.1 break-even** (§10, §12).
@@ -511,7 +511,7 @@ The `lmsysorg/sglang:dev-dsv41` image was not inspected.
 
 ### Divergence and porting strategy
 
-- Our HEAD (`codex/nvfp4-expert-stream-main`) is 256 ahead / 462 behind `dsv4.1`, from
+- Our HEAD (`master`) is 256 ahead / 462 behind `dsv4.1`, from
   merge-base `7bc4eb3740`.
 - `dsv4.1` touches **none** of `expert_stream.py`, `expert_hot_cache.py`,
   `expert_residency*.py`, `model_runner.py`, `scheduler.py` or
@@ -519,7 +519,7 @@ The `lmsysorg/sglang:dev-dsv41` image was not inspected.
 - **Conflict hotspot:** `layers/moe/fused_moe_triton/layer.py` (+34/−19 upstream,
   +93/−0 ours). Re-validate `topk.py` against the streamer.
 - **Base.** The mainline includes Stage B since 2026-09-18 (`SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE`,
-  `797be6f678`, now under `codex/nvfp4-expert-stream-main` @ `b59edf2dc4`).
+  `797be6f678`, now under `master` @ `b59edf2dc4`).
 - **Strategy (measured 2026-09-18): merge, don't cherry-pick.**
   - Applied to our base, the squashed 110-file `dsv4.1` diff leaves 29 files
     unapplied, because upstream's branch point is 270 commits newer than ours.
@@ -660,7 +660,7 @@ codebook `mul1`, `out_scales=always`, `--hq`.
 
 ## 8. Our fork's integration surface
 
-(`codex/nvfp4-expert-stream-main` @ `557c1fbaec`; line numbers are jump targets.)
+(`master` @ `557c1fbaec`; line numbers are jump targets.)
 
 > **Historical code snapshot.** This section describes the fork at `557c1fbaec`,
 > before the EXL3 and Engram implementation. Its present-tense gaps and line numbers
@@ -2198,7 +2198,7 @@ Artifacts: `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/
 
 - `dsv41` merged `cc/moe-expert-plugins` (`ad4998c0fe`, bringing mainline's offload
   presets, cuda_graph_config normalization and the stage-2 shortlist fix), then was merged
-  with `origin/main` 993d1fccba into `codex/nvfp4-expert-stream-main` (`afca79bc89`,
+  with `origin/main` 993d1fccba into `master` (`afca79bc89`,
   `39362680bb`, pushed to `shared`). That candidate was validated against the Qwen4
   production config before main was fast-forwarded (decode tok/s and tail NLL at 2.5k and
   23k tokens matched main within run-to-run spread).
@@ -3284,7 +3284,7 @@ area P and the E1, §2, §4.3 and §4.4 amendments.
   67/67.
 - **Branch history:** built on `cc/dsv41-piece-stream` (tasks 0b and 1–6, each
   task-reviewed, plus a final whole-branch review). It was fast-forwarded into
-  `cc/dsv41-direct-two-phase` and then into `codex/nvfp4-expert-stream-main` on `shared`.
+  `cc/dsv41-direct-two-phase` and then into `master` on `shared`.
   The merged tree is the tree benchmarked below.
 - **Tests at merge:** kernels plus MoE RAM-miss 1,474 passed and 0 failed; piece-stream
   CPU tests 82/82; piece-stream GPU tests 22/22.

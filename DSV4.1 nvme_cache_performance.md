@@ -1,6 +1,6 @@
 # DSV4.1 NVMe, RAM, and VRAM cache performance
 
-Evidence snapshot: **2026-09-19**, local branch `codex/nvfp4-expert-stream-main`, inspected at `3be5d97b83`. This document records the current transfer path and six optimization priorities. It does not report a new benchmark or an implemented optimization. Historical experiments ran at the commits recorded in [DSV41_REFERENCE.md](DSV41_REFERENCE.md), particularly §§16–18; the local inspection commit is not the provenance of every measurement below.
+Evidence snapshot: **2026-09-19**, local branch `master`, inspected at `3be5d97b83`. This document records the current transfer path and six optimization priorities. It does not report a new benchmark or an implemented optimization. Historical experiments ran at the commits recorded in [DSV41_REFERENCE.md](DSV41_REFERENCE.md), particularly §§16–18; the local inspection commit is not the provenance of every measurement below.
 
 **Measured** means an existing experiment or artifact reports the result. **Code observation** means the current implementation establishes the behavior. **Derived** means arithmetic or an upper bound calculated from those observations. **Proposed** means work whose benefit has not yet been demonstrated.
 

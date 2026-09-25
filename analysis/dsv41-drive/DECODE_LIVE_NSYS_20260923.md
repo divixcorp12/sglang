@@ -7,7 +7,7 @@ Systems 2026.3.2 with the same model, 32,768-token context, prefix cache,
 50 GiB pinned MoE tier, 14 GiB GPU hot tier, EXL3 `uring_direct` reader,
 RAM-miss leases, GPU residency updates, DIRECT insert-on-miss stage 2, and
 decode update interval 1. The checkout was `709d819356` on
-`codex/nvfp4-expert-stream-main`. Node-level CUDA graph tracing was enabled
+`master`. Node-level CUDA graph tracing was enabled
 only after server startup and a 260-token warm-up request. The capture contains
 a 7-token request followed by a 100-token request with the same 260-token
 prompt and `ignore_eos=true`. Both returned HTTP 200; the long request finished

@@ -1,7 +1,7 @@
 # NEXTN speculative decoding with CUDA graphs under NVFP4 expert offload
 
 Status: plan only, nothing implemented. Written 2026-09-13 from a read-only investigation of branch
-`codex/nvfp4-expert-stream-main` plus three measured runs on divix01 (RTX 5090, PCIe Gen3 x16, bs=1).
+`master` plus three measured runs on divix01 (RTX 5090, PCIe Gen3 x16, bs=1).
 File:line citations are as of `d9e6720112`.
 
 ## Decision summary

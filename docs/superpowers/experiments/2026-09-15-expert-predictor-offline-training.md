@@ -241,10 +241,10 @@ pre-fix numbers suggested.
 ## Environment
 
 - Laptop: `/home/dimitri/data/divix/sglang-nvfp4`,
-  branch `codex/nvfp4-expert-stream-main`.
+  branch `master`.
 - Executed and tested on divix01 only, via
   `/data/models/slang/nvfp4-work/cc-expert-prediction/worktree` (synced with
-  `git fetch shared codex/nvfp4-expert-stream-main && git checkout --detach FETCH_HEAD`),
+  `git fetch origin master && git checkout --detach FETCH_HEAD`),
   using `/data/models/slang/.venv` with
   `PYTHONPATH=$flashinfer_overlay:$worktree/python`.
 - GPU: one RTX 5090 (32 GB), shared with other users' experiments; no

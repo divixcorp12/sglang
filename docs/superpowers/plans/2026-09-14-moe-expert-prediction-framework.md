@@ -60,7 +60,7 @@ The code blocks below show the original task text; the committed code differs as
 
 ## Global Constraints
 
-- All code lives in `/home/dimitri/data/divix/sglang-nvfp4` on branch `codex/nvfp4-expert-stream-main`. Never touch `/home/dimitri/data/divix/crypto`.
+- All code lives in `/home/dimitri/data/divix/sglang-nvfp4` on branch `master`. Never touch `/home/dimitri/data/divix/crypto`.
 - The package must not import from `sglang.srt.models`; model-specific behavior lives only in `adapters.py`, keyed by model class name.
 - Off by default: with `SGLANG_MOE_EXPERT_PREDICTOR` empty, no hooks, buffers, or per-forward work.
 - No host synchronization in hooks, `predict`, `observe`, `score_candidates`, or `on_forward_end` (no `.item()`, `.tolist()`, `.cpu()`, boolean-mask indexing, `nonzero`). Only `ShadowMetrics.snapshot` / `append_jsonl` read the device.
@@ -91,7 +91,7 @@ EOF
 )" -- <files>
 
 # L2: push to the shared bare repo and check out the commit in the experiment worktree
-git push shared codex/nvfp4-expert-stream-main
+git push origin master
 COMMIT=$(git rev-parse HEAD)
 ssh -n divix01 "cd /data/models/slang/sglang && git fetch shared && git -C /data/models/slang/nvfp4-work/cc-expert-prediction/worktree checkout --detach $COMMIT && git -C /data/models/slang/nvfp4-work/cc-expert-prediction/worktree log -1 --oneline"
 
@@ -155,7 +155,7 @@ A run is complete only when an `EXIT=` line prints; record the pass count. If `L
 - [x] **Step 0: Create the divix01 experiment worktree (once)**
 
 ```bash
-ssh -n divix01 'test -d /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && echo EXISTS || (cd /data/models/slang/sglang && git fetch shared && mkdir -p /data/models/slang/nvfp4-work/cc-expert-prediction && git worktree add --detach /data/models/slang/nvfp4-work/cc-expert-prediction/worktree shared/codex/nvfp4-expert-stream-main && git -C /data/models/slang/nvfp4-work/cc-expert-prediction/worktree log -1 --oneline)'
+ssh -n divix01 'test -d /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && echo EXISTS || (cd /data/models/slang/sglang && git fetch shared && mkdir -p /data/models/slang/nvfp4-work/cc-expert-prediction && git worktree add --detach /data/models/slang/nvfp4-work/cc-expert-prediction/worktree origin/master && git -C /data/models/slang/nvfp4-work/cc-expert-prediction/worktree log -1 --oneline)'
 ```
 
 Expected: `EXISTS` or a `log -1` line.

@@ -1,6 +1,6 @@
 # Publish and run the NVFP4 SGLang server on divix01
 
-This guide publishes the `codex/nvfp4-expert-stream-main` branch from the local
+This guide publishes the `master` branch from the local
 SGLang checkout, updates the matching checkout on divix01, and launches the
 NVFP4 server with dynamic expert residency.
 
@@ -11,7 +11,7 @@ NVFP4 server with dynamic expert residency.
 | Local checkout | `/home/dimitri/data/divix/sglang-nvfp4` |
 | divix01 checkout | `/data/models/slang/nvfp4-work/main-port-probe-7bc4eb` |
 | Shared bare remote on divix01 | `/data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git` |
-| Branch | `codex/nvfp4-expert-stream-main` |
+| Branch | `master` |
 | Launch script | `/data/models/slang/nvfp4-work/run-nvfp4-expert-dynamic-hot10g.sh` |
 | tmux session | `cc-nvfp4-dynamic` |
 | Server endpoint on divix01 | `http://127.0.0.1:7867` |
@@ -116,7 +116,7 @@ files that Git already tracks.
 Push the branch to the shared remote:
 
 ```bash
-git push shared codex/nvfp4-expert-stream-main
+git push origin master
 ```
 
 Confirm that the local branch is synchronized:
@@ -149,7 +149,7 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && git stat
 If it is clean, update it with:
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = codex/nvfp4-expert-stream-main || { echo "WRONG_BRANCH: $branch"; exit 1; }; git pull --rebase shared codex/nvfp4-expert-stream-main'
+ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = master || { echo "WRONG_BRANCH: $branch"; exit 1; }; git pull --rebase shared master'
 ```
 
 If it is dirty, do not reset or overwrite it. Those changes may be work created
@@ -167,7 +167,7 @@ When the remote changes are known to match the published commit, preserve them
 in a recoverable stash before pulling:
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = codex/nvfp4-expert-stream-main || { echo "WRONG_BRANCH: $branch"; exit 1; }; git stash push -u -m pre-shared-update-$(date +%Y%m%d-%H%M%S) && git pull --rebase shared codex/nvfp4-expert-stream-main'
+ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = master || { echo "WRONG_BRANCH: $branch"; exit 1; }; git stash push -u -m pre-shared-update-$(date +%Y%m%d-%H%M%S) && git pull --rebase shared master'
 ```
 
 Keep that stash until the updated server has been verified. Do not immediately

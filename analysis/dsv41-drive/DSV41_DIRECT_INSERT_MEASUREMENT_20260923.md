@@ -1,7 +1,7 @@
 # DSV4.1 EXL3 DIRECT insert-on-miss: implementation and first serving measurement
 
 Measured on divix01, 2026-09-23. The implementation is on
-`codex/nvfp4-expert-stream-main`. All three serving arms used commit
+`master`. All three serving arms used commit
 `165a48fa4f1784dfdb72843ab8db424397dab706` and Python tree
 `9822a387d6b4610948efdaac79106a534fec102c`. The final test-only commits
 through `e22f725d18` leave that Python tree unchanged.

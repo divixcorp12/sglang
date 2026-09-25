@@ -1,6 +1,6 @@
 # Layer 14 Engram graph replay implementation plan
 
-> **For agentic workers:** Implement and review each task in order. Work on `codex/nvfp4-expert-stream-main`; preserve unrelated working-tree changes. Use the existing layer-1 host-node path as the implementation template.
+> **For agentic workers:** Implement and review each task in order. Work on `master`; preserve unrelated working-tree changes. Use the existing layer-1 host-node path as the implementation template.
 
 **Goal:** Capture the layer-14 Engram file lookup in the batch-1 TP-1 decode graph so both Engram lookups replay with zero eager graph breaks.
 
@@ -77,4 +77,4 @@ if (
 
 ## Done when
 
-Two-layer graph test reports one segment and zero Engram breaks; changing/cold/warm/failure/fallback tests pass; real-shard output matches eager; and a matched `divix01` serving comparison states whether the change improves decode performance. Commit only the intended implementation, tests, and result note on `codex/nvfp4-expert-stream-main` after checking the working tree.
+Two-layer graph test reports one segment and zero Engram breaks; changing/cold/warm/failure/fallback tests pass; real-shard output matches eager; and a matched `divix01` serving comparison states whether the change improves decode performance. Commit only the intended implementation, tests, and result note on `master` after checking the working tree.

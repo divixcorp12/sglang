@@ -20,7 +20,7 @@ Every task's requirements include this section. Implementers see only their own 
 - The laptop has no usable python for these tests. Never run pytest on the laptop.
 
 **Git rules**
-- Never commit to `codex/nvfp4-expert-stream-main`. Never merge into it or into `dsv41` from this plan (`dsv41` merges this branch later, in another plan).
+- Never commit to `master`. Never merge into it or into `dsv41` from this plan (`dsv41` merges this branch later, in another plan).
 - Stage files by name. Never `git add -A`, never `git stash`, never `--amend`, never force-push.
 - Each task makes two commits: first the failing tests, then the implementation. The red commit is pushed so divix01 can run it.
 - Commit messages end with exactly these two lines:

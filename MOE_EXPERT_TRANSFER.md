@@ -1,7 +1,7 @@
 # MoE expert transfer — paths, results, and how to run it
 
 State as of `797be6f678` (`insert-on-miss-stage-b`, fast-forwarded into
-`codex/nvfp4-expert-stream-main` 2026-09-18) — all accepted
+`master` 2026-09-18) — all accepted
 optimizations merged, plus insert-on-miss **stage 2 (DIRECT)** and the **fused
 route planner** (`SGLANG_MOE_EXPERT_FUSED_PLAN=1`), both accepted 2026-09-18 on
 acceptance-grade paired serving arms. Suite on that merge:
@@ -374,7 +374,7 @@ Protocol: 8 sessions / 29 turns / 768 tokens, cold server per arm, mode verified
 | 21 | **Fused route planner** | flag only, on `797be6f678` (planner code predates the campaign) | **19.442 → 20.695 (+6.4%)**, 28/29 paired turns, p = 5.6e-8; 2.77 ms/token; hit rate unchanged | `matrix/fplan-20260918-032147` |
 | 24 | Per-layer slot floor for stage 2 | `e1d227a4bd` | Enabler, no speed of its own: lets 4 draft tokens start at 12,288 MB. **N4 vs N3: tie** (11/29 turns, median −1.5%, p = 0.27 two-sided); keep 3 | `matrix/nextn-20260918-123932` |
 | 25 | **Prefill staging in place, allocated once** | `844bb9d7a5` | **Peak VRAM 32,143 → 30,587 MiB** (37k-token prompt, NEXTN-3, 12,288 MB); prefill time unchanged | `matrix/memprobe-20260918-144144` |
-| 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `codex/nvfp4-expert-stream-main` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
+| 23 | **NEXTN speculative decoding, 3 draft tokens** (guard lifted) | `master` (guard removal + test + launcher switch) | **22.650 → 24.930 (+9.6%)** at 12,288 MB, 29/29 paired turns, p = 1.9e-9; 3.94 ms/token; accept length 2.55. **Not deployed**: 31.9/32 GB, long-context OOM untested | `matrix/nextn-20260918-115808` |
 | 27 | **Spend the freed VRAM on the hot cache: 13,312 MB** | flag only (`HOT_GPU_MB`), on `844bb9d7a5` | **25.208 → 27.081 (+6.1% paired median)** vs 12,288 MB, both NEXTN-3; 24/29 turns, p = 2.7e-4; 2.16 ms/token; hit rate 70.17 → 72.11%, 372 → 345 MB/token. 37k-token peak **31,647 MiB at chunk 4096 (safe); chunk 8192 OOMs** | `matrix/cache-20260918-161820`, `matrix/memprobe-20260918-171612` |
 | 30 | **Draft (MTP) experts requantized FP8 → NVFP4 at load** | `46735b12b4` (`SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT=1`) | **Draft 2.46 → 1.45 GB; free after startup 3.05 → 4.04 GB.** Accept length 2.546 → 2.564, speed tie (26.096 → 26.198, 19/29 turns, p = 0.07), both at 13,312 MB. Enabler for a bigger cache | `matrix/draft-20260918-173157` |
 | 32 | **Spend the draft's freed GB on the hot cache: 14,336 MB** (NVFP4 draft) | flag only, on `46735b12b4` | **26.877 → 28.101 (+6.65% paired median)** vs 13,312 MB, both NVFP4 draft; 27/29 turns, p = 8.1e-7; 2.28 ms/token; 5,048 → 5,437 slots, hit rate 72.67 → 74.20%, 335 → 321 MB/token. 37k-token peak **31,667 MiB at chunk 4096 (safe)** | `matrix/memprobe-d-20260918-180224`, `matrix/draftcache-20260918-180224` |

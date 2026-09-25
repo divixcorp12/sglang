@@ -45,8 +45,8 @@ Model: Qwen NVFP4, 48 MoE layers, 512 experts/layer, top_k 10. One expert row = 
 
 | Thing | State | How to re-check |
 |---|---|---|
-| Local branch | `codex/nvfp4-expert-stream-main`, HEAD `f867e73e8b`, **55 commits ahead of `shared`** | `git status --short --branch` |
-| `shared` remote tip | `bd8cc84d1a` | `git log -1 shared/codex/nvfp4-expert-stream-main` |
+| Local branch | `master`, HEAD `f867e73e8b`, **55 commits ahead of `shared`** | `git status --short --branch` |
+| `shared` remote tip | `bd8cc84d1a` | `git log -1 origin/master` |
 | divix01 test worktree | `/data/models/slang/nvfp4-work/cc-expert-prediction/worktree` at **`d725c54a31`** — far behind local, clean | section 4 |
 | Production (port 7867) | **down** (health 000). Left down deliberately; whether that is intended is an open user question | section 4 |
 | GPU | 4.5 / 32.6 GiB used by two processes that are not ours (pids 3349801 3.7 GiB, 3349981 0.76 GiB) | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` |
@@ -121,11 +121,11 @@ correctness tests do.
 
 ```bash
 git commit -m "..." -- <paths>
-git push -q shared codex/nvfp4-expert-stream-main
+git push -q origin master
 ssh -n -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o BatchMode=yes divix01 '
   cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree &&
   git status --short | head -3 &&
-  git fetch -q /data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git codex/nvfp4-expert-stream-main &&
+  git fetch -q origin master &&
   git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
 ```
 

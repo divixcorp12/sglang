@@ -1,6 +1,6 @@
 # MoE Expert Prediction Framework (shadow milestone) — Design
 
-Date: 2026-09-14. Branch `codex/nvfp4-expert-stream-main`.
+Date: 2026-09-14. Branch `master`.
 
 ## Purpose
 

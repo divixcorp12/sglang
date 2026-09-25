@@ -1,6 +1,6 @@
 # RAM-miss service: synchronization audit and the two follow-ups — handoff
 
-Date: 2026-09-24. Branch `codex/nvfp4-expert-stream-main`, head **`9183637f51`**
+Date: 2026-09-24. Branch `master`, head **`9183637f51`**
 (`feat(dsv41-baseline): recipe runs a 100 GiB NUMA-placed tier with two-phase piece
 streaming`). Written from a read of the code only; nothing in this file has been run on a
 GPU and no code was changed. Every `file:line` below was printed and checked at this head;

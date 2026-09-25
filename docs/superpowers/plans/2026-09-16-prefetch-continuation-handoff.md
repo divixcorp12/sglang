@@ -14,7 +14,7 @@ Use the recorded final-code baseline to start the pipeline changes that attack t
 
 ## Current code state
 
-Branch: `codex/nvfp4-expert-stream-main`, pushed to `shared` at `f2c6cd2cbc` (the 2026-09-17 optimizations and test fixes are merged; see Implementation results). Commits added after `0283eacb74`:
+Branch: `master`, pushed to `shared` at `f2c6cd2cbc` (the 2026-09-17 optimizations and test fixes are merged; see Implementation results). Commits added after `0283eacb74`:
 
 | Commit | Content |
 | --- | --- |
@@ -98,7 +98,7 @@ Full detail and rulings in the ledger. Per decode token (LLaPor D trace, node-mo
 > [`MOE_EXPERT_TRANSFER.md`](../../../MOE_EXPERT_TRANSFER.md).
 
 
-Full detail, commits and run directories are in the ledger. The accepted work is merged to `codex/nvfp4-expert-stream-main` @ `f2c6cd2cbc`; the rejected and in-flight branches remain separate. Compare arms only within the same matrix; CPU placement differs from the 2026-09-16 baseline.
+Full detail, commits and run directories are in the ledger. The accepted work is merged to `master` @ `f2c6cd2cbc`; the rejected and in-flight branches remain separate. Compare arms only within the same matrix; CPU placement differs from the 2026-09-16 baseline.
 
 | Work | Branch @ commit | Result | Status |
 | --- | --- | --- | --- |
@@ -204,7 +204,7 @@ Iteration-speed rulings (user, 2026-09-17). Arm cost breaks down as ~26 s proces
 plus the fused route planner at 20.695 tok/s, +48.2% over the 13.96 baseline**
 (stage 2 alone: 19.360, +38.7%). Branch
 `insert-on-miss-stage-b` @ `797be6f678`, fast-forwarded into
-`codex/nvfp4-expert-stream-main` 2026-09-18, **not pushed** — the repo owner pushes.
+`master` 2026-09-18, **not pushed** — the repo owner pushes.
 Full results, the winning config and every closed line live in
 [`MOE_EXPERT_TRANSFER.md`](../../../MOE_EXPERT_TRANSFER.md), which is now the
 authoritative document; this file is history plus what remains.

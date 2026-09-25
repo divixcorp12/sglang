@@ -2,7 +2,7 @@
 
 > **For implementers:** Execute the checked tasks in order. Review the native
 > request protocol and the GPU cache ownership change independently before a
-> served benchmark. Work on `codex/nvfp4-expert-stream-main`; do not silently
+> served benchmark. Work on `master`; do not silently
 > change the default serving recipe.
 
 **Goal:** Reuse Qwen's DIRECT insert-on-miss policy for DSV4.1 so a routed

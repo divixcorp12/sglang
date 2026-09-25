@@ -2,7 +2,7 @@
 
 ## Setup
 
-- Commit: `97ceacd64d` (`feat(moe): add capture two-turn smoke driver and gate top-k checker`), on `codex/nvfp4-expert-stream-main`.
+- Commit: `97ceacd64d` (`feat(moe): add capture two-turn smoke driver and gate top-k checker`), on `master`.
 - Launch: `HOT_GPU_MB=12288 CAPTURE=1 run-shadow-server.sh capture-smoke 31010 off radix` (predictors off, radix cache on, 12 GB hot cache, matching the production recommendation in `2026-09-14-radix-cache-ab.md`).
 - Capture directory: `/mnt/nvme2/nvfp4-work/expert-prediction-capture/capture-smoke/20260914-231957`.
 - Server log confirms: `MoE expert capture: directory=... capacity_rows=4096 frames=2 pinned_bytes=4074242048 max_bytes=536870912000`.

@@ -1,6 +1,6 @@
 # MoE Expert Prefetch Candidates (LLaPor/APEX): Phase A In-Graph Shadow Scoring, Phase B Doorbell Wiring — Implementation Plan
 
-> **Dependency, stated first:** Phase B (Tasks B1–B2) is **BLOCKED** until crypto-c9's `cc/doorbell-serving` merges into `codex/nvfp4-expert-stream-main`.
+> **Dependency, stated first:** Phase B (Tasks B1–B2) is **BLOCKED** until crypto-c9's `cc/doorbell-serving` merges into `master`.
 > - That branch owns the whole shared copy layer: the plan interface, the planner, delivered/residual accounting, and both the in-graph and doorbell copy backends.
 > - It merges as one piece after review, divix01 tests and a serving A/B. It is in a rework round for a late-copy race, so there is no ETA.
 > - Phase A (Tasks 1–7) starts now and touches no copy path.
@@ -39,7 +39,7 @@
 - **Phase split (hard). Phase A must not modify the copy path.**
   - Off limits: `python/sglang/srt/layers/moe/expert_stream.py`, `expert_route_plan.py`, `expert_hot_cache.py`, `expert_residency_gpu.py`, `expert_transfer.py`, `expert_prefetch.py`, and `python/sglang/kernels/ops/moe/*`.
   - Also off limits: any file `cc/doorbell-serving` adds.
-  - Before each Phase A task, run `git fetch -q shared cc/doorbell-serving && git diff --stat codex/nvfp4-expert-stream-main...shared/cc/doorbell-serving`.
+  - Before each Phase A task, run `git fetch -q shared cc/doorbell-serving && git diff --stat master...shared/cc/doorbell-serving`.
   - **Two overlaps are known and allowed** (checked 2026-09-15 at `56a5920489`):
     - `environ.py`: the branch's hunk is at lines 328–333. Phase A adds lines only after `SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_FRAMES` (line 348).
     - `model_runner.py`: the branch's hunks are at 754–798, 1257 and 1631–1700. Phase A changes one condition in `maybe_init_expert_prediction` (line ~803).
@@ -64,7 +64,7 @@
   - Never start while a server on port 7867 is relaunching: if a 7867 process exists, `http://127.0.0.1:7867/health` must be 200 and the run must fit beside production. Only CPU work or GPU unit tests under 1 GiB qualify.
   - Production is taken down only with the user's explicit approval, obtained with AskUserQuestion by the task that needs it. With production down by approval, the GPU must be empty before launch.
   - While the doorbell session owns the GPU, run no GPU work at all. CPU steps set `CUDA_VISIBLE_DEVICES=""`.
-- **Code and tests run on divix01.** Laptop commits, then `git push shared HEAD` is followed by a sync of `/data/models/slang/nvfp4-work/cc-expert-prediction/worktree`: `git fetch -q /data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git codex/nvfp4-expert-stream-main && git checkout -q --detach FETCH_HEAD`. Use `ssh -n divix01 '...'` only; never `ssh -t` and never `tmux capture-pane`.
+- **Code and tests run on divix01.** Laptop commits, then `git push shared HEAD` is followed by a sync of `/data/models/slang/nvfp4-work/cc-expert-prediction/worktree`: `git fetch -q origin master && git checkout -q --detach FETCH_HEAD`. Use `ssh -n divix01 '...'` only; never `ssh -t` and never `tmux capture-pane`.
 - **Test command (divix01):** `cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && timeout 900 /data/models/slang/.venv/bin/python -m pytest -q -p no:cacheprovider -rfEs <test files>`
 - **Commits:** stage by name, `git commit -m "..." -- <paths>`. Never stage `.omc/`, `.superpowers/`, or `docs/superpowers/experiments/nvfp4-expert-offload-experiment-log.md`. End messages with:
   ```
@@ -2015,7 +2015,7 @@ git commit -m "docs(moe): measure prefetch scoring cost and concurrent expert co
 
 ## Phase B — BLOCKED on the `cc/doorbell-serving` merge
 
-Do not start any Phase B step until crypto-c9's shared copy layer is on `codex/nvfp4-expert-stream-main` and synced to divix01. Do not write code against the unmerged branch.
+Do not start any Phase B step until crypto-c9's shared copy layer is on `master` and synced to divix01. Do not write code against the unmerged branch.
 
 **Scheduling (user decision):** Task 6's live shadow run waits for this merge. It then shares one GPU window with B2, booked through crypto-c9.
 

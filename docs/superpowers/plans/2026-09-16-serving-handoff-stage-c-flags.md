@@ -1,6 +1,6 @@
 # Serving handoff — running the NVFP4 server with Stage A/C features enabled
 
-Written 2026-09-16 against branch `codex/nvfp4-expert-stream-main`, **unpushed**. Supersedes nothing;
+Written 2026-09-16 against branch `master`, **unpushed**. Supersedes nothing;
 read alongside `2026-09-16-side-stream-expert-pull-handoff.md`, whose Stage C this operationalises.
 
 **Read section 1 before enabling anything.** One of these flags is ready, one changes a recorded

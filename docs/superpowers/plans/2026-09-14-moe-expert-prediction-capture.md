@@ -20,7 +20,7 @@
 
 ## Global Constraints
 
-- Work on branch `codex/nvfp4-expert-stream-main` in `/home/dimitri/data/divix/sglang-nvfp4`. No worktrees on the laptop; nothing in `/home/dimitri/data/divix/crypto`.
+- Work on branch `master` in `/home/dimitri/data/divix/sglang-nvfp4`. No worktrees on the laptop; nothing in `/home/dimitri/data/divix/crypto`.
 - **Commits:**
   - Stage by name; commit with `git commit -m ... -- <paths>`.
   - Never stage `.omc/`, `.superpowers/`, or `docs/superpowers/experiments/nvfp4-expert-offload-experiment-log.md`.
@@ -372,8 +372,8 @@ git commit -m "feat(moe): add expert capture row schema and prefix hashing" -- \
   python/sglang/srt/layers/moe/expert_prediction/capture_schema.py \
   python/sglang/srt/layers/moe/expert_prediction/prefix_hash.py \
   test/registered/unit/layers/moe/test_expert_prediction_capture_schema.py
-git push shared codex/nvfp4-expert-stream-main
-ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && git fetch -q /data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git codex/nvfp4-expert-stream-main && git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
+git push origin master
+ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && git fetch -q origin master && git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
 ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && \
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=/data/models/slang/nvfp4-work/flashinfer-0.6.18-cu130-overlay:$PWD/python:/data/models/slang/nvfp4-work/uring-test-deps \
   timeout 900 /data/models/slang/.venv/bin/python -m pytest -q -p no:cacheprovider -rfEs \
@@ -1115,8 +1115,8 @@ git commit -m "feat(moe): add expert capture frames, shard writer, and reader" -
   python/sglang/srt/layers/moe/expert_prediction/capture_reader.py \
   python/sglang/srt/layers/moe/expert_prediction/feature_store.py \
   test/registered/unit/layers/moe/test_expert_prediction_capture_writer.py
-git push shared codex/nvfp4-expert-stream-main
-ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && git fetch -q /data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git codex/nvfp4-expert-stream-main && git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
+git push origin master
+ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && git fetch -q origin master && git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
 ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && \
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=/data/models/slang/nvfp4-work/flashinfer-0.6.18-cu130-overlay:$PWD/python:/data/models/slang/nvfp4-work/uring-test-deps \
   timeout 900 /data/models/slang/.venv/bin/python -m pytest -q -p no:cacheprovider -rfEs \
@@ -1879,8 +1879,8 @@ git commit -m "feat(moe): capture full-sequence expert routing data for predicto
   scripts/expert_prediction/run-shadow-server.sh \
   test/registered/unit/layers/moe/test_expert_prediction_capture.py \
   test/registered/unit/layers/moe/test_expert_prediction_capture_graph.py
-git push shared codex/nvfp4-expert-stream-main
-ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && git fetch -q /data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git codex/nvfp4-expert-stream-main && git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
+git push origin master
+ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && git fetch -q origin master && git checkout -q --detach FETCH_HEAD && git log -1 --oneline'
 ssh -n divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/worktree && \
   PYTHONPATH=/data/models/slang/nvfp4-work/flashinfer-0.6.18-cu130-overlay:$PWD/python:/data/models/slang/nvfp4-work/uring-test-deps \
   timeout 900 /data/models/slang/.venv/bin/python -m pytest -q -p no:cacheprovider -rfEs \

@@ -10,7 +10,7 @@
 
 **Spec and context:** [prediction handoff](../../../DSV4.1%20expert_prediction_handoff.md), [cache background](../../../DSV4.1%20nvme_cache_performance.md), and [DSV41_REFERENCE](../../../DSV41_REFERENCE.md), especially §§16.9 and 18.4–18.6. This plan specifies the cache-policy work that complements the handoff's prediction experiments.
 
-**Snapshot:** 2026-09-19; branch `codex/nvfp4-expert-stream-main`; inspected source `24404a3560`. No implementation, training, replay, or GPU benchmark was run to produce this plan. New files, interfaces, configuration fields, and commands for them below are **proposed**, not existing capabilities.
+**Snapshot:** 2026-09-19; branch `master`; inspected source `24404a3560`. No implementation, training, replay, or GPU benchmark was run to produce this plan. New files, interfaces, configuration fields, and commands for them below are **proposed**, not existing capabilities.
 
 ## Global constraints and current evidence
 

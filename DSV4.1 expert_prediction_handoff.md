@@ -1,6 +1,6 @@
 # DSV4.1 expert prediction and NVMe prefetch: implementation handoff
 
-**Snapshot:** 2026-09-19, `codex/nvfp4-expert-stream-main`, local source `24404a3560`.
+**Snapshot:** 2026-09-19, `master`, local source `24404a3560`.
 **Scope:** a documented experiment and implementation plan. No capture, training, inference, or implementation was performed to create this handoff.
 **Primary objective:** predict useful future target experts early enough to bring their weights from NVMe into the bounded RAM cache before demand. This can reduce exposed NVMe wait; it does not make each byte of RAM → VRAM PCIe transfer intrinsically faster.
 

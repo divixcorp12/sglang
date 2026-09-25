@@ -4,7 +4,7 @@ Written while the decision was open, and kept as written: it is the brief the me
 from. Recorded here for the record rather than edited into hindsight.
 
 **Status now.** Approved and merged, **disabled by default** (`SGLANG_MOE_EXPERT_DOORBELL`
-defaults to false). `cc/doorbell-serving` landed on `codex/nvfp4-expert-stream-main` as merge
+defaults to false). `cc/doorbell-serving` landed on `master` as merge
 commit `da3e9297be`, over three commits — `1a06114e87` (bounded drain and host fail-stop),
 `0f20010cfe` (always-synchronize fail-stop check and the copier prime), `245c5e0d67` (tests).
 Not pushed. The port 7867 server the user tested these changes on was stopped after the

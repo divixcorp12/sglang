@@ -9,7 +9,7 @@ RAM-miss waiting and pinned-host expert-row copying dominate the traced graph;
 Engram host callbacks are small by comparison. Sections 1–3 below predate
 these attributions.
 
-Date: 2026-09-22. Branch `codex/nvfp4-expert-stream-main`, head `1d75e639b3`.
+Date: 2026-09-22. Branch `master`, head `1d75e639b3`.
 divix01 worktree `/data/models/slang/nvfp4-work/wt-p1bench`, left at `d337301dd1`
 (pull it forward before new work).
 
@@ -156,11 +156,11 @@ nothing at all.
 
 ```bash
 # laptop
-git push shared codex/nvfp4-expert-stream-main
+git push origin master
 
 # divix01
 cd /data/models/slang/nvfp4-work/wt-p1bench
-git fetch /data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git codex/nvfp4-expert-stream-main
+git fetch origin master
 git checkout --detach <sha>
 tree=$(git rev-parse HEAD:python)   # register this if new
 

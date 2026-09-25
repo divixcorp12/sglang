@@ -30,7 +30,7 @@
 
 ## Global Constraints
 
-- **Never commit to `codex/nvfp4-expert-stream-main`.** EXL3 work goes on `dsv41` (worktree `WT`). Never merge `dsv41` into a mainline or production branch.
+- **Never commit to `master`.** EXL3 work goes on `dsv41` (worktree `WT`). Never merge `dsv41` into a mainline or production branch.
 - **(R3) Framework files are edited only on `cc/moe-expert-plugins` in `FWT`:** `python/sglang/srt/layers/moe/expert_*.py`, `layers/moe/expert_format.py`, `arg_groups/expert_stream_requirements.py`, `arg_groups/memory_hook.py`, `model_executor/model_runner.py`, `python/sglang/test/moe_expert_fakes.py`, `python/sglang/kernels/ops/moe/expert_*.py`, `python/sglang/kernels/jit/csrc/moe/expert_*.cuh`. Each change is pushed to `shared`, CPU-tested on `DFWT`, and brought into `dsv41` by a plain `git merge shared/cc/moe-expert-plugins` (never rebase or cherry-pick). Never merge `dsv41` into `cc/moe-expert-plugins`. Prefer the EXL3 side (`quantization/exl3*.py`, `layers/moe/exl3_*.py`, `arg_groups/expert_stream_requirements_exl3.py`, `engram*`, `scripts/dsv41`) when equally clean.
 - **The production doorbell's behaviour for Qwen does not change.** `expert_doorbell.cuh`/`.py` are not edited (Design decision D18); Qwen's doorbell tests (`test/registered/unit/kernels/test_expert_doorbell_copier.py`) run unmodified in Task 16.
 - **CPU jobs on divix01:** `taskset -c 0-63` with `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16`. Cores 64–71 are reserved (core 71 is production's doorbell spin core). The reader thread's CPU-test pinning uses cores inside 0–63 only.

@@ -11,7 +11,7 @@ comparison.
 The run used divix01's isolated diagnostic checkout at
 `fb8385a0fe0fd2eea36a6848bcee5f2ab0aaa657` (Python tree
 `cc79afadcbffcdb21fff053bfdc2971a5fd2f1d3`), corresponding to the NVTX
-source change on `codex/nvfp4-expert-stream-main` at `c88567866d`. The checkout
+source change on `master` at `c88567866d`. The checkout
 passed the clean-tree and registered-generation gates. The harness verified all
 34 expected server variables against the live process. Relevant settings were
 `SGLANG_MOE_ASYNC_RESIDENCY_SCORES=1`,
