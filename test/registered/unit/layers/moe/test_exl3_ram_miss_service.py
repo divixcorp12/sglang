@@ -1109,19 +1109,17 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
 
     monkeypatch.setattr(module.Exl3RamMissHost, "enable_copy_engine", reached)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    with (
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
-    ):
-        if value == "EAGER":
-            with pytest.raises(_CopyEngineReached):
-                service.ensure_started()
-        else:
-            with pytest.raises(RuntimeError, match="CUDA_MODULE_LOADING=EAGER"):
-                service.ensure_started()
+    # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
+    # reaches enable_copy_engine here would leak the copy-engine config into every later test.
+    for name in ("COPY_ENGINE", "PIECE_STREAM", "LEASES", "TWO_PHASE"):
+        monkeypatch.setenv(f"SGLANG_DSV41_ENABLE_RAM_MISS_{name}", "1")
+    monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_PACK_WORKERS", "1")
+    if value == "EAGER":
+        with pytest.raises(_CopyEngineReached):
+            service.ensure_started()
+    else:
+        with pytest.raises(RuntimeError, match="CUDA_MODULE_LOADING=EAGER"):
+            service.ensure_started()
     assert service.host is None, "a refused start left a host behind"
 
 
