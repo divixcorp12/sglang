@@ -110,6 +110,8 @@ def _stage_record(**over):
         pack_ns=40, bytes=45380, extents=2, drives=[{"dev": 49, "bytes": 45380, "extents": 2}],
         status="served", rows_asked=2, missing_stages=[], useful_bytes=45000, submitted_bytes=45380,
         retried_bytes=0, cancelled_bytes=0, rows_untraced=0, extents_untraced=0, dropped_before=0, lanes=6,
+        pack_workers=0, pack_split=0, piece_stream=0, pieces=[], pieces_published=0, pieces_out_of_order=0,
+        piece_publish_refused=0,
         row_pack=[
             {"row": 0, "admit": 112, "start": 220, "end": 240},
             {"row": 1, "admit": 112, "start": 240, "end": 260},
@@ -140,7 +142,10 @@ def test_ram_miss_requests_are_traced_and_skipped_by_tier_sim(tmp_path):
     assert [line["kind"] for line in lines] == ["graph_step", "ram_miss_request", "ram_miss_request"]
     first = lines[1]
     assert (first["layer"], first["forward"], lines[2]["layer"]) == (5, 1, 3)
-    assert first["request"] == {"seq": 7, "type": "demand", "ok": 1, "rows": 2, "batches": 1, "backlog": 0, "lanes": 6}
+    assert first["request"] == {
+        "seq": 7, "type": "demand", "ok": 1, "rows": 2, "batches": 1, "backlog": 0, "lanes": 6,
+        "pack_workers": 0, "pack_split": 0, "piece_stream": 0,
+    }
     assert list(first["stages_ns"]) == [
         "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done"
     ]
