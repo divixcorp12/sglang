@@ -1875,6 +1875,10 @@ class Envs:
     # Needs mirror dirs holding images built by scripts/dsv41/build_row_images.py and
     # SGLANG_MOE_EXPERT_FILE_READER=uring_direct. The eager row source keeps reading the mirrored shards. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES = EnvBool(False)
+    # DSV4 MoE side stream (plan 2026-09-25-dsv41-copy-compute-overlap, 1a): the shared expert and the DIRECT
+    # residency commit run on one side stream, joined before the shared-expert add, so they overlap the RAM-miss
+    # copies and the routed MoE kernel instead of running in line. Read once per process. Off by default.
+    SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

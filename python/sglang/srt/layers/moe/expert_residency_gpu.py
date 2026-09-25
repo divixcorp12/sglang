@@ -750,6 +750,11 @@ class GpuResidencyUpdater:
         rank = (remap - scratch_base).clamp(min=0, max=self.miss_rows - 1).long()
         return torch.where(remap >= scratch_base, destinations.index_select(0, rank), remap)
 
+    def pending_commit_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The per-gather tensors ``commit_gather`` reads, for a caller that runs it on another stream."""
+        _, _, destinations, live = self._pending_commit
+        return destinations, live
+
     def commit_gather(self) -> None:
         """Commit the residency of the gather whose copies were just issued."""
         row, streamer, destinations, live = self._pending_commit

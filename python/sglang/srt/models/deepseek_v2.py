@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
@@ -99,6 +100,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
+from sglang.srt.layers.moe import moe_side_stream
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -609,6 +611,8 @@ class DeepseekV2MoE(nn.Module):
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        if is_deepseek_v4:
+            moe_side_stream.enable_if_requested()
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
             and getattr(config, "hc_pre_from_prev_sublayer", False)
@@ -1245,10 +1249,16 @@ class DeepseekV2MoE(nn.Module):
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
-                shared_output = self._forward_shared_experts(
+                shared = functools.partial(
+                    self._forward_shared_experts,
                     hidden_states,
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
+                )
+                shared_output = (
+                    moe_side_stream.fork(shared)
+                    if self.is_deepseek_v4 and moe_side_stream.active()
+                    else shared()
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
@@ -1341,6 +1351,10 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
+        if self.is_deepseek_v4:
+            moe_side_stream.join(
+                (shared_output,) if isinstance(shared_output, torch.Tensor) else ()
+            )
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,

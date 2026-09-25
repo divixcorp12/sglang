@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import moe_side_stream
 from sglang.srt.layers.moe.expert_dma import ExpertDMABackend, _aot_transfer_available
 from sglang.srt.layers.moe.expert_format import (
     DenseLayerFormat,
@@ -1196,7 +1197,11 @@ class ExpertStreamer:
         if direct is not None:
             # Strictly after the copies, on this same stream: residency only claims a row
             # once the copy that fills it has been issued ahead of it.
-            direct.commit_gather()
+            if moe_side_stream.active():
+                # The side stream forks after the copies; the MoE layer joins it before the next layer's gather.
+                moe_side_stream.fork(direct.commit_gather, inputs=direct.pending_commit_tensors())
+            else:
+                direct.commit_gather()
         if not fused:
             self.graph_counters[0].add_(count)
             self.graph_counters[1].add_(plan.routed_miss_rows)
