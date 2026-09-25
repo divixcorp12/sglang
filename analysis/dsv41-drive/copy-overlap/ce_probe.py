@@ -39,6 +39,8 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--rows", type=int, default=2)
     ap.add_argument("--replays", type=int, default=30)
+    ap.add_argument("--ahead", type=int, default=0, help="0: replay back to back; k: wait for replay i-k after launching replay i")
+    ap.add_argument("--timeout-ms", type=int, default=5000)
     ap.add_argument("--host-nodes", action="store_true", help="add host nodes at layers 1 and 14, as the Engram callbacks")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
@@ -92,7 +94,7 @@ def main() -> int:
             for _ in range(FILLER):
                 mod.ce_probe_filler(x)
             mod.ce_probe_post(post_word, counter, stamps)
-            mod.ce_probe_wait(done_word, counter, stamps, fail, 5_000_000_000)
+            mod.ce_probe_wait(done_word, counter, stamps, fail, a.timeout_ms * 1_000_000)
 
     step()  # warm the path eagerly, with the service live
     torch.cuda.synchronize()
@@ -107,10 +109,16 @@ def main() -> int:
     base_seq = int(counter.item())
     launch_ms = []
     t0 = time.perf_counter()
+    pending = []
     for _ in range(a.replays):
         t = time.perf_counter()
         graph.replay()
         launch_ms.append((time.perf_counter() - t) * 1e3)
+        if a.ahead:
+            pending.append(torch.cuda.Event())
+            pending[-1].record(torch.cuda.current_stream())
+            if len(pending) > a.ahead:
+                pending.pop(0).synchronize()
     torch.cuda.synchronize()
     wall_ms = (time.perf_counter() - t0) * 1e3
     out = torch.zeros(2 + 3 * 20000, dtype=torch.int64)
@@ -128,6 +136,7 @@ def main() -> int:
     res = {
         "rows_per_request": a.rows,
         "host_nodes": a.host_nodes,
+        "ahead": a.ahead,
         "requests": len(dev_us),
         "served_total": served,
         "service_error": error,
