@@ -16,7 +16,8 @@
 #
 # Optional environment: SOAK_OUT_ROOT (default /mnt/nvme1/ce-soak), SOAK_PORT (30021), SOAK_MINUTES (115),
 # SOAK_REQUESTS (320), SOAK_DRIVER_ARGS (extra driver flags, e.g. "--only-kinds sampled"), SOAK_ENV_OVERRIDES (arm_env
-# overrides as Python dict items, e.g. "'SGLANG_DSV41_RAM_MISS_TIMEOUT_MS': '60000'"), SOAK_STACK_SECONDS (sample
+# overrides as Python dict items, e.g. "'SGLANG_DSV41_RAM_MISS_TIMEOUT_MS': '60000'"), SOAK_EXTRA_ARGS (server flags
+# appended to the recipe's, diagnosis only), SOAK_STACK_SECONDS (sample
 # the scheduler's native stacks once a second for this long after arming; diagnosis only, it perturbs timing).
 #
 # Takes cc-gpu.lock and rowimg-disk.lock for the whole soak. Refuses when production (port 7867) is up, or when the
@@ -67,6 +68,7 @@ mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 print(*arm_env.ServerArgs(port=$PORT).argv(), sep='\n')
 ")
+[ -n "${SOAK_EXTRA_ARGS:-}" ] && ARGV+=(${SOAK_EXTRA_ARGS})  # diagnosis only; argparse keeps a repeated flag's last value
 MODEL=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.MODEL_PATH)")
 CORES=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.SERVER_CORES)")
 DCORES=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.DRIVER_CORES)")
