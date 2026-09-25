@@ -664,6 +664,7 @@ def main() -> int:
     ap.add_argument("--server-pid", type=int)
     ap.add_argument("--only-kinds")
     ap.add_argument("--start-item", type=int, default=0, help="skip the plan's first items (a rerun of one item)")
+    ap.add_argument("--skip-items", default="", help="comma-separated plan items not to run (bisection)")
     ap.add_argument("--plan-only", action="store_true")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -679,7 +680,7 @@ def main() -> int:
     deadline = time.monotonic() + 60 * a.max_minutes
     died, items_run = False, 0
     for i, item in enumerate(plan.items):
-        if i < a.start_item:
+        if i < a.start_item or str(i) in a.skip_items.split(","):
             continue
         if time.monotonic() > deadline:
             print(f"time cap reached before item {i}", flush=True)
