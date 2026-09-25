@@ -1080,6 +1080,35 @@ def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monk
     assert syncs == [True], "an eager forward did not drain the device once armed"
 
 
+@pytest.mark.parametrize("value", [None, "", "LAZY", "eager", "DEFAULT"])
+def test_the_copy_engine_refuses_any_module_loading_but_eager(value):
+    """A kernel loaded lazily after arming fail-stopped the copy-engine soak on the same decode step every time, and
+    never under EAGER. torch sets LAZY when the variable is unset, so unset is refused too."""
+    environ = {} if value is None else {"CUDA_MODULE_LOADING": value}
+    with pytest.raises(RuntimeError, match="CUDA_MODULE_LOADING=EAGER"):
+        module.check_copy_engine_module_loading(environ)
+    module.check_copy_engine_module_loading({"CUDA_MODULE_LOADING": "EAGER"})
+
+
+def test_a_jit_library_load_drains_the_device_first_once_armed(monkeypatch):
+    """Under EAGER, tvm-ffi's load_module (sglang's load_jit, flashinfer's JIT) loads a library's kernels at once: the
+    same hazard as a Triton load, so the guard wraps it too."""
+    import sys
+
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    order = []
+    fake = SimpleNamespace(load_module=lambda path: order.append(("load", path)) or "module")
+    monkeypatch.setitem(sys.modules, "tvm_ffi", fake)
+    monkeypatch.setitem(sys.modules, "triton.runtime", None)  # no Triton: the guard must still wrap tvm-ffi
+    service._install_copy_engine_module_load_guard()
+    assert fake.load_module("a.so") == "module" and not syncs
+    service._copy_armed = True
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("sync"))
+    assert fake.load_module("b.so") == "module"
+    assert order[-2:] == ["sync", ("load", "b.so")]
+    assert service.copy_engine_module_loads == 1
+
+
 def test_a_triton_module_load_drains_the_device_first_once_armed(monkeypatch):
     """cuModuleLoadData holds the driver lock the copy thread needs and waits for the device, which may spin in a copy
     wait for that very copy (diag arm1eager83-on). The guard drains before the load, and never inside a capture."""
