@@ -10,6 +10,7 @@ Run on divix01 holding cc-gpu.lock, with PYTHONPATH pointing at the tree under t
 """
 
 import random
+import time
 
 import pytest
 import torch
@@ -129,24 +130,35 @@ def test_hits_go_to_the_copy_engine_while_s_streams_the_misses(ce):
 
 
 def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
-    """W1 polls once (no budget), usually before the service has published, and then claims nothing; S must hand the
-    COPYING lanes on rather than copy them or fail the request on them. At least one of the repetitions must take
-    that path (W1's `claimed` all zero)."""
+    """The service is paused while the chain is launched, so W1 (no budget) passes before any lane is published and
+    claims nothing; on resume the lanes are published COPYING and S must hand them to CW rather than copy them or
+    fail the request on them."""
     s = StreamService(tmp_path, copy_engine=True, hit_wait_ns=0)
     try:
         s.plan([3, 4, 5])
         s.step()
         assert s.until(lambda: _all_retired(s))
-        handed = 0
-        for _ in range(20):
+        for _ in range(5):
             s.plan([3, 4, 5])
-            snapshot = _snapshot_step(s)
+            s.host.pause(5.0)
+            s.post()
+            s.hit_wait()
+            s.copy1()
+            s.ack1()
+            s.stream()
+            s.ack2()
+            s.copy_wait()
+            s.finalize()
+            snapshot = {n: s.dest[n].clone() for n in s.names}
+            s.total()
+            time.sleep(0.01)  # W1 has long finished its one pass
+            s.host.resume()
+            torch.cuda.synchronize()
+            assert s.dev.claimed[:3].tolist() == [0, 0, 0], "W1 claimed a lane published after it ran"
             assert s.keep.item() == 1.0, (s.counters(), s.stats())
             _check(s, [3, 4, 5], snapshot)
             assert int(s.dev.go_ce.item()) == 3 and int(s.dev.go_1.item()) + int(s.dev.go_2.item()) == 0
-            handed += s.dev.claimed[:3].tolist() == [0, 0, 0]
             assert s.until(lambda: _all_retired(s))
-        assert handed > 0, "W1 claimed every lane every time: the hand-over path was never taken"
     finally:
         s.close()
 
