@@ -248,10 +248,11 @@ class Oracle(Predictor):
 class NoisyOracle(Predictor):
     """A stand-in for a predictor of known quality, to price one before building it (not deployable).
 
-    Per target layer it names ``k`` rows; each is, with probability ``precision``, one of the layer's
-    true routes that is not resident (while any remain), and otherwise a random expert that is neither
-    routed nor resident: a wrong prefetch. It reads residency, so ``precision`` is the precision of the
-    rows actually prefetched (short only where a layer has fewer true misses than hits drawn).
+    Per target layer it makes ``k`` draws; with probability ``precision`` a draw names one of the
+    layer's true routes that is not resident (or, once none is left, names nothing: a correct "no
+    prefetch"), and otherwise a random expert that is neither routed nor resident: a wrong prefetch. It
+    reads residency, so the measured precision of the rows it prefetches is at most ``precision`` (lower
+    where a layer has fewer misses than draws). At 1.0 it is the oracle; at 0.0 every row is wasted.
     """
 
     def __init__(self, stream: DecodeStream, precision: float, k: int, seed: int = 0) -> None:
@@ -270,8 +271,9 @@ class NoisyOracle(Predictor):
         missing = [e for e in routed if e not in resident]
         out = []
         for _ in range(self.k):
-            if missing and self.rng.random() < self.precision:
-                out.append(missing.pop(0))
+            if self.rng.random() < self.precision:
+                if missing:
+                    out.append(missing.pop(0))
                 continue
             while True:
                 wrong = int(self.rng.integers(NUM_EXPERTS))
