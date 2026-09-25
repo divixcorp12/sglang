@@ -58,10 +58,13 @@ def main() -> int:
         steps[corr].append((s, e, names[name]))
         graph_streams.add(stream)
     steps = sorted((sorted(v) for v in steps.values() if len(v) > 1000), key=lambda k: k[0][0])
+    # nsys 2026.3's export has no graphId on memcpy rows, only graphNodeId (NULL outside a graph).
+    cols = {r[1] for r in c.execute("pragma table_info(CUPTI_ACTIVITY_KIND_MEMCPY)")}
+    outside = "graphId = 0" if "graphId" in cols else "coalesce(graphNodeId, 0) = 0"
     copies = [
         (s, e, b)
         for s, e, b, stream, kind in c.execute(
-            "select start, end, bytes, streamId, copyKind from CUPTI_ACTIVITY_KIND_MEMCPY where graphId = 0"
+            f"select start, end, bytes, streamId, copyKind from CUPTI_ACTIVITY_KIND_MEMCPY where {outside}"
         )
         if stream not in graph_streams and kind == 1
     ]
