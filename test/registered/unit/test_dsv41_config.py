@@ -37,6 +37,7 @@ def test_defaults_match_the_env_declarations():
         enable_native_prefetch=False,
         enable_moe_side_stream=False,
         enable_layer_fusion=False,
+        enable_exl3_cast_fusion=False,
         torch_prefill_indexer=False,
         fused_wo_a=True,
     )
