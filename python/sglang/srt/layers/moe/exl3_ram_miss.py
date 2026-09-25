@@ -834,6 +834,10 @@ class Exl3RamMissService:
             )
             if self._stages_traced:
                 self._start_route_log(cache.device)
+            if self.copy_engine:
+                from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+
+                get_global_expert_distribution_recorder().register_pre_forward_observer(self._copy_engine_barrier)
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         next_row = row + 1 if row + 1 < len(self._rows) else -1
@@ -929,6 +933,12 @@ class Exl3RamMissService:
         self._arm_copy_engine()
         self._trace_step()
         self._trace_stages()
+
+    def _copy_engine_barrier(self, forward_pass_id: int, forward_batch) -> None:
+        # An eager forward may load a kernel module, and a load blocks the copy thread's cuMemcpyAsync while a decode
+        # graph in flight spins in its copy wait, until the deadline (LEASE_PROTOCOL.md 7.6): let that step end first.
+        if self._copy_armed and not forward_batch.forward_mode.is_decode():
+            torch.cuda.synchronize()
 
     def _arm_copy_engine(self) -> None:
         if not self.copy_engine or self._copy_armed or self.device_side is None:
