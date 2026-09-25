@@ -2789,6 +2789,17 @@ enum Counter : int {
   kCopyFallbacks,        // hit lanes published READY while the copy engine was armed (flag off, no table, bad slot)
   kCopyErrors,           // CUDA errors on the copy thread: the page is fatal and the leases stay held
   kCopyGenerationMismatches,  // a completed lane whose slot generation moved: fatal, CopyDone never published
+  // Native prefetch (plan 2026-09-25-dsv41-native-prefetch): advisory next-layer copies through the copy engine.
+  kPrefetchRequests,         // prefetch requests the device posted and the service read
+  kPrefetchIssued,           // ... leased and handed to the copy thread
+  kPrefetchCopied,           // ... whose copy completed and whose PrefetchDone said COPIED
+  kPrefetchSkippedUnarmed,   // skipped: the copy engine was not armed (or the service is closing)
+  kPrefetchSkippedNotReady,  // skipped: the row was not READY in the pinned tier when the service looked
+  kPrefetchSkippedInvalid,   // skipped: bad row, expert or destination slot
+  kPrefetchUsed,             // copied rows the target layer's next request routed
+  kPrefetchWasted,           // copied rows it did not route
+  kPrefetchHeld,             // prefetch jobs the copy thread held back behind a demand job
+  kPrefetchLatencyNs,        // request read to completion observed, summed over copied prefetches
   kCounterCount,
 };
 
@@ -2968,7 +2979,26 @@ struct CopyJob {
   CopyLane lanes[kLeaseLanes];
   int64_t submit_ns = 0;
   int64_t token = -1;  // the backend's completion marker, recorded after the job's last copy
+  bool prefetch = false;  // a native-prefetch job: issued only behind demand jobs, completed into PrefetchDone
 };
+
+// ---- Native prefetch page (plan 2026-09-25-dsv41-native-prefetch) ----
+// A pinned 256-byte page beside the lease block. The device (the plan kernel) writes the request line, the service
+// the done line. The device posts one request and waits for its done word before it posts the next, so one request
+// line is enough; `gen` is the device's 56-bit prefetch counter, tagged kPfTagRequest.
+constexpr int64_t kPfReqGen = 0;      // u64 tagged(kPfTagRequest, gen), stored last with a release
+constexpr int64_t kPfReqRow = 8;      // i32 streamed row of the target layer
+constexpr int64_t kPfReqExpert = 12;  // i32 expert
+constexpr int64_t kPfReqDst = 16;     // i32 destination hot slot of the target layer
+constexpr int64_t kPfDoneGen = 128;   // u64 tagged(kPfTagCopied | kPfTagSkipped, gen), service-written
+constexpr int64_t kPfDoneReason = 136;  // u32, why a request was skipped (kPfSkip*), stored before kPfDoneGen
+constexpr int64_t kPrefetchPageBytes = 256;
+constexpr uint64_t kPfTagRequest = 1;
+constexpr uint64_t kPfTagCopied = 1;
+constexpr uint64_t kPfTagSkipped = 2;
+constexpr uint32_t kPfSkipUnarmed = 1;
+constexpr uint32_t kPfSkipNotReady = 2;
+constexpr uint32_t kPfSkipInvalid = 3;
 
 // One entry of a row's copy table: C1's (source slab, destination tensor, row bytes); lane rows index both.
 struct CopyEntry {
@@ -3274,6 +3304,7 @@ class CopyEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     std::deque<CopyJob> in_flight;
+    std::deque<CopyJob> held;  // prefetch jobs not yet issued: demand goes first on the link
     int64_t last_active = now_ns();
     while (true) {
       std::deque<CopyJob> fresh;
@@ -3285,18 +3316,29 @@ class CopyEngine {
         stopping = stop_;
         drain_deadline = drain_deadline_;
       }
+      bool demand_fresh = false;
       for (CopyJob& job : fresh) {
-        if (broken_ != 0) {
-          finish_failed(job, broken_);
+        if (job.prefetch) {
+          held.push_back(job);
           continue;
         }
-        const int error_code = issue(job);
-        if (error_code != 0) {
-          broken_ = error_code;
-          finish_failed(job, error_code);
-          continue;
-        }
-        in_flight.push_back(job);
+        demand_fresh = true;
+        issue_or_fail(job, in_flight);
+      }
+      // Demand before prefetch: a prefetch is issued only when no demand job arrived this pass and none is in flight,
+      // so a mispredicted row never sits on the copy stream ahead of a demand row. Once issued it cannot be preempted;
+      // the device never posts a demand while its own layer's prefetch is outstanding, so none can queue behind it.
+      bool demand_in_flight = false;
+      for (const CopyJob& job : in_flight) demand_in_flight = demand_in_flight || !job.prefetch;
+      if (!held.empty() && (demand_fresh || demand_in_flight)) {
+        if (!held_counted_) counters_[kPrefetchHeld].fetch_add(1);
+        held_counted_ = true;
+      }
+      while (!held.empty() && ((!demand_fresh && !demand_in_flight) || stopping)) {
+        held_counted_ = false;
+        CopyJob job = held.front();
+        held.pop_front();
+        issue_or_fail(job, in_flight);
       }
       bool progressed = !fresh.empty();
       while (!in_flight.empty() && broken_ == 0) {
@@ -3319,10 +3361,10 @@ class CopyEngine {
           in_flight.pop_front();
         }
       }
-      if (stopping && (in_flight.empty() || now_ns() > drain_deadline)) break;
+      if (stopping && held.empty() && (in_flight.empty() || now_ns() > drain_deadline)) break;
       if (progressed) {
         last_active = now_ns();
-      } else if (!in_flight.empty() || now_ns() - last_active < spin_ns_) {
+      } else if (!in_flight.empty() || !held.empty() || now_ns() - last_active < spin_ns_) {
         _mm_pause();
       } else {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -3330,6 +3372,20 @@ class CopyEngine {
       }
     }
     backend_->shutdown(in_flight.empty() && broken_ == 0);
+  }
+
+  void issue_or_fail(CopyJob& job, std::deque<CopyJob>& in_flight) {
+    if (broken_ != 0) {
+      finish_failed(job, broken_);
+      return;
+    }
+    const int error_code = issue(job);
+    if (error_code != 0) {
+      broken_ = error_code;
+      finish_failed(job, error_code);
+      return;
+    }
+    in_flight.push_back(job);
   }
 
   int issue(CopyJob& job) {
@@ -3390,6 +3446,7 @@ class CopyEngine {
   bool started_ = false;
   std::string init_error_;
   int broken_ = 0;  // copy thread only: the first backend error
+  bool held_counted_ = false;  // copy thread only: the current hold was counted in kPrefetchHeld
   std::atomic<uint64_t> ballast_dst_{0};
   std::atomic<uint64_t> ballast_src_{0};
   std::atomic<int64_t> ballast_bytes_{0};
@@ -3508,6 +3565,7 @@ class RamTier {
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
     Request request;
     if (read_record(record, next_demand_, &request)) {
+      judge_prefetch(request);
       const bool gpu_hot = gpu_hot_mode_.load() && request.armed;
       const bool hot_ok = !gpu_hot ||
           (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
@@ -3757,6 +3815,84 @@ class RamTier {
   void arm_copy_engine(bool on) {
     if (on && copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
     copy_armed_.store(on, std::memory_order_release);
+  }
+
+  // Native prefetch (plan 2026-09-25-dsv41-native-prefetch): serve the device's advisory next-layer copy requests
+  // from `page` (kPrefetchPageBytes, pinned). Needs the copy engine; before the service thread starts.
+  void enable_native_prefetch(uint8_t* page) {
+    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: enable native prefetch before the service thread starts");
+    if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: native prefetch needs the copy engine");
+    if (page == nullptr) throw std::runtime_error("exl3 RAM miss: native prefetch needs its page");
+    prefetch_page_ = page;
+    last_prefetch_gen_ = generation_of(load_acquire64(page + kPfReqGen));
+    judge_.assign(static_cast<size_t>(layers_), PrefetchJudge{});
+  }
+
+  // Serve the device's posted prefetch request, if a new one is there. True when it handled one. Called after
+  // pump_demand, so a demand posted meanwhile is always served first. A prefetch never reads NVMe: a row that is not
+  // READY in the pinned tier is skipped. A served one leases its pinned slot like a COPYING lane and is handed to the
+  // copy thread; only that thread's observed completion publishes COPIED and releases the lease.
+  bool pump_prefetch() {
+    if (prefetch_page_ == nullptr) return false;
+    const uint64_t word = load_acquire64(prefetch_page_ + kPfReqGen);
+    if (tag_of(word) != kPfTagRequest) return false;
+    const uint64_t gen = generation_of(word);
+    if (gen == last_prefetch_gen_) return false;
+    int32_t row = -1, expert = -1, dst = -1;
+    std::memcpy(&row, prefetch_page_ + kPfReqRow, 4);
+    std::memcpy(&expert, prefetch_page_ + kPfReqExpert, 4);
+    std::memcpy(&dst, prefetch_page_ + kPfReqDst, 4);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (load_acquire64(prefetch_page_ + kPfReqGen) != word) return false;  // rewritten under us: read it again
+    last_prefetch_gen_ = gen;
+    counters_[kPrefetchRequests].fetch_add(1);
+    const int64_t read_ns = now_ns();
+    uint32_t skip = 0;
+    CopyJob job;
+    if (admission_closed_.load() || copy_engine_ == nullptr || !copy_armed_.load(std::memory_order_acquire) ||
+        load_acquire(page_ + kFatal) != 0) {
+      skip = kPfSkipUnarmed;
+    } else if (row < 0 || row >= layers_ || expert < 0 || expert >= experts_ || !copy_engine_->eligible(row, dst)) {
+      skip = kPfSkipInvalid;
+    } else {
+      std::lock_guard<std::mutex> guard(mutex_);
+      Tier& tier = tiers_[row];
+      const int32_t slot = tier.expert_slot[expert];
+      if (slot < 0 || tier.state[slot] != kReady || tier.slot_to_expert[slot] != expert || prefetch_lease_.active) {
+        skip = kPfSkipNotReady;
+      } else {
+        tier.leases[slot] += 1;  // E1: the slot is neither evicted nor rewritten while the copy may read it
+        tier.stamp[slot] = ++tick_;
+        prefetch_lease_ = PrefetchLease{true, gen, row, slot, tier.generation[slot], expert};
+        job.gen = gen;
+        job.idx = -1;
+        job.row = row;
+        job.mask = 1u;
+        job.count = 1;
+        job.lanes[0] = CopyLane{0, slot, dst, tier.generation[slot]};
+        job.submit_ns = read_ns;
+        job.prefetch = true;
+      }
+    }
+    if (skip != 0) {
+      counters_[skip == kPfSkipUnarmed    ? kPrefetchSkippedUnarmed
+                : skip == kPfSkipNotReady ? kPrefetchSkippedNotReady
+                                          : kPrefetchSkippedInvalid]
+          .fetch_add(1);
+      publish_prefetch_done(kPfTagSkipped, gen, skip);
+      return true;
+    }
+    counters_[kPrefetchIssued].fetch_add(1);
+    copy_engine_->submit(job);
+    return true;
+  }
+
+  // Test only: the service's prefetch lease, {active, row, slot}.
+  void prefetch_lease(int64_t* out) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    out[0] = prefetch_lease_.active ? 1 : 0;
+    out[1] = prefetch_lease_.row;
+    out[2] = prefetch_lease_.slot;
   }
 
   // Every job handed to the copy thread has completed (or failed) and been retired.
@@ -4216,6 +4352,10 @@ class RamTier {
   // Copy thread. Completion was observed, so no copy of this job reads its slots any more: publish CopyDone, then
   // release. A leased slot's generation cannot move (E1); if one did, the bytes are not the lease's, so fail stop.
   void copy_completed(const CopyJob& job) {
+    if (job.prefetch) {
+      prefetch_completed(job);
+      return;
+    }
     const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
     for (int i = 0; i < job.count; ++i) {
       const CopyLane& lane = job.lanes[i];
@@ -4244,6 +4384,56 @@ class RamTier {
     bool open = entry.grants_pending;
     for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
     if (!open) entry.active = false;
+  }
+
+  // Copy thread, a prefetch job: the same E6 check as a COPYING lane, then the judge entry for the target's next
+  // request and COPIED, then the lease release (all after the observed completion). A mismatch fails stop and
+  // publishes nothing, so the device's wait for this request ends only on the fatal word.
+  void prefetch_completed(const CopyJob& job) {
+    const CopyLane& lane = job.lanes[0];
+    const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
+    if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
+      counters_[kCopyGenerationMismatches].fetch_add(1);
+      raise_fatal(static_cast<uint32_t>(job.gen));
+      return;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!prefetch_lease_.active || prefetch_lease_.gen != job.gen) {
+      counters_[kCopyErrors].fetch_add(1);
+      raise_fatal(static_cast<uint32_t>(job.gen));
+      return;
+    }
+    Tier& tier = tiers_[prefetch_lease_.row];
+    if (tier.leases[prefetch_lease_.slot] == 0) {
+      counters_[kCopyErrors].fetch_add(1);
+      raise_fatal(static_cast<uint32_t>(job.gen));
+      return;
+    }
+    judge_[job.row] = PrefetchJudge{true, prefetch_lease_.expert};
+    counters_[kPrefetchCopied].fetch_add(1);
+    counters_[kPrefetchLatencyNs].fetch_add(now_ns() - job.submit_ns);
+    publish_prefetch_done(kPfTagCopied, job.gen, 0);
+    tier.leases[prefetch_lease_.slot] -= 1;
+    lease_changes_.fetch_add(1);  // a demand deferred on this slot may retry
+    prefetch_lease_.active = false;
+  }
+
+  void publish_prefetch_done(uint64_t tag, uint64_t gen, uint32_t reason) {
+    store_release(prefetch_page_ + kPfDoneReason, reason);
+    store_release64(prefetch_page_ + kPfDoneGen, tagged_word(tag, gen));
+  }
+
+  // Service thread, every record read: the first request of a row after a COPIED prefetch into it says whether the
+  // row was routed. Every layer posts a record per forward (touch-only when it misses nothing), so each copied row
+  // is judged by its target layer's own forward.
+  void judge_prefetch(const Request& request) {
+    if (prefetch_page_ == nullptr || request.row < 0 || request.row >= layers_) return;
+    std::lock_guard<std::mutex> guard(mutex_);
+    PrefetchJudge& judge = judge_[request.row];
+    if (!judge.pending) return;
+    judge.pending = false;
+    const bool used = listed(request.protect, judge.expert) || listed(request.need, judge.expert);
+    counters_[used ? kPrefetchUsed : kPrefetchWasted].fetch_add(1);
   }
 
   // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
@@ -4778,6 +4968,25 @@ class RamTier {
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
   std::unique_ptr<CopyEngine> copy_engine_;
   std::atomic<bool> copy_armed_{false};
+  // Native prefetch: the page (null when off), the last request generation read (service thread), the one lease a
+  // prefetch holds (at most one is outstanding: the device waits for its done word before posting the next), and per
+  // row the copied expert its next request judges. The last two are guarded by mutex_.
+  struct PrefetchLease {
+    bool active = false;
+    uint64_t gen = 0;
+    int64_t row = 0;
+    int32_t slot = -1;
+    uint32_t slot_generation = 0;
+    int32_t expert = -1;
+  };
+  struct PrefetchJudge {
+    bool pending = false;
+    int32_t expert = -1;
+  };
+  uint8_t* prefetch_page_ = nullptr;
+  uint64_t last_prefetch_gen_ = 0;
+  PrefetchLease prefetch_lease_;
+  std::vector<PrefetchJudge> judge_;
   // Piece streaming: serve()'s readiness words per row it reads, reused every request (like packed_).
   std::vector<PieceTarget> piece_targets_;
   PiecePublish piece_publish_;
@@ -4890,11 +5099,13 @@ int64_t exl3_ram_miss_open(
 // Defined after RamThread (the service thread block below).
 void exl3_ram_miss_close(int64_t handle);
 
-// 1 served a demand record, 2 an advisory record, 0 nothing posted. Refused while a thread pumps.
+// 1 served a demand record, 3 a native-prefetch request, 2 an advisory record, 0 nothing posted. Refused while a
+// thread pumps. The order is the service thread's: demand, prefetch, advisory.
 int64_t exl3_ram_miss_pump(int64_t handle) {
   const auto tier = exl3_ram_miss::find(handle);
   if (tier->threaded()) throw std::runtime_error("exl3 RAM miss: pump() while the service thread runs");
   if (tier->pump_demand()) return 1;
+  if (tier->pump_prefetch()) return 3;
   return tier->pump_advice() ? 2 : 0;
 }
 
@@ -4977,6 +5188,18 @@ void exl3_ram_miss_set_copy_table(int64_t handle, int64_t row, TensorView entrie
 
 void exl3_ram_miss_arm_copy_engine(int64_t handle, int64_t on) {
   exl3_ram_miss::find(handle)->arm_copy_engine(on != 0);
+}
+
+// page: pinned uint8 [kPrefetchPageBytes], the native-prefetch request and done lines.
+void exl3_ram_miss_enable_native_prefetch(int64_t handle, TensorView page) {
+  if (page.dim() != 1 || page.size(0) != exl3_ram_miss::kPrefetchPageBytes)
+    throw std::runtime_error("exl3 RAM miss: the native prefetch page must be uint8 [256]");
+  exl3_ram_miss::find(handle)->enable_native_prefetch(static_cast<uint8_t*>(page.data_ptr()));
+}
+
+// Test only: out int64 [3] = {active, row, slot} of the service's prefetch lease.
+void exl3_ram_miss_prefetch_lease(int64_t handle, TensorView out) {
+  exl3_ram_miss::find(handle)->prefetch_lease(static_cast<int64_t*>(out.data_ptr()));
 }
 
 int64_t exl3_ram_miss_copy_engine_idle(int64_t handle, int64_t timeout_ns) {
@@ -5208,6 +5431,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_enable_copy_engine, exl3_ram_miss_en
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_copy_table, exl3_ram_miss_set_copy_table);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_arm_copy_engine, exl3_ram_miss_arm_copy_engine);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_idle, exl3_ram_miss_copy_engine_idle);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_enable_native_prefetch, exl3_ram_miss_enable_native_prefetch);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_prefetch_lease, exl3_ram_miss_prefetch_lease);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_release, exl3_ram_miss_copy_engine_release);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_fail, exl3_ram_miss_copy_engine_fail);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_marked, exl3_ram_miss_copy_engine_marked);
@@ -5355,7 +5580,7 @@ class RamThread {
         paused_.store(false);
         continue;
       }
-      if (tier_->pump_demand() || tier_->pump_advice()) {
+      if (tier_->pump_demand() || tier_->pump_prefetch() || tier_->pump_advice()) {
         last_active = now_ns();
         iterations = 0;  // one heartbeat per request served
         continue;

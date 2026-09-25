@@ -30,6 +30,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_ram_miss_piece_stream: bool
     enable_ram_miss_row_images: bool
     enable_ram_miss_copy_engine: bool
+    enable_native_prefetch: bool
     torch_prefill_indexer: bool
 
     @classmethod
@@ -54,5 +55,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_ram_miss_piece_stream=envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.get(),
             enable_ram_miss_row_images=envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES.get(),
             enable_ram_miss_copy_engine=envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
+            enable_native_prefetch=envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
         )

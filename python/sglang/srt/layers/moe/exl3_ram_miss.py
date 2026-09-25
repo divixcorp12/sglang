@@ -644,6 +644,8 @@ class Exl3RamMissService:
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
+        # SGLANG_DSV41_ENABLE_NATIVE_PREFETCH (exl3_native_prefetch.py): needs the copy engine; None when off.
+        self.native_prefetch = None
         self.hit_wait_ns = 100_000
         self.hot_page = None
         self.gpu_hot_enabled = False
@@ -732,6 +734,19 @@ class Exl3RamMissService:
                         "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"
                     )
                 host.enable_copy_engine(torch.cuda.current_device())  # before the thread starts; unarmed
+            native_prefetch = None
+            if cfg.enable_native_prefetch:
+                if not copy_engine:
+                    raise RuntimeError(
+                        "exl3 RAM miss: SGLANG_DSV41_ENABLE_NATIVE_PREFETCH needs "
+                        "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE: the prefetch copies run on the copy engine"
+                    )
+                from sglang.kernels.ops.moe.exl3_ram_miss import new_prefetch_page
+                from sglang.srt.layers.moe.exl3_native_prefetch import NativePrefetch
+
+                prefetch_page = new_prefetch_page(pin=pin)
+                host.enable_native_prefetch(prefetch_page)  # before the thread starts
+                native_prefetch = NativePrefetch(prefetch_page, self)
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
@@ -751,6 +766,7 @@ class Exl3RamMissService:
         self.two_phase = two_phase
         self.piece_stream = piece_stream
         self.copy_engine = copy_engine
+        self.native_prefetch = native_prefetch
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
@@ -801,9 +817,13 @@ class Exl3RamMissService:
             manager.register_fail_stop_check(self.fail_stop_check)
             updater = getattr(manager, "gpu_residency", None)
             if updater is None or not updater.insert_direct:
+                if self.native_prefetch is not None:
+                    raise RuntimeError("exl3 native prefetch needs the GPU residency updater at DIRECT insert-on-miss")
                 manager.add_residency_listener(self.on_residency)
             else:
                 self._enable_gpu_hot(updater)
+                if self.native_prefetch is not None:
+                    self.native_prefetch.bind(updater)
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
@@ -836,6 +856,8 @@ class Exl3RamMissService:
                 piece_stream=self.piece_stream,
                 piece_runs=self.host.piece_runs() if self.piece_stream else None,
             )
+            # Every layer's backend reaches the prefetch hooks through its device side (Exl3MoEMethod._apply_graph).
+            self.device_side.native_prefetch = self.native_prefetch
             if self._stages_traced:
                 self._start_route_log(cache.device)
             if self.copy_engine:
@@ -936,6 +958,8 @@ class Exl3RamMissService:
                 f"(thread {self.host.counters()}); fail-stop"
             )
         self._arm_copy_engine()
+        if self.native_prefetch is not None:
+            self.native_prefetch.poll_counters()
         self._trace_step()
         self._trace_stages()
 
@@ -952,6 +976,8 @@ class Exl3RamMissService:
         if not self.copy_engine or self._copy_armed or self.device_side is None:
             return
         if self._copy_decodes >= COPY_ENGINE_ARM_DECODES:
+            if self.native_prefetch is not None:
+                self.native_prefetch.check_armable()  # its kernels are in the graph, so loaded, before arming
             self.host.arm_copy_engine()
             self._copy_armed = True
             logger.info("exl3 RAM miss copy engine armed after %d decode forwards since capture", self._copy_decodes)

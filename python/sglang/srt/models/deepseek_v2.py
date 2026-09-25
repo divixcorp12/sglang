@@ -643,6 +643,11 @@ class DeepseekV2MoE(nn.Module):
             is_deepseek_v4=is_deepseek_v4,
             vl_correction_bias=vl_correction_bias,
         )
+        if is_deepseek_v4 and not is_nextn and envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get():
+            from sglang.srt.layers.moe.exl3_native_prefetch import register_gate
+
+            # Layer T-1 scores layer T's gate on its own router input (native next-layer prefetch).
+            register_gate(layer_id, self.gate)
 
         # scaling factor for fused shared experts on AMD-platform.
         # DeepEP/MegaMOE doesn't need this: shared expert is only computed on home rank

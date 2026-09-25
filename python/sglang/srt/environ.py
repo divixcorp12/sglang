@@ -1897,6 +1897,12 @@ class Envs:
     # Captured decode graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in
     # flight can still deadlock it into a fail-stop (7.6 "Module loading"). Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
+    # Native next-layer prefetch (plan 2026-09-25-dsv41-native-prefetch): in each captured decode layer T-1, after its
+    # gather, layer T's own router gate scores layer T-1's router input; the best top-6 expert of T that is neither in
+    # VRAM nor missing from the pinned tier is copied into one of T's hot slots by the copy engine, and layer T waits
+    # for that copy before its gather reads residency. Residency only, never the math. Needs the copy engine (refused
+    # without it). Read once at service start. Off by default.
+    SGLANG_DSV41_ENABLE_NATIVE_PREFETCH = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

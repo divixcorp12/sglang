@@ -144,7 +144,7 @@ class StreamService:
 
     def __init__(
         self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2, layers=LAYERS,
-        row=0, copy_engine=False,
+        row=0, copy_engine=False, native_prefetch=False,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -180,6 +180,12 @@ class StreamService:
                 self.host.enable_piece_stream()
             if copy_engine:
                 self.host.enable_copy_engine(torch.cuda.current_device())
+            self.prefetch_page = None
+            if native_prefetch:  # the native-prefetch request and done lines (test_exl3_native_prefetch_cuda.py)
+                from sglang.kernels.ops.moe.exl3_ram_miss import new_prefetch_page
+
+                self.prefetch_page = new_prefetch_page(pin=True)
+                self.host.enable_native_prefetch(self.prefetch_page)
             self.host.start_thread(fatal_wait_s=60.0)
             self.dev = Exl3RamMissDevice(
                 self.page, self.slot_map, device="cuda", layers=layers, timeout_ms=timeout_ms, advise=False,
