@@ -101,6 +101,10 @@ WEIGHTS_AND_OVERHEAD_MIB = 12288  # ~9.94 GiB of weights, plus slack
 
 HEALTH_TIMEOUT_S = 900  # /health runs a real generation; slow cold. Never shorten this.
 
+# Production serves the base recipe unchanged on all interfaces; launch_prod.sh is its only launcher.
+PROD_PORT = 7867
+PROD_HOST = "0.0.0.0"
+
 
 def base_env() -> dict[str, str]:
     """The option-C EXL3 recipe env, before a V2 storage-change override is applied."""
@@ -175,12 +179,17 @@ def arm_env(overrides: dict[str, str]) -> dict[str, str]:
 
 class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     port: int
+    host: str = "127.0.0.1"
     # ServerArgs default is 40. Not part of smoke.sh's flag set; exists so
     # decode_log_interval_compare.sh can override it per arm without touching the
     # base recipe. See README "One harness, not two", option 2: a genuine
     # engine-side step-latency source, with an unmeasured observer-effect risk at
     # interval=1 that this override exists to measure, not to assume.
     decode_log_interval: int | None = None
+
+    @classmethod
+    def prod(cls) -> "ServerArgs":
+        return cls(port=PROD_PORT, host=PROD_HOST)
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
         """The smoke-validated launch, updated to production's context and cache mode."""
@@ -191,7 +200,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--model-path",
             MODEL_PATH,
             "--host",
-            "127.0.0.1",
+            self.host,
             "--port",
             str(self.port),
             "--context-length",

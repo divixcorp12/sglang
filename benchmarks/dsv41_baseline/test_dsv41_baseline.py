@@ -985,6 +985,29 @@ def test_server_args_matches_current_context_and_prefix_cache_mode():
     assert session_subset.CONTEXT_LENGTH == arm_env.CONTEXT_LENGTH
 
 
+def test_server_args_binds_loopback_by_default():
+    argv = arm_env.ServerArgs(port=31050).argv()
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+
+
+def test_prod_server_args_serve_the_base_recipe_on_port_7867_on_all_interfaces():
+    prod = arm_env.ServerArgs.prod().argv()
+    arm = arm_env.ServerArgs(port=arm_env.PROD_PORT).argv()
+    assert prod[prod.index("--host") + 1] == "0.0.0.0"
+    assert prod[prod.index("--port") + 1] == "7867"
+    # Everything but the bind address matches a benchmark arm on the same port.
+    i = prod.index("--host") + 1
+    assert prod[:i] + prod[i + 1 :] == arm[:i] + arm[i + 1 :]
+
+
+def test_launch_prod_uses_the_base_recipe_without_overrides():
+    script = open(os.path.join(os.path.dirname(__file__), "launch_prod.sh")).read()
+    assert "arm_env.base_env()" in script
+    assert "arm_env.ServerArgs.prod().argv()" in script
+    assert "overrides" not in script
+    assert "flock --nonblock 9" in script
+
+
 def test_server_args_omits_decode_log_interval_by_default():
     argv = arm_env.ServerArgs(port=31050).argv()
     assert "--decode-log-interval" not in argv
