@@ -1917,6 +1917,11 @@ class Envs:
     # chunk waits only for its own rows. Needs SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES and the native slot table
     # (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when the service starts. Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_FILLS = EnvBool(False)
+    # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
+    # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own
+    # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
+    # Off by default.
+    SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

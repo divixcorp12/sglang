@@ -31,7 +31,7 @@ from sglang.kernels.ops.moe.exl3_ram_miss import (
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, RowSegment
+from sglang.srt.layers.moe.exl3_expert_format import EXL3_MAX_GATHER_ROWS, EXL3_STREAMED_NAMES, RowSegment
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
 from sglang.srt.layers.moe.exl3_row_image import RowImageSet
@@ -584,6 +584,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 # (7.6). Counting batches instead armed inside the server's 8-token warm-up request, whose first decode steps then
 # deadlocked (smokes abba1-on at 4 batches, diag arm1-on at 1). 16 covers the warm-up; arbitrary beyond that.
 COPY_ENGINE_ARM_DECODES = 16
+# The prefill share: one eager gather chunk, the most rows gather_rows protects at once (the replay's best bound,
+# analysis/dsv41-drive/prefill-evict/ram_replay.py).
+PREFILL_SHARE_ROWS = EXL3_MAX_GATHER_ROWS
 
 # The copy engine needs every kernel of every library loaded before it arms (LEASE_PROTOCOL.md 7.6, "Module loading").
 # Under LAZY (torch's default) a kernel loads at its first launch, and a first launch after arming can stop the copy
@@ -788,6 +791,20 @@ class Exl3RamMissService:
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
+            share_recorder = None
+            if cfg.enable_prefill_share:
+                from sglang.srt.eplb.expert_distribution import (
+                    _ExpertDistributionRecorderNoop,
+                    get_global_expert_distribution_recorder,
+                )
+
+                share_recorder = get_global_expert_distribution_recorder()
+                if isinstance(share_recorder, _ExpertDistributionRecorderNoop):
+                    # The no-op recorder drops pre-forward observers: the share would never be set.
+                    raise RuntimeError(
+                        "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
+                        "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
+                    )
             host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
             fault = parse_fault(cfg.ram_miss_fault)
             if fault is not None:
@@ -813,6 +830,8 @@ class Exl3RamMissService:
         # finalizers detached before they could unregister them. Move this earlier and the quarantine is silently undone.
         atexit.register(_quarantine_service_at_exit, weakref.ref(self))
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
+        if share_recorder is not None:
+            share_recorder.register_pre_forward_observer(self._set_prefill_share)
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s, "
             "row images %s, copy engine %s",
@@ -1001,6 +1020,11 @@ class Exl3RamMissService:
             self.native_prefetch.poll_counters()
         self._trace_step()
         self._trace_stages()
+
+    def _set_prefill_share(self, forward_pass_id: int, forward_batch) -> None:
+        """SGLANG_DSV41_ENABLE_PREFILL_SHARE's pre-forward observer: a prefill's pinned-tier admissions own at most
+        PREFILL_SHARE_ROWS rows per layer (then they evict their own), a decode forward's own none."""
+        self.host.set_prefill_share(0 if forward_batch.forward_mode.is_decode() else PREFILL_SHARE_ROWS)
 
     def _copy_engine_barrier(self, forward_pass_id: int, forward_batch) -> None:
         # An eager forward may load a kernel module, and a load blocks the copy thread's cuMemcpyAsync while a decode
