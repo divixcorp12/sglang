@@ -109,13 +109,17 @@ def load_forwards(path: str, *, allow_dropped: bool = False) -> dict:
         raise ValueError(f"{path}: the route reader lost {dropped} graph forwards; the run cannot be replayed")
     layer_ids = header["layer_ids"]
     hot_layer_ids = header.get("hot_layer_ids") or []
+    # A graph replay the capture code runs itself has no pre-forward stamp (pass id -1) and runs no
+    # Python, so GraphRouteLog.warmup cannot count it: it is a capture forward, not serving.
+    stamped = any(line.get("forward_pass_id", -1) >= 0 for line in graph)
     events = []
     for line in graph:
         hot = line.get("hot")
+        unstamped = stamped and line.get("forward_pass_id", -1) < 0
         events.append(((line["seq"], 1), {
             "kind": "graph",
             "seq": line["seq"],
-            "phase": line.get("phase", "decode"),
+            "phase": "capture" if unstamped else line.get("phase", "decode"),
             "tokens": line.get("forward_tokens", 1),
             "rids": line.get("rids", []),
             "forward_pass_id": line.get("forward_pass_id"),
@@ -342,6 +346,8 @@ def replay_direct(
     out = {"decode_tokens": 0, "vram_misses": 0, "measured_vram_misses": 0, "per_forward": [],
            "hot_checked": 0, "hot_mismatched": 0, "first_hot_mismatch": None}
     for forward in loaded["forwards"]:
+        if forward["phase"] == "capture":
+            continue  # its dummy routes' inserts are in the startup state, not in the replay's scope
         if forward["kind"] == "graph":
             if forward.get("hot") is not None:
                 for layer, experts in forward["hot"].items():
