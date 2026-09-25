@@ -58,11 +58,324 @@ NVME_MS = {"nvme2": 7.0, "x4": 3.4}
 MAX_GATHER_ROWS = EXL3_MAX_GATHER_ROWS
 
 
+# Lines that are not forward calls: stage timing, and the graph route log that load_forwards reads.
+_NOT_CALLS = ("ram_miss_request", "graph_routes", "graph_routes_header")
+
+
 def load_trace(path: str) -> list[dict]:
     with open(path) as f:
         lines = [json.loads(line) for line in f if line.strip()]
-    # Only forward calls and graph steps: a ram_miss_request line is stage timing, not a call.
-    return [line for line in lines if line.get("kind") != "ram_miss_request"]
+    # Only forward calls and graph steps.
+    return [line for line in lines if line.get("kind") not in _NOT_CALLS]
+
+
+def load_forwards(path: str, *, allow_dropped: bool = False) -> dict:
+    """Every serving forward of a trace with graph routes, in execution order.
+
+    A replayed decode graph writes one ``graph_routes`` line per forward (GraphRouteLog): its routed
+    experts per streamed layer, the misses its gathers found and, when logged, the hot set each layer
+    held as it started. Eager forwards (prefill) write their per-layer calls, each stamped with
+    ``graph_seq``, the graph forwards that ran before it. ``phase`` is the scheduler's forward mode
+    where the trace has it (``decode``, ``extend``...); only a trace without it falls back to one token
+    meaning decode. A run whose reader lost entries (``dropped_before``) is refused unless
+    ``allow_dropped``: its replay would silently miss accesses.
+
+    Returns ``run``, ``layer_ids``, ``hot_capacity`` per layer, ``hot_layer_ids``, ``dropped`` and
+    ``forwards``, each ``{"kind": "graph"|"eager", "phase", "tokens", "rids", "forward_pass_id",
+    "misses": {layer: n}}`` plus, for a graph forward, ``seq``, ``routes: {layer: [ids]}`` and ``hot:
+    {layer: [ids]}`` (or None), and for an eager one ``forward`` and ``counts: {layer: (ids, counts)}``.
+    """
+    headers = []
+    graph, eager, dropped = [], {}, 0
+    with open(path) as f:
+        for text in f:
+            if not text.strip():
+                continue
+            line = json.loads(text)
+            kind = line.get("kind")
+            if kind == "graph_routes_header":
+                headers.append(line)
+            elif kind == "graph_routes":
+                graph.append(line)
+                dropped += line.get("dropped_before", 0)
+            elif kind is None and "tokens" in line:
+                eager.setdefault(line["forward"], []).append(line)
+    if not headers:
+        raise ValueError(f"{path} has no graph route log (a trace from before GraphRouteLog, or trace off)")
+    if len({header.get("run") for header in headers}) != 1:
+        raise ValueError(f"{path} holds more than one run's route log; split it by run first")
+    header = headers[0]
+    if dropped and not allow_dropped:
+        raise ValueError(f"{path}: the route reader lost {dropped} graph forwards; the run cannot be replayed")
+    layer_ids = header["layer_ids"]
+    hot_layer_ids = header.get("hot_layer_ids") or []
+    # A graph replay the capture code runs itself has no pre-forward stamp (pass id -1) and runs no
+    # Python, so GraphRouteLog.warmup cannot count it: it is a capture forward, not a served token.
+    # replay_direct skips it.
+    stamped = any(line.get("forward_pass_id", -1) >= 0 for line in graph)
+    events = []
+    for line in graph:
+        hot = line.get("hot")
+        unstamped = stamped and line.get("forward_pass_id", -1) < 0
+        events.append(((line["seq"], 1), {
+            "kind": "graph",
+            "seq": line["seq"],
+            "phase": "capture" if unstamped else line.get("phase", "decode"),
+            "tokens": line.get("forward_tokens", 1),
+            "rids": line.get("rids", []),
+            "forward_pass_id": line.get("forward_pass_id"),
+            "routes": dict(zip(layer_ids, line["routes"])),
+            "misses": dict(zip(layer_ids, line["misses"])),
+            "hot": dict(zip(hot_layer_ids, hot)) if hot is not None else None,
+        }))
+    for forward, calls in eager.items():
+        seqs = {call.get("graph_seq") for call in calls}
+        if None in seqs or len(seqs) != 1:
+            raise ValueError(f"eager forward {forward} lacks a single graph_seq stamp")
+        first = calls[0]
+        tokens = first["tokens"]
+        events.append(((seqs.pop(), 0, forward), {
+            "kind": "eager",
+            "forward": forward,
+            "phase": first.get("phase", "decode" if tokens == 1 else "extend"),
+            "tokens": tokens,
+            "rids": first.get("rids", []),
+            "forward_pass_id": first.get("forward_pass_id"),
+            "counts": {call["layer"]: (call["experts"], call["counts"]) for call in calls},
+            "misses": {call["layer"]: call["vram_miss"] for call in calls},
+        }))
+    events.sort(key=lambda event: event[0])
+    seqs = [line["seq"] for line in graph]
+    if len(set(seqs)) != len(seqs):
+        raise ValueError("a graph forward was logged twice")
+    passes = [event["forward_pass_id"] for _, event in events if event["forward_pass_id"] not in (None, -1)]
+    if passes != sorted(passes):
+        raise ValueError("forward pass ids are out of execution order: the pre-forward stamp and the ring disagree")
+    return {
+        "run": header.get("run"),
+        "schema": header.get("schema", 0),
+        "layer_ids": layer_ids,
+        "hot_capacity": dict(zip(layer_ids, header["hot_capacity"])),
+        "hot_layer_ids": hot_layer_ids,
+        "dropped": dropped,
+        "forwards": [event for _, event in events],
+    }
+
+
+def direct_hot_allocation(
+    slots: int, layer_ids: list[int], num_experts: int, floor: int, seed: Optional[np.ndarray] = None
+) -> dict[int, list[int]]:
+    """ExpertHotCacheManager.from_model's startup residency under stage DIRECT, equal-size rows, no clamp.
+
+    Every layer first takes ``floor`` (twice its graph-gather rows) of its own best experts; the rest
+    of the budget goes by seed count, ties to the lower expert, then the lower layer. Without a seed
+    that is experts 0, 1, ... in every layer, and the remainder lands on the lowest layer ids.
+    """
+    candidates = sorted(
+        (-(float(seed[layer, expert]) if seed is not None else 1.0), expert, layer)
+        for layer in layer_ids
+        for expert in range(num_experts)
+    )
+    chosen: dict[int, list[int]] = {layer: [] for layer in layer_ids}
+    used = 0
+    for floor_pass in (True, False):
+        for _, expert, layer in candidates:
+            if used >= slots:
+                break
+            if expert in chosen[layer] or (floor_pass and len(chosen[layer]) >= floor):
+                continue
+            chosen[layer].append(expert)
+            used += 1
+    if any(len(experts) < floor for experts in chosen.values()):
+        raise ValueError(f"{slots} slots cannot give every layer its floor of {floor}")
+    return chosen
+
+
+class DirectInsertReplay:
+    """The running recipe's residency, stage DIRECT insert-on-miss (GpuResidencyUpdater), per layer.
+
+    Each graph decode forward applies the boundary its predecessor left pending, then every layer's
+    gather sends its misses into the layer's victim shortlist: the ``miss_rows`` resident slots ranked
+    lowest by (routed in the open window, insert score, -expert), less any slot this forward hits. The
+    ranking runs at the start of every graph forward even when no boundary is due (after a prefill),
+    over the scores as they stand, so the prefill's routes rank as routed before they are scored. Insert scores decay by ``decay`` per token and add each window's route counts. An eager
+    forward inserts nothing; it adds its route counts, and its first layer's first gather applies a
+    decode boundary still pending (after that layer recorded its counts); a prefill of at least
+    ``update_prefill_tokens`` tokens is a boundary of its own. The clocks are the device mirror of
+    ResidencyBoundaryClock at SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1. Float32 throughout, as on the
+    device, so ties break the same way.
+    """
+
+    def __init__(
+        self,
+        initial: dict[int, list[int]],
+        capacity: dict[int, int],
+        num_experts: int,
+        *,
+        decay: float = 0.98,
+        update_prefill_tokens: int = 256,
+        miss_rows: int = 6,
+    ) -> None:
+        self.layer_ids = sorted(capacity)
+        self.row = {layer: row for row, layer in enumerate(self.layer_ids)}
+        self.num_experts, self.miss_rows = num_experts, miss_rows
+        self.decay, self.update_prefill_tokens = decay, update_prefill_tokens
+        layers = len(self.layer_ids)
+        self.slots = [[-1] * capacity[layer] for layer in self.layer_ids]
+        self.where = np.full((layers, num_experts), -1, dtype=np.int64)
+        for layer in self.layer_ids:
+            row = self.row[layer]
+            for slot, expert in enumerate(initial[layer][: capacity[layer]]):
+                self.slots[row][slot] = expert
+                self.where[row, expert] = slot
+        self.scores = np.zeros((layers, num_experts), dtype=np.float32)
+        self.route_counts = np.zeros((layers, num_experts), dtype=np.float32)
+        self.routed = np.zeros((layers, num_experts), dtype=bool)
+        self.tokens = 0
+        self.decode_forwards = 0
+        self.boundary_pending = False
+        self.host_pending = False
+        self.truncated = 0
+        self.shortlist = [self._rank(row) for row in range(layers)]  # reset_after_capture
+
+    def _decay(self, tokens: int) -> np.float32:
+        return np.float32(self.decay**tokens) if self.decay < 1.0 else np.float32(1.0)
+
+    def _rank(self, row: int) -> list[int]:
+        slots, scores, routed = self.slots[row], self.scores[row], self.routed[row]
+        free = [slot for slot, expert in enumerate(slots) if expert < 0]
+        held = sorted(
+            (slot for slot, expert in enumerate(slots) if expert >= 0),
+            key=lambda slot: (routed[slots[slot]], scores[slots[slot]], -slots[slot]),
+        )
+        return (free + held)[: self.miss_rows]
+
+    def _apply(self, gate: bool = True) -> None:
+        """GpuResidencyUpdater._apply: the scores, counts and clocks move only under ``gate``, but the
+        victim shortlist is re-ranked on every call, with the counts not yet applied as ``routed``."""
+        if gate:
+            self.scores = self.scores * self._decay(self.tokens) + self.route_counts
+        self.routed = self.route_counts > 0
+        self.shortlist = [self._rank(row) for row in range(len(self.layer_ids))]
+        if gate:
+            self.route_counts = np.zeros_like(self.route_counts)
+            self.tokens = 0
+            self.decode_forwards = 0
+            self.boundary_pending = False
+
+    def _count(self, tokens: int, decode: bool) -> None:
+        self.tokens += tokens
+        if decode:
+            self.decode_forwards += 1
+            self.boundary_pending = self.boundary_pending or self.decode_forwards >= 1
+
+    def _flush(self) -> None:
+        if self.host_pending:
+            self.host_pending = False
+            self._apply(self.boundary_pending)
+
+    def graph_forward(self, routes: dict[int, list[int]], phase: str = "decode") -> dict[int, int]:
+        """One forward served by the graph gather (a replay, or a one-token extend run eagerly through
+        it); returns each layer's misses (its plan count)."""
+        self._apply(self.boundary_pending)  # on_graph_forward: re-ranks even when no boundary is due
+        self._count(1, decode=True)  # on_graph_forward counts every graph-served forward as decode
+        misses = {}
+        for layer, experts in routes.items():
+            row = self.row[layer]
+            where, slots = self.where[row], self.slots[row]
+            hits = {int(where[e]) for e in experts if where[e] >= 0}
+            missing = list(dict.fromkeys(e for e in experts if where[e] < 0))
+            np.add.at(self.route_counts[row], experts, np.float32(1.0))
+            usable = [slot for slot in self.shortlist[row] if slot not in hits]
+            for expert, slot in zip(missing, usable):
+                old = slots[slot]
+                if old >= 0:
+                    where[old] = -1
+                slots[slot] = expert
+                where[expert] = slot
+            self.truncated += max(len(missing) - len(usable), 0)
+            misses[layer] = len(missing)
+        # observe_forward(graph_served=True): a decode is a boundary at interval 1; a graph-served
+        # prefill is taken back out of the decode count and is a boundary only past the prefill threshold.
+        self.host_pending = phase == "decode"
+        if phase != "decode":
+            self.decode_forwards -= 1
+            self.boundary_pending = self.decode_forwards >= 1
+        return misses
+
+    def eager_forward(
+        self, tokens: int, counts: dict[int, tuple[list[int], list[int]]], phase: Optional[str] = None
+    ) -> dict[int, int]:
+        """One eager forward (prefill, or a decode the graph did not serve); returns its misses per layer."""
+        misses = {}
+        for index, layer in enumerate(sorted(counts)):
+            experts, weights = counts[layer]
+            row = self.row[layer]
+            np.add.at(self.route_counts[row], experts, np.asarray(weights, dtype=np.float32))
+            if index == 0:  # streamers[0].before_eager_gather runs after that layer's record_routes
+                self._flush()
+            misses[layer] = sum(1 for e in experts if self.where[row, e] < 0)
+        decode = phase == "decode" if phase is not None else tokens == 1
+        self._flush()
+        self._count(tokens, decode=decode)
+        if not decode and tokens >= self.update_prefill_tokens:
+            self._apply()
+        elif decode:
+            self.host_pending = True
+        return misses
+
+    def resident(self, layer: int) -> set[int]:
+        return {e for e in self.slots[self.row[layer]] if e >= 0}
+
+
+def replay_direct(
+    loaded: dict,
+    *,
+    capacity: Optional[dict[int, int]] = None,
+    num_experts: int = 384,
+    initial: Optional[dict[int, list[int]]] = None,
+    **options,
+) -> dict:
+    """Replay ``load_forwards`` output through DirectInsertReplay, next to what the run measured.
+
+    ``capacity`` defaults to the run's own hot slots per layer and ``initial`` to the framework's
+    unseeded startup residency (experts 0..capacity-1). Returns decode tokens, simulated and measured
+    decode misses in total and per decode forward, and, where the trace logged hot sets, how many
+    (graph forward, layer) pairs started with a different hot set than the replay's.
+    """
+    capacity = capacity or loaded["hot_capacity"]
+    if initial is None:
+        initial = {layer: list(range(slots)) for layer, slots in capacity.items()}
+    sim = DirectInsertReplay(initial, capacity, num_experts, **options)
+    out = {"decode_tokens": 0, "vram_misses": 0, "measured_vram_misses": 0, "per_forward": [],
+           "hot_checked": 0, "hot_mismatched": 0, "first_hot_mismatch": None}
+    for forward in loaded["forwards"]:
+        if forward["phase"] == "capture":
+            # Runs before discard_graph_capture_routes: its counts are dropped, and any insert it made is
+            # in the first logged hot set (smoke6 seq 8: no misses, no effect on the next ranking).
+            continue
+        if forward["kind"] == "graph":
+            if forward.get("hot") is not None:
+                for layer, experts in forward["hot"].items():
+                    out["hot_checked"] += 1
+                    if set(experts) != sim.resident(layer):
+                        out["hot_mismatched"] += 1
+                        if out["first_hot_mismatch"] is None:
+                            out["first_hot_mismatch"] = (forward["seq"], layer)
+            simulated = sim.graph_forward(forward["routes"], forward["phase"])
+        else:
+            simulated = sim.eager_forward(forward["tokens"], forward["counts"], forward["phase"])
+        if forward["phase"] != "decode":
+            continue
+        out["decode_tokens"] += 1
+        out["vram_misses"] += sum(simulated.values())
+        out["measured_vram_misses"] += sum(forward["misses"].values())
+        out["per_forward"].append((forward.get("seq"), simulated, forward["misses"]))
+    tokens = out["decode_tokens"] or 1
+    out["G"] = out["vram_misses"] / tokens
+    out["measured_G"] = out["measured_vram_misses"] / tokens
+    out["truncated"] = sim.truncated
+    return out
 
 
 def ram_rows_per_layer(rows: int, num_layers: int, num_experts: int) -> list[int]:
