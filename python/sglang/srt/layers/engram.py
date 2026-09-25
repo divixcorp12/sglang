@@ -170,6 +170,8 @@ def post_engram_device_lookups(
 # Arbitrary: far above the host node's 33.8 ms worst case, short enough that a lost
 # request stops the server within seconds.
 ENGRAM_DEVICE_WAIT_TIMEOUT_MS = 10_000
+# Test-only: the post kernel's spin after its first id (engram_ring.cuh); 0 in production.
+ENGRAM_POST_TEST_STALL_NS = 0
 
 
 class _EngramDeviceWaitLookup:
@@ -217,7 +219,13 @@ class _EngramDeviceWaitLookup:
     def post(self, indices: torch.Tensor) -> None:
         from sglang.kernels.ops.embeddings.engram_ring import engram_ring_post
 
-        engram_ring_post(indices.reshape(-1), self.ids, self.control, self.counter)
+        engram_ring_post(
+            indices.reshape(-1),
+            self.ids,
+            self.control,
+            self.counter,
+            ENGRAM_POST_TEST_STALL_NS,
+        )
 
     def wait(self, file_table: EngramFileTable, indices: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.embeddings.engram_ring import engram_ring_wait

@@ -38,10 +38,14 @@ def _module() -> Module:
 
 
 def engram_ring_post(
-    ids_dev: torch.Tensor, ids_host: torch.Tensor, control: torch.Tensor, counter: torch.Tensor
+    ids_dev: torch.Tensor,
+    ids_host: torch.Tensor,
+    control: torch.Tensor,
+    counter: torch.Tensor,
+    test_stall_ns: int = 0,
 ) -> None:
     """Post ``ids_dev`` (int64 [n], CUDA) into ``ids_host`` (pinned) and release the next sequence."""
-    _module().engram_ring_post(ids_dev, ids_host, control, counter)
+    _module().engram_ring_post(ids_dev, ids_host, control, counter, test_stall_ns)
 
 
 def engram_ring_wait(

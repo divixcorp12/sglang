@@ -187,6 +187,24 @@ def test_the_wait_holds_the_stream_until_a_slow_service_serves(tmp_path, monkeyp
     assert torch.equal(out14.cpu()[0], _want(*weights[14], [8, 9, 10]))
 
 
+def test_the_post_publishes_its_sequence_after_every_id(tmp_path, monkeypatch):
+    """The post kernel stalls after its first id: a sequence published before the ids (a reordered or unfenced
+    post) lets the service read the other ids from the previous step while the kernel stalls."""
+    weights = _make_table(tmp_path)
+    layer1, layer14 = _open(tmp_path, monkeypatch, device_wait=True)
+    monkeypatch.setattr(engram, "ENGRAM_POST_TEST_STALL_NS", 20_000_000)
+    ids = torch.tensor([[[3, 0, 49], [7, 1, 7]]], device="cuda", dtype=torch.int64)
+    graph, out1, out14 = _capture_two_layers(layer1, layer14, ids, early_post=True, forbid_host_nodes=True)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for ids1, ids14 in (([3, 0, 49], [7, 1, 7]), ([3, 20, 21], [7, 22, 23])):
+            ids.copy_(torch.tensor([[ids1, ids14]], device="cuda"))
+            graph.replay()
+            stream.synchronize()
+            assert torch.equal(out1.cpu()[0], _want(*weights[1], ids1))
+            assert torch.equal(out14.cpu()[0], _want(*weights[14], ids14))
+
+
 def _timeout_worker(directory, connection):
     try:
         os.environ["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] = "1"

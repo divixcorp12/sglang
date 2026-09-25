@@ -58,15 +58,22 @@ __device__ __forceinline__ uint64_t global_ns() {
 }
 
 // `counter` is pinned host memory that only these kernels read and write (see _EngramDeviceWaitLookup).
+// `test_stall_ns` (0 in production) spins after the first id so a test can catch a sequence published too early.
 __global__ void post_kernel(const int64_t* __restrict__ ids_dev, int64_t* ids_host, int64_t n, int32_t* control,
-                            int32_t* counter) {
+                            int32_t* counter, int64_t test_stall_ns) {
   if (threadIdx.x != 0) return;
   volatile int32_t* sequence = counter;
   uint32_t seq = static_cast<uint32_t>(*sequence) + 1u;
   if (seq == 0u) seq = 1u;  // 0 is the control block's initial value, never a posted sequence
   *sequence = static_cast<int32_t>(seq);
   volatile int64_t* out = ids_host;
-  for (int64_t i = 0; i < n; ++i) out[i] = ids_dev[i];
+  for (int64_t i = 0; i < n; ++i) {
+    out[i] = ids_dev[i];
+    if (i == 0 && test_stall_ns > 0) {
+      const uint64_t start = global_ns();
+      while (static_cast<int64_t>(global_ns() - start) < test_stall_ns) __nanosleep(1000);
+    }
+  }
   // The ids are posted writes over PCIe; the fence and the release store both order them before the sequence.
   __threadfence_system();
   st_release_sys(control + kPostSeq, seq);
@@ -117,7 +124,7 @@ __global__ void wait_kernel(int32_t* control, const int32_t* counter, const uint
 }  // namespace engram_ring_device
 
 void engram_ring_post(tvm::ffi::TensorView ids_dev, tvm::ffi::TensorView ids_host, tvm::ffi::TensorView control,
-                      tvm::ffi::TensorView counter) {
+                      tvm::ffi::TensorView counter, int64_t test_stall_ns) {
   const auto device = host::LaunchKernel::resolve_device(ids_dev.device());
   host::LaunchKernel(1, 32, device)(
       engram_ring_device::post_kernel,
@@ -125,7 +132,8 @@ void engram_ring_post(tvm::ffi::TensorView ids_dev, tvm::ffi::TensorView ids_hos
       static_cast<int64_t*>(ids_host.data_ptr()),
       static_cast<int64_t>(ids_dev.size(0)),
       static_cast<int32_t*>(control.data_ptr()),
-      static_cast<int32_t*>(counter.data_ptr()));
+      static_cast<int32_t*>(counter.data_ptr()),
+      test_stall_ns);
 }
 
 void engram_ring_wait(tvm::ffi::TensorView control, tvm::ffi::TensorView counter, tvm::ffi::TensorView rows_host,
