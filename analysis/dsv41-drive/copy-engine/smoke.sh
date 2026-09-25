@@ -13,6 +13,7 @@
 #
 # Optional environment: SMOKE_OUT_ROOT (default /data/models/slang/nvfp4-work/copy-engine/smoke) holds <tag>-<arm>;
 # SMOKE_ENV_OVERRIDES adds arm_env overrides as Python dict items, e.g. "'SGLANG_DSV41_RAM_MISS_TIMEOUT_MS': '60000'".
+# SMOKE_EXTRA_ARGS appends server flags; SMOKE_STACK_SECONDS and SMOKE_CUDA_GDB=1 sample stacks and resident kernels.
 #
 # Takes cc-gpu.lock and rowimg-disk.lock. Refuses when production (port 7867) is up. Never starts production.
 set -u
@@ -71,6 +72,7 @@ mapfile -t ARGV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 print(*arm_env.ServerArgs(port=$PORT).argv(), sep='\n')
 ")
+[ -n "${SMOKE_EXTRA_ARGS:-}" ] && ARGV+=(${SMOKE_EXTRA_ARGS})  # diagnosis only, e.g. --disable-overlap-schedule
 CORES=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.SERVER_CORES)")
 say "arm=$ARM wt=$WT head=$(git -C $WT rev-parse HEAD) dirty=$(git -C $WT status --porcelain --untracked-files=no | wc -l) cores=$CORES mode=$MODE root_free=${ROOT_FREE}G"
 PYTHONPATH=$WT/python $PY -c 'import sglang; print("sglang from", sglang.__file__)' 2>&1 | tee -a $OUT/driver.log
