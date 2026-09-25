@@ -230,7 +230,49 @@ def test_graph_route_log_says_where_a_lagging_reader_lost_forwards(tmp_path):
     steps = [json.loads(line) for line in path.read_text().splitlines()][1:]
     assert [line["seq"] for line in steps] == [0, 3, 4, 5, 6]
     assert steps[1]["dropped_before"] == 2 and steps[1]["routes"] == _forward_routes(3, 1)
-    assert _tier_sim().load_forwards(str(path))["dropped"] == 2
+    # A replay of this run would miss two forwards' accesses: it is refused, not silently shortened.
+    with pytest.raises(ValueError, match="lost 2 graph forwards"):
+        _tier_sim().load_forwards(str(path))
+    assert _tier_sim().load_forwards(str(path), allow_dropped=True)["dropped"] == 2
+
+
+def _batch(mode, rids, tokens):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(name=mode.upper(), is_extend=lambda: mode == "extend"),
+        rids=rids, batch_size=1, extend_num_tokens=tokens if mode == "extend" else None,
+    )
+
+
+def test_phase_comes_from_the_forward_mode_not_the_token_count(tmp_path):
+    """A prompt whose prefix is cached can prefill one token, which the graph gather serves and the ring
+    logs like a decode step. Its phase must still say extend, and a replay must not score it as decode.
+    Each entry also carries its own pass id and requests, and the hot set bound at its start."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=8, margin=2)
+    log.bind(0, 3, 12)
+    bank = torch.tensor([[0, 1, -1]])
+    log.bind_hot(bank, [3])
+    trace.graph_seq_source, trace.forward_meta_source = log.read_seq, log.current_meta
+    log.on_pre_forward(7, _batch("extend", ["req-b"], 1))
+    _log_forward(log, 0, 1)
+    bank[0, 2] = 9  # a gather commits after the snapshot: the next forward starts with it
+    log.on_pre_forward(8, _batch("decode", ["req-b"], 1))
+    _log_forward(log, 1, 1)
+    log.on_pre_forward(9, _batch("extend", ["req-c"], 2))
+    trace.record(3, torch.tensor([[1, 2], [2, 3]]), _stats(1, 0), 0)
+    log.poll(trace)
+    trace.close()
+    loaded = _tier_sim().load_forwards(str(path))
+    graph, decode, eager = loaded["forwards"]
+    assert (graph["phase"], graph["forward_pass_id"], graph["rids"], graph["hot"]) == ("extend", 7, ["req-b"], {3: [0, 1]})
+    assert (decode["phase"], decode["forward_pass_id"], decode["hot"]) == ("decode", 8, {3: [0, 1, 9]})
+    assert (eager["kind"], eager["phase"], eager["forward_pass_id"], eager["rids"]) == ("eager", "extend", 9, ["req-c"])
+    assert loaded["run"] == log.run and loaded["schema"] == module.ROUTE_LOG_SCHEMA
+    replay = _tier_sim().replay_direct(loaded, capacity={3: 12}, initial={3: [0, 1]})
+    assert replay["decode_tokens"] == 1  # the one-token extend is not a decode token
 
 
 def test_eager_forwards_carry_the_graph_seq_and_tier_sim_interleaves_them(tmp_path):

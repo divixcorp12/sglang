@@ -363,10 +363,10 @@ def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypa
     assert int(log.seq[0]) == 1
     log.poll(trace)
     trace.close()
-    routes = tier_sim_load_forwards(tmp_path / "trace.jsonl")["forwards"]
-    assert routes == [{"kind": "graph", "seq": 0, "tokens": 1,
-                       "routes": {layer: [row, 3, 5] for row, layer in enumerate(sorted(streamers))},
-                       "misses": {layer: row + 1 for row, layer in enumerate(sorted(streamers))}}]
+    (forward,) = tier_sim_load_forwards(tmp_path / "trace.jsonl")["forwards"]
+    assert (forward["kind"], forward["seq"]) == ("graph", 0)
+    assert forward["routes"] == {layer: [row, 3, 5] for row, layer in enumerate(sorted(streamers))}
+    assert forward["misses"] == {layer: row + 1 for row, layer in enumerate(sorted(streamers))}
 
 
 def tier_sim_load_forwards(path):

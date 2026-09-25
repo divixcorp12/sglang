@@ -787,10 +787,7 @@ class Exl3RamMissService:
                 piece_runs=self.host.piece_runs() if self.piece_stream else None,
             )
             if self._stages_traced:
-                from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
-
-                self.route_log = GraphRouteLog(len(self._rows), MAX_IDS, cache.device)
-                get_exl3_stream_trace().graph_seq_source = self.route_log.read_seq
+                self._start_route_log(cache.device)
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         next_row = row + 1 if row + 1 < len(self._rows) else -1
@@ -810,6 +807,21 @@ class Exl3RamMissService:
             ),
             route_log=self.route_log,
         )
+
+    def _start_route_log(self, device) -> None:
+        """Trace runs only: log every graph forward's routes (GraphRouteLog), stamped with the scheduler's
+        forward identity, and the GPU residency bank's hot sets when the updater owns them."""
+        from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+        from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+        log = GraphRouteLog(len(self._rows), MAX_IDS, device)
+        if self._gpu_hot_updater is not None:
+            log.bind_hot(self._gpu_hot_updater.slot_to_expert, self._gpu_hot_updater.layer_ids)
+        trace = get_exl3_stream_trace()
+        trace.graph_seq_source = log.read_seq
+        trace.forward_meta_source = log.current_meta
+        get_global_expert_distribution_recorder().register_pre_forward_observer(log.on_pre_forward)
+        self.route_log = log
 
     def _refresh_hot_lists(self) -> None:
         updater = self._gpu_hot_updater

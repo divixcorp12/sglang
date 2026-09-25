@@ -16,6 +16,8 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
+import socket
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -56,6 +58,11 @@ def capturing_graphs() -> bool:
 RAM_MISS_TRACE_SCHEMA = 7
 
 
+# Bumped whenever a graph_routes / graph_routes_header field changes meaning or the layout changes.
+# 1: the first layout (DSV41 hot-cache-policy capture, 2026-09-24).
+ROUTE_LOG_SCHEMA = 1
+
+
 def _stream_capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
@@ -68,15 +75,19 @@ class GraphRouteLog:
     captured with it: the first streamed layer (row 0) takes the next ring slot and bumps ``seq``, then
     every layer copies its routes and its plan's miss count into that slot. Each forward thus writes
     its own entry, numbered by ``seq`` (the graph forwards that ran before it), whatever the scheduler's
-    per-batch cadence: no per-batch read can fold or skip one.
+    per-batch cadence: no per-batch read can fold or skip one. Row 0 also stores the forward's pass id
+    (``on_pre_forward`` writes it to the device before the forward is queued, so its phase and request
+    come from the scheduler's forward mode, never from a token count) and, when ``bind_hot`` named the
+    GPU residency bank, the hot set every layer held when the forward started.
 
     ``poll`` runs at the per-batch check. It reads the ring back through pinned buffers without waiting,
     one batch behind (like ``Exl3RamMissService._graph_rows``), and writes the entries finished since
     the last read. The copy is on the host's current stream, which need not be the stream the graph
     replays on, so an entry is trusted only when the ``seq`` read before the ring shows a later forward
     has started (entries below ``seq - 1``), and only if it is ``margin`` entries clear of the slots
-    later forwards may overwrite while the ring copy runs. ``final`` (after shutdown's device barrier)
-    reads everything.
+    later forwards may overwrite while the ring copy runs. An entry overwritten before it was read is
+    counted in ``dropped`` and in the next line's ``dropped_before``; a replay must refuse such a run.
+    ``final`` (after shutdown's device barrier) reads everything.
 
     Warmup forwards before capture execute these copies too. ``warmup`` counts them, from the Python
     calls made in capture mode outside a stream capture (a capture records the copies but runs none),
@@ -87,23 +98,57 @@ class GraphRouteLog:
         if depth <= margin + 1:
             raise ValueError("the route ring must be deeper than its safety margin")
         self.layers, self.width, self.depth, self.margin = layers, width, depth, margin
+        self.run = f"{socket.gethostname()}-{os.getpid()}-{time.time_ns()}"
         self.layer_ids: list[int] = [-1] * layers
         self.capacities: list[int] = [0] * layers  # hot slots per row, for the replay's allocation
         self.routes = torch.full((depth, layers, width), -1, dtype=torch.int64, device=device)
         self.misses = torch.full((depth, layers), -1, dtype=torch.int32, device=device)
+        self.pass_ids = torch.full((depth,), -1, dtype=torch.int64, device=device)
+        self.pass_id = torch.full((1,), -1, dtype=torch.int64, device=device)
         self.seq = torch.zeros(1, dtype=torch.int64, device=device)
         self.slot = torch.zeros(1, dtype=torch.int64, device=device)
+        self.hot_bank: Optional[torch.Tensor] = None
+        self.hot_layer_ids: list[int] = []
+        self.hot: Optional[torch.Tensor] = None
         self.warmup = 0
         self.next_seq = 0
         self.dropped = 0
+        self._meta: dict[int, dict] = {}
+        self._current: Optional[dict] = None
         self._header_written = False
-        self._host: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        self._host: Optional[list[torch.Tensor]] = None
         self._event = None
         self._pending = False
 
     def bind(self, row: int, layer_id: int, capacity: int) -> None:
         self.layer_ids[row] = int(layer_id)
         self.capacities[row] = int(capacity)
+
+    def bind_hot(self, bank: torch.Tensor, layer_ids: list[int]) -> None:
+        """Snapshot ``bank`` (GpuResidencyUpdater.slot_to_expert, one row per ``layer_ids``) per forward."""
+        self.hot_bank = bank
+        self.hot_layer_ids = [int(layer) for layer in layer_ids]
+        self.hot = torch.full((self.depth, *bank.shape), -1, dtype=bank.dtype, device=bank.device)
+
+    def on_pre_forward(self, forward_pass_id: int, forward_batch) -> None:
+        """The expert distribution recorder's pre-forward observer: the forward's identity, on the host and
+        the device. Runs before the forward is queued, on its stream, outside any capture."""
+        mode = forward_batch.forward_mode
+        tokens = forward_batch.extend_num_tokens if mode.is_extend() else forward_batch.batch_size
+        meta = {
+            "forward_pass_id": int(forward_pass_id),
+            "phase": mode.name.lower(),
+            "rids": list(forward_batch.rids or []),
+            "tokens": int(tokens or 0),
+        }
+        self._current = meta
+        if _stream_capturing():
+            return  # a capture would freeze this pass id into every replay
+        self._meta[meta["forward_pass_id"]] = meta
+        self.pass_id.fill_(meta["forward_pass_id"])
+
+    def current_meta(self) -> Optional[dict]:
+        return self._current
 
     def record(self, row: int, routes: torch.Tensor, count: torch.Tensor) -> None:
         """Log one layer's routes (``routes[:n]``, -1 past them) and plan miss count; captured in the graph."""
@@ -112,6 +157,10 @@ class GraphRouteLog:
                 self.warmup += 1
             torch.remainder(self.seq, self.depth, out=self.slot)
             self.seq.add_(1)
+            self.pass_ids.index_copy_(0, self.slot, self.pass_id)
+            if self.hot is not None:
+                # Before this layer's gather commits: the residency every layer held at the forward's start.
+                self.hot.index_copy_(0, self.slot, self.hot_bank.unsqueeze(0))
         n = min(routes.numel(), self.width)
         self.routes[:, row, :n].index_copy_(0, self.slot, routes[:n].view(1, n))
         self.misses[:, row].index_copy_(0, self.slot, count.reshape(-1)[:1])
@@ -120,14 +169,16 @@ class GraphRouteLog:
         """Graph forwards run so far. Called by eager forwards only, which already wait for the stream."""
         return int(self.seq.item())
 
+    def _ring(self) -> list[torch.Tensor]:
+        return [self.seq, self.routes, self.misses, self.pass_ids] + ([self.hot] if self.hot is not None else [])
+
     def tensors(self) -> list[torch.Tensor]:
         """Every buffer a copy may still be writing, for the service's quarantine."""
-        owned = [self.routes, self.misses, self.seq, self.slot]
-        return owned + (list(self._host) if self._host is not None else [])
+        return self._ring() + [self.slot, self.pass_id] + (self._host or [])
 
     def poll(self, trace: "Exl3StreamTrace", *, final: bool = False) -> None:
         if self.seq.device.type != "cuda":
-            self._emit(trace, int(self.seq[0]), self.routes, self.misses, complete=True)
+            self._emit(trace, self._ring(), complete=True)
             return
         if not final and torch.cuda.is_current_stream_capturing():
             return
@@ -137,23 +188,25 @@ class GraphRouteLog:
             elif not self._event.query():
                 return
             self._pending = False
-            seq, routes, misses = self._host
-            self._emit(trace, int(seq[0]), routes, misses, complete=False)
+            self._emit(trace, self._host, complete=False)
         if final:
-            self._emit(trace, int(self.seq.item()), self.routes.cpu(), self.misses.cpu(), complete=True)
+            self._emit(trace, [tensor.cpu() for tensor in self._ring()], complete=True)
             return
         if self._host is None:
-            self._host = tuple(torch.empty_like(t, device="cpu").pin_memory() for t in (self.seq, self.routes, self.misses))
+            self._host = [torch.empty_like(t, device="cpu").pin_memory() for t in self._ring()]
             self._event = torch.cuda.Event(enable_timing=False)
-        for host, device in zip(self._host, (self.seq, self.routes, self.misses)):
+        for host, device in zip(self._host, self._ring()):
             host.copy_(device, non_blocking=True)  # seq first: the stream runs these in order
         self._event.record(torch.cuda.current_stream(self.seq.device))
         self._pending = True
 
-    def _emit(self, trace: "Exl3StreamTrace", seq: int, routes: torch.Tensor, misses: torch.Tensor, *, complete: bool) -> None:
+    def _emit(self, trace: "Exl3StreamTrace", ring: list[torch.Tensor], *, complete: bool) -> None:
         if not self._header_written:
             trace.record_graph_routes_header(self)
             self._header_written = True
+        seq_tensor, routes, misses, pass_ids = ring[:4]
+        hot = ring[4] if len(ring) > 4 else None
+        seq = int(seq_tensor[0])
         end = seq if complete else seq - 1
         start = max(self.next_seq, self.warmup)
         oldest = max(seq - self.depth + (0 if complete else self.margin), 0)
@@ -162,11 +215,17 @@ class GraphRouteLog:
         self.dropped += lost
         for s in range(start, end):
             slot = s % self.depth
+            pass_id = int(pass_ids[slot])
+            meta = self._meta.pop(pass_id, None)
+            for stale in [key for key in self._meta if key < pass_id]:
+                del self._meta[stale]  # eager forwards: they never log here
             trace.record_graph_route_step(
                 s,
                 [[int(e) for e in row if e >= 0] for row in routes[slot].tolist()],
                 [int(m) for m in misses[slot].tolist()],
                 dropped_before=lost if s == start else 0,
+                meta={"run": self.run, **(meta if meta is not None else {"forward_pass_id": pass_id})},
+                hot=None if hot is None else [sorted(int(e) for e in row if e >= 0) for row in hot[slot].tolist()],
             )
         self.next_seq = max(self.next_seq, end)
 
@@ -176,10 +235,13 @@ class Exl3StreamTrace:
         # Line-buffered: the scheduler process may exit without running atexit.
         self._file = open(path, "a", buffering=1) if path else None
         self.log_every = log_every
-        # Set by the RAM-miss service when it logs graph routes: stamps each eager forward with the
-        # graph forwards that ran before it, so a replay can interleave the two (tier_sim.load_forwards).
+        # Set by the RAM-miss service when it logs graph routes: stamp each eager forward with the graph
+        # forwards that ran before it, so a replay can interleave the two (tier_sim.load_forwards), and
+        # with its pass id, phase and requests.
         self.graph_seq_source: Optional[Callable[[], int]] = None
+        self.forward_meta_source: Optional[Callable[[], Optional[dict]]] = None
         self._graph_seq: Optional[int] = None
+        self._meta: Optional[dict] = None
         self._last_layer: Optional[int] = None
         self._background: dict[int, int] = {}
         self.forwards = 0
@@ -211,6 +273,8 @@ class Exl3StreamTrace:
                 self.decode_tokens += 1
             if self.graph_seq_source is not None:
                 self._graph_seq = self.graph_seq_source()
+            if self.forward_meta_source is not None:
+                self._meta = self.forward_meta_source()
             if self.forwards % self.log_every == 0:
                 self.log()
         self._last_layer = layer_id
@@ -247,6 +311,8 @@ class Exl3StreamTrace:
             }
             if self._graph_seq is not None:
                 line["graph_seq"] = self._graph_seq
+            if self._meta is not None:
+                line.update({key: self._meta[key] for key in ("forward_pass_id", "phase", "rids")})
             self._file.write(json.dumps(line) + "\n")
 
     @property
@@ -304,23 +370,43 @@ class Exl3StreamTrace:
             return
         line = {
             "kind": "graph_routes_header",
+            "schema": ROUTE_LOG_SCHEMA,
+            "run": log.run,
             "layer_ids": list(log.layer_ids),
             "hot_capacity": list(log.capacities),
             "width": log.width,
             "depth": log.depth,
             "warmup_forwards": log.warmup,
+            "hot_layer_ids": list(log.hot_layer_ids),
             "t": round(time.monotonic(), 6),
         }
         self._file.write(json.dumps(line) + "\n")
 
-    def record_graph_route_step(self, seq: int, routes: list[list[int]], misses: list[int], dropped_before: int = 0) -> None:
+    def record_graph_route_step(
+        self,
+        seq: int,
+        routes: list[list[int]],
+        misses: list[int],
+        dropped_before: int = 0,
+        meta: Optional[dict] = None,
+        hot: Optional[list[list[int]]] = None,
+    ) -> None:
         """One graph forward: ``routes[row]`` its routed experts in router order, ``misses[row]`` the
         experts its gather found outside VRAM (the plan's count). ``seq`` counts the graph forwards before
-        it, warmup included; an eager forward line's ``graph_seq`` is on the same count. Not a forward
-        call: no ``tokens``, and tier_sim.load_trace skips it."""
+        it, warmup included; an eager forward line's ``graph_seq`` is on the same count. ``meta``: the
+        forward's pass id, and its phase, requests and tokens when the pre-forward observer saw it. ``hot``:
+        the experts each ``hot_layer_ids`` layer held when the forward started. ``dropped_before``: entries
+        lost just before this one (a replay must refuse the run). Not a forward call: no ``tokens`` key,
+        and tier_sim.load_trace skips it."""
         if self._file is None:
             return
-        line = {"kind": "graph_routes", "seq": seq, "routes": routes, "misses": misses, "t": round(time.monotonic(), 6)}
+        line = {"kind": "graph_routes", "schema": ROUTE_LOG_SCHEMA, "seq": seq}
+        line.update(meta or {})
+        line.update({"routes": routes, "misses": misses, "t": round(time.monotonic(), 6)})
+        if meta is not None and "tokens" in meta:
+            line["forward_tokens"] = line.pop("tokens")  # keeps load_trace's "tokens means a call" rule
+        if hot is not None:
+            line["hot"] = hot
         if dropped_before:
             line["dropped_before"] = dropped_before
         self._file.write(json.dumps(line) + "\n")
