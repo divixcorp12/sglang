@@ -60,11 +60,57 @@ RAM_MISS_TRACE_SCHEMA = 7
 
 # Bumped whenever a graph_routes / graph_routes_header field changes meaning or the layout changes.
 # 1: the first layout (DSV41 hot-cache-policy capture, 2026-09-24).
-ROUTE_LOG_SCHEMA = 1
+# 2: adds graph_routes.router, the forward's record number in the RouterCapture side files. With router
+# capture off it is never written, and every schema-1 field keeps its meaning.
+ROUTE_LOG_SCHEMA = 2
+# The RouterCapture side files' own layout; <prefix>.json states it.
+ROUTER_CAPTURE_SCHEMA = 1
 
 
 def _stream_capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+class RouterCapture:
+    """Binary side files of every graph forward's router input, one record per forward in ``seq`` order.
+
+    ``<prefix>.x.bin``: bf16 ``[records, layers, hidden]`` (raw little-endian 16-bit words), each streamed
+    layer's normalized MoE input as its gate saw it. ``<prefix>.w.bin``: fp32 ``[records, layers, topk]``,
+    the top-k weights in route order. ``<prefix>.seq.bin``: int64 ``[records, 2]``, the forward's ``seq``
+    and pass id, the keys of its ``graph_routes`` line (which names the record as ``router``).
+    ``<prefix>.json`` gives the shapes and layer ids; the record count is the files' size.
+    """
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+        self.records = 0
+        self._files: Optional[list] = None
+
+    def write(self, log: "GraphRouteLog", seq: int, pass_id: int, x: torch.Tensor, weights: torch.Tensor) -> int:
+        if self._files is None:
+            header = {
+                "schema": ROUTER_CAPTURE_SCHEMA,
+                "run": log.run,
+                "layer_ids": list(log.layer_ids),
+                "hidden": int(x.shape[-1]),
+                "topk": int(weights.shape[-1]),
+                "x_dtype": "bfloat16",
+                "w_dtype": "float32",
+                "depth": log.depth,
+            }
+            with open(self.prefix + ".json", "w") as f:
+                json.dump(header, f)
+            self._files = [open(self.prefix + suffix, "ab") for suffix in (".x.bin", ".w.bin", ".seq.bin")]
+        x_file, w_file, seq_file = self._files
+        x_file.write(x.contiguous().view(torch.int16).numpy().tobytes())
+        w_file.write(weights.contiguous().numpy().tobytes())
+        seq_file.write(torch.tensor([seq, pass_id], dtype=torch.int64).numpy().tobytes())
+        self.records += 1
+        return self.records - 1
+
+    def flush(self) -> None:
+        for f in self._files or []:
+            f.flush()
 
 
 class GraphRouteLog:
@@ -88,6 +134,10 @@ class GraphRouteLog:
     later forwards may overwrite while the ring copy runs. An entry overwritten before it was read is
     counted in ``dropped`` and in the next line's ``dropped_before``; a replay must refuse such a run.
     ``final`` (after shutdown's device barrier) reads everything.
+
+    ``enable_router`` adds two rings on the same slots: ``record_router`` copies each layer's router
+    input and top-k weights into them, and every emitted forward is also written to the RouterCapture
+    side files. Without it no router tensor exists and nothing calls ``record_router``.
 
     Warmup forwards before capture execute these copies too. ``warmup`` counts them, from the Python
     calls made in capture mode outside a stream capture (a capture records the copies but runs none),
@@ -119,6 +169,9 @@ class GraphRouteLog:
         self._host: Optional[list[torch.Tensor]] = None
         self._event = None
         self._pending = False
+        self.router: Optional[RouterCapture] = None
+        self.router_x: Optional[torch.Tensor] = None
+        self.router_w: Optional[torch.Tensor] = None
 
     def bind(self, row: int, layer_id: int, capacity: int) -> None:
         self.layer_ids[row] = int(layer_id)
@@ -129,6 +182,14 @@ class GraphRouteLog:
         self.hot_bank = bank
         self.hot_layer_ids = [int(layer) for layer in layer_ids]
         self.hot = torch.full((self.depth, *bank.shape), -1, dtype=bank.dtype, device=bank.device)
+
+    def enable_router(self, prefix: str) -> None:
+        """Also capture each layer's router input and top-k weights, into side files at ``prefix``. The
+        rings are sized by the first ``record_router`` call, a warmup forward's."""
+        self.router = RouterCapture(prefix)
+
+    def ring_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self._ring())
 
     def on_pre_forward(self, forward_pass_id: int, forward_batch) -> None:
         """The expert distribution recorder's pre-forward observer: the forward's identity, on the host and
@@ -165,12 +226,34 @@ class GraphRouteLog:
         self.routes[:, row, :n].index_copy_(0, self.slot, routes[:n].view(1, n))
         self.misses[:, row].index_copy_(0, self.slot, count.reshape(-1)[:1])
 
+    def record_router(self, row: int, x: torch.Tensor, topk_weights: torch.Tensor) -> None:
+        """Log one layer's router input and top-k weights (one token) into this forward's slot; captured in
+        the graph. Must follow the layer's ``record``: row 0's takes the slot."""
+        if self.router_x is None:
+            if _stream_capturing() or self._host is not None:
+                raise RuntimeError("the router rings must be allocated by a warmup forward, before capture and reads")
+            device = self.routes.device
+            shape = (self.depth, self.layers)
+            self.router_x = torch.zeros((*shape, x.shape[-1]), dtype=torch.bfloat16, device=device)
+            self.router_w = torch.zeros((*shape, topk_weights.shape[-1]), dtype=torch.float32, device=device)
+        hidden, topk = self.router_x.shape[-1], self.router_w.shape[-1]
+        if x.numel() != hidden or topk_weights.numel() != topk:
+            raise ValueError(
+                f"router capture holds one token of [{hidden}] and [{topk}], got {tuple(x.shape)} and "
+                f"{tuple(topk_weights.shape)}"
+            )
+        self.router_x[:, row].index_copy_(0, self.slot, x.reshape(1, hidden).to(torch.bfloat16))
+        self.router_w[:, row].index_copy_(0, self.slot, topk_weights.reshape(1, topk).float())
+
     def read_seq(self) -> int:
         """Graph forwards run so far. Called by eager forwards only, which already wait for the stream."""
         return int(self.seq.item())
 
     def _ring(self) -> list[torch.Tensor]:
-        return [self.seq, self.routes, self.misses, self.pass_ids] + ([self.hot] if self.hot is not None else [])
+        ring = [self.seq, self.routes, self.misses, self.pass_ids]
+        ring += [self.hot] if self.hot is not None else []
+        ring += [self.router_x, self.router_w] if self.router_x is not None else []
+        return ring
 
     def tensors(self) -> list[torch.Tensor]:
         """Every buffer a copy may still be writing, for the service's quarantine."""
@@ -205,7 +288,8 @@ class GraphRouteLog:
             trace.record_graph_routes_header(self)
             self._header_written = True
         seq_tensor, routes, misses, pass_ids = ring[:4]
-        hot = ring[4] if len(ring) > 4 else None
+        hot = ring[4] if self.hot is not None else None
+        router_x, router_w = ring[-2:] if self.router_x is not None else (None, None)
         seq = int(seq_tensor[0])
         end = seq if complete else seq - 1
         start = max(self.next_seq, self.warmup)
@@ -219,6 +303,9 @@ class GraphRouteLog:
             meta = self._meta.pop(pass_id, None)
             for stale in [key for key in self._meta if key < pass_id]:
                 del self._meta[stale]  # eager forwards: they never log here
+            record = None
+            if router_x is not None:
+                record = self.router.write(self, s, pass_id, router_x[slot], router_w[slot])
             trace.record_graph_route_step(
                 s,
                 [[int(e) for e in row if e >= 0] for row in routes[slot].tolist()],
@@ -226,8 +313,11 @@ class GraphRouteLog:
                 dropped_before=lost if s == start else 0,
                 meta={"run": self.run, **(meta if meta is not None else {"forward_pass_id": pass_id})},
                 hot=None if hot is None else [sorted(int(e) for e in row if e >= 0) for row in hot[slot].tolist()],
+                router=record,
             )
         self.next_seq = max(self.next_seq, end)
+        if self.router is not None:
+            self.router.flush()  # the scheduler may be SIGKILLed at shutdown, like the stage trace's lines
 
 
 class Exl3StreamTrace:
@@ -380,6 +470,8 @@ class Exl3StreamTrace:
             "hot_layer_ids": list(log.hot_layer_ids),
             "t": round(time.monotonic(), 6),
         }
+        if log.router is not None:
+            line["router_prefix"] = log.router.prefix
         self._file.write(json.dumps(line) + "\n")
 
     def record_graph_route_step(
@@ -390,13 +482,15 @@ class Exl3StreamTrace:
         dropped_before: int = 0,
         meta: Optional[dict] = None,
         hot: Optional[list[list[int]]] = None,
+        router: Optional[int] = None,
     ) -> None:
         """One graph forward: ``routes[row]`` its routed experts in router order, ``misses[row]`` the
         experts its gather found outside VRAM (the plan's count). ``seq`` counts the graph forwards before
         it, warmup included; an eager forward line's ``graph_seq`` is on the same count. ``meta``: the
         forward's pass id, and its phase, requests and tokens when the pre-forward observer saw it. ``hot``:
         the experts each ``hot_layer_ids`` layer held when the forward started. ``dropped_before``: entries
-        lost just before this one (a replay must refuse the run). Not a forward call: no ``tokens`` key,
+        lost just before this one (a replay must refuse the run). ``router``: the forward's record in the
+        RouterCapture side files, when router capture is on. Not a forward call: no ``tokens`` key,
         and tier_sim.load_trace skips it."""
         if self._file is None:
             return
@@ -407,6 +501,8 @@ class Exl3StreamTrace:
             line["forward_tokens"] = line.pop("tokens")  # keeps load_trace's "tokens means a call" rule
         if hot is not None:
             line["hot"] = hot
+        if router is not None:
+            line["router"] = router
         if dropped_before:
             line["dropped_before"] = dropped_before
         self._file.write(json.dumps(line) + "\n")

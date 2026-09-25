@@ -6,7 +6,9 @@
 #
 # Usage: smoke_routes.sh <tag> <worktree> [prompts.json] [max_tokens] [reps]
 #   no prompts file: smoke.sh's three prompts, 96 tokens, twice (the six-prompt smoke)
+# ROUTER_CAPTURE=1 also writes every graph forward's router input to $T/<tag>/router.* (RouterCapture).
 set -u
+ROUTER=${ROUTER_CAPTURE:-0}
 TAG=${1:?tag}
 WT=${2:?worktree path}
 PROMPTS=${3:-}
@@ -36,11 +38,13 @@ say "locks held"
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do say "GPU busy; waiting"; sleep 180; done
 ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exit 1; }
 
-rm -f $OUT/stages.jsonl
+rm -f $OUT/stages.jsonl $OUT/router.json $OUT/router.x.bin $OUT/router.w.bin $OUT/router.seq.bin
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
 e = arm_env.arm_env($OVR)
 e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
+if '$ROUTER' == '1':
+    e['SGLANG_DSV41_ROUTER_CAPTURE_PATH'] = '$OUT/router'
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
 for k, v in e.items(): print(f'{k}={v}')

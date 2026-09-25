@@ -635,6 +635,13 @@ class Exl3RamMissService:
         self._refuse_if_shut_down()
         if self.host is not None:
             return
+        from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+        if envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get() and not get_exl3_stream_trace().enabled:
+            raise RuntimeError(
+                "exl3 RAM miss: SGLANG_DSV41_ROUTER_CAPTURE_PATH needs SGLANG_DSV41_EXPERT_TRACE_PATH: the "
+                "router capture is written by the stage trace's graph route log"
+            )
         cfg = Dsv41Config.from_envs()
         streamers = {layer_id: table.streamer_of() for layer_id, table in sorted(self.tables.items())}
         missing = [layer_id for layer_id, s in streamers.items() if s is None or s.pinned_host_cache is None]
@@ -814,7 +821,11 @@ class Exl3RamMissService:
         from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
         from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-        log = GraphRouteLog(len(self._rows), MAX_IDS, device)
+        router_prefix = envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get()
+        # The router rings hold ~400 KB per forward, so they get a shallower ring: 32 deep is ~13 MB of VRAM.
+        log = GraphRouteLog(len(self._rows), MAX_IDS, device, depth=32 if router_prefix else 64)
+        if router_prefix:
+            log.enable_router(router_prefix)
         if self._gpu_hot_updater is not None:
             log.bind_hot(self._gpu_hot_updater.slot_to_expert, self._gpu_hot_updater.layer_ids)
         trace = get_exl3_stream_trace()
