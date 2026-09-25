@@ -77,7 +77,9 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-
   && git pull --ff-only origin master && git log -1 --oneline'
 ```
 
-The `dsv41-direct-prod` checkout tracks `origin/master`.
+The `dsv41-direct-prod` checkout tracks `origin/master`. The full production procedure
+(publish, check, update, dry-run, start, health, stop) is `run_server.md`, section
+"DSV4.1 production".
 Older linked diagnostic worktrees may be detached; inspect each checkout before updating
 it. Do not assume the old `wt-p1bench` path is the benchmark target.
 

@@ -1,6 +1,12 @@
-# Publish and run the NVFP4 SGLang server on divix01
+# Publish and run the SGLang servers on divix01
 
-This guide publishes the `master` branch from the local
+Two servers can run on divix01's port 7867, one at a time:
+
+- **Qwen3.8 NVFP4** (below): the earlier production server, kept so it can be run again.
+- **DeepSeek-V4.1 Flash EXL3** ([DSV4.1 production](#dsv41-production)): the current
+  production server.
+
+The Qwen guide publishes the `master` branch from the local
 SGLang checkout, updates the matching checkout on divix01, and launches the
 NVFP4 server with dynamic expert residency.
 
@@ -9,8 +15,8 @@ NVFP4 server with dynamic expert residency.
 | Item | Value |
 | --- | --- |
 | Local checkout | `/home/dimitri/data/divix/sglang-nvfp4` |
-| divix01 checkout | `/data/models/slang/nvfp4-work/main-port-probe-7bc4eb` |
-| Shared bare remote on divix01 | `/data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git` |
+| divix01 checkout | `/data/models/slang/nvfp4-work/main-port-probe-7bc4eb` (as of 2026-09-25 detached at `797be6f678`, the last Qwen-served commit; the update step below refuses a detached checkout, so run `git switch master` there first only if Qwen should run on current `master`) |
+| Remote | `origin` = `git@github.com:divixcorp12/sglang.git` (the divix01 bare repo is retired) |
 | Branch | `master` |
 | Launch script | `/data/models/slang/nvfp4-work/run-nvfp4-expert-dynamic-hot10g.sh` |
 | tmux session | `cc-nvfp4-dynamic` |
@@ -113,7 +119,7 @@ git commit
 Add every new file explicitly by name; `git add --patch` only stages changes to
 files that Git already tracks.
 
-Push the branch to the shared remote:
+Push the branch to GitHub:
 
 ```bash
 git push origin master
@@ -149,7 +155,7 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && git stat
 If it is clean, update it with:
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = master || { echo "WRONG_BRANCH: $branch"; exit 1; }; git pull --rebase shared master'
+ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = master || { echo "WRONG_BRANCH: $branch"; exit 1; }; git pull --rebase origin master'
 ```
 
 If it is dirty, do not reset or overwrite it. Those changes may be work created
@@ -167,7 +173,7 @@ When the remote changes are known to match the published commit, preserve them
 in a recoverable stash before pulling:
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = master || { echo "WRONG_BRANCH: $branch"; exit 1; }; git stash push -u -m pre-shared-update-$(date +%Y%m%d-%H%M%S) && git pull --rebase shared master'
+ssh divix01 'cd /data/models/slang/nvfp4-work/main-port-probe-7bc4eb && branch=$(git branch --show-current) && test "$branch" = master || { echo "WRONG_BRANCH: $branch"; exit 1; }; git stash push -u -m pre-shared-update-$(date +%Y%m%d-%H%M%S) && git pull --rebase origin master'
 ```
 
 Keep that stash until the updated server has been verified. Do not immediately
@@ -291,3 +297,136 @@ ssh divix01 'ss -ltn 2>/dev/null | grep ":7867[[:space:]]" || echo PORT_7867_FRE
 ```
 
 Do not run `tmux kill-server`, `byobu kill-server`, or `tmux capture-pane`.
+
+---
+
+## DSV4.1 production
+
+DeepSeek-V4.1 Flash EXL3 on port 7867. Every flag and environment variable comes from
+[`benchmarks/dsv41_baseline/arm_env.py`](benchmarks/dsv41_baseline/arm_env.py) (`base_env()`
+and `ServerArgs.prod()`), launched by
+[`benchmarks/dsv41_baseline/launch_prod.sh`](benchmarks/dsv41_baseline/launch_prod.sh) with no
+overrides, so production and every benchmark arm run one recipe. To change a production
+setting, change `arm_env.py`, not the launcher. Current settings and their evidence:
+`DSV41_REFERENCE.md` §23.1 and §25.
+
+| Item | Value |
+| --- | --- |
+| Remote and branch | `origin` = `git@github.com:divixcorp12/sglang.git`, `master` |
+| divix01 checkout | `/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod` (tracks `origin/master`) |
+| Launcher | `/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live/launch.sh`, which execs the checkout's `launch_prod.sh` |
+| Log and pid | `dsv41-direct-live/server.log` (appended), `dsv41-direct-live/server.pid` |
+| Endpoint | `http://<divix01>:7867`, bound to all interfaces |
+| GPU lock | `/data/models/slang/nvfp4-work/cc-gpu.lock`, held by the server for its lifetime |
+
+Rules that apply to this server:
+
+- Never test in the production checkout. Tests and benchmark arms run in private worktrees
+  (`.claude/rules/divix01-run-protocol.md`).
+- The server holds `cc-gpu.lock`, so no GPU test or benchmark can run while it is up, and it
+  refuses to start while one does.
+- The copy engine requires `CUDA_MODULE_LOADING=EAGER`, which `arm_env` sets. Never run
+  graph-mode nsys against this server.
+- Memory fraction is 0.83. A ~30k-token prompt at this setting has **not** been tested (§25.3).
+
+### D1. Publish from the laptop
+
+Commit on `master` in the local checkout and push:
+
+```bash
+cd /home/dimitri/data/divix/sglang-nvfp4
+git status --short --branch
+git push origin master
+git status --short --branch   # no ahead/behind count
+```
+
+From a worktree whose `HEAD` is the commit to ship, `git push origin HEAD:master` does the
+same. It must fast-forward; never force-push `master`.
+
+### D2. Check that production is stopped
+
+Never update the checkout under a running server:
+
+```bash
+ssh divix01 'pgrep -af "[s]glang.launch_server.*--port 7867" || echo DSV41_STOPPED'
+ssh divix01 'ss -ltn 2>/dev/null | grep ":7867[[:space:]]" || echo PORT_7867_FREE'
+ssh divix01 'flock --nonblock /data/models/slang/nvfp4-work/cc-gpu.lock true && echo GPU_LOCK_FREE || echo GPU_LOCK_HELD'
+```
+
+If the server is running, stop it first (D7). If the GPU lock is held by a test or benchmark,
+wait for it; do not kill another job's process.
+
+### D3. Update the production checkout
+
+Inspect it, then fast-forward it to `origin/master`:
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod && git status --short --branch && git log -1 --oneline'
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod && git pull --ff-only origin master && git log -1 --oneline'
+```
+
+The only expected untracked file is `benchmarks/dsv41_baseline/generations.json`. Any tracked
+change is work done directly on divix01: stop and commit it from the laptop instead of
+overwriting it. If the pull refuses to fast-forward, someone committed on divix01 or
+rewrote `master`; investigate, do not reset.
+
+Confirm the laptop and divix01 agree:
+
+```bash
+git -C /home/dimitri/data/divix/sglang-nvfp4 rev-parse --short origin/master
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod && git rev-parse --short HEAD'
+```
+
+### D4. Dry-run the launch
+
+Prints the checkout, cores, every environment variable and the full argv. It takes no lock
+and starts nothing:
+
+```bash
+ssh divix01 'DRY_RUN=1 bash /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod/benchmarks/dsv41_baseline/launch_prod.sh'
+```
+
+Check that `sglang:` resolves inside `dsv41-direct-prod`, and that the argv has
+`--host 0.0.0.0 --port 7867`.
+
+### D5. Start
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live || exit 1; setsid nohup bash launch.sh >> server.log 2>&1 < /dev/null & echo $! > server.pid; sleep 5; ps -o pid,args -p $(cat server.pid) | cut -c1-120'
+```
+
+Every step from `setsid` to the server `exec`s in place, so `server.pid` is the server's own
+pid; the `ps` line should show `sglang.launch_server ... --port 7867`. If the GPU lock is held, the launcher exits at once with
+`cc-gpu.lock is held by another GPU job; not starting production` in `server.log`.
+
+### D6. Monitor startup and check health
+
+Startup takes several minutes (weights, pinned tier, graph capture). Follow the events, not
+the whole log:
+
+```bash
+ssh divix01 'grep -E "Uvicorn running|fired up|copy engine|Traceback|Error|out of memory|refus" /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live/server.log | tail -20 | cut -c1-300'
+```
+
+A good start logs, in order: `Uvicorn running on http://0.0.0.0:7867`, `The server is fired up
+and ready to roll!`, and after the first 16 decode forwards `exl3 RAM miss copy engine armed
+after 16 decode forwards since capture`.
+
+```bash
+ssh divix01 'curl --fail --silent --show-error --max-time 900 http://127.0.0.1:7867/health >/dev/null && echo HEALTH_OK'
+ssh divix01 'curl --fail --silent --show-error --max-time 300 http://127.0.0.1:7867/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: DSV41 OK\"}],\"temperature\":0,\"max_tokens\":32}" | jq -c "{finish_reason: .choices[0].finish_reason, content: .choices[0].message.content}"'
+```
+
+`/health` runs a real generation, so it can take minutes on a cold server.
+
+### D7. Stop
+
+Confirm the pid is the server before signalling it:
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live && ps -o pid,args -p $(cat server.pid) | cut -c1-120'
+ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live && kill $(cat server.pid)'
+ssh divix01 'for i in $(seq 60); do pgrep -f "[s]glang.launch_server.*--port 7867" >/dev/null || { echo DSV41_STOPPED; break; }; sleep 2; done; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader'
+```
+
+Only kill the pid that the first command shows as `sglang.launch_server ... --port 7867`.

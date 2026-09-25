@@ -1006,6 +1006,8 @@ def test_launch_prod_uses_the_base_recipe_without_overrides():
     assert "arm_env.ServerArgs.prod().argv()" in script
     assert "overrides" not in script
     assert "flock --nonblock 9" in script
+    # The dry run must exit before the lock is taken or anything is exec'd.
+    assert script.index('DRY_RUN:-0') < script.index("flock --nonblock 9")
 
 
 def test_server_args_omits_decode_log_interval_by_default():
