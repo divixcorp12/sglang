@@ -11,6 +11,9 @@ Each arm is one CUDA graph of 40 layers, the way the decode graph issues them:
 - ``two_torch/<r>+<m>``: as two_static, with the masks built by the torch ops of the parity test
   (``split_route_tables``), an upper bound on the route-table work.
 - ``res_only`` / ``miss_only``: two_static with one of its two launches, to split the cost.
+- ``tables_only``: two_static with neither launch (route tables + gather), the floor under every arm.
+- ``miss_wide/<r>+<m>``: miss_only with num_active = m (wider expert groups). Not bitwise with the single launch
+  (the parity test's ``test_num_active_must_stay_six``); measured only to bound what a non-identical variant saves.
 
 The split is the one ``test_exl3_moe_split_parity_cuda.py`` proves bitwise.
 
@@ -121,7 +124,7 @@ def prepare_static(par, L: Layer, split):
     L.state.kind.copy_((count > 0).long() * (L.keep > 0).long())
 
 
-def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss")):
+def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss"), miss_active: int = 6):
     f, st = L.fused, L.state
     # Full-route placement: the fused route-tables kernel with keep = 1 (the resident launch precedes F).
     remap64, inv_order, weight_full, det = f._fused_route_tables(L.x, L.weights, L.remap, st.ones_keep)
@@ -136,7 +139,7 @@ def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss")):
         st.missed.count.mul_(kept)
         torch.mul(det[2], kept, out=st.kind)
     if "miss" in launches:
-        par.launch(f, f.x16, f.out, st.missed.count, st.missed.weights, det[0])
+        par.launch(f, f.x16, f.out, st.missed.count, st.missed.weights, det[0], miss_active)
     s = f.slots
     f.ext.exl3_moe_gather(f.out, f.scratch, remap64, inv_order, det[1, :s], det[0, :s], st.kind[:s], weight_full)
 
@@ -178,6 +181,9 @@ def main():
           f"allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
 
     arms = {"one": capture(lambda L: one(par, L), layers)}
+    for L in layers:
+        prepare_static(par, L, SPLITS[1])
+    arms["tables_only"] = capture(lambda L: two(par, L, SPLITS[1], torch_tables=False, launches=()), layers)
     for split in SPLITS[1:]:
         tag = f"{split[0]}+{split[1]}"
         for L in layers:
@@ -187,6 +193,9 @@ def main():
         arms[f"two_static/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=False), layers)
         arms[f"res_only/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=False, launches=("res",)), layers)
         arms[f"miss_only/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=False, launches=("miss",)), layers)
+        arms[f"miss_wide/{tag}"] = capture(
+            lambda L, s=split: two(par, L, s, torch_tables=False, launches=("miss",), miss_active=s[1]), layers
+        )
         arms[f"two_torch/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=True), layers)
     split_of = {name: tuple(int(v) for v in name.split("/")[1].split("+")) for name in arms if "/" in name}
 
