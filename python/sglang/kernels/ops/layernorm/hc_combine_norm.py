@@ -34,6 +34,35 @@ def _hc_combine_norm(
 
 
 @triton.jit
+def _hc_combine_norm_half(
+    X,
+    P,
+    W,
+    Y,
+    Y16,
+    SX: tl.constexpr,
+    SP: tl.constexpr,
+    EPS: tl.constexpr,
+    PARTS: tl.constexpr,
+):
+    # _hc_combine_norm plus the fp16 copy of its bf16 output, which the EXL3 linears read.
+    row, part = tl.program_id(0), tl.program_id(1)
+    h = tl.arange(0, 8192)
+    value = tl.full((8192,), 0, tl.float32)
+    for c in tl.static_range(4):
+        pre = tl.load(P + row * SP + c).to(tl.float32)
+        x = tl.load(X + row * SX + c * 5120 + h, h < 5120, 0).to(tl.float32)
+        value += x * pre
+    value = value.to(tl.bfloat16).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(value * value, 0) / 5120 + EPS)
+    mask = (h >= part * (5120 // PARTS)) & (h < (part + 1) * (5120 // PARTS))
+    weight = tl.load(W + h, mask, 0).to(tl.float32)
+    y = (value * inv_rms * weight).to(tl.bfloat16)
+    tl.store(Y + row * 5120 + h, y, mask)
+    tl.store(Y16 + row * 5120 + h, y.to(tl.float32).to(tl.float16), mask)
+
+
+@triton.jit
 def _hc_combine_norm_prefill(
     X, P, W, Y, SX: tl.constexpr, SP: tl.constexpr, EPS: tl.constexpr
 ):
@@ -75,6 +104,24 @@ def hc_combine_norm(
         x, pre, weight, y, x.stride(0), pre.stride(0), eps, parts, num_warps=8
     )
     return y
+
+
+def hc_combine_norm_half(
+    x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hc_combine_norm`` for decode batches, also returning ``y.to(fp16)`` from the same kernel."""
+    m = x.shape[0]
+    assert 0 < m <= 96 and x.shape == (m, 20480)
+    assert pre.shape == (m, 4) and pre.stride(1) == 1
+    assert weight.shape == (5120,) and weight.is_contiguous()
+    assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
+    y = torch.empty((m, 5120), dtype=x.dtype, device=x.device)
+    y16 = torch.empty((m, 5120), dtype=torch.float16, device=x.device)
+    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
+    _hc_combine_norm_half[(m, parts)](
+        x, pre, weight, y, y16, x.stride(0), pre.stride(0), eps, parts, num_warps=8
+    )
+    return y, y16
 
 
 @triton.jit
