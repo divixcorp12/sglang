@@ -12,6 +12,9 @@ the tier's hits and admits the misses with the chunk protected. The prefill poli
 - ``unbounded``: an upper bound, not a policy. Prefill admits into extra slots and evicts nothing; each later
   decode admission gives one extra slot back (its LRU row) until the tier is at capacity again. No decode row is
   lost to a prefill, and every prefill row stays available to decode.
+- ``shareK``: prefill admits at the MRU end but owns at most K rows per layer. A row is prefill-owned from its
+  admission until decode touches it; once K are owned, a prefill admission evicts the LRU owned row instead of a
+  decode row. So a prefill displaces at most K of decode's rows and keeps its K most recent rows warm.
 
 ``--no-touch`` also stops prefill hits from stamping. VRAM hot sets are the logged ones (graph forwards log the set
 each layer held as the forward started; an eager forward uses the next graph forward's). Leases are not modelled:
@@ -42,13 +45,14 @@ class Tier:
         self.slot_expert = [-1] * capacity
         self.stamp = [0] * capacity
         self.where: dict[int, int] = {}
+        self.owned: set[int] = set()
 
-    def take(self, hot: set, protect: set) -> int:
+    def take(self, hot: set, protect: set, only: set | None = None) -> int:
         best = -1
         for slot, expert in enumerate(self.slot_expert):
             if expert < 0:
                 return slot
-            if expert in hot or expert in protect:
+            if expert in hot or expert in protect or (only is not None and slot not in only):
                 continue
             if best < 0 or self.stamp[slot] < self.stamp[best]:
                 best = slot
@@ -56,9 +60,10 @@ class Tier:
             raise RuntimeError("no victim")
         del self.where[self.slot_expert[best]]
         self.slot_expert[best] = -1
+        self.owned.discard(best)
         return best
 
-    def admit(self, expert: int, stamp: int, hot: set, protect: set, grow: bool = False) -> None:
+    def admit(self, expert: int, stamp: int, hot: set, protect: set, grow: bool = False, share: int = 0) -> None:
         if grow:
             self.slot_expert.append(-1)
             self.stamp.append(0)
@@ -67,10 +72,19 @@ class Tier:
             self.slot_expert.pop(gone)
             self.stamp.pop(gone)
             self.where = {e: s for s, e in enumerate(self.slot_expert) if e >= 0}
-        slot = self.take(hot, protect)
+        slot = -1
+        if share and len(self.owned) >= share:
+            try:
+                slot = self.take(hot, protect, only=self.owned)
+            except RuntimeError:
+                slot = -1
+        if slot < 0:
+            slot = self.take(hot, protect)
         self.slot_expert[slot] = expert
         self.stamp[slot] = stamp
         self.where[expert] = slot
+        if share:
+            self.owned.add(slot)
 
 
 class Replay:
@@ -91,6 +105,7 @@ class Replay:
                 missing.append(expert)
             else:
                 tier.stamp[slot] = self._next()
+                tier.owned.discard(slot)
         for expert in missing:
             tier.admit(expert, self._next(), hot, wanted)
         return len(missing)
@@ -112,7 +127,8 @@ class Replay:
             protect = set(chunk)
             for expert in missing:
                 stamp = 0 if self.policy == "cold" else self._next()
-                tier.admit(expert, stamp, hot, protect, grow=self.policy == "unbounded")
+                share = int(self.policy[5:]) if self.policy.startswith("share") else 0
+                tier.admit(expert, stamp, hot, protect, grow=self.policy == "unbounded", share=share)
         return misses
 
 
@@ -168,13 +184,14 @@ def main() -> None:
     p.add_argument("trace")
     p.add_argument("--ram-rows", type=int, default=8063)
     p.add_argument("--num-experts", type=int, default=384)
+    p.add_argument("--arms", nargs="+", default=["base", "cold", "noadmit", "unbounded"])
     args = p.parse_args()
     loaded = load_forwards(args.trace)
     layers = len(loaded["layer_ids"])
     capacity = ram_rows_per_layer(args.ram_rows, layers, args.num_experts)
     report = {"trace": args.trace, "ram_rows": args.ram_rows, "arms": {}}
     measured = measured_ram_rows(args.trace)
-    for policy in ("base", "cold", "noadmit", "unbounded"):
+    for policy in args.arms:
         for touch in (True, False):
             result = run(loaded, capacity, policy, touch)
             name = policy + ("" if touch else "-notouch")
