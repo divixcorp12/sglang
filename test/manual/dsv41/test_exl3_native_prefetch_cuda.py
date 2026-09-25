@@ -219,6 +219,7 @@ class Decode:
         self.gen = torch.zeros(1, dtype=torch.int64, device=dev)
         self.counters = torch.zeros(len(kernels.NATIVE_PREFETCH_COUNTERS), dtype=torch.int64, device=dev)
         self.lru = list(range(SLOTS))  # host LRU of slots, oldest first
+        self.expected = None  # expert -> checkpoint rows, set by the test to check every mapped slot each step
         self.s.plan([])
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -260,9 +261,18 @@ class Decode:
         s.routes[: len(routes)] = torch.tensor(routes, dtype=torch.int64)  # the commit counts a used row against them
         if self.prefetch:
             self.g1.replay()
-            torch.cuda.synchronize()
+        # Taken on the stream right behind the commit, before anything synchronizes: every slot the residency maps must
+        # already hold its expert's bytes, so a commit that maps a prefetched slot before its copy landed shows here.
+        snapshot = {n: t.clone() for n, t in s.dest.items()}
+        torch.cuda.synchronize()
         mapping = self.mapping.cpu().tolist()
         slot_to_expert = self.slot_to_expert.cpu().tolist()
+        if self.expected is not None:
+            for e in range(EXPERTS):
+                if mapping[e] >= 0:
+                    for n in s.names:
+                        got = snapshot[n][mapping[e]].cpu().view(torch.uint8)
+                        assert torch.equal(got, self.expected[e][n].view(torch.uint8)), ("mapped before landing", e, n)
         misses = [e for e in routes if mapping[e] < 0]
         hit_slots = {mapping[e] for e in routes if mapping[e] >= 0}
         free = [slot for slot in self.lru if slot not in hit_slots][: len(misses)]
@@ -319,6 +329,7 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
             d.s.host.copy_engine_ballast(ballast_dst, ballast_src)
         try:
             expected = d.s.expected(list(range(EXPERTS)))
+            d.expected = expected
             outs[arm], misses[arm] = [], 0
             for i in range(STEPS):
                 out, missed = d.run(steps[i], predicted[i])
