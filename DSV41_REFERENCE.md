@@ -3984,6 +3984,128 @@ sections cited and the merged code.
 | `2026-09-25-dsv41-native-prefetch.md` | Native next-layer prefetch, plus the early-post estimate | Built, flag off (123.2 vs 120.6); early post not built (misses the 8 ms bar) | §25.4 |
 | `2026-09-25-dsv41-per-expert-compute.md` | Compute experts as they land (resident-first split) | Closed: step 2 fails the gate | §25.4 |
 
+## 27. The transfer path under a traced arm, with PCIe RX/TX (2026-09-25)
+
+A node-mode arm at `master` `69df716412` was traced together with GPU-metrics sampling (PCIe RX/TX, §26, `run_arm.sh`
+`NSYS_GPU_METRICS`):
+
+- `NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node run_arm.sh pcie-node 30021`: exit 0, result gate OK.
+- The run has two timed sessions, each a 260-token prompt: TTFT 23.6 s with 7 output tokens, and 19.8 s with 103.
+- Reports on divix01: `/mnt/nvme1/dsv41-nsys/pcie-node-20260925-170510{,-pcie}.nsys-rep`. Laptop copies and their
+  sqlite exports: `/home/dimitri/data/divix/nsys-reports/`.
+- Scripts: `analysis/dsv41-drive/pcie-trace/`. Each script reads the laptop sqlite paths; run them under
+  `systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0`.
+- The PCIe report starts 530.79 ms before the trace (compare the two `TARGET_INFO_SESSION_START_TIME`): trace time
+  t is PCIe time t + 0.531 s.
+
+Node mode inflates small-kernel and graph-launch cost, so no ms/token below comes from this trace.
+Traced decode steps average 118.4 ms, against ~111 ms/token untraced (§25.1).
+
+### 27.1 PCIe metrics on this machine
+
+- **The link is Gen3 x16.** `nvidia-smi -q` reports Host Max 3 and Device Max 5. An idle GPU drops the link to Gen1,
+  so read the link speed under load.
+- **nsys's "PCIe RX Throughput %" is not a fraction of that link.** During copy-engine bursts measured at
+  12.17 GB/s, RX reads 42.8%, so 100% ≈ 28.4 GB/s and 1 point ≈ 0.284 GB/s. The highest RX observed, 46%, is
+  ≈ 13.1 GB/s, the practical Gen3 ceiling.
+- **Counter access:** GPU counters are admin-only on divix01 (`RmProfilingAdminOnly: 1`). `run_arm.sh` therefore
+  samples them in a second root session through `sudo -n /usr/local/sbin/nsys-profile` (CLAUDE.md).
+
+### 27.2 Prefill: the transfer path is serial, and it dominates TTFT
+
+Session 1's prefill ran from 1.18 to 24.56 s in the trace, 23.4 s for 260 tokens:
+
+| Component | Time | What it is |
+|---|---:|---|
+| `_gather_host_rows_kernel` | 6.5 s | An SM zero-copy gather from pinned RAM at 12.33 GB/s, which is link-bound. There are 129 calls; each is 6 segment launches over ≤64 experts (the staging buffer holds 64), ~47 on average. That moves ~78 GB for 260 tokens: ~146 non-VRAM experts × 13.3 MB per layer. |
+| GPU idle, host busy | ~12 s | 128 gaps of 10–250 ms, about 3 per layer, one per gather chunk. During them the scheduler thread makes no CUDA call and no traced syscall: it is filling the pinned tier (below). |
+| GPU idle, launch gaps | 3.9 s | ~157,000 gaps under 0.1 ms between ~149,000 eager kernels. |
+| Other kernels | ~0.5 s | All other prefill compute. |
+
+**How the pinned-tier fill works:** `_gather_cached` → `ExpertPinnedHostCache.gather_rows` →
+`ensure_rows` → `Exl3ShardRowSource.read`. Each chunk's fill runs synchronously on the scheduler thread:
+
+- **Read:** an io_uring read (liburing's raw syscalls, which nsys does not see) into a **bounce buffer**.
+- **Copy:** a **single-threaded CPU `copy_`**, one segment at a time, into the pinned slot.
+
+Decode dropped this double handling with row images (§24.9); the prefill path still has it. Each chunk runs
+fill → gather → `.item()`, with no overlap between NVMe, CPU and GPU.
+
+**The pageable copies in the trace are sync points, not a pinning problem.**
+
+- **Readbacks:** there are 1,325 device-to-pageable readbacks of ≤256 B during prefill (`hit_mask.sum().item()`,
+  `chunk.tolist()`, `torch.unique(...).numel()`). Their GPU time totals 0.87 ms, but the host is blocked in them for
+  12.5 s across both prefills, waiting for queued gathers to finish.
+- **Larger copies:** the 1.52 MiB and 48.75 KiB pageable copies total 0.65 ms.
+- **Decode:** has only 10 pageable copies.
+
+**Prefill evicts decode's RAM set.** The RAM-miss service reads the same `pinned_host_cache` that prefill fills.
+After session 2's prefill:
+
+| Decode steps | NVMe wait (S) per step | Step wall |
+|---|---:|---:|
+| 0–4 | 64 ms | 149 ms |
+| 70–102 | 36 ms | 107 ms |
+
+One session, so this is directional (`s_decay.py`).
+
+**Long prompts, *estimate*.** With `--chunked-prefill-size 512`, every chunk routes 3,072 lanes per layer, which
+touches nearly all 384 experts. That streams ~356 non-VRAM rows per layer, ~190 GB per chunk: ≥15 s per chunk at the
+link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes to first token. Not measured.
+
+### 27.3 Decode: the link is well used while copying; the copy thread is not always running
+
+- **Copy engine:** per step, 458 copies (~2.2 MB each, six segments per row), 1.02 GB in total, on stream 141.
+  - Within a layer the copies run back to back: 46,500 of 50,412 gaps are under 10 µs.
+  - Busy throughput is 12.4–12.5 GB/s, ~91% of the 13.7 GB/s bench.
+  - A layer's first copy starts a median 20 µs after its post kernel ends (`ce_latency.py`).
+- **Link use per step, from RX samples joined to kernel state (`pcie_decode.py`):**
+
+| State | ms/step (traced) | Mean link rate |
+|---|---:|---:|
+| Copy engine running, GPU in CW | 54.1 | 12.5 GB/s |
+| Copy engine running, GPU in S | 27.0 | 11.5 GB/s |
+| No copy, GPU in S (NVMe waits and SM pulls of streamed pieces) | 17.4 | 7.4 GB/s; RX < 5% in 25% of samples |
+| No copy, compute | 19.3 | 0.9 GB/s; RX < 5% in 85% of samples |
+
+  The link carries ~1.14 GB per step in all. Only prefetch could use the idle link during compute (§25.4).
+- **Chain order:** post → W1 → S → CW → MoE. S runs before CW, and the RAM-hit copies overlap S (`ce_order.py`).
+- **CW waits after its copies have landed: 13.3 ms per step.** CW's end minus the layer's last copy end has
+  median 4.7 µs but p90 1.4 ms.
+  - The wait kernel polls every 256 ns with no backoff, and the copy thread writes CopyDone as soon as
+    `cuEventQuery` reports done. So the delay is the copy thread not running.
+  - All 820 tails ≥ 0.5 ms are a single silence of `exl3-copy-eng`, a stretch with no API call at all. Its
+    busy-poll otherwise issues ~9.9 million `cuEventQuery` calls (`ce_thread.py`).
+  - Over 47–58.6 s there are 1,250 silences ≥ 0.5 ms, totalling 2.66 s of 11.6 s (23%), median 1.5 ms, about a
+    scheduler time slice. They are not periodic in call count (CV 0.95), so they are not a fixed-size trace-buffer
+    flush (`ce_silence.py`).
+  - **Cause not determined from this trace.** Both preemption and a CUPTI artefact fit.
+    - Preemption: the run flagged tmux's server process at ~100% on server cores 36, 47 and 50, and
+      OMP_NUM_THREADS=16 spin threads also run there.
+    - CUPTI: in node mode `cudaGraphLaunch` blocks for a whole step (99 launches, 10.9 s), so every silence falls
+      inside one.
+  - The check is untraced: sample the copy thread's `/proc/<pid>/task/<tid>/schedstat` during an arm (§27.5).
+
+### 27.4 Next steps
+
+1. **Prefill fills.**
+   - Serve prefill misses through the C++ RAM-miss service with row images: direct reads into the slabs, no bounce
+     buffer or CPU copy, all drives in parallel.
+   - Issue a layer's reads as soon as it has routed, and overlap reading chunk k+1 with gathering chunk k. This
+     removes the per-chunk syncs.
+   - Gather with the copy engine, not the SM kernel.
+2. **Keep prefill from evicting decode's RAM set:** stage prefill misses without admitting them, or protect
+   decode-hot rows.
+3. **The copy thread:** if §27.5 shows run-queue delay, pin it to a dedicated core. Also have the copy stream publish
+   CopyDone itself (`cuStreamWriteValue64` after the job's copies), so CW does not depend on the host. Lease release
+   stays event-driven, off the critical path. Worth up to ~13 ms/token if the silences are real.
+4. **Long prompts:** larger prefill chunks, which trades against Track A's VRAM headroom (§25.4).
+5. **Environment:** the spinning tmux server on the server cores contaminates every arm.
+
+### 27.5 Copy-thread scheduling, untraced
+
+Pending: an untraced arm that samples `exl3-copy-eng`'s schedstat (run-queue delay) and context switches.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
