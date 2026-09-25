@@ -1158,3 +1158,76 @@ def test_a_triton_module_load_drains_the_device_first_once_armed(monkeypatch):
     order.clear()
     load("name", b"cubin")
     assert order == [("load", ("name", b"cubin"), {})], "the guard synchronized during a capture"
+
+
+class _Recorder:
+    """Stands in for the real expert distribution recorder: keeps the pre-forward observers it is given."""
+
+    def __init__(self):
+        self.observers = []
+
+    def register_pre_forward_observer(self, callback):
+        self.observers.append(callback)
+
+
+def _prefill_share_service(tiers, monkeypatch, *, on, share=1):
+    from sglang.srt.eplb import expert_distribution
+
+    service, streamers, caches = tiers
+    recorder = _Recorder()
+    monkeypatch.setattr(expert_distribution, "get_global_expert_distribution_recorder", lambda: recorder)
+    monkeypatch.setattr(module, "PREFILL_SHARE_ROWS", share)
+    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(on):
+        service.ensure_started()
+    return service, caches, recorder
+
+
+def _gather(cache, expert):
+    """One eager gather chunk of one miss, as _gather_cached hands it to the pinned tier."""
+    outputs = {
+        name: torch.empty((1, *cache.tensors[name].shape[1:]), dtype=cache.tensors[name].dtype)
+        for name in cache.cached_names
+    }
+    cache.gather_rows(torch.tensor([expert]), outputs)
+
+
+@pytest.mark.parametrize("on, survivors", [(False, [3, 4, 5]), (True, [1, 2, 5])], ids=["flag_off", "flag_on"])
+def test_decode_rows_survive_a_prefills_admissions_under_the_prefill_share(tiers, monkeypatch, on, survivors):
+    """The flag's purpose, through the real eager path: decode's rows (read by the thread) survive a prefill's
+    admissions once it holds its share. Mutations: the observer is not registered, or sets no share for a prefill."""
+    service, caches, recorder = _prefill_share_service(tiers, monkeypatch, on=on)
+    assert len(recorder.observers) == int(on)
+    row = service.row_of(1)
+    for expert in (0, 1, 2):  # decode fills the tier (capacity 3); 0 is the LRU row
+        assert sim_wait(service.page, sim_post(service.page, row, need=[expert], protect=[expert]), 10) == 1
+    for observer in recorder.observers:
+        observer(7, _batch(decode=False))
+    for expert in (3, 4, 5):
+        _gather(caches[1], expert)
+    assert sorted(e for e in service.host.slot_to_expert(row) if e >= 0) == survivors
+
+
+def test_a_decode_forward_clears_the_share(tiers, monkeypatch):
+    """Mutation: the observer sets the share for every forward (then decode's rows would be taken as prefill's)."""
+    service, caches, recorder = _prefill_share_service(tiers, monkeypatch, on=True, share=5)
+    shares = []
+    monkeypatch.setattr(service.host, "set_prefill_share", shares.append)
+    (observer,) = recorder.observers
+    observer(1, _batch(decode=False))
+    observer(2, _batch(decode=True))
+    assert shares == [5, 0]
+
+
+def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
+    """The no-op recorder drops observers, so the flag would silently do nothing."""
+    from sglang.srt.eplb import expert_distribution
+
+    service, streamers, caches = tiers
+    monkeypatch.setattr(
+        expert_distribution,
+        "get_global_expert_distribution_recorder",
+        lambda: expert_distribution._ExpertDistributionRecorderNoop(),
+    )
+    with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_PREFILL_SHARE"):
+            service.ensure_started()
