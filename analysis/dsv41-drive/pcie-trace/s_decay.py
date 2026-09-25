@@ -1,13 +1,34 @@
-"""NVMe wait (S kernel time) and RAM-hit bytes per decode step, by position after the prefill."""
+"""NVMe wait (S kernel time) and RAM-hit bytes per decode step, by position after the prefill.
+
+Usage: s_decay.py [SQLITE] [--start-ns T]. The defaults are the §27 report and the decode of its second session.
+Without --start-ns, decode starts at the first S kernel after the last prefill gather (``_gather_host_rows_kernel``),
+i.e. the last session's decode. The RAM-hit copies are the memcpys of the stream that moved the most bytes there.
+"""
+import argparse
 import bisect
 import sqlite3
 
-db = sqlite3.connect("file:/home/dimitri/data/divix/nsys-reports/pcie-node-20260925-170510.sqlite?mode=ro", uri=True)
-def kern(n):
+p = argparse.ArgumentParser()
+p.add_argument("db", nargs="?", default="/home/dimitri/data/divix/nsys-reports/pcie-node-20260925-170510.sqlite")
+p.add_argument("--start-ns", type=float, default=None)
+args = p.parse_args()
+db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+
+
+def kern(n, after):
     return db.execute("select k.start, k.end from CUPTI_ACTIVITY_KIND_KERNEL k join StringIds s on s.id=k.shortName "
-                      "where s.value=? and k.start > 46.5e9 order by k.start", (n,)).fetchall()
-s, cw = kern("exl3_ram_miss_lease_stream_kernel"), kern("exl3_ram_miss_lease_copy_wait_kernel")
-cp = db.execute("select start, bytes from CUPTI_ACTIVITY_KIND_MEMCPY where streamId=141 and start > 46.5e9 order by start").fetchall()
+                      "where s.value=? and k.start > ? order by k.start", (n, after)).fetchall()
+
+
+start = args.start_ns
+if start is None:
+    gathers = kern("_gather_host_rows_kernel", 0)
+    start = kern("exl3_ram_miss_lease_stream_kernel", gathers[-1][1])[0][0] - 1
+s = kern("exl3_ram_miss_lease_stream_kernel", start)
+stream = db.execute("select streamId from CUPTI_ACTIVITY_KIND_MEMCPY where start > ? group by streamId "
+                    "order by sum(bytes) desc limit 1", (start,)).fetchone()[0]
+cp = db.execute("select start, bytes from CUPTI_ACTIVITY_KIND_MEMCPY where streamId=? and start > ? order by start",
+                (stream, start)).fetchall()
 cs = [a for a, _ in cp]
 steps = len(s) // 40
 rows = []
@@ -17,7 +38,7 @@ for k in range(steps):
     a0, a1 = L[0][0], (s[(k + 1) * 40][0] if (k + 1) * 40 < len(s) else L[-1][1] + 10_000_000)
     i, j = bisect.bisect_left(cs, a0 - 2_000_000), bisect.bisect_left(cs, a1 - 2_000_000)
     rows.append((s_ms, sum(b for _, b in cp[i:j]) / 1e9, (a1 - a0) / 1e6))
-print(f"session-2 decode steps: {steps}")
+print(f"decode from {start / 1e9:.3f} s: {steps} steps; copy stream {stream}")
 for lo, hi in ((0, 5), (5, 15), (15, 40), (40, 70), (70, steps)):
     part = rows[lo:hi]
     if not part:
