@@ -1023,8 +1023,10 @@ class Exl3RamMissService:
 
     def _set_prefill_share(self, forward_pass_id: int, forward_batch) -> None:
         """SGLANG_DSV41_ENABLE_PREFILL_SHARE's pre-forward observer: a prefill's pinned-tier admissions own at most
-        PREFILL_SHARE_ROWS rows per layer (then they evict their own), a decode forward's own none."""
-        self.host.set_prefill_share(0 if forward_batch.forward_mode.is_decode() else PREFILL_SHARE_ROWS)
+        PREFILL_SHARE_ROWS rows per layer (then they evict their own); any other forward's own none. The value holds
+        until the next forward's observer runs."""
+        prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        self.host.set_prefill_share(PREFILL_SHARE_ROWS if prefill else 0)
 
     def _copy_engine_barrier(self, forward_pass_id: int, forward_batch) -> None:
         # An eager forward may load a kernel module, and a load blocks the copy thread's cuMemcpyAsync while a decode

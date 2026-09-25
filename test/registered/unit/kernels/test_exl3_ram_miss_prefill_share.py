@@ -16,7 +16,6 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-FREE, LOADING, READY = 0, 1, 2
 EXPERTS = 10
 
 
@@ -163,6 +162,49 @@ def test_a_freed_owned_slot_is_no_longer_counted(tier):
     assert evicted == 1, "one owned row, below the share of 2: a decode row goes"
     _, evicted = host.assign(0, 7, protected=[7])
     assert evicted == 5
+
+
+def test_a_prefill_takes_free_slots_before_its_own_rows(tier):
+    """Mutation: the owned branch runs while a slot is free (then 5 evicts 4 on a cold tier)."""
+    page, host = tier
+    host.set_prefill_share(1)
+    for expert in (4, 5, 6):
+        _, evicted = host.assign(0, expert, protected=[expert])
+        assert evicted is None
+    assert _resident(host) == [4, 5, 6]
+
+
+def test_a_decode_eviction_of_an_owned_row_ends_its_ownership(tier):
+    """Mutation: the eviction in take_slot_locked leaves the slot owned (then 8 evicts decode's 6, whose slot
+    still reads as prefill-owned, instead of the LRU decode row 2)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(2)
+    _prefill(host, [[4, 5]])  # evicts 0 and 1; 4 and 5 owned
+    host.set_prefill_share(0)
+    _serve(page, host, need=[2, 3], protect=[2, 3])  # 4 and 5 are now the LRU rows
+    _serve(page, host, need=[6, 7], protect=[6, 7])  # evicts the owned 4 and 5
+    assert _resident(host) == [2, 3, 6, 7]
+    host.set_prefill_share(2)
+    _, evicted = host.assign(0, 8, protected=[8])
+    assert evicted == 2
+
+
+def test_a_row_decode_makes_hot_ends_its_ownership(tier):
+    """Mutation: set_hot leaves the row owned (then the share reads full and 6 evicts the owned 5, not decode's 1)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(2)
+    _prefill(host, [[4, 5]])  # evicts 0 and 1
+    host.set_hot(0, [4])
+    _, evicted = host.assign(0, 6, protected=[6])
+    assert evicted == 2 and host.contains(0, 5)
+
+
+def test_a_negative_share_is_refused(tier):
+    page, host = tier
+    with pytest.raises(RuntimeError, match="negative"):
+        host.set_prefill_share(-1)
 
 
 if __name__ == "__main__":
