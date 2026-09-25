@@ -23,6 +23,9 @@ def kern(n, after):
 start = args.start_ns
 if start is None:
     gathers = kern("_gather_host_rows_kernel", 0)
+    if not gathers:
+        raise SystemExit("no prefill gather in this report (graph mode, or no prefill): pass --start-ns")
+    # 1 ns before the first S kernel, so the query's `start >` keeps it.
     start = kern("exl3_ram_miss_lease_stream_kernel", gathers[-1][1])[0][0] - 1
 s = kern("exl3_ram_miss_lease_stream_kernel", start)
 stream = db.execute("select streamId from CUPTI_ACTIVITY_KIND_MEMCPY where start > ? group by streamId "
