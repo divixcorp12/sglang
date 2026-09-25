@@ -1090,6 +1090,41 @@ def test_the_copy_engine_refuses_any_module_loading_but_eager(value):
     module.check_copy_engine_module_loading({"CUDA_MODULE_LOADING": "EAGER"})
 
 
+class _CopyEngineReached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("value", [None, "LAZY", "EAGER"])
+def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tiers, monkeypatch, value):
+    """The refusal must sit on the service's start path, not only in a helper nobody calls: a LAZY server whose copy
+    engine arms fail-stops on a kernel's first launch (the soak's items 11 and 15). EAGER gets as far as enabling it."""
+    service, streamers, caches = tiers
+    if value is None:
+        monkeypatch.delenv("CUDA_MODULE_LOADING", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_MODULE_LOADING", value)
+
+    def reached(self, device):
+        raise _CopyEngineReached
+
+    monkeypatch.setattr(module.Exl3RamMissHost, "enable_copy_engine", reached)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    with (
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
+        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
+    ):
+        if value == "EAGER":
+            with pytest.raises(_CopyEngineReached):
+                service.ensure_started()
+        else:
+            with pytest.raises(RuntimeError, match="CUDA_MODULE_LOADING=EAGER"):
+                service.ensure_started()
+    assert service.host is None, "a refused start left a host behind"
+
+
 def test_a_jit_library_load_drains_the_device_first_once_armed(monkeypatch):
     """Under EAGER, tvm-ffi's load_module (sglang's load_jit, flashinfer's JIT) loads a library's kernels at once: the
     same hazard as a Triton load, so the guard wraps it too."""
