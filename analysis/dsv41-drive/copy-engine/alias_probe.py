@@ -28,9 +28,22 @@ def main() -> int:
     ap.add_argument("--streams", type=int, default=40)
     ap.add_argument("--sleep-ms", type=float, default=200.0)
     ap.add_argument("--priority", type=int, default=0, help="priority of the probed streams B (0 default, -1 high)")
+    ap.add_argument(
+        "--blocked-copy",
+        choices=("none", "h2d", "d2h", "d2d"),
+        default="none",
+        help="also queue a copy of this kind on stream C behind A's sleep (C waits on A), as the overlap scheduler's "
+        "result copy and a graph's memcpy nodes wait on the decode graph: does a copy engine stall behind it?",
+    )
     a = ap.parse_args()
     torch.cuda.init()
+    if a.priority == -99:
+        a.priority = torch.cuda.Stream.priority_range()[1]  # the greatest, as the copy thread uses
     a_stream = torch.cuda.Stream()
+    c_stream = torch.cuda.Stream()
+    c_host = torch.empty(16 << 20, dtype=torch.uint8).pin_memory()
+    c_dev = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    c_dev2 = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     src = torch.empty(64 << 20, dtype=torch.uint8).pin_memory()
     dst = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
     x = torch.zeros(1, device="cuda")
@@ -52,6 +65,15 @@ def main() -> int:
         with torch.cuda.stream(a_stream):
             torch.cuda._sleep(sleep_cycles)
             x.add_(1)  # waits for the sleep: the blocked head of A's queue
+        if a.blocked_copy != "none":
+            c_stream.wait_stream(a_stream)
+            with torch.cuda.stream(c_stream):
+                if a.blocked_copy == "h2d":
+                    c_dev.copy_(c_host, non_blocking=True)
+                elif a.blocked_copy == "d2h":
+                    c_host.copy_(c_dev, non_blocking=True)
+                else:
+                    c_dev2.copy_(c_dev, non_blocking=True)
         time.sleep(0.002)  # the sleep is running
         done = torch.cuda.Event()
         t0 = time.perf_counter()
@@ -68,6 +90,7 @@ def main() -> int:
     summary = {
         "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"),
         "priority": a.priority,
+        "blocked_copy": a.blocked_copy,
         "sleep_ms": a.sleep_ms,
         "aliased": [r["stream"] for r in results if r["aliased"]],
         "results": results,
