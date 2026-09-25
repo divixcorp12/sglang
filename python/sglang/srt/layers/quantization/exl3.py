@@ -34,6 +34,8 @@ from sglang.srt.layers.moe.expert_format import STREAMER_ATTRIBUTE, expert_strea
 from sglang.srt.layers.quantization.exl3_ops import (
     Exl3Tensors,
     assert_not_capturing,
+    exl3_gemm_bs1,
+    exl3_half_input,
     exl3_linear,
     exl3_moe_accumulate,
     exl3_moe_loop,
@@ -144,6 +146,7 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def __init__(self, config: Exl3Config):
         self.config = config
+        self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
 
     def create_weights(
         self,
@@ -204,9 +207,29 @@ class Exl3LinearMethod(LinearMethodBase):
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if self.cast_fusion and bias is None and x.dtype == torch.bfloat16 and x.numel() == layer.exl3_in:
+            y = exl3_gemm_bs1(exl3_half_input(x), layer.exl3_tensors).to(x.dtype)
+            return y.reshape(*x.shape[:-1], y.shape[-1])
         outs = [exl3_linear(x, t) for t in layer.exl3_tensors]
         y = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
         return y if bias is None else y + bias
+
+
+def exl3_cast_fusion_mlp(gate_up: nn.Module, down: nn.Module) -> bool:
+    """Whether a gate_up/down MLP runs as ``exl3_swiglu_mlp`` at BS1 (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION)."""
+    return all(
+        isinstance(linear.quant_method, Exl3LinearMethod) and linear.quant_method.cast_fusion
+        for linear in (gate_up, down)
+    )
+
+
+def exl3_swiglu_mlp(x: torch.Tensor, gate_up: nn.Module, down: nn.Module, swiglu_limit: float) -> torch.Tensor:
+    """DeepseekV2MLP's gate_up -> silu_and_mul_clamp -> down for one bf16 row, fp16 between the EXL3 gemvs."""
+    from sglang.kernels.ops.moe.dsv41_cast_fusion import exl3_silu_mul_clamp_half
+
+    hidden = exl3_silu_mul_clamp_half(exl3_gemm_bs1(exl3_half_input(x), gate_up.exl3_tensors), swiglu_limit)
+    y = exl3_gemm_bs1(hidden, down.exl3_tensors).to(x.dtype)
+    return y.reshape(*x.shape[:-1], y.shape[-1])
 
 
 _SLOTS = {"w1": ("w13", 0), "w3": ("w13", 1), "w2": ("w2", 0)}
@@ -285,6 +308,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.config = config
         self.streamed = streamed
         self.moe_runner_config = None
+        self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
 
     def create_weights(
         self,
@@ -396,10 +420,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             topk = topk.to_standard(layer_id=layer.layer_id)
         topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
         streamer = expert_streamer_of(layer)
+        scale = (
+            cfg.routed_scaling_factor
+            if cfg.routed_scaling_factor is not None and not layer.should_fuse_routed_scaling_factor_in_topk
+            else None
+        )
+        x = dispatch_output.hidden_states
         if streamer is not None and streamer.serves_graph_gather(topk):
-            out = self._apply_graph(
-                layer, streamer, dispatch_output.hidden_states, topk_weights, topk_ids, cfg.swiglu_limit
-            )
+            if self.cast_fusion and scale is not None and x.dtype == torch.bfloat16:
+                from sglang.kernels.ops.moe.dsv41_cast_fusion import exl3_scale_to_bf16
+
+                out = self._apply_graph(layer, streamer, x, topk_weights, topk_ids, cfg.swiglu_limit, cast=False)
+                return StandardCombineInput(hidden_states=exl3_scale_to_bf16(out, scale))
+            out = self._apply_graph(layer, streamer, x, topk_weights, topk_ids, cfg.swiglu_limit)
         elif streamer is not None:
             assert_not_capturing("Exl3MoEMethod.apply")
             out = self._apply_streamed(
@@ -427,12 +460,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # On CUDA, DeepseekV2MoE never scales the routed output itself (its multiply is
         # under `not _is_cuda`): the runner does, unless the factor is already fused into
         # topk_weights -- as the unquantized triton path does (unquant.py:1075).
-        if cfg.routed_scaling_factor is not None and not layer.should_fuse_routed_scaling_factor_in_topk:
-            out = out * cfg.routed_scaling_factor
+        if scale is not None:
+            out = out * scale
         return StandardCombineInput(hidden_states=out)
 
     @staticmethod
-    def _apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+    def _apply_graph(layer, streamer, x, topk_weights, topk_ids, swiglu_limit, cast=True):
         """BS1 decode inside a CUDA graph: device-only gather, then the fused MoE over slots.
 
         Hits are read in place from the hot cache, misses land in scratch rows from
@@ -488,7 +521,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             streamer.row_backend.keep,
             swiglu_limit,
         )
-        return out.to(x.dtype)
+        # cast=False hands the fp32 output to exl3_scale_to_bf16, which casts and scales in one kernel.
+        return out.to(x.dtype) if cast else out
 
     @staticmethod
     def _apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
