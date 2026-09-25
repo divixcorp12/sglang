@@ -94,6 +94,14 @@ class EngramFileTable:
 
     @classmethod
     def open(cls, table_dir: str, layer_id: int, num_embeddings: int, dim: int) -> "EngramFileTable":
+        if (
+            envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get()
+            and not envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get()
+        ):
+            raise ValueError(
+                "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT serves from the native store of "
+                "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING; set both"
+            )
         weight_key = f"layers.{layer_id}.engram.embed.weight"
         for path in sorted(glob.glob(os.path.join(table_dir, "*.safetensors"))):
             _, header = read_safetensors_header(path)

@@ -14,8 +14,10 @@
 """CUDA runtime binding utilities."""
 
 try:
+    from cuda.bindings import driver as drv
     from cuda.bindings import runtime as rt
 except ImportError:
+    drv = None
     rt = None
 
 
@@ -45,3 +47,31 @@ def checkCudaErrors(result):
         return result[1]
     else:
         return result[1:]
+
+
+def _count_host_nodes(graph) -> int:
+    _, count = checkCudaErrors(drv.cuGraphGetNodes(graph, 0))
+    nodes, _ = checkCudaErrors(drv.cuGraphGetNodes(graph, count))
+    host = 0
+    for node in nodes:
+        node_type = checkCudaErrors(drv.cuGraphNodeGetType(node))
+        if node_type == drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_HOST:
+            host += 1
+        elif node_type == drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_GRAPH:
+            host += _count_host_nodes(
+                checkCudaErrors(drv.cuGraphChildGraphNodeGetGraph(node))
+            )
+    return host
+
+
+def capturing_host_node_count(stream_handle: int) -> int:
+    """Host nodes (child graphs included) in the graph ``stream_handle`` is capturing."""
+    if drv is None:
+        raise RuntimeError(
+            "cuda.bindings is not available. Install it with: pip install cuda-python"
+        )
+    info = checkCudaErrors(drv.cuStreamGetCaptureInfo(drv.CUstream(stream_handle)))
+    status, graph = info[0], info[2]
+    if status != drv.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+        raise RuntimeError(f"stream {stream_handle:#x} is not capturing ({status})")
+    return _count_host_nodes(graph)

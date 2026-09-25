@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -376,6 +377,137 @@ class EngramHostLookup {
   int64_t host_stage_bytes_,device_stage_bytes_;
 };
 
+// Device-wait lookup (SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT): a device post kernel writes the step's ids and
+// release-stores kPostSeq; the service thread acquire-loads it, serves the ids into the pinned rows buffer through
+// the Store, writes kStatus and release-stores kDoneSeq; a device wait kernel acquire-spins on kDoneSeq. The word
+// offsets (int32 words of the pinned control block) mirror engram_ring.cuh and sglang.kernels.ops.embeddings.engram_ring.
+namespace ring {
+constexpr int64_t kPostSeq = 0;
+constexpr int64_t kDoneSeq = 16;
+constexpr int64_t kStatus = 17;
+constexpr int64_t kFatalSeq = 32;
+constexpr int64_t kFatalStatus = 33;
+constexpr int64_t kControlWords = 48;
+// Status codes. 0-3 are Store::enqueue's; the rest are the service's and the device wait's.
+constexpr int32_t kServed = 0;
+constexpr int32_t kRefusedAfterFatal = 4;
+constexpr int32_t kDeviceTimeout = 5;
+constexpr int32_t kDeviceSawFatal = 6;
+}  // namespace ring
+
+class RingLookup;
+
+// One polling thread serves every registered RingLookup, in registration order, so layer 1's request (posted first)
+// is served before layer 14's. It never calls the CUDA API: an API call from a second thread is what deadlocked
+// against a blocked cudaGraphLaunch (copy-overlap plan, section 3, probe (ii)).
+class RingService {
+ public:
+  RingService() : thread_([this] { loop(); }) {}
+  ~RingService() {
+    stop_.store(true);
+    if (thread_.joinable()) thread_.join();
+  }
+  void add(RingLookup* lookup) { std::lock_guard<std::mutex> l(mu_); lookups_.push_back(lookup); }
+  // Returns only once the thread is not serving `lookup`: serving holds mu_.
+  void remove(RingLookup* lookup) {
+    std::lock_guard<std::mutex> l(mu_);
+    lookups_.erase(std::remove(lookups_.begin(), lookups_.end(), lookup), lookups_.end());
+  }
+
+ private:
+  void loop();
+  std::mutex mu_;
+  std::vector<RingLookup*> lookups_;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
+static std::mutex ring_service_mu;
+static std::weak_ptr<RingService> ring_service_weak;
+static std::shared_ptr<RingService> shared_ring_service() {
+  std::lock_guard<std::mutex> l(ring_service_mu);
+  auto service = ring_service_weak.lock();
+  if (!service) { service = std::make_shared<RingService>(); ring_service_weak = service; }
+  return service;
+}
+
+class RingLookup {
+ public:
+  RingLookup(std::shared_ptr<Store> store, const std::string& path, uint64_t weight_offset, uint64_t scale_offset,
+             int64_t num_embeddings, int64_t dim, int64_t scale_dim, int64_t tag, int64_t n, uintptr_t ids,
+             uintptr_t rows, uintptr_t control)
+    : store_(std::move(store)),
+      table_{path, weight_offset, scale_offset, num_embeddings, dim, scale_dim, tag},
+      n_(n), ids_(ids), rows_(rows), control_(reinterpret_cast<int32_t*>(control)) {
+    if (n <= 0) throw std::invalid_argument("Engram ring lookup needs at least one id");
+    store_->register_table(table_);
+    last_seq_ = load_acquire(ring::kPostSeq);
+    service_ = shared_ring_service();
+    service_->add(this);
+  }
+  ~RingLookup() { close(); }
+  void close() {
+    if (service_) { service_->remove(this); service_.reset(); }
+  }
+  void set_test_delay_us(int64_t us) { test_delay_us_.store(us); }
+  uint64_t served() const { return served_.load(); }
+
+  // Called by the service thread only; returns whether a request was pending.
+  bool poll() {
+    const uint32_t seq = load_acquire(ring::kPostSeq);
+    if (seq == last_seq_) return false;
+    last_seq_ = seq;
+    if (const int64_t us = test_delay_us_.load()) std::this_thread::sleep_for(std::chrono::microseconds(us));
+    int32_t status = ring::kRefusedAfterFatal;
+    if (load_acquire(ring::kFatalSeq) == 0) {
+      status = 1;
+      try {
+        store_->enqueue(ids_, rows_, reinterpret_cast<uintptr_t>(&status), n_, table_.tag);
+      } catch (...) {
+        status = 3;
+      }
+    }
+    // kStatus and the rows are plain stores; the release store of kDoneSeq orders them before it.
+    reinterpret_cast<volatile int32_t*>(control_)[ring::kStatus] = status;
+    __atomic_store_n(reinterpret_cast<uint32_t*>(control_ + ring::kDoneSeq), seq, __ATOMIC_RELEASE);
+    served_.fetch_add(1);
+    return true;
+  }
+
+ private:
+  uint32_t load_acquire(int64_t word) const {
+    return __atomic_load_n(reinterpret_cast<const uint32_t*>(control_ + word), __ATOMIC_ACQUIRE);
+  }
+  std::shared_ptr<Store> store_;
+  Table table_;
+  int64_t n_;
+  uintptr_t ids_, rows_;
+  int32_t* control_;
+  uint32_t last_seq_ = 0;
+  std::atomic<int64_t> test_delay_us_{0};
+  std::atomic<uint64_t> served_{0};
+  std::shared_ptr<RingService> service_;
+};
+
+void RingService::loop() {
+  auto last_work = std::chrono::steady_clock::now();
+  while (!stop_.load(std::memory_order_relaxed)) {
+    bool worked = false;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      for (RingLookup* lookup : lookups_) worked |= lookup->poll();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (worked) {
+      last_work = now;
+    } else if (now - last_work > std::chrono::microseconds(200)) {
+      // Idle between steps: a sleep costs one timer slack (~50 us) of latency, which the device hides behind
+      // layer 0 for layer 1's request and behind layers 1-13 for layer 14's.
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
+}
+
 PYBIND11_MODULE(engram_host_node_cpp,m) {
   py::class_<Store,std::shared_ptr<Store>>(m,"Store")
    .def("register_table",[](Store& s,const std::string& path,uint64_t wo,uint64_t so,int64_t n,int64_t d,int64_t sd,int64_t tag){s.register_table(Table{path,wo,so,n,d,sd,tag});})
@@ -388,4 +520,14 @@ PYBIND11_MODULE(engram_host_node_cpp,m) {
    .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t,int64_t,int64_t>())
    .def("enqueue",&EngramHostLookup::enqueue).def("run",&EngramHostLookup::run);
   py::class_<Table>(m,"Table");
+  py::class_<RingLookup>(m,"RingLookup")
+   .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t>())
+   .def("close",&RingLookup::close,py::call_guard<py::gil_scoped_release>())
+   .def("set_test_delay_us",&RingLookup::set_test_delay_us)
+   .def("served",&RingLookup::served);
+  m.def("ring_layout",[](){py::dict d;
+    d["post_seq"]=ring::kPostSeq; d["done_seq"]=ring::kDoneSeq; d["status"]=ring::kStatus;
+    d["fatal_seq"]=ring::kFatalSeq; d["fatal_status"]=ring::kFatalStatus; d["control_words"]=ring::kControlWords;
+    d["refused_after_fatal"]=ring::kRefusedAfterFatal; d["device_timeout"]=ring::kDeviceTimeout;
+    d["device_saw_fatal"]=ring::kDeviceSawFatal; return d;});
 }
