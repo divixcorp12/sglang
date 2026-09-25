@@ -11,6 +11,9 @@
 #              graph-mode CUPTI tracing deadlocks the copy wait (LEASE_PROTOCOL.md 7.6).
 #   long       instead of the six requests: one ~8k-token prompt (chunked prefill), then prompt 0
 #
+# Optional environment: SMOKE_OUT_ROOT (default /data/models/slang/nvfp4-work/copy-engine/smoke) holds <tag>-<arm>;
+# SMOKE_ENV_OVERRIDES adds arm_env overrides as Python dict items, e.g. "'SGLANG_DSV41_RAM_MISS_TIMEOUT_MS': '60000'".
+#
 # Takes cc-gpu.lock and rowimg-disk.lock. Refuses when production (port 7867) is up. Never starts production.
 set -u
 ARM=${1:?arm: off|on}
@@ -23,7 +26,7 @@ case $MODE in
 esac
 H=$WT/benchmarks/dsv41_baseline
 PY=/data/models/slang/.venv/bin/python
-T=/data/models/slang/nvfp4-work/copy-engine/smoke
+T=${SMOKE_OUT_ROOT:-/data/models/slang/nvfp4-work/copy-engine/smoke}
 OUT=$T/$TAG-$ARM
 PORT=30013
 export NSYS_TMPDIR=/mnt/nvme1/nsys-tmp
@@ -38,7 +41,7 @@ case $ARM in
   on)  FLAG=1 ;;
   *) echo "arm must be off|on"; exit 2 ;;
 esac
-OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE': '$FLAG'}"
+OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE': '$FLAG', ${SMOKE_ENV_OVERRIDES:-}}"
 
 exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock
 say "waiting for cc-gpu.lock"
@@ -82,6 +85,21 @@ else
   taskset -c $CORES env "${ENV[@]}" "${ARGV[@]}" > $LOG 2>&1 &
 fi
 SPID=$!
+if [ "${SMOKE_STACK_SECONDS:-0}" -gt 0 ]; then
+  # Diagnosis: once the copy engine arms, sample every thread's native stack of the scheduler process with eu-stack,
+  # once a second for SMOKE_STACK_SECONDS, into stacks/. A copy thread blocked in the driver shows up here.
+  (
+    mkdir -p $OUT/stacks
+    for i in $(seq 1 600); do grep -q "copy engine armed" $LOG 2>/dev/null && break; sleep 0.5; done
+    SCHED=$(pgrep -f "sglang::scheduler" | head -1)
+    [ -n "$SCHED" ] || SCHED=$(pgrep -P $SPID | head -1)
+    for i in $(seq 1 ${SMOKE_STACK_SECONDS}); do
+      timeout 20 eu-stack -p $SCHED > $OUT/stacks/$(date +%H%M%S)-$SCHED.txt 2>&1
+      kill -0 $SCHED 2>/dev/null || break
+      sleep 1
+    done
+  ) &
+fi
 healthy=0
 for i in $(seq 1 180); do
   sleep 5
