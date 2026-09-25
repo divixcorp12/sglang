@@ -351,7 +351,7 @@ average between T-1's post and T's gather, but the median is 0.41 ms. Only 17% o
 ### Recommendation
 
 - **Keep `SGLANG_DSV41_ENABLE_NATIVE_PREFETCH` off and do not build the early post.** A layer-ahead prefetch has
-  little left to gain on a link that is ~75% busy with demand (~73 hit lanes and ~11 NVMe rows per token at
+  little left to gain on a link that is ~70% busy with demand (~73 hit lanes and ~11 NVMe rows per token at
   0.98 ms/row, ~120 ms/token).
 - **What would move the number is fewer link rows, not earlier ones.** Two ways to get them:
   - a larger VRAM hot set (fewer hit lanes);
