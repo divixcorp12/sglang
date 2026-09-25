@@ -6,7 +6,7 @@
 # Usage: smoke.sh <off|on> <tag> <worktree> [nsys-graph]
 #   off  arm_env defaults with SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=0
 #   on   arm_env defaults with SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1
-#   nsys-graph  wrap the server in a graph-mode nsys capture (trace.nsys-rep next to the logs)
+#   nsys-graph|nsys-node  wrap the server in an nsys capture of that graph-trace mode (trace.nsys-rep next to the logs)
 #
 # Takes cc-gpu.lock and rowimg-disk.lock. Refuses when production (port 7867) is up. Never starts production.
 set -u
@@ -65,8 +65,9 @@ PYTHONPATH=$WT/python $PY -c 'import sglang; print("sglang from", sglang.__file_
 grep -q "sglang from $WT/python/sglang/__init__.py" $OUT/driver.log || { say "sglang not imported from $WT; refusing"; exit 1; }
 
 cd $WT
-if [ "$NSYS" = nsys-graph ]; then
-  taskset -c $CORES env "${ENV[@]}" nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=graph --sample=none \
+if [ "$NSYS" = nsys-graph ] || [ "$NSYS" = nsys-node ]; then
+  # Node mode is for per-kernel and per-stream attribution only; never read ms/token from it (CLAUDE.md).
+  taskset -c $CORES env "${ENV[@]}" nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=${NSYS#nsys-} --sample=none \
     --cpuctxsw=none -o $OUT/trace --force-overwrite true "${ARGV[@]}" > $LOG 2>&1 &
 else
   taskset -c $CORES env "${ENV[@]}" "${ARGV[@]}" > $LOG 2>&1 &
