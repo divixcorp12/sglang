@@ -1830,6 +1830,10 @@ class Envs:
     # tokens, experts and route counts, VRAM and RAM misses, read and split time)
     # for offline tier simulation (scripts/dsv41/tier_sim.py).
     SGLANG_DSV41_EXPERT_TRACE_PATH = EnvStr("")
+    # With the trace above on and EXL3 graph decode: also capture every graph forward's per-layer router
+    # input and top-k weights into binary side files at this path prefix (exl3_stream_trace.RouterCapture,
+    # ~410 KB per token). Setting it without the trace is refused.
+    SGLANG_DSV41_ROUTER_CAPTURE_PATH = EnvStr("")
     # Option C (EXL3 graph decode): how long the in-graph wait for the RAM-miss
     # thread may take per MoE layer, in ms, before the process fails stop. The
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),

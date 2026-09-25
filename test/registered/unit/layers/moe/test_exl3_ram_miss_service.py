@@ -369,6 +369,96 @@ def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypa
     assert forward["misses"] == {layer: row + 1 for row, layer in enumerate(sorted(streamers))}
 
 
+def test_router_capture_is_refused_without_the_stage_trace(tiers, monkeypatch, tmp_path):
+    """The router rings live in the route log, which exists only with the stage trace: a router path alone
+    would capture nothing, so it is refused before the service builds anything."""
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    service, streamers, caches = tiers
+    monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: exl3_stream_trace.Exl3StreamTrace(""))
+    with envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.override(str(tmp_path / "router")):
+        with pytest.raises(RuntimeError, match="needs SGLANG_DSV41_EXPERT_TRACE_PATH"):
+            service.ensure_started()
+    assert service.host is None
+
+
+@pytest.mark.parametrize("router", [False, True], ids=["router_off", "router_on"])
+def test_router_capture_rides_the_route_log_only_when_its_path_is_set(tiers, monkeypatch, tmp_path, router):
+    """Unset, the route log is exactly Track B's: 64 deep, no router rings. Set, the same log shared by every
+    layer carries them, on a 32-deep ring so the router input costs ~13 MB of VRAM, not ~26."""
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    service, streamers, caches = tiers
+    trace = exl3_stream_trace.Exl3StreamTrace(str(tmp_path / "trace.jsonl"))
+    monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
+    prefix = str(tmp_path / "router")
+    with envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.override(prefix if router else ""):
+        _attach_all(service, streamers, capacity=12)
+    log = service.route_log
+    assert all(streamer.row_backend.route_log is log for streamer in streamers.values())
+    if not router:
+        assert log.router is None and log.depth == 64 and len(log._ring()) == 4
+        return
+    assert log.router.prefix == prefix and log.depth == 32
+    assert log.router_x is None  # sized by the first warmup forward's record_router
+
+
+def _apply_graph_ops(monkeypatch, route_log):
+    """Every aten op _apply_graph issues around a gather that itself issues none (its post is not under test)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from sglang.srt.layers.quantization import exl3_fused_moe
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    class Ops(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.ops = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.ops.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    monkeypatch.setattr(exl3_fused_moe, "exl3_fused_moe_for",
+                        lambda layer, streamer: SimpleNamespace(run=lambda x, w, remap, keep, limit: x.float()))
+    backend = module.Exl3RamMissRowBackend(
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, -1, 6, route_log=route_log
+    )
+    remap = torch.zeros(6, dtype=torch.int32)
+    streamer = SimpleNamespace(row_backend=backend, gather=lambda topk_ids: (remap, None))
+    x = torch.arange(16, dtype=torch.float32).to(torch.bfloat16).reshape(1, 16)
+    weights = torch.full((1, 6), 0.25)
+    with Ops() as mode:
+        out = Exl3MoEMethod._apply_graph(SimpleNamespace(layer_id=0), streamer, x, weights,
+                                         torch.arange(6).reshape(1, 6), 10.0)
+    assert torch.equal(out, x)
+    return mode.ops
+
+
+def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_path):
+    """Trace off (no route log) and trace on without router capture build the same captured chain; router
+    capture adds exactly its two ring copies. A regression here puts kernels in the production graph."""
+    from collections import Counter
+
+    from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
+
+    off = _apply_graph_ops(monkeypatch, None)
+    routes_only = _apply_graph_ops(monkeypatch, GraphRouteLog(1, 8, "cpu"))
+    assert routes_only == off
+    log = GraphRouteLog(1, 8, "cpu", depth=32)
+    log.enable_router(str(tmp_path / "router"))
+    log.router_x = torch.zeros((32, 1, 16), dtype=torch.bfloat16)  # as the warmup forward sizes them
+    log.router_w = torch.zeros((32, 1, 6))
+    captured = _apply_graph_ops(monkeypatch, log)
+    added = Counter(captured) - Counter(off)
+    assert added["aten.index_copy_.default"] == 2
+    views = {"aten.select.int", "aten.slice.Tensor", "aten.view.default", "aten._unsafe_view.default",
+             "aten.reshape.default", "aten.alias.default"}
+    assert set(added) - {"aten.index_copy_.default"} <= views, added
+    assert not Counter(off) - Counter(captured)
+    assert log.router_x[0, 0].tolist() == list(range(16)) and log.router_w[0, 0].tolist() == [0.25] * 6
+
+
 def tier_sim_load_forwards(path):
     import sys
 
