@@ -30,7 +30,7 @@ def hang_guard():
     faulthandler.cancel_dump_traceback_later()
 
 
-def _build(tmp_path, *, row_images=True, fills=True):
+def _build(tmp_path, *, row_images=True, fills=True, device="cpu"):
     source = tmp_path / "ckpt"
     source.mkdir()
     write_fake_exl3(str(source), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
@@ -57,14 +57,17 @@ def _build(tmp_path, *, row_images=True, fills=True):
         fmt = Exl3ExpertFormat(layout, layer_id, direct=True, source_root=str(source))
         streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
         layer._nvfp4_expert_streamer = streamer
-        caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
+        caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device=device, **fmt.pinned_tier_options(layer))
         streamers[layer_id] = streamer
     return stack, layout, source, streamers, caches
 
 
-@pytest.fixture
-def tiers(tmp_path):
-    stack, layout, source, streamers, caches = _build(tmp_path)
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@pytest.fixture(params=["cpu", pytest.param("cuda", marks=CUDA)])
+def tiers(tmp_path, request):
+    stack, layout, source, streamers, caches = _build(tmp_path, device=request.param)
     service = module.Exl3RamMissService.get()
     yield service, layout, source, streamers, caches
     service.shutdown()
@@ -98,29 +101,31 @@ def test_the_native_slot_table_is_the_tiers_row_fills(tiers):
 def test_ensure_rows_lands_the_row_images_through_the_service_reader(tiers, monkeypatch):
     service, layout, source, streamers, caches = tiers
     monkeypatch.setattr(streamers[1], "read_host_rows", lambda *a, **k: pytest.fail("the eager row source read"))
-    caches[1].ensure_rows(torch.tensor([4, 2]))
+    caches[1].ensure_rows(torch.tensor([4, 2], device=caches[1].device))
     assert service.host.tables.row_images
-    outputs = {n: torch.empty_like(caches[1].tensors[n][:2]) for n in EXL3_STREAMED_NAMES}
-    caches[1].copy_rows(torch.tensor([4, 2]), outputs)
-    assert _same(outputs, _reference(layout, source, 1, [4, 2]))
+    device = caches[1].device
+    outputs = {n: torch.empty_like(caches[1].tensors[n][:2], device=device) for n in EXL3_STREAMED_NAMES}
+    caches[1].copy_rows(torch.tensor([4, 2], device=device), outputs)
+    assert _same({n: t.cpu() for n, t in outputs.items()}, _reference(layout, source, 1, [4, 2]))
 
 
 def test_a_layers_prefetch_serves_its_chunks_and_ends_with_the_host_use(tiers, monkeypatch):
     service, layout, source, streamers, caches = tiers
     streamer, cache = streamers[0], caches[0]
     monkeypatch.setattr(streamer, "read_host_rows", lambda *a, **k: pytest.fail("the eager row source read"))
-    cache.ensure_rows(torch.tensor([5]))
+    device = cache.device
+    cache.ensure_rows(torch.tensor([5], device=device))
     experts = [0, 3, 5, 1]
     outputs = []
-    with streamer.prefill_fills(torch.tensor(experts)):
+    with streamer.prefill_fills(torch.tensor(experts, device=device)):
         assert service._pause_depth == 1  # one host use for the whole layer
         for chunk in ([0, 1], [3, 5]):
-            out = {n: torch.empty_like(cache.tensors[n][:2]) for n in EXL3_STREAMED_NAMES}
-            cache.gather_rows(torch.tensor(chunk), out)
+            out = {n: torch.empty_like(cache.tensors[n][:2], device=device) for n in EXL3_STREAMED_NAMES}
+            cache.gather_rows(torch.tensor(chunk, device=device), out)
             outputs.append((chunk, out))
     assert service._pause_depth == 0
     for chunk, out in outputs:
-        assert _same(out, _reference(layout, source, 0, chunk))
+        assert _same({n: t.cpu() for n, t in out.items()}, _reference(layout, source, 0, chunk))
     assert cache.stats.populated_rows == 4  # 5 by ensure_rows, then 0, 1, 3 by the prefetch
 
 
