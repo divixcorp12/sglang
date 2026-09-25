@@ -53,6 +53,20 @@ class TestEnvField(unittest.TestCase):
         self.assertTrue(envs.SGLANG_TEST_RETRACT.is_set())
         self.assertIsNone(envs.SGLANG_TEST_RETRACT.get())
 
+    def test_override_restores_when_the_block_raises(self):
+        """An exception inside override() must not leave the value set for later code."""
+        with self.assertRaises(ValueError):
+            with envs.SGLANG_TEST_RETRACT.override(True):
+                raise ValueError("inside")
+        self.assertFalse(envs.SGLANG_TEST_RETRACT.is_set())
+
+        envs.SGLANG_TEST_RETRACT.set(None)
+        with self.assertRaises(ValueError):
+            with envs.SGLANG_TEST_RETRACT.override(True):
+                raise ValueError("inside")
+        self.assertTrue(envs.SGLANG_TEST_RETRACT.is_set())
+        self.assertIsNone(envs.SGLANG_TEST_RETRACT.get())
+
     def test_override_with_exit_stack(self):
         envs.SGLANG_TEST_RETRACT.set(None)
         exit_stack = ExitStack()
