@@ -138,6 +138,12 @@ class EngramFileTable:
                 return table
         raise FileNotFoundError(f"{weight_key} not found in {table_dir}")
 
+    def _native_stats(self) -> dict:
+        """The native store's counters and each device-wait lookup's wait statistics."""
+        stats = self._native_store.stats()
+        stats["device_waits"] = list(self._host_node_extension.ring_stats())
+        return stats
+
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
         assert_not_capturing("EngramFileTable.lookup")
         flat = indices.reshape(-1).cpu().numpy()
@@ -148,7 +154,7 @@ class EngramFileTable:
 
                 sink = cache_stats_sink()
                 if sink is not None:
-                    sink.maybe_write("engram", self._native_store.stats)
+                    sink.maybe_write("engram", self._native_stats)
             weight_rows = np.ascontiguousarray(rows[:, : self.dim])
             scale_rows = np.ascontiguousarray(rows[:, self.dim :])
             weight = torch.from_numpy(weight_rows).to(indices.device).view(torch.float8_e4m3fn)

@@ -122,6 +122,11 @@ def test_layout_matches_the_native_service():
         "refused_after_fatal": engram_ring.REFUSED_AFTER_FATAL,
         "device_timeout": engram_ring.DEVICE_TIMEOUT,
         "device_saw_fatal": engram_ring.DEVICE_SAW_FATAL,
+        "waits": engram_ring.WAITS,
+        "spins": engram_ring.SPINS,
+        "spin_ns_lo": engram_ring.SPIN_NS_LO,
+        "spin_ns_hi": engram_ring.SPIN_NS_HI,
+        "spin_us_max": engram_ring.SPIN_US_MAX,
     }
 
 

@@ -28,6 +28,11 @@ constexpr int64_t kDoneSeq = 16;
 constexpr int64_t kStatus = 17;
 constexpr int64_t kFatalSeq = 32;
 constexpr int64_t kFatalStatus = 33;
+constexpr int64_t kWaits = 40;
+constexpr int64_t kSpins = 41;
+constexpr int64_t kSpinNsLo = 42;
+constexpr int64_t kSpinNsHi = 43;
+constexpr int64_t kSpinUsMax = 44;
 constexpr int32_t kDeviceTimeout = 5;
 constexpr int32_t kDeviceSawFatal = 6;
 constexpr int kWaitThreads = 256;
@@ -90,9 +95,23 @@ __global__ void wait_kernel(int32_t* control, const int32_t* counter, const uint
     } else {
       const uint64_t start = global_ns();
       uint32_t done = ld_acquire_sys(control + kDoneSeq);
+      const bool spun = done != seq;
       while (done != seq && static_cast<int64_t>(global_ns() - start) < timeout_ns) {
         __nanosleep(256);
         done = ld_acquire_sys(control + kDoneSeq);
+      }
+      // Statistics (engram_host_node.cpp ring_stats): only this thread writes them.
+      volatile uint32_t* stats = reinterpret_cast<volatile uint32_t*>(control);
+      stats[kWaits] = stats[kWaits] + 1u;
+      if (spun) {
+        const uint64_t spin_ns = global_ns() - start;
+        const uint64_t total = ((static_cast<uint64_t>(stats[kSpinNsHi]) << 32) | stats[kSpinNsLo]) + spin_ns;
+        stats[kSpins] = stats[kSpins] + 1u;
+        stats[kSpinNsLo] = static_cast<uint32_t>(total);
+        stats[kSpinNsHi] = static_cast<uint32_t>(total >> 32);
+        const uint64_t spin_us = spin_ns / 1000u;
+        const uint32_t clamped = spin_us > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(spin_us);
+        if (clamped > stats[kSpinUsMax]) stats[kSpinUsMax] = clamped;
       }
       // kStatus is read after the acquire load that saw done == seq, so it is the service's status for this seq.
       status = done == seq ? *reinterpret_cast<const volatile int32_t*>(control + kStatus) : kDeviceTimeout;

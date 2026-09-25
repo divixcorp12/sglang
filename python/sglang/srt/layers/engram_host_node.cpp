@@ -387,6 +387,13 @@ constexpr int64_t kDoneSeq = 16;
 constexpr int64_t kStatus = 17;
 constexpr int64_t kFatalSeq = 32;
 constexpr int64_t kFatalStatus = 33;
+// Device-written wait statistics, cumulative: waits, waits that found the request unserved and spun, their summed
+// spin time in ns (lo, hi), and the longest spin in us.
+constexpr int64_t kWaits = 40;
+constexpr int64_t kSpins = 41;
+constexpr int64_t kSpinNsLo = 42;
+constexpr int64_t kSpinNsHi = 43;
+constexpr int64_t kSpinUsMax = 44;
 constexpr int64_t kControlWords = 48;
 // Status codes. 0-3 are Store::enqueue's; the rest are the service's and the device wait's.
 constexpr int32_t kServed = 0;
@@ -408,6 +415,7 @@ class RingService {
     if (thread_.joinable()) thread_.join();
   }
   void add(RingLookup* lookup) { std::lock_guard<std::mutex> l(mu_); lookups_.push_back(lookup); }
+  py::list stats();
   // Returns only once the thread is not serving `lookup`: serving holds mu_.
   void remove(RingLookup* lookup) {
     std::lock_guard<std::mutex> l(mu_);
@@ -451,6 +459,18 @@ class RingLookup {
   }
   void set_test_delay_us(int64_t us) { test_delay_us_.store(us); }
   uint64_t served() const { return served_.load(); }
+  // A racy read of the device's counters: statistics only.
+  py::dict wait_stats() const {
+    const volatile uint32_t* w = reinterpret_cast<const volatile uint32_t*>(control_);
+    py::dict d;
+    d["layer"] = table_.tag >> 40;
+    d["served"] = served_.load();
+    d["waits"] = w[ring::kWaits];
+    d["spins"] = w[ring::kSpins];
+    d["spin_ns"] = (static_cast<uint64_t>(w[ring::kSpinNsHi]) << 32) | w[ring::kSpinNsLo];
+    d["spin_us_max"] = w[ring::kSpinUsMax];
+    return d;
+  }
 
   // Called by the service thread only; returns whether a request was pending.
   bool poll() {
@@ -489,6 +509,14 @@ class RingLookup {
   std::shared_ptr<RingService> service_;
 };
 
+// Under mu_, so no lookup is unregistered (and freed) while it is read.
+py::list RingService::stats() {
+  std::lock_guard<std::mutex> l(mu_);
+  py::list out;
+  for (RingLookup* lookup : lookups_) out.append(lookup->wait_stats());
+  return out;
+}
+
 void RingService::loop() {
   auto last_work = std::chrono::steady_clock::now();
   while (!stop_.load(std::memory_order_relaxed)) {
@@ -524,10 +552,13 @@ PYBIND11_MODULE(engram_host_node_cpp,m) {
    .def(py::init<std::shared_ptr<Store>,const std::string&,uint64_t,uint64_t,int64_t,int64_t,int64_t,int64_t,int64_t,uintptr_t,uintptr_t,uintptr_t>())
    .def("close",&RingLookup::close,py::call_guard<py::gil_scoped_release>())
    .def("set_test_delay_us",&RingLookup::set_test_delay_us)
-   .def("served",&RingLookup::served);
+   .def("served",&RingLookup::served)
+   .def("wait_stats",&RingLookup::wait_stats);
+  m.def("ring_stats",[](){auto service=ring_service_weak.lock(); return service?service->stats():py::list();});
   m.def("ring_layout",[](){py::dict d;
     d["post_seq"]=ring::kPostSeq; d["done_seq"]=ring::kDoneSeq; d["status"]=ring::kStatus;
     d["fatal_seq"]=ring::kFatalSeq; d["fatal_status"]=ring::kFatalStatus; d["control_words"]=ring::kControlWords;
     d["refused_after_fatal"]=ring::kRefusedAfterFatal; d["device_timeout"]=ring::kDeviceTimeout;
-    d["device_saw_fatal"]=ring::kDeviceSawFatal; return d;});
+    d["device_saw_fatal"]=ring::kDeviceSawFatal; d["waits"]=ring::kWaits; d["spins"]=ring::kSpins;
+    d["spin_ns_lo"]=ring::kSpinNsLo; d["spin_ns_hi"]=ring::kSpinNsHi; d["spin_us_max"]=ring::kSpinUsMax; return d;});
 }

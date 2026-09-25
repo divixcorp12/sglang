@@ -183,6 +183,9 @@ def test_the_wait_holds_the_stream_until_a_slow_service_serves(tmp_path, monkeyp
         stream.synchronize()
         total_s = time.perf_counter() - start
     assert launch_s < 0.02 < 0.1 <= total_s
+    for context in graph._retained_host_callbacks:
+        stats = context.native_context.wait_stats()
+        assert stats["waits"] == 2 and stats["spins"] >= 1 and stats["spin_us_max"] >= 100_000, stats
     assert torch.equal(out1.cpu()[0], _want(*weights[1], [5, 6, 7]))
     assert torch.equal(out14.cpu()[0], _want(*weights[14], [8, 9, 10]))
 
