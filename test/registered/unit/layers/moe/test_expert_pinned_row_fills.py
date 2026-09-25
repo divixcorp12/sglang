@@ -107,6 +107,8 @@ def test_ensure_rows_reads_through_the_fills_and_joins_them():
     cache.copy_rows(torch.tensor([3, 1]), outputs)
     _check(outputs, reference, [3, 1])
     assert cache.stats.populated_rows == 2
+    # Counted as reads in the stream trace (rows and blocked time), with no split.
+    assert streamer.background_read_stats.rows == 2 and streamer.background_read_stats.split_ns == 0
 
 
 def test_a_failed_fill_raises_from_ensure_rows():

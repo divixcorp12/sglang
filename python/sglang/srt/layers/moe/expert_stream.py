@@ -7,6 +7,7 @@ import functools
 import logging
 import json
 import os
+import time
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from operator import index
@@ -385,8 +386,11 @@ class ExpertPinnedHostCache:
     def _fill_rows(self, missing: list[int], protected: frozenset[int]) -> None:
         """``ensure_rows`` through ``row_fills``: claim and read ``missing`` now, after any prefetch has ended."""
         self.finish_fills()
+        began = time.perf_counter_ns()
         slots, evictions = self.row_fills.fill_begin(missing, protected, True)
         landed = self.row_fills.fill_end()
+        # The trace's read_ms: the time this thread was blocked reading. There is no split (split_ms stays 0).
+        self.streamer._record_read(RowReadStats(rows=len(slots), read_ns=time.perf_counter_ns() - began))
         self._refresh_mapping()
         if not landed:
             raise RuntimeError(f"reading pinned host rows of experts {missing[: len(slots)]} failed")
@@ -432,7 +436,10 @@ class ExpertPinnedHostCache:
             return
         rows = max((order.get(expert_id, -1) for expert_id in expert_ids), default=-1) + 1
         if rows:
+            began = time.perf_counter_ns()
             self.row_fills.fill_wait(rows)
+            # Only the wait is on this thread: the prefetched rows are read while it gathers.
+            self.streamer._record_read(RowReadStats(read_ns=time.perf_counter_ns() - began))
 
     @_host_use
     def copy_rows(
