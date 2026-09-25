@@ -1150,7 +1150,14 @@ def _run_arm_script():
 
 def test_nsys_graph_trace_defaults_to_graph():
     assert nsys_capture.graph_trace_mode(None, {}) == "graph"
-    assert nsys_capture.graph_trace_mode("", arm_env.base_env()) == "graph"
+    off = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "0"})
+    assert nsys_capture.graph_trace_mode("", off) == "graph"
+
+
+def test_nsys_graph_trace_default_is_refused_for_the_default_arm():
+    # The copy engine is on in base_env, so tracing the default arm must name node mode explicitly.
+    with pytest.raises(ValueError, match="deadlocks"):
+        nsys_capture.graph_trace_mode(None, arm_env.base_env())
 
 
 def test_nsys_graph_trace_accepts_node_with_or_without_the_copy_engine():
