@@ -4019,7 +4019,7 @@ Session 1's prefill ran from 1.18 to 24.56 s in the trace, 23.4 s for 260 tokens
 |---|---:|---|
 | `_gather_host_rows_kernel` | 6.5 s | An SM zero-copy gather from pinned RAM at 12.33 GB/s, which is link-bound. There are 129 calls; each is 6 segment launches over ≤64 experts (the staging buffer holds 64), ~47 on average. That moves ~78 GB for 260 tokens: ~146 non-VRAM experts × 13.3 MB per layer. |
 | GPU idle, host busy | ~12 s | 128 gaps of 10–250 ms, about 3 per layer, one per gather chunk. During them the scheduler thread makes no CUDA call and no traced syscall: it is filling the pinned tier (below). |
-| GPU idle, launch gaps | 3.9 s | ~157,000 gaps under 0.1 ms between ~149,000 eager kernels. |
+| GPU idle, launch gaps | 3.9 s | ~157,000 gaps under 0.1 ms between ~149,000 eager kernels, mostly torch glue: ~65,000 elementwise, ~10,000 index kernels, and ~23,000 cub select/reduce/compact kernels from per-chunk routing bookkeeping. Prefill runs without CUDA graphs (`--cuda-graph-backend-prefill disabled`). |
 | Other kernels | ~0.5 s | All other prefill compute. |
 
 **How the pinned-tier fill works:** `_gather_cached` → `ExpertPinnedHostCache.gather_rows` →
@@ -4053,7 +4053,7 @@ One session, so this is directional (`s_decay.py`).
 touches nearly all 384 experts. That streams ~356 non-VRAM rows per layer, ~190 GB per chunk: ≥15 s per chunk at the
 link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes to first token. Not measured.
 
-### 27.3 Decode: the link is well used while copying; the copy thread is not always running
+### 27.3 Decode: the link is well used while copying; the idle link is compute and NVMe waits
 
 - **Copy engine:** per step, 458 copies (~2.2 MB each, six segments per row), 1.02 GB in total, on stream 141.
   - Within a layer the copies run back to back: 46,500 of 50,412 gaps are under 10 µs.
@@ -4070,21 +4070,36 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
 
   The link carries ~1.14 GB per step in all. Only prefetch could use the idle link during compute (§25.4).
 - **Chain order:** post → W1 → S → CW → MoE. S runs before CW, and the RAM-hit copies overlap S (`ce_order.py`).
-- **CW waits after its copies have landed: 13.3 ms per step.** CW's end minus the layer's last copy end has
-  median 4.7 µs but p90 1.4 ms.
-  - The wait kernel polls every 256 ns with no backoff, and the copy thread writes CopyDone as soon as
-    `cuEventQuery` reports done. So the delay is the copy thread not running.
-  - All 820 tails ≥ 0.5 ms are a single silence of `exl3-copy-eng`, a stretch with no API call at all. Its
-    busy-poll otherwise issues ~9.9 million `cuEventQuery` calls (`ce_thread.py`).
-  - Over 47–58.6 s there are 1,250 silences ≥ 0.5 ms, totalling 2.66 s of 11.6 s (23%), median 1.5 ms, about a
-    scheduler time slice. They are not periodic in call count (CV 0.95), so they are not a fixed-size trace-buffer
-    flush (`ce_silence.py`).
-  - **Cause not determined from this trace.** Both preemption and a CUPTI artefact fit.
-    - Preemption: the run flagged tmux's server process at ~100% on server cores 36, 47 and 50, and
-      OMP_NUM_THREADS=16 spin threads also run there.
-    - CUPTI: in node mode `cudaGraphLaunch` blocks for a whole step (99 launches, 10.9 s), so every silence falls
-      inside one.
-  - The check is untraced: sample the copy thread's `/proc/<pid>/task/<tid>/schedstat` during an arm (§27.5).
+- **After a layer's RAM-hit copies land, the layer waits for NVMe: 13.3 ms per step.** The time from a layer's last
+  copy to the end of its CW is S still waiting for NVMe-streamed rows, not a CW wait (`tail_one.py`).
+  - The chain order is S → CW, so CW starts only when S ends, and it then runs for ~5 µs.
+  - An earlier reading of this trace called the 13.3 ms a "CW tail caused by the copy thread not running". That was
+    wrong. `exl3-copy-eng`'s 1,250 silences ≥ 0.5 ms (23% of 47–58.6 s, median 1.5 ms, `ce_silence.py`) are the
+    thread idle: with nothing queued or in flight, it waits on its condition variable for up to 1 ms.
+  - This time is part of the "no copy, GPU in S" state above: the link is partly idle while NVMe serves the
+    layer's remaining rows.
+- **The link carries no duplicate or padded bytes.** 111.88 GB in 50,412 copies averages 2.219 MB, and six
+  segments make 13.32 MB, exactly one row (13,315,584 B). Each RAM-hit row crosses once per step.
+  - The link carries ~1.14 GB per step, against 1.02 GB of copy-engine traffic plus a few streamed rows (~0.04 GB).
+    The remainder is within the RX calibration's error.
+  - Rows re-copied on consecutive steps are a residency-policy cost (Track B: Belady's bound is 31 misses per token
+    lower), not a lease-protocol cost. Hot-cache insertions copy device to device (7.6 GB on stream 13), off PCIe.
+- **NVMe waits are concentrated in a few layers** (`more.py`). S time per step: layer 0 3.10 ms, layer 19 2.43,
+  layer 1 2.11, layer 23 2.10, layer 39 2.09, 47.0 ms in total. Only layers 0, 1 and 19 have a median S above 1 ms
+  in every step.
+  - **Not hash routing:** DSV4.1's layer 0 has a learned gate (`layers.0.ffn.gate.weight`, `.bias`, no `tid2eid`),
+    and the config sets no hash layers, so these routes cannot be known before the layer runs.
+  - **The pinned tier is split evenly:** `ExpertPinnedHostCacheManager.from_model` deals the 100 GiB budget out
+    round-robin, one row per layer per pass. Every layer gets 201–202 of the 8,063 rows, whatever its miss rate.
+  - **Layer 0 has least cover:** it runs first in the step, so no earlier compute hides its NVMe reads.
+- **Small kernels are on the critical path** (node mode, so inflated). Per decode step: 15.1 ms of compute kernels,
+  ~1,800 of them under 3 µs, and 3.0 ms of gaps between kernels.
+  - The link is idle ~85% of the compute time, so compute is serial with the transfers and every ms removed is a ms
+    per token.
+  - Measure it in graph mode with the copy engine off; graph mode with the copy engine on is refused.
+- **The first decode step after a prefill is slow:** the two sessions' first graphs ran 240.8 and 198.9 ms on the
+  GPU, against ~110 ms in steady state. This is consistent with prefill evicting decode's RAM rows plus a stale hot
+  cache.
 
 ### 27.4 Next steps
 
@@ -4096,15 +4111,28 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    - Gather with the copy engine, not the SM kernel.
 2. **Keep prefill from evicting decode's RAM set:** stage prefill misses without admitting them, or protect
    decode-hot rows.
-3. **The copy thread:** if §27.5 shows run-queue delay, pin it to a dedicated core. Also have the copy stream publish
-   CopyDone itself (`cuStreamWriteValue64` after the job's copies), so CW does not depend on the host. Lease release
-   stays event-driven, off the critical path. Worth up to ~13 ms/token if the silences are real.
+3. **NVMe waits in decode:** ~13 ms per step of S outlasts the layer's RAM-hit copies, with the link partly idle.
+   Fewer NVMe misses (the RAM tier, and item 2) or faster streaming are the levers. The earlier "copy-thread" reading
+   of this time was wrong (§27.3).
 4. **Long prompts:** larger prefill chunks, which trades against Track A's VRAM headroom (§25.4).
-5. **Environment:** the spinning tmux server on the server cores contaminates every arm.
+5. **Per-layer RAM split:** give the pinned tier's rows to layers by their miss rate instead of evenly (§27.3).
+   Replay the route logs to find the split, then run it as an arm.
+6. **Decode small kernels:** another fusion round over the ~1,800 sub-3 µs kernels per step. Worth a few ms/token,
+   *estimate*.
+7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
+8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 
 ### 27.5 Copy-thread scheduling, untraced
 
-Pending: an untraced arm that samples `exl3-copy-eng`'s schedstat (run-queue delay) and context switches.
+An untraced arm (`sched-probe`, same commit and recipe) sampled `/proc/<pid>/task/<tid>/schedstat` and the context
+switches once a second (`divix01:/mnt/nvme1/sched-probe/`). It confirms the corrected reading in §27.3: nothing
+preempts the copy thread.
+
+| Thread | On CPU | Run-queue wait | Voluntary / involuntary switches |
+|---|---:|---:|---:|
+| `exl3-copy-eng` | 35.8% | 11 ms of 175 s (0.01%) | 106,834 / 132 |
+| `exl3-ram-miss` | 34.0% | 52 ms (0.03%) | 1,311,302 / 322 |
+| scheduler | 84.8% | 12 ms (0.01%) | 24,870 / 302 |
 
 ## Sources
 
