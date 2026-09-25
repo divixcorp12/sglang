@@ -1170,10 +1170,14 @@ class _Recorder:
         self.observers.append(callback)
 
 
+def _mode(prefill: bool):
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: prefill))
+
+
 def _prefill_share_service(tiers, monkeypatch, *, on, share=1):
     from sglang.srt.eplb import expert_distribution
 
-    service, streamers, caches = tiers
+    service, _, caches = tiers
     recorder = _Recorder()
     monkeypatch.setattr(expert_distribution, "get_global_expert_distribution_recorder", lambda: recorder)
     monkeypatch.setattr(module, "PREFILL_SHARE_ROWS", share)
@@ -1201,20 +1205,20 @@ def test_decode_rows_survive_a_prefills_admissions_under_the_prefill_share(tiers
     for expert in (0, 1, 2):  # decode fills the tier (capacity 3); 0 is the LRU row
         assert sim_wait(service.page, sim_post(service.page, row, need=[expert], protect=[expert]), 10) == 1
     for observer in recorder.observers:
-        observer(7, _batch(decode=False))
+        observer(7, _mode(prefill=True))
     for expert in (3, 4, 5):
         _gather(caches[1], expert)
     assert sorted(e for e in service.host.slot_to_expert(row) if e >= 0) == survivors
 
 
-def test_a_decode_forward_clears_the_share(tiers, monkeypatch):
+def test_only_a_prefill_forward_sets_the_share(tiers, monkeypatch):
     """Mutation: the observer sets the share for every forward (then decode's rows would be taken as prefill's)."""
     service, caches, recorder = _prefill_share_service(tiers, monkeypatch, on=True, share=5)
     shares = []
     monkeypatch.setattr(service.host, "set_prefill_share", shares.append)
     (observer,) = recorder.observers
-    observer(1, _batch(decode=False))
-    observer(2, _batch(decode=True))
+    observer(1, _mode(prefill=True))
+    observer(2, _mode(prefill=False))  # decode, and also idle, mixed or a speculative verify
     assert shares == [5, 0]
 
 
@@ -1222,7 +1226,7 @@ def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
     """The no-op recorder drops observers, so the flag would silently do nothing."""
     from sglang.srt.eplb import expert_distribution
 
-    service, streamers, caches = tiers
+    service, _, _ = tiers
     monkeypatch.setattr(
         expert_distribution,
         "get_global_expert_distribution_recorder",

@@ -4325,7 +4325,11 @@ class RamTier {
     Tier& tier = tiers_[row];
     std::fill(tier.hot.begin(), tier.hot.end(), 0);
     for (int64_t i = 0; i < count; ++i) {
-      if (experts[i] >= 0 && experts[i] < experts_) tier.hot[experts[i]] = 1;
+      if (experts[i] >= 0 && experts[i] < experts_) {
+        tier.hot[experts[i]] = 1;
+        // A VRAM-hot row is decode's: kept owned it could never be a victim and would hold the share down.
+        if (tier.expert_slot[experts[i]] >= 0) disown_locked(tier, tier.expert_slot[experts[i]]);
+      }
     }
   }
 
@@ -4606,14 +4610,15 @@ class RamTier {
     }
   }
 
-  // A slot for a row a Python-side read admits (assign; the prefill fill path). With a prefill share set and the layer
-  // already holding that many prefill-owned rows, the victim is the LRU owned row, under every exclusion of
-  // take_slot_locked, so a prefill displaces at most `share` of decode's rows. Otherwise, and whenever no owned row
-  // qualifies, it is take_slot_locked's choice. Under a share the slot becomes prefill-owned.
+  // A slot for a row a Python-side read admits (assign; the prefill fill path). With a prefill share set, no free slot,
+  // and the layer already holding that many prefill-owned rows, the victim is the LRU owned row, under every exclusion
+  // of take_slot_locked, so a prefill displaces at most `share` of decode's rows. Otherwise, and whenever no owned row
+  // qualifies, it is take_slot_locked's choice (a free slot first). Under a share the slot becomes prefill-owned.
   int64_t take_admit_slot_locked(int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
     int64_t slot = -1;
-    if (prefill_share_ > 0 && tier.owned >= prefill_share_) {
+    if (prefill_share_ > 0 && tier.owned >= prefill_share_ &&
+        std::find(tier.state.begin(), tier.state.end(), kFree) == tier.state.end()) {
       int64_t best = -1;
       for (int64_t s = 0; s < tier.capacity; ++s) {
         if (!tier.prefill_owned[s] || tier.state[s] != kReady || leased_locked(tier, s)) continue;
