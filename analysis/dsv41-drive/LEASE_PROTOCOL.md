@@ -936,16 +936,14 @@ synchronizes (no `cu*Synchronize`), allocates, frees, registers memory or loads 
 never touches the decode stream or a graph.
 
 **The copy stream needs a hardware queue of its own.** Nothing CUDA knows about orders CW after the
-copy, so nothing obliges the driver to run the copy while CW spins. The driver hands the streams of
-one priority out round robin over a fixed set of hardware queues (32 on the RTX 5090, whatever
-`CUDA_DEVICE_MAX_CONNECTIONS` says), and a queue runs its work in order: a copy stream that shares a
-queue with any stream whose head waits on the decode graph (the overlap scheduler's result copies,
-another stream's event wait) cannot start until CW gives up. That is the deadlock of the diagnostic
-smoke `diag/arm1-on` (a job issued in 143 us whose event never completed while CW spun for 60 s). The
-copy stream is therefore created at the greatest priority, whose queues no default-priority stream
-shares (`copy-engine/alias_probe.py`: the 32nd default-priority stream after another shares its
-queue, no greatest-priority one did; `test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams`).
-The residual exposure is a greatest-priority stream created by someone else, 32 such streams later.
+copy, so nothing obliges the driver to run the copy while CW spins. Streams share
+`CUDA_DEVICE_MAX_CONNECTIONS` hardware queues (the server sets 8) and a queue runs in order: a copy
+stream sharing a queue with any stream whose head waits on the decode graph (the overlap scheduler's
+result copies, another stream's event wait) cannot start until CW gives up. `copy-engine/hol_probe.py`
+(raw streams; `torch.cuda.Stream()` is a 32-stream pool and must not be used for this): a fresh
+default-priority stream waited 596 ms behind 8 blocked streams, while greatest-priority kernels and
+copies never waited with up to 64 blocked. The copy stream is therefore created at the greatest
+priority. This hardening did **not** cure the startup deadlock of the copy-overlap plan's section 10.
 
 **Completion mechanism: `cuEventQuery` on an event recorded after the job's last copy.** The event
 completes only once all earlier work of the same stream has completed, so a `CUDA_SUCCESS` from the

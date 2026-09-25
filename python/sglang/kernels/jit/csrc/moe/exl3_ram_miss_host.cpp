@@ -3028,12 +3028,11 @@ class CudaCopyBackend : public CopyBackend {
     retained_ = true;
     if (int r = cu_ctx_set_current_(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
     constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING: no implicit sync with the legacy stream
-    // The greatest priority, for its hardware queue. The driver hands streams of one priority out round robin over a
-    // fixed set of queues (32 on the RTX 5090, whatever CUDA_DEVICE_MAX_CONNECTIONS says), and a queue runs its work in
-    // order: a copy queued behind a stream whose head waits on the decode graph cannot start until CW gives up, which
-    // is a deadlock only the device deadline breaks (alias_probe.py: the 32nd default-priority stream after another
-    // one shares its queue; no greatest-priority stream did). sglang creates no other greatest-priority stream; one
-    // created 32 greatest-priority streams after this one would share its queue again.
+    // The greatest priority, for a hardware queue of its own. Streams share CUDA_DEVICE_MAX_CONNECTIONS queues (the
+    // server sets 8) and a queue runs in order, so a copy queued behind a stream whose head waits on the decode graph
+    // cannot start until CW gives up: a deadlock only the device deadline breaks. hol_probe.py (raw streams): a fresh
+    // default-priority stream waited 596 ms behind 8 blocked ones; greatest-priority kernels and copies never waited,
+    // with up to 64 blocked. sglang creates no other greatest-priority stream.
     int least = 0;
     int greatest = 0;
     if (int r = cu_priority_range_(&least, &greatest)) return "cuCtxGetStreamPriorityRange failed: " + std::to_string(r);
