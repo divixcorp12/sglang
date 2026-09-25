@@ -282,3 +282,80 @@ analysis/dsv41-drive/native-prefetch/smoke.sh off A<commit> $PWD; analysis/dsv41
 taskset -c 0-63 python analysis/dsv41-drive/row-images/compare_arms.py ref=$N/../row-images/p2a-rowimg A=... B=...
 taskset -c 0-63 python analysis/dsv41-drive/native-prefetch/np_stats.py A=... B=...
 ```
+
+## Early post: gate 1 fails (2026-09-25)
+
+**Branch** `cc/early-prefetch`, from `shared/cc/dsv41-pinned-numa` at `16a19c5087`. **Evidence:**
+`divix01:/data/models/slang/nvfp4-work/direct-two-phase-tests/early-prefetch/gate/` (`gate.{json,log,cmd}`), made by
+`analysis/dsv41-drive/early-prefetch/window_replay.py` at `07b2e4a907`.
+
+**Verdict: the early post estimates -2.8 ms/token at best (117.8 against A's 120.6). That misses the 8 ms bar, so
+nothing was built.** Steps 2-5 of the brief (build, tests, smoke, nsys wrapper fix) were not run, as the brief
+requires at a failed gate. Defect 3 above (`smoke.sh nsys-node` writes no report) is therefore still open.
+
+### The replay
+
+It uses A's own link timeline (`smoke/A426e1d2e10-off`, 569 graph decode steps after arming) and B's prefetch
+rates (`smoke/B426e1d2e10-on`: 33.4 issued, 24.3 used per step).
+
+- **Per (step, layer):** the service's `observed` post time, the copy-engine job (hit lanes = `lanes - rows_asked`,
+  starting at `reserved`), and S's pieces (one per NVMe extent, released at its `extent_cqe_ns` completion).
+- **One link, served first come first served, at 0.98 ms per 13.3 MB row.** Three fits agree on this rate:
+  - the step's summed copy latency is 0.15 ms/job + 1.00 ms/lane;
+  - a no-read layer's post-to-post period is 0.39 ms + 0.98 ms per hit lane;
+  - `numa-h2d` measured 13.7 GB/s (0.97 ms/row) for one copy, and zero-copy is no faster.
+
+  So a second concurrent copy adds no bandwidth, and one link is the right model.
+- **Model check:** `observed(L+1)` minus L's modelled chain end is the compute after the chain. It should be flat
+  across lane and read counts.
+  - Without NVMe reads it is 0.36-0.39 ms at every lane count.
+  - With reads it is 0.41-0.62 ms: the model ends those chains ~0.2 ms early, which makes it slightly *optimistic*
+    about the idle link after them.
+- **Early post:** the prefetch for T is released at `max(observed(T-1), CE_end(T-1))`, which is the proposal's hold.
+  Its deadline is `observed(T)`, since T's commit precedes its post. It needs 0.988 ms, B's measured copy time.
+  - `priority`: it gets only link time demand does not want.
+  - `share`: it splits a busy link 50/50, and the delay this adds to T-1's chain is charged.
+
+  A copy not finished by the deadline is charged in full for the rest.
+- **Saving:** a used row removes one hit lane from T's copy-engine job. It saves
+  `max(CE_end, S_end) - max(CE_end - lane, S_end)`, a full lane only where the copy engine and not NVMe sets T's
+  chain.
+- **Calibration:** the `late` arm replays B's placement (release 0.361 ms before the deadline).
+  - It reproduces B's measured wait: 0.627 ms per prefetch against 620 us.
+  - It overstates B's cost: +4.5 against the measured +2.6 ms/token. The saving per used row is modelled at 0.68 ms
+    against ~0.74 inferred.
+  - That 1.9 ms/token error is carried to the early arms as a constant.
+
+| arm | idle link, T-1 post to T gather (mean / p50 / share >= 1 copy) | exposed per prefetch | fully hidden | exposed + chain delay, ms/tok | saving ms/tok | est. ms/tok raw | calibrated |
+|---|---|---:|---:|---:|---:|---:|---:|
+| late (B, calibration) | 0.74 / 0.41 ms / 17% | 0.627 ms | 0% | 21.0 | 16.5 | 125.1 | **123.2** (measured 123.2) |
+| **early, demand priority** | same | 0.465 ms | 17% | 15.6 | 16.5 | 119.7 | **117.8** |
+| early, shared link | same | 0.416 ms | 32% | 13.9 + 4.5 | 16.5 | 122.5 | 120.6 |
+
+### Why
+
+**The idle link is not in T-1's NVMe wait either, for most layers.** Per layer, the link is idle for 0.74 ms on
+average between T-1's post and T's gather, but the median is 0.41 ms. Only 17% of layers have a full copy's worth.
+
+- **About two thirds of layers read nothing from NVMe.** For those, the copy engine is the chain's critical path, and
+  the link runs back to back from T-1's copy-engine start until its end. Only the ~0.39 ms of compute after it is
+  free, the same window the late post already had. So holding the prefetch until T-1's copy-engine job finishes gains
+  nothing on these layers.
+- **Layers that do read from NVMe have more idle link, but S's pieces use most of it.** A row read from NVMe costs the
+  link about 1 ms of piece copies, arriving over the read's ~2.6 ms. That is as much link time as the prefetch itself.
+- **The saving has a ceiling:** at 24.3 used rows it is 16.5 ms/token modelled, ~18 inferred, even with nothing
+  exposed. On this link, every used row costs 0.98 ms of link time wherever it is moved. It can only win if it lands
+  in time the link would otherwise idle, and the replay finds ~0.74 ms of that per layer, against a copy of ~1 ms.
+  - The prefetch also adds the 9.1 wasted rows per token, 8.9 ms of link time that demand does not need.
+
+### Recommendation
+
+- **Keep `SGLANG_DSV41_ENABLE_NATIVE_PREFETCH` off and do not build the early post.** A layer-ahead prefetch has
+  little left to gain on a link that is ~70% busy with demand (~73 hit lanes and ~11 NVMe rows per token at
+  0.98 ms/row, ~120 ms/token).
+- **What would move the number is fewer link rows, not earlier ones.** Two ways to get them:
+  - a larger VRAM hot set (fewer hit lanes);
+  - a faster host-to-device path. `numa-h2d` measures 13.7 GB/s for one copy, against the card's PCIe ceiling, and
+    that gap is worth explaining before any further prefetch work.
+- **The nsys-node wrapper fix (defect 3) is still needed by the next full-arm trace.** It should be done on its own
+  branch.
