@@ -403,7 +403,7 @@ def test_router_capture_rides_the_route_log_only_when_its_path_is_set(tiers, mon
     assert log.router_x is None  # sized by the first warmup forward's record_router
 
 
-def _apply_graph_ops(monkeypatch, route_log):
+def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
     """Every aten op _apply_graph issues around a gather that itself issues none (its post is not under test)."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -420,7 +420,8 @@ def _apply_graph_ops(monkeypatch, route_log):
             return func(*args, **(kwargs or {}))
 
     monkeypatch.setattr(exl3_fused_moe, "exl3_fused_moe_for",
-                        lambda layer, streamer: SimpleNamespace(run=lambda x, w, remap, keep, limit: x.float()))
+                        lambda layer, streamer: SimpleNamespace(
+                            layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit: x.float()))
     backend = module.Exl3RamMissRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, -1, 6, route_log=route_log
     )
@@ -435,21 +436,22 @@ def _apply_graph_ops(monkeypatch, route_log):
     return mode.ops
 
 
-def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_path):
+@pytest.mark.parametrize("layer_fusion", [False, True], ids=["unfused", "fused"])
+def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_path, layer_fusion):
     """Trace off (no route log) and trace on without router capture build the same captured chain; router
     capture adds exactly its two ring copies. A regression here puts kernels in the production graph."""
     from collections import Counter
 
     from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 
-    off = _apply_graph_ops(monkeypatch, None)
-    routes_only = _apply_graph_ops(monkeypatch, GraphRouteLog(1, 8, "cpu"))
+    off = _apply_graph_ops(monkeypatch, None, layer_fusion)
+    routes_only = _apply_graph_ops(monkeypatch, GraphRouteLog(1, 8, "cpu"), layer_fusion)
     assert routes_only == off
     log = GraphRouteLog(1, 8, "cpu", depth=32)
     log.enable_router(str(tmp_path / "router"))
     log.router_x = torch.zeros((32, 1, 16), dtype=torch.bfloat16)  # as the warmup forward sizes them
     log.router_w = torch.zeros((32, 1, 6))
-    captured = _apply_graph_ops(monkeypatch, log)
+    captured = _apply_graph_ops(monkeypatch, log, layer_fusion)
     added = Counter(captured) - Counter(off)
     assert added["aten.index_copy_.default"] == 2
     views = {"aten.select.int", "aten.slice.Tensor", "aten.view.default", "aten._unsafe_view.default",
