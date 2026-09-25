@@ -96,6 +96,11 @@ if [ "${SMOKE_STACK_SECONDS:-0}" -gt 0 ]; then
     for i in $(seq 1 ${SMOKE_STACK_SECONDS}); do
       timeout 20 eu-stack -p $SCHED > $OUT/stacks/$(date +%H%M%S)-$SCHED.txt 2>&1
       kill -0 $SCHED 2>/dev/null || break
+      if [ "${SMOKE_CUDA_GDB:-0}" = 1 ] && [ $i = 15 ]; then
+        # Which kernels are resident on the GPU 15 s after arming (a stalled step shows its spinning kernel).
+        timeout 300 /usr/local/cuda-13.2/bin/cuda-gdb -p $SCHED -batch -ex "info cuda kernels" \
+          -ex "info cuda contexts" -ex detach > $OUT/cuda-gdb.txt 2>&1
+      fi
       sleep 1
     done
   ) &
