@@ -45,15 +45,17 @@ def _method(fusion: bool) -> Exl3LinearMethod:
 
 def _linear(in_features: int, out_features: int, parts: int, seed: int, bits_: int = 5) -> nn.Module:
     layer = nn.Module()
-    _method(False).create_weights(
-        layer, in_features, [out_features] * parts, in_features, out_features * parts, torch.bfloat16
-    )
-    for part in range(parts):
-        t = random_exl3_tensors(in_features, out_features, bits_, device="cuda", seed=seed + part)
-        for name in ("trellis", "suh", "svh"):
-            getattr(layer, name).weight_loader(getattr(layer, name), getattr(t, name), part)
-        layer.mul1.weight_loader(layer.mul1, torch.tensor(1, dtype=torch.int32, device="cuda"), part)
-    _method(False).process_weights_after_loading(layer)
+    with torch.device("cuda"):  # the weight loader materializes the parameters on the default device
+        _method(False).create_weights(
+            layer, in_features, [out_features] * parts, in_features, out_features * parts, torch.bfloat16
+        )
+        for part in range(parts):
+            t = random_exl3_tensors(in_features, out_features, bits_, device="cuda", seed=seed + part)
+            for name in ("trellis", "suh", "svh"):
+                getattr(layer, name).weight_loader(getattr(layer, name), getattr(t, name), part)
+            layer.mul1.weight_loader(layer.mul1, torch.tensor(1, dtype=torch.int32, device="cuda"), part)
+        _method(False).process_weights_after_loading(layer)
+    assert all(t.trellis.is_cuda for t in layer.exl3_tensors)
     return layer
 
 
@@ -143,8 +145,7 @@ def test_linear_apply_is_bit_identical_with_the_flag_on(in_features, out_feature
 def test_linear_apply_leaves_more_than_one_row_to_the_unfused_path(rows):
     layer = _linear(5120, 2304, 2, seed=5)
     x = torch.randn(rows, 5120, device="cuda").to(torch.bfloat16)
-    with torch.device("cuda"):  # the > 144-row path reconstructs the dense weight on the default device
-        assert_bits_equal(_method(True).apply(layer, x), _method(False).apply(layer, x))
+    assert_bits_equal(_method(True).apply(layer, x), _method(False).apply(layer, x))
 
 
 # ---- the shared expert
