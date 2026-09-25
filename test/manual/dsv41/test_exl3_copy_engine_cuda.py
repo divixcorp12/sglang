@@ -202,62 +202,42 @@ def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_
         s.close()
 
 
-def _sleep_cycles(ms: float) -> int:
-    torch.cuda._sleep(1000)
+@pytest.mark.parametrize("fillers", [0, 3000])
+def test_the_first_replay_of_a_copy_engine_graph_completes_armed(ce, fillers):
+    """Both smokes that failed at startup (abba1-on, diag arm1-on) failed on a decode step that ran armed early in
+    the server's life, where a graph variant may run for the first time. Here a freshly captured graph, with
+    ``fillers`` kernels on each side of the chain as a stand-in for the decode graph's size, is replayed for the
+    first time with the copy engine armed and every lane a hit: its copy must complete inside the deadline."""
+    s = ce
+    s.plan([0, 1, 2])
+    s.step()  # resident, through S
+    assert s.until(lambda: _all_retired(s))
+    backend = s.make_backend()
+    plan = s.make_plan()
+    x = torch.zeros(1, device="cuda")
+    with torch.cuda.stream(torch.cuda.Stream()):
+        backend.post(0, plan)  # eager warm-up: loads every kernel, copy engine not allowed
     torch.cuda.synchronize()
+    assert s.until(lambda: _all_retired(s))
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        for _ in range(fillers):
+            x.add_(1)
+        backend.post(0, plan)
+        for _ in range(fillers):
+            x.add_(1)
+    jobs = s.counters()["copy_jobs"]
+    experts = [2, 0, 1]
+    s.plan(experts)
     t0 = time.perf_counter()
-    torch.cuda._sleep(int(5e7))
+    graph.replay()
     torch.cuda.synchronize()
-    return int(5e7 * ms / ((time.perf_counter() - t0) * 1e3))
-
-
-def test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams(tmp_path):
-    """The driver hands default-priority streams out round robin over a fixed set of hardware queues (32 here), and a
-    queue runs in order: a copy stream sharing a queue with a stream whose head waits on other work cannot start until
-    that work ends. In the server that work is the decode graph spinning in CW for this very copy: a deadlock only the
-    deadline breaks (smoke abba1-on, diag arm1-on). Here 64 default-priority streams, each a 3 s sleep and a kernel
-    that waits for it, cover every such queue twice over, and the chain runs on a greatest-priority stream of its own:
-    the copy must still complete well inside the 1 s deadline. Mutant: the copy thread's stream at default priority."""
-    s = StreamService(tmp_path, copy_engine=True, timeout_ms=1000)
-    try:
-        s.plan([0, 1, 2])
-        s.step()  # resident, through S
-        assert s.until(lambda: _all_retired(s))
-        cycles = _sleep_cycles(3000)
-        scratch = torch.zeros(64, device="cuda")
-        experts = [2, 0, 1]  # all resident: every lane COPYING
-        s.plan(experts)  # its pageable copies would queue behind the blockers
-        torch.cuda.synchronize()
-        blockers = [torch.cuda.Stream() for _ in range(64)]
-        for i, blocker in enumerate(blockers):
-            with torch.cuda.stream(blocker):
-                torch.cuda._sleep(cycles)
-                scratch[i : i + 1].add_(1)  # waits for the sleep: the blocked head of the blocker's queue
-        _, greatest = torch.cuda.Stream.priority_range()
-        jobs = s.counters()["copy_jobs"]
-        t0 = time.perf_counter()
-        with torch.cuda.stream(torch.cuda.Stream(priority=greatest)):
-            s.post()
-            s.hit_wait()
-            s.copy1()
-            s.ack1()
-            s.stream()
-            s.ack2()
-            s.copy_wait()
-            s.finalize()
-            snapshot = {n: s.dest[n].clone() for n in s.names}
-            s.total()
-            torch.cuda.current_stream().synchronize()
-        chain_s = time.perf_counter() - t0
-        assert s.keep.item() == 1.0, ("the copy waited behind a blocked stream", s.counters(), s.stats())
-        assert chain_s < 1.0, (chain_s, s.stats())
-        assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
-        torch.cuda.synchronize()  # the blockers
-        _check(s, experts, snapshot)
-        assert s.until(lambda: _all_retired(s)), s.counters()
-    finally:
-        torch.cuda.synchronize()
-        s.close()
+    replay_s = time.perf_counter() - t0
+    assert s.keep.item() == 1.0, (replay_s, s.counters(), s.stats())
+    assert replay_s < 1.0, replay_s
+    assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
+    assert s.delivered(experts)
+    assert s.until(lambda: _all_retired(s)), s.counters()
 
 
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")

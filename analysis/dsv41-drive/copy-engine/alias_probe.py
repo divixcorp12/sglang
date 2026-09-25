@@ -22,6 +22,24 @@ import time
 import torch
 
 
+def raw_stream(priority: int = 0) -> torch.cuda.ExternalStream:
+    """A new CUDA stream. torch.cuda.Stream() hands out a pool of 32 streams per priority round robin, so the 33rd
+    "new" torch stream is the first one again: a probe that means distinct streams must create them itself."""
+    from cuda.bindings import runtime as rt
+
+    err, stream = rt.cudaStreamCreateWithPriority(rt.cudaStreamNonBlocking, priority)
+    assert err == rt.cudaError_t.cudaSuccess, err
+    return torch.cuda.ExternalStream(int(stream))
+
+
+def greatest_priority() -> int:
+    from cuda.bindings import runtime as rt
+
+    err, _least, greatest = rt.cudaDeviceGetStreamPriorityRange()
+    assert err == rt.cudaError_t.cudaSuccess, err
+    return greatest
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -38,9 +56,9 @@ def main() -> int:
     a = ap.parse_args()
     torch.cuda.init()
     if a.priority == -99:
-        a.priority = torch.cuda.Stream.priority_range()[1]  # the greatest, as the copy thread uses
-    a_stream = torch.cuda.Stream()
-    c_stream = torch.cuda.Stream()
+        a.priority = greatest_priority()  # the greatest, as the copy thread uses
+    a_stream = raw_stream()
+    c_stream = raw_stream()
     c_host = torch.empty(16 << 20, dtype=torch.uint8).pin_memory()
     c_dev = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     c_dev2 = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
@@ -57,7 +75,7 @@ def main() -> int:
     sleep_cycles = int(cycles_per_ms * a.sleep_ms)
     results = []
     for k in range(a.streams):
-        b_stream = torch.cuda.Stream(priority=a.priority)
+        b_stream = raw_stream(a.priority)
         # The copy alone, for its own time.
         with torch.cuda.stream(b_stream):
             dst.copy_(src, non_blocking=True)

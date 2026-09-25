@@ -16,6 +16,24 @@ import time
 import torch
 
 
+def raw_stream(priority: int = 0) -> torch.cuda.ExternalStream:
+    """A new CUDA stream. torch.cuda.Stream() hands out a pool of 32 streams per priority round robin, so the 33rd
+    "new" torch stream is the first one again: a probe that means distinct streams must create them itself."""
+    from cuda.bindings import runtime as rt
+
+    err, stream = rt.cudaStreamCreateWithPriority(rt.cudaStreamNonBlocking, priority)
+    assert err == rt.cudaError_t.cudaSuccess, err
+    return torch.cuda.ExternalStream(int(stream))
+
+
+def greatest_priority() -> int:
+    from cuda.bindings import runtime as rt
+
+    err, _least, greatest = rt.cudaDeviceGetStreamPriorityRange()
+    assert err == rt.cudaError_t.cudaSuccess, err
+    return greatest
+
+
 def _cycles_per_ms() -> float:
     torch.cuda._sleep(1000)
     torch.cuda.synchronize()
@@ -43,7 +61,8 @@ def main() -> int:
     ap.add_argument("--sleep-ms", type=float, default=300.0)
     a = ap.parse_args()
     torch.cuda.init()
-    least, greatest = torch.cuda.Stream.priority_range()
+    greatest = greatest_priority()
+    least = 0
     cycles = int(_cycles_per_ms() * a.sleep_ms)
     src = torch.empty(16 << 20, dtype=torch.uint8).pin_memory()
     dst = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
@@ -51,10 +70,10 @@ def main() -> int:
     scratch = torch.zeros(256, device="cuda")
     rows = []
     for n in [int(c) for c in a.counts.split(",")]:
-        blockers = [torch.cuda.Stream() for _ in range(n)]
-        default_fresh = torch.cuda.Stream()
-        high_fresh = torch.cuda.Stream(priority=greatest)
-        high_copy = torch.cuda.Stream(priority=greatest)
+        blockers = [raw_stream() for _ in range(n)]
+        default_fresh = raw_stream()
+        high_fresh = raw_stream(greatest)
+        high_copy = raw_stream(greatest)
         torch.cuda.synchronize()
         for i, blocker in enumerate(blockers):
             with torch.cuda.stream(blocker):
