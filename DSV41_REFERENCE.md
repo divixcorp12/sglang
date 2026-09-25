@@ -3155,12 +3155,13 @@ the historical relaunch with it set produced a 164 MB report and a passing verdi
 
 ### 23.1 Checkout, launch, and cache budgets
 
-The latest measured serving code is `e36fa2530c` on the shared branch. The saved launcher
-is `/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live/launch.sh`;
-the checkout it uses is `dsv41-direct-prod`. Port 7867 is **stopped** at the owner's
-request. The launcher and the benchmark both read
-[`benchmarks/dsv41_baseline/arm_env.py`](benchmarks/dsv41_baseline/arm_env.py), so the
-following are **DSV4.1 recipe defaults**, not general SGLang defaults:
+**Updated 2026-09-25 (§25).** Production is launched by the checked-in
+[`benchmarks/dsv41_baseline/launch_prod.sh`](benchmarks/dsv41_baseline/launch_prod.sh), which
+serves `arm_env.base_env()` unchanged with `arm_env.ServerArgs.prod()` (port 7867, host
+`0.0.0.0`). It has no overrides of its own, so production and every benchmark arm run the same
+recipe. The divix01 wrapper `/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live/launch.sh`
+only calls it from the `dsv41-direct-prod` checkout. Port 7867 is **stopped** at the owner's
+request. The following are **DSV4.1 recipe defaults**, not general SGLang defaults:
 
 | Setting | Current value | Status |
 |---|---:|---|
@@ -3170,7 +3171,11 @@ following are **DSV4.1 recipe defaults**, not general SGLang defaults:
 | GPU hot expert budget | 14 GiB (`SGLANG_MOE_HOT_GPU_MB=14336`) | DIRECT mode observed 1,128 resident slots and zero graph-gather scratch bytes |
 | MoE miss path | leases=1, GPU residency update=1, DIRECT insert stage=2, decode update interval=1, two-phase=1, hit-wait 100 µs, piece streaming=1 | Two-phase and piece streaming default since 2026-09-24 (§24); prefetch and doorbell off |
 | Row packing | 8 workers | Current default; eight versus four has not had a matched served-path comparison |
-| Engram lookup | host-node cache with io_uring=1 | Layers 1 and 14 are in the single batch-1 decode graph |
+| Engram lookup | host-node cache with io_uring=1, device wait=1 | Since 2026-09-25 the decode lookup is a device post plus a device wait served by a polling thread; the decode graph has no host nodes (§25.2) |
+| Layer fusion | `SGLANG_DSV41_ENABLE_LAYER_FUSION=1` | Since 2026-09-25: three JIT kernels replace 89 small kernels per layer, byte-identical (§25.2) |
+| Copy engine | `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1` with `CUDA_MODULE_LOADING=EAGER` | Since 2026-09-25: RAM-hit rows move by DMA, not the SM kernel C1; requires EAGER (§25.3) |
+| Memory fraction | 0.83 | Since 2026-09-25, for EAGER's ~1 GiB; KV 204,288 tokens. A ~30k-token prompt at 0.83 is **untested** (§25.3) |
+| Decoder SWA bounded replay | `--enable-decoder-swa-bounded-replay` | Since 2026-09-25; prompt-token logprob requests are refused, not crashed (§25.5) |
 | Context and prefix | 32,768 tokens; prefix caching enabled | Production and current benchmark match |
 | Async CPU residency scores | 0 | Conflicts with the selected GPU residency update mode; the older async-score win was measured in a different mode |
 | Expert fused plan | 1 by default | Enabled in `arm_env.base_env()` after the one-arm opt-in measurement below; compatible with DIRECT stage 2 |
@@ -3535,8 +3540,8 @@ responses and 0 refusals or quarantined slots.
      2.8 GiB of dense dequantized modules (§4) and the 1.23 GiB embedding.
    - Retune the residency policy for the DIRECT recipe. This needs routing traces with
      expert IDs, which today only eager decode records.
-2. **Overlap the link with compute:** fetch the next layer's likely experts during the
-   current layer. The link idles about 40% of the step, so it has spare capacity, but a
+2. **Closed 2026-09-25 (§25.4): no prefetch placement pays.** Originally: overlap the link
+   with compute, fetching the next layer's likely experts during the current layer. The link idles about 40% of the step, so it has spare capacity, but a
    wrong guess costs link time. Prefetch is currently refused under DIRECT.
 3. **Done 2026-09-24 (§24.8):** W1 now exits once every lane is claimed or LOADING. On
    read layers its p90 fell from 101 to 21 µs, saving 0.29 ms/token at 100 GiB.
@@ -3694,6 +3699,153 @@ traced 96-token request.
 - CPU `test/registered/unit/kernels`: 1665 passed, 1 skipped (the sibling test, under
   `taskset -c 0-31`).
 - GPU, six manual files plus the row-image file: 99 passed.
+
+## 25. Copy engine, fusion, and the closed overlap studies (2026-09-25)
+
+Everything below is merged into `codex/nvfp4-expert-stream-main`. Plans and raw numbers live in
+`docs/superpowers/plans/2026-09-25-dsv41-*.md`; runs live under
+`divix01:/data/models/slang/nvfp4-work/direct-two-phase-tests/` and `/mnt/nvme1/`.
+
+### 25.1 Where decode stands
+
+**Full arms** (`run_arm.sh`, A then B once each, same commit; `2026-09-25-dsv41-final-arms.md`):
+
+| | A: recipe, copy engine off | B: recipe + copy engine |
+|---|---:|---:|
+| ms/token, pooled | 119.3 | **112.4** |
+| ms/token, 103-token session | 117.8 | 110.8 |
+| client step p50 / p90 (ms) | 117.6 / 153.9 | 110.7 / 148.0 |
+| TTFT (s) | 21.4 / 17.7 | 20.9 / 17.7 |
+| stalls | 0 | 0 |
+
+- Outputs are byte-identical between A and B.
+- B won both sessions, but two sessions only reach p = 0.25, so the result is directional.
+- Both arms ran with questdb's `java` at ~90% on the server cores; the verdict flagged contention,
+  mostly in A.
+- These arms ran under LAZY module loading at memory fraction 0.80, before §25.3's EAGER requirement.
+  EAGER's cost in ms/token is **not yet measured**.
+
+**Node-mode trace of B, per step** (attribution only; not a ms/token source):
+
+| Group | Kernels before today | Kernels now | ms before | ms now (p50) |
+|---|---:|---:|---:|---:|
+| attention | 1,485 | 1,489 | 7.50 | 7.18 |
+| shared expert | 440 | 440 | 1.67 | 1.62 |
+| routing | 1,254 | 254 | 1.39 | 0.45 |
+| chain (waits, copies, S, F) | 280 | 320 | 95.15 | 96.9 |
+| bookkeeping | 2,560 | 160 | 2.00 | 0.35 |
+| MoE | 80 | 80 | 4.02 | 4.11 |
+| **total kernels** | **6,112** | **2,756** | | |
+
+- C1, the SM copy kernel, fell from 72.26 to 0.03 ms. The copy engine moves 458 copies (1.02 GB)
+  per step at 12.57 GB/s, and 99.98% of that time sits under the chain's own wait kernels.
+- **Where ~111 ms/token goes:** ~78–81 ms is the link moving ~76 RAM-hit rows of 13.3 MB;
+  ~16–20 ms is the rest of S (streamed rows and NVMe waits); ~13.7 ms is all compute; ~2 ms is
+  small chain kernels.
+- **What that implies:** there is at most 13.7 ms of compute to hide copies behind, and the link is
+  ~70% busy with demand rows. Further gains need fewer bytes per token or a faster link, not more
+  overlap (§25.4).
+
+### 25.2 Layer fusion and the Engram device wait
+
+Both are on in `arm_env`, and both are byte-identical to the unfused recipe.
+
+- **Layer fusion** (`SGLANG_DSV41_ENABLE_LAYER_FUSION`): three JIT kernels
+  (`dsv41_layer_fusion.cuh`) replace 89 small torch kernels per layer (152 to 66): the gather
+  destinations, `commit_gather`, and the fused MoE's route tables. **−3.2 ms/token.**
+- **Engram device wait** (`SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT`): the layer-1 and layer-14
+  lookups are a device post plus a device wait. A polling thread serves them and makes no CUDA calls.
+  The post goes out early, and the wait sits at the layer. **−2.6 ms/token.**
+  - The decode graph now has **zero host nodes**, which is asserted at capture. That was the
+    precondition for the copy engine: with host nodes, `cudaGraphLaunch` held the driver lock that
+    the copy thread needs, and the graph spun on a copy that could never be issued.
+  - The 104 ms `cudaGraphLaunch` block seen in graph-mode nsys is an nsys artefact, not host-node
+    cost.
+- **Combined:** 125.5 ms/token against 132.1–132.4 for the row-image recipe of §24.9. Output was
+  6/6 byte-identical and there were 0 stalls.
+
+### 25.3 The copy engine
+
+`SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1` is on in `arm_env`. Protocol: `LEASE_PROTOCOL.md` §7.6.
+
+- **What it does:**
+  - The post kernel publishes each lane's destination slot.
+  - The RAM-miss service issues the six segment copies of each RAM-hit row with `cuMemcpyAsync` on
+    its own thread and top-priority stream, then writes a completion word.
+  - The graph's W1 and C1 become one wait kernel on that word (CW).
+  - The service holds each lease until an event after its copies completes.
+- **Why it's faster:** at the bench, the DMA engine gets 13.5–13.7 GB/s against the SM copy's
+  12.1–12.3, and it doesn't slow concurrent compute. In practice the gain came from overlapping
+  the copy with S.
+- **Deadlock 1, startup:** a CUDA module loaded on the scheduler thread while an armed step spins.
+  - The load waits for the device, the device waits in CW, and the copy thread waits for the load.
+  - **Fixed:** the engine arms only after 16 decode forwards since capture. Once armed, Triton and
+    `tvm_ffi.load_module` loads first wait for device idle.
+- **Deadlock 2, the soak:** a seeded soak (`analysis/dsv41-drive/ce-soak/`, seed 20260925)
+  fail-stopped deterministically at decode step 14 of item 15, with items 11 and 15 both using
+  min_p sampling.
+  - At the stall no copy on any stream completed, including fresh ones.
+  - It passes under `CUDA_MODULE_LOADING=EAGER` and fails under LAZY, 2 of 2 each in a reduced
+    GPU scenario.
+  - **Fixed:** the service refuses the copy engine unless `CUDA_MODULE_LOADING=EAGER`. `arm_env`
+    sets EAGER, and raises `MEM_FRACTION_STATIC` from 0.80 to 0.83 for EAGER's ~1 GiB. The KV pool
+    is 204,288 tokens (209,408 before).
+  - The lazily loaded kernel is **not identified**. Finding it would allow a targeted warm-up
+    instead of EAGER.
+- **Soak status: incomplete, stopped by the owner.**
+  - `s4`, with the fix, ran 91 requests over 43 minutes, including items 11 and 15, with no
+    fail-stop and a largest inter-token gap of ~0.2 s.
+  - The full ~2 h soak, a second seed, and mutants of the two copy-engine changes have not run.
+  - **A ~30k-token prompt at 0.83 + EAGER is untested.** §25.4's Track A saw a 30k prompt peak at
+    31.0 of 31.8 GiB at 0.80, so this is the most likely out-of-memory case.
+  - To resume: the "Handoff (mid-task)" section of `2026-09-25-dsv41-copy-engine-soak.md`.
+- **Operational rules:**
+  - Never run graph-mode nsys with the copy engine on. `run_arm.sh` refuses it
+    (`NSYS_CUDA_GRAPH_TRACE=node` is required for the default arm).
+  - A first-time kernel on a path no earlier request took is the residual risk class. It
+    fail-stops after the 2 s deadline and never produces a wrong answer.
+
+### 25.4 Studies that closed
+
+| Study | Result | Plan |
+|---|---|---|
+| Link and NUMA | HPE DL380 Gen10: the GPU is on a Gen3 x16 slot, the only kind the board has. The copy engine gets 13.67 GB/s and an SM zero-copy 12.23 GB/s, the same from either NUMA node. CPU memory load on the GPU's node cuts H2D 27–43%; load on the other node has no effect. All NVMe is on socket 1; nvme2 (the Engram table) runs at x2 | `analysis/dsv41-drive/numa-h2d/` |
+| VRAM headroom (Track A) | None to spare. A 30k prompt peaked at 31.0 of 31.8 GiB, with allocator retries driven by the torch prefill indexer's score tensor. Keep the hot cache at 14336 MiB. Candidates, not built: cap the score tensor (~2 GiB), keep the dense modules quantized (2.8 GiB), move the embedding to host (1.23 GiB) | `analysis/dsv41-drive/hot-cache-size/` |
+| Residency policy (Track B) | An exact replay matches measurement (G 78.783). The current policy is the best online policy found. Each +1 GiB of hot cache saves 2–2.7 misses per token. Belady's bound is 31 misses per token lower | `2026-09-25-dsv41-prefetch-study.md` |
+| Side stream for the shared expert and `commit_gather` (1a) | Overlaps correctly, saves nothing at the wall; the flag stays off | `…-copy-compute-overlap.md` |
+| Route-only predictors | Useless. Prefetch breaks even at a precision of ~0.25 and is worth building at ≥0.4 | `…-prefetch-study.md` |
+| Native-gate lookahead | Layer T's own gate on layer T−1's input gives 0.68 rank-1 precision on non-resident rows | `…-router-capture.md` |
+| Native prefetch, built (`SGLANG_DSV41_ENABLE_NATIVE_PREFETCH`, off) | Precision 0.73 live, byte-identical, but **123.2 vs 120.6 ms/token**. Only ~0.36 ms of compute sits between the post and the next gather, so ~0.62 ms of each ~1 ms copy is exposed | `…-native-prefetch.md` |
+| Early-post prefetch | Replay on real per-layer windows: at best 117.8 vs 120.6, below the 8 ms bar. 68% of layers have no NVMe wait to hide under. Not built | `…-native-prefetch.md` |
+| Resident-first MoE split | Byte-identical is possible (112/112 parity cases), but one `exl3_moe` launch costs ~92 µs whether it runs 1 or 6 experts. A second launch adds ~90 µs per layer | `…-per-expert-compute.md` |
+
+### 25.5 Correctness fixes found on the way
+
+- **Prompt-token logprobs under `--enable-decoder-swa-bounded-replay` crashed the server.** Rows
+  outside the replay tail have no late-layer logits, so the error came from
+  `_check_late_layer_tail_readers` during prefill. The scheduler now refuses such a request at
+  admission with a message, and the TokenizerManager no longer crashes on the refusal
+  (`c2f69ce864`, `d46a5f8e91`). Output-token logprobs are unaffected.
+- **`Dsv41Config` had fallen six knobs behind `Envs`,** so `test_one_field_per_knob` failed. It now
+  carries every `SGLANG_*DSV41*` knob again.
+- **The reversed-CQE fault in `exl3_ram_miss_host.cpp` waits for every read in flight,** so a test
+  that used it is no longer flaky.
+- **Known test exceptions:**
+  `test_graph_routes_are_logged_only_when_the_stage_trace_is_on[trace_on]` errors on the GPU at
+  base too; `test_work_queued_behind_the_graph_on_other_streams_does_not_hold_the_copy_back[kernel]`
+  and `test_a_hit_lanes_slot_is_never_its_own_requests_victim` (`lease_double_signal`) are rare
+  intermittents.
+
+### 25.6 Next decode work
+
+1. **Finish the copy-engine soak** (§25.3): the full soak, a second seed, the 30k-prompt memory
+   test at 0.83, the mutants, and EAGER's ms/token cost. If 0.83 runs out of memory, find the
+   highest fraction that survives, or identify the lazily loaded kernel and warm it up instead of
+   using EAGER.
+2. **Fewer bytes per token.** The link carries ~1 GB per token. Return VRAM to the hot cache
+   (Track A's candidates, ~6 GiB together). Each GiB saves ~2–2.7 rows per token at ~1 ms each.
+3. **Why one H2D stream stops at ~13.7 GB/s** on Gen3 x16. The platform cannot go faster, but the
+   gap to line rate has not been explained.
 
 ## Sources
 
