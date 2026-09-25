@@ -67,7 +67,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=CUDA)])
 def tiers(tmp_path, request):
-    stack, layout, source, streamers, caches = _build(tmp_path, device=request.param)
+    device = "cpu" if request.param == "cpu" else f"cuda:{torch.cuda.current_device()}"
+    stack, layout, source, streamers, caches = _build(tmp_path, device=device)
     service = module.Exl3RamMissService.get()
     yield service, layout, source, streamers, caches
     service.shutdown()
