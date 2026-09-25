@@ -221,8 +221,9 @@ def test_an_enabled_trace_reads_the_clock_at_every_stamp(tmp_path):
 NON_TRACE_CLOCK_READS = {
     "inline int64_t now_ns() {": 1,  # the clock itself
     "return now_ns();": 1,  # stamp() itself
-    "busy_since_.store(now_ns());": 2,  # the watchdog's stuck-request marker, needed with the trace off
-    "const int64_t deadline = now_ns() + timeout_ns;": 2,
+    # the watchdog's stuck-request marker, needed with the trace off (the third is a prefill fill's, below)
+    "busy_since_.store(now_ns());": 3,
+    "const int64_t deadline = now_ns() + timeout_ns;": 3,
     "if (now_ns() > deadline) {": 2,
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
@@ -254,6 +255,10 @@ NON_TRACE_CLOCK_READS = {
     # served, for the always-on prefetch_latency_ns counter.
     "const int64_t read_ns = now_ns();": 1,
     "counters_[kPrefetchLatencyNs].fetch_add(now_ns() - job.submit_ns);": 1,
+    # Prefill fills (plan 2026-09-25-dsv41-prefill-fills), reached only with them enabled: the fill thread's
+    # watchdog marker (counted with the stuck-request marker above) and fill_wait's deadline (counted with the
+    # deadlines above, and this line).
+    "if (now_ns() > deadline) return -1;": 1,
 }
 
 

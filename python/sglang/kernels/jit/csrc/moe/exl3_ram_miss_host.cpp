@@ -5134,7 +5134,9 @@ class RamTier {
   RowReader reader_;
   std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, sized by read(), reused every request
   // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics.
-  static constexpr int kFillOk = 0, kFillRunning = 1, kFillFailed = 2;
+  static constexpr int kFillOk = 0;
+  static constexpr int kFillRunning = 1;
+  static constexpr int kFillFailed = 2;
   std::thread fill_thread_;
   int64_t fill_row_ = 0;
   std::vector<int32_t> fill_experts_;
