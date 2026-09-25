@@ -582,6 +582,8 @@ class Runner:
         if req.get("determinism"):
             self.determinism_texts.append(rec["text"])
             rec["determinism_identical"] = rec["text"] == self.determinism_texts[0]
+        # A refused or dropped connection is how a fail-stop looks from here; the process may take a while to exit.
+        rec["connection_lost"] = any(e in rec.get("error", "") for e in ("ConnectionRefused", "RemoteDisconnected", "ConnectionReset"))
         rec["server_alive"] = self.server_alive()
         with self.lock:
             self.records.write(json.dumps(rec) + "\n")
@@ -705,7 +707,7 @@ def main() -> int:
             print(f"[{r['t_start']:8.1f}s] item {i} req {r['idx']} {kind:12s} {r['endpoint']:22s} stream={int(r['stream'])} "
                   f"tok={((r.get('usage') or {}).get('completion_tokens'))} {r['wall_s']:.1f}s "
                   f"mspt={r.get('ms_per_token')} gapmax={r.get('gap_ms_max')}{flag}", flush=True)
-        if not all(r["server_alive"] for r in recs) or not runner.server_alive():
+        if any(r["connection_lost"] and not r.get("aborted_after_chunks") for r in recs) or not all(r["server_alive"] for r in recs) or not runner.server_alive():
             died = True
             print(f"SERVER DIED during item {i} ({kind}) at {runner.now():.1f}s", flush=True)
             break
