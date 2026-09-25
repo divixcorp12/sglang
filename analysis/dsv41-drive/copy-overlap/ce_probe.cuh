@@ -121,6 +121,8 @@ void service_loop(Probe* p, int device, volatile uint32_t* post_word, uint32_t* 
 
 }  // namespace ce_probe
 
+namespace sglang {
+
 void ce_probe_start(tvm::ffi::TensorView post_word, tvm::ffi::TensorView done_word, tvm::ffi::TensorView gen_ring,
                     tvm::ffi::TensorView src_ptrs, tvm::ffi::TensorView dst_ptrs, tvm::ffi::TensorView seg_bytes,
                     int64_t src_rows, int64_t rows_per_request, int64_t dst_slots, int64_t device) {
@@ -180,3 +182,5 @@ void ce_probe_filler(tvm::ffi::TensorView x) {
   const auto device = host::LaunchKernel::resolve_device(x.device());
   host::LaunchKernel(1, 32, device)(ce_probe::filler_kernel, static_cast<float*>(x.data_ptr()));
 }
+
+}  // namespace sglang
