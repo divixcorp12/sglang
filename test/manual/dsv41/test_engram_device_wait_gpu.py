@@ -68,9 +68,17 @@ def _want(weight, scale, row_ids):
     )
 
 
-def _layer(directory, layer_id):
+def _layer(directory, layer_id, store):
     table = EngramFileTable.open(str(directory), layer_id=layer_id, num_embeddings=ROWS, dim=DIM)
+    # A private store: the shared one keeps rows cached by (layer, id) across tests whose tables differ.
+    table._native_store = store
     return types.SimpleNamespace(file_table=table, dim=DIM, layer_id=layer_id, tp_size=1, _posted_lookup=None)
+
+
+def _private_store():
+    native = native_engram_host_node()
+    native.get_shared_store(1 << 20, DIM + DIM // BLOCK)
+    return native.create_store(64 * (DIM + DIM // BLOCK), DIM + DIM // BLOCK)
 
 
 def _batch():
@@ -80,8 +88,8 @@ def _batch():
 def _open(directory, monkeypatch, *, device_wait: bool):
     monkeypatch.setenv("SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING", "1")
     monkeypatch.setenv("SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT", "1" if device_wait else "0")
-    native_engram_host_node().get_shared_store(1 << 20, DIM + DIM // BLOCK)
-    return _layer(directory, 1), _layer(directory, 14)
+    store = _private_store()
+    return _layer(directory, 1, store), _layer(directory, 14, store)
 
 
 def _capture_two_layers(layer1, layer14, ids, *, early_post: bool, forbid_host_nodes: bool, registry=None):
@@ -184,8 +192,7 @@ def _timeout_worker(directory, connection):
         os.environ["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] = "1"
         os.environ["SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT"] = "1"
         engram.ENGRAM_DEVICE_WAIT_TIMEOUT_MS = 50
-        native_engram_host_node().get_shared_store(1 << 20, DIM + DIM // BLOCK)
-        layer14 = _layer(directory, 14)
+        layer14 = _layer(directory, 14, _private_store())
         ids = torch.tensor([[1, 2]], device="cuda", dtype=torch.int64)
         graph = BreakableCUDAGraph()
         with torch.cuda.stream(torch.cuda.Stream()):
