@@ -297,7 +297,8 @@ class Plan:
         return [self.chat(self.user(self.prompt()), **self.sampling())]
 
     def make_penalties(self):
-        rng, p = self.rng, self.sampling(greedy=rng.random() < 0.3)
+        rng = self.rng
+        p = self.sampling(greedy=rng.random() < 0.3)
         for key, lo, hi in (("frequency_penalty", -0.5, 1.5), ("presence_penalty", -0.5, 1.5), ("repetition_penalty", 0.8, 1.5)):
             if rng.random() < 0.6:
                 p[key] = round(rng.uniform(lo, hi), 3)
