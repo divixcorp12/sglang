@@ -240,6 +240,58 @@ def test_the_first_replay_of_a_copy_engine_graph_completes_armed(ce, fillers):
     assert s.until(lambda: _all_retired(s)), s.counters()
 
 
+@pytest.mark.parametrize("waiter", ["h2d", "d2h", "kernel"])
+def test_work_queued_behind_the_graph_on_other_streams_does_not_hold_the_copy_back(ce, waiter):
+    """What the overlap scheduler does around a decode graph: the graph replays on a forward stream, and before it
+    finishes the scheduler queues work behind it on other streams (schedule_stream waits on the forward for its next
+    H2D input copies; copy_stream waits on it for the result's D2H copy). The recipe with --disable-overlap-schedule
+    ran the diag that deadlocks with overlap on (diag arm1nooverlap-on). Here each kind of queued-behind work is put
+    behind the first and later armed replays of a copy-engine graph: the copy must complete inside the deadline."""
+    s = ce
+    s.plan([0, 1, 2])
+    s.step()
+    assert s.until(lambda: _all_retired(s))
+    backend = s.make_backend()
+    plan = s.make_plan()
+    forward = torch.cuda.Stream()
+    behind = torch.cuda.Stream()
+    host = torch.empty(4 << 20, dtype=torch.uint8).pin_memory()
+    dev = torch.empty(4 << 20, dtype=torch.uint8, device="cuda")
+    with torch.cuda.stream(forward):
+        backend.post(0, plan)
+    torch.cuda.synchronize()
+    assert s.until(lambda: _all_retired(s))
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph, stream=forward):
+        backend.post(0, plan)
+    for replay in range(3):
+        experts = [(e + replay) % 3 for e in range(3)]
+        s.plan(experts)
+        torch.cuda.synchronize()
+        jobs = s.counters()["copy_jobs"]
+        t0 = time.perf_counter()
+        with torch.cuda.stream(forward):
+            graph.replay()
+        done = torch.cuda.Event()
+        done.record(forward)
+        behind.wait_event(done)
+        with torch.cuda.stream(behind):
+            if waiter == "h2d":
+                dev.copy_(host, non_blocking=True)
+            elif waiter == "d2h":
+                host.copy_(dev, non_blocking=True)
+            else:
+                dev.add_(1)
+        done.synchronize()
+        replay_s = time.perf_counter() - t0
+        torch.cuda.synchronize()
+        assert s.keep.item() == 1.0, (replay, replay_s, s.counters(), s.stats())
+        assert replay_s < 1.0, (replay, replay_s)
+        assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
+        assert s.delivered(experts)
+        assert s.until(lambda: _all_retired(s)), s.counters()
+
+
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
 def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(ce):
     """The captured backend chain is post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F -> add -> add; its replays deliver
