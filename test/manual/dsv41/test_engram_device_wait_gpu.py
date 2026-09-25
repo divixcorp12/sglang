@@ -124,13 +124,22 @@ def test_device_wait_graph_has_no_host_nodes_and_replays_exact_rows(tmp_path, mo
     assert len(graph._retained_host_callbacks) == 2
     assert layer1._posted_lookup is None and layer14._posted_lookup is None
     replay_stream = torch.cuda.Stream()
+    contexts = dict(zip((1, 14), graph._retained_host_callbacks))
     with torch.cuda.stream(replay_stream):
-        for ids1, ids14 in ID_SETS:
+        for step, (ids1, ids14) in enumerate(ID_SETS, start=1):
             ids.copy_(torch.tensor([[ids1, ids14]], device="cuda"))
             graph.replay()
             replay_stream.synchronize()
-            assert torch.equal(out1.cpu()[0], _want(*weights[1], ids1))
-            assert torch.equal(out14.cpu()[0], _want(*weights[14], ids14))
+            for layer, row_ids, out in ((1, ids1, out1), (14, ids14, out14)):
+                # Stage by stage: the posted ids, the served rows, the rows the wait copied, the dequant.
+                context = contexts[layer]
+                weight, scale = weights[layer]
+                packed = torch.cat([weight.view(torch.uint8), scale.view(torch.uint8)], dim=1)[row_ids]
+                where = f"layer {layer} step {step}: control {context.control.tolist()}"
+                assert context.ids.tolist() == row_ids, where
+                assert torch.equal(context.rows, packed), where
+                assert torch.equal(context.packed_gpu.cpu(), packed), where
+                assert torch.equal(out.cpu()[0], _want(weight, scale, row_ids)), where
     for context in graph._retained_host_callbacks:
         assert context.native_context.served() == len(ID_SETS)
     if registry is not None:
