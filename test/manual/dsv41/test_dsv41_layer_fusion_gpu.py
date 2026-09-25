@@ -126,14 +126,16 @@ STATE = ("mapping", "slot_to_expert", "slot_state", "slot_generations", "gather_
     [(6, 6, 256, 40), (6, 6, 257, 12), (1, 1, 9, 2), (7, 5, 33, 15), (13, 13, 101, 29), (32, 32, 400, 64)],
 )
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+# int64 with int32 routes is the unfused planner's remap under an int32 router.
+@pytest.mark.parametrize("remap_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("leased", [True, False])
-def test_gather_and_commit_match_the_torch_chain(width, routes, experts, capacity, id_dtype, leased):
+def test_gather_and_commit_match_the_torch_chain(width, routes, experts, capacity, id_dtype, remap_dtype, leased):
     gen = torch.Generator().manual_seed(width * 1000 + routes * 7 + capacity + (id_dtype == torch.int32))
     for trial in range(60):
         state, flat, remap, base, source_rows, miss_count, delivered, keep = _scenario(
             gen, width, routes, experts, capacity
         )
-        flat, remap = flat.to(id_dtype), remap.to(id_dtype)
+        flat, remap = flat.to(id_dtype), remap.to(remap_dtype)
         ref_streamer = _streamer(source_rows, miss_count, delivered, keep, leased, width)
         fused_streamer = _streamer(source_rows, miss_count, delivered, keep, leased, width)
         ref = _updater(width, experts, capacity, False, state, ref_streamer)
