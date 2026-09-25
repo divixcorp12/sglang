@@ -9,6 +9,9 @@ the tier's hits and admits the misses with the chunk protected. The prefill poli
 - ``base``: today's rule, prefill admits at the MRU end.
 - ``cold``: prefill admits with stamp 0, below every decode stamp (SGLANG_DSV41_PREFILL_COLD_ADMIT).
 - ``noadmit``: prefill misses are staged outside the tier and never enter it (option (a)).
+- ``unbounded``: an upper bound, not a policy. Prefill admits into extra slots and evicts nothing; each later
+  decode admission gives one extra slot back (its LRU row) until the tier is at capacity again. No decode row is
+  lost to a prefill, and every prefill row stays available to decode.
 
 ``--no-touch`` also stops prefill hits from stamping. VRAM hot sets are the logged ones (graph forwards log the set
 each layer held as the forward started; an eager forward uses the next graph forward's). Leases are not modelled:
@@ -55,7 +58,15 @@ class Tier:
         self.slot_expert[best] = -1
         return best
 
-    def admit(self, expert: int, stamp: int, hot: set, protect: set) -> None:
+    def admit(self, expert: int, stamp: int, hot: set, protect: set, grow: bool = False) -> None:
+        if grow:
+            self.slot_expert.append(-1)
+            self.stamp.append(0)
+        elif len(self.slot_expert) > self.capacity:
+            gone = self.take(hot, protect)
+            self.slot_expert.pop(gone)
+            self.stamp.pop(gone)
+            self.where = {e: s for s, e in enumerate(self.slot_expert) if e >= 0}
         slot = self.take(hot, protect)
         self.slot_expert[slot] = expert
         self.stamp[slot] = stamp
@@ -100,7 +111,8 @@ class Replay:
                 continue
             protect = set(chunk)
             for expert in missing:
-                tier.admit(expert, 0 if self.policy == "cold" else self._next(), hot, protect)
+                stamp = 0 if self.policy == "cold" else self._next()
+                tier.admit(expert, stamp, hot, protect, grow=self.policy == "unbounded")
         return misses
 
 
@@ -162,7 +174,7 @@ def main() -> None:
     capacity = ram_rows_per_layer(args.ram_rows, layers, args.num_experts)
     report = {"trace": args.trace, "ram_rows": args.ram_rows, "arms": {}}
     measured = measured_ram_rows(args.trace)
-    for policy in ("base", "cold", "noadmit"):
+    for policy in ("base", "cold", "noadmit", "unbounded"):
         for touch in (True, False):
             result = run(loaded, capacity, policy, touch)
             name = policy + ("" if touch else "-notouch")
