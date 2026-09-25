@@ -436,20 +436,25 @@ class BreakableCUDAGraphCapture:
             forked.clear()
         graph = self._current_graph
         assert graph is not None
-        if self._forbid_host_nodes:
-            # Checked before capture_end: torch keeps no raw graph to inspect afterwards.
-            host_nodes = capturing_host_node_count(main_stream.cuda_stream)
-            if host_nodes:
-                raise RuntimeError(
-                    f"captured {host_nodes} CUDA host node(s) into a graph that forbids them "
-                    "(SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT); a host node blocks cudaGraphLaunch"
-                )
+        # Counted before capture_end, as torch keeps no raw graph to inspect afterwards,
+        # and raised after it, so a refused capture does not leave the stream capturing.
+        host_nodes = (
+            capturing_host_node_count(main_stream.cuda_stream)
+            if self._forbid_host_nodes
+            else 0
+        )
         # A segment that enqueued no kernels (back-to-back breaks, or a segment
         # whose ops all ran eagerly) captures an empty graph, which replays as a
         # no-op. Torch warns about it on every such capture_end; expected here.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
             graph.capture_end()
+        if host_nodes:
+            self._current_graph = None
+            raise RuntimeError(
+                f"captured {host_nodes} CUDA host node(s) into a graph that forbids them "
+                "(SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT); a host node blocks cudaGraphLaunch"
+            )
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
