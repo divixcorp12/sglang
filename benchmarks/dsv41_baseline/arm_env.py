@@ -52,7 +52,10 @@ GPU_LOCK = f"{NVFP4_WORK}/cc-gpu.lock"
 
 # Match the current production launcher; older benchmark arms used 4096.
 CONTEXT_LENGTH = 32768
-MEM_FRACTION_STATIC = 0.80
+# 0.83 since 2026-09-25, with CUDA_MODULE_LOADING=EAGER (base_env): eager loading keeps every kernel resident, ~1 GiB,
+# and at 0.80 the KV cache no longer fit. At 0.83 it holds 204,288 tokens (0.80 under LAZY: 209,408), with the same
+# ~4.7 GB left over. An arm run at 0.80 is not comparable on memory, only on speed.
+MEM_FRACTION_STATIC = 0.83
 CHUNKED_PREFILL_SIZE = 512
 MAX_PREFILL_TOKENS = 16384
 # Decode CUDA graphs exist only at batch size 1; anything above it runs eagerly and
@@ -155,6 +158,10 @@ def base_env() -> dict[str, str]:
         # A kernel module first loaded mid-step after arming can still fail-stop the server (LEASE_PROTOCOL.md 7.6),
         # and graph-mode nsys must not be used with it on.
         "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "1",
+        # The copy engine requires it and the server refuses to start without it: a kernel loaded lazily after the
+        # copy engine arms fail-stopped the soak deterministically, never under EAGER
+        # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). Costs ~1 GiB, hence MEM_FRACTION_STATIC.
+        "CUDA_MODULE_LOADING": "EAGER",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 

@@ -574,6 +574,26 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 # deadlocked (smokes abba1-on at 4 batches, diag arm1-on at 1). 16 covers the warm-up; arbitrary beyond that.
 COPY_ENGINE_ARM_DECODES = 16
 
+# The copy engine needs every kernel of every library loaded before it arms (LEASE_PROTOCOL.md 7.6, "Module loading").
+# Under LAZY (torch's default) a kernel loads at its first launch, and a first launch after arming can stop the copy
+# thread's copies until the device deadline fail-stops the server: the soak's seeded pair of min_p requests (a 525-
+# token prompt, then a 3,314-token one) did so on the second's 14th decode step, every time, and never under EAGER
+# (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). EAGER loads a library's kernels when it is loaded, so
+# what remains is a library loaded after arming, which the module-load guard drains for.
+COPY_ENGINE_MODULE_LOADING = "EAGER"
+
+
+def check_copy_engine_module_loading(environ: Mapping[str, str]) -> None:
+    """Refuse the copy engine unless CUDA_MODULE_LOADING is EAGER; torch sets LAZY when the variable is unset."""
+    value = environ.get("CUDA_MODULE_LOADING", "")
+    if value != COPY_ENGINE_MODULE_LOADING:
+        raise RuntimeError(
+            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs CUDA_MODULE_LOADING="
+            f"{COPY_ENGINE_MODULE_LOADING} in the server's environment (it is {value or 'unset'}): a kernel loaded "
+            "lazily after the copy engine arms can hold its copies back until the RAM-miss deadline stops the server "
+            "(LEASE_PROTOCOL.md 7.6). EAGER costs ~1 GiB of device memory; raise --mem-fraction-static by ~0.03."
+        )
+
 
 def watchdog_wait_s(timeout_ms: int) -> float:
     """The C++ watchdog's abort limit for a wait timeout of ``timeout_ms``: max(30 s, 3 x timeout).
@@ -728,6 +748,7 @@ class Exl3RamMissService:
                 host.enable_piece_stream()
             copy_engine = cfg.enable_ram_miss_copy_engine
             if copy_engine:
+                check_copy_engine_module_loading(os.environ)
                 if not piece_stream:
                     raise RuntimeError(
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs "
@@ -983,7 +1004,8 @@ class Exl3RamMissService:
             logger.info("exl3 RAM miss copy engine armed after %d decode forwards since capture", self._copy_decodes)
 
     def _copy_engine_module_load_guard(self, load):
-        """Wraps a module loader (Triton's ``load_binary``): once armed, the device drains before a module loads.
+        """Wraps a module loader (Triton's ``load_binary``, tvm-ffi's ``load_module``): once armed, the device drains
+        before a module loads.
 
         ``cuModuleLoadData`` takes the driver lock that the copy thread's ``cuMemcpyAsync`` needs and then waits for
         the device, which may be spinning in a copy wait for exactly that copy: a deadlock the device deadline ends in
@@ -1000,6 +1022,15 @@ class Exl3RamMissService:
         return guarded
 
     def _install_copy_engine_module_load_guard(self) -> None:
+        # tvm-ffi loads every JIT library (sglang's load_jit and flashinfer's): under EAGER its dlopen loads the
+        # library's kernels there and then, the same hazard as a Triton load. Both callers look load_module up on the
+        # module at call time, so wrapping the attribute covers them.
+        try:
+            import tvm_ffi
+        except ImportError:
+            tvm_ffi = None
+        if tvm_ffi is not None:
+            tvm_ffi.load_module = self._copy_engine_module_load_guard(tvm_ffi.load_module)
         try:
             from triton.runtime import driver
         except ImportError:

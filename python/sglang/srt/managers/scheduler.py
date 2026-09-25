@@ -206,6 +206,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.prompt_logprobs import prompt_logprob_refusal
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -3091,19 +3092,14 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if (
-            get_device().mlx_enable_sampling
-            and req.return_logprob
-            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
-        ):
-            # The MLX sampling path computes output logprobs only; the
-            # prefill result carries no input_token_logprobs, so letting
-            # this through would crash output processing.
-            error_msg = (
-                "Prompt input logprobs (logprob_start_len) are not supported "
-                "on the MLX sampling path; omit logprob_start_len to get "
-                "output logprobs."
-            )
+        error_msg = prompt_logprob_refusal(
+            mlx_sampling=get_device().mlx_enable_sampling,
+            decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
+            return_logprob=req.return_logprob,
+            logprob_start_len=req.logprob_start_len,
+            input_len=len(req.origin_input_ids),
+        )
+        if error_msg:
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
