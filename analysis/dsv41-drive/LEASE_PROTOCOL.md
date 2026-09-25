@@ -900,8 +900,9 @@ runs and the chain is 7.3-7.5 as before.
 **Which lanes.** A lane of the reservation-hold grant (`grant_lane_group_locked`, `hit_phase`)
 whose slot is `kReady` is published with tag **COPYING (3)** instead of READY when all of:
 
-1. the copy engine is enabled and **armed** (`arm_copy_engine`; Python arms it on the fourth
-   batch after the first captured copy-engine post, see "Module loading" below);
+1. the copy engine is enabled and **armed** (`arm_copy_engine`; Python arms it once
+   `COPY_ENGINE_ARM_DECODES` (16) decode forwards have run after the first captured copy-engine
+   post, see "Module loading" below);
 2. the request's `LaneRequest.flags` carries `kLeaseLrFlagCopyEngine`. The post kernel sets it only
    when Python captured it with `copy_engine=1`, which `Exl3RamMissRowBackend.post` passes only
    while a CUDA graph is being captured: an eager chain never waits on the copy engine;
@@ -1004,10 +1005,15 @@ for up to 5 s; a job that does not complete keeps its leases and its stream, so 
 
 **Module loading.** A CUDA module load holds the context lock that `cuMemcpyAsync` needs and can
 wait for the device, which is spinning in CW for that copy: a deadlock only the device deadline
-breaks (engram-no-hostnode plan, section 10). Hence rule 2 above (eager forwards never allow the
-copy engine) and arming only after the first batches following capture, by which time the decode
-steps' kernels, inside and outside the graph, have loaded. What remains is a module first loaded by
-the scheduler thread while a copy-engine graph is in flight; the plan records what was measured.
+breaks, and the process fails stop (engram-no-hostnode plan, section 10; seen in the server twice,
+copy-compute-overlap plan section 10). The guards: rule 2 above (eager forwards never allow the copy
+engine); once armed, an eager forward drains the device first (`_copy_engine_barrier`) and so does
+a Triton module load (`_copy_engine_module_load_guard` on Triton's `load_binary`); and arming waits
+for 16 decode forwards, past the server's 8-token warm-up, so the kernels a decode step launches
+lazily outside the graph have loaded. **Not guarded:** a runtime-API kernel first launched after
+arming (lazy loading, `CUDA_MODULE_LOADING=LAZY`; e.g. a sampling path no earlier request took),
+and any other driver call that takes the lock and waits for the device (`cudaFree` through
+`empty_cache`, host registration). Each is a fail-stop, not a wrong answer.
 
 **Profiling.** Never capture a copy-engine run with `nsys --cuda-graph-trace=graph`: graph-mode
 CUPTI tracing makes the launch synchronous and holds off the copy thread's calls, which deadlocks CW
