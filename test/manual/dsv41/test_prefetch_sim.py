@@ -9,8 +9,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts", "dsv41"))
 
 from prefetch_sim import (  # noqa: E402
+    CrossLayer,
     DecodeStream,
     LinkModel,
+    NoisyOracle,
     Oracle,
     Predictor,
     PrefetchReplay,
@@ -117,6 +119,41 @@ def test_the_oracle_turns_every_later_miss_into_a_useful_prefetch(monkeypatch):
     # Layer 0 of step 0 has no issue point (no previous token); everything else is prefetched in time.
     assert out.demand[1:].sum() == 0 and out.demand[0, 1] == 0
     assert (out.useful == out.prefetch).all()
+
+
+def test_a_noisy_oracle_spans_the_oracle_and_pure_waste(monkeypatch):
+    import prefetch_sim
+
+    monkeypatch.setattr(prefetch_sim, "NUM_EXPERTS", 32)
+    loaded = _loaded(50)
+    stream = _stream(loaded)
+    perfect = run_arm(loaded, stream, NoisyOracle(stream, 1.0, 6), 6, 1)
+    oracle = run_arm(loaded, stream, Oracle(stream), 6, 1)
+    assert (perfect.demand == oracle.demand).all() and (perfect.useful == perfect.prefetch).all()
+    waste = run_arm(loaded, stream, NoisyOracle(stream, 0.0, 1), 1, 1)
+    base = run_arm(loaded, stream, Predictor(), 0, 1)
+    assert waste.useful.sum() == 0 and waste.prefetch.sum() > 0
+    assert waste.demand.sum() >= base.demand.sum()
+
+
+def test_a_gated_cross_layer_predictor_names_only_confident_rows(monkeypatch):
+    import prefetch_sim
+
+    monkeypatch.setattr(prefetch_sim, "NUM_EXPERTS", 32)
+    # Layer 1 always routes expert 20 + (layer 0's first expert mod 6), plus five fixed experts.
+    rng = np.random.default_rng(2)
+    routes = []
+    for _ in range(200):
+        first = rng.choice(20, 6, replace=False)
+        routes.append([first.tolist(), [20 + int(first[0]) % 6, 26, 27, 28, 29, 30]])
+    routes = np.array(routes)
+    stream = DecodeStream([0, 1], routes, ["r"] * 200, np.arange(200) > 0)
+    train = np.arange(200) < 150
+    gated = CrossLayer(stream, train, 1, min_prob=0.99)
+    for step in range(150, 200):
+        ranked = set(int(e) for e in gated.rank(step, 1, 1))
+        assert ranked == {26, 27, 28, 29, 30}  # the one certain set; the varying expert is never certain
+    assert CrossLayer(stream, train, 1, min_prob=0.5).rank(150, 1, 1)[0] in (26, 27, 28, 29, 30)
 
 
 def test_source_reaches_the_previous_token_only_within_a_request():

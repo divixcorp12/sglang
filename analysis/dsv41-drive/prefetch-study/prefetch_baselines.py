@@ -36,7 +36,7 @@ class Arm(msgspec.Struct, frozen=True):
     predictor: str
     k: int
     horizon: int
-    decay: float = 0.0
+    decay: float = 0.0  # recency: decay per token; cross_layer: min_prob gate; noisy_oracle: precision
 
 
 _STATE: dict = {}
@@ -55,7 +55,9 @@ def build(arm: Arm) -> prefetch_sim.Predictor:
     if arm.predictor == "recency":
         return prefetch_sim.Recency(stream, arm.decay)
     if arm.predictor == "cross_layer":
-        return prefetch_sim.CrossLayer(stream, train, arm.horizon)
+        return prefetch_sim.CrossLayer(stream, train, arm.horizon, min_prob=arm.decay)
+    if arm.predictor == "noisy_oracle":
+        return prefetch_sim.NoisyOracle(stream, arm.decay, arm.k)
     raise ValueError(arm.predictor)
 
 
@@ -90,13 +92,17 @@ def run(arm: Arm) -> dict:
     return out
 
 
-def arms(ks, horizons, decays) -> list[Arm]:
+def arms(ks, horizons, decays, gates, precisions, only) -> list[Arm]:
     out = [Arm("none", 0, 1)]
     for h in horizons:
         for k in ks:
             out += [Arm("oracle", k, h), Arm("prev_token", k, h), Arm("popularity", k, h), Arm("cross_layer", k, h)]
             out += [Arm("recency", k, h, decay) for decay in decays]
-    return out
+            out += [Arm("cross_layer", k, h, gate) for gate in gates]
+            out += [Arm("noisy_oracle", k, h, precision) for precision in precisions]
+    if only:
+        out = [arm for arm in out if arm.predictor == "none" or arm.predictor in only]
+    return list(dict.fromkeys(out))
 
 
 def main() -> None:
@@ -106,6 +112,9 @@ def main() -> None:
     p.add_argument("--ks", type=int, nargs="+", default=[1, 2, 4, 6])
     p.add_argument("--horizons", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--decays", type=float, nargs="+", default=[0.5, 0.9, 0.98])
+    p.add_argument("--gates", type=float, nargs="*", default=[], help="cross_layer min_prob gates")
+    p.add_argument("--precisions", type=float, nargs="*", default=[], help="noisy_oracle precisions")
+    p.add_argument("--only", nargs="*", default=[], help="run only these predictors (plus the baseline)")
     p.add_argument("--budgets", type=float, nargs="+", default=[0.85, 1.7])
     p.add_argument("--base-ms", type=float, default=116.0, help="measured decode ms/token of the recipe")
     p.add_argument("--ms-per-row", type=float, default=1.0)
@@ -121,7 +130,7 @@ def main() -> None:
     train, test, driver = split_requests(stream.rids, args.prompts)
     _STATE.update(loaded=loaded, stream=stream, train=train, test=test, all=np.ones(len(train), dtype=bool),
                   budgets=args.budgets)
-    todo = arms(args.ks, args.horizons, args.decays)
+    todo = arms(args.ks, args.horizons, args.decays, args.gates, args.precisions, args.only)
     print(f"{len(stream.rids)} decode steps; {int(train.sum())} train / {int(test.sum())} test; {len(todo)} arms",
           flush=True)
     with multiprocessing.get_context("fork").Pool(args.workers) as pool:

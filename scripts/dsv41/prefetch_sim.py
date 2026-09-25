@@ -229,6 +229,9 @@ class Predictor:
     def observe(self, step: int) -> None:
         pass
 
+    def bind(self, sim: "PrefetchReplay", index: dict[int, int]) -> None:
+        """Called once by run_arm; only predictors that model a quality level read residency."""
+
 
 class Oracle(Predictor):
     """The target's true routes: a non-deployable upper bound on what prefetch can do."""
@@ -240,6 +243,42 @@ class Oracle(Predictor):
 
     def rank(self, step, target, horizon):
         return self.stream.routes[step, target]
+
+
+class NoisyOracle(Predictor):
+    """A stand-in for a predictor of known quality, to price one before building it (not deployable).
+
+    Per target layer it names ``k`` rows; each is, with probability ``precision``, one of the layer's
+    true routes that is not resident (while any remain), and otherwise a random expert that is neither
+    routed nor resident: a wrong prefetch. It reads residency, so ``precision`` is the precision of the
+    rows actually prefetched (short only where a layer has fewer true misses than hits drawn).
+    """
+
+    def __init__(self, stream: DecodeStream, precision: float, k: int, seed: int = 0) -> None:
+        self.stream, self.precision, self.k = stream, precision, k
+        self.rng = np.random.default_rng(seed)
+        self.name = f"noisy_oracle_p{precision:g}"
+        self.sim: Optional["PrefetchReplay"] = None
+
+    def bind(self, sim, index):
+        self.sim, self.layer_of = sim, {li: layer for layer, li in index.items()}
+
+    def rank(self, step, target, horizon):
+        layer = self.layer_of[target]
+        resident = self.sim.resident(layer)
+        routed = [int(e) for e in self.stream.routes[step, target]]
+        missing = [e for e in routed if e not in resident]
+        out = []
+        for _ in range(self.k):
+            if missing and self.rng.random() < self.precision:
+                out.append(missing.pop(0))
+                continue
+            while True:
+                wrong = int(self.rng.integers(NUM_EXPERTS))
+                if wrong not in resident and wrong not in routed and wrong not in out:
+                    out.append(wrong)
+                    break
+        return out
 
 
 class PreviousToken(Predictor):
@@ -299,13 +338,26 @@ class CrossLayer(Predictor):
     Score of target expert ``j`` = sum over the source's six experts ``i`` of count(i at source, j at
     target), ties to training popularity. The source is ``source_of``: the same token ``h`` layers back,
     or, past layer 0, the previous token's tail.
+
+    With ``min_prob`` the score is instead the best single-source estimate max_i P(j at target | i at
+    source) (sources seen at least ``min_support`` times in training), and only experts scoring at least
+    ``min_prob`` are candidates: a confidence gate, so a layer may get no prefetch at all.
     """
 
-    def __init__(self, stream: DecodeStream, train: np.ndarray, horizon: int, depth: int = 48) -> None:
-        self.stream, self.horizon, self.depth = stream, horizon, depth
-        self.name = "cross_layer"
+    def __init__(
+        self,
+        stream: DecodeStream,
+        train: np.ndarray,
+        horizon: int,
+        depth: int = 48,
+        min_prob: float = 0.0,
+        min_support: int = 5,
+    ) -> None:
+        self.stream, self.horizon, self.depth, self.min_prob = stream, horizon, depth, min_prob
+        self.name = "cross_layer" if not min_prob else f"cross_layer_p{min_prob:g}"
         layers = len(stream.layers)
         self.counts = np.zeros((layers, NUM_EXPERTS, NUM_EXPERTS), dtype=np.float32)
+        self.support = np.zeros((layers, NUM_EXPERTS), dtype=np.float32)
         popularity = np.zeros((layers, NUM_EXPERTS), dtype=np.float64)
         for step in np.flatnonzero(train):
             for target in range(layers):
@@ -316,13 +368,25 @@ class CrossLayer(Predictor):
                 src = stream.routes[source[0], source[1]]
                 dst = stream.routes[step, target]
                 self.counts[target][np.ix_(src, dst)] += 1.0
+                self.support[target, src] += 1.0
         self.tiebreak = (popularity / (popularity.max() + 1.0) * 1e-3).astype(np.float32)
+        if min_prob:
+            enough = self.support >= min_support
+            self.prob = np.where(enough[:, :, None], self.counts / np.maximum(self.support, 1.0)[:, :, None], 0.0)
+            self.prob = self.prob.astype(np.float32)
+            del self.counts
 
     def rank(self, step, target, horizon):
         source = source_of(self.stream, step, target, self.horizon)
         if source is None:
+            if self.min_prob:
+                return ()
             return np.argsort(-self.tiebreak[target], kind="stable")[: self.depth]
         src = self.stream.routes[source[0], source[1]]
+        if self.min_prob:
+            score = self.prob[target][src].max(axis=0)
+            chosen = np.flatnonzero(score >= self.min_prob)
+            return chosen[np.argsort(-score[chosen], kind="stable")]
         score = self.counts[target][src].sum(axis=0) + self.tiebreak[target]
         top = np.argpartition(-score, self.depth)[: self.depth]
         return top[np.argsort(-score[top], kind="stable")]
@@ -357,6 +421,7 @@ def run_arm(
     sim = PrefetchReplay(initial, capacity, NUM_EXPERTS)
     layers = stream.layers
     index = {layer: li for li, layer in enumerate(layers)}
+    predictor.bind(sim, index)
     steps = len(stream.rids)
     demand = np.zeros((steps, len(layers)), dtype=np.int64)
     prefetch = np.zeros_like(demand)
