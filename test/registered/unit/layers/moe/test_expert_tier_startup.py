@@ -1,11 +1,14 @@
 """CPU tests of the tiers' startup path: the pinned manager and inclusive hot slots."""
 
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import expert_format, expert_hot_cache, expert_stream
 from sglang.srt.layers.moe.expert_format import (
     inclusive_hot_slot_limit,
@@ -110,6 +113,53 @@ class TestPinnedManagerStartup(unittest.TestCase):
                 model, budget_bytes=2 * streamer.host_bytes_per_expert
             )
         self.assertEqual(built, [(0, 1, {}), (1, 1, {})])
+
+
+class TestPinnedLayerWeights(unittest.TestCase):
+    """SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS splits the pinned budget by per-layer weight instead of evenly."""
+
+    def _capacities(self, budget_rows, weights):
+        model, _ = _model()
+        row_bytes = model.get_submodule("0")._nvfp4_expert_streamer.host_bytes_per_expert
+        built = {}
+
+        def fake_cache(streamer, capacity, **options):
+            built[streamer.layer_id] = capacity
+            return SimpleNamespace(capacity=capacity, residency_bytes=0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = ""
+            if weights is not None:
+                path = f"{tmp}/weights.json"
+                with open(path, "w") as f:
+                    json.dump({"layer_rows": weights}, f)
+            with patch.object(expert_stream, "ExpertPinnedHostCache", fake_cache), \
+                    envs.SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS.override(path):
+                ExpertPinnedHostCacheManager.from_model(model, budget_bytes=budget_rows * row_bytes)
+        return [built.get(layer_id, 0) for layer_id in range(2)]
+
+    def test_unset_splits_evenly(self):
+        self.assertEqual(self._capacities(7, None), [4, 3])
+
+    def test_rows_follow_the_weights(self):
+        self.assertEqual(self._capacities(8, [3, 1]), [6, 2])
+
+    def test_the_total_matches_the_even_split(self):
+        self.assertEqual(sum(self._capacities(7, [2, 5])), 7)
+        self.assertEqual(self._capacities(7, [1, 1]), [4, 3])
+
+    def test_a_layer_is_capped_at_its_experts_and_the_rest_goes_elsewhere(self):
+        self.assertEqual(self._capacities(10, [9, 1]), [EXPERTS, 2])
+
+    def test_a_weight_list_of_the_wrong_length_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "one weight per streamed layer"):
+            self._capacities(4, [1, 1, 1])
+
+    def test_negative_or_all_zero_weights_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "weights"):
+            self._capacities(4, [1, -1])
+        with self.assertRaisesRegex(ValueError, "weights"):
+            self._capacities(4, [0, 0])
 
 
 class TestInclusiveHotSlotLimit(unittest.TestCase):

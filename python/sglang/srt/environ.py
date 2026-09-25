@@ -386,6 +386,10 @@ class Envs:
     # in that proportion, and startup refuses a node without the memory. Empty keeps
     # first-touch placement.
     SGLANG_MOE_PINNED_HOST_NUMA_MB = EnvStr("")
+    # A JSON file {"layer_rows": [w, ...]}, one weight per streamed layer in layer-id order: the pinned host
+    # tier's rows are split in proportion to them instead of evenly, with the same total. Empty splits evenly.
+    # scripts/dsv41/ram_split.py derives weights from a route log (DSV41_REFERENCE.md 27.4 item 5).
+    SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS = EnvStr("")
     SGLANG_MOE_EXPERT_COPY_BACKEND = EnvStr("gpu")
     SGLANG_MOE_HOT_GPU_MB = EnvInt(0)
     SGLANG_MOE_HOT_SEED = EnvStr("")

@@ -512,6 +512,62 @@ def _placement_report(placement: "Placement", caches) -> dict | None:
     }
 
 
+def _load_layer_weights(path: str) -> list[float]:
+    with open(path) as f:
+        return [float(w) for w in json.load(f)["layer_rows"]]
+
+
+def _weighted_capacities(
+    streamers: dict, budget_bytes: int, *, total_rows: int, weights: list[float]
+) -> dict[int, int]:
+    """Split ``total_rows`` over the streamed layers in proportion to ``weights`` (one per layer, in layer-id order).
+
+    A layer is capped at its expert count and its share goes to the others; rounding hands the leftover rows to
+    the largest remainders, lowest layer first. Rows are then trimmed, if needed, until the bytes fit the budget.
+    """
+    layer_ids = sorted(streamers)
+    if len(weights) != len(layer_ids):
+        raise ValueError(
+            f"pinned host layer weights need one weight per streamed layer: got {len(weights)} for {len(layer_ids)}"
+        )
+    if any(w < 0 for w in weights) or sum(weights) <= 0:
+        raise ValueError("pinned host layer weights must be nonnegative and not all zero")
+    weight = dict(zip(layer_ids, weights))
+    limit = {layer_id: streamers[layer_id].num_experts for layer_id in layer_ids}
+    capacities = {layer_id: 0 for layer_id in layer_ids}
+    active = [layer_id for layer_id in layer_ids if weight[layer_id] > 0]
+    remaining = total_rows
+    # Water-filling: a layer whose share exceeds its experts is capped, and the rest is re-split.
+    while active and remaining > 0:
+        total_weight = sum(weight[layer_id] for layer_id in active)
+        share = {layer_id: remaining * weight[layer_id] / total_weight for layer_id in active}
+        capped = [layer_id for layer_id in active if share[layer_id] >= limit[layer_id]]
+        if capped:
+            for layer_id in capped:
+                capacities[layer_id] = limit[layer_id]
+                remaining -= limit[layer_id]
+                active.remove(layer_id)
+            continue
+        for layer_id in active:
+            capacities[layer_id] = int(share[layer_id])
+        leftover = remaining - sum(capacities[layer_id] for layer_id in active)
+        by_remainder = sorted(active, key=lambda layer_id: (-(share[layer_id] % 1), layer_id))
+        for layer_id in by_remainder[:leftover]:
+            capacities[layer_id] += 1
+        break
+
+    def used_bytes() -> int:
+        return sum(capacities[l] * streamers[l].host_bytes_per_expert for l in layer_ids)
+
+    while used_bytes() > budget_bytes:
+        layer_id = max(
+            (l for l in layer_ids if capacities[l] > 0),
+            key=lambda l: capacities[l] / max(weight[l], 1e-12),
+        )
+        capacities[layer_id] -= 1
+    return capacities
+
+
 class ExpertPinnedHostCacheManager:
     """Allocate a global complete-row budget across streamed expert layers."""
 
@@ -551,6 +607,14 @@ class ExpertPinnedHostCacheManager:
                 capacities[layer_id] += 1
                 remaining -= streamer.host_bytes_per_expert
                 progress = True
+        weights_path = envs.SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS.get()
+        if weights_path:
+            capacities = _weighted_capacities(
+                streamers,
+                budget_bytes,
+                total_rows=sum(capacities.values()),
+                weights=_load_layer_weights(weights_path),
+            )
         if not any(capacities.values()):
             return None
         manager = cls()
