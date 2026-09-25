@@ -305,6 +305,7 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
     predicted = [steps[i + 1][0] if rng.random() < 0.5 else rng.randrange(EXPERTS) for i in range(STEPS)]
     outs, misses = {}, {}
     for arm in (False, True):
+        (tmp_path / f"arm{int(arm)}").mkdir()
         d = Decode(tmp_path / f"arm{int(arm)}", prefetch=arm)
         try:
             expected = d.s.expected(list(range(EXPERTS)))
