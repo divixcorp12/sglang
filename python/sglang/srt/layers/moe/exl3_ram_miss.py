@@ -568,9 +568,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
 
 
-# Arbitrary: enough batches after the first copy-engine capture for the first decode steps (and the kernels they
-# launch outside the graph) to run unarmed. No kernel module may load while a copy wait spins (7.6).
-COPY_ENGINE_ARM_BATCHES = 4
+# Decode forwards after the first copy-engine capture that run unarmed, so that the kernels a decode step launches
+# for the first time (lazily loaded under CUDA_MODULE_LOADING=LAZY, outside any hook) load while no copy wait can spin
+# (7.6). Counting batches instead armed inside the server's 8-token warm-up request, whose first decode steps then
+# deadlocked (smokes abba1-on at 4 batches, diag arm1-on at 1). 16 covers the warm-up; arbitrary beyond that.
+COPY_ENGINE_ARM_DECODES = 16
 
 
 def watchdog_wait_s(timeout_ms: int) -> float:
@@ -635,11 +637,13 @@ class Exl3RamMissService:
         # disagree about which chain this process runs.
         self.two_phase = False
         self.piece_stream = False
-        # LEASE_PROTOCOL.md 7.6. Enabled at start, armed by fail_stop_check once a copy-engine graph was captured and
-        # COPY_ENGINE_ARM_BATCHES batches have run since, so the first decode steps load their kernels unarmed.
+        # LEASE_PROTOCOL.md 7.6. Enabled at start, armed by fail_stop_check once COPY_ENGINE_ARM_DECODES decode
+        # forwards have run after a copy-engine graph was captured, so the first decode steps load their kernels
+        # unarmed. Once armed, an eager forward and a Triton module load first drain the device.
         self.copy_engine = False
         self._copy_armed = False
-        self._copy_batches = 0
+        self._copy_decodes = 0
+        self.copy_engine_module_loads = 0  # Triton loads that drained the device first
         self.hit_wait_ns = 100_000
         self.hot_page = None
         self.gpu_hot_enabled = False
@@ -838,6 +842,7 @@ class Exl3RamMissService:
                 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 
                 get_global_expert_distribution_recorder().register_pre_forward_observer(self._copy_engine_barrier)
+                self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         next_row = row + 1 if row + 1 < len(self._rows) else -1
@@ -937,19 +942,44 @@ class Exl3RamMissService:
     def _copy_engine_barrier(self, forward_pass_id: int, forward_batch) -> None:
         # An eager forward may load a kernel module, and a load blocks the copy thread's cuMemcpyAsync while a decode
         # graph in flight spins in its copy wait, until the deadline (LEASE_PROTOCOL.md 7.6): let that step end first.
-        if self._copy_armed and not forward_batch.forward_mode.is_decode():
-            torch.cuda.synchronize()
+        if not forward_batch.forward_mode.is_decode():
+            if self._copy_armed:
+                torch.cuda.synchronize()
+        elif self.device_side is not None and self.device_side.copy_engine_captured:
+            self._copy_decodes += 1
 
     def _arm_copy_engine(self) -> None:
         if not self.copy_engine or self._copy_armed or self.device_side is None:
             return
-        if not self.device_side.copy_engine_captured:
-            return
-        self._copy_batches += 1
-        if self._copy_batches >= COPY_ENGINE_ARM_BATCHES:
+        if self._copy_decodes >= COPY_ENGINE_ARM_DECODES:
             self.host.arm_copy_engine()
             self._copy_armed = True
-            logger.info("exl3 RAM miss copy engine armed after %d batches since capture", self._copy_batches)
+            logger.info("exl3 RAM miss copy engine armed after %d decode forwards since capture", self._copy_decodes)
+
+    def _copy_engine_module_load_guard(self, load):
+        """Wraps a module loader (Triton's ``load_binary``): once armed, the device drains before a module loads.
+
+        ``cuModuleLoadData`` takes the driver lock that the copy thread's ``cuMemcpyAsync`` needs and then waits for
+        the device, which may be spinning in a copy wait for exactly that copy: a deadlock the device deadline ends in
+        a fail-stop (smoke diag/arm1eager83-on: the scheduler in ``loadBinary`` -> ``cuModuleLoadData``, the copy
+        thread in ``cuMemcpyAsync`` on the lock, 20 s). Draining first is safe, because no load holds the lock yet.
+        """
+
+        def guarded(*args, **kwargs):
+            if self._copy_armed and not torch.cuda.is_current_stream_capturing():
+                self.copy_engine_module_loads += 1
+                torch.cuda.synchronize()
+            return load(*args, **kwargs)
+
+        return guarded
+
+    def _install_copy_engine_module_load_guard(self) -> None:
+        try:
+            from triton.runtime import driver
+        except ImportError:
+            return
+        utils = driver.active.utils
+        utils.load_binary = self._copy_engine_module_load_guard(utils.load_binary)
 
     def _trace_stages(self) -> None:
         """The stage records the service produced since the last check, into the stream trace."""
