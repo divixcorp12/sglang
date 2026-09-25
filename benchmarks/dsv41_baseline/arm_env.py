@@ -197,6 +197,8 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--expert-distribution-recorder-mode",
             "per_pass",
             "--disable-shared-experts-fusion",
+            # Needs the prefill CUDA graph off (it is, above) and no DP attention (deepseek_v4_hook refuses both).
+            "--enable-decoder-swa-bounded-replay",
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]
