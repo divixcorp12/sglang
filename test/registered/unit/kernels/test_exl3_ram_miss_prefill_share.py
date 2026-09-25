@@ -1,0 +1,171 @@
+"""The prefill share of the C++ RAM tier (CPU): a prefill owns at most K rows per layer, so its admissions stop
+evicting decode's rows once it holds K (SGLANG_DSV41_ENABLE_PREFILL_SHARE, plan 2026-09-25-dsv41-prefill-eviction).
+
+Prefill admissions go through ``assign`` (ExpertPinnedHostCache.ensure_rows, a chunk protected at a time); decode
+rows through served demands. Each test names the mutation it must fail under.
+"""
+
+import faulthandler
+
+import pytest
+import torch
+
+from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+FREE, LOADING, READY = 0, 1, 2
+EXPERTS = 10
+
+
+@pytest.fixture(autouse=True)
+def hang_guard():
+    faulthandler.dump_traceback_later(120, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
+
+
+@pytest.fixture
+def tier(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=4, experts=EXPERTS)
+    page = new_page(pin=False)
+    host = Exl3RamMissHost(
+        s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), direct=False
+    )
+    yield page, host
+    host.stop()
+
+
+def _serve(page, host, need, protect):
+    seq = sim_post(page, 0, need=need, protect=protect)
+    assert host.pump() == 1
+    assert sim_wait(page, seq, timeout_s=1.0) == 1
+
+
+def _decode_rows(page, host):
+    """Decode reads 0, 1, 2, 3 in that order: the tier is full and 0 is the LRU row."""
+    for expert in range(4):
+        _serve(page, host, need=[expert], protect=[expert])
+
+
+def _prefill(host, chunks):
+    """gather_rows' admissions: each chunk's misses assigned with the chunk protected."""
+    for chunk in chunks:
+        for expert in chunk:
+            host.assign(0, expert, protected=chunk)
+
+
+def _resident(host):
+    return sorted(e for e in host.slot_to_expert(0) if e >= 0)
+
+
+@pytest.mark.parametrize("share, resident", [(0, [6, 7, 8, 9]), (2, [2, 3, 8, 9])])
+def test_decode_rows_survive_a_prefill_that_holds_its_share(tier, share, resident):
+    """Mutation: the share is ignored (then the prefill evicts all four decode rows, as with share 0)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(share)
+    _prefill(host, [[4, 5], [6, 7], [8, 9]])
+    assert _resident(host) == resident
+
+
+def test_without_a_share_the_victim_order_is_unchanged(tier):
+    """Mutation: share 0 still marks or prefers owned rows."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(0)
+    _, evicted = host.assign(0, 4, protected=[4])
+    assert evicted == 0
+    host.set_prefill_share(0)
+    _, evicted = host.assign(0, 5, protected=[5])
+    assert evicted == 1
+
+
+def test_a_decode_hit_ends_a_rows_prefill_ownership(tier):
+    """Mutation: a served demand's hit does not clear ownership (then 5's admission evicts 4, not decode's 1)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(1)
+    _, evicted = host.assign(0, 4, protected=[4])
+    assert evicted == 0
+    host.set_prefill_share(0)
+    _serve(page, host, need=[], protect=[4])  # decode routes 4: it is decode's row now
+    host.set_prefill_share(1)
+    _, evicted = host.assign(0, 5, protected=[5])
+    assert evicted == 1 and host.contains(0, 4)
+    _, evicted = host.assign(0, 6, protected=[6])
+    assert evicted == 5, "5 is owned and the share is full"
+
+
+def test_an_unarmed_touch_ends_ownership_but_a_prefill_touch_does_not(tier):
+    """Mutations: the unarmed record keeps ownership; a Python touch under a share clears it."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(1)
+    host.assign(0, 4, protected=[4])
+    host.touch(0, 4)  # the prefill's own lookup hit
+    _, evicted = host.assign(0, 5, protected=[5])
+    assert evicted == 4
+    host.set_prefill_share(0)
+    sim_post(page, 0, need=[], protect=[5], armed=False)
+    assert host.pump() == 1
+    host.set_prefill_share(1)
+    _, evicted = host.assign(0, 6, protected=[6])
+    assert evicted == 1 and host.contains(0, 5)
+
+
+def test_a_python_touch_without_a_share_ends_ownership(tier):
+    """Mutation: touch() never clears ownership (then 5 evicts 4)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(1)
+    host.assign(0, 4, protected=[4])
+    host.set_prefill_share(0)
+    host.touch(0, 4)
+    host.set_prefill_share(1)
+    _, evicted = host.assign(0, 5, protected=[5])
+    assert evicted == 1 and host.contains(0, 4)
+
+
+@pytest.mark.parametrize("exclude", ["protected", "hot", "leased"])
+def test_an_owned_row_that_is_protected_hot_or_leased_is_never_the_victim(tier, exclude):
+    """Mutation: the owned-row branch skips an exclusion of take_slot_locked (then 4 is evicted)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(1)
+    slot4, evicted = host.assign(0, 4, protected=[4])
+    assert evicted == 0
+    protected = [5]
+    if exclude == "protected":
+        protected = [4, 5]
+    elif exclude == "hot":
+        host.set_hot(0, [4])
+    else:
+        host.inject_lease(0, slot4, +1)
+    _, evicted = host.assign(0, 5, protected=protected)
+    assert evicted == 1 and host.contains(0, 4)
+    if exclude == "leased":
+        host.inject_lease(0, slot4, -1)
+
+
+def test_a_freed_owned_slot_is_no_longer_counted(tier):
+    """Mutation: release() leaves the slot owned (then the stale count sends 6 to evict the owned 5, not a decode row)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(1)
+    slot4, _ = host.assign(0, 4, protected=[4])
+    host.release(0, slot4)
+    host.assign(0, 5, protected=[5])  # takes the free slot, owned: count 1
+    host.set_prefill_share(2)
+    _, evicted = host.assign(0, 6, protected=[6])
+    assert evicted == 1, "one owned row, below the share of 2: a decode row goes"
+    _, evicted = host.assign(0, 7, protected=[7])
+    assert evicted == 5
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
