@@ -3612,7 +3612,58 @@ cold copies with the source on node 0, where the bounce slots live:
   altogether. Rows start mid-page and the segment layout differs from the file's, so it is
   a layout change.
 - Either would be worth about 0.1–0.3 ms/token at 4.2 read layers per token. C1's 75 ms
-  on the link (§24.6) is still the wall.
+  on the link (§24.6) is still the wall. (That estimate undercounted: §24.9 measured the
+  second option at about 4 ms/token.)
+
+### 24.9 Row images: reads land straight in the pinned slabs (2026-09-24)
+
+**What changed.** With `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1`, the RAM-miss reader
+reads each sub-read with one O_DIRECT `readv` whose iovecs are the pinned slab rows it
+fills. There is no bounce buffer and no pack workers, and each piece is published as soon
+as its read is checked. Plan: `docs/superpowers/plans/2026-09-24-dsv41-row-images.md`.
+
+- **Why the files had to change.** Checkpoint rows start at odd file offsets, and the
+  4-byte `mul1`s shift each later tensor, so no tensor boundary is 512-aligned. O_DIRECT
+  needs 512-aligned file offsets and segment lengths; memory alignment is 4 bytes.
+- **Row images.** A row image stores each row as its six slab rows back to back
+  (`exl3_row_image.py`). Every slab row is a multiple of 512 bytes, so a `readv` can
+  scatter any 512-aligned range of an image into the slabs.
+- **Build.** `scripts/dsv41/build_row_images.py` writes them under
+  `<mirror root>/exl3_row_images/`, 204.5 GB per root, in 7.5 min for both drives. It
+  checks each row against its digest and writes the manifest last. The reader refuses a
+  root whose manifest doesn't match the live checkpoint.
+- **What stays the same.** The slabs, copy tables, device kernels and lease protocol are
+  unchanged. The mode requires mirror dirs, `uring_direct` and leases.
+- **Why leases are required.** Leases keep a GPU copy's slot from being chosen as a
+  victim. A direct read overwrites its slot from the moment it is submitted, not after the
+  read as packing did.
+- **Probe:** `analysis/dsv41-drive/direct-read-probe/`. XFS and ext4 both report
+  `dio_mem_align 4` / `dio_offset_align 512`. `readv` into mbind'd, registered slab rows
+  matched the bounce path's throughput within 1%.
+
+**100 GiB smoke at `e543f74c80`.** Script: `analysis/dsv41-drive/row-images/compare_arms.py`,
+with `--include-warmup`. Runs: `divix01:.../direct-two-phase-tests/row-images/`.
+
+| | bounce: fresh | bounce: base2 | row images 1 | row images 2 |
+|---|---|---|---|---|
+| pack tail p50 / mean (µs) | 179.3 / 208.4 | 185.8 / 220.3 | 0.3 / 0.3 | 0.3 / 0.3 |
+| host tail p50 (µs) | 182.1 | 189.3 | 2.0 | 1.8 |
+| submit→done p50, 1 / 2 / 3+ rows (µs) | 2905 / 5205 / 7305 | 2944 / – / – | 2605 / 4731 / 6714 | 2610 / 4721 / 6744 |
+| stalls (multi-row demands > 10 ms) | 0 | 4 | 0 | 0 |
+| ms/token, trace (checked against wall) | 136.1 (138.8) | 137.0 (139.8) | **132.4 (135.2)** | **132.1 (134.9)** |
+
+- **Responses** are byte-identical in all five runs (6 of 6 each).
+- **Gain:** about 4 ms/token. Every request was faster, by 1.6–7.0 ms/token.
+- **Where the gain comes from.** Removing the pack tail explains about 13.3 demands per
+  step × ~0.2 ms. The rest is reads finishing sooner: single-row submit→done fell 300 µs.
+- **The first bounce run on the merged head (not shown).** One request hit the known SPCC
+  late-sub-read pattern: 254 stalls, and part-1 sub-reads 10–35 ms late. It also had a
+  ~38 µs higher tail. A rerun (base2) was clean, so it was the drive, not the merge.
+
+**Suites at `e543f74c80`:**
+- CPU `test/registered/unit/kernels`: 1665 passed, 1 skipped (the sibling test, under
+  `taskset -c 0-31`).
+- GPU, six manual files plus the row-image file: 99 passed.
 
 ## Sources
 
