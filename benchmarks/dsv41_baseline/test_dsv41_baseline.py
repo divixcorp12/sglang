@@ -16,6 +16,7 @@ import compile_watch
 import concat_arms
 import generations
 import metrics
+import nsys_capture
 import paired
 import provenance
 import report_builder
@@ -1138,3 +1139,71 @@ def test_piece_streaming_defaults_carry_their_prerequisites():
     assert env["SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE"] == "1"
     assert env["SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"] == "1"
     assert int(env["SGLANG_DSV41_RAM_MISS_PACK_WORKERS"]) > 0
+
+
+# --- run_arm.sh's Nsight options (nsys_capture.py) ---
+
+
+def _run_arm_script():
+    return open(os.path.join(os.path.dirname(__file__), "run_arm.sh")).read()
+
+
+def test_nsys_graph_trace_defaults_to_graph():
+    assert nsys_capture.graph_trace_mode(None, {}) == "graph"
+    assert nsys_capture.graph_trace_mode("", arm_env.base_env()) == "graph"
+
+
+def test_nsys_graph_trace_accepts_node_with_or_without_the_copy_engine():
+    on = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "1"})
+    assert nsys_capture.graph_trace_mode("node", on) == "node"
+    assert nsys_capture.graph_trace_mode("node", arm_env.base_env()) == "node"
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "y"])
+def test_nsys_graph_trace_refuses_graph_with_the_copy_engine_on(value):
+    env = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": value})
+    with pytest.raises(ValueError, match="deadlocks"):
+        nsys_capture.graph_trace_mode("graph", env)
+    with pytest.raises(ValueError, match="deadlocks"):
+        nsys_capture.graph_trace_mode(None, env)  # the default is graph, so it is refused too
+
+
+def test_nsys_graph_trace_allows_graph_with_the_copy_engine_off():
+    env = arm_env.arm_env({"SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "0"})
+    assert nsys_capture.graph_trace_mode("graph", env) == "graph"
+
+
+@pytest.mark.parametrize("value", ["Graph", "nodes", "none", "graph,node"])
+def test_nsys_graph_trace_refuses_an_unknown_mode(value):
+    with pytest.raises(ValueError, match="must be one of"):
+        nsys_capture.graph_trace_mode(value, {})
+
+
+def test_nsys_report_dir_must_stay_on_nvme1():
+    assert nsys_capture.check_report_dir("/mnt/nvme1/dsv41-nsys") == "/mnt/nvme1/dsv41-nsys"
+    for bad in ["/tmp/nsys", "dsv41-nsys", "/mnt/nvme1", "/mnt/nvme1/../tmp", "/data/models/x"]:
+        with pytest.raises(ValueError):
+            nsys_capture.check_report_dir(bad)
+
+
+def test_nsys_scratch_is_on_nvme1():
+    assert nsys_capture.NSYS_TMPDIR.startswith(nsys_capture.REPORT_ROOT)
+
+
+def test_run_arm_passes_the_chosen_graph_trace_mode_to_nsys():
+    script = _run_arm_script()
+    assert "--cuda-graph-trace=graph" not in script, "the mode is hard-wired again"
+    assert '--cuda-graph-trace="$nsys_graph_trace"' in script
+    # The check reads the arm's full resolved env, not just the KEY=VAL overrides.
+    assert "nsys_capture.graph_trace_mode(sys.argv[1], json.load(open('$expected_env_path')))" in script
+    assert "export NSYS_TMPDIR" in script
+    assert "nsys_capture.check_report_dir" in script
+
+
+def test_run_arm_writes_the_nsys_report_before_it_stops_the_server():
+    lines = _run_arm_script().splitlines()
+    stop = next(i for i, l in enumerate(lines) if l.strip().startswith('nsys stop --session="$nsys_session"'))
+    wait = next(i for i, l in enumerate(lines) if 'stat -c %s "$nsys_report.nsys-rep"' in l)
+    # The unindented stop_server that ends a successful arm (abort paths call it inside `{ ...; }` or a block).
+    final_stop = next(i for i, l in enumerate(lines) if l == "stop_server")
+    assert stop < wait < final_stop

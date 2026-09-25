@@ -52,8 +52,11 @@ def main() -> int:
     tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
     copies = []
     if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
+        # nsys 2026.3's export has no graphId on memcpy rows, only graphNodeId (NULL outside a graph).
+        cols = {r[1] for r in c.execute("pragma table_info(CUPTI_ACTIVITY_KIND_MEMCPY)")}
+        outside = "graphId = 0" if "graphId" in cols else "coalesce(graphNodeId, 0) = 0"
         copies = c.execute(
-            "select start, end, bytes, streamId, copyKind from CUPTI_ACTIVITY_KIND_MEMCPY where graphId = 0 order by start"
+            f"select start, end, bytes, streamId, copyKind from CUPTI_ACTIVITY_KIND_MEMCPY where {outside} order by start"
         ).fetchall()
     ce = [(s, e, b) for s, e, b, stream, kind in copies if stream not in graph_streams and kind == 1]
     per_step = []

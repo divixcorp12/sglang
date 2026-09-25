@@ -361,6 +361,12 @@ the Qwen campaign's split, and caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 - `decode_log_interval_compare.sh` — runs the same arm at `decode_log_interval=40`
   and `=1`, pairs the two. Written for the team lead to run; not run here (see "One
   harness, not two").
+- `nsys_capture.py` — `run_arm.sh`'s `NSYS_TRACE=1` options: `NSYS_CUDA_GRAPH_TRACE=graph|node`
+  (default `graph`; `graph` refused when the arm's env turns the RAM-miss copy engine on, since
+  graph-mode tracing deadlocks its copy wait), `NSYS_TMPDIR=/mnt/nvme1/nsys-tmp`, and reports
+  kept under `/mnt/nvme1`. Read ms/token only from a graph-mode report; node mode is for
+  per-kernel attribution. After `nsys stop`, `run_arm.sh` waits for the report to stop growing
+  before it stops the server.
 - `paired.py` — the only comparison this harness offers: per-session, refusing to pair
   arms under mismatched tenancy, mismatched clock profile, or any compile-contaminated
   session. Usage: `python paired.py <arm_a_dir> <arm_b_dir> [--a-name NAME] [--b-name
