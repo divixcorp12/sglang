@@ -272,6 +272,20 @@ def test_direct_replay_victims_skip_the_slots_the_forward_reads():
     assert sim.resident(0) == {0, 2, 6}
 
 
+def test_direct_replay_ranks_a_short_prefills_routes_before_it_scores_them():
+    """GpuResidencyUpdater._apply re-ranks the shortlist on every graph forward; only the score update is
+    gated. After a prefill below the 256-token boundary no boundary is due, yet the first decode's victims
+    already rank the prefill's experts as routed: expert 2 survives and 1 goes. Found replaying smoke6,
+    where the old replay kept the startup shortlist there and drifted from the logged hot sets."""
+    from tier_sim import DirectInsertReplay
+
+    sim = DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=1)
+    sim.eager_forward(20, {0: ([2], [1])}, "extend")
+    assert sim.graph_forward({0: [5]}) == {0: 1}
+    assert sim.resident(0) == {0, 2, 5}
+    assert sim.scores.sum() == 0  # the prefill's count is scored at the next forward's boundary
+
+
 def test_direct_replay_eager_prefill_inserts_nothing():
     from tier_sim import DirectInsertReplay
 
