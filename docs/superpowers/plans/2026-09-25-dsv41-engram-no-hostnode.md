@@ -42,7 +42,11 @@ layer 14     wait(layer 14): same
   its own 64-byte line. Offsets are defined three times (`engram_ring.cuh`, `engram_host_node.cpp` `ring::`,
   `sglang/kernels/ops/embeddings/engram_ring.py`); a CPU test checks the C++ and Python copies agree and the GPU
   tests exercise the kernel's.
-- **Post kernel** (`engram_ring_post`, one thread): `seq = ++counter` (a device word; 0 is skipped), copy the 24
+- **Sequence word** (`counter`): one int32 of pinned memory that only the two kernels touch. It is not device
+  memory because the lookup is built inside the capture, where `torch.zeros(device=...)` records a memset that
+  would reset it on every replay (the first GPU run failed exactly so: every replay posted seq 1, and the wait
+  passed at once on the stale done word, returning the previous step's rows).
+- **Post kernel** (`engram_ring_post`, one thread): `seq = ++counter` (0 is skipped), copy the 24
   ids into pinned `ids`, `__threadfence_system()`, `st.release.sys` `kPostSeq = seq`.
 - **Service** (`RingService`, `engram_host_node.cpp`): one thread for all lookups, polling in registration order
   (layer 1 before layer 14). For each lookup whose `kPostSeq` (acquire load) differs from the last seen: if

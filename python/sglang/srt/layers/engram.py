@@ -194,9 +194,11 @@ class _EngramDeviceWaitLookup:
         self.control = torch.zeros(
             (engram_ring.CONTROL_WORDS,), dtype=torch.int32, pin_memory=True
         )
-        self.counter = torch.zeros((1,), dtype=torch.int32, device=indices.device)
+        # The device's own sequence word. Pinned, not device memory: a device tensor made
+        # here, inside the capture, would be zeroed by a captured memset on every replay.
+        self.counter = torch.zeros((1,), dtype=torch.int32, pin_memory=True)
         self.packed_gpu = torch.empty(self.rows.shape, dtype=torch.uint8, device=indices.device)
-        self.status_gpu = torch.zeros((1,), dtype=torch.int32, device=indices.device)
+        self.status_gpu = torch.empty((1,), dtype=torch.int32, device=indices.device)
         self.native_context = native.RingLookup(
             store,
             file_table.path,

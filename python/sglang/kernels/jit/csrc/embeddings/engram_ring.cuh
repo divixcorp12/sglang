@@ -57,12 +57,14 @@ __device__ __forceinline__ uint64_t global_ns() {
   return value;
 }
 
+// `counter` is pinned host memory that only these kernels read and write (see _EngramDeviceWaitLookup).
 __global__ void post_kernel(const int64_t* __restrict__ ids_dev, int64_t* ids_host, int64_t n, int32_t* control,
                             int32_t* counter) {
   if (threadIdx.x != 0) return;
-  uint32_t seq = static_cast<uint32_t>(counter[0]) + 1u;
+  volatile int32_t* sequence = counter;
+  uint32_t seq = static_cast<uint32_t>(*sequence) + 1u;
   if (seq == 0u) seq = 1u;  // 0 is the control block's initial value, never a posted sequence
-  counter[0] = static_cast<int32_t>(seq);
+  *sequence = static_cast<int32_t>(seq);
   volatile int64_t* out = ids_host;
   for (int64_t i = 0; i < n; ++i) out[i] = ids_dev[i];
   // The ids are posted writes over PCIe; the fence and the release store both order them before the sequence.
@@ -74,7 +76,7 @@ __global__ void wait_kernel(int32_t* control, const int32_t* counter, const uint
                             int64_t bytes, int32_t* status_dev, int64_t timeout_ns) {
   __shared__ int32_t block_status;
   if (threadIdx.x == 0) {
-    const uint32_t seq = static_cast<uint32_t>(counter[0]);
+    const uint32_t seq = static_cast<uint32_t>(*reinterpret_cast<const volatile int32_t*>(counter));
     int32_t status;
     if (ld_acquire_sys(control + kFatalSeq) != 0) {
       status = kDeviceSawFatal;
@@ -116,7 +118,7 @@ __global__ void wait_kernel(int32_t* control, const int32_t* counter, const uint
 
 void engram_ring_post(tvm::ffi::TensorView ids_dev, tvm::ffi::TensorView ids_host, tvm::ffi::TensorView control,
                       tvm::ffi::TensorView counter) {
-  const auto device = host::LaunchKernel::resolve_device(counter.device());
+  const auto device = host::LaunchKernel::resolve_device(ids_dev.device());
   host::LaunchKernel(1, 32, device)(
       engram_ring_device::post_kernel,
       static_cast<const int64_t*>(ids_dev.data_ptr()),
@@ -128,7 +130,7 @@ void engram_ring_post(tvm::ffi::TensorView ids_dev, tvm::ffi::TensorView ids_hos
 
 void engram_ring_wait(tvm::ffi::TensorView control, tvm::ffi::TensorView counter, tvm::ffi::TensorView rows_host,
                       tvm::ffi::TensorView rows_dev, tvm::ffi::TensorView status_dev, int64_t timeout_ns) {
-  const auto device = host::LaunchKernel::resolve_device(counter.device());
+  const auto device = host::LaunchKernel::resolve_device(rows_dev.device());
   host::LaunchKernel(1, engram_ring_device::kWaitThreads, device)(
       engram_ring_device::wait_kernel,
       static_cast<int32_t*>(control.data_ptr()),
