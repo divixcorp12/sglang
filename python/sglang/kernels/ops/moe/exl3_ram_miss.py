@@ -10,7 +10,7 @@ import atexit
 import json
 import sys
 import weakref
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 import torch
 
@@ -782,6 +782,37 @@ class Exl3RamMissHost:
     def release(self, row: int, slot: int) -> None:
         self._check(row, slot=slot)
         self._module.exl3_ram_miss_release(self.handle, row, slot)
+
+    def fill_begin(
+        self, row: int, experts: Sequence[int], protected: Iterable[int] = (), fallback: bool = False
+    ) -> tuple[list[int], int]:
+        """Prefill fills: claim slots for ``experts`` of ``row`` in order and read them on a helper thread.
+
+        Needs the service thread paused (or no thread). Claiming stops at the first expert with no victim;
+        returns the claimed prefix's slots and the rows evicted for them. Every expert must hold no slot.
+        """
+        self._check(row)
+        experts = [int(expert) for expert in experts]
+        for expert in experts:
+            self._check(row, expert)
+        out = torch.zeros(len(experts) + 1, dtype=torch.int64)
+        claimed = int(
+            self._module.exl3_ram_miss_fill_begin(self.handle, row, _ids(experts), _ids(protected), int(fallback), out)
+        )
+        values = out.tolist()
+        return values[:claimed], values[len(experts)]
+
+    def fill_wait(self, rows: int, timeout_s: float) -> None:
+        """Return once the first ``rows`` claimed rows of the running fill have landed in their slabs."""
+        outcome = int(self._module.exl3_ram_miss_fill_wait(self.handle, int(rows), int(timeout_s * 1e9)))
+        if outcome == 0:
+            raise RuntimeError(f"exl3 RAM miss: a prefill fill failed before its first {rows} rows landed")
+        if outcome != 1:
+            raise RuntimeError(f"exl3 RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s")
+
+    def fill_end(self) -> bool:
+        """Join the fill; False when it failed (its rows that did not land were released)."""
+        return bool(self._module.exl3_ram_miss_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int, int]]:
         """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY, 3 QUARANTINE (piece

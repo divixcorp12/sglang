@@ -35,6 +35,7 @@ def test_defaults_match_the_env_declarations():
         enable_ram_miss_row_images=False,
         enable_ram_miss_copy_engine=False,
         enable_native_prefetch=False,
+        enable_prefill_fills=False,
         enable_moe_side_stream=False,
         enable_layer_fusion=False,
         torch_prefill_indexer=False,

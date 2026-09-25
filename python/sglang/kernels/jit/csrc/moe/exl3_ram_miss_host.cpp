@@ -3461,6 +3461,7 @@ struct Tier {
   std::vector<uint8_t> hot;
   std::vector<uint32_t> leases;      // GPU-reader leases per slot (LEASE_PROTOCOL.md section 8); 0 frees a slot for eviction
   std::vector<uint32_t> generation;  // bumped before a slot's bytes change; mirrored into the lease block's SlotGen
+  std::vector<uint8_t> filling;      // a prefill fill is still writing this kReady slot: never a victim, never released
   int64_t rows_demand = 0;
   int64_t rows_advisory = 0;
 };
@@ -3503,12 +3504,14 @@ class RamTier {
       tier.hot.assign(experts_, 0);
       tier.leases.assign(tier.capacity, 0);
       tier.generation.assign(tier.capacity, 0);
+      tier.filling.assign(tier.capacity, 0);
     }
     if (lease_ != nullptr) init_lease_block(capacity, lease_bytes);
   }
 
   // The copy thread's callbacks use tiers_, mutex_ and counters_, which are destroyed before copy_engine_ would be.
   ~RamTier() {
+    fill_join();  // the fill thread reads through reader_ into the slabs
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
   }
 
@@ -3718,8 +3721,88 @@ class RamTier {
     if (leased_locked(tiers_[row], slot)) {
       throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while it is leased");
     }
+    if (tiers_[row].filling[slot]) {
+      throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while a fill writes it");
+    }
     release_locked(row, slot);
     counters_[kVersion].fetch_add(1);
+  }
+
+  // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS, plan 2026-09-25-dsv41-prefill-fills) ----
+  //
+  // An eager caller that holds the pause (or pumps, with no thread) claims slots for `experts` of `row` in order, until
+  // one cannot be taken (take_slot_locked: never a hot, leased or filling row, and a `protect`ed one only with
+  // `fallback`), and one helper thread reads the claimed rows through the service's reader while the caller gathers.
+  // A claimed slot is kReady and mapped at once, as assign() leaves it, and flagged filling until the read ends: no
+  // admission can evict it and release() refuses it. The read's progress publishes how many rows have landed, as a
+  // prefix of the claim order (fill_wait). The helper holds busy_since_, so the watchdog aborts a hung fill the way it
+  // aborts a hung demand. fill_end() joins it; the service thread's resume() joins it first too, so the service
+  // thread and a fill never use the reader at once. Returns the count claimed; slots[i] is expert i's slot.
+  int64_t fill_begin(
+      int64_t row, const std::vector<int32_t>& experts, const std::vector<int32_t>& protect, bool fallback,
+      int64_t* slots, int64_t* evictions) {
+    if (threaded_.load() && !pause_requested_.load()) {
+      throw std::runtime_error("exl3 RAM miss: a prefill fill needs the service thread paused");
+    }
+    if (fill_thread_.joinable()) throw std::runtime_error("exl3 RAM miss: a prefill fill is already running");
+    std::vector<int32_t> claimed;
+    std::vector<int64_t> taken;
+    *evictions = 0;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      Tier& tier = tiers_[row];
+      for (const int32_t expert : experts) {
+        if (tier.expert_slot[expert] >= 0) {
+          throw std::runtime_error("exl3 RAM miss: fill of expert " + std::to_string(expert) + " that holds a slot");
+        }
+        int64_t evicted = -1;
+        const int64_t slot = take_slot_locked(row, protect, fallback, &evicted);
+        if (slot < 0) break;
+        *evictions += evicted >= 0 ? 1 : 0;
+        bump_generation_locked(row, slot);  // the fill writes the bytes after this returns
+        tier.slot_to_expert[slot] = expert;
+        tier.state[slot] = kReady;
+        tier.stamp[slot] = ++tick_;
+        tier.expert_slot[expert] = static_cast<int32_t>(slot);
+        tier.filling[slot] = 1;
+        publish_map(row, expert, static_cast<int32_t>(slot));
+        claimed.push_back(expert);
+        taken.push_back(slot);
+      }
+      if (!taken.empty()) counters_[kVersion].fetch_add(1);
+    }
+    for (size_t i = 0; i < taken.size(); ++i) slots[i] = taken[i];
+    fill_landed_.store(0, std::memory_order_release);
+    fill_state_.store(taken.empty() ? kFillOk : kFillRunning, std::memory_order_release);
+    if (taken.empty()) return 0;
+    fill_row_ = row;
+    fill_experts_ = std::move(claimed);
+    fill_slots_ = std::move(taken);
+    fill_thread_ = std::thread([this] { run_fill(); });
+    return static_cast<int64_t>(fill_slots_.size());
+  }
+
+  // 1 once the first `rows` claimed rows have landed, 0 when the fill failed first, -1 at the deadline.
+  int64_t fill_wait(int64_t rows, int64_t timeout_ns) {
+    const int64_t deadline = now_ns() + timeout_ns;
+    while (true) {
+      const int state = fill_state_.load(std::memory_order_acquire);
+      if (fill_landed_.load(std::memory_order_acquire) >= rows) return 1;
+      if (state != kFillRunning) return 0;  // ended short of `rows`: failed, or never claimed them
+      if (now_ns() > deadline) return -1;
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
+
+  // Joins the fill: 1 when every claimed row landed (or nothing was claimed), 0 when it failed; a failed fill has
+  // released its rows that did not land.
+  int64_t fill_end() {
+    fill_join();
+    return fill_state_.load(std::memory_order_acquire) == kFillFailed ? 0 : 1;
+  }
+
+  void fill_join() {
+    if (fill_thread_.joinable()) fill_thread_.join();
   }
 
   // Lease mode: the service reads each armed request's lane request, leases every lane's source slot and publishes
@@ -4567,7 +4650,7 @@ class RamTier {
         ++census.free;
       } else if (tier.state[slot] == kReady) {
         const int32_t expert = tier.slot_to_expert[slot];
-        if (tier.hot[expert] || listed(wanted, expert)) continue;
+        if (tier.hot[expert] || tier.filling[slot] || listed(wanted, expert)) continue;
         if (leased_locked(tier, slot)) {
           ++census.leased;
         } else {
@@ -4576,6 +4659,48 @@ class RamTier {
       }
     }
     return census;
+  }
+
+  void run_fill() {
+    busy_since_.store(now_ns());
+    apply_pending_fault();  // test only: inject_fault() acts on a fill's read as on a demand's
+    std::vector<uint8_t> packed;
+    size_t landed = 0;
+    auto advance = [&] {
+      while (landed < packed.size() && packed[landed] != 0) ++landed;
+      fill_landed_.store(static_cast<int64_t>(landed), std::memory_order_release);
+    };
+    int result = 0;
+    try {
+      // A demand's batch size and no publish target: a fill has no device readiness words.
+      result = reader_.read(
+          fill_row_, fill_experts_, fill_slots_, kBounceRows, [](size_t) { return false; }, nullptr, &packed, SIZE_MAX,
+          advance, nullptr);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "ERROR exl3 RAM miss: prefill fill: %s\n", error.what());
+      result = 0;
+    }
+    _mm_sfence();  // the rows' bytes land before the caller is told (fill_landed_)
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      Tier& tier = tiers_[fill_row_];
+      for (size_t i = 0; i < fill_slots_.size(); ++i) {
+        const int64_t slot = fill_slots_[i];
+        tier.filling[slot] = 0;
+        if (result != 1 && !(i < packed.size() && packed[i] != 0)) release_locked(fill_row_, slot);
+      }
+      if (result != 1) {
+        counters_[kReadErrors].fetch_add(1);
+        counters_[kVersion].fetch_add(1);
+      }
+    }
+    if (result == 1) {
+      fill_landed_.store(static_cast<int64_t>(fill_slots_.size()), std::memory_order_release);
+    } else {
+      advance();
+    }
+    busy_since_.store(0);
+    fill_state_.store(result == 1 ? kFillOk : kFillFailed, std::memory_order_release);
   }
 
   void publish_map(int64_t row, int64_t expert, int32_t slot) {
@@ -4593,6 +4718,7 @@ class RamTier {
     int64_t spare = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
       if (tier.state[slot] != kReady) continue;
+      if (tier.filling[slot]) continue;  // a prefill fill is still writing it
       if (leased_locked(tier, slot)) continue;  // a GPU reader may still be reading it
       const int32_t expert = tier.slot_to_expert[slot];
       if (tier.hot[expert]) continue;
@@ -5007,6 +5133,14 @@ class RamTier {
   int64_t experts_;
   RowReader reader_;
   std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, sized by read(), reused every request
+  // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics.
+  static constexpr int kFillOk = 0, kFillRunning = 1, kFillFailed = 2;
+  std::thread fill_thread_;
+  int64_t fill_row_ = 0;
+  std::vector<int32_t> fill_experts_;
+  std::vector<int64_t> fill_slots_;
+  std::atomic<int64_t> fill_landed_{0};
+  std::atomic<int> fill_state_{kFillOk};
   std::vector<Tier> tiers_;
   std::mutex mutex_;
   uint64_t tick_ = 0;
@@ -5123,6 +5257,23 @@ void exl3_ram_miss_assign(
   int64_t evicted = -1;
   result[0] = exl3_ram_miss::find(handle)->assign(row, expert, exl3_ram_miss::ids_of(protect), fallback != 0, &evicted);
   result[1] = evicted;
+}
+
+// Prefill fills: `out` holds experts.size() + 1 int64, the claimed slots in order and then the evictions.
+int64_t exl3_ram_miss_fill_begin(
+    int64_t handle, int64_t row, TensorView experts, TensorView protect, int64_t fallback, TensorView out) {
+  auto* result = static_cast<int64_t*>(out.data_ptr());
+  const std::vector<int32_t> ids = exl3_ram_miss::ids_of(experts);
+  return exl3_ram_miss::find(handle)->fill_begin(
+      row, ids, exl3_ram_miss::ids_of(protect), fallback != 0, result, result + ids.size());
+}
+
+int64_t exl3_ram_miss_fill_wait(int64_t handle, int64_t rows, int64_t timeout_ns) {
+  return exl3_ram_miss::find(handle)->fill_wait(rows, timeout_ns);
+}
+
+int64_t exl3_ram_miss_fill_end(int64_t handle) {
+  return exl3_ram_miss::find(handle)->fill_end();
 }
 
 void exl3_ram_miss_release(int64_t handle, int64_t row, int64_t slot) {
@@ -5417,6 +5568,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_contains, exl3_ram_miss_contains);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_touch, exl3_ram_miss_touch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_assign, exl3_ram_miss_assign);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_release, exl3_ram_miss_release);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_begin, exl3_ram_miss_fill_begin);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_wait, exl3_ram_miss_fill_wait);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_end, exl3_ram_miss_fill_end);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_lease_entry, exl3_ram_miss_lease_entry);
@@ -5536,6 +5690,7 @@ class RamThread {
 
   // Advisories posted while paused predate the eager use: skip them too.
   void resume() {
+    tier_->fill_join();  // a prefill fill uses the reader the service thread is about to use
     tier_->skip_advice_posted_so_far();
     pause_requested_.store(false);
     tier_->request_pause(false);

@@ -1903,6 +1903,12 @@ class Envs:
     # for that copy before its gather reads residency. Residency only, never the math. Needs the copy engine (refused
     # without it). Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_NATIVE_PREFETCH = EnvBool(False)
+    # Prefill fills (plan 2026-09-25-dsv41-prefill-fills): eager pinned-tier misses are read by the RAM-miss service's
+    # native reader straight into the pinned slabs (row images, every mirror drive at once) instead of the Python bounce
+    # read and CPU copy. A layer's misses are all issued once its routing is known, on a helper thread, and each gather
+    # chunk waits only for its own rows. Needs SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES and the native slot table
+    # (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when the service starts. Off by default.
+    SGLANG_DSV41_ENABLE_PREFILL_FILLS = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
