@@ -35,6 +35,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_ram_miss_copy_engine: bool
     enable_native_prefetch: bool
     enable_prefill_fills: bool
+    enable_prefill_share: bool
     enable_moe_side_stream: bool
     enable_layer_fusion: bool
     torch_prefill_indexer: bool
@@ -67,6 +68,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_ram_miss_copy_engine=envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
             enable_native_prefetch=envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get(),
             enable_prefill_fills=envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get(),
+            enable_prefill_share=envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.get(),
             enable_moe_side_stream=envs.SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM.get(),
             enable_layer_fusion=envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
