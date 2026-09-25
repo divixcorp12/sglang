@@ -1,5 +1,27 @@
 # DeepSeek V4.1 Flash — scoping reference
 
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+    --tp-size 1 \
+    --kv-cache-dtype nvfp4 \
+    --prefill-kv-cache-dequant-dtype nvfp4 \
+    --page-size 16
+
+    --reasoning-parser auto \
+    --tool-call-parser auto \
++   --enable-hierarchical-cache \
++   --hicache-ratio 2 \
++   --hicache-size 0 \
++   --hicache-write-policy write_through \
+
+```
+Production starts through a short wrapper on divix01, which runs the real launcher from the prod checkout.
+
+- Wrapper (what you start, per run_server.md D5): divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-live/launch.sh. It only execs the real launcher in the prod checkout. The old standalone version is saved beside it as launch-before-0925-consolidation.sh.
+- Real launcher: benchmarks/dsv41_baseline/launch_prod.sh in the repo. On divix01 it runs from the prod checkout, /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod/benchmarks/dsv41_baseline/launch_prod.sh. It takes cc-gpu.lock, pins the server cores and starts sglang.launch_server.
+- Settings: benchmarks/dsv41_baseline/arm_env.py. The launcher has no flags of its own: the environment comes from base_env() and the command-line arguments from ServerArgs.prod(). To change a production setting, edit arm_env.py, not the launcher.
+```
+
 **Current status (2026-09-23):** DSV4.1 serves on divix01 from
 `master`; the latest measured code commit is `e36fa2530c`.
 The saved production launcher uses
