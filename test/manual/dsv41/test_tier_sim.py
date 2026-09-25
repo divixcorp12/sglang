@@ -247,5 +247,65 @@ def test_graph_steps_mix_with_eager_prefill_lines():
     assert live["decode_tokens"] == 2 and live["G"] == 5.0 and live["f"] == 0.4
 
 
+def test_direct_replay_evicts_a_resident_the_closing_window_did_not_route_before_a_lower_score():
+    """GpuResidencyUpdater._rank_victims ranks residents routed in the closing window last, whatever
+    their score: expert 0 (decayed score ~2.9) goes before expert 1 (score 1, routed one forward ago).
+    A plain decayed-LFU would evict 1."""
+    from tier_sim import DirectInsertReplay
+
+    sim = DirectInsertReplay({0: [0, 1]}, {0: 2}, 8, miss_rows=1)
+    for routes in ([0], [0], [0], [1]):
+        assert sim.graph_forward({0: routes}) == {0: 0}
+    assert sim.graph_forward({0: [5]}) == {0: 1}
+    assert sim.resident(0) == {1, 5}
+    assert sim.scores[0, 0] > sim.scores[0, 1] > 0
+
+
+def test_direct_replay_victims_skip_the_slots_the_forward_reads():
+    """The shortlist is ranked before the forward's routes are known; a listed slot the forward hits is
+    dropped (gather_destinations), so the miss takes the next one."""
+    from tier_sim import DirectInsertReplay
+
+    sim = DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=2)
+    sim.graph_forward({0: [0]})  # expert 0 scores; 2 then 1 rank lowest (ties evict the higher id)
+    assert sim.graph_forward({0: [2, 6]}) == {0: 1}
+    assert sim.resident(0) == {0, 2, 6}
+
+
+def test_direct_replay_ranks_a_short_prefills_routes_before_it_scores_them():
+    """GpuResidencyUpdater._apply re-ranks the shortlist on every graph forward; only the score update is
+    gated. After a prefill below the 256-token boundary no boundary is due, yet the first decode's victims
+    already rank the prefill's experts as routed: expert 2 survives and 1 goes. Found replaying smoke6,
+    where the old replay kept the startup shortlist there and drifted from the logged hot sets."""
+    from tier_sim import DirectInsertReplay
+
+    sim = DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=1)
+    sim.eager_forward(20, {0: ([2], [1])}, "extend")
+    assert sim.graph_forward({0: [5]}) == {0: 1}
+    assert sim.resident(0) == {0, 2, 5}
+    assert sim.scores.sum() == 0  # the prefill's count is scored at the next forward's boundary
+
+
+def test_direct_replay_eager_prefill_inserts_nothing():
+    from tier_sim import DirectInsertReplay
+
+    sim = DirectInsertReplay({0: [0, 1], 1: [0, 1]}, {0: 2, 1: 2}, 8, miss_rows=1)
+    assert sim.eager_forward(40, {0: ([1, 7], [30, 10]), 1: ([3], [40])}) == {0: 1, 1: 1}
+    assert sim.resident(0) == {0, 1} and sim.resident(1) == {0, 1}
+    assert sim.scores.sum() == 0  # a 40-token prefill is below the 256-token boundary: counts wait
+    sim.eager_forward(300, {0: ([7], [300])})
+    assert sim.scores[0, 7] == 310 and sim.resident(0) == {0, 1}
+
+
+def test_direct_allocation_gives_every_layer_its_floor_then_lowest_layers_the_rest():
+    from tier_sim import direct_hot_allocation
+
+    hot = direct_hot_allocation(1128, list(range(40)), 384, floor=12)
+    assert [len(hot[layer]) for layer in range(40)] == [29] * 8 + [28] * 32
+    assert all(hot[layer] == list(range(len(hot[layer]))) for layer in range(40))
+    with pytest.raises(ValueError, match="floor"):
+        direct_hot_allocation(100, list(range(40)), 384, floor=12)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

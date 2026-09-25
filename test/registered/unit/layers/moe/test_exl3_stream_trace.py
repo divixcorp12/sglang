@@ -110,6 +110,8 @@ def _stage_record(**over):
         pack_ns=40, bytes=45380, extents=2, drives=[{"dev": 49, "bytes": 45380, "extents": 2}],
         status="served", rows_asked=2, missing_stages=[], useful_bytes=45000, submitted_bytes=45380,
         retried_bytes=0, cancelled_bytes=0, rows_untraced=0, extents_untraced=0, dropped_before=0, lanes=6,
+        pack_workers=0, pack_split=0, piece_stream=0, pieces=[], pieces_published=0, pieces_out_of_order=0,
+        piece_publish_refused=0,
         row_pack=[
             {"row": 0, "admit": 112, "start": 220, "end": 240},
             {"row": 1, "admit": 112, "start": 240, "end": 260},
@@ -140,7 +142,10 @@ def test_ram_miss_requests_are_traced_and_skipped_by_tier_sim(tmp_path):
     assert [line["kind"] for line in lines] == ["graph_step", "ram_miss_request", "ram_miss_request"]
     first = lines[1]
     assert (first["layer"], first["forward"], lines[2]["layer"]) == (5, 1, 3)
-    assert first["request"] == {"seq": 7, "type": "demand", "ok": 1, "rows": 2, "batches": 1, "backlog": 0, "lanes": 6}
+    assert first["request"] == {
+        "seq": 7, "type": "demand", "ok": 1, "rows": 2, "batches": 1, "backlog": 0, "lanes": 6,
+        "pack_workers": 0, "pack_split": 0, "piece_stream": 0,
+    }
     assert list(first["stages_ns"]) == [
         "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done"
     ]
@@ -163,3 +168,188 @@ def test_ram_miss_requests_are_traced_and_skipped_by_tier_sim(tmp_path):
 def test_ram_miss_requests_cost_nothing_without_a_trace_file():
     trace = Exl3StreamTrace()
     trace.record_ram_miss_requests([_stage_record()], layer_ids=[0, 1])  # no file: no work, no error
+
+
+def _tier_sim():
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "scripts", "dsv41"))
+    import tier_sim
+
+    return tier_sim
+
+
+def _forward_routes(step, layers, width=6):
+    """Distinct, step-dependent routes for every layer: no two steps or layers log the same list."""
+    return [[(7 * step + 11 * row + k) % 97 for k in range(width)] for row in range(layers)]
+
+
+def _log_forward(log, step, layers, count_of=lambda step, row: (step + row) % 4):
+    for row, routes in enumerate(_forward_routes(step, layers)):
+        log.record(row, torch.tensor(routes, dtype=torch.int64), torch.tensor([count_of(step, row)], dtype=torch.int32))
+
+
+def test_graph_route_log_writes_every_serving_forward_once_and_no_warmup_forward(tmp_path, monkeypatch):
+    """Warmup forwards execute the logged copies, so they sit in the ring below ``warmup``; a replay that
+    read them would start from the capture's dummy routes. More forwards than the ring holds, read after
+    each one, must all arrive: the ring wraps without losing or repeating a forward."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = module.GraphRouteLog(layers=3, width=8, device="cpu", depth=8, margin=2)
+    for row, layer in enumerate((4, 5, 9)):
+        log.bind(row, layer, 28 + row)
+    monkeypatch.setattr(module, "capturing_graphs", lambda: True)
+    for step in range(2):
+        _log_forward(log, 100 + step, 3)  # warmup routes: never written
+    monkeypatch.setattr(module, "capturing_graphs", lambda: False)
+    for step in range(20):
+        _log_forward(log, step, 3)
+        log.poll(trace)
+    trace.close()
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    header, steps = lines[0], lines[1:]
+    assert header["kind"] == "graph_routes_header" and header["warmup_forwards"] == 2
+    assert header["layer_ids"] == [4, 5, 9] and header["hot_capacity"] == [28, 29, 30]
+    assert [line["seq"] for line in steps] == list(range(2, 22))
+    for step, line in enumerate(steps):
+        assert line["routes"] == _forward_routes(step, 3)
+        assert line["misses"] == [(step + row) % 4 for row in range(3)]
+        assert "dropped_before" not in line
+
+
+def test_graph_route_log_says_where_a_lagging_reader_lost_forwards(tmp_path):
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=4, margin=1)
+    _log_forward(log, 0, 1)
+    log.poll(trace)
+    for step in range(1, 7):  # six forwards between reads: the ring holds four
+        _log_forward(log, step, 1)
+    log.poll(trace)
+    trace.close()
+    steps = [json.loads(line) for line in path.read_text().splitlines()][1:]
+    assert [line["seq"] for line in steps] == [0, 3, 4, 5, 6]
+    assert steps[1]["dropped_before"] == 2 and steps[1]["routes"] == _forward_routes(3, 1)
+    # A replay of this run would miss two forwards' accesses: it is refused, not silently shortened.
+    with pytest.raises(ValueError, match="lost 2 graph forwards"):
+        _tier_sim().load_forwards(str(path))
+    assert _tier_sim().load_forwards(str(path), allow_dropped=True)["dropped"] == 2
+
+
+def _batch(mode, rids, tokens):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(name=mode.upper(), is_extend=lambda: mode == "extend"),
+        rids=rids, batch_size=1, extend_num_tokens=tokens if mode == "extend" else None,
+    )
+
+
+def test_phase_comes_from_the_forward_mode_not_the_token_count(tmp_path):
+    """A prompt whose prefix is cached can prefill one token, which the graph gather serves and the ring
+    logs like a decode step. Its phase must still say extend, and a replay must not score it as decode.
+    Each entry also carries its own pass id and requests, and the hot set bound at its start."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=8, margin=2)
+    log.bind(0, 3, 12)
+    bank = torch.tensor([[0, 1, -1]])
+    log.bind_hot(bank, [3])
+    trace.graph_seq_source, trace.forward_meta_source = log.read_seq, log.current_meta
+    log.on_pre_forward(7, _batch("extend", ["req-b"], 1))
+    _log_forward(log, 0, 1)
+    bank[0, 2] = 9  # a gather commits after the snapshot: the next forward starts with it
+    log.on_pre_forward(8, _batch("decode", ["req-b"], 1))
+    _log_forward(log, 1, 1)
+    log.on_pre_forward(9, _batch("extend", ["req-c"], 2))
+    trace.record(3, torch.tensor([[1, 2], [2, 3]]), _stats(1, 0), 0)
+    log.poll(trace)
+    trace.close()
+    loaded = _tier_sim().load_forwards(str(path))
+    graph, decode, eager = loaded["forwards"]
+    assert (graph["phase"], graph["forward_pass_id"], graph["rids"], graph["hot"]) == ("extend", 7, ["req-b"], {3: [0, 1]})
+    assert (decode["phase"], decode["forward_pass_id"], decode["hot"]) == ("decode", 8, {3: [0, 1, 9]})
+    assert (eager["kind"], eager["phase"], eager["forward_pass_id"], eager["rids"]) == ("eager", "extend", 9, ["req-c"])
+    assert loaded["run"] == log.run and loaded["schema"] == module.ROUTE_LOG_SCHEMA
+    replay = _tier_sim().replay_direct(loaded, capacity={3: 12}, initial={3: [0, 1]})
+    assert replay["decode_tokens"] == 1  # the one-token extend is not a decode token
+
+
+def test_eager_forwards_carry_the_graph_seq_and_tier_sim_interleaves_them(tmp_path):
+    """A route line is written a batch late, after the prefill that ran behind it; only the stamps put
+    the replay back in execution order: graph forwards 0-1, prefill, graph forward 2."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = module.GraphRouteLog(layers=2, width=8, device="cpu", depth=8, margin=2)
+    log.bind(0, 0, 12)
+    log.bind(1, 1, 12)
+    trace.graph_seq_source = log.read_seq
+    for step in range(2):
+        _log_forward(log, step, 2)
+    trace.record(0, torch.tensor([[1, 2], [2, 3]]), _stats(2, 0), 0)
+    trace.record(1, torch.tensor([[4, 5], [5, 5]]), _stats(1, 0), 0)
+    _log_forward(log, 2, 2)
+    log.poll(trace)
+    trace.close()
+    loaded = _tier_sim().load_forwards(str(path))
+    assert [(f["kind"], f.get("seq")) for f in loaded["forwards"]] == [
+        ("graph", 0), ("graph", 1), ("eager", None), ("graph", 2)
+    ]
+    prefill = loaded["forwards"][2]
+    assert prefill["tokens"] == 2 and prefill["counts"][1] == ([4, 5], [1, 3])
+    assert loaded["forwards"][3]["routes"] == {0: _forward_routes(2, 2)[0], 1: _forward_routes(2, 2)[1]}
+    assert loaded["hot_capacity"] == {0: 12, 1: 12}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+def test_graph_route_log_records_each_replay_of_a_captured_graph(tmp_path, monkeypatch):
+    """The copies are captured once and must log each replay's own routes, read back without waiting,
+    one batch behind, on the host's stream while the graph replays on another."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    layers, depth = 3, 8
+    path = tmp_path / "trace.jsonl"
+    trace = module.Exl3StreamTrace(str(path))
+    log = module.GraphRouteLog(layers=layers, width=8, device="cuda", depth=depth, margin=2)
+    for row in range(layers):
+        log.bind(row, row, 12)
+    routes = [torch.full((6,), -1, dtype=torch.int64, device="cuda") for _ in range(layers)]
+    counts = [torch.zeros(1, dtype=torch.int32, device="cuda") for _ in range(layers)]
+
+    def forward():
+        for row in range(layers):
+            log.record(row, routes[row], counts[row])
+
+    side = torch.cuda.Stream()
+    monkeypatch.setattr(module, "capturing_graphs", lambda: True)
+    with torch.cuda.stream(side):
+        forward()  # warmup, executed
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            forward()
+    monkeypatch.setattr(module, "capturing_graphs", lambda: False)
+    torch.cuda.synchronize()
+    assert log.warmup == 1
+    steps = 3 * depth
+    for step in range(steps):
+        with torch.cuda.stream(side):
+            for row, values in enumerate(_forward_routes(step, layers)):
+                routes[row].copy_(torch.tensor(values, device="cuda"), non_blocking=True)
+                counts[row].fill_((step + row) % 4)
+            graph.replay()
+        log.poll(trace)  # the current stream is not the replay stream
+    torch.cuda.synchronize()
+    log.poll(trace, final=True)
+    trace.close()
+    lines = [json.loads(line) for line in path.read_text().splitlines()][1:]
+    assert [line["seq"] for line in lines] == list(range(1, steps + 1))
+    for step, line in enumerate(lines):
+        assert line["routes"] == _forward_routes(step, layers)
+        assert line["misses"] == [(step + row) % 4 for row in range(layers)]

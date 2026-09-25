@@ -1518,7 +1518,10 @@ class RowReader {
       return;
     }
     if (c.trace && c.submitted == 0) c.submitted = stamp(c.trace);
-    const int rc = submit(ready ? 0u : 1u);
+    // Fault: reversing only reorders one reaped batch, so wait for every read in flight; otherwise whether
+    // anything is reversed depends on how the device happened to batch its completions.
+    const unsigned wait_nr = fault_.reverse_cqes && c.pending > 0 ? c.pending : (ready ? 0u : 1u);
+    const int rc = submit(wait_nr);
     if (rc < 0) {
       // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
       // (uring_file_reader.cpp). Anything else, or a soft error that never clears, fails.
