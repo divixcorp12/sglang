@@ -110,7 +110,8 @@ def load_forwards(path: str, *, allow_dropped: bool = False) -> dict:
     layer_ids = header["layer_ids"]
     hot_layer_ids = header.get("hot_layer_ids") or []
     # A graph replay the capture code runs itself has no pre-forward stamp (pass id -1) and runs no
-    # Python, so GraphRouteLog.warmup cannot count it: it is a capture forward, not serving.
+    # Python, so GraphRouteLog.warmup cannot count it: it is a capture forward, not a served token.
+    # It runs after reset_after_capture, so it does move residency (replay_direct applies it).
     stamped = any(line.get("forward_pass_id", -1) >= 0 for line in graph)
     events = []
     for line in graph:
@@ -347,7 +348,10 @@ def replay_direct(
            "hot_checked": 0, "hot_mismatched": 0, "first_hot_mismatch": None}
     for forward in loaded["forwards"]:
         if forward["phase"] == "capture":
-            continue  # its dummy routes' inserts are in the startup state, not in the replay's scope
+            # Replayed after reset_after_capture: its dummy routes count in the next boundary's scores
+            # and routed flags, so it moves residency like a decode forward. It is not a served token.
+            sim.graph_forward(forward["routes"], "decode")
+            continue
         if forward["kind"] == "graph":
             if forward.get("hot") is not None:
                 for layer, experts in forward["hot"].items():

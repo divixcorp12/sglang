@@ -27,10 +27,7 @@ def main() -> None:
     loaded = tier_sim.load_forwards(args.trace)
     initial = None
     if args.initial_from_log:
-        first = next(
-            f for f in loaded["forwards"]
-            if f["kind"] == "graph" and f["phase"] != "capture" and f.get("hot") is not None
-        )
+        first = next(f for f in loaded["forwards"] if f["kind"] == "graph" and f.get("hot") is not None)
         initial = {layer: list(experts) for layer, experts in first["hot"].items()}
     out = tier_sim.replay_direct(loaded, initial=initial)
     steps = out["per_forward"]
