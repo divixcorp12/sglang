@@ -225,6 +225,9 @@ def test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams(
         assert s.until(lambda: _all_retired(s))
         cycles = _sleep_cycles(3000)
         scratch = torch.zeros(64, device="cuda")
+        experts = [2, 0, 1]  # all resident: every lane COPYING
+        s.plan(experts)  # its pageable copies would queue behind the blockers
+        torch.cuda.synchronize()
         blockers = [torch.cuda.Stream() for _ in range(64)]
         for i, blocker in enumerate(blockers):
             with torch.cuda.stream(blocker):
@@ -234,8 +237,6 @@ def test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams(
         jobs = s.counters()["copy_jobs"]
         t0 = time.perf_counter()
         with torch.cuda.stream(torch.cuda.Stream(priority=greatest)):
-            experts = [2, 0, 1]  # all resident: every lane COPYING
-            s.plan(experts)
             s.post()
             s.hit_wait()
             s.copy1()
@@ -249,7 +250,7 @@ def test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams(
             torch.cuda.current_stream().synchronize()
         chain_s = time.perf_counter() - t0
         assert s.keep.item() == 1.0, ("the copy waited behind a blocked stream", s.counters(), s.stats())
-        assert chain_s < 1.0, chain_s
+        assert chain_s < 1.0, (chain_s, s.stats())
         assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
         torch.cuda.synchronize()  # the blockers
         _check(s, experts, snapshot)
