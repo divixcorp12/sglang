@@ -36,6 +36,7 @@ from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
 from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_row_reader import mirror_path
+from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
 from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
@@ -440,6 +441,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         hot_slots: Optional[torch.Tensor] = None,
         hot_capacity: int = 0,
         stream_maps: Optional[Mapping[int, torch.Tensor]] = None,
+        route_log=None,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -458,6 +460,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         if self.piece_stream and (stream_maps is None or set(stream_maps) != set(self.segments)):
             raise ValueError("piece streaming needs a stream segment map for every copy table")
         self.stream_maps = dict(stream_maps) if self.piece_stream else None
+        # A GraphRouteLog only when the stage trace is on; None builds exactly the untraced chain.
+        self.route_log = route_log
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -499,6 +503,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         copy in the same stream. Whether a record is armed is decided by the post kernel and read back by the service
         from the record, so no arming decision is made here.
         """
+        if self.route_log is not None:
+            # ``routes`` was refreshed by _apply_graph and ``plan.count`` by the planner, both earlier
+            # in this gather on this stream.
+            self.route_log.record(self.row, self.routes, plan.count)
         if self.device_side.lease_block is None:
             super().post(tag, plan)
             return
@@ -589,6 +597,7 @@ class Exl3RamMissService:
         self._trace_pending_rows: Optional[list[int]] = None
         self._stages_traced = False  # the host records a stage line per request (trace runs only)
         self._stages_dropped = 0
+        self.route_log: Optional[GraphRouteLog] = None  # trace runs only
         # Routed rows of one bs-1 decode step over every in-graph layer (attach sums it).
         self.routed_rows_per_step = 0
         self._shut_down = False
@@ -777,9 +786,16 @@ class Exl3RamMissService:
                 piece_stream=self.piece_stream,
                 piece_runs=self.host.piece_runs() if self.piece_stream else None,
             )
+            if self._stages_traced:
+                from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
+
+                self.route_log = GraphRouteLog(len(self._rows), MAX_IDS, cache.device)
+                get_exl3_stream_trace().graph_seq_source = self.route_log.read_seq
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         next_row = row + 1 if row + 1 < len(self._rows) else -1
+        if self.route_log is not None:
+            self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows,
@@ -792,6 +808,7 @@ class Exl3RamMissService:
                 if self.piece_stream
                 else None
             ),
+            route_log=self.route_log,
         )
 
     def _refresh_hot_lists(self) -> None:
@@ -914,6 +931,8 @@ class Exl3RamMissService:
         trace = get_exl3_stream_trace()
         if not trace.enabled:
             return
+        if self.route_log is not None:
+            self.route_log.poll(trace, final=final)
         rows = self.host.layer_rows()  # demand rows only: advisory reads are not misses
         sample = self._graph_rows(rows, final=final)
         if sample is not None:
@@ -1092,6 +1111,8 @@ class Exl3RamMissService:
             owned.append(self._trace_snapshot)
         if self._hot_snapshot is not None:
             owned.append(self._hot_snapshot)
+        if self.route_log is not None:
+            owned += self.route_log.tensors()
         if self._gpu_hot_updater is not None:
             owned.append(self._gpu_hot_updater.slot_to_expert)
         for layer_id in sorted(self.tables):

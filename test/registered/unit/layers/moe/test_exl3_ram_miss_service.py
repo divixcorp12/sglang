@@ -318,14 +318,64 @@ def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, 
         assert streamer.row_backend.device_side is service.device_side  # one device side, shared by every layer
 
 
-def _attach_all(service, streamers):
+def _attach_all(service, streamers, capacity=None):
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
     for streamer in streamers.values():
         streamer._graph_pinned_tier = True
-        streamer.hot_cache = SimpleNamespace(device="cpu")
+        streamer.hot_cache = SimpleNamespace(device="cpu", capacity=capacity)
         streamer.graph_gather_rows = 6
         streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
         streamer.format.attach_hot_cache_manager(manager, streamer)
+
+
+@pytest.mark.parametrize("traced", [False, True], ids=["trace_off", "trace_on"])
+def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypatch, tmp_path, traced):
+    """Trace off: no route log exists, so no backend adds a copy to the captured graph, no per-batch
+    check reads one back, and no eager forward reads the graph count (each would cost a sync or a
+    kernel per layer in production). Trace on: one log shared by every layer, which the backend's post
+    fills with the routes _apply_graph copied in and the plan's miss count."""
+    from sglang.srt.layers.moe import exl3_stream_trace
+
+    service, streamers, caches = tiers
+    trace = exl3_stream_trace.Exl3StreamTrace(str(tmp_path / "trace.jsonl") if traced else "")
+    monkeypatch.setattr(exl3_stream_trace, "get_exl3_stream_trace", lambda: trace)
+    _attach_all(service, streamers, capacity=12)
+    backends = [streamer.row_backend for streamer in streamers.values()]
+    if not traced:
+        assert service.route_log is None and trace.graph_seq_source is None
+        assert all(backend.route_log is None for backend in backends)
+        service.fail_stop_check()  # nothing to read back
+        return
+    log = service.route_log
+    assert all(backend.route_log is log for backend in backends)
+    assert log.layer_ids == sorted(streamers) and log.capacities == [12] * LAYERS
+    assert trace.graph_seq_source == log.read_seq
+    from sglang.srt.layers.moe import expert_row_plan
+
+    monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", lambda *args: None)
+    service.device_side = SimpleNamespace(lease_block=None, post=lambda *a: None, wait=lambda *a: None)
+    for backend in backends:
+        backend.device_side = service.device_side
+    for row, backend in enumerate(backends):  # one forward, as _apply_graph then the gather leave it
+        backend.routes.copy_(torch.tensor([row, 3, 5, -1, -1, -1][: backend.routes.numel()]))
+        backend.post(0, SimpleNamespace(expert_ids=torch.tensor([3]), slots=torch.zeros(1, dtype=torch.int32),
+                                        count=torch.tensor([row + 1], dtype=torch.int32)))
+    assert int(log.seq[0]) == 1
+    log.poll(trace)
+    trace.close()
+    routes = tier_sim_load_forwards(tmp_path / "trace.jsonl")["forwards"]
+    assert routes == [{"kind": "graph", "seq": 0, "tokens": 1,
+                       "routes": {layer: [row, 3, 5] for row, layer in enumerate(sorted(streamers))},
+                       "misses": {layer: row + 1 for row, layer in enumerate(sorted(streamers))}}]
+
+
+def tier_sim_load_forwards(path):
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "scripts", "dsv41"))
+    import tier_sim
+
+    return tier_sim.load_forwards(str(path))
 
 
 def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):

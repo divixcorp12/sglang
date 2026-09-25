@@ -18,7 +18,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -56,11 +56,130 @@ def capturing_graphs() -> bool:
 RAM_MISS_TRACE_SCHEMA = 7
 
 
+def _stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+class GraphRouteLog:
+    """Every graph forward's routed experts and VRAM misses per streamed layer, for the stage trace only.
+
+    A replayed decode graph runs no Python, so its routes never reach ``Exl3StreamTrace.record``.
+    ``record`` is called from each layer's in-graph gather (``Exl3RamMissRowBackend.post``) and is
+    captured with it: the first streamed layer (row 0) takes the next ring slot and bumps ``seq``, then
+    every layer copies its routes and its plan's miss count into that slot. Each forward thus writes
+    its own entry, numbered by ``seq`` (the graph forwards that ran before it), whatever the scheduler's
+    per-batch cadence: no per-batch read can fold or skip one.
+
+    ``poll`` runs at the per-batch check. It reads the ring back through pinned buffers without waiting,
+    one batch behind (like ``Exl3RamMissService._graph_rows``), and writes the entries finished since
+    the last read. The copy is on the host's current stream, which need not be the stream the graph
+    replays on, so an entry is trusted only when the ``seq`` read before the ring shows a later forward
+    has started (entries below ``seq - 1``), and only if it is ``margin`` entries clear of the slots
+    later forwards may overwrite while the ring copy runs. ``final`` (after shutdown's device barrier)
+    reads everything.
+
+    Warmup forwards before capture execute these copies too. ``warmup`` counts them, from the Python
+    calls made in capture mode outside a stream capture (a capture records the copies but runs none),
+    and no entry below it is written.
+    """
+
+    def __init__(self, layers: int, width: int, device, depth: int = 64, margin: int = 4) -> None:
+        if depth <= margin + 1:
+            raise ValueError("the route ring must be deeper than its safety margin")
+        self.layers, self.width, self.depth, self.margin = layers, width, depth, margin
+        self.layer_ids: list[int] = [-1] * layers
+        self.capacities: list[int] = [0] * layers  # hot slots per row, for the replay's allocation
+        self.routes = torch.full((depth, layers, width), -1, dtype=torch.int64, device=device)
+        self.misses = torch.full((depth, layers), -1, dtype=torch.int32, device=device)
+        self.seq = torch.zeros(1, dtype=torch.int64, device=device)
+        self.slot = torch.zeros(1, dtype=torch.int64, device=device)
+        self.warmup = 0
+        self.next_seq = 0
+        self.dropped = 0
+        self._header_written = False
+        self._host: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        self._event = None
+        self._pending = False
+
+    def bind(self, row: int, layer_id: int, capacity: int) -> None:
+        self.layer_ids[row] = int(layer_id)
+        self.capacities[row] = int(capacity)
+
+    def record(self, row: int, routes: torch.Tensor, count: torch.Tensor) -> None:
+        """Log one layer's routes (``routes[:n]``, -1 past them) and plan miss count; captured in the graph."""
+        if row == 0:
+            if capturing_graphs() and not _stream_capturing():
+                self.warmup += 1
+            torch.remainder(self.seq, self.depth, out=self.slot)
+            self.seq.add_(1)
+        n = min(routes.numel(), self.width)
+        self.routes[:, row, :n].index_copy_(0, self.slot, routes[:n].view(1, n))
+        self.misses[:, row].index_copy_(0, self.slot, count.reshape(-1)[:1])
+
+    def read_seq(self) -> int:
+        """Graph forwards run so far. Called by eager forwards only, which already wait for the stream."""
+        return int(self.seq.item())
+
+    def tensors(self) -> list[torch.Tensor]:
+        """Every buffer a copy may still be writing, for the service's quarantine."""
+        owned = [self.routes, self.misses, self.seq, self.slot]
+        return owned + (list(self._host) if self._host is not None else [])
+
+    def poll(self, trace: "Exl3StreamTrace", *, final: bool = False) -> None:
+        if self.seq.device.type != "cuda":
+            self._emit(trace, int(self.seq[0]), self.routes, self.misses, complete=True)
+            return
+        if not final and torch.cuda.is_current_stream_capturing():
+            return
+        if self._pending:
+            if final:
+                self._event.synchronize()
+            elif not self._event.query():
+                return
+            self._pending = False
+            seq, routes, misses = self._host
+            self._emit(trace, int(seq[0]), routes, misses, complete=False)
+        if final:
+            self._emit(trace, int(self.seq.item()), self.routes.cpu(), self.misses.cpu(), complete=True)
+            return
+        if self._host is None:
+            self._host = tuple(torch.empty_like(t, device="cpu").pin_memory() for t in (self.seq, self.routes, self.misses))
+            self._event = torch.cuda.Event(enable_timing=False)
+        for host, device in zip(self._host, (self.seq, self.routes, self.misses)):
+            host.copy_(device, non_blocking=True)  # seq first: the stream runs these in order
+        self._event.record(torch.cuda.current_stream(self.seq.device))
+        self._pending = True
+
+    def _emit(self, trace: "Exl3StreamTrace", seq: int, routes: torch.Tensor, misses: torch.Tensor, *, complete: bool) -> None:
+        if not self._header_written:
+            trace.record_graph_routes_header(self)
+            self._header_written = True
+        end = seq if complete else seq - 1
+        start = max(self.next_seq, self.warmup)
+        oldest = max(seq - self.depth + (0 if complete else self.margin), 0)
+        lost = max(oldest - start, 0)
+        start += lost
+        self.dropped += lost
+        for s in range(start, end):
+            slot = s % self.depth
+            trace.record_graph_route_step(
+                s,
+                [[int(e) for e in row if e >= 0] for row in routes[slot].tolist()],
+                [int(m) for m in misses[slot].tolist()],
+                dropped_before=lost if s == start else 0,
+            )
+        self.next_seq = max(self.next_seq, end)
+
+
 class Exl3StreamTrace:
     def __init__(self, path: str = "", log_every: int = LOG_EVERY_FORWARDS) -> None:
         # Line-buffered: the scheduler process may exit without running atexit.
         self._file = open(path, "a", buffering=1) if path else None
         self.log_every = log_every
+        # Set by the RAM-miss service when it logs graph routes: stamps each eager forward with the
+        # graph forwards that ran before it, so a replay can interleave the two (tier_sim.load_forwards).
+        self.graph_seq_source: Optional[Callable[[], int]] = None
+        self._graph_seq: Optional[int] = None
         self._last_layer: Optional[int] = None
         self._background: dict[int, int] = {}
         self.forwards = 0
@@ -90,6 +209,8 @@ class Exl3StreamTrace:
             self.forwards += 1
             if tokens == 1:
                 self.decode_tokens += 1
+            if self.graph_seq_source is not None:
+                self._graph_seq = self.graph_seq_source()
             if self.forwards % self.log_every == 0:
                 self.log()
         self._last_layer = layer_id
@@ -124,6 +245,8 @@ class Exl3StreamTrace:
                 "background_rows": background,
                 "t": round(time.monotonic(), 6),
             }
+            if self._graph_seq is not None:
+                line["graph_seq"] = self._graph_seq
             self._file.write(json.dumps(line) + "\n")
 
     @property
@@ -174,6 +297,33 @@ class Exl3StreamTrace:
             if thread is not None:
                 line["thread"] = thread
             self._file.write(json.dumps(line) + "\n")
+
+    def record_graph_routes_header(self, log: GraphRouteLog) -> None:
+        """Once, before the first route step: what a ``graph_routes`` line's rows are."""
+        if self._file is None:
+            return
+        line = {
+            "kind": "graph_routes_header",
+            "layer_ids": list(log.layer_ids),
+            "hot_capacity": list(log.capacities),
+            "width": log.width,
+            "depth": log.depth,
+            "warmup_forwards": log.warmup,
+            "t": round(time.monotonic(), 6),
+        }
+        self._file.write(json.dumps(line) + "\n")
+
+    def record_graph_route_step(self, seq: int, routes: list[list[int]], misses: list[int], dropped_before: int = 0) -> None:
+        """One graph forward: ``routes[row]`` its routed experts in router order, ``misses[row]`` the
+        experts its gather found outside VRAM (the plan's count). ``seq`` counts the graph forwards before
+        it, warmup included; an eager forward line's ``graph_seq`` is on the same count. Not a forward
+        call: no ``tokens``, and tier_sim.load_trace skips it."""
+        if self._file is None:
+            return
+        line = {"kind": "graph_routes", "seq": seq, "routes": routes, "misses": misses, "t": round(time.monotonic(), 6)}
+        if dropped_before:
+            line["dropped_before"] = dropped_before
+        self._file.write(json.dumps(line) + "\n")
 
     def record_ram_miss_requests(self, records: list[dict], layer_ids: list[int]) -> None:
         """One line per RAM-miss request the native service served, from ``Exl3RamMissHost.drain_trace``.
