@@ -32,6 +32,7 @@ def hang_guard():
 
 def _build(tmp_path, *, row_images=True, fills=True):
     source = tmp_path / "ckpt"
+    source.mkdir()
     write_fake_exl3(str(source), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(source))
     root = tmp_path / "mirror"
