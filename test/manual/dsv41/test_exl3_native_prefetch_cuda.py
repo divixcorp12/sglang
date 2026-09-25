@@ -190,6 +190,9 @@ def test_commit_ignores_an_older_done_word_times_out_fails_stop_and_takes_the_sl
 SLOTS = TOP_K  # the harness's destination rows are the hot slots
 ROUTES = 3
 STEPS = 120
+# ~40 ms of copy engine per job: longer than the host takes between two steps, so a commit that does not wait maps a
+# slot the next step reads before its bytes land.
+BALLAST_BYTES = 512 << 20
 
 
 class Decode:
@@ -301,7 +304,7 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
     """Each step routes 3 of 16 experts; the prefetch predicts the next step's first expert half the time and a random
     one otherwise, so copied rows are used, wasted and (outside the 8-row pinned tier) filtered. The bytes the MoE reads
     must be the checkpoint's in both arms; prefetch on must also remove demand misses. With the ballast every copy job
-    completes ~5 ms after it is issued, so a commit that does not wait for the done word maps a slot before its bytes
+    completes ~40 ms after it is issued, so a commit that does not wait for the done word maps a slot before its bytes
     land (mutant: the commit kernel's wait removed -- red on the byte check)."""
     rng = random.Random(5)
     steps = [rng.sample(range(EXPERTS), ROUTES) for _ in range(STEPS + 1)]
@@ -310,8 +313,8 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
     for arm in (False, True):
         (tmp_path / f"arm{int(arm)}").mkdir()
         d = Decode(tmp_path / f"arm{int(arm)}", prefetch=arm)
-        ballast_src = torch.empty(64 << 20, dtype=torch.uint8).pin_memory() if ballast else None
-        ballast_dst = torch.empty(64 << 20, dtype=torch.uint8, device="cuda") if ballast else None
+        ballast_src = torch.empty(BALLAST_BYTES, dtype=torch.uint8).pin_memory() if ballast else None
+        ballast_dst = torch.empty(BALLAST_BYTES, dtype=torch.uint8, device="cuda") if ballast else None
         if ballast:
             d.s.host.copy_engine_ballast(ballast_dst, ballast_src)
         try:
