@@ -1239,3 +1239,92 @@ def test_run_arm_writes_the_nsys_report_before_it_stops_the_server():
     # The unindented stop_server that ends a successful arm (abort paths call it inside `{ ...; }` or a block).
     final_stop = next(i for i, l in enumerate(lines) if l == "stop_server")
     assert stop < wait < final_stop
+
+
+# --- GPU metrics (PCIe RX/TX): a root metrics-only nsys session beside run_arm.sh's trace ---
+_DIVIX01_NO_COUNTERS = (
+    "GPU Metrics: None of the installed GPUs are supported:\n"
+    "\tBlackwell GB202 | NVIDIA GeForce RTX 5090 PCI[0000:37:00.0] - Insufficient privilege, "
+    "see https://developer.nvidia.com/ERR_NVGPUCTRPERM\n"
+)
+# What `sudo -n /usr/local/sbin/nsys-profile profile --gpu-metrics-devices=help` printed on divix01, 2026-09-25.
+_DIVIX01_ROOT_DEVICES = (
+    "Possible --gpu-metrics-devices values are:\n"
+    "\t0: Blackwell GB202 | NVIDIA GeForce RTX 5090 PCI[0000:37:00.0]\n"
+    "\tall: Select all supported GPUs\n"
+)
+
+
+def test_nsys_gpu_metrics_default_to_on_with_the_gb20x_set_on_every_gpu():
+    args = nsys_capture.gpu_metrics_args(None)
+    assert args == nsys_capture.gpu_metrics_args("") == nsys_capture.gpu_metrics_args("1")
+    assert "--gpu-metrics-set=gb20x" in args
+    # sudo resets the environment, so cuda-visible would not see CUDA_VISIBLE_DEVICES.
+    assert "--gpu-metrics-devices=all" in args
+
+
+def test_nsys_gpu_metrics_can_be_turned_off():
+    assert nsys_capture.gpu_metrics_args("0") == []
+
+
+@pytest.mark.parametrize("value", ["yes", "2", "true", "on"])
+def test_nsys_gpu_metrics_refuses_an_unknown_value(value):
+    with pytest.raises(ValueError, match="NSYS_GPU_METRICS"):
+        nsys_capture.gpu_metrics_args(value)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        _DIVIX01_NO_COUNTERS,
+        "sudo: a password is required\n",
+        "Sorry, user x is not allowed to execute '/usr/local/sbin/nsys-profile' as root\n",
+        "sudo: /usr/local/sbin/nsys-profile: command not found\n",
+        "something nsys never printed\n",
+    ],
+)
+def test_nsys_gpu_metrics_unavailable_names_the_fix(output):
+    why = nsys_capture.gpu_metrics_unavailable(output)
+    assert why is not None
+    assert nsys_capture.NSYS_SUDO_WRAPPER in why
+    assert "NSYS_GPU_METRICS=0" in why
+
+
+def test_nsys_gpu_metrics_available_when_root_lists_the_gpu():
+    assert nsys_capture.gpu_metrics_unavailable(_DIVIX01_ROOT_DEVICES) is None
+
+
+def _line(lines, needle, start=0):
+    return next(i for i in range(start, len(lines)) if needle in lines[i])
+
+
+def test_run_arm_checks_gpu_metrics_through_sudo_before_the_server_starts():
+    lines = _run_arm_script().splitlines()
+    check = _line(lines, '"${nsys_sudo[@]}" profile --gpu-metrics-devices=help')
+    launch = next(i for i, l in enumerate(lines) if l.startswith('taskset -c "$server_cores"'))
+    assert check < launch
+    assert any("sudo -n" in l and "NSYS_SUDO_WRAPPER" in l for l in lines)
+
+
+def test_run_arm_starts_the_pcie_session_before_the_trace_and_stops_it_after():
+    lines = _run_arm_script().splitlines()
+    pcie_launch = _line(lines, '"${nsys_sudo[@]}" launch --session-new="$pcie_session" --trace=none')
+    pcie_start = _line(lines, '"${nsys_sudo[@]}" start --session="$pcie_session" --output="$nsys_report-pcie"')
+    trace_start = _line(lines, 'nsys start --session="$nsys_session"')
+    trace_stop = _line(lines, 'nsys stop --session="$nsys_session"')
+    pcie_stop = _line(lines, "stop_pcie_session stop", trace_stop)
+    final_stop = next(i for i, l in enumerate(lines) if l == "stop_server")
+    assert pcie_launch < pcie_start < trace_start < trace_stop < pcie_stop < final_stop
+    assert '"${nsys_gpu_metrics[@]}"' in lines[pcie_start]
+    # The user-level trace cannot read the counters; they belong only to the root session.
+    assert "gpu-metrics" not in "".join(lines[trace_start : trace_start + 3])
+
+
+def test_run_arm_cancels_and_shuts_down_the_pcie_session_on_abort():
+    script = _run_arm_script()
+    body = script[script.index("stop_server() {") :]
+    body = body[: body.index("\n}\n")]
+    assert "stop_pcie_session cancel" in body
+    helper = script[script.index("stop_pcie_session() {") :]
+    helper = helper[: helper.index("\n}\n")]
+    assert 'shutdown --session="$pcie_session"' in helper

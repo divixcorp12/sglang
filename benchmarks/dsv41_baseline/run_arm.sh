@@ -29,6 +29,10 @@
 # NSYS_OUT_DIR, default /mnt/nvme1/dsv41-nsys; anything off /mnt/nvme1 is refused).
 # NSYS_CUDA_GRAPH_TRACE=graph|node (default graph) picks --cuda-graph-trace; graph is
 # refused when the arm's env turns on SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.
+# NSYS_GPU_METRICS=1 (default) also samples GPU metrics, including PCIe RX/TX throughput,
+# in a second root session (sudo -n /usr/local/sbin/nsys-profile; the driver keeps the
+# counters admin-only) written to <report>-pcie.nsys-rep over the same window. The arm
+# refuses to start when that sudo path cannot read the counters. 0 skips them.
 #
 # Cost: ~200 s server startup + a readiness loop (clock stability + JIT compile
 # settling; the smoke launch saw a 34 s Triton compile land mid-decode after /health
@@ -223,6 +227,7 @@ for k, v in json.load(open('$expected_env_path')).items():
 #     graph-mode report's kernel table omits the graph body. Graph is refused when the arm
 #     runs the RAM-miss copy engine: graph-mode tracing deadlocks its copy wait.
 nsys_session=""
+pcie_session=""
 if [ "${NSYS_TRACE:-0}" = 1 ]; then
     command -v nsys >/dev/null 2>&1 || abort "NSYS_TRACE=1 but nsys is not on PATH"
     nsys_graph_trace=$(pyrun -c "
@@ -248,6 +253,25 @@ except ValueError as error:
     NSYS_TMPDIR=$(pyrun -c "import nsys_capture; print(nsys_capture.NSYS_TMPDIR)")
     export NSYS_TMPDIR
     mkdir -p "$NSYS_TMPDIR" || abort "cannot create NSYS_TMPDIR=$NSYS_TMPDIR"
+    nsys_gpu_metrics_line=$(pyrun -c "
+import sys
+import nsys_capture
+try:
+    print(' '.join(nsys_capture.gpu_metrics_args(sys.argv[1])))
+except ValueError as e:
+    sys.exit(str(e))
+" "${NSYS_GPU_METRICS:-}") || abort "$arm: bad NSYS_GPU_METRICS"
+    # shellcheck disable=SC2206
+    nsys_gpu_metrics=($nsys_gpu_metrics_line)
+    nsys_sudo=(sudo -n "$(pyrun -c "import nsys_capture; print(nsys_capture.NSYS_SUDO_WRAPPER)")")
+    if [ ${#nsys_gpu_metrics[@]} -gt 0 ]; then
+        nsys_gpu_metrics_why=$("${nsys_sudo[@]}" profile --gpu-metrics-devices=help 2>&1 | pyrun -c "
+import sys
+import nsys_capture
+print(nsys_capture.gpu_metrics_unavailable(sys.stdin.read()) or '')
+")
+        [ -z "$nsys_gpu_metrics_why" ] || abort "$arm: $nsys_gpu_metrics_why"
+    fi
     nsys_report=$nsys_out_dir/$arm-$(date +%Y%m%d-%H%M%S)
     # NSYS_LAUNCH_ARGS adds application-scope options, which is where --cudabacktrace and
     # --python-backtrace must go (nsys calls them "Application scope"); both also require
@@ -304,6 +328,16 @@ if [ -n "$nsys_session" ]; then
 fi
 echo "server pid=$spid"
 
+# $1 is stop (write the report) or cancel (abort path). shutdown then ends the root
+# session's placeholder `sleep infinity`, which would otherwise outlive the arm.
+stop_pcie_session() {
+    [ -n "$pcie_session" ] || return 0
+    "${nsys_sudo[@]}" "$1" --session="$pcie_session" >/dev/null 2>&1 \
+        || echo "WARNING: nsys $1 failed for $pcie_session"
+    "${nsys_sudo[@]}" shutdown --session="$pcie_session" >/dev/null 2>&1
+    pcie_session=""
+}
+
 stop_server() {
     # A capture still running here would leave the session behind and never write a
     # report, so end it first -- and cancel rather than stop, because every caller of
@@ -311,6 +345,7 @@ stop_server() {
     if [ -n "$nsys_session" ]; then
         nsys cancel --session="$nsys_session" >/dev/null 2>&1
     fi
+    stop_pcie_session cancel
     kill -TERM "$spid" 2>/dev/null
     for _ in $(seq 1 120); do kill -0 "$spid" 2>/dev/null || break; sleep 1; done
     kill -KILL "$spid" 2>/dev/null
@@ -427,6 +462,18 @@ echo "$arm ready: clock=${clock}MHz decode=${tok_s}tok/s compile_events=$prev_co
 if [ -n "$nsys_session" ]; then
     # Collection starts HERE, after warm-up: the clock is stable, the graph is captured
     # and no JIT compile remains, so the report contains steady-state decode only.
+    # The root metrics-only session starts first so its window covers the whole trace.
+    if [ ${#nsys_gpu_metrics[@]} -gt 0 ]; then
+        pcie_session="dsv41-pcie-$arm-$$"
+        "${nsys_sudo[@]}" launch --session-new="$pcie_session" --trace=none sleep infinity >> "$log" 2>&1 &
+        for _ in $(seq 1 30); do
+            "${nsys_sudo[@]}" sessions list 2>/dev/null | grep -q "$pcie_session" && break
+            sleep 1
+        done
+        "${nsys_sudo[@]}" start --session="$pcie_session" --output="$nsys_report-pcie" "${nsys_gpu_metrics[@]}" \
+            || { stop_server; abort "$arm: nsys start failed for GPU metrics session $pcie_session"; }
+        echo "GPU metrics (PCIe RX/TX) capture started -> $nsys_report-pcie.nsys-rep"
+    fi
     nsys start --session="$nsys_session" --output="$nsys_report" \
         --sample="${NSYS_SAMPLE:-none}" --cpuctxsw="${NSYS_CPUCTXSW:-none}" --force-overwrite=true \
         || { stop_server; abort "$arm: nsys start failed for session $nsys_session"; }
@@ -512,6 +559,10 @@ if [ -n "$nsys_session" ]; then
     # report still being written is how other scripts lost theirs.
     nsys stop --session="$nsys_session" || echo "WARNING: nsys stop failed for $nsys_session"
     nsys_session=""
+    if [ -n "$pcie_session" ]; then
+        stop_pcie_session stop
+        ls -l "$nsys_report-pcie.nsys-rep" 2>/dev/null || echo "WARNING: no GPU metrics report at $nsys_report-pcie.nsys-rep"
+    fi
     report_size=-1
     for _ in $(seq 1 180); do
         size=$(stat -c %s "$nsys_report.nsys-rep" 2>/dev/null || echo -1)

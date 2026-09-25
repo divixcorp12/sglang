@@ -18,6 +18,44 @@ _TRUE = ("true", "1", "yes", "y")
 # and the server dies mid-run with a ~361 KB report (CLAUDE.md, DSV41_REFERENCE.md section 22).
 NSYS_TMPDIR = "/mnt/nvme1/nsys-tmp"
 REPORT_ROOT = "/mnt/nvme1/"
+# The RTX 5090 is GB202; this set carries the PCIe read (RX) and write (TX) throughput rows.
+GPU_METRICS_SET = "gb20x"
+# divix01's driver keeps GPU counters admin-only (RmProfilingAdminOnly=1), so GPU metrics come from a second,
+# metrics-only nsys session run as root through this NOPASSWD sudo wrapper (`exec nsys "$@"`).
+NSYS_SUDO_WRAPPER = "/usr/local/sbin/nsys-profile"
+_GPU_METRICS_UNSUPPORTED = "None of the installed GPUs are supported"
+_SUDO_REFUSED = ("a password is required", "not allowed to execute", "command not found", "No such file")
+GPU_METRICS_FIX = (
+    f"GPU metrics need `sudo -n {NSYS_SUDO_WRAPPER}` (a NOPASSWD rule for a wrapper that execs nsys) or the driver "
+    "option NVreg_RestrictProfilingToAdminUsers=0 (/etc/modprobe.d, dracut -f, reboot). "
+    "Or set NSYS_GPU_METRICS=0 to trace without PCIe RX/TX"
+)
+
+
+def gpu_metrics_args(requested: str | None) -> list[str]:
+    """`nsys start` options for the root metrics-only session; NSYS_GPU_METRICS is 1 (the default) or 0."""
+    value = (requested or "1").strip()
+    if value == "0":
+        return []
+    if value != "1":
+        raise ValueError(f"NSYS_GPU_METRICS={requested!r}: must be 0 or 1")
+    # sudo's env_reset drops CUDA_VISIBLE_DEVICES, so select every GPU; divix01 has one.
+    return [
+        "--sample=none",
+        "--cpuctxsw=none",
+        "--gpu-metrics-devices=all",
+        f"--gpu-metrics-set={GPU_METRICS_SET}",
+        "--force-overwrite=true",
+    ]
+
+
+def gpu_metrics_unavailable(devices_help: str) -> str | None:
+    """Why GPU metrics cannot be collected, from `sudo -n <wrapper> profile --gpu-metrics-devices=help`, or None."""
+    if _GPU_METRICS_UNSUPPORTED in devices_help or any(s in devices_help for s in _SUDO_REFUSED):
+        return f"nsys cannot sample GPU metrics (PCIe RX/TX): {devices_help.strip()} -- {GPU_METRICS_FIX}"
+    if "--gpu-metrics-devices values are" not in devices_help:
+        return f"unrecognised nsys GPU metrics output: {devices_help.strip()!r} -- {GPU_METRICS_FIX}"
+    return None
 
 
 def copy_engine_on(env: dict[str, str]) -> bool:
