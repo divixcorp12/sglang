@@ -1,5 +1,14 @@
 # Engram served path: where the time goes — analysis handoff
 
+**Measurement update (2026-09-23):** Read the
+[sampled attribution](analysis/dsv41-drive/ENGRAM_DECODE_SAMPLED_MEASUREMENT_20260923.md)
+and [graph-node measurement](analysis/dsv41-drive/ENGRAM_DECODE_GRAPH_NODE_MEASUREMENT_20260923.md)
+before using the optimization ranking below. The long visible 256-byte
+readbacks are ExL3 MoE `chunk.tolist()` during prefill. Within decode, MoE
+RAM-miss waiting and pinned-host expert-row copying dominate the traced graph;
+Engram host callbacks are small by comparison. Sections 1–3 below predate
+these attributions.
+
 Date: 2026-09-22. Branch `codex/nvfp4-expert-stream-main`, head `1d75e639b3`.
 divix01 worktree `/data/models/slang/nvfp4-work/wt-p1bench`, left at `d337301dd1`
 (pull it forward before new work).

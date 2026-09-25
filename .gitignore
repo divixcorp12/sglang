@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+**/.omc/
+**/.omc/state/sessions/
+**/.omc/state/**
+**/.omc/sessions/
 
 # C extensions
 *.so
