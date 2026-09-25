@@ -18,9 +18,12 @@ def test_defaults_match_the_env_declarations():
         engram_host_table_layout="shared",
         engram_table_dir="",
         engram_ram_gib=0.0,
+        engram_host_node_cache_uring=False,
+        enable_engram_device_wait=False,
         expert_stream=False,
         expert_dir="",
         expert_trace_path="",
+        router_capture_path="",
         ram_miss_timeout_ms=2000,
         ram_miss_pack_workers=0,
         ram_miss_fault="",
@@ -31,7 +34,11 @@ def test_defaults_match_the_env_declarations():
         enable_ram_miss_piece_stream=False,
         enable_ram_miss_row_images=False,
         enable_ram_miss_copy_engine=False,
+        enable_native_prefetch=False,
+        enable_moe_side_stream=False,
+        enable_layer_fusion=False,
         torch_prefill_indexer=False,
+        fused_wo_a=True,
     )
 
 

@@ -17,9 +17,12 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     engram_host_table_layout: str
     engram_table_dir: str
     engram_ram_gib: float
+    engram_host_node_cache_uring: bool
+    enable_engram_device_wait: bool
     expert_stream: bool
     expert_dir: str
     expert_trace_path: str
+    router_capture_path: str
     ram_miss_timeout_ms: int
     ram_miss_pack_workers: int
     ram_miss_fault: str
@@ -31,7 +34,10 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_ram_miss_row_images: bool
     enable_ram_miss_copy_engine: bool
     enable_native_prefetch: bool
+    enable_moe_side_stream: bool
+    enable_layer_fusion: bool
     torch_prefill_indexer: bool
+    fused_wo_a: bool
 
     @classmethod
     def from_envs(cls) -> "Dsv41Config":
@@ -42,9 +48,12 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             engram_host_table_layout=envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get(),
             engram_table_dir=envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get(),
             engram_ram_gib=envs.SGLANG_DSV41_ENGRAM_RAM_GIB.get(),
+            engram_host_node_cache_uring=envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get(),
+            enable_engram_device_wait=envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get(),
             expert_stream=envs.SGLANG_DSV41_EXPERT_STREAM.get(),
             expert_dir=envs.SGLANG_DSV41_EXPERT_DIR.get(),
             expert_trace_path=envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get(),
+            router_capture_path=envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get(),
             ram_miss_timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
             ram_miss_pack_workers=envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.get(),
             ram_miss_fault=envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get(),
@@ -56,5 +65,8 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_ram_miss_row_images=envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES.get(),
             enable_ram_miss_copy_engine=envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
             enable_native_prefetch=envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get(),
+            enable_moe_side_stream=envs.SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM.get(),
+            enable_layer_fusion=envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
+            fused_wo_a=envs.SGLANG_DSV41_FUSED_WO_A.get(),
         )
