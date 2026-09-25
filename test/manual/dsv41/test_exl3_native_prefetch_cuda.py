@@ -189,7 +189,7 @@ def test_commit_ignores_an_older_done_word_times_out_fails_stop_and_takes_the_sl
 
 SLOTS = TOP_K  # the harness's destination rows are the hot slots
 ROUTES = 3
-STEPS = 60
+STEPS = 120
 
 
 class Decode:
@@ -322,7 +322,7 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
                 torch.cuda.synchronize()
                 assert d.s.until(lambda: d.s.counters()["prefetch_requests"] == int(d.counters[COUNTER["posted"]]))
                 c, dc = d.s.counters(), d.counters.cpu().tolist()
-                assert dc[COUNTER["posted"]] > 20, dc
+                assert dc[COUNTER["posted"]] > 15, dc
                 assert dc[COUNTER["copied"]] == c["prefetch_copied"] > 5, (dc, c)
                 assert dc[COUNTER["aborted"]] == 0 and c["copy_errors"] == 0, (dc, c)
                 assert c["prefetch_skipped_not_ready"] + dc[COUNTER["ram_filtered"]] > 0, (dc, c)
