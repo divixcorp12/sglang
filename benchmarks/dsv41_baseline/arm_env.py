@@ -147,6 +147,9 @@ def base_env() -> dict[str, str]:
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
         # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
         "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
+        # Engram lookups by device post/wait instead of graph host nodes: no host nodes in the decode graph,
+        # byte-identical (docs/superpowers/plans/2026-09-25-dsv41-engram-no-hostnode.md).
+        "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT": "1",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 
