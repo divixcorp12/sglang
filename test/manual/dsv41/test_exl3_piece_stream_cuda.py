@@ -139,11 +139,12 @@ class StreamService:
     """The real chain one call at a time against the real C++ service thread: lease mode, two-phase and (unless
     ``piece_stream`` is False) piece streaming with ``pack_workers`` packing workers. Flag on, the chain is
     post -> W1 -> C1 -> A1 -> S -> A2 -> F; flag off, today's post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F.
-    ``layers`` streamed layers are built and every request goes to streamed row ``row``."""
+    ``layers`` streamed layers are built and every request goes to streamed row ``row``. ``copy_engine`` enables and
+    arms the service's copy engine (LEASE_PROTOCOL.md 7.6), posts with its flag and adds the copy wait before F."""
 
     def __init__(
         self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2, layers=LAYERS,
-        row=0,
+        row=0, copy_engine=False,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -162,6 +163,7 @@ class StreamService:
         self.hit_wait_ns = hit_wait_ns
         self.timeout_ms = timeout_ms
         self.piece_stream = piece_stream
+        self.copy_engine = copy_engine
         try:
             for lid in range(layers):
                 for n in self.names:
@@ -176,6 +178,8 @@ class StreamService:
             self.host.enable_two_phase()
             if piece_stream:
                 self.host.enable_piece_stream()
+            if copy_engine:
+                self.host.enable_copy_engine(torch.cuda.current_device())
             self.host.start_thread(fatal_wait_s=60.0)
             self.dev = Exl3RamMissDevice(
                 self.page, self.slot_map, device="cuda", layers=layers, timeout_ms=timeout_ms, advise=False,
@@ -197,6 +201,9 @@ class StreamService:
         self.dest_slots = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
         self.segments = expert_row_segments([(self.slabs[row][n], self.dest[n]) for n in self.names])
         self.segment_map = stream_segment_map(self.segments, self.tables, row) if piece_stream else None
+        if copy_engine:
+            self.host.set_copy_table(row, self.segments.table, TOP_K)
+            self.host.arm_copy_engine()
         if piece_stream:
             # One empty (unarmed) request through the whole chain: JIT-compiles every kernel before a test times one.
             self.plan([])
@@ -215,7 +222,10 @@ class StreamService:
 
     # --- the stages ------------------------------------------------------------------------------------------
     def post(self):
-        self.dev.post(self.row, self.planned, self.count, self.routes, -1)
+        if self.copy_engine:
+            self.dev.post(self.row, self.planned, self.count, self.routes, -1, dst_slots=self.dest_slots, copy_engine=True)
+        else:
+            self.dev.post(self.row, self.planned, self.count, self.routes, -1)
 
     def hit_wait(self):
         self.dev.hit_wait(self.row, self.planned, self.count, self.dest_slots, self.hit_wait_ns)
@@ -247,8 +257,13 @@ class StreamService:
     def finalize(self):
         self.dev.finalize(self.count, self.keep)
 
+    def copy_wait(self):
+        self.dev.copy_wait(self.count)
+
     def total(self):
         torch.add(self.dev.go_1, self.dev.go_2, out=self.dev.go_total)
+        if self.copy_engine:
+            self.dev.go_total.add_(self.dev.go_ce)
 
     def step(self):
         """The whole chain in production order (flag off: W2 and C2 in place of S). Returns the request's seq."""
@@ -262,6 +277,8 @@ class StreamService:
             self.rest_wait()
             self.copy2()
         self.ack2()
+        if self.copy_engine:
+            self.copy_wait()
         self.finalize()
         self.total()
         _cuda_ready()
@@ -319,6 +336,7 @@ class StreamService:
             two_phase=True,
             hit_wait_ns=self.hit_wait_ns,
             stream_maps={0: self.segment_map} if self.piece_stream else None,
+            copy_engine=self.copy_engine,
         )
 
     def make_plan(self):
