@@ -35,6 +35,7 @@ except ImportError:
     rt = None
 
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
+    capturing_host_node_count,
     checkCudaErrors,
 )
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
@@ -355,6 +356,7 @@ class BreakableCUDAGraphCapture:
         stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
+        forbid_host_nodes: bool = False,
     ):
         assert isinstance(cuda_graph, BreakableCUDAGraph), (
             "cuda_graph must be a BreakableCUDAGraph"
@@ -364,6 +366,7 @@ class BreakableCUDAGraphCapture:
         self._stream = stream
         self._capture_error_mode = capture_error_mode
         self._barrier_fn = barrier_fn
+        self._forbid_host_nodes = forbid_host_nodes
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None
@@ -433,12 +436,25 @@ class BreakableCUDAGraphCapture:
             forked.clear()
         graph = self._current_graph
         assert graph is not None
+        # Counted before capture_end, as torch keeps no raw graph to inspect afterwards,
+        # and raised after it, so a refused capture does not leave the stream capturing.
+        host_nodes = (
+            capturing_host_node_count(main_stream.cuda_stream)
+            if self._forbid_host_nodes
+            else 0
+        )
         # A segment that enqueued no kernels (back-to-back breaks, or a segment
         # whose ops all ran eagerly) captures an empty graph, which replays as a
         # no-op. Torch warns about it on every such capture_end; expected here.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
             graph.capture_end()
+        if host_nodes:
+            self._current_graph = None
+            raise RuntimeError(
+                f"captured {host_nodes} CUDA host node(s) into a graph that forbids them "
+                "(SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT); a host node blocks cudaGraphLaunch"
+            )
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False

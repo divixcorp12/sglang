@@ -94,6 +94,14 @@ class EngramFileTable:
 
     @classmethod
     def open(cls, table_dir: str, layer_id: int, num_embeddings: int, dim: int) -> "EngramFileTable":
+        if (
+            envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get()
+            and not envs.SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING.get()
+        ):
+            raise ValueError(
+                "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT serves from the native store of "
+                "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING; set both"
+            )
         weight_key = f"layers.{layer_id}.engram.embed.weight"
         for path in sorted(glob.glob(os.path.join(table_dir, "*.safetensors"))):
             _, header = read_safetensors_header(path)
@@ -130,6 +138,12 @@ class EngramFileTable:
                 return table
         raise FileNotFoundError(f"{weight_key} not found in {table_dir}")
 
+    def _native_stats(self) -> dict:
+        """The native store's counters and each device-wait lookup's wait statistics."""
+        stats = self._native_store.stats()
+        stats["device_waits"] = list(self._host_node_extension.ring_stats())
+        return stats
+
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
         assert_not_capturing("EngramFileTable.lookup")
         flat = indices.reshape(-1).cpu().numpy()
@@ -140,7 +154,7 @@ class EngramFileTable:
 
                 sink = cache_stats_sink()
                 if sink is not None:
-                    sink.maybe_write("engram", self._native_store.stats)
+                    sink.maybe_write("engram", self._native_stats)
             weight_rows = np.ascontiguousarray(rows[:, : self.dim])
             scale_rows = np.ascontiguousarray(rows[:, self.dim :])
             weight = torch.from_numpy(weight_rows).to(indices.device).view(torch.float8_e4m3fn)

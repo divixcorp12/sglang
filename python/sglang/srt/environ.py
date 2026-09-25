@@ -1816,6 +1816,10 @@ class Envs:
     # Capture layer-1 Engram lookup as a CUDA host node backed by a shared native
     # row cache and an io_uring worker. Disabled unless explicitly requested.
     SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING = EnvBool(False)
+    # With the above, capture the decode lookup as a device post kernel and a device
+    # wait kernel served by a polling thread instead of a host node; the decode graph
+    # then has no host nodes, which is asserted at capture.
+    SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT = EnvBool(False)
 
     # DeepSeek-V4.1 EXL3 routed experts streamed from disk (eager only): the
     # checkpoint loader skips them and each MoE layer gathers the experts it

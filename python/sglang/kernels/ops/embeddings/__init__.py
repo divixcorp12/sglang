@@ -54,4 +54,20 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="embeddings.engram_ring_post",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.embeddings.engram_ring:engram_ring_post",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="embeddings.engram_ring_wait",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.embeddings.engram_ring:engram_ring_wait",
+    )
+)
+
 __all__ = []

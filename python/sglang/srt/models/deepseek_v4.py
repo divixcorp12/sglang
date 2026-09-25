@@ -101,7 +101,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    Engram,
+    EngramHasher,
+    EngramLayout,
+    post_engram_device_lookups,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -4442,6 +4447,15 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+                post_engram_device_lookups(
+                    [
+                        self.layers[i].engram
+                        for i in range(self.start_layer, self.end_layer)
+                        if self.layers[i].engram is not None
+                    ],
+                    hash_ids,
+                    forward_batch,
+                )
         tail = None
         if (
             self.late_layer_start is not None

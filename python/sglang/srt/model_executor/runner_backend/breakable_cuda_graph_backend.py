@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -159,6 +160,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 pool=self._pool,
                 stream=self._capture_stream,
                 barrier_fn=self._tp_group.barrier,
+                forbid_host_nodes=envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get(),
             ),
         ):
             self._precarve.mint()

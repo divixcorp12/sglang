@@ -118,13 +118,149 @@ def _capture_engram_file_lookup(
         context.status_gpu.eq(0), "Engram file lookup failed in CUDA graph host node"
     )
     retain_for_current_graph(context)
-    weight = context.packed_gpu[:, : file_table.dim].view(torch.float8_e4m3fn)
-    scale = context.packed_gpu[:, file_table.dim :].view(torch.float8_e8m0fnu)
+    return _dequantize_packed_rows(context.packed_gpu, file_table, indices)
+
+
+def _captures_native_lookup(
+    embed: EngramEmbedding, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
+) -> bool:
+    """Whether this file-table lookup is captured into the decode graph (host node or
+    device wait) rather than run as an eager break."""
+    return (
+        getattr(embed, "layer_id", None) in (1, 14)
+        and getattr(embed, "tp_size", None) == 1
+        and indices.is_cuda
+        and indices.shape[0] == 1
+        and getattr(embed.file_table, "_host_node_extension", None) is not None
+        and getattr(embed.file_table, "_native_store", None) is not None
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_decode()
+        and is_breakable_graph_capturing()
+    )
+
+
+def _device_wait_lookup(embed: EngramEmbedding, indices: torch.Tensor) -> torch.Tensor:
+    lookup = embed._posted_lookup
+    embed._posted_lookup = None
+    if lookup is None:
+        # No early post (a caller outside DeepseekV4Model's layer loop): post here.
+        lookup = _EngramDeviceWaitLookup(embed.file_table, indices)
+        lookup.post(indices)
+    retain_for_current_graph(lookup)
+    return lookup.wait(embed.file_table, indices)
+
+
+def post_engram_device_lookups(
+    engrams: list[Engram], hash_ids: torch.Tensor, forward_batch: ForwardBatch
+) -> None:
+    """Post every device-wait lookup of this captured decode step as soon as its hash ids
+    exist, so the service reads them while layers 0-13 run; each layer's forward waits."""
+    if not envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get():
+        return
+    for engram in engrams:
+        embed = engram.embed
+        indices = hash_ids[:, engram.layer_hash_index]
+        if embed.file_table is not None and _captures_native_lookup(
+            embed, indices, forward_batch
+        ):
+            embed._posted_lookup = _EngramDeviceWaitLookup(embed.file_table, indices)
+            embed._posted_lookup.post(indices)
+
+
+# Arbitrary: far above the host node's 33.8 ms worst case, short enough that a lost
+# request stops the server within seconds.
+ENGRAM_DEVICE_WAIT_TIMEOUT_MS = 10_000
+# Test-only: the post kernel's spin after its first id (engram_ring.cuh); 0 in production.
+ENGRAM_POST_TEST_STALL_NS = 0
+
+
+class _EngramDeviceWaitLookup:
+    """One captured decode lookup served without a host node: pinned ids, rows and control
+    block shared with the native service thread, and the device sequence and status words.
+    Retained by the graph; ``close`` unregisters from the service before the buffers go."""
+
+    def __init__(self, file_table: EngramFileTable, indices: torch.Tensor):
+        from sglang.kernels.ops.embeddings import engram_ring
+
+        self.native_context = None
+        if not indices.is_cuda or indices.dtype != torch.int64:
+            raise ValueError("the Engram device-wait lookup expects CUDA int64 hash IDs")
+        native = file_table._host_node_extension
+        store = file_table._native_store
+        if native is None or store is None:
+            raise RuntimeError("the native Engram store is unavailable")
+        row_bytes = file_table.dim + file_table.dim // file_table.block
+        n = indices.numel()
+        self.ids = torch.zeros((n,), dtype=torch.int64, pin_memory=True)
+        self.rows = torch.zeros((n, row_bytes), dtype=torch.uint8, pin_memory=True)
+        self.control = torch.zeros(
+            (engram_ring.CONTROL_WORDS,), dtype=torch.int32, pin_memory=True
+        )
+        # The device's own sequence word. Pinned, not device memory: a device tensor made
+        # here, inside the capture, would be zeroed by a captured memset on every replay.
+        self.counter = torch.zeros((1,), dtype=torch.int32, pin_memory=True)
+        self.packed_gpu = torch.empty(self.rows.shape, dtype=torch.uint8, device=indices.device)
+        self.status_gpu = torch.empty((1,), dtype=torch.int32, device=indices.device)
+        self.native_context = native.RingLookup(
+            store,
+            file_table.path,
+            file_table.weight_offset,
+            file_table.scale_offset,
+            file_table.num_embeddings,
+            file_table.dim,
+            file_table.dim // file_table.block,
+            file_table._tag,
+            n,
+            self.ids.data_ptr(),
+            self.rows.data_ptr(),
+            self.control.data_ptr(),
+        )
+
+    def post(self, indices: torch.Tensor) -> None:
+        from sglang.kernels.ops.embeddings.engram_ring import engram_ring_post
+
+        engram_ring_post(
+            indices.reshape(-1),
+            self.ids,
+            self.control,
+            self.counter,
+            ENGRAM_POST_TEST_STALL_NS,
+        )
+
+    def wait(self, file_table: EngramFileTable, indices: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.embeddings.engram_ring import engram_ring_wait
+
+        engram_ring_wait(
+            self.control,
+            self.counter,
+            self.rows,
+            self.packed_gpu,
+            self.status_gpu,
+            ENGRAM_DEVICE_WAIT_TIMEOUT_MS * 1_000_000,
+        )
+        # Status codes: engram_ring.py. A failure also latches the control block's fatal word.
+        torch._assert_async(
+            self.status_gpu.eq(0), "Engram device-wait lookup timed out or failed"
+        )
+        return _dequantize_packed_rows(self.packed_gpu, file_table, indices)
+
+    def close(self) -> None:
+        if self.native_context is not None:
+            self.native_context.close()
+
+    def __del__(self):
+        self.close()
+
+
+def _dequantize_packed_rows(
+    packed: torch.Tensor, file_table: EngramFileTable, indices: torch.Tensor
+) -> torch.Tensor:
+    weight = packed[:, : file_table.dim].view(torch.float8_e4m3fn)
+    scale = packed[:, file_table.dim :].view(torch.float8_e8m0fnu)
     values = weight.float().unflatten(-1, (-1, file_table.block)) * scale.float().unsqueeze(
         -1
     )
-    result = values.flatten(-2).to(torch.bfloat16).reshape(*indices.shape, file_table.dim)
-    return result
+    return values.flatten(-2).to(torch.bfloat16).reshape(*indices.shape, file_table.dim)
 
 
 def _engram_lookup_capture_stub(file_table, indices):
@@ -774,6 +910,7 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self.file_table: Optional[EngramFileTable] = None
+        self._posted_lookup: Optional[_EngramDeviceWaitLookup] = None
         table_dir = envs.SGLANG_DSV41_ENGRAM_TABLE_DIR.get()
         if table_dir:
             if self.tp_size != 1:
@@ -841,17 +978,9 @@ class EngramEmbedding(nn.Module):
         if self.file_table is not None:
             if indices.shape[0] == 0:
                 return self._empty(indices)
-            if (
-                getattr(self, "layer_id", None) in (1, 14)
-                and getattr(self, "tp_size", None) == 1
-                and indices.is_cuda
-                and indices.shape[0] == 1
-                and getattr(self.file_table, "_host_node_extension", None) is not None
-                and getattr(self.file_table, "_native_store", None) is not None
-                and forward_batch is not None
-                and forward_batch.forward_mode.is_decode()
-                and is_breakable_graph_capturing()
-            ):
+            if _captures_native_lookup(self, indices, forward_batch):
+                if envs.SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT.get():
+                    return _device_wait_lookup(self, indices)
                 return _capture_engram_file_lookup(self.file_table, indices)
             return _engram_file_table_lookup(self.file_table, indices)
         if self._shared:
