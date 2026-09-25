@@ -3012,7 +3012,8 @@ class CudaCopyBackend : public CopyBackend {
     get(cu_primary_retain_, "cuDevicePrimaryCtxRetain");
     get(cu_primary_release_, "cuDevicePrimaryCtxRelease_v2");
     get(cu_ctx_set_current_, "cuCtxSetCurrent");
-    get(cu_stream_create_, "cuStreamCreate");
+    get(cu_stream_create_, "cuStreamCreateWithPriority");
+    get(cu_priority_range_, "cuCtxGetStreamPriorityRange");
     get(cu_stream_destroy_, "cuStreamDestroy_v2");
     get(cu_event_create_, "cuEventCreate");
     get(cu_event_destroy_, "cuEventDestroy_v2");
@@ -3027,7 +3028,18 @@ class CudaCopyBackend : public CopyBackend {
     retained_ = true;
     if (int r = cu_ctx_set_current_(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
     constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING: no implicit sync with the legacy stream
-    if (int r = cu_stream_create_(&stream_, kNonBlocking)) return "cuStreamCreate failed: " + std::to_string(r);
+    // The greatest priority, for its hardware queue. The driver hands streams of one priority out round robin over a
+    // fixed set of queues (32 on the RTX 5090, whatever CUDA_DEVICE_MAX_CONNECTIONS says), and a queue runs its work in
+    // order: a copy queued behind a stream whose head waits on the decode graph cannot start until CW gives up, which
+    // is a deadlock only the device deadline breaks (alias_probe.py: the 32nd default-priority stream after another
+    // one shares its queue; no greatest-priority stream did). sglang creates no other greatest-priority stream; one
+    // created 32 greatest-priority streams after this one would share its queue again.
+    int least = 0;
+    int greatest = 0;
+    if (int r = cu_priority_range_(&least, &greatest)) return "cuCtxGetStreamPriorityRange failed: " + std::to_string(r);
+    if (int r = cu_stream_create_(&stream_, kNonBlocking, greatest)) {
+      return "cuStreamCreateWithPriority failed: " + std::to_string(r);
+    }
     constexpr unsigned kDisableTiming = 2;  // CU_EVENT_DISABLE_TIMING
     for (auto& event : events_) {
       if (int r = cu_event_create_(&event, kDisableTiming)) return "cuEventCreate failed: " + std::to_string(r);
@@ -3075,7 +3087,8 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_primary_retain_)(void**, int) = nullptr;
   int (*cu_primary_release_)(int) = nullptr;
   int (*cu_ctx_set_current_)(void*) = nullptr;
-  int (*cu_stream_create_)(void**, unsigned) = nullptr;
+  int (*cu_stream_create_)(void**, unsigned, int) = nullptr;
+  int (*cu_priority_range_)(int*, int*) = nullptr;
   int (*cu_stream_destroy_)(void*) = nullptr;
   int (*cu_event_create_)(void**, unsigned) = nullptr;
   int (*cu_event_destroy_)(void*) = nullptr;

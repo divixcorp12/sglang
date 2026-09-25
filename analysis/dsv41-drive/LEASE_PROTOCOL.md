@@ -890,8 +890,8 @@ misbehaves.
 
 ### 7.6 The copy engine (copy-engine plan, `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE`, ABI 3)
 
-Plan: `docs/superpowers/plans/2026-09-25-dsv41-copy-engine.md` (design 1b of
-`2026-09-25-dsv41-copy-compute-overlap.md`). The service copies a request's **resident**
+Plan: design 1b of `docs/superpowers/plans/2026-09-25-dsv41-copy-compute-overlap.md`, whose section 10
+records the implementation's tests and measurements. The service copies a request's **resident**
 (tag-READY) lanes into their VRAM slots itself, with `cuMemcpyAsync` on the DMA engine, instead
 of the in-graph SM copy C1. Miss lanes are unchanged (tag LOADING, streamed by S). The flag needs
 piece streaming (the only chain that grants every lane in the reservation hold); off, nothing here
@@ -926,7 +926,7 @@ through the driver API resolved from `libcuda.so.1` (the module still builds wit
 
 | When | Calls |
 |---|---|
-| start, before the service thread | `cuInit`, `cuDeviceGet`, `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuStreamCreate(CU_STREAM_NON_BLOCKING)`, 32 x `cuEventCreate(CU_EVENT_DISABLE_TIMING)` |
+| start, before the service thread | `cuInit`, `cuDeviceGet`, `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuCtxGetStreamPriorityRange`, `cuStreamCreateWithPriority(CU_STREAM_NON_BLOCKING, greatest)`, 32 x `cuEventCreate(CU_EVENT_DISABLE_TIMING)` |
 | per job | one `cuMemcpyAsync(dst + dst_slot * bytes, src + host_slot * bytes, bytes, stream)` per table entry per lane, then one `cuEventRecord(event, stream)` |
 | polling, oldest job first | `cuEventQuery(event)` |
 | stop, only when nothing is in flight and no call failed | `cuEventDestroy`, `cuStreamDestroy`, `cuDevicePrimaryCtxRelease` |
@@ -934,6 +934,18 @@ through the driver API resolved from `libcuda.so.1` (the module still builds wit
 Every call is on its own non-blocking stream in the primary context. It calls nothing that
 synchronizes (no `cu*Synchronize`), allocates, frees, registers memory or loads a module, and it
 never touches the decode stream or a graph.
+
+**The copy stream needs a hardware queue of its own.** Nothing CUDA knows about orders CW after the
+copy, so nothing obliges the driver to run the copy while CW spins. The driver hands the streams of
+one priority out round robin over a fixed set of hardware queues (32 on the RTX 5090, whatever
+`CUDA_DEVICE_MAX_CONNECTIONS` says), and a queue runs its work in order: a copy stream that shares a
+queue with any stream whose head waits on the decode graph (the overlap scheduler's result copies,
+another stream's event wait) cannot start until CW gives up. That is the deadlock of the diagnostic
+smoke `diag/arm1-on` (a job issued in 143 us whose event never completed while CW spun for 60 s). The
+copy stream is therefore created at the greatest priority, whose queues no default-priority stream
+shares (`copy-engine/alias_probe.py`: the 32nd default-priority stream after another shares its
+queue, no greatest-priority one did; `test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams`).
+The residual exposure is a greatest-priority stream created by someone else, 32 such streams later.
 
 **Completion mechanism: `cuEventQuery` on an event recorded after the job's last copy.** The event
 completes only once all earlier work of the same stream has completed, so a `CUDA_SUCCESS` from the

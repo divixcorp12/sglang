@@ -202,6 +202,63 @@ def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_
         s.close()
 
 
+def _sleep_cycles(ms: float) -> int:
+    torch.cuda._sleep(1000)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    torch.cuda._sleep(int(5e7))
+    torch.cuda.synchronize()
+    return int(5e7 * ms / ((time.perf_counter() - t0) * 1e3))
+
+
+def test_the_copy_stream_does_not_queue_behind_blocked_default_priority_streams(tmp_path):
+    """The driver hands default-priority streams out round robin over a fixed set of hardware queues (32 here), and a
+    queue runs in order: a copy stream sharing a queue with a stream whose head waits on other work cannot start until
+    that work ends. In the server that work is the decode graph spinning in CW for this very copy: a deadlock only the
+    deadline breaks (smoke abba1-on, diag arm1-on). Here 64 default-priority streams, each a 3 s sleep and a kernel
+    that waits for it, cover every such queue twice over, and the chain runs on a greatest-priority stream of its own:
+    the copy must still complete well inside the 1 s deadline. Mutant: the copy thread's stream at default priority."""
+    s = StreamService(tmp_path, copy_engine=True, timeout_ms=1000)
+    try:
+        s.plan([0, 1, 2])
+        s.step()  # resident, through S
+        assert s.until(lambda: _all_retired(s))
+        cycles = _sleep_cycles(3000)
+        scratch = torch.zeros(64, device="cuda")
+        blockers = [torch.cuda.Stream() for _ in range(64)]
+        for i, blocker in enumerate(blockers):
+            with torch.cuda.stream(blocker):
+                torch.cuda._sleep(cycles)
+                scratch[i : i + 1].add_(1)  # waits for the sleep: the blocked head of the blocker's queue
+        _, greatest = torch.cuda.Stream.priority_range()
+        jobs = s.counters()["copy_jobs"]
+        t0 = time.perf_counter()
+        with torch.cuda.stream(torch.cuda.Stream(priority=greatest)):
+            experts = [2, 0, 1]  # all resident: every lane COPYING
+            s.plan(experts)
+            s.post()
+            s.hit_wait()
+            s.copy1()
+            s.ack1()
+            s.stream()
+            s.ack2()
+            s.copy_wait()
+            s.finalize()
+            snapshot = {n: s.dest[n].clone() for n in s.names}
+            s.total()
+            torch.cuda.current_stream().synchronize()
+        chain_s = time.perf_counter() - t0
+        assert s.keep.item() == 1.0, ("the copy waited behind a blocked stream", s.counters(), s.stats())
+        assert chain_s < 1.0, chain_s
+        assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
+        torch.cuda.synchronize()  # the blockers
+        _check(s, experts, snapshot)
+        assert s.until(lambda: _all_retired(s)), s.counters()
+    finally:
+        torch.cuda.synchronize()
+        s.close()
+
+
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
 def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(ce):
     """The captured backend chain is post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F -> add -> add; its replays deliver
