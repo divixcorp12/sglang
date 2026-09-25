@@ -4115,8 +4115,16 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    Fewer NVMe misses (the RAM tier, and item 2) or faster streaming are the levers. The earlier "copy-thread" reading
    of this time was wrong (§27.3).
 4. **Long prompts:** larger prefill chunks, which trades against Track A's VRAM headroom (§25.4).
-5. **Per-layer RAM split:** give the pinned tier's rows to layers by their miss rate instead of evenly (§27.3).
-   Replay the route logs to find the split, then run it as an arm.
+5. **Per-layer RAM split: tried, no gain; not merged.** Branch `cc/pinned-layer-weights`: `SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS`
+   plus `scripts/dsv41/ram_split.py`.
+   - **Replay:** an LRU stack-distance replay of the varied24 route log reproduces the measured per-layer ranking, but
+     runs 12% high (12.66 against 11.26 RAM misses/token). A greedy split fitted on even-numbered requests cut
+     held-out RAM misses from 11.99 to 11.16 per token (−7%).
+   - **Arms** (`pinw-A` even, then `pinw-B` weighted, same commit, byte-identical outputs): decode NVMe `rows_read`
+     went **up**, 4,387 → 4,554 (+3.8%). Prefill RAM misses were flat (10,967 → 10,926). TTFT and tok/s moved
+     within noise.
+   - **Likely cause, not verified:** the replay models decode only. Prefill admissions churn the same tier, and
+     layers cut to ~116 rows lose more of their rows to them. Revisit after item 2 stops prefill evictions.
 6. **Decode small kernels:** another fusion round over the ~1,800 sub-3 µs kernels per step. Worth a few ms/token,
    *estimate*.
 7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
