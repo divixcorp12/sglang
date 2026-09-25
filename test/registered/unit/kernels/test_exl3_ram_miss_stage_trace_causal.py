@@ -226,8 +226,6 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline) {": 2,
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
-    "int64_t last_active = now_ns();": 1,
-    "last_active = now_ns();": 1,
     "if (now_ns() - last_active < spin_ns_) {": 1,
     # RamThread's watchdog poll (unchanged) and RowReader::read()'s progress-callback gate (phase 1,
     # ram-miss-progress-phase1): only reached when a `progress` callback was passed, so the disabled
@@ -237,6 +235,21 @@ NON_TRACE_CLOCK_READS = {
     # line's `c.hold_until == 0` short-circuits before the clock read otherwise.
     "c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;": 1,
     "if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;": 1,
+    # The copy engine (LEASE_PROTOCOL.md 7.6), reached only with it enabled: its thread's spin and drain clock (the
+    # second "last_active" pair), the idle waits of pause() and of the test hook, and four reads per copy job for the
+    # always-on copy_issue_ns and copy_latency_ns counters, which are how stages.jsonl times the copies.
+    "int64_t last_active = now_ns();": 2,
+    "last_active = now_ns();": 2,
+    "} else if (!in_flight.empty() || now_ns() - last_active < spin_ns_) {": 1,
+    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline)) break;": 1,
+    "drain_deadline_ = now_ns() + drain_ns;": 1,
+    "if (now_ns() > deadline_ns) return false;": 1,
+    "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
+    "return exl3_ram_miss::find(handle)->wait_copy_idle(exl3_ram_miss::now_ns() + timeout_ns) ? 1 : 0;": 1,
+    "job.submit_ns = now_ns();": 1,
+    "const int64_t start = now_ns();": 1,
+    "counters_[kCopyIssueNs].fetch_add(now_ns() - start);": 1,
+    "const int64_t latency = now_ns() - job.submit_ns;": 1,
 }
 
 
