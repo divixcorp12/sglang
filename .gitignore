@@ -6,6 +6,7 @@ __pycache__/
 **/.omc/state/sessions/
 **/.omc/state/**
 **/.omc/sessions/
+.omc/state/hud-stdin-cache.json
 
 # C extensions
 *.so
