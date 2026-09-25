@@ -10,6 +10,9 @@ launches that kernel for the first time, on a side stream, which loads its modul
   jit      a fresh tvm-ffi JIT CUDA module (unique source), built and dlopened: the launch lazily loads the module
   control  no load
 
+In the "-first" variants the service is paused while the chain is launched, the load starts at once, and a helper
+thread resumes the service 5 ms later: the copies are issued while the load is under way, not before it.
+
 It reports per trial whether the request timed out, the chain's wall time and how long the load call took. A
 deadlock shows as a timeout (keep 0) with the chain taking the full deadline.
 
@@ -20,6 +23,7 @@ import argparse
 import json
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -111,22 +115,38 @@ def main() -> int:
 
             return run
 
-        loads = {"control": None, "triton": prepare_triton, "jit": prepare_jit}
+        loads = {
+            "control": (None, False),
+            "triton": (prepare_triton, False),
+            "jit": (prepare_jit, False),
+            "control-first": (None, True),
+            "triton-first": (prepare_triton, True),
+            "jit-first": (prepare_jit, True),
+        }
         for trial in range(a.trials):
-            for kind, prepare in loads.items():
+            for kind, (prepare, first) in loads.items():
                 load = prepare() if prepare is not None else None
                 torch.cuda.synchronize()
+                assert s.until(lambda: s.host.copy_engine_idle(0.0))
                 timeouts = s.stats()["timeouts"]
                 s.plan([0, 1, 2])
+                if first:
+                    s.host.pause(5.0)
                 t0 = time.perf_counter()
                 launch()
-                time.sleep(0.002)  # CW is spinning: the ballast holds the copy ~20 ms
+                if first:
+                    resume = threading.Timer(0.005, s.host.resume)
+                    resume.start()
+                else:
+                    time.sleep(0.002)  # CW is spinning: the ballast holds the copy ~20 ms
                 t1 = time.perf_counter()
                 if load is not None:
                     load()
                 t2 = time.perf_counter()
                 torch.cuda.synchronize()
                 t3 = time.perf_counter()
+                if first:
+                    resume.join()
                 row = {
                     "trial": trial,
                     "kind": kind,
