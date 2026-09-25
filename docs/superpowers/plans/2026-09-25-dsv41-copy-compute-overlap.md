@@ -292,3 +292,101 @@ under back-to-back launches.
 2. Then **1b** as specified in section 3, then **prefetch (1d)** on the same machinery.
 3. Drop 1a (flag stays off) and 1c until C1 is off the SMs. Elementwise fusion (section 6) is worth ~3.5 ms/step in
    kernel time. Given 1a's result, measure one fusion before committing to all four.
+
+## 10. 1b implemented: results (branch `cc/copy-engine`)
+
+Flag `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE`, default off, needs piece streaming. The design as built is
+LEASE_PROTOCOL.md 7.6: the service publishes a resident lane of a captured request COPYING, its copy thread copies
+it with `cuMemcpyAsync` on its own stream, observes completion with `cuEventQuery`, publishes CopyDone and releases
+the lease; the chain's copy wait CW (after S and A2) commits `go_ce`. C1/A1 stay for the lanes it does not take.
+Evidence: `divix01:/data/models/slang/nvfp4-work/direct-two-phase-tests/copy-engine/`.
+
+### 10.1 Smoke, one ON arm against the merged recipe
+
+Arm A is **not** from this session: it is the merged recipe's smoke at `4f8dd84069` (layer fusion and Engram device
+wait on), `row-images/merge0925both-rowimg`, taken earlier on 2026-09-25. Arm B is the copy engine on, at
+`423d516028`, `copy-engine/smoke/B423d516-on` (`smoke.sh on`, cold server, six greedy requests). One run each, A then
+B, no interleaving. `compare_arms.py ref=p2a-rowimg A=... B=...` (`smoke/compare_AB.json`):
+
+| Arm | ms/token, trace (wall-validated) | step p50 / p90 ms | stalls (multi-row > 10 ms) | responses vs p2a-rowimg |
+|---|---:|---:|---:|---|
+| A, copy engine off (earlier session) | 125.5 (128.2) | 121.8 / 154.7 | 0 of 1884 | 6 of 6 byte-identical |
+| B, copy engine on | **119.0 (121.6)** | 114.5 / 147.4 | 0 of 1878 | 6 of 6 byte-identical |
+
+**-6.5 ms/token**, within the design's ~7 ms estimate (section 3), and the same answers. B arms after 16 decode
+forwards, so the warm-up and the first ~9 steps of the first request run C1; the gain over a fully armed run is
+slightly larger. The previous agent's ABBA partial (`nvfp4-work/copy-engine/smoke/compare_abba_partial.json`, `1540c85d7b`) had
+off 125.6 / 125.7 and on 119.1 from its one ON arm that started. B's copy counters (`ce_stats.py`): 33.5 jobs and
+71.2 lanes per step (949 MB), 2.30 ms mean grant-to-observed-completion per job (max 6.5 ms), 34 us of driver time
+per job, 0 fallbacks, errors or generation mismatches; 41,603 leases released by the copy thread, 11,920 by
+acknowledgements, 0 voided. No node-mode trace was taken: the gain matches the estimate and needs no attribution.
+
+### 10.2 The startup deadlock, and what fixed it
+
+Of the previous agent's two ON arms, one died at startup (`nvfp4-work/copy-engine/smoke/abba1-on`: request 644 timed out,
+fail-stop). Reproduced deterministically by arming after one batch (a throwaway edit in a private worktree), with a
+60 s deadline and stack sampling (`smoke.sh` `SMOKE_STACK_SECONDS`, `SMOKE_CUDA_GDB`), under `diag/`:
+
+| Run | What happened | Reading |
+|---|---|---|
+| `arm1-on`, `arm1fix-on`, `arm1gdb-on` | first armed copy job issued in ~0.1 ms, never completed until CW gave up (60 s, 120 s); scheduler in `cudaEventSynchronize`; cuda-gdb: CW the only resident kernel | the copy did not run while CW spun |
+| `arm1nooverlap-on` (`--disable-overlap-schedule`) | 19,739 jobs, no stall; 130.1 ms/token, 6/6 identical | overlap-scheduler-only; not a fix (slower than A) |
+| `arm1eager83-on` (`CUDA_MODULE_LOADING=EAGER`, mem fraction 0.83) | first steps passed; request 649 hung with the scheduler in Triton `loadBinary` -> `cuModuleLoadData` and the copy thread in `cuMemcpyAsync` on the driver's rwlock | a module load takes the lock and waits for the device |
+
+Both variants are the module-load hazard the Engram plan (section 10) named: the first decode steps of the server's
+own warm-up request launch kernels for the first time, lazily loaded, while an armed graph is in flight (the first
+variant; eager loading removed it), and Triton loads a newly specialised kernel mid-stream (the second).
+`EAGER` alone does not fit the recipe: at mem fraction 0.8 the KV cache no longer fits.
+
+Fixed in `423d516028`: arming counts **decode forwards** (16, past the 8-token warm-up) instead of batches, and once
+armed Triton's `load_binary` drains the device before it loads (safe: no load holds the lock yet). The existing
+barrier (an eager forward drains first once armed) stays. B above ran with these and no stall.
+
+Two hypotheses were tested and rejected on the way: hardware-queue aliasing of the copy stream (a probe built on
+`torch.cuda.Stream()` "found" it at the 32nd stream, which was torch's 32-stream pool handing back the same stream;
+with raw streams, `hol_probe.py` shows default-priority streams can queue behind blocked ones while
+greatest-priority streams never did, so the copy stream now takes the greatest priority as hardening, but it did not
+cure the hang), and a graph's first replay (harness tests with 0 and 3,000 filler kernels pass).
+
+### 10.3 Review findings
+
+- Lease/lane protocol: sound. A COPYING lane is released only by the copy thread after `cuEventQuery` observed its
+  copies complete; `retire_leases` skips it, so a Terminal bit (F names every unacknowledged lane) can neither release
+  it nor count as a double signal; an entry cannot close while such a lane is GRANTED; CW commits only on a CopyDone
+  carrying the generation and exactly the COPYING mask. The victim-slot argument holds because the copy is issued
+  only after the post kernel ran. Mutants (previous agent, CPU): no completion wait, CopyDone at grant, a Terminal
+  releasing a COPYING lease, each caught.
+- `LEASE_PROTOCOL.md` and `environ.py` cited a plan file that does not exist; both now point here.
+- The "deadlock fix" `5406a21a74` (eager forwards drain once armed) was correct but not sufficient; see 10.2.
+
+### 10.4 Tests (commands and logs under `copy-engine/logs/`, each count from pytest's own status)
+
+- CPU (`cpu_suite.sh`: `CUDA_VISIBLE_DEVICES= PYTHONPATH=$WT/python OMP_NUM_THREADS=8 taskset -c 0-31 python -m pytest
+  test/registered/unit/kernels test/registered/unit/layers/moe/test_exl3_ram_miss_service.py
+  test/registered/unit/layers/moe/test_exl3_ram_miss_shutdown.py test/registered/unit/layers/moe/test_exl3_ram_miss_tables.py
+  test/registered/unit/layers/moe/test_exl3_stream_trace.py test/registered/unit/test_dsv41_config.py -q -p no:randomly -rfE`):
+  head `423d516028` **1372 passed, 414 skipped, 2 failed**; base `4f8dd84069` 1357 passed, 414 skipped, 2 failed.
+  The same two fail at the base (`test_apply_graph_adds_nothing_unless_router_capture_is_on`,
+  `test_one_field_per_knob`): pre-existing. The known flake `test_a_hit_lanes_slot_is_never_its_own_requests_victim`
+  did not occur.
+- GPU (`gpu_suite.sh`, `cc-gpu.lock`, cores 32-63: the CPU targets with the GPU visible, plus the manual RAM-miss CUDA
+  files, the side-stream file and `test_exl3_copy_engine_cuda.py`): head `423d516028` **1916 passed, 1 skipped, 2
+  failed, 1 error**. The base suite was skipped (coordinator's call); the two failures and the error
+  (`test_graph_routes_are_logged_only_when_the_stage_trace_is_on[trace_on]`) were run alone at `4f8dd84069` and fail
+  there too (`gpu_base_targeted_4f8dd84069.log`): pre-existing.
+- New tests: the arming rule and the Triton load guard (CPU), the first armed replay of a fresh graph and work queued
+  behind the graph on other streams (GPU). Mutants in a private worktree, reverted and re-run green
+  (`mut_arming.log`): eager forwards counting toward arming, and a guard that does not drain, each caught.
+
+### 10.5 Recommendation
+
+Keep the flag **off by default** for now, although it is -6.5 ms/token and byte-identical. The remaining failure mode
+is a fail-stop, not a wrong answer, but it is live: any driver call that takes the context lock and waits for the
+device while an armed step is in flight deadlocks that step until the RAM-miss deadline (2 s), and the process stops.
+Guarded now: eager forwards, Triton loads, the warm-up. Not guarded: a runtime-API kernel first launched after arming
+(a sampling or grammar path no earlier request took), `empty_cache`, host registration. Before turning it on:
+1. a soak with varied sampling parameters, lengths and grammars, counting stalls and fatal words;
+2. either `CUDA_MODULE_LOADING=EAGER` with the memory it costs, or a device-side fallback: CW gives up on CopyDone
+   after a few ms and the chain copies the lanes itself, which needs a device/host handshake so the lease outlives
+   the fallback read and a late DMA cannot land on a reused slot (LEASE_PROTOCOL 7.6 would change);
+3. never a graph-mode nsys run with it on (section 9 of the Engram plan).

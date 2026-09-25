@@ -30,7 +30,7 @@ def _host_module() -> Module:
     return load_jit(
         "exl3_ram_miss_host",
         cpp_files=["moe/exl3_ram_miss_host.cpp"],
-        extra_ldflags=["-luring", "-lpthread"],
+        extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
     )
 
@@ -556,6 +556,17 @@ COUNTERS = (
     "piece_stream_refused",
     "piece_publish_refused",
     "slots_quarantined",
+    # Copy engine (LEASE_PROTOCOL.md 7.6).
+    "leases_copied",
+    "copy_jobs",
+    "copy_lanes",
+    "copy_bytes",
+    "copy_issue_ns",
+    "copy_latency_ns",
+    "copy_latency_max_ns",
+    "copy_fallbacks",
+    "copy_errors",
+    "copy_generation_mismatches",
 )
 
 
@@ -759,7 +770,7 @@ class Exl3RamMissHost:
     def lease_entry(self, idx: int) -> dict:
         """Test only: the service's lease account of request slot ``idx`` (``(seq - 1) % DEMAND_RECORDS``)."""
         lanes = exl3_lease_block.LANES
-        out = torch.zeros(4 + 2 * lanes, dtype=torch.int64)
+        out = torch.zeros(4 + 3 * lanes, dtype=torch.int64)
         self._module.exl3_ram_miss_lease_entry(self.handle, idx, out)
         values = out.tolist()
         return {
@@ -768,7 +779,8 @@ class Exl3RamMissHost:
             "count": values[2],
             "gen": values[3] & 0xFFFFFFFFFFFFFFFF,
             "lane_state": values[4 : 4 + lanes],
-            "lane_slot": values[4 + lanes :],
+            "lane_slot": values[4 + lanes : 4 + 2 * lanes],
+            "lane_copy_engine": values[4 + 2 * lanes :],
         }
 
     def inject_lease(self, row: int, slot: int, delta: int) -> None:
@@ -807,6 +819,55 @@ class Exl3RamMissHost:
     def enable_piece_stream(self) -> None:
         """Read each part as sub-reads and vet rows piece by piece; before the thread starts, and needs pack workers."""
         self._module.exl3_ram_miss_set_piece_stream(self.handle, 1)
+
+    def enable_copy_engine(self, device: int, *, spin_us: int = 5000) -> None:
+        """Start the copy-engine thread on CUDA device ``device`` (-1: the CPU test backend); before the thread starts.
+
+        It copies nothing until :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
+        """
+        self._module.exl3_ram_miss_enable_copy_engine(self.handle, int(device), int(spin_us * 1e3))
+
+    def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int) -> None:
+        """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
+        C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows."""
+        self._check(row)
+        entries = table.detach().to("cpu", torch.int64).contiguous()
+        if entries.dim() != 2 or entries.shape[1] != 3 or entries.shape[0] < 1:
+            raise ValueError(f"a copy table is int64 [n, 3], not {tuple(entries.shape)}")
+        if dst_rows < 1:
+            raise ValueError("a copy table needs at least one destination row")
+        self._module.exl3_ram_miss_set_copy_table(self.handle, row, entries, int(dst_rows))
+
+    def arm_copy_engine(self, on: bool = True) -> None:
+        """Let the service publish resident lanes COPYING and copy them itself, for requests whose post allows it."""
+        self._module.exl3_ram_miss_arm_copy_engine(self.handle, int(bool(on)))
+
+    def copy_engine_idle(self, timeout_s: float) -> bool:
+        """Whether every job handed to the copy thread completed (or failed) and was retired within ``timeout_s``."""
+        return bool(self._module.exl3_ram_miss_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
+
+    def copy_engine_release(self, marks: int = -1) -> None:
+        """Test only (CPU backend): let ``marks`` more copy marks complete; negative lets every one complete."""
+        self._module.exl3_ram_miss_copy_engine_release(self.handle, int(marks))
+
+    def copy_engine_fail(self, *, issue: bool = False, query: bool = False) -> None:
+        """Test only (CPU backend): make issuing a copy, or asking whether a mark completed, return an error."""
+        self._module.exl3_ram_miss_copy_engine_fail(self.handle, int(issue), int(query))
+
+    def copy_engine_ballast(self, dst: Optional[torch.Tensor], src: Optional[torch.Tensor]) -> None:
+        """Test only: copy ``src`` into ``dst`` (same byte size) ahead of every copy job, delaying its completion;
+        ``None`` turns it off. The caller keeps both tensors alive while it is on."""
+        if dst is None or src is None:
+            self._module.exl3_ram_miss_copy_engine_ballast(self.handle, 0, 0, 0)
+            return
+        nbytes = dst.numel() * dst.element_size()
+        if nbytes != src.numel() * src.element_size() or not (dst.is_contiguous() and src.is_contiguous()):
+            raise ValueError("ballast tensors must be contiguous and of one byte size")
+        self._module.exl3_ram_miss_copy_engine_ballast(self.handle, dst.data_ptr(), src.data_ptr(), nbytes)
+
+    def copy_engine_marked(self) -> int:
+        """Test only (CPU backend): copy marks recorded so far, one per job issued."""
+        return int(self._module.exl3_ram_miss_copy_engine_marked(self.handle))
 
     def inject_done_stall(self, seconds: float) -> None:
         """Test only: sleep between serving a demand and storing demand_done."""
@@ -973,6 +1034,9 @@ STATE_WORDS = {
     "stream_polls": 16,
     # Stage 1's (W1's) polling passes, cumulative: under piece streaming it stops once every lane is claimed or LOADING.
     "w1_passes": 17,
+    # The copy wait: requests with copy-engine lanes it waited for, and those whose CopyDone was not yet published.
+    "copy_waits": 18,
+    "copy_spun": 19,
 }
 
 # The stream kernel's test-only fault words (kStreamFault* in exl3_ram_miss.cuh): all zero in production.
@@ -992,6 +1056,7 @@ def _device_module() -> Module:
         "exl3_ram_miss_lease_finalize",
         "exl3_ram_miss_lease_stream_hit_wait",
         "exl3_ram_miss_lease_stream",
+        "exl3_ram_miss_lease_copy_wait",
     )
     return load_jit(
         "exl3_ram_miss",
@@ -1109,6 +1174,10 @@ class Exl3RamMissDevice:
         self.origin_2 = None
         self.claimed = None
         self.violated = None
+        self.go_ce = None
+        self._lease_c = 0
+        # Set by the row backend when it captures a post that lets the service copy (the service arms on it).
+        self.copy_engine_captured = False
         if lease_block is not None:
             if lease_layout.rows != layers:
                 raise ValueError(f"the lease layout has {lease_layout.rows} rows for {layers} layers")
@@ -1140,6 +1209,9 @@ class Exl3RamMissDevice:
             self.origin_2 = torch.zeros(lanes, dtype=torch.int32, device=device)
             self.claimed = torch.zeros(lanes, dtype=torch.int32, device=device)
             self.violated = torch.zeros(1, dtype=torch.int32, device=device)
+            # Lanes the copy wait found COPYING and saw CopyDone for; stays 0 in a chain without a copy wait.
+            self.go_ce = torch.zeros(1, dtype=torch.int32, device=device)
+            self._lease_c = int(lease_layout.copy_offset)
         # Piece streaming (plan 5): the stream kernel S replaces W2 and C2. Its one counter word and abort word are
         # reset by the stream W1 every replay; `stream_fault` is the test-only fault tensor, zero in production.
         self.piece_stream = bool(piece_stream)
@@ -1175,10 +1247,19 @@ class Exl3RamMissDevice:
             if tensor.dtype != dtype or tensor.device != self.state.device or not tensor.is_contiguous() or tensor.numel() < 1:
                 raise ValueError(f"{name} must be a non-empty contiguous {dtype} tensor on {self.state.device}")
 
-    def post(self, row: int, planned, count, routes, next_row: int, hot_slots=None, hot_capacity: int = 0) -> None:
+    def post(
+        self, row: int, planned, count, routes, next_row: int, hot_slots=None, hot_capacity: int = 0, dst_slots=None,
+        copy_engine: bool = False,
+    ) -> None:
+        """``dst_slots`` (the plan's int32 destination slots) goes into the LaneRequest; ``copy_engine`` lets the
+        service copy this request's resident lanes itself, which only a chain with :meth:`copy_wait` may allow."""
         self._check_row("row", row)
         self._check_row("next_row", next_row, allow_none=True)
         self._check_buffers(planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64))
+        if dst_slots is not None:
+            self._check_buffers(dst_slots=(dst_slots, torch.int32))
+        elif copy_engine:
+            raise ValueError("the copy engine needs the plan's destination slots")
         if hot_slots is not None:
             self._check_buffers(hot_slots=(hot_slots, torch.int64))
             if self._hot_address == 0 or not 0 < hot_capacity <= hot_slots.numel():
@@ -1187,6 +1268,7 @@ class Exl3RamMissDevice:
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
             self._lease_address, self._lease_d, self.timeout_ns, self._hot_address, self._hot_stride,
             hot_slots if hot_slots is not None else self.state, hot_capacity,
+            dst_slots if dst_slots is not None else self.state[:0], int(bool(copy_engine)),
         )
 
     def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:
@@ -1310,6 +1392,18 @@ class Exl3RamMissDevice:
             self.page, self.state, self._lease_address, self._lease_d, go, lane_ctx, origin, self.violated
         )
 
+    def copy_wait(self, count) -> None:
+        """The copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and its acknowledgement and before :meth:`finalize`.
+
+        It commits ``go_ce`` once the service's CopyDone names this request and exactly its COPYING lanes.
+        """
+        if not self.piece_stream:
+            raise RuntimeError("the copy wait runs in the piece-streaming chain only")
+        self._check_buffers(count=(count, torch.int32))
+        self._kernels().exl3_ram_miss_lease_copy_wait(
+            self.page, self.state, count, self._lease_address, self._lease_c, self.go_ce
+        )
+
     def finalize(self, count, keep) -> None:
         """The sole writer of ``keep`` (D4), after every copy and acknowledgement and before the fused MoE.
 
@@ -1319,7 +1413,7 @@ class Exl3RamMissDevice:
             raise RuntimeError("this device was built without a lease block")
         self._check_buffers(count=(count, torch.int32), keep=(keep, torch.float32))
         self._kernels().exl3_ram_miss_lease_finalize(
-            self.page, self.state, count, self.go_1, self.go_2, self.violated, keep,
+            self.page, self.state, count, self.go_1, self.go_2, self.go_ce, self.violated, keep,
             self._lease_address, self._lease_d,
         )
 

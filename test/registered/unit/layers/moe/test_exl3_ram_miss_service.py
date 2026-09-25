@@ -1035,3 +1035,64 @@ def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
     service._stages_traced = True
     service._trace_stages()
     assert sent == [([{"row": 1}], [7, 3])]
+
+
+def _copy_engine_service(monkeypatch):
+    """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md 7.6)."""
+    service = module.Exl3RamMissService()
+    service.copy_engine = True
+    service.device_side = SimpleNamespace(copy_engine_captured=True)
+    armed = []
+    service.host = SimpleNamespace(arm_copy_engine=lambda: armed.append(True))
+    syncs = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: syncs.append(True))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    return service, armed, syncs
+
+
+def _batch(decode: bool):
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode))
+
+
+def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monkeypatch):
+    """Counting batches armed it inside the server's warm-up request, whose first decode steps then deadlocked;
+    eager forwards must not count, and nothing counts before a copy-engine graph was captured."""
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    service.device_side.copy_engine_captured = False
+    service._copy_engine_barrier(0, _batch(decode=True))
+    assert service._copy_decodes == 0
+    service.device_side.copy_engine_captured = True
+    for _ in range(3 * module.COPY_ENGINE_ARM_DECODES):
+        service._copy_engine_barrier(0, _batch(decode=False))
+        service._arm_copy_engine()
+    assert not armed and not syncs, "eager forwards armed the copy engine, or drained the device before arming"
+    for _ in range(module.COPY_ENGINE_ARM_DECODES - 1):
+        service._copy_engine_barrier(0, _batch(decode=True))
+        service._arm_copy_engine()
+    assert not armed
+    service._copy_engine_barrier(0, _batch(decode=True))
+    service._arm_copy_engine()
+    service._arm_copy_engine()
+    assert armed == [True] and service._copy_armed
+    service._copy_engine_barrier(0, _batch(decode=True))
+    assert not syncs, "a decode forward drained the device"
+    service._copy_engine_barrier(0, _batch(decode=False))
+    assert syncs == [True], "an eager forward did not drain the device once armed"
+
+
+def test_a_triton_module_load_drains_the_device_first_once_armed(monkeypatch):
+    """cuModuleLoadData holds the driver lock the copy thread needs and waits for the device, which may spin in a copy
+    wait for that very copy (diag arm1eager83-on). The guard drains before the load, and never inside a capture."""
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    order = []
+    load = service._copy_engine_module_load_guard(lambda *a, **k: order.append(("load", a, k)) or "handle")
+    assert load("name", b"cubin", shared=0) == "handle" and not syncs
+    service._copy_armed = True
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("sync"))
+    assert load("name", b"cubin") == "handle"
+    assert order[-2:] == ["sync", ("load", ("name", b"cubin"), {})]
+    assert service.copy_engine_module_loads == 1
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    order.clear()
+    load("name", b"cubin")
+    assert order == [("load", ("name", b"cubin"), {})], "the guard synchronized during a capture"
