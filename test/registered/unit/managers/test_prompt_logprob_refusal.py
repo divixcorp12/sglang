@@ -9,7 +9,6 @@ import unittest
 
 from sglang.srt.managers.prompt_logprobs import prompt_logprob_refusal
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -24,7 +23,8 @@ def refusal(*, mlx=False, replay=False, return_logprob=True, start=0, n=10):
     )
 
 
-class TestPromptLogprobRefusal(CustomTestCase):
+# unittest.TestCase, not CustomTestCase: sglang.test.test_utils imports pyarrow, which fails collection on divix01.
+class TestPromptLogprobRefusal(unittest.TestCase):
     def test_bounded_replay_refuses_prompt_logprobs(self):
         for start in (0, 5, 9):
             msg = refusal(replay=True, start=start)
