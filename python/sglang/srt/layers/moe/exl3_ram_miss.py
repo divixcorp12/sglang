@@ -375,6 +375,17 @@ class NativePinnedSlotTable:
     def mapping(self, num_experts: int) -> list[int]:
         return self.service.host.mapping(self._row)
 
+    # PinnedRowFills (SGLANG_DSV41_ENABLE_PREFILL_FILLS): the service's reader fills this layer's slots while the
+    # tier's host use holds the thread paused.
+    def fill_begin(self, experts, protected, fallback: bool) -> tuple[list[int], int]:
+        return self.service.host.fill_begin(self._row, experts, protected, fallback)
+
+    def fill_wait(self, rows: int) -> None:
+        self.service.host.fill_wait(rows, self.service.fill_timeout_s)
+
+    def fill_end(self) -> bool:
+        return self.service.host.fill_end()
+
     def before_host_use(self, cache) -> None:
         """Pause the thread (the service counts nesting), then, at this table's outermost
         level only, push the layer's hot set to C++ and refresh the device slot map if the
@@ -667,6 +678,8 @@ class Exl3RamMissService:
         # SGLANG_DSV41_ENABLE_NATIVE_PREFETCH (exl3_native_prefetch.py): needs the copy engine; None when off.
         self.native_prefetch = None
         self.hit_wait_ns = 100_000
+        # A prefill fill's wait gives up after the watchdog's limit, which aborts a hung fill first.
+        self.fill_timeout_s = watchdog_wait_s(2000) + 5.0
         self.hot_page = None
         self.gpu_hot_enabled = False
         self._gpu_hot_updater = None
@@ -740,6 +753,10 @@ class Exl3RamMissService:
                 )
             piece_stream = cfg.enable_ram_miss_piece_stream
             check_piece_stream(cfg, row_images=tables.row_images)
+            if cfg.enable_prefill_fills and not tables.row_images:
+                raise RuntimeError(
+                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_FILLS needs SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES"
+                )
             if lease_mode:
                 host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if two_phase:
@@ -789,6 +806,7 @@ class Exl3RamMissService:
         self.copy_engine = copy_engine
         self.native_prefetch = native_prefetch
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
+        self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
         # later is refused by register()), makes this run before that hook, so the slabs are quarantined and their

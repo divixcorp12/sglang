@@ -506,11 +506,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         source_ids = torch.unique(routed)
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         gathered = False
-        for chunk, row_of_source, rows in streamer.iter_gather_experts(source_ids):
-            gathered = True
-            experts = chunk.tolist()
-            w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source.tolist())
-            exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts)
+        # A no-op unless SGLANG_DSV41_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
+        with streamer.prefill_fills(source_ids):
+            for chunk, row_of_source, rows in streamer.iter_gather_experts(source_ids):
+                gathered = True
+                experts = chunk.tolist()
+                w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source.tolist())
+                exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts)
         get_exl3_stream_trace().record(
             layer.layer_id,
             topk_ids,

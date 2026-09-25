@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.expert_format import (
 )
 from sglang.srt.layers.moe.expert_host_tier import (
     PinnedGatherResult,
+    PinnedRowFills,
     PinnedSlotLRU,
     PinnedSlotTable,
     allocate_host_slab,
@@ -160,6 +161,11 @@ class ExpertPinnedHostCache:
     ``slot_table`` replaces the default ``PinnedSlotLRU``. Such a table chooses
     its own victims: ``is_pinned`` is then used only to size requests
     (``evictable_rows``), so the table must protect the same experts itself.
+
+    ``row_fills`` (SGLANG_DSV41_ENABLE_PREFILL_FILLS) reads missing rows in place
+    of the streamer's row source: ``ensure_rows`` reads through it, and
+    ``prefetch_rows`` starts a layer's reads ahead of its chunked gather, which
+    then waits per chunk for only its own rows. None keeps every read as it was.
     """
 
     def __init__(
@@ -171,6 +177,7 @@ class ExpertPinnedHostCache:
         is_pinned: Callable[[int], bool] | None = None,
         slot_table: PinnedSlotTable | None = None,
         placement: "Placement" = (),
+        row_fills: PinnedRowFills | None = None,
     ):
         capacity = index(capacity)
         if not 0 <= capacity <= streamer.num_experts:
@@ -241,6 +248,9 @@ class ExpertPinnedHostCache:
             else PinnedSlotLRU(capacity, is_pinned=is_pinned)
         )
         self.stats = PinnedHostCacheStats()
+        self.row_fills = row_fills
+        # The running prefetch's claim order by expert (fill_wait counts rows in that order); None when none runs.
+        self._fill_order: dict[int, int] | None = None
         streamer.pinned_host_cache = self
 
     @staticmethod
@@ -340,6 +350,9 @@ class ExpertPinnedHostCache:
         if not missing:
             return
         protected = frozenset(requested).union(int(value) for value in protected)
+        if self.row_fills is not None:
+            self._fill_rows(missing, protected)
+            return
         assignments = []
         evictions = 0
         # Assignment and read are one transaction: on any failure every slot this
@@ -368,6 +381,58 @@ class ExpertPinnedHostCache:
         self.stats.evictions += evictions
         self.stats.populated_rows += len(final_slots)
         self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
+
+    def _fill_rows(self, missing: list[int], protected: frozenset[int]) -> None:
+        """``ensure_rows`` through ``row_fills``: claim and read ``missing`` now, after any prefetch has ended."""
+        self.finish_fills()
+        slots, evictions = self.row_fills.fill_begin(missing, protected, True)
+        landed = self.row_fills.fill_end()
+        self._refresh_mapping()
+        if not landed:
+            raise RuntimeError(f"reading pinned host rows of experts {missing[: len(slots)]} failed")
+        if len(slots) < len(missing):
+            raise RuntimeError("every pinned host slot holds a protected or leased expert")
+        self.stats.evictions += evictions
+        self.stats.populated_rows += len(slots)
+        self.stats.populated_bytes += len(slots) * self.bytes_per_expert
+
+    @_host_use
+    def prefetch_rows(self, expert_ids: Sequence[int], protected: Iterable[int]) -> int:
+        """Start reading the experts of ``expert_ids`` that are not resident, in that order; returns how many.
+
+        ``row_fills`` only, inside a host use the caller holds until ``finish_fills``: the reads run while the
+        caller gathers, and ``gather_rows`` waits per chunk for only its own rows. Slots are claimed until one has
+        no victim outside ``protected``; the rest are left to ``gather_rows``' own admission.
+        """
+        self.finish_fills()
+        missing = [expert_id for expert_id in dict.fromkeys(int(e) for e in expert_ids) if expert_id not in self._lru]
+        if not missing:
+            return 0
+        slots, evictions = self.row_fills.fill_begin(missing, [int(e) for e in protected], False)
+        self._fill_order = {expert_id: position for position, expert_id in enumerate(missing[: len(slots)])}
+        self._refresh_mapping()
+        self.stats.evictions += evictions
+        self.stats.populated_rows += len(slots)
+        self.stats.populated_bytes += len(slots) * self.bytes_per_expert
+        return len(slots)
+
+    def finish_fills(self) -> None:
+        """Join the running prefetch, if any; raise if it failed (its rows that did not land were released)."""
+        if self._fill_order is None:
+            return
+        self._fill_order = None
+        if not self.row_fills.fill_end():
+            self._refresh_mapping()
+            raise RuntimeError("a prefetch of pinned host rows failed")
+
+    def _await_fills(self, expert_ids: Iterable[int]) -> None:
+        """Wait until the prefetched rows among ``expert_ids`` are in their slabs."""
+        order = self._fill_order
+        if order is None:
+            return
+        rows = max((order.get(expert_id, -1) for expert_id in expert_ids), default=-1) + 1
+        if rows:
+            self.row_fills.fill_wait(rows)
 
     @_host_use
     def copy_rows(
@@ -464,6 +529,7 @@ class ExpertPinnedHostCache:
                 name: output[start : start + chunk_rows]
                 for name, output in outputs.items()
             }
+            self._await_fills(chunk_ids)
             fallback_used = self.copy_rows(chunk, chunk_outputs) or fallback_used
             start += chunk_rows
         return PinnedGatherResult(
@@ -1565,6 +1631,38 @@ class ExpertStreamer:
             unique_miss_rows=row_count,
         )
         return compact_ids.reshape(topk_ids.shape).to(topk_ids.dtype), padded
+
+    @contextlib.contextmanager
+    def prefill_fills(self, source_ids: torch.Tensor) -> Iterator[None]:
+        """SGLANG_DSV41_ENABLE_PREFILL_FILLS: read a layer's pinned-tier misses while its chunks gather.
+
+        ``source_ids`` are the layer's distinct routed experts, gathered inside this context. The pinned tier is
+        held in one host use for the whole layer (one stream sync, one pause of its owner), the experts that miss
+        VRAM and RAM are claimed in ascending order (the chunks' order) and read on the tier's fill thread, and each
+        chunk's ``gather_rows`` waits only for its own rows. Nothing happens without the tier's ``row_fills``.
+        """
+        cache = self.pinned_host_cache
+        if cache is None or cache.row_fills is None or source_ids.numel() == 0:
+            yield
+            return
+        if self.before_eager_gather is not None:
+            # The first gather would apply a pending residency boundary; apply it before reading the hot set.
+            self.before_eager_gather()
+        ids = source_ids.long()
+        with cache.host_use():
+            hot = self.hot_cache
+            if hot is not None and hot.capacity:
+                experts, hot_slots = torch.stack((ids, hot.expert_to_slot[ids].long())).tolist()
+            else:
+                experts = ids.tolist()
+                hot_slots = [-1] * len(experts)
+            cache.prefetch_rows(
+                sorted(expert for expert, slot in zip(experts, hot_slots) if slot < 0), protected=experts
+            )
+            try:
+                yield
+            finally:
+                cache.finish_fills()
 
     def _plan_eager_routes(
         self, topk_ids: torch.Tensor, record: bool = True

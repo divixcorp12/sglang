@@ -84,6 +84,25 @@ class PinnedSlotTable(Protocol):
     def after_host_use(self, cache: Any) -> None: ...
 
 
+class PinnedRowFills(Protocol):
+    """Asynchronous reads of a layer's missing rows into its pinned slots (SGLANG_DSV41_ENABLE_PREFILL_FILLS).
+
+    Driven by ``ExpertPinnedHostCache`` inside one host use. ``fill_begin`` claims slots for ``experts`` in order,
+    until one has no victim (a ``protected`` row goes only with ``fallback``), maps them at once and starts reading;
+    it returns the claimed prefix's slots and the evictions. A claimed slot is never a victim until ``fill_end``.
+    ``fill_wait(rows)`` returns once the first ``rows`` claimed rows are in their slabs, and raises if the fill failed
+    first. ``fill_end`` joins the reads; False means the fill failed and released its rows that did not land.
+    """
+
+    def fill_begin(
+        self, experts: Sequence[int], protected: Iterable[int], fallback: bool
+    ) -> tuple[list[int], int]: ...
+
+    def fill_wait(self, rows: int) -> None: ...
+
+    def fill_end(self) -> bool: ...
+
+
 class PinnedSlotLRU:
     """Slot bookkeeping of a bounded host row cache.
 
