@@ -111,7 +111,7 @@ def load_forwards(path: str, *, allow_dropped: bool = False) -> dict:
     hot_layer_ids = header.get("hot_layer_ids") or []
     # A graph replay the capture code runs itself has no pre-forward stamp (pass id -1) and runs no
     # Python, so GraphRouteLog.warmup cannot count it: it is a capture forward, not a served token.
-    # It runs after reset_after_capture, so it does move residency (replay_direct applies it).
+    # replay_direct skips it.
     stamped = any(line.get("forward_pass_id", -1) >= 0 for line in graph)
     events = []
     for line in graph:
@@ -196,8 +196,9 @@ class DirectInsertReplay:
 
     Each graph decode forward applies the boundary its predecessor left pending, then every layer's
     gather sends its misses into the layer's victim shortlist: the ``miss_rows`` resident slots ranked
-    lowest at that boundary by (routed in the closing window, insert score, -expert), less any slot this
-    forward hits. Insert scores decay by ``decay`` per token and add each window's route counts. An eager
+    lowest by (routed in the open window, insert score, -expert), less any slot this forward hits. The
+    ranking runs at the start of every graph forward even when no boundary is due (after a prefill),
+    over the scores as they stand, so the prefill's routes rank as routed before they are scored. Insert scores decay by ``decay`` per token and add each window's route counts. An eager
     forward inserts nothing; it adds its route counts, and its first layer's first gather applies a
     decode boundary still pending (after that layer recorded its counts); a prefill of at least
     ``update_prefill_tokens`` tokens is a boundary of its own. The clocks are the device mirror of
@@ -249,14 +250,18 @@ class DirectInsertReplay:
         )
         return (free + held)[: self.miss_rows]
 
-    def _apply(self) -> None:
-        self.scores = self.scores * self._decay(self.tokens) + self.route_counts
+    def _apply(self, gate: bool = True) -> None:
+        """GpuResidencyUpdater._apply: the scores, counts and clocks move only under ``gate``, but the
+        victim shortlist is re-ranked on every call, with the counts not yet applied as ``routed``."""
+        if gate:
+            self.scores = self.scores * self._decay(self.tokens) + self.route_counts
         self.routed = self.route_counts > 0
-        self.route_counts = np.zeros_like(self.route_counts)
         self.shortlist = [self._rank(row) for row in range(len(self.layer_ids))]
-        self.tokens = 0
-        self.decode_forwards = 0
-        self.boundary_pending = False
+        if gate:
+            self.route_counts = np.zeros_like(self.route_counts)
+            self.tokens = 0
+            self.decode_forwards = 0
+            self.boundary_pending = False
 
     def _count(self, tokens: int, decode: bool) -> None:
         self.tokens += tokens
@@ -267,14 +272,12 @@ class DirectInsertReplay:
     def _flush(self) -> None:
         if self.host_pending:
             self.host_pending = False
-            if self.boundary_pending:
-                self._apply()
+            self._apply(self.boundary_pending)
 
     def graph_forward(self, routes: dict[int, list[int]], phase: str = "decode") -> dict[int, int]:
         """One forward served by the graph gather (a replay, or a one-token extend run eagerly through
         it); returns each layer's misses (its plan count)."""
-        if self.boundary_pending:
-            self._apply()
+        self._apply(self.boundary_pending)  # on_graph_forward: re-ranks even when no boundary is due
         self._count(1, decode=True)  # on_graph_forward counts every graph-served forward as decode
         misses = {}
         for layer, experts in routes.items():
@@ -348,9 +351,8 @@ def replay_direct(
            "hot_checked": 0, "hot_mismatched": 0, "first_hot_mismatch": None}
     for forward in loaded["forwards"]:
         if forward["phase"] == "capture":
-            # Replayed after reset_after_capture: its dummy routes count in the next boundary's scores
-            # and routed flags, so it moves residency like a decode forward. It is not a served token.
-            sim.graph_forward(forward["routes"], "decode")
+            # Runs before discard_graph_capture_routes: its counts are dropped, and any insert it made is
+            # in the first logged hot set (smoke6 seq 8: no misses, no effect on the next ranking).
             continue
         if forward["kind"] == "graph":
             if forward.get("hot") is not None:
