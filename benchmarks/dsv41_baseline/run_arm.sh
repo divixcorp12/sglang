@@ -25,6 +25,10 @@
 # generations.json first (`python -c "import generations; generations.register(TREE,
 # LABEL)"`) or the arm refuses to start, matching task1-baseline-arms.sh's
 # generation_gate.
+# Env: NSYS_TRACE=1 captures the timed set with Nsight Systems (report under
+# NSYS_OUT_DIR, default /mnt/nvme1/dsv41-nsys; anything off /mnt/nvme1 is refused).
+# NSYS_CUDA_GRAPH_TRACE=graph|node (default graph) picks --cuda-graph-trace; graph is
+# refused when the arm's env turns on SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.
 #
 # Cost: ~200 s server startup + a readiness loop (clock stability + JIT compile
 # settling; the smoke launch saw a 34 s Triton compile land mid-decode after /health
@@ -211,17 +215,39 @@ for k, v in json.load(open('$expected_env_path')).items():
 # --- optional Nsight Systems capture, gated so the default arm is untraced ---
 #     NSYS_TRACE=1 wraps the launch in `nsys launch`, which starts the application
 #     immediately but collects nothing until `nsys start`. That is exactly the shape
-#     asked for: warm-up runs untraced, the timed set is captured. Graph granularity is
-#     mandatory, not a preference -- see CLAUDE.md: `node` makes cudaGraphLaunch cost
-#     ~0.77 us per traced node and fabricates a ~6 ms idle gap at the end of every
-#     decode step. Read no per-kernel ranking out of a graph-mode report either; its
-#     kernel table omits the graph body.
+#     asked for: warm-up runs untraced, the timed set is captured.
+#     NSYS_CUDA_GRAPH_TRACE=graph|node picks --cuda-graph-trace (nsys_capture.py). Graph is
+#     the default and the only mode to read ms/token or step-tail idle from -- see CLAUDE.md:
+#     `node` makes cudaGraphLaunch cost ~0.77 us per traced node and fabricates a ~6 ms idle
+#     gap at the end of every decode step. Node is for per-kernel attribution only, since a
+#     graph-mode report's kernel table omits the graph body. Graph is refused when the arm
+#     runs the RAM-miss copy engine: graph-mode tracing deadlocks its copy wait.
 nsys_session=""
 if [ "${NSYS_TRACE:-0}" = 1 ]; then
     command -v nsys >/dev/null 2>&1 || abort "NSYS_TRACE=1 but nsys is not on PATH"
+    nsys_graph_trace=$(pyrun -c "
+import json, sys
+import nsys_capture
+try:
+    print(nsys_capture.graph_trace_mode(sys.argv[1], json.load(open('$expected_env_path'))))
+except ValueError as error:
+    raise SystemExit(f'REFUSE: {error}')
+" "${NSYS_CUDA_GRAPH_TRACE:-}") || abort "$arm: bad NSYS_CUDA_GRAPH_TRACE"
     nsys_session="dsv41-$arm-$$"
-    nsys_out_dir=${NSYS_OUT_DIR:-/mnt/nvme1/dsv41-nsys}
+    nsys_out_dir=$(pyrun -c "
+import sys
+import nsys_capture
+try:
+    print(nsys_capture.check_report_dir(sys.argv[1]))
+except ValueError as error:
+    raise SystemExit(f'REFUSE: {error}')
+" "${NSYS_OUT_DIR:-/mnt/nvme1/dsv41-nsys}") || abort "$arm: bad NSYS_OUT_DIR"
     mkdir -p "$nsys_out_dir" || abort "cannot create $nsys_out_dir"
+    # nsys wants ~200 MiB of scratch; divix01's /tmp is on the ~88% full root volume, and
+    # exhausting it kills the server mid-run and leaves a ~361 KB report (CLAUDE.md).
+    NSYS_TMPDIR=$(pyrun -c "import nsys_capture; print(nsys_capture.NSYS_TMPDIR)")
+    export NSYS_TMPDIR
+    mkdir -p "$NSYS_TMPDIR" || abort "cannot create NSYS_TMPDIR=$NSYS_TMPDIR"
     nsys_report=$nsys_out_dir/$arm-$(date +%Y%m%d-%H%M%S)
     # NSYS_LAUNCH_ARGS adds application-scope options, which is where --cudabacktrace and
     # --python-backtrace must go (nsys calls them "Application scope"); both also require
@@ -231,8 +257,9 @@ if [ "${NSYS_TRACE:-0}" = 1 ]; then
     nsys_launch_extra=(${NSYS_LAUNCH_ARGS:-})
     nsys_prefix=(nsys launch --session-new="$nsys_session"
                  --trace=cuda,nvtx,osrt
-                 --cuda-graph-trace=graph
+                 --cuda-graph-trace="$nsys_graph_trace"
                  "${nsys_launch_extra[@]}")
+    echo "nsys: --cuda-graph-trace=$nsys_graph_trace NSYS_TMPDIR=$NSYS_TMPDIR report dir=$nsys_out_dir"
 else
     nsys_prefix=()
 fi
@@ -480,10 +507,25 @@ done
 if [ -n "$nsys_session" ]; then
     # Stop before the server is torn down; nsys writes the report on stop, and a killed
     # application loses it. This is the one path that stops rather than cancels.
+    # Then wait for the report file to exist and stop growing before stop_server runs: a
+    # node-mode report of a full arm is hundreds of MB, and killing the server under a
+    # report still being written is how other scripts lost theirs.
     nsys stop --session="$nsys_session" || echo "WARNING: nsys stop failed for $nsys_session"
     nsys_session=""
-    echo "nsys capture written: $nsys_report.nsys-rep"
-    ls -la "$nsys_report.nsys-rep" 2>/dev/null || echo "WARNING: no report at $nsys_report.nsys-rep"
+    report_size=-1
+    for _ in $(seq 1 180); do
+        size=$(stat -c %s "$nsys_report.nsys-rep" 2>/dev/null || echo -1)
+        [ "$size" -gt 0 ] && [ "$size" = "$report_size" ] && break
+        report_size=$size
+        sleep 10
+    done
+    if [ "$report_size" -gt 0 ]; then
+        echo "nsys capture written: $nsys_report.nsys-rep ($report_size bytes)"
+        # ~361 KB is the signature of nsys running out of scratch mid-run (CLAUDE.md).
+        [ "$report_size" -ge 10000000 ] || echo "WARNING: nsys report is only $report_size bytes; check NSYS_TMPDIR space and $log"
+    else
+        echo "WARNING: no report at $nsys_report.nsys-rep after 30 min"
+    fi
 fi
 
 # --- residency after the timed set (whole-arm, not per-session: run_capture_sessions.py
