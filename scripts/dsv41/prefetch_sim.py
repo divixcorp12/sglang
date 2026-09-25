@@ -252,7 +252,9 @@ class NoisyOracle(Predictor):
     layer's true routes that is not resident (or, once none is left, names nothing: a correct "no
     prefetch"), and otherwise a random expert that is neither routed nor resident: a wrong prefetch. It
     reads residency, so the measured precision of the rows it prefetches is at most ``precision`` (lower
-    where a layer has fewer misses than draws). At 1.0 it is the oracle; at 0.0 every row is wasted.
+    where a layer has fewer misses than draws). Each resident true route is also named, first, with
+    probability ``precision``, as a real ranking would name it: named rows are never prefetch victims.
+    At 1.0 it is the oracle; at 0.0 every row is wasted.
     """
 
     def __init__(self, stream: DecodeStream, precision: float, k: int, seed: int = 0) -> None:
@@ -269,8 +271,10 @@ class NoisyOracle(Predictor):
         resident = self.sim.resident(layer)
         routed = [int(e) for e in self.stream.routes[step, target]]
         missing = [e for e in routed if e not in resident]
-        out = []
-        for _ in range(self.k):
+        out = [e for e in routed if e in resident and self.rng.random() < self.precision]
+        drawn = 0
+        while drawn < self.k:
+            drawn += 1
             if self.rng.random() < self.precision:
                 if missing:
                     out.append(missing.pop(0))
