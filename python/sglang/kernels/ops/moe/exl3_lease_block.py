@@ -31,10 +31,12 @@ HEADER = {
     "slot_gen_offset": 32,
     "d_offset": 36,
     "piece_offset": 40,
+    "copy_offset": 44,
 }
 MAGIC = 0x4C534531  # "LSE1"
-# 2: StreamProbe appended to area D (piece streaming). A block of another version is refused at attach.
-ABI_VERSION = 2
+# 2: StreamProbe appended to area D (piece streaming). 3: LaneRequest grown to 128 bytes (destination slots and
+# flags) and area C (CopyDone) appended (copy engine). A block of another version is refused at attach.
+ABI_VERSION = 3
 
 ROW_TABLE = HEADER_BYTES  # rows * {u32 slot_gen_base; u32 capacity}
 ROW_TABLE_ENTRY_BYTES = 8
@@ -49,8 +51,11 @@ SLOT_GEN = ROW_RESULT + RING * LANES * ROW_RESULT_BYTES
 
 # Area D, device-written, at d_offset: LaneRequest[RING], LaneAck[RING][LANES], Terminal[RING], StreamProbe[RING].
 LANE_REQUEST = 0
-LANE_REQUEST_BYTES = 64
-LANE_REQUEST_FIELDS = {"gen": 0, "count": 8, "row": 12, "expert": 16}
+LANE_REQUEST_BYTES = 128
+# expert[LANES] and dst_slot[LANES] are int32 per lane; flags is a u32 of LANE_REQUEST_FLAGS bits.
+LANE_REQUEST_FIELDS = {"gen": 0, "count": 8, "row": 12, "expert": 16, "dst_slot": 48, "flags": 80}
+# The service may copy this request's resident lanes with its copy engine (the device passes it only when capturing).
+LANE_REQUEST_FLAG_COPY_ENGINE = 1
 LANE_ACK = LANE_REQUEST + RING * LANE_REQUEST_BYTES
 LANE_ACK_BYTES = 8
 TERMINAL = LANE_ACK + RING * LANES * LANE_ACK_BYTES
@@ -70,9 +75,17 @@ PIECE_MASK_LINE_BYTES = 128
 PIECE_MASK_BYTES = 8  # one uint64 per word
 AREA_PIECE_MASK_BYTES = RING * LANES * PIECE_MASK_LINE_BYTES
 
+# Area C, service-written, at copy_offset (copy engine, LEASE_PROTOCOL.md 7.6): CopyDone[RING], the lane mask, then
+# tagged(COPIED, generation) stored last once the service observed the request's copy-engine copies complete.
+COPY_DONE_BYTES = 16
+COPY_DONE_FIELDS = {"mask": 0, "gen": 8}
+AREA_COPY_DONE_BYTES = RING * COPY_DONE_BYTES
+
 # Tags of the 8-bit field above the 56-bit generation.
 READY = 1  # RowResult.ready
 LOADING = 2  # RowResult.ready: leased, still loading (piece-streaming plan; task 1)
+COPYING = 3  # RowResult.ready: leased, the service's copy engine writes the lane's destination slot
+COPIED = 1  # CopyDone.gen
 CONSUMED, VIOLATED = 1, 2  # LaneAck
 DEMAND_TAG = 1  # LaneRequest.gen, written by the post kernel
 TERMINAL_TAG = 1  # Terminal.gen, written by the wait kernel
@@ -107,6 +120,7 @@ class LeaseLayout:
     slot_gen_offset: int  # bytes from the block base
     d_offset: int  # bytes from the block base to area D
     piece_offset: int  # bytes from the block base to area P (PieceMask)
+    copy_offset: int  # bytes from the block base to area C (CopyDone)
     total_bytes: int
 
 
@@ -123,6 +137,7 @@ def lease_layout(capacities: Sequence[int]) -> LeaseLayout:
         total_slots += capacity
     d_offset = _align(SLOT_GEN + 4 * total_slots)
     piece_offset = _align(d_offset + AREA_D_BYTES)
+    copy_offset = _align(piece_offset + AREA_PIECE_MASK_BYTES)
     return LeaseLayout(
         rows=len(capacities),
         capacities=capacities,
@@ -130,7 +145,8 @@ def lease_layout(capacities: Sequence[int]) -> LeaseLayout:
         slot_gen_offset=SLOT_GEN,
         d_offset=d_offset,
         piece_offset=piece_offset,
-        total_bytes=_align(piece_offset + AREA_PIECE_MASK_BYTES),
+        copy_offset=copy_offset,
+        total_bytes=_align(copy_offset + AREA_COPY_DONE_BYTES),
     )
 
 

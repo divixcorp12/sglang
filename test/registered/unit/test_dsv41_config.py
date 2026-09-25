@@ -30,6 +30,7 @@ def test_defaults_match_the_env_declarations():
         ram_miss_hit_wait_us=100,
         enable_ram_miss_piece_stream=False,
         enable_ram_miss_row_images=False,
+        enable_ram_miss_copy_engine=False,
         torch_prefill_indexer=False,
     )
 

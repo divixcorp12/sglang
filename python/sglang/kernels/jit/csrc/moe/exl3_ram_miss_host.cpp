@@ -9,6 +9,7 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/function.h>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <liburing.h>
@@ -21,14 +22,17 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -36,6 +40,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -2682,6 +2687,7 @@ constexpr int64_t kLeaseHeaderShutdown = 20;
 constexpr int64_t kLeaseHeaderSlotGenOffset = 32;
 constexpr int64_t kLeaseHeaderDOffset = 36;
 constexpr int64_t kLeaseHeaderPieceOffset = 40;
+constexpr int64_t kLeaseHeaderCopyOffset = 44;
 constexpr int64_t kLeaseRowTable = 128;
 constexpr int64_t kLeaseRowResult = 4096;
 constexpr int64_t kLeaseRowResultBytes = 32;
@@ -2691,11 +2697,17 @@ constexpr int64_t kLeaseRrHostSlot = 12;
 constexpr int64_t kLeaseRrExpert = 16;
 constexpr int64_t kLeaseSlotGen = kLeaseRowResult + kLeaseRing * kLeaseLanes * kLeaseRowResultBytes;
 constexpr int64_t kLeaseLaneRequest = 0;
-constexpr int64_t kLeaseLaneRequestBytes = 64;
+constexpr int64_t kLeaseLaneRequestBytes = 128;
 constexpr int64_t kLeaseLrGen = 0;
 constexpr int64_t kLeaseLrCount = 8;
 constexpr int64_t kLeaseLrRow = 12;
 constexpr int64_t kLeaseLrExpert = 16;
+constexpr int64_t kLeaseLrDst = 48;
+constexpr int64_t kLeaseLrFlags = 80;
+constexpr uint32_t kLeaseLrFlagCopyEngine = 1;
+static_assert(kLeaseLrExpert + 4 * kLeaseLanes == kLeaseLrDst, "LaneRequest: dst_slot[] follows expert[]");
+static_assert(kLeaseLrDst + 4 * kLeaseLanes == kLeaseLrFlags, "LaneRequest: flags follow dst_slot[]");
+static_assert(kLeaseLrFlags + 4 <= kLeaseLaneRequestBytes, "LaneRequest: the payload fits one record");
 constexpr int64_t kLeaseLaneAck = kLeaseLaneRequest + kLeaseRing * kLeaseLaneRequestBytes;
 constexpr int64_t kLeaseLaneAckBytes = 8;
 constexpr int64_t kLeaseTerminal = kLeaseLaneAck + kLeaseRing * kLeaseLanes * kLeaseLaneAckBytes;
@@ -2717,6 +2729,13 @@ constexpr int64_t kLeasePieceMaskLineBytes = 128;
 constexpr int64_t kLeasePieceMaskBytes = 8;  // one uint64 per word
 constexpr int64_t kLeaseAreaPieceMaskBytes = kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
 static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
+// Area C, service-written, at kLeaseHeaderCopyOffset: CopyDone[kLeaseRing], {u32 lane mask; u32 reserved; u64
+// tagged(kLeaseTagCopied, generation)}. Only the copy-engine thread writes it, after it observed the copies complete.
+constexpr int64_t kLeaseCopyDoneBytes = 16;
+constexpr int64_t kLeaseCdMask = 0;
+constexpr int64_t kLeaseCdGen = 8;
+constexpr int64_t kLeaseAreaCopyDoneBytes = kLeaseRing * kLeaseCopyDoneBytes;
+static_assert(kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes <= 4096, "area D fits one page");
 
 // kQuarantine (piece streaming only): a slot whose read failed while a lane still leased it under tag LOADING. Its
 // mapping is cleared on entry, it is never taken, evicted or counted as a victim, and it becomes kFree when its last
@@ -2727,6 +2746,9 @@ enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2, kQuarantine = 3 };
 // a miss lane granted at reservation, whose pieces become readable bit by bit through its PieceMask word.
 constexpr uint64_t kLeaseTagReady = 1;
 constexpr uint64_t kLeaseTagLoading = 2;
+// A hit lane the copy-engine thread copies into its destination slot; the device neither copies nor acknowledges it.
+constexpr uint64_t kLeaseTagCopying = 3;
+constexpr uint64_t kLeaseTagCopied = 1;  // CopyDone
 
 enum Counter : int {
   kServedRequests = 0,
@@ -2757,6 +2779,16 @@ enum Counter : int {
   kPieceStreamRefused,   // requests refused because piece streaming is on without two-phase and lease mode
   kPiecePublishRefused,  // piece publishes a readiness word refused, over the reader's life (each failed its read)
   kSlotsQuarantined,     // piece streaming: leased slots of a failed read put in kQuarantine instead of released
+  kLeasesCopied,         // copy engine: released on the service's own observation that the lane's copy completed
+  kCopyJobs,             // copy engine: requests whose COPYING lanes were handed to the copy thread
+  kCopyLanes,            // ... and their lanes
+  kCopyBytes,            // bytes the copy thread issued
+  kCopyIssueNs,          // host ns in the copy thread's CUDA calls that issue copies and record events, summed
+  kCopyLatencyNs,        // submit (the grant) to completion observed, summed over jobs
+  kCopyLatencyMaxNs,
+  kCopyFallbacks,        // hit lanes published READY while the copy engine was armed (flag off, no table, bad slot)
+  kCopyErrors,           // CUDA errors on the copy thread: the page is fatal and the leases stay held
+  kCopyGenerationMismatches,  // a completed lane whose slot generation moved: fatal, CopyDone never published
   kCounterCount,
 };
 
@@ -2817,14 +2849,18 @@ struct Request {
   // Lease mode: the device's lane list and 56-bit request generation, from the lane request (not the record).
   uint64_t gen = 0;
   std::vector<int32_t> lane_experts;
+  std::vector<int32_t> lane_dst;  // the plan's destination slot per lane, -1 unknown
+  uint32_t lane_flags = 0;        // kLeaseLrFlag*
 };
 
 // The service's private account of one request's leases, by request slot (LEASE_PROTOCOL.md 5.2).
 struct LaneLease {
-  uint8_t state = 0;  // 0 none, 1 granted, 2 acknowledged, 3 voided by a terminal
+  uint8_t state = 0;  // 0 none, 1 granted, 2 acknowledged (or its copy-engine copy completed), 3 voided by a terminal
   int32_t slot = -1;
   uint32_t slot_generation = 0;
   bool counted = false;  // a second signal for this lane was already counted
+  // Published COPYING: only the copy thread's observed completion releases it; LaneAck and Terminal never do.
+  bool copy_engine = false;
 };
 
 struct Outstanding {
@@ -2913,6 +2949,440 @@ class StageRing {
   int64_t unreported_ = 0;  // producer only: drops since the last record that got in
 };
 
+// ---- Copy engine (LEASE_PROTOCOL.md 7.6) ----
+
+struct CopyLane {
+  int32_t lane = 0;
+  int32_t host_slot = 0;
+  int32_t dst_slot = 0;
+  uint32_t slot_generation = 0;
+};
+
+// One request's COPYING lanes, handed from the grant to the copy thread.
+struct CopyJob {
+  uint64_t gen = 0;
+  int64_t idx = 0;
+  int64_t row = 0;
+  uint32_t mask = 0;
+  int count = 0;
+  CopyLane lanes[kLeaseLanes];
+  int64_t submit_ns = 0;
+  int64_t token = -1;  // the backend's completion marker, recorded after the job's last copy
+};
+
+// One entry of a row's copy table: C1's (source slab, destination tensor, row bytes); lane rows index both.
+struct CopyEntry {
+  uint64_t src = 0;
+  uint64_t dst = 0;
+  int64_t bytes = 0;
+};
+
+// What the copy thread drives: issue copies in order, mark the point after them, and ask whether a mark is complete.
+// Every call is made on the copy thread only.
+class CopyBackend {
+ public:
+  static constexpr int kDone = 0;
+  static constexpr int kPending = 1;
+  virtual ~CopyBackend() = default;
+  virtual std::string init() = 0;  // empty on success
+  virtual int issue(uint64_t dst, uint64_t src, int64_t bytes) = 0;  // 0 or an error code
+  virtual int mark(int64_t* token) = 0;
+  virtual int query(int64_t token) = 0;  // kDone, kPending, or an error code (negative for the host backend)
+  virtual void shutdown(bool idle) = 0;
+};
+
+// The CUDA driver, resolved from libcuda.so.1 when the copy engine is enabled, so this module still builds and loads
+// without a CUDA toolkit. It calls cuMemcpyAsync, cuEventRecord and cuEventQuery on its own non-blocking stream, and
+// nothing that waits on another stream, a graph launch or the device (no synchronize, no module load, no allocation).
+class CudaCopyBackend : public CopyBackend {
+ public:
+  explicit CudaCopyBackend(int device) : device_(device) {}
+
+  std::string init() override {
+    void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (lib == nullptr) lib = dlopen("libcuda.so.1", RTLD_NOW);
+    if (lib == nullptr) return "cannot open libcuda.so.1";
+    bool ok = true;
+    auto get = [&](auto& fn, const char* name) {
+      fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
+      ok = ok && fn != nullptr;
+    };
+    get(cu_init_, "cuInit");
+    get(cu_device_get_, "cuDeviceGet");
+    get(cu_primary_retain_, "cuDevicePrimaryCtxRetain");
+    get(cu_primary_release_, "cuDevicePrimaryCtxRelease_v2");
+    get(cu_ctx_set_current_, "cuCtxSetCurrent");
+    get(cu_stream_create_, "cuStreamCreate");
+    get(cu_stream_destroy_, "cuStreamDestroy_v2");
+    get(cu_event_create_, "cuEventCreate");
+    get(cu_event_destroy_, "cuEventDestroy_v2");
+    get(cu_event_record_, "cuEventRecord");
+    get(cu_event_query_, "cuEventQuery");
+    get(cu_memcpy_async_, "cuMemcpyAsync");
+    if (!ok) return "libcuda.so.1 lacks a driver entry point the copy engine needs";
+    if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
+    if (int r = cu_device_get_(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
+    // The primary context: the one PyTorch uses, so the slabs' registrations and the destinations are valid here.
+    if (int r = cu_primary_retain_(&context_, cu_device_)) return "cuDevicePrimaryCtxRetain failed: " + std::to_string(r);
+    retained_ = true;
+    if (int r = cu_ctx_set_current_(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
+    constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING: no implicit sync with the legacy stream
+    if (int r = cu_stream_create_(&stream_, kNonBlocking)) return "cuStreamCreate failed: " + std::to_string(r);
+    constexpr unsigned kDisableTiming = 2;  // CU_EVENT_DISABLE_TIMING
+    for (auto& event : events_) {
+      if (int r = cu_event_create_(&event, kDisableTiming)) return "cuEventCreate failed: " + std::to_string(r);
+    }
+    return "";
+  }
+
+  int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
+    return cu_memcpy_async_(dst, src, static_cast<size_t>(bytes), stream_);
+  }
+
+  // Events are reused round robin: there are more of them than jobs can be outstanding (one per request slot).
+  int mark(int64_t* token) override {
+    const int64_t index = next_event_++ % static_cast<int64_t>(events_.size());
+    *token = index;
+    return cu_event_record_(events_[index], stream_);
+  }
+
+  int query(int64_t token) override {
+    constexpr int kNotReady = 600;  // CUDA_ERROR_NOT_READY
+    const int r = cu_event_query_(events_[token]);
+    return r == 0 ? kDone : r == kNotReady ? kPending : r;
+  }
+
+  // After an error, or with copies in flight, keep the stream, events and context: a copy may still read a slab.
+  void shutdown(bool idle) override {
+    if (!idle) return;
+    for (auto& event : events_) {
+      if (event != nullptr) cu_event_destroy_(event);
+    }
+    if (stream_ != nullptr) cu_stream_destroy_(stream_);
+    if (retained_) cu_primary_release_(cu_device_);
+  }
+
+ private:
+  int device_;
+  int cu_device_ = 0;
+  void* context_ = nullptr;
+  void* stream_ = nullptr;
+  bool retained_ = false;
+  std::array<void*, 2 * kDemandRecords> events_{};
+  int64_t next_event_ = 0;
+  int (*cu_init_)(unsigned) = nullptr;
+  int (*cu_device_get_)(int*, int) = nullptr;
+  int (*cu_primary_retain_)(void**, int) = nullptr;
+  int (*cu_primary_release_)(int) = nullptr;
+  int (*cu_ctx_set_current_)(void*) = nullptr;
+  int (*cu_stream_create_)(void**, unsigned) = nullptr;
+  int (*cu_stream_destroy_)(void*) = nullptr;
+  int (*cu_event_create_)(void**, unsigned) = nullptr;
+  int (*cu_event_destroy_)(void*) = nullptr;
+  int (*cu_event_record_)(void*, void*) = nullptr;
+  int (*cu_event_query_)(void*) = nullptr;
+  int (*cu_memcpy_async_)(uint64_t, uint64_t, size_t, void*) = nullptr;
+};
+
+// Test only (CPU): "copies" between host buffers. A mark completes only once the test has released it, and its
+// copies land then, so a CopyDone published before its release is visible as bytes that are not there yet.
+class HostCopyBackend : public CopyBackend {
+ public:
+  std::string init() override {
+    return "";
+  }
+
+  int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (fail_issue_) return -1;
+    pending_.push_back(CopyEntry{src, dst, bytes});
+    return 0;
+  }
+
+  int mark(int64_t* token) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    marks_.push_back(std::move(pending_));
+    pending_.clear();
+    *token = static_cast<int64_t>(marks_.size()) - 1;
+    return 0;
+  }
+
+  int query(int64_t token) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (fail_query_) return -2;
+    if (token < completed_) return kDone;
+    if (token != completed_ || released_ <= completed_) return kPending;  // one stream: marks complete in order
+    for (const CopyEntry& copy : marks_[token]) {
+      std::memcpy(reinterpret_cast<void*>(copy.dst), reinterpret_cast<const void*>(copy.src), copy.bytes);
+    }
+    ++completed_;
+    return kDone;
+  }
+
+  void shutdown(bool) override {}
+
+  // Lets `marks` more marks complete; negative: every mark, from now on.
+  void release(int64_t marks) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    released_ = marks < 0 ? INT64_MAX : released_ + marks;
+  }
+
+  void fail(bool issue, bool query) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    fail_issue_ = issue;
+    fail_query_ = query;
+  }
+
+  int64_t marked() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return static_cast<int64_t>(marks_.size());
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<CopyEntry> pending_;
+  std::vector<std::vector<CopyEntry>> marks_;
+  int64_t completed_ = 0;
+  int64_t released_ = 0;
+  bool fail_issue_ = false;
+  bool fail_query_ = false;
+};
+
+// The copy thread: issues each job's copies on the backend's stream, records one mark after them, polls marks in
+// order and hands each completed job to `complete`. A backend error hands every job it still holds to `fail` and
+// stops issuing: nothing it issued may be assumed complete, so none of those leases is released (E5).
+class CopyEngine {
+ public:
+  using Handler = std::function<void(const CopyJob&)>;
+  using Failure = std::function<void(const CopyJob&, int)>;
+
+  CopyEngine(std::unique_ptr<CopyBackend> backend, int64_t rows, int64_t spin_ns, std::atomic<int64_t>* counters,
+             Handler complete, Failure fail)
+      : backend_(std::move(backend)),
+        tables_(static_cast<size_t>(rows)),
+        spin_ns_(spin_ns),
+        counters_(counters),
+        complete_(std::move(complete)),
+        fail_(std::move(fail)) {}
+
+  ~CopyEngine() {
+    stop(5'000'000'000LL);
+  }
+
+  // Starts the thread and returns once the backend is initialised on it; throws with the backend's error.
+  void start() {
+    thread_ = std::thread([this] { run(); });
+    std::unique_lock<std::mutex> lock(mutex_);
+    ready_cv_.wait(lock, [this] { return started_; });
+    if (!init_error_.empty()) {
+      lock.unlock();
+      stop(0);
+      throw std::runtime_error("exl3 RAM miss copy engine: " + init_error_);
+    }
+  }
+
+  // Row `row`'s copy table and the number of destination rows each entry's tensor holds. Once per row.
+  void set_table(int64_t row, std::vector<CopyEntry> entries, int64_t dst_rows) {
+    if (row < 0 || row >= static_cast<int64_t>(tables_.size())) throw std::runtime_error("copy table row out of range");
+    Table& table = tables_[row];
+    if (table.ready.load(std::memory_order_acquire)) throw std::runtime_error("copy table already set for this row");
+    table.entries = std::move(entries);
+    table.dst_rows = dst_rows;
+    table.ready.store(true, std::memory_order_release);
+  }
+
+  bool eligible(int64_t row, int32_t dst_slot) const {
+    if (row < 0 || row >= static_cast<int64_t>(tables_.size())) return false;
+    const Table& table = tables_[row];
+    return table.ready.load(std::memory_order_acquire) && !table.entries.empty() && dst_slot >= 0 &&
+           dst_slot < table.dst_rows;
+  }
+
+  void submit(const CopyJob& job) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      queue_.push_back(job);
+      ++outstanding_;
+    }
+    work_cv_.notify_one();
+  }
+
+  // No job queued, in flight or still being handed to `complete`.
+  bool idle() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return outstanding_ == 0;
+  }
+
+  bool wait_idle(int64_t deadline_ns) {
+    while (!idle()) {
+      if (now_ns() > deadline_ns) return false;
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    return true;
+  }
+
+  // Joins the thread once it has seen every in-flight job complete, or `drain_ns` passed.
+  void stop(int64_t drain_ns) {
+    if (!thread_.joinable()) return;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stop_ = true;
+      drain_deadline_ = now_ns() + drain_ns;
+    }
+    work_cv_.notify_one();
+    thread_.join();
+  }
+
+  HostCopyBackend* host_backend() {
+    return dynamic_cast<HostCopyBackend*>(backend_.get());
+  }
+
+  // Test only: one more copy of `bytes` issued ahead of every job's own, so each job completes that much later.
+  void set_ballast(uint64_t dst, uint64_t src, int64_t bytes) {
+    ballast_dst_.store(dst);
+    ballast_src_.store(src);
+    ballast_bytes_.store(bytes);
+  }
+
+ private:
+  struct Table {
+    std::vector<CopyEntry> entries;
+    int64_t dst_rows = 0;
+    std::atomic<bool> ready{false};
+  };
+
+  void run() {
+    pthread_setname_np(pthread_self(), "exl3-copy-eng");
+    const std::string error = backend_->init();
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      init_error_ = error;
+      started_ = true;
+    }
+    ready_cv_.notify_all();
+    if (!error.empty()) return;
+    std::deque<CopyJob> in_flight;
+    int64_t last_active = now_ns();
+    while (true) {
+      std::deque<CopyJob> fresh;
+      bool stopping = false;
+      int64_t drain_deadline = 0;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        fresh.swap(queue_);
+        stopping = stop_;
+        drain_deadline = drain_deadline_;
+      }
+      for (CopyJob& job : fresh) {
+        if (broken_ != 0) {
+          finish_failed(job, broken_);
+          continue;
+        }
+        const int error_code = issue(job);
+        if (error_code != 0) {
+          broken_ = error_code;
+          finish_failed(job, error_code);
+          continue;
+        }
+        in_flight.push_back(job);
+      }
+      bool progressed = !fresh.empty();
+      while (!in_flight.empty() && broken_ == 0) {
+        const int state = backend_->query(in_flight.front().token);
+        if (state == CopyBackend::kPending) break;
+        if (state != CopyBackend::kDone) {
+          broken_ = state;
+          break;
+        }
+        const CopyJob job = in_flight.front();
+        in_flight.pop_front();
+        record_latency(job);
+        complete_(job);
+        finish();
+        progressed = true;
+      }
+      if (broken_ != 0) {
+        while (!in_flight.empty()) {
+          finish_failed(in_flight.front(), broken_);
+          in_flight.pop_front();
+        }
+      }
+      if (stopping && (in_flight.empty() || now_ns() > drain_deadline)) break;
+      if (progressed) {
+        last_active = now_ns();
+      } else if (!in_flight.empty() || now_ns() - last_active < spin_ns_) {
+        _mm_pause();
+      } else {
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_cv_.wait_for(lock, std::chrono::milliseconds(1), [this] { return !queue_.empty() || stop_; });
+      }
+    }
+    backend_->shutdown(in_flight.empty() && broken_ == 0);
+  }
+
+  int issue(CopyJob& job) {
+    const Table& table = tables_[job.row];
+    const int64_t start = now_ns();
+    int64_t bytes = 0;
+    if (const int64_t ballast = ballast_bytes_.load(); ballast > 0) {
+      if (const int r = backend_->issue(ballast_dst_.load(), ballast_src_.load(), ballast)) return r;
+    }
+    for (int i = 0; i < job.count; ++i) {
+      const CopyLane& lane = job.lanes[i];
+      for (const CopyEntry& entry : table.entries) {
+        const uint64_t dst = entry.dst + static_cast<uint64_t>(lane.dst_slot) * static_cast<uint64_t>(entry.bytes);
+        const uint64_t src = entry.src + static_cast<uint64_t>(lane.host_slot) * static_cast<uint64_t>(entry.bytes);
+        if (const int r = backend_->issue(dst, src, entry.bytes)) return r;
+        bytes += entry.bytes;
+      }
+    }
+    const int r = backend_->mark(&job.token);
+    counters_[kCopyIssueNs].fetch_add(now_ns() - start);
+    counters_[kCopyBytes].fetch_add(bytes);
+    return r;
+  }
+
+  void record_latency(const CopyJob& job) {
+    const int64_t latency = now_ns() - job.submit_ns;
+    counters_[kCopyLatencyNs].fetch_add(latency);
+    int64_t seen = counters_[kCopyLatencyMaxNs].load();
+    while (latency > seen && !counters_[kCopyLatencyMaxNs].compare_exchange_weak(seen, latency)) {
+    }
+  }
+
+  void finish_failed(const CopyJob& job, int error_code) {
+    counters_[kCopyErrors].fetch_add(1);
+    fail_(job, error_code);
+    finish();
+  }
+
+  void finish() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    --outstanding_;
+  }
+
+  std::unique_ptr<CopyBackend> backend_;
+  std::vector<Table> tables_;
+  int64_t spin_ns_;
+  std::atomic<int64_t>* counters_;
+  Handler complete_;
+  Failure fail_;
+  std::thread thread_;
+  std::mutex mutex_;  // guards queue_, outstanding_, stop_, drain_deadline_, started_ and init_error_
+  std::condition_variable work_cv_;
+  std::condition_variable ready_cv_;
+  std::deque<CopyJob> queue_;
+  int64_t outstanding_ = 0;
+  bool stop_ = false;
+  int64_t drain_deadline_ = 0;
+  bool started_ = false;
+  std::string init_error_;
+  int broken_ = 0;  // copy thread only: the first backend error
+  std::atomic<uint64_t> ballast_dst_{0};
+  std::atomic<uint64_t> ballast_src_{0};
+  std::atomic<int64_t> ballast_bytes_{0};
+};
+
 struct Tier {
   int64_t capacity = 0;
   std::vector<int32_t> slot_to_expert;
@@ -2966,6 +3436,11 @@ class RamTier {
       tier.generation.assign(tier.capacity, 0);
     }
     if (lease_ != nullptr) init_lease_block(capacity, lease_bytes);
+  }
+
+  // The copy thread's callbacks use tiers_, mutex_ and counters_, which are destroyed before copy_engine_ would be.
+  ~RamTier() {
+    if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
   }
 
   bool open() {
@@ -3229,6 +3704,63 @@ class RamTier {
   void set_piece_stream(bool on) {
     if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set piece streaming before the service thread starts");
     reader_.set_piece_stream(on);
+    piece_stream_ = on;
+  }
+
+  // Copy engine (LEASE_PROTOCOL.md 7.6): a thread that copies the reservation hold's hit lanes with the DMA engine.
+  // `device` < 0 is the CPU test backend (HostCopyBackend). Before the service thread starts; unarmed until arm().
+  void enable_copy_engine(int64_t device, int64_t spin_ns) {
+    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: enable the copy engine before the service thread starts");
+    if (copy_engine_ != nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is already enabled");
+    // Only the piece-streaming chain grants every lane in the reservation hold and runs the copy wait.
+    if (!(lease_mode_ && two_phase_ && piece_stream_)) {
+      throw std::runtime_error("exl3 RAM miss: the copy engine needs lease mode, two-phase and piece streaming");
+    }
+    std::unique_ptr<CopyBackend> backend;
+    if (device < 0) {
+      backend = std::make_unique<HostCopyBackend>();
+    } else {
+      backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device));
+    }
+    auto engine = std::make_unique<CopyEngine>(
+        std::move(backend), layers_, spin_ns, counters_,
+        [this](const CopyJob& job) { copy_completed(job); },
+        [this](const CopyJob& job, int error) { copy_failed(job, error); });
+    engine->start();
+    copy_engine_ = std::move(engine);
+  }
+
+  // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}.
+  void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows) {
+    if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    std::vector<CopyEntry> table;
+    for (int64_t i = 0; i < count; ++i) {
+      if (entries[3 * i + 2] <= 0) throw std::runtime_error("exl3 RAM miss: a copy-table entry of no bytes");
+      table.push_back(CopyEntry{
+          static_cast<uint64_t>(entries[3 * i]), static_cast<uint64_t>(entries[3 * i + 1]), entries[3 * i + 2]});
+    }
+    copy_engine_->set_table(row, std::move(table), dst_rows);
+  }
+
+  void arm_copy_engine(bool on) {
+    if (on && copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    copy_armed_.store(on, std::memory_order_release);
+  }
+
+  // Every job handed to the copy thread has completed (or failed) and been retired.
+  bool wait_copy_idle(int64_t deadline_ns) {
+    return copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
+  }
+
+  void copy_engine_ballast(uint64_t dst, uint64_t src, int64_t bytes) {
+    if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    copy_engine_->set_ballast(dst, src, bytes);
+  }
+
+  HostCopyBackend& host_copy_backend() {
+    HostCopyBackend* backend = copy_engine_ != nullptr ? copy_engine_->host_backend() : nullptr;
+    if (backend == nullptr) throw std::runtime_error("exl3 RAM miss: no test copy backend");
+    return *backend;
   }
 
   // Shutdown, first step (LEASE_PROTOCOL.md 14.3 S1): the header word tells the device to stop waiting on the service,
@@ -3252,12 +3784,18 @@ class RamTier {
     std::memcpy(&count, base + kLeaseLrCount, 4);
     std::memcpy(&row, base + kLeaseLrRow, 4);
     int32_t experts[kLeaseLanes];
+    int32_t dst[kLeaseLanes];
+    uint32_t flags = 0;
     std::memcpy(experts, base + kLeaseLrExpert, sizeof(experts));
+    std::memcpy(dst, base + kLeaseLrDst, sizeof(dst));
+    std::memcpy(&flags, base + kLeaseLrFlags, 4);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (load_acquire64(base + kLeaseLrGen) != word) return false;
     if (count > static_cast<uint32_t>(kLeaseLanes) || static_cast<int64_t>(row) != request->row) return false;
     request->gen = generation_of(word);
     request->lane_experts.assign(experts, experts + count);
+    request->lane_dst.assign(dst, dst + count);
+    request->lane_flags = flags;
     return true;
   }
 
@@ -3389,6 +3927,10 @@ class RamTier {
     uint64_t tags[kLeaseLanes] = {};
     size_t taken = 0;
     size_t hits = 0;
+    // Hit lanes of the reservation-hold grant go to the copy engine when it is armed and the device allowed it.
+    const bool copy_request = hit_phase && copy_engine_ != nullptr && copy_armed_.load(std::memory_order_acquire) &&
+                              (request.lane_flags & kLeaseLrFlagCopyEngine) != 0;
+    CopyJob job;
     for (size_t lane = 0; lane < count; ++lane) {
       if (!select(lane)) continue;
       if (entry.lane[lane].state != 0) return false;  // granted already: the two groups must be disjoint
@@ -3404,6 +3946,16 @@ class RamTier {
       tags[lane] = still_loading ? kLeaseTagLoading : kLeaseTagReady;
       ++taken;
       if (!still_loading) ++hits;
+      if (copy_request && !still_loading) {
+        const int32_t dst = lane < request.lane_dst.size() ? request.lane_dst[lane] : -1;
+        if (copy_engine_->eligible(request.row, dst)) {
+          tags[lane] = kLeaseTagCopying;
+          job.lanes[job.count++] = CopyLane{static_cast<int32_t>(lane), slot, dst, tier.generation[slot]};
+          job.mask |= 1u << lane;
+        } else {
+          counters_[kCopyFallbacks].fetch_add(1);
+        }
+      }
     }
     if (taken == 0) return true;
     uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
@@ -3418,7 +3970,7 @@ class RamTier {
       if (!take[lane]) continue;
       const int32_t slot = slots[lane];
       tier.leases[slot] += 1;
-      entry.lane[lane] = LaneLease{1, slot, tier.generation[slot], false};
+      entry.lane[lane] = LaneLease{1, slot, tier.generation[slot], false, tags[lane] == kLeaseTagCopying};
       uint8_t* result = results + lane * kLeaseRowResultBytes;
       const uint32_t generation = tier.generation[slot];
       const int32_t expert = request.lane_experts[lane];
@@ -3436,7 +3988,17 @@ class RamTier {
     }
     lanes_outstanding_.fetch_add(static_cast<int64_t>(taken));
     counters_[kLeasesGranted].fetch_add(static_cast<int64_t>(taken));
-    if (hit_phase) counters_[kHitLeasesGranted].fetch_add(static_cast<int64_t>(hits));  // S7: tag-READY lanes only
+    if (hit_phase) counters_[kHitLeasesGranted].fetch_add(static_cast<int64_t>(hits));  // S7: resident lanes
+    if (job.count > 0) {
+      // After the COPYING words are published: the copy thread may complete and publish CopyDone at once.
+      job.gen = request.gen;
+      job.idx = idx;
+      job.row = request.row;
+      job.submit_ns = now_ns();
+      counters_[kCopyJobs].fetch_add(1);
+      counters_[kCopyLanes].fetch_add(job.count);
+      copy_engine_->submit(job);
+    }
     return true;
   }
 
@@ -3469,6 +4031,8 @@ class RamTier {
       if (terminated) std::memcpy(&mask, terminal + kLeaseTermSkippedMask, 4);
       for (uint32_t lane = 0; lane < entry.count; ++lane) {
         LaneLease& held = entry.lane[lane];
+        // No kernel reads a COPYING lane's slot, so no LaneAck or Terminal bit can release it; its copy's completion does.
+        if (held.copy_engine) continue;
         const uint64_t word = load_acquire64(acks + lane * kLeaseLaneAckBytes);
         const bool acknowledged = tag_of(word) != 0 && generation_of(word) == entry.gen;
         const bool voided = terminated && (mask >> lane & 1u) != 0;
@@ -3512,7 +4076,7 @@ class RamTier {
       throw std::runtime_error("exl3 RAM miss: lease underflow on slot " + std::to_string(held.slot));
     }
     tier.leases[held.slot] -= 1;
-    held.state = counter == kLeasesAcked ? 2 : 3;
+    held.state = counter == kLeasesVoided ? 3 : 2;
     lanes_outstanding_.fetch_sub(1);
     counters_[counter].fetch_add(1);
     lease_changes_.fetch_add(1);
@@ -3531,7 +4095,7 @@ class RamTier {
   }
 
   // Test only: the service's account of request slot `idx`: [active, grants_pending, count, gen, then per lane
-  // (kLeaseLanes) its state, then per lane its slot].
+  // (kLeaseLanes) its state, then per lane its slot, then per lane 1 if it is a copy-engine lane].
   void lease_entry(int64_t idx, int64_t* out) {
     std::lock_guard<std::mutex> guard(mutex_);
     const Outstanding& entry = outstanding_[idx];
@@ -3542,6 +4106,7 @@ class RamTier {
     for (int64_t lane = 0; lane < kLeaseLanes; ++lane) {
       out[4 + lane] = entry.lane[lane].state;
       out[4 + kLeaseLanes + lane] = entry.lane[lane].slot;
+      out[4 + 2 * kLeaseLanes + lane] = entry.lane[lane].copy_engine ? 1 : 0;
     }
   }
 
@@ -3636,6 +4201,54 @@ class RamTier {
   }
 
  private:
+  // Copy thread. Completion was observed, so no copy of this job reads its slots any more: publish CopyDone, then
+  // release. A leased slot's generation cannot move (E1); if one did, the bytes are not the lease's, so fail stop.
+  void copy_completed(const CopyJob& job) {
+    const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
+    for (int i = 0; i < job.count; ++i) {
+      const CopyLane& lane = job.lanes[i];
+      if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
+        counters_[kCopyGenerationMismatches].fetch_add(1);
+        raise_fatal(static_cast<uint32_t>(job.gen));
+        return;
+      }
+    }
+    uint8_t* done = lease_ + lease_c_ + job.idx * kLeaseCopyDoneBytes;
+    std::memcpy(done + kLeaseCdMask, &job.mask, 4);
+    store_release64(done + kLeaseCdGen, tagged_word(kLeaseTagCopied, job.gen));
+    std::lock_guard<std::mutex> guard(mutex_);
+    Outstanding& entry = outstanding_[job.idx];
+    if (!entry.active || entry.gen != job.gen) {
+      // Nothing but this completion releases a COPYING lane, so its entry cannot have closed: an internal error.
+      counters_[kCopyErrors].fetch_add(1);
+      raise_fatal(static_cast<uint32_t>(job.gen));
+      return;
+    }
+    Tier& tier = tiers_[entry.row];
+    for (int i = 0; i < job.count; ++i) {
+      LaneLease& held = entry.lane[job.lanes[i].lane];
+      if (held.state == 1 && held.copy_engine) release_lease_locked(tier, held, kLeasesCopied);
+    }
+    bool open = entry.grants_pending;
+    for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
+    if (!open) entry.active = false;
+  }
+
+  // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
+  void copy_failed(const CopyJob& job, int error) {
+    std::fprintf(stderr, "ERROR exl3 RAM miss copy engine: copy of request %llu failed (%d); leases held\n",
+                 static_cast<unsigned long long>(job.gen), error);
+    std::fflush(stderr);
+    raise_fatal(static_cast<uint32_t>(job.gen));
+  }
+
+  void raise_fatal(uint32_t seq) {
+    uint32_t zero = 0;
+    __atomic_compare_exchange_n(
+        reinterpret_cast<uint32_t*>(page_ + kFatal), &zero, seq == 0 ? 0xFFFFFFFFu : seq, false, __ATOMIC_RELEASE,
+        __ATOMIC_RELAXED);
+  }
+
   // Called the moment a posted record is found. With the trace off this is one relaxed load and
   // no clock read; requests are served one at a time, so one member record serves them all.
   void begin_stage(int64_t kind, uint32_t seq, uint32_t backlog) {
@@ -3699,7 +4312,9 @@ class RamTier {
     lease_d_ = d_offset;
     const int64_t piece_offset = round_up_page(d_offset + kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes);
     lease_p_ = piece_offset;
-    const int64_t needed = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
+    const int64_t copy_offset = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
+    lease_c_ = copy_offset;
+    const int64_t needed = round_up_page(copy_offset + kLeaseAreaCopyDoneBytes);
     if (lease_bytes < needed) {
       throw std::runtime_error(
           "exl3 RAM miss: the lease block has " + std::to_string(lease_bytes) + " bytes, its layout needs " +
@@ -3707,7 +4322,7 @@ class RamTier {
     }
     auto put_u32 = [&](int64_t offset, uint32_t value) { std::memcpy(lease_ + offset, &value, 4); };
     put_u32(0, 0x4C534531u);  // "LSE1"
-    put_u32(4, 2u);           // ABI version (exl3_lease_block.ABI_VERSION; 2 added StreamProbe)
+    put_u32(4, 3u);           // ABI version (exl3_lease_block.ABI_VERSION; 3: 128-byte LaneRequest, area C)
     put_u32(kLeaseHeaderRing, static_cast<uint32_t>(kLeaseRing));
     put_u32(kLeaseHeaderLanes, static_cast<uint32_t>(kLeaseLanes));
     put_u32(16, static_cast<uint32_t>(layers_));
@@ -3715,6 +4330,7 @@ class RamTier {
     put_u32(kLeaseHeaderSlotGenOffset, static_cast<uint32_t>(kLeaseSlotGen));
     put_u32(kLeaseHeaderDOffset, static_cast<uint32_t>(d_offset));
     put_u32(kLeaseHeaderPieceOffset, static_cast<uint32_t>(piece_offset));
+    put_u32(kLeaseHeaderCopyOffset, static_cast<uint32_t>(copy_offset));
     for (int64_t row = 0; row < layers_; ++row) {
       put_u32(kLeaseRowTable + 8 * row, static_cast<uint32_t>(slot_gen_base_[row]));
       put_u32(kLeaseRowTable + 8 * row + 4, static_cast<uint32_t>(capacity[row]));
@@ -4145,6 +4761,11 @@ class RamTier {
   std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
   int64_t lease_d_ = 0;                 // byte offset of area D (the device-written words)
   int64_t lease_p_ = 0;                 // byte offset of area P (the piece readiness words)
+  int64_t lease_c_ = 0;                 // byte offset of area C (CopyDone)
+  bool piece_stream_ = false;           // set before the service thread starts, with the reader's flag
+  // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
+  std::unique_ptr<CopyEngine> copy_engine_;
+  std::atomic<bool> copy_armed_{false};
   // Piece streaming: serve()'s readiness words per row it reads, reused every request (like packed_).
   std::vector<PieceTarget> piece_targets_;
   PiecePublish piece_publish_;
@@ -4329,6 +4950,43 @@ void exl3_ram_miss_set_two_phase(int64_t handle, int64_t on) {
 
 void exl3_ram_miss_set_piece_stream(int64_t handle, int64_t on) {
   exl3_ram_miss::find(handle)->set_piece_stream(on != 0);
+}
+
+void exl3_ram_miss_enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns) {
+  exl3_ram_miss::find(handle)->enable_copy_engine(device, spin_ns);
+}
+
+// entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination.
+void exl3_ram_miss_set_copy_table(int64_t handle, int64_t row, TensorView entries, int64_t dst_rows) {
+  if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error("exl3 RAM miss: copy table must be [n, 3]");
+  exl3_ram_miss::find(handle)->set_copy_table(
+      row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows);
+}
+
+void exl3_ram_miss_arm_copy_engine(int64_t handle, int64_t on) {
+  exl3_ram_miss::find(handle)->arm_copy_engine(on != 0);
+}
+
+int64_t exl3_ram_miss_copy_engine_idle(int64_t handle, int64_t timeout_ns) {
+  return exl3_ram_miss::find(handle)->wait_copy_idle(exl3_ram_miss::now_ns() + timeout_ns) ? 1 : 0;
+}
+
+// Test only (HostCopyBackend): let `marks` more copy marks complete (negative: all), fail the calls, count marks.
+void exl3_ram_miss_copy_engine_release(int64_t handle, int64_t marks) {
+  exl3_ram_miss::find(handle)->host_copy_backend().release(marks);
+}
+
+void exl3_ram_miss_copy_engine_fail(int64_t handle, int64_t issue, int64_t query) {
+  exl3_ram_miss::find(handle)->host_copy_backend().fail(issue != 0, query != 0);
+}
+
+// Test only: delay every copy job's completion by one extra copy of `bytes` from `src` to `dst` (0 bytes: off).
+void exl3_ram_miss_copy_engine_ballast(int64_t handle, int64_t dst, int64_t src, int64_t bytes) {
+  exl3_ram_miss::find(handle)->copy_engine_ballast(static_cast<uint64_t>(dst), static_cast<uint64_t>(src), bytes);
+}
+
+int64_t exl3_ram_miss_copy_engine_marked(int64_t handle) {
+  return exl3_ram_miss::find(handle)->host_copy_backend().marked();
 }
 
 void exl3_ram_miss_inject_done_stall(int64_t handle, int64_t ns) {
@@ -4534,6 +5192,14 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_lease_mode, exl3_ram_miss_set_le
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_gpu_hot, exl3_ram_miss_set_gpu_hot);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_two_phase, exl3_ram_miss_set_two_phase);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_piece_stream, exl3_ram_miss_set_piece_stream);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_enable_copy_engine, exl3_ram_miss_enable_copy_engine);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_set_copy_table, exl3_ram_miss_set_copy_table);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_arm_copy_engine, exl3_ram_miss_arm_copy_engine);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_idle, exl3_ram_miss_copy_engine_idle);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_release, exl3_ram_miss_copy_engine_release);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_fail, exl3_ram_miss_copy_engine_fail);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_marked, exl3_ram_miss_copy_engine_marked);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_copy_engine_ballast, exl3_ram_miss_copy_engine_ballast);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_done_stall, exl3_ram_miss_inject_done_stall);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_mapping, exl3_ram_miss_mapping);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_to_expert, exl3_ram_miss_slot_to_expert);
@@ -4621,6 +5287,8 @@ class RamThread {
       }
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
+    // The caller synchronized the stream, so every copy wait has seen its CopyDone; the copy thread releases just after.
+    tier_->wait_copy_idle(now_ns() + timeout_ns);
     tier_->retire_leases();
     if (tier_->graph_leases_outstanding() > 0) {
       resume();

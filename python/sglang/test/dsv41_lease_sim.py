@@ -79,6 +79,12 @@ class LeaseSim:
         """The lane's PieceMask word (area P): ``generation << 8 | bits``, written only by the service."""
         return self.read_u64(self.layout.piece_offset + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
 
+    def copy_done(self, req: SimRequest) -> tuple[int, int, int]:
+        """(tag, generation, lane mask) of the request's CopyDone word (area C), as the copy wait would read it."""
+        base = self.layout.copy_offset + req.idx * lease.COPY_DONE_BYTES
+        tag, gen = lease.untag(self.read_u64(base + lease.COPY_DONE_FIELDS["gen"]))
+        return tag, gen, int(self._i32(base + lease.COPY_DONE_FIELDS["mask"])[0]) & 0xFFFFFFFF
+
     def ack_offset(self, req: SimRequest, lane: int) -> int:
         return self._d(lease.LANE_ACK + (req.idx * lease.LANES + lane) * lease.LANE_ACK_BYTES)
 
@@ -96,8 +102,11 @@ class LeaseSim:
         write_lane_request: bool = True,
         need: Optional[Sequence[int]] = None,
         protect: Optional[Sequence[int]] = None,
+        dst: Optional[Sequence[int]] = None,
+        copy_engine: bool = False,
     ) -> SimRequest:
-        """``need`` and ``protect`` override what the post kernel would put in the record (its routes, not its lanes)."""
+        """``need`` and ``protect`` override what the post kernel would put in the record (its routes, not its lanes);
+        ``dst`` are the lanes' destination slots and ``copy_engine`` the LaneRequest flag (LEASE_PROTOCOL.md 7.6)."""
         head = page_word(self.page, "demand_head")
         seq = (head + 1) & 0xFFFFFFFF
         if seq == 0:
@@ -113,6 +122,10 @@ class LeaseSim:
             self._i32(base + fields["count"], 2)[:] = torch.tensor([len(lanes), row], dtype=torch.int32)
             padded = list(lanes) + [-1] * (lease.LANES - len(lanes))
             self._i32(base + fields["expert"], lease.LANES)[:] = torch.tensor(padded, dtype=torch.int32)
+            slots = list(dst or []) + [-1] * (lease.LANES - len(dst or []))
+            self._i32(base + fields["dst_slot"], lease.LANES)[:] = torch.tensor(slots, dtype=torch.int32)
+            flags = lease.LANE_REQUEST_FLAG_COPY_ENGINE if copy_engine else 0
+            self._i32(base + fields["flags"])[:] = torch.tensor([flags], dtype=torch.int32)
             self.write_u64(base + fields["gen"], lease.tagged(DEMAND_TAG, gen))
         mapping = self.host.mapping(row)
         distinct = list(dict.fromkeys(lanes))

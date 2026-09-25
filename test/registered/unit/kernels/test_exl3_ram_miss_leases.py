@@ -66,6 +66,7 @@ def test_the_service_writes_the_header_and_the_row_table_at_open(tier):
         "slot_gen_offset": lease.SLOT_GEN,
         "d_offset": layout.d_offset,
         "piece_offset": layout.piece_offset,
+        "copy_offset": layout.copy_offset,
     }
     assert host.lease_row_table() == [(0, 2), (2, 2)]
 

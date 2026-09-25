@@ -442,6 +442,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         hot_capacity: int = 0,
         stream_maps: Optional[Mapping[int, torch.Tensor]] = None,
         route_log=None,
+        copy_engine: bool = False,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -462,6 +463,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.stream_maps = dict(stream_maps) if self.piece_stream else None
         # A GraphRouteLog only when the stage trace is on; None builds exactly the untraced chain.
         self.route_log = route_log
+        # LEASE_PROTOCOL.md 7.6: the chain also waits for the service's copy-engine copies before finalize.
+        if copy_engine and not self.piece_stream:
+            raise ValueError("the copy engine runs in the piece-streaming chain only")
+        self.copy_engine = copy_engine
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -519,10 +524,20 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         # stage copies its own compacted plan, so each copy takes that stage's source rows, destination slots and
         # committed count rather than the plan's lane-ordered arrays.
         self._stage_planned(plan)
-        self.device_side.post(
-            self.row, self.planned, plan.count, self.routes, self.next_row,
-            self.hot_slots, self.hot_capacity,
-        )
+        if self.copy_engine:
+            # Only a captured graph lets the service copy: an eager forward may load a kernel module while the copy
+            # wait spins, and a load blocks the copy thread's driver calls (engram-no-hostnode plan, section 10).
+            capturing = torch.cuda.is_current_stream_capturing()
+            self.device_side.post(
+                self.row, self.planned, plan.count, self.routes, self.next_row,
+                self.hot_slots, self.hot_capacity, dst_slots=plan.slots, copy_engine=capturing,
+            )
+            self.device_side.copy_engine_captured |= capturing
+        else:
+            self.device_side.post(
+                self.row, self.planned, plan.count, self.routes, self.next_row,
+                self.hot_slots, self.hot_capacity,
+            )
         self.device_side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.hit_wait_ns)
         copy_expert_row_segments_gpu(
             self.segments[tag], self.device_side.host_rows_1, self.device_side.dst_slots_1, self.device_side.go_1
@@ -535,8 +550,13 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
                 self.row, self.planned, plan.count, plan.slots, self.ram_miss, self.segments[tag], self.stream_maps[tag]
             )
             self.device_side.stage_ack(2)
+            if self.copy_engine:
+                # post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F: the hits' DMA copies overlap S's reads and copies.
+                self.device_side.copy_wait(plan.count)
             self.device_side.finalize(plan.count, self.keep)
             torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
+            if self.copy_engine:
+                self.device_side.go_total.add_(self.device_side.go_ce)
             return
         self.device_side.rest_wait(self.row, self.planned, plan.count, plan.slots, self.ram_miss)
         copy_expert_row_segments_gpu(
@@ -546,6 +566,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.device_side.finalize(plan.count, self.keep)
         # Lanes each stage copied into plan.slots; finalize keeps only a request whose stages copied every lane.
         torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
+
+
+# Arbitrary: enough batches after the first copy-engine capture for the first decode steps (and the kernels they
+# launch outside the graph) to run unarmed. No kernel module may load while a copy wait spins (7.6).
+COPY_ENGINE_ARM_BATCHES = 4
 
 
 def watchdog_wait_s(timeout_ms: int) -> float:
@@ -610,6 +635,11 @@ class Exl3RamMissService:
         # disagree about which chain this process runs.
         self.two_phase = False
         self.piece_stream = False
+        # LEASE_PROTOCOL.md 7.6. Enabled at start, armed by fail_stop_check once a copy-engine graph was captured and
+        # COPY_ENGINE_ARM_BATCHES batches have run since, so the first decode steps load their kernels unarmed.
+        self.copy_engine = False
+        self._copy_armed = False
+        self._copy_batches = 0
         self.hit_wait_ns = 100_000
         self.hot_page = None
         self.gpu_hot_enabled = False
@@ -690,6 +720,14 @@ class Exl3RamMissService:
                 host.enable_two_phase()
             if piece_stream:
                 host.enable_piece_stream()
+            copy_engine = cfg.enable_ram_miss_copy_engine
+            if copy_engine:
+                if not piece_stream:
+                    raise RuntimeError(
+                        "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs "
+                        "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"
+                    )
+                host.enable_copy_engine(torch.cuda.current_device())  # before the thread starts; unarmed
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
@@ -708,6 +746,7 @@ class Exl3RamMissService:
         self.hot_page = hot_page
         self.two_phase = two_phase
         self.piece_stream = piece_stream
+        self.copy_engine = copy_engine
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
@@ -717,9 +756,9 @@ class Exl3RamMissService:
         self._rows = {layer_id: row for row, layer_id in enumerate(tables.layer_ids)}
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s, "
-            "row images %s",
+            "row images %s, copy engine %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
-            "on" if lease_mode else "off", "on" if tables.row_images else "off",
+            "on" if lease_mode else "off", "on" if tables.row_images else "off", "on" if copy_engine else "off",
         )
 
     def before_host_use(self) -> None:
@@ -813,7 +852,14 @@ class Exl3RamMissService:
                 else None
             ),
             route_log=self.route_log,
+            copy_engine=self.copy_engine,
         )
+        if self.copy_engine:
+            if list(previous.segments) != [streamer.row_tag]:
+                raise ValueError(f"exl3 RAM miss copy engine: layer {streamer.layer_id} has copy tables {list(previous.segments)}")
+            segments = previous.segments[streamer.row_tag]
+            dst_rows = min(int(destination.shape[0]) for _, destination in segments.pairs)
+            self.host.set_copy_table(row, segments.table, dst_rows)
 
     def _start_route_log(self, device) -> None:
         """Trace runs only: log every graph forward's routes (GraphRouteLog), stamped with the scheduler's
@@ -880,8 +926,20 @@ class Exl3RamMissService:
                 f"exl3 RAM miss: request {fatal} timed out or failed "
                 f"(thread {self.host.counters()}); fail-stop"
             )
+        self._arm_copy_engine()
         self._trace_step()
         self._trace_stages()
+
+    def _arm_copy_engine(self) -> None:
+        if not self.copy_engine or self._copy_armed or self.device_side is None:
+            return
+        if not self.device_side.copy_engine_captured:
+            return
+        self._copy_batches += 1
+        if self._copy_batches >= COPY_ENGINE_ARM_BATCHES:
+            self.host.arm_copy_engine()
+            self._copy_armed = True
+            logger.info("exl3 RAM miss copy engine armed after %d batches since capture", self._copy_batches)
 
     def _trace_stages(self) -> None:
         """The stage records the service produced since the last check, into the stream trace."""

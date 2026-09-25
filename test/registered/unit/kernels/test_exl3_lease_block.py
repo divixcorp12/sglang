@@ -12,9 +12,10 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 def test_the_areas_are_where_the_protocol_puts_them():
     assert lease.ROW_TABLE == 0x80 and lease.ROW_RESULT == 0x1000
     assert lease.SLOT_GEN == 0x2000, "RowResult[16][8] at 32 bytes each fills 4096 bytes from 0x1000"
-    assert (lease.LANE_REQUEST, lease.LANE_ACK, lease.TERMINAL) == (0, 0x400, 0x800)
-    assert lease.STREAM_PROBE == 0x900, "StreamProbe[16] (piece streaming) follows Terminal[16] at 16 bytes each"
-    assert lease.AREA_D_BYTES == 0x980
+    assert lease.LANE_REQUEST_BYTES == 128, "ABI 3: expert[8], dst_slot[8] and flags after the 16-byte head"
+    assert (lease.LANE_REQUEST, lease.LANE_ACK, lease.TERMINAL) == (0, 0x800, 0xC00)
+    assert lease.STREAM_PROBE == 0xD00, "StreamProbe[16] (piece streaming) follows Terminal[16] at 16 bytes each"
+    assert lease.AREA_D_BYTES == 0xD80
 
 
 def test_service_written_and_device_written_words_never_share_a_128_byte_line():
@@ -32,6 +33,22 @@ def test_area_p_is_one_word_per_128_byte_line_after_area_d():
     assert layout.d_offset + lease.AREA_D_BYTES <= layout.piece_offset
     assert lease.AREA_PIECE_MASK_BYTES == lease.RING * lease.LANES * lease.PIECE_MASK_LINE_BYTES == 16 * 1024
     assert layout.piece_offset + lease.AREA_PIECE_MASK_BYTES <= layout.total_bytes
+
+
+def test_the_lane_request_payload_fits_its_record_in_the_order_the_kernels_write_it():
+    f = lease.LANE_REQUEST_FIELDS
+    assert f["expert"] + 4 * lease.LANES == f["dst_slot"] and f["dst_slot"] + 4 * lease.LANES == f["flags"]
+    assert f["flags"] + 4 <= lease.LANE_REQUEST_BYTES
+
+
+def test_area_c_follows_area_p_and_the_block_ends_after_it():
+    """CopyDone[kLeaseRing] (copy engine, LEASE_PROTOCOL.md 7.6): service-written, on its own page."""
+    layout = lease.lease_layout([5, 7])
+    assert layout.copy_offset % lease.BLOCK_ALIGN == 0
+    assert layout.piece_offset + lease.AREA_PIECE_MASK_BYTES <= layout.copy_offset
+    assert layout.copy_offset + lease.AREA_COPY_DONE_BYTES <= layout.total_bytes
+    assert lease.COPY_DONE_FIELDS["mask"] + 4 <= lease.COPY_DONE_FIELDS["gen"] < lease.COPY_DONE_BYTES
+    assert lease.HEADER["copy_offset"] == lease.HEADER["piece_offset"] + 4 < lease.HEADER_BYTES
 
 
 def test_area_p_header_offset_is_a_new_header_word_beside_d_offset():

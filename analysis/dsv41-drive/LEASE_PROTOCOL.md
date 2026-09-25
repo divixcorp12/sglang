@@ -265,6 +265,7 @@ section 18:
 | E4 | The device publishes a terminal skip for a lane only when no copy for that lane can start or is running. | 13 |
 | E5 | If completion cannot be established (CUDA error, synchronization timeout), leases are never decremented and the memory is quarantined until process teardown. | 14 |
 | E6 | The acknowledgement kernel re-checks the slot generation after the copy. A mismatch makes the request fail and is counted; it cannot end as a success. | 6.5 |
+| E7 | Copy engine: a COPYING lane's lease is released only by the service's copy thread, after `cuEventQuery` observed its copies complete; no acknowledgement or terminal releases it, and the device reads its destination only after CopyDone. | 7.6 |
 
 **Tag LOADING reader contract (piece-streaming plan).** I1 as stated is the tag-READY
 case: the whole slot is unchanged from readiness. A miss lane granted at reservation is
@@ -404,15 +405,15 @@ tens of KiB at most for any plausible tier.
 
 | Offset from `D0` | Size | Structure | Writer |
 |---|---|---|---|
-| 0x000 | 16 x 64 B | `LaneRequest[R]`: `{u64 gen (tagged word, tag 1); u32 count; u32 row; i32 expert[8]; u32 reserved[4]}` = 8+4+4+32+16 = 64 B | device post kernel |
-| 0x400 | 16 x 8 x 8 B | `LaneAck[R][L]`: one tagged u64 per lane; tag 1 = CONSUMED, 2 = VIOLATED | device ack kernel |
-| 0x800 | 16 x 16 B | `Terminal[R]`: `{u32 skipped_mask; u32 reason; u64 gen (tagged word)}`; the tagged word is stored last (offset 8) | device wait/finalize kernel |
-| 0x900 | 16 x 8 B | `StreamProbe[R]` [piece-streaming plan, ABI 2]: tagged u64 (tag 1) stored with `st.release.sys` once the stream kernel has copied a piece of that request; the host's only view of streaming progress (read by the G2 test hook only) | device stream kernel |
+| 0x000 | 16 x 128 B | `LaneRequest[R]` [ABI 3, copy engine 7.6]: `{u64 gen (tagged word, tag 1); u32 count; u32 row; i32 expert[8]; i32 dst_slot[8]; u32 flags; u32 reserved[11]}` = 8+4+4+32+32+4+44 = 128 B. `dst_slot[i]` is the plan's destination slot of lane `i` (-1 past the plan); `flags` bit 0 lets the service copy the request's resident lanes itself | device post kernel |
+| 0x800 | 16 x 8 x 8 B | `LaneAck[R][L]`: one tagged u64 per lane; tag 1 = CONSUMED, 2 = VIOLATED | device ack kernel |
+| 0xC00 | 16 x 16 B | `Terminal[R]`: `{u32 skipped_mask; u32 reason; u64 gen (tagged word)}`; the tagged word is stored last (offset 8) | device wait/finalize kernel |
+| 0xD00 | 16 x 8 B | `StreamProbe[R]` [piece-streaming plan, ABI 2]: tagged u64 (tag 1) stored with `st.release.sys` once the stream kernel has copied a piece of that request; the host's only view of streaming progress (read by the G2 test hook only) | device stream kernel |
 
 `LaneAck[idx]` is exactly one 64-byte line (8 lanes x 8 bytes); two request slots share a
 128-byte line, which is fine because both halves have the same single writer (the
-device). Area D is `D0 + 0x980` rounded up to 4096; total block size is that plus area P
-below, rounded up to 4096 again.
+device). Area D is `D0 + 0xD80` rounded up to 4096 (ABI 2 had a 64-byte LaneRequest and ended at
+`D0 + 0x980`); total block size is that plus areas P and C below, each rounded up to 4096.
 
 **Area P (piece-streaming plan): service-written, at a new header offset
 `piece_offset`, the next 4096 boundary after area D.** `PieceMask[R][L]`: one `u64` word per
@@ -425,6 +426,15 @@ piece with the CAS above, from `collect_packed`, once that piece job's `done()` 
 kernel S reads the words with `ld.acquire.sys`, and re-reads them after acquiring `kDemandDone`
 before it judges a request complete. This 16 KiB is allocated for every lease-mode service
 regardless of whether the flag is on; with the flag off nothing writes or reads it.
+
+**Area C (copy engine, 7.6, ABI 3): service-written, at a new header offset `copy_offset`
+(0x2C), the next 4096 boundary after area P.** `CopyDone[R]`, 16 bytes each: `{u32 lane_mask;
+u32 reserved; u64 gen (tagged word, tag 1 = COPIED)}`. Only the copy thread writes it: the mask,
+then the tagged word with a release store, once it has observed the completion of every copy of
+that request's COPYING lanes, whose lanes the mask names. The copy wait CW reads the tagged word
+with `ld.acquire.sys`, then the mask. A request slot's word is rewritten only for `G + 16`, which
+the device cannot post before G's chain has ended. All 16 records share two lines with one writer.
+Allocated for every lease-mode service; with the flag off nothing writes or reads it.
 
 ### 4.4 Which of `{request_generation, slot_generation, host_slot, status}` lives where
 
@@ -456,9 +466,11 @@ makes the word visible, and nothing else.
 | `Header.shutdown` | service | once, at stop | device wait/post kernels | after seeing 1, the service issues no new leases and will not publish further `RowResult`s |
 | `RowResult[idx][lane]` payload | service | after the previous generation of that request slot retired, before `ready` | device | nothing, until it has acquired `ready` with the expected generation |
 | `RowResult[idx][lane].ready` | service | last store of the record | device (wait kernel) | if `gen == G` and tag == READY: payload is complete, the lease exists, and the slot's bytes are final and immutable until this lane's retirement |
+| `RowResult[idx][lane].ready`, tag COPYING (3) [copy engine, 7.6] | service | last store of the record, in the reservation-hold grant | device (W1, S, CW) | if `gen == G` and tag == COPYING: the payload is complete and the lease exists; the lane's **destination** slot is being written by the service's copy engine, so no kernel copies or acknowledges it, and nothing may read the destination before `CopyDone[idx]` carries `G` |
+| `CopyDone[idx]` [copy engine, 7.6] | service (copy thread) | once per request with COPYING lanes, after it observed their copies complete | device (CW) | tag COPIED with `gen == G`: every copy of the lanes in `lane_mask` has completed; their destinations hold the leased slots' bytes |
 | `RowResult[idx][lane].ready`, tag LOADING (2) [piece-streaming plan] | service | last store of the record, at reservation (before the read starts) | device (wait/stream kernel) | if `gen == G` and tag == LOADING: the payload is complete and the lease exists; the bytes of piece `p` are final and immutable once the device has acquired bit `p` of `PieceMask[idx][lane]` under `G`; the other bytes are unspecified |
 | `SlotGen[row, slot]` | service | before the first byte store that changes the slot | device (ack kernel) | a value different from the leased generation means the slot's bytes were, or are being, rewritten |
-| `LaneRequest[idx]` | device post kernel | before `demand_head` is stored | service | after acquiring `demand_head` and passing the seqlock re-check, lane `i`'s expert is `expert[i]` for request `G` |
+| `LaneRequest[idx]` | device post kernel | before `demand_head` is stored | service | after acquiring `demand_head` and passing the seqlock re-check, lane `i`'s expert is `expert[i]` and its destination slot `dst_slot[i]` for request `G`, and `flags` is the post's |
 | `LaneAck[idx][lane]` | device ack kernel | after the copy kernel for that lane completed | service | tag CONSUMED / VIOLATED with `gen == G`: that lane's copy finished; nothing else. Not an ordering statement about any other word |
 | `Terminal[idx]` | device wait/finalize kernel | once per request, only if some lane is skipped | service | `skipped_mask` lanes will never read a source. Lanes not in the mask may still be copying, and will acknowledge |
 | `PieceMask[idx][lane]` [piece-streaming plan] | service | one CAS per piece: in `collect_packed` once that piece job's `done()` holds, or in `dispatch_ready_pieces` for a piece with no bytes (nothing to store) | device (stream kernel) | a bit set under `gen == G` means that piece's bytes are final and immutable per the tag-LOADING row above. The service stores `G << 8` (no bits) at reservation, fenced before the request's first ready word |
@@ -537,6 +549,11 @@ Only after all lanes of a Task 5 request are published does the service do the e
 tail: `_mm_sfence()`, `set_status(record, kServed)`, `store_release(demand_done, seq)`
 (`pump_demand`, `handle_demand`).
 
+Copy engine (7.6): a resident lane the copy engine takes is published by the same five steps with
+tag COPYING; after the group's ready stores, the job goes to the copy thread. Its CopyDone word
+(area C) follows its own order: observed completion, SlotGen re-check, mask, then the tagged word
+with a release store, and only then the lease release.
+
 ### 6.2 Device side [E] primitives, [P] additions
 
 `device.cuh` already has `ld_acquire_sys` (`ld.acquire.sys.global.u32`) and
@@ -549,8 +566,8 @@ introduced.
 *Post kernel* (`exl3_ram_miss_post_kernel`), for a request with `count > 0` **[P]**:
 
 1. write `LaneRequest[idx]` as the existing `write_record` does: `gen = 0` (invalidate),
-   `__threadfence_system()`, payload `{count, row, expert[]}`, tagged `gen` word last
-   with `st.release.sys`;
+   `__threadfence_system()`, payload `{count, row, expert[], dst_slot[], flags}` (ABI 3: the
+   destination slots and the copy-engine flag of 7.6), tagged `gen` word last with `st.release.sys`;
 2. the existing `write_record` for the demand record and the `st_release_sys(demand_head)`.
 
 The `LaneRequest` seqlock is the same shape as `write_record` and is read by the same
@@ -860,6 +877,9 @@ when nothing is outstanding. For each `Outstanding` entry (all lanes not yet ACK
   `leases[slot]--`, lane state ACKED (VIOLATED also increments `lease_violations`).
 - `t = load_acquire64(Terminal[idx].gen)`; if `gen(t) == G`: read `skipped_mask`;
   for each lane in the mask not yet ACKED: `leases[slot]--`, lane state VOID.
+- A lane published COPYING (7.6) is skipped: neither its LaneAck word nor a Terminal bit releases it;
+  the copy thread does, after it observed the lane's copy complete, and closes the entry if that was the
+  last GRANTED lane.
 - When every lane of the entry is ACKED or VOID the entry is freed and `idx` is reusable.
 
 A decrement that would underflow, or a lane retired twice, is an internal error: fatal.
@@ -868,6 +888,121 @@ misbehaves.
 
 ---
 
+### 7.6 The copy engine (copy-engine plan, `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE`, ABI 3)
+
+Plan: `docs/superpowers/plans/2026-09-25-dsv41-copy-engine.md` (design 1b of
+`2026-09-25-dsv41-copy-compute-overlap.md`). The service copies a request's **resident**
+(tag-READY) lanes into their VRAM slots itself, with `cuMemcpyAsync` on the DMA engine, instead
+of the in-graph SM copy C1. Miss lanes are unchanged (tag LOADING, streamed by S). The flag needs
+piece streaming (the only chain that grants every lane in the reservation hold); off, nothing here
+runs and the chain is 7.3-7.5 as before.
+
+**Which lanes.** A lane of the reservation-hold grant (`grant_lane_group_locked`, `hit_phase`)
+whose slot is `kReady` is published with tag **COPYING (3)** instead of READY when all of:
+
+1. the copy engine is enabled and **armed** (`arm_copy_engine`; Python arms it on the fourth
+   batch after the first captured copy-engine post, see "Module loading" below);
+2. the request's `LaneRequest.flags` carries `kLeaseLrFlagCopyEngine`. The post kernel sets it only
+   when Python captured it with `copy_engine=1`, which `Exl3RamMissRowBackend.post` passes only
+   while a CUDA graph is being captured: an eager chain never waits on the copy engine;
+3. a copy table is registered for the row (`set_copy_table`: C1's `ExpertRowSegments.table`) and
+   `LaneRequest.dst_slot[lane]` is in `[0, dst_rows)`.
+
+Otherwise the lane is READY and takes the unchanged C1/A1 path (`copy_fallbacks` counts rule 3's
+refusals). The graph therefore keeps C1 and A1; with every hit COPYING they run with `go_1 == 0`.
+
+**LaneRequest (6.3, ABI 3).** 128 bytes: `{u64 gen; u32 count; u32 row; i32 expert[8]; i32
+dst_slot[8]; u32 flags; reserved}`, the plan's destination slots written by the post kernel from
+`plan.slots` (-1 past the plan). The seqlock shape is unchanged; the service reads `dst_slot[]` and
+`flags` inside the same re-checked read as `expert[]`. `static_assert`s on both sides pin
+`expert + 32 == dst_slot`, `dst_slot + 32 == flags` and `flags + 4 <= 128`.
+
+**Service publication order for a COPYING lane.** Exactly 6.1 steps 1-5 with tag COPYING, then,
+after the group's ready stores, the job (`{G, idx, row, lane mask, per lane host_slot, dst_slot,
+slot_generation}`) is handed to the copy thread. The lane's `LaneLease` records `copy_engine`.
+
+**The copy thread** (`CopyEngine`, `host.cpp`) is a second service thread. Its CUDA calls, all
+through the driver API resolved from `libcuda.so.1` (the module still builds without a toolkit):
+
+| When | Calls |
+|---|---|
+| start, before the service thread | `cuInit`, `cuDeviceGet`, `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuStreamCreate(CU_STREAM_NON_BLOCKING)`, 32 x `cuEventCreate(CU_EVENT_DISABLE_TIMING)` |
+| per job | one `cuMemcpyAsync(dst + dst_slot * bytes, src + host_slot * bytes, bytes, stream)` per table entry per lane, then one `cuEventRecord(event, stream)` |
+| polling, oldest job first | `cuEventQuery(event)` |
+| stop, only when nothing is in flight and no call failed | `cuEventDestroy`, `cuStreamDestroy`, `cuDevicePrimaryCtxRelease` |
+
+Every call is on its own non-blocking stream in the primary context. It calls nothing that
+synchronizes (no `cu*Synchronize`), allocates, frees, registers memory or loads a module, and it
+never touches the decode stream or a graph.
+
+**Completion mechanism: `cuEventQuery` on an event recorded after the job's last copy.** The event
+completes only once all earlier work of the same stream has completed, so a `CUDA_SUCCESS` from the
+query is an observation by the service that every copy of the job has finished reading its source
+slot and writing its destination. The query never blocks, so the thread keeps polling the next job
+and never parks inside the driver waiting on the device; one event per job lets it poll the oldest
+job alone, in stream order. Rejected: `cuStreamQuery` (would couple a job's completion to jobs issued
+after it), `cuEventSynchronize` (blocks the thread in the driver), and the probe's stream-ordered
+4-byte copy of the generation into a device word, which publishes without the service observing
+anything and rests on cross-engine visibility of the data before the flag, which CUDA does not
+document.
+
+**Then, in this order:** (a) the host E6: each lane's `SlotGen` word still equals its leased
+generation (a lock-free acquire of the mirrored word; a mismatch fails stop and publishes
+nothing); (b) `CopyDone[idx]` (area C): the lane mask, then `tagged(COPIED, G)` with a release store;
+(c) under `mutex_`, each COPYING lane's lease is released (`leases_copied`, lane state ACKED) and
+the entry closes if no lane is still GRANTED. Publishing before releasing keeps the lease-mutex off
+the device's critical path; it is safe because both follow the observed completion.
+
+**Device.** W1 claims a valid COPYING lane with `claimed = 2`: it is left out of C1's compacted
+plan and A1's acknowledgements, and S skips it. A COPYING lane W1's budget missed is handed over by
+S (`stream_admit` validates it and clears the lane from S's set). The copy wait **CW**
+(`exl3_ram_miss_lease_copy_wait_kernel`) runs after A2 and before F: it reads every planned lane's
+ready word, forms the mask of COPYING lanes of this generation, and waits for
+`CopyDone[idx] == tagged(COPIED, G)` and a CopyDone mask equal to it, under the request's shared
+deadline (D5), leaving early on the fatal word or the header's shutdown. Only then does it commit
+`go_ce = popcount(mask)`. Any other exit leaves `go_ce == 0` and records `kReqFailed` and the
+reason; F requires `go_1 + go_2 + go_ce == count`, so the request fails closed (keep 0, a terminal,
+the fatal word). CW writes neither `keep` nor a terminal. The chain is post -> W1 -> C1 -> A1 -> S ->
+A2 -> CW -> F -> add, and `go_total = go_1 + go_2 + go_ce`. Placing CW after S lets the hits' DMA
+copies overlap S's reads and piece copies.
+
+**The invariants, for a COPYING lane.**
+
+- *No host slot is rewritten while a copy reads it* (I1). Only the copy thread's step (c) releases
+  a COPYING lease, after the observed completion. `retire_leases` skips `copy_engine` lanes: no
+  LaneAck is ever written for them, and a Terminal bit naming one (F names every lane without a
+  LaneAck) releases nothing and is not counted as a double signal. Until (c) the slot is leased,
+  so E1 keeps it from being evicted or reassigned; a demand that needs it defers (section 16).
+- *No hot slot is read before its copy completed.* CopyDone is published only after the observed
+  completion; CW commits only on CopyDone and precedes F and the MoE kernel in stream order.
+- *No victim slot is overwritten while a GPU read of it may be in flight.* The copy thread issues
+  a job only after the service has read the request's LaneRequest, which the post kernel publishes;
+  every kernel stream-ordered before the post has completed, and that includes every earlier reader
+  of the victim slot (earlier steps' and layers' MoE kernels). DIRECT's hazard check keeps this
+  step's routed experts off the victim list, as it did for C1, which wrote the same slot at the same
+  point of the step, only later. Requirement: no kernel that reads hot-slot bytes may run on another
+  stream concurrently with the post (the 1a MoE side stream runs the shared expert and the DIRECT
+  commit, which read none).
+
+**Failure.** A driver error on the copy thread (issue, record or query) raises the page's fatal
+word, keeps every lease it holds (E5), never publishes those CopyDone words, and stops issuing;
+later jobs fail the same way. CW then leaves on the fatal word and F fails the request. A request
+the device gave up on (timeout, a W1/S failure) keeps its COPYING leases until their copies
+complete; the Terminal changes nothing for them. At shutdown the copy thread drains in-flight jobs
+for up to 5 s; a job that does not complete keeps its leases and its stream, so the quarantine of
+14.1 covers it.
+
+**Module loading.** A CUDA module load holds the context lock that `cuMemcpyAsync` needs and can
+wait for the device, which is spinning in CW for that copy: a deadlock only the device deadline
+breaks (engram-no-hostnode plan, section 10). Hence rule 2 above (eager forwards never allow the
+copy engine) and arming only after the first batches following capture, by which time the decode
+steps' kernels, inside and outside the graph, have loaded. What remains is a module first loaded by
+the scheduler thread while a copy-engine graph is in flight; the plan records what was measured.
+
+**Profiling.** Never capture a copy-engine run with `nsys --cuda-graph-trace=graph`: graph-mode
+CUPTI tracing makes the launch synchronous and holds off the copy thread's calls, which deadlocks CW
+(engram-no-hostnode plan, section 9). Node mode is the one to use.
+
 ## 8. Lease lifecycle and the eviction predicate
 
 Lane state machine (service-private, per `Outstanding` lane):
@@ -875,6 +1010,7 @@ Lane state machine (service-private, per `Outstanding` lane):
 ```text
 NONE --grant+publish--> GRANTED --ack CONSUMED|VIOLATED--> ACKED
                             \----terminal, lane in mask---> VOID
+      (COPYING lane, 7.6)   \----copy completion observed--> ACKED   (no ack, no terminal applies)
 ```
 
 - `GRANTED` is entered and `ready` published in one critical step (6.1). There is no
@@ -1097,6 +1233,11 @@ Why this is safe and cannot deadlock or lap:
     only the loads after it, so without the fence the re-read may be served before the
     payload loads.
 
+Copy engine (7.6): a COPYING lane retires when the copy thread observes its copy complete, not on
+an acknowledgement, so the entry for `G` closes only once both the device's acknowledgements and the
+service's own completions are in. Either may come last; the rule above is unchanged, and so is the
+argument, since G's copies were issued before `G + 16` can be posted and complete in finite time.
+
 ### 11.5 Guard for concurrent graphs [OPEN 9]
 
 The plan says concurrent graph execution "remains unsupported and guarded". I did not
@@ -1211,7 +1352,12 @@ Everything a still-running or possibly-running GPU kernel may read *or write*:
 - the request page, `slot_map` and the lease block (pinned tensors);
 - device buffers used by captured kernels: `state`, `last_routes`, `host_rows`,
   `go_count`, `lane_ctx`, `keep`, `ram_miss`, the GPU scratch destination rows, and the
-  captured graph's memory pool.
+  captured graph's memory pool;
+- with the copy engine (7.6), whatever its copies may still read or write: the slabs and the
+  VRAM destinations are already above; the copy thread keeps its stream, events and the primary
+  context reference whenever a job is still in flight or a driver call failed, and the leases of
+  such jobs are never released, so `graph_leases_outstanding` stays non-zero and the orderly
+  shutdown's completion check sees them.
 
 Not quarantined: the C++ `RamTier` and its io_uring, file descriptors and bounce buffer.
 Nothing GPU-side touches them. (Whether io_uring teardown waits for an in-flight O_DIRECT

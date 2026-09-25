@@ -194,6 +194,8 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kStreamPieces": "stream_pieces",
         "kStreamPolls": "stream_polls",
         "kW1Passes": "w1_passes",
+        "kCopyWaits": "copy_waits",
+        "kCopySpun": "copy_spun",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
     # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.
@@ -268,6 +270,7 @@ def _lease_python_constants():
         "kLeaseHeaderSlotGenOffset": lease.HEADER["slot_gen_offset"],
         "kLeaseHeaderDOffset": lease.HEADER["d_offset"],
         "kLeaseHeaderPieceOffset": lease.HEADER["piece_offset"],
+        "kLeaseHeaderCopyOffset": lease.HEADER["copy_offset"],
         "kLeaseRowTable": lease.ROW_TABLE,
         "kLeaseRowResult": lease.ROW_RESULT,
         "kLeaseRowResultBytes": lease.ROW_RESULT_BYTES,
@@ -282,6 +285,9 @@ def _lease_python_constants():
         "kLeaseLrCount": lease.LANE_REQUEST_FIELDS["count"],
         "kLeaseLrRow": lease.LANE_REQUEST_FIELDS["row"],
         "kLeaseLrExpert": lease.LANE_REQUEST_FIELDS["expert"],
+        "kLeaseLrDst": lease.LANE_REQUEST_FIELDS["dst_slot"],
+        "kLeaseLrFlags": lease.LANE_REQUEST_FIELDS["flags"],
+        "kLeaseLrFlagCopyEngine": lease.LANE_REQUEST_FLAG_COPY_ENGINE,
         "kLeaseLaneAck": lease.LANE_ACK,
         "kLeaseLaneAckBytes": lease.LANE_ACK_BYTES,
         "kLeaseTerminal": lease.TERMINAL,
@@ -295,6 +301,10 @@ def _lease_python_constants():
         "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
         "kLeasePieceMaskBytes": lease.PIECE_MASK_BYTES,
         "kLeaseAreaPieceMaskBytes": lease.AREA_PIECE_MASK_BYTES,
+        "kLeaseCopyDoneBytes": lease.COPY_DONE_BYTES,
+        "kLeaseCdMask": lease.COPY_DONE_FIELDS["mask"],
+        "kLeaseCdGen": lease.COPY_DONE_FIELDS["gen"],
+        "kLeaseAreaCopyDoneBytes": lease.AREA_COPY_DONE_BYTES,
     }
 
 
@@ -307,6 +317,8 @@ def _lease_device_only_constants():
         "kLeaseTagDemand": lease.DEMAND_TAG,
         "kLeaseTagReady": lease.READY,
         "kLeaseTagLoading": lease.LOADING,
+        "kLeaseTagCopying": lease.COPYING,
+        "kLeaseTagCopied": lease.COPIED,
         "kLeaseTagConsumed": lease.CONSUMED,
         "kLeaseTagViolated": lease.VIOLATED,
         "kLeaseTagTerminal": lease.TERMINAL_TAG,

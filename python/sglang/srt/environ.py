@@ -1891,6 +1891,11 @@ class Envs:
     # gather_destinations and commit_gather and for the fused MoE's route tables, in place of their ~89 small torch
     # kernels per layer. Bit-identical to the torch chains. Read once when each layer's buffers are built. Off by default.
     SGLANG_DSV41_ENABLE_LAYER_FUSION = EnvBool(False)
+    # Copy engine (plan 2026-09-25-dsv41-copy-engine, LEASE_PROTOCOL.md 7.6): the RAM-miss service copies each decode
+    # layer's RAM-resident rows into their VRAM slots with the DMA engine (cudaMemcpyAsync on its own thread) instead
+    # of the in-graph SM copy C1, and the graph waits for its completion word. Needs piece streaming. Captured decode
+    # graphs only, armed after the first batches following capture. Read once when the service starts. Off by default.
+    SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
