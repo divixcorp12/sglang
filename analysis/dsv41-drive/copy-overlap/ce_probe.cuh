@@ -17,6 +17,12 @@
 
 namespace ce_probe {
 
+inline int64_t realtime_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+}
+
 __device__ __forceinline__ uint64_t global_ns() {
   uint64_t t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -50,6 +56,13 @@ __global__ void wait_kernel(const uint32_t* done_word, const uint32_t* counter, 
   stamps[2 * (static_cast<int64_t>(seq - 1) % stamp_cap) + 1] = global_ns();
 }
 
+// A host node standing in for the decode graph's Engram host callbacks: about 50 us of host work.
+void CUDART_CB host_node_fn(void*) {
+  const int64_t end = realtime_ns() + 50000;
+  while (realtime_ns() < end) {
+  }
+}
+
 __global__ void filler_kernel(float* x) { x[threadIdx.x] = x[threadIdx.x] * 0.999f + 1.0f; }
 
 struct Probe {
@@ -63,11 +76,6 @@ struct Probe {
 
 Probe* g_probe = nullptr;
 
-inline int64_t realtime_ns() {
-  timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
-}
 
 void service_loop(Probe* p, int device, volatile uint32_t* post_word, uint32_t* done_word_dev, uint32_t* gen_ring_host,
                   std::vector<int64_t> src, std::vector<int64_t> dst, std::vector<int64_t> bytes, int64_t src_rows,
@@ -181,6 +189,12 @@ void ce_probe_wait(tvm::ffi::TensorView done_word, tvm::ffi::TensorView counter,
 void ce_probe_filler(tvm::ffi::TensorView x) {
   const auto device = host::LaunchKernel::resolve_device(x.device());
   host::LaunchKernel(1, 32, device)(ce_probe::filler_kernel, static_cast<float*>(x.data_ptr()));
+}
+
+void ce_probe_host_node(tvm::ffi::TensorView x) {
+  const auto device = x.device();
+  const auto stream = static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+  host::RuntimeCheck(cudaLaunchHostFunc(stream, ce_probe::host_node_fn, nullptr) == cudaSuccess, "cudaLaunchHostFunc failed");
 }
 
 }  // namespace sglang

@@ -39,6 +39,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--rows", type=int, default=2)
     ap.add_argument("--replays", type=int, default=30)
+    ap.add_argument("--host-nodes", action="store_true", help="add host nodes at layers 1 and 14, as the Engram callbacks")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
     import sglang
@@ -51,7 +52,7 @@ def main() -> int:
     mod = load_jit(
         "ce_probe_copy_overlap",
         cuda_files=[str(Path(__file__).resolve().parent / "ce_probe.cuh")],
-        cuda_wrappers=[(n, n) for n in ("ce_probe_start", "ce_probe_stop", "ce_probe_post", "ce_probe_wait", "ce_probe_filler")],
+        cuda_wrappers=[(n, n) for n in ("ce_probe_start", "ce_probe_stop", "ce_probe_post", "ce_probe_wait", "ce_probe_filler", "ce_probe_host_node")],
     )
     dev = torch.device("cuda")
     src = [allocate_host_slab(SRC_ROWS, (b,), torch.uint8, register=True, placement=((0, SRC_ROWS * b),)) for b in SEGMENTS]
@@ -85,7 +86,9 @@ def main() -> int:
                        SRC_ROWS, a.rows, max(a.rows, 1), dev.index or 0)
 
     def step():
-        for _ in range(LAYERS):
+        for layer in range(LAYERS):
+            if a.host_nodes and layer in (1, 14):
+                mod.ce_probe_host_node(x)
             for _ in range(FILLER):
                 mod.ce_probe_filler(x)
             mod.ce_probe_post(post_word, counter, stamps)
@@ -124,6 +127,7 @@ def main() -> int:
     api_us = [h[2] / 1e3 for h in rec_host]
     res = {
         "rows_per_request": a.rows,
+        "host_nodes": a.host_nodes,
         "requests": len(dev_us),
         "served_total": served,
         "service_error": error,
