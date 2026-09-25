@@ -3287,6 +3287,20 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                     quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
                     return y
+                if x.shape[0] == 1 and envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get():
+                    from sglang.kernels.ops.layernorm.hc_combine_norm import (
+                        hc_combine_norm_half,
+                    )
+                    from sglang.srt.layers.quantization.exl3_ops import (
+                        EXL3_HALF_INPUT,
+                    )
+
+                    # The sublayer's EXL3 linears take y16 instead of each casting y.
+                    y, y16 = hc_combine_norm_half(
+                        x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                    )
+                    EXL3_HALF_INPUT.publish(y, y16)
+                    return y
                 from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
                 return hc_combine_norm(
