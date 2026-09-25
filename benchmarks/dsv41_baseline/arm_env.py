@@ -144,6 +144,9 @@ def base_env() -> dict[str, str]:
         # Reads land straight in the pinned slabs, no pack workers (section 24.9). Needs the row images built on
         # every mirror root by scripts/dsv41/build_row_images.py; startup refuses a root without a matching set.
         "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES": "1",
+        # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
+        # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
+        "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 
