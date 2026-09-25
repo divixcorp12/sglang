@@ -55,7 +55,8 @@ def sweep_seconds(fn, reps: int) -> list[float]:
 def start_load(node: int, procs: int, seconds: float, python: str) -> list[subprocess.Popen]:
     return [
         subprocess.Popen(
-            ["numactl", f"--physcpubind={LOAD_CORES[node]}", f"--membind={node}", python, f"{HERE}/load.py", str(seconds)],
+            # taskset, not numactl --physcpubind: numactl only accepts CPUs inside the caller's affinity mask.
+            ["taskset", "-c", LOAD_CORES[node], "numactl", f"--membind={node}", python, f"{HERE}/load.py", str(seconds)],
             stdout=subprocess.PIPE,
             text=True,
         )
@@ -127,8 +128,9 @@ def main() -> None:
             p.terminate()
         for p in load:
             out, _ = p.communicate(timeout=30)
-            if out.strip():
-                load_gbs.append(json.loads(out.strip().splitlines()[-1])["gbs"])
+            if p.returncode != 0 or not out.strip():
+                raise RuntimeError(f"load process exited {p.returncode} with no result; the loaded rows are not loaded")
+            load_gbs.append(json.loads(out.strip().splitlines()[-1])["gbs"])
         if load:
             print(json.dumps({"load_node": load_node, "load_procs": procs, "load_gbs_total": round(sum(load_gbs), 1)}), flush=True)
 
