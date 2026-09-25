@@ -75,7 +75,8 @@ def graph_blocks(path):
     for line in open(path):
         r = json.loads(line)
         kind = r.get("kind")
-        if kind == "ram_miss_request":
+        # The route log's records (graph_routes*) sit between graph steps but are not forwards.
+        if kind in ("ram_miss_request", "graph_routes", "graph_routes_header"):
             continue
         tag = "g" if kind == "graph_step" else "e"
         if not blocks or blocks[-1]["tag"] != tag:
