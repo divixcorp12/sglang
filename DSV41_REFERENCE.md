@@ -64,21 +64,20 @@ cannot be run. Never copy a tree to divix01 by other means
 (`.claude/rules/divix01-run-protocol.md`).
 
 ```bash
-git push shared codex/nvfp4-expert-stream-main
+git push origin master
 ```
 
-**2. divix01: move the serving checkout onto the new commit.** The `shared` remote
-points to divix01's bare repo at
-`/data/models/slang/nvfp4-work/remotes/sglang-nvfp4.git`. The current production and
-benchmark checkout is `dsv41-direct-prod`:
+**2. divix01: move the serving checkout onto the new commit.** Since 2026-09-25 there is
+one branch, `master`, on one remote, `origin` = GitHub `divixcorp12/sglang`; the divix01
+bare repo (`remotes/sglang-nvfp4.git`, remote `shared`) and `codex/nvfp4-expert-stream-main`
+are retired. The production and benchmark checkout is `dsv41-direct-prod`:
 
 ```bash
 ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-prod \
-  && git fetch origin codex/nvfp4-expert-stream-main \
-  && git merge --ff-only FETCH_HEAD && git log -1 --oneline'
+  && git pull --ff-only origin master && git log -1 --oneline'
 ```
 
-The current `dsv41-direct-prod` checkout tracks `origin/codex/nvfp4-expert-stream-main`.
+The `dsv41-direct-prod` checkout tracks `origin/master`.
 Older linked diagnostic worktrees may be detached; inspect each checkout before updating
 it. Do not assume the old `wt-p1bench` path is the benchmark target.
 
@@ -3702,7 +3701,7 @@ traced 96-token request.
 
 ## 25. Copy engine, fusion, and the closed overlap studies (2026-09-25)
 
-Everything below is merged into `codex/nvfp4-expert-stream-main`. Plans and raw numbers live in
+Everything below is merged into `master` (then named `codex/nvfp4-expert-stream-main`). Plans and raw numbers live in
 `docs/superpowers/plans/2026-09-25-dsv41-*.md`; runs live under
 `divix01:/data/models/slang/nvfp4-work/direct-two-phase-tests/` and `/mnt/nvme1/`.
 

@@ -78,7 +78,7 @@ below is ~12 min of decode plus ~4 min of TTFT per arm.
 
 ## Launch
 
-On divix01, in `wt-dsv41` after `git pull --ff-only shared dsv41`:
+On divix01, in `wt-dsv41` after `git pull --ff-only origin <branch>` (GitHub; see `.claude/rules/divix01-run-protocol.md`):
 
 ```bash
 cd /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41

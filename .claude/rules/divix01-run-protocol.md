@@ -1,18 +1,24 @@
 # Running code on divix01
 
-Code is written on the laptop, committed, pushed to `shared`, and pulled on
+Code is written on the laptop, committed, pushed to GitHub, and pulled on
 divix01. Never copy a working tree to divix01 by other means.
+
+There is one remote, `origin` = `git@github.com:divixcorp12/sglang.git`, and one
+main branch, `master` (`upstream` is sgl-project, for syncing only). The old divix01
+bare repo (`remotes/sglang-nvfp4.git`, remote `shared`) is retired: do not push to it.
 
 ```bash
 # laptop, in the worktree for the branch
-git push shared <branch>
+git push origin <branch>
 
-# divix01
-ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/wt-dsv41 \
-  && git pull --ff-only shared dsv41 && git log -1 --oneline'
+# divix01: a private worktree of the divix01 clone, at the pushed commit
+ssh divix01 'git -C /data/models/slang/sglang fetch origin \
+  && git -C /data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-<name> origin/<branch> \
+  && git -C /data/models/slang/nvfp4-work/wt-<name> log -1 --oneline'
 ```
 
-Then run in that worktree, with `PYTHONPATH=$PWD/python`.
+Then run in that worktree, with `PYTHONPATH=$PWD/python`. Never run tests in the
+production checkout (`cc-expert-prediction/dsv41-direct-prod`); it tracks `origin/master`.
 
 ## No ad-hoc copies
 
