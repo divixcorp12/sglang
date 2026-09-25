@@ -7,7 +7,7 @@ Found by the DSV4.1 copy-engine soak (docs/superpowers/plans/2026-09-25-dsv41-co
 
 import unittest
 
-from sglang.srt.managers.scheduler import prompt_logprob_refusal
+from sglang.srt.managers.prompt_logprobs import prompt_logprob_refusal
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
