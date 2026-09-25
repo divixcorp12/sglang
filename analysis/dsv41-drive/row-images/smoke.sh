@@ -4,7 +4,8 @@
 # Derived from direct-two-phase-tests/pinned-numa/smoke_100_audit.sh; the base arm is that script's `on` arm.
 #
 # Usage: smoke.sh <base|rowimg> <tag> <worktree>
-#   base    two-phase, piece stream, 100 GiB pinned host split 60/40 GiB over NUMA nodes 0/1, mirrors (arm_env)
+#   base    two-phase, piece stream, 100 GiB pinned host split 60/40 GiB over NUMA nodes 0/1, mirrors, bounce + pack
+#           workers (ROW_IMAGES forced to 0: arm_env turns it on by default since 2026-09-24)
 #   rowimg  base + SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1 (every mirror root must hold exl3_row_images/manifest.json)
 #
 # Takes cc-gpu.lock and rowimg-disk.lock (the row-image converter holds the latter while it writes the mirror drives;
@@ -28,7 +29,7 @@ say() { echo "$(date +%T) $*" | tee -a $OUT/driver.log; }
 
 [ -d "$WT/python/sglang" ] || { say "no sglang tree under $WT"; exit 2; }
 case $ARM in
-  base)   EXTRA="" ;;
+  base)   EXTRA=", 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '0'" ;;
   rowimg) EXTRA=", 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1'" ;;
   *) echo "arm must be base|rowimg"; exit 2 ;;
 esac

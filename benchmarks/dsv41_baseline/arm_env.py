@@ -141,6 +141,9 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE": "1",
         "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
         "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM": "1",
+        # Reads land straight in the pinned slabs, no pack workers (section 24.9). Needs the row images built on
+        # every mirror root by scripts/dsv41/build_row_images.py; startup refuses a root without a matching set.
+        "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES": "1",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
 
