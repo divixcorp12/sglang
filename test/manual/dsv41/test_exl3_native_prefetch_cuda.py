@@ -296,10 +296,13 @@ class Decode:
         self.s.close()
 
 
-def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_path):
+@pytest.mark.parametrize("ballast", [False, True])
+def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_path, ballast):
     """Each step routes 3 of 16 experts; the prefetch predicts the next step's first expert half the time and a random
-    one otherwise, so copied rows are used, wasted and (outside the 8-row pinned tier) skipped. The bytes the MoE reads
-    must be the checkpoint's in both arms; prefetch on must also remove demand misses."""
+    one otherwise, so copied rows are used, wasted and (outside the 8-row pinned tier) filtered. The bytes the MoE reads
+    must be the checkpoint's in both arms; prefetch on must also remove demand misses. With the ballast every copy job
+    completes ~5 ms after it is issued, so a commit that does not wait for the done word maps a slot before its bytes
+    land (mutant: the commit kernel's wait removed -- red on the byte check)."""
     rng = random.Random(5)
     steps = [rng.sample(range(EXPERTS), ROUTES) for _ in range(STEPS + 1)]
     predicted = [steps[i + 1][0] if rng.random() < 0.5 else rng.randrange(EXPERTS) for i in range(STEPS)]
@@ -307,6 +310,10 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
     for arm in (False, True):
         (tmp_path / f"arm{int(arm)}").mkdir()
         d = Decode(tmp_path / f"arm{int(arm)}", prefetch=arm)
+        ballast_src = torch.empty(64 << 20, dtype=torch.uint8).pin_memory() if ballast else None
+        ballast_dst = torch.empty(64 << 20, dtype=torch.uint8, device="cuda") if ballast else None
+        if ballast:
+            d.s.host.copy_engine_ballast(ballast_dst, ballast_src)
         try:
             expected = d.s.expected(list(range(EXPERTS)))
             outs[arm], misses[arm] = [], 0
@@ -328,6 +335,8 @@ def test_replay_with_prefetch_on_is_byte_identical_to_replay_with_it_off(tmp_pat
                 assert c["prefetch_skipped_not_ready"] + dc[COUNTER["ram_filtered"]] > 0, (dc, c)
                 assert dc[COUNTER["used"]] > 0 and c["prefetch_used"] + c["prefetch_wasted"] > 0, (dc, c)
         finally:
+            if ballast:
+                d.s.host.copy_engine_ballast(None, None)
             d.close()
     for i in range(STEPS):
         for n in outs[False][i]:
