@@ -185,6 +185,9 @@ def test_a_prefetch_job_waits_on_the_copy_thread_while_a_demand_job_is_in_flight
         _load(sim, host, [2, 3])
         demand = sim.post(ROW, [2], dst=[0], copy_engine=True)
         assert host.pump() == 1
+        deadline = time.time() + 5
+        while host.copy_engine_marked() < 1 and time.time() < deadline:
+            time.sleep(0.002)
         assert host.copy_engine_marked() == 1  # the demand job is on the stream, its mark held
         gen = pf.post(ROW, 3, 4)
         assert host.pump() == 3

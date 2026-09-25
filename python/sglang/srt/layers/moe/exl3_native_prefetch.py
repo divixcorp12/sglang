@@ -86,7 +86,7 @@ class NativePrefetch:
 
     def commit(self, layer_id: int, routes: torch.Tensor) -> None:
         """At the start of layer ``layer_id``'s graph forward, before its gather: settle its pending prefetch."""
-        if self.updater is None or not torch.cuda.is_current_stream_capturing():
+        if self.updater is None or not _capturing():
             return
         row = self.rows.get(int(layer_id))
         if row is None or row == 0:
@@ -102,12 +102,14 @@ class NativePrefetch:
 
     def predict(self, layer_id: int, x: torch.Tensor) -> None:
         """In layer ``layer_id``'s graph forward, after its gather and before its fused MoE: plan the next layer."""
-        if self.updater is None or not torch.cuda.is_current_stream_capturing():
+        if self.updater is None or not _capturing():
             return
         target = int(layer_id) + 1
         row = self.rows.get(target)
         gate = registered_gate(target)
-        if row is None or gate is None or row != self.rows.get(int(layer_id), -2) + 1:
+        if row is None or gate is None or getattr(gate, "e_score_correction_bias", None) is None:
+            return
+        if row != self.rows.get(int(layer_id), -2) + 1:
             return
         from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 
@@ -143,7 +145,7 @@ class NativePrefetch:
             out = dict(zip(kernels.NATIVE_PREFETCH_COUNTERS, self._snapshot.tolist()))
             logger.info("exl3 native prefetch device counters %s", out)
             self._snapshot_event = None
-        if self._checks % every == 0 and self._snapshot_event is None and not torch.cuda.is_current_stream_capturing():
+        if self._checks % every == 0 and self._snapshot_event is None and not _capturing():
             if self._snapshot is None:
                 self._snapshot = torch.empty_like(self.counters, device="cpu").pin_memory()
             self._snapshot.copy_(self.counters, non_blocking=True)
@@ -156,6 +158,11 @@ class NativePrefetch:
         if self.counters is None:
             return {}
         return dict(zip(kernels.NATIVE_PREFETCH_COUNTERS, self.counters.cpu().tolist()))
+
+
+def _capturing() -> bool:
+    """A CUDA graph capture is underway on the current stream (False on a machine without a GPU)."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
 def _ready_state() -> int:
