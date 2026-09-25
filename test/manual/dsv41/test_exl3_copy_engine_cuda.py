@@ -9,8 +9,13 @@ most visibly under the ballast, which delays every copy job's completion by one 
 Run on divix01 holding cc-gpu.lock, with PYTHONPATH pointing at the tree under test and SGLANG_EXL3_SRC set.
 """
 
+import json
+import os
 import random
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -238,6 +243,29 @@ def test_the_first_replay_of_a_copy_engine_graph_completes_armed(ce, fillers):
     assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
     assert s.delivered(experts)
     assert s.until(lambda: _all_retired(s)), s.counters()
+
+
+@pytest.mark.parametrize("mode", ["LAZY", "EAGER"])
+def test_a_kernels_first_launch_while_cw_spins_fails_stop_under_lazy_loading_only(tmp_path, mode):
+    """The soak's fail-stop (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md), reduced: a JIT kernel,
+    built and loaded but never launched, is launched for the first time while the copy thread's copies are being
+    issued and CW waits for them. Under LAZY the launch loads the kernel, which waits for the device, which waits in CW
+    for copies that cannot be issued: the request times out and the page goes fatal. Under EAGER the kernel loaded
+    with its library and the launch returns at once. The service refuses the copy engine without EAGER; this pins the
+    reason. Each mode runs in its own process: CUDA reads CUDA_MODULE_LOADING once, at initialisation."""
+    scenario = Path(__file__).resolve().parent / "ce_lazy_load_scenario.py"
+    env = dict(os.environ, CUDA_MODULE_LOADING=mode)
+    r = subprocess.run([sys.executable, str(scenario), str(tmp_path)], env=env, capture_output=True, text=True,
+                       timeout=900)
+    assert r.returncode == 0, r.stderr[-4000:]
+    row = json.loads([line for line in r.stdout.splitlines() if line.startswith("{")][-1])
+    if mode == "EAGER":
+        assert row["keep"] == 1.0 and row["timeouts"] == 0 and row["fatal"] == 0, row
+        assert row["launch_ms"] < 100, row
+    else:
+        assert row["keep"] == 0.0 and row["timeouts"] == 1 and row["fatal"] != 0, row
+        assert row["launch_ms"] > 1000, row
+    assert row["x"] == 1.0, row  # the kernel itself ran once either way
 
 
 @pytest.mark.parametrize("waiter", ["h2d", "d2h", "kernel"])
