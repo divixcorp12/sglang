@@ -4019,7 +4019,7 @@ Session 1's prefill ran from 1.18 to 24.56 s in the trace, 23.4 s for 260 tokens
 |---|---:|---|
 | `_gather_host_rows_kernel` | 6.5 s | An SM zero-copy gather from pinned RAM at 12.33 GB/s, which is link-bound. There are 129 calls; each is 6 segment launches over ≤64 experts (the staging buffer holds 64), ~47 on average. That moves ~78 GB for 260 tokens: ~146 non-VRAM experts × 13.3 MB per layer. |
 | GPU idle, host busy | ~12 s | 128 gaps of 10–250 ms, about 3 per layer, one per gather chunk. During them the scheduler thread makes no CUDA call and no traced syscall: it is filling the pinned tier (below). |
-| GPU idle, launch gaps | 3.9 s | ~157,000 gaps under 0.1 ms between ~149,000 eager kernels. |
+| GPU idle, launch gaps | 3.9 s | ~157,000 gaps under 0.1 ms between ~149,000 eager kernels, mostly torch glue: ~65,000 elementwise, ~10,000 index kernels, and ~23,000 cub select/reduce/compact kernels from per-chunk routing bookkeeping. Prefill runs without CUDA graphs (`--cuda-graph-backend-prefill disabled`). |
 | Other kernels | ~0.5 s | All other prefill compute. |
 
 **How the pinned-tier fill works:** `_gather_cached` → `ExpertPinnedHostCache.gather_rows` →
@@ -4084,6 +4084,22 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
     The remainder is within the RX calibration's error.
   - Rows re-copied on consecutive steps are a residency-policy cost (Track B: Belady's bound is 31 misses per token
     lower), not a lease-protocol cost. Hot-cache insertions copy device to device (7.6 GB on stream 13), off PCIe.
+- **NVMe waits are concentrated in a few layers** (`more.py`). S time per step: layer 0 3.10 ms, layer 19 2.43,
+  layer 1 2.11, layer 23 2.10, layer 39 2.09, 47.0 ms in total. Only layers 0, 1 and 19 have a median S above 1 ms
+  in every step.
+  - **Not hash routing:** DSV4.1's layer 0 has a learned gate (`layers.0.ffn.gate.weight`, `.bias`, no `tid2eid`),
+    and the config sets no hash layers, so these routes cannot be known before the layer runs.
+  - **The pinned tier is split evenly:** `ExpertPinnedHostCacheManager.from_model` deals the 100 GiB budget out
+    round-robin, one row per layer per pass. Every layer gets 201–202 of the 8,063 rows, whatever its miss rate.
+  - **Layer 0 has least cover:** it runs first in the step, so no earlier compute hides its NVMe reads.
+- **Small kernels are on the critical path** (node mode, so inflated). Per decode step: 15.1 ms of compute kernels,
+  ~1,800 of them under 3 µs, and 3.0 ms of gaps between kernels.
+  - The link is idle ~85% of the compute time, so compute is serial with the transfers and every ms removed is a ms
+    per token.
+  - Measure it in graph mode with the copy engine off; graph mode with the copy engine on is refused.
+- **The first decode step after a prefill is slow:** the two sessions' first graphs ran 240.8 and 198.9 ms on the
+  GPU, against ~110 ms in steady state. This is consistent with prefill evicting decode's RAM rows plus a stale hot
+  cache.
 
 ### 27.4 Next steps
 
@@ -4099,7 +4115,12 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    Fewer NVMe misses (the RAM tier, and item 2) or faster streaming are the levers. The earlier "copy-thread" reading
    of this time was wrong (§27.3).
 4. **Long prompts:** larger prefill chunks, which trades against Track A's VRAM headroom (§25.4).
-5. **Environment:** the spinning tmux server on the server cores contaminates every arm.
+5. **Per-layer RAM split:** give the pinned tier's rows to layers by their miss rate instead of evenly (§27.3).
+   Replay the route logs to find the split, then run it as an arm.
+6. **Decode small kernels:** another fusion round over the ~1,800 sub-3 µs kernels per step. Worth a few ms/token,
+   *estimate*.
+7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
+8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 
 ### 27.5 Copy-thread scheduling, untraced
 
