@@ -3839,6 +3839,8 @@ Both are on in `arm_env`, and both are byte-identical to the unfused recipe.
 
 ### 25.6 Next decode work
 
+Superseded by §26.2, which orders and expands this list.
+
 1. **Finish the copy-engine soak** (§25.3): the full soak, a second seed, the 30k-prompt memory
    test at 0.83, the mutants, and EAGER's ms/token cost. If 0.83 runs out of memory, find the
    highest fraction that survives, or identify the lazily loaded kernel and warm it up instead of
@@ -3847,6 +3849,118 @@ Both are on in `arm_env`, and both are byte-identical to the unfused recipe.
    (Track A's candidates, ~6 GiB together). Each GiB saves ~2–2.7 rows per token at ~1 ms each.
 3. **Why one H2D stream stops at ~13.7 GB/s** on Gen3 x16. The platform cannot go faster, but the
    gap to line rate has not been explained.
+
+## 26. Decode performance roadmap and plan status (2026-09-25)
+
+This section expands §25.6. It lists the next decode performance steps in order, then every DSV4.1
+plan file with its status. Numbers are measured unless marked *estimate*.
+
+### 26.1 How decode got here
+
+| Date | Change | ms/token | Where |
+|---|---|---:|---|
+| 2026-09-24 | Row-image recipe (piece streaming + row images) | 132.1–132.4 | §24.9 |
+| 2026-09-25 | + layer fusion (−3.2) and Engram device wait (−2.6) | 125.5 | §25.2 |
+| 2026-09-25 | + copy engine (A 119.3 → B 112.4, pooled, same session) | **112.4** | §25.1 |
+
+Production has run this recipe since 2026-09-25 16:31: `master` `b9620985ed`,
+`CUDA_MODULE_LOADING=EAGER`, memory fraction 0.83, copy engine armed after 16 decode forwards.
+The 112.4 arms ran under LAZY at 0.80, so production's own ms/token is not yet measured (item 1).
+
+Where the ~111 ms/token goes (§25.1, node trace):
+
+- ~78–81 ms: the PCIe link moving ~76 RAM-hit rows of 13.3 MB each (~1.02 GB per token at
+  12.57 GB/s).
+- ~16–20 ms: the rest of S (streamed rows and NVMe waits).
+- ~13.7 ms: all compute.
+- ~2 ms: small chain kernels.
+
+**The link is the bottleneck.** Overlap has run out: there is at most 13.7 ms of compute to hide
+copies behind, and three overlap studies have closed (§25.4). The levers left are fewer bytes per
+token, a faster link, and less NVMe exposure.
+
+### 26.2 Next steps, in order
+
+GPU work cannot run while production holds `cc-gpu.lock`. Items 1, 2, 4, 5 and 6 need production
+stopped (`run_server.md` D7).
+
+1. **Finish the copy-engine soak.** This gates trusting production.
+   - Remaining: the full ~2 h soak, a second seed, mutants of the two copy-engine changes, and a
+     ~30k-token prompt at 0.83 + EAGER. The 30k prompt is the likeliest out-of-memory case: it
+     peaked at 31.0 of 31.8 GiB at 0.80 (§25.4).
+   - To resume: "Handoff (mid-task)" in `2026-09-25-dsv41-copy-engine-soak.md`.
+   - **Also measure EAGER's cost** with the copy engine off, A = LAZY then B = EAGER. The copy
+     engine refuses LAZY, so the two cannot be compared with it on.
+2. **Replace EAGER with a targeted warm-up.** The kernel that loads lazily and hangs the copy engine
+   (§25.3) is not identified. Once it is, warming it up at startup would return EAGER's ~1 GiB, to
+   the hot cache or to prefill headroom.
+3. **Fewer bytes per token: return VRAM to the hot cache.** This is the largest lever.
+   - Each +1 GiB of hot cache saves 2–2.7 misses per token (Track B), at ~1 ms of link per miss.
+   - Track A's three candidates, none built, total ~6 GiB:
+     - cap the torch prefill indexer's score tensor (~2 GiB);
+     - keep the dense modules quantized (2.8 GiB);
+     - move the embedding to host (1.23 GiB).
+   - Together, *estimate* 12–16 ms/token.
+   - **Constraint:** Track A found no spare VRAM at 0.80. Each freed GiB must first cover the
+     30k-prompt peak from item 1 before it can go to the hot cache.
+4. **Faster link: close the gap to line rate.**
+   - One H2D stream reaches 13.67 GB/s. Gen3 x16's theoretical rate is 15.75 GB/s, so at most 13%
+     of link time (~10 ms/token, *estimate*, an upper bound) is unexplained.
+   - Things to try:
+     - **Coalesce copies.** Each RAM-hit row is six segment copies today; try fewer, larger ones.
+     - **Split the copies** across two streams or copy engines.
+     - **Keep the GPU's NUMA node quiet.** CPU memory load there cuts H2D by 27–43% (§25.4), and
+       the final arms ran with questdb's `java` at ~90% on the server cores. Move such load off the
+       GPU's node before trusting any arm, and possibly in production too.
+5. **Re-test the MoE side stream under the copy engine.** This is cheap: an environment flag and
+   A-then-B arms.
+   - `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM` (1a) was measured only before the copy engine existed.
+     It overlapped correctly, but 131.8 vs 131.9 ms/token showed no gain. Part of its saving came
+     back as a longer C1, because the SM copy kernel shared SMs with the shared-expert GEMVs
+     (`2026-09-25-dsv41-copy-compute-overlap.md` §7).
+   - With the copy engine, C1 is DMA and uses no SMs, so that interference is gone.
+   - At stake: the shared expert (1.62 ms/step) plus `commit_gather` (0.35 ms of bookkeeping,
+     after fusion). *Estimate* ≤2 ms/token.
+   - Not yet validated: the side stream together with the copy engine's wait kernel in the same
+     graph. Run the side-stream GPU tests and a soak item before any arm.
+6. **Less NVMe exposure (the ~16–20 ms of S).** The session-aware RAM cache plan targets this and
+   is not started. The Belady bound shows 31 misses per token between today's policy and the
+   optimum (Track B). Today's policy is the best online one found, so closing that gap needs
+   prediction, not a better recency rule.
+7. **Parked:**
+   - **Prefetch** (native gate, early post): precision is good enough (0.68–0.73), but there is
+     no idle link or compute to hide under. Revisit only if items 3–4 leave the link well under
+     70% busy.
+   - **Resident-first MoE split:** each extra `exl3_moe` launch costs ~90 µs per layer.
+   - **DSpark:** blocked on four items (§18.5), and a 6-token verify routes more experts per step,
+     which means more link bytes.
+
+### 26.3 Plan files and progress
+
+All under `docs/superpowers/plans/`. The plans do not tick their checkboxes. Status comes from the
+sections cited and the merged code.
+
+| Plan | What | Status | Results |
+|---|---|---|---|
+| `2026-09-18-dsv41-phase0.md` | Base branch, Engram parity, quant-file scope, `_HostTable` | Done | §11, §14 |
+| `2026-09-18-dsv41-phase1.md` | EXL3-first bring-up | Done | §15 |
+| `2026-09-18-dsv41-phase3a.md` | Eager three-tier streaming, `G`/`f` | Replaced by revision 2 | §16 |
+| `2026-09-18-dsv41-phase3a-r2.md` | 3a on the MoE expert framework | Done | §16 |
+| `2026-09-19-dsv41-phase3b-optionC.md` | MoE inside the decode graph, io_uring RAM-miss thread, device wait | Done; the base of today's path | §17 |
+| `2026-09-19-dsv41-phase3b1.md` | "Graphs first": breakable graphs, one readback per layer | Superseded by option C, which met its goals | §17, §18 |
+| `2026-09-19-dsv41-dspark.md` | DSpark on the EXL3 stack, phase D1 | Parked by the owner 2026-09-19; not started | §18.5 |
+| `2026-09-19-dsv41-session-aware-ram-cache.md` | Session-aware RAM admission and replacement | Not started (route-log tooling only) | item 6 |
+| `2026-09-24-dsv41-piece-streaming.md` | Stream NVMe rows to the GPU piece by piece | Done; in the recipe | §24 |
+| `2026-09-24-dsv41-row-images.md` | Read rows straight into the pinned slabs | Done; in the recipe | §24.9 |
+| `2026-09-25-dsv41-engram-no-hostnode.md` | Engram lookups without host nodes | Done; in the recipe (−2.6) | §25.2 |
+| `2026-09-25-dsv41-layer-fusion.md` | Fuse the per-layer bookkeeping chains | Done; in the recipe (−3.2) | §25.2 |
+| `2026-09-25-dsv41-copy-compute-overlap.md` | 1a side stream, 1b copy engine, item 3 Python gaps | 1a closed (flag off; see item 5); 1b became the copy engine; item 3 has no decode value | §25.3, §25.4 |
+| `2026-09-25-dsv41-copy-engine-soak.md` | Soak the copy engine | **In progress:** the LAZY hang is fixed with EAGER; `s4` ran 91 requests clean; full soak, 2nd seed, mutants and the 30k prompt remain | §25.3, item 1 |
+| `2026-09-25-dsv41-final-arms.md` | Full A/B arms and node trace | Done: 119.3 → 112.4, byte-identical | §25.1 |
+| `2026-09-25-dsv41-prefetch-study.md` | Offline prefetch study (route-only, residency replay) | Done: route-only predictors useless | §25.4 |
+| `2026-09-25-dsv41-router-capture.md` | Router-input capture, native-gate lookahead | Done: 0.68 rank-1 precision | §25.4 |
+| `2026-09-25-dsv41-native-prefetch.md` | Native next-layer prefetch, plus the early-post estimate | Built, flag off (123.2 vs 120.6); early post not built (misses the 8 ms bar) | §25.4 |
+| `2026-09-25-dsv41-per-expert-compute.md` | Compute experts as they land (resident-first split) | Closed: step 2 fails the gate | §25.4 |
 
 ## Sources
 
