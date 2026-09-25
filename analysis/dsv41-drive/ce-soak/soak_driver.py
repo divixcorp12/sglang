@@ -467,6 +467,17 @@ class Runner:
         with open(path, "w") as f:
             f.write(f"t={self.now():.3f} tag={tag} scheduler pids={pids}\n")
             f.flush()
+            if os.environ.get("SOAK_CAPTURE_CUDA_GDB") == "1" and pids:
+                # Diagnosis runs only (a long RAM-miss deadline): which kernels are resident while the step is
+                # stuck. First, before anything else can change the device state.
+                cmd = ["/usr/local/cuda-13.2/bin/cuda-gdb", "-p", pids[0], "-batch", "-ex", "info cuda kernels",
+                       "-ex", "info cuda contexts", "-ex", "detach"]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    f.write(f"\n===== cuda-gdb rc={r.returncode}\n{r.stdout}\n{r.stderr[-4000:]}\n")
+                except Exception as e:  # noqa: BLE001
+                    f.write(f"\n===== cuda-gdb failed: {e!r}\n")
+                f.flush()
             for pid in pids[:1]:
                 for cmd in (
                     ["/data/models/slang/.venv/bin/py-spy", "dump", "--native", "--pid", pid],
@@ -480,15 +491,6 @@ class Runner:
                     f.flush()
             r = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
             f.write("\n===== nvidia-smi\n" + r.stdout)
-            if os.environ.get("SOAK_CAPTURE_CUDA_GDB") == "1" and pids:
-                # Diagnosis runs only (a long RAM-miss deadline): which kernels are resident while the step is stuck.
-                cmd = ["/usr/local/cuda-13.2/bin/cuda-gdb", "-p", pids[0], "-batch", "-ex", "info cuda kernels",
-                       "-ex", "thread apply all bt 25", "-ex", "detach"]
-                try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                    f.write(f"\n===== cuda-gdb rc={r.returncode}\n{r.stdout}\n{r.stderr[-4000:]}\n")
-                except Exception as e:  # noqa: BLE001
-                    f.write(f"\n===== cuda-gdb failed: {e!r}\n")
 
     def server_alive(self):
         if self.server_pid is None:
