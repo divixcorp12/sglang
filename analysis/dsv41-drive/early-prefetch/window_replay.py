@@ -36,7 +36,11 @@ give prefetches issued and used per graph step. Issued prefetches are spread uni
 ones over the targets with at least one hit lane (a used row is by definition a RAM-ready VRAM miss of T, i.e. a hit
 lane). Estimate per token: ``base + issued/39 * sum(exposed + share penalty) - used * mean saving over eligible``.
 
-    window_replay.py A_DIR B_DIR [--base-ms 120.6] [--json OUT]
+**Calibration.** The ``late`` arm is B's own placement, measured at +2.6 ms/token. The model's error there is carried
+to the early arms as a constant (``calibrated_*``). The gate passes only if both the raw and the calibrated early
+estimate clear -8 ms/token.
+
+    window_replay.py A_DIR B_DIR [--base-ms 120.6] [--b-measured-delta 2.6] [--json OUT]
 """
 
 from __future__ import annotations
@@ -54,28 +58,37 @@ LANE_BYTES = 13315584.0  # one expert row
 
 
 def load_steps(directory: str) -> tuple[list[list[dict]], dict]:
-    """Graph decode steps with a record for every layer, in forward order, plus the graph_step lines."""
-    per_forward: dict[int, dict[int, dict]] = collections.defaultdict(dict)
+    """Graph decode steps after the copy engine armed, each the 40 layers' records in post order, plus the
+    graph_step lines. Steps are cut by post order (a new step at each layer-0 record), not by the records'
+    ``forward`` label, which sometimes names the previous forward on layer 0. Prefill forwards are dropped."""
+    records: list[dict] = []
     graph_steps: dict[int, dict] = {}
+    extend: set[int] = set()
     for line in open(os.path.join(directory, "stages.jsonl")):
         record = json.loads(line)
         kind = record.get("kind")
         if kind == "ram_miss_request":
-            per_forward[record["forward"]][record["layer"]] = record
+            records.append(record)
         elif kind == "graph_step" and record.get("thread"):
             graph_steps[record["forward"]] = record
+        elif kind is None and record.get("phase") == "extend":
+            extend.add(record["forward"])
+    armed = min(g["t"] for g in graph_steps.values() if g["thread"].get("copy_jobs", 0))
+    records.sort(key=lambda r: r["stages_ns"]["observed"])
+    groups: list[list[dict]] = []
+    for record in records:
+        if record["layer"] == 0 or not groups:
+            groups.append([])
+        groups[-1].append(record)
     steps = []
-    for forward in sorted(per_forward):
-        layers = per_forward[forward]
-        if forward not in graph_steps or len(layers) != LAYERS:
+    for group in groups:
+        if [r["layer"] for r in group] != list(range(LAYERS)):
             continue
-        if not graph_steps[forward]["thread"].get("copy_jobs", 0):
-            continue  # before the copy engine armed
-        records = [layers[layer] for layer in range(LAYERS)]
-        obs = [r["stages_ns"]["observed"] for r in records]
-        if any(b <= a for a, b in zip(obs, obs[1:])):
+        if group[0]["stages_ns"]["observed"] / 1e9 < armed:
             continue
-        steps.append(records)
+        if any(r["forward"] in extend for r in group[1:]):
+            continue
+        steps.append(group)
     return steps, graph_steps
 
 
@@ -243,6 +256,7 @@ def main() -> int:
     ap.add_argument("--issue-ms", type=float, default=0.033)
     ap.add_argument("--prefetch-ms", type=float, default=0.988, help="B's measured read-to-completion per copy")
     ap.add_argument("--late-window-ms", type=float, default=0.361)
+    ap.add_argument("--b-measured-delta", type=float, default=2.6, help="B - A measured, ms/token (late post)")
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--json")
     a = ap.parse_args()
@@ -258,6 +272,13 @@ def main() -> int:
         r = replay(timelines, rates, a.lane_ms, a.prefetch_ms, variant, mode, a.late_window_ms)
         r["est_ms_per_token"] = round(a.base_ms + r["delta_ms_per_token"], 2)
         out["arms"].append(r)
+    # Calibration: the late arm is B's placement, measured at +2.6 ms/token. The model's error there (mostly the
+    # saving per used row, which B implies at ~0.74 ms) is carried to the early arms as a constant correction.
+    correction = a.b_measured_delta - out["arms"][0]["delta_ms_per_token"]
+    for r in out["arms"]:
+        r["calibrated_delta_ms_per_token"] = round(r["delta_ms_per_token"] + correction, 2)
+        r["calibrated_est_ms_per_token"] = round(a.base_ms + r["calibrated_delta_ms_per_token"], 2)
+        r["clears_8ms"] = r["calibrated_delta_ms_per_token"] <= -8.0 and r["delta_ms_per_token"] <= -8.0
         print(json.dumps(r), flush=True)
     print(json.dumps(out["model_check"]))
     print("rates", out["rates_from_b"])
