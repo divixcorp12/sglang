@@ -3660,6 +3660,36 @@ with `--include-warmup`. Runs: `divix01:.../direct-two-phase-tests/row-images/`.
   late-sub-read pattern: 254 stalls, and part-1 sub-reads 10–35 ms late. It also had a
   ~38 µs higher tail. A rerun (base2) was clean, so it was the drive, not the merge.
 
+**Traces of the default recipe at `2a3523e76e`** (row images on). Reports:
+`/mnt/nvme1/dsv41-nsys/default-{graph-20260924-193419,node-20260924-193728}`. Script:
+`divix01:.../row-images/trace_default.sh`. Same prompt as §24.2/§24.6: 2 warm-ups, then one
+traced 96-token request.
+
+- **Graph mode, 96 launches.**
+  - Step p50 116.1 ms and mean 115.6 (p10 87.7, p90 147.5).
+  - The host is in `cudaGraphLaunch` for 104 ms p50. The host tail is 12.3 ms, all hidden:
+    the tail's kernels start 111 ms after their launch, so the host is a step ahead.
+  - There are 0 blocking copies of 5 ms or more in decode.
+- **Node mode:** 112.1 ms of GPU time per token, so the GPU is busy almost the whole step.
+
+  | GPU time per token | ms |
+  |---|---:|
+  | C1 `copy_expert_row_segments` | 72.3 |
+  | S `lease_stream_kernel` | 21.3 |
+  | Expert GEMMs (`exl3_moe`, `exl3_gemv`) | 8.8 |
+  | Everything else | 9.7 |
+
+- **C1 still runs at Gen3 x16 line rate.** Each token has 79.9 VRAM misses, of which 9.8
+  are NVMe reads. C1's 70.1 rows are 0.93 GB at **12.9 GB/s**.
+- **The whole step is the link.** All of the ~80 VRAM misses cross it: 1.06 GB, about
+  82 ms/token at 13 GB/s. That leaves about 34 ms/token when the link is idle: compute
+  (~17), S's wait on the disk (~11), and the rest. Those periods run one after another, not
+  overlapped.
+- **What moves decode now:**
+  - fewer VRAM misses: each row is about 1.02 ms;
+  - overlapping the link with compute (§24.7 item 2);
+  - a faster link: the RTX 5090 is Gen5 but sits in a Gen3 slot.
+
 **Suites at `e543f74c80`:**
 - CPU `test/registered/unit/kernels`: 1665 passed, 1 skipped (the sibling test, under
   `taskset -c 0-31`).
