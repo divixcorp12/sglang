@@ -1,0 +1,23 @@
+50cd50160e bench(dsv41): resident-first split bench adds the no-launch floor and a wide missed launch
+sglang from /data/models/slang/nvfp4-work/wt-resident-first/python/sglang/__init__.py
+cmd: python analysis/dsv41-drive/resident-first/split_launch_bench.py --replays 300 --out /mnt/nvme1/resident-first/run2/bench.json
+row 13.32 MB; per token 3.20 GB over 40 layers; allocated 4.01 GiB
+one                   4045.0 us/token   101.13 us/layer  extra   +0.00 us/layer     +0.0 us/token  (p10 4041.4, p90 4050.4)
+tables_only            362.3 us/token     9.06 us/layer  extra  -92.07 us/layer  -3682.7 us/token  (p10 360.3, p90 364.5)
+two_static/5+1        7724.7 us/token   193.12 us/layer  extra  +91.99 us/layer  +3679.7 us/token  (p10 7718.7, p90 7739.5)
+res_only/5+1          4080.8 us/token   102.02 us/layer  extra   +0.89 us/layer    +35.8 us/token  (p10 4076.9, p90 4086.9)
+miss_only/5+1         4014.1 us/token   100.35 us/layer  extra   -0.77 us/layer    -31.0 us/token  (p10 4010.1, p90 4018.5)
+miss_wide/5+1         3762.9 us/token    94.07 us/layer  extra   -7.05 us/layer   -282.1 us/token  (p10 3759.4, p90 3766.1)
+two_torch/5+1         9512.6 us/token   237.82 us/layer  extra +136.69 us/layer  +5467.6 us/token  (p10 9500.9, p90 9524.3)
+two_static/4+2        7667.7 us/token   191.69 us/layer  extra  +90.57 us/layer  +3622.6 us/token  (p10 7662.0, p90 7681.1)
+res_only/4+2          4049.4 us/token   101.24 us/layer  extra   +0.11 us/layer     +4.4 us/token  (p10 4045.2, p90 4055.7)
+miss_only/4+2         4033.9 us/token   100.85 us/layer  extra   -0.28 us/layer    -11.2 us/token  (p10 4030.3, p90 4037.5)
+miss_wide/4+2         3737.0 us/token    93.43 us/layer  extra   -7.70 us/layer   -308.0 us/token  (p10 3733.9, p90 3740.9)
+two_torch/4+2         9434.8 us/token   235.87 us/layer  extra +134.74 us/layer  +5389.8 us/token  (p10 9422.7, p90 9446.0)
+two_static/3+3        7623.6 us/token   190.59 us/layer  extra  +89.46 us/layer  +3578.6 us/token  (p10 7619.6, p90 7638.1)
+res_only/3+3          4039.2 us/token   100.98 us/layer  extra   -0.15 us/layer     -5.9 us/token  (p10 4035.7, p90 4045.0)
+miss_only/3+3         4034.8 us/token   100.87 us/layer  extra   -0.26 us/layer    -10.2 us/token  (p10 4030.8, p90 4038.1)
+miss_wide/3+3         3749.6 us/token    93.74 us/layer  extra   -7.39 us/layer   -295.4 us/token  (p10 3746.0, p90 3753.5)
+two_torch/3+3         9412.9 us/token   235.32 us/layer  extra +134.20 us/layer  +5367.9 us/token  (p10 9402.0, p90 9423.5)
+implied bandwidth, one: 790 GB/s
+EXIT=0
