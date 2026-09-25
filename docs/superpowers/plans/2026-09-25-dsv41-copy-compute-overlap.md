@@ -187,8 +187,9 @@ Results: section 7.
   the host can compute them before launch. Either way the lookup overlaps layers 0-13 instead of stalling the stream,
   **saving up to 2.5 ms/token by itself**.
 - **Does it remove the launch block?** In the probe, yes: the same graph without host nodes launched in 9 us (p50,
-  max 3.6 ms) over 300 back-to-back replays; with host nodes it blocked. One mechanism, one probe; to be confirmed
-  on the real graph by a graph-mode trace (`cudaGraphLaunch` duration) after the change.
+  max 3.6 ms) over 300 back-to-back replays; with host nodes it blocked, back to back and one step ahead (section 8).
+  One mechanism, one probe; to be confirmed on the real graph by a graph-mode trace (`cudaGraphLaunch` duration)
+  after the change.
 - **What a non-blocking launch changes:** the host returns from the launch immediately and would reach the next
   step's first device-to-host dependency (the sampled token's readback) sooner. It then blocks there instead, so the
   GPU step does not shorten. What it buys is that no host API call ever waits behind a blocked launch, which 1b
@@ -221,8 +222,73 @@ Attribution is by stream position within the layer, checked against the code.
 
 ## 7. Measurements of 1a
 
-(filled in below from the smokes and the trace)
+**Tests** (commands recorded in `divix01:.../copy-overlap/suite/*.log`):
+- CPU: `PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 python -m pytest test/registered/unit/kernels -q -p no:randomly -k "ram_miss or lease or piece or expert"`
+  at `f26c910abe`: **1629 passed, 37 deselected, PIPESTATUS 0** (`cpu_head.log`).
+- GPU: `analysis/dsv41-drive/copy-overlap/gpu_suite.sh` (the seven manual RAM-miss files of 24.8/24.9, the RAM-miss
+  graph file, the side-stream file): head `b4e77e5ebb` **120 passed, exit 0**; base `37c8927027` **116 passed, exit 0**.
+  The difference is the four new side-stream tests. (A first head run without the suite's `SGLANG_EXL3_SRC` env
+  failed 18 on the environment; `gpu_head.log`.)
+- Mutants on `moe_side_stream.py`, each reverted and the file re-run green: dropping the join's wait fails the
+  ordering test; dropping the fork's wait fails the captured test.
+
+**Smokes**, 100 GiB `arm_env` recipe, cold server per arm, order off/on/on/off, same session
+(`analysis/dsv41-drive/copy-overlap/smoke.sh`, `compare_arms.py --include-warmup`; `smoke/compare_abba.json`):
+
+| Arm | ms/token, trace (wall-validated) | step p50 / p90 | 1-row submit->done p50 | stalls (multi-row > 10 ms) |
+|---|---:|---:|---:|---:|
+| off 1 | 131.8 (134.4) | 126.9 / 161.4 | 2604 us | 1 of 2004 |
+| on 1 | 131.9 (134.5) | 127.4 / 161.9 | 2599 us | 2 of 2023 |
+| on 2 | 132.1 (134.7) | 128.2 / 161.6 | 2601 us | 0 of 2026 |
+| off 2 | 131.9 (134.6) | 128.0 / 161.1 | 2604 us | 0 of 2026 |
+
+Responses are **byte-identical**, 6 of 6 for every arm against off 1, and each arm's reps agree. **No gain:** the
+arms sit within 0.3 ms/token of each other, with the order effect as large as the flag's.
+
+**Node-mode traces, flag on and off**, same prompts, 393 paired steps (`smoke/node-{on,off}/trace.sqlite`).
+Attribution only; node mode inflates small-kernel cost, so these are not ms/token:
+- The fork works. Shared-expert GEMVs run beside the router and plan kernels, and `commit_gather`'s scatters run
+  beside the MoE prep and `exl3_moe_kernel`. Per layer, norm-to-post fell 87 -> 62 us and F-to-MoE 65 -> 42 us.
+- The main-stream kernels running beside the GEMV slow down (`plan_unique_routes` 3.1 us against ~1.3).
+- Paired per step: time outside the chain **-1.92 ms**, but C1 **+1.05 ms** and S -0.14. Node-mode span -1.69 ms.
+  The graph-mode smokes, which have far smaller per-kernel overhead, show none of it.
+
+**Verdict:** 1a is correct and measurably overlapped, but saves nothing at the wall. Leave the flag off. The
+within-layer compute that can move off the chain is too small (about 2 ms/step in node mode, less in graph mode) and
+partly comes back as a longer C1. Per the brief, no graph-mode trace was taken because the smoke showed no gain.
+The node traces above are the confirmation that the overlap exists.
 
 ## 8. Python between steps (item 3)
 
-(filled in below from the py-spy capture)
+`py-spy record --rate 250 --duration 90` on the scheduler during the off arm's decode (`smoke/pyspy-off/`, 21,119
+samples):
+
+| Where the scheduler thread was | Share |
+|---|---:|
+| waiting in `process_batch_result_decode` -> `torch.cuda` `synchronize` (the previous step's result) | 65.0% |
+| eager prefill forward (the six requests' prefills) | 28.5% |
+| decode Python outside that wait | 6.2% |
+
+Of the decode Python outside the wait, **82%** is `_expert_doorbell_fail_stop_check` -> `stage_records`, the RAM-miss
+stage-trace drain, which runs only because the smoke sets `SGLANG_DSV41_EXPERT_TRACE_PATH`. The rest (prepare
+for decode, graph `replay()`, allocation) is about 0.9 s over ~470 steps, **~2 ms per step, all while the GPU runs**.
+**Item 3 has no decode value today:** the host waits for the GPU two-thirds of the time and never gates it.
+If the stage trace is on during a measurement, it costs host time but is hidden the same way.
+
+The same profile shows `graph.replay()` taking about 1% of the decode Python, while section 24.9's graph-mode nsys
+trace put the host in `cudaGraphLaunch` for 104 ms per step. The two disagree; whether nsys's graph tracing moves the
+wait into the launch is not established. The probe below settles what matters for 1b either way.
+
+**Probe (ii) again, as the overlap scheduler launches** (`--ahead 1`: launch step i, then wait for step i-1; 2 host
+nodes per step; 200 ms device timeout; `probe_rows2_hostnodes_ahead1.json`): 2,400 requests, **14 timeouts**. Every
+timeout fell in one `replay()` call that blocked for 2.8 s. So the deadlock also occurs one step ahead, not only
+under back-to-back launches.
+
+## 9. Recommended next step
+
+1. **Remove the Engram host nodes (section 5).** It saves up to 2.5 ms/token directly, and it is the precondition
+   for 1b's ~7-8 ms/token and for any copy-engine prefetch. Re-run `ce_probe.py --host-nodes --ahead 1` against the
+   new scheme's launch pattern, and take a graph-mode trace to confirm `cudaGraphLaunch` no longer blocks.
+2. Then **1b** as specified in section 3, then **prefetch (1d)** on the same machinery.
+3. Drop 1a (flag stays off) and 1c until C1 is off the SMs. Elementwise fusion (section 6) is worth ~3.5 ms/step in
+   kernel time. Given 1a's result, measure one fusion before committing to all four.
