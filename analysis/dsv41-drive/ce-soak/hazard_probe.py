@@ -15,7 +15,11 @@ request deadline. The chain is launched without waiting; while CW spins, the mai
                issues its own: a copy-engine copy that waits on the chain, as a decode step's input update does
   d2h_after    the same with a device->pinned copy (the overlap scheduler's result copies)
   d2d_after    the same with a device->device copy
-  h2d_side     a pinned->device copy on a side stream that waits on the chain's stream
+  h2d_side     a pinned->device copy on a side stream that waits on the chain's stream; the stream is created in
+               the call (torch.cuda.Stream())
+  h2d_sidepre  the same on a stream created beforehand
+  streamcreate a raw cudaStreamCreateWithFlags(non-blocking)
+  eventcreate  a raw cudaEventCreate
 
 For every *_after/_side kind the service is paused while the chain and the copy are enqueued and resumed 5 ms
 later, so the copy thread's copies are issued after the waiting copy (the order of a real decode step).
@@ -43,7 +47,7 @@ def main() -> int:
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--trials", type=int, default=2)
-    ap.add_argument("--kinds", default="control,hostalloc,hostregister,hostfree,malloc,emptycache,h2d_after,d2h_after,d2d_after,h2d_side")
+    ap.add_argument("--kinds", default="control,hostalloc,hostregister,hostfree,malloc,emptycache,h2d_after,d2h_after,d2d_after,h2d_sidepre,eventcreate,streamcreate,h2d_side")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
     import sglang
@@ -109,7 +113,18 @@ def main() -> int:
             if kind == "malloc":
                 n = (fresh_mib() << 20) + 2 * 1024 * 1024 * (len(keep) + 1)
                 return lambda: keep.append(torch.empty(n, dtype=torch.uint8, device="cuda"))
-            if kind in ("h2d_after", "d2h_after", "d2d_after", "h2d_side"):
+            if kind == "streamcreate":
+                def create_stream():
+                    handle = ctypes.c_void_p()
+                    rc = ctypes.CDLL("libcudart.so.13").cudaStreamCreateWithFlags(ctypes.byref(handle), 1)
+                    keep.append(handle)
+                    if rc:
+                        raise RuntimeError(f"cudaStreamCreateWithFlags rc={rc}")
+
+                return create_stream
+            if kind == "eventcreate":
+                return lambda: keep.append(torch.cuda.Event())
+            if kind in ("h2d_after", "d2h_after", "d2d_after", "h2d_side", "h2d_sidepre"):
                 pinned = torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)
                 device = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
                 device2 = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
@@ -128,7 +143,17 @@ def main() -> int:
                     with torch.cuda.stream(side):
                         device.copy_(pinned, non_blocking=True)
 
-                return side_copy
+                if kind == "h2d_side":
+                    return side_copy
+                pre = torch.cuda.Stream()
+                keep.append(pre)
+
+                def side_copy_pre():
+                    pre.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(pre):
+                        device.copy_(pinned, non_blocking=True)
+
+                return side_copy_pre
             if kind == "emptycache":
                 block = torch.empty(96 << 20, dtype=torch.uint8, device="cuda")
                 del block
@@ -142,7 +167,7 @@ def main() -> int:
                 assert s.until(lambda: s.host.copy_engine_idle(0.0))
                 timeouts = s.stats()["timeouts"]
                 s.plan([0, 1, 2])
-                behind = kind.endswith("_after") or kind.endswith("_side")
+                behind = kind.endswith("_after") or kind.startswith("h2d_side")
                 if behind:
                     s.host.pause(5.0)
                 t0 = time.perf_counter()
