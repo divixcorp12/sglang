@@ -1879,6 +1879,10 @@ class Envs:
     # residency commit run on one side stream, joined before the shared-expert add, so they overlap the RAM-miss
     # copies and the routed MoE kernel instead of running in line. Read once per process. Off by default.
     SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM = EnvBool(False)
+    # DSV4 EXL3 decode layer fusion (plan 2026-09-25-dsv41-layer-fusion): one JIT kernel each for DIRECT's
+    # gather_destinations and commit_gather and for the fused MoE's route tables, in place of their ~89 small torch
+    # kernels per layer. Bit-identical to the torch chains. Read once when each layer's buffers are built. Off by default.
+    SGLANG_DSV41_ENABLE_LAYER_FUSION = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

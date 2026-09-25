@@ -1150,7 +1150,18 @@ class ExpertStreamer:
             remap = plan.remap
             source_rows = plan.source_rows
         direct = getattr(self, "residency_direct", None)
-        if direct is not None:
+        if direct is not None and direct.layer_fusion:
+            # One kernel for the branch below. Without a prefetch join it writes the router's own
+            # dtype, so the cast on return is a no-op; the join keeps the int64 the branch returns.
+            remap = direct.fused_gather_destinations(
+                self.residency_row,
+                remap,
+                flat,
+                expert_to_slot,
+                self.row_planner.scratch_base,
+                topk_ids.dtype if prefetch_puller is None else torch.int64,
+            )
+        elif direct is not None:
             # Stage DIRECT: send the miss lanes into victim slots instead of scratch rows.
             # `expert_to_slot` is still this forward's pre-gather mapping here, so its slots
             # are exactly the rows the gather is about to read.

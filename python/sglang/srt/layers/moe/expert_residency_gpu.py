@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.moe.expert_insert_rows import insert_expert_rows
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_residency import (
     decide_residency_on_device,
     residency_rank_keys,
@@ -328,6 +329,17 @@ class GpuResidencyUpdater:
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.gather_evictions = torch.zeros(layers, dtype=torch.long, device=device)
         self._pending_commit = None
+        # SGLANG_DSV41_ENABLE_LAYER_FUSION: one kernel each for gather_destinations and commit_gather. Their per-layer
+        # outputs live in these rows, so a commit forked onto the side stream reads buffers nothing else reuses.
+        self.layer_fusion = envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()
+        if self.layer_fusion:
+            self._init_layer_fusion()
+
+    def _init_layer_fusion(self) -> None:
+        shape, device = (self.num_layers, self.miss_rows), self.device
+        self.fused_destinations = torch.zeros(shape, dtype=torch.long, device=device)
+        self.fused_live = torch.zeros(shape, dtype=torch.bool, device=device)
+        self.fused_remaps = {dtype: torch.zeros(shape, dtype=dtype, device=device) for dtype in (torch.int32, torch.int64)}
 
     def check_miss_plans(self) -> None:
         """Refuse every backend that could write a cache row this mode does not control.
@@ -750,6 +762,40 @@ class GpuResidencyUpdater:
         rank = (remap - scratch_base).clamp(min=0, max=self.miss_rows - 1).long()
         return torch.where(remap >= scratch_base, destinations.index_select(0, rank), remap)
 
+    def fused_gather_destinations(
+        self,
+        row: int,
+        remap: torch.Tensor,
+        flat: torch.Tensor,
+        expert_to_slot: torch.Tensor,
+        scratch_base: int,
+        remap_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """:meth:`gather_destinations` as one kernel, which also looks up ``expert_to_slot`` of ``flat`` itself.
+
+        Returns the translated remap in ``remap_dtype``, a view of a per-layer buffer.
+        """
+        from sglang.kernels.ops.moe.dsv41_layer_fusion import direct_gather_destinations
+
+        streamer = self.streamers[row]
+        destinations, live = self.fused_destinations[row], self.fused_live[row]
+        remap_out = self.fused_remaps[remap_dtype][row, : flat.numel()]
+        direct_gather_destinations(
+            flat,
+            expert_to_slot,
+            self.victims[row],
+            self.victim_valid[row],
+            streamer._graph_miss_count,
+            remap,
+            scratch_base,
+            streamer._graph_destination_slots,
+            destinations,
+            live,
+            remap_out,
+        )
+        self._pending_commit = (row, streamer, destinations, live)
+        return remap_out
+
     def pending_commit_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The per-gather tensors ``commit_gather`` reads, for a caller that runs it on another stream."""
         _, _, destinations, live = self._pending_commit
@@ -760,6 +806,9 @@ class GpuResidencyUpdater:
         row, streamer, destinations, live = self._pending_commit
         self._pending_commit = None
         backend = streamer.row_backend
+        if self.layer_fusion:
+            self._fused_commit_gather(row, streamer, destinations, live)
+            return
         if getattr(backend, "name", None) == "exl3_ram_miss":
             delivered = backend.delivered_count.long()
             live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
@@ -802,6 +851,30 @@ class GpuResidencyUpdater:
             self.insertion_truncated[row].add_(((delivered > live.sum()) & good).long().sum())
         else:
             self.insertion_truncated[row].add_((streamer._graph_miss_count.long() > live.sum()).long().sum())
+
+    def _fused_commit_gather(self, row: int, streamer, destinations: torch.Tensor, live: torch.Tensor) -> None:
+        """:meth:`commit_gather` as one kernel; ``live`` is narrowed to the delivered lanes inside it."""
+        from sglang.kernels.ops.moe.dsv41_layer_fusion import direct_commit_gather
+
+        backend = streamer.row_backend
+        leased = getattr(backend, "name", None) == "exl3_ram_miss"
+        direct_commit_gather(
+            destinations,
+            live,
+            streamer._graph_source_rows[: self.miss_rows],
+            self.mapping[row],
+            self.slot_to_expert[row],
+            self.slot_state[row],
+            self.slot_generations[row],
+            self.gather_insertions[row : row + 1],
+            self.gather_evictions[row : row + 1],
+            self.insertion_truncated[row : row + 1],
+            backend.delivered_count if leased else None,
+            backend.keep if leased else None,
+            streamer._graph_miss_count,
+            ready=_READY,
+            free_state=_FREE,
+        )
 
     def _copy_promotions(self, width: int) -> None:
         """Copy each layer's promoted rows into its destination slots on the current stream."""

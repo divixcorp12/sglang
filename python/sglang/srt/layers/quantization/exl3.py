@@ -470,7 +470,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         out = fused.run(
             x,
             topk_weights.reshape(-1),
-            remap.reshape(-1).long(),
+            # Layer fusion takes the router's int32 remap and writes the int64 copy inside its one kernel.
+            remap.reshape(-1) if fused.layer_fusion else remap.reshape(-1).long(),
             streamer.row_backend.keep,
             swiglu_limit,
         )

@@ -16,6 +16,7 @@ from typing import Mapping
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.exl3_ext import exl3_ext
 
 ACT_SILU = 0
@@ -115,14 +116,43 @@ class Exl3FusedMoE:
             self.temp_intermediate_g,
             self.temp_intermediate_u,
         ) = shared_temps(device, hidden, inter)
+        # SGLANG_DSV41_ENABLE_LAYER_FUSION: route_tables and the copies around it as one kernel, into these buffers.
+        self.layer_fusion = envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()
+        if self.layer_fusion:
+            self.remap64 = torch.zeros(top_k, dtype=torch.int64, device=device)
+            self.inv_order = torch.zeros(top_k, dtype=torch.int64, device=device)
+            self.weight_sorted = torch.zeros(top_k, **half)
+            self.det = torch.zeros((3, slots + 1), dtype=torch.int64, device=device)
+
+    def _fused_route_tables(self, x, topk_weights, remap, keep):
+        from sglang.kernels.ops.moe.dsv41_layer_fusion import exl3_moe_route_tables
+
+        exl3_moe_route_tables(
+            remap.contiguous(),
+            topk_weights.contiguous(),
+            keep,
+            x.contiguous(),
+            self.remap64,
+            self.x16,
+            self.out,
+            self.expert_count,
+            self.inv_order,
+            self.weight_sorted,
+            self.det,
+        )
+        return self.remap64, self.inv_order, self.weight_sorted, self.det
 
     def run(self, x, topk_weights, remap, keep, act_limit: float) -> torch.Tensor:
-        """x [1, H] any float dtype; topk_weights [6]; remap int64 [6] slots; keep fp32 [1]."""
+        """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int64 (int32 too with layer fusion);
+        keep fp32 [1]."""
         if x.shape[0] != 1:  # a host-side shape read: capture-safe
             raise ValueError(f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}")
-        self.x16.copy_(x)
-        inv_order, weight_sorted, det = route_tables(remap, self.expert_count, self.ones, topk_weights, keep)
-        self.out.zero_()
+        if self.layer_fusion:
+            remap, inv_order, weight_sorted, det = self._fused_route_tables(x, topk_weights, remap, keep)
+        else:
+            self.x16.copy_(x)
+            inv_order, weight_sorted, det = route_tables(remap, self.expert_count, self.ones, topk_weights, keep)
+            self.out.zero_()
         t = self.tables
         self.ext.exl3_moe(
             self.x16, self.out, self.expert_count, self.token_sorted, weight_sorted,
