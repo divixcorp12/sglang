@@ -191,6 +191,17 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.int32)
 
 
+def _bench_module():
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "..", "analysis", "dsv41-drive", "resident-first", "split_launch_bench.py")
+    spec = importlib.util.spec_from_file_location("split_launch_bench", os.path.normpath(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 @pytest.mark.parametrize("layer_fusion", [False, True])
 def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
     device = slot_rows["w13_trellis"].device
@@ -305,3 +316,30 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-s"]))
+
+
+def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
+    """The resident-first bench's copy arms are only meaningful if copy_missed writes the rows the missed launch
+    reads: poisoned sources must change the layer output, and the true bytes must restore it bitwise."""
+    bench = _bench_module()
+    device = torch.device("cuda", torch.cuda.current_device())
+    gen = torch.Generator().manual_seed(7)
+    par = bench._parity_module()
+    layers = bench.build_layers(par, slot_rows, device, gen)[:1]
+    L = layers[0]
+    bench.one(par, L)
+    want = L.fused.out.clone()
+    bench.add_pinned_sources(layers, (4, 2))
+    true_bytes = {n: t.clone() for n, t in L.pinned.items()}
+    for t in L.pinned.values():
+        t.zero_()
+    bench.copy_missed(L)
+    bench.one(par, L)
+    torch.cuda.synchronize()
+    assert not torch.equal(_bits(L.fused.out), _bits(want)), "poisoned rows did not reach the launch"
+    for n, t in L.pinned.items():
+        t.copy_(true_bytes[n])
+    bench.copy_missed(L)
+    bench.one(par, L)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(L.fused.out), _bits(want))
