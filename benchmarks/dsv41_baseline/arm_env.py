@@ -250,6 +250,15 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--disable-shared-experts-fusion",
             # Needs the prefill CUDA graph off (it is, above) and no DP attention (deepseek_v4_hook refuses both).
             "--enable-decoder-swa-bounded-replay",
+            # A 4k-token conversation's SWA tail does not survive another's prefill in the 3584-slot pool, so revisits
+            # reused nothing; the host copy restores them (DSV41_REFERENCE.md 27.16). Costs ~6k tokens of GPU KV.
+            "--enable-hierarchical-cache",
+            "--hicache-ratio",
+            "2",
+            "--hicache-size",
+            "0",
+            "--hicache-write-policy",
+            "write_through",
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]

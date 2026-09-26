@@ -985,6 +985,15 @@ def test_server_args_matches_current_context_and_prefix_cache_mode():
     assert session_subset.CONTEXT_LENGTH == arm_env.CONTEXT_LENGTH
 
 
+def test_server_args_back_the_prefix_cache_with_host_memory():
+    # Without it a 4k-token conversation's SWA tail is evicted from the 3584-slot pool and revisits reuse nothing.
+    argv = arm_env.ServerArgs(port=31050).argv()
+    assert "--enable-hierarchical-cache" in argv
+    flags = {"--hicache-ratio": "2", "--hicache-size": "0", "--hicache-write-policy": "write_through"}
+    for flag, value in flags.items():
+        assert argv[argv.index(flag) + 1] == value
+
+
 def test_server_args_binds_loopback_by_default():
     argv = arm_env.ServerArgs(port=31050).argv()
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
