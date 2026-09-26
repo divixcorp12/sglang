@@ -241,8 +241,8 @@ NON_TRACE_CLOCK_READS = {
     # always-on copy_issue_ns and copy_latency_ns counters, which are how stages.jsonl times the copies.
     "int64_t last_active = now_ns();": 2,
     "last_active = now_ns();": 2,
-    "} else if (!in_flight.empty() || !held.empty() || now_ns() - last_active < spin_ns_) {": 1,
-    "if (stopping && held.empty() && (in_flight.empty() || now_ns() > drain_deadline)) break;": 1,
+    "} else if (!in_flight.empty() || !held.empty() || !acking.empty() || now_ns() - last_active < spin_ns_) {": 1,
+    "if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline)) break;": 1,
     "drain_deadline_ = now_ns() + drain_ns;": 1,
     "if (now_ns() > deadline_ns) return false;": 1,
     "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
