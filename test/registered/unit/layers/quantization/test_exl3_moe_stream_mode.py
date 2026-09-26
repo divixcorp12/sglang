@@ -1,6 +1,7 @@
 """Exl3MoEMethod in streaming mode: no expert parameters, an attached expert
 streamer, and an apply that runs gathered chunks through the eager loop (CPU)."""
 
+import contextlib
 import functools
 import json
 import types
@@ -81,6 +82,9 @@ class FakeStreamer:
 
     def record_routes(self, topk_ids):
         self.recorded.append(topk_ids.clone())
+
+    def prefill_fills(self, source_ids):
+        return contextlib.nullcontext()  # no pinned tier to fill
 
     def iter_gather_experts(self, source_ids, chunk_rows=None):
         ids = source_ids.tolist()
@@ -395,6 +399,9 @@ def test_streamed_apply_skips_route_recording_while_capturing(monkeypatch):
 
         def iter_gather_experts(self, source_ids):
             return iter(())
+
+        def prefill_fills(self, source_ids):
+            return contextlib.nullcontext()
 
     layer = type("L", (), {"layer_id": 0})()
     x = torch.zeros((1, 8), dtype=torch.float16)
