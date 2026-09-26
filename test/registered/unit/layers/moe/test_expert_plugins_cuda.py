@@ -231,6 +231,67 @@ class TestPinnedTierCuda(unittest.TestCase):
             cache.copy_rows(ids, strided, rows=torch.tensor([0], device="cuda"))
         cache.close()
 
+    def test_a_split_chunk_copies_its_row_index_to_the_device_once(self):
+        """A resident row and three batches of filling rows: every copy slices one host-to-device row index."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        experts = 24
+        layer = torch.nn.Module()
+        layer.host_rows = torch.nn.Parameter(
+            torch.randint(0, 256, (experts, 3000), dtype=torch.uint8), requires_grad=False
+        )
+        layer.gpu_rows = torch.nn.Parameter(torch.rand(experts, 5, device="cuda"), requires_grad=False)
+        layer._nvfp4_file_source_bytes_per_expert = 3000
+        streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
+        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(True):
+            cache = ExpertPinnedHostCache(streamer, experts)
+        cache.row_fills = _LazyFills(cache, layer.host_rows.data)
+        cache.ensure_rows(torch.tensor([20], device="cuda"))
+        filling = list(range(18))
+        ids = torch.tensor(filling + [20], device="cuda")
+        out = torch.full((19, 3000), 7, dtype=torch.uint8, device="cuda")
+        with cache.host_use():
+            cache.prefetch_rows(filling, protected=filling + [20])
+            torch.cuda.synchronize()
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+                cache.gather_rows(ids, {"host_rows": out})
+                torch.cuda.synchronize()
+            cache.finish_fills()
+        self.assertEqual(cache.row_fills.waits, [8, 16, 18])
+        host_to_device = [event for event in profile.events() if "HtoD" in event.name]
+        self.assertEqual(len(host_to_device), 1, [event.name for event in profile.events()])
+        self.assertTrue(torch.equal(out.cpu(), layer.host_rows.data[ids.cpu()]))
+        cache.close()
+
+
+class _LazyFills:
+    """A PinnedRowFills whose claimed rows land in the tier's slabs only when waited for or joined."""
+
+    def __init__(self, cache, rows):
+        self.cache, self.rows, self.claimed, self.landed, self.waits = cache, rows, [], 0, []
+
+    def fill_begin(self, experts, protected, fallback):
+        self.claimed = [(expert, self.cache._lru.assign(expert, frozenset(protected))[0]) for expert in experts]
+        self.landed = 0
+        return [slot for _, slot in self.claimed], 0
+
+    def _land(self, rows):
+        for expert, slot in self.claimed[self.landed : rows]:
+            self.cache.tensors["host_rows"][slot].copy_(self.rows[expert])
+        self.landed = max(self.landed, rows)
+
+    def fill_wait(self, rows):
+        self.waits.append(rows)
+        self._land(rows)
+
+    def fill_landed(self):
+        return self.landed
+
+    def fill_end(self):
+        self._land(len(self.claimed))
+        return True
+
 
 def _spec_only_reference(names=None, experts=EXPERTS, seed=5):
     generator = torch.Generator().manual_seed(seed)

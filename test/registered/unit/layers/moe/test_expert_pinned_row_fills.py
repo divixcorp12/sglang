@@ -1,7 +1,8 @@
 """The pinned tier's native fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS) as ExpertPinnedHostCache drives them (CPU).
 
-A fake PinnedRowFills stands in for the RAM-miss service: its rows land only when waited for or joined, so a copy
-that ran before its wait would read the sentinel instead of the row.
+A fake PinnedRowFills stands in for the RAM-miss service: its rows land only when waited for or joined (or, to stand
+in for the reader running ahead, ``progress`` rows per ``fill_landed`` poll), so a copy that ran before its row landed
+would read the sentinel instead of the row.
 """
 
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ class FakeFills:
         self.claimed = []
         self.landed = 0
         self.fail = False
+        self.progress = 0
 
     def fill_begin(self, experts, protected, fallback):
         self.events.append(("begin", list(experts), sorted(protected), fallback))
@@ -53,6 +55,10 @@ class FakeFills:
     def fill_wait(self, rows):
         self.events.append(("wait", rows))
         self._land(rows)
+
+    def fill_landed(self):
+        self._land(min(len(self.claimed), self.landed + self.progress))
+        return self.landed
 
     def fill_end(self):
         self.events.append(("end",))
@@ -276,3 +282,92 @@ def test_a_failed_fill_still_raises_with_the_split():
         with pytest.raises(RuntimeError, match="prefetch"):
             cache.gather_rows(torch.tensor([1, 4]), _sentinel_outputs(reference, 2))
         cache.finish_fills()
+
+
+def _snapshot_at_waits(fills, outputs):
+    """Record the outputs as they are each time the host starts waiting for a fill."""
+    seen = []
+    wait = fills.fill_wait
+    fills.fill_wait = lambda rows: (seen.append((rows, {n: o.clone() for n, o in outputs.items()})), wait(rows))
+    return seen
+
+
+def _copied(snapshot, row, reference, expert):
+    return all(torch.equal(snapshot[name][row], reference[name][expert]) for name in NAMES)
+
+
+def _untouched(snapshot, row):
+    return all((snapshot[name][row] == SENTINEL).all() for name in NAMES)
+
+
+def test_a_row_that_landed_in_an_earlier_chunks_wait_is_copied_before_the_next_wait():
+    streamer, cache, fills, reference = _split_setup()
+    with cache.host_use():
+        cache.prefetch_rows([1, 2, 5, 6], protected=[1, 2, 5, 6])
+        cache.gather_rows(torch.tensor([1, 5]), _sentinel_outputs(reference, 2))  # waits for 1, 2 and 5
+        outputs = _sentinel_outputs(reference, 2)
+        seen = _snapshot_at_waits(fills, outputs)
+        cache.gather_rows(torch.tensor([2, 6]), outputs)
+        cache.finish_fills()
+    assert [rows for rows, _ in seen] == [4]
+    assert _copied(seen[0][1], 0, reference, 2) and _untouched(seen[0][1], 1)
+    _check(outputs, reference, [2, 6])
+
+
+def test_rows_the_reader_landed_before_the_chunk_are_copied_before_its_wait():
+    streamer, cache, fills, reference = _split_setup()
+    with cache.host_use():
+        cache.prefetch_rows([1, 2, 3, 6], protected=[1, 2, 3, 6])
+        fills._land(2)  # the fill thread landed 1 and 2 while the host was elsewhere
+        outputs = _sentinel_outputs(reference, 4)
+        seen = _snapshot_at_waits(fills, outputs)
+        cache.gather_rows(torch.tensor([1, 2, 3, 6]), outputs)
+        cache.finish_fills()
+    assert [rows for rows, _ in seen] == [4]
+    snapshot = seen[0][1]
+    assert _copied(snapshot, 0, reference, 1) and _copied(snapshot, 1, reference, 2)
+    assert _untouched(snapshot, 2) and _untouched(snapshot, 3)
+    _check(outputs, reference, [1, 2, 3, 6])
+
+
+def test_a_chunks_filling_rows_are_copied_batch_by_batch_as_they_land():
+    """Twenty filling rows: the host waits for eight at a time and copies each batch before waiting for the next."""
+    streamer, cache, fills, reference = _split_setup(capacity=24, experts=24)
+    experts = list(range(20))
+    with cache.host_use():
+        assert cache.prefetch_rows(experts, protected=experts) == 20
+        outputs = _sentinel_outputs(reference, 20)
+        seen = _snapshot_at_waits(fills, outputs)
+        cache.gather_rows(torch.tensor(experts), outputs)
+        cache.finish_fills()
+    assert [rows for rows, _ in seen] == [8, 16, 20]
+    for (_, snapshot), done in zip(seen, (0, 8, 16)):
+        assert all(_copied(snapshot, row, reference, row) for row in range(done))
+        assert all(_untouched(snapshot, row) for row in range(done, 20))
+    _check(outputs, reference, experts)
+
+
+@pytest.mark.parametrize("progress", [0, 3])
+def test_three_chunks_with_resident_landed_and_filling_rows_place_like_the_unsplit_gather(progress):
+    got = None
+    chunks = ([9, 0, 2, 11], [3, 5, 12, 4], [13, 7, 1, 10])
+    for split in (False, True):
+        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(split):
+            streamer, cache, fills, reference = _setup(capacity=14, experts=14)
+        cache.ensure_rows(torch.tensor([0, 5, 7]))
+        fills.progress = progress
+        with cache.host_use():
+            prefetch = sorted({e for chunk in chunks for e in chunk} - {0, 5, 7})
+            cache.prefetch_rows(prefetch, protected=prefetch + [0, 5, 7])
+            outputs = [_sentinel_outputs(reference, len(chunk)) for chunk in chunks]
+            for chunk, output in zip(chunks, outputs):
+                cache.gather_rows(torch.tensor(chunk), output)
+            cache.finish_fills()
+        for chunk, output in zip(chunks, outputs):
+            _check(output, reference, chunk)
+        if got is None:
+            got = outputs
+        else:
+            for a, b in zip(got, outputs):
+                for name in NAMES:
+                    assert torch.equal(a[name], b[name])

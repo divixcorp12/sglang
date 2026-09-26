@@ -139,6 +139,20 @@ def test_fill_wait_returns_as_a_prefix_lands(tmp_path):
         host.stop()
 
 
+def test_fill_landed_reports_the_landed_prefix_without_blocking(slow_tier):
+    s, host = slow_tier
+    host.inject_fault(pack_delay_ns=SLOW_PACK_NS)
+    host.fill_begin(0, [0, 1, 2, 3])
+    started = time.perf_counter()
+    assert host.fill_landed() < 4
+    assert time.perf_counter() - started < SLOW_PACK_NS / 1e9
+    host.fill_wait(1, 10.0)
+    assert host.fill_landed() >= 1
+    assert host.fill_end()
+    host.inject_fault()
+    assert host.fill_landed() == 4
+
+
 def test_waiting_for_more_rows_than_were_claimed_raises(tier):
     s, host = tier
     host.fill_begin(0, [0, 1])
@@ -158,6 +172,7 @@ def test_a_failed_fill_releases_the_rows_that_did_not_land(tmp_path):
         with pytest.raises(RuntimeError, match="failed"):
             host.fill_wait(1, 10.0)
         assert not host.fill_end()
+        assert host.fill_landed() == 0
         assert not host.contains(1, 2)
         assert host.counters()["read_errors"] == 1
     finally:
