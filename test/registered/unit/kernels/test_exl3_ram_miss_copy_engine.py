@@ -312,7 +312,8 @@ def test_an_acknowledgement_of_an_earlier_generation_releases_nothing_and_a_late
         assert host.pump() == 1
         host.copy_engine_release(-1)
         assert _until(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
-        sim.sm_ack(req, generation=req.gen - 16)
+        assert req.gen > 1  # _load posted the earlier request
+        sim.sm_ack(req, generation=req.gen - 1)
         time.sleep(0.05)
         assert host.slot_info(ROW)[slot][2] == 1, "a stale acknowledgement released the lease"
         sim.sm_ack(req, generation=req.gen + 16)
