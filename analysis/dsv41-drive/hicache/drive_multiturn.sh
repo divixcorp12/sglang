@@ -10,7 +10,8 @@
 #   big-2k         big over 2048-token documents, the prompt size where earlier soaks did reuse prefixes;
 #   big-tails16    big with --swa-prefix-tails 16: a larger SWA pool, in case a 4k prefill evicts the other
 #                  conversation's SWA tail from the 3584-slot pool;
-#   big-hicache    big plus the hierarchical cache: a host-backed SWA tail is a valid match boundary.
+#   big-hicache    big plus the hierarchical cache: a host-backed SWA tail is a valid match boundary;
+#   equiv-hicache  big-hicache running prefix_equiv.py: does a prefix hit change greedy output?
 # Output under /mnt/nvme1/hicache/mt-<arm>/. Production must be stopped.
 # Usage: drive_multiturn.sh <worktree> [arm ...]
 set -u
@@ -51,7 +52,7 @@ CORES=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.SERVER_CORES)")
 MODEL=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.MODEL_PATH)")
 
 for arm in $ARMS; do
-  doc=4096; turns=3; drop=""
+  doc=4096; turns=3; drop=""; client=multiturn
   case $arm in
     big) extra="" ;;
     small) extra="$SMALL" ;;
@@ -60,6 +61,7 @@ for arm in $ARMS; do
     big-2k) extra=""; turns=2; doc=2048 ;;
     big-tails16) extra="--swa-prefix-tails 16"; turns=2 ;;
     big-hicache) extra="$HICACHE"; turns=2 ;;
+    equiv-hicache) extra="$HICACHE"; client=equiv ;;
     *) say "unknown arm $arm"; exit 2 ;;
   esac
   OUT=$T/mt-$arm
@@ -81,8 +83,13 @@ for arm in $ARMS; do
   done
   if [ $healthy = 1 ]; then
     say "arm $arm healthy"
-    taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/multiturn.py --port $PORT --model $MODEL \
-      --text $WT/DSV41_REFERENCE.md --doc-tokens $doc --turns $turns --out $OUT/turns.jsonl 2>&1 | tee -a $OUT/client.log
+    if [ $client = equiv ]; then
+      taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/prefix_equiv.py --port $PORT --model $MODEL \
+        --text $WT/DSV41_REFERENCE.md --out $OUT/equiv.jsonl 2>&1 | tee -a $OUT/client.log
+    else
+      taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/multiturn.py --port $PORT --model $MODEL \
+        --text $WT/DSV41_REFERENCE.md --doc-tokens $doc --turns $turns --out $OUT/turns.jsonl 2>&1 | tee -a $OUT/client.log
+    fi
     say "arm $arm client rc=${PIPESTATUS[0]}"
   else
     say "arm $arm never became healthy (see $OUT/server.log)"
