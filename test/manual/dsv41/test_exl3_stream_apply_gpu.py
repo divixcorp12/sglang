@@ -184,6 +184,49 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
     assert torch.equal(got, want)
 
 
+def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeypatch):
+    """The layer's host use (prefill_fills) must not end, resuming the RAM-miss service thread, while a chunk's
+    pinned-tier copy may still be reading the slabs; the flag-off path's chunk.tolist() used to guarantee that."""
+    import contextlib
+
+    from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
+    from sglang.srt.layers.quantization import exl3 as exl3_mod
+    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
+
+    gather_done = []
+    exit_saw = []
+
+    class _Streamer:
+        background_read_stats = type("S", (), {"rows": 0})()
+        last_gather_stats = types.SimpleNamespace(miss_rows=0, host_read_rows=0, host_read_ns=0, host_split_ns=0)
+
+        def record_routes(self, routed):
+            pass
+
+        @contextlib.contextmanager
+        def prefill_fills(self, source_ids):
+            yield
+            exit_saw.append([event.query() for event in gather_done])
+
+        def iter_gather_experts_host(self, source_ids, experts):
+            for start in range(0, len(experts), 2):
+                torch.cuda._sleep(200_000_000)  # the chunk's gather: a long copy still running when yielded
+                event = torch.cuda.Event()
+                event.record()
+                gather_done.append(event)
+                yield experts[start : start + 2], [0, 1][: len(experts[start : start + 2])], {}
+
+    monkeypatch.setattr(exl3_mod.EXL3_ROW_VIEWS, "select", lambda rows, experts, row_of_source: ({}, {}))
+    monkeypatch.setattr(exl3_mod, "exl3_moe_accumulate_planned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: Exl3StreamTrace())
+    layer = type("L", (), {"layer_id": 0})()
+    x = torch.zeros((2, 8), dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones((2, 3), dtype=torch.float32, device="cuda")
+    ids = torch.tensor([[0, 1, 2], [3, 1, 0]], dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
+    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None, route_plan=True)
+    assert len(gather_done) == 2 and exit_saw == [[True, True]]
+
 def _planned_inputs(experts=8, hidden=5120, inter=2304, tokens=40):
     from sglang.srt.layers.quantization.exl3_ops import Exl3RoutePlan, random_exl3_tensors
 
