@@ -288,6 +288,15 @@ def _expand_index_page_table(
 _TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
 
 
+def _torch_indexer_rows_per_chunk(num_heads: int, lc: int) -> int:
+    """Query rows per torch prefill indexer chunk: as many as keep one bf16
+    [rows, num_heads, lc] score tensor within the budget, at least one.
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB overrides the built-in cap."""
+    budget_mb = envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB.get()
+    budget = budget_mb << 20 if budget_mb > 0 else _TORCH_INDEXER_SCORE_BUDGET_BYTES
+    return max(1, budget // (num_heads * lc * 2))
+
+
 def _every_request_fits() -> bool:
     from sglang.srt.model_executor.runner_utils.capture_mode import (
         get_capture_attention_variant,
@@ -3647,10 +3656,7 @@ class DeepseekV4AttnBackend(
             k = min(topk, lc)
             # Every step below is per query row; chunk rows so the [rows, heads, lc]
             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
-            rows_per_chunk = max(
-                1,
-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
-            )
+            rows_per_chunk = _torch_indexer_rows_per_chunk(q.shape[1], lc)
             masks = [] if publish is not None else None
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
