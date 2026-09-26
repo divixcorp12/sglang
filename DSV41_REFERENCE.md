@@ -4110,8 +4110,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    - Not done: the per-chunk readbacks and the per-expert `torch.where` syncs stay (item 7).
    - Not done: the copy-engine gather. The SM gather already runs at the link rate, so DMA would only overlap it with
      the ~0.5 s of MoE compute, and that needs a second ~852 MB staging set.
-2. **Keep prefill from evicting decode's RAM set:** stage prefill misses without admitting them, or protect
-   decode-hot rows.
+2. **Keep prefill from evicting decode's RAM set: done, small; default off (§27.9),** behind
+   `SGLANG_DSV41_ENABLE_PREFILL_SHARE`. A bounded 64-row prefill share cut S by ~3 ms per step and cost 0.5–1.2 s
+   of TTFT. Staging without admission is worse. Most of early decode's excess misses are a cold start.
 3. **NVMe waits in decode:** ~13 ms per step of S outlasts the layer's RAM-hit copies, with the link partly idle.
    Fewer NVMe misses (the RAM tier, and item 2) or faster streaming are the levers. The earlier "copy-thread" reading
    of this time was wrong (§27.3).
@@ -4271,6 +4272,69 @@ Every kernel is compared as bits against the chain it replaces, and the chain ca
 The gain is ~1.7 µs per removed kernel. It matches the round-1 rate (§25.2) but is within two-session noise
 (p = 0.75). Left for a later round: folding wq_b's and wkv's output casts into the q rope and k-norm-rope, and wo_b's
 into the mHC post (3 kernels per layer, ~0.1 ms/token each).
+
+### 27.9 Keeping prefill from evicting decode's RAM set (result: small, default off)
+
+**Flag.** `SGLANG_DSV41_ENABLE_PREFILL_SHARE` (default off; `Dsv41Config.enable_prefill_share`). Plan and replay:
+`docs/superpowers/plans/2026-09-25-dsv41-prefill-eviction.md`.
+
+**Option chosen: a bounded prefill share, not staging.** A replay of the C++ tier's victim rule over three route
+captures (`analysis/dsv41-drive/prefill-evict/ram_replay.py`; its base arm gives 11.33 RAM misses per token against
+11.26 measured) decided it:
+- **(a) Staging without admission is worst.** A prompt's experts are what its first decode tokens route to, so not
+  admitting them raised decode steps 0–4 from 19.5 to 49.8 RAM misses per token on varied24. It would also need an
+  ~850 MB pinned staging set outside the service's slab tables.
+- **Most of the early-decode excess is cold start, not eviction.** Even a tier where prefill evicts nothing leaves
+  steps 0–4 at 16.9 misses per token, against 9.3 at steps 70+.
+- **(b) A 64-row share** (one gather chunk, `EXL3_MAX_GATHER_ROWS`) was never worse than base for decode, and on
+  the long-prompt soaks it cut decode RAM misses by 6–7%. The cost is 28–32% more prefill row reads, because a long
+  prompt's chunks re-use each other's experts. Cold admission (stamp 0) saved slightly more decode misses but cost
+  ~40% more prefill reads.
+
+**How it works.**
+- `RamTier` marks the rows a prefill admits as prefill-owned.
+- Once a layer holds 64 of them, and no slot is free, a prefill admission evicts the LRU owned row instead of one of
+  decode's. The victim is bound by every exclusion of `take_slot_locked`: READY, unleased, not hot, not protected,
+  not filling.
+- Decode ends a row's ownership by using it: a served demand, an unarmed touch, a prefetch lease, or `set_hot`.
+- A pre-forward observer sets the share for prefill forwards (`is_extend_without_speculative`) and clears it for
+  every other forward. It needs the expert-distribution recorder, and startup refuses the no-op one.
+- **With `SGLANG_DSV41_ENABLE_PREFILL_FILLS` (§27.6).** `fill_begin` claims through the same rule. A layer's
+  prefetch stops once the share is full; the chunk admissions after it evict the rows earlier chunks have gathered.
+
+**Arms.**
+- A (off) and B (on) ran at `b4e660e996` (before the rebase onto §27.6). Both were node-mode traced on port 30021,
+  once each, in that order.
+- C ran after the rebase, at `48186189c1`, with both flags on. It was untraced.
+- Every arm returned rc 0. The session with 103 output tokens carries the comparison.
+
+| | A (off) | B (share) | C (share + fills) | §27.6 B (fills) |
+|---|---:|---:|---:|---:|
+| S per step, decode steps 0–4 / 5–14 / 70+ (ms, traced) | 63.6 / 39.5 / 35.4 | 60.5 / 37.0 / 32.6 | | |
+| step wall, steps 0–4 / 5–14 / 70+ (ms, traced) | 148.3 / 110.2 / 106.3 | 145.5 / 109.8 / 105.9 | | |
+| ms/token, session 1 (pooled) | 114.2 (115.8) | 113.6 (115.4) | 110.1 (111.8) | 110.9 (112.5) |
+| TTFT, session 0 / 1 (s) | 22.87 / 19.47 | 22.93 / **20.63** | 12.54 / 11.88 | 12.05 / 11.14 |
+| decode NVMe rows (service `rows_read`, whole server) | 4,358 | 4,154 | 4,465 | 4,453 |
+| outputs vs A | | 2 of 2 byte-identical | 2 of 2 byte-identical | 2 of 2 byte-identical |
+
+- **Decode gains are small.** B cut S by 3 ms per step at decode steps 0–4 and by 2.8 ms at steps 70+, and the
+  service read 4.7% fewer rows. Step wall moved by 0.4–2.8 ms. Each arm is one session, so all of this is
+  directional.
+- **TTFT got worse:** +1.2 s on session 1 with the share alone. With fills on, the share cost +0.5 / +0.7 s,
+  because chunks after the first are no longer prefetched.
+- **So the flag stays off.** The replay and the arms agree: after a short prefill, decode's early misses are mostly
+  a cold start that no admission policy removes. Only a predictor could remove them (Track B, §25.4).
+
+**Tests.**
+- `test/registered/unit/kernels/test_exl3_ram_miss_prefill_share.py` has 16 tests. Among them: decode's rows survive
+  a prefill that holds its share, and prefill fills claim through the share. Three C++ mutants were each caught.
+- The service tests are at the end of `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`.
+
+**Evidence** (divix01):
+- Arm runs: `cc-expert-prediction/dsv41-baseline/servers/pevict-{A,B,C}/`.
+- Traces: `/mnt/nvme1/dsv41-nsys/pevict-{A,B}-*.{nsys-rep,sqlite}`.
+- Replays: `/mnt/nvme1/prefill-evict/replay3_*.json`.
+- Command: `analysis/dsv41-drive/pcie-trace/s_decay.py <sqlite>`, which now finds the last session's decode itself.
 
 ## Sources
 
