@@ -359,3 +359,21 @@ def test_sm_small_copies_are_refused_without_the_copy_engine():
     check_sm_small_copies(
         msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True, enable_ram_miss_copy_engine=True)
     )
+
+
+def test_the_sm_table_refuses_a_small_tensor_off_16_byte_alignment():
+    """CW reads 16-byte units only when both ends allow it and otherwise falls back to 1-byte loads: refuse that at
+    bind time rather than run the slow path silently."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_table
+
+    table = torch.tensor(
+        [[1 << 20, 2 << 20, 1 << 16], [(1 << 20) + 8, 2 << 20, 64], [1 << 20, (2 << 20) + 4, 64], [1 << 20, 2 << 20, 40]],
+        dtype=torch.int64,
+    )
+    segments = SimpleNamespace(table=table)
+    assert sm_copy_table(segments, 0b0001).tolist() == [[1 << 20, 2 << 20, 1 << 16]]
+    for bad in (0b0010, 0b0100, 0b1000):
+        with pytest.raises(ValueError, match="16-byte"):
+            sm_copy_table(segments, bad)

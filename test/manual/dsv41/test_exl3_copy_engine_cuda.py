@@ -449,3 +449,127 @@ def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the
         for n in s.names:
             s.slabs[s.row][n].copy_(originals[n])
         s.close()
+
+
+# ---- Review findings on the SM path: one mask for reads and commit (I1), SmAck after every read (I2), and an
+# SmAck for a failed request (I3). The test-build hooks are EXL3_RAM_MISS_TEST_* defines (device_module_with_hooks). ----
+
+SM_READ_DELAY_NS = 100_000_000
+
+
+def _resident_sm_service(tmp_path):
+    s = StreamService(tmp_path, copy_engine=True, sm_small=True)
+    s.plan(list(range(TOP_K)))
+    s.step()
+    assert s.until(lambda: _all_retired(s)), s.counters()
+    return s
+
+
+def _hook(s, *defines):
+    """Swap the chain's kernels for a hooked build and compile it on an empty request."""
+    from sglang.kernels.ops.moe.exl3_ram_miss import device_module_with_hooks
+
+    s.dev._module = device_module_with_hooks(defines)
+    s.plan([])
+    s.step()
+
+
+def _launch_to_snapshot(s):
+    s.post()
+    s.hit_wait()
+    s.copy1()
+    s.ack1()
+    s.stream()
+    s.ack2()
+    s.copy_wait()
+    s.finalize()
+    snapshot = {n: s.dest[n].clone() for n in s.names}
+    s.total()
+    return snapshot
+
+
+def _rewrite_on_release(s, slots, timeout_s=10.0):
+    """The instant every lease of ``slots`` has dropped, write 0xAB over those slab slots; seconds from the call."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout_s:
+        info = s.host.slot_info(s.row)
+        if all(info[slot][2] == 0 for slot in slots):
+            released = time.perf_counter() - t0
+            for n in s.names:
+                for slot in slots:  # an int index is a view of the slab
+                    s.slabs[s.row][n][slot].view(torch.uint8).fill_(0xAB)
+            return released
+    return None
+
+
+def test_a_lane_that_turns_copying_after_the_sm_read_fails_the_request_as_identity(tmp_path):
+    """I1. CW forms the COPYING mask for its SM reads and again for its commit. A lane in the second and not the first
+    had its small tensors never read: committing it would pair fresh trellis with stale scales. The hook makes lane 0
+    read as not COPYING at the SM read; the request must fail closed as Identity, and still acknowledge its reads."""
+    s = _resident_sm_service(tmp_path)
+    try:
+        _hook(s, "EXL3_RAM_MISS_TEST_CW_SM_SKIP_LANE=0")
+        s.plan(list(range(TOP_K)))
+        _launch_to_snapshot(s)
+        torch.cuda.synchronize()
+        assert int(s.dev.go_ce.item()) == 0 and s.keep.item() == 0.0, (s.counters(), s.stats())
+        assert s.stats()["fail_reason"] == lease.TERMINAL_REASONS["identity"], s.stats()
+        assert s.host.copy_engine_idle(5.0), "the failed request's SmAck never released its copy-engine leases"
+    finally:
+        s.close()
+
+
+def test_smack_follows_every_threads_read_of_the_slot(tmp_path):
+    """I2. The hook starts all but CW's first warp ~100 ms late on their reads. A watcher writes 0xAB over each slab slot
+    the instant its lease drops: an SmAck published before the late reads finish lets the sentinel into the
+    destination. Mutants: drop the barrier after the reads, or publish SmAck above the read loop -- each red on 0xAB."""
+    s = _resident_sm_service(tmp_path)
+    experts = list(range(TOP_K))
+    slots = [s.host.mapping(s.row)[e] for e in experts]
+    originals = {n: s.slabs[s.row][n].clone() for n in s.names}
+    try:
+        _hook(s, f"EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS={SM_READ_DELAY_NS}")
+        s.plan(experts)
+        snapshot = _launch_to_snapshot(s)
+        released_s = _rewrite_on_release(s, slots)
+        torch.cuda.synchronize()
+        assert released_s is not None, s.counters()
+        assert s.keep.item() == 1.0, (s.counters(), s.stats())
+        _check(s, experts, snapshot)  # 0xAB here: SmAck was published before a read of the slot finished
+        assert released_s > SM_READ_DELAY_NS / 2e9, f"the leases dropped {released_s:.3f} s in: the delay did not act"
+    finally:
+        for n in s.names:
+            s.slabs[s.row][n].copy_(originals[n])
+        s.close()
+
+
+def test_a_request_failed_before_cw_still_acknowledges_and_releases_its_copying_leases(tmp_path):
+    """I3. An earlier stage failed (req_failed set before CW), after the service granted every lane COPYING: CW reads
+    nothing, but its SmAck is the only thing that releases those leases, so it must still publish one.
+    Mutant: publish SmAck only when CW read something -- red on the held leases."""
+    from sglang.kernels.ops.moe.exl3_ram_miss import STATE_WORDS
+
+    s = _resident_sm_service(tmp_path)
+    experts = list(range(TOP_K))
+    slots = [s.host.mapping(s.row)[e] for e in experts]
+    try:
+        lanes = s.counters()["copy_lanes"]
+        s.plan(experts)
+        s.post()
+        s.hit_wait()
+        s.copy1()
+        s.ack1()
+        s.stream()
+        s.ack2()
+        s.dev.state[STATE_WORDS["req_failed"]] = 1
+        s.dev.state[STATE_WORDS["fail_reason"]] = lease.TERMINAL_REASONS["aborted"]  # aborted: no fatal word
+        s.copy_wait()
+        s.finalize()
+        s.total()
+        torch.cuda.synchronize()
+        assert int(s.dev.go_ce.item()) == 0 and s.keep.item() == 0.0, (s.counters(), s.stats())
+        assert s.counters()["copy_lanes"] - lanes == TOP_K, "the lanes were not copy-engine lanes"
+        assert s.host.copy_engine_idle(5.0), "a copy-engine job still awaits the failed request's SmAck"
+        assert s.until(lambda: all(s.host.slot_info(s.row)[slot][2] == 0 for slot in slots)), s.counters()
+    finally:
+        s.close()

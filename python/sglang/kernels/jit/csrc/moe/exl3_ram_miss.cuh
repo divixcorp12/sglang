@@ -1637,6 +1637,10 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl
         const int64_t named = planned_count < kLeaseLanes ? planned_count : kLeaseLanes;
         const uint64_t generation_mask = (1ull << 56) - 1;
         for (int64_t lane = 0; lane < named; ++lane) {
+#ifdef EXL3_RAM_MISS_TEST_CW_SM_SKIP_LANE
+          // Test build: this lane reads as not yet COPYING here, as if it turned COPYING after the SM read.
+          if (lane == EXL3_RAM_MISS_TEST_CW_SM_SKIP_LANE) continue;
+#endif
           const uint8_t* result = results + lane * kLeaseRowResultBytes;
           const uint64_t word = ld_acquire_sys64(result + kLeaseRrReady);
           if ((word >> 56) != kLeaseTagCopying || (word & generation_mask) != generation) continue;
@@ -1649,6 +1653,10 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl
       sm_mask = mask;
     }
     __syncthreads();
+#ifdef EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS
+    // Test build: all but the first warp start their reads late, so an SmAck that does not wait for them shows.
+    if (threadIdx.x >= 32) spin_ns(EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS);
+#endif
     for (uint32_t lanes = sm_mask; lanes != 0; lanes &= lanes - 1) {
       const int lane = __ffs(lanes) - 1;
       for (int64_t k = 0; k < sm_count; ++k) {

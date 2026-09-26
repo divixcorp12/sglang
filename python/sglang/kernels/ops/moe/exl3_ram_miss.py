@@ -1123,25 +1123,41 @@ STATE_WORDS = {
 STREAM_FAULT_WORDS = {"abort_block": 0, "abort_delay_ns": 1, "stall_ns": 2, "count_delay_ns": 3}
 
 
+_DEVICE_KERNELS = (
+    "exl3_ram_miss_post",
+    "exl3_ram_miss_wait",
+    "exl3_ram_miss_lease_wait",
+    "exl3_ram_miss_lease_ack",
+    "exl3_ram_miss_lease_hit_wait",
+    "exl3_ram_miss_lease_rest_wait",
+    "exl3_ram_miss_lease_stage_ack",
+    "exl3_ram_miss_lease_finalize",
+    "exl3_ram_miss_lease_stream_hit_wait",
+    "exl3_ram_miss_lease_stream",
+    "exl3_ram_miss_lease_copy_wait",
+)
+
+
 @cache_once
 def _device_module() -> Module:
-    names = (
-        "exl3_ram_miss_post",
-        "exl3_ram_miss_wait",
-        "exl3_ram_miss_lease_wait",
-        "exl3_ram_miss_lease_ack",
-        "exl3_ram_miss_lease_hit_wait",
-        "exl3_ram_miss_lease_rest_wait",
-        "exl3_ram_miss_lease_stage_ack",
-        "exl3_ram_miss_lease_finalize",
-        "exl3_ram_miss_lease_stream_hit_wait",
-        "exl3_ram_miss_lease_stream",
-        "exl3_ram_miss_lease_copy_wait",
-    )
     return load_jit(
         "exl3_ram_miss",
         cuda_files=["moe/exl3_ram_miss.cuh"],
-        cuda_wrappers=[(name, name) for name in names],
+        cuda_wrappers=[(name, name) for name in _DEVICE_KERNELS],
+    )
+
+
+def device_module_with_hooks(defines: Sequence[str]) -> Module:
+    """Test only: the device kernels built with the ``EXL3_RAM_MISS_TEST_*`` hooks ``defines`` turn on (``NAME`` or
+    ``NAME=value``), a module of its own; production builds with none, so its kernels carry no test knob."""
+    if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
+        raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
+    return load_jit(
+        "exl3_ram_miss",
+        "test",
+        cuda_files=["moe/exl3_ram_miss.cuh"],
+        cuda_wrappers=[(name, name) for name in _DEVICE_KERNELS],
+        extra_cuda_cflags=[f"-D{d}" for d in defines],
     )
 
 
