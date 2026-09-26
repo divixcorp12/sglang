@@ -161,6 +161,30 @@ def mm_runtime_reservation_gb(
     return reserved_mb / 1024
 
 
+def hicache_runtime_reservation_gb(*, enable_hierarchical_cache: bool) -> float:
+    """HiCache device memory allocated only after the KV pool is sized (write-back
+    staging buffers); reserve it out of the KV budget so it doesn't eat the runtime slack."""
+    if not enable_hierarchical_cache:
+        return 0.0
+    reserved_mb = envs.SGLANG_HICACHE_DEVICE_RESERVE_MB.get()
+    logger.info(
+        "Reserving %.2f GB of the KV budget for post-sizing HiCache allocations "
+        "(write-back staging buffers).",
+        reserved_mb / 1024,
+    )
+    return reserved_mb / 1024
+
+
+def check_hicache_staging_within_reserve(*, staging_bytes: int) -> None:
+    reserve_bytes = envs.SGLANG_HICACHE_DEVICE_RESERVE_MB.get() << 20
+    if staging_bytes > reserve_bytes:
+        raise ValueError(
+            f"HiCache write-back staging buffers take {staging_bytes / (1 << 20):.1f} MiB of device "
+            f"memory, over the {reserve_bytes >> 20} MiB the KV budget reserved for them. Raise "
+            f"SGLANG_HICACHE_DEVICE_RESERVE_MB or lower SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB."
+        )
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -2213,7 +2237,12 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        hicache_reservation_gb = hicache_runtime_reservation_gb(
+            enable_hierarchical_cache=get_memory().enable_hierarchical_cache
+        )
+        rest_memory = (
+            available_gpu_memory - slack_gb - mm_reservation_gb - hicache_reservation_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

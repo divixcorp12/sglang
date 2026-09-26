@@ -1007,6 +1007,10 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Device bytes one page_first host pool may spend on its write-back staging buffer; fewer pages, more chunks.
+    SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB = EnvInt(32)
+    # Device memory reserved out of the KV budget for HiCache allocations made after the pool is sized.
+    SGLANG_HICACHE_DEVICE_RESERVE_MB = EnvInt(64)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

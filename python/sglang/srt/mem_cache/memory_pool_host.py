@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
-    _WRITE_BACK_STAGING_PAGE_CHUNK,
     host_memory_budget_bytes,
     synchronized,
+    write_back_staging_page_capacity,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -306,7 +306,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        staging_page_capacity = write_back_staging_page_capacity(
+            num_host_pages=self.num_host_pages,
+            page_row_bytes=self.layer_num * self.item_bytes * self.dtype.itemsize,
+        )
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.item_bytes),
             dtype=self.dtype,
@@ -842,7 +845,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.state_page_bytes * self.dtype.itemsize,
         )
-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        staging_page_capacity = write_back_staging_page_capacity(
+            num_host_pages=self.num_host_pages,
+            page_row_bytes=self.layer_num * self.state_page_bytes * self.dtype.itemsize,
+        )
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.state_page_bytes),
             dtype=self.dtype,

@@ -8,13 +8,17 @@ import torch
 
 from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    hicache_runtime_reservation_gb,
+    mm_runtime_reservation_gb,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_mm,
     get_parallel,
     pre_capture_activation_reserve_mb,
@@ -99,6 +103,9 @@ def compute_post_capture_kv_resize(
         is_multimodal=model_runner.model_config.is_multimodal,
         mm_feature_transport=get_mm().mm_feature_transport,
     )
+    hicache_reservation_gb = hicache_runtime_reservation_gb(
+        enable_hierarchical_cache=get_memory().enable_hierarchical_cache
+    )
     # Sequential target/draft forwards reuse workspace at unchanged capacities.
     canary_workspace_bytes = max(
         (
@@ -109,7 +116,10 @@ def compute_post_capture_kv_resize(
         default=0,
     )
     budget_bytes = (
-        int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
+        int(
+            max(0.0, free_gb - headroom_gb - mm_reservation_gb - hicache_reservation_gb)
+            * (1 << 30)
+        )
         + pool.post_capture_backed_bytes
         - canary_workspace_bytes
     )

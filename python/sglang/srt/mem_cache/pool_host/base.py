@@ -9,6 +9,7 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -26,6 +27,12 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+def write_back_staging_page_capacity(*, num_host_pages: int, page_row_bytes: int) -> int:
+    """Pages a device staging buffer holds: the page chunk, capped in bytes, at least one."""
+    max_bytes = envs.SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB.get() << 20
+    return max(1, min(num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK, max_bytes // page_row_bytes))
 
 
 def ranks_per_host() -> int:

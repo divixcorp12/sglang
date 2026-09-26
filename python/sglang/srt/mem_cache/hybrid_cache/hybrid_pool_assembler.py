@@ -12,6 +12,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    check_hicache_staging_within_reserve,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -729,6 +732,16 @@ def _build_dsv4_rope_entry(
     )
 
 
+def dsv4_hicache_staging_bytes(entries: list[PoolEntry]) -> int:
+    """Device bytes the DSV4 host mirrors spend on write-back staging buffers."""
+    return sum(
+        entry.host_pool.staging_buffer.nbytes
+        for entry in entries
+        if isinstance(entry.host_pool, (DeepSeekV4PagedHostPool, DeepSeekV4StateHostPool))
+        and entry.host_pool.staging_buffer is not None
+    )
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -1007,6 +1020,7 @@ def build_deepseek_v4_hicache_stack(
     entries.extend(
         _dsv4_low_ratio_entries(kvcache, page_size, num_host_pages, transfer_layer_num)
     )
+    check_hicache_staging_within_reserve(staging_bytes=dsv4_hicache_staging_bytes(entries))
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
