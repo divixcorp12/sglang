@@ -1,5 +1,10 @@
 # Task: cut DSV4.1 prefill TTFT by removing the host/GPU ping-pong in the eager streamed-MoE prefill path
 
+> **Status 2026-09-25:** steps 1, 2 and 4 are done, behind `SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN` (`DSV41_REFERENCE.md`
+> §27.11): TTFT ~12.6 → ~9.9 s, outputs identical. The attribution showed that one readback per chunk, not the
+> ~8,000 small syncs, held the host. What remains is ~2.7 s of GPU idle, inferred to sit mostly at layer boundaries.
+> Steps 3 and 5 do not pay yet (§27.11 "Next"). The text below is the original brief.
+
 You are continuing performance work on DeepSeek V4.1 Flash (EXL3 3.0 bpw) served by our SGLang fork on one RTX 5090 (SM120,
 32 GB) on the host `divix01`. The experts do not fit in VRAM: they stream from a VRAM hot cache (1,128 rows), a 100 GiB
 pinned host-RAM tier, and two NVMe mirrors. Batch size is 1.

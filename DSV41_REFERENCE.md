@@ -4130,9 +4130,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
 6. **Decode small kernels: done for the EXL3 cast glue (§27.8), behind `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION`.**
    -358 kernels per step, byte-identical, -0.6 ms/token (within noise). Not "a few ms": most of the remaining small
    kernels are attention, mHC reductions and the RAM-miss chain, not glue.
-7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
-   With fills on, this is the largest remaining TTFT lever (§27.10): the GPU idles ~6.3 s of a 12.9 s prefill
-   waiting for the host, and the host is blocked ~6.1 s in 8,174 small readbacks.
+7. **Prefill glue: partly done (§27.11), behind `SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN`.** The host no longer waits
+   for each chunk's gather before launching its compute: TTFT 12.6 → 9.9 s and 11.5 → 9.2 s, outputs identical,
+   prefill GPU idle 49% → 29%. Left: ~2.7 s of GPU idle, most of it inferred to sit at layer boundaries.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
    cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
@@ -4415,6 +4415,115 @@ nvme2n1 serves only 4 kB Engram lookups.
 - NVMe samples: `/mnt/nvme1/prod-flags/{nvme_diskstats.jsonl,iostat.log}`.
 - Timed sessions, wall clock: session 0 prefill 21:14:10–21:14:23.3; session 1 prefill 21:14:25.5–21:14:38.4, decode to
   21:14:50.4.
+
+### 27.11 Prefill route plan: the host runs ahead of the gather (result, 2026-09-25)
+
+Item 7 of §27.4, steps 1, 2 and 4 of `MOE_PREFILL_OPT.md`. Plan: `docs/superpowers/plans/2026-09-25-dsv41-prefill-route-plan.md`.
+Flag: **`SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN`** (`EnvBool`, default off; `Dsv41Config.enable_prefill_route_plan`).
+
+**Attribution** (`prod-flags-node`, 260-token prefill, 12,882 ms; scripts in `analysis/dsv41-drive/pcie-trace/`:
+`prefill_sync_sites.py` keys each readback by the kernels before it, `chunk_host_time.py` times each chunk):
+
+| Where the host blocked | Readbacks | Host blocked |
+|---|---:|---:|
+| `chunk.tolist()` right after a chunk's gather was queued (`exl3.py`, `_apply_streamed`) | 115 | 5,970 ms (median 57.9 ms) |
+| `row_of_source.tolist()` right after it | 116 | ~2 ms |
+| Per-expert `torch.where` count (`exl3_moe_accumulate`) | ~6,970 | 72 ms |
+| Everything else | ~1,050 | ~60 ms |
+
+- The ~8,000 small syncs were cheap: they ran with the GPU queue empty.
+- All of the cost was the host waiting for each chunk's ~58 ms gather before launching that chunk's compute. After
+  each wait, the host spent a median 38 ms (same layer) or 63 ms (next layer, with attention) before the next gather.
+- The host and GPU strictly took turns, ~6.0 s each. The §27.10 reading ("8,174 small readbacks") was right on the
+  count and wrong on the cause: one readback per chunk carried almost all of it.
+
+**What changed.** With the flag on, `_apply_streamed` reads the layer's `topk_ids` to the host once, before any of its
+gathers is queued.
+- `Exl3RoutePlan` groups the routes by expert: `torch.where`'s own (token, slot) indices, row-major within each
+  expert.
+- `ExpertStreamer.iter_gather_experts_host` yields each chunk's expert ids and `row_of_source` as host lists. The hot
+  slots and hit mask come back in the one readback `_gather_cached` already made before the gather, in place of its
+  hit-count `.item()`.
+- `exl3_moe_accumulate_planned` runs the same per-expert body (`_accumulate_expert`, shared with the flag-off loop)
+  with no readback.
+- Stream order still makes chunk k+1's gather wait for chunk k's consumers.
+- With the flag off, the ops and their order are unchanged.
+- Commits `d1031bcb2a`..`469aafec49` on master.
+
+**Tests** (divix01, private worktree; commands and logs in `/mnt/nvme1/prefill-opt/`):
+- CPU: `test_exl3_route_plan.py`, `test_exl3_moe_stream_mode.py` (parity over the flag with a fake and a real
+  pinned-tier streamer, three chunks, eviction, all routes dropped, capture), plus `test_exl3_ops_cpu.py`,
+  `test_exl3_moe_method.py`, `test_expert_gather_experts.py` and `test_dsv41_config.py`: 70 passed.
+- GPU, real EXL3 kernels, under `cc-gpu.lock`: `test/manual/dsv41/test_exl3_stream_apply_gpu.py` (bitwise over the
+  flag; 80 experts in two 64-expert chunks with a repeated expert and dropped routes) and `test_expert_plugins_cuda.py`
+  (host lists equal the device gather through mixed, all-hot and all-cold chunks): 24 passed, 0 skipped.
+- **No-sync proof:** `test_planned_chunk_body_never_syncs` runs the planned loop under
+  `torch.cuda.set_sync_debug_mode("error")`. Its control, `test_the_where_loop_does_sync`, shows the mode catches the
+  old loop.
+- Registered suite, `pytest -q -p no:randomly test/registered/unit/kernels` under the GPU lock:
+  - base `4831d251bc`: 1726 passed, 1 skipped;
+  - tip `e6a01c33ac`: 1725 passed, 1 skipped, 1 failed. The failure,
+    `test_exl3_ram_miss_pack_workers::test_no_worker_thread_exists_unless_asked_for_and_close_joins_them`, counts
+    threads process-wide. It passed 5 of 5 alone and in its whole file (549 passed), and nothing here touches pack
+    workers.
+- Pre-existing breakage fixed on the way: three stream-mode tests failed on master because their fake streamers
+  predated `prefill_fills`.
+
+**Mutants** (each reverted; the suite was green again after):
+
+| Mutant | Caught by |
+|---|---|
+| Plan order reversed within an expert | `test_plan_matches_torch_where_row_major`, `test_planned_accumulate_is_bitwise_...` |
+| `host_row_of_source` puts hits first | CPU row test; GPU streamed-apply and many-experts parity; the CUDA host-rows test |
+| The planned loop walks a chunk's experts in reverse | `test_streamed_apply_accumulates_in_ascending_expert_order` |
+| `hot_out` slots rotated by one | GPU all-hot streamed-apply; the CUDA host-rows test |
+
+The reversed-order mutant first escaped every parity test, CPU and GPU: the bf16 output rounds away a change in fp32
+accumulation order. The ascending-order test makes experts add 2^24, 1 and -2^24, which give 0 only in ascending
+order. The flag-off loop had the same blind spot, and the test covers both.
+
+**Arms** (A = production recipe, B = + the flag; A then B, once each, port 30021, commit `469aafec49`):
+
+| | A | B |
+|---|---:|---:|
+| TTFT, session 0 (260-token prompt) | 12.61 s | **9.91 s** |
+| TTFT, session 1 | 11.48 s | **9.16 s** |
+| Decode, pooled client ms/token | 116.4 | 114.3 |
+| Output | | identical to A (both sessions) |
+
+**Trace** (node-mode traced B, last timed session's prefill, against `prod-flags-node`):
+
+| | Before (§27.10) | Route plan |
+|---|---:|---:|
+| Prefill wall | 12,882 ms | **9,296 ms** |
+| GPU busy (kernels + copies) | 6,571 ms | 6,562 ms |
+| of which the gather | 6,068 ms | 6,095 ms |
+| GPU idle | 49% | **29%** |
+| D2H readbacks / host blocked in them | 8,256 / 6,103 ms | 1,385 / 2,828 ms |
+| Eager kernels | 141,593 | 108,452 |
+| Decode steps 15+, ms / GPU busy per step | 111.2 / 108.6 | 111.3 / 108.7 |
+
+- **Where the host waits now:** one ~1 KB readback per chunk, `_gather_cached`'s pre-gather lookup, blocked 2.8 s in
+  total (median 35.5 ms). It waits for the previous chunk's gather, which the host has already queued compute
+  behind: this is the GPU being the bottleneck, as intended.
+- Within a layer, the host then needs a median 2.2 ms (914 ms total) to launch the next gather.
+- **What is left above the link floor:** ~2.7 s of GPU idle. The 0.9 s of within-layer host gaps accounts for part of
+  it. The remaining ~1.8 s is inferred to sit at the 40 layer boundaries, not measured per site. At a boundary, the
+  next layer's attention, route readback, fill start and first-chunk fill wait all run with the gather queue empty.
+- The PCIe metrics session failed to stop (`nsys stop failed`), so this arm has no PCIe RX figures.
+
+**Next** (§27.4 item 7 remainder):
+- **The layer boundary.** Measure its ~1.8 s by site first. Candidates:
+  - start the next layer's first fills earlier (needs its routing, so a predictor, or the router run ahead);
+  - make the boundary's syncs not wait for the last chunk's gather.
+- **Grouped expert compute** does not pay yet. The host now waits on the GPU within a layer, so fewer launches would
+  not shorten it.
+- **Production** still runs without the flag. Adding it to `arm_env.base_env()` is a separate, asked-for change.
+
+**Evidence** (divix01):
+- Runs: `cc-expert-prediction/dsv41-baseline/servers/route-plan-{A,B,B-node}/run-20260925-23*/`.
+- Trace: `/mnt/nvme1/dsv41-nsys/route-plan-B-node-20260925-233535{.nsys-rep,.sqlite}`.
+- Analyses: `/mnt/nvme1/prefill-opt/{compare.txt,sites-after.txt,chunks-after.txt,arm-table.txt,mutants.txt}`.
 
 ## Sources
 
