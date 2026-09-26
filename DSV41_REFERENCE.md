@@ -4140,6 +4140,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
    cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
+10. **Decode RAM-miss frontend (W1/C1/A1): sized, no-go (§27.15).** At most 0.41 ms/step to gain; neither
+    `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
+    overlapping the resident launch saves 10-13 us/layer against a 25 us bar.
 
 ### 27.5 Copy-thread scheduling, untraced
 
@@ -4808,6 +4811,56 @@ reads while chunk k computes. Per-layer pinned room limits both.
 - Best realistic predictor, layer T+1's gate on layer T's input: precision 0.40 on not-in-RAM rows, **~2 ms/token**.
 - Perfect prediction saves 6.2 ms/token. Next-token and frequency predictors, and anything for layer 0, gain nothing.
 - Demand reads must outrank speculative ones; FIFO turns most arms negative.
+
+### 27.15 Decode RAM-miss frontend: sized, no-go; resident-first after real copies (study, 2026-09-26)
+
+Plan: `docs/superpowers/plans/2026-09-26-dsv41-ram-miss-frontend.md`. The question was whether the stage-1 frontend
+(`post -> W1 -> C1 -> A1` before `S -> A2 -> CW -> F`) still costs decode time now that the copy engine carries the RAM
+hits, and whether resident-first compute pays once real transfers are in the picture.
+
+**The bound** (`analysis/dsv41-drive/frontend/frontend_bound.py`, CPU-tested, 4 tests). The host starts the copy-engine
+DMA after post, so CW ends no earlier than the layer's last copy. A cut of `c` before CW, on a layer where CW spun `s`
+past its floor (p5 of CW), saves at most `max(0, c - s)`. For a reset-only frontend `c = S.start - post.end`; for
+`HIT_WAIT_US=0`, `c = W1 - p10(W1)`. S's own NVMe wait can hide more of `c`, so both are upper bounds.
+
+**Result on the recipe with SM small copies** (node-mode trace `sm-small-B-node-20260926-034122`, 90 steady steps x 40
+layers; W1 1.055 ms/step and 994.6 MB/step of copies match `ce_trace.py` on the same trace):
+
+| Per step | Value |
+|---|---:|
+| Frontend span (post end to S start) | 1.13 ms |
+| W1 | 1.05 ms; p50 11.3 us, p90 78.1 us; 7.7% at the 100 us budget |
+| CW floor / CW spin | 0.86 us / 54.6 ms |
+| Copy-engine H2D | 994.6 MB, 78.0 ms busy |
+| Last copy lands after post (p50 per layer) | 1,979 us |
+| CW ends after the last copy (p50 per layer) | 4.96 us |
+| **Bound, reset-only frontend** | **0.41 ms** |
+| **Bound, `HIT_WAIT_US=0`** | **0.32 ms** |
+
+Both are under the 1.0 ms/step gate (untraced A/Bs move ~0.5 ms/token between identical arms), so neither Task 2's
+env-var A/B nor Task 3's reset chain was built or run. The frontend is almost wholly hidden: each layer waits ~2 ms for
+its copies, and CW finishes ~5 us after the last one lands. The lever is the transfer, not the chain in front of it.
+
+**Resident-first after real copies** (`analysis/dsv41-drive/resident-first/split_launch_bench.py`, commit `f04a78f3d3`;
+`divix01:/mnt/nvme1/frontend/resident-first/`). New arms copy each layer's missed rows H2D from pinned memory inside
+the 40-layer graph. `test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads` proves the copies reach the launch:
+poisoned bytes change the output, the true bytes restore it bitwise (parity file 5 passed). `one` = 101.43 us/layer
+(bench-run2: 101.13), 788 GB/s implied.
+
+| us/layer | 5+1 | 4+2 | 3+3 |
+|---|---:|---:|---:|
+| `miss_only` (no copy) | 100.38 | 100.87 | 100.86 |
+| `copy_only` | 976.19 | 1952.47 | 2926.98 |
+| `copy_then_one` (today's serial order) | 1086.92 | 2066.18 | 3037.52 |
+| `copy_then_miss` | 1084.03 | 2063.73 | 3036.31 |
+| `overlap` (copy beside the resident launch, join, missed launch, one gather) | 1076.53 | 2053.37 | 3027.75 |
+| **Serial minus overlap** | **10.39** | **12.81** | **9.77** |
+
+- Copies run at 13.6 GB/s (26.6 MB in 1.95 ms at 4+2) and dominate every copy arm.
+- Overlap hides the resident launch (~100 us) but adds a second exl3_moe launch (~92 us fixed cost), for a net
+  10-13 us/layer: **Gate C (25 us/layer, 1 ms/token) fails** at every split.
+- Freshly copied rows do not speed the tail: `(copy_then_miss - copy_only) - miss_only` = +10.4 us/layer at 4+2.
+- Resident-first stays shelved.
 
 ## Sources
 
