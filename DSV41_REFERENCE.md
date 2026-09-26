@@ -4774,8 +4774,21 @@ reads while chunk k computes. Per-layer pinned room limits both.
 - `cuMemcpyBatchAsync` gains nothing at 1–3 rows per layer.
 - One copy per row saves ~7–8 µs/row alone (~0.55 ms/token) but needs a slab layout redesign across the C++ reader,
   two CUDA kernels and several Python consumers.
-- In progress: the copy-wait kernel fetches the four small tensors (44.5 KB/row) with SM loads, and the lease is
-  released after both the large copies and those reads.
+- **Built: `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`, in the recipe since `c515e0c153`.** CW reads each
+  RAM-hit row's four small tensors (44.5 KB) from the pinned slab with SM loads, then publishes a device-written
+  `SmAck`. The copy engine sends only the two large tensors. A copy-engine lease is released only after both its DMA
+  (CopyDone) and its `SmAck`. Protocol: `LEASE_PROTOCOL.md` §7.6. Commits `62527a1444`..`150d7212c7`.
+  - Tests: a 60-step byte-for-byte parity run against the six-copy path, and a sentinel test that overwrites a slab
+    row the instant its lease drops. After review: CW commits only the lanes its SM phase read (else Identity), 16 B
+    alignment is enforced, and there are tests for late reads (threads 32+ delayed 100 ms) and a failed request.
+    Mutants caught: release on DMA alone, stale SmAck accepted, no barrier after the reads, SmAck above the reads,
+    SmAck only when something was read, commit without the mask check.
+  - Registered suite 1727 → 1733 passed. CPU set 68 passed, GPU set 48 passed plus the known
+    `other_streams[kernel]` flake (2 of 8 at base too), which does not use this path.
+  - Traced: copies per row 6 → 2, copies per step 450.7 → 150.2, copy busy 79.1 → 78.1 ms/step, CW 55.2 → 54.7 ms/step,
+    median step 111.0 → 109.9 ms. Untraced A/B, outputs identical: 111.5 → 111.0 ms/token, within noise.
+  - Deferred: the SM mask comes from `streamer._graph_sources`, not the copy table's own names; the copy thread spins
+    on jobs awaiting an SmAck that a dead chain will never write, until the drain deadline.
 
 **Async hot-cache promotions: no-go.**
 - The synchronous path the EXL3 gate named (`ExpertHotCache._load_reserved_in_chunks`) never runs in the recipe.
