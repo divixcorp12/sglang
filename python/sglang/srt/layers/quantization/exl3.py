@@ -32,12 +32,14 @@ from sglang.srt.layers.moe.exl3_stream_trace import (
 )
 from sglang.srt.layers.moe.expert_format import STREAMER_ATTRIBUTE, expert_streamer_of
 from sglang.srt.layers.quantization.exl3_ops import (
+    Exl3RoutePlan,
     Exl3Tensors,
     assert_not_capturing,
     exl3_gemm_bs1,
     exl3_half_input,
     exl3_linear,
     exl3_moe_accumulate,
+    exl3_moe_accumulate_planned,
     exl3_moe_loop,
 )
 from sglang.srt.utils import set_weight_attrs
@@ -309,6 +311,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.streamed = streamed
         self.moe_runner_config = None
         self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
+        self.route_plan = envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get()
 
     def create_weights(
         self,
@@ -442,6 +445,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 cfg.swiglu_limit,
+                route_plan=self.route_plan,
             )
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
@@ -525,7 +529,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return out.to(x.dtype) if cast else out
 
     @staticmethod
-    def _apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
+    def _apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit, route_plan=False):
         """Routed experts gathered in chunks of distinct experts by the streamer.
 
         Routes are recorded once for the whole call; every chunk's experts run
@@ -537,16 +541,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if not capturing_graphs():
             # Warmup and capture forwards route dummy tokens; they must not move residency.
             streamer.record_routes(routed)
-        source_ids = torch.unique(routed)
+        if route_plan:
+            # SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN: one readback before any gather of this layer, then none
+            # between a chunk's gather and its compute, so the host queues the compute behind the gather.
+            plan = Exl3RoutePlan.from_topk(topk_ids)
+            source_ids = plan.source_ids
+        else:
+            source_ids = torch.unique(routed)
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         gathered = False
         # A no-op unless SGLANG_DSV41_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
         with streamer.prefill_fills(source_ids):
-            for chunk, row_of_source, rows in streamer.iter_gather_experts(source_ids):
-                gathered = True
-                experts = chunk.tolist()
-                w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source.tolist())
-                exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts)
+            if route_plan:
+                for experts, row_of_source, rows in streamer.iter_gather_experts_host(source_ids, plan.experts):
+                    gathered = True
+                    w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source)
+                    exl3_moe_accumulate_planned(out, x, topk_weights, plan, w13, w2, swiglu_limit, experts)
+            else:
+                for chunk, row_of_source, rows in streamer.iter_gather_experts(source_ids):
+                    gathered = True
+                    experts = chunk.tolist()
+                    w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source.tolist())
+                    exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts)
         get_exl3_stream_trace().record(
             layer.layer_id,
             topk_ids,
