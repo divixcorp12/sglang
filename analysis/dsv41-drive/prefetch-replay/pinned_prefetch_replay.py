@@ -161,12 +161,12 @@ class Tier:
         self.spec = [None] * capacity  # for a prefetched row not yet used: its record
         self.where: dict[int, int] = {}
 
-    def take(self, hot: set, protect: set, now: float) -> tuple[int, int]:
+    def take(self, hot: set, protect: set, now: float, only: set | None = None) -> tuple[int, int]:
         best = -1
         for slot, expert in enumerate(self.slot_expert):
             if expert < 0:
                 return slot, -1
-            if expert in hot or expert in protect or self.ready[slot] > now:
+            if expert in hot or expert in protect or self.ready[slot] > now or (only is not None and slot not in only):
                 continue
             if best < 0 or self.stamp[slot] < self.stamp[best]:
                 best = slot
@@ -209,7 +209,17 @@ class Replay:
 
     def admit(self, layer: int, expert: int, hot: set, protect: set, now: float, kind: str, record=None):
         tier = self.tiers[layer]
-        slot, gone = tier.take(hot, protect, now)
+        slot = gone = -1
+        # --spec-share N: once a layer holds N unused prefetched rows, a prefetch evicts the LRU of those
+        # (as SGLANG_DSV41_ENABLE_PREFILL_SHARE bounds prefill), so a wrong prefetch displaces no demand row.
+        owned = {i for i, r in enumerate(tier.spec) if r is not None and not r["used"]}
+        if kind == "spec" and self.a.spec_share and len(owned) >= self.a.spec_share:
+            try:
+                slot, gone = tier.take(hot, protect, now, only=owned)
+            except RuntimeError:
+                slot = -1
+        if slot < 0:
+            slot, gone = tier.take(hot, protect, now)
         if gone >= 0:
             if kind == "spec":
                 self.evicted_by_spec[layer][gone] = True
@@ -493,6 +503,7 @@ def parse(argv=None):
     p.add_argument("--budget", type=int, default=16, help="speculative rows per decode step")
     p.add_argument("--queue", default="prio", choices=["prio", "fifo"])
     p.add_argument("--admit", default="mru", choices=["mru", "cold"])
+    p.add_argument("--spec-share", type=int, default=0, help="unused prefetched rows a layer may hold (0: no cap)")
     p.add_argument("--layers", type=lambda s: {int(x) for x in s.split(",")}, default=None)
     p.add_argument("--nvme-row-ms", type=float, default=2.5)
     p.add_argument("--pieces", type=int, default=8)
