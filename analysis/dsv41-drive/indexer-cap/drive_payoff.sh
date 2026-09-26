@@ -2,12 +2,15 @@
 # Indexer-cap payoff (DSV41_REFERENCE.md 27.7): the production recipe plus a 128 MB score budget and 3 GiB more hot
 # cache (14336 -> 17408 MB), which the cap's ~3.0 GiB of freed prefill transient pays for. One untraced arm, then the
 # same arm traced in node mode with the root PCIe session. Production must be stopped.
+# The hot cache counts against --mem-fraction-static (at 0.83, 17408 MB leaves no KV: minimum viable 0.911), so the
+# fraction rises by the same 3072 MiB of the card's 32607: 0.83 -> 0.925 keeps today's KV pool.
 # Usage: drive_payoff.sh SHA [arm|traced|all]
 set -u
 WT=/data/models/slang/nvfp4-work/wt-payoff
 SHA=$1
 MODE=${2:-all}
 FLAGS="SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB=128 SGLANG_MOE_HOT_GPU_MB=17408"
+export DSV41_MEM_FRACTION_STATIC=0.925
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 say() { echo "$(date +%T) $*"; }
 wait_gpu() { while ! flock -n $GPU_LOCK true; do say "cc-gpu.lock held; waiting"; sleep 60; done; }

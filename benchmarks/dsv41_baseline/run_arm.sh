@@ -20,6 +20,7 @@
 # Env: DSV41_SESSION_INDICES=<i,j,...> times those indices of CORPUS_8_SESSION_IDS
 # instead of the shared default (session_subset.timed_session_indices); the resolved
 # indices and ids are recorded in run-manifest.json.
+# Env: DSV41_MEM_FRACTION_STATIC=0.x replaces arm_env's --mem-fraction-static for this arm only (logged to server.log).
 # Env: EXPECT_SHA=<sha> to pin the worktree to an exact commit (refuse otherwise); the
 # worktree must always be clean (preflight). The python/ tree must be registered in
 # generations.json first (`python -c "import generations; generations.register(TREE,
@@ -295,6 +296,10 @@ cd "$worktree"
 # DECODE_LOG_INTERVAL overrides ServerArgs' default (unset here); see
 # decode_log_interval_compare.sh, which is the only caller that sets it.
 decode_log_interval_py=${DECODE_LOG_INTERVAL:-None}
+# DSV41_MEM_FRACTION_STATIC swaps --mem-fraction-static in this arm's argv only; arm_env (and production) keep theirs.
+mem_fraction=${DSV41_MEM_FRACTION_STATIC:-}
+[ -z "$mem_fraction" ] || [[ $mem_fraction =~ ^0\.[0-9]+$ ]] || abort "DSV41_MEM_FRACTION_STATIC must be 0.x, got $mem_fraction"
+[ -z "$mem_fraction" ] || echo "mem-fraction-static override: $mem_fraction" | tee -a "$log"
 taskset -c "$server_cores" "${nsys_prefix[@]}" env "${env_argv[@]}" \
     PYTHONPATH="$worktree/python" PYTHONUNBUFFERED=1 \
     "$py" -c "
@@ -302,6 +307,8 @@ import sys
 sys.path.insert(0, '$here')
 import arm_env
 argv = arm_env.ServerArgs(port=$port, decode_log_interval=$decode_log_interval_py).argv()
+if '$mem_fraction':
+    argv[argv.index('--mem-fraction-static') + 1] = '$mem_fraction'
 import os
 os.execvp(argv[0], argv)
 " >> "$log" 2>&1 &
