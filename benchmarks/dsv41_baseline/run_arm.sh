@@ -21,6 +21,7 @@
 # instead of the shared default (session_subset.timed_session_indices); the resolved
 # indices and ids are recorded in run-manifest.json.
 # Env: DSV41_MEM_FRACTION_STATIC=0.x replaces arm_env's --mem-fraction-static for this arm only (logged to server.log).
+# Env: DSV41_EXTRA_SERVER_ARGS="--flag v ..." appends server flags for this arm only (logged to server.log).
 # Env: EXPECT_SHA=<sha> to pin the worktree to an exact commit (refuse otherwise); the
 # worktree must always be clean (preflight). The python/ tree must be registered in
 # generations.json first (`python -c "import generations; generations.register(TREE,
@@ -300,6 +301,8 @@ decode_log_interval_py=${DECODE_LOG_INTERVAL:-None}
 mem_fraction=${DSV41_MEM_FRACTION_STATIC:-}
 [ -z "$mem_fraction" ] || [[ $mem_fraction =~ ^0\.[0-9]+$ ]] || abort "DSV41_MEM_FRACTION_STATIC must be 0.x, got $mem_fraction"
 [ -z "$mem_fraction" ] || echo "mem-fraction-static override: $mem_fraction" | tee -a "$log"
+# DSV41_EXTRA_SERVER_ARGS (shell-split) is appended to this arm's argv only.
+[ -z "${DSV41_EXTRA_SERVER_ARGS:-}" ] || echo "extra server args: $DSV41_EXTRA_SERVER_ARGS" | tee -a "$log"
 taskset -c "$server_cores" "${nsys_prefix[@]}" env "${env_argv[@]}" \
     PYTHONPATH="$worktree/python" PYTHONUNBUFFERED=1 \
     "$py" -c "
@@ -310,6 +313,8 @@ argv = arm_env.ServerArgs(port=$port, decode_log_interval=$decode_log_interval_p
 if '$mem_fraction':
     argv[argv.index('--mem-fraction-static') + 1] = '$mem_fraction'
 import os
+import shlex
+argv += shlex.split(os.environ.get('DSV41_EXTRA_SERVER_ARGS', ''))
 os.execvp(argv[0], argv)
 " >> "$log" 2>&1 &
 launch_pid=$!
