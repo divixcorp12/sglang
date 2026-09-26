@@ -38,6 +38,7 @@ def test_defaults_match_the_env_declarations():
         enable_prefill_fills=False,
         enable_prefill_share=False,
         enable_prefill_route_plan=False,
+        enable_prefill_split_gather=False,
         enable_moe_side_stream=False,
         enable_layer_fusion=False,
         enable_exl3_cast_fusion=False,
