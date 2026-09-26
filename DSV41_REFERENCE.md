@@ -4138,8 +4138,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    for chunks the fill did not claim (§27.13), ~0.5 s Python and launches, and ~0.2 s `pthread_cond_wait`.
    Copying landed rows first (§27.13) is correct but moved nothing.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
-9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
-   cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
+9. **Prefill indexer score cap: peaks measured (§27.7).** A 128 MB cap frees ~3.0 GiB at 30k/32k and removes the
+   OOM retries, TTFT unchanged, short outputs identical. Next: the payoff arm (cap plus a larger hot cache) after a
+   rebase onto master. Branch `cc/indexer-cap`, not merged.
 10. **Decode RAM-miss frontend (W1/C1/A1): sized, no-go (§27.15).** At most 0.41 ms/step to gain; neither
     `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
     overlap saves 10-13 us/layer against a 25 us bar,
@@ -4196,7 +4197,7 @@ Evidence is on divix01:
 - The eager launch gaps and per-expert syncs (item 7).
 - The first chunk's reads of each layer, which nothing overlaps.
 
-### 27.7 Prefill indexer score cap (on hold, 2026-09-26)
+### 27.7 Prefill indexer score cap (peaks measured, payoff arm pending, 2026-09-26)
 
 **Why.** Track A (§25.4) found no VRAM headroom: a 30k prompt peaked at 31.0 of 31.8 GiB, with allocator retries from
 the torch prefill indexer's score tensor. Freed VRAM can go to the hot cache, at 2–2.7 fewer misses per token per GiB
@@ -4224,10 +4225,29 @@ the torch prefill indexer's score tensor. Freed VRAM can go to the hot cache, at
   - CPU 4 passed, 3 skipped; GPU 7 passed; a mutant (the chunked path drops the last score column) fails 2.
   - `test/registered/unit/kernels` with CUDA hidden: 1290 passed, 413 skipped, EXIT=0. No merge-base comparison.
 
-**Not measured yet.** Peak VRAM, freed GiB, TTFT and end-to-end greedy parity at 30k/32k, and the payoff arm
-(A = today's recipe, B = cap plus a larger hot cache). The estimate at a 128 MiB cap is 69 rows per chunk at 30k and
-a transient of ~0.4 GB instead of ~2.9 GB, **~2.5 GB freed, not measured**. The runs were held by the owner: each
-long prompt prefills at ~12 tok/s (~45 min per run), and they queued behind the prefill-fills and prefill-evict arms.
+**Peaks and parity (measured 2026-09-26, `divix01:/mnt/nvme1/indexer-cap/`).** Run by `drive_peaks.sh` at 128 MB,
+plus a repeat of budget 0 at 30k (`b0-30k-r2`). All smokes rc=0, on the branch's own recipe (`b9ae131af0`, on
+`01e0a6ea7f`, older than today's master recipe), so the TTFTs do not carry over to production.
+
+| Long prompt | Peak VRAM | Headroom | OOM retries | TTFT |
+|---|---:|---:|---:|---:|
+| 30k, budget 0 | 31.38 GiB | 0.47 GiB | 28 | 2,098 s |
+| 30k, budget 0, repeat | 31.36 GiB | 0.49 GiB | 28 | 1,869 s |
+| 30k, 128 MB | 28.33 GiB | 3.51 GiB | 0 | 1,851 s |
+| 32k, budget 0 | 31.38 GiB | 0.47 GiB | 32 | 1,949 s |
+| 32k, 128 MB | 28.35 GiB | 3.49 GiB | 0 | 1,958 s |
+
+- **VRAM:** at 128 MB the long prompt adds nothing measurable over idle (~29.0 GiB). **~3.0 GiB freed** against the
+  2.5 GB estimate, and the allocator retries go to zero.
+- **TTFT:** no measurable change. The two budget-0 runs at 30k differ by 229 s, which covers the cap's -247 s at 30k
+  and its +9 s at 32k.
+- **Parity:** the six short greedy responses are byte-identical across all five runs. The 64-token long-prompt output
+  is not reproducible even at a fixed budget: the two budget-0 runs diverge at character 75, earlier than budget 0 vs
+  128 MB (character 109). So the long-output difference is run-to-run nondeterminism in this build's long prefill, not
+  the cap; the chunking tests above remain the bitwise evidence.
+
+**Not measured yet:** the payoff arm (A = today's recipe, B = cap plus ~3 GiB more hot cache), on a rebase onto
+today's master.
 
 **To resume.**
 - Driver: `analysis/dsv41-drive/indexer-cap/drive_peaks.sh <worktree> <budget_mb>` runs 30000 then 32000 tokens, each
