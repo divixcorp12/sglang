@@ -4142,7 +4142,8 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
 10. **Decode RAM-miss frontend (W1/C1/A1): sized, no-go (§27.15).** At most 0.41 ms/step to gain; neither
     `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
-    overlapping the resident launch saves 10-13 us/layer against a 25 us bar.
+    overlap saves 10-13 us/layer against a 25 us bar,
+    ~1 us of it the resident launch and the rest a same-stream copy residual.
 
 ### 27.5 Copy-thread scheduling, untraced
 
@@ -4840,6 +4841,8 @@ layers; W1 1.055 ms/step and 994.6 MB/step of copies match `ce_trace.py` on the 
 Both are under the 1.0 ms/step gate (untraced A/Bs move ~0.5 ms/token between identical arms), so neither Task 2's
 env-var A/B nor Task 3's reset chain was built or run. The frontend is almost wholly hidden: each layer waits ~2 ms for
 its copies, and CW finishes ~5 us after the last one lands. The lever is the transfer, not the chain in front of it.
+`frontend_bound.py` and `ce_trace.py` share the step grouping and memcpy filter, so their agreement checks the
+arithmetic, not the grouping; `check_steps` confirms every step has exactly 40 layers.
 
 **Resident-first after real copies** (`analysis/dsv41-drive/resident-first/split_launch_bench.py`, commit `f04a78f3d3`;
 `divix01:/mnt/nvme1/frontend/resident-first/`). New arms copy each layer's missed rows H2D from pinned memory inside
@@ -4857,10 +4860,13 @@ poisoned bytes change the output, the true bytes restore it bitwise (parity file
 | **Serial minus overlap** | **10.39** | **12.81** | **9.77** |
 
 - Copies run at 13.6 GB/s (26.6 MB in 1.95 ms at 4+2) and dominate every copy arm.
-- Overlap hides the resident launch (~100 us) but adds a second exl3_moe launch (~92 us fixed cost), for a net
-  10-13 us/layer: **Gate C (25 us/layer, 1 ms/token) fails** at every split.
-- Freshly copied rows do not speed the tail: `(copy_then_miss - copy_only) - miss_only` = +10.4 us/layer at 4+2.
-- Resident-first stays shelved.
+- The arms decompose as `overlap = copy_only + miss_only` (within 0.1 us at every split) and
+  `copy_then_one = copy_only + one + R`, with `R` = 9.3 / 12.3 / 9.1 us/layer. The same `R` (~10 us) appears in
+  `copy_then_miss`: it is a residual whenever a kernel follows the copies on the same stream in the graph, not a cache
+  effect.
+- So the serial-minus-overlap figure is `(one - miss_only) + R`: about 1 us/layer of real resident-first gain plus
+  `R`. Production copies run off-graph on the copy engine and CW waits on a flag, so `R` may not exist there at all.
+- **Gate C (25 us/layer, 1 ms/token) fails** at every split, even crediting all of `R`. Resident-first stays shelved.
 
 ## Sources
 

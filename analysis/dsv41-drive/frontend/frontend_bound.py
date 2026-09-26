@@ -83,6 +83,14 @@ def copy_metrics(steps: list[list[Layer]], copies: list[tuple[int, int, int]]) -
     }
 
 
+def check_steps(steps: list[list[Layer]]) -> None:
+    if not steps:
+        raise ValueError("no graph chain kernels: not a node-mode trace, or --skip covers every step")
+    counts = {len(step) for step in steps}
+    if len(counts) != 1:
+        raise ValueError(f"layers per step differ ({sorted(counts)}): a torn chain would understate the bound")
+
+
 def saving_bound_ns(cut_ns: int, cw_ns: int, cw_floor_ns: int) -> int:
     return max(0, cut_ns - max(0, cw_ns - cw_floor_ns))
 
@@ -138,6 +146,7 @@ def main() -> int:
             by_step[corr].append((start, end, label))
     ordered = sorted(by_step.values(), key=lambda k: k[0][0])[a.skip :]
     steps = [split_layers(k) for k in ordered]
+    check_steps(steps)
     result = summarize(steps, budget_ns=a.budget_us * 1000)
     tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
     if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:

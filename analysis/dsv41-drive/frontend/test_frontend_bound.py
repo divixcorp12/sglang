@@ -100,3 +100,18 @@ def test_the_cli_reads_a_node_mode_export_and_reports_per_step_bounds(tmp_path):
     # W1 floor = p10 of W1 = 5 us. Layer 1: 95 us, no spin. Layer 2: 0.
     assert abs(r["hit_wait0_bound_ms_per_step"] - 0.095) < 1e-9
     assert r["copy_bytes_per_step"] == 2000 and r["cw_end_after_copy_p50_us"] == 4.0
+
+
+def test_steps_with_different_layer_counts_are_refused():
+    """A step whose layer lacks S or F would shrink the bound's numerator silently and understate the saving."""
+    import pytest
+
+    from frontend_bound import check_steps
+
+    whole = split_layers(_chain(0, 50, 30, 20) + _chain(1_000_000, 5, 30, 20))
+    torn = split_layers(_chain(0, 50, 30, 20) + [k for k in _chain(1_000_000, 5, 30, 20) if k[2] != "F"])
+    check_steps([whole, whole])
+    with pytest.raises(ValueError, match="layers per step"):
+        check_steps([whole, torn])
+    with pytest.raises(ValueError, match="node-mode"):
+        check_steps([])
