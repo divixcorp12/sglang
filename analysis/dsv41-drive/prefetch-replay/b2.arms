@@ -1,0 +1,23 @@
+# bounded prefetch share (wrong prefetches evict only each other)
+gate_h1_k1_s2: --predictor gate --h 1 --k 1 --spec-share 2
+gate_h1_k1_s4: --predictor gate --h 1 --k 1 --spec-share 4
+gate_h1_k1_s8: --predictor gate --h 1 --k 1 --spec-share 8
+gate_h1_k2_s4: --predictor gate --h 1 --k 2 --spec-share 4
+gate_h2_k1_s4: --predictor gate --h 2 --k 1 --spec-share 4
+gate_h2_k2_s4: --predictor gate --h 2 --k 2 --spec-share 4
+gate_h1_k1_s4_b40: --predictor gate --h 1 --k 1 --spec-share 4 --budget 40
+gate_h2_k2_s4_b40: --predictor gate --h 2 --k 2 --spec-share 4 --budget 40
+gate_h1_k1_s4_fifo: --predictor gate --h 1 --k 1 --spec-share 4 --queue fifo
+near_k2_s4: --predictor near --lead next --k 2 --spec-share 4
+noisy_h2_p25_s4: --predictor noisy --h 2 --k 2 --p 0.25 --spec-share 4
+noisy_h2_p10_s4: --predictor noisy --h 2 --k 2 --p 0.10 --spec-share 4
+noisy_next_p10_s4: --predictor noisy --lead next --k 2 --p 0.10 --spec-share 4
+noisy_next_p25_s4: --predictor noisy --lead next --k 2 --p 0.25 --spec-share 4
+gate_h1_k1_b40: --predictor gate --h 1 --k 1 --budget 40
+# sensitivity: 2.0 ms per row
+r20_none: --predictor none --nvme-row-ms 2.0
+r20_gate_h1_k1: --predictor gate --h 1 --k 1 --nvme-row-ms 2.0
+r20_gate_h1_k1_s4: --predictor gate --h 1 --k 1 --spec-share 4 --nvme-row-ms 2.0
+r20_gate_h2_k1: --predictor gate --h 2 --k 1 --nvme-row-ms 2.0
+r20_oracle_next: --predictor oracle --lead next --k 6 --nvme-row-ms 2.0
+r20_oracle_h1: --predictor oracle --h 1 --k 6 --nvme-row-ms 2.0

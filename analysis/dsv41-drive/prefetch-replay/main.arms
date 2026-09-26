@@ -1,0 +1,51 @@
+none: --predictor none
+# (a)/(b) native-gate lookahead, h layers
+gate_h1_k1: --predictor gate --h 1 --k 1
+gate_h1_k2: --predictor gate --h 1 --k 2
+gate_h2_k1: --predictor gate --h 2 --k 1
+gate_h2_k2: --predictor gate --h 2 --k 2
+gate_h3_k1: --predictor gate --h 3 --k 1
+gate_h3_k2: --predictor gate --h 3 --k 2
+gate_h4_k1: --predictor gate --h 4 --k 1
+gate_h4_k2: --predictor gate --h 4 --k 2
+gate_h1_k2_fifo: --predictor gate --h 1 --k 2 --queue fifo
+gate_h2_k2_fifo: --predictor gate --h 2 --k 2 --queue fifo
+gate_h2_k2_cold: --predictor gate --h 2 --k 2 --admit cold
+gate_h1_k1_L0: --predictor gate --h 1 --k 1 --layers 0
+gate_h2_k2_L0: --predictor gate --h 2 --k 2 --layers 0
+# (c) next token, same layer
+near_k1: --predictor near --lead next --k 1
+near_k2: --predictor near --lead next --k 2
+near_k4: --predictor near --lead next --k 4
+near_k2_fifo: --predictor near --lead next --k 2 --queue fifo
+near_k2_cold: --predictor near --lead next --k 2 --admit cold
+freq_k1: --predictor freq --lead next --k 1
+freq_k2: --predictor freq --lead next --k 2
+freq_k2_cold: --predictor freq --lead next --k 2 --admit cold
+near_k2_L0: --predictor near --lead next --k 2 --layers 0
+near_k4_L0: --predictor near --lead next --k 4 --layers 0
+freq_k4_L0: --predictor freq --lead next --k 4 --layers 0
+# (d) oracle, same budget
+oracle_h1: --predictor oracle --h 1 --k 6
+oracle_h2: --predictor oracle --h 2 --k 6
+oracle_h4: --predictor oracle --h 4 --k 6
+oracle_next: --predictor oracle --lead next --k 6
+oracle_next_nobudget: --predictor oracle --lead next --k 6 --budget 100000
+oracle_next_L0: --predictor oracle --lead next --k 6 --layers 0
+oracle_h1_fifo: --predictor oracle --h 1 --k 6 --queue fifo
+# break-even: noisy oracle, lead h=2 and next token
+noisy_h2_p10: --predictor noisy --h 2 --k 2 --p 0.10
+noisy_h2_p25: --predictor noisy --h 2 --k 2 --p 0.25
+noisy_h2_p40: --predictor noisy --h 2 --k 2 --p 0.40
+noisy_h2_p60: --predictor noisy --h 2 --k 2 --p 0.60
+noisy_h2_p80: --predictor noisy --h 2 --k 2 --p 0.80
+noisy_next_p10: --predictor noisy --lead next --k 2 --p 0.10
+noisy_next_p25: --predictor noisy --lead next --k 2 --p 0.25
+noisy_next_p40: --predictor noisy --lead next --k 2 --p 0.40
+noisy_next_p60: --predictor noisy --lead next --k 2 --p 0.60
+noisy_next_p25_fifo: --predictor noisy --lead next --k 2 --p 0.25 --queue fifo
+noisy_h2_p25_fifo: --predictor noisy --h 2 --k 2 --p 0.25 --queue fifo
+# budget sweep
+gate_h2_k2_b4: --predictor gate --h 2 --k 2 --budget 4
+gate_h2_k2_b8: --predictor gate --h 2 --k 2 --budget 8
+gate_h2_k2_b40: --predictor gate --h 2 --k 2 --budget 40

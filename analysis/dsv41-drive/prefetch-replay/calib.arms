@@ -1,0 +1,10 @@
+lat0_r25: --nvme-lat-ms 0 --nvme-row-ms 2.5
+lat05_r25: --nvme-lat-ms 0.5 --nvme-row-ms 2.5
+lat1_r25: --nvme-lat-ms 1.0 --nvme-row-ms 2.5
+lat15_r25: --nvme-lat-ms 1.5 --nvme-row-ms 2.5
+lat2_r25: --nvme-lat-ms 2.0 --nvme-row-ms 2.5
+lat3_r25: --nvme-lat-ms 3.0 --nvme-row-ms 2.5
+lat0_r35: --nvme-lat-ms 0 --nvme-row-ms 3.5
+lat1_r35: --nvme-lat-ms 1.0 --nvme-row-ms 3.5
+lat0_r2: --nvme-lat-ms 0 --nvme-row-ms 2.0 --pieces 1
+lat0_r25_p1: --nvme-lat-ms 0 --nvme-row-ms 2.5 --pieces 1
