@@ -4132,7 +4132,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    kernels are attention, mHC reductions and the RAM-miss chain, not glue.
 7. **Prefill glue: partly done (§27.11), behind `SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN`.** The host no longer waits
    for each chunk's gather before launching its compute: TTFT 12.6 → 9.9 s and 11.5 → 9.2 s, outputs identical,
-   prefill GPU idle 49% → 29%. Left: ~2.7 s of GPU idle, most of it inferred to sit at layer boundaries.
+   prefill GPU idle 49% → 29%. Then the split fill gather (§27.12, behind
+   `SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER`): TTFT 9.9 → 8.6 s and 9.2 → 8.2 s, outputs identical, prefill GPU
+   idle 29% → 21%. Left: 1.76 s of GPU idle, of which 0.71 s is later-chunk fill waits and 0.73 s Python and launches.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
    cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
@@ -4563,6 +4565,105 @@ prefill; TTFT 10.04 / 9.30 s traced):
 - Runs: `cc-expert-prediction/dsv41-baseline/servers/route-plan-{A,B,B-node}/run-20260925-23*/`.
 - Trace: `/mnt/nvme1/dsv41-nsys/route-plan-B-node-20260925-233535{.nsys-rep,.sqlite}`.
 - Analyses: `/mnt/nvme1/prefill-opt/{compare.txt,sites-after.txt,chunks-after.txt,arm-table.txt,mutants.txt}`.
+
+### 27.12 Split fill gather: a chunk's resident rows go first (result, 2026-09-26)
+
+The first item of §27.11's Next. Plan: `docs/superpowers/plans/2026-09-26-dsv41-split-fill-gather.md`.
+Flag: **`SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER`** (`EnvBool`, default off; `Dsv41Config.enable_prefill_split_gather`).
+
+**What changed.** With the flag on, `ExpertPinnedHostCache.gather_rows` splits a chunk that has rows still filling:
+- It copies the chunk's rows already resident in the pinned tier first, through `copy_rows(..., rows=...)`.
+  `_gather_host_rows_to_kernel` is `_gather_host_rows_kernel` with an output-row index.
+- It then waits for the chunk's fills (`_await_fills`), and copies the filled rows.
+- The same bytes land in the same staging rows, so outputs are bitwise identical.
+- A chunk with no fills, or with only filling rows, takes the unsplit path.
+- The split is used only when every output is on the CPU, or the source and outputs are contiguous (`_splits`). A split
+  copy to named rows refuses outputs the unsplit path would send to its fallback, rather than silently taking it.
+- Commits `0bb3ffbe55`..`5fe531c64b` on master; each implementation commit follows its red test.
+
+**Tests** (divix01, private worktree `wt-route-plan`; runners `/mnt/nvme1/prefill-opt/{rpt,gpt}.sh`):
+- CPU, `test_expert_pinned_row_fills.py`: 14 passed. Resident rows are copied before the fill wait. Every chunk's rows
+  land where the unsplit gather puts them (chunks [0,2,5] and [7,5,3]). A chunk of only filling rows waits, then
+  copies once. A failed fill still raises. The overflow test runs with and without the split.
+- GPU, under `cc-gpu.lock`: `test_expert_plugins_cuda.py`, `test_expert_pinned_row_fills.py` and
+  `test/manual/dsv41/test_exl3_stream_apply_gpu.py`: 41 passed at `5fe531c64b`, both with the flag unset and with
+  `SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER=1` in the environment. The CUDA tests cover:
+  - a copy to named rows leaves the other rows untouched;
+  - a split copy refuses outputs the fallback would take.
+- Registered suite, `pytest -q -p no:randomly test/registered/unit/kernels` under the GPU lock: 1726 passed, 1 skipped
+  at both base `eb70bd3413` and tip `5fe531c64b`.
+- Focused set (`test_exl3_ops_cpu.py`, `test_exl3_moe_stream_mode.py`, `test_exl3_moe_method.py`,
+  `test_expert_gather_experts.py`, `test_expert_plugins_cuda.py`, `test_dsv41_config.py`): 70 → 72 passed. The two new
+  tests are the difference.
+
+**Mutants** (`/mnt/nvme1/prefill-opt/mutants_split.py`; each reverted, and the files were green again after):
+
+| Mutant | Caught by |
+|---|---|
+| Fill wait moved before the resident copy | `test_split_gather_copies_resident_rows_before_waiting_for_the_fills` |
+| Ready and filling rows swapped | the same, and `test_split_gather_places_every_chunks_rows_like_the_unsplit_gather` |
+| The indexed kernel stores to its program row, not the named row | `test_copy_rows_to_named_rows_on_cuda_leaves_the_rest` |
+| `_filling_positions` always empty | `test_split_gather_copies_resident_rows_before_waiting_for_the_fills` |
+| `_splits` always true | `test_a_split_copy_refuses_outputs_the_fallback_would_take` |
+
+The `_splits` mutant first survived every test. The CUDA refusal test (`9a26ec89a5`) was added for it.
+
+**Arms** (A = production recipe with the route plan, B = + the flag; A then B, once each, port 30021, `5fe531c64b`):
+
+| | A | B | B, traced |
+|---|---:|---:|---:|
+| TTFT, session 0 (260-token prompt) | 9.94 s | **8.59 s** | 8.78 s |
+| TTFT, session 1 | 9.19 s | **8.20 s** | 8.32 s |
+| Decode, pooled client ms/token | 114.1 | 114.1 | 116.6 |
+| Output | | identical to A | identical to A |
+
+**Trace** (node-mode traced B, last session's prefill, against §27.11's `route-plan-fix-node`):
+
+| | Route plan (§27.11) | + split |
+|---|---:|---:|
+| Prefill wall | 9,280 ms | **8,300 ms** |
+| GPU busy (kernels + copies) | 6,552 ms | 6,543 ms |
+| of which the gather | 6,087 ms (726 launches) | 6,076 ms (1,236 indexed + 108 plain) |
+| GPU idle | 2,728 ms (29%) | **1,756 ms (21%)** |
+| Decode steps 15+, ms / GPU busy per step | 110.6 / 108.1 | 110.5 / 107.9 |
+
+| Host state while the GPU idles | Route plan | + split |
+|---|---:|---:|
+| Fill wait before a layer's first chunk's gather | 1,296 ms (40 chunks, median 26.9 ms) | **286 ms** (5 chunks, median 74.1 ms) |
+| Fill wait before a later chunk's gather | 637 ms (13 chunks, median 51 ms) | 714 ms (12 chunks, median 60.4 ms) |
+| Blocking CUDA calls | 30 ms | 28 ms |
+| Everything else: Python and launches | 765 ms | 729 ms |
+
+- The first-chunk wait fell by 1.0 s, as §27.11 estimated. Only 5 of 40 first chunks still wait: those whose resident
+  rows gather faster than their fills land.
+- The later-chunk waits did not move. Those chunks' resident rows are too few to cover their fills.
+- The gather's own time is unchanged, which is the link floor. The extra launches add ~0.5% of eager kernels
+  (108,450 → 110,508).
+
+**The traced arm needs 4 GiB of the pinned tier moved off node 0.** Its first two attempts refused to start:
+- `check_capacity` found node 0 ~0.5 GB short: 54.7 GB free plus 10.3 GB of page cache, against 60 GiB plus 4 GiB of
+  headroom.
+- A 1 s sample of node 0 during a traced start showed anonymous memory growing 1 → 17.4 GB before the check. The
+  scheduler held 9.0 GB, the main process 4.9 GB and the detokenizer 4.8 GB, all under `nsys launch
+  --trace=cuda,nvtx,osrt`.
+- Untraced arms start: the recipe's 60 GiB on node 0 is sized to leave exactly 4 GiB spare.
+- The third attempt ran with `SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:45056`: the same 100 GiB and rows, 4 GiB of
+  them on node 1. §25.4 measured the same H2D rate from either node.
+- `analysis/dsv41-drive/split-gather/drive_arms.sh` now passes that placement to its traced arm.
+
+**What remains** (§27.4 item 7):
+- **Later-chunk fill waits, 714 ms.** Copying each filled row as it lands, not after the chunk's last fill, needs a poll
+  of `fill_landed` and more launches.
+- **Python and launches, 729 ms.** Not yet attributed.
+- **Starting a layer's fills before its routing is known** needs a predictor (Track B, §25.4).
+- **Production** still runs without the flag. Adding it to `arm_env.base_env()` is a separate, asked-for change.
+
+**Evidence** (divix01):
+- Runs: `cc-expert-prediction/dsv41-baseline/servers/split-gather-{A,B}/run-20260926-01*/` and
+  `split-gather-B-node/run-20260926-014232/`.
+- Trace: `/mnt/nvme1/dsv41-nsys/split-gather-B-node-20260926-014247{.nsys-rep,.sqlite}`.
+- Analyses: `/mnt/nvme1/prefill-opt/{idle-split.txt,compare-split.txt,arm-table-split.txt,mutants-split.txt,
+  mutants-split-4.txt,node0-sample.log,suite-split{tip,base}.log}`.
 
 ## Sources
 

@@ -24,8 +24,11 @@ if [ "$MODE" = ab ] || [ "$MODE" = all ]; then
 fi
 if [ "$MODE" = traced ] || [ "$MODE" = all ]; then
     # No root PCIe session: its nsys stop failed on 2026-09-25 and the orphan held cc-gpu.lock.
+    # nsys adds ~17 GB of anon memory on node 0 before the pinned tier's capacity check, so 4 GiB of the tier moves to
+    # node 1 (DSV41_REFERENCE.md section 27.12).
     wait_gpu; say "arm B traced"
     NSYS_TMPDIR=/mnt/nvme1/nsys-tmp NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node NSYS_GPU_METRICS=0 EXPECT_SHA=$SHA \
-        bash benchmarks/dsv41_baseline/run_arm.sh split-gather-B-node 30021 $FLAG; say "B traced rc=$?"
+        bash benchmarks/dsv41_baseline/run_arm.sh split-gather-B-node 30021 $FLAG \
+        SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:45056; say "B traced rc=$?"
 fi
 say "DRIVER DONE"
