@@ -70,3 +70,26 @@ def test_planned_accumulate_is_bitwise_the_where_loop_over_many_experts():
         exl3_ops.exl3_moe_accumulate(want, x, topk_weights, topk_ids, w13, w2, 10.0, chunk, _fake_linear)
         exl3_ops.exl3_moe_accumulate_planned(got, x, topk_weights, plan, w13, w2, 10.0, chunk, _fake_linear)
     assert torch.equal(got, want)
+
+
+def _device_rows(slots, hits):
+    """_gather_cached's own row_of_source computation (the hit_rows branch in expert_stream.py), on CPU tensors."""
+    slots_t, hit_mask = torch.tensor(slots), torch.tensor(hits)
+    if bool(hit_mask.all()):
+        return slots_t.tolist()
+    order = torch.cat(((~hit_mask).nonzero().flatten(), hit_mask.nonzero().flatten()))
+    row_of_source = torch.empty_like(order)
+    row_of_source[order] = torch.arange(len(slots))
+    return row_of_source.tolist()
+
+
+@pytest.mark.parametrize(
+    "slots",
+    [[2, 0, 1], [-1, -1, -1], [-1, 4, -1, 0, -1], [7, -1]],
+    ids=["all_hit", "all_miss", "mixed", "hit_first"],
+)
+def test_host_row_of_source_matches_the_device_order(slots):
+    from sglang.srt.layers.moe.expert_stream import host_row_of_source
+
+    hits = [slot >= 0 for slot in slots]
+    assert host_row_of_source(slots, hits) == _device_rows(slots, hits)
