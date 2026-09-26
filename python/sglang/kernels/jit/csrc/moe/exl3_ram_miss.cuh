@@ -1595,8 +1595,8 @@ __device__ __forceinline__ void copy_wait_read(const uint8_t* src, uint8_t* dst,
                    : "memory");
     }
   }
-  for (; u < units; u += step) stream_copy16(src + 16 * u, dst + 16 * u);
-  for (int64_t b = units * 16 + threadIdx.x; b < bytes; b += step) stream_copy1(src + b, dst + b);
+  for (; u < units; u += step) exl3_ram_miss_device::stream_copy16(src + 16 * u, dst + 16 * u);
+  for (int64_t b = units * 16 + threadIdx.x; b < bytes; b += step) exl3_ram_miss_device::stream_copy1(src + b, dst + b);
 }
 
 // Copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and A2 and before F. The COPYING lanes are read back from the row
