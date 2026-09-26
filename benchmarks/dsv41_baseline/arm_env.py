@@ -180,6 +180,10 @@ def base_env() -> dict[str, str]:
         # A prefill chunk copies its rows already in the pinned tier before waiting for its fills: TTFT 9.9 -> 8.6 s,
         # outputs identical (DSV41_REFERENCE.md 27.12).
         "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER": "1",
+        # CW reads each RAM-hit row's four small tensors itself, so the copy engine sends 2 copies per row, not 6:
+        # outputs identical, ~1 ms/step in a node-mode trace, within noise untraced (DSV41_REFERENCE.md 27.14).
+        # Needs the copy engine above.
+        "SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES": "1",
     }
 
 
