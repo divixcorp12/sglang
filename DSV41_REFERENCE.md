@@ -4523,10 +4523,38 @@ order. The flag-off loop had the same blind spot, and the test covers both.
   next layer's attention, route readback, fill start and first-chunk fill wait all run with the gather queue empty.
 - The PCIe metrics session failed to stop (`nsys stop failed`), so this arm has no PCIe RX figures.
 
+**Where the remaining GPU idle goes, by site** (traced arm at `035ce226d3`, route plan plus the review fix; 9,280 ms
+prefill; TTFT 10.04 / 9.30 s traced):
+
+| Host state while the GPU idles | GPU idle |
+|---|---:|
+| Fill wait before a layer's **first** chunk's gather (40 chunks, median 26.9 ms, max 97.5 ms) | **1,296 ms** |
+| Fill wait before a later chunk's gather (13 of 81 chunks, median 51 ms, max 106 ms) | 637 ms |
+| Blocking CUDA calls | 30 ms |
+| Everything else: Python and launches | 765 ms |
+| Total | 2,728 ms (29%) |
+
+- **Method.** A fill wait is a CUDA-free stretch of at least 1 ms that ends within 1 ms of a chunk's first gather
+  launch. OS-runtime tracing shows the thread there in back-to-back ~70 µs `nanosleep`s, which is `RamTier::fill_wait`
+  polling every 20 µs from `_await_fills`. Scripts: `analysis/dsv41-drive/pcie-trace/idle_by_host_state.py` and
+  `boundary_timeline.py`.
+- **Correction.** The "~1.8 s at layer boundaries" read above was mostly right about place and wrong about cause. It
+  is not attention or syncs but NVMe: a layer's fills can start only once its routing is known, and `gather_rows`
+  copies nothing of a chunk until every row of it has landed.
+- The fill reader works in claim order (ascending, batches of 8 rows, progress every 200 µs), so a first chunk
+  waits for its own misses, not the layer's.
+
 **Next** (§27.4 item 7 remainder):
-- **The layer boundary.** Measure its ~1.8 s by site first. Candidates:
-  - start the next layer's first fills earlier (needs its routing, so a predictor, or the router run ahead);
-  - make the boundary's syncs not wait for the last chunk's gather.
+- **Split each chunk's gather around its fills.** Copy the chunk's rows already in the pinned tier first, then wait
+  for the fills, then copy the filled rows. The same bytes land in the same staging rows, so outputs stay bitwise
+  identical. This needs:
+  - an output-row index on `_gather_host_rows_kernel`;
+  - a second launch for chunks with fills.
+
+  The pre-gather `.item()` has already drained the stream, so the index copies cost no wait. At ~1.08 ms a row
+  gathered against ~1.75 ms a row read from NVMe, a first chunk's ~49 resident rows cover its ~15 fills in most
+  layers. Estimated gain: most of the 1.3 s, and part of the 0.64 s.
+- **Starting a layer's fills before its routing is known** needs a predictor (Track B).
 - **Grouped expert compute** does not pay yet. The host now waits on the GPU within a layer, so fewer launches would
   not shorten it.
 - **Production** still runs without the flag. Adding it to `arm_env.base_env()` is a separate, asked-for change.
