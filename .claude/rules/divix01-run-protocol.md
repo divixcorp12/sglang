@@ -117,8 +117,16 @@ result is only meaningful next to the restored baseline.
 
 Every CPU job runs under `taskset -c 0-63` with threads capped
 (`OMP_NUM_THREADS`). Cores 64-71 stay free: core 71 is production's doorbell
-spin core. GPU work goes through `gpu-run.sh` (takes `cc-gpu.lock`, pins cores
-32-63), never a bare command.
+spin core. GPU work runs under `cc-gpu.lock` on cores 32-63, never as a bare
+command. Two ways, both on divix01:
+
+- `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh <cmd>`
+  (not in any repo). It retries the lock every 60 s and **gives up after 30 min
+  with exit 75**, so it fails behind a long arm or soak; check for 75.
+- To wait as long as it takes, lock directly:
+  `flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 <cmd>`,
+  or `exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock; flock 9` in a script
+  (see the lock order below).
 
 ## Lock order: `rowimg-disk.lock`, then `cc-gpu.lock`
 
