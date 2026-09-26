@@ -36,6 +36,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     enable_native_prefetch: bool
     enable_prefill_fills: bool
     enable_prefill_share: bool
+    enable_prefill_route_plan: bool
     enable_moe_side_stream: bool
     enable_layer_fusion: bool
     enable_exl3_cast_fusion: bool
@@ -70,6 +71,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             enable_native_prefetch=envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get(),
             enable_prefill_fills=envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get(),
             enable_prefill_share=envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.get(),
+            enable_prefill_route_plan=envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get(),
             enable_moe_side_stream=envs.SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM.get(),
             enable_layer_fusion=envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
             enable_exl3_cast_fusion=envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get(),
