@@ -12,6 +12,7 @@
 #                  conversation's SWA tail from the 3584-slot pool;
 #   big-hicache    big plus the hierarchical cache: a host-backed SWA tail is a valid match boundary;
 #   equiv-hicache  big-hicache running prefix_equiv.py: does a prefix hit change greedy output?
+#   poison         the recipe (HiCache included) running prefix_poison.py: a mid-chunk hit over a poisoned SWA pool.
 # Output under /mnt/nvme1/hicache/mt-<arm>/. Production must be stopped.
 # Usage: drive_multiturn.sh <worktree> [arm ...]
 set -u
@@ -62,6 +63,7 @@ for arm in $ARMS; do
     big-tails16) extra="--swa-prefix-tails 16"; turns=2 ;;
     big-hicache) extra="$HICACHE"; turns=2 ;;
     equiv-hicache) extra="$HICACHE"; client=equiv ;;
+    poison) extra=""; client=poison ;;
     *) say "unknown arm $arm"; exit 2 ;;
   esac
   OUT=$T/mt-$arm
@@ -83,7 +85,10 @@ for arm in $ARMS; do
   done
   if [ $healthy = 1 ]; then
     say "arm $arm healthy"
-    if [ $client = equiv ]; then
+    if [ $client = poison ]; then
+      taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/prefix_poison.py --port $PORT --model $MODEL \
+        --text $WT/DSV41_REFERENCE.md --out $OUT/poison.jsonl 2>&1 | tee -a $OUT/client.log
+    elif [ $client = equiv ]; then
       taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/prefix_equiv.py --port $PORT --model $MODEL \
         --text $WT/DSV41_REFERENCE.md --out $OUT/equiv.jsonl 2>&1 | tee -a $OUT/client.log
     else
