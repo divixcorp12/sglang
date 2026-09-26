@@ -810,6 +810,10 @@ class Exl3RamMissHost:
         if outcome != 1:
             raise RuntimeError(f"exl3 RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s")
 
+    def fill_landed(self) -> int:
+        """How many claimed rows of the fill have landed so far, a prefix of the claim order; never blocks."""
+        return int(self._module.exl3_ram_miss_fill_landed(self.handle))
+
     def fill_end(self) -> bool:
         """Join the fill; False when it failed (its rows that did not land were released)."""
         return bool(self._module.exl3_ram_miss_fill_end(self.handle))

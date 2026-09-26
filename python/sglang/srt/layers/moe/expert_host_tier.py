@@ -91,7 +91,8 @@ class PinnedRowFills(Protocol):
     until one has no victim (a ``protected`` row goes only with ``fallback``), maps them at once and starts reading;
     it returns the claimed prefix's slots and the evictions. A claimed slot is never a victim until ``fill_end``.
     ``fill_wait(rows)`` returns once the first ``rows`` claimed rows are in their slabs, and raises if the fill failed
-    first. ``fill_end`` joins the reads; False means the fill failed and released its rows that did not land.
+    first. ``fill_landed`` returns how many claimed rows have landed so far, a prefix of the claim order, without
+    blocking. ``fill_end`` joins the reads; False means the fill failed and released its rows that did not land.
     """
 
     def fill_begin(
@@ -99,6 +100,8 @@ class PinnedRowFills(Protocol):
     ) -> tuple[list[int], int]: ...
 
     def fill_wait(self, rows: int) -> None: ...
+
+    def fill_landed(self) -> int: ...
 
     def fill_end(self) -> bool: ...
 

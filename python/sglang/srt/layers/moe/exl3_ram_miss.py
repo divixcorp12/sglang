@@ -383,6 +383,9 @@ class NativePinnedSlotTable:
     def fill_wait(self, rows: int) -> None:
         self.service.host.fill_wait(rows, self.service.fill_timeout_s)
 
+    def fill_landed(self) -> int:
+        return self.service.host.fill_landed()
+
     def fill_end(self) -> bool:
         return self.service.host.fill_end()
 

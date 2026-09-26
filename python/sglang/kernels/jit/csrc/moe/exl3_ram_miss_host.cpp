@@ -3804,6 +3804,11 @@ class RamTier {
     }
   }
 
+  // How many claimed rows have landed so far, a prefix of the claim order (what fill_wait waits on); never blocks.
+  int64_t fill_landed() const {
+    return fill_landed_.load(std::memory_order_acquire);
+  }
+
   // Joins the fill: 1 when every claimed row landed (or nothing was claimed), 0 when it failed; a failed fill has
   // released its rows that did not land.
   int64_t fill_end() {
@@ -5348,6 +5353,10 @@ int64_t exl3_ram_miss_fill_wait(int64_t handle, int64_t rows, int64_t timeout_ns
   return exl3_ram_miss::find(handle)->fill_wait(rows, timeout_ns);
 }
 
+int64_t exl3_ram_miss_fill_landed(int64_t handle) {
+  return exl3_ram_miss::find(handle)->fill_landed();
+}
+
 int64_t exl3_ram_miss_fill_end(int64_t handle) {
   return exl3_ram_miss::find(handle)->fill_end();
 }
@@ -5650,6 +5659,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_assign, exl3_ram_miss_assign);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_release, exl3_ram_miss_release);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_begin, exl3_ram_miss_fill_begin);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_wait, exl3_ram_miss_fill_wait);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_landed, exl3_ram_miss_fill_landed);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_fill_end, exl3_ram_miss_fill_end);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_slot_info, exl3_ram_miss_slot_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_inject_lease, exl3_ram_miss_inject_lease);

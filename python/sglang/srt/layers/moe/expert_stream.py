@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import functools
 import logging
@@ -70,6 +71,9 @@ _PINNED_STAGING: Dict[Tuple, torch.Tensor] = {}
 _PINNED_INDEX: Dict[Tuple, torch.Tensor] = {}
 _ARANGE_CACHE: Dict[Tuple, torch.Tensor] = {}
 _LOGGED_SOURCE_SIGNATURES: set[Tuple] = set()
+# The prefill fill reader lands rows in batches of this many (exl3_ram_miss_host.cpp kBounceRows); a split gather
+# copies a chunk's filling rows at that grain.
+_FILL_COPY_ROWS = 8
 
 NVFP4_STREAM_TENSORS = (
     "w13_weight",
@@ -447,7 +451,10 @@ class ExpertPinnedHostCache:
         order = self._fill_order
         if order is None:
             return
-        rows = max((order.get(expert_id, -1) for expert_id in expert_ids), default=-1) + 1
+        self._wait_fill(max((order.get(expert_id, -1) for expert_id in expert_ids), default=-1) + 1)
+
+    def _wait_fill(self, rows: int) -> None:
+        """Wait until the first ``rows`` rows of the prefetch's claim order are in their slabs."""
         if rows:
             began = time.perf_counter_ns()
             self.row_fills.fill_wait(rows)
@@ -455,11 +462,39 @@ class ExpertPinnedHostCache:
             self.streamer._record_read(RowReadStats(read_ns=time.perf_counter_ns() - began))
 
     def _filling_positions(self, chunk_ids: list[int]) -> list[int]:
-        """Positions in ``chunk_ids`` of rows the running prefetch claimed; [] unless splitting."""
+        """Positions in ``chunk_ids`` of the prefetch's rows not landed yet, in claim order; [] unless splitting."""
         order = self._fill_order
         if not self.split_fill_gather or order is None:
             return []
-        return [i for i, expert_id in enumerate(chunk_ids) if expert_id in order]
+        landed = self.row_fills.fill_landed()
+        filling = [i for i, expert_id in enumerate(chunk_ids) if order.get(expert_id, -1) >= landed]
+        return sorted(filling, key=lambda i: order[chunk_ids[i]])
+
+    def _copy_as_filled(
+        self, chunk: torch.Tensor, chunk_ids: list[int], outputs: dict[str, torch.Tensor], filling: list[int]
+    ) -> None:
+        """Copy the chunk's landed rows now, then its ``filling`` rows a batch at a time as the fill lands them.
+
+        The same bytes go to the same rows as one unsplit copy. The stream is idle here (gather_rows' .item()), so
+        the one row-index copy for the chunk costs no wait; each copy takes a slice of it.
+        """
+        filling_set = set(filling)
+        ready = [i for i in range(len(chunk_ids)) if i not in filling_set]
+        rows = torch.tensor(ready + filling, dtype=torch.int64, device=chunk.device)
+        if ready:
+            self.copy_rows(chunk, outputs, rows=rows[: len(ready)])
+        claims = [self._fill_order[chunk_ids[i]] for i in filling]
+        done = 0
+        while done < len(filling):
+            # The reader lands rows in claim order, _FILL_COPY_ROWS per batch: wait for the next batch, then copy
+            # every row landed by then.
+            self._wait_fill(claims[min(done + _FILL_COPY_ROWS, len(filling)) - 1] + 1)
+            upto = bisect.bisect_left(claims, self.row_fills.fill_landed())
+            if not ready and done == 0 and upto == len(filling):
+                self.copy_rows(chunk, outputs)
+            else:
+                self.copy_rows(chunk, outputs, rows=rows[len(ready) + done : len(ready) + upto])
+            done = upto
 
     def _splits(self, outputs: dict[str, torch.Tensor]) -> bool:
         """Whether copy_rows can copy named rows into ``outputs``: never through the non-contiguous fallback."""
@@ -484,6 +519,7 @@ class ExpertPinnedHostCache:
         if source_ids.numel() == 0:
             return False
         slots = self.expert_to_slot[source_ids.long()]
+        row_slots = None if rows is None else slots[rows]
         fallback_used = False
         for name in self.cached_names:
             source = self.tensors[name]
@@ -492,7 +528,7 @@ class ExpertPinnedHostCache:
                 if rows is None:
                     torch.index_select(source, 0, slots.cpu(), out=output)
                 else:
-                    output[rows.cpu()] = torch.index_select(source, 0, slots[rows].cpu())
+                    output[rows.cpu()] = torch.index_select(source, 0, row_slots.cpu())
             elif source.is_contiguous() and output.is_contiguous():
                 row_bytes = source.numel() * source.element_size() // self.capacity
                 if rows is None:
@@ -508,7 +544,7 @@ class ExpertPinnedHostCache:
                 else:
                     _gather_host_rows_to_kernel[(rows.numel(), triton.cdiv(row_bytes, 1024))](
                         source.view(torch.uint8),
-                        slots[rows],
+                        row_slots,
                         rows,
                         output.view(torch.uint8),
                         row_bytes,
@@ -587,16 +623,8 @@ class ExpertPinnedHostCache:
                 for name, output in outputs.items()
             }
             filling = self._filling_positions(chunk_ids)
-            if filling and len(filling) < len(chunk_ids) and self._splits(chunk_outputs):
-                # The resident rows' copy runs while the fills land: the same bytes to the same rows, in two
-                # copies. The stream is idle here (the chunk's .item() above), so the row lists cost no wait.
-                filling_set = set(filling)
-                ready = [i for i in range(len(chunk_ids)) if i not in filling_set]
-                ready_rows = torch.tensor(ready, dtype=torch.int64, device=chunk.device)
-                filling_rows = torch.tensor(filling, dtype=torch.int64, device=chunk.device)
-                self.copy_rows(chunk, chunk_outputs, rows=ready_rows)
-                self._await_fills([chunk_ids[i] for i in filling])
-                self.copy_rows(chunk, chunk_outputs, rows=filling_rows)
+            if filling and self._splits(chunk_outputs):
+                self._copy_as_filled(chunk, chunk_ids, chunk_outputs, filling)
             else:
                 self._await_fills(chunk_ids)
                 fallback_used = self.copy_rows(chunk, chunk_outputs) or fallback_used
