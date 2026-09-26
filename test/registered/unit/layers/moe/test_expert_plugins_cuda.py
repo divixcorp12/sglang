@@ -212,6 +212,25 @@ class TestPinnedTierCuda(unittest.TestCase):
         self.assertTrue((got[0] == 7).all())
         cache.close()
 
+    def test_a_split_copy_refuses_outputs_the_fallback_would_take(self):
+        """gather_rows splits only when every copy can take a kernel; a strided output goes to the unsplit path."""
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        layer = torch.nn.Module()
+        layer.host_rows = torch.nn.Parameter(torch.randint(0, 256, (8, 3000), dtype=torch.uint8), requires_grad=False)
+        layer.gpu_rows = torch.nn.Parameter(torch.rand(8, 5, device="cuda"), requires_grad=False)
+        layer._nvfp4_file_source_bytes_per_expert = 3000
+        cache = ExpertPinnedHostCache(ExpertStreamer(layer, ("host_rows", "gpu_rows")), 4)
+        ids = torch.tensor([6, 2, 5], device="cuda")
+        cache.ensure_rows(ids)
+        contiguous = {"host_rows": torch.empty((3, 3000), dtype=torch.uint8, device="cuda")}
+        strided = {"host_rows": torch.empty((3, 6000), dtype=torch.uint8, device="cuda")[:, ::2]}
+        self.assertTrue(cache._splits(contiguous))
+        self.assertFalse(cache._splits(strided))
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            cache.copy_rows(ids, strided, rows=torch.tensor([0], device="cuda"))
+        cache.close()
+
 
 def _spec_only_reference(names=None, experts=EXPERTS, seed=5):
     generator = torch.Generator().manual_seed(seed)
