@@ -22,8 +22,9 @@ PORT=30021
 export NSYS_TMPDIR=/mnt/nvme1/nsys-tmp TMPDIR=/mnt/nvme1/ce-soak/tmp
 mkdir -p $OUT $NSYS_TMPDIR $TMPDIR
 say() { echo "$(date +%T) $*" | tee -a $OUT/probe.log; }
-exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock; flock 9
+# Disk lock, then GPU lock: the order every driver on divix01 uses (.claude/rules/divix01-run-protocol.md).
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock; flock 8
+exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock; flock 9
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do say "GPU busy; waiting"; sleep 60; done
 ss -ltn "sport = :$PORT" | grep -q LISTEN && { say "port $PORT taken"; exit 1; }
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "

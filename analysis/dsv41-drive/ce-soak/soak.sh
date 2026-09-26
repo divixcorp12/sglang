@@ -40,12 +40,13 @@ say() { echo "$(date +%T) $*" | tee -a $OUT/soak.log; }
 [ -d "$WT/python/sglang" ] || { say "no sglang tree under $WT"; exit 2; }
 [ "$PORT" != 7867 ] || { say "port 7867 is production's; refusing"; exit 2; }
 
-exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock
-say "waiting for cc-gpu.lock"
-flock 9
+# Disk lock, then GPU lock: the order every driver on divix01 uses (.claude/rules/divix01-run-protocol.md).
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
 say "waiting for rowimg-disk.lock"
 flock 8
+exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock
+say "waiting for cc-gpu.lock"
+flock 9
 say "locks held"
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do say "GPU busy; waiting"; sleep 180; done
 ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exit 1; }

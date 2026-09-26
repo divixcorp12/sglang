@@ -120,6 +120,14 @@ Every CPU job runs under `taskset -c 0-63` with threads capped
 spin core. GPU work goes through `gpu-run.sh` (takes `cc-gpu.lock`, pins cores
 32-63), never a bare command.
 
+## Lock order: `rowimg-disk.lock`, then `cc-gpu.lock`
+
+A job that needs both locks takes the disk lock first. `run_arm.sh` takes
+`cc-gpu.lock` itself (non-blocking), so an arm driver must already hold
+`rowimg-disk.lock` and poll for the GPU; a script that held the GPU while
+waiting for the disk would deadlock against it, both waiting forever.
+Every committed script under `analysis/dsv41-drive/` follows this order.
+
 ## The launch gate can validate the wrong format and pass
 
 `expert_stream_requirements_for` (`python/sglang/srt/arg_groups/expert_stream_requirements.py:160`) asks
