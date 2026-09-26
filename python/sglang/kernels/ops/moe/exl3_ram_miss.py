@@ -891,16 +891,17 @@ class Exl3RamMissHost:
         """
         self._module.exl3_ram_miss_enable_copy_engine(self.handle, int(device), int(spin_us * 1e3))
 
-    def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int) -> None:
+    def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0) -> None:
         """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
-        C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows."""
+        C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows. Bit i of ``sm_mask`` leaves
+        entry i to the copy wait's SM reads, and its leases then wait for the copy wait's SmAck."""
         self._check(row)
         entries = table.detach().to("cpu", torch.int64).contiguous()
         if entries.dim() != 2 or entries.shape[1] != 3 or entries.shape[0] < 1:
             raise ValueError(f"a copy table is int64 [n, 3], not {tuple(entries.shape)}")
         if dst_rows < 1:
             raise ValueError("a copy table needs at least one destination row")
-        self._module.exl3_ram_miss_set_copy_table(self.handle, row, entries, int(dst_rows))
+        self._module.exl3_ram_miss_set_copy_table(self.handle, row, entries, int(dst_rows), int(sm_mask))
 
     def enable_native_prefetch(self, page: torch.Tensor) -> None:
         """Serve native-prefetch requests posted into ``page`` (``new_prefetch_page``); needs the copy engine and must
@@ -1473,16 +1474,26 @@ class Exl3RamMissDevice:
             self.page, self.state, self._lease_address, self._lease_d, go, lane_ctx, origin, self.violated
         )
 
-    def copy_wait(self, count) -> None:
+    def copy_wait(self, count, sm_table: Optional[torch.Tensor] = None) -> None:
         """The copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and its acknowledgement and before :meth:`finalize`.
 
-        It commits ``go_ce`` once the service's CopyDone names this request and exactly its COPYING lanes.
+        It commits ``go_ce`` once the service's CopyDone names this request and exactly its COPYING lanes. With
+        ``sm_table`` (int64 ``[n, 3]`` on the device, the copy-table rows the service's ``sm_mask`` named), it first
+        reads those entries of every COPYING lane from its leased slot and publishes SmAck.
         """
         if not self.piece_stream:
             raise RuntimeError("the copy wait runs in the piece-streaming chain only")
         self._check_buffers(count=(count, torch.int32))
+        sm_address, sm_count = 0, 0
+        if sm_table is not None:
+            if sm_table.dtype != torch.int64 or sm_table.dim() != 2 or sm_table.shape[1] != 3 or not sm_table.is_contiguous():
+                raise ValueError(f"the copy wait's SM table is a contiguous int64 [n, 3], not {tuple(sm_table.shape)}")
+            if sm_table.device != self.state.device:
+                raise ValueError("the copy wait's SM table must live on the device the kernel reads it from")
+            sm_address, sm_count = sm_table.data_ptr(), int(sm_table.shape[0])
         self._kernels().exl3_ram_miss_lease_copy_wait(
-            self.page, self.state, count, self._lease_address, self._lease_c, self.go_ce
+            self.page, self.state, count, self._lease_address, self._lease_c, self._lease_d, sm_address, sm_count,
+            self.go_ce,
         )
 
     def finalize(self, count, keep) -> None:

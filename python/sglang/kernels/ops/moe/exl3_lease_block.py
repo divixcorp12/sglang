@@ -65,7 +65,11 @@ TERMINAL_FIELDS = {"skipped_mask": 0, "reason": 4, "gen": 8}
 # one device-to-host progress word (the kernels' state words live in device memory).
 STREAM_PROBE = TERMINAL + RING * TERMINAL_BYTES
 STREAM_PROBE_BYTES = 8
-AREA_D_BYTES = STREAM_PROBE + RING * STREAM_PROBE_BYTES
+# SmAck[RING], device-written: tagged(SM_ACK_TAG, generation) once the copy wait has finished every SM read of that
+# request's leased slots (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES); a COPYING lease is released only after it.
+SM_ACK = STREAM_PROBE + RING * STREAM_PROBE_BYTES
+SM_ACK_BYTES = 8
+AREA_D_BYTES = SM_ACK + RING * SM_ACK_BYTES
 
 # Area P, service-written, at a new header offset (piece_offset): PieceMask[RING][LANES], a per-lane
 # generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment). Each
@@ -90,6 +94,7 @@ CONSUMED, VIOLATED = 1, 2  # LaneAck
 DEMAND_TAG = 1  # LaneRequest.gen, written by the post kernel
 TERMINAL_TAG = 1  # Terminal.gen, written by the wait kernel
 STREAM_PROBE_TAG = 1  # StreamProbe, written by the stream kernel
+SM_ACK_TAG = 1  # SmAck, written by the copy wait
 # Terminal.reason, written by the wait kernel (the service does not interpret it; it is for the trace and the tests).
 TERMINAL_REASONS = {"timeout": 1, "aborted": 2, "failed": 3, "identity": 4, "count": 5}
 TAG_SHIFT = 56

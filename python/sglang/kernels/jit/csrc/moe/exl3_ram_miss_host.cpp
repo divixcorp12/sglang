@@ -2718,6 +2718,9 @@ constexpr int64_t kLeaseTermGen = 8;
 // StreamProbe[kLeaseRing], device-written: the stream kernel's tagged(1, generation) once it has copied a piece.
 constexpr int64_t kLeaseStreamProbe = kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes;
 constexpr int64_t kLeaseStreamProbeBytes = 8;
+// SmAck[kLeaseRing], device-written: the copy wait finished its SM reads of that request's leased slots.
+constexpr int64_t kLeaseSmAck = kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes;
+constexpr int64_t kLeaseSmAckBytes = 8;
 constexpr int64_t kLeaseRowTableBytes = 8;
 
 // Area P, service-written, at a new header offset (kLeaseHeaderPieceOffset): PieceMask[kLeaseRing][kLeaseLanes],
@@ -2735,7 +2738,7 @@ constexpr int64_t kLeaseCopyDoneBytes = 16;
 constexpr int64_t kLeaseCdMask = 0;
 constexpr int64_t kLeaseCdGen = 8;
 constexpr int64_t kLeaseAreaCopyDoneBytes = kLeaseRing * kLeaseCopyDoneBytes;
-static_assert(kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes <= 4096, "area D fits one page");
+static_assert(kLeaseSmAck + kLeaseRing * kLeaseSmAckBytes <= 4096, "area D fits one page");
 
 // kQuarantine (piece streaming only): a slot whose read failed while a lane still leased it under tag LOADING. Its
 // mapping is cleared on entry, it is never taken, evicted or counted as a victim, and it becomes kFree when its last
@@ -2749,6 +2752,7 @@ constexpr uint64_t kLeaseTagLoading = 2;
 // A hit lane the copy-engine thread copies into its destination slot; the device neither copies nor acknowledges it.
 constexpr uint64_t kLeaseTagCopying = 3;
 constexpr uint64_t kLeaseTagCopied = 1;  // CopyDone
+constexpr uint64_t kLeaseTagSmAck = 1;   // SmAck
 
 enum Counter : int {
   kServedRequests = 0,
@@ -2980,6 +2984,10 @@ struct CopyJob {
   int64_t submit_ns = 0;
   int64_t token = -1;  // the backend's completion marker, recorded after the job's last copy
   bool prefetch = false;  // a native-prefetch job: issued only behind demand jobs, completed into PrefetchDone
+  // Its row has SM entries (set at issue): the copy wait reads them from the leased slots, so the leases are released
+  // only once it acknowledged its reads (SmAck), not on the DMA's completion. Never a prefetch job: no kernel reads
+  // a prefetched row's slot, so a prefetch copies every entry itself.
+  bool sm = false;
 };
 
 // ---- Native prefetch page (plan 2026-09-25-dsv41-native-prefetch) ----
@@ -3005,6 +3013,7 @@ struct CopyEntry {
   uint64_t src = 0;
   uint64_t dst = 0;
   int64_t bytes = 0;
+  bool sm = false;  // SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy wait reads it, not the DMA
 };
 
 // What the copy thread drives: issue copies in order, mark the point after them, and ask whether a mark is complete.
@@ -3195,16 +3204,19 @@ class HostCopyBackend : public CopyBackend {
 // stops issuing: nothing it issued may be assumed complete, so none of those leases is released (E5).
 class CopyEngine {
  public:
-  using Handler = std::function<void(const CopyJob&)>;
+  // complete: the job's copies completed; false when it still waits for the copy wait's SmAck, which `acked` then
+  // polls (true once it released the job's leases).
+  using Handler = std::function<bool(const CopyJob&)>;
   using Failure = std::function<void(const CopyJob&, int)>;
 
   CopyEngine(std::unique_ptr<CopyBackend> backend, int64_t rows, int64_t spin_ns, std::atomic<int64_t>* counters,
-             Handler complete, Failure fail)
+             Handler complete, Handler acked, Failure fail)
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
         spin_ns_(spin_ns),
         counters_(counters),
         complete_(std::move(complete)),
+        acked_(std::move(acked)),
         fail_(std::move(fail)) {}
 
   ~CopyEngine() {
@@ -3228,6 +3240,7 @@ class CopyEngine {
     if (row < 0 || row >= static_cast<int64_t>(tables_.size())) throw std::runtime_error("copy table row out of range");
     Table& table = tables_[row];
     if (table.ready.load(std::memory_order_acquire)) throw std::runtime_error("copy table already set for this row");
+    table.sm = std::any_of(entries.begin(), entries.end(), [](const CopyEntry& e) { return e.sm; });
     table.entries = std::move(entries);
     table.dst_rows = dst_rows;
     table.ready.store(true, std::memory_order_release);
@@ -3249,7 +3262,7 @@ class CopyEngine {
     work_cv_.notify_one();
   }
 
-  // No job queued, in flight or still being handed to `complete`.
+  // No job queued, in flight, awaiting its SmAck or still being handed to `complete`.
   bool idle() {
     std::lock_guard<std::mutex> guard(mutex_);
     return outstanding_ == 0;
@@ -3289,6 +3302,7 @@ class CopyEngine {
  private:
   struct Table {
     std::vector<CopyEntry> entries;
+    bool sm = false;  // an entry is left to the copy wait's SM reads
     int64_t dst_rows = 0;
     std::atomic<bool> ready{false};
   };
@@ -3305,6 +3319,7 @@ class CopyEngine {
     if (!error.empty()) return;
     std::deque<CopyJob> in_flight;
     std::deque<CopyJob> held;  // prefetch jobs not yet issued: demand goes first on the link
+    std::deque<CopyJob> acking;  // copies completed, CopyDone published; the leases wait for the copy wait's SmAck
     int64_t last_active = now_ns();
     while (true) {
       std::deque<CopyJob> fresh;
@@ -3351,9 +3366,21 @@ class CopyEngine {
         const CopyJob job = in_flight.front();
         in_flight.pop_front();
         record_latency(job);
-        complete_(job);
-        finish();
+        if (complete_(job)) {
+          finish();
+        } else {
+          acking.push_back(job);
+        }
         progressed = true;
+      }
+      for (auto it = acking.begin(); it != acking.end();) {
+        if (acked_(*it)) {
+          finish();
+          progressed = true;
+          it = acking.erase(it);
+        } else {
+          ++it;
+        }
       }
       if (broken_ != 0) {
         while (!in_flight.empty()) {
@@ -3361,10 +3388,10 @@ class CopyEngine {
           in_flight.pop_front();
         }
       }
-      if (stopping && held.empty() && (in_flight.empty() || now_ns() > drain_deadline)) break;
+      if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline)) break;
       if (progressed) {
         last_active = now_ns();
-      } else if (!in_flight.empty() || !held.empty() || now_ns() - last_active < spin_ns_) {
+      } else if (!in_flight.empty() || !held.empty() || !acking.empty() || now_ns() - last_active < spin_ns_) {
         _mm_pause();
       } else {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -3395,9 +3422,11 @@ class CopyEngine {
     if (const int64_t ballast = ballast_bytes_.load(); ballast > 0) {
       if (const int r = backend_->issue(ballast_dst_.load(), ballast_src_.load(), ballast)) return r;
     }
+    job.sm = table.sm && !job.prefetch;
     for (int i = 0; i < job.count; ++i) {
       const CopyLane& lane = job.lanes[i];
       for (const CopyEntry& entry : table.entries) {
+        if (entry.sm && job.sm) continue;
         const uint64_t dst = entry.dst + static_cast<uint64_t>(lane.dst_slot) * static_cast<uint64_t>(entry.bytes);
         const uint64_t src = entry.src + static_cast<uint64_t>(lane.host_slot) * static_cast<uint64_t>(entry.bytes);
         if (const int r = backend_->issue(dst, src, entry.bytes)) return r;
@@ -3434,6 +3463,7 @@ class CopyEngine {
   int64_t spin_ns_;
   std::atomic<int64_t>* counters_;
   Handler complete_;
+  Handler acked_;
   Failure fail_;
   std::thread thread_;
   std::mutex mutex_;  // guards queue_, outstanding_, stop_, drain_deadline_, started_ and init_error_
@@ -3900,20 +3930,26 @@ class RamTier {
     }
     auto engine = std::make_unique<CopyEngine>(
         std::move(backend), layers_, spin_ns, counters_,
-        [this](const CopyJob& job) { copy_completed(job); },
+        [this](const CopyJob& job) { return copy_completed(job); },
+        [this](const CopyJob& job) { return copy_acked(job); },
         [this](const CopyJob& job, int error) { copy_failed(job, error); });
     engine->start();
     copy_engine_ = std::move(engine);
   }
 
-  // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}.
-  void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows) {
+  // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}. Bit i
+  // of `sm_mask` leaves entry i to the copy wait's SM reads (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
+  void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows, int64_t sm_mask) {
     if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    if (sm_mask < 0 || (count < 63 && (sm_mask >> count) != 0)) {
+      throw std::runtime_error("exl3 RAM miss: the SM mask names a copy-table entry that does not exist");
+    }
     std::vector<CopyEntry> table;
     for (int64_t i = 0; i < count; ++i) {
       if (entries[3 * i + 2] <= 0) throw std::runtime_error("exl3 RAM miss: a copy-table entry of no bytes");
       table.push_back(CopyEntry{
-          static_cast<uint64_t>(entries[3 * i]), static_cast<uint64_t>(entries[3 * i + 1]), entries[3 * i + 2]});
+          static_cast<uint64_t>(entries[3 * i]), static_cast<uint64_t>(entries[3 * i + 1]), entries[3 * i + 2],
+          (sm_mask >> i & 1) != 0});
     }
     copy_engine_->set_table(row, std::move(table), dst_rows);
   }
@@ -4462,10 +4498,12 @@ class RamTier {
  private:
   // Copy thread. Completion was observed, so no copy of this job reads its slots any more: publish CopyDone, then
   // release. A leased slot's generation cannot move (E1); if one did, the bytes are not the lease's, so fail stop.
-  void copy_completed(const CopyJob& job) {
+  // A job whose row has SM entries is not released here (false): the copy wait still reads those slots, and
+  // copy_acked releases them once it acknowledged. True otherwise, fail-stops included (the leases stay held, E5).
+  bool copy_completed(const CopyJob& job) {
     if (job.prefetch) {
       prefetch_completed(job);
-      return;
+      return true;
     }
     const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
     for (int i = 0; i < job.count; ++i) {
@@ -4473,12 +4511,29 @@ class RamTier {
       if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
         counters_[kCopyGenerationMismatches].fetch_add(1);
         raise_fatal(static_cast<uint32_t>(job.gen));
-        return;
+        return true;
       }
     }
     uint8_t* done = lease_ + lease_c_ + job.idx * kLeaseCopyDoneBytes;
     std::memcpy(done + kLeaseCdMask, &job.mask, 4);
     store_release64(done + kLeaseCdGen, tagged_word(kLeaseTagCopied, job.gen));
+    if (job.sm) return false;
+    release_copied(job);
+    return true;
+  }
+
+  // Copy thread, a job copy_completed left waiting: true once the copy wait's SmAck for its ring index carries this
+  // request's generation or a later one (the copy wait of a later request in the index ran, so this one's finished),
+  // after which no SM read of the job's slots can be in flight, and the leases are released.
+  bool copy_acked(const CopyJob& job) {
+    const uint64_t word = load_acquire64(lease_ + lease_d_ + kLeaseSmAck + job.idx * kLeaseSmAckBytes);
+    if (tag_of(word) != kLeaseTagSmAck || generation_of(word) < job.gen) return false;
+    release_copied(job);
+    return true;
+  }
+
+  // Copy thread: release a completed job's COPYING leases, the only place one is released.
+  void release_copied(const CopyJob& job) {
     std::lock_guard<std::mutex> guard(mutex_);
     Outstanding& entry = outstanding_[job.idx];
     if (!entry.active || entry.gen != job.gen) {
@@ -4623,7 +4678,7 @@ class RamTier {
     }
     const int64_t d_offset = round_up_page(kLeaseSlotGen + 4 * total_slots);
     lease_d_ = d_offset;
-    const int64_t piece_offset = round_up_page(d_offset + kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes);
+    const int64_t piece_offset = round_up_page(d_offset + kLeaseSmAck + kLeaseRing * kLeaseSmAckBytes);
     lease_p_ = piece_offset;
     const int64_t copy_offset = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
     lease_c_ = copy_offset;
@@ -5419,11 +5474,12 @@ void exl3_ram_miss_enable_copy_engine(int64_t handle, int64_t device, int64_t sp
   exl3_ram_miss::find(handle)->enable_copy_engine(device, spin_ns);
 }
 
-// entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination.
-void exl3_ram_miss_set_copy_table(int64_t handle, int64_t row, TensorView entries, int64_t dst_rows) {
+// entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;
+// sm_mask: the entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES), 0 for none.
+void exl3_ram_miss_set_copy_table(int64_t handle, int64_t row, TensorView entries, int64_t dst_rows, int64_t sm_mask) {
   if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error("exl3 RAM miss: copy table must be [n, 3]");
   exl3_ram_miss::find(handle)->set_copy_table(
-      row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows);
+      row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows, sm_mask);
 }
 
 void exl3_ram_miss_arm_copy_engine(int64_t handle, int64_t on) {

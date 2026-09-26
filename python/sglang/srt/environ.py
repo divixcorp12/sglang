@@ -1905,6 +1905,11 @@ class Envs:
     # Captured decode graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in
     # flight can still deadlock it into a fail-stop (7.6 "Module loading"). Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
+    # SM small copies (LEASE_PROTOCOL.md 7.6): the copy engine copies only each RAM-hit row's two trellis tensors; the
+    # copy wait (CW) reads the four small ones (44.5 KB a row) from the pinned slot with SM loads while it waits, and
+    # the lease is released only once both the DMA completed and CW acknowledged its reads (SmAck). Needs the copy
+    # engine (refused without it). Read once at service start. Off by default.
+    SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES = EnvBool(False)
     # Native next-layer prefetch (plan 2026-09-25-dsv41-native-prefetch): in each captured decode layer T-1, after its
     # gather, layer T's own router gate scores layer T-1's router input; the best top-6 expert of T that is neither in
     # VRAM nor missing from the pinned tier is copied into one of T's hot slots by the copy engine, and layer T waits

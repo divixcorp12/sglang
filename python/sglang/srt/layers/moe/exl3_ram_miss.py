@@ -272,6 +272,28 @@ def _row_image_tables(
     )
 
 
+def sm_copy_mask(names: Sequence[str]) -> int:
+    """The copy-table entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): every tensor
+    but the trellises. The four small ones are 44.5 KB of a 13.3 MB DSV4.1 row, and as DMA copies each paid a fixed
+    per-copy cost that dwarfed its bytes."""
+    return sum(1 << i for i, name in enumerate(names) if not name.endswith("_trellis"))
+
+
+def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
+    """The rows of ``segments.table`` (the copy table, on the device) that ``sm_mask`` names, for the copy wait."""
+    rows = [i for i in range(segments.table.shape[0]) if sm_mask >> i & 1]
+    return segments.table[rows].contiguous()
+
+
+def check_sm_small_copies(cfg: Dsv41Config) -> None:
+    """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES without the copy engine: it moves part of the copy engine's
+    work into its copy wait, which only the copy-engine chain runs."""
+    if cfg.enable_ram_miss_sm_small_copies and not cfg.enable_ram_miss_copy_engine:
+        raise RuntimeError(
+            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"
+        )
+
+
 def check_piece_stream(cfg: Dsv41Config, *, row_images: bool) -> None:
     """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM without what it needs. It is a mode of two-phase (itself a mode
     of lease mode), and the inline no-pool pack path (pack_workers == 0) has no publisher for a piece job, so it is
@@ -457,6 +479,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         stream_maps: Optional[Mapping[int, torch.Tensor]] = None,
         route_log=None,
         copy_engine: bool = False,
+        copy_sm_table: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -481,6 +504,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         if copy_engine and not self.piece_stream:
             raise ValueError("the copy engine runs in the piece-streaming chain only")
         self.copy_engine = copy_engine
+        # SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy-table rows the copy wait reads itself.
+        self.copy_sm_table = copy_sm_table
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -566,7 +591,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             self.device_side.stage_ack(2)
             if self.copy_engine:
                 # post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F: the hits' DMA copies overlap S's reads and copies.
-                self.device_side.copy_wait(plan.count)
+                self.device_side.copy_wait(plan.count, self.copy_sm_table)
             self.device_side.finalize(plan.count, self.keep)
             torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
             if self.copy_engine:
@@ -678,6 +703,7 @@ class Exl3RamMissService:
         # forwards have run after a copy-engine graph was captured, so the first decode steps load their kernels
         # unarmed. Once armed, an eager forward and a Triton module load first drain the device.
         self.copy_engine = False
+        self.sm_small_copies = False
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
@@ -770,6 +796,7 @@ class Exl3RamMissService:
             if piece_stream:
                 host.enable_piece_stream()
             copy_engine = cfg.enable_ram_miss_copy_engine
+            check_sm_small_copies(cfg)
             if copy_engine:
                 check_copy_engine_module_loading(os.environ)
                 if not piece_stream:
@@ -825,6 +852,7 @@ class Exl3RamMissService:
         self.piece_stream = piece_stream
         self.copy_engine = copy_engine
         self.native_prefetch = native_prefetch
+        self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
@@ -932,6 +960,18 @@ class Exl3RamMissService:
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend
+        sm_mask, copy_sm = 0, None
+        if self.copy_engine:
+            if list(previous.segments) != [streamer.row_tag]:
+                raise ValueError(f"exl3 RAM miss copy engine: layer {streamer.layer_id} has copy tables {list(previous.segments)}")
+            segments = previous.segments[streamer.row_tag]
+            if self.sm_small_copies:
+                # The pinned tier's copy table has one row per host source, in the sources' order.
+                names = list(streamer._graph_sources)
+                if len(names) != segments.table.shape[0]:
+                    raise ValueError(f"exl3 RAM miss: layer {streamer.layer_id}'s copy table does not match its sources {names}")
+                sm_mask = sm_copy_mask(names)
+                copy_sm = sm_copy_table(segments, sm_mask) if sm_mask else None
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows,
             two_phase=self.two_phase, hit_wait_ns=self.hit_wait_ns,
@@ -945,13 +985,11 @@ class Exl3RamMissService:
             ),
             route_log=self.route_log,
             copy_engine=self.copy_engine,
+            copy_sm_table=copy_sm,
         )
         if self.copy_engine:
-            if list(previous.segments) != [streamer.row_tag]:
-                raise ValueError(f"exl3 RAM miss copy engine: layer {streamer.layer_id} has copy tables {list(previous.segments)}")
-            segments = previous.segments[streamer.row_tag]
             dst_rows = min(int(destination.shape[0]) for _, destination in segments.pairs)
-            self.host.set_copy_table(row, segments.table, dst_rows)
+            self.host.set_copy_table(row, segments.table, dst_rows, sm_mask=sm_mask)
 
     def _start_route_log(self, device) -> None:
         """Trace runs only: log every graph forward's routes (GraphRouteLog), stamped with the scheduler's

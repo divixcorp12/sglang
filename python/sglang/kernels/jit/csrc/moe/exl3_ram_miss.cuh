@@ -41,6 +41,7 @@ namespace sglang {
 namespace exl3_ram_miss_device {
 
 constexpr int kBlock = 32;
+constexpr int kCopyWaitThreads = 256;  // the copy wait's block when it also reads the small tensors
 // The page layout mirrors exl3_ram_miss_host.cpp and the Python constants;
 // test_exl3_ram_miss_device_args checks all three agree.
 constexpr int64_t kDemandHead = 0;
@@ -111,6 +112,11 @@ constexpr int64_t kLeaseTermGen = 8;
 // request. The only piece-streaming progress the host can see; `state` lives in device memory.
 constexpr int64_t kLeaseStreamProbe = kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes;
 constexpr int64_t kLeaseStreamProbeBytes = 8;
+// SmAck[kLeaseRing], device-written (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): tagged(kLeaseTagSmAck, generation)
+// once the copy wait has finished every SM read of that request's leased slots. The service releases a COPYING lease
+// of a row with SM entries only after its DMA completed AND this word reached the request's generation.
+constexpr int64_t kLeaseSmAck = kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes;
+constexpr int64_t kLeaseSmAckBytes = 8;
 constexpr int64_t kLeaseRowTableBytes = 8;
 // Area P, service-written, at kLeaseHeaderPieceOffset: PieceMask[kLeaseRing][kLeaseLanes], a per-lane
 // generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment). Each word
@@ -126,7 +132,7 @@ constexpr int64_t kLeaseCopyDoneBytes = 16;
 constexpr int64_t kLeaseCdMask = 0;
 constexpr int64_t kLeaseCdGen = 8;
 constexpr int64_t kLeaseAreaCopyDoneBytes = kLeaseRing * kLeaseCopyDoneBytes;
-static_assert(kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes <= 4096, "area D fits one page");
+static_assert(kLeaseSmAck + kLeaseRing * kLeaseSmAckBytes <= 4096, "area D fits one page");
 // Tags of the byte above the 56-bit request generation, and the reasons a Terminal record carries (section 4.3, 13).
 constexpr uint64_t kLeaseTagDemand = 1;
 constexpr uint64_t kLeaseTagReady = 1;
@@ -139,6 +145,7 @@ constexpr uint64_t kLeaseTagConsumed = 1;
 constexpr uint64_t kLeaseTagViolated = 2;
 constexpr uint64_t kLeaseTagTerminal = 1;
 constexpr uint64_t kLeaseTagStreamed = 1;  // StreamProbe
+constexpr uint64_t kLeaseTagSmAck = 1;    // SmAck
 constexpr uint32_t kLeaseReasonTimeout = 1;
 constexpr uint32_t kLeaseReasonAborted = 2;
 constexpr uint32_t kLeaseReasonFailed = 3;
@@ -1566,18 +1573,98 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   keep[0] = 0.0f;
 }
 
+// The copy wait's SM reads: `bytes` of the pinned slot into the destination, four 16-byte units in flight per thread
+// (ld.global.cv, as S: never .nc on host bytes). Every load has returned once its store is issued.
+__device__ __forceinline__ void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) {
+  const bool aligned = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0;
+  const int64_t units = aligned ? bytes / 16 : 0;
+  const int64_t step = blockDim.x;
+  int64_t u = threadIdx.x;
+  for (; u + 3 * step < units; u += 4 * step) {
+    uint64_t v[8];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      asm volatile("ld.global.cv.v2.b64 {%0,%1},[%2];"
+                   : "=l"(v[2 * k]), "=l"(v[2 * k + 1])
+                   : "l"(src + 16 * (u + k * step))
+                   : "memory");
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dst + 16 * (u + k * step)), "l"(v[2 * k]), "l"(v[2 * k + 1])
+                   : "memory");
+    }
+  }
+  for (; u < units; u += step) stream_copy16(src + 16 * u, dst + 16 * u);
+  for (int64_t b = units * 16 + threadIdx.x; b < bytes; b += step) stream_copy1(src + b, dst + b);
+}
+
 // Copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and A2 and before F. The COPYING lanes are read back from the row
 // results rather than from W1's claims, because S also hands over the ones W1's budget missed. It commits go_ce only
 // once CopyDone carries this generation and exactly that lane mask; any other exit leaves go_ce 0 and records the
 // failure for F, which publishes the terminal. It never writes keep, a terminal or the fatal word.
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_lease_copy_wait_kernel(
+//
+// SM small copies (`sm_count` > 0, SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): the copy engine copied only the
+// row's other entries, so first the whole block reads the `sm_count` entries of `sm_table` ({source slab, destination
+// tensor, row bytes}) of every COPYING lane from its leased host slot into its destination slot, then thread 0 fences
+// and publishes SmAck. The service releases those leases only after SmAck, so no slot is rewritten under these
+// reads. SmAck is published for every armed request, also one that failed and read nothing, since a lease it holds
+// is released only by it; nothing of this request is read after it.
+__global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int32_t* __restrict__ count,
     uint8_t* __restrict__ lease,
     int64_t lease_c,
+    int64_t lease_d,
+    const int64_t* __restrict__ sm_table,
+    int64_t sm_count,
     int32_t* __restrict__ go_ce) {
   using namespace exl3_ram_miss_device;
+  if (sm_count > 0) {
+    __shared__ uint32_t sm_mask;
+    __shared__ int32_t sm_host[kLeaseLanes];
+    __shared__ int32_t sm_dst[kLeaseLanes];
+    const uint32_t seq = static_cast<uint32_t>(state[kPending]);
+    const uint64_t generation = (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq;
+    const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
+    if (threadIdx.x == 0) {
+      uint32_t mask = 0;
+      const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
+      if (seq != 0 && planned_count != 0 && state[kReqFailed] == 0 && state[kSticky] == 0) {
+        const uint8_t* results = lease + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
+        const uint8_t* request = lease + lease_d + kLeaseLaneRequest + idx * kLeaseLaneRequestBytes;
+        const int64_t named = planned_count < kLeaseLanes ? planned_count : kLeaseLanes;
+        const uint64_t generation_mask = (1ull << 56) - 1;
+        for (int64_t lane = 0; lane < named; ++lane) {
+          const uint8_t* result = results + lane * kLeaseRowResultBytes;
+          const uint64_t word = ld_acquire_sys64(result + kLeaseRrReady);
+          if ((word >> 56) != kLeaseTagCopying || (word & generation_mask) != generation) continue;
+          // After the acquire of the ready word; a COPYING lane's payload is fixed until its lease is released.
+          sm_host[lane] = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrHostSlot);
+          sm_dst[lane] = *reinterpret_cast<const volatile int32_t*>(request + kLeaseLrDst + 4 * lane);
+          mask |= 1u << lane;
+        }
+      }
+      sm_mask = mask;
+    }
+    __syncthreads();
+    for (uint32_t lanes = sm_mask; lanes != 0; lanes &= lanes - 1) {
+      const int lane = __ffs(lanes) - 1;
+      for (int64_t k = 0; k < sm_count; ++k) {
+        const int64_t* e = sm_table + 3 * k;
+        copy_wait_read(
+            reinterpret_cast<const uint8_t*>(static_cast<intptr_t>(e[0])) + sm_host[lane] * e[2],
+            reinterpret_cast<uint8_t*>(static_cast<intptr_t>(e[1])) + sm_dst[lane] * e[2],
+            e[2]);
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && seq != 0) {
+      __threadfence_system();
+      st_release_sys64(lease + lease_d + kLeaseSmAck + idx * kLeaseSmAckBytes, tagged_word(kLeaseTagSmAck, generation));
+    }
+  }
   if (threadIdx.x != 0) return;
   go_ce[0] = 0;  // fail closed
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
@@ -1931,15 +2018,22 @@ void exl3_ram_miss_lease_copy_wait(
     tvm::ffi::TensorView count,
     int64_t lease_address,
     int64_t lease_c,
+    int64_t lease_d,
+    int64_t sm_table_address,
+    int64_t sm_count,
     tvm::ffi::TensorView go_ce) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  const int threads = sm_count > 0 ? exl3_ram_miss_device::kCopyWaitThreads : exl3_ram_miss_device::kBlock;
+  host::LaunchKernel(1, threads, stream)(
       exl3_ram_miss_lease_copy_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
       static_cast<const int32_t*>(count.data_ptr()),
       reinterpret_cast<uint8_t*>(lease_address),
       lease_c,
+      lease_d,
+      reinterpret_cast<const int64_t*>(sm_table_address),
+      sm_count,
       static_cast<int32_t*>(go_ce.data_ptr()));
 }
 

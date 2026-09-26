@@ -1015,6 +1015,20 @@ arming (lazy loading, `CUDA_MODULE_LOADING=LAZY`; e.g. a sampling path no earlie
 and any other driver call that takes the lock and waits for the device (`cudaFree` through
 `empty_cache`, host registration). Each is a fail-stop, not a wrong answer.
 
+**SM small copies (`SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`, needs the copy engine).** A DSV4.1 row's six
+DMA copies include four small tensors (44.5 KB of 13.3 MB), each paying a fixed per-copy cost. With the flag the
+copy table's non-trellis entries carry an SM bit (`set_copy_table(..., sm_mask)`): a demand job issues only the
+trellis copies (a prefetch job still issues all six: no kernel reads a prefetched slot), and CW, launched with 256
+threads, first reads the SM entries of every COPYING lane from its leased host slot (RowResult `host_slot`) into its
+destination (LaneRequest `dst_slot`) with `ld.global.cv`, then fences and release-stores **SmAck[idx]** (area D,
+after StreamProbe, device-written) = `tagged(1, G)`, and only then waits for CopyDone as before. SmAck is published
+for every armed request, including one that failed and read nothing. Step (c) above changes for such a job: CopyDone
+is still published on the observed completion, but the leases are released only once SmAck[idx] carries G or a later
+generation (a later request's CW ran, so G's finished). I1 then reads: no host slot is rewritten while a copy **or a
+CW read** of it may be in flight. Request-slot reuse (11.4) is unchanged: G + 16 is served only after G retires, and
+CW(G) precedes post(G + 16) in stream order. Miss lanes (LOADING, streamed by S) and READY fallback lanes (C1) are
+untouched.
+
 **Profiling.** Never capture a copy-engine run with `nsys --cuda-graph-trace=graph`: graph-mode
 CUPTI tracing makes the launch synchronous and holds off the copy thread's calls, which deadlocks CW
 (engram-no-hostnode plan, section 9). Node mode is the one to use.
