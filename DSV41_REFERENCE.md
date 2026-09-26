@@ -4145,6 +4145,10 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
     `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
     overlap saves 10-13 us/layer against a 25 us bar,
     ~1 us of it the resident launch and the rest a same-stream copy residual.
+11. **Multi-turn prefix reuse: done, HiCache in the recipe (§27.16).** The 3584-slot SWA pool lost a 4k conversation's
+    tail to the next prefill, so revisits reused nothing (TTFT 130 s). HiCache reloads the tail from host (2.3 s), and
+    cache hits matched cold output within noise. Open: why a mid-chunk hit shows no damage from late-layer slots that
+    bounded replay never wrote.
 
 ### 27.5 Copy-thread scheduling, untraced
 
@@ -4925,6 +4929,65 @@ poisoned bytes change the output, the true bytes restore it bitwise (parity file
 - So the serial-minus-overlap figure is `(one - miss_only) + R`: about 1 us/layer of real resident-first gain plus
   `R`. Production copies run off-graph on the copy engine and CW waits on a flag, so `R` may not exist there at all.
 - **Gate C (25 us/layer, 1 ms/token) fails** at every split, even crediting all of `R`. Resident-first stays shelved.
+
+### 27.16 Multi-turn prefix reuse and the hierarchical cache (result, in the recipe, 2026-09-26)
+
+**The production recipe reused no prefix for a returning 4k-token conversation.** The hierarchical cache (HiCache)
+restores it, at about 50x lower revisit TTFT, and is now in the recipe (`arm_env.ServerArgs.argv`):
+`--enable-hierarchical-cache --hicache-ratio 2 --hicache-size 0 --hicache-write-policy write_through`.
+
+**Single-turn benchmark: no effect.** The standard arm with the HiCache flags ran at ratio 1.004 against the recipe,
+byte-identical. It is compatible with the DSV4 pools, adding ~0.7 GB of host pools. A single-turn arm never revisits a
+prefix, so this measures only overhead.
+
+**Multi-turn.** `analysis/dsv41-drive/hicache/multiturn.py` runs two conversations, X and Y, over 4096-token slices
+of this file, interleaved X1 Y1 X2 Y2 through `/generate` (greedy, 32 new tokens). The driver is `drive_multiturn.sh`.
+Output is on divix01 under `/mnt/nvme1/hicache/mt-<arm>/`.
+
+| Arm | Prompt | Revisit cached (X2 / Y2) | Revisit TTFT (s) | Full KV pool (tokens) |
+|---|---|---|---|---|
+| `big`: the recipe | 4.1k | 0 / 0 | 132 / 126 | 172,544 |
+| `big-noreplay`: without `--enable-decoder-swa-bounded-replay` | 4.1k | 0 / 0 | 163 / 146 | |
+| `big-2k` | 2.1k | 2048 / 2048 | 3.6 / 2.0 | 172,544 |
+| `big-tails16`: `--swa-prefix-tails 16` (SWA pool 3584 -> 8192) | 4.1k | 4096 / 4096 | 2.3 / 3.8 | 101,376 |
+| `big-hicache`: the recipe plus HiCache | 4.1k | 4096 / 4096 | 2.3 / 3.8 | 166,144 |
+
+- **Cause: the capped SWA pool.** In cap mode it holds 3584 slots: the request cap plus four prefix tails. Admitting
+  a 4k chunked prefill evicts the other conversation's SWA tail from the tree. A match needs a live
+  `sliding_window` of SWA ending at the match boundary (`SWAComponent.create_match_validator`), so the evicted
+  prefix cannot match, although its full KV is still cached.
+  - At 2k both tails fit, which is why earlier soaks (`ce-soak/s4`, 2.3-2.6k conversation turns) did hit.
+  - Bounded replay is not involved: turning it off changes nothing.
+- **Two fixes.**
+  - A larger pool (`--swa-prefix-tails 16`) costs 71k tokens of full KV and still caps the number of live tails.
+  - HiCache costs 6k tokens. Its write-through host copy of the SWA tail is a valid match boundary, so an evicted
+    tail is reloaded from host memory. The host SWA pool is 28 pages, 2x the device's.
+- **Revisit TTFT with HiCache equals the on-GPU hit's.** The host reload is not visible: 2.3 / 3.8 s, the same as
+  `big-tails16`, against 125-160 s for a cold 4k prefill at ~30 tok/s.
+
+**Equivalence (`prefix_equiv.py`, arm `equiv-hicache`).** Each case compares a warm request against the same request
+cold after `/flush_cache`, with a second cold run as the noise floor. All runs are greedy, 64 tokens, `ignore_eos`.
+
+| Case | Cached | Warm vs cold: first diff, max abs dlogprob before it | Cold vs cold |
+|---|---|---|---|
+| `aligned`: 4106-token prompt re-sent; boundary 4096 is a chunk end | 4096 | token 1, 0.0 | token 9, 0.70 |
+| `midchunk`: 3900-token seed, then its first 3840 + 4 new tokens | 3840 | token 41, 0.215 | token 44, 0.205 |
+| `reload`: X after Y evicted its tail; X reloaded from host | 4096 | token 15, 0.225 | token 15, 0.173 |
+
+- **No hit is distinguishable from run-to-run noise**, which is large on this stack: two cold runs of one prompt split
+  by token 9 with logprob differences up to 0.70. All nine texts are coherent and on-document.
+  - The `aligned` warm run diverges at token 1, while the cold runs agree to token 9. The token before the split has
+    identical logprobs, and the warm text is as grounded as the cold ones. Read it as noise, one sample.
+- **`midchunk` was the suspect.** Under bounded replay a prefill writes late-layer SWA only for the last
+  `min(128, extend)` tokens of each extend (`late_layer_tail_layout`). A match boundary inside a chunk therefore
+  leaves late-layer slots, which a short suffix's first decode windows read, that no forward wrote.
+  - The outputs show no damage: warm and cold diverge at the same depth as cold and cold.
+  - Why is not established. It would take a direct probe of those slots.
+- **One sample per case.** This rules out gross corruption, not a subtle bias.
+- **Headroom.** HiCache's host-gather Triton kernels load after serving starts. At `mem-fraction-static 0.925` the
+  server logged 0.03 GiB free when they did, with no failure. Pre-load them at init if another late load appears.
+- **Operational note.** Under HiCache, `/flush_cache` returns 400 ("pending requests", with none queued or running)
+  straight after a request, until write-back drains. Retry it.
 
 ## Sources
 
