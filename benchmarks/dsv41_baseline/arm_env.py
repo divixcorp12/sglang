@@ -174,6 +174,9 @@ def base_env() -> dict[str, str]:
         # Fewer fp16/bf16 casts around the EXL3 gemvs at BS1 decode: 358 fewer kernels per step, bit-identical,
         # 112.4 -> 111.8 ms/token (within noise; DSV41_REFERENCE.md 27.8).
         "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION": "1",
+        # The eager streamed MoE queues each chunk's compute behind its gather instead of waiting for it: TTFT
+        # 12.6 -> 9.9 s on a 260-token prompt, outputs identical (DSV41_REFERENCE.md 27.11).
+        "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN": "1",
     }
 
 
