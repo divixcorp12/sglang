@@ -282,7 +282,13 @@ def sm_copy_mask(names: Sequence[str]) -> int:
 def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
     """The rows of ``segments.table`` (the copy table, on the device) that ``sm_mask`` names, for the copy wait."""
     rows = [i for i in range(segments.table.shape[0]) if sm_mask >> i & 1]
-    return segments.table[rows].contiguous()
+    table = segments.table[rows].contiguous()
+    for source, destination, row_bytes in table.tolist():
+        # CW falls back to 1-byte loads off 16-byte alignment: refuse the slow path rather than take it silently.
+        if (source | destination | row_bytes) % 16:
+            raise ValueError(f"CW reads 16-byte units: source {source:#x}, destination {destination:#x} and rows of "
+                             f"{row_bytes} B are not all 16-byte aligned")
+    return table
 
 
 def check_sm_small_copies(cfg: Dsv41Config) -> None:

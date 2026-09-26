@@ -1621,8 +1621,8 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl
     int64_t sm_count,
     int32_t* __restrict__ go_ce) {
   using namespace exl3_ram_miss_device;
+  __shared__ uint32_t sm_mask;  // the lanes whose SM entries this kernel read; the commit must name exactly them
   if (sm_count > 0) {
-    __shared__ uint32_t sm_mask;
     __shared__ int32_t sm_host[kLeaseLanes];
     __shared__ int32_t sm_dst[kLeaseLanes];
     const uint32_t seq = static_cast<uint32_t>(state[kPending]);
@@ -1688,6 +1688,13 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl
   for (int64_t lane = 0; lane < named; ++lane) {
     const uint64_t word = ld_acquire_sys64(results + lane * kLeaseRowResultBytes + kLeaseRrReady);
     if ((word >> 56) == kLeaseTagCopying && (word & generation_mask) == generation) mask |= 1u << lane;
+  }
+  if (sm_count > 0 && mask != sm_mask) {
+    // A lane COPYING now but not at the SM read never had its SM entries read: committing it would pair the DMA's
+    // fresh tensors with stale small ones. Fail closed; SmAck is already published, so its lease still retires.
+    state[kReqFailed] = 1;
+    if (state[kFailReason] == 0) state[kFailReason] = static_cast<int32_t>(kLeaseReasonIdentity);
+    return;
   }
   if (mask == 0) return;
   state[kCopyWaits] += 1;
