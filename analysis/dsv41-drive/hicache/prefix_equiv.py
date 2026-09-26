@@ -34,7 +34,7 @@ def post(port: int, path: str, body: dict | None = None) -> bytes:
 def generate(port: int, ids: list[int], max_new: int) -> dict:
     out = json.loads(post(port, "/generate", {
         "input_ids": ids, "return_logprob": True,
-        "sampling_params": {"max_new_tokens": max_new, "temperature": 0}}))
+        "sampling_params": {"max_new_tokens": max_new, "temperature": 0, "ignore_eos": True}}))
     meta = out["meta_info"]
     lp = meta["output_token_logprobs"]
     return {"cached": meta.get("cached_tokens"), "prompt": meta.get("prompt_tokens"),
