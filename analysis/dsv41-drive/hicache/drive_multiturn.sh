@@ -53,7 +53,7 @@ CORES=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.SERVER_CORES)")
 MODEL=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.MODEL_PATH)")
 
 for arm in $ARMS; do
-  doc=4096; turns=3; drop=""; client=multiturn
+  doc=4096; turns=3; drop=""; client=multiturn; poison_args=""
   case $arm in
     big) extra="" ;;
     small) extra="$SMALL" ;;
@@ -64,13 +64,22 @@ for arm in $ARMS; do
     big-hicache) extra="$HICACHE"; turns=2 ;;
     equiv-hicache) extra="$HICACHE"; client=equiv ;;
     poison) extra=""; client=poison ;;
+    poison-nohicache) extra=""; client=poison; poison_args="--short 1 --control 2"
+      drop="--enable-hierarchical-cache --hicache-ratio --hicache-size --hicache-write-policy" ;;
     *) say "unknown arm $arm"; exit 2 ;;
   esac
   OUT=$T/mt-$arm
   rm -rf $OUT; mkdir -p $OUT
   printf '%s\n' "${ENV[@]}" > $OUT/env.txt
   ARGV=()
-  for a in "${BASE_ARGV[@]}"; do [ "$a" = "$drop" ] || ARGV+=("$a"); done
+  # drop lists flags to remove; a dropped flag's value (the next non-flag element) goes with it.
+  skip_value=0
+  for a in "${BASE_ARGV[@]}"; do
+    if [ $skip_value = 1 ] && [ "${a#--}" = "$a" ]; then skip_value=0; continue; fi
+    skip_value=0
+    case " $drop " in *" $a "*) skip_value=1; continue ;; esac
+    ARGV+=("$a")
+  done
   ARGV+=($extra)
   printf '%s\n' "${ARGV[@]}" > $OUT/argv.txt
   say "arm $arm: extra='$extra' drop='$drop' doc=$doc turns=$turns"
@@ -87,7 +96,7 @@ for arm in $ARMS; do
     say "arm $arm healthy"
     if [ $client = poison ]; then
       taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/prefix_poison.py --port $PORT --model $MODEL \
-        --text $WT/DSV41_REFERENCE.md --out $OUT/poison.jsonl 2>&1 | tee -a $OUT/client.log
+        --text $WT/DSV41_REFERENCE.md --out $OUT/poison.jsonl $poison_args 2>&1 | tee -a $OUT/client.log
     elif [ $client = equiv ]; then
       taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/prefix_equiv.py --port $PORT --model $MODEL \
         --text $WT/DSV41_REFERENCE.md --out $OUT/equiv.jsonl 2>&1 | tee -a $OUT/client.log
