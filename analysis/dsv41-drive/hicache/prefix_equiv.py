@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
+import urllib.error
 import urllib.request
 
 from transformers import AutoTokenizer
@@ -40,7 +42,16 @@ def generate(port: int, ids: list[int], max_new: int) -> dict:
 
 
 def flush(port: int) -> None:
-    post(port, "/flush_cache")
+    # The scheduler refuses a flush until it is fully idle, which lags a finished request by hicache write-back.
+    for _ in range(120):
+        try:
+            post(port, "/flush_cache")
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            time.sleep(1)
+    raise RuntimeError("server never went idle enough to flush its cache")
 
 
 def compare(a: dict, b: dict) -> dict:
@@ -68,31 +79,33 @@ def main() -> int:
     docs = [text[i * 4096 : (i + 1) * 4096] for i in range(4)]
     gen = lambda ids: generate(a.port, ids, a.max_new)
 
-    cases = {}
+    f = open(a.out, "w")
+
+    def record(name: str, warm: dict, cold1: dict, cold2: dict) -> None:
+        assert cold1["cached"] == 0 and cold2["cached"] == 0, f"{name}: flush left a cached prefix"
+        row = {"case": name, "warm_cached": warm["cached"], "prompt": warm["prompt"],
+               "warm_vs_cold": compare(warm, cold1), "cold_vs_cold": compare(cold1, cold2),
+               "warm_text": warm["text"], "cold_text": cold1["text"], "cold2_text": cold2["text"]}
+        f.write(json.dumps(row) + "\n")
+        f.flush()
+        print(f"{name}: prompt {row['prompt']} warm cached {row['warm_cached']} "
+              f"warm-vs-cold {row['warm_vs_cold']} cold-vs-cold {row['cold_vs_cold']}", flush=True)
+
     p = docs[0] + q
     flush(a.port); cold1 = gen(p); warm = gen(p); flush(a.port); cold2 = gen(p)
-    cases["aligned"] = (warm, cold1, cold2)
+    record("aligned", warm, cold1, cold2)
 
     seed_ids = docs[1][:3900]
     p = seed_ids[:3840] + suffix
     flush(a.port); gen(seed_ids); warm = gen(p)
     flush(a.port); cold1 = gen(p); flush(a.port); cold2 = gen(p)
-    cases["midchunk"] = (warm, cold1, cold2)
+    record("midchunk", warm, cold1, cold2)
 
     x, y = docs[2] + q, docs[3] + q
     flush(a.port); gen(x); gen(y); warm = gen(x)
     flush(a.port); cold1 = gen(x); flush(a.port); cold2 = gen(x)
-    cases["reload"] = (warm, cold1, cold2)
-
-    with open(a.out, "w") as f:
-        for name, (warm, cold1, cold2) in cases.items():
-            assert cold1["cached"] == 0 and cold2["cached"] == 0, f"{name}: flush left a cached prefix"
-            row = {"case": name, "warm_cached": warm["cached"], "prompt": warm["prompt"],
-                   "warm_vs_cold": compare(warm, cold1), "cold_vs_cold": compare(cold1, cold2),
-                   "warm_text": warm["text"], "cold_text": cold1["text"], "cold2_text": cold2["text"]}
-            f.write(json.dumps(row) + "\n")
-            print(f"{name}: prompt {row['prompt']} warm cached {row['warm_cached']} "
-                  f"warm-vs-cold {row['warm_vs_cold']} cold-vs-cold {row['cold_vs_cold']}", flush=True)
+    record("reload", warm, cold1, cold2)
+    f.close()
     return 0
 
 
