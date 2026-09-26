@@ -207,6 +207,33 @@ def test_a_negative_share_is_refused(tier):
         host.set_prefill_share(-1)
 
 
+# ---- with SGLANG_DSV41_ENABLE_PREFILL_FILLS: the native fill claims through the same rule ----
+
+
+def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefills_own_rows(tier):
+    """A layer's prefetch (fill_begin without fallback) claims until the share is full and no owned row can go; the
+    chunk admissions after it (with fallback) evict the prefill's gathered rows, not decode's.
+    Mutations: fill_begin claims through take_slot_locked (then the prefetch claims 3 and evicts 0, 1, 2); the stop
+    applies to ensure fills too (then 6 is not claimed)."""
+    page, host = tier
+    _decode_rows(page, host)
+    host.set_prefill_share(2)
+    slots, evictions = host.fill_begin(0, [4, 5, 6], protected=[4, 5, 6])
+    assert host.fill_end()
+    assert len(slots) == 2 and evictions == 2 and _resident(host) == [2, 3, 4, 5]
+    slots, evictions = host.fill_begin(0, [6], protected=[6], fallback=True)
+    assert host.fill_end()
+    assert len(slots) == 1 and evictions == 1 and _resident(host) == [2, 3, 5, 6]
+
+
+def test_without_a_share_a_prefetch_fill_claims_as_before(tier):
+    page, host = tier
+    _decode_rows(page, host)
+    slots, evictions = host.fill_begin(0, [4, 5, 6], protected=[4, 5, 6])
+    assert host.fill_end()
+    assert len(slots) == 3 and evictions == 3 and _resident(host) == [3, 4, 5, 6]
+
+
 if __name__ == "__main__":
     import sys
 
