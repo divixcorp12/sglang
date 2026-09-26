@@ -14,6 +14,11 @@ Each arm is one CUDA graph of 40 layers, the way the decode graph issues them:
 - ``tables_only``: two_static with neither launch (route tables + gather), the floor under every arm.
 - ``miss_wide/<r>+<m>``: miss_only with num_active = m (wider expert groups). Not bitwise with the single launch
   (the parity test's ``test_num_active_must_stay_six``); measured only to bound what a non-identical variant saves.
+- ``copy_only/<r>+<m>``: the H2D copies of each layer's missed rows from pinned memory, as the RAM tier issues them.
+- ``copy_then_one/<r>+<m>``: those copies, then ``one``: today's serial order.
+- ``copy_then_miss/<r>+<m>``: the copies, then miss_only: the missed-only tail on freshly written rows.
+- ``overlap/<r>+<m>``: the copies on a side stream beside the route tables and the resident launch, a join, then the
+  missed launch and one gather in the original routing order.
 
 The split is the one ``test_exl3_moe_split_parity_cuda.py`` proves bitwise.
 
@@ -28,6 +33,7 @@ Run on divix01 under gpu-run.sh with PYTHONPATH at the tree under test and SGLAN
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -62,6 +68,9 @@ class Layer(msgspec.Struct):
     remap: torch.Tensor
     keep: torch.Tensor
     hits: dict  # split -> bool [TOP_K] route mask
+    pinned: dict = {}  # tensor name -> pinned [len(missed_phys), ...]: the current split's missed rows
+    missed_phys: list = []
+    sources: dict = {}  # split -> (missed_phys, pinned); captured graphs hold these addresses, so they live on
 
 
 def build_layers(par, real: dict, device, gen) -> list[Layer]:
@@ -124,7 +133,32 @@ def prepare_static(par, L: Layer, split):
     L.state.kind.copy_((count > 0).long() * (L.keep > 0).long())
 
 
-def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss"), miss_active: int = 6):
+def add_pinned_sources(layers: list[Layer], split) -> None:
+    """Pinned copies of each layer's missed rows: the copy arms move these bytes H2D as the RAM tier would."""
+    for L in layers:
+        if split not in L.sources:
+            missed = (~L.hits[split]).nonzero().flatten()
+            phys = sorted({int(p) for p in (L.remap[missed].long() % PHYS).tolist()})
+            pinned = {name: t[phys].to("cpu").pin_memory() for name, t in L.rows.items()}
+            L.sources[split] = (phys, pinned)
+        L.missed_phys, L.pinned = L.sources[split]
+
+
+def copy_missed(L: Layer, stream=None) -> None:
+    with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+        for name, t in L.rows.items():
+            for j, p in enumerate(L.missed_phys):
+                t[p].copy_(L.pinned[name][j], non_blocking=True)
+
+
+def overlap(par, L: Layer, split, side) -> None:
+    main = torch.cuda.current_stream()
+    side.wait_stream(main)
+    copy_missed(L, side)
+    two(par, L, split, torch_tables=False, between=lambda: main.wait_stream(side))
+
+
+def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss"), miss_active: int = 6, between=None):
     f, st = L.fused, L.state
     # Full-route placement: the fused route-tables kernel with keep = 1 (the resident launch precedes F).
     remap64, inv_order, weight_full, det = f._fused_route_tables(L.x, L.weights, L.remap, st.ones_keep)
@@ -134,6 +168,8 @@ def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss"), m
         par.split_route_tables(remap64, L.weights, ~hit, st.missed)
     if "res" in launches:
         par.launch(f, f.x16, f.out, st.resident.count, st.resident.weights, det[0])
+    if between is not None:
+        between()
     if torch_tables:
         kept = (L.keep > 0).long()
         st.missed.count.mul_(kept)
@@ -180,6 +216,7 @@ def main():
     print(f"row {row_bytes / 1e6:.2f} MB; per token {touched / 1e9:.2f} GB over {LAYERS} layers; "
           f"allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
 
+    side = torch.cuda.Stream()
     arms = {"one": capture(lambda L: one(par, L), layers)}
     for L in layers:
         prepare_static(par, L, SPLITS[1])
@@ -197,6 +234,13 @@ def main():
             lambda L, s=split: two(par, L, s, torch_tables=False, launches=("miss",), miss_active=s[1]), layers
         )
         arms[f"two_torch/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=True), layers)
+        add_pinned_sources(layers, split)
+        arms[f"copy_only/{tag}"] = capture(lambda L: copy_missed(L), layers)
+        arms[f"copy_then_one/{tag}"] = capture(lambda L: (copy_missed(L), one(par, L)), layers)
+        arms[f"copy_then_miss/{tag}"] = capture(
+            lambda L, s=split: (copy_missed(L), two(par, L, s, torch_tables=False, launches=("miss",))), layers
+        )
+        arms[f"overlap/{tag}"] = capture(lambda L, s=split: overlap(par, L, s, side), layers)
     split_of = {name: tuple(int(v) for v in name.split("/")[1].split("+")) for name in arms if "/" in name}
 
     times = {name: [] for name in arms}
