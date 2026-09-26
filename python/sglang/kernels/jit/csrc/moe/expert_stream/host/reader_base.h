@@ -43,6 +43,8 @@
 namespace sglang {
 namespace exl3_ram_miss {
 
+using tvm::ffi::TensorView;
+
 // A bounce bank holds kBounceRows row slots and there are kBanks banks (kBounceSlots slots): a bank is
 // the unit that is reused only once every I/O and packing reference to it has retired. Ring credit
 // (kQueueDepth) is unrelated to both.
