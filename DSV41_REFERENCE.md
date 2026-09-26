@@ -4140,7 +4140,7 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: peaks measured (§27.7).** A 128 MB cap frees ~3.0 GiB at 30k/32k and removes the
    OOM retries, TTFT unchanged, short outputs identical. Next: the payoff arm (cap plus a larger hot cache) after a
-   rebase onto master. Branch `cc/indexer-cap`, not merged.
+   rebase onto master. Merged to master at `c08f5484c9`; default off (budget 0).
 10. **Decode RAM-miss frontend (W1/C1/A1): sized, no-go (§27.15).** At most 0.41 ms/step to gain; neither
     `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
     overlap saves 10-13 us/layer against a 25 us bar,
@@ -4213,7 +4213,7 @@ the torch prefill indexer's score tensor. Freed VRAM can go to the hot cache, at
 - Track A's failed allocations grow 32 MiB per 512-token chunk, which is this einsum at the ratio-1 layers, so the
   attribution holds.
 
-**What was built** (branch `cc/indexer-cap`, head `b9ae131af0`, on `01e0a6ea7f`; not merged):
+**What was built** (branch `cc/indexer-cap`, head `b9ae131af0`, on `01e0a6ea7f`; merged to master at `c08f5484c9`, where `test/registered/unit/kernels` gives 1740 passed, 1 skipped against 1733 at the parent):
 - `SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB = EnvInt(0)`. 0 keeps the built-in 1 GiB, today's behaviour.
   Otherwise rows per chunk = `max(1, budget // (heads * lc * 2))` (`_torch_indexer_rows_per_chunk`).
 - Only the chunking changes: no truncation of the scored context, same precision, same top-k. Rows are scored and
