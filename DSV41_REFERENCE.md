@@ -4103,12 +4103,13 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
 
 ### 27.4 Next steps
 
-1. **Prefill fills.**
-   - Serve prefill misses through the C++ RAM-miss service with row images: direct reads into the slabs, no bounce
-     buffer or CPU copy, all drives in parallel.
-   - Issue a layer's reads as soon as it has routed, and overlap reading chunk k+1 with gathering chunk k. This
-     removes the per-chunk syncs.
-   - Gather with the copy engine, not the SM kernel.
+1. **Prefill fills: done (§27.6), behind `SGLANG_DSV41_ENABLE_PREFILL_FILLS`.** TTFT fell from 21.1/17.8 s to
+   12.1/11.1 s.
+   - Done: native direct reads through the service's reader; a layer's reads issued once it has routed; chunk k+1 read
+     while chunk k gathers.
+   - Not done: the per-chunk readbacks and the per-expert `torch.where` syncs stay (item 7).
+   - Not done: the copy-engine gather. The SM gather already runs at the link rate, so DMA would only overlap it with
+     the ~0.5 s of MoE compute, and that needs a second ~852 MB staging set.
 2. **Keep prefill from evicting decode's RAM set:** stage prefill misses without admitting them, or protect
    decode-hot rows.
 3. **NVMe waits in decode:** ~13 ms per step of S outlasts the layer's RAM-hit copies, with the link partly idle.
@@ -4141,6 +4142,45 @@ preempts the copy thread.
 | `exl3-copy-eng` | 35.8% | 11 ms of 175 s (0.01%) | 106,834 / 132 |
 | `exl3-ram-miss` | 34.0% | 52 ms (0.03%) | 1,311,302 / 322 |
 | scheduler | 84.8% | 12 ms (0.01%) | 24,870 / 302 |
+
+### 27.6 Prefill fills through the native reader (result)
+
+**Flag.** `SGLANG_DSV41_ENABLE_PREFILL_FILLS` (default off). It needs row images and option C's native slot table.
+Plan: `docs/superpowers/plans/2026-09-25-dsv41-prefill-fills.md`.
+
+**How it works.** Eager pinned-tier misses are now read by the RAM-miss service's own `RowReader`, straight into the
+slabs, on a helper thread (`RamTier::fill_begin/fill_wait/fill_end`).
+- `_apply_streamed` holds one host use per layer, which syncs the stream and pauses the service thread once. Inside
+  it, the layer claims slots for every expert that misses both VRAM and RAM, in chunk order.
+- Each gather chunk waits only for its own rows.
+- A claimed slot is flagged `filling` until its read ends. A filling slot is never a victim and cannot be released.
+- The service thread's `resume` joins any fill still running.
+
+**Arms.** Master `b1441f9b0b` on port 30021: A (flag off) at 19:17, then B (flag on) at 19:37, once each. Both
+returned rc 0 with every harness gate passed.
+
+| | A (off) | B (on) |
+|---|---:|---:|
+| TTFT, session 0 / 1 (s) | 21.06 / 17.79 | **12.05 / 11.14** |
+| ms/token, session 0 / 1 | 138.8 / 110.5 | 139.5 / 110.9 |
+| pooled ms/token | 112.1 | 112.5 |
+| outputs vs A | | **2 of 2 byte-identical** |
+| eager `read_ms` / `split_ms` (whole run) | 22,732 / 24,974 | 1,836 / 0 |
+
+- **`read_ms` means something different in B.** With the flag on it is only the time the scheduler thread was blocked
+  waiting for a fill.
+- **`ram_misses` also changes meaning: 10,948 in A, 923 in B.** B's prefetched rows are already claimed when the
+  chunk looks them up, so they count as hits. Only overflow admissions still count as misses.
+- **Decode is unchanged.** ms/token matches within 0.4 ms. That is a single run, so treat it as directional.
+
+Evidence is on divix01:
+- `cc-expert-prediction/dsv41-baseline/servers/prefill-fills-{A,B}/`.
+- `/mnt/nvme1/prefill-fills/arm_metrics_AB.json`.
+
+**What remains of the 11-12 s.**
+- The link-bound SM gather: ~6.5 s.
+- The eager launch gaps and per-expert syncs (item 7).
+- The first chunk's reads of each layer, which nothing overlaps.
 
 ## Sources
 
