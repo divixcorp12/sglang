@@ -127,6 +127,18 @@ def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
     return ExpertGatherStats(**values)
 
 
+def host_row_of_source(slots: list[int], hits: list[bool]) -> list[int]:
+    """The staging row ``_gather_cached`` gives each source, from its hot-cache lookup read to the host: the hot slot
+    itself when every source hits, else misses first and then hits, each in source order."""
+    if all(hits):
+        return list(slots)
+    order = [i for i, hit in enumerate(hits) if not hit] + [i for i, hit in enumerate(hits) if hit]
+    row_of_source = [0] * len(slots)
+    for row, source in enumerate(order):
+        row_of_source[source] = row
+    return row_of_source
+
+
 @dataclass
 class PinnedHostCacheStats:
     """Cumulative counters for the bounded pinned-host expert cache."""
@@ -1447,6 +1459,7 @@ class ExpertStreamer:
         source_ids: torch.Tensor,
         compact_ids: torch.Tensor,
         topk_ids: torch.Tensor,
+        hot_out: list | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Gather routed rows through the hot cache for the fused-MoE kernel.
 
@@ -1462,7 +1475,14 @@ class ExpertStreamer:
         slots, hit_mask = cache.lookup(source_ids)
         row_count = source_ids.numel()
         routed_rows = compact_ids.numel()
-        if routed_rows == row_count:
+        if hot_out is not None:
+            if routed_rows != row_count:
+                raise ValueError("hot_out needs one route per source, as _gather_experts_host gives")
+            # The chunk's one sync, as below, also hands the host every row's place: no readback after its gather.
+            slots_host, hits_host = torch.stack((slots.long(), hit_mask.long())).tolist()
+            hot_out.extend((slots_host, [bool(hit) for hit in hits_host]))
+            hit_rows = routed_hit_rows = sum(hot_out[1])
+        elif routed_rows == row_count:
             hit_rows = routed_hit_rows = int(hit_mask.sum().item())
         else:
             hit_rows, routed_hit_rows = torch.stack(
@@ -1811,6 +1831,15 @@ class ExpertStreamer:
         since both can vary by chunk.
         """
         count = source_ids.numel()
+        self._begin_eager_chunk(count)
+        compact_ids = _cached_arange(count, source_ids.device, source_ids.dtype)
+        row_of_source, rows = self._gather_eager_rows(
+            source_ids, compact_ids, source_ids.reshape(1, -1)
+        )
+        return row_of_source.reshape(-1), rows
+
+    def _begin_eager_chunk(self, count: int) -> None:
+        """Per chunk: the format's ``max_gather_rows`` cap, the prefetch refusal, and a pending residency boundary."""
         cap = self.format.max_gather_rows
         if cap is not None and count > cap:
             raise ValueError(
@@ -1823,11 +1852,20 @@ class ExpertStreamer:
             raise ValueError("gather_experts does not drive expert prefetch")
         if self.before_eager_gather is not None:
             self.before_eager_gather()
+
+    def _gather_experts_host(
+        self, source_ids: torch.Tensor
+    ) -> tuple[list[int], dict[str, torch.Tensor]]:
+        """``_gather_experts`` returning ``row_of_source`` as a host list, read with the chunk's pre-gather sync."""
+        count = source_ids.numel()
+        self._begin_eager_chunk(count)
         compact_ids = _cached_arange(count, source_ids.device, source_ids.dtype)
-        row_of_source, rows = self._gather_eager_rows(
-            source_ids, compact_ids, source_ids.reshape(1, -1)
+        hot: list = []
+        _, rows = self._gather_eager_rows(
+            source_ids, compact_ids, source_ids.reshape(1, -1), hot_out=hot
         )
-        return row_of_source.reshape(-1), rows
+        # Without a hot cache the pinned and uncached paths return compact_ids: source i is row i.
+        return (host_row_of_source(*hot) if hot else list(range(count))), rows
 
     def iter_gather_experts(
         self, source_ids: torch.Tensor, chunk_rows: int | None = None
@@ -1880,16 +1918,67 @@ class ExpertStreamer:
             if chunk_stats:
                 self.last_gather_stats = _sum_gather_stats(chunk_stats)
 
+    def iter_gather_experts_host(
+        self,
+        source_ids: torch.Tensor,
+        experts: list[int],
+        chunk_rows: int | None = None,
+    ) -> Iterator[tuple[list[int], list[int], dict[str, torch.Tensor]]]:
+        """``iter_gather_experts`` for a caller holding ``source_ids`` on the host as ``experts``.
+
+        Yields each chunk's expert ids and ``row_of_source`` as lists, read with the chunk's own pre-gather sync,
+        so consuming a chunk needs no readback and the host can run ahead of its gather. Validated on the host.
+        The staging-reuse contract and ``last_gather_stats`` are ``iter_gather_experts``'s.
+        """
+        count = len(experts)
+        if source_ids.ndim != 1 or source_ids.numel() != count:
+            raise ValueError(
+                "iter_gather_experts_host needs a 1-D source_ids as long as experts"
+            )
+        if count == 0:
+            return
+        if min(experts) < 0 or max(experts) >= self.num_experts:
+            raise ValueError(
+                f"selected expert ID is outside [0, {self.num_experts - 1}]"
+            )
+        if len(set(experts)) != count:
+            raise ValueError("iter_gather_experts_host needs distinct expert IDs")
+        cap = self.format.max_gather_rows
+        if chunk_rows is None:
+            chunk_rows = cap if cap is not None else count
+        chunk_rows = index(chunk_rows)
+        if chunk_rows < 1:
+            raise ValueError("gather chunks need at least one row")
+        if cap is not None and chunk_rows > cap:
+            raise ValueError(
+                f"gather chunks of {chunk_rows} rows exceed the format's "
+                f"max_gather_rows={cap}"
+            )
+        chunk_stats = []
+        try:
+            for start in range(0, count, chunk_rows):
+                row_of_source, rows = self._gather_experts_host(
+                    source_ids[start : start + chunk_rows]
+                )
+                chunk_stats.append(self.last_gather_stats)
+                yield experts[start : start + chunk_rows], row_of_source, rows
+        finally:
+            if chunk_stats:
+                self.last_gather_stats = _sum_gather_stats(chunk_stats)
+
     def _gather_eager_rows(
         self,
         source_ids: torch.Tensor,
         compact_ids: torch.Tensor,
         topk_ids: torch.Tensor,
+        hot_out: list | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run one eager gather and add the host reads it caused to its stats."""
         self._gather_read_stats = RowReadStats()
         try:
-            result = self._dispatch_eager_rows(source_ids, compact_ids, topk_ids)
+            result = self._dispatch_eager_rows(
+                source_ids, compact_ids, topk_ids, hot_out=hot_out
+            )
             read = self._gather_read_stats
         finally:
             self._gather_read_stats = None
@@ -1909,9 +1998,10 @@ class ExpertStreamer:
         source_ids: torch.Tensor,
         compact_ids: torch.Tensor,
         topk_ids: torch.Tensor,
+        hot_out: list | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.hot_cache is not None and self.hot_cache.capacity:
-            return self._gather_cached(source_ids, compact_ids, topk_ids)
+            return self._gather_cached(source_ids, compact_ids, topk_ids, hot_out=hot_out)
         if (
             self.pinned_host_cache is not None
             and self.pinned_host_cache.capacity

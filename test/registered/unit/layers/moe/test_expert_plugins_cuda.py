@@ -316,6 +316,38 @@ class TestGatherExpertsCuda(unittest.TestCase):
         stats = streamer.last_gather_stats
         self.assertEqual((stats.requested_rows, stats.hot_hit_rows), (5, 2))
 
+    def test_host_rows_match_the_device_gather_through_hot_and_cold_rows(self):
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        ids = [6, 1, 3, 4, 0]
+        for hot in ([1, 4], [6, 1, 3, 4, 0], [7]):  # mixed, all hit, all miss (7 never routes)
+            layer = _nvfp4_layer(pinned=False)
+            streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+            ExpertHotCache(streamer, len(hot)).reassign(hot)
+            source_ids = torch.tensor(ids, device="cuda")
+
+            def picked(rows, row_of_source):
+                index = torch.as_tensor(row_of_source, device="cuda").long()
+                return {n: rows[n][index].view(torch.uint8).cpu() for n in NVFP4_STREAM_TENSORS}
+
+            got = [
+                (chunk, row_of_source, picked(rows, row_of_source))
+                for chunk, row_of_source, rows in streamer.iter_gather_experts_host(
+                    source_ids, ids, chunk_rows=2
+                )
+            ]
+            want = [
+                (chunk.tolist(), row_of_source.tolist(), picked(rows, row_of_source))
+                for chunk, row_of_source, rows in streamer.iter_gather_experts(
+                    source_ids, chunk_rows=2
+                )
+            ]
+            self.assertEqual(len(got), len(want))
+            for (g_chunk, g_rows_of, g_rows), (w_chunk, w_rows_of, w_rows) in zip(got, want):
+                self.assertEqual((g_chunk, g_rows_of), (w_chunk, w_rows_of), hot)
+                for n in NVFP4_STREAM_TENSORS:
+                    self.assertTrue(torch.equal(g_rows[n], w_rows[n]), (hot, n))
+
     def test_staging_stays_within_the_cap_and_eager_gathers_above_it_are_refused(self):
         from sglang.srt.layers.moe import expert_stream
         from sglang.srt.layers.moe.expert_format import DenseLayerFormat
