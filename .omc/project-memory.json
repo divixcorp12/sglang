@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1789413617861,
+  "lastScanned": 1790381142014,
   "projectRoot": "/home/dimitri/data/divix/sglang-nvfp4",
   "techStack": {
     "languages": [],
@@ -32,7 +32,7 @@
       "test"
     ],
     "gitBranches": {
-      "defaultBranch": "main",
+      "defaultBranch": "codex/nvfp4-expert-stream-main",
       "branchingStrategy": null
     }
   },
@@ -42,14 +42,21 @@
       "path": "3rdparty",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1789413617856,
+      "lastAccessed": 1790381142002,
+      "keyFiles": []
+    },
+    "analysis": {
+      "path": "analysis",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1790381142003,
       "keyFiles": []
     },
     "assets": {
       "path": "assets",
       "purpose": "Static assets",
       "fileCount": 4,
-      "lastAccessed": 1789413617856,
+      "lastAccessed": 1790381142004,
       "keyFiles": [
         "logo.png",
         "logo.svg",
@@ -61,17 +68,24 @@
       "path": "benchmark",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1789413617857,
+      "lastAccessed": 1790381142009,
       "keyFiles": [
         "bench_adaptive_speculative.py",
         "lean_kernel_sweep.py"
       ]
     },
+    "benchmarks": {
+      "path": "benchmarks",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1790381142009,
+      "keyFiles": []
+    },
     "docker": {
       "path": "docker",
       "purpose": null,
       "fileCount": 18,
-      "lastAccessed": 1789413617858,
+      "lastAccessed": 1790381142009,
       "keyFiles": [
         "Dockerfile",
         "Dockerfile.cu134",
@@ -84,7 +98,7 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 10,
-      "lastAccessed": 1789413617858,
+      "lastAccessed": 1790381142010,
       "keyFiles": [
         "AGENTS.md",
         "CONTRIBUTING.md",
@@ -97,28 +111,28 @@
       "path": "examples",
       "purpose": "Example code",
       "fileCount": 0,
-      "lastAccessed": 1789413617858,
+      "lastAccessed": 1790381142010,
       "keyFiles": []
     },
     "experimental": {
       "path": "experimental",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1789413617858,
+      "lastAccessed": 1790381142010,
       "keyFiles": []
     },
     "proto": {
       "path": "proto",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1789413617858,
+      "lastAccessed": 1790381142010,
       "keyFiles": []
     },
     "python": {
       "path": "python",
       "purpose": null,
-      "fileCount": 7,
-      "lastAccessed": 1789413617858,
+      "fileCount": 8,
+      "lastAccessed": 1790381142011,
       "keyFiles": [
         "MANIFEST.in",
         "pyproject.toml",
@@ -131,7 +145,7 @@
       "path": "rust",
       "purpose": null,
       "fileCount": 3,
-      "lastAccessed": 1789413617858,
+      "lastAccessed": 1790381142012,
       "keyFiles": [
         "Cargo.lock",
         "Cargo.toml",
@@ -142,7 +156,7 @@
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 10,
-      "lastAccessed": 1789413617859,
+      "lastAccessed": 1790381142012,
       "keyFiles": [
         "build_sgl_deep_gemm.sh",
         "build_sgl_deepep.sh",
@@ -155,7 +169,7 @@
       "path": "sgl-model-gateway",
       "purpose": null,
       "fileCount": 7,
-      "lastAccessed": 1789413617859,
+      "lastAccessed": 1790381142012,
       "keyFiles": [
         "Cargo.toml",
         "Makefile",
@@ -168,7 +182,7 @@
       "path": "test",
       "purpose": "Test files",
       "fileCount": 3,
-      "lastAccessed": 1789413617859,
+      "lastAccessed": 1790381142012,
       "keyFiles": [
         "README.md",
         "pytest.ini",
@@ -179,14 +193,14 @@
       "path": "tools",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1789413617859,
+      "lastAccessed": 1790381142012,
       "keyFiles": []
     },
     "examples/assets": {
       "path": "examples/assets",
       "purpose": "Static assets",
       "fileCount": 2,
-      "lastAccessed": 1789413617860,
+      "lastAccessed": 1790381142013,
       "keyFiles": [
         "example_image.png"
       ]
@@ -195,7 +209,7 @@
       "path": "sgl-model-gateway/examples",
       "purpose": "Example code",
       "fileCount": 0,
-      "lastAccessed": 1789413617861,
+      "lastAccessed": 1790381142014,
       "keyFiles": []
     }
   },
