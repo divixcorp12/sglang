@@ -3764,7 +3764,9 @@ class RamTier {
           throw std::runtime_error("exl3 RAM miss: fill of expert " + std::to_string(expert) + " that holds a slot");
         }
         int64_t evicted = -1;
-        const int64_t slot = take_slot_locked(row, protect, fallback, &evicted);
+        // A prefetch (no fallback) stops at the prefill share, leaving the rest to gather_rows' chunked admission,
+        // which evicts the share's rows the earlier chunks have gathered.
+        const int64_t slot = take_admit_slot_locked(row, protect, fallback, &evicted, /*stop_at_share=*/!fallback);
         if (slot < 0) break;
         *evictions += evicted >= 0 ? 1 : 0;
         bump_generation_locked(row, slot);  // the fill writes the bytes after this returns
@@ -4738,8 +4740,10 @@ class RamTier {
   // A slot for a row a Python-side read admits (assign; the prefill fill path). With a prefill share set, no free slot,
   // and the layer already holding that many prefill-owned rows, the victim is the LRU owned row, under every exclusion
   // of take_slot_locked, so a prefill displaces at most `share` of decode's rows. Otherwise, and whenever no owned row
-  // qualifies, it is take_slot_locked's choice (a free slot first). Under a share the slot becomes prefill-owned.
-  int64_t take_admit_slot_locked(int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
+  // qualifies, it is take_slot_locked's choice (a free slot first); with `stop_at_share`, when no owned row qualifies
+  // it is none (-1). Under a share the slot becomes prefill-owned.
+  int64_t take_admit_slot_locked(
+      int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted, bool stop_at_share = false) {
     Tier& tier = tiers_[row];
     int64_t slot = -1;
     if (prefill_share_ > 0 && tier.owned >= prefill_share_ &&
@@ -4756,6 +4760,9 @@ class RamTier {
         release_locked(row, best);  // unmaps it before its bytes are overwritten (D11) and ends its ownership
         counters_[kEvictions].fetch_add(1);
         slot = best;
+      } else if (stop_at_share) {
+        *evicted = -1;
+        return -1;
       }
     }
     if (slot < 0) slot = take_slot_locked(row, protect, fallback, evicted);
