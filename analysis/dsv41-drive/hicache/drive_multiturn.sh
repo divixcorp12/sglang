@@ -7,7 +7,10 @@
 #                  --hicache-write-policy write_through: revisits can reload their prefix from host memory.
 # Two diagnostic arms, two turns each, for why big's revisits reused nothing (0 cached tokens on 4k prompts):
 #   big-noreplay   big without --enable-decoder-swa-bounded-replay;
-#   big-2k         big over 2048-token documents, the prompt size where earlier soaks did reuse prefixes.
+#   big-2k         big over 2048-token documents, the prompt size where earlier soaks did reuse prefixes;
+#   big-tails16    big with --swa-prefix-tails 16: a larger SWA pool, in case a 4k prefill evicts the other
+#                  conversation's SWA tail from the 3584-slot pool;
+#   big-hicache    big plus the hierarchical cache: a host-backed SWA tail is a valid match boundary.
 # Output under /mnt/nvme1/hicache/mt-<arm>/. Production must be stopped.
 # Usage: drive_multiturn.sh <worktree> [arm ...]
 set -u
@@ -55,6 +58,8 @@ for arm in $ARMS; do
     small-hicache) extra="$SMALL $HICACHE" ;;
     big-noreplay) extra=""; turns=2; drop="--enable-decoder-swa-bounded-replay" ;;
     big-2k) extra=""; turns=2; doc=2048 ;;
+    big-tails16) extra="--swa-prefix-tails 16"; turns=2 ;;
+    big-hicache) extra="$HICACHE"; turns=2 ;;
     *) say "unknown arm $arm"; exit 2 ;;
   esac
   OUT=$T/mt-$arm
