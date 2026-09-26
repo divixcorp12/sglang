@@ -6,7 +6,6 @@ Ordering only: nothing here asserts a wall-time bound.
 import collections
 import errno
 import faulthandler
-from pathlib import Path
 
 import pytest
 import torch
@@ -15,11 +14,11 @@ import sglang.kernels.ops.moe.exl3_ram_miss as ops
 from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, read_rows_traced, sim_post, sim_wait
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.expert_stream_sources import host_sources, joined_text
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 PAGE = 4096
-CPP = Path(ops.__file__).resolve().parents[2] / "jit" / "csrc" / "moe" / "exl3_ram_miss_host.cpp"
 
 
 @pytest.fixture(autouse=True)
@@ -263,7 +262,7 @@ NON_TRACE_CLOCK_READS = {
 
 
 def test_no_clock_read_bypasses_the_trace_gate():
-    lines = [line.strip() for line in CPP.read_text().splitlines()]
+    lines = [line.strip() for line in joined_text(host_sources()).splitlines()]
     reads = collections.Counter(line for line in lines if "now_ns()" in line and not line.startswith("//"))
     assert reads == NON_TRACE_CLOCK_READS, {
         line: count for line, count in (reads - collections.Counter(NON_TRACE_CLOCK_READS)).items()

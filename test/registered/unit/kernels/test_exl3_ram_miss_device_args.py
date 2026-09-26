@@ -11,6 +11,7 @@ import torch
 import sglang.kernels.ops.moe.exl3_ram_miss as ram_miss
 from sglang.kernels.ops.moe.exl3_ram_miss import PAGE_BYTES, STATE_WORDS, Exl3RamMissDevice
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -125,15 +126,17 @@ def _evaluate(node, known):
     raise ValueError(f"unsupported constant expression {ast.dump(node)}")
 
 
-def _constants(path: Path) -> dict[str, int]:
-    """Every ``constexpr <type> kName = <integer expression>;`` of a C++ source; a name defined twice fails."""
-    known: dict[str, int] = {}
+def _constants(*paths: Path, known: dict[str, int] | None = None) -> dict[str, int]:
+    """Every ``constexpr <type> kName = <integer expression>;`` of the given C++ sources, read as one text; a name
+    defined twice fails. ``known`` seeds names defined elsewhere (the wire header)."""
+    seeded = dict(known or {})
+    found: dict[str, int] = {}
     pattern = r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=\s*([^;]+);"
-    for name, expression in re.findall(pattern, path.read_text(), re.MULTILINE):
-        assert name not in known, f"{path.name} defines {name} twice: the layout check cannot tell which one applies"
+    for name, expression in re.findall(pattern, joined_text(paths), re.MULTILINE):
+        assert name not in found, f"{name} is defined twice: the layout check cannot tell which one applies"
         expression = re.sub(r"(?<=\d)[uU][lL]*\b", "", expression.strip())
-        known[name] = _evaluate(ast.parse(expression, mode="eval").body, known)
-    return known
+        found[name] = seeded[name] = _evaluate(ast.parse(expression, mode="eval").body, seeded)
+    return found
 
 
 # The page protocol (plan D10): every name here must be defined, with one value, in both C++ files.
@@ -146,7 +149,7 @@ PAGE_PROTOCOL = (
 
 def test_the_device_kernels_speak_the_host_page_layout():
     """The page protocol is written three times (Python, host C++, device CUDA): one layout."""
-    files = {name: _constants(CSRC / name) for name in ("exl3_ram_miss.cuh", "exl3_ram_miss_host.cpp")}
+    files = {"device": _constants(*device_sources()), "host": _constants(*host_sources())}
     python = {
         "kDemandHead": ram_miss.WORDS["demand_head"],
         "kDemandDone": ram_miss.WORDS["demand_done"],
@@ -160,7 +163,7 @@ def test_the_device_kernels_speak_the_host_page_layout():
         "kMaxIds": ram_miss.MAX_IDS,
         "kServed": ram_miss.STATUS["served"],
     }
-    reference = files["exl3_ram_miss_host.cpp"]
+    reference = files["host"]
     for file, constants in files.items():
         for name in PAGE_PROTOCOL:
             assert name in constants, (file, name)
@@ -169,7 +172,7 @@ def test_the_device_kernels_speak_the_host_page_layout():
             assert constants[name] == value, (file, name, constants[name], value)
 
 
-    device = files["exl3_ram_miss.cuh"]
+    device = files["device"]
     assert device["kAdviseRing"] + device["kAdviseRecords"] * device["kRecordBytes"] <= PAGE_BYTES
     state = {
         "kPosted": "posted",
@@ -199,14 +202,14 @@ def test_the_device_kernels_speak_the_host_page_layout():
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
     # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.
-    counters = re.search(r"enum Counter : int \{(.*?)\bkCounterCount\b", (CSRC / "exl3_ram_miss_host.cpp").read_text(), re.S)
+    counters = re.search(r"enum Counter : int \{(.*?)\bkCounterCount\b", joined_text(host_sources()), re.S)
     assert len(re.findall(r"^\s*(k\w+)", re.sub(r"//[^\n]*", "", counters.group(1)), re.M)) == len(ram_miss.COUNTERS)
 
 
 def test_the_stream_kernels_fault_words_are_the_device_sources():
     """The stream kernel reads its test-only fault tensor by these indices; a word moved on one side only would
     silently inject a different fault (or none) in the GPU tests that kill M13, M15 and M16."""
-    device = _constants(CSRC / "exl3_ram_miss.cuh")
+    device = _constants(*device_sources())
     names = {
         "abort_block": "kStreamFaultAbortBlock",
         "abort_delay_ns": "kStreamFaultAbortDelay",
@@ -241,8 +244,8 @@ def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
 
 
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
-    files = [_constants(CSRC / name) for name in ("exl3_ram_miss.cuh", "exl3_ram_miss_host.cpp")]
-    for constants in files:
+    files = {"device": _constants(*device_sources()), "host": _constants(*host_sources())}
+    for constants in files.values():
         assert constants["kHotHeaderBytes"] == ram_miss.HOT_HEADER_BYTES == 8
         assert constants["kHotAlignment"] == ram_miss.HOT_ALIGNMENT == 64
         assert constants["kHotRecords"] == ram_miss.HOT_RECORDS == ram_miss.DEMAND_RECORDS == 16
@@ -336,7 +339,7 @@ def _lease_device_only_constants():
 
 def test_the_lease_block_layout_is_written_once_in_python_and_in_the_device_source():
     """The lease block (LEASE_PROTOCOL.md section 4) joins the page's agreement check: one layout, several writers."""
-    device = _constants(CSRC / "exl3_ram_miss.cuh")
+    device = _constants(*device_sources())
     python = _lease_python_constants()
     for name, value in python.items():
         assert name in device, name
@@ -373,8 +376,9 @@ def _check_host_lease_layout(host_source: str, host_constants: dict[str, int], p
 def test_the_host_source_agrees_with_the_lease_layout_once_it_defines_it():
     """Skips while the host source has no lease code (step 2 of LEASE_PROTOCOL.md section 20 adds it); from then on
     it is a hard failure if the constants are missing, partial or different."""
-    path = CSRC / "exl3_ram_miss_host.cpp"
-    outcome = _check_host_lease_layout(path.read_text(), _constants(path), _lease_python_constants())
+    outcome = _check_host_lease_layout(
+        joined_text(host_sources()), _constants(*host_sources()), _lease_python_constants()
+    )
     if outcome == "skip":
         pytest.skip("the host source has no lease code yet; this check activates when it does")
 
