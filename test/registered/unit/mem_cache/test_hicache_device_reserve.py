@@ -22,7 +22,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -69,7 +68,7 @@ def _state_pool(*, layers: int, row_elems: int, num_host_pages: int) -> DeepSeek
         )
 
 
-class TestWriteBackStagingCap(CustomTestCase):
+class TestWriteBackStagingCap(unittest.TestCase):
     def test_paged_pool_staging_is_capped_in_bytes(self):
         # The production SWA mirror staged all 28 pages x 40 layers x 149760 B = 160 MiB of device memory.
         with envs.SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB.override(1):
@@ -94,7 +93,7 @@ class TestWriteBackStagingCap(CustomTestCase):
         self.assertGreaterEqual(pool.staging_buffer.shape[0], 1)
 
 
-class TestHiCacheDeviceReserve(CustomTestCase):
+class TestHiCacheDeviceReserve(unittest.TestCase):
     def test_no_reservation_without_hierarchical_cache(self):
         self.assertEqual(hicache_runtime_reservation_gb(enable_hierarchical_cache=False), 0.0)
 
