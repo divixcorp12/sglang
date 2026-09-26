@@ -428,26 +428,22 @@ def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the
         s.finalize()
         snapshot = {n: s.dest[n].clone() for n in s.names}
         s.total()
-        done = torch.cuda.Event()
-        done.record()
-        rewritten = False
-        held_after_dma = None
+        released_s = None  # when every lease had dropped, from the chain's launch
         t0 = time.perf_counter()
-        while not rewritten:
+        while released_s is None and time.perf_counter() - t0 < 10:
             info = s.host.slot_info(s.row)
-            if held_after_dma is None and time.perf_counter() - t0 > 0.1:
-                held_after_dma = all(info[slot][2] >= 1 for slot in slots) and not done.query()
             if all(info[slot][2] == 0 for slot in slots):
+                released_s = time.perf_counter() - t0
                 for n in s.names:
-                    s.slabs[s.row][n][slots].view(torch.uint8).fill_(0xAB)
-                rewritten = True
-            elif time.perf_counter() - t0 > 10:
-                break
+                    for slot in slots:  # an int index is a view of the slab; a list index would fill a copy
+                        s.slabs[s.row][n][slot].view(torch.uint8).fill_(0xAB)
+        rewritten = released_s is not None
         torch.cuda.synchronize()
         assert rewritten, s.counters()
         assert s.keep.item() == 1.0, (s.counters(), s.stats())
         _check(s, experts, snapshot)  # a sentinel byte here: the slot was rewritten under CW's reads
-        assert held_after_dma, "the leases dropped before CW ran"
+        # The trellis DMA completes within milliseconds; CW runs only after the ~250 ms device sleep.
+        assert released_s > 0.1, f"the leases dropped {released_s:.3f} s after launch, before CW ran"
         assert s.counters()["leases_copied"] - before == TOP_K
     finally:
         for n in s.names:
