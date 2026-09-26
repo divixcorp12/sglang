@@ -12,7 +12,7 @@
 #   long_tokens      prompt length of the long request (default 30000; 0 skips it)
 #
 # Writes env.txt, argv.txt, driver.log, server.log, responses.jsonl, long.json, vram.csv, phases.txt and
-# retries.txt to /mnt/nvme1/indexer-cap/<tag>. Takes cc-gpu.lock and rowimg-disk.lock (waits, never breaks
+# retries.txt to /mnt/nvme1/indexer-cap/<tag>. Takes rowimg-disk.lock, then cc-gpu.lock (waits, never breaks
 # them). Refuses when production (port 7867) is up. Never starts production.
 set -u
 TAG=${1:?tag}
@@ -39,12 +39,13 @@ phase() { echo "$(date '+%Y/%m/%d %H:%M:%S.%3N') $1" >> $OUT/phases.txt; }
 [[ $BUDGET =~ ^[0-9]+$ ]] || { say "score_budget_mb must be an integer"; exit 2; }
 OVR="{'SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE': '1', 'SGLANG_DSV41_RAM_MISS_HIT_WAIT_US': '100', 'SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM': '1', 'SGLANG_MOE_PINNED_HOST_MB': '102400', 'SGLANG_MOE_PINNED_HOST_NUMA_MB': '0:61440,1:40960', 'SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES': '1', 'SGLANG_MOE_HOT_GPU_MB': '$HOT_MB', 'SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB': '$BUDGET'}"
 
-exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock
-say "waiting for cc-gpu.lock"
-flock 9
+# Disk lock first, then the GPU lock: the order the other drivers on this box use, so neither waits holding the GPU.
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
 say "waiting for rowimg-disk.lock"
 flock 8
+exec 9>/data/models/slang/nvfp4-work/cc-gpu.lock
+say "waiting for cc-gpu.lock"
+flock 9
 say "locks held"
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do say "GPU busy; waiting"; sleep 180; done
 ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exit 1; }
