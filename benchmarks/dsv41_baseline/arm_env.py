@@ -177,6 +177,9 @@ def base_env() -> dict[str, str]:
         # The eager streamed MoE queues each chunk's compute behind its gather instead of waiting for it: TTFT
         # 12.6 -> 9.9 s on a 260-token prompt, outputs identical (DSV41_REFERENCE.md 27.11).
         "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN": "1",
+        # A prefill chunk copies its rows already in the pinned tier before waiting for its fills: TTFT 9.9 -> 8.6 s,
+        # outputs identical (DSV41_REFERENCE.md 27.12).
+        "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER": "1",
     }
 
 
