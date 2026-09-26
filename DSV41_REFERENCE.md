@@ -4131,6 +4131,8 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    -358 kernels per step, byte-identical, -0.6 ms/token (within noise). Not "a few ms": most of the remaining small
    kernels are attention, mHC reductions and the RAM-miss chain, not glue.
 7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
+   With fills on, this is the largest remaining TTFT lever (§27.10): the GPU idles ~6.3 s of a 12.9 s prefill
+   waiting for the host, and the host is blocked ~6.1 s in 8,174 small readbacks.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
    cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
@@ -4335,6 +4337,84 @@ captures (`analysis/dsv41-drive/prefill-evict/ram_replay.py`; its base arm gives
 - Traces: `/mnt/nvme1/dsv41-nsys/pevict-{A,B}-*.{nsys-rep,sqlite}`.
 - Replays: `/mnt/nvme1/prefill-evict/replay3_*.json`.
 - Command: `analysis/dsv41-drive/pcie-trace/s_decay.py <sqlite>`, which now finds the last session's decode itself.
+
+### 27.10 The production recipe traced: prefill fills and cast fusion on, with NVMe load (2026-09-25)
+
+**Recipe.** `003d82fb77` turns on `SGLANG_DSV41_ENABLE_PREFILL_FILLS` and `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION` in
+`arm_env.base_env()`, which is both the arms' base and production's launch env.
+
+**Arm.** `prod-flags-node`: node-mode trace plus the root PCIe session, port 30021, once, rc 0, outputs normal.
+- Driver: `analysis/dsv41-drive/nvme-load/drive_traced_arm.sh`.
+- Session 1 (103 tokens): TTFT 13.63 / 12.90 s and 113.3 ms/token, traced; §27.6's untraced fills arm had
+  12.05 / 11.14 s.
+- The comparison below is against `pevict-A` (§27.9): the same recipe with both flags off, traced the same way.
+  `analysis/dsv41-drive/pcie-trace/compare_arms.py` measures the last session in both.
+
+**Prefill (260 tokens, last session).**
+
+| | Flags off | Both on |
+|---|---:|---:|
+| Wall | 19,454 ms | 12,882 ms |
+| GPU busy (kernels and copies) | 6,588 ms | 6,571 ms |
+| of which `_gather_host_rows_kernel` (726 launches) | 6,083 ms | 6,068 ms |
+| GPU idle | 66% | 49% |
+| D2H readbacks ≤256 B / host time blocked in them | 8,380 / 6,114 ms | 8,174 / 6,102 ms |
+| PCIe RX mean | 13.7% | 20.6% (~5.9 GB/s, ~75 GB in all) |
+
+- **The gather is capped by the link.** A 260-token prompt touches ~75 GB of expert rows, and the SM gather moves them
+  over PCIe Gen3 in ~6.1 s. Only gathering fewer rows shortens it.
+- **The other ~6.3 s is the GPU waiting for the host.** `prefill_idle_vs_nvme.py` splits the idle time by NVMe
+  activity in 100 ms bins:
+  - 1.4 s with a mirror ≥50% busy (fill waits);
+  - 2.7 s with 10–50% busy;
+  - 2.2 s with the mirrors idle, i.e. pure host overhead: ~141,600 eager launches, Python, the syncs.
+- **The host and GPU take turns.** The host is blocked ~6.1 s in the readbacks waiting for the GPU, and the GPU is idle
+  ~6.3 s waiting for the host; together they are nearly the whole prefill. Removing the syncs (§27.4 item 7) would
+  let the next chunk's launches and reads overlap the current gather. The floor is then the ~6.1 s link time.
+
+**Decode.**
+
+| Steps | Flags off: step / S | Both on: step / S |
+|---|---:|---:|
+| 0 | 198 / 103 ms | 201 / 108 ms |
+| 1–4 | 125 / 54 ms | 126 / 56 ms |
+| 5–14 | 106 / 41 ms | 105 / 41 ms |
+| 15–102 | 111.6 / 37.3 ms | 111.2 / 37.2 ms |
+
+- **Cast fusion removes kernels, not time.** Kernels per step 2,788 → 2,430 and sub-3 µs kernels 1,851 → 1,493, but
+  GPU busy per step is 108.6 ms in both arms.
+- **The cold start after a prefill is unchanged by either flag:** ~150 ms of extra S per request, mostly in step 0
+  (§27.9). In steady state S is still a third of every step.
+- PCIe RX over steps 15+: 34.1% / 34.4%.
+
+**NVMe load.** `analysis/dsv41-drive/nvme-load/` samples `/proc/diskstats` every 100 ms (plus `iostat -x` at 1 s)
+alongside an arm, with wall and monotonic clocks for alignment with the trace. The two mirrors split every read in
+half: nvme0n1 (`/mnt/nvme0`) at 416 kB per request, nvme3n1 (`/mnt/nvme4`, SPCC, 256 KB maximum transfer) at 212 kB.
+nvme2n1 serves only 4 kB Engram lookups.
+
+| Session 1 | nvme0n1: mean / while busy / busy | nvme3n1: mean / while busy / busy |
+|---|---:|---:|
+| Prefill (12.9 s) | 873 MB/s / 3.84 GB/s / 23% | 872 MB/s / 3.80 GB/s / 23% |
+| Decode (11.9 s) | 767 MB/s / 3.33 GB/s / 23% | 765 MB/s / 2.67 GB/s / 29% |
+
+- **The mirrors saturate in bursts.** Whenever a mirror is reading, it runs at the Gen3 x4 link rate (~3.5–3.9 GB/s).
+  The low averages mean no read is known yet, not a shallow queue: a layer's misses run both drives flat out, and a
+  13.3 MB row takes ~2 ms at best across the two. Deeper queues would not shorten S. The levers are:
+  - fewer NVMe misses;
+  - more read bandwidth, e.g. a third mirror;
+  - reading earlier, which needs a predictor (Track B, §25.4).
+- **Another tenant writes to the SPCC mirror.** Bursts of 200–576 MB/s of writes hit nvme3n1 during decode, with queue
+  depth up to ~920, and its busy read rate is the lowest (2.67 GB/s). The bursts continued after the arm ended.
+  The likely writer is a Ray cluster (running since 2026-09-25 00:34) whose temp and spill directory is
+  `/mnt/nvme4/ray_tmp`; not proven. The 64 GB swapfile on nvme4 was moved to `/mnt/nvme1` on 2026-09-25.
+
+**Evidence** (divix01):
+- Run: `cc-expert-prediction/dsv41-baseline/servers/prod-flags-node/run-20260925-211029/`.
+- Traces: `/mnt/nvme1/dsv41-nsys/prod-flags-node-20260925-211044{.nsys-rep,-pcie.nsys-rep,.sqlite}`; the PCIe
+  exports are under `/mnt/nvme1/prod-flags/`.
+- NVMe samples: `/mnt/nvme1/prod-flags/{nvme_diskstats.jsonl,iostat.log}`.
+- Timed sessions, wall clock: session 0 prefill 21:14:10–21:14:23.3; session 1 prefill 21:14:25.5–21:14:38.4, decode to
+  21:14:50.4.
 
 ## Sources
 
