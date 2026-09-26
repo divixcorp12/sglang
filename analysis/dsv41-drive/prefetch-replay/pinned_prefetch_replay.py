@@ -58,7 +58,8 @@ NUM_EXPERTS = 384
 class Nvme:
     """One server; jobs are rows split into pieces. Tracks per-row completion times."""
 
-    def __init__(self, row_ms: float, pieces: int, mode: str) -> None:
+    def __init__(self, row_ms: float, pieces: int, mode: str, lat_ms: float = 0.0) -> None:
+        self.lat_ms = lat_ms
         self.piece_ms = row_ms / pieces
         self.pieces = pieces
         self.mode = mode
@@ -107,7 +108,7 @@ class Nvme:
 
     def _serve_one(self, q) -> None:
         job = q[0]
-        start = max(self.free, job["t"])
+        start = max(self.free, job["t"] + self.lat_ms)
         self.free = start + self.piece_ms
         self.busy_ms += self.piece_ms
         job["left"] -= 1
@@ -128,7 +129,7 @@ class Nvme:
         """Serve every piece that starts before t (all queued jobs were issued at or before t)."""
         while True:
             q = self._next()
-            if q is None or max(self.free, q[0]["t"]) >= t:
+            if q is None or max(self.free, q[0]["t"] + self.lat_ms) >= t:
                 return
             self._serve_one(q)
 
@@ -184,7 +185,7 @@ class Replay:
     def __init__(self, a, capacity: list[int], ranks) -> None:
         self.a = a
         self.tiers = [Tier(c) for c in capacity]
-        self.nvme = Nvme(a.nvme_row_ms, a.pieces, a.queue)
+        self.nvme = Nvme(a.nvme_row_ms, a.pieces, a.queue, a.nvme_lat_ms)
         self.tick = 0
         self.ranks = ranks
         self.rng = random.Random(a.seed)
@@ -194,7 +195,7 @@ class Replay:
             demand_misses=0, demand_misses_decode=0, spec_issued=0, spec_used_target=0, spec_used_any=0,
             spec_late=0, harmful=0,
             exposed_ms=0.0, link_ms=0.0, step_ms=0.0, decode_steps=0, vram_misses=0, ram_hits=0,
-            prefill_misses=0, budget_capped=0, hot_not_in_ram=0,
+            prefill_misses=0, budget_capped=0, hot_not_in_ram=0, after_hits_ms=0.0,
         )
         self.per_layer_exposed = np.zeros(len(capacity))
         self.per_layer_misses = np.zeros(len(capacity))
@@ -385,6 +386,7 @@ class Replay:
                     end = max(end, job["done"] + a.link_row_ms / a.pieces)
                 exposed = end - link_end
                 if decode:
+                    self.st["after_hits_ms"] += end - (now + (n_rows - len(jobs)) * a.link_row_ms)
                     self.per_layer_exposed[layer] += exposed
                     step_exposed += exposed
                     self.st["link_ms"] += n_rows * a.link_row_ms
@@ -467,6 +469,7 @@ class Replay:
             "budget_capped_per_token": st["budget_capped"] / n,
             "exposed_ms_per_token": st["exposed_ms"] / n,
             "step_ms_per_token": st["step_ms"] / n,
+            "after_hits_ms_per_token": st["after_hits_ms"] / n,
             "link_ms_per_token": st["link_ms"] / n,
             "nvme_busy_frac": self.nvme.busy_ms / max(st["step_ms"], 1e-9),
             "steady_ram_misses_per_token": self.steady["misses"] / max(self.steady["steps"], 1),
@@ -493,6 +496,7 @@ def parse(argv=None):
     p.add_argument("--layers", type=lambda s: {int(x) for x in s.split(",")}, default=None)
     p.add_argument("--nvme-row-ms", type=float, default=2.5)
     p.add_argument("--pieces", type=int, default=8)
+    p.add_argument("--nvme-lat-ms", type=float, default=0.0, help="issue-to-first-piece latency of every read")
     p.add_argument("--link-row-ms", type=float, default=1.07)
     p.add_argument("--compute-ms", type=float, default=0.35)
     p.add_argument("--step-ms", type=float, default=2.0)

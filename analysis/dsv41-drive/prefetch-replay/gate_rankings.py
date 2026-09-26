@@ -41,12 +41,16 @@ def main() -> None:
     p.add_argument("--depth", type=int, default=12)
     a = p.parse_args()
 
+    capture = router_score.load_capture(a.router_prefix)
+    # Gates first: safetensors maps whole shard files, which must not coexist with the loaded trace under ulimit -v.
+    W, bias = router_score.load_gates(a.model, capture.header["layer_ids"])
     loaded = tier_sim.load_forwards(a.stages)
     stream = prefetch_sim.decode_stream(loaded)
-    capture = router_score.load_capture(a.router_prefix)
+    if stream.layers != capture.header["layer_ids"]:
+        raise ValueError("route log and router capture disagree on the layers")
     records = router_score.decode_records(loaded, capture)
     seqs = np.asarray([f["seq"] for f in loaded["forwards"] if f["phase"] == "decode"], dtype=np.int64)
-    W, bias = router_score.load_gates(a.model, stream.layers)
+    del loaded
     steps, layers = len(stream.rids), len(stream.layers)
     H, depth = a.horizons, a.depth
     order = np.zeros((steps, layers, H + 1, depth), dtype=np.int16)
