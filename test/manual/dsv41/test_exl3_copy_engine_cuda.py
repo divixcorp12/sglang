@@ -415,6 +415,7 @@ def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the
         assert s.until(lambda: _all_retired(s)), s.counters()
         slots = [s.host.mapping(s.row)[e] for e in experts]
         originals = {n: s.slabs[s.row][n].clone() for n in s.names}
+        before = s.counters()["leases_copied"]
         s.plan(experts)
         s.post()
         s.hit_wait()
@@ -429,7 +430,6 @@ def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the
         s.total()
         done = torch.cuda.Event()
         done.record()
-        before = s.counters()["leases_copied"]
         rewritten = False
         held_after_dma = None
         t0 = time.perf_counter()
@@ -445,10 +445,10 @@ def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the
                 break
         torch.cuda.synchronize()
         assert rewritten, s.counters()
-        assert s.counters()["leases_copied"] - before == TOP_K
         assert s.keep.item() == 1.0, (s.counters(), s.stats())
-        _check(s, experts, snapshot)
+        _check(s, experts, snapshot)  # a sentinel byte here: the slot was rewritten under CW's reads
         assert held_after_dma, "the leases dropped before CW ran"
+        assert s.counters()["leases_copied"] - before == TOP_K
     finally:
         for n in s.names:
             s.slabs[s.row][n].copy_(originals[n])
