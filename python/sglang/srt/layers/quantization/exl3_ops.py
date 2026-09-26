@@ -7,9 +7,11 @@ had is exllamav3's blockwise 128 Hadamard and W_inner = reconstruct(trellis).
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Union
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -214,14 +216,85 @@ def exl3_moe_accumulate(
         token, slot = torch.where(topk_ids == expert)
         if token.numel() == 0:
             continue
-        xe = x[token]
-        gate = linear(xe, w13[expert][0], torch.float32)
-        up = linear(xe, w13[expert][1], torch.float32)
-        if swiglu_limit is not None and swiglu_limit > 0:
-            up = up.clamp(-swiglu_limit, swiglu_limit)
-            gate = gate.clamp(max=swiglu_limit)
-        h = F.silu(gate) * up * topk_weights[token, slot].float().unsqueeze(-1)
-        out.index_add_(0, token, linear(h.to(x.dtype), w2[expert], torch.float32))
+        _accumulate_expert(out, x, topk_weights, token, slot, w13[expert], w2[expert], swiglu_limit, linear)
+
+
+def _accumulate_expert(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    token: torch.Tensor,
+    slot: torch.Tensor,
+    w13e: tuple[Exl3Tensors, Exl3Tensors],
+    w2e: Exl3Tensors,
+    swiglu_limit: Optional[float],
+    linear: Callable,
+) -> None:
+    xe = x[token]
+    gate = linear(xe, w13e[0], torch.float32)
+    up = linear(xe, w13e[1], torch.float32)
+    if swiglu_limit is not None and swiglu_limit > 0:
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+        gate = gate.clamp(max=swiglu_limit)
+    h = F.silu(gate) * up * topk_weights[token, slot].float().unsqueeze(-1)
+    out.index_add_(0, token, linear(h.to(x.dtype), w2e, torch.float32))
+
+
+class Exl3RoutePlan(msgspec.Struct, frozen=True):
+    """A layer's routes grouped by expert on the host, from one readback, so the expert loop never syncs.
+
+    Expert ``experts[i]``'s routes are ``tokens``/``slots`` over ``offsets[i]:offsets[i + 1]``, row-major within
+    the expert: the order ``torch.where(topk_ids == expert)`` returns, so every gather and ``index_add_`` sees the
+    same indices as ``exl3_moe_accumulate``.
+    """
+
+    experts: list[int]
+    offsets: list[int]
+    index_of: dict[int, int]
+    tokens: torch.Tensor
+    slots: torch.Tensor
+    source_ids: torch.Tensor
+
+    @classmethod
+    def from_topk(cls, topk_ids: torch.Tensor) -> "Exl3RoutePlan":
+        width = topk_ids.shape[-1]
+        # The layer's one readback; nothing of this layer is queued yet, so the pageable copies back cost no wait.
+        flat = topk_ids.reshape(-1).cpu()
+        positions = (flat >= 0).nonzero().flatten()
+        positions = positions[torch.argsort(flat[positions], stable=True)]
+        experts, counts = torch.unique_consecutive(flat[positions], return_counts=True)
+        index = torch.stack((positions // width, positions % width)).to(topk_ids.device)
+        expert_list = experts.tolist()
+        return cls(
+            experts=expert_list,
+            offsets=[0, *itertools.accumulate(counts.tolist())],
+            index_of={expert: i for i, expert in enumerate(expert_list)},
+            tokens=index[0],
+            slots=index[1],
+            source_ids=experts.to(device=topk_ids.device, dtype=topk_ids.dtype),
+        )
+
+    def routes_of(self, expert: int) -> tuple[torch.Tensor, torch.Tensor]:
+        i = self.index_of[expert]
+        a, b = self.offsets[i], self.offsets[i + 1]
+        return self.tokens[a:b], self.slots[a:b]
+
+
+def exl3_moe_accumulate_planned(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    plan: Exl3RoutePlan,
+    w13: Union[Sequence, Mapping[int, tuple[Exl3Tensors, Exl3Tensors]]],
+    w2: Union[Sequence, Mapping[int, Exl3Tensors]],
+    swiglu_limit: Optional[float],
+    experts: Iterable[int],
+    linear: Callable = exl3_linear,
+) -> None:
+    """``exl3_moe_accumulate`` over ``plan``'s routes: the same math and order, with no per-expert readback."""
+    for expert in experts:
+        token, slot = plan.routes_of(expert)
+        _accumulate_expert(out, x, topk_weights, token, slot, w13[expert], w2[expert], swiglu_limit, linear)
 
 
 def random_exl3_tensors(
