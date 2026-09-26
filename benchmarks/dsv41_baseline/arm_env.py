@@ -55,7 +55,9 @@ CONTEXT_LENGTH = 32768
 # 0.83 since 2026-09-25, with CUDA_MODULE_LOADING=EAGER (base_env): eager loading keeps every kernel resident, ~1 GiB,
 # and at 0.80 the KV cache no longer fit. At 0.83 it holds 204,288 tokens (0.80 under LAZY: 209,408), with the same
 # ~4.7 GB left over. An arm run at 0.80 is not comparable on memory, only on speed.
-MEM_FRACTION_STATIC = 0.83
+# 0.925 since 2026-09-26: the hot cache counts against this fraction, so its +3072 MiB (of 32607) raised it by the
+# same amount and the KV pool is unchanged. The indexer score budget is what keeps long prefills inside the rest.
+MEM_FRACTION_STATIC = 0.925
 CHUNKED_PREFILL_SIZE = 512
 MAX_PREFILL_TOKENS = 16384
 # Decode CUDA graphs exist only at batch size 1; anything above it runs eagerly and
@@ -118,6 +120,9 @@ def base_env() -> dict[str, str]:
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
         "SGLANG_DSV41_ENGRAM_TABLE_DIR": ENGRAM_TABLE_DIR,
         "SGLANG_DSV41_TORCH_PREFILL_INDEXER": "1",
+        # Chunks the prefill indexer's score tensor: a 30k/32k prompt peaks 3.0 GiB lower with no OOM retries, and
+        # that VRAM funds the larger hot cache below (DSV41_REFERENCE.md 27.7).
+        "SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB": "128",
         "SGLANG_DSV41_ENGRAM_RAM_GIB": "5",
         "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "1",
         "SGLANG_DSV41_EXPERT_STREAM": "1",
@@ -127,7 +132,9 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_FILE_READER": "uring_direct",
         "SGLANG_MOE_PINNED_HOST_MB": PINNED_HOST_MB,
         "SGLANG_MOE_PINNED_HOST_NUMA_MB": PINNED_HOST_NUMA_MB,
-        "SGLANG_MOE_HOT_GPU_MB": "14336",
+        # 14336 + 3072 on the indexer cap's freed VRAM: 110.1 -> 103.0 ms/token, byte-identical (27.7). Counts against
+        # MEM_FRACTION_STATIC, which rose with it.
+        "SGLANG_MOE_HOT_GPU_MB": "17408",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
         "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
