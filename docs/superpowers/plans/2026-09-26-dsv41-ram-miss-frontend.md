@@ -47,6 +47,122 @@ binding points are restated here:
   measures that case, with copy-engine-only overlap and one final gather in the original routing order. Resident-first
   is revisited only if Task 5 clears Gate C.
 
+## Results (executed 2026-09-26)
+
+**Outcome: no-go on both fronts.** Task 1's bounds failed Gates A and B, so Tasks 2-4 were skipped by design. Task 5
+failed Gate C, so resident-first stays shelved. Nothing changed the production recipe. Write-up: `DSV41_REFERENCE.md`
+§27.15 and §27.4 item 10. Evidence: `divix01:/mnt/nvme1/frontend/`.
+
+| Task | Status | Commits |
+|---|---|---|
+| 1. Frontend bound from the existing trace | Ran; Gate A and Gate B fail | `a6a5e54bea` (red), `051b37bf0a`; fix `d97b581be9` |
+| 2. `HIT_WAIT_US` 100 vs 0 | Skipped (Gate A) | none |
+| 3. Reset-only frontend | Skipped (Gate B) | none |
+| 4. Reset-frontend arms | Skipped (Gate B) | none |
+| 5. Resident-first tail after real copies | Ran; Gate C fails | `bf52ca24e4` (red), `f04a78f3d3` |
+| 6. Write-up and final review | Done | `38b91ebb1a`, `d97b581be9` |
+
+Coverage of the critique's five experiments, as executed:
+
+| Critique experiment | What happened |
+|---|---|
+| 1. Frontend at 100 vs 0 | Not run: its best case is 0.32 ms/step, under the 1.0 ms gate |
+| 2. Reset-only chain | Not built: its best case is 0.41 ms/step, under the 1.0 ms gate |
+| 3. Route and lifecycle tests | Not written: they belonged to Task 3 |
+| 4. Layer latency, transfer completion, PCIe | Per-layer copy completion measured (Task 1). PCIe RX not captured: it belonged to the traced arms of Tasks 2 and 4 |
+| 5. Resident-first after real transfers | Measured (Task 5): 10-13 us/layer against a 25 us bar |
+
+### Task 1 result: the frontend bound
+
+- **Trace:** `sm-small-B-node-20260926-034122` (the recipe with SM small copies, node mode), 90 steady steps x 40 layers,
+  `--skip 20`.
+- **Command:**
+  ```bash
+  frontend_bound.py /mnt/nvme1/dsv41-nsys/sm-small-B-node-20260926-034122.sqlite \
+    --json /mnt/nvme1/frontend/step0-sm-small.json
+  ```
+- **Tests:** `test_frontend_bound.py`, 4 passed at `051b37bf0a` after red at `a6a5e54bea` (collection error, EXIT=2).
+  5 passed at `d97b581be9`.
+
+| Per decode step | Value |
+|---|---:|
+| Frontend span (post end to S start) | 1.130 ms |
+| W1 | 1.055 ms; p50 11.26 us, p90 78.08 us |
+| W1 at the 100 us budget | 7.7% of layers |
+| CW floor (p5) / CW spin past it | 0.864 us / 54.55 ms |
+| Post to F, per layer (p50) | 1,997 us |
+| Copy-engine H2D | 994.6 MB, 77.97 ms busy |
+| Last copy lands after post, per layer (p50) | 1,979 us |
+| CW ends after the last copy, per layer (p50) | 4.96 us |
+| **Bound, reset-only frontend** | **0.411 ms** (Gate B needs >= 1.0: fail) |
+| **Bound, `HIT_WAIT_US=0`** | **0.324 ms** (Gate A needs >= 1.0: fail) |
+
+- **Cross-check against `ce_trace.py` on the same trace:**
+  - W1: 1.055 ms/step in both.
+  - Copies: 994.591 MB/step in both.
+  - CW: 54.587 ms/step there, 54.55 ms of spin here.
+  - Caveat: the two scripts share the step grouping and the memcpy filter, so their agreement checks the arithmetic,
+    not the grouping.
+- **Why the frontend cannot pay:** each layer waits ~2 ms for its copies, and CW ends ~5 us after the last one lands.
+  Shortening the chain in front of CW only lengthens CW's spin. The lever is the transfer itself (the NVMe and link
+  items of §27.4), not W1, C1 or A1.
+- **Review fix** (`d97b581be9`): `check_steps` refuses an empty trace, e.g. a graph-mode trace or `--skip` covering
+  every step. It also refuses steps with different layer counts, since a torn chain would silently understate the
+  bound. Test: `test_steps_with_different_layer_counts_are_refused`, which failed first and then passed. The real trace
+  passes, with 40 layers in every step and the bounds unchanged.
+
+### Task 5 result: resident-first after real copies
+
+- **Command:**
+  ```bash
+  gpu-run.sh analysis/dsv41-drive/resident-first/run.sh /mnt/nvme1/frontend/resident-first
+  ```
+  EXIT=0, 300 replays per arm, at `f04a78f3d3`.
+- **Test:** `test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads`.
+  - Red at `bf52ca24e4`: `AttributeError` on `add_pinned_sources`.
+  - At `f04a78f3d3` the parity file passed 5 of 5.
+  - What it proves: poisoned pinned bytes change the output, and the true bytes restore it bitwise.
+- **Sanity:** `one` = 101.43 us/layer (bench-run2: 101.13, +0.3%), which implies 788 GB/s. Rows are 13.32 MB.
+
+| us/layer | 5+1 | 4+2 | 3+3 |
+|---|---:|---:|---:|
+| `res_only` | 101.91 | 101.25 | 100.99 |
+| `miss_only` | 100.38 | 100.87 | 100.86 |
+| `two_static` | 193.05 | 191.72 | 190.59 |
+| `copy_only` | 976.19 | 1952.47 | 2926.98 |
+| `copy_then_one` (serial, today's order) | 1086.92 | 2066.18 | 3037.52 |
+| `copy_then_miss` | 1084.03 | 2063.73 | 3036.31 |
+| `overlap` (copies beside the resident launch, join, missed launch, one gather) | 1076.53 | 2053.37 | 3027.75 |
+| **Gate C value: serial minus overlap** | **10.39** | **12.81** | **9.77** |
+
+- **Copy rate:** 13.6 GB/s (26.6 MB in 1.95 ms at 4+2). The copies dominate every copy arm.
+- **Decomposition:**
+  - `overlap = copy_only + miss_only`, within 0.1 us at every split.
+  - `copy_then_one = copy_only + one + R`, with `R` = 9.3 / 12.3 / 9.1 us/layer.
+  - The same `R` (~10 us) appears in `copy_then_miss`. It is the leftover cost whenever a kernel follows the copies
+    on the same stream in the graph. It is not a cache effect.
+  - The plan's cache-effect formula gives +10.39 us/layer at 4+2: freshly copied rows do not speed up the tail.
+- **Real resident-first gain:** `one - miss_only`, about 1 us/layer. Production copies run off-graph and CW waits on a
+  flag, so `R` may not exist there at all.
+- **Gate C** (>= 25 us/layer, i.e. 1 ms/token) fails at every split, even crediting all of `R`.
+
+### Rulings made during execution
+
+- **Task 5, pinned sources.** `add_pinned_sources` caches each split's `(missed_phys, pinned)` in `Layer.sources`.
+  Re-creating them per split, as Step 2 said, would free pinned buffers that captured graphs still read. Cost: ~3.2 GB
+  of pinned host memory held for the bench's lifetime.
+- **Task 5, completion evidence.** Completion was recorded from the divix01 GPU run of the parity file (5 passed), not
+  from a local test run. The GPU file cannot run on the laptop.
+- **Review, node mode.** The reviewer asked whether node mode distorts the frontend span. Node mode inflates the span,
+  so it overstates the bound, and the no-go stands. Cost if wrong: a saving under 1 ms/step missed.
+
+### Deferred minors (final review)
+
+- The bench-copy GPU test runs `one`, not the missed launch. It would not catch copies landing in a resident row, or a
+  missing join in `overlap()`.
+- That test sits after the parity file's `if __name__ == "__main__":` block.
+- `Layer`'s empty `{}`/`[]` defaults could use `msgspec.field(default_factory=...)` for readability.
+
 ## Global Constraints
 
 - **Git:**
@@ -126,6 +242,8 @@ binding points are restated here:
 ---
 
 ### Task 1: Size the frontend from the existing node-mode trace (step 0)
+
+> **Status: done.** Gate A and Gate B fail; see Results.
 
 **Files:**
 - Create: `analysis/dsv41-drive/frontend/frontend_bound.py`
@@ -481,6 +599,8 @@ Gate A <pass|fail>, Gate B <pass|fail>`. If both fail, go to Task 5.
 
 ### Task 2: `HIT_WAIT_US` 100 vs 0 (only if Gate A passes)
 
+> **Status: skipped.** Gate A failed (0.324 ms/step < 1.0). `pcie_decode.py` was not generalized.
+
 **Files:**
 - Create: `analysis/dsv41-drive/frontend/drive_hit_wait.sh`
 
@@ -609,6 +729,8 @@ Expected for B:
 ---
 
 ### Task 3: Reset-only frontend behind `SGLANG_DSV41_ENABLE_RAM_MISS_RESET_FRONTEND` (only if Gate B passes)
+
+> **Status: skipped.** Gate B failed (0.411 ms/step < 1.0). No flag, kernel, tests or mutants were written.
 
 **Files:**
 - Modify: `python/sglang/srt/environ.py` (next to `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`, ~:1912)
@@ -1063,6 +1185,8 @@ git commit -m "feat(dsv41): reset-only RAM-miss frontend behind SGLANG_DSV41_ENA
 
 ### Task 4: Reset-frontend arms (only if Task 3 is done)
 
+> **Status: skipped.** Task 3 was not built.
+
 **Files:**
 - Create: `analysis/dsv41-drive/frontend/drive_reset.sh`. It is `drive_hit_wait.sh` with:
   - `FLAG=SGLANG_DSV41_ENABLE_RAM_MISS_RESET_FRONTEND=1`;
@@ -1109,6 +1233,8 @@ If B is faster by at least 1.0 ms/token untraced, with identical output, ASK the
 ---
 
 ### Task 5: Resident-first's post-transfer tail, with copy-engine-only overlap (always runs; measurement only)
+
+> **Status: done.** Gate C fails (12.81 us/layer at 4+2, bar 25); see Results.
 
 **Why:** `bench-run2.txt` timed the missed-only launch on weights that no copy had just written. The critique names
 two gaps: overlap with real transfers, and the cache state of freshly copied rows. The two missed rows are ~26.6 MB,
@@ -1261,6 +1387,8 @@ Ledger: `Task 5: serial <x> us/layer, overlapped <y>, saving <x-y>, cache effect
 ---
 
 ### Task 6: Write-up
+
+> **Status: done.** `DSV41_REFERENCE.md` §27.15 (`38b91ebb1a`, corrected in `d97b581be9`).
 
 **Files:**
 - Modify: `DSV41_REFERENCE.md`: a new §27.15 after §27.14, and a line in §27.4 Next steps.
