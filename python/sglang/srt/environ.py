@@ -1927,6 +1927,10 @@ class Envs:
     # row_of_source as host lists, so no readback sits between a chunk's gather and its compute and the host runs
     # ahead of the gather. Outputs are bitwise those of the per-expert torch.where loop. Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
+    # Split fill gather (plan 2026-09-26-dsv41-split-fill-gather): a prefill gather chunk holding rows the layer's
+    # prefill fill is still reading copies its other rows first, then waits for the fill and copies the filled rows,
+    # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
+    SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
