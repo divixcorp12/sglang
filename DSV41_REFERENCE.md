@@ -4138,9 +4138,10 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    for chunks the fill did not claim (§27.13), ~0.5 s Python and launches, and ~0.2 s `pthread_cond_wait`.
    Copying landed rows first (§27.13) is correct but moved nothing.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
-9. **Prefill indexer score cap: peaks measured (§27.7).** A 128 MB cap frees ~3.0 GiB at 30k/32k and removes the
-   OOM retries, TTFT unchanged, short outputs identical. Next: the payoff arm (cap plus a larger hot cache) after a
-   rebase onto master. Merged to master at `c08f5484c9`; default off (budget 0).
+9. **Prefill indexer score cap: measured, payoff positive, not in the recipe (§27.7).** A 128 MB cap frees ~3.0 GiB
+   at 30k/32k and removes the OOM retries. Spent on 3 GiB more hot cache (mem-fraction 0.925): 110.1 -> 103.0
+   ms/token, output identical, 116 MB/step fewer RAM-hit copies. Merged at `c08f5484c9`, default off. Adopting it
+   needs `base_env()` and production's mem-fraction changed.
 10. **Decode RAM-miss frontend (W1/C1/A1): sized, no-go (§27.15).** At most 0.41 ms/step to gain; neither
     `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
     overlap saves 10-13 us/layer against a 25 us bar,
@@ -4197,7 +4198,7 @@ Evidence is on divix01:
 - The eager launch gaps and per-expert syncs (item 7).
 - The first chunk's reads of each layer, which nothing overlaps.
 
-### 27.7 Prefill indexer score cap (peaks measured, payoff arm pending, 2026-09-26)
+### 27.7 Prefill indexer score cap (measured; payoff -7 ms/token, 2026-09-26)
 
 **Why.** Track A (§25.4) found no VRAM headroom: a 30k prompt peaked at 31.0 of 31.8 GiB, with allocator retries from
 the torch prefill indexer's score tensor. Freed VRAM can go to the hot cache, at 2–2.7 fewer misses per token per GiB
@@ -4246,8 +4247,45 @@ plus a repeat of budget 0 at 30k (`b0-30k-r2`). All smokes rc=0, on the branch's
   128 MB (character 109). So the long-output difference is run-to-run nondeterminism in this build's long prefill, not
   the cap; the chunking tests above remain the bitwise evidence.
 
-**Not measured yet:** the payoff arm (A = today's recipe, B = cap plus ~3 GiB more hot cache), on a rebase onto
-today's master.
+**Payoff arm (2026-09-26, `f62f7af0b6`; driver `analysis/dsv41-drive/indexer-cap/drive_payoff.sh`).** The recipe
+plus `SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB=128` and `SGLANG_MOE_HOT_GPU_MB=17408` (+3 GiB, 232 more
+slots).
+- **The hot cache counts against `--mem-fraction-static`.** At 0.83, 17408 MB left no KV ("minimum viable 0.911") and
+  both arms refused to start. The arm runs at 0.925 (+3072 MiB of the card's 32607), which keeps today's KV pool; the
+  cap's freed prefill transient is what makes that fit. `run_arm.sh` takes it per arm as
+  `DSV41_MEM_FRACTION_STATIC`; `arm_env.MEM_FRACTION_STATIC` stays 0.83.
+- **Untraced** (`indexer-payoff`, one arm, compared with `sm-small-B` from 04:22 the same day, not an interleaved
+  A/B): output byte-identical. The 103-token session decoded at 9.08 -> 9.71 tok/s, **110.1 -> 103.0 ms/token
+  (-7.1)**; the other session is 7 tokens. TTFT 8.46/8.16 -> 8.41/8.07 s. Median ratio 1.047, 2 of 2 sessions faster
+  (p = 0.25). The prediction was 6-8 ms/token (3 GiB x 2-2.7 misses per GiB x ~1 ms per miss).
+- **Traced** (`indexer-payoff-node-20260926-143541`, node mode, against `sm-small-B-node-20260926-034122`, 90 steps
+  each; `ce_trace.py` and `frontend_bound.py`):
+
+| Per decode step | sm-small-B-node | payoff-node |
+|---|---:|---:|
+| RAM-hit copies (copy engine) | 994.6 MB, 149.9 copies | **878.4 MB**, 132.4 copies |
+| Copy-engine busy | 78.0 ms | 69.2 ms |
+| CW | 54.6 ms | **47.9 ms** |
+| S (NVMe pieces) | 40.8 ms | 40.3 ms |
+| W1 | 1.06 ms | 0.89 ms |
+| Step span (node mode, inflated) | 113.7 ms | **106.5 ms** |
+
+  The gain is fewer RAM hits to copy: -116 MB/step, ~8.7 rows per token at 13.3 MB. NVMe streaming is unchanged.
+- **PCIe RX** (the root session's `-pcie` report; clock offset 482,882,340 ns from the session starts; calibration
+  12.43 GB/s = 43.3% RX, so 100% ~ 28.7 GB/s; 108 steps, 122.1 ms/step traced): 1.05 GB/step, mean 8.6 GB/s.
+
+| Link state | ms/step | Mean RX | ~GB/s |
+|---|---:|---:|---:|
+| Copying, GPU in CW | 46.7 | 44.5% | 12.77 |
+| No copy, GPU in S | 32.4 | 16.2% | 4.67 |
+| Copying, GPU in S | 23.6 | 41.2% | 11.82 |
+| No copy, other | 18.4 | 3.1% | 0.89 |
+
+  Decoded with a divix01 copy of `pcie-trace/pcie_decode.py` that takes its reports as arguments
+  (`/mnt/nvme1/indexer-cap/pcie_decode_args.py`, output `payoff-pcie.txt`). Its step windows differ from §27.14's
+  steady-step selection, so compare states within this table, not against §27.14's.
+- **Not yet in the recipe.** Adopting it changes `base_env()` (the two flags) and production's
+  `--mem-fraction-static` (0.83 -> 0.925).
 
 **To resume.**
 - Driver: `analysis/dsv41-drive/indexer-cap/drive_peaks.sh <worktree> <budget_mb>` runs 30000 then 32000 tokens, each
