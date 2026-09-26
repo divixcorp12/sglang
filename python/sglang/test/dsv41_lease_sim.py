@@ -85,6 +85,29 @@ class LeaseSim:
         tag, gen = lease.untag(self.read_u64(base + lease.COPY_DONE_FIELDS["gen"]))
         return tag, gen, int(self._i32(base + lease.COPY_DONE_FIELDS["mask"])[0]) & 0xFFFFFFFF
 
+    def dst_slot(self, req: SimRequest, lane: int) -> int:
+        """The lane's destination slot as the post kernel wrote it into the LaneRequest."""
+        base = self._d(lease.LANE_REQUEST + req.idx * lease.LANE_REQUEST_BYTES) + lease.LANE_REQUEST_FIELDS["dst_slot"]
+        return int(self._i32(base + 4 * lane)[0])
+
+    def sm_ack_offset(self, req: SimRequest) -> int:
+        return self._d(lease.SM_ACK + req.idx * lease.SM_ACK_BYTES)
+
+    def sm_ack(self, req: SimRequest, generation: Optional[int] = None) -> None:
+        """The copy wait's acknowledgement that it has finished reading the request's leased slots."""
+        self.write_u64(self.sm_ack_offset(req), lease.tagged(lease.SM_ACK_TAG, req.gen if generation is None else generation))
+
+    def sm_fetch(self, req: SimRequest, dst: dict, names: Sequence[str]) -> None:
+        """The copy wait's SM half (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): copy ``names`` of every COPYING lane
+        from its leased slot into its destination row, then acknowledge the reads."""
+        for lane in range(len(req.lanes)):
+            result = self.row_result(req, lane)
+            if result["tag"] != lease.COPYING or result["gen"] != req.gen:
+                continue
+            for name in names:
+                dst[name][self.dst_slot(req, lane)].copy_(self.slabs[req.row][name][result["host_slot"]])
+        self.sm_ack(req)
+
     def ack_offset(self, req: SimRequest, lane: int) -> int:
         return self._d(lease.LANE_ACK + (req.idx * lease.LANES + lane) * lease.LANE_ACK_BYTES)
 

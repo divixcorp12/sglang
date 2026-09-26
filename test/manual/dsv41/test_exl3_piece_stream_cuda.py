@@ -144,7 +144,7 @@ class StreamService:
 
     def __init__(
         self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2, layers=LAYERS,
-        row=0, copy_engine=False, native_prefetch=False,
+        row=0, copy_engine=False, native_prefetch=False, sm_small=False,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -207,8 +207,17 @@ class StreamService:
         self.dest_slots = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
         self.segments = expert_row_segments([(self.slabs[row][n], self.dest[n]) for n in self.names])
         self.segment_map = stream_segment_map(self.segments, self.tables, row) if piece_stream else None
+        # SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy wait reads the non-trellis tensors itself.
+        self.sm_table = None
         if copy_engine:
-            self.host.set_copy_table(row, self.segments.table, TOP_K)
+            if sm_small:
+                from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask, sm_copy_table
+
+                mask = sm_copy_mask(self.names)
+                self.host.set_copy_table(row, self.segments.table, TOP_K, sm_mask=mask)
+                self.sm_table = sm_copy_table(self.segments, mask)
+            else:
+                self.host.set_copy_table(row, self.segments.table, TOP_K)
             self.host.arm_copy_engine()
         if piece_stream:
             # One empty (unarmed) request through the whole chain: JIT-compiles every kernel before a test times one.
@@ -264,7 +273,10 @@ class StreamService:
         self.dev.finalize(self.count, self.keep)
 
     def copy_wait(self):
-        self.dev.copy_wait(self.count)
+        if self.sm_table is None:
+            self.dev.copy_wait(self.count)
+        else:
+            self.dev.copy_wait(self.count, sm_table=self.sm_table)
 
     def total(self):
         torch.add(self.dev.go_1, self.dev.go_2, out=self.dev.go_total)

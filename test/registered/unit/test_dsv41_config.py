@@ -34,6 +34,7 @@ def test_defaults_match_the_env_declarations():
         enable_ram_miss_piece_stream=False,
         enable_ram_miss_row_images=False,
         enable_ram_miss_copy_engine=False,
+        enable_ram_miss_sm_small_copies=False,
         enable_native_prefetch=False,
         enable_prefill_fills=False,
         enable_prefill_share=False,

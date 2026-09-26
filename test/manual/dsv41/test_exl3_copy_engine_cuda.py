@@ -355,3 +355,99 @@ def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(ce):
             assert s.until(lambda: _all_retired(s))
         grew = s.counters()["copy_jobs"] > jobs
         assert grew == armed, (armed, s.counters())
+
+
+# ---- SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: CW reads the small tensors; the lease waits for its reads ----
+
+CW_DELAY_CYCLES = 600_000_000  # ~250 ms at the 5090's clock: CW starts long after the trellis DMA has completed
+
+
+def _victim_sequence(s, steps, seed):
+    rng = random.Random(seed)
+    snapshots = []
+    for _ in range(steps):
+        experts = rng.sample(range(EXPERTS), TOP_K)
+        s.plan(experts)
+        snapshot = _snapshot_step(s)
+        assert s.keep.item() == 1.0, (experts, s.counters(), s.stats())
+        _check(s, experts, snapshot)
+        snapshots.append({n: t.cpu() for n, t in snapshot.items()})
+        assert s.until(lambda: _all_retired(s)), s.counters()
+    return snapshots
+
+
+def test_sm_small_copies_deliver_the_same_six_tensors_as_the_six_copy_path(tmp_path):
+    """Sixty steps of sixteen experts through eight pinned slots, host slots evicted and reused, on the six-copy path
+    and on the SM path: every snapshot of every tensor must be byte-identical, and equal to the checkpoint's rows."""
+    off = StreamService(tmp_path / "off", copy_engine=True)
+    try:
+        want = _victim_sequence(off, 60, seed=11)
+    finally:
+        off.close()
+    on = StreamService(tmp_path / "on", copy_engine=True, sm_small=True)
+    try:
+        got = _victim_sequence(on, 60, seed=11)
+        c = on.counters()
+        assert c["copy_jobs"] > 20 and c["leases_copied"] > 60 and c["evictions"] > 0, c
+        assert c["copy_errors"] == 0 and c["copy_generation_mismatches"] == 0 and c["lease_double_signal"] == 0, c
+        # Only the two trellis tensors per lane went through the copy engine.
+        trellis = sum(on.dest[n][0].numel() * on.dest[n].element_size() for n in on.names if n.endswith("_trellis"))
+        assert c["copy_bytes"] == c["copy_lanes"] * trellis, (c["copy_bytes"], c["copy_lanes"], trellis)
+    finally:
+        on.close()
+    for step, (a, b) in enumerate(zip(want, got)):
+        for n in a:
+            assert torch.equal(a[n].view(torch.uint8), b[n].view(torch.uint8)), (step, n)
+
+
+def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the_destination(tmp_path):
+    """The hazard: CW reads the small tensors from the pinned slot, so the slot must stay leased until CW has read it,
+    not merely until the DMA completed. CW is delayed ~250 ms behind a device sleep; a watcher rewrites every leased
+    slot with a sentinel the instant its lease drops. The destination must hold the checkpoint's bytes.
+    Mutant: release on the DMA's completion alone -- the sentinel lands before CW reads and the snapshot is red."""
+    s = StreamService(tmp_path, copy_engine=True, sm_small=True)
+    try:
+        experts = list(range(TOP_K))
+        s.plan(experts)
+        s.step()  # resident
+        assert s.until(lambda: _all_retired(s)), s.counters()
+        slots = [s.host.mapping(s.row)[e] for e in experts]
+        originals = {n: s.slabs[s.row][n].clone() for n in s.names}
+        s.plan(experts)
+        s.post()
+        s.hit_wait()
+        s.copy1()
+        s.ack1()
+        s.stream()
+        s.ack2()
+        torch.cuda._sleep(CW_DELAY_CYCLES)
+        s.copy_wait()
+        s.finalize()
+        snapshot = {n: s.dest[n].clone() for n in s.names}
+        s.total()
+        done = torch.cuda.Event()
+        done.record()
+        before = s.counters()["leases_copied"]
+        rewritten = False
+        held_after_dma = None
+        t0 = time.perf_counter()
+        while not rewritten:
+            info = s.host.slot_info(s.row)
+            if held_after_dma is None and time.perf_counter() - t0 > 0.1:
+                held_after_dma = all(info[slot][2] >= 1 for slot in slots) and not done.query()
+            if all(info[slot][2] == 0 for slot in slots):
+                for n in s.names:
+                    s.slabs[s.row][n][slots].view(torch.uint8).fill_(0xAB)
+                rewritten = True
+            elif time.perf_counter() - t0 > 10:
+                break
+        torch.cuda.synchronize()
+        assert rewritten, s.counters()
+        assert s.counters()["leases_copied"] - before == TOP_K
+        assert s.keep.item() == 1.0, (s.counters(), s.stats())
+        _check(s, experts, snapshot)
+        assert held_after_dma, "the leases dropped before CW ran"
+    finally:
+        for n in s.names:
+            s.slabs[s.row][n].copy_(originals[n])
+        s.close()

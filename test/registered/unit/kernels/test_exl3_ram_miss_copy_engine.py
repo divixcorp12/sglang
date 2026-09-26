@@ -222,3 +222,139 @@ def test_the_lane_request_carries_the_destination_slots_and_the_flag(tmp_path):
         assert host.lease_header()["copy_offset"] == host.lease_layout.copy_offset
     finally:
         host.stop()
+
+
+# ---- SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy wait reads the small tensors, the lease waits for it ----
+
+
+def _sm_copy_engine(s, host):
+    """As _copy_engine, with the row's small (non-trellis) entries left to the copy wait's SM reads."""
+    from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
+
+    host.enable_copy_engine(-1, spin_us=200)
+    names = list(s.slabs[ROW])
+    dst = {name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for name, slab in s.slabs[ROW].items()}
+    table = torch.tensor(
+        [[slab.data_ptr(), dst[name].data_ptr(), slab[0].numel() * slab.element_size()] for name, slab in s.slabs[ROW].items()],
+        dtype=torch.int64,
+    )
+    mask = sm_copy_mask(names)
+    host.set_copy_table(ROW, table, DST_ROWS, sm_mask=mask)
+    host.arm_copy_engine()
+    sm_names = [n for i, n in enumerate(names) if mask >> i & 1]
+    return dst, sm_names, [n for n in names if n not in sm_names]
+
+
+def _until(predicate, timeout_s=5.0):
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.002)
+    return False
+
+
+def test_the_sm_mask_leaves_exactly_the_trellis_tensors_on_the_copy_engine():
+    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+    from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
+
+    assert list(EXL3_STREAMED_NAMES) == ["w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh"]
+    assert sm_copy_mask(EXL3_STREAMED_NAMES) == 0b110110
+
+
+def test_sm_entries_skip_the_dma_and_the_lease_holds_until_the_copy_wait_acknowledges_its_reads(tmp_path):
+    """The DMA copies only the trellis tensors; CopyDone is published on its completion, but the lease is released only
+    once the copy wait has acknowledged its SM reads of the slot. Mutant: release the lease on the DMA's completion
+    alone -- red on the held lease and the sentinel below."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        dst, sm_names, dma_names = _sm_copy_engine(s, host)
+        assert len(sm_names) == 4 and len(dma_names) == 2
+        _load(sim, host, [3])
+        slot = _slot_of(host, 3)
+        original = {n: s.slabs[ROW][n][slot].clone() for n in dst}
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1 and sim.row_result(req, 0)["tag"] == lease.COPYING
+
+        host.copy_engine_release(-1)
+        assert _until(lambda: sim.copy_done(req) == (lease.COPIED, req.gen, 1)), "CopyDone never published"
+        assert all(torch.equal(dst[n][2].view(torch.uint8), original[n].view(torch.uint8)) for n in dma_names)
+        assert not any(dst[n][2].view(torch.uint8).any() for n in sm_names), "the copy engine copied an SM entry"
+
+        time.sleep(0.05)  # the copy thread has had every chance to release early
+        assert host.slot_info(ROW)[slot][2] == 1, "the lease was released before the copy wait acknowledged its reads"
+        assert host.lease_entry(req.idx)["lane_state"][0] == 1 and host.lease_entry(req.idx)["active"]
+        assert not host.copy_engine_idle(0.01), "a job awaiting its acknowledgement counts as outstanding"
+
+        sim.sm_fetch(req, dst, sm_names)
+        assert host.copy_engine_idle(5.0)
+        assert host.slot_info(ROW)[slot][2] == 0 and host.lease_entry(req.idx)["lane_state"][0] == 2
+        assert not host.lease_entry(req.idx)["active"]
+        # Only now may the service rewrite the slot: the destination must keep the bytes read under the lease.
+        for n in dst:
+            s.slabs[ROW][n][slot].view(torch.uint8).fill_(0xAB)
+        assert all(torch.equal(dst[n][2].view(torch.uint8), original[n].view(torch.uint8)) for n in dst)
+        counters = host.counters()
+        assert counters["leases_copied"] == 1 and counters["copy_errors"] == 0 and counters["lease_double_signal"] == 0
+    finally:
+        host.stop()
+
+
+def test_an_acknowledgement_of_an_earlier_generation_releases_nothing_and_a_later_one_releases(tmp_path):
+    """The acknowledgement word is per ring index: a stale one (an earlier request in the same index) must not release,
+    and a later one (the copy wait of a later request ran, so this request's copy wait finished) must."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        dst, sm_names, _ = _sm_copy_engine(s, host)
+        _load(sim, host, [3])
+        slot = _slot_of(host, 3)
+        req = sim.post(ROW, [3], dst=[1], copy_engine=True)
+        assert host.pump() == 1
+        host.copy_engine_release(-1)
+        assert _until(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
+        sim.sm_ack(req, generation=req.gen - 16)
+        time.sleep(0.05)
+        assert host.slot_info(ROW)[slot][2] == 1, "a stale acknowledgement released the lease"
+        sim.sm_ack(req, generation=req.gen + 16)
+        assert host.copy_engine_idle(5.0) and host.slot_info(ROW)[slot][2] == 0
+    finally:
+        host.stop()
+
+
+def test_a_copy_in_flight_under_sm_reads_keeps_its_slot_from_being_a_victim_until_the_acknowledgement(tmp_path):
+    """Victim reuse at the SM step: the DMA has completed, the copy wait has not read yet. A demand that could only
+    evict that slot defers until the acknowledgement, and the destination holds the pre-eviction bytes."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        dst, sm_names, _ = _sm_copy_engine(s, host)
+        _load(sim, host, [0, 1, 2, 3])
+        slot = _slot_of(host, 3)
+        expected = {n: s.slabs[ROW][n][slot].clone() for n in dst}
+        req = sim.post(ROW, [3], dst=[4], copy_engine=True)
+        assert host.pump() == 1
+        host.copy_engine_release(-1)
+        assert _until(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
+        demand = sim.post(ROW, [4], protect=[0, 1, 2, 4])
+        assert host.pump() == 0 and page_word(page, "demand_done") == req.seq, "a slot under SM reads was evicted"
+        sim.sm_fetch(req, dst, sm_names)
+        assert host.copy_engine_idle(5.0)
+        assert all(torch.equal(dst[n][4].view(torch.uint8), expected[n].view(torch.uint8)) for n in dst)
+        assert host.pump() == 1 and page_word(page, "demand_done") == demand.seq
+        assert _slot_of(host, 4) == slot
+    finally:
+        host.stop()
+
+
+def test_sm_small_copies_are_refused_without_the_copy_engine():
+    import msgspec
+
+    from sglang.srt.dsv41_config import Dsv41Config
+    from sglang.srt.layers.moe.exl3_ram_miss import check_sm_small_copies
+
+    base = Dsv41Config.from_envs()
+    check_sm_small_copies(base)  # off: nothing to check
+    with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"):
+        check_sm_small_copies(msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True))
+    check_sm_small_copies(
+        msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True, enable_ram_miss_copy_engine=True)
+    )

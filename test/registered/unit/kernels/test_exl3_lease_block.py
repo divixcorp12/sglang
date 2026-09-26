@@ -15,7 +15,8 @@ def test_the_areas_are_where_the_protocol_puts_them():
     assert lease.LANE_REQUEST_BYTES == 128, "ABI 3: expert[8], dst_slot[8] and flags after the 16-byte head"
     assert (lease.LANE_REQUEST, lease.LANE_ACK, lease.TERMINAL) == (0, 0x800, 0xC00)
     assert lease.STREAM_PROBE == 0xD00, "StreamProbe[16] (piece streaming) follows Terminal[16] at 16 bytes each"
-    assert lease.AREA_D_BYTES == 0xD80
+    assert lease.SM_ACK == 0xD80, "SmAck[16] (the copy wait's SM reads) follows StreamProbe[16] at 8 bytes each"
+    assert lease.AREA_D_BYTES == 0xE00
 
 
 def test_service_written_and_device_written_words_never_share_a_128_byte_line():
