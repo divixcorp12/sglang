@@ -4138,10 +4138,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    for chunks the fill did not claim (§27.13), ~0.5 s Python and launches, and ~0.2 s `pthread_cond_wait`.
    Copying landed rows first (§27.13) is correct but moved nothing.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
-9. **Prefill indexer score cap: measured, payoff positive, not in the recipe (§27.7).** A 128 MB cap frees ~3.0 GiB
-   at 30k/32k and removes the OOM retries. Spent on 3 GiB more hot cache (mem-fraction 0.925): 110.1 -> 103.0
-   ms/token, output identical, 116 MB/step fewer RAM-hit copies. Merged at `c08f5484c9`, default off. Adopting it
-   needs `base_env()` and production's mem-fraction changed.
+9. **Prefill indexer score cap: done, in the recipe since `24bbd3baab` (§27.7).** A 128 MB cap frees ~3.0 GiB at
+   30k/32k and removes the OOM retries. Spent on 3 GiB more hot cache (mem-fraction 0.925): 110.1 -> 103.0 ms/token,
+   output identical, 116 MB/step fewer RAM-hit copies. Open: a 30k-32k prompt at these settings (~0.5 GiB headroom).
 10. **Decode RAM-miss frontend (W1/C1/A1): sized, no-go (§27.15).** At most 0.41 ms/step to gain; neither
     `HIT_WAIT_US=0` nor a reset-only frontend was built or run. Resident-first stays shelved: with real copies,
     overlap saves 10-13 us/layer against a 25 us bar,
@@ -4284,8 +4283,9 @@ slots).
   Decoded with a divix01 copy of `pcie-trace/pcie_decode.py` that takes its reports as arguments
   (`/mnt/nvme1/indexer-cap/pcie_decode_args.py`, output `payoff-pcie.txt`). Its step windows differ from §27.14's
   steady-step selection, so compare states within this table, not against §27.14's.
-- **Not yet in the recipe.** Adopting it changes `base_env()` (the two flags) and production's
-  `--mem-fraction-static` (0.83 -> 0.925).
+- **In the recipe since `24bbd3baab`:** `base_env()` carries both flags and `arm_env.MEM_FRACTION_STATIC` is 0.925,
+  so `launch_prod.sh` and every arm use them. Not checked at these settings: a 30k-32k prompt, where the smokes
+  (at 0.83) left ~3.5 GiB and this leaves ~0.5 GiB.
 
 **To resume.**
 - Driver: `analysis/dsv41-drive/indexer-cap/drive_peaks.sh <worktree> <budget_mb>` runs 30000 then 32000 tokens, each
