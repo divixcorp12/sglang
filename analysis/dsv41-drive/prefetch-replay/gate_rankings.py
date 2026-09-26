@@ -17,6 +17,7 @@ Usage: gate_rankings.py STAGES_JSONL ROUTER_PREFIX MODEL_DIR --out rank.npz [--h
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -31,6 +32,34 @@ import router_score  # noqa: E402
 import tier_sim  # noqa: E402
 
 
+def read_tensor(path: str, name: str) -> torch.Tensor:
+    """One tensor of a safetensors shard as fp32, read by byte range (safe_open maps the whole multi-GB shard,
+    which a ``ulimit -v`` run cannot afford)."""
+    import struct
+
+    dtypes = {"BF16": np.uint16, "F32": np.float32, "F16": np.float16}
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        meta = json.loads(f.read(n))[name]
+        start, end = meta["data_offsets"]
+        f.seek(8 + n + start)
+        raw = np.frombuffer(f.read(end - start), dtype=dtypes[meta["dtype"]]).reshape(meta["shape"])
+    if meta["dtype"] == "BF16":
+        raw = router_score.bf16_to_f32(raw)
+    return torch.from_numpy(np.ascontiguousarray(raw, dtype=np.float32))
+
+
+def load_gates(model_path: str, layer_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """As router_score.load_gates: ``W`` [layers, 384, hidden] and ``bias`` [layers, 384], fp32."""
+    with open(os.path.join(model_path, "model.safetensors.index.json")) as f:
+        where = json.load(f)["weight_map"]
+    pairs = [
+        [read_tensor(os.path.join(model_path, where[n]), n) for n in (f"layers.{i}.ffn.gate.weight", f"layers.{i}.ffn.gate.bias")]
+        for i in layer_ids
+    ]
+    return torch.stack([w for w, _ in pairs]), torch.stack([b for _, b in pairs])
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("stages")
@@ -42,8 +71,7 @@ def main() -> None:
     a = p.parse_args()
 
     capture = router_score.load_capture(a.router_prefix)
-    # Gates first: safetensors maps whole shard files, which must not coexist with the loaded trace under ulimit -v.
-    W, bias = router_score.load_gates(a.model, capture.header["layer_ids"])
+    W, bias = load_gates(a.model, capture.header["layer_ids"])
     loaded = tier_sim.load_forwards(a.stages)
     stream = prefetch_sim.decode_stream(loaded)
     if stream.layers != capture.header["layer_ids"]:
