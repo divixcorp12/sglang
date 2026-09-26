@@ -4134,7 +4134,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    for each chunk's gather before launching its compute: TTFT 12.6 → 9.9 s and 11.5 → 9.2 s, outputs identical,
    prefill GPU idle 49% → 29%. Then the split fill gather (§27.12, behind
    `SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER`): TTFT 9.9 → 8.6 s and 9.2 → 8.2 s, outputs identical, prefill GPU
-   idle 29% → 21%. Left: 1.76 s of GPU idle, of which 0.71 s is later-chunk fill waits and 0.73 s Python and launches.
+   idle 29% → 21%. In the recipe since `e0bd452bf6`. Left: 1.76 s of GPU idle, of which ~0.99 s is demand reads
+   for chunks the fill did not claim (§27.13), ~0.5 s Python and launches, and ~0.2 s `pthread_cond_wait`.
+   Copying landed rows first (§27.13) is correct but moved nothing.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
    cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
@@ -4636,7 +4638,10 @@ The `_splits` mutant first survived every test. The CUDA refusal test (`9a26ec89
 
 - The first-chunk wait fell by 1.0 s, as §27.11 estimated. Only 5 of 40 first chunks still wait: those whose resident
   rows gather faster than their fills land.
-- The later-chunk waits did not move. Those chunks' resident rows are too few to cover their fills.
+- The later-chunk waits did not move. **Correction (§27.13):** they are not fill waits at all. Each is a demand read
+  (`ensure_rows` → `_fill_rows`, one `pthread_create` + `pthread_join`) for a chunk the layer's fill did not claim.
+  `idle_by_host_state.py` matches only the plain gather kernel, so it misreads split traces;
+  `analysis/dsv41-drive/split-gather/fill_waits.py` replaces it for them.
 - The gather's own time is unchanged, which is the link floor. The extra launches add ~0.5% of eager kernels
   (108,450 → 110,508).
 
@@ -4652,11 +4657,10 @@ The `_splits` mutant first survived every test. The CUDA refusal test (`9a26ec89
 - `analysis/dsv41-drive/split-gather/drive_arms.sh` now passes that placement to its traced arm.
 
 **What remains** (§27.4 item 7):
-- **Later-chunk fill waits, 714 ms.** Copying each filled row as it lands, not after the chunk's last fill, needs a poll
-  of `fill_landed` and more launches.
+- **Later-chunk waits, 714 ms:** demand reads, not fills (§27.13).
 - **Python and launches, 729 ms.** Not yet attributed.
 - **Starting a layer's fills before its routing is known** needs a predictor (Track B, §25.4).
-- **Production** still runs without the flag. Adding it to `arm_env.base_env()` is a separate, asked-for change.
+- **Production:** the flag is in `arm_env.base_env()` since `e0bd452bf6`.
 
 **Evidence** (divix01):
 - Runs: `cc-expert-prediction/dsv41-baseline/servers/split-gather-{A,B}/run-20260926-01*/` and
@@ -4664,6 +4668,133 @@ The `_splits` mutant first survived every test. The CUDA refusal test (`9a26ec89
 - Trace: `/mnt/nvme1/dsv41-nsys/split-gather-B-node-20260926-014247{.nsys-rep,.sqlite}`.
 - Analyses: `/mnt/nvme1/prefill-opt/{idle-split.txt,compare-split.txt,arm-table-split.txt,mutants-split.txt,
   mutants-split-4.txt,node0-sample.log,suite-split{tip,base}.log}`.
+
+### 27.13 Split gather: landed rows first; the later-chunk waits are demand reads (result, 2026-09-26)
+
+Review minors 4 and 5 of §27.12. Same flag, `SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER`; no new knob.
+
+**What changed** (`a8e0fb6bc2` red tests, `ec9dbda80f` implementation, `96ef745220` and `35083933b5` analysis):
+- `RamTier::fill_landed()` returns how many claimed rows have landed, without blocking. It is exposed through the
+  binding, `NativePinnedSlotTable` and the `PinnedRowFills` protocol.
+- A chunk copies its resident and already-landed rows first. It then waits for its filling rows eight at a time (the
+  reader's batch) and copies each batch as it lands.
+- One host-to-device index tensor per chunk (`ready + filling`), sliced for each copy. `slots[rows]` is computed once
+  per copy, not per tensor.
+- Failures still surface at the wait: the real `fill_wait` binding raises on failure or timeout.
+- **Pre-existing, unchanged:** the landed count is published during a read without the `_mm_sfence()` the end of
+  the fill uses. `fill_wait` has always relied on this; `fill_landed` inherits it.
+
+**Tests** (divix01, private worktree; logs in `/mnt/nvme1/split-landed/`):
+- CPU, `test_expert_pinned_row_fills.py` + `test_exl3_ram_miss_prefill_fills.py`: 5 failed / 30 passed at the red
+  commit, 35 passed after.
+- GPU: `test_expert_plugins_cuda.py`, `test_expert_pinned_row_fills.py`, `test/manual/dsv41/test_exl3_stream_apply_gpu.py`:
+  47 passed, flag unset and set. The CUDA one-index-copy test was red first (waits `[8, 16, 18]` against `[18]`).
+- Registered suite, `pytest -q -p no:randomly test/registered/unit/kernels` under the GPU lock: base `ca74e5391a`
+  1725 passed, 1 skipped, 2 failed (the two red kernel tests); tip 1727 passed, 1 skipped.
+
+**Mutants** (all caught; worktree clean after; baseline green again, CPU 35 and GPU 15):
+
+| Mutant | Caught by |
+|---|---|
+| Landed rows count as filling (`fill_landed` ignored) | `test_a_row_that_landed_in_an_earlier_chunks_wait_is_copied_before_the_next_wait`, `test_rows_the_reader_landed_before_the_chunk_are_copied_before_its_wait` |
+| Wait for every filling row before the first filled copy | `test_a_chunks_filling_rows_are_copied_batch_by_batch_as_they_land` |
+| Copy the whole filling rest after the first batch wait | the same |
+| Filling rows left in chunk order, not claim order | `test_split_gather_places_every_chunks_rows_like_the_unsplit_gather` |
+| Filling rows copied from a second host-to-device index | `test_a_split_chunk_copies_its_row_index_to_the_device_once` |
+| `fill_landed` reports nothing landed | `test_fill_landed_reports_the_landed_prefix_without_blocking` |
+
+**Arms** (A = base `ca74e5391a`, B = tip `ec9dbda80f`, same recipe, once each):
+
+| | A | B | B, traced |
+|---|---:|---:|---:|
+| TTFT, session 0 | 8.61 s | 8.52 s | 8.69 s |
+| TTFT, session 1 | 8.21 s | 8.23 s | 8.43 s |
+| Decode, pooled client ms/token | 113.9 | 114.2 | 116.8 |
+| Output | | identical to A | identical to A |
+
+**Why nothing moved: the 714 ms was never a fill wait.** `fill_waits.py` classifies every wait before a gather copy,
+indexed copies included, and joins the host thread's OS-runtime calls:
+
+| GPU idle by host OS call | Split (§27.12 trace) | + landed first |
+|---|---:|---:|
+| `pthread_join` (demand reads: `ensure_rows` → `_fill_rows`) | 989 ms | 990 ms |
+| No OS call (Python, launches) | 500 ms | 634 ms |
+| `pthread_cond_wait` | 216 ms | 217 ms |
+| `nanosleep` (`fill_wait` polling) | 47 ms | 13 ms |
+| Total GPU idle | 1,756 ms | 1,859 ms |
+| Prefill wall | 8,300 ms | 8,413 ms |
+
+- **Split trace, by wait** (121 chunks, 40 first-of-layer):
+  - first chunks: 3 unsplit waits cost 265 ms of GPU idle; 37 split waits total 985 ms of waiting but only 43 ms of
+    GPU idle, which the split hides;
+  - later chunks: 14 unsplit waits, 735 ms, all GPU idle.
+- The later-chunk waits are whole chunks (41–60 rows each) read on demand. They come from layers cold in the pinned
+  tier: the layer's fill stops claiming at the prefill share, so each later chunk's misses are read in one blocking
+  `_fill_rows` with nothing queued on the GPU. Examples: layer 0's chunks 1–4, 6–8 and chunks 50–52, 63–66.
+- The review's "count already waited" fix could not help. Chunks and claims both run in ascending expert order, so a
+  later chunk never holds rows an earlier wait covered.
+- The after-trace's 454 ms of later-chunk waits (against 735) is run-to-run: the same cold chunks take the same time,
+  and that run had 3 fewer of them. The rise in Python and launches is unexplained in one traced run.
+
+**Next prefill lever: ~1 s of demand-read joins.** Either claim past the prefill share, or start chunk k+1's demand
+reads while chunk k computes. Per-layer pinned room limits both.
+
+**Evidence** (divix01):
+- Trace: `/mnt/nvme1/dsv41-nsys/split-landed-B-node-20260926-025931.sqlite`.
+- Analyses: `/mnt/nvme1/split-landed/{fill-waits-before.txt,fill-waits-after.txt,idle-osrt.txt,compare.txt,
+  arm-table.txt,mutants-landed.txt,suite-base.log,suite-tip.log}`.
+
+### 27.14 Decode link losses, async promotions and pinned-tier prefetch (studies, 2026-09-26)
+
+**Link losses in decode** (trace `prod-flags-node`, steady steps 22–109; `divix01:/mnt/nvme1/prefill-opt/link-idle/`):
+
+| Link state | ms/step | Link rate |
+|---|---:|---:|
+| Copying, GPU in CW | 55.0 | 13.62 GB/s |
+| Copying, GPU in S | 24.2 | 12.79 GB/s |
+| No copy, GPU in S (NVMe waits) | 16.9 | 7.9 GB/s |
+| No copy, compute | 14.6 (+2.6 idle, +0.65 other waits) | 0.9 GB/s |
+
+- **Per copy on stream 141**, 50,448 copies:
+  - 16,816 large ones (8.8 and 4.4 MB) carry 99.7% of the bytes; 73% of them run at 12–13.75 GB/s.
+  - The other 27% run at 10.8–12 GB/s while `exl3_ram_miss_lease_stream_kernel` runs. The link is then ~96% full
+    (13.2 GB/s, 2.5 GB/s of it the kernel's SM reads), so the true loss is ~0.8 ms/step.
+  - 33,632 small ones (4.6–20 KB, four per row) run at 1.5–5 GB/s.
+- **Small segments:** 1.06 ms/step of copy time plus 0.62 ms/step of gaps inside rows, an upper bound of
+  1.44 ms/token. Every layer's last copy is a small one and CW ends ~4.5 µs after it, so 0.66 ms/token is on the
+  critical path.
+- **Idle gaps:** gaps of 1 ms or more total 20.0 ms/step, all between layers: 69% in S, 21% in compute.
+  S totals 41.1 ms/step (steady). By layer: L0 2.70 (median 1.33), L19 2.11, L39 2.05, L23 1.96, L13 1.67; the others
+  are rare stalls with medians of 0.08–0.09 ms.
+
+**Merging a row's copies** (investigation; `divix01:/mnt/nvme1/coalesce/`):
+- The six copies per row are per tensor, not deliberate chunking. `CopyEngine::issue`
+  (`exl3_ram_miss_host.cpp:3398-3405`) makes one `cuMemcpyAsync` per `ExpertRowSegments` entry, and both the pinned
+  slabs and the hot cache store rows name-major.
+- `cuMemcpyBatchAsync` gains nothing at 1–3 rows per layer.
+- One copy per row saves ~7–8 µs/row alone (~0.55 ms/token) but needs a slab layout redesign across the C++ reader,
+  two CUDA kernels and several Python consumers.
+- In progress: the copy-wait kernel fetches the four small tensors (44.5 KB/row) with SM loads, and the lease is
+  released after both the large copies and those reads.
+
+**Async hot-cache promotions: no-go.**
+- The synchronous path the EXL3 gate named (`ExpertHotCache._load_reserved_in_chunks`) never runs in the recipe.
+  `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` with insert-on-miss stage 2 ranks victims in-graph, and the gather writes missed
+  rows straight into them.
+- The whole cost is ~0.35–0.4 ms/step of in-graph kernels (`direct_commit_gather_kernel` 235 µs,
+  `direct_gather_destinations_kernel` 81 µs), with no host syncs. These stay on the critical path whenever promotion
+  runs.
+- §18.6's old ~3.6 ms/token was removed by the in-graph path. `6512709f1a` corrects the gate's refusal message.
+
+**NVMe → pinned-tier prefetch: no-go.** Full write-up: `NVME_PINNED_PREFETCH_HANDOFF.md`; code:
+`analysis/dsv41-drive/prefetch-replay/`.
+- A whole next layer is 384 × 13.3 MB = 5.11 GB, 0.68–0.85 s at the mirrors' 6–7.5 GB/s, against ~2.75 ms per layer:
+  250–310× too slow.
+- A missed row still crosses the link. Prefetch removes only the NVMe wait beyond the layer's link-bound time,
+  ~6.2 ms/token in a replay calibrated to 11.33 RAM misses/token (11.265 measured).
+- Best realistic predictor, layer T+1's gate on layer T's input: precision 0.40 on not-in-RAM rows, **~2 ms/token**.
+- Perfect prediction saves 6.2 ms/token. Next-token and frequency predictors, and anything for layer 0, gain nothing.
+- Demand reads must outrank speculative ones; FIFO turns most arms negative.
 
 ## Sources
 
