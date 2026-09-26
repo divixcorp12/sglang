@@ -1955,6 +1955,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Byte cap (MiB) on one bf16 [rows, heads, visible] score chunk of that torch
+    # prefill indexer; the chunk's transient peaks at ~3x this. Rows are scored
+    # independently, so any cap gives the same top-k. 0 keeps the built-in 1 GiB.
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB = EnvInt(0)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
