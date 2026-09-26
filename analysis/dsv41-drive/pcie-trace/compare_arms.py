@@ -155,24 +155,29 @@ def pcie_rx(main, pcie, lo, hi):
     return off, (statistics.mean(vals) if vals else float("nan")), len(vals)
 
 
-for arg in sys.argv[1:]:
-    name, paths = arg.split("=", 1)
-    main_path, *rest = paths.split(",")
-    db = connect(main_path)
-    p0, d0 = windows(db)
-    print(f"===== {name}: prefill {p0 / 1e9:.3f}-{d0 / 1e9:.3f} s")
-    pre, top = prefill_report(db, p0, d0)
-    for k, v in pre.items():
-        print(f"  prefill {k}: {v if not isinstance(v, float) else round(v, 1)}")
-    print("  prefill top kernels (name, count, ms):")
-    for n, c, t in top:
-        print(f"    {t:9.1f} ms {c:7d}  {n[:70]}")
-    dec, starts = decode_report(db, d0)
-    for k, v in dec.items():
-        print(f"  decode {k}: {v}")
-    if rest:
-        pc = connect(rest[0])
-        off, rx, n = pcie_rx(db, pc, p0, d0)
-        print(f"  PCIe RX over prefill: mean {rx:.1f}% ({n} samples; offset {off / 1e6:.1f} ms)")
-        off, rx, n = pcie_rx(db, pc, starts[15], starts[-1])
-        print(f"  PCIe RX over decode steps 15+: mean {rx:.1f}% ({n} samples)")
+def main():
+    for arg in sys.argv[1:]:
+        name, paths = arg.split("=", 1)
+        main_path, *rest = paths.split(",")
+        db = connect(main_path)
+        p0, d0 = windows(db)
+        print(f"===== {name}: prefill {p0 / 1e9:.3f}-{d0 / 1e9:.3f} s")
+        pre, top = prefill_report(db, p0, d0)
+        for k, v in pre.items():
+            print(f"  prefill {k}: {v if not isinstance(v, float) else round(v, 1)}")
+        print("  prefill top kernels (name, count, ms):")
+        for n, c, t in top:
+            print(f"    {t:9.1f} ms {c:7d}  {n[:70]}")
+        dec, starts = decode_report(db, d0)
+        for k, v in dec.items():
+            print(f"  decode {k}: {v}")
+        if rest:
+            pc = connect(rest[0])
+            off, rx, n = pcie_rx(db, pc, p0, d0)
+            print(f"  PCIe RX over prefill: mean {rx:.1f}% ({n} samples; offset {off / 1e6:.1f} ms)")
+            off, rx, n = pcie_rx(db, pc, starts[15], starts[-1])
+            print(f"  PCIe RX over decode steps 15+: mean {rx:.1f}% ({n} samples)")
+
+
+if __name__ == "__main__":
+    main()
