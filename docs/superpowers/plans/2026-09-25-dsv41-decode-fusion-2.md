@@ -104,4 +104,92 @@ rows (`x.shape[0] == 1`) on the gemv path. With the flag off no new code runs.
 
 ## 6. Results
 
-(filled in below as the work lands)
+Code at `cc7620a247` (branch `dsv41-decode-fusion-2-rebased`, on `origin/master` `01e0a6ea7f`). Evidence:
+`divix01:/data/models/slang/nvfp4-work/decode-fusion-2/` (logs) and `/mnt/nvme1/decode-fusion-2/` (traces, metrics).
+
+**Result.** F1-F4 remove **358 kernels per step** (2,676 -> 2,318, node mode, copy engine off) and are
+**byte-identical**: every kernel and chain matches the unfused bits, and the arms' outputs are 2 of 2 identical. The
+arms measure **112.4 -> 111.8 ms/token pooled (-0.6)**, in line with the ~0.3-0.4 ms estimate but inside two-session
+noise (sign test p = 0.75).
+
+### 6.1 Tests
+
+GPU runs use `run_gpu_tests.sh` (`PYTHONPATH=$WT/python`, `taskset -c 32-63`, under `cc-gpu.lock`, exit code read
+from pytest itself): `pytest -q -p no:randomly -rfE <files>`.
+
+| Run | Result |
+|---|---|
+| CPU: `test_exl3_cast_fusion_cpu.py test_exl3_ops_cpu.py test_dsv41_config.py` (`taskset -c 0-63`) | 18 passed, EXIT 0 |
+| GPU parity: `test_dsv41_cast_fusion_gpu.py` (`parity3.log`) | 54 passed, EXIT 0 |
+| GPU parity + apply: `test_exl3_graph_apply_gpu.py test_dsv41_cast_fusion_gpu.py`, flag on (`apply_on.log`) | 57 passed, EXIT 0 |
+| Integration, flag on / off (`integ_on.log`, `integ_off.log`): `test_exl3_ram_miss_graph_gpu.py test_exl3_graph_apply_gpu.py test_moe_side_stream_gpu.py test_exl3_task5_item4_gpu.py test_dsv41_layer_fusion_gpu.py test_exl3_method_gpu.py test_exl3_ops_gpu.py test_exl3_moe_split_parity_cuda.py` | 188 passed both ways, EXIT 0 |
+| `native-prefetch/gpu_suite.sh`, flag exported (`gpu_suite_on.log`) | 1956 passed, 2 failed, 1 error, EXIT 1: all three below are not this change |
+
+The suite's three non-passes:
+
+- `test_defaults_match_the_env_declarations` asserts the defaults, and the suite ran with the flag exported. It passes
+  without it (CPU row above).
+- `test_graph_routes_are_logged_only_when_the_stage_trace_is_on[trace_on]` is the pre-existing error recorded in the
+  layer-fusion plan §3.
+- `test_work_queued_behind_the_graph_on_other_streams_does_not_hold_the_copy_back[kernel]` is a race that is already
+  on master. Its first replay hits the 2 s RAM-miss deadline, the lazy-load stall of LEASE_PROTOCOL 7.6. Run alone
+  12 times at each commit, it fails 2 of 12 at the merge base `01e0a6ea7f` and 2 of 12 at `cc7620a247`
+  (`ce_rep_*.log`).
+
+**Graph capture.** The parity file captures the whole fused chain in a CUDA graph and asserts **0 host nodes**. It
+then replays 8 new input sets bit-identically: `hc_combine_norm_half` + publish, wq_a, wkv, the shared expert, and the
+scale.
+
+**Mutants**, run in a throwaway worktree, then reverted and removed:
+
+- Four together (`mutant_parity.log`): silu's fp16 output skips the bf16 rounding; the scale skips the bf16 rounding;
+  the fp16 copy of `hc_combine_norm` is rounded from fp32; `take` ignores `_version`. They fail 37 of 54 parity
+  cases, and every mutant is caught.
+- The routed output scaled x2 survived the integration files (160 passed, `mutant_integ_on.log`), because they call
+  `_apply_graph` directly. `test_apply_casts_and_scales_bit_identically_with_the_cast_fusion_flag` was added for it
+  and catches it (`mutant_apply.log`).
+
+### 6.2 Kernels per step
+
+`kernel_groups.py` over the node-mode traces `df2-node-{A,B}` (copy engine off, 110 steps each, counts exact):
+
+| Group | Flag off | Flag on |
+|---|---:|---:|
+| cast before an EXL3 gemv | 283 | 85 |
+| cast after an EXL3 gemv | 283 | 203 |
+| shared expert `cat` / silu | 80 | 40 |
+| MoE combine | 120 | 80 |
+| everything else | 1,910 | 1,910 |
+| **total** | **2,676** | **2,318** |
+
+The design removes 200 input casts; 198 are gone. For the other two, a linear's input was not the published tensor,
+so it cast for itself, which is the safe path.
+
+### 6.3 Arms
+
+Arms ran on port 30021, A then B once each, under `rowimg-disk.lock`, `EXPECT_SHA=cc7620a247`. The python tree was
+registered as `decode-fusion-2-cc7620a247`. Driver: `decode-fusion-2/drive_arms.sh`. One other agent's job ran
+between A and B.
+
+| | A: flag off | B: flag on |
+|---|---:|---:|
+| pooled ms/token | 112.4 | **111.8** |
+| 103-token session ms/token | 110.9 | 110.2 |
+| 7-token session ms/token | 138.6 | 139.0 |
+| gap p50 / p90, pooled (ms) | 111.3 / 148.6 | 110.4 / 147.7 |
+| TTFT mean (s) | 19.81 | 19.42 |
+| stalls >= 0.5 s | 0 | 0 |
+| outputs vs the other arm | | 2 of 2 byte-identical |
+
+- **Verdicts:** both arms are valid except the acknowledged step-latency gap.
+- **Clocks:** A 2955 MHz; B 2970/2962 MHz.
+- **Paired comparison:** `paired.py` gives B 1 of 2 sessions, ratio median 1.002, p = 0.75.
+- **Commands:** `paired.py $A $B` and `arm_metrics.py A=$A B=$B`.
+
+## 7. Left undone
+
+- F5-F7 (wq_b's and wkv's output casts into the rope and k-norm kernels, wo_b's into the mHC post): 3 more kernels
+  per layer, each needing a variant of a numerics-bearing kernel. Worth ~0.1 ms/token each at the measured rate.
+- The remaining small kernels are not glue. They are attention metadata and norms, the mHC reductions (which cannot
+  be fused bit-exactly), and the RAM-miss chain (other lanes). A further round has at most ~1 ms/token to find.
+- `arm_env` is unchanged. Turning the flag on there is a decision for the next measurement lane.
