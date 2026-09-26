@@ -388,6 +388,50 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     assert torch.equal(got, want)
 
 
+
+def _constant_linear(x, t, out_dtype=None):
+    """Ignores its input: every row is svh[0] * 2**14, so each expert adds an exact constant through w2."""
+    value = float(t.svh.reshape(-1)[0]) * 2**14
+    return torch.full((x.shape[0], t.svh.numel()), value, dtype=out_dtype or x.dtype)
+
+
+@pytest.mark.parametrize("route_plan", [False, True])
+def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch, route_plan):
+    """Experts 0, 1, 2 add 2**24, 1 and -2**24 in fp32: ascending order gives 0, any other order gives 1 or more,
+    which survives the bf16 cast. Every other parity test is blind to the order at bf16."""
+    reference, w13, w2 = _reference(ckpt, 1)
+    for expert, svh0 in ((0, 1024.0), (1, 2.0**-14), (2, -1024.0)):
+        reference["w2_svh"][expert, 0, 0] = svh0
+        w2[expert].svh[0] = svh0
+    monkeypatch.setattr(
+        exl3_mod, "exl3_moe_accumulate",
+        functools.partial(exl3_ops.exl3_moe_accumulate, linear=_constant_linear),
+    )
+    monkeypatch.setattr(
+        exl3_mod, "exl3_moe_accumulate_planned",
+        functools.partial(exl3_ops.exl3_moe_accumulate_planned, linear=_constant_linear),
+    )
+    trace = Exl3StreamTrace()
+    monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
+    with (
+        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
+        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
+    ):
+        method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
+        layer = _layer(method)
+    streamer = FakeStreamer(reference, 64)
+    layer._nvfp4_expert_streamer = streamer
+    layer.should_fuse_routed_scaling_factor_in_topk = False
+    method.moe_runner_config = types.SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+    )
+    topk_ids = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+    x, topk_weights, dispatch = _routed_inputs(topk_ids)
+    got = method.apply(layer, dispatch).hidden_states
+    want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_constant_linear)
+    assert float(got[0, 0]) == 0.0
+    assert torch.equal(got, want)
+
 def test_route_plan_all_dropped_routes_give_zeros(ckpt, monkeypatch):
     """Every route -1: no chunk is gathered and the output is zeros, as with the flag off."""
     reference, _, _ = _reference(ckpt, 1)
