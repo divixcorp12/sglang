@@ -455,9 +455,16 @@ class ExpertPinnedHostCache:
 
     @_host_use
     def copy_rows(
-        self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
+        self,
+        source_ids: torch.Tensor,
+        outputs: dict[str, torch.Tensor],
+        rows: torch.Tensor | None = None,
     ) -> bool:
-        """Gather resident pinned rows directly into CUDA (or, on a CPU tier, CPU) outputs."""
+        """Gather resident pinned rows directly into CUDA (or, on a CPU tier, CPU) outputs.
+
+        ``rows`` limits the copy to those output rows (int64, on ``source_ids``' device), each from ``source_ids`` at
+        the same position; other rows are left as they are, and the non-contiguous fallback refuses it.
+        """
         if source_ids.numel() == 0:
             return False
         slots = self.expert_to_slot[source_ids.long()]
@@ -466,19 +473,34 @@ class ExpertPinnedHostCache:
             source = self.tensors[name]
             output = outputs[name]
             if output.device.type == "cpu":
-                torch.index_select(source, 0, slots.cpu(), out=output)
+                if rows is None:
+                    torch.index_select(source, 0, slots.cpu(), out=output)
+                else:
+                    output[rows.cpu()] = torch.index_select(source, 0, slots[rows].cpu())
             elif source.is_contiguous() and output.is_contiguous():
                 row_bytes = source.numel() * source.element_size() // self.capacity
-                _gather_host_rows_kernel[
-                    (source_ids.numel(), triton.cdiv(row_bytes, 1024))
-                ](
-                    source.view(torch.uint8),
-                    slots,
-                    output.view(torch.uint8),
-                    row_bytes,
-                    BLOCK=1024,
-                )
+                if rows is None:
+                    _gather_host_rows_kernel[
+                        (source_ids.numel(), triton.cdiv(row_bytes, 1024))
+                    ](
+                        source.view(torch.uint8),
+                        slots,
+                        output.view(torch.uint8),
+                        row_bytes,
+                        BLOCK=1024,
+                    )
+                else:
+                    _gather_host_rows_to_kernel[(rows.numel(), triton.cdiv(row_bytes, 1024))](
+                        source.view(torch.uint8),
+                        slots[rows],
+                        rows,
+                        output.view(torch.uint8),
+                        row_bytes,
+                        BLOCK=1024,
+                    )
             else:
+                if rows is not None:
+                    raise ValueError("a copy to named rows needs contiguous pinned rows and outputs")
                 fallback_used = True
                 slots_cpu = _copy_indices_to_cpu(slots, source_ids.numel())
                 host_output = _pinned_staging_buffer(
@@ -708,6 +730,24 @@ def _gather_host_rows_kernel(
         other=0,
     )
     output_row = tl.program_id(0).to(tl.int64)
+    tl.store(output_ptr + output_row * row_bytes + offsets, values, mask=mask)
+
+
+@triton.jit
+def _gather_host_rows_to_kernel(
+    src_ptr,
+    index_ptr,
+    rows_ptr,
+    output_ptr,
+    row_bytes,
+    BLOCK: tl.constexpr,
+):
+    """``_gather_host_rows_kernel`` into chosen output rows: program i copies source row index[i] to row rows[i]."""
+    source_row = tl.load(index_ptr + tl.program_id(0)).to(tl.int64)
+    output_row = tl.load(rows_ptr + tl.program_id(0)).to(tl.int64)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < row_bytes
+    values = tl.load(src_ptr + source_row * row_bytes + offsets, mask=mask, other=0)
     tl.store(output_ptr + output_row * row_bytes + offsets, values, mask=mask)
 
 
