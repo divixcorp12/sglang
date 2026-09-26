@@ -379,6 +379,8 @@ def _victim_sequence(s, steps, seed):
 def test_sm_small_copies_deliver_the_same_six_tensors_as_the_six_copy_path(tmp_path):
     """Sixty steps of sixteen experts through eight pinned slots, host slots evicted and reused, on the six-copy path
     and on the SM path: every snapshot of every tensor must be byte-identical, and equal to the checkpoint's rows."""
+    (tmp_path / "off").mkdir()
+    (tmp_path / "on").mkdir()
     off = StreamService(tmp_path / "off", copy_engine=True)
     try:
         want = _victim_sequence(off, 60, seed=11)
