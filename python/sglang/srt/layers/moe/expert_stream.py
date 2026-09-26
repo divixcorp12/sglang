@@ -262,6 +262,7 @@ class ExpertPinnedHostCache:
         )
         self.stats = PinnedHostCacheStats()
         self.row_fills = row_fills
+        self.split_fill_gather = envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.get()
         # The running prefetch's claim order by expert (fill_wait counts rows in that order); None when none runs.
         self._fill_order: dict[int, int] | None = None
         streamer.pinned_host_cache = self
@@ -453,6 +454,21 @@ class ExpertPinnedHostCache:
             # Only the wait is on this thread: the prefetched rows are read while it gathers.
             self.streamer._record_read(RowReadStats(read_ns=time.perf_counter_ns() - began))
 
+    def _filling_positions(self, chunk_ids: list[int]) -> list[int]:
+        """Positions in ``chunk_ids`` of rows the running prefetch claimed; [] unless splitting."""
+        order = self._fill_order
+        if not self.split_fill_gather or order is None:
+            return []
+        return [i for i, expert_id in enumerate(chunk_ids) if expert_id in order]
+
+    def _splits(self, outputs: dict[str, torch.Tensor]) -> bool:
+        """Whether copy_rows can copy named rows into ``outputs``: never through the non-contiguous fallback."""
+        return all(
+            outputs[name].device.type == "cpu"
+            or (self.tensors[name].is_contiguous() and outputs[name].is_contiguous())
+            for name in self.cached_names
+        )
+
     @_host_use
     def copy_rows(
         self,
@@ -570,8 +586,20 @@ class ExpertPinnedHostCache:
                 name: output[start : start + chunk_rows]
                 for name, output in outputs.items()
             }
-            self._await_fills(chunk_ids)
-            fallback_used = self.copy_rows(chunk, chunk_outputs) or fallback_used
+            filling = self._filling_positions(chunk_ids)
+            if filling and len(filling) < len(chunk_ids) and self._splits(chunk_outputs):
+                # The resident rows' copy runs while the fills land: the same bytes to the same rows, in two
+                # copies. The stream is idle here (the chunk's .item() above), so the row lists cost no wait.
+                filling_set = set(filling)
+                ready = [i for i in range(len(chunk_ids)) if i not in filling_set]
+                ready_rows = torch.tensor(ready, dtype=torch.int64, device=chunk.device)
+                filling_rows = torch.tensor(filling, dtype=torch.int64, device=chunk.device)
+                self.copy_rows(chunk, chunk_outputs, rows=ready_rows)
+                self._await_fills([chunk_ids[i] for i in filling])
+                self.copy_rows(chunk, chunk_outputs, rows=filling_rows)
+            else:
+                self._await_fills(chunk_ids)
+                fallback_used = self.copy_rows(chunk, chunk_outputs) or fallback_used
             start += chunk_rows
         return PinnedGatherResult(
             hit_rows,
