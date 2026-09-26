@@ -33,6 +33,7 @@ CASES = {
     "repeated": torch.tensor([[2, 2, 0], [1, 2, 2], [0, 0, 0]], dtype=torch.int32),
     "dropped": torch.tensor([[-1, 3, -1], [3, -1, 1], [-1, -1, -1]], dtype=torch.int32),
     "all_dropped": torch.full((2, 3), -1, dtype=torch.int32),
+    "int64": torch.tensor([[4, 1, -1], [0, 4, 2]], dtype=torch.int64),
 }
 
 

@@ -258,7 +258,8 @@ class Exl3RoutePlan(msgspec.Struct, frozen=True):
     @classmethod
     def from_topk(cls, topk_ids: torch.Tensor) -> "Exl3RoutePlan":
         width = topk_ids.shape[-1]
-        # The layer's one readback; nothing of this layer is queued yet, so the pageable copies back cost no wait.
+        # One readback per layer, then two small pageable copies back; the caller builds the plan before queuing
+        # any of the layer's gathers, so neither waits on one.
         flat = topk_ids.reshape(-1).cpu()
         positions = (flat >= 0).nonzero().flatten()
         positions = positions[torch.argsort(flat[positions], stable=True)]

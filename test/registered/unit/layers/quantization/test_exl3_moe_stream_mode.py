@@ -388,7 +388,6 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     assert torch.equal(got, want)
 
 
-
 def _constant_linear(x, t, out_dtype=None):
     """Ignores its input: every row is svh[0] * 2**14, so each expert adds an exact constant through w2."""
     value = float(t.svh.reshape(-1)[0]) * 2**14
@@ -431,6 +430,7 @@ def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch,
     want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_constant_linear)
     assert float(got[0, 0]) == 0.0
     assert torch.equal(got, want)
+
 
 def test_route_plan_all_dropped_routes_give_zeros(ckpt, monkeypatch):
     """Every route -1: no chunk is gathered and the output is zeros, as with the flag off."""

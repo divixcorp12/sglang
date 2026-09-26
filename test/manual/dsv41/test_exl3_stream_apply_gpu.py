@@ -120,8 +120,9 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
 
 @pytest.mark.parametrize("route_plan", [False, True])
 def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
-    """80 experts, 40 tokens x 6 routes with a repeated expert and dropped routes: two 64-expert chunks, through
-    an 8-expert hot cache and a pinned tier that holds them all."""
+    """80 experts, 40 tokens x 6 routes with dropped routes: two 64-expert chunks, through
+    an 8-expert hot cache and a pinned tier that holds them all. No token routes an expert twice: CUDA index_add_
+    adds repeated rows atomically, in no fixed order; the CPU tests pin that case bitwise."""
     from sglang.srt.layers.moe.exl3_expert_format import exl3_expert_layout_for
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
@@ -155,7 +156,6 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
     topk_ids = torch.stack([torch.randperm(num_experts, generator=generator)[:topk] for _ in range(tokens)])
     topk_ids = topk_ids.to(torch.int32)
     topk_ids[5, 3] = -1
-    topk_ids[9, 2] = topk_ids[9, 1]
     assert len(set(topk_ids[topk_ids >= 0].tolist())) > 64
     x = (torch.randn(tokens, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).cuda()
     topk_ids = topk_ids.cuda()
