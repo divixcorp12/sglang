@@ -4503,6 +4503,17 @@ order. The flag-off loop had the same blind spot, and the test covers both.
 | Eager kernels | 141,593 | 108,452 |
 | Decode steps 15+, ms / GPU busy per step | 111.2 / 108.6 | 111.3 / 108.7 |
 
+**Review fix** (`7d05dc2bc1`).
+- **The problem:** the flag-off path's `chunk.tolist()` also guaranteed that a layer's pinned-tier host use
+  (`prefill_fills`) ended only after its last gather had read the slabs. Running ahead, the host could end the host use,
+  and so resume the RAM-miss service thread, with that copy still reading. This is the hazard of §18.6's `host_use`
+  contract. There is no known trigger today: the thread's current work is ordered on the same stream.
+- **The fix:** each chunk now records an event after its gather and waits on it after queuing the chunk's compute.
+  The launches still overlap the gather.
+- **Test:** `test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands` failed before the fix, 25/25 GPU
+  tests pass after.
+- **Cost:** none. Arm B2 at the fix measured TTFT **9.91 / 9.21 s**, 114.0 ms/token, output identical to A.
+
 - **Where the host waits now:** one ~1 KB readback per chunk, `_gather_cached`'s pre-gather lookup, blocked 2.8 s in
   total (median 35.5 ms). It waits for the previous chunk's gather, which the host has already queued compute
   behind: this is the GPU being the bottleneck, as intended.
