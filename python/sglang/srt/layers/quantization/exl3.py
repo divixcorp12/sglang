@@ -555,8 +555,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             if route_plan:
                 for experts, row_of_source, rows in streamer.iter_gather_experts_host(source_ids, plan.experts):
                     gathered = True
+                    copied = torch.cuda.Event() if x.is_cuda else None
+                    if copied is not None:
+                        copied.record()
                     w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source)
                     exl3_moe_accumulate_planned(out, x, topk_weights, plan, w13, w2, swiglu_limit, experts)
+                    if copied is not None:
+                        # The gather reads pinned slabs the RAM-miss thread may reuse once the host use ends: wait
+                        # for it (not for the compute just queued) before the next chunk or the host use can end.
+                        copied.synchronize()
             else:
                 for chunk, row_of_source, rows in streamer.iter_gather_experts(source_ids):
                     gathered = True
