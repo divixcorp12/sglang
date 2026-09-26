@@ -190,6 +190,29 @@ class TestPinnedTierCuda(unittest.TestCase):
         self.assertEqual(pinned.stats.evictions, 4)
 
 
+    def test_copy_rows_to_named_rows_on_cuda_leaves_the_rest(self):
+        from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
+
+        experts = 8
+        layer = torch.nn.Module()
+        layer.host_rows = torch.nn.Parameter(
+            torch.randint(0, 256, (experts, 3000), dtype=torch.uint8), requires_grad=False
+        )
+        layer.gpu_rows = torch.nn.Parameter(torch.rand(experts, 5, device="cuda"), requires_grad=False)
+        layer._nvfp4_file_source_bytes_per_expert = 3000
+        streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
+        cache = ExpertPinnedHostCache(streamer, 4)
+        ids = torch.tensor([6, 2, 5], device="cuda")
+        cache.ensure_rows(ids)
+        out = torch.full((3, 3000), 7, dtype=torch.uint8, device="cuda")
+        cache.copy_rows(ids, {"host_rows": out}, rows=torch.tensor([1, 2], device="cuda"))
+        got = out.cpu()
+        self.assertTrue(torch.equal(got[1], layer.host_rows.data[2]))
+        self.assertTrue(torch.equal(got[2], layer.host_rows.data[5]))
+        self.assertTrue((got[0] == 7).all())
+        cache.close()
+
+
 def _spec_only_reference(names=None, experts=EXPERTS, seed=5):
     generator = torch.Generator().manual_seed(seed)
     shapes = {

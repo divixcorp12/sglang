@@ -183,3 +183,14 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_copy_rows_copies_only_the_named_rows_and_leaves_the_rest():
+    streamer, cache, fills, reference = _setup()
+    cache.ensure_rows(torch.tensor([3, 1, 5]))
+    outputs = {n: torch.full_like(t, SENTINEL) for n, t in _outputs(reference, 3).items()}
+    cache.copy_rows(torch.tensor([3, 1, 5]), outputs, rows=torch.tensor([2, 0]))
+    for name in NAMES:
+        assert torch.equal(outputs[name][0], reference[name][3])
+        assert torch.equal(outputs[name][2], reference[name][5])
+        assert (outputs[name][1] == SENTINEL).all()
