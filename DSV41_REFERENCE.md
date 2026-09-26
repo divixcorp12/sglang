@@ -4130,6 +4130,8 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    *estimate*.
 7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
+9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
+   cache, output-preserving by construction. Branch `cc/indexer-cap`, not merged.
 
 ### 27.5 Copy-thread scheduling, untraced
 
@@ -4181,6 +4183,56 @@ Evidence is on divix01:
 - The link-bound SM gather: ~6.5 s.
 - The eager launch gaps and per-expert syncs (item 7).
 - The first chunk's reads of each layer, which nothing overlaps.
+
+### 27.7 Prefill indexer score cap (on hold, 2026-09-26)
+
+**Why.** Track A (§25.4) found no VRAM headroom: a 30k prompt peaked at 31.0 of 31.8 GiB, with allocator retries from
+the torch prefill indexer's score tensor. Freed VRAM can go to the hot cache, at 2–2.7 fewer misses per token per GiB
+(Track B).
+
+**The path, corrected.** Production runs `SGLANG_DSV41_TORCH_PREFILL_INDEXER=1`, so SM120 prefill scores in
+`DeepseekV4AttnBackend._low_ratio_index_topk_torch` (`deepseek_v4_backend.py`), not in `indexer.py`'s
+`fp8_paged_mqa_logits_torch_sm120`.
+- It already shares one key copy per request: an einsum over `[rows, 32 heads, lc]` in bf16.
+- It already chunks rows, but under a hard-coded 1 GiB budget (`_TORCH_INDEXER_SCORE_BUDGET_BYTES`). With 512-row
+  prefill chunks and at most 32k context, that budget never splits: one tensor is ~0.98 GB at 30k, and the einsum,
+  `relu` and `*weights` keep ~3x that live.
+- Track A's failed allocations grow 32 MiB per 512-token chunk, which is this einsum at the ratio-1 layers, so the
+  attribution holds.
+
+**What was built** (branch `cc/indexer-cap`, head `b9ae131af0`, on `01e0a6ea7f`; not merged):
+- `SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB = EnvInt(0)`. 0 keeps the built-in 1 GiB, today's behaviour.
+  Otherwise rows per chunk = `max(1, budget // (heads * lc * 2))` (`_torch_indexer_rows_per_chunk`).
+- Only the chunking changes: no truncation of the scored context, same precision, same top-k. Rows are scored and
+  reduced independently, so the output should be unchanged.
+- Tests: `test/registered/unit/kernels/test_dsv41_torch_indexer_chunking.py` compares page indices, raw indices and
+  candidate masks bitwise, chunked against one pass, through the real `_low_ratio_index_topk_torch` and
+  `DeepseekV41Indexer.scores`. It covers ties, a request shorter than `index_topk`, chunk sizes that don't divide the
+  row count, and on CUDA the production shape (512 rows, 32 heads, 30k ratio-1 context).
+  - CPU 4 passed, 3 skipped; GPU 7 passed; a mutant (the chunked path drops the last score column) fails 2.
+  - `test/registered/unit/kernels` with CUDA hidden: 1290 passed, 413 skipped, EXIT=0. No merge-base comparison.
+
+**Not measured yet.** Peak VRAM, freed GiB, TTFT and end-to-end greedy parity at 30k/32k, and the payoff arm
+(A = today's recipe, B = cap plus a larger hot cache). The estimate at a 128 MiB cap is 69 rows per chunk at 30k and
+a transient of ~0.4 GB instead of ~2.9 GB, **~2.5 GB freed, not measured**. The runs were held by the owner: each
+long prompt prefills at ~12 tok/s (~45 min per run), and they queued behind the prefill-fills and prefill-evict arms.
+
+**To resume.**
+- Driver: `analysis/dsv41-drive/indexer-cap/drive_peaks.sh <worktree> <budget_mb>` runs 30000 then 32000 tokens, each
+  at budget 0 then `budget_mb` (tags `b<budget>-<N>k`), under `/mnt/nvme1/indexer-cap`:
+  ```bash
+  cd /mnt/nvme1/indexer-cap && setsid nohup bash \
+    /data/models/slang/nvfp4-work/wt-indexer-cap/analysis/dsv41-drive/indexer-cap/drive_peaks.sh \
+    /data/models/slang/nvfp4-work/wt-indexer-cap 128 > drive_peaks.log 2>&1 < /dev/null &
+  ```
+- One smoke is `analysis/dsv41-drive/indexer-cap/smoke.sh <tag> <worktree> 14336 <budget_mb> <long_tokens>`:
+  Track A's smoke plus the budget override. It refuses to run unless the budget and the torch prefill indexer are in
+  the live server's environment, uses `arm_env`'s mem-fraction (0.83), takes `rowimg-disk.lock` before
+  `cc-gpu.lock`, and counts OOM retries into `retries.txt`.
+- Peaks: `analysis/dsv41-drive/hot-cache-size/vram_peaks.py /mnt/nvme1/indexer-cap/<tag>`. Parity: diff
+  `responses.jsonl` and the `long.json` text between budgets; TTFT is in `long.json`.
+- Before the payoff arm, re-check the lock order (`rowimg-disk.lock`, then `cc-gpu.lock`) against the other drivers.
+- `wt-indexer-cap` on divix01 is clean at `b9ae131af0`.
 
 ## Sources
 
