@@ -4126,8 +4126,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
      within noise.
    - **Likely cause, not verified:** the replay models decode only. Prefill admissions churn the same tier, and
      layers cut to ~116 rows lose more of their rows to them. Revisit after item 2 stops prefill evictions.
-6. **Decode small kernels:** another fusion round over the ~1,800 sub-3 µs kernels per step. Worth a few ms/token,
-   *estimate*.
+6. **Decode small kernels: done for the EXL3 cast glue (§27.8), behind `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION`.**
+   -358 kernels per step, byte-identical, -0.6 ms/token (within noise). Not "a few ms": most of the remaining small
+   kernels are attention, mHC reductions and the RAM-miss chain, not glue.
 7. **Prefill glue:** the ~149,000 eager kernels per 260-token prefill, once item 1 has removed the serial fills.
 8. **Environment:** the spinning tmux server and questdb's `java` share the server's cores and contaminate every arm.
 9. **Prefill indexer score cap: built, long-prompt measurement on hold (§27.7).** Frees prefill VRAM for the hot
@@ -4233,6 +4234,43 @@ long prompt prefills at ~12 tok/s (~45 min per run), and they queued behind the 
   `responses.jsonl` and the `long.json` text between budgets; TTFT is in `long.json`.
 - Before the payoff arm, re-check the lock order (`rowimg-disk.lock`, then `cc-gpu.lock`) against the other drivers.
 - `wt-indexer-cap` on divix01 is clean at `b9ae131af0`.
+
+### 27.8 Decode cast fusion (result)
+
+Plan: `docs/superpowers/plans/2026-09-25-dsv41-decode-fusion-2.md`. Flag: `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION`,
+default off, not yet in `arm_env`.
+
+**Where the small kernels were.** In the traced decode step (§27.3), 566 of the ~1,800 sub-3 µs kernels are the fp16/bf16
+casts around the seven dense EXL3 gemvs per layer: `exl3_gemm` takes and returns fp16, and the model runs in bf16. Three
+of those casts per layer redo the same conversion: wq_a and wkv share an input, and so do the shared expert's gate and
+up. The rest of the small kernels are not glue:
+
+- attention metadata and norms, 537;
+- the mHC reductions, 320, which cannot be fused bit-exactly;
+- the RAM-miss chain, 320-400.
+
+**What was fused (F1-F4), all at BS1:**
+
+- **Sublayer input.** `hc_combine_norm` also writes the fp16 copy of the sublayer input and publishes it (a one-slot
+  registry keyed on the tensor object, its version and the stream). wq_a, wkv and the shared expert take the copy
+  instead of casting.
+- **Merged linears.** A merged linear writes every part into one fp16 row, with one output cast and no `cat`.
+- **Shared expert.** It stays in fp16 between its gemvs: `silu_mul_clamp` reads the fp16 gate/up and writes the fp16
+  down input, keeping both bf16 roundings.
+- **Routed output.** The cast to bf16 and `* routed_scaling_factor` are one kernel.
+
+Every kernel is compared as bits against the chain it replaces, and the chain captures with 0 host nodes.
+
+| | Flag off | Flag on |
+|---|---:|---:|
+| kernels per decode step (node mode, copy engine off) | 2,676 | **2,318** |
+| pooled ms/token (arms A then B, same commit `cc7620a247`) | 112.4 | **111.8** |
+| 103-token session ms/token | 110.9 | 110.2 |
+| outputs | | 2 of 2 byte-identical |
+
+The gain is ~1.7 µs per removed kernel. It matches the round-1 rate (§25.2) but is within two-session noise
+(p = 0.75). Left for a later round: folding wq_b's and wkv's output casts into the q rope and k-norm-rope, and wo_b's
+into the mHC post (3 kernels per layer, ~0.1 ms/token each).
 
 ## Sources
 
