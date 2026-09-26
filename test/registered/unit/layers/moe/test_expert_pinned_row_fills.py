@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_host_tier import PinnedSlotLRU
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -137,8 +138,10 @@ def test_gather_rows_waits_for_each_chunks_own_prefetched_rows_before_copying():
     _check(second, reference, [2, 6])
 
 
-def test_a_chunk_miss_outside_the_prefetch_joins_it_before_admitting():
-    streamer, cache, fills, reference = _setup()
+@pytest.mark.parametrize("split", [False, True])
+def test_a_chunk_miss_outside_the_prefetch_joins_it_before_admitting(split):
+    with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(split):
+        streamer, cache, fills, reference = _setup()
     with cache.host_use():
         cache.prefetch_rows([1, 2], protected=[1, 2])
         outputs = _outputs(reference, 2)
@@ -194,3 +197,82 @@ def test_copy_rows_copies_only_the_named_rows_and_leaves_the_rest():
         assert torch.equal(outputs[name][0], reference[name][3])
         assert torch.equal(outputs[name][2], reference[name][5])
         assert (outputs[name][1] == SENTINEL).all()
+
+
+def _split_setup(**kwargs):
+    with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(True):
+        return _setup(**kwargs)
+
+
+def _sentinel_outputs(reference, rows):
+    return {n: torch.full_like(t, SENTINEL) for n, t in _outputs(reference, rows).items()}
+
+
+def test_split_gather_copies_resident_rows_before_waiting_for_the_fills():
+    """A chunk's resident rows must already be copied when the host starts waiting for its fills."""
+    streamer, cache, fills, reference = _split_setup()
+    cache.ensure_rows(torch.tensor([4]))
+    seen = []
+    wait = fills.fill_wait
+    with cache.host_use():
+        assert cache.prefetch_rows([1, 4, 6], protected=[1, 4, 6]) == 2  # claims 1 and 6; 4 is resident
+        outputs = _sentinel_outputs(reference, 3)
+        fills.fill_wait = lambda rows: (seen.append({n: o.clone() for n, o in outputs.items()}), wait(rows))
+        cache.gather_rows(torch.tensor([1, 4, 6]), outputs)
+        cache.finish_fills()
+    for name in NAMES:
+        assert torch.equal(seen[0][name][1], reference[name][4])  # the resident row, copied before the wait
+        assert (seen[0][name][0] == SENTINEL).all() and (seen[0][name][2] == SENTINEL).all()
+    _check(outputs, reference, [1, 4, 6])
+
+
+def test_split_gather_places_every_chunks_rows_like_the_unsplit_gather():
+    """Two chunks with filling rows at different positions: byte-identical to the flag-off gather."""
+    got = None
+    for split in (False, True):
+        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(split):
+            streamer, cache, fills, reference = _setup(capacity=6, experts=8)
+        cache.ensure_rows(torch.tensor([0, 5]))
+        with cache.host_use():
+            cache.prefetch_rows([0, 2, 3, 5, 7], protected=[0, 2, 3, 5, 7])
+            first, second = _sentinel_outputs(reference, 3), _sentinel_outputs(reference, 3)
+            cache.gather_rows(torch.tensor([0, 2, 5]), first)
+            cache.gather_rows(torch.tensor([7, 5, 3]), second)  # filling at 0 and 2, resident 5 between
+            cache.finish_fills()
+        _check(first, reference, [0, 2, 5])
+        _check(second, reference, [7, 5, 3])
+        if got is None:
+            got = (first, second)
+        else:
+            for a, b in zip(got, (first, second)):
+                for name in NAMES:
+                    assert torch.equal(a[name], b[name])
+
+
+def test_a_chunk_of_only_filling_rows_waits_then_copies_once():
+    streamer, cache, fills, reference = _split_setup()
+    copies = []
+    copy = cache.copy_rows
+    cache.copy_rows = lambda ids, outputs, rows=None: copies.append(rows) or copy(ids, outputs, rows=rows)
+    with cache.host_use():
+        cache.prefetch_rows([1, 6], protected=[1, 6])
+        outputs = _sentinel_outputs(reference, 2)
+        cache.gather_rows(torch.tensor([1, 6]), outputs)
+        cache.finish_fills()
+    assert copies == [None] and fills.events[1] == ("wait", 2)
+    _check(outputs, reference, [1, 6])
+
+
+def test_a_failed_fill_still_raises_with_the_split():
+    streamer, cache, fills, reference = _split_setup()
+    cache.ensure_rows(torch.tensor([4]))
+
+    def failing_wait(rows):
+        raise RuntimeError("a prefetch of pinned host rows failed")
+
+    with cache.host_use():
+        cache.prefetch_rows([1, 4], protected=[1, 4])
+        fills.fill_wait = failing_wait
+        with pytest.raises(RuntimeError, match="prefetch"):
+            cache.gather_rows(torch.tensor([1, 4]), _sentinel_outputs(reference, 2))
+        cache.finish_fills()
