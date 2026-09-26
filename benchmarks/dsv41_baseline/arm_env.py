@@ -167,6 +167,13 @@ def base_env() -> dict[str, str]:
         # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). Costs ~1 GiB, hence MEM_FRACTION_STATIC.
         "CUDA_MODULE_LOADING": "EAGER",
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
+        # Prefill's pinned-tier misses read by the RAM-miss service's reader straight into the slabs, a layer's reads
+        # issued up front: TTFT 21.06/17.79 -> 12.05/11.14 s, decode unchanged, byte-identical (DSV41_REFERENCE.md 27.6).
+        # Needs the row images above.
+        "SGLANG_DSV41_ENABLE_PREFILL_FILLS": "1",
+        # Fewer fp16/bf16 casts around the EXL3 gemvs at BS1 decode: 358 fewer kernels per step, bit-identical,
+        # 112.4 -> 111.8 ms/token (within noise; DSV41_REFERENCE.md 27.8).
+        "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION": "1",
     }
 
 
