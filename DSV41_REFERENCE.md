@@ -4984,8 +4984,22 @@ cold after `/flush_cache`, with a second cold run as the noise floor. All runs a
   - The outputs show no damage: warm and cold diverge at the same depth as cold and cold.
   - Why is not established. It would take a direct probe of those slots.
 - **One sample per case.** This rules out gross corruption, not a subtle bias.
-- **Headroom.** HiCache's host-gather Triton kernels load after serving starts. At `mem-fraction-static 0.925` the
-  server logged 0.03 GiB free when they did, with no failure. Pre-load them at init if another late load appears.
+- **Headroom: HiCache's staging buffers caused an OOM (fixed).**
+  - Every page_first host mirror allocates a device write-back staging buffer after the KV pool is sized, out of
+    the runtime slack. On DSV4 that was ~0.18 GiB, 160 MiB of it the SWA mirror (28 pages x 40 layers x 149,760 B).
+  - Free memory fell to 0.02-0.03 GiB. A poisoned-pool arm then died of a CUDA OOM: a 300 MiB Engram EXL3 dequant
+    transient failed with 276 MiB free.
+  - The `_gather_host_rows*` Triton kernels logged near those lows belong to the MoE expert stream
+    (`expert_stream.py`), not HiCache. The load watch only reports under 1 GiB free.
+  - **Fix (`cc/hicache-reserve`).**
+    - `SGLANG_HICACHE_WRITE_BACK_STAGING_MAX_MB` (32) caps each staging buffer in bytes, so the SWA mirror stages
+      5 pages.
+    - `SGLANG_HICACHE_DEVICE_RESERVE_MB` (64) comes out of the KV budget at both sizing sites, like the multimodal
+      reservation.
+    - The DSV4 HiCache stack refuses to start if its staging exceeds the reserve (~54 MiB here).
+  - **GPU check.** The same arm then ran all six trials with no OOM, and its lowest logged free memory was 0.19 GiB.
+    That run's KV pool was 122,368 tokens, against 166-186k in earlier HiCache runs. Sizing varies run to run, and
+    this drop is not yet explained.
 - **Operational note.** Under HiCache, `/flush_cache` returns 400 ("pending requests", with none queued or running)
   straight after a request, until write-back drains. Retry it.
 
