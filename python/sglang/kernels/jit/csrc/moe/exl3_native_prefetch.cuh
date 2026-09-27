@@ -13,7 +13,7 @@
 // slot generation); SKIPPED changes nothing. A timeout, the fatal word or the lease block's shutdown word raises the
 // page's fatal word and unmaps the victim, which is then neither free nor evictable: a copy may still land there.
 //
-// The page layout mirrors exl3_ram_miss_host.cpp (kPf*) and ops/moe/exl3_ram_miss.py (PREFETCH_FIELDS).
+// The page layout mirrors exl3_ram_miss_host.cpp (kPf*) and ops/moe/expert_stream_transport.py (PREFETCH_FIELDS).
 
 #include "expert_stream/lease_layout.h"
 

@@ -1,5 +1,5 @@
 // Wire layout of the expert-stream request page, lease block and prefetch page (LEASE_PROTOCOL.md section 4).
-// Mirrored by ops/moe/exl3_ram_miss.py and ops/moe/exl3_lease_block.py; test_exl3_ram_miss_device_args checks both.
+// Mirrored by ops/moe/expert_stream_transport.py and ops/moe/expert_lease_block.py; test_exl3_ram_miss_device_args checks both.
 // Only `constexpr <type> kName = <integer expression>;` lines: that test parses them.
 #pragma once
 
@@ -41,8 +41,9 @@ constexpr uint16_t kServed = 1;
 constexpr uint16_t kFailed = 2;
 
 // ---- Lease block (LEASE_PROTOCOL.md section 4) ----
-// The lease block beside the request page. Its layout is written here, in exl3_ram_miss_host.cpp (the EXL3
-// instantiation), lease_device.cuh and ops/moe/exl3_lease_block.py; test_exl3_ram_miss_device_args checks they agree. The
+// The lease block beside the request page. Its layout is written here (the one home; exl3_ram_miss_host.cpp
+// and lease_device.cuh both include this header) and mirrored in ops/moe/expert_lease_block.py;
+// test_exl3_ram_miss_device_args checks they agree. The
 // publication word (tag << 56 | generation) is built in code: the layout test parses these lines with + - * only.
 constexpr int64_t kLeaseRing = 16;   // == kDemandRecords
 constexpr int64_t kLeaseLanes = 8;   // == kMaxIds

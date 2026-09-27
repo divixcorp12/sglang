@@ -102,7 +102,7 @@ constexpr int kTraceExtents = 32;
 
 // One request's stage record, written only when the stage trace is on. Fixed size and int64
 // words only, so it is copied out to Python as a row of a torch int64 tensor: keep
-// STAGE_FIELDS in ops/moe/exl3_ram_miss.py in step. Every time is now_ns(), CLOCK_MONOTONIC on
+// STAGE_FIELDS in ops/moe/expert_stream_transport.py in step. Every time is now_ns(), CLOCK_MONOTONIC on
 // the host; a stage the request never reached stays 0. Nothing here is a GPU timestamp.
 //
 // Terminal status: how the request ended. kStatusNone (0) is never stored in a pushed record.

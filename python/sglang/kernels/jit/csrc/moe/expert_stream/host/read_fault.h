@@ -1,4 +1,4 @@
-// Test-only fault injection for RowReader (exl3_ram_miss_read_rows_faulted).
+// Test-only fault injection for RowReader (expert_stream_read_rows_faulted).
 #pragma once
 
 #include "row_tables.h"
@@ -6,7 +6,7 @@
 namespace sglang {
 namespace expert_stream {
 
-// Test-only fault injection for RowReader (exl3_ram_miss_read_rows_faulted).
+// Test-only fault injection for RowReader (expert_stream_read_rows_faulted).
 struct ReadFault {
   int submit_error = 0;       // errno the `submit_call`-th submit returns (0: no fault)
   int64_t submit_call = 0;    // 1-based count of submit-and-wait calls over the reader's life
@@ -78,7 +78,7 @@ inline int64_t worker_stamp(const void* trace) {
 // configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
 // one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
 // streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
-// last_publish_delay_ns. Keep the layout in step with _fault_tensor in ops/moe/exl3_ram_miss.py.
+// last_publish_delay_ns. Keep the layout in step with _fault_tensor in ops/moe/expert_stream_transport.py.
 constexpr int64_t kFaultWords = 28;
 
 inline ReadFault fault_from(const int64_t* f) {
