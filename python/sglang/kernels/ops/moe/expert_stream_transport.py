@@ -99,14 +99,14 @@ def _table_args(tables, direct: bool) -> tuple:
     )
 
 
-def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS) -> int:
+def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS, layout: str = "exl3") -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++: 1 ok, 0 failed.
 
     ``step`` rows go to io_uring per batch (at most ``BOUNCE_ROWS``).
     """
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     return int(
-        _host_module().expert_stream_read_rows(
+        _host_module(layout).expert_stream_read_rows(
             *_table_args(tables, direct), row, expert_ids, slot_ids, int(step)
         )
     )
@@ -188,6 +188,7 @@ def read_rows_traced(
     direct: bool,
     step: int = BOUNCE_ROWS,
     owner_core: int = -1,
+    layout: str = "exl3",
     **faults,
 ) -> tuple[int, dict]:
     """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
@@ -204,9 +205,9 @@ def read_rows_traced(
     admitted, the rows admitted were still read and packed, the rest never read)."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     result = int(
-        _host_module().expert_stream_read_rows_traced(
+        _host_module(layout).expert_stream_read_rows_traced(
             *_table_args(tables, direct),
             row,
             expert_ids,
@@ -231,6 +232,7 @@ def read_rows_with_fault(
     direct: bool,
     cqes: Optional[list[int]] = None,
     stats: Optional[dict] = None,
+    layout: str = "exl3",
     **faults,
 ) -> tuple[int, int]:
     """Test only: on one C++ reader, read with an injected fault, then read cleanly.
@@ -272,7 +274,7 @@ def read_rows_with_fault(
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
     results = torch.zeros(8, dtype=torch.int64)
-    _host_module().expert_stream_read_rows_faulted(
+    _host_module(layout).expert_stream_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
     if cqes is not None:
@@ -286,17 +288,26 @@ def read_rows_with_fault(
 
 
 def read_rows_sqes(
-    tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS, max_sqes: int = 4096, **faults
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    direct: bool,
+    step: int = BOUNCE_ROWS,
+    max_sqes: int = 4096,
+    layout: str = "exl3",
+    **faults,
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
     """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
     ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
     (the ring's) and ``cqes``. Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
     info = torch.zeros(5, dtype=torch.int64)
-    _host_module().expert_stream_read_rows_sqes(
+    _host_module(layout).expert_stream_read_rows_sqes(
         *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
     )
     result, count, descriptors, credit, cqes = info.tolist()
@@ -308,11 +319,11 @@ def read_rows_sqes(
     )[0]
 
 
-def publish_piece(word: int, generation: int, bit: int) -> tuple[bool, int]:
+def publish_piece(word: int, generation: int, bit: int, *, layout: str = "exl3") -> tuple[bool, int]:
     """Test only: the reader owner's publish primitive on one readiness word holding ``word`` (``generation << 8 |
     bits``): whether it set ``bit``, and the word afterwards."""
     cell = torch.tensor([word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64)
-    done = int(_host_module().expert_stream_publish_piece(cell, int(generation), int(bit)))
+    done = int(_host_module(layout).expert_stream_publish_piece(cell, int(generation), int(bit)))
     return bool(done), int(cell[0]) & 0xFFFFFFFFFFFFFFFF
 
 
@@ -333,6 +344,7 @@ def read_rows_pieces(
     reference: Optional[torch.Tensor] = None,
     ref_slots=None,
     step: int = BOUNCE_ROWS,
+    layout: str = "exl3",
     **faults,
 ) -> tuple[int, dict, torch.Tensor, dict]:
     """Test only: ``read_rows_traced``'s read with piece streaming's publishing: row ordinal o's pieces are published
@@ -346,11 +358,11 @@ def read_rows_pieces(
     if masks is None:
         masks = torch.full((len(expert_ids), 1), piece_word(generation), dtype=torch.int64)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     info = torch.zeros(5, dtype=torch.int64)
     ref = reference if reference is not None else torch.zeros(0, dtype=torch.int64)
     ref_ids = _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
-    _host_module().expert_stream_read_rows_pieces(
+    _host_module(layout).expert_stream_read_rows_pieces(
         *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
         ref_ids, info,
     )
@@ -360,7 +372,7 @@ def read_rows_pieces(
     )
 
 
-def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], list[dict]]]:
+def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Optional[tuple[list[dict], list[dict]]]:
     """Test only: the sub-reads and pieces the C++ reader cuts expert ``expert`` of streamed row ``row`` into
     under piece streaming, or None when it refuses the row. Sub-reads, in file order: ``{file, offset, length,
     dest, part, k}``. Pieces (``STAGE_PIECES``): ``{deps, runs}``, ``deps`` the bitmask of sub-reads the piece
@@ -369,7 +381,7 @@ def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], 
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
-        _host_module().expert_stream_piece_geometry(*_table_args(tables, False)[:-1], row, expert, subs, pieces)
+        _host_module(layout).expert_stream_piece_geometry(*_table_args(tables, False)[:-1], row, expert, subs, pieces)
     )
     if count < 0:
         return None
@@ -435,8 +447,8 @@ STAGE_ORDER = (
 )
 
 
-def _stage_words() -> int:
-    words = int(_host_module().expert_stream_trace_words())
+def _stage_words(layout: str = "exl3") -> int:
+    words = int(_host_module(layout).expert_stream_trace_words())
     if words != len(STAGE_FIELDS):
         raise RuntimeError(f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}")
     return words
@@ -634,7 +646,16 @@ def page_word(page: torch.Tensor, name: str) -> int:
 
 
 def sim_post(
-    page, row: int, need, protect, *, advisory: bool = False, after: int = 0, armed: bool = True, lanes: Optional[int] = None
+    page,
+    row: int,
+    need,
+    protect,
+    *,
+    advisory: bool = False,
+    after: int = 0,
+    armed: bool = True,
+    lanes: Optional[int] = None,
+    layout: str = "exl3",
 ) -> int:
     """Post a record as the device post kernel does; returns its sequence.
 
@@ -645,21 +666,21 @@ def sim_post(
     its need is non-empty or advisories are on; the thread only touches for an unarmed one.
     """
     return int(
-        _host_module().expert_stream_sim_post(
+        _host_module(layout).expert_stream_sim_post(
             page, row, _ids(need), _ids(protect), int(advisory), after, int(armed), len(list(need)) if lanes is None else int(lanes)
         )
     )
 
 
-def sim_wait(page, seq: int, timeout_s: float) -> int:
+def sim_wait(page, seq: int, timeout_s: float, *, layout: str = "exl3") -> int:
     """Wait as the device wait kernel does: 1 served, 2 failed, 0 timed out, 3 fatal already raised."""
-    return int(_host_module().expert_stream_sim_wait(page, seq, int(timeout_s * 1e9)))
+    return int(_host_module(layout).expert_stream_sim_wait(page, seq, int(timeout_s * 1e9)))
 
 
-def seqlock_stress(seconds: float) -> tuple[int, int]:
+def seqlock_stress(seconds: float, *, layout: str = "exl3") -> tuple[int, int]:
     """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted)."""
     out = torch.zeros(2, dtype=torch.int64)
-    _host_module().expert_stream_seqlock_stress(int(seconds * 1e9), out)
+    _host_module(layout).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
 
 
