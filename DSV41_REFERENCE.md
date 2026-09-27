@@ -5192,6 +5192,119 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
   context as it did to 30k.
 - Steady decode ms/token at the smaller hot cache.
 
+### 27.19 Task 12: layer-major vs chunked GPU equivalence (result: BLOCKED, 2026-09-27)
+
+Phase 0's numbers (TTFT, chunk times at 128k, peak VRAM, indexer path, node-1 free) are §27.18; not repeated here.
+
+**Two construction-order bugs found and fixed, required just to boot any layer-major-enabled server.** Neither was
+caught by any CPU unit test, because every one mocks `model_runner` with a `SimpleNamespace` that already carries
+the field being read.
+- `DeepseekV4LayerMajorAdapter.__init__` cached `model_runner.attn_backend`, but `TpModelWorker.__init__` builds the
+  adapter (`layer_major_runtime_for_worker`) before `Scheduler.init_all_attention_backends()` ever runs
+  (`init_tp_model_worker()` precedes it in `init_model_worker()`); `ModelRunner` only sets `attn_backend` inside
+  `init_attention_backends()`. First launch: `AttributeError: 'ModelRunner' object has no attribute 'attn_backend'`
+  in `TpModelWorker.__init__`. Fixed by making `backend` a property that reads `self.runner.attn_backend` on demand
+  (`deepseek_v4_layer_major.py`).
+- Same class of bug on `self.allocator = model_runner.token_to_kv_pool_allocator`: `Scheduler.init_memory_pools()`
+  also runs after `init_tp_model_worker()`, so the cached value was the constructor's `None` placeholder. First
+  admitted layer-major request: `AttributeError: 'NoneType' object has no attribute 'swa_req_ring'` in `begin_pass`.
+  Fixed the same way (property reading `self.runner.token_to_kv_pool_allocator`). `page` and `chunk` stay cached:
+  `model_runner.page_size` and `server_args.chunked_prefill_size` are both set once at `ModelRunner` construction
+  and never reassigned.
+- Both fixes are pure read-timing changes (same value, read later); neither alters what either field resolves to
+  once the pass actually runs.
+
+**A third bug found, not fixed: chained layer-major admission racing radix eviction (`layer-major-8k` arm).** With
+`SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=8192`, every case (including the deliberately shared-prefix `LENGTHS` list)
+is admitted to layer-major. The 5th case (`len32868`) crashed mid-pass, at a chunk-boundary radix-cache insert:
+
+```
+AssertionError: new_prefix_len=32512, len(new_indices)=16384
+  python/sglang/srt/mem_cache/unified_radix_cache.py:1211-1212
+```
+
+Root cause, as far as diagnosed: `len32868`'s server session had already run `len8192`, `len16384`, `len32768`,
+`len33000` (all literal nested prefixes of the same repeated corpus, because `--enable-hierarchical-cache` is on and
+`equiv.py`'s `LENGTHS` cases share one underlying token array). The server's own log line shows `len32868`'s actual
+admitted extend was **16,484 tokens in 5 chunks** — i.e. only the first 16,384 of its 32,768-token prefix was still
+resident when it was admitted; the rest had been evicted (LRU) after an earlier layer-major pass's
+`finalize_ring()` released everything but the final `chunk + page` window from the SWA pool, while the *full*-
+attention pool kept the tokens (window-ring design, §5.1/6.4 of the layer-major spec: "only the final window's ring
+slots stay mapped"). A subsequent request's `insert()` matched a *longer* prefix against the full pool
+(`new_prefix_len=32512`) than `match_prefix()`'s SWA-limited `device_indices` (`len=16384`) — code outside
+layer-major (`unified_radix_cache.py`) that assumes the two always agree, an assumption the window-ring's more
+aggressive SWA release breaks. This is "Ring mapping on the first chunk after a prefix," the Step-5 suspect list's
+#3 entry, but on a request *chain* (two sequential layer-major admissions sharing a prefix) rather than the single
+prefix→layer-major-suffix case `equiv.py`'s dedicated `prefix` case exercises. Not fixed: the correct fix is in
+shared radix-cache/window-ring code outside this task's authorized file set, and needs design work (does a request
+admitted after a layer-major prefix need its own re-derived, ring-consistent prefix length, or does layer-major need
+to keep the full ring resident until nothing shorter can still match it?), not a quick patch.
+
+**The equivalence pass criterion is not established, independent of the bug above.** `compare(chunked.jsonl,
+layer-major.jsonl)`:
+
+| case | chunked vs layer-major | first differing char |
+|---|---|---:|
+| len8192 | DIFFERENT | 18 |
+| len16384 | IDENTICAL | — |
+| len32768 | DIFFERENT | 47 |
+| len33000 | DIFFERENT | 110 |
+| len32868 | DIFFERENT | 74 |
+| prefix-warm | DIFFERENT | 9 |
+| prefix | DIFFERENT | 38 |
+| after | IDENTICAL | — |
+
+`len8192` and `prefix-warm` differ despite **neither case ever admitting to layer-major in either arm** (both stay
+under `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=32768`, confirmed by the absence of a `layer-major prefill:` log line
+for them). Two separate server processes running the *identical* chunked-prefill code path on the *identical*
+prompt produced different greedy text, diverging within the first few dozen characters. This means chunked-vs-
+chunked reproducibility is not established on this stack across process launches (candidate causes not yet isolated:
+EXL3's "not fully optimized" custom kernels, a non-deterministic reduction, or something seed-dependent — `argv()`
+does not pin `--random-seed`, so each launch samples a fresh one), which confounds every other row in the table:
+the layer-major cases' differences cannot be attributed to a layer-major defect specifically versus this general,
+unexplained non-determinism. `len16384` and `after` being IDENTICAL shows the non-determinism is not universal, just
+unpredictable case-to-case.
+
+**Gate: BLOCKED.** Neither "every case IDENTICAL" nor "the layer-major-8k arm completes" holds. Per the brief's
+Step 5, this is not marked done.
+
+**What did run clean:**
+- `chunked` arm: `rc=0`, 0 OOM retries, peak VRAM 32,114 MiB.
+- `layer-major` arm (`SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=32768`): `rc=0`, 0 OOM retries, no watchdog timeout
+  (`watchdog_timeout=300`; a timeout would have killed the server, so every internal tick gap was empirically
+  < 300 s), one `layer-major prefill: 32768 tokens in 8 chunks` line (`len32768`; `len33000`/`len32868`/`prefix`
+  found enough of that prefix still cached to stay under threshold and go chunked instead — the shared-corpus
+  overlap noted above). Peak VRAM 32,096 MiB. NUMA node-1 free minimum 34,032 MiB.
+- `layer-major-8k` arm, before the crash: `len8192` (logged twice — a mid-run retraction/retry, not investigated
+  further), `len16384`, `len32768` all completed and wrote to `layer-major-8k.jsonl`; peak VRAM to that point
+  31,786 MiB, NUMA node-1 free minimum 33,905 MiB, 0 OOM retries.
+- Check (a): `test_window_ring.py`'s new `TestWindowRingCudaFreePath` (real CUDA device, real Triton
+  `alloc_extend_kernel`, exercising `_free_swa_pages_cuda`/`get_and_clear_swa_pages` instead of the CPU-mocked
+  suite's `_free_swa_pages_none_cuda`) — pass.
+- Check (b): `test_state_store.py::test_pinned_numa_store_round_trips_to_a_cuda_tensor` (previously skip-guarded,
+  never executed) — pass under CUDA.
+- Check (c): no watchdog timeout in any arm's `server.log`; see above.
+- Check (d): NUMA node-1 free minimum 33,905-34,032 MiB across arms, against a StateStore pinned footprint estimated
+  at ~15 GiB (`context_len=262144`, `hc_mult=4`, `hidden` field `bfloat16`, `prev_pre` negligible) — several GiB of
+  headroom, not exact-measured. Peak VRAM 31,786-32,114 MiB across all three arms, all below the ~32,150 MiB CUDA
+  limit margin from §27.18.
+- Check (e): the `layer-major-8k` arm is the one meant to exercise the phase-0b tail-only candidate mask change on
+  the GPU (non-final chunks publish no mask, the final chunk installs tail metadata for layer 20's tail-only build);
+  it crashed before completing every case, so this check is incomplete, not passed.
+
+**Commands:**
+```bash
+# divix01, wt-lm-t12 at cc/lm-task-12
+cd /mnt/nvme1/layer-major && bash <wt>/analysis/dsv41-drive/layer-major/drive_equiv.sh chunked <wt> 0
+bash <wt>/analysis/dsv41-drive/layer-major/drive_equiv.sh layer-major <wt> 32768
+bash <wt>/analysis/dsv41-drive/layer-major/drive_equiv.sh layer-major-8k <wt> 8192
+cd /mnt/nvme1/layer-major/equiv
+python equiv.py compare chunked.jsonl layer-major.jsonl        # EXIT=1
+python equiv.py compare chunked.jsonl layer-major-8k.jsonl     # incomplete (4/8 cases written)
+```
+Evidence: `divix01:/mnt/nvme1/layer-major/equiv/{chunked,layer-major,layer-major-8k}/` (`driver.log`, `server.log`,
+`vram.csv`, `numa.log`, `phases.txt`) and `equiv/{chunked,layer-major,layer-major-8k}.jsonl`.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
