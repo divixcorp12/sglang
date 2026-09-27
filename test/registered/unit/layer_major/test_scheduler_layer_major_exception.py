@@ -47,6 +47,9 @@ def _make_scheduler():
     sched = Scheduler.__new__(Scheduler)
     sched.tree_cache = object()
     sched.ipc_channels = SimpleNamespace(send_to_tokenizer=_FakeSendToTokenizer())
+    # run_batch/process_batch_result are @scheduler_stage_method-decorated;
+    # None bypasses the (unrelated) stage-timing recorder.
+    sched.scheduler_stage_metrics = None
     return sched
 
 
