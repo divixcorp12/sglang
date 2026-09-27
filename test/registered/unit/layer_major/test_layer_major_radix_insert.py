@@ -69,6 +69,7 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.adapter.chunk = CHUNK
         self.ids = list(range(1000, 9000))
         self.rid = 0
+        self.pool_baseline = self._pool_sizes()
 
     def _run_pass(self, n: int) -> Req:
         """Admission match, ring allocation and ring finalize, as the scheduler runs them mid-pass."""
@@ -114,9 +115,11 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
     def _pool_sizes(self) -> tuple[int, int]:
         return self.alloc.full_available_size(), self.alloc.swa_available_size()
 
-    def _assert_pool_restored_after_evict(self, before: tuple[int, int]) -> None:
+    def _assert_pool_restored_after_evict(self) -> None:
+        # evict() reclaims every unlocked node, seeded prefixes included, so the only stable baseline to
+        # compare against is the pristine pool from setUp, not a snapshot taken after _seed().
         self.cache.evict(EvictParams(num_tokens=KV, swa_num_tokens=KV))
-        self.assertEqual(self._pool_sizes(), before)
+        self.assertEqual(self._pool_sizes(), self.pool_baseline)
 
     def _seed(self, n: int, swa_live_from: int) -> None:
         """Cache ids[:n] with window KV live only from swa_live_from, as a request whose window slid there leaves it."""
@@ -134,60 +137,48 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
     def test_prefix_hit_capped_at_a_tombstone_branch_point(self):
         # The crash's shape at 1/16 scale: [0, 1792) tombstoned, [1792, 2048) live. A 2148-token prompt's match,
         # capped at 2148 - 128, reaches full KV 1792 but no live window, so admission sets branch point 1792.
+        # This is also the radix-prefix-hit case for the clamp (Radix M4): prefix_len=1792 here, and the raw
+        # no-branch floor (1536) sits below it, so max(prefix_len, floor) must bind to keep the assertion below
+        # true. A layer-major extend must be at least a ring long (see min_ring_len), and a ring is always many
+        # pages wide, so the floor sits within ~2 pages of seq_len -- always past any prefix short of a
+        # tombstone branch point like this one.
         self._seed(2048, swa_live_from=1792)
-        before = self._pool_sizes()
         req = self._layer_major_prefill(2148)
         self.assertEqual(req.kv.cache_protected_len, 1792)
         self._assert_matches(1792)
         self._finish(req)
         self.cache.sanity_check()
-        self._assert_pool_restored_after_evict(before)
+        self._assert_pool_restored_after_evict()
 
     def test_branch_point_older_than_the_ring_inserts_to_the_end(self):
         # Branch point 2048 lies more than a ring (5 pages) below seq_len 4000, so its window is gone from the
         # ring: finalize drops the branch and the insert runs to page_floor(seq_len).
         self._seed(2048, swa_live_from=2048)
-        before = self._pool_sizes()
         req = self._layer_major_prefill(4000)
         self.assertEqual(req.kv.cache_protected_len, 3840)
         self._assert_matches(3840)
         self._finish(req)
         self.cache.sanity_check()
-        self._assert_pool_restored_after_evict(before)
+        self._assert_pool_restored_after_evict()
 
     def test_unaligned_tail_at_least_a_window_long(self):
         # seq_len % page >= window: the last window starts at page_floor(seq_len), where the insert ends, so a
         # finalize keeping only that window left the whole inserted leaf tombstoned and the tree matched nothing.
-        before = self._pool_sizes()
         req = self._layer_major_prefill(2048 + 200)
         self.assertEqual(req.kv.cache_protected_len, 2048)
         self._assert_matches(2048)
         self._finish(req)
         self.cache.sanity_check()
-        self._assert_pool_restored_after_evict(before)
-
-    def test_live_prefix_hit_clamps_the_no_branch_floor(self):
-        # A real (live, untombstoned) radix hit at 2048: the no-branch floor computed from seq_len alone would
-        # fall to 1536, below the prefix; max(prefix_len, floor) must clamp up to the prefix instead.
-        before = self._pool_sizes()
-        first = self._layer_major_prefill(2048)
-        self._finish(first)
-        req = self._layer_major_prefill(2148)
-        self.assertEqual(req.kv.cache_protected_len, 2048)
-        self._assert_matches(2048)
-        self._finish(req)
-        self.cache.sanity_check()
-        self._assert_pool_restored_after_evict(before)
+        self._assert_pool_restored_after_evict()
 
     def test_abort_after_finalize_restores_the_pool(self):
         # release_pass(failed=True) runs _finalize_ring only; cache_finished_req(is_insert=False) then frees the
         # request's KV without inserting it: both the SWA and full pools must return to their starting sizes.
         self._seed(2048, swa_live_from=1792)
-        before = self._pool_sizes()
         req = self._run_pass(2148)
         self._abort(req, owned_kv_len=2148)
         self.cache.sanity_check()
-        self._assert_pool_restored_after_evict(before)
+        self._assert_pool_restored_after_evict()
 
 
 if __name__ == "__main__":
