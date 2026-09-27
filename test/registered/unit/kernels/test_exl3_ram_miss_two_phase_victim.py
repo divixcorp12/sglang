@@ -13,7 +13,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup

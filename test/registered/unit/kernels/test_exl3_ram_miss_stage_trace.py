@@ -7,7 +7,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe.expert_stream_transport import (
     STAGE_ORDER,
     Exl3RamMissHost,
     new_page,
@@ -45,7 +45,7 @@ def _serve(page, host, row, need, protect):
 
 
 def _assert_ordered(record):
-    """The documented contract (ops/moe/exl3_ram_miss.py): non-zero stamps never decrease along
+    """The documented contract (ops/moe/expert_stream_transport.py): non-zero stamps never decrease along
     STAGE_ORDER EXCEPT last_cqe against pack_start, because a row packs as soon as ITS OWN extents
     land. What holds instead is first_cqe <= pack_start and last_cqe <= pack_end.
 

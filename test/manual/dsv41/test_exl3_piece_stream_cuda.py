@@ -35,8 +35,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only when cuda-python is missing
     cuda_drv = None
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     DEMAND_RING,
     RECORD_BYTES,
@@ -182,7 +182,7 @@ class StreamService:
                 self.host.enable_copy_engine(torch.cuda.current_device())
             self.prefetch_page = None
             if native_prefetch:  # the native-prefetch request and done lines (test_exl3_native_prefetch_cuda.py)
-                from sglang.kernels.ops.moe.exl3_ram_miss import new_prefetch_page
+                from sglang.kernels.ops.moe.expert_stream_transport import new_prefetch_page
 
                 self.prefetch_page = new_prefetch_page(pin=True)
                 self.host.enable_native_prefetch(self.prefetch_page)

@@ -24,8 +24,8 @@ from pathlib import Path
 
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
-from sglang.kernels.ops.moe.exl3_ram_miss import STAGE_FIELDS
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import STAGE_FIELDS
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 EXPERTS, CAPACITY = 64, 32

@@ -4,7 +4,7 @@ Real GPU kernels against the real C++ service thread in lease mode with two-phas
 (``Exl3RamMissHost.enable_two_phase()``), following the same shape as
 ``test_exl3_lease_kernels_cuda.py``'s ``TestServiceEndToEnd``. ``TwoPhaseService`` mirrors
 ``Exl3RamMissRowBackend.post``'s two-phase branch (post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F,
-``exl3_ram_miss.py:345-360``) one call at a time, so a test can intervene between stages -- T6
+``expert_stream_transport.py:345-360``) one call at a time, so a test can intervene between stages -- T6
 needs to rewrite a slot's generation between the grant and its acknowledgement, and T7/T10 need
 to measure one stage's wall time in isolation.
 
@@ -19,8 +19,8 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissDevice, Exl3RamMissHost, WORDS, new_page  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissDevice, Exl3RamMissHost, WORDS, new_page  # noqa: E402
 
 LAYERS, EXPERTS, CAPACITY = 1, 16, 8
 TOP_K = 6

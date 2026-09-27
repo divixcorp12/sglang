@@ -16,7 +16,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word, sim_post
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -173,7 +173,7 @@ def test_an_advisory_for_the_deferred_demands_own_row_takes_no_leased_slot(runni
 _DEFERRAL_SCRIPT = """
 import pathlib, sys, time
 import torch
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 

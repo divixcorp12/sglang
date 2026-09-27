@@ -23,8 +23,8 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     DEMAND_RING,
     PAGE_BYTES,
@@ -825,7 +825,7 @@ def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrappe
     ``LeaseProtocolKernel::post`` turns this red: dropping `state`'s lets the bad-dtype call through to the kernel
     (an undefined read, not a raised exception), and dropping `page`'s lets the wrong-device call through and the
     next real bug it should have caught goes undetected."""
-    import sglang.kernels.ops.moe.exl3_ram_miss as ram_miss
+    import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
 
     page = ram_miss.new_page(pin=True)
     slot_map = torch.full((1, 16), -1, dtype=torch.int32).pin_memory()

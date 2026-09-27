@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "test" / "manual" / "dsv41"))
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissDevice, Exl3RamMissHost, new_page  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissDevice, Exl3RamMissHost, new_page  # noqa: E402
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, expert_row_segments  # noqa: E402
 
 LAYERS, EXPERTS, CAPACITY, TOP_K = 2, 16, 8, 6

@@ -5,8 +5,8 @@ import json
 
 import torch
 
-import sglang.kernels.ops.moe.exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+import sglang.kernels.ops.moe.expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
 from sglang.srt.layers.moe.exl3_stream_trace import RAM_MISS_TRACE_SCHEMA, Exl3StreamTrace
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup

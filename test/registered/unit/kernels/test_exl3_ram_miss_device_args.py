@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 import torch
 
-import sglang.kernels.ops.moe.exl3_ram_miss as ram_miss
-from sglang.kernels.ops.moe import exl3_lease_block
-from sglang.kernels.ops.moe.exl3_ram_miss import PAGE_BYTES, STATE_WORDS, Exl3RamMissDevice
+import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
+from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, Exl3RamMissDevice
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.expert_stream_sources import (
     device_sources,
@@ -174,7 +174,7 @@ def test_the_wire_header_is_the_python_layout():
         "kPfSkipUnarmed": ram_miss.PREFETCH_SKIP_REASONS["unarmed"],
         "kPfSkipNotReady": ram_miss.PREFETCH_SKIP_REASONS["not_ready"],
         "kPfSkipInvalid": ram_miss.PREFETCH_SKIP_REASONS["invalid"],
-        "kLeaseBlockAlign": exl3_lease_block.BLOCK_ALIGN,
+        "kLeaseBlockAlign": expert_lease_block.BLOCK_ALIGN,
         **_lease_python_constants(), **_lease_device_only_constants(),
     }
     assert {name: wire.get(name) for name in python} == python
@@ -280,7 +280,7 @@ def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
 
 
 def _lease_python_constants():
-    from sglang.kernels.ops.moe import exl3_lease_block as lease
+    from sglang.kernels.ops.moe import expert_lease_block as lease
 
     return {
         "kLeaseRing": lease.RING,
@@ -334,7 +334,7 @@ def _lease_python_constants():
 def _lease_device_only_constants():
     """Tags and Terminal reasons: every one is in the device source; the host may name some (the RowResult ready tags
     it writes), and then must agree, but is not required to define any."""
-    from sglang.kernels.ops.moe import exl3_lease_block as lease
+    from sglang.kernels.ops.moe import expert_lease_block as lease
 
     return {
         "kLeaseTagDemand": lease.DEMAND_TAG,

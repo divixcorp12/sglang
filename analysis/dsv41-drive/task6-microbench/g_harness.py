@@ -79,7 +79,7 @@ def run(a):
     if not str(Path(sglang.__file__).resolve()).startswith(str(repo)):
         raise SystemExit("INTERPRETER TRAP: sglang imported from %s, not under %s; set PYTHONPATH=%s/python" % (sglang.__file__, repo, repo))
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, expert_row_segments
-    from sglang.kernels.ops.moe.exl3_ram_miss import new_page
+    from sglang.kernels.ops.moe.expert_stream_transport import new_page
     import c_harness as H
 
     lib = ctypes.CDLL(str(build_lib(a.build_dir)))

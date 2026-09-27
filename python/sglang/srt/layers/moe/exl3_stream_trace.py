@@ -547,7 +547,7 @@ class Exl3StreamTrace:
         """
         if self._file is None or not records:
             return
-        from sglang.kernels.ops.moe.exl3_ram_miss import STAGE_ORDER
+        from sglang.kernels.ops.moe.expert_stream_transport import STAGE_ORDER
 
         for record in records:
             line = {

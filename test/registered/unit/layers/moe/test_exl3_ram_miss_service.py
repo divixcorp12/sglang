@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import sim_post, sim_wait
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -642,7 +642,7 @@ def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
 def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch):
     """The device kernels read area D at the offsets of lease ABI 2 (StreamProbe appended); a block the host wrote
     under any other version is refused at attach, not read at the wrong offsets."""
-    from sglang.kernels.ops.moe import exl3_lease_block as lease
+    from sglang.kernels.ops.moe import expert_lease_block as lease
 
     service, streamers, caches = tiers
     header = module.Exl3RamMissHost.lease_header
@@ -979,7 +979,7 @@ def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
 def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
     # The post kernel reads planned for min(count, 8) lanes and count lives on the
     # device, so a 6-lane plan (graph_gather_rows = top-6) must not be passed as is.
-    from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS
+    from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
 
     calls = []
     device_side = SimpleNamespace(

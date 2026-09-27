@@ -19,8 +19,8 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe.expert_stream_transport import (
     MAX_IDS,
     Exl3RamMissDevice,
     Exl3RamMissHost,
@@ -825,7 +825,7 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_NATIVE_PREFETCH needs "
                         "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE: the prefetch copies run on the copy engine"
                     )
-                from sglang.kernels.ops.moe.exl3_ram_miss import new_prefetch_page
+                from sglang.kernels.ops.moe.expert_stream_transport import new_prefetch_page
                 from sglang.srt.layers.moe.exl3_native_prefetch import NativePrefetch
 
                 prefetch_page = new_prefetch_page(pin=pin)
@@ -939,10 +939,10 @@ class Exl3RamMissService:
         if self.device_side is None:
             from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
 
-            if self.lease_mode and self.host.lease_header()["abi_version"] != exl3_lease_block.ABI_VERSION:
+            if self.lease_mode and self.host.lease_header()["abi_version"] != expert_lease_block.ABI_VERSION:
                 raise RuntimeError(
                     f"exl3 RAM miss: the lease block's ABI version is {self.host.lease_header()['abi_version']}, "
-                    f"the device kernels speak {exl3_lease_block.ABI_VERSION}"
+                    f"the device kernels speak {expert_lease_block.ABI_VERSION}"
                 )
             self.device_side = Exl3RamMissDevice(
                 self.page,

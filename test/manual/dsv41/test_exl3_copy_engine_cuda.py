@@ -22,7 +22,7 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from test_exl3_piece_stream_cuda import (  # noqa: E402
     CAPACITY,
     EXPERTS,
@@ -467,7 +467,7 @@ def _resident_sm_service(tmp_path):
 
 def _hook(s, *defines):
     """Swap the chain's kernels for a hooked build and compile it on an empty request."""
-    from sglang.kernels.ops.moe.exl3_ram_miss import device_module_with_hooks
+    from sglang.kernels.ops.moe.expert_stream_transport import device_module_with_hooks
 
     s.dev._module = device_module_with_hooks(defines)
     s.plan([])
@@ -547,7 +547,7 @@ def test_a_request_failed_before_cw_still_acknowledges_and_releases_its_copying_
     """I3. An earlier stage failed (req_failed set before CW), after the service granted every lane COPYING: CW reads
     nothing, but its SmAck is the only thing that releases those leases, so it must still publish one.
     Mutant: publish SmAck only when CW read something -- red on the held leases."""
-    from sglang.kernels.ops.moe.exl3_ram_miss import STATE_WORDS
+    from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS
 
     s = _resident_sm_service(tmp_path)
     experts = list(range(TOP_K))

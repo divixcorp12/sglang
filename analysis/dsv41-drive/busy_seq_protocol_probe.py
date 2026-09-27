@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word, sim_post
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 

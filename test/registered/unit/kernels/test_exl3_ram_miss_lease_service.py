@@ -13,8 +13,8 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, Exl3RamMissHost, new_page, page_word, sim_post
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim

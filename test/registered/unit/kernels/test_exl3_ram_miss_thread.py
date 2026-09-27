@@ -12,7 +12,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word, sim_post, sim_wait
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -158,7 +158,7 @@ def test_concurrent_eager_use_and_advisories_never_share_a_slot(tmp_path):
 
 _SCRIPT_HEAD = """
 import pathlib, sys, time
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
@@ -234,7 +234,7 @@ def test_a_stop_during_a_hung_advisory_still_ends_in_the_watchdog_abort(tmp_path
     result = _run_script(
         tmp_path,
         """
-        from sglang.kernels.ops.moe.exl3_ram_miss import page_word
+        from sglang.kernels.ops.moe.expert_stream_transport import page_word
         host.start_thread(fatal_wait_s=0.5)
         host.inject(delay_s=8.0)  # advisories sleep before their first read
         sim_post(page, 1, need=[3], protect=[3], advisory=True, after=page_word(page, "demand_head") + 10)

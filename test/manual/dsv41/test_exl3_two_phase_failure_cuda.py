@@ -16,8 +16,8 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     Exl3RamMissDevice,
     Exl3RamMissHost,

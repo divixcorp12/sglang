@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_exl3_piece_stream_cuda as cuda_suite  # noqa: E402
 from test_exl3_piece_stream_cuda import service  # noqa: E402,F401  (fixture of the reused tests)
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost  # noqa: E402
 from sglang.srt.layers.moe import exl3_ram_miss as ram_miss  # noqa: E402
 
 pytestmark = cuda_suite.pytestmark

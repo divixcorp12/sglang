@@ -20,8 +20,8 @@ import torch
 
 import test_exl3_ram_miss_split as split
 import test_exl3_ram_miss_thread as thread
-from sglang.kernels.ops.moe import exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, read_rows_traced
+from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, read_rows_traced
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup

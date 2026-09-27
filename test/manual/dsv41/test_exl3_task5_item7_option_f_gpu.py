@@ -25,7 +25,7 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe.exl3_ram_miss import STATE_WORDS, Exl3RamMissDevice, new_page, page_word  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS, Exl3RamMissDevice, new_page, page_word  # noqa: E402
 
 LAYERS, EXPERTS = 2, 16
 TOP_K = 6
@@ -42,7 +42,7 @@ class Device:
             self.slot_map[0, expert] = slot
         kwargs = {}
         if lease:
-            from sglang.kernels.ops.moe import exl3_lease_block as lease_block
+            from sglang.kernels.ops.moe import expert_lease_block as lease_block
 
             self.layout = lease_block.lease_layout([8] * LAYERS)
             self.raw = lease_block.new_lease_block(self.layout, pin=True)

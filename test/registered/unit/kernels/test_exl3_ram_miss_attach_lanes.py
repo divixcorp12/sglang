@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS
+from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat

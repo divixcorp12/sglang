@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.ops.moe import exl3_lease_block
+from sglang.kernels.ops.moe import expert_lease_block
 
 # Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
 # row slots each. A bank is reused only after every row read into it has packed.
@@ -687,11 +687,11 @@ class Exl3RamMissHost:
         self.threaded = False
         # The lease block (LEASE_PROTOCOL.md section 4): the service writes its header and slot generations
         # through a raw address, so this object holds it. Allocated here when the caller passes none.
-        self.lease_layout = exl3_lease_block.lease_layout([int(c) for c in tables.capacity])
+        self.lease_layout = expert_lease_block.lease_layout([int(c) for c in tables.capacity])
         if lease_block is None:
-            lease_block = exl3_lease_block.new_lease_block(self.lease_layout, pin=page.is_pinned())
+            lease_block = expert_lease_block.new_lease_block(self.lease_layout, pin=page.is_pinned())
         else:
-            exl3_lease_block.check_lease_block(lease_block, self.lease_layout, need_pinned=page.is_pinned())
+            expert_lease_block.check_lease_block(lease_block, self.lease_layout, need_pinned=page.is_pinned())
         self.lease_block = lease_block
         self.hot_page = hot_page
         if hot_page is not None:
@@ -837,7 +837,7 @@ class Exl3RamMissHost:
 
     def lease_entry(self, idx: int) -> dict:
         """Test only: the service's lease account of request slot ``idx`` (``(seq - 1) % DEMAND_RECORDS``)."""
-        lanes = exl3_lease_block.LANES
+        lanes = expert_lease_block.LANES
         out = torch.zeros(4 + 3 * lanes, dtype=torch.int64)
         self._module.exl3_ram_miss_lease_entry(self.handle, idx, out)
         values = out.tolist()
@@ -963,12 +963,12 @@ class Exl3RamMissHost:
 
     def lease_header(self) -> dict[str, int]:
         """The header words the service wrote (u32 each), read back from the block."""
-        words = self.lease_block[: exl3_lease_block.HEADER_BYTES].view(torch.int32).tolist()
-        return {name: words[offset // 4] & 0xFFFFFFFF for name, offset in exl3_lease_block.HEADER.items()}
+        words = self.lease_block[: expert_lease_block.HEADER_BYTES].view(torch.int32).tolist()
+        return {name: words[offset // 4] & 0xFFFFFFFF for name, offset in expert_lease_block.HEADER.items()}
 
     def lease_row_table(self) -> list[tuple[int, int]]:
         """(slot_gen_base, capacity) per row, as the service wrote them."""
-        start = exl3_lease_block.ROW_TABLE
+        start = expert_lease_block.ROW_TABLE
         words = self.lease_block[start : start + 8 * self.layers].view(torch.int32).tolist()
         return [(words[2 * r], words[2 * r + 1]) for r in range(self.layers)]
 
@@ -1297,7 +1297,7 @@ class Exl3RamMissDevice:
         if lease_block is not None:
             if lease_layout.rows != layers:
                 raise ValueError(f"the lease layout has {lease_layout.rows} rows for {layers} layers")
-            exl3_lease_block.check_lease_block(
+            expert_lease_block.check_lease_block(
                 lease_block, lease_layout, need_pinned=torch.device(device).type == "cuda"
             )
             self._lease_address = int(lease_block.data_ptr())
@@ -1305,12 +1305,12 @@ class Exl3RamMissDevice:
             # The committed copy count (the one word that gates both the copy and the acknowledgement) and, per
             # lane, {request generation, slot generation, row, host slot}. Stable addresses: a graph captures them.
             self.go_count = torch.zeros(1, dtype=torch.int32, device=device)
-            self.lane_ctx = torch.zeros((exl3_lease_block.LANES, 4), dtype=torch.int64, device=device)
+            self.lane_ctx = torch.zeros((expert_lease_block.LANES, 4), dtype=torch.int64, device=device)
             # V1 two-phase (D7): one committed count and one lane context PER STAGE, plus the compacted copy plans
             # each stage hands its own copy launch. `claimed` is stage 1's per-lane verdict and stage 2's
             # complement; `origin` maps a compacted entry back to the lane whose acknowledgement word it writes;
             # `violated` replaces the acknowledgement kernel's keep write, and only the finalize kernel writes keep.
-            lanes = exl3_lease_block.LANES
+            lanes = expert_lease_block.LANES
             self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
             self.go_2 = torch.zeros(1, dtype=torch.int32, device=device)
             # go_1 + go_2, written after finalize: the count a DIRECT residency commit reads.

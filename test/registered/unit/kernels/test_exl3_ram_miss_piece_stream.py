@@ -23,9 +23,9 @@ import torch
 import test_exl3_ram_miss_split as split
 import test_exl3_ram_miss_two_phase as two_phase
 import test_exl3_ram_miss_two_phase_victim as two_phase_victim
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe import exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_stream_transport import (
     Exl3RamMissHost,
     new_page,
     page_word,

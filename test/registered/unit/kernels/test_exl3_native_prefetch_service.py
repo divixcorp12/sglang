@@ -11,7 +11,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe.expert_stream_transport import (
     PREFETCH_FIELDS,
     PREFETCH_SKIP_REASONS,
     PREFETCH_TAG_COPIED,

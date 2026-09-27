@@ -45,8 +45,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only when cuda-python is missing
     cuda_drv = None
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     Exl3RamMissDevice,
     Exl3RamMissHost,
     new_page,

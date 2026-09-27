@@ -132,7 +132,7 @@ def diskstats_of(path: str) -> str:
 
 
 def one_read(tables, experts, mode, *, scenario: str, direct: bool = False, owner_core: int = -1):
-    from sglang.kernels.ops.moe.exl3_ram_miss import read_rows_traced
+    from sglang.kernels.ops.moe.expert_stream_transport import read_rows_traced
 
     workers, split = mode
     n = len(experts)

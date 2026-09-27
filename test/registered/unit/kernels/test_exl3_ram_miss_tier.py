@@ -11,9 +11,9 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_ram_miss
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe import expert_stream_transport
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
     PAGE_BYTES,
     Exl3RamMissHost,
@@ -303,7 +303,7 @@ def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
     s = ram_miss_setup(tmp_path)
     narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:5])
     with pytest.raises(RuntimeError, match="^slabs: "):
-        exl3_ram_miss.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=False)
+        expert_stream_transport.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=False)
 
 
 def test_open_refuses_an_extent_table_of_the_wrong_dtype(tmp_path):
@@ -313,7 +313,7 @@ def test_open_refuses_an_extent_table_of_the_wrong_dtype(tmp_path):
     s = ram_miss_setup(tmp_path)
     bad = dataclasses.replace(s.tables, extents=s.tables.extents.to(torch.int32))
     with pytest.raises(Exception, match="^extents: "):
-        exl3_ram_miss.read_rows_once(bad, row=0, experts=[0], slots=[0], direct=False)
+        expert_stream_transport.read_rows_once(bad, row=0, experts=[0], slots=[0], direct=False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to show experts is refused off it")
@@ -322,12 +322,12 @@ def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
     entry read GPU memory as host memory. read_rows_once always rebuilds experts as a fresh CPU tensor
     (``_ids``), so this device refusal is only observable by calling the raw C++ export directly."""
     s = ram_miss_setup(tmp_path)
-    module = exl3_ram_miss._host_module()
-    args = exl3_ram_miss._table_args(s.tables, False)
+    module = expert_stream_transport._host_module()
+    args = expert_stream_transport._table_args(s.tables, False)
     experts = torch.tensor([0], dtype=torch.int64, device="cuda")
     slots = torch.tensor([0], dtype=torch.int64)
     with pytest.raises(Exception, match="^experts: "):
-        module.exl3_ram_miss_read_rows(*args, 0, experts, slots, exl3_ram_miss.BOUNCE_ROWS)
+        module.exl3_ram_miss_read_rows(*args, 0, experts, slots, expert_stream_transport.BOUNCE_ROWS)
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
@@ -389,7 +389,7 @@ def test_a_lapped_demand_ring_counts_every_skipped_record(tier):
 
 
 def test_the_seqlock_reader_never_accepts_a_torn_record():
-    accepted, torn = exl3_ram_miss.seqlock_stress(seconds=1.0)
+    accepted, torn = expert_stream_transport.seqlock_stress(seconds=1.0)
     assert accepted > 100 and torn == 0, (accepted, torn)
 
 
@@ -476,7 +476,7 @@ def test_release_refuses_a_slot_that_is_still_loading(tier):
 
 _CLOSE_DURING_PUMP = """
 import pathlib, sys, threading, time
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
@@ -521,7 +521,7 @@ def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(hosts[0], "counters", broken)
     monkeypatch.setattr(hosts[1], "counters", broken)
-    exl3_ram_miss._stop_live()
+    expert_stream_transport._stop_live()
     assert not hosts[0]._close.alive and not hosts[1]._close.alive
     assert "counters broke" in capsys.readouterr().err
 

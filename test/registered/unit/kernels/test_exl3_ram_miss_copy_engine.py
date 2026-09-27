@@ -10,8 +10,8 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -265,7 +265,7 @@ def test_the_sm_mask_leaves_exactly_the_trellis_tensors_on_the_copy_engine():
 def test_the_python_names_are_the_host_modules_layout():
     """EXL3_STREAMED_NAMES orders the slab table and the copy table; the C++ trait orders the SM mask. A reorder on
     one side would SM-copy a trellis and DMA a scale vector."""
-    from sglang.kernels.ops.moe.exl3_ram_miss import host_layout
+    from sglang.kernels.ops.moe.expert_stream_transport import host_layout
     from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 
     names, small_mask = host_layout()
