@@ -22,7 +22,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -105,15 +105,36 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.cache.cache_finished_req(req, owned_kv_len=len(req.origin_input_ids))
         self.rtp.free(req)
 
+    def _seed(self, n: int, swa_live_from: int) -> None:
+        """Cache ids[:n] with window KV live only from swa_live_from, as a request whose window slid there leaves it."""
+        full = self.alloc.alloc_extend(
+            torch.tensor([0]), torch.tensor([0]), torch.tensor([n]), torch.tensor([n]), torch.tensor([-1]), n
+        ).to(torch.int64)
+        self.alloc.free_swa_segment(full[:swa_live_from], start_pos=0)
+        self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:n])), value=full,
+                                       swa_evicted_seqlen=swa_live_from))
+
+    def _assert_matches(self, n: int) -> None:
+        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:n]))))
+        self.assertEqual(len(m.device_indices), n)
+
     def test_prefix_hit_capped_at_a_tombstone_branch_point(self):
-        # The crash's shape at 1/16 scale: a layer-major pass leaves [0, 1792) tombstoned and [1792, 2048) live;
-        # a longer prompt's capped match (2148 - 128) reaches full KV 1792 but no live SWA, so its branch point
-        # is 1792 and the insert stops on the tombstone.
-        self._finish(self._layer_major_prefill(2048))
+        # The crash's shape at 1/16 scale: [0, 1792) tombstoned, [1792, 2048) live. A 2148-token prompt's match,
+        # capped at 2148 - 128, reaches full KV 1792 but no live window, so admission sets branch point 1792.
+        self._seed(2048, swa_live_from=1792)
         req = self._layer_major_prefill(2148)
-        self.assertGreaterEqual(req.kv.cache_protected_len, 1792)
-        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:1792]))))
-        self.assertEqual(len(m.device_indices), 1792)
+        self.assertEqual(req.kv.cache_protected_len, 1792)
+        self._assert_matches(1792)
+        self._finish(req)
+        self.cache.sanity_check()
+
+    def test_branch_point_older_than_the_ring_inserts_to_the_end(self):
+        # Branch point 2048 lies more than a ring (5 pages) below seq_len 4000, so its window is gone from the
+        # ring: finalize drops the branch and the insert runs to page_floor(seq_len).
+        self._seed(2048, swa_live_from=2048)
+        req = self._layer_major_prefill(4000)
+        self.assertEqual(req.kv.cache_protected_len, 3840)
+        self._assert_matches(3840)
         self._finish(req)
         self.cache.sanity_check()
 
@@ -122,6 +143,7 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         # finalize keeping only that window left the whole inserted leaf tombstoned and the tree matched nothing.
         req = self._layer_major_prefill(2048 + 200)
         self.assertEqual(req.kv.cache_protected_len, 2048)
+        self._assert_matches(2048)
         self._finish(req)
         self.cache.sanity_check()
 
