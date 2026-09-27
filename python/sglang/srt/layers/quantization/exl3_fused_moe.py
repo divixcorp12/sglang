@@ -53,12 +53,17 @@ _PROJECTIONS = (("gate", "w13", 0), ("up", "w13", 1), ("down", "w2", 0))
 _KINDS = ("trellis", "suh", "svh")
 
 
-def slot_pointer_tables(tensors: Mapping[str, torch.Tensor], slots: int) -> dict[str, torch.Tensor]:
+def slot_pointer_tables(
+    tensors: Mapping[str, torch.Tensor], slots: int
+) -> dict[str, torch.Tensor]:
     """Nine int64 [slots] tables of row addresses: gate = w13 part 0, up = w13 part 1, down = w2."""
     device = tensors["w13_trellis"].device
     return {
         f"{proj}_{kind}": torch.tensor(
-            [tensors[f"{prefix}_{kind}"][slot, part].data_ptr() for slot in range(slots)],
+            [
+                tensors[f"{prefix}_{kind}"][slot, part].data_ptr()
+                for slot in range(slots)
+            ],
             dtype=torch.int64,
             device=device,
         )
@@ -91,9 +96,19 @@ def route_tables(remap, expert_count, ones, weights, keep):
 class Exl3FusedMoE:
     """Static buffers and pointer tables of one streamed layer's in-graph fused MoE."""
 
-    def __init__(self, tensors: Mapping[str, torch.Tensor], slots: int, hidden: int, inter: int, top_k: int, device):
+    def __init__(
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        slots: int,
+        hidden: int,
+        inter: int,
+        top_k: int,
+        device,
+    ):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Exl3FusedMoE must be built before CUDA-graph capture (in a warmup)")
+            raise RuntimeError(
+                "Exl3FusedMoE must be built before CUDA-graph capture (in a warmup)"
+            )
         ext = exl3_ext()
         self.ext = ext
         self.slots = slots
@@ -146,27 +161,66 @@ class Exl3FusedMoE:
         """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int64 (int32 too with layer fusion);
         keep fp32 [1]."""
         if x.shape[0] != 1:  # a host-side shape read: capture-safe
-            raise ValueError(f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}")
+            raise ValueError(
+                f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}"
+            )
         if self.layer_fusion:
-            remap, inv_order, weight_sorted, det = self._fused_route_tables(x, topk_weights, remap, keep)
+            remap, inv_order, weight_sorted, det = self._fused_route_tables(
+                x, topk_weights, remap, keep
+            )
         else:
             self.x16.copy_(x)
-            inv_order, weight_sorted, det = route_tables(remap, self.expert_count, self.ones, topk_weights, keep)
+            inv_order, weight_sorted, det = route_tables(
+                remap, self.expert_count, self.ones, topk_weights, keep
+            )
             self.out.zero_()
         t = self.tables
         self.ext.exl3_moe(
-            self.x16, self.out, self.expert_count, self.token_sorted, weight_sorted,
-            self.temp_state_g, self.temp_state_u, self.temp_intermediate_g, self.temp_intermediate_u,
-            ACT_SILU, self.bits["gate"], self.bits["up"], self.bits["down"],
-            t["gate_trellis"], t["gate_suh"], t["gate_svh"],
-            t["up_trellis"], t["up_suh"], t["up_svh"],
-            t["down_trellis"], t["down_suh"], t["down_svh"],
-            False, True, False, True, False, True,
-            float(act_limit), NUM_ACTIVE, self.scratch, det[0], 1, ROW_TILE, 16,
+            self.x16,
+            self.out,
+            self.expert_count,
+            self.token_sorted,
+            weight_sorted,
+            self.temp_state_g,
+            self.temp_state_u,
+            self.temp_intermediate_g,
+            self.temp_intermediate_u,
+            ACT_SILU,
+            self.bits["gate"],
+            self.bits["up"],
+            self.bits["down"],
+            t["gate_trellis"],
+            t["gate_suh"],
+            t["gate_svh"],
+            t["up_trellis"],
+            t["up_suh"],
+            t["up_svh"],
+            t["down_trellis"],
+            t["down_suh"],
+            t["down_svh"],
+            False,
+            True,
+            False,
+            True,
+            False,
+            True,
+            float(act_limit),
+            NUM_ACTIVE,
+            self.scratch,
+            det[0],
+            1,
+            ROW_TILE,
+            16,
         )
         self.ext.exl3_moe_gather(
-            self.out, self.scratch, remap, inv_order,
-            det[1, : self.slots], det[0, : self.slots], det[2, : self.slots], weight_sorted,
+            self.out,
+            self.scratch,
+            remap,
+            inv_order,
+            det[1, : self.slots],
+            det[0, : self.slots],
+            det[2, : self.slots],
+            weight_sorted,
         )
         return self.out
 
@@ -181,18 +235,26 @@ def exl3_fused_moe_for(layer, streamer) -> Exl3FusedMoE:
         # into resident hot slots before this kernel; other modes need scratch
         # rows to hold every route that is not resident.
         if rows != layer.top_k:
-            raise ValueError(f"exl3 in-graph MoE needs graph_gather_rows ({rows}) == top_k ({layer.top_k})")
+            raise ValueError(
+                f"exl3 in-graph MoE needs graph_gather_rows ({rows}) == top_k ({layer.top_k})"
+            )
         updater = getattr(cache, "device_residency", None)
         direct = (
             getattr(updater, "insert_direct", False)
             and getattr(streamer.row_backend, "name", None) == "exl3_ram_miss"
         )
         if direct and cache.capacity < rows:
-            raise ValueError(f"exl3 DIRECT needs at least top_k resident slots ({cache.capacity} < {rows})")
+            raise ValueError(
+                f"exl3 DIRECT needs at least top_k resident slots ({cache.capacity} < {rows})"
+            )
         if not direct and cache.scratch_rows < rows:
-            raise ValueError(f"exl3 in-graph MoE needs a scratch row per route ({cache.scratch_rows} < {rows})")
+            raise ValueError(
+                f"exl3 in-graph MoE needs a scratch row per route ({cache.scratch_rows} < {rows})"
+            )
         if cache.reserves_prefetch_pull_row:
-            raise ValueError("exl3 in-graph MoE does not cover a prefetch-pull row (expert prefetch is off for EXL3)")
+            raise ValueError(
+                "exl3 in-graph MoE does not cover a prefetch-pull row (expert prefetch is off for EXL3)"
+            )
         slots = cache.capacity + cache.scratch_rows
         fused = Exl3FusedMoE(
             cache.tensors,
