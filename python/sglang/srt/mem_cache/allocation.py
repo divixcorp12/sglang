@@ -468,8 +468,7 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
-            # TODO(layer-major Task 7): batch.layer_major_ring_tokens.
-            swa_ring_tokens=None,
+            swa_ring_tokens=batch.layer_major_ring_tokens,
         )
 
     # Write to req_to_token_pool

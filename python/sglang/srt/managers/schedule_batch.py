@@ -1203,6 +1203,10 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        # Set by _select_prefill_admission when the whole uncached suffix is
+        # admitted as one layer-major extend; cleared once its forward returns.
+        self.layer_major = False
+
         self.weight_version_events: List[WeightVersionEvent] = []
 
         # Incremental streamining
@@ -2465,6 +2469,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
+    # Window-ring size (in tokens) when this batch's single request is a
+    # layer-major extend, read by alloc_for_extend and the tp_worker seam; None
+    # for every other batch, including every non-layer-major extend.
+    layer_major_ring_tokens: Optional[int] = None
+
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
 
@@ -2512,6 +2521,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        layer_major_ring_size: Optional[int] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -2537,6 +2547,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            layer_major_ring_tokens=(
+                layer_major_ring_size if any(r.layer_major for r in reqs) else None
+            ),
         )
         return batch
 
