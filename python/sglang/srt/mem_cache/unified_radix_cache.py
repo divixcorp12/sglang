@@ -88,7 +88,12 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -3398,7 +3403,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv needs this: SWA lives in a per-request ring
+        Decoder SWA bounded replay needs this for every layout (see below). Otherwise
+        only unified_kv does: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never stored in the tree, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring.
@@ -3415,6 +3421,10 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
+        if get_exec().features.enable_decoder_swa_bounded_replay:
+            # Late layers write SWA only for each extend's last window of tokens, so a match boundary inside an
+            # earlier extend keeps unwritten late-layer slots, on device and in the host copy alike.
+            return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:
