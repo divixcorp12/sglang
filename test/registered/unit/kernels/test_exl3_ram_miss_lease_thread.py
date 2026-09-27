@@ -237,6 +237,44 @@ def test_a_long_deferral_does_not_trip_the_watchdog_and_the_demand_is_served_aft
     assert "ERROR exl3" not in result.stderr
 
 
+def _a_terminal_lands_after_the_last_ack_retired(host, sim):
+    """Serve and ack one request, then deliver a terminal for the same generation: a device double signal whose second
+    word lands after the lane retired and the entry closed. Nothing is outstanding and nothing is posted, so every
+    pass of the running thread takes the idle early-out and compares nothing (LEASE_PROTOCOL.md 7.5)."""
+    req, waited = _served(sim, 0, [3])
+    sim.ack(req, waited)
+    sim.deliver()
+    assert _until(lambda: host.counters()["leases_acked"] == 1 and not host.lease_entry(req.idx)["active"])
+    sim.terminal(req, mask=0b1)
+    sim.deliver()
+    time.sleep(0.05)  # many idle passes of the thread
+    assert host.counters()["lease_double_signal"] == 0, "an idle pass compares nothing; the settle must count it"
+
+
+def test_a_pause_settles_a_double_signal_that_landed_after_the_last_lease_retired(running):
+    """pause's caller synchronized the stream, so its retirement pass is a settle pass and counts the late terminal.
+    Mutation: RamThread::pause calls retire_leases(false)."""
+    s, page, host, sim = running
+    _a_terminal_lands_after_the_last_ack_retired(host, sim)
+    host.pause(2.0)
+    try:
+        counters = host.counters()
+        assert counters["lease_double_signal"] == 1 and counters["leases_voided"] == 0
+    finally:
+        host.resume()
+
+
+def test_stopping_the_thread_settles_a_double_signal_on_the_last_request(running):
+    """No request follows the last one, so no posted demand settles it: stop_thread's final settle pass must, before
+    the counters line ExpertStreamHost.stop writes. Mutation: stop_thread does not settle."""
+    s, page, host, sim = running
+    _a_terminal_lands_after_the_last_ack_retired(host, sim)
+    host._module.expert_stream_stop_thread(host.handle)
+    host.threaded = False
+    counters = host.counters()
+    assert counters["lease_double_signal"] == 1 and counters["leases_voided"] == 0
+
+
 if __name__ == "__main__":
     import sys
 
