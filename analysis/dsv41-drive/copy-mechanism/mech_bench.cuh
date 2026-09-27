@@ -51,15 +51,30 @@ __device__ __forceinline__ uint32_t smem(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
-// The fresh check's midpoint. Every block counts itself in words[1], then its thread 0 polls words[0] with an
-// acquire until the host has rewritten the source and released the word. The block barrier after the poll orders
-// the other threads' second-pass reads after it.
+__device__ __forceinline__ uint32_t ld_relaxed(const uint32_t* p) {
+  uint32_t v;
+  asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+
+// The fresh check's midpoint. Every block counts itself in words[1], then its thread 0 polls words[0] until the
+// host has rewritten the source and released the word. The block barrier after the poll orders the other threads'
+// second-pass reads after it. Swept kernels poll with an acquire, as the visibility contract requires. On sm_120 that
+// acquire compiles to LDG.E.STRONG.SYS + CCTL.IVALL, which invalidates the SM's whole L1 -- so the .nc control
+// (kRelaxed) polls with a relaxed load, no CCTL, or its stale L1 lines would be dropped and it would read fresh bytes
+// (the blind check of 2026-09-27). mech_bench.py asserts the CCTL split on the built SASS.
+template <bool kRelaxed = false>
 __device__ void fresh_barrier(uint32_t* words) {
   __syncthreads();
   if (threadIdx.x == 0) {
     atomicAdd_system(words + 1, 1u);
-    while (ld_acquire(words) == 0)
-      __nanosleep(1000);
+    if constexpr (kRelaxed) {
+      while (ld_relaxed(words) == 0)
+        __nanosleep(1000);
+    } else {
+      while (ld_acquire(words) == 0)
+        __nanosleep(1000);
+    }
   }
   __syncthreads();
 }
@@ -112,7 +127,7 @@ __device__ __forceinline__ void store(uint8_t* p, const Vec<W>& r) {
 template <int U, int W, bool kNc>
 __global__ __launch_bounds__(kThreads, 1) void sm_kernel(const Job* jobs, int64_t njobs, uint32_t* fresh) {
   for (int pass = 0; pass < (fresh != nullptr ? 2 : 1); ++pass) {
-    if (pass == 1) fresh_barrier(fresh);
+    if (pass == 1) fresh_barrier<kNc>(fresh);
     for (int64_t j = 0; j < njobs; ++j) {
       const auto src = reinterpret_cast<const uint8_t*>(jobs[j].src);
       const auto dst = reinterpret_cast<uint8_t*>(jobs[j].dst);

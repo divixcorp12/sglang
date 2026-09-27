@@ -16,6 +16,7 @@ Every method first passes a byte check; the fresh check (kind "fresh" records) r
 import argparse
 import collections
 import json
+import re
 import socket
 import statistics
 import subprocess
@@ -33,6 +34,7 @@ SLOTS = 16  # 213 MB of destination slots, rotated: past the 96 MiB L2
 N_ROWS = 4
 FRESH_BYTES = 64 << 10  # small enough that one block's share fits its L1, so a stale .nc read shows
 KIND_CV, KIND_NC, KIND_LDGSTS, KIND_TMA = 0, 1, 2, 3
+LOAD_NC = 1  # sm_kernel's load template argument for the .nc control (bool true today)
 WRAPPERS = ["mech_copy", "mech_fresh", "mech_latency", "mech_pingpong"]
 BUILD_FLAGS = []  # (probe name, define) pairs; Task 4 and 5 append theirs
 Cell = collections.namedtuple("Cell", "method grid a b in_flight name rows which run")
@@ -51,6 +53,51 @@ def load(repo: Path, probe: dict):
     return load_jit("copy_mech_bench", variant, cuda_files=[str(HERE / "mech_bench.cuh")],
                     cuda_wrappers=[(n, n) for n in WRAPPERS + (["mech_ce_batch"] if probe_ok(probe, "batch") else [])],
                     extra_cuda_cflags=flags)
+
+
+def loaded_module_path(tag: str) -> str:
+    """The .so of the JIT module this process loaded, from its own memory map (exact, whatever the cache holds)."""
+    paths = {line.split()[-1] for line in open("/proc/self/maps") if tag in line and line.rstrip().endswith(".so")}
+    if len(paths) != 1:
+        raise SystemExit(f"expected one loaded module matching {tag!r}, found {sorted(paths)}")
+    return paths.pop()
+
+
+def sass_by_function(so: str) -> dict[str, str]:
+    import os
+    import shutil
+
+    cuobjdump = shutil.which("cuobjdump") or os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin/cuobjdump")
+    text = subprocess.run([cuobjdump, "-sass", so], capture_output=True, text=True, check=True).stdout
+    functions, name = {}, None
+    for line in text.splitlines():
+        if "Function :" in line:
+            name = line.split("Function :")[1].strip()
+            functions[name] = ""
+        elif name is not None:
+            functions[name] += line + "\n"
+    return functions
+
+
+def cctl_check(so: str) -> dict:
+    """The fresh check is only as good as this split: the .nc control's midpoint must not invalidate L1 (no CCTL),
+    and every swept copy kernel's acquire must (CCTL.IVALL). Refuses to sweep when either side is wrong."""
+    control, swept, bad = [], [], []
+    for name, sass in sass_by_function(so).items():
+        m = re.search(r"sm_kernelILi\d+ELi\d+EL[bi](\d+)E", name)
+        if m:
+            is_control = int(m.group(1)) == LOAD_NC
+        elif "ldgsts_kernel" in name or "tma_kernel" in name:
+            is_control = False
+        else:
+            continue  # latency / ping-pong: not copy kernels
+        has = "CCTL" in sass
+        (control if is_control else swept).append(name)
+        if has == is_control:
+            bad.append({"function": name, "control": is_control, "cctl": has})
+    if not control or not swept or bad:
+        raise SystemExit(f"CCTL split wrong (control {control}, swept {len(swept)}): {bad}")
+    return {"kind": "sass", "module": so, "control_no_cctl": control, "swept_with_cctl": len(swept)}
 
 
 class Rows:
@@ -205,6 +252,7 @@ def main() -> int:
     # Everything on a side stream: cudaMemcpyBatchAsync rejects the legacy NULL stream (torch's default).
     torch.cuda.set_stream(torch.cuda.Stream())
     mod = load(repo, probe)
+    sass = cctl_check(loaded_module_path("copy_mech_bench_"))
     rows = Rows(a.node)
     gen, width, gen_now, width_now = pcie(a.gpu_index)
     out = open(a.out, "a")
@@ -217,6 +265,7 @@ def main() -> int:
           "pcie_width": width, "pcie_gen_at_start": gen_now, "pcie_width_at_start": width_now,
           "cuda": torch.version.cuda, "node": a.node, "sglang": sglang.__file__,
           "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "probe": {k: v["ok"] for k, v in probe["probes"].items()}})
+    emit(sass)
     host_word = torch.zeros(1, dtype=torch.int32).pin_memory()
     dev_word = torch.zeros(1, dtype=torch.int32, device="cuda")
     lat = torch.zeros(3, dtype=torch.int64, device="cuda")
