@@ -3,7 +3,6 @@ objects. Holds named fields only: what a field means belongs to the model adapte
 
 from __future__ import annotations
 
-import ctypes
 import math
 from typing import Any
 
@@ -74,39 +73,13 @@ class StateStore:
 
 def _allocate(spec: FieldSpec, capacity_tokens: int, *, numa_node: int | None, pin: bool) -> torch.Tensor:
     shape = (capacity_tokens,) + tuple(spec.per_token_shape)
-    # cudaHostAlloc (pin_memory=True) faults in pages at allocation time, so the
-    # preferred-node bias below actually steers physical placement; a plain
-    # torch.empty is lazily paged and this context is then a no-op.
-    with _numa_preferred(numa_node):
-        return torch.empty(shape, dtype=_dtype(spec), pin_memory=pin)
+    if numa_node is None and not pin:
+        return torch.empty(shape, dtype=_dtype(spec))
+    from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
 
-
-def _get_libnuma():
-    # Load directly rather than via sglang.srt.utils.numa_utils: that module pulls in
-    # ServerArgs and the whole server import graph, which this leaf allocator must not.
-    for name in ("libnuma.so", "libnuma.so.1"):
-        try:
-            return ctypes.CDLL(name)
-        except OSError:
-            continue
-    return None
-
-
-class _numa_preferred:
-    """Best-effort MPOL_PREFERRED bias for the calling thread during allocation. Silently does nothing if libnuma
-    is unavailable; this is a placement hint, not a hard guarantee."""
-
-    def __init__(self, node: int | None):
-        self._libnuma = _get_libnuma() if node is not None else None
-        self._node = node
-
-    def __enter__(self):
-        if self._libnuma is not None and self._libnuma.numa_available() >= 0:
-            self._libnuma.numa_set_preferred(ctypes.c_int(self._node))
-
-    def __exit__(self, *exc):
-        if self._libnuma is not None and self._libnuma.numa_available() >= 0:
-            self._libnuma.numa_set_preferred(ctypes.c_int(-1))
+    nbytes = math.prod(shape) * _dtype(spec).itemsize
+    placement = [(numa_node, nbytes)] if numa_node is not None else []
+    return allocate_host_slab(capacity_tokens, spec.per_token_shape, _dtype(spec), register=pin, placement=placement)
 
 
 class _on:

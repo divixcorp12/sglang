@@ -78,6 +78,18 @@ class TestStateStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             store.unpark(0, torch.device("cpu"))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA device")
+    def test_pinned_numa_store_round_trips_to_a_cuda_tensor(self):
+        fields = [FieldSpec(name="hidden", per_token_shape=(2, 3), dtype="bfloat16")]
+        store = StateStore(fields, 8, numa_node=1, pin=True)
+        rows = torch.randn(3, 2, 3).to(torch.bfloat16)
+        store.write("hidden", 2, rows)
+        stream = torch.cuda.Stream()
+        out = torch.empty(3, 2, 3, dtype=torch.bfloat16, device="cuda")
+        store.read_into("hidden", 2, out, stream=stream)
+        stream.synchronize()
+        self.assertTrue(torch.equal(out.cpu(), rows))
+
 
 if __name__ == "__main__":
     unittest.main()
