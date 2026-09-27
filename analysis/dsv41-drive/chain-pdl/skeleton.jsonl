@@ -1,0 +1,6 @@
+{"kind": "skeleton", "mode": 0, "work_ns": 0, "layers": 40, "replay_us_p50": 242.35, "per_layer_us_p50": 6.059}
+{"kind": "skeleton", "mode": 1, "work_ns": 0, "layers": 40, "replay_us_p50": 211.42, "per_layer_us_p50": 5.286}
+{"kind": "skeleton", "mode": 2, "work_ns": 0, "layers": 40, "replay_us_p50": 185.81, "per_layer_us_p50": 4.645}
+{"kind": "skeleton", "mode": 0, "work_ns": 2000, "layers": 40, "replay_us_p50": 953.54, "per_layer_us_p50": 23.838}
+{"kind": "skeleton", "mode": 1, "work_ns": 2000, "layers": 40, "replay_us_p50": 922.66, "per_layer_us_p50": 23.066}
+{"kind": "skeleton", "mode": 2, "work_ns": 2000, "layers": 40, "replay_us_p50": 894.27, "per_layer_us_p50": 22.357}
