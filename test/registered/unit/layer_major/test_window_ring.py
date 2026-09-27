@@ -47,7 +47,7 @@ class _FakeExtendKernel:
         return _launch
 
 
-def _allocator(size=256, size_swa=64):
+def _allocator(size=256, size_swa=64, device="cpu"):
     kv = SWAKVPool(
         size=size,
         size_swa=size_swa,
@@ -57,21 +57,21 @@ def _allocator(size=256, size_swa=64):
         head_dim=8,
         swa_attention_layer_ids=[1],
         full_attention_layer_ids=[0],
-        device="cpu",
+        device=device,
     )
     return SWATokenToKVPoolAllocator(
         size=size,
         size_swa=size_swa,
         page_size=PAGE,
         dtype=torch.bfloat16,
-        device="cpu",
+        device=device,
         kvcache=kv,
         need_sort=False,
     )
 
 
-def _alloc_whole(a, n):
-    t = torch.tensor
+def _alloc_whole(a, n, device="cpu"):
+    t = lambda x: torch.tensor(x, device=device)
     full = a.alloc_extend_swa_tail(
         t([0]), t([0]), t([n]), t([n]), t([-1]), n, swa_tail_len=RING
     )
@@ -233,6 +233,43 @@ class TestRingEvictionSizing(unittest.TestCase):
         self.assertEqual(params.num_tokens, full_target)
         self.assertEqual(params.swa_num_tokens, swa_target)
         self.assertLess(params.swa_num_tokens, full_target)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestWindowRingCudaFreePath(unittest.TestCase):
+    """TestWindowRing above mocks alloc_extend_kernel with the pure-torch alloc_extend_naive and runs
+    on a CPU allocator, so free_index.is_cuda is always False there and _free_swa_pages always takes
+    _free_swa_pages_none_cuda. This class runs on a real CUDA device with the real Triton
+    alloc_extend_kernel, so free_index.is_cuda is True and _free_swa_pages dispatches to
+    _free_swa_pages_cuda (get_and_clear_swa_pages), the path Task 12's GPU equivalence run actually
+    exercises."""
+
+    def test_finalize_keeps_the_partially_kept_page_off_the_free_list_on_cuda(self):
+        # Same scenario as TestWindowRing.test_finalize_keeps_the_partially_kept_page_off_the_free_list
+        # (Critical-1: a page that still backs a kept position must not be freed), but through the real
+        # CUDA free kernel instead of the CPU fallback.
+        a = _allocator(device="cuda")
+        swa_before, full_before = a.swa_available_size(), a.full_available_size()
+        n = 50  # PAGE=4 does not divide n; final kept page is only partially live.
+        full = _alloc_whole(a, n, device="cuda")
+        ring = a.ring_slots(full[-RING:])
+        for start in range(0, n, CHUNK):
+            pos = torch.arange(start, min(n, start + CHUNK), device="cuda")
+            a.map_ring_positions(full[pos], pos, ring)
+        keep_from = (n - 8) // PAGE * PAGE
+        a.finalize_ring(full, extend_start=0, keep_from=keep_from, ring=ring)
+
+        kept = a.full_to_swa_index_mapping[full[keep_from:]]
+        kept_pages = (kept[kept > 0] // PAGE).unique().tolist()
+        free_pages = a.swa_attn_allocator.get_all_free_pages().tolist()
+        for p in kept_pages:
+            self.assertNotIn(p, free_pages, f"page {p} still backs a kept position but was freed")
+
+        a.free(full)
+        self.assertEqual(a.swa_available_size(), swa_before)
+        self.assertEqual(a.full_available_size(), full_before)
+        all_free = a.swa_attn_allocator.get_all_free_pages()
+        self.assertEqual(all_free.numel(), all_free.unique().numel())
 
 
 if __name__ == "__main__":
