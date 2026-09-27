@@ -30,6 +30,7 @@ constexpr int kKindLdgsts = 2;
 constexpr int kKindTma = 3;
 constexpr int kKindWeak = 4;
 constexpr int kKindCwReal = 5;
+constexpr int kKindLine = 7;
 // sm_kernel's load flavour: .cv (swept), .nc (the fresh check's control, never swept), weak (plain ld.global after
 // the acquire; swept: the PTX memory model orders it after an acquire that observed the host's release).
 constexpr int kLoadCv = 0;
@@ -387,6 +388,43 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void cw
     copy_wait_read(reinterpret_cast<const uint8_t*>(jobs[j].src), reinterpret_cast<uint8_t*>(jobs[j].dst), jobs[j].bytes);
 }
 
+// Partial-line probe: sm_cv16's loop, but unit u reads the (u % (kTouch / 16))-th 16 B of line u / (kTouch / 16), so
+// only the first kTouch bytes of every 128 B line are loaded (.cv) and stored. Tells whether the SM's sysmem path
+// fetches whole 128 B lines (useful GB/s scales with kTouch) or 32 B sectors (it does not, down to 32 B).
+template <int U, int kTouch>
+__global__ __launch_bounds__(kThreads, 1) void line_kernel(const Job* jobs, int64_t njobs) {
+  constexpr int kPer = kTouch / 16;
+  for (int64_t j = 0; j < njobs; ++j) {
+    const auto src = reinterpret_cast<const uint8_t*>(jobs[j].src);
+    const auto dst = reinterpret_cast<uint8_t*>(jobs[j].dst);
+    const int64_t units = jobs[j].bytes / 128 * kPer;
+    for (int64_t chunk = blockIdx.x; chunk * kThreads * U < units; chunk += gridDim.x) {
+      Vec<16> v[U];
+#pragma unroll
+      for (int k = 0; k < U; ++k) {
+        const int64_t u = (chunk * U + k) * kThreads + threadIdx.x;
+        if (u < units) v[k] = load<16, kLoadCv>(src + 128 * (u / kPer) + 16 * (u % kPer));
+      }
+#pragma unroll
+      for (int k = 0; k < U; ++k) {
+        const int64_t u = (chunk * U + k) * kThreads + threadIdx.x;
+        if (u < units) store<16>(dst + 128 * (u / kPer) + 16 * (u % kPer), v[k]);
+      }
+    }
+  }
+}
+
+template <int U>
+inline bool launch_line(int g, int64_t touch, const Job* jobs, int64_t njobs, cudaStream_t stream) {
+  switch (touch) {
+    case 16: host::LaunchKernel(g, kThreads, stream)(line_kernel<U, 16>, jobs, njobs); return true;
+    case 32: host::LaunchKernel(g, kThreads, stream)(line_kernel<U, 32>, jobs, njobs); return true;
+    case 64: host::LaunchKernel(g, kThreads, stream)(line_kernel<U, 64>, jobs, njobs); return true;
+    case 128: host::LaunchKernel(g, kThreads, stream)(line_kernel<U, 128>, jobs, njobs); return true;
+  }
+  return false;
+}
+
 // Every copy kernel of this file behind one switch; Tasks 4 (kinds 2, 3) extend it.
 inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, int64_t a, int64_t b, uint32_t* fresh,
                    cudaStream_t stream) {
@@ -395,6 +433,12 @@ inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, i
     host::RuntimeCheck(a == 1 && b == 16, "the .nc control is U=1, W=16 only");
     host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, kLoadNc>, jobs, njobs, fresh);
     return;
+  }
+  if (kind == kKindLine) {
+    host::RuntimeCheck(fresh == nullptr, "line: no fresh check");
+    if ((a == 4 && launch_line<4>(g, b, jobs, njobs, stream)) || (a == 8 && launch_line<8>(g, b, jobs, njobs, stream)))
+      return;
+    host::RuntimeCheck(false, "line: unroll 4 or 8, touch 16, 32, 64 or 128");
   }
   if (kind == kKindCwReal) {
     host::RuntimeCheck(grid == 1 && fresh == nullptr, "cw_real: one block, no fresh check (it has no midpoint)");
