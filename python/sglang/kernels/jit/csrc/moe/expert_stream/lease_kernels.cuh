@@ -3,32 +3,61 @@
 #pragma once
 
 #include "lease_device.cuh"
+#include "tensor_checks.h"
+
+#include <sgl_kernel/tensor.h>
 
 namespace sglang {
 
+struct PostParams {
+  uint8_t* page;
+  int32_t* state;
+  const int32_t* slot_map;
+  const int64_t* planned;
+  const int32_t* count;
+  const int64_t* routes;
+  int64_t route_count;
+  int64_t row;
+  int64_t experts;
+  int64_t advise;
+  int32_t* last_routes;
+  int64_t next_row;
+  uint8_t* lease;
+  int64_t lease_d;
+  int64_t timeout_ns;
+  uint8_t* hot_page;
+  int64_t hot_stride;
+  const int64_t* hot_slots;
+  int64_t hot_capacity;
+  const int32_t* dst_slots;
+  int64_t dst_count;
+  int64_t copy_engine;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int32_t* __restrict__ slot_map,
-    const int64_t* __restrict__ planned,
-    const int32_t* __restrict__ count,
-    const int64_t* __restrict__ routes,
-    int64_t route_count,
-    int64_t row,
-    int64_t experts,
-    int64_t advise,
-    int32_t* __restrict__ last_routes,
-    int64_t next_row,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    int64_t timeout_ns,
-    uint8_t* __restrict__ hot_page,
-    int64_t hot_stride,
-    const int64_t* __restrict__ hot_slots,
-    int64_t hot_capacity,
-    const int32_t* __restrict__ dst_slots,
-    int64_t dst_count,
-    int64_t copy_engine) {
+    const __grid_constant__ PostParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int32_t* __restrict__ const slot_map = p.slot_map;
+  const int64_t* __restrict__ const planned = p.planned;
+  const int32_t* __restrict__ const count = p.count;
+  const int64_t* __restrict__ const routes = p.routes;
+  const int64_t route_count = p.route_count;
+  const int64_t row = p.row;
+  const int64_t experts = p.experts;
+  const int64_t advise = p.advise;
+  int32_t* __restrict__ const last_routes = p.last_routes;
+  const int64_t next_row = p.next_row;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  const int64_t timeout_ns = p.timeout_ns;
+  uint8_t* __restrict__ const hot_page = p.hot_page;
+  const int64_t hot_stride = p.hot_stride;
+  const int64_t* __restrict__ const hot_slots = p.hot_slots;
+  const int64_t hot_capacity = p.hot_capacity;
+  const int32_t* __restrict__ const dst_slots = p.dst_slots;
+  const int64_t dst_count = p.dst_count;
+  const int64_t copy_engine = p.copy_engine;
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   if (state[kSticky] != 0 || ld_acquire_sys(page + kFatal) != 0) {
@@ -131,19 +160,35 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   st_release_sys(page + kAdviseHead, advice);
 }
 
+struct WaitParams {
+  uint8_t* page;
+  int32_t* state;
+  const int32_t* slot_map;
+  const int64_t* planned;
+  const int32_t* count;
+  int64_t row;
+  int64_t experts;
+  int64_t lanes;
+  int64_t* host_rows;
+  float* keep;
+  int64_t* ram_miss;
+  int64_t timeout_ns;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_wait_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int32_t* __restrict__ slot_map,
-    const int64_t* __restrict__ planned,
-    const int32_t* __restrict__ count,
-    int64_t row,
-    int64_t experts,
-    int64_t lanes,
-    int64_t* __restrict__ host_rows,
-    float* __restrict__ keep,
-    int64_t* __restrict__ ram_miss,
-    int64_t timeout_ns) {
+    const __grid_constant__ WaitParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int32_t* __restrict__ const slot_map = p.slot_map;
+  const int64_t* __restrict__ const planned = p.planned;
+  const int32_t* __restrict__ const count = p.count;
+  const int64_t row = p.row;
+  const int64_t experts = p.experts;
+  const int64_t lanes = p.lanes;
+  int64_t* __restrict__ const host_rows = p.host_rows;
+  float* __restrict__ const keep = p.keep;
+  int64_t* __restrict__ const ram_miss = p.ram_miss;
+  const int64_t timeout_ns = p.timeout_ns;
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   // D15: the page's fatal word too, not only this device's sticky flag.
@@ -209,21 +254,39 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 // from the lanes' RowResults, never from the slot map. `go_count[0]` is zero on entry and is written exactly once,
 // as the last store of a commit; every other exit leaves it zero, so the copy kernel that reads it as its active
 // count copies nothing and the ack kernel that reads it acknowledges nothing.
+struct LeaseWaitParams {
+  uint8_t* page;
+  int32_t* state;
+  const int64_t* planned;
+  const int32_t* count;
+  int64_t row;
+  int64_t lanes;
+  int64_t* host_rows;
+  float* keep;
+  int64_t* ram_miss;
+  int64_t timeout_ns;
+  uint8_t* lease;
+  int64_t lease_d;
+  int32_t* go_count;
+  int64_t* lane_ctx;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_wait_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int64_t* __restrict__ planned,
-    const int32_t* __restrict__ count,
-    int64_t row,
-    int64_t lanes,
-    int64_t* __restrict__ host_rows,
-    float* __restrict__ keep,
-    int64_t* __restrict__ ram_miss,
-    int64_t timeout_ns,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    int32_t* __restrict__ go_count,
-    int64_t* __restrict__ lane_ctx) {
+    const __grid_constant__ LeaseWaitParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int64_t* __restrict__ const planned = p.planned;
+  const int32_t* __restrict__ const count = p.count;
+  const int64_t row = p.row;
+  const int64_t lanes = p.lanes;
+  int64_t* __restrict__ const host_rows = p.host_rows;
+  float* __restrict__ const keep = p.keep;
+  int64_t* __restrict__ const ram_miss = p.ram_miss;
+  const int64_t timeout_ns = p.timeout_ns;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  int32_t* __restrict__ const go_count = p.go_count;
+  int64_t* __restrict__ const lane_ctx = p.lane_ctx;
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   go_count[0] = 0;  // fail closed
@@ -357,25 +420,45 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 // It writes neither `keep` nor `ram_miss`: `keep` has exactly one writer (the finalize kernel) and `ram_miss` is
 // owned by stage 2, the stage that knows the true miss count once the request has been served.
 
+struct HitWaitParams {
+  uint8_t* page;
+  int32_t* state;
+  const int64_t* planned;
+  const int32_t* count;
+  const int32_t* dst_slots;
+  int64_t row;
+  int64_t lanes;
+  int64_t* host_rows_1;
+  int32_t* dst_slots_1;
+  uint8_t* lease;
+  int64_t lease_d;
+  int32_t* go_1;
+  int64_t* lane_ctx_1;
+  int32_t* origin_1;
+  int32_t* claimed;
+  int32_t* violated;
+  int64_t budget_ns;
+};
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_hit_wait_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int64_t* __restrict__ planned,
-    const int32_t* __restrict__ count,
-    const int32_t* __restrict__ dst_slots,
-    int64_t row,
-    int64_t lanes,
-    int64_t* __restrict__ host_rows_1,
-    int32_t* __restrict__ dst_slots_1,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    int32_t* __restrict__ go_1,
-    int64_t* __restrict__ lane_ctx_1,
-    int32_t* __restrict__ origin_1,
-    int32_t* __restrict__ claimed,
-    int32_t* __restrict__ violated,
-    int64_t budget_ns) {
+    const __grid_constant__ HitWaitParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int64_t* __restrict__ const planned = p.planned;
+  const int32_t* __restrict__ const count = p.count;
+  const int32_t* __restrict__ const dst_slots = p.dst_slots;
+  const int64_t row = p.row;
+  const int64_t lanes = p.lanes;
+  int64_t* __restrict__ const host_rows_1 = p.host_rows_1;
+  int32_t* __restrict__ const dst_slots_1 = p.dst_slots_1;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  int32_t* __restrict__ const go_1 = p.go_1;
+  int64_t* __restrict__ const lane_ctx_1 = p.lane_ctx_1;
+  int32_t* __restrict__ const origin_1 = p.origin_1;
+  int32_t* __restrict__ const claimed = p.claimed;
+  int32_t* __restrict__ const violated = p.violated;
+  const int64_t budget_ns = p.budget_ns;
   if (threadIdx.x != 0) return;
   device::expert_stream::lease_hit_wait_body(
       page, state, planned, count, dst_slots, row, lanes, host_rows_1, dst_slots_1, lease, lease_d, go_1, lane_ctx_1,
@@ -385,27 +468,51 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 // Piece streaming's W1: stage 1 exactly, after resetting every word the stream kernel and the finalize kernel read
 // from it (plan 5, C1). go_2 and the counter are written by S only on a commit and by its blocks' counts, so without
 // this a replay could read an earlier replay's values; this is the first kernel of the chain that owns them.
+struct StreamHitWaitParams {
+  uint8_t* page;
+  int32_t* state;
+  const int64_t* planned;
+  const int32_t* count;
+  const int32_t* dst_slots;
+  int64_t row;
+  int64_t lanes;
+  int64_t* host_rows_1;
+  int32_t* dst_slots_1;
+  uint8_t* lease;
+  int64_t lease_d;
+  int32_t* go_1;
+  int64_t* lane_ctx_1;
+  int32_t* origin_1;
+  int32_t* claimed;
+  int32_t* violated;
+  int64_t budget_ns;
+  int32_t* go_2;
+  uint32_t* stream_count;
+  int32_t* stream_abort;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_stream_hit_wait_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int64_t* __restrict__ planned,
-    const int32_t* __restrict__ count,
-    const int32_t* __restrict__ dst_slots,
-    int64_t row,
-    int64_t lanes,
-    int64_t* __restrict__ host_rows_1,
-    int32_t* __restrict__ dst_slots_1,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    int32_t* __restrict__ go_1,
-    int64_t* __restrict__ lane_ctx_1,
-    int32_t* __restrict__ origin_1,
-    int32_t* __restrict__ claimed,
-    int32_t* __restrict__ violated,
-    int64_t budget_ns,
-    int32_t* __restrict__ go_2,
-    uint32_t* __restrict__ stream_count,
-    int32_t* __restrict__ stream_abort) {
+    const __grid_constant__ StreamHitWaitParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int64_t* __restrict__ const planned = p.planned;
+  const int32_t* __restrict__ const count = p.count;
+  const int32_t* __restrict__ const dst_slots = p.dst_slots;
+  const int64_t row = p.row;
+  const int64_t lanes = p.lanes;
+  int64_t* __restrict__ const host_rows_1 = p.host_rows_1;
+  int32_t* __restrict__ const dst_slots_1 = p.dst_slots_1;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  int32_t* __restrict__ const go_1 = p.go_1;
+  int64_t* __restrict__ const lane_ctx_1 = p.lane_ctx_1;
+  int32_t* __restrict__ const origin_1 = p.origin_1;
+  int32_t* __restrict__ const claimed = p.claimed;
+  int32_t* __restrict__ const violated = p.violated;
+  const int64_t budget_ns = p.budget_ns;
+  int32_t* __restrict__ const go_2 = p.go_2;
+  uint32_t* __restrict__ const stream_count = p.stream_count;
+  int32_t* __restrict__ const stream_abort = p.stream_abort;
   if (threadIdx.x != 0) return;
   go_2[0] = 0;
   stream_count[0] = 0u;
@@ -428,23 +535,43 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 //
 // `state[kPending]` is not cleared here even though this is the later of the two waits: the finalize kernel still
 // needs the request's generation, so the clear moves there and both stages read it.
+struct RestWaitParams {
+  uint8_t* page;
+  int32_t* state;
+  const int64_t* planned;
+  const int32_t* count;
+  const int32_t* dst_slots;
+  int64_t row;
+  int64_t lanes;
+  int64_t* host_rows_2;
+  int32_t* dst_slots_2;
+  int64_t* ram_miss;
+  uint8_t* lease;
+  int64_t lease_d;
+  const int32_t* claimed;
+  int32_t* go_2;
+  int64_t* lane_ctx_2;
+  int32_t* origin_2;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_rest_wait_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int64_t* __restrict__ planned,
-    const int32_t* __restrict__ count,
-    const int32_t* __restrict__ dst_slots,
-    int64_t row,
-    int64_t lanes,
-    int64_t* __restrict__ host_rows_2,
-    int32_t* __restrict__ dst_slots_2,
-    int64_t* __restrict__ ram_miss,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    const int32_t* __restrict__ claimed,
-    int32_t* __restrict__ go_2,
-    int64_t* __restrict__ lane_ctx_2,
-    int32_t* __restrict__ origin_2) {
+    const __grid_constant__ RestWaitParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int64_t* __restrict__ const planned = p.planned;
+  const int32_t* __restrict__ const count = p.count;
+  const int32_t* __restrict__ const dst_slots = p.dst_slots;
+  const int64_t row = p.row;
+  const int64_t lanes = p.lanes;
+  int64_t* __restrict__ const host_rows_2 = p.host_rows_2;
+  int32_t* __restrict__ const dst_slots_2 = p.dst_slots_2;
+  int64_t* __restrict__ const ram_miss = p.ram_miss;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  const int32_t* __restrict__ const claimed = p.claimed;
+  int32_t* __restrict__ const go_2 = p.go_2;
+  int64_t* __restrict__ const lane_ctx_2 = p.lane_ctx_2;
+  int32_t* __restrict__ const origin_2 = p.origin_2;
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   go_2[0] = 0;  // fail closed
@@ -559,14 +686,25 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 // stage emits nothing: not an acknowledgement, not a violation, not a fatal word.
 //
 // It records a violation in `violated` rather than writing `keep`, which only the finalize kernel writes.
+struct StageAckParams {
+  uint8_t* page;
+  uint8_t* lease;
+  int64_t lease_d;
+  const int32_t* go_count;
+  const int64_t* lane_ctx;
+  const int32_t* origin;
+  int32_t* violated;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ram_miss_lease_stage_ack_kernel(
-    uint8_t* __restrict__ page,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    const int32_t* __restrict__ go_count,
-    const int64_t* __restrict__ lane_ctx,
-    const int32_t* __restrict__ origin,
-    int32_t* __restrict__ violated) {
+    const __grid_constant__ StageAckParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  const int32_t* __restrict__ const go_count = p.go_count;
+  const int64_t* __restrict__ const lane_ctx = p.lane_ctx;
+  const int32_t* __restrict__ const origin = p.origin;
+  int32_t* __restrict__ const violated = p.violated;
   using namespace device::expert_stream;
   __shared__ int any_violated;
   if (threadIdx.x == 0) any_violated = 0;
@@ -604,20 +742,35 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
 // whole-request mask would void the hit lanes stage 1 has already acknowledged; retire_leases's per-lane state
 // machine keeps that from corrupting anything, but it records it only as kLeaseDoubleSignal, so the wrong mask
 // would otherwise be invisible.
+//
+// No `lanes` field on purpose. The only bound this kernel needs is kLeaseLanes, because the array it walks is
+// the per-record LaneAck table, which is kLeaseLanes wide by construction -- not a staging buffer. Passing the
+// staging width here would read as the bound and be wrong.
+struct FinalizeParams {
+  uint8_t* page;
+  int32_t* state;
+  const int32_t* count;
+  const int32_t* go_1;
+  const int32_t* go_2;
+  const int32_t* go_ce;
+  const int32_t* violated;
+  float* keep;
+  uint8_t* lease;
+  int64_t lease_d;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_finalize_kernel(
-    uint8_t* __restrict__ page,
-    int32_t* __restrict__ state,
-    const int32_t* __restrict__ count,
-    // No `lanes` parameter on purpose. The only bound this kernel needs is kLeaseLanes, because the array it
-    // walks is the per-record LaneAck table, which is kLeaseLanes wide by construction -- not a staging buffer.
-    // Passing the staging width here would read as the bound and be wrong.
-    const int32_t* __restrict__ go_1,
-    const int32_t* __restrict__ go_2,
-    const int32_t* __restrict__ go_ce,
-    const int32_t* __restrict__ violated,
-    float* __restrict__ keep,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d) {
+    const __grid_constant__ FinalizeParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  int32_t* __restrict__ const state = p.state;
+  const int32_t* __restrict__ const count = p.count;
+  const int32_t* __restrict__ const go_1 = p.go_1;
+  const int32_t* __restrict__ const go_2 = p.go_2;
+  const int32_t* __restrict__ const go_ce = p.go_ce;
+  const int32_t* __restrict__ const violated = p.violated;
+  float* __restrict__ const keep = p.keep;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
@@ -668,13 +821,23 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 // Every effect below is guarded by `lane < n` with n = go_count[0], so n == 0 emits nothing: not an
 // acknowledgement, not a keep write, not a fatal word. The kernel does not test "was the copy skipped"; the
 // one word that gated the copy gates this too.
+struct LeaseAckParams {
+  uint8_t* page;
+  uint8_t* lease;
+  int64_t lease_d;
+  const int32_t* go_count;
+  const int64_t* lane_ctx;
+  float* keep;
+};
+
 __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ram_miss_lease_ack_kernel(
-    uint8_t* __restrict__ page,
-    uint8_t* __restrict__ lease,
-    int64_t lease_d,
-    const int32_t* __restrict__ go_count,
-    const int64_t* __restrict__ lane_ctx,
-    float* __restrict__ keep) {
+    const __grid_constant__ LeaseAckParams p) {
+  uint8_t* __restrict__ const page = p.page;
+  uint8_t* __restrict__ const lease = p.lease;
+  const int64_t lease_d = p.lease_d;
+  const int32_t* __restrict__ const go_count = p.go_count;
+  const int64_t* __restrict__ const lane_ctx = p.lane_ctx;
+  float* __restrict__ const keep = p.keep;
   using namespace device::expert_stream;
   __shared__ int violated;
   if (threadIdx.x == 0) violated = 0;
@@ -701,5 +864,582 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     raise_fatal(page, static_cast<uint32_t>(lane_ctx[0]));
   }
 }
+
+/// \brief Checked host launchers for the lease-protocol kernels above: format-free post, wait, lease_wait,
+/// lease_ack, lease_hit_wait, lease_rest_wait, lease_stage_ack, lease_finalize and lease_stream_hit_wait.
+///
+/// Every tensor argument is verified with `TensorMatcher` (named via `verify_named`) and every address/offset with
+/// `RuntimeCheck` before the params struct is built and the kernel launched. FFI signatures are unchanged from the
+/// free launchers they replace, so Python call sites do not change.
+struct LeaseProtocolKernel {
+  static void post(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView slot_map,
+      tvm::ffi::TensorView planned,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView routes,
+      int64_t row,
+      int64_t advise,
+      tvm::ffi::TensorView last_routes,
+      int64_t next_row,
+      int64_t lease_address,
+      int64_t lease_d,
+      int64_t timeout_ns,
+      int64_t hot_address,
+      int64_t hot_stride,
+      tvm::ffi::TensorView hot_slots,
+      int64_t hot_capacity,
+      tvm::ffi::TensorView dst_slots,
+      int64_t copy_engine) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    auto L_ = SymbolicSize{"layers"};
+    auto E_ = SymbolicSize{"experts"};
+    auto P_ = SymbolicSize{"planned"};
+    auto R_ = SymbolicSize{"routes"};
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("slot_map", TensorMatcher({L_, E_}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), slot_map);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("routes", TensorMatcher({R_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), routes);
+    expert_stream::verify_named(
+        "last_routes", TensorMatcher({L_, kMaxIds}).with_dtype<int32_t>().with_device<kDLCUDA>(device), last_routes);
+    expert_stream::verify_named(
+        "hot_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), hot_slots);
+    if (hot_address != 0) {
+      RuntimeCheck(hot_slots.size(0) >= hot_capacity, "hot_slots: size must be at least hot_capacity");
+    }
+    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = PostParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .slot_map = static_cast<const int32_t*>(slot_map.data_ptr()),
+        .planned = static_cast<const int64_t*>(planned.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .routes = static_cast<const int64_t*>(routes.data_ptr()),
+        .route_count = routes.size(0),
+        .row = row,
+        .experts = slot_map.size(1),
+        .advise = advise,
+        .last_routes = static_cast<int32_t*>(last_routes.data_ptr()),
+        .next_row = next_row,
+        .lease = reinterpret_cast<uint8_t*>(lease_address),  // zero: no lease block, today's protocol
+        .lease_d = lease_d,
+        .timeout_ns = timeout_ns,
+        .hot_page = reinterpret_cast<uint8_t*>(hot_address),
+        .hot_stride = hot_stride,
+        .hot_slots = static_cast<const int64_t*>(hot_slots.data_ptr()),
+        .hot_capacity = hot_capacity,
+        .dst_slots = dst_slots.size(0) > 0 ? static_cast<const int32_t*>(dst_slots.data_ptr()) : nullptr,  // empty: no plan slots
+        .dst_count = dst_slots.size(0),
+        .copy_engine = copy_engine,
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_post_kernel, params);
+  }
+
+  static void wait(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView slot_map,
+      tvm::ffi::TensorView planned,
+      tvm::ffi::TensorView count,
+      int64_t row,
+      tvm::ffi::TensorView host_rows,
+      tvm::ffi::TensorView keep,
+      tvm::ffi::TensorView ram_miss,
+      int64_t timeout_ns) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    auto L_ = SymbolicSize{"layers"};
+    auto E_ = SymbolicSize{"experts"};
+    auto P_ = SymbolicSize{"planned"};
+    const int64_t lanes = host_rows.size(0);
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("slot_map", TensorMatcher({L_, E_}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), slot_map);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+    RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows");
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = WaitParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .slot_map = static_cast<const int32_t*>(slot_map.data_ptr()),
+        .planned = static_cast<const int64_t*>(planned.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .row = row,
+        .experts = slot_map.size(1),
+        .lanes = lanes,
+        .host_rows = static_cast<int64_t*>(host_rows.data_ptr()),
+        .keep = static_cast<float*>(keep.data_ptr()),
+        .ram_miss = static_cast<int64_t*>(ram_miss.data_ptr()),
+        .timeout_ns = timeout_ns,
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_wait_kernel, params);
+  }
+
+  static void lease_wait(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView planned,
+      tvm::ffi::TensorView count,
+      int64_t row,
+      tvm::ffi::TensorView host_rows,
+      tvm::ffi::TensorView keep,
+      tvm::ffi::TensorView ram_miss,
+      int64_t timeout_ns,
+      int64_t lease_address,
+      int64_t lease_d,
+      tvm::ffi::TensorView go_count,
+      tvm::ffi::TensorView lane_ctx) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    auto P_ = SymbolicSize{"planned"};
+    const int64_t lanes = host_rows.size(0);
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+    RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows");
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+    expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
+    expert_stream::verify_named(
+        "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = LeaseWaitParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .planned = static_cast<const int64_t*>(planned.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .row = row,
+        .lanes = lanes,
+        .host_rows = static_cast<int64_t*>(host_rows.data_ptr()),
+        .keep = static_cast<float*>(keep.data_ptr()),
+        .ram_miss = static_cast<int64_t*>(ram_miss.data_ptr()),
+        .timeout_ns = timeout_ns,
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+        .go_count = static_cast<int32_t*>(go_count.data_ptr()),
+        .lane_ctx = static_cast<int64_t*>(lane_ctx.data_ptr()),
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_wait_kernel, params);
+  }
+
+  static void lease_ack(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      int64_t lease_address,
+      int64_t lease_d,
+      tvm::ffi::TensorView go_count,
+      tvm::ffi::TensorView lane_ctx,
+      tvm::ffi::TensorView keep) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
+    expert_stream::verify_named(
+        "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = LeaseAckParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+        .go_count = static_cast<const int32_t*>(go_count.data_ptr()),
+        .lane_ctx = static_cast<const int64_t*>(lane_ctx.data_ptr()),
+        .keep = static_cast<float*>(keep.data_ptr()),
+    };
+    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(exl3_ram_miss_lease_ack_kernel, params);
+  }
+
+  static void lease_hit_wait(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView planned,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView dst_slots,
+      int64_t row,
+      tvm::ffi::TensorView host_rows_1,
+      tvm::ffi::TensorView dst_slots_1,
+      int64_t lease_address,
+      int64_t lease_d,
+      tvm::ffi::TensorView go_1,
+      tvm::ffi::TensorView lane_ctx_1,
+      tvm::ffi::TensorView origin_1,
+      tvm::ffi::TensorView claimed,
+      tvm::ffi::TensorView violated,
+      int64_t budget_ns) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    auto P_ = SymbolicSize{"planned"};
+    // The lane bound must cover EVERY lane-indexed array the kernel reads, not just its own staging buffer:
+    // dst_slots is the plan's, of length capacity, while host_rows_1 is LANES. Bounding by the staging buffer alone
+    // lets a device-side count above capacity, up to LANES, read dst_slots out of bounds.
+    const int64_t lanes = std::min<int64_t>(host_rows_1.size(0), dst_slots.size(0));
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+    RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_1/dst_slots");
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
+    expert_stream::verify_named(
+        "dst_slots_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_1);
+    expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
+    expert_stream::verify_named(
+        "lane_ctx_1", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
+    expert_stream::verify_named("origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = HitWaitParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .planned = static_cast<const int64_t*>(planned.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .dst_slots = static_cast<const int32_t*>(dst_slots.data_ptr()),
+        .row = row,
+        .lanes = lanes,
+        .host_rows_1 = static_cast<int64_t*>(host_rows_1.data_ptr()),
+        .dst_slots_1 = static_cast<int32_t*>(dst_slots_1.data_ptr()),
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+        .go_1 = static_cast<int32_t*>(go_1.data_ptr()),
+        .lane_ctx_1 = static_cast<int64_t*>(lane_ctx_1.data_ptr()),
+        .origin_1 = static_cast<int32_t*>(origin_1.data_ptr()),
+        .claimed = static_cast<int32_t*>(claimed.data_ptr()),
+        .violated = static_cast<int32_t*>(violated.data_ptr()),
+        .budget_ns = budget_ns,
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_hit_wait_kernel, params);
+  }
+
+  static void lease_stream_hit_wait(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView planned,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView dst_slots,
+      int64_t row,
+      tvm::ffi::TensorView host_rows_1,
+      tvm::ffi::TensorView dst_slots_1,
+      int64_t lease_address,
+      int64_t lease_d,
+      tvm::ffi::TensorView go_1,
+      tvm::ffi::TensorView lane_ctx_1,
+      tvm::ffi::TensorView origin_1,
+      tvm::ffi::TensorView claimed,
+      tvm::ffi::TensorView violated,
+      int64_t budget_ns,
+      tvm::ffi::TensorView go_2,
+      tvm::ffi::TensorView stream_count,
+      tvm::ffi::TensorView stream_abort) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    auto P_ = SymbolicSize{"planned"};
+    const int64_t lanes = std::min<int64_t>(host_rows_1.size(0), dst_slots.size(0));
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+    RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_1/dst_slots");
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
+    expert_stream::verify_named(
+        "dst_slots_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_1);
+    expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
+    expert_stream::verify_named(
+        "lane_ctx_1", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
+    expert_stream::verify_named("origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+    expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
+    expert_stream::verify_named(
+        "stream_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_count);
+    expert_stream::verify_named(
+        "stream_abort", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_abort);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = StreamHitWaitParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .planned = static_cast<const int64_t*>(planned.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .dst_slots = static_cast<const int32_t*>(dst_slots.data_ptr()),
+        .row = row,
+        .lanes = lanes,
+        .host_rows_1 = static_cast<int64_t*>(host_rows_1.data_ptr()),
+        .dst_slots_1 = static_cast<int32_t*>(dst_slots_1.data_ptr()),
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+        .go_1 = static_cast<int32_t*>(go_1.data_ptr()),
+        .lane_ctx_1 = static_cast<int64_t*>(lane_ctx_1.data_ptr()),
+        .origin_1 = static_cast<int32_t*>(origin_1.data_ptr()),
+        .claimed = static_cast<int32_t*>(claimed.data_ptr()),
+        .violated = static_cast<int32_t*>(violated.data_ptr()),
+        .budget_ns = budget_ns,
+        .go_2 = static_cast<int32_t*>(go_2.data_ptr()),
+        .stream_count = static_cast<uint32_t*>(stream_count.data_ptr()),
+        .stream_abort = static_cast<int32_t*>(stream_abort.data_ptr()),
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_stream_hit_wait_kernel, params);
+  }
+
+  static void lease_rest_wait(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView planned,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView dst_slots,
+      int64_t row,
+      tvm::ffi::TensorView host_rows_2,
+      tvm::ffi::TensorView dst_slots_2,
+      tvm::ffi::TensorView ram_miss,
+      int64_t lease_address,
+      int64_t lease_d,
+      tvm::ffi::TensorView claimed,
+      tvm::ffi::TensorView go_2,
+      tvm::ffi::TensorView lane_ctx_2,
+      tvm::ffi::TensorView origin_2) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+    auto P_ = SymbolicSize{"planned"};
+    const int64_t lanes = std::min<int64_t>(host_rows_2.size(0), dst_slots.size(0));
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+    RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_2/dst_slots");
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "host_rows_2", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
+    expert_stream::verify_named(
+        "dst_slots_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
+    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
+    expert_stream::verify_named(
+        "lane_ctx_2", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
+    expert_stream::verify_named("origin_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = RestWaitParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .planned = static_cast<const int64_t*>(planned.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .dst_slots = static_cast<const int32_t*>(dst_slots.data_ptr()),
+        .row = row,
+        .lanes = lanes,
+        .host_rows_2 = static_cast<int64_t*>(host_rows_2.data_ptr()),
+        .dst_slots_2 = static_cast<int32_t*>(dst_slots_2.data_ptr()),
+        .ram_miss = static_cast<int64_t*>(ram_miss.data_ptr()),
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+        .claimed = static_cast<const int32_t*>(claimed.data_ptr()),
+        .go_2 = static_cast<int32_t*>(go_2.data_ptr()),
+        .lane_ctx_2 = static_cast<int64_t*>(lane_ctx_2.data_ptr()),
+        .origin_2 = static_cast<int32_t*>(origin_2.data_ptr()),
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_rest_wait_kernel, params);
+  }
+
+  static void lease_stage_ack(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      int64_t lease_address,
+      int64_t lease_d,
+      tvm::ffi::TensorView go_count,
+      tvm::ffi::TensorView lane_ctx,
+      tvm::ffi::TensorView origin,
+      tvm::ffi::TensorView violated) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
+    expert_stream::verify_named(
+        "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
+    expert_stream::verify_named("origin", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin);
+    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = StageAckParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+        .go_count = static_cast<const int32_t*>(go_count.data_ptr()),
+        .lane_ctx = static_cast<const int64_t*>(lane_ctx.data_ptr()),
+        .origin = static_cast<const int32_t*>(origin.data_ptr()),
+        .violated = static_cast<int32_t*>(violated.data_ptr()),
+    };
+    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(
+        exl3_ram_miss_lease_stage_ack_kernel, params);
+  }
+
+  static void lease_finalize(
+      tvm::ffi::TensorView page,
+      tvm::ffi::TensorView state,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView go_1,
+      tvm::ffi::TensorView go_2,
+      tvm::ffi::TensorView go_ce,
+      tvm::ffi::TensorView violated,
+      tvm::ffi::TensorView keep,
+      int64_t lease_address,
+      int64_t lease_d) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto on_host = SymbolicDevice{};
+    on_host.set_options<kDLCPU, kDLCUDAHost>();
+
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
+    expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
+    expert_stream::verify_named("go_ce", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_ce);
+    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+
+    RuntimeCheck(
+        lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
+        "lease_address: must be 0 or a multiple of kLeaseBlockAlign");
+    if (lease_address != 0) {
+      RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
+    }
+
+    const auto stream = LaunchKernel::resolve_device(state.device());
+    const auto params = FinalizeParams{
+        .page = static_cast<uint8_t*>(page.data_ptr()),
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .go_1 = static_cast<const int32_t*>(go_1.data_ptr()),
+        .go_2 = static_cast<const int32_t*>(go_2.data_ptr()),
+        .go_ce = static_cast<const int32_t*>(go_ce.data_ptr()),
+        .violated = static_cast<const int32_t*>(violated.data_ptr()),
+        .keep = static_cast<float*>(keep.data_ptr()),
+        .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lease_d = lease_d,
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_finalize_kernel, params);
+  }
+};
 
 }  // namespace sglang

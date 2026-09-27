@@ -1131,19 +1131,25 @@ STATE_WORDS = {
 STREAM_FAULT_WORDS = {"abort_block": 0, "abort_delay_ns": 1, "stall_ns": 2, "count_delay_ns": 3}
 
 
-_DEVICE_KERNELS = (
-    "exl3_ram_miss_post",
-    "exl3_ram_miss_wait",
-    "exl3_ram_miss_lease_wait",
-    "exl3_ram_miss_lease_ack",
-    "exl3_ram_miss_lease_hit_wait",
-    "exl3_ram_miss_lease_rest_wait",
-    "exl3_ram_miss_lease_stage_ack",
-    "exl3_ram_miss_lease_finalize",
-    "exl3_ram_miss_lease_stream_hit_wait",
-    "exl3_ram_miss_lease_stream",
-    "exl3_ram_miss_lease_copy_wait",
-)
+_LEASE_METHODS = {
+    "exl3_ram_miss_post": "post",
+    "exl3_ram_miss_wait": "wait",
+    "exl3_ram_miss_lease_wait": "lease_wait",
+    "exl3_ram_miss_lease_ack": "lease_ack",
+    "exl3_ram_miss_lease_hit_wait": "lease_hit_wait",
+    "exl3_ram_miss_lease_rest_wait": "lease_rest_wait",
+    "exl3_ram_miss_lease_stage_ack": "lease_stage_ack",
+    "exl3_ram_miss_lease_finalize": "lease_finalize",
+    "exl3_ram_miss_lease_stream_hit_wait": "lease_stream_hit_wait",
+}
+_ROW_COPY_METHODS = {"exl3_ram_miss_lease_stream": "lease_stream", "exl3_ram_miss_lease_copy_wait": "lease_copy_wait"}
+_LAYOUT = "sglang::exl3::Exl3RowLayout"
+
+
+def _device_wrappers() -> list[tuple[str, str]]:
+    return [(name, f"LeaseProtocolKernel::{method}") for name, method in _LEASE_METHODS.items()] + [
+        (name, f"RowCopyKernel<{_LAYOUT}>::{method}") for name, method in _ROW_COPY_METHODS.items()
+    ]
 
 
 @cache_once
@@ -1151,7 +1157,7 @@ def _device_module() -> Module:
     return load_jit(
         "exl3_ram_miss",
         cuda_files=["moe/exl3_ram_miss.cuh"],
-        cuda_wrappers=[(name, name) for name in _DEVICE_KERNELS],
+        cuda_wrappers=_device_wrappers(),
     )
 
 
@@ -1164,7 +1170,7 @@ def device_module_with_hooks(defines: Sequence[str]) -> Module:
         "exl3_ram_miss",
         "test",
         cuda_files=["moe/exl3_ram_miss.cuh"],
-        cuda_wrappers=[(name, name) for name in _DEVICE_KERNELS],
+        cuda_wrappers=_device_wrappers(),
         extra_cuda_cflags=[f"-D{d}" for d in defines],
     )
 
@@ -1246,6 +1252,10 @@ class Exl3RamMissDevice:
             state[STATE_WORDS[word]] = page[WORDS[head] : WORDS[head] + 4].view(torch.int32)[0]
         self.state = state.to(device)
         self.last_routes = torch.full((layers, MAX_IDS), -1, dtype=torch.int32, device=device)
+        # The post kernel's "no hot sidecar" sentinel: hot_slots is int64 on the device, so self.state (int32)
+        # cannot stand in for it any more (the checked launcher's matcher would refuse the dtype). Stable for
+        # graph capture, like every other sentinel `post` passes in place of an absent tensor.
+        self._no_hot_slots = torch.empty(0, dtype=torch.int64, device=device)
         self._module = None
         if (lease_block is None) != (lease_layout is None):
             raise ValueError("lease_block and lease_layout go together")
@@ -1373,7 +1383,7 @@ class Exl3RamMissDevice:
         self._kernels().exl3_ram_miss_post(
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
             self._lease_address, self._lease_d, self.timeout_ns, self._hot_address, self._hot_stride,
-            hot_slots if hot_slots is not None else self.state, hot_capacity,
+            hot_slots if hot_slots is not None else self._no_hot_slots, hot_capacity,
             dst_slots if dst_slots is not None else self.state[:0], int(bool(copy_engine)),
         )
 
