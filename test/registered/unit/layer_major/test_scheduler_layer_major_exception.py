@@ -31,6 +31,8 @@ class _FakeReq:
     def __init__(self, rid):
         self.rid = rid
         self.finished_reason = None
+        self.weight_version_events = []
+        self.output_ids = []
 
     def finished(self):
         return self.finished_reason is not None
