@@ -149,6 +149,10 @@ struct Outstanding {
   uint64_t gen = 0;
   int64_t row = 0;
   uint32_t count = 0;
+  // A lane of this entry was retired by an ack or a terminal, and a second signal for it may still land after the
+  // entry closed: retire_leases keeps comparing a watched entry's words until a settle pass (host/ram_tier.h) or
+  // the ring index's reuse ends the watch.
+  bool watched = false;
   LaneLease lane[kLeaseLanes];
 };
 

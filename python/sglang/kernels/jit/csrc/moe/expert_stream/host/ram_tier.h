@@ -116,10 +116,14 @@ class RamTier {
 
   // Serve the next posted demand record, if any. True when it handled one.
   bool pump_demand() {
-    retire_leases();  // first, so that an idle pump still retires what the device has acknowledged
-    if (admission_closed_.load()) return false;
+    // The head is read before the retirement pass, so a posted demand makes that pass a settle pass (retire_leases):
+    // every signal of each older request is then visible. Once per demand, so a deferred one's polls stay cheap.
     const uint32_t head = load_acquire(page_ + kDemandHead);
-    if (head == 0 || !reached(head, next_demand_)) return false;
+    const bool posted = head != 0 && reached(head, next_demand_);
+    retire_leases(posted && settled_seq_ != next_demand_);  // first, so that an idle pump still retires
+    if (posted) settled_seq_ = next_demand_;
+    if (admission_closed_.load()) return false;
+    if (!posted) return false;
     // A deferred demand is not looked at again until a lease retires: no stage record, no clock read per poll.
     if (deferred_seq_ == next_demand_ && !deferral_may_retry()) return false;
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
@@ -842,12 +846,19 @@ class RamTier {
 
   // Retire the leases the device has acknowledged, or voided with a terminal, without waiting for either. Cheap when
   // nothing is outstanding. Called from the service loop; never blocks (LEASE_PROTOCOL.md 7.5, 16).
-  void retire_leases() {
-    if (lease_ == nullptr || lanes_outstanding_.load(std::memory_order_relaxed) == 0) return;
+  //
+  // lease_double_signal: a lane retired by one signal is compared against the other in every later pass, not only
+  // in the pass that retired it, so a second word that lands after the entry closed is still counted. A closed
+  // entry is watched until a `settle` pass: one that runs after the caller observed a later demand posted (or
+  // synchronized the stream). Under A1 the device emitted every signal of a request before posting the next one,
+  // so that pass compares each closed entry's words for the last time and ends its watch. The idle early-out
+  // skips unsettled watches, which the next posted demand's settle pass then covers.
+  void retire_leases(bool settle = false) {
+    if (lease_ == nullptr || (!settle && lanes_outstanding_.load(std::memory_order_relaxed) == 0)) return;
     std::lock_guard<std::mutex> guard(mutex_);
     for (int64_t idx = 0; idx < kDemandRecords; ++idx) {
       Outstanding& entry = outstanding_[idx];
-      if (!entry.active) continue;
+      if (!entry.active && !entry.watched) continue;
       Tier& tier = tiers_[entry.row];
       const uint8_t* acks = lease_ + lease_d_ + kLeaseLaneAck + idx * kLeaseLanes * kLeaseLaneAckBytes;
       const uint8_t* terminal = lease_ + lease_d_ + kLeaseTerminal + idx * kLeaseTerminalBytes;
@@ -865,8 +876,10 @@ class RamTier {
         if (held.state == 1) {
           if (acknowledged) {
             release_lease_locked(tier, held, kLeasesAcked);
+            entry.watched = true;
           } else if (voided) {
             release_lease_locked(tier, held, kLeasesVoided);
+            entry.watched = true;
           }
           // Plan 3.3: the last lease of a quarantined slot frees it. Its mapping was cleared on entry, so
           // release_locked unmaps nothing -- the expert may already live in another slot (M3). A kLoading slot only
@@ -875,7 +888,9 @@ class RamTier {
             release_locked(entry.row, held.slot);
           }
         }
-        // A second signal for a lane already released: counted once, and it releases nothing.
+        // A second signal for a lane already released, in this pass or any later one while the entry is watched:
+        // counted once, and it releases nothing. Both words carry the generation, so a later request's signal on
+        // the same lane or ring index never matches entry.gen.
         if (!held.counted && ((held.state == 2 && voided) || (held.state == 3 && acknowledged))) {
           held.counted = true;
           counters_[kLeaseDoubleSignal].fetch_add(1);
@@ -887,6 +902,7 @@ class RamTier {
       bool open = entry.grants_pending;
       for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
       if (!open) entry.active = false;
+      if (settle && !entry.active) entry.watched = false;
     }
   }
 
@@ -1813,6 +1829,7 @@ class RamTier {
   uint64_t deferred_stamp_ = 0;
   uint64_t deferred_gen_ = 0;
   int64_t deferred_observed_ns_ = 0;
+  uint32_t settled_seq_ = 0;  // the demand whose posting last settled the double-signal watch (service thread only)
   int64_t layers_;
   int64_t experts_;
   Source reader_;

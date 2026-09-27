@@ -77,7 +77,7 @@ class RamThread {
     }
     // The caller synchronized the stream, so every copy wait has seen its CopyDone; the copy thread releases just after.
     tier_->wait_copy_idle(now_ns() + timeout_ns);
-    tier_->retire_leases();
+    tier_->retire_leases(true);  // a settle pass: the synchronized stream left no signal still to land
     if (tier_->graph_leases_outstanding() > 0) {
       resume();
       return 2;
