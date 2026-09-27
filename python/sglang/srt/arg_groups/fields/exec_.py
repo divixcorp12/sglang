@@ -944,11 +944,9 @@ class ExecOffload(msgspec.Struct):
             help="Named MoE expert-offload configuration that fills every offload "
             "SGLANG_MOE_* / SGLANG_QWEN4_* variable left unset. 'graph-gather' is the "
             "current best (in-graph gather, insert-on-miss stage 2, fused planner; "
-            "tuned for a 32 GB RTX 5090). 'doorbell' is experimental and unmeasured "
-            "(side-thread copier; no speculative decoding; turns overlap scheduling "
-            "off). 'off' sets nothing. Explicitly set variables win. See "
-            "sglang.srt.layers.moe.offload_presets.",
-            choices=["off", "graph-gather", "doorbell"],
+            "tuned for a 32 GB RTX 5090). 'off' sets nothing. Explicitly set variables "
+            "win. See sglang.srt.layers.moe.offload_presets.",
+            choices=["off", "graph-gather"],
         ),
     ] = "off"
 
