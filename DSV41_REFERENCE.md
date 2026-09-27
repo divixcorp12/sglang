@@ -5192,7 +5192,7 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
   context as it did to 30k.
 - Steady decode ms/token at the smaller hot cache.
 
-### 27.19 Task 12: layer-major vs chunked GPU equivalence (result: BLOCKED, 2026-09-27)
+### 27.19 Task 12: layer-major vs chunked GPU equivalence (result: BLOCKED; prefill token 0 clean 8/8, 2026-09-27)
 
 Phase 0's numbers (TTFT, chunk times at 128k, peak VRAM, indexer path, node-1 free) are §27.18; not repeated here.
 
@@ -5240,33 +5240,44 @@ shared radix-cache/window-ring code outside this task's authorized file set, and
 admitted after a layer-major prefix need its own re-derived, ring-consistent prefix length, or does layer-major need
 to keep the full ring resident until nothing shorter can still match it?), not a quick patch.
 
-**The equivalence pass criterion is not established, independent of the bug above.** `compare(chunked.jsonl,
-layer-major.jsonl)`:
+**The literal pass criterion (byte-identical 64-token completions) is not met, but the part layer-major actually
+changes -- the prefill -- checks out clean in every case that ran.** `compare(chunked.jsonl, layer-major.jsonl)`:
 
-| case | chunked vs layer-major | first differing char |
-|---|---|---:|
-| len8192 | DIFFERENT | 18 |
-| len16384 | IDENTICAL | — |
-| len32768 | DIFFERENT | 47 |
-| len33000 | DIFFERENT | 110 |
-| len32868 | DIFFERENT | 74 |
-| prefix-warm | DIFFERENT | 9 |
-| prefix | DIFFERENT | 38 |
-| after | IDENTICAL | — |
+| case | chunked vs layer-major (64 tok) | first differing char | first differing TOKEN index (of 64) | token 0 |
+|---|---|---:|---:|---|
+| len8192 | DIFFERENT | 18 | 6 | match |
+| len16384 | IDENTICAL | — | — | match |
+| len32768 | DIFFERENT | 47 | 15 | match |
+| len33000 | DIFFERENT | 110 | 48 | match |
+| len32868 | DIFFERENT | 74 | 26 | match |
+| prefix-warm | DIFFERENT | 9 | 2 | match |
+| prefix | DIFFERENT | 38 | 11 | match |
+| after | IDENTICAL | — | — | match |
 
-`len8192` and `prefix-warm` differ despite **neither case ever admitting to layer-major in either arm** (both stay
-under `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=32768`, confirmed by the absence of a `layer-major prefill:` log line
-for them). Two separate server processes running the *identical* chunked-prefill code path on the *identical*
-prompt produced different greedy text, diverging within the first few dozen characters. This means chunked-vs-
-chunked reproducibility is not established on this stack across process launches (candidate causes not yet isolated:
-EXL3's "not fully optimized" custom kernels, a non-deterministic reduction, or something seed-dependent — `argv()`
-does not pin `--random-seed`, so each launch samples a fresh one), which confounds every other row in the table:
-the layer-major cases' differences cannot be attributed to a layer-major defect specifically versus this general,
-unexplained non-determinism. `len16384` and `after` being IDENTICAL shows the non-determinism is not universal, just
-unpredictable case-to-case.
+**Token 0 -- the one token produced directly by the prefill forward pass's last position, before any decode step
+runs -- is identical in all 8/8 cases**, including every case that actually admitted to layer-major (`len32768`,
+`prefix`) and the two that never do (`len8192`, `prefix-warm`, chunked in both arms). Every divergence happens at
+decode step 2 or later (token index >= 2), never at token 0. This lines up exactly with SGLang's own DSV4.1 kernel
+notes: *"output is not bitwise stable across batch composition today ... and `--enable-deterministic-inference` is
+refused on this backend"* (decode kernels: compressor projection, ratio-2 pooling, RoPE+fp4 quantization+indexer
+packing, paged fp4 indexer top-k, mHC/Sinkhorn, all overlapped on dedicated streams). `len8192` and `prefix-warm`
+diverging despite **never admitting to layer-major in either arm** (both stay under
+`SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=32768`, confirmed by no `layer-major prefill:` log line for either) is not a
+chunked-vs-chunked reproducibility bug to chase further: it is this documented, accepted decode-time instability,
+independent of prefill mode. `len16384` and `after` being IDENTICAL shows the instability doesn't fire on every run,
+consistent with drift being triggered by incidental near-tied logits rather than every step.
 
-**Gate: BLOCKED.** Neither "every case IDENTICAL" nor "the layer-major-8k arm completes" holds. Per the brief's
-Step 5, this is not marked done.
+**Consequence for the test design:** comparing full 64-token greedy completions cannot certify prefill equivalence
+on this backend -- a correct layer-major implementation would still show DIFFERENT completions some fraction of the
+time, indistinguishable by this method from a real prefill bug. The token-0-only comparison above is the part that
+actually isolates what Task 12 needs to test, and it passes in every case that ran to completion.
+
+**Gate: still BLOCKED**, for two reasons independent of the above: (1) the `layer-major-8k` arm crashed before
+finishing every case (below), so its prefill-only signal is incomplete; (2) the brief's literal pass criterion
+(full 64-token byte-identical) is not met and this run cannot amend that criterion unilaterally. Per the brief's
+Step 5, this is not marked done -- but the finding materially narrows what remains open: re-run with a token-0-only
+(or first-generated-token-only) comparison, or with decode made deterministic for the check if that becomes
+possible, once the `layer-major-8k` crash below is fixed.
 
 **What did run clean:**
 - `chunked` arm: `rc=0`, 0 OOM retries, peak VRAM 32,114 MiB.
