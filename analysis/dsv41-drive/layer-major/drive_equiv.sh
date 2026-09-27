@@ -3,13 +3,14 @@
 # (arm_env as is) with SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS overridden, then equiv.py's full case
 # list run against it. Derived from analysis/dsv41-drive/prefill-chunk/chunk_smoke.sh.
 #
-# Usage: drive_equiv.sh <arm> <worktree> <min_tokens>
+# Usage: drive_equiv.sh <arm> <worktree> <min_tokens> [out_root]
 #   arm         a label, used only for output paths (e.g. chunked, layer-major, layer-major-8k).
 #   min_tokens  SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS for this arm (0 disables layer-major prefill
 #               entirely, i.e. the chunked-prefill baseline).
+#   out_root    output root, default /mnt/nvme1/layer-major/equiv; compare only arms from one root and head.
 #
 # Writes env.txt, argv.txt, driver.log, server.log, vram.csv, numa.log, phases.txt and retries.txt to
-# /mnt/nvme1/layer-major/equiv/<arm>/, and the case results to /mnt/nvme1/layer-major/equiv/<arm>.jsonl.
+# <out_root>/<arm>/, and the case results to <out_root>/<arm>.jsonl.
 # Takes rowimg-disk.lock, then cc-gpu.lock (waits, never breaks them), exactly as chunk_smoke.sh.
 # Refuses when production (port 7867) is up. Never starts production.
 set -u
@@ -18,7 +19,7 @@ WT=${2:?worktree path}
 MIN_TOKENS=${3:?min_tokens}
 H=$WT/benchmarks/dsv41_baseline
 PY=/data/models/slang/.venv/bin/python
-ROOT=/mnt/nvme1/layer-major/equiv
+ROOT=${4:-/mnt/nvme1/layer-major/equiv}
 OUT=$ROOT/$ARM
 PORT=30014
 export NSYS_TMPDIR=/mnt/nvme1/nsys-tmp

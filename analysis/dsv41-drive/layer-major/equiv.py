@@ -5,6 +5,7 @@ Usage: equiv.py run --port P --model M --text FILE --out OUT.jsonl
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import urllib.request
@@ -22,19 +23,32 @@ def _generate(port, ids):
     return {"text": d["text"], "ids": d.get("output_ids"), "meta": d.get("meta_info", {})}
 
 
+def _flush(port):
+    # Each case starts from an empty radix cache, so every long case is a full prefill down the layer-major path.
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/flush_cache?timeout=60", timeout=120).read()
+
+
+def _prompt_hash(ids):
+    return hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
+
+
 def run(a):
     tok = AutoTokenizer.from_pretrained(a.model)
     ids = tok(open(a.text).read(), add_special_tokens=False)["input_ids"]
     while len(ids) < 70000:
         ids = ids + ids
-    cases = [(f"len{n}", ids[:n]) for n in LENGTHS]
-    cases.append(("prefix-warm", ids[5000:6024]))
-    cases.append(("prefix", ids[5000:6024] + ids[:32768]))
-    cases.append(("after", ids[100:356]))
+    # (name, prompt, flush first): prefix-warm -> prefix is the intended radix hit, and after follows it unflushed.
+    cases = [(f"len{n}", ids[:n], True) for n in LENGTHS]
+    cases.append(("prefix-warm", ids[5000:6024], True))
+    cases.append(("prefix", ids[5000:6024] + ids[:32768], False))
+    cases.append(("after", ids[100:356], False))
     with open(a.out, "w") as f:
-        for name, prompt in cases:
+        for name, prompt, flush in cases:
+            if flush:
+                _flush(a.port)
             r = _generate(a.port, prompt)
-            f.write(json.dumps({"case": name, **r}) + "\n")
+            f.write(json.dumps({"case": name, "prompt_len": len(prompt), "prompt_hash": _prompt_hash(prompt), **r})
+                    + "\n")
             f.flush()
             print(name, len(prompt), repr(r["text"][:60]), flush=True)
 
@@ -48,6 +62,18 @@ def compare(path_a, path_b):
     printed, informationally, so a genuine early (pre-decode-drift) divergence is not hidden."""
     a = {json.loads(l)["case"]: json.loads(l) for l in open(path_a)}
     b = {json.loads(l)["case"]: json.loads(l) for l in open(path_b)}
+    # Refuse, rather than raise, when the two runs are not comparable case for case.
+    problems = [f"case {c} missing from {path_b}" for c in a if c not in b]
+    problems += [f"case {c} missing from {path_a}" for c in b if c not in a]
+    for case in sorted(set(a) & set(b)):
+        ha, hb = a[case].get("prompt_hash"), b[case].get("prompt_hash")
+        if ha is None or hb is None or ha != hb:
+            problems.append(f"case {case}: prompt hash differs or is missing (a={ha} b={hb})")
+        if not a[case].get("ids") or not b[case].get("ids"):
+            problems.append(f"case {case}: no output ids (a={a[case].get('ids')!r} b={b[case].get('ids')!r})")
+    if problems:
+        print("NOT COMPARABLE:\n  " + "\n  ".join(problems))
+        return 1
     bad = 0
     for case in a:
         token0_same = a[case]["ids"][0] == b[case]["ids"][0]
@@ -58,7 +84,8 @@ def compare(path_a, path_b):
         if not token0_same:
             print(f"   token 0: a={a[case]['ids'][0]!r} b={b[case]['ids'][0]!r}")
         elif not full_same:
-            first_tok = next(i for i, (x, y) in enumerate(zip(a[case]["ids"], b[case]["ids"])) if x != y)
+            ids_a, ids_b = a[case]["ids"], b[case]["ids"]
+            first_tok = next((i for i, (x, y) in enumerate(zip(ids_a, ids_b)) if x != y), min(len(ids_a), len(ids_b)))
             print(f"   first differing token index (decode): {first_tok} / {len(a[case]['ids'])}")
     return 1 if bad else 0
 
