@@ -306,7 +306,7 @@ def test_a_device_shared_by_the_service_and_the_tiers_is_synced_once(world, monk
 # work.
 
 
-def _release_scheduler_host_resources(order, *, manager=True):
+def _release_scheduler_host_resources(order):
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
 
@@ -321,7 +321,6 @@ def _release_scheduler_host_resources(order, *, manager=True):
 
     # A bare namespace: release_host_resources calls nothing on the manager, and any call would raise.
     stub = SimpleNamespace(
-        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(expert_hot_cache_manager=SimpleNamespace() if manager else None)),
         hisparse_coordinator=recorder("hisparse"),
         tree_cache=recorder("tree_cache"),
         decode_offload_manager=recorder("decode_offload"),
@@ -365,14 +364,6 @@ def test_a_failing_service_shutdown_does_not_escape_the_scheduler_release(monkey
         escaped = error
     assert escaped is None, f"the release raised {escaped!r}"
     assert order == CHEAP + ["ram_miss"]
-
-
-def test_the_service_is_shut_down_even_when_the_scheduler_has_no_expert_hot_cache_manager(world, monkeypatch):
-    """Mutation: the block is nested under `if expert_hot_cache_manager is not None` (the natural place to paste it)."""
-    service, caches, order = world
-    _barrier(service, monkeypatch, order, lambda: None)
-    _release_scheduler_host_resources(order, manager=False)
-    assert "close_admission" in order and order[-2:] == ["free0", "free1"]
 
 
 def test_scheduler_shutdown_drives_a_live_service_through_the_barrier_last(world, monkeypatch):

@@ -248,7 +248,7 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
         return graph
 
     def test_gathers_match_the_pre_doorbell_path_across_residency_updates(self):
-        """Gathers, then residency updates, then more gathers, with the host (Python) update and
+        """Gathers, then residency updates, then more gathers, with the host (Python) update
         and with SGLANG_MOE_GPU_RESIDENCY_UPDATE. Each step's gathered rows,
         per-layer hit and miss counters and residency state must equal a twin manager whose
         streamers run 7de955329a's ``_gather_graph``, and the rows must equal the source rows.
