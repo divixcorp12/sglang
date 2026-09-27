@@ -250,6 +250,15 @@ class SWAPrefillBudget(PrefillBudget):
             return False, None
         return True, min(chunk_limit, cap)
 
+    def check_prefill_ring(
+        self, *, total_tokens: int, max_new_tokens: int, ring_tokens: int
+    ) -> bool:
+        """Admission of a layer-major extend: full KV for every token, window KV for one ring of slots only."""
+        if total_tokens >= self.remaining_total:
+            return False
+        # One page of decode headroom past the ring, as estimate_swa_kv_tokens charges a normal prefill.
+        return ring_tokens + self.page_size < self.remaining_swa
+
     def has_capacity(self) -> bool:
         return super().has_capacity() and self.remaining_swa > 0
 
