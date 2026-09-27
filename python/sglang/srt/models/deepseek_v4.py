@@ -4433,13 +4433,17 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        *,
+        layer_ids: Optional[range] = None,
+        prev_pre_in: Optional[torch.Tensor] = None,
+        hash_ids_in: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
-        hash_ids = None
+        hash_ids = hash_ids_in
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
-        if self.engram_hasher is not None:
+        if self.engram_hasher is not None and hash_ids_in is None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
@@ -4479,11 +4483,11 @@ class DeepseekV4Model(nn.Module):
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
-        prev_pre = None
+        prev_pre = prev_pre_in
         precomputed_attn = None
         combined_attn = None
         normalized_attn = None
-        for i in range(self.start_layer, self.end_layer):
+        for i in (layer_ids if layer_ids is not None else range(self.start_layer, self.end_layer)):
             if tail is not None and i == self.late_layer_start:
                 combined_attn = None
                 normalized_attn = None
@@ -5194,6 +5198,41 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         if tail is not None:
             output.hidden_states_token_indices = tail.token_indices
+        return output
+
+    def forward_late_tail(self, *, forward_batch, hidden_states, prev_pre, hash_ids):
+        """Layers late_layer_start.. on the final chunk's tail, for a layer-major prefill; logits of the tail only.
+
+        The backend holds the final chunk's metadata and tail metadata (install_forward_metadata).
+        """
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+        model = self.model
+        input_ids = forward_batch.input_ids
+        hidden_states, last_pre, tail = model._forward_layers_hc_pre_from_prev(
+            forward_batch.positions,
+            hidden_states,
+            forward_batch,
+            input_ids,
+            input_ids,
+            False,
+            [],
+            layer_ids=range(model.late_layer_start, model.end_layer),
+            prev_pre_in=prev_pre,
+            hash_ids_in=hash_ids,
+        )
+        pre_hc_head = hidden_states.flatten(1)
+        hidden_states = model.norm(hc_combine(pre_hc_head.float(), last_pre, model.hc_mult, hidden_states.dtype))
+        # Tail rows only: scattering back to the full extend would allocate [T, 5120] and [T, 20480] tensors.
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = self.logits_processor(
+            tail.rows(input_ids), hidden_states, self.lm_head, logits_metadata, None,
+            hidden_states_before_norm=pre_hc_head,
+        )
+        output.hidden_states_token_indices = tail.token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
