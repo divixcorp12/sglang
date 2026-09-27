@@ -1478,6 +1478,7 @@ class Scheduler(
             enable_dp_attention=self.enable_dp_attention,
             attn_cp_size=get_parallel().attn_cp_size,
             enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+            pp_size=get_parallel().pp_size,
         )
         if reason is None:
             model_cls = type(self.tp_worker.model_runner.model)
@@ -4395,14 +4396,18 @@ class Scheduler(
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        """Run a batch, containing a layer-major pass's failure to this one request.
+        """Run a batch, containing a layer-major pass's forward exception to its one request.
 
-        Only a batch whose layer_major_ring_tokens is not None is guarded: by the
-        time such an exception reaches here, the adapter's release_pass(failed=True)
-        (Task 10/11's seam) has already finalized the ring, so the remaining
-        FULL-KV/req-pool state can be released through the same no-further-forward
-        path retraction uses (release_kv_cache). A normal batch is not guarded here
-        -- its exceptions still reach run_scheduler_process's handler."""
+        Guarded only when batch.layer_major_ring_tokens is not None; a normal batch's
+        exception still reaches run_scheduler_process's handler. By the time the
+        exception surfaces, the adapter's release_pass(failed=True) (Task 10/11's
+        seam) has already finalized the window ring. The request is then released
+        through the same no-further-forward path retraction uses: release_kv_cache
+        -> cache_finished_req frees [req.kv.cache_protected_len, owned_kv_len).
+        alloc_for_extend sets kv_committed_len (owned_kv_len reads it) to the whole
+        new sequence length at allocation time, before this pass ever runs, so that
+        range already covers the entire failed extend; is_insert=False is what keeps
+        a possibly-partial pass's KV out of the shared tree, not the freed range."""
         if batch.layer_major_ring_tokens is not None:
             try:
                 return self._run_batch_impl(batch, pp_proxy_tensors)
