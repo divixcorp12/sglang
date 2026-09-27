@@ -8,8 +8,8 @@ import tempfile
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import read_rows_once, read_rows_traced
+from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_stream_transport import read_rows_once, read_rows_traced
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -306,7 +306,7 @@ def test_open_refuses_a_mirror_copy_of_the_wrong_size_naming_both_files(tmp_path
         f.truncate(source_bytes + delta)
     for attempt in (
         lambda: read_rows_once(s.tables, 0, [0], [0], direct=False),
-        lambda: ops.Exl3RamMissHost(
+        lambda: ops.ExpertStreamHost(
             s.tables, page=ops.new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
         ),
     ):

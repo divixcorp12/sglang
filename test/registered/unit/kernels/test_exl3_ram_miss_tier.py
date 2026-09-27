@@ -1,5 +1,6 @@
 """The C++ slot LRU and request service, pumped by hand against a host-simulated device (CPU)."""
 
+import dataclasses
 import errno
 import faulthandler
 import subprocess
@@ -10,12 +11,12 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_ram_miss
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe import expert_stream_transport
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
     PAGE_BYTES,
-    Exl3RamMissHost,
+    ExpertStreamHost,
     new_page,
     new_hot_page,
     hot_record_bytes,
@@ -45,7 +46,7 @@ def tier(tmp_path, request):
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
     yield s, page, slot_map, host
     host.stop()
 
@@ -95,7 +96,7 @@ def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path, two_
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
     try:
         host.enable_lease_mode()
         if two_phase:
@@ -130,7 +131,7 @@ def test_gpu_hot_sidecar_fails_closed_on_stale_bitmap_and_wraps(tmp_path, fault)
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
     try:
         host.enable_lease_mode()
         host.enable_gpu_hot()
@@ -240,7 +241,7 @@ def mirrored_tier(tmp_path):
             s.slabs[1][name][slot].view(torch.uint8).fill_(0xAB)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
     yield s, page, slot_map, host
     host.stop()
 
@@ -292,6 +293,41 @@ def test_a_file_cut_short_after_open_fails_the_read(tier):
         f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)
     assert _serve(page, host, 0, need=[0], protect=[0]) == 2
     assert not host.contains(0, 0) and host.counters()["read_errors"] == 1
+
+
+def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
+    """tables_from indexes slabs[row][name] for every layout name; a 5-wide table would read past each row.
+
+    check_table_tensors now runs before tables_from and refuses a 5-wide slabs table on shape alone, naming the
+    tensor (Ruling 3's verify_named prefix), so tables_from's own "6 names" message is never reached."""
+    s = ram_miss_setup(tmp_path)
+    narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:5])
+    with pytest.raises(RuntimeError, match="^slabs: "):
+        expert_stream_transport.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=False)
+
+
+def test_open_refuses_an_extent_table_of_the_wrong_dtype(tmp_path):
+    """open() (via read_rows_once's C++ entry) reads extents as int64 [L, E, parts, 4] through a raw pointer; int32
+    would be read as packed pairs and name files and offsets that were never written. check_table_tensors catches
+    this at the FFI boundary before tables_from ever dereferences the tensor."""
+    s = ram_miss_setup(tmp_path)
+    bad = dataclasses.replace(s.tables, extents=s.tables.extents.to(torch.int32))
+    with pytest.raises(Exception, match="^extents: "):
+        expert_stream_transport.read_rows_once(bad, row=0, experts=[0], slots=[0], direct=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to show experts is refused off it")
+def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
+    """experts is read on the host through ids_of's raw int64 cast; a CUDA tensor would have this host-only FFI
+    entry read GPU memory as host memory. read_rows_once always rebuilds experts as a fresh CPU tensor
+    (``_ids``), so this device refusal is only observable by calling the raw C++ export directly."""
+    s = ram_miss_setup(tmp_path)
+    module = expert_stream_transport._host_module()
+    args = expert_stream_transport._table_args(s.tables, False)
+    experts = torch.tensor([0], dtype=torch.int64, device="cuda")
+    slots = torch.tensor([0], dtype=torch.int64)
+    with pytest.raises(Exception, match="^experts: "):
+        module.expert_stream_read_rows(*args, 0, experts, slots, expert_stream_transport.BOUNCE_ROWS)
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
@@ -353,7 +389,7 @@ def test_a_lapped_demand_ring_counts_every_skipped_record(tier):
 
 
 def test_the_seqlock_reader_never_accepts_a_torn_record():
-    accepted, torn = exl3_ram_miss.seqlock_stress(seconds=1.0)
+    accepted, torn = expert_stream_transport.seqlock_stress(seconds=1.0)
     assert accepted > 100 and torn == 0, (accepted, torn)
 
 
@@ -418,7 +454,7 @@ def test_a_repeated_protect_id_takes_one_slot(tier):
 def test_the_host_refuses_a_page_or_slot_map_it_cannot_index(tmp_path, page_fn, map_fn):
     s = ram_miss_setup(tmp_path)
     with pytest.raises(ValueError):
-        Exl3RamMissHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=False)
+        ExpertStreamHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=False)
 
 
 def test_release_refuses_a_slot_that_is_still_loading(tier):
@@ -440,12 +476,12 @@ def test_release_refuses_a_slot_that_is_still_loading(tier):
 
 _CLOSE_DURING_PUMP = """
 import pathlib, sys, threading, time
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
 page = new_page(pin=False)
-host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
 host.inject(delay_s=0.5)
 seq = sim_post(page, 0, need=[1], protect=[1])
 results = []
@@ -475,7 +511,7 @@ def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, 
         (tmp_path / str(i)).mkdir()
         s = ram_miss_setup(tmp_path / str(i))
         hosts.append(
-            Exl3RamMissHost(
+            ExpertStreamHost(
                 s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
             )
         )
@@ -485,7 +521,7 @@ def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(hosts[0], "counters", broken)
     monkeypatch.setattr(hosts[1], "counters", broken)
-    exl3_ram_miss._stop_live()
+    expert_stream_transport._stop_live()
     assert not hosts[0]._close.alive and not hosts[1]._close.alive
     assert "counters broke" in capsys.readouterr().err
 

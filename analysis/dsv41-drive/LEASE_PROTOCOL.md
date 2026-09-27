@@ -23,7 +23,7 @@ Files cited (all under `python/sglang/`):
 | `host.cpp` | `kernels/jit/csrc/moe/exl3_ram_miss_host.cpp` |
 | `device.cuh` | `kernels/jit/csrc/moe/exl3_ram_miss.cuh` |
 | `transfer.cuh` | `kernels/jit/csrc/moe/expert_cache_transfer.cuh` |
-| `ops.py` | `kernels/ops/moe/exl3_ram_miss.py` |
+| `ops.py` | `kernels/ops/moe/expert_stream_transport.py` |
 | `srt_ram_miss.py` | `srt/layers/moe/exl3_ram_miss.py` |
 | `row_plan.py` | `srt/layers/moe/expert_row_plan.py` |
 | `host_tier.py` | `srt/layers/moe/expert_host_tier.py` |
@@ -124,10 +124,10 @@ quarantine.**
   `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py` and
   `test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`. The production teardown path is
   the module-level `@atexit.register _stop_live` in `ops.py`, which calls
-  `Exl3RamMissHost.stop()` for every live host (thread stop, then the finalizer
+  `ExpertStreamHost.stop()` for every live host (thread stop, then the finalizer
   `exl3_ram_miss_close`; `self._close.atexit = False` because `_stop_live` owns exit).
   That path stops the service thread and closes the C++ handle. It does not synchronize
-  the device. The slab tensors survive only because `Exl3RamMissHost.tables` keeps them
+  the device. The slab tensors survive only because `ExpertStreamHost.tables` keeps them
   alive, and interpreter teardown then frees them with no device barrier.
 - **A second exit-time actor unregisters the slabs, and it runs in every process.**
   `ExpertPinnedHostCache.__init__` (`expert_stream.py`) creates
@@ -327,7 +327,7 @@ test (section 18), so agreement checking scales instead of forking.
 
 Allocation: pinned, zero-filled, base address 4096-aligned. The constructor **adds** a
 check that refuses a block whose `data_ptr() % 4096 != 0`; there is no alignment check today
-(`Exl3RamMissDevice.__init__` checks numel, dtype, host, contiguous and pinned, and nothing
+(`ExpertStreamDevice.__init__` checks numel, dtype, host, contiguous and pinned, and nothing
 about alignment), so an implementer must not assume one exists. It also refuses a block that
 is not pinned for a CUDA device, as `__init__` does for the page. **[OPEN 3]**: `torch.zeros(...,
 pin_memory=True)` (what `new_page` uses) does not obviously guarantee 4096 alignment. If
@@ -1457,7 +1457,7 @@ Python service (it iterates `_LIVE` hosts, not `Exl3RamMissService`). Separately
 `ExpertPinnedHostCache` finalizer unregisters the slabs at exit (D5). Two options:
 
 - **(a)** Make the atexit hook run S1..S5 above for the service that owns the host, and
-  have `Exl3RamMissHost.stop()` refuse to run when leases are outstanding and completion
+  have `ExpertStreamHost.stop()` refuse to run when leases are outstanding and completion
   is unproven, choosing quarantine instead.
 - **(b)** Leave `_stop_live` as the last-resort path but make it quarantine
   unconditionally: at exit the process is ending, so leaking is free and safe; do the
@@ -1821,7 +1821,7 @@ checklist. None has been done.
 | `host.cpp` | `exl3_ram_miss_sim_post`, `_sim_wait` | extend the host-side simulated device with `sim_ack`, `sim_terminal` and the lane request, so the whole protocol is testable on CPU with no GPU |
 | `device.cuh` | `exl3_ram_miss_post_kernel`, `exl3_ram_miss_wait_kernel` | `LaneRequest`; row-result acquire/validate; `go_count`; terminal; poll on fatal/shutdown (D4); 64-bit acquire/release |
 | `device.cuh` | new `exl3_ram_miss_ack_kernel` | section 7.4 |
-| `ops.py` | `PAGE_BYTES`-style constants for the block; `STATE_WORDS`; `new_lease_block`; `Exl3RamMissDevice` | append `epoch`, `pending_epoch`; allocate/validate the block; ack wrapper |
+| `ops.py` | `PAGE_BYTES`-style constants for the block; `STATE_WORDS`; `new_lease_block`; `ExpertStreamDevice` | append `epoch`, `pending_epoch`; allocate/validate the block; ack wrapper |
 | `srt_ram_miss.py` | `Exl3RamMissRowBackend.translate` and its copy | pass `go_count` to the copy; launch the ack kernel after the copy |
 | `srt_ram_miss.py`, `ops.py`, `host_tier.py`, `expert_stream.py` | `Exl3RamMissService.shutdown`, `_stop_live`, `release_host_slabs`, `ExpertPinnedHostCache._release_slabs` | sections 14.2-14.4 (`expert_stream.py` is outside the four files the plan lists for Task 5; flagging it) |
 | `test_exl3_ram_miss_device_args.py` | the layout agreement test | extend to the lease block constants (three-way agreement stays one test); see the constraints below |
@@ -2144,7 +2144,7 @@ side is transcribed faithfully.
   restart at epoch 0 while old acknowledgement words still carry epoch 0 generations.
 - **[OPEN 13]** (ordering answered by review, production path still open: see D5) The order of the exit-time callbacks: `_stop_live` (`ops.py`), the
   `ExpertPinnedHostCache._release_slabs` finalizer (`expert_stream.py`), and the
-  `Exl3RamMissHost._close` finalizer (`atexit = False`). If the slab finalizer runs while a
+  `ExpertStreamHost._close` finalizer (`atexit = False`). If the slab finalizer runs while a
   GPU kernel can still read, the D5 hazard occurs in every normal exit today. Determine the
   actual order before choosing between 14.4 options (a) and (b); (b) is safe under any order
   only if it detaches the slab finalizer.
@@ -2168,7 +2168,7 @@ side is transcribed faithfully.
 ### Plan correction
 
 The plan's Task 5 file list is Native service/pipeline header, `exl3_ram_miss.cuh`,
-`ops/moe/exl3_ram_miss.py`, `srt/layers/moe/exl3_ram_miss.py` and the thread/GPU-graph tests.
+`ops/moe/expert_stream_transport.py`, `srt/layers/moe/exl3_ram_miss.py` and the thread/GPU-graph tests.
 The shutdown requirement cannot be met inside those files: `ExpertPinnedHostCache.__init__`
 in `srt/layers/moe/expert_stream.py` creates the `weakref.finalize(... release_host_slabs ...)`
 that unregisters the slabs at every process exit, and a quarantine that leaves it attached is
@@ -2207,9 +2207,9 @@ this order may change).
 | # | Change (symbol, file) | Test that covers it | Constraint that bites | Needs GPU |
 |---|---|---|---|---|
 | 1 | **Constants and block allocator, no behaviour.** `ops.py`: lease-block constants (`LEASE_RING`, `LEASE_LANES`, offsets of area H/S/D from 4.3) and `new_lease_block(rows, capacities, pin)`, allocating `bytes + 4096` and slicing to a 4096-aligned view (there is no alignment check today; add it). Mirror the same names in `host.cpp` and `device.cuh`. | Extend `test_exl3_ram_miss_device_args` so the lease constants join the existing three-way agreement test; a test that an unaligned or unpinned block is refused. | The `_constants` parser accepts only `constexpr <type> kName = <expr>;` with integers, `+ - *` and known names, and fails on a duplicate name. No `<<`, `|`, `/`, `sizeof` in a `k` constexpr; the tag encoding stays in code. | no |
-| 2 | **Slot generations and the eviction predicate.** `host.cpp`: `Tier` gains `leases` and `slot_generation`; `SlotGen[]` mapped writes with the `_mm_sfence()` of 6.5; `take_slot_locked` returns the tri-state {slot, deferred, none} with the cause (graph or host); `assign`/`release` refuse a leased slot; new counters. `exl3_ram_miss_open` takes the block tensor and writes the immutable header and `RowTable` (the service is the only writer); `ops.py` `Exl3RamMissHost.__init__` creates the block itself when none is passed, so no test call site changes. Nothing grants a lease yet. | All existing `test_exl3_ram_miss_tier` / `_split` / `_thread` / `_advisory` unchanged and green; new CPU tests for the tri-state, for `SlotGen` bumping before the first byte store, for `release` of a leased slot throwing. | Append the new counters at the end of `enum Counter` before `kCounterCount` **and** the same position in `COUNTERS` (`ops.py`), which is index-aligned by convention. `kVersion` must not move on a lease change (R8). | no |
+| 2 | **Slot generations and the eviction predicate.** `host.cpp`: `Tier` gains `leases` and `slot_generation`; `SlotGen[]` mapped writes with the `_mm_sfence()` of 6.5; `take_slot_locked` returns the tri-state {slot, deferred, none} with the cause (graph or host); `assign`/`release` refuse a leased slot; new counters. `exl3_ram_miss_open` takes the block tensor and writes the immutable header and `RowTable` (the service is the only writer); `ops.py` `ExpertStreamHost.__init__` creates the block itself when none is passed, so no test call site changes. Nothing grants a lease yet. | All existing `test_exl3_ram_miss_tier` / `_split` / `_thread` / `_advisory` unchanged and green; new CPU tests for the tri-state, for `SlotGen` bumping before the first byte store, for `release` of a leased slot throwing. | Append the new counters at the end of `enum Counter` before `kCounterCount` **and** the same position in `COUNTERS` (`ops.py`), which is index-aligned by convention. `kVersion` must not move on a lease change (R8). | no |
 | 3 | **Admission, grant, publish, retire, terminal; the CPU device.** `host.cpp`: read `LaneRequest` with the seqlock re-check; take `G` from it (11.3); `Outstanding` ring; in `serve()` grant and publish per lane (6.1 order, RAII undo); `retire_leases()` called from the top of `RamThread::run` and from the give-up lambda of `RowReader::read`; the pause acknowledgement's graph-lane `outstanding == 0`; the terminal check and `late_after_terminal`; deferral. Extend `exl3_ram_miss_sim_post` / `_sim_wait` and add `sim_ack`, `sim_terminal` so the whole protocol runs with no GPU. | Section 18.2 items 1-4, 6, 7(b)-(d), 8, 10, 14 and 15, each with its precondition asserted and its mutation demonstrated (the ledger in 18.2; item 5 is sim-only on the CPU and is not evidence for the kernel), plus the model counterexamples that have a service analogue, replayed at scenario level (20.2b). The wrap tests (`test_exl3_ram_miss_wrap.py`) still pass. | **A deferral must return before `begin_stage`, or push nothing**, and retry only when `retire_leases()` changed something or a `Terminal` appeared, or the 8192-slot stage ring floods per poll (7.1, OPEN 15). Weak ordering between ack and terminal words: the sim must be able to deliver them in either order, as the model does. | no |
-| 4 | **The device kernels.** `device.cuh`: `LaneRequest` in the post kernel; the wait kernel with `go_count`, the `RowResult` validate (generation, tag, expert), the terminal, the `fatal`/`Header.shutdown` poll inside the loop (D4), and 64-bit `ld.acquire.sys` / `st.release.sys`; new `exl3_ram_miss_ack_kernel`. `ops.py`: `Exl3RamMissDevice.post/wait/ack`, `lane_ctx`, `go_count`; append `epoch` and `pending_epoch` to `STATE_WORDS`. | CPU: argument validation in `test_exl3_ram_miss_device_args`; the state-word agreement test. GPU (manual, under the lock, after crypto-c9 schedules): a wait kernel timeout leaves `go_count == 0` and a poisoned slab is not read; an acknowledgement is emitted only for copied lanes; the `ld.global.nc` experiment (6.6), independent of this step. | **`STATE_WORDS` is a triple edit**: the device-state enum in `device.cuh`, `STATE_WORDS` in `ops.py`, and the hard-coded dict in the device-args test, all together or the existing test fails. **`go_count` must be an int32 CUDA tensor of shape `[1]`** (`_validate_plan`), not a scalar, not int64. Constexprs as in step 1. | yes |
+| 4 | **The device kernels.** `device.cuh`: `LaneRequest` in the post kernel; the wait kernel with `go_count`, the `RowResult` validate (generation, tag, expert), the terminal, the `fatal`/`Header.shutdown` poll inside the loop (D4), and 64-bit `ld.acquire.sys` / `st.release.sys`; new `exl3_ram_miss_ack_kernel`. `ops.py`: `ExpertStreamDevice.post/wait/ack`, `lane_ctx`, `go_count`; append `epoch` and `pending_epoch` to `STATE_WORDS`. | CPU: argument validation in `test_exl3_ram_miss_device_args`; the state-word agreement test. GPU (manual, under the lock, after crypto-c9 schedules): a wait kernel timeout leaves `go_count == 0` and a poisoned slab is not read; an acknowledgement is emitted only for copied lanes; the `ld.global.nc` experiment (6.6), independent of this step. | **`STATE_WORDS` is a triple edit**: the device-state enum in `device.cuh`, `STATE_WORDS` in `ops.py`, and the hard-coded dict in the device-args test, all together or the existing test fails. **`go_count` must be an int32 CUDA tensor of shape `[1]`** (`_validate_plan`), not a scalar, not int64. Constexprs as in step 1. | yes |
 | 5 | **The backend and the arming rule.** `srt_ram_miss.py`: `Exl3RamMissRowBackend` overrides `post` (today only `translate` is overridden and `post` is inherited from `PinnedTierRowBackend`) to pass `go_count` to `copy_expert_row_segments_gpu` and to launch the acknowledgement kernel after it; `Exl3RamMissService.ensure_started` / `attach` allocate the block and hand it to the host and the device; lease mode arms every record with `count > 0` (15). The new environment switch is read here. | Existing service tests green with the switch off; with it on, the GPU graph parity test (`test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`): byte-exact output versus off, an injected timeout, and the arming cost measurement (OPEN 11) reported, not assumed. | The switch defaults off. `advise` and the arming rule must agree between the device (`armed = need_count > 0 || advise != 0`) and the service's `touch_request` path, or a record is waited on that the service treats as touch-only. | yes |
 | 6 | **Shutdown and quarantine. (Production reachability: only the exit-hook quarantine, only on normal exit; `shutdown()` has no production caller. See the finding at the top of section 14.)** `srt_ram_miss.py` `Exl3RamMissService.shutdown` runs S0-S5 (14.3); `Header.shutdown` is set by the service; the device-wide `torch.cuda.synchronize` in a helper thread with a deadline; `_stop_live` in `ops.py` quarantines unconditionally (DECIDE 2). **`expert_stream.py`: `ExpertPinnedHostCache._release_slabs.detach()`**, and `expert_host_tier.py`: the unregister-skipping path; the quarantine takes an unreleased extra reference (`Py_IncRef`), not a module-level list. | Section 18.2 item 9(c) (a fake CUDA error and a fake sync timeout select quarantine; `release_host_slabs` patched before the cache is built, the fake sync asserted to have been called, no unregister, the slab alive by weak reference); an atexit-order test that pins OPEN 13's answer; the model's shutdown mutant as a regression. | **The two files the plan did not list** (`expert_stream.py`, `expert_host_tier.py`): the finalizer that unregisters slabs at exit lives in the first. Without `detach()` the quarantine is silently undone. | no (helper-thread and fake-error paths are CPU) |
 | 7 | **The host-lease API for Task 8.** `host.cpp` and the export table: `acquire_host_lease`, `lease_on_ready`, `release_host_lease` (17.1, R1-R8), never bumping `kVersion`, releasable by an executor-stream host callback (R1a, OPEN 16) and not only by the scheduler thread's poll, a stale or repeated `LeaseRef` counted as an error; the pause counts graph-lane leases only; **a host lease is released by an executor-stream host callback, not the scheduler thread's poll (R1a, OPEN 16)**. | R1-R8 tests; the model's Task 8 mutants replayed against the real API through the sim. | R8 (`kVersion`), R2 (the pause split), R3 (`lease_on_ready`), and A3 for whoever calls it. | no |
@@ -2244,7 +2244,7 @@ independent review) that lease mode defaults off.
 ### 20.2a Deviations from this order, recorded as they happen
 
 - **Step 1 deviated.** The order above put the block constants and allocator in `ops.py` and
-  `host.cpp`. They were built instead as a **new module** (`ops/moe/exl3_lease_block.py`), the
+  `host.cpp`. They were built instead as a **new module** (`ops/moe/expert_lease_block.py`), the
   constants in `exl3_ram_miss.cuh`, and new tests, because `host.cpp`, `ops.py` and
   `srt/layers/moe/exl3_ram_miss.py` were carrying another change's uncommitted diff (the Task 4
   packing-worker pool) and editing them in step 1 would have collided with it. The host-side
@@ -2851,7 +2851,7 @@ Wired (`exl3_ram_miss.py`, `environ.py`; the file 20.1 row 5 calls `srt_ram_miss
 - `Exl3RamMissRowBackend.post`: without a lease block on the device it is the inherited `post`; with one it is
   translate, copy with `device_side.go_count` in place of `plan.count`, then `device_side.ack(keep)`, in that stream.
 - The quarantine also keeps the device's `go_count` and `lane_ctx` alive.
-- Nothing allocates a block in the service: `Exl3RamMissHost` already allocates one (step 1); row 5's "allocate the
+- Nothing allocates a block in the service: `ExpertStreamHost` already allocates one (step 1); row 5's "allocate the
   block" is satisfied by passing that one on.
 
 Verification, by kind (none of it ticks a plan box):

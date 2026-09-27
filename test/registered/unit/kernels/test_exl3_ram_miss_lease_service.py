@@ -13,8 +13,8 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, ExpertStreamHost, new_page, page_word, sim_post
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
@@ -38,7 +38,7 @@ def world(tmp_path, request):
     capacity = getattr(request, "param", 3)
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     yield s, page, host, LeaseSim(host, page, s.slabs)
     host.stop()
@@ -160,7 +160,7 @@ def test_with_lease_mode_off_the_lane_request_is_ignored_and_nothing_is_leased(t
     """Off is today's behaviour: a service that was not told to lease never reads the lane request."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     try:
         sim = LeaseSim(host, page, s.slabs)
         req = sim.post(0, [1])
@@ -257,7 +257,7 @@ def test_the_leases_exist_before_the_device_can_see_demand_done(tmp_path):
     and storing demand_done; a device that saw done at that instant would otherwise find no lease."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     try:
         sim = LeaseSim(host, page, s.slabs)
@@ -348,7 +348,7 @@ def test_an_acknowledged_graph_lane_lease_no_longer_holds_back_an_eager_pause(tm
     pause is granted. Mutation: `lanes_outstanding_` is not decremented on release (the pause is refused for ever)."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     sim = LeaseSim(host, page, s.slabs)
@@ -388,7 +388,7 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
     """
     s = ram_miss_setup(tmp_path, capacity=4)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     sim = LeaseSim(host, page, s.slabs)

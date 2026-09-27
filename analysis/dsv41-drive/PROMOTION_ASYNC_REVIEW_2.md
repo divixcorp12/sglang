@@ -311,7 +311,7 @@ bearing assumption's only guard is unimplementable as worded.
 
 Not everything is a finding. These hold: the executor is fakeable; `test_exl3_ram_miss_graph_gpu.py`
 exists in `test/manual/dsv41`; the "More misses than slots" comment quoted in the M0 test exists
-(`expert_stream.py:331`); `torch.cuda._sleep` is already used in this repo; `Exl3RamMissHost.pause`,
+(`expert_stream.py:331`); `torch.cuda._sleep` is already used in this repo; `ExpertStreamHost.pause`,
 `host_use`, `_drain_device` and `wait_for_slot_publication` exist under the names given; the fault
 injector's `delay_s` and `delay_after_demands` exist (`ops/moe/exl3_ram_miss.py:533-537`). No claimed
 defect in these sections was found to be false.

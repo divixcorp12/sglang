@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_exl3_piece_stream_cuda as cuda_suite  # noqa: E402
 from test_exl3_piece_stream_cuda import service  # noqa: E402,F401  (fixture of the reused tests)
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost  # noqa: E402
 from sglang.srt.layers.moe import exl3_ram_miss as ram_miss  # noqa: E402
 
 pytestmark = cuda_suite.pytestmark
@@ -33,7 +33,7 @@ def row_images(monkeypatch):
     from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
     from sglang.test.dsv41_ram_miss_fixtures import write_row_images
 
-    tables_of, host_init = ram_miss.exl3_ram_miss_tables, Exl3RamMissHost.__init__
+    tables_of, host_init = ram_miss.exl3_ram_miss_tables, ExpertStreamHost.__init__
 
     def image_tables(layout, segments, slabs, **mirrors):
         # G1's real service passes row_images=None (the flag is off in its environment); nothing else is passed.
@@ -52,7 +52,7 @@ def row_images(monkeypatch):
         host_init(self, tables, *args, direct=direct or tables.row_images, **kwargs)
 
     monkeypatch.setattr(ram_miss, "exl3_ram_miss_tables", image_tables)
-    monkeypatch.setattr(Exl3RamMissHost, "__init__", direct_host)
+    monkeypatch.setattr(ExpertStreamHost, "__init__", direct_host)
     yield
 
 

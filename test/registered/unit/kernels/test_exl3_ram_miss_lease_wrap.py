@@ -10,7 +10,7 @@ import faulthandler
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, WORDS, Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, WORDS, ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -33,7 +33,7 @@ def world(tmp_path):
     page = new_page(pin=False)
     for name in ("demand_head", "demand_done"):
         page[WORDS[name] : WORDS[name] + 4].view(torch.int32)[0] = -BELOW_WRAP  # 2**32 - 6
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     yield s, page, host, LeaseSim(host, page, s.slabs)
     host.stop()

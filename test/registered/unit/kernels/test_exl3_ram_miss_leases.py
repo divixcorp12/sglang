@@ -10,8 +10,8 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post, sim_wait
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post, sim_wait
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -33,7 +33,7 @@ def tier(tmp_path, request):
     capacity = getattr(request, "param", 2)
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     yield s, page, host
     host.stop()
 
@@ -80,9 +80,9 @@ def test_the_service_refuses_a_block_it_cannot_address(tmp_path, monkeypatch):
     start = (-raw.data_ptr()) % lease.BLOCK_ALIGN
     common = dict(page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     with pytest.raises(RuntimeError, match="aligned"):
-        Exl3RamMissHost(s.tables, lease_block=raw[start + 1 : start + 1 + layout.total_bytes], **common)
+        ExpertStreamHost(s.tables, lease_block=raw[start + 1 : start + 1 + layout.total_bytes], **common)
     with pytest.raises(RuntimeError, match="layout needs"):
-        Exl3RamMissHost(s.tables, lease_block=raw[start : start + layout.total_bytes - lease.BLOCK_ALIGN], **common)
+        ExpertStreamHost(s.tables, lease_block=raw[start : start + layout.total_bytes - lease.BLOCK_ALIGN], **common)
 
 
 # ---- slot generations ----
@@ -128,7 +128,7 @@ def test_the_generation_is_bumped_before_any_byte_of_the_new_row_is_written(tmp_
     slot and reading into it, a GPU reader that re-read the generation would otherwise see the old one."""
     s = ram_miss_setup(tmp_path, capacity=2)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     try:
         for slot in range(2):
             for name in EXL3_STREAMED_NAMES:
@@ -211,7 +211,7 @@ def test_the_census_counts_free_evictable_and_leased_slots_without_taking_any(tm
     """Mutation: a hot or requested slot is counted as a victim, or a leased one as evictable."""
     s = ram_miss_setup(tmp_path, capacity=4)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     try:
         for expert in (0, 1, 2):
             host.assign(0, expert, protected=[expert])

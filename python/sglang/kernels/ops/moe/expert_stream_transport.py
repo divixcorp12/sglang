@@ -12,10 +12,11 @@ import sys
 import weakref
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.ops.moe import exl3_lease_block
+from sglang.kernels.ops.moe import expert_lease_block
 
 # Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
 # row slots each. A bank is reused only after every row read into it has packed.
@@ -25,14 +26,54 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+class TransportBuild(msgspec.Struct, frozen=True):
+    """One instantiation of the transport: the host translation unit that binds its C++ layout and file reader, the
+    device translation unit RowCopyKernel is compiled in, and the device layout type it is instantiated with."""
+
+    host_source: str
+    device_source: str
+    device_layout: str
+
+
+# One row per format the transport is built for; adding a format adds a row, its instantiation files
+# (host_source, device_source) and the layout type they define.
+LAYOUTS = {
+    "exl3": TransportBuild(
+        host_source="moe/exl3_ram_miss_host.cpp",
+        device_source="moe/exl3_ram_miss.cuh",
+        device_layout="sglang::exl3::Exl3RowLayout",
+    )
+}
+
+
+# cache_once keys f(), f("exl3") and f(layout="exl3") apart; each cached loader below is called only positionally,
+# through a wrapper, so a layout has exactly one module whatever the call form.
+def _host_module(layout: str = "exl3") -> Module:
+    return _host_module_cached(layout)
+
+
 @cache_once
-def _host_module() -> Module:
+def _host_module_cached(layout: str) -> Module:
+    # Hidden by default: HostExports' registries and members stay private to each module's .so; only the
+    # TVM_FFI_DLL_EXPORT entry points (visibility "default") are exported.
     return load_jit(
-        "exl3_ram_miss_host",
-        cpp_files=["moe/exl3_ram_miss_host.cpp"],
+        f"expert_stream_host_{layout}",
+        cpp_files=[LAYOUTS[layout].host_source],
+        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
     )
+
+
+def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
+    """The host module's row layout: its tensor names in copy-table order and the SM-readable ones as a bit mask."""
+    return _host_layout_cached(layout)
+
+
+@cache_once
+def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
+    module = _host_module(layout)
+    return tuple(str(module.expert_stream_layout_names()).split("\n")), int(module.expert_stream_layout_small_mask())
 
 
 def _ids(values: Iterable[int]) -> torch.Tensor:
@@ -71,14 +112,14 @@ def _table_args(tables, direct: bool) -> tuple:
     )
 
 
-def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS) -> int:
+def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS, layout: str = "exl3") -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++: 1 ok, 0 failed.
 
     ``step`` rows go to io_uring per batch (at most ``BOUNCE_ROWS``).
     """
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     return int(
-        _host_module().exl3_ram_miss_read_rows(
+        _host_module(layout).expert_stream_read_rows(
             *_table_args(tables, direct), row, expert_ids, slot_ids, int(step)
         )
     )
@@ -160,6 +201,7 @@ def read_rows_traced(
     direct: bool,
     step: int = BOUNCE_ROWS,
     owner_core: int = -1,
+    layout: str = "exl3",
     **faults,
 ) -> tuple[int, dict]:
     """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
@@ -176,9 +218,9 @@ def read_rows_traced(
     admitted, the rows admitted were still read and packed, the rest never read)."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     result = int(
-        _host_module().exl3_ram_miss_read_rows_traced(
+        _host_module(layout).expert_stream_read_rows_traced(
             *_table_args(tables, direct),
             row,
             expert_ids,
@@ -203,6 +245,7 @@ def read_rows_with_fault(
     direct: bool,
     cqes: Optional[list[int]] = None,
     stats: Optional[dict] = None,
+    layout: str = "exl3",
     **faults,
 ) -> tuple[int, int]:
     """Test only: on one C++ reader, read with an injected fault, then read cleanly.
@@ -244,7 +287,7 @@ def read_rows_with_fault(
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
     results = torch.zeros(8, dtype=torch.int64)
-    _host_module().exl3_ram_miss_read_rows_faulted(
+    _host_module(layout).expert_stream_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
     if cqes is not None:
@@ -258,17 +301,26 @@ def read_rows_with_fault(
 
 
 def read_rows_sqes(
-    tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS, max_sqes: int = 4096, **faults
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    direct: bool,
+    step: int = BOUNCE_ROWS,
+    max_sqes: int = 4096,
+    layout: str = "exl3",
+    **faults,
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
     """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
     ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
     (the ring's) and ``cqes``. Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
     info = torch.zeros(5, dtype=torch.int64)
-    _host_module().exl3_ram_miss_read_rows_sqes(
+    _host_module(layout).expert_stream_read_rows_sqes(
         *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
     )
     result, count, descriptors, credit, cqes = info.tolist()
@@ -280,11 +332,11 @@ def read_rows_sqes(
     )[0]
 
 
-def publish_piece(word: int, generation: int, bit: int) -> tuple[bool, int]:
+def publish_piece(word: int, generation: int, bit: int, *, layout: str = "exl3") -> tuple[bool, int]:
     """Test only: the reader owner's publish primitive on one readiness word holding ``word`` (``generation << 8 |
     bits``): whether it set ``bit``, and the word afterwards."""
     cell = torch.tensor([word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64)
-    done = int(_host_module().exl3_ram_miss_publish_piece(cell, int(generation), int(bit)))
+    done = int(_host_module(layout).expert_stream_publish_piece(cell, int(generation), int(bit)))
     return bool(done), int(cell[0]) & 0xFFFFFFFFFFFFFFFF
 
 
@@ -305,6 +357,7 @@ def read_rows_pieces(
     reference: Optional[torch.Tensor] = None,
     ref_slots=None,
     step: int = BOUNCE_ROWS,
+    layout: str = "exl3",
     **faults,
 ) -> tuple[int, dict, torch.Tensor, dict]:
     """Test only: ``read_rows_traced``'s read with piece streaming's publishing: row ordinal o's pieces are published
@@ -318,11 +371,11 @@ def read_rows_pieces(
     if masks is None:
         masks = torch.full((len(expert_ids), 1), piece_word(generation), dtype=torch.int64)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     info = torch.zeros(5, dtype=torch.int64)
     ref = reference if reference is not None else torch.zeros(0, dtype=torch.int64)
     ref_ids = _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
-    _host_module().exl3_ram_miss_read_rows_pieces(
+    _host_module(layout).expert_stream_read_rows_pieces(
         *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
         ref_ids, info,
     )
@@ -332,7 +385,7 @@ def read_rows_pieces(
     )
 
 
-def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], list[dict]]]:
+def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Optional[tuple[list[dict], list[dict]]]:
     """Test only: the sub-reads and pieces the C++ reader cuts expert ``expert`` of streamed row ``row`` into
     under piece streaming, or None when it refuses the row. Sub-reads, in file order: ``{file, offset, length,
     dest, part, k}``. Pieces (``STAGE_PIECES``): ``{deps, runs}``, ``deps`` the bitmask of sub-reads the piece
@@ -341,7 +394,7 @@ def piece_geometry(tables, row: int, expert: int) -> Optional[tuple[list[dict], 
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
-        _host_module().exl3_ram_miss_piece_geometry(*_table_args(tables, False)[:-1], row, expert, subs, pieces)
+        _host_module(layout).expert_stream_piece_geometry(*_table_args(tables, False)[:-1], row, expert, subs, pieces)
     )
     if count < 0:
         return None
@@ -407,8 +460,8 @@ STAGE_ORDER = (
 )
 
 
-def _stage_words() -> int:
-    words = int(_host_module().exl3_ram_miss_trace_words())
+def _stage_words(layout: str = "exl3") -> int:
+    words = int(_host_module(layout).expert_stream_trace_words())
     if words != len(STAGE_FIELDS):
         raise RuntimeError(f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}")
     return words
@@ -527,7 +580,7 @@ WORDS = {
 STATUS = {"pending": 0, "served": 1, "failed": 2}
 # Order of the C++ counters. ``rows_read`` counts every row read, demand AND advisory
 # (``advisory_rows`` is the advisory part); it is not the RAM-miss count behind ``f``. Demand
-# rows come only from ``Exl3RamMissHost.layer_rows()``: per streamed layer, demand-only, and
+# rows come only from ``ExpertStreamHost.layer_rows()``: per streamed layer, demand-only, and
 # read under the host's lock. Do not derive them as ``rows_read - advisory_rows``: the two
 # counters are separate atomics bumped after the rows are published, so a read can tear.
 COUNTERS = (
@@ -606,7 +659,16 @@ def page_word(page: torch.Tensor, name: str) -> int:
 
 
 def sim_post(
-    page, row: int, need, protect, *, advisory: bool = False, after: int = 0, armed: bool = True, lanes: Optional[int] = None
+    page,
+    row: int,
+    need,
+    protect,
+    *,
+    advisory: bool = False,
+    after: int = 0,
+    armed: bool = True,
+    lanes: Optional[int] = None,
+    layout: str = "exl3",
 ) -> int:
     """Post a record as the device post kernel does; returns its sequence.
 
@@ -617,25 +679,25 @@ def sim_post(
     its need is non-empty or advisories are on; the thread only touches for an unarmed one.
     """
     return int(
-        _host_module().exl3_ram_miss_sim_post(
+        _host_module(layout).expert_stream_sim_post(
             page, row, _ids(need), _ids(protect), int(advisory), after, int(armed), len(list(need)) if lanes is None else int(lanes)
         )
     )
 
 
-def sim_wait(page, seq: int, timeout_s: float) -> int:
+def sim_wait(page, seq: int, timeout_s: float, *, layout: str = "exl3") -> int:
     """Wait as the device wait kernel does: 1 served, 2 failed, 0 timed out, 3 fatal already raised."""
-    return int(_host_module().exl3_ram_miss_sim_wait(page, seq, int(timeout_s * 1e9)))
+    return int(_host_module(layout).expert_stream_sim_wait(page, seq, int(timeout_s * 1e9)))
 
 
-def seqlock_stress(seconds: float) -> tuple[int, int]:
+def seqlock_stress(seconds: float, *, layout: str = "exl3") -> tuple[int, int]:
     """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted)."""
     out = torch.zeros(2, dtype=torch.int64)
-    _host_module().exl3_ram_miss_seqlock_stress(int(seconds * 1e9), out)
+    _host_module(layout).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
 
 
-_LIVE: weakref.WeakSet[Exl3RamMissHost] = weakref.WeakSet()
+_LIVE: weakref.WeakSet[ExpertStreamHost] = weakref.WeakSet()
 
 
 @atexit.register
@@ -647,7 +709,7 @@ def _stop_live() -> None:
             sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
 
 
-class Exl3RamMissHost:
+class ExpertStreamHost:
     """The C++-owned pinned-slot bookkeeping of every streamed layer and its request service.
 
     ``tables``: ``Exl3RamMissTables``; ``page``: a ``new_page`` tensor; ``slot_map``:
@@ -666,6 +728,7 @@ class Exl3RamMissHost:
         lease_block: Optional[torch.Tensor] = None,
         hot_page: Optional[torch.Tensor] = None,
         pack_workers: int = 0,
+        layout: str = "exl3",
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
@@ -676,15 +739,16 @@ class Exl3RamMissHost:
             raise ValueError("page and slot_map must be contiguous CPU tensors")
         if not bool((slot_map == -1).all()):
             raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
-        self._module = _host_module()
+        self._layout = layout
+        self._module = _host_module(self._layout)
         self.threaded = False
         # The lease block (LEASE_PROTOCOL.md section 4): the service writes its header and slot generations
         # through a raw address, so this object holds it. Allocated here when the caller passes none.
-        self.lease_layout = exl3_lease_block.lease_layout([int(c) for c in tables.capacity])
+        self.lease_layout = expert_lease_block.lease_layout([int(c) for c in tables.capacity])
         if lease_block is None:
-            lease_block = exl3_lease_block.new_lease_block(self.lease_layout, pin=page.is_pinned())
+            lease_block = expert_lease_block.new_lease_block(self.lease_layout, pin=page.is_pinned())
         else:
-            exl3_lease_block.check_lease_block(lease_block, self.lease_layout, need_pinned=page.is_pinned())
+            expert_lease_block.check_lease_block(lease_block, self.lease_layout, need_pinned=page.is_pinned())
         self.lease_block = lease_block
         self.hot_page = hot_page
         if hot_page is not None:
@@ -701,7 +765,7 @@ class Exl3RamMissHost:
         self.slot_map = slot_map
         self.layers, self.experts = tables.starts.shape
         self.handle = int(
-            self._module.exl3_ram_miss_open(
+            self._module.expert_stream_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
                 tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
                 "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), int(direct), self.lease_block,
@@ -711,8 +775,9 @@ class Exl3RamMissHost:
         )
         if self.handle < 0:
             raise RuntimeError("exl3 RAM miss service failed to open (files, io_uring or bounce)")
-        # exl3_ram_miss_close also stops and joins the service thread, if one runs.
-        self._close = weakref.finalize(self, self._module.exl3_ram_miss_close, self.handle)
+        self.layout_names, self.small_mask = host_layout(self._layout)
+        # expert_stream_close also stops and joins the service thread, if one runs.
+        self._close = weakref.finalize(self, self._module.expert_stream_close, self.handle)
         self._close.atexit = False  # _stop_live closes live hosts at exit, logging counters first
         _LIVE.add(self)
 
@@ -733,7 +798,7 @@ class Exl3RamMissHost:
         """
         if 64 <= cpu_core <= 71:
             raise ValueError(f"cpu_core {cpu_core}: cores 64-71 are reserved (71 is production's doorbell core)")
-        self._module.exl3_ram_miss_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
+        self._module.expert_stream_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
         self.threaded = True
 
     def pause(self, timeout_s: float) -> None:
@@ -744,7 +809,7 @@ class Exl3RamMissHost:
         """
         if not self.threaded:
             return
-        outcome = int(self._module.exl3_ram_miss_pause(self.handle, int(timeout_s * 1e9)))
+        outcome = int(self._module.expert_stream_pause(self.handle, int(timeout_s * 1e9)))
         if outcome == 2:
             raise RuntimeError("exl3 RAM miss: not paused, a GPU reader still holds a graph-lane lease")
         if outcome != 1:
@@ -752,26 +817,26 @@ class Exl3RamMissHost:
 
     def resume(self) -> None:
         if self.threaded:
-            self._module.exl3_ram_miss_resume(self.handle)
+            self._module.expert_stream_resume(self.handle)
 
     def pump(self) -> int:
-        return int(self._module.exl3_ram_miss_pump(self.handle))
+        return int(self._module.expert_stream_pump(self.handle))
 
     def contains(self, row: int, expert: int) -> bool:
         """True once the expert holds a slot in ``row``: from the moment the thread claims the
         slot, before its read has finished. It does not mean the bytes are in RAM; the read is
         done when ``layer_rows()`` / ``layer_advisory_rows()`` count the row."""
         self._check(row, expert)
-        return bool(self._module.exl3_ram_miss_contains(self.handle, row, expert))
+        return bool(self._module.expert_stream_contains(self.handle, row, expert))
 
     def touch(self, row: int, expert: int) -> None:
         self._check(row, expert)
-        self._module.exl3_ram_miss_touch(self.handle, row, expert)
+        self._module.expert_stream_touch(self.handle, row, expert)
 
     def assign(self, row: int, expert: int, protected: Iterable[int] = (), protected_fallback: bool = True) -> tuple[int, Optional[int]]:
         self._check(row, expert)
         out = torch.zeros(2, dtype=torch.int64)
-        self._module.exl3_ram_miss_assign(self.handle, row, expert, _ids(protected), int(protected_fallback), out)
+        self._module.expert_stream_assign(self.handle, row, expert, _ids(protected), int(protected_fallback), out)
         slot, evicted = int(out[0]), int(out[1])
         if evicted == -2:
             raise ValueError(f"expert {expert} already holds a pinned slot")
@@ -781,7 +846,7 @@ class Exl3RamMissHost:
 
     def release(self, row: int, slot: int) -> None:
         self._check(row, slot=slot)
-        self._module.exl3_ram_miss_release(self.handle, row, slot)
+        self._module.expert_stream_release(self.handle, row, slot)
 
     def fill_begin(
         self, row: int, experts: Sequence[int], protected: Iterable[int] = (), fallback: bool = False
@@ -797,14 +862,14 @@ class Exl3RamMissHost:
             self._check(row, expert)
         out = torch.zeros(len(experts) + 1, dtype=torch.int64)
         claimed = int(
-            self._module.exl3_ram_miss_fill_begin(self.handle, row, _ids(experts), _ids(protected), int(fallback), out)
+            self._module.expert_stream_fill_begin(self.handle, row, _ids(experts), _ids(protected), int(fallback), out)
         )
         values = out.tolist()
         return values[:claimed], values[len(experts)]
 
     def fill_wait(self, rows: int, timeout_s: float) -> None:
         """Return once the first ``rows`` claimed rows of the running fill have landed in their slabs."""
-        outcome = int(self._module.exl3_ram_miss_fill_wait(self.handle, int(rows), int(timeout_s * 1e9)))
+        outcome = int(self._module.expert_stream_fill_wait(self.handle, int(rows), int(timeout_s * 1e9)))
         if outcome == 0:
             raise RuntimeError(f"exl3 RAM miss: a prefill fill failed before its first {rows} rows landed")
         if outcome != 1:
@@ -812,26 +877,26 @@ class Exl3RamMissHost:
 
     def fill_landed(self) -> int:
         """How many claimed rows of the fill have landed so far, a prefix of the claim order; never blocks."""
-        return int(self._module.exl3_ram_miss_fill_landed(self.handle))
+        return int(self._module.expert_stream_fill_landed(self.handle))
 
     def fill_end(self) -> bool:
         """Join the fill; False when it failed (its rows that did not land were released)."""
-        return bool(self._module.exl3_ram_miss_fill_end(self.handle))
+        return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int, int]]:
         """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY, 3 QUARANTINE (piece
         streaming: a failed read's slot a lane still leases; its expert reads -1)."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 4, dtype=torch.int64)
-        self._module.exl3_ram_miss_slot_info(self.handle, row, out)
+        self._module.expert_stream_slot_info(self.handle, row, out)
         values = out.tolist()
         return [tuple(values[i : i + 4]) for i in range(0, len(values), 4)]
 
     def lease_entry(self, idx: int) -> dict:
         """Test only: the service's lease account of request slot ``idx`` (``(seq - 1) % DEMAND_RECORDS``)."""
-        lanes = exl3_lease_block.LANES
+        lanes = expert_lease_block.LANES
         out = torch.zeros(4 + 3 * lanes, dtype=torch.int64)
-        self._module.exl3_ram_miss_lease_entry(self.handle, idx, out)
+        self._module.expert_stream_lease_entry(self.handle, idx, out)
         values = out.tolist()
         return {
             "active": bool(values[0]),
@@ -846,50 +911,50 @@ class Exl3RamMissHost:
     def inject_lease(self, row: int, slot: int, delta: int) -> None:
         """Test only: stand in for a GPU reader's lease (the service grants its own from step 3)."""
         self._check(row, slot=slot)
-        self._module.exl3_ram_miss_inject_lease(self.handle, row, slot, delta)
+        self._module.expert_stream_inject_lease(self.handle, row, slot, delta)
 
     def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int, int]:
         """(free, evictable, leased) slots a request wanting ``wanted`` could take, counted without taking any."""
         self._check(row)
         out = torch.empty(3, dtype=torch.int64)
-        self._module.exl3_ram_miss_victim_census(self.handle, row, _ids(wanted), out)
+        self._module.expert_stream_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
 
     def close_admission(self) -> None:
         """Shutdown, first step: the service serves nothing new and the header's shutdown word is set."""
-        self._module.exl3_ram_miss_close_admission(self.handle)
+        self._module.expert_stream_close_admission(self.handle)
 
     def busy_since_ns(self) -> int:
         """When the request now in service began (0 when none): what the watchdog's stuck rule reads."""
-        return int(self._module.exl3_ram_miss_busy_since(self.handle))
+        return int(self._module.expert_stream_busy_since(self.handle))
 
     def enable_lease_mode(self) -> None:
         """Lease every armed request's lanes and publish their row results (LEASE_PROTOCOL.md 7); before the thread starts."""
-        self._module.exl3_ram_miss_set_lease_mode(self.handle, 1)
+        self._module.expert_stream_set_lease_mode(self.handle, 1)
 
     def enable_gpu_hot(self) -> None:
         if self.hot_page is None:
             raise ValueError("EXL3 DIRECT requires a hot bitmap sidecar")
-        self._module.exl3_ram_miss_set_gpu_hot(self.handle, 1)
+        self._module.expert_stream_set_gpu_hot(self.handle, 1)
 
     def set_prefill_share(self, share: int) -> None:
         """Rows a prefill may own per layer before its admissions evict its own rows instead of decode's; 0 is off."""
-        self._module.exl3_ram_miss_set_prefill_share(self.handle, int(share))
+        self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_two_phase(self) -> None:
         """Grant the resident lanes inside the reservation hold, before read() (Task 6 V1); before the thread starts."""
-        self._module.exl3_ram_miss_set_two_phase(self.handle, 1)
+        self._module.expert_stream_set_two_phase(self.handle, 1)
 
     def enable_piece_stream(self) -> None:
         """Read each part as sub-reads and vet rows piece by piece; before the thread starts, and needs pack workers."""
-        self._module.exl3_ram_miss_set_piece_stream(self.handle, 1)
+        self._module.expert_stream_set_piece_stream(self.handle, 1)
 
     def enable_copy_engine(self, device: int, *, spin_us: int = 5000) -> None:
         """Start the copy-engine thread on CUDA device ``device`` (-1: the CPU test backend); before the thread starts.
 
         It copies nothing until :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         """
-        self._module.exl3_ram_miss_enable_copy_engine(self.handle, int(device), int(spin_us * 1e3))
+        self._module.expert_stream_enable_copy_engine(self.handle, int(device), int(spin_us * 1e3))
 
     def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0) -> None:
         """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
@@ -901,66 +966,66 @@ class Exl3RamMissHost:
             raise ValueError(f"a copy table is int64 [n, 3], not {tuple(entries.shape)}")
         if dst_rows < 1:
             raise ValueError("a copy table needs at least one destination row")
-        self._module.exl3_ram_miss_set_copy_table(self.handle, row, entries, int(dst_rows), int(sm_mask))
+        self._module.expert_stream_set_copy_table(self.handle, row, entries, int(dst_rows), int(sm_mask))
 
     def enable_native_prefetch(self, page: torch.Tensor) -> None:
         """Serve native-prefetch requests posted into ``page`` (``new_prefetch_page``); needs the copy engine and must
         precede the thread. The page must outlive the host: the service reads it by address."""
         if page.dtype != torch.uint8 or page.numel() != PREFETCH_PAGE_BYTES or not page.is_contiguous():
             raise ValueError(f"the native prefetch page is a contiguous uint8 tensor of {PREFETCH_PAGE_BYTES} bytes")
-        self._module.exl3_ram_miss_enable_native_prefetch(self.handle, page)
+        self._module.expert_stream_enable_native_prefetch(self.handle, page)
         self.prefetch_page = page
 
     def prefetch_lease(self) -> tuple[bool, int, int]:
         """Test only: (active, row, slot) of the service's one native-prefetch lease."""
         out = torch.zeros(3, dtype=torch.int64)
-        self._module.exl3_ram_miss_prefetch_lease(self.handle, out)
+        self._module.expert_stream_prefetch_lease(self.handle, out)
         active, row, slot = out.tolist()
         return bool(active), row, slot
 
     def arm_copy_engine(self, on: bool = True) -> None:
         """Let the service publish resident lanes COPYING and copy them itself, for requests whose post allows it."""
-        self._module.exl3_ram_miss_arm_copy_engine(self.handle, int(bool(on)))
+        self._module.expert_stream_arm_copy_engine(self.handle, int(bool(on)))
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Whether every job handed to the copy thread completed (or failed) and was retired within ``timeout_s``."""
-        return bool(self._module.exl3_ram_miss_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
+        return bool(self._module.expert_stream_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
 
     def copy_engine_release(self, marks: int = -1) -> None:
         """Test only (CPU backend): let ``marks`` more copy marks complete; negative lets every one complete."""
-        self._module.exl3_ram_miss_copy_engine_release(self.handle, int(marks))
+        self._module.expert_stream_copy_engine_release(self.handle, int(marks))
 
     def copy_engine_fail(self, *, issue: bool = False, query: bool = False) -> None:
         """Test only (CPU backend): make issuing a copy, or asking whether a mark completed, return an error."""
-        self._module.exl3_ram_miss_copy_engine_fail(self.handle, int(issue), int(query))
+        self._module.expert_stream_copy_engine_fail(self.handle, int(issue), int(query))
 
     def copy_engine_ballast(self, dst: Optional[torch.Tensor], src: Optional[torch.Tensor]) -> None:
         """Test only: copy ``src`` into ``dst`` (same byte size) ahead of every copy job, delaying its completion;
         ``None`` turns it off. The caller keeps both tensors alive while it is on."""
         if dst is None or src is None:
-            self._module.exl3_ram_miss_copy_engine_ballast(self.handle, 0, 0, 0)
+            self._module.expert_stream_copy_engine_ballast(self.handle, 0, 0, 0)
             return
         nbytes = dst.numel() * dst.element_size()
         if nbytes != src.numel() * src.element_size() or not (dst.is_contiguous() and src.is_contiguous()):
             raise ValueError("ballast tensors must be contiguous and of one byte size")
-        self._module.exl3_ram_miss_copy_engine_ballast(self.handle, dst.data_ptr(), src.data_ptr(), nbytes)
+        self._module.expert_stream_copy_engine_ballast(self.handle, dst.data_ptr(), src.data_ptr(), nbytes)
 
     def copy_engine_marked(self) -> int:
         """Test only (CPU backend): copy marks recorded so far, one per job issued."""
-        return int(self._module.exl3_ram_miss_copy_engine_marked(self.handle))
+        return int(self._module.expert_stream_copy_engine_marked(self.handle))
 
     def inject_done_stall(self, seconds: float) -> None:
         """Test only: sleep between serving a demand and storing demand_done."""
-        self._module.exl3_ram_miss_inject_done_stall(self.handle, int(seconds * 1e9))
+        self._module.expert_stream_inject_done_stall(self.handle, int(seconds * 1e9))
 
     def lease_header(self) -> dict[str, int]:
         """The header words the service wrote (u32 each), read back from the block."""
-        words = self.lease_block[: exl3_lease_block.HEADER_BYTES].view(torch.int32).tolist()
-        return {name: words[offset // 4] & 0xFFFFFFFF for name, offset in exl3_lease_block.HEADER.items()}
+        words = self.lease_block[: expert_lease_block.HEADER_BYTES].view(torch.int32).tolist()
+        return {name: words[offset // 4] & 0xFFFFFFFF for name, offset in expert_lease_block.HEADER.items()}
 
     def lease_row_table(self) -> list[tuple[int, int]]:
         """(slot_gen_base, capacity) per row, as the service wrote them."""
-        start = exl3_lease_block.ROW_TABLE
+        start = expert_lease_block.ROW_TABLE
         words = self.lease_block[start : start + 8 * self.layers].view(torch.int32).tolist()
         return [(words[2 * r], words[2 * r + 1]) for r in range(self.layers)]
 
@@ -975,24 +1040,24 @@ class Exl3RamMissHost:
     def mapping(self, row: int) -> list[int]:
         self._check(row)
         out = torch.empty(self.experts, dtype=torch.int64)
-        self._module.exl3_ram_miss_mapping(self.handle, row, out)
+        self._module.expert_stream_mapping(self.handle, row, out)
         return out.tolist()
 
     def slot_to_expert(self, row: int) -> list[int]:
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]), dtype=torch.int64)
-        self._module.exl3_ram_miss_slot_to_expert(self.handle, row, out)
+        self._module.expert_stream_slot_to_expert(self.handle, row, out)
         return out.tolist()
 
     def lru_order(self, row: int) -> list[int]:
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]), dtype=torch.int64)
-        count = int(self._module.exl3_ram_miss_lru_order(self.handle, row, out))
+        count = int(self._module.expert_stream_lru_order(self.handle, row, out))
         return out[:count].tolist()
 
     def set_hot(self, row: int, experts: Iterable[int]) -> None:
         self._check(row)
-        self._module.exl3_ram_miss_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
+        self._module.expert_stream_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
 
     def version(self) -> int:
         return self.counters()["version"]
@@ -1006,7 +1071,7 @@ class Exl3RamMissHost:
     ) -> None:
         """Test-only faults (see RamTier::inject). ``abandon_after_batches``: an advisory gives up once
         that many of its rows (batches) were admitted; the rows admitted still complete and publish."""
-        self._module.exl3_ram_miss_inject(
+        self._module.expert_stream_inject(
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands, abandon_after_batches
         )
 
@@ -1017,7 +1082,7 @@ class Exl3RamMissHost:
         runs = torch.zeros(
             (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2), dtype=torch.int32
         )
-        refused = int(self._module.exl3_ram_miss_piece_runs(*_table_args(tables, False)[:-1], runs))
+        refused = int(self._module.expert_stream_piece_runs(*_table_args(tables, False)[:-1], runs))
         if refused:
             # A refused row's runs are empty: S would admit a READY hit of it, copy nothing and commit.
             raise RuntimeError(f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces")
@@ -1030,35 +1095,35 @@ class Exl3RamMissHost:
         replaced, and ``inject_fault()`` with no keywords clears it. ``abandon_after``, ``step``,
         ``pack_workers`` and ``pack_split`` are not faults and are ignored (``inject`` takes the abandon
         point). Call-numbered faults (``submit_call``, ``cqe_call``) count from the reader's creation."""
-        self._module.exl3_ram_miss_inject_fault(self.handle, _fault_tensor(**faults))
+        self._module.expert_stream_inject_fault(self.handle, _fault_tensor(**faults))
 
     def enable_trace(self, capacity: int = 8192) -> None:
         """Record one stage record per served request, up to ``capacity`` undrained (more are dropped
         and counted). Before ``start_thread``; with it off the service takes no timestamps."""
-        _stage_words()
-        self._module.exl3_ram_miss_trace_enable(self.handle, int(capacity))
+        _stage_words(layout=self._layout)
+        self._module.expert_stream_trace_enable(self.handle, int(capacity))
 
     def drain_trace(self, limit: int = 4096) -> list[dict]:
         """The stage records not yet drained, oldest first, as ``stage_records`` decodes them."""
         out = []
         while True:
             words = torch.empty((limit, len(STAGE_FIELDS)), dtype=torch.int64)
-            count = int(self._module.exl3_ram_miss_trace_drain(self.handle, words))
+            count = int(self._module.expert_stream_trace_drain(self.handle, words))
             out.extend(stage_records(words[:count]))
             if count < limit:
                 return out
 
     def trace_dropped(self) -> int:
-        return int(self._module.exl3_ram_miss_trace_dropped(self.handle))
+        return int(self._module.expert_stream_trace_dropped(self.handle))
 
     def trace_clock_reads(self) -> int:
         """Clock reads taken for trace records, process-wide and cumulative: zero growth while the
         trace is off is what shows a disabled trace does no timing work."""
-        return int(self._module.exl3_ram_miss_trace_clock_reads())
+        return int(self._module.expert_stream_trace_clock_reads())
 
     def counters(self) -> dict[str, int]:
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)
-        self._module.exl3_ram_miss_counters(self.handle, out)
+        self._module.expert_stream_counters(self.handle, out)
         return dict(zip(COUNTERS, out.tolist()))
 
     def layer_rows(self) -> list[int]:
@@ -1067,12 +1132,12 @@ class Exl3RamMissHost:
         ``counters()["rows_read"]`` is demand plus advisory rows.
         """
         out = torch.zeros(self.layers, dtype=torch.int64)
-        self._module.exl3_ram_miss_layer_rows(self.handle, 0, out)
+        self._module.expert_stream_layer_rows(self.handle, 0, out)
         return out.tolist()
 
     def layer_advisory_rows(self) -> list[int]:
         out = torch.zeros(self.layers, dtype=torch.int64)
-        self._module.exl3_ram_miss_layer_rows(self.handle, 1, out)
+        self._module.expert_stream_layer_rows(self.handle, 1, out)
         return out.tolist()
 
     def fatal_seq(self) -> int:
@@ -1083,7 +1148,7 @@ class Exl3RamMissHost:
         if close is not None and close.alive:
             try:
                 if self.threaded:
-                    self._module.exl3_ram_miss_stop_thread(self.handle)
+                    self._module.expert_stream_stop_thread(self.handle)
                     self.threaded = False
                 # One line for the window's records (the corpus arms grep it).
                 sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
@@ -1123,40 +1188,50 @@ STATE_WORDS = {
 STREAM_FAULT_WORDS = {"abort_block": 0, "abort_delay_ns": 1, "stall_ns": 2, "count_delay_ns": 3}
 
 
-_DEVICE_KERNELS = (
-    "exl3_ram_miss_post",
-    "exl3_ram_miss_wait",
-    "exl3_ram_miss_lease_wait",
-    "exl3_ram_miss_lease_ack",
-    "exl3_ram_miss_lease_hit_wait",
-    "exl3_ram_miss_lease_rest_wait",
-    "exl3_ram_miss_lease_stage_ack",
-    "exl3_ram_miss_lease_finalize",
-    "exl3_ram_miss_lease_stream_hit_wait",
-    "exl3_ram_miss_lease_stream",
-    "exl3_ram_miss_lease_copy_wait",
-)
+_LEASE_METHODS = {
+    "expert_stream_post": "post",
+    "expert_stream_wait": "wait",
+    "expert_stream_lease_wait": "lease_wait",
+    "expert_stream_lease_ack": "lease_ack",
+    "expert_stream_lease_hit_wait": "lease_hit_wait",
+    "expert_stream_lease_rest_wait": "lease_rest_wait",
+    "expert_stream_lease_stage_ack": "lease_stage_ack",
+    "expert_stream_lease_finalize": "lease_finalize",
+    "expert_stream_lease_stream_hit_wait": "lease_stream_hit_wait",
+}
+_ROW_COPY_METHODS = {"expert_stream_lease_stream": "lease_stream", "expert_stream_lease_copy_wait": "lease_copy_wait"}
+
+
+def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
+    device_layout = LAYOUTS[layout].device_layout
+    return [(name, f"LeaseProtocolKernel::{method}") for name, method in _LEASE_METHODS.items()] + [
+        (name, f"RowCopyKernel<{device_layout}>::{method}") for name, method in _ROW_COPY_METHODS.items()
+    ]
+
+
+def _device_module(layout: str = "exl3") -> Module:
+    return _device_module_cached(layout)
 
 
 @cache_once
-def _device_module() -> Module:
+def _device_module_cached(layout: str) -> Module:
     return load_jit(
-        "exl3_ram_miss",
-        cuda_files=["moe/exl3_ram_miss.cuh"],
-        cuda_wrappers=[(name, name) for name in _DEVICE_KERNELS],
+        f"expert_stream_{layout}",
+        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_wrappers=_device_wrappers(layout),
     )
 
 
-def device_module_with_hooks(defines: Sequence[str]) -> Module:
+def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Module:
     """Test only: the device kernels built with the ``EXL3_RAM_MISS_TEST_*`` hooks ``defines`` turn on (``NAME`` or
     ``NAME=value``), a module of its own; production builds with none, so its kernels carry no test knob."""
     if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
         raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
     return load_jit(
-        "exl3_ram_miss",
+        f"expert_stream_{layout}",
         "test",
-        cuda_files=["moe/exl3_ram_miss.cuh"],
-        cuda_wrappers=[(name, name) for name in _DEVICE_KERNELS],
+        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_wrappers=_device_wrappers(layout),
         extra_cuda_cflags=[f"-D{d}" for d in defines],
     )
 
@@ -1191,7 +1266,7 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
     return torch.tensor([entry_of[name] for name in names] + whole, dtype=torch.int32, device=segments.table.device)
 
 
-class Exl3RamMissDevice:
+class ExpertStreamDevice:
     """The post and wait kernels of option C, capturable in a CUDA graph.
 
     ``page`` and ``slot_map`` are the host's pinned tensors (device-readable
@@ -1208,7 +1283,7 @@ class Exl3RamMissDevice:
 
     def __init__(
         self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None,
-        hot_page=None, piece_stream: bool = False, piece_runs: Optional[torch.Tensor] = None,
+        hot_page=None, piece_stream: bool = False, piece_runs: Optional[torch.Tensor] = None, layout: str = "exl3",
     ) -> None:
         if piece_stream and (lease_block is None or piece_runs is None):
             raise ValueError("piece streaming needs the lease block and the host's piece table (host.piece_runs())")
@@ -1238,7 +1313,12 @@ class Exl3RamMissDevice:
             state[STATE_WORDS[word]] = page[WORDS[head] : WORDS[head] + 4].view(torch.int32)[0]
         self.state = state.to(device)
         self.last_routes = torch.full((layers, MAX_IDS), -1, dtype=torch.int32, device=device)
+        # The post kernel's "no hot sidecar" sentinel: hot_slots is int64 on the device, so self.state (int32)
+        # cannot stand in for it any more (the checked launcher's matcher would refuse the dtype). Stable for
+        # graph capture, like every other sentinel `post` passes in place of an absent tensor.
+        self._no_hot_slots = torch.empty(0, dtype=torch.int64, device=device)
         self._module = None
+        self._layout = layout
         if (lease_block is None) != (lease_layout is None):
             raise ValueError("lease_block and lease_layout go together")
         self.lease_block = lease_block
@@ -1279,7 +1359,7 @@ class Exl3RamMissDevice:
         if lease_block is not None:
             if lease_layout.rows != layers:
                 raise ValueError(f"the lease layout has {lease_layout.rows} rows for {layers} layers")
-            exl3_lease_block.check_lease_block(
+            expert_lease_block.check_lease_block(
                 lease_block, lease_layout, need_pinned=torch.device(device).type == "cuda"
             )
             self._lease_address = int(lease_block.data_ptr())
@@ -1287,12 +1367,12 @@ class Exl3RamMissDevice:
             # The committed copy count (the one word that gates both the copy and the acknowledgement) and, per
             # lane, {request generation, slot generation, row, host slot}. Stable addresses: a graph captures them.
             self.go_count = torch.zeros(1, dtype=torch.int32, device=device)
-            self.lane_ctx = torch.zeros((exl3_lease_block.LANES, 4), dtype=torch.int64, device=device)
+            self.lane_ctx = torch.zeros((expert_lease_block.LANES, 4), dtype=torch.int64, device=device)
             # V1 two-phase (D7): one committed count and one lane context PER STAGE, plus the compacted copy plans
             # each stage hands its own copy launch. `claimed` is stage 1's per-lane verdict and stage 2's
             # complement; `origin` maps a compacted entry back to the lane whose acknowledgement word it writes;
             # `violated` replaces the acknowledgement kernel's keep write, and only the finalize kernel writes keep.
-            lanes = exl3_lease_block.LANES
+            lanes = expert_lease_block.LANES
             self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
             self.go_2 = torch.zeros(1, dtype=torch.int32, device=device)
             # go_1 + go_2, written after finalize: the count a DIRECT residency commit reads.
@@ -1331,7 +1411,7 @@ class Exl3RamMissDevice:
 
     def _kernels(self):
         if self._module is None:
-            self._module = _device_module()
+            self._module = _device_module(self._layout)
         return self._module
 
     def _check_row(self, name: str, row: int, *, allow_none: bool = False) -> None:
@@ -1362,10 +1442,10 @@ class Exl3RamMissDevice:
             self._check_buffers(hot_slots=(hot_slots, torch.int64))
             if self._hot_address == 0 or not 0 < hot_capacity <= hot_slots.numel():
                 raise ValueError("EXL3 DIRECT needs a hot sidecar and a valid slot capacity")
-        self._kernels().exl3_ram_miss_post(
+        self._kernels().expert_stream_post(
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
             self._lease_address, self._lease_d, self.timeout_ns, self._hot_address, self._hot_stride,
-            hot_slots if hot_slots is not None else self.state, hot_capacity,
+            hot_slots if hot_slots is not None else self._no_hot_slots, hot_capacity,
             dst_slots if dst_slots is not None else self.state[:0], int(bool(copy_engine)),
         )
 
@@ -1381,12 +1461,12 @@ class Exl3RamMissDevice:
         if planned.numel() < host_rows.numel():
             raise ValueError(f"planned has {planned.numel()} lanes but host_rows {host_rows.numel()}: the wait reads planned per lane")
         if self.lease_block is not None:
-            self._kernels().exl3_ram_miss_lease_wait(
+            self._kernels().expert_stream_lease_wait(
                 self.page, self.state, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns,
                 self._lease_address, self._lease_d, self.go_count, self.lane_ctx,
             )
             return
-        self._kernels().exl3_ram_miss_wait(
+        self._kernels().expert_stream_wait(
             self.page, self.state, self.slot_map, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns
         )
 
@@ -1399,7 +1479,7 @@ class Exl3RamMissDevice:
         if self.lease_block is None:
             raise RuntimeError("this device was built without a lease block")
         self._check_buffers(keep=(keep, torch.float32))
-        self._kernels().exl3_ram_miss_lease_ack(
+        self._kernels().expert_stream_lease_ack(
             self.page, self.state, self._lease_address, self._lease_d, self.go_count, self.lane_ctx, keep
         )
 
@@ -1417,13 +1497,13 @@ class Exl3RamMissDevice:
             raise RuntimeError("this device was built without a lease block")
         if self.piece_stream:
             # The same stage 1, which also resets go_2 and the stream kernel's counter and abort words (plan 5, C1).
-            self._kernels().exl3_ram_miss_lease_stream_hit_wait(
+            self._kernels().expert_stream_lease_stream_hit_wait(
                 self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
                 self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
                 self.violated, budget_ns, self.go_2, self.stream_count, self.stream_abort,
             )
             return
-        self._kernels().exl3_ram_miss_lease_hit_wait(
+        self._kernels().expert_stream_lease_hit_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
             self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
             self.violated, budget_ns,
@@ -1443,7 +1523,7 @@ class Exl3RamMissDevice:
         )
         if self.lease_block is None:
             raise RuntimeError("this device was built without a lease block")
-        self._kernels().exl3_ram_miss_lease_rest_wait(
+        self._kernels().expert_stream_lease_rest_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_2, self.dst_slots_2, ram_miss,
             self._lease_address, self._lease_d, self.claimed, self.go_2, self.lane_ctx_2, self.origin_2,
         )
@@ -1470,7 +1550,7 @@ class Exl3RamMissDevice:
         if segment_map.numel() != row_segments + segments.table.shape[0]:
             raise ValueError(f"segment_map has {segment_map.numel()} entries, the kernel reads "
                              f"{row_segments} + {segments.table.shape[0]}")
-        self._kernels().exl3_ram_miss_lease_stream(
+        self._kernels().expert_stream_lease_stream(
             self.page, self.state, planned, count, dst_slots, row, int(self.piece_runs.shape[1]), self.host_rows_2,
             self.dst_slots_2, ram_miss, self._lease_address, self._lease_d, self._lease_p, self.claimed, self.go_2,
             self.lane_ctx_2, self.origin_2, self.stream_count, self.stream_abort, segments.table, segment_map,
@@ -1486,7 +1566,7 @@ class Exl3RamMissDevice:
         go = self.go_1 if stage == 1 else self.go_2
         lane_ctx = self.lane_ctx_1 if stage == 1 else self.lane_ctx_2
         origin = self.origin_1 if stage == 1 else self.origin_2
-        self._kernels().exl3_ram_miss_lease_stage_ack(
+        self._kernels().expert_stream_lease_stage_ack(
             self.page, self.state, self._lease_address, self._lease_d, go, lane_ctx, origin, self.violated
         )
 
@@ -1507,7 +1587,7 @@ class Exl3RamMissDevice:
             if sm_table.device != self.state.device:
                 raise ValueError("the copy wait's SM table must live on the device the kernel reads it from")
             sm_address, sm_count = sm_table.data_ptr(), int(sm_table.shape[0])
-        self._kernels().exl3_ram_miss_lease_copy_wait(
+        self._kernels().expert_stream_lease_copy_wait(
             self.page, self.state, count, self._lease_address, self._lease_c, self._lease_d, sm_address, sm_count,
             self.go_ce,
         )
@@ -1520,7 +1600,7 @@ class Exl3RamMissDevice:
         if self.lease_block is None:
             raise RuntimeError("this device was built without a lease block")
         self._check_buffers(count=(count, torch.int32), keep=(keep, torch.float32))
-        self._kernels().exl3_ram_miss_lease_finalize(
+        self._kernels().expert_stream_lease_finalize(
             self.page, self.state, count, self.go_1, self.go_2, self.go_ce, self.violated, keep,
             self._lease_address, self._lease_d,
         )

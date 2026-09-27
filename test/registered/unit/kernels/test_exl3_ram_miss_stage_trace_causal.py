@@ -6,20 +6,19 @@ Ordering only: nothing here asserts a wall-time bound.
 import collections
 import errno
 import faulthandler
-from pathlib import Path
 
 import pytest
 import torch
 
-import sglang.kernels.ops.moe.exl3_ram_miss as ops
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, read_rows_traced, sim_post, sim_wait
+import sglang.kernels.ops.moe.expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced, sim_post, sim_wait
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.expert_stream_sources import host_sources, joined_text
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 PAGE = 4096
-CPP = Path(ops.__file__).resolve().parents[2] / "jit" / "csrc" / "moe" / "exl3_ram_miss_host.cpp"
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +32,7 @@ def _host(tmp_path, *, trace_capacity=None, capacity=6):
     """A tier and its host; ``trace_capacity`` None leaves the trace off."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32), direct=False)
     if trace_capacity is not None:
         host.enable_trace(capacity=trace_capacity)
     return s, page, host
@@ -246,7 +245,7 @@ NON_TRACE_CLOCK_READS = {
     "drain_deadline_ = now_ns() + drain_ns;": 1,
     "if (now_ns() > deadline_ns) return false;": 1,
     "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
-    "return exl3_ram_miss::find(handle)->wait_copy_idle(exl3_ram_miss::now_ns() + timeout_ns) ? 1 : 0;": 1,
+    "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "job.submit_ns = now_ns();": 1,
     "const int64_t start = now_ns();": 1,
     "counters_[kCopyIssueNs].fetch_add(now_ns() - start);": 1,
@@ -263,7 +262,7 @@ NON_TRACE_CLOCK_READS = {
 
 
 def test_no_clock_read_bypasses_the_trace_gate():
-    lines = [line.strip() for line in CPP.read_text().splitlines()]
+    lines = [line.strip() for line in joined_text(host_sources()).splitlines()]
     reads = collections.Counter(line for line in lines if "now_ns()" in line and not line.startswith("//"))
     assert reads == NON_TRACE_CLOCK_READS, {
         line: count for line, count in (reads - collections.Counter(NON_TRACE_CLOCK_READS)).items()

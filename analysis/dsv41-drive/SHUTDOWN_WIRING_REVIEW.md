@@ -2,7 +2,7 @@
 
 Reviewed: the proposal `LEASE_PROTOCOL.md` section 20.2i and its addendum (`3d702eb1c2`, `88c126a655`), against `scheduler.py`
 (`release_host_resources`, `run_scheduler_process`'s `finally`), `exl3_ram_miss.py` (`Exl3RamMissService.shutdown`,
-`_establish_gpu_completion`, `_quarantine`, `_quarantine_service_at_exit`), `ops/moe/exl3_ram_miss.py` (`Exl3RamMissHost.stop`,
+`_establish_gpu_completion`, `_quarantine`, `_quarantine_service_at_exit`), `ops/moe/exl3_ram_miss.py` (`ExpertStreamHost.stop`,
 `close_admission`), `expert_stream.py` (`ExpertPinnedHostCache.close`, `quarantine`), `expert_host_tier.py`
 (`quarantine_host_slabs`), and the tests `test_exl3_ram_miss_shutdown.py` and the `release_host_resources` tests in
 `test_expert_doorbell_copier.py`. Read-only: nothing under `python/` was touched, no GPU, nothing run. Reviewer: the author of
@@ -45,7 +45,7 @@ finally:
 ```
 
 `uncertain` is decided **before** `stop()` runs and is never updated by it. If the barrier succeeds (`uncertain is None`) and
-`Exl3RamMissHost.stop()` raises (`exl3_ram_miss_stop_thread` is a TVM FFI call that can raise; its `finally: close()` then destroys the
+`ExpertStreamHost.stop()` raises (`exl3_ram_miss_stop_thread` is a TVM FFI call that can raise; its `finally: close()` then destroys the
 native handle regardless), the inner `finally` runs the *free* branch. The service thread, which writes into the slabs through raw
 addresses (the comment two lines above says so), may still be running. Today the same failure at exit is harmless, because the exit
 path quarantines unconditionally. **After wiring, this is a path strictly worse than not wiring.** The same holds for a
@@ -123,7 +123,7 @@ After `stop_doorbell()`, before the other host releases, before `abort_distribut
 
 - After an orderly success: `tier.close()` calls the tier's `weakref.finalize` (`_release_slabs`) once, and a finalizer is callable
   once. The exit hook `_quarantine_service_at_exit` calls `shutdown(at_exit=True)`, which returns at `if self._shut_down`. `_stop_live`
-  (ops) calls `Exl3RamMissHost.stop()`, which is a no-op once the handle's finalizer is no longer alive. So no second unregister, no
+  (ops) calls `ExpertStreamHost.stop()`, which is a no-op once the handle's finalizer is no longer alive. So no second unregister, no
   second native close.
 - **What is missing is a test of that sequence.** The five tests in `test_exl3_ram_miss_shutdown.py` call `shutdown()` or
   `shutdown(at_exit=True)` separately; none runs an orderly shutdown *then* the exit hook. Add it: orderly shutdown, then
@@ -254,7 +254,7 @@ resolves its index on the helper, which is the original bug again), and synchron
 
 ### S4. LOW: `stop()`'s outcome when it returns normally but the thread did not stop is still not observed
 
-`Exl3RamMissHost.stop()` returns normally after `exl3_ram_miss_stop_thread`; if that returned without joining (not the case in the C++ I read: it joins), the free branch would run.
+`ExpertStreamHost.stop()` returns normally after `exl3_ram_miss_stop_thread`; if that returned without joining (not the case in the C++ I read: it joins), the free branch would run.
 Nothing in Python checks the thread is gone. It is fine as read; note it as an assumption the free branch rests on, and add a post-stop `host.threaded == False` / running-counter check if it is cheap.
 
 ### S5. LOW: what stays unestablished, and should stay in the message
@@ -278,7 +278,7 @@ request kinds: `handle_demand` (line ~2583) and the advisory path (line ~1886), 
 `max(30 s, 3 x SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)`. So the worst case of a hung read is a `SIGABRT` after **at most 30 s at the default**, not an unbounded hang.
 
 **Why not bound it.** Bounding a blocking native `stop()` means running it on a helper thread with a deadline, as the barrier is. On a miss the shutdown quarantines and carries on, but
-the first `stop()` is then still blocked, and the exit hook (`_stop_live` in the ops module, and `shutdown(at_exit=True)`) calls `Exl3RamMissHost.stop()` again on the main thread while
+the first `stop()` is then still blocked, and the exit hook (`_stop_live` in the ops module, and `shutdown(at_exit=True)`) calls `ExpertStreamHost.stop()` again on the main thread while
 `close.alive` is still true. Two threads joining the same `std::thread` is undefined behaviour, and `close()` would destroy the native handle under the blocked join. Making that safe needs a
 "stop in progress" state that the exit hook honours: new machinery, on a path no test can exercise (a hung join cannot be simulated on CPU), to remove an exposure that is
 bounded by an abort the design already provides. That trade is worse than the risk.

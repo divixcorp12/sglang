@@ -24,14 +24,14 @@ import time
 
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 
 def _host(capacity=6):
     s = ram_miss_setup(pathlib.Path(tempfile.mkdtemp(prefix="busy_seq_probe_")), capacity=capacity, experts=6)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     return page, host
 
 

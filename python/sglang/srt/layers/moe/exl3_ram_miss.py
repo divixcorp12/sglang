@@ -19,11 +19,12 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe.expert_stream_transport import (
     MAX_IDS,
-    Exl3RamMissDevice,
-    Exl3RamMissHost,
+    ExpertStreamDevice,
+    ExpertStreamHost,
+    host_layout,
     new_hot_page,
     new_page,
     stream_segment_map,
@@ -273,10 +274,11 @@ def _row_image_tables(
 
 
 def sm_copy_mask(names: Sequence[str]) -> int:
-    """The copy-table entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): every tensor
-    but the trellises. The four small ones are 44.5 KB of a 13.3 MB DSV4.1 row, and as DMA copies each paid a fixed
-    per-copy cost that dwarfed its bytes."""
-    return sum(1 << i for i, name in enumerate(names) if not name.endswith("_trellis"))
+    """The copy-table entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): the host
+    layout's small tensors, wherever they sit in ``names``."""
+    layout_names, small = host_layout()
+    small_names = {name for i, name in enumerate(layout_names) if small >> i & 1}
+    return sum(1 << i for i, name in enumerate(names) if name in small_names)
 
 
 def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
@@ -474,7 +476,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self,
         segments,
         host_row_map: torch.Tensor,
-        device_side: Exl3RamMissDevice,
+        device_side: ExpertStreamDevice,
         row: int,
         next_row: int,
         capacity: int,
@@ -675,8 +677,8 @@ class Exl3RamMissService:
 
     def __init__(self) -> None:
         self.tables: dict[int, NativePinnedSlotTable] = {}
-        self.host: Optional[Exl3RamMissHost] = None
-        self.device_side: Optional[Exl3RamMissDevice] = None
+        self.host: Optional[ExpertStreamHost] = None
+        self.device_side: Optional[ExpertStreamDevice] = None
         self.page = None
         self.slot_map = None
         self._rows: dict[int, int] = {}
@@ -765,12 +767,17 @@ class Exl3RamMissService:
             **mirrors,
             row_images=open_service_row_images(cfg, fmt.layout, fmt.segment_map(), mirrors, direct, streamers),
         )
+        layout_names, _ = host_layout()
+        if layout_names != EXL3_STREAMED_NAMES:
+            raise RuntimeError(
+                f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
+            )
         pin = torch.cuda.is_available()
         page = new_page(pin=pin)
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
-        host = Exl3RamMissHost(
+        host = ExpertStreamHost(
             tables,
             page=page,
             slot_map=slot_map,
@@ -818,7 +825,7 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_NATIVE_PREFETCH needs "
                         "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE: the prefetch copies run on the copy engine"
                     )
-                from sglang.kernels.ops.moe.exl3_ram_miss import new_prefetch_page
+                from sglang.kernels.ops.moe.expert_stream_transport import new_prefetch_page
                 from sglang.srt.layers.moe.exl3_native_prefetch import NativePrefetch
 
                 prefetch_page = new_prefetch_page(pin=pin)
@@ -932,19 +939,19 @@ class Exl3RamMissService:
         if self.device_side is None:
             from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
 
-            if self.lease_mode and self.host.lease_header()["abi_version"] != exl3_lease_block.ABI_VERSION:
+            if self.lease_mode and self.host.lease_header()["abi_version"] != expert_lease_block.ABI_VERSION:
                 raise RuntimeError(
                     f"exl3 RAM miss: the lease block's ABI version is {self.host.lease_header()['abi_version']}, "
-                    f"the device kernels speak {exl3_lease_block.ABI_VERSION}"
+                    f"the device kernels speak {expert_lease_block.ABI_VERSION}"
                 )
-            self.device_side = Exl3RamMissDevice(
+            self.device_side = ExpertStreamDevice(
                 self.page,
                 self.slot_map,
                 device=cache.device,
                 layers=len(self._rows),
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 advise=prefetch_enabled(),
-                # The host owns the block (Exl3RamMissHost allocates it); the device reads the same one.
+                # The host owns the block (ExpertStreamHost allocates it); the device reads the same one.
                 lease_block=self.host.lease_block if self.lease_mode else None,
                 lease_layout=self.host.lease_layout if self.lease_mode else None,
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,

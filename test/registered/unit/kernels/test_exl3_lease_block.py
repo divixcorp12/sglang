@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")

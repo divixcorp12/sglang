@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import sim_post, sim_wait
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -282,9 +282,9 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
         assert wait_s >= 30.0
         assert wait_s > 2 * timeout_ms / 1000 + 1.0  # the eager pause bound
     started = []
-    start = module.Exl3RamMissHost.start_thread
+    start = module.ExpertStreamHost.start_thread
     monkeypatch.setattr(
-        module.Exl3RamMissHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
+        module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
     )
     with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
         service.ensure_started()
@@ -295,7 +295,7 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
 @pytest.mark.parametrize("prefetch, advise", [(True, 1), (None, 0)], ids=["env_on", "env_unset"])
 def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, prefetch, advise):
     """The production hop: SGLANG_DSV41_ENABLE_EXPERT_PREFETCH -> prefetch_enabled() -> attach ->
-    Exl3RamMissDevice(advise=...) -> the row backend's posts. Nothing else sets ``advise``."""
+    ExpertStreamDevice(advise=...) -> the row backend's posts. Nothing else sets ``advise``."""
     service, streamers, caches = tiers
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
     for streamer in streamers.values():
@@ -473,7 +473,7 @@ def tier_sim_load_forwards(path):
 def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):
     service, streamers, caches = tiers
     enabled = []
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: enabled.append(self))
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: enabled.append(self))
     assert envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get() is False
     _attach_all(service, streamers)
     assert enabled == [] and service.lease_mode is False
@@ -484,9 +484,9 @@ def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_w
     """One env read (ensure_started) feeds both sides, so the device's arming and the service's leasing cannot disagree."""
     service, streamers, caches = tiers
     order = []
-    enable, start = module.Exl3RamMissHost.enable_lease_mode, module.Exl3RamMissHost.start_thread
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
-    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    enable, start = module.ExpertStreamHost.enable_lease_mode, module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
+    monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
     with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
         _attach_all(service, streamers)
     assert order == ["lease", "thread"] and service.lease_mode is True
@@ -536,9 +536,9 @@ def test_piece_stream_is_accepted_by_the_config_refusal_once_all_three_hold(tier
 def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on(tiers, monkeypatch, piece_stream):
     service, streamers, caches = tiers
     order = []
-    enable, start = module.Exl3RamMissHost.enable_piece_stream, module.Exl3RamMissHost.start_thread
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_piece_stream", lambda self: (order.append("piece"), enable(self))[1])
-    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    enable, start = module.ExpertStreamHost.enable_piece_stream, module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_piece_stream", lambda self: (order.append("piece"), enable(self))[1])
+    monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
     with (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(piece_stream),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
@@ -626,8 +626,8 @@ def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
             return getattr(real, name)
 
         @staticmethod
-        def exl3_ram_miss_piece_runs(*args):
-            real.exl3_ram_miss_piece_runs(*args)
+        def expert_stream_piece_runs(*args):
+            real.expert_stream_piece_runs(*args)
             return 1
 
     host._module = OneRowRefused()
@@ -639,15 +639,30 @@ def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
     assert host.piece_runs().abs().sum() > 0, "the real tables cut every row"
 
 
+def test_ensure_started_refuses_a_host_module_whose_layout_disagrees_with_exl3_streamed_names(tiers, monkeypatch):
+    """Review Focus 4 (final-review.md Minor 8) was tested only statically: nothing exercised the refusal at
+    exl3_ram_miss.py:770-774 with a reordered host layout. A host module built against a different name order
+    than the Python EXL3_STREAMED_NAMES would stream bytes into the wrong tensor; ensure_started must refuse it
+    rather than start."""
+    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+
+    service, streamers, caches = tiers
+    reordered = tuple(reversed(EXL3_STREAMED_NAMES))
+    assert reordered != EXL3_STREAMED_NAMES, "the fixture's names must actually differ once reversed"
+    monkeypatch.setattr(module, "host_layout", lambda: (reordered, 0))
+    with pytest.raises(RuntimeError, match="the host module's layout"):
+        service.ensure_started()
+
+
 def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch):
     """The device kernels read area D at the offsets of lease ABI 2 (StreamProbe appended); a block the host wrote
     under any other version is refused at attach, not read at the wrong offsets."""
-    from sglang.kernels.ops.moe import exl3_lease_block as lease
+    from sglang.kernels.ops.moe import expert_lease_block as lease
 
     service, streamers, caches = tiers
-    header = module.Exl3RamMissHost.lease_header
+    header = module.ExpertStreamHost.lease_header
     monkeypatch.setattr(
-        module.Exl3RamMissHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
+        module.ExpertStreamHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
     )
     with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True), pytest.raises(RuntimeError, match="ABI version"):
         _attach_with_copy_tables(service, streamers)
@@ -979,7 +994,7 @@ def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
 def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
     # The post kernel reads planned for min(count, 8) lanes and count lives on the
     # device, so a 6-lane plan (graph_gather_rows = top-6) must not be passed as is.
-    from sglang.kernels.ops.moe.exl3_ram_miss import MAX_IDS
+    from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
 
     calls = []
     device_side = SimpleNamespace(
@@ -1107,7 +1122,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     def reached(self, device):
         raise _CopyEngineReached
 
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_copy_engine", reached)
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
     # reaches enable_copy_engine here would leak the copy-engine config into every later test.

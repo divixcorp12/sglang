@@ -23,8 +23,8 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     DEMAND_RING,
     PAGE_BYTES,
@@ -32,8 +32,8 @@ from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
     STATE_WORDS,
     STATUS,
     WORDS,
-    Exl3RamMissDevice,
-    Exl3RamMissHost,
+    ExpertStreamDevice,
+    ExpertStreamHost,
     new_page,
     page_word,
 )
@@ -141,7 +141,7 @@ class Rig:
             entry = lease.ROW_TABLE + row * lease.ROW_TABLE_ENTRY_BYTES
             self.block.set_u32(entry, self.layout.slot_gen_base[row])
             self.block.set_u32(entry + 4, self.layout.capacities[row])
-        self.dev = Exl3RamMissDevice(
+        self.dev = ExpertStreamDevice(
             self.page, self.slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=False,
             lease_block=self.raw, lease_layout=self.layout,
         )
@@ -233,7 +233,7 @@ class TestHandDriven:
         assert rig.state("epoch") == 0 and rig.state("pending_epoch") == 0
 
         legacy_page = new_page(pin=True)
-        legacy = Exl3RamMissDevice(legacy_page, rig.slot_map, device="cuda", layers=LAYERS, timeout_ms=50, advise=False)
+        legacy = ExpertStreamDevice(legacy_page, rig.slot_map, device="cuda", layers=LAYERS, timeout_ms=50, advise=False)
         legacy.post(0, rig.planned, rig.count, rig.routes, -1)
         _cuda_ready()
         assert int(legacy.state[STATE_WORDS["pending"]]) == 0, "without a lease block the post arms as before"
@@ -473,7 +473,7 @@ class TestHandDriven:
     def test_the_acknowledgement_kernel_needs_a_lease_device(self):
         page = new_page(pin=True)
         slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
-        dev = Exl3RamMissDevice(page, slot_map, device="cuda", layers=LAYERS, timeout_ms=50, advise=False)
+        dev = ExpertStreamDevice(page, slot_map, device="cuda", layers=LAYERS, timeout_ms=50, advise=False)
         with pytest.raises(RuntimeError, match="lease"):
             dev.ack(torch.ones(1, dtype=torch.float32, device="cuda"))
 
@@ -512,10 +512,10 @@ class Service:
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = Exl3RamMissHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
             self.host.enable_lease_mode()
             self.host.start_thread(fatal_wait_s=60.0)
-            self.dev = Exl3RamMissDevice(
+            self.dev = ExpertStreamDevice(
                 self.page, slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=advise,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
             )
@@ -760,7 +760,7 @@ class TestDelayedConsumption:
         assert all(s.leases()[slot] > 0 for slot in slots.values()), s.leases()
         assert s.host.counters()["leases_acked"] == 0, s.host.counters()
 
-        newer = Exl3RamMissDevice(
+        newer = ExpertStreamDevice(
             s.page, s.slot_map, device="cuda", layers=LAYERS, timeout_ms=2000, advise=False,
             lease_block=s.host.lease_block, lease_layout=s.host.lease_layout,
         )
@@ -816,6 +816,36 @@ class TestDelayedConsumption:
         assert s.host.counters()["evictions"] - evicted_before == 2, s.host.counters()
         gone = [expert for expert in held if not s.host.contains(0, expert)]
         assert gone == [3, 4], (gone, _resident(s))
+
+
+def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrapper_sends():
+    """The launchers check what they cast: a state tensor of int64 would have its words read as halves of int32.
+    The sentinels the wrapper sends for 'absent' (empty dst_slots, the no-hot-slots tensor, a zero lease address)
+    and the pinned host page must still pass. Removing either `verify_named` call (`state`'s or `page`'s) from
+    ``LeaseProtocolKernel::post`` turns this red: dropping `state`'s lets the bad-dtype call through to the kernel
+    (an undefined read, not a raised exception), and dropping `page`'s lets the wrong-device call through and the
+    next real bug it should have caught goes undetected."""
+    import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
+
+    page = ram_miss.new_page(pin=True)
+    slot_map = torch.full((1, 16), -1, dtype=torch.int32).pin_memory()
+    dev = ram_miss.ExpertStreamDevice(page, slot_map, device="cuda", layers=1, timeout_ms=5, advise=False)
+    planned = torch.zeros(8, dtype=torch.int64, device="cuda")
+    count = torch.zeros(1, dtype=torch.int32, device="cuda")
+    routes = torch.zeros(8, dtype=torch.int64, device="cuda")
+    dev.post(0, planned, count, routes, next_row=-1)  # hot_slots, dst_slots absent; no lease block
+    torch.cuda.synchronize()
+    bad_state = torch.zeros(len(ram_miss.STATE_WORDS), dtype=torch.int64, device="cuda")
+    with pytest.raises(Exception, match="^state: "):
+        dev._kernels().expert_stream_post(
+            page, bad_state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
+            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
+        )
+    with pytest.raises(Exception, match="^page: "):
+        dev._kernels().expert_stream_post(
+            page.cuda(), dev.state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
+            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
+        )
 
 
 if __name__ == "__main__":

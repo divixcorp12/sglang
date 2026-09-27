@@ -1,4 +1,4 @@
-// Packing-pool microbenchmark: the real PackPool (exl3_ram_miss_pack_pool.h) driven the way a piece-streaming read
+// Packing-pool microbenchmark: the real PackPool (expert_stream/host/pack_pool.h) driven the way a piece-streaming read
 // drives it, with per-chunk stamps, so a piece's pack time splits into worker wake-up and copy.
 //
 // Why: in serving, the last piece of a single-row demand (1.66 MB, 8 chunks of ~208 KB on 8 workers) takes a median
@@ -31,12 +31,12 @@
 #include <thread>
 #include <vector>
 
-#include "exl3_ram_miss_pack_pool.h"
+#include "expert_stream/host/pack_pool.h"
 
-using sglang::exl3_ram_miss::ChunkStamp;
-using sglang::exl3_ram_miss::CopyRun;
-using sglang::exl3_ram_miss::PackJob;
-using sglang::exl3_ram_miss::PackPool;
+using sglang::expert_stream::ChunkStamp;
+using sglang::expert_stream::CopyRun;
+using sglang::expert_stream::PackJob;
+using sglang::expert_stream::PackPool;
 
 namespace {
 
@@ -158,7 +158,9 @@ int main(int argc, char** argv) {
          memcpy_gbps(src, src_bytes, dst, dst_bytes, chunk, 2000),
          memcpy_gbps(src, src_bytes, dst, dst_bytes, o.piece_bytes, 300));
 
-  PackPool pool(o.workers, inherited, 64);
+  // Out-of-tree: no ExpertRowLayout in scope here, so the prefix/thread-name text is reproduced literally,
+  // matching what the in-tree EXL3 instantiation passes.
+  PackPool pool(o.workers, inherited, 64, "exl3 RAM miss: ", "exl3-pack");
   std::vector<CopyRun> runs(static_cast<size_t>(o.runs));
   std::vector<ChunkStamp> stamps(o.split);
   PackJob job;

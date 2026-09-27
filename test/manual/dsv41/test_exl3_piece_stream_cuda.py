@@ -35,16 +35,16 @@ try:
 except ImportError:  # pragma: no cover - exercised only when cuda-python is missing
     cuda_drv = None
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     DEMAND_RING,
     RECORD_BYTES,
     STATUS,
     STREAM_FAULT_WORDS,
     WORDS,
-    Exl3RamMissDevice,
-    Exl3RamMissHost,
+    ExpertStreamDevice,
+    ExpertStreamHost,
     new_page,
     piece_word,
     stream_segment_map,
@@ -171,7 +171,7 @@ class StreamService:
             self.tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
             self.page = new_page(pin=True)
             self.slot_map = torch.full((layers, EXPERTS), -1, dtype=torch.int32).pin_memory()
-            self.host = Exl3RamMissHost(
+            self.host = ExpertStreamHost(
                 self.tables, page=self.page, slot_map=self.slot_map, direct=False, pack_workers=pack_workers
             )
             self.host.enable_lease_mode()
@@ -182,12 +182,12 @@ class StreamService:
                 self.host.enable_copy_engine(torch.cuda.current_device())
             self.prefetch_page = None
             if native_prefetch:  # the native-prefetch request and done lines (test_exl3_native_prefetch_cuda.py)
-                from sglang.kernels.ops.moe.exl3_ram_miss import new_prefetch_page
+                from sglang.kernels.ops.moe.expert_stream_transport import new_prefetch_page
 
                 self.prefetch_page = new_prefetch_page(pin=True)
                 self.host.enable_native_prefetch(self.prefetch_page)
             self.host.start_thread(fatal_wait_s=60.0)
-            self.dev = Exl3RamMissDevice(
+            self.dev = ExpertStreamDevice(
                 self.page, self.slot_map, device="cuda", layers=layers, timeout_ms=timeout_ms, advise=False,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
                 piece_stream=piece_stream, piece_runs=self.host.piece_runs() if piece_stream else None,
@@ -1040,7 +1040,7 @@ class Rig:
         for piece in range(8):
             runs[0, :, piece, 0, 0] = piece * ROW_BYTES // 8
             runs[0, :, piece, 0, 1] = (piece + 1) * ROW_BYTES // 8
-        self.dev = Exl3RamMissDevice(
+        self.dev = ExpertStreamDevice(
             self.page, self.slot_map, device="cuda", layers=1, timeout_ms=timeout_ms, advise=False,
             lease_block=self.raw, lease_layout=self.layout, piece_stream=True, piece_runs=runs,
         )

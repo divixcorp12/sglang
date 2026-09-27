@@ -11,13 +11,13 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.exl3_ram_miss import (
+from sglang.kernels.ops.moe.expert_stream_transport import (
     PREFETCH_FIELDS,
     PREFETCH_SKIP_REASONS,
     PREFETCH_TAG_COPIED,
     PREFETCH_TAG_REQUEST,
     PREFETCH_TAG_SKIPPED,
-    Exl3RamMissHost,
+    ExpertStreamHost,
     new_page,
     new_prefetch_page,
     page_word,
@@ -64,7 +64,7 @@ class Prefetcher:
 def _setup(tmp_path, *, copy_engine=True, arm=True):
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=2
     )
     host.enable_lease_mode()

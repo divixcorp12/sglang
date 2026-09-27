@@ -14,8 +14,8 @@ from typing import Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import DEMAND_RECORDS, page_word, piece_word, sim_post, sim_wait
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, page_word, piece_word, sim_post, sim_wait
 
 DEMAND_TAG = 1  # the tag of a LaneRequest generation word
 ALL_PIECES = 0xFF  # a PieceMask word's bits once every piece of the row is published

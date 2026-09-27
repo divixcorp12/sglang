@@ -18,7 +18,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 from sglang.kernels.ops.moe import exl3_native_prefetch as kernels  # noqa: E402
-from sglang.kernels.ops.moe.exl3_ram_miss import (  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     PREFETCH_FIELDS,
     PREFETCH_TAG_COPIED,
     PREFETCH_TAG_REQUEST,

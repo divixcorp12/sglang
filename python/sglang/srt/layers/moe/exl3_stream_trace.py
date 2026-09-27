@@ -508,7 +508,7 @@ class Exl3StreamTrace:
         self._file.write(json.dumps(line) + "\n")
 
     def record_ram_miss_requests(self, records: list[dict], layer_ids: list[int]) -> None:
-        """One line per RAM-miss request the native service served, from ``Exl3RamMissHost.drain_trace``.
+        """One line per RAM-miss request the native service served, from ``ExpertStreamHost.drain_trace``.
 
         ``layer_ids[row]`` names each record's streamed row. The line is not a forward call: it has
         no ``tokens``, and ``kind`` is ``ram_miss_request`` (tier_sim.load_trace skips it). Every
@@ -547,7 +547,7 @@ class Exl3StreamTrace:
         """
         if self._file is None or not records:
             return
-        from sglang.kernels.ops.moe.exl3_ram_miss import STAGE_ORDER
+        from sglang.kernels.ops.moe.expert_stream_transport import STAGE_ORDER
 
         for record in records:
             line = {

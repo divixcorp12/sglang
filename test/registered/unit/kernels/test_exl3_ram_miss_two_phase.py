@@ -14,8 +14,8 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe import exl3_lease_block as lease
-from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -37,7 +37,7 @@ def hang_guard():
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     host.enable_two_phase()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)

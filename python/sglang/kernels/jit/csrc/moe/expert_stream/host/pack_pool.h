@@ -33,7 +33,7 @@
 #include <vector>
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 // One contiguous copy of a row: `bytes` from the bounce slot to a slab.
 struct CopyRun {
@@ -148,18 +148,24 @@ inline std::vector<int> pick_worker_cpus(const cpu_set_t& allowed, unsigned work
 // SPCC mirror's completions for milliseconds.
 class PackPool {
  public:
+  // `prefix` is the layout's error_prefix<Layout>(), for this class's messages; `thread_name` is each worker
+  // thread's pthread name (Layout::kName + "-pack"), truncated to 15 bytes (pthread_setname_np's limit) so a
+  // longer layout name is silently shortened rather than refused.
   // Throws, with every thread already joined, when there is no allowed core, fewer allowed cores than workers, or a
   // worker cannot be pinned.
-  PackPool(unsigned workers, const cpu_set_t& inherited, size_t capacity)
-      : allowed_(pack_worker_cpus(inherited)), queue_(capacity, nullptr) {
+  PackPool(unsigned workers, const cpu_set_t& inherited, size_t capacity, std::string prefix, std::string thread_name)
+      : prefix_(std::move(prefix)),
+        thread_name_(thread_name.substr(0, 15)),
+        allowed_(pack_worker_cpus(inherited)),
+        queue_(capacity, nullptr) {
     if (CPU_COUNT(&allowed_) == 0) {
-      throw std::runtime_error("exl3 RAM miss: no core is left for the packing workers once cores 64-71 are excluded");
+      throw std::runtime_error(prefix_ + "no core is left for the packing workers once cores 64-71 are excluded");
     }
-    if (workers == 0) throw std::runtime_error("exl3 RAM miss: a packing pool needs at least one worker");
+    if (workers == 0) throw std::runtime_error(prefix_ + "a packing pool needs at least one worker");
     cpus_ = pick_worker_cpus(allowed_, workers);
     if (cpus_.size() < workers) {
       throw std::runtime_error(
-          "exl3 RAM miss: " + std::to_string(workers) + " packing workers need a core each, and only " +
+          prefix_ + std::to_string(workers) + " packing workers need a core each, and only " +
           std::to_string(cpus_.size()) + " are allowed once cores 64-71 are excluded");
     }
     try {
@@ -172,8 +178,7 @@ class PackPool {
     }
     if (const int error = pin_error_.load()) {
       shutdown();
-      throw std::runtime_error(
-          std::string("exl3 RAM miss: could not pin a packing worker: ") + std::strerror(error));
+      throw std::runtime_error(prefix_ + "could not pin a packing worker: " + std::strerror(error));
     }
   }
 
@@ -197,7 +202,7 @@ class PackPool {
   // Resize the queue of an idle pool (nothing posted): the reader posts a job per piece with piece streaming.
   void set_capacity(size_t capacity) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (count_ != 0) throw std::runtime_error("exl3 RAM miss: the packing queue was resized while jobs were posted");
+    if (count_ != 0) throw std::runtime_error(prefix_ + "the packing queue was resized while jobs were posted");
     queue_.assign(capacity, nullptr);
     head_ = 0;
   }
@@ -206,7 +211,7 @@ class PackPool {
   void post(PackJob* job) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (count_ == queue_.size()) throw std::runtime_error("exl3 RAM miss: the packing queue overflowed its slot count");
+      if (count_ == queue_.size()) throw std::runtime_error(prefix_ + "the packing queue overflowed its slot count");
       queue_[(head_ + count_) % queue_.size()] = job;
       ++count_;
     }
@@ -219,7 +224,7 @@ class PackPool {
     CPU_ZERO(&mine);
     CPU_SET(cpus_[index], &mine);
     const int error = pthread_setaffinity_np(pthread_self(), sizeof(mine), &mine);
-    pthread_setname_np(pthread_self(), "exl3-pack");
+    pthread_setname_np(pthread_self(), thread_name_.c_str());
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (error != 0) pin_error_.store(error);
@@ -291,6 +296,8 @@ class PackPool {
     threads_.clear();
   }
 
+  std::string prefix_;
+  std::string thread_name_;
   cpu_set_t allowed_;
   std::vector<int> cpus_;  // worker i's CPU
   std::vector<PackJob*> queue_;  // ring of posted jobs; a job leaves it when its last chunk is claimed
@@ -305,5 +312,5 @@ class PackPool {
   std::vector<std::thread> threads_;
 };
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang
