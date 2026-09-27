@@ -71,9 +71,13 @@ def _allocator(size=256, size_swa=64, device="cpu"):
 
 
 def _alloc_whole(a, n, device="cpu"):
-    t = lambda x: torch.tensor(x, device=device)
+    # prefix_lens/seq_lens/last_loc mirror the batch's own device tensors (CUDA in production,
+    # allocation.py:alloc_for_extend); prefix_lens_cpu/seq_lens_cpu are always host tensors
+    # (get_num_new_pages asserts on this) regardless of the allocator's device.
+    cpu = lambda x: torch.tensor(x)
+    dev = lambda x: torch.tensor(x, device=device)
     full = a.alloc_extend_swa_tail(
-        t([0]), t([0]), t([n]), t([n]), t([-1]), n, swa_tail_len=RING
+        dev([0]), cpu([0]), dev([n]), cpu([n]), dev([-1]), n, swa_tail_len=RING
     )
     assert full is not None
     return full
