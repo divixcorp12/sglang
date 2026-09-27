@@ -651,15 +651,18 @@ int64_t expert_stream_open(
   using namespace expert_stream;
   using namespace host;
   check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
-  // page, slot_map, lease and hot_page are pinned (or not) together (ExpertStreamHost.__init__), so one
-  // SymbolicDevice ties them to the same actual device; capacity is always a plain CPU tensor.
+  // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
+  // ties them to the same actual device; capacity is always a plain CPU tensor. hot_page is optional (an
+  // absent one is an unpinned torch.empty(0)) and gets its own SymbolicDevice so it is not forced to equal
+  // page's device when it is not given.
   auto host_mem = SymbolicDevice{};
   verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
   verify_named(
       "slot_map", TensorMatcher({extents.size(0), extents.size(1)}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
       slot_map);
   verify_named("lease", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), lease);
-  verify_named("hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), hot_page);
+  auto hot_page_mem = SymbolicDevice{};
+  verify_named("hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(hot_page_mem), hot_page);
   auto cpu = SymbolicDevice{};
   verify_named("capacity", TensorMatcher({extents.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), capacity);
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
