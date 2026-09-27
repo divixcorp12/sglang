@@ -54,6 +54,16 @@ def test_the_arms_differ_only_in_the_lease_switch_and_both_graph_gather():
     assert off[ac.GRAPH_GATHER_ENV] == on[ac.GRAPH_GATHER_ENV] == "1"
 
 
+def test_every_arm_names_only_sglang_variables_this_tree_defines():
+    # bench_arm refuses an arm naming an undefined SGLANG_* variable; the doorbell pin went with the copier.
+    from sglang.srt.environ import envs
+
+    for arm in ac.ARMS:
+        env = ac.arm_env(arm, paths=PATHS, res=RES)
+        unknown = [n for n in env if n.startswith("SGLANG_") and n not in vars(type(envs))]
+        assert unknown == [], arm
+
+
 def test_the_phase3a_graph_gather_off_recipe_is_refused():
     kwargs = ac.engine_kwargs(paths=PATHS, res=RES)
     env = {**ac.arm_env("lease_on", paths=PATHS, res=RES), ac.GRAPH_GATHER_ENV: "0"}

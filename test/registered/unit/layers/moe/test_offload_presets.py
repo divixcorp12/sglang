@@ -58,9 +58,6 @@ PROD_OFFLOAD_ENV = {
     "SGLANG_MOE_EXPERT_COPY_BACKEND": "dma",
 }
 
-ALL_CPUS = frozenset(range(72))
-
-
 def parsed(values):
     return {name: getattr(envs, name).parse(value) for name, value in values.items()}
 
@@ -74,7 +71,6 @@ def check(values, **overrides):
         pp_size=1,
         dp_size=1,
         dp_attention=False,
-        allowed_cpus=ALL_CPUS,
         nvfp4_hot_cache=True,
     )
     context.update(overrides)
@@ -85,27 +81,24 @@ class TestPresetValues(unittest.TestCase):
     def test_graph_gather_preset_is_the_prod_offload_env(self):
         self.assertEqual(parsed(presets.preset_env(presets.GRAPH_GATHER_PRESET)), parsed(PROD_OFFLOAD_ENV))
 
-    def test_doorbell_preset_departs_from_graph_gather_only_where_the_doorbell_forces_it(self):
-        graph = parsed(presets.preset_env(presets.GRAPH_GATHER_PRESET))
-        doorbell = parsed(presets.preset_env(presets.DOORBELL_PRESET))
-        changed = {name for name in graph.keys() | doorbell.keys() if graph.get(name) != doorbell.get(name)}
-        self.assertEqual(
-            changed,
-            {
-                "SGLANG_MOE_EXPERT_DOORBELL",
-                "SGLANG_MOE_EXPERT_DOORBELL_MODE",
-                "SGLANG_MOE_EXPERT_DOORBELL_CPU",
-                "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE",
-                "SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT",
-            },
-        )
-
     def test_every_preset_field_names_an_envs_descriptor(self):
         self.assertEqual(set(presets.ENV_NAMES), set(presets.MoeOffloadPreset.__struct_fields__))
         for name in presets.ENV_NAMES.values():
             self.assertTrue(hasattr(envs, name), name)
-        self.assertEqual(set(presets.PRESETS), {"off", "graph-gather", "doorbell"})
+        self.assertEqual(set(presets.PRESETS), {"off", "graph-gather"})
         self.assertIsNone(presets.PRESETS["off"])
+
+    def test_the_doorbell_preset_is_refused_by_the_cli(self):
+        import contextlib
+        import io
+
+        from sglang.srt.server_args import prepare_server_args
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            prepare_server_args(["--model-path", "dummy", "--moe-offload-preset", "doorbell"])
+        self.assertIn("invalid choice", stderr.getvalue())
+        self.assertIn("doorbell", stderr.getvalue())
 
 
 class TestResolution(unittest.TestCase):
@@ -149,36 +142,25 @@ class TestResolution(unittest.TestCase):
 
 
 class TestOverlapRule(unittest.TestCase):
-    def test_graph_gather_keeps_overlap_and_doorbell_turns_it_off(self):
+    def test_graph_gather_keeps_overlap(self):
         graph = presets.preset_env(presets.GRAPH_GATHER_PRESET)
-        doorbell = presets.preset_env(presets.DOORBELL_PRESET)
         self.assertFalse(presets.needs_overlap_off(graph, nvfp4_hot_cache=True))
-        self.assertTrue(presets.needs_overlap_off(doorbell, nvfp4_hot_cache=True))
 
     def test_a_hot_cache_without_graph_gather_and_the_residency_update_turns_overlap_off(self):
         self.assertTrue(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=True))
         self.assertFalse(presets.needs_overlap_off({}, nvfp4_hot_cache=True))
 
-    def test_the_hot_cache_rule_is_nvfp4s_but_the_doorbell_rule_is_every_formats(self):
+    def test_the_hot_cache_rule_is_nvfp4s_only(self):
         self.assertFalse(presets.needs_overlap_off({"SGLANG_MOE_HOT_GPU_MB": "1024"}, nvfp4_hot_cache=False))
-        doorbell = presets.preset_env(presets.DOORBELL_PRESET)
-        self.assertTrue(presets.needs_overlap_off(doorbell, nvfp4_hot_cache=False))
 
 
 class TestValidation(unittest.TestCase):
-    def test_both_presets_pass_their_intended_setups(self):
+    def test_the_graph_gather_preset_passes_its_intended_setup(self):
         check(presets.preset_env(presets.GRAPH_GATHER_PRESET), speculative=True)
-        check(presets.preset_env(presets.DOORBELL_PRESET))
 
     def test_invalid_combinations_are_refused_before_the_weight_load(self):
         graph = presets.preset_env(presets.GRAPH_GATHER_PRESET)
-        doorbell = presets.preset_env(presets.DOORBELL_PRESET)
         cases = (
-            (doorbell, dict(speculative=True), "speculative"),
-            (dict(doorbell, SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE="2"), {}, "INSERT_ON_MISS_STAGE=2"),
-            (doorbell, dict(allowed_cpus=frozenset(range(64))), "DOORBELL_CPU=71"),
-            (doorbell, dict(tp_size=2), "parallel"),
-            (doorbell, dict(dp_attention=True), "parallel"),
             (graph, dict(decode_graphs_disabled=True), "decode CUDA graphs"),
             (graph, dict(decode_max_bs=2), "cuda-graph-max-bs-decode 1"),
             (dict(graph, SGLANG_MOE_EXPERT_STREAM="0"), {}, "SGLANG_MOE_EXPERT_STREAM=1"),
@@ -207,9 +189,6 @@ class TestPresetHook(unittest.TestCase):
             patcher = patch.object(moe_offload_hook, target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
-        affinity = patch.object(moe_offload_hook.os, "sched_getaffinity", return_value=set(range(72)))
-        affinity.start()
-        self.addCleanup(affinity.stop)
         self.declared = []
 
     def record_declaration(self, server_args, source, **fields):
@@ -239,10 +218,10 @@ class TestPresetHook(unittest.TestCase):
         self.assertEqual(presets.explicit_offload_env(os.environ), expected)
         self.assertEqual(self.declared, [])
 
-    def test_doorbell_turns_overlap_off(self):
-        moe_offload_hook.handle_moe_offload_preset(self.args("doorbell"))
-        self.assertEqual(self.declared, [{"disable_overlap_schedule": True}])
-        self.assertEqual(envs.SGLANG_MOE_EXPERT_DOORBELL_CPU.get(), 71)
+    def test_an_api_launch_naming_the_doorbell_preset_fails_loudly(self):
+        # Engine(moe_offload_preset=...) bypasses argparse's choices; the unknown name must not fall through to "off".
+        with self.assertRaises(KeyError):
+            moe_offload_hook.handle_moe_offload_preset(self.args("doorbell"))
 
     def test_off_with_no_offload_env_touches_nothing(self):
         moe_offload_hook.handle_moe_offload_preset(self.args("off"))
@@ -265,9 +244,17 @@ class TestPresetHook(unittest.TestCase):
             moe_offload_hook.check_moe_offload_config(args)
 
     def test_a_refusal_names_the_preset(self):
-        args = self.args("doorbell", speculative_algorithm="NEXTN")
+        args = self.args(
+            "graph-gather",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend="breakable", max_bs=2),
+                prefill=PhaseConfig(backend="disabled"),
+            ),
+        )
         moe_offload_hook.handle_moe_offload_preset(args)
-        with self.assertRaisesRegex(ValueError, "--moe-offload-preset doorbell: .*speculative"):
+        with self.assertRaisesRegex(
+            ValueError, "--moe-offload-preset graph-gather: .*cuda-graph-max-bs-decode 1"
+        ):
             moe_offload_hook.check_moe_offload_config(args)
 
 
