@@ -3,7 +3,10 @@
 #include "expert_stream/host/ram_thread.h"
 #include "expert_stream/host/faulty_reader.h"
 #include "expert_stream/host/uring_reader.h"
+#include "expert_stream/tensor_checks.h"
 #include "exl3/exl3_row_layout.h"
+
+#include <sgl_kernel/tensor.h>
 
 namespace sglang {
 namespace expert_stream {
@@ -34,6 +37,29 @@ using Exl3Tier = RamTier<Exl3Source>;
 using Exl3Thread = RamThread<Exl3Tier>;
 
 static_assert(AsyncFileReader<FaultyReader<UringReader>>);
+
+// The table tensors every reader entry takes, checked once here rather than per read: tables_from
+// dereferences all six through raw pointers with no dtype or device check of its own. Run before
+// tables_from so a wrong-dtype or too-narrow table raises here, naming the tensor, not there.
+void check_table_tensors(
+    TensorView extents, TensorView starts, TensorView file_sizes, TensorView segments, TensorView slabs,
+    TensorView row_bytes) {
+  using namespace host;
+  auto L_ = SymbolicSize{"layers"};
+  auto E_ = SymbolicSize{"experts"};
+  auto P_ = SymbolicSize{"parts"};
+  auto cpu = SymbolicDevice{};
+  verify_named("extents", TensorMatcher({L_, E_, P_, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), extents);
+  verify_named("starts", TensorMatcher({L_, E_}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), starts);
+  verify_named("file_sizes", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), file_sizes);
+  verify_named("segments", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), segments);
+  verify_named(
+      "slabs", TensorMatcher({L_, kNumNames<exl3::Exl3RowLayout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+      slabs);
+  verify_named(
+      "row_bytes", TensorMatcher({kNumNames<exl3::Exl3RowLayout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+      row_bytes);
+}
 
 inline std::mutex& registry_mutex() {
   static std::mutex mutex;
@@ -101,6 +127,11 @@ int64_t exl3_ram_miss_read_rows(
     TensorView slots,
     int64_t step) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+  verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
   Exl3Source reader(tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
@@ -135,6 +166,13 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView record,
     int64_t owner_core) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+  verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+  verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+  verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
   check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   Exl3Source reader(
@@ -181,6 +219,15 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView fault,
     TensorView results) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+  verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+  verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+  verify_named("then_experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_experts);
+  verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
+  verify_named("results", TensorMatcher({8}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), results);
   auto* out = static_cast<int64_t*>(results.data_ptr());
   check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
@@ -233,6 +280,15 @@ void exl3_ram_miss_read_rows_sqes(
     TensorView sqes,
     TensorView info) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+  verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+  verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+  verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
+  verify_named("sqes", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sqes);
+  verify_named("info", TensorMatcher({5}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
   check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
@@ -310,6 +366,15 @@ void exl3_ram_miss_read_rows_pieces(
     TensorView ref_slots,
     TensorView info) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+  verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+  verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+  verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
+  verify_named("masks", TensorMatcher({-1, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), masks);
+  verify_named("info", TensorMatcher({5}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
   check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
@@ -334,6 +399,10 @@ void exl3_ram_miss_read_rows_pieces(
 
   // The checker: the pieces' runs per row, then poll until the read returns, and once more after.
   const bool checking = reference.numel() > 0;
+  if (checking) {
+    verify_named("reference", TensorMatcher({-1, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), reference);
+    verify_named("ref_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), ref_slots);
+  }
   const size_t count = t.segments.size();
   std::vector<PieceRun> runs(ids.size() * kPieces * count);
   const auto* ref_table = checking ? static_cast<const int64_t*>(reference.data_ptr()) : nullptr;
@@ -425,8 +494,15 @@ int64_t exl3_ram_miss_piece_geometry(
     TensorView subs,
     TensorView pieces) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("subs", TensorMatcher({kPieces, 6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), subs);
   const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
+  verify_named(
+      "pieces", TensorMatcher({kPieces, 1 + 2 * static_cast<int64_t>(count)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+      pieces);
   RowGeometry g;
   std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
   if (!row_geometry(t, static_cast<size_t>(row * t.experts + expert), g, runs.data())) return -1;
@@ -468,6 +544,10 @@ int64_t exl3_ram_miss_piece_runs(
     int64_t row_images,
     TensorView runs) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  auto cpu = SymbolicDevice{};
+  verify_named("runs", TensorMatcher({-1, -1, -1, -1, -1}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), runs);
   const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   const size_t rows = static_cast<size_t>(t.layers * t.experts);
@@ -569,6 +649,19 @@ int64_t exl3_ram_miss_open(
     int64_t pack_workers,
     TensorView hot_page) {
   using namespace expert_stream;
+  using namespace host;
+  check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+  // page, slot_map, lease and hot_page are pinned (or not) together (Exl3RamMissHost.__init__), so one
+  // SymbolicDevice ties them to the same actual device; capacity is always a plain CPU tensor.
+  auto host_mem = SymbolicDevice{};
+  verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
+  verify_named(
+      "slot_map", TensorMatcher({extents.size(0), extents.size(1)}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
+      slot_map);
+  verify_named("lease", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), lease);
+  verify_named("hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), hot_page);
+  auto cpu = SymbolicDevice{};
+  verify_named("capacity", TensorMatcher({extents.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), capacity);
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
   auto tier = std::make_shared<Exl3Tier>(
       static_cast<uint8_t*>(page.data_ptr()),
@@ -644,6 +737,9 @@ void exl3_ram_miss_release(int64_t handle, int64_t row, int64_t slot) {
 }
 
 void exl3_ram_miss_slot_info(int64_t handle, int64_t row, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   find(handle)->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
@@ -658,6 +754,10 @@ void exl3_ram_miss_inject_lease(int64_t handle, int64_t row, int64_t slot, int64
 
 // out: free, evictable, leased.
 void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("wanted", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), wanted);
+  expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   const auto census = find(handle)->victim_census(row, expert_stream::ids_of(wanted));
   auto* result = static_cast<int64_t*>(out.data_ptr());
   result[0] = census.free;
@@ -700,6 +800,9 @@ void exl3_ram_miss_enable_copy_engine(int64_t handle, int64_t device, int64_t sp
 // entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;
 // sm_mask: the entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES), 0 for none.
 void exl3_ram_miss_set_copy_table(int64_t handle, int64_t row, TensorView entries, int64_t dst_rows, int64_t sm_mask) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("entries", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), entries);
   if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error("exl3 RAM miss: copy table must be [n, 3]");
   find(handle)->set_copy_table(
       row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows, sm_mask);
@@ -711,6 +814,12 @@ void exl3_ram_miss_arm_copy_engine(int64_t handle, int64_t on) {
 
 // page: pinned uint8 [kPrefetchPageBytes], the native-prefetch request and done lines.
 void exl3_ram_miss_enable_native_prefetch(int64_t handle, TensorView page) {
+  using namespace host;
+  auto host_mem = SymbolicDevice{};
+  expert_stream::verify_named(
+      "page",
+      TensorMatcher({expert_stream::kPrefetchPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
+      page);
   if (page.dim() != 1 || page.size(0) != expert_stream::kPrefetchPageBytes)
     throw std::runtime_error("exl3 RAM miss: the native prefetch page must be uint8 [256]");
   find(handle)->enable_native_prefetch(static_cast<uint8_t*>(page.data_ptr()));
@@ -718,6 +827,9 @@ void exl3_ram_miss_enable_native_prefetch(int64_t handle, TensorView page) {
 
 // Test only: out int64 [3] = {active, row, slot} of the service's prefetch lease.
 void exl3_ram_miss_prefetch_lease(int64_t handle, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   find(handle)->prefetch_lease(static_cast<int64_t*>(out.data_ptr()));
 }
 
@@ -748,18 +860,30 @@ void exl3_ram_miss_inject_done_stall(int64_t handle, int64_t ns) {
 }
 
 void exl3_ram_miss_mapping(int64_t handle, int64_t row, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   find(handle)->mapping(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_slot_to_expert(int64_t handle, int64_t row, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   find(handle)->slot_to_expert(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 int64_t exl3_ram_miss_lru_order(int64_t handle, int64_t row, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   return find(handle)->lru_order(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_set_hot(int64_t handle, int64_t row, TensorView experts) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
   find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
 }
 
@@ -770,15 +894,26 @@ void exl3_ram_miss_inject(
 
 // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
 void exl3_ram_miss_inject_fault(int64_t handle, TensorView fault) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named(
+      "fault", TensorMatcher({expert_stream::kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
   expert_stream::check_fault_words<exl3::Exl3RowLayout>(fault);
   find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
 }
 
 void exl3_ram_miss_counters(int64_t handle, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named(
+      "out", TensorMatcher({expert_stream::kCounterCount}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_layer_rows(int64_t handle, int64_t advisory, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   find(handle)->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
 }
 
@@ -793,6 +928,12 @@ void exl3_ram_miss_trace_enable(int64_t handle, int64_t capacity) {
 
 // Fills up to out.size(0) records, stage_words() int64 each; returns the count.
 int64_t exl3_ram_miss_trace_drain(int64_t handle, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  // drain_trace treats `out` as a contiguous StageRecord array of out.size(0) records (it never reads
+  // out.size(1)), so the row width must equal stage_words() int64 words or the stride is wrong.
+  expert_stream::verify_named(
+      "out", TensorMatcher({-1, expert_stream::stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   return find(handle)->drain_trace(
       static_cast<expert_stream::StageRecord*>(out.data_ptr()), out.size(0));
 }
