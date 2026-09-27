@@ -672,33 +672,33 @@ struct RowCopyKernel {
     auto P_ = SymbolicSize{"planned"};
     const int64_t lanes = std::min<int64_t>(host_rows_2.size(0), dst_slots.size(0));
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device(on_host), page);
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device(device), state);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device(device), planned);
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_2/dst_slots");
-    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device(device), count);
-    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device(device), dst_slots);
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "host_rows_2", TensorMatcher({-1}).with_dtype<int64_t>().with_device(device), host_rows_2);
+        "host_rows_2", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
     expert_stream::verify_named(
-        "dst_slots_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device(device), dst_slots_2);
-    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device(device), ram_miss);
-    expert_stream::verify_named("claimed", TensorMatcher({-1}).with_dtype<int32_t>().with_device(device), claimed);
-    expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device(device), go_2);
+        "dst_slots_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
+    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+    expert_stream::verify_named("claimed", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named(
-        "lane_ctx_2", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device(device), lane_ctx_2);
-    expert_stream::verify_named("origin_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device(device), origin_2);
+        "lane_ctx_2", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
+    expert_stream::verify_named("origin_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
     expert_stream::verify_named(
-        "stream_count", TensorMatcher({1}).with_dtype<int32_t>().with_device(device), stream_count);
+        "stream_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_count);
     expert_stream::verify_named(
-        "stream_abort", TensorMatcher({1}).with_dtype<int32_t>().with_device(device), stream_abort);
+        "stream_abort", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_abort);
     expert_stream::verify_named(
         "segments",
-        TensorMatcher({expert_stream::kNumNames<L>, 3}).with_dtype<int64_t>().with_device(device),
+        TensorMatcher({expert_stream::kNumNames<L>, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device),
         segments);
     expert_stream::verify_named(
-        "segment_map", TensorMatcher({-1}).with_dtype<int32_t>().with_device(device), segment_map);
+        "segment_map", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), segment_map);
     RuntimeCheck(
         segment_map.size(0) == row_segments + expert_stream::kNumNames<L>,
         "segment_map: size must equal row_segments + the layout's name count");
@@ -706,11 +706,11 @@ struct RowCopyKernel {
         "piece_runs",
         TensorMatcher({-1, -1, device::expert_stream::kRowPieces, row_segments, 2})
             .with_dtype<int32_t>()
-            .with_device(device),
+            .with_device<kDLCUDA>(device),
         piece_runs);
     expert_stream::verify_named(
         "fault",
-        TensorMatcher({device::expert_stream::kStreamFaultWords}).with_dtype<int32_t>().with_device(device),
+        TensorMatcher({device::expert_stream::kStreamFaultWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
         fault);
 
     RuntimeCheck(
@@ -771,11 +771,11 @@ struct RowCopyKernel {
     auto on_host = SymbolicDevice{};
     on_host.set_options<kDLCPU, kDLCUDAHost>();
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device(on_host), page);
+    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device(device), state);
-    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device(device), count);
-    expert_stream::verify_named("go_ce", TensorMatcher({1}).with_dtype<int32_t>().with_device(device), go_ce);
+        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+    expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named("go_ce", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_ce);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
