@@ -861,17 +861,20 @@ Inactive lanes (`i >= count`) are never in the set.
 
 ### 7.5 Service: retirement
 
-`retire_leases()` **[P]**, called from three places and never blocking:
+`retire_leases()` **[P]**, called from four places and never blocking:
 
-1. the top of every `RamThread::run()` iteration (before `pump_demand`);
+1. the top of every `pump_demand` (each `RamThread::run()` iteration, and each `pump()`),
+   after the demand head is read: a settle pass when a new demand is posted (below);
 2. the between-batches callback of `RowReader::read` (the lambda passed in `serve()`
    that currently evaluates `demand_pending() || pause_requested_ || ...`), so leases keep
    retiring while a long read is in flight;
-3. once when a pause is being acknowledged (section 12, F10) and once in the shutdown
-   drain.
+3. once when a pause is being acknowledged (section 12, F10), as a settle pass;
+4. once in `stop_thread`, after the thread joined, as the final settle pass. There is no
+   separate shutdown drain.
 
-Work per call is bounded: at most `R * L = 128` lane entries, and it returns immediately
-when nothing is outstanding. For each `Outstanding` entry (all lanes not yet ACKED/VOID):
+Work per call is bounded: at most `R * L = 128` lane entries. A pass that is not a settle
+pass returns immediately when nothing is outstanding. It visits each `Outstanding` entry
+that is active (a lane not yet ACKED/VOID) or watched (below):
 
 - `a = load_acquire64(LaneAck[idx][i])`; if `gen(a) == G`: CONSUMED or VIOLATED ->
   `leases[slot]--`, lane state ACKED (VIOLATED also increments `lease_violations`).
@@ -889,10 +892,14 @@ misbehaves.
 A second signal for a lane already retired (an ack and a terminal bit for the same lane and
 generation) releases nothing and is counted in `lease_double_signal`, whenever it lands: the
 entry stays *watched* after it closes, and every later pass compares its words again. The watch
-ends at a *settle* pass, the first one after the service observed a later demand posted (or
-after `pause`, whose caller synchronized the stream). By A1 the device emitted every signal of a
-request before posting the next, so that pass is the last comparison needed. A pass that takes
-the idle early-out compares nothing; the next posted demand's settle pass covers it.
+ends at a *settle* pass: the first one after the service observed a later demand posted, the
+one in `pause` (whose caller synchronized the stream), or the final one in `stop_thread`. By
+assumption 1 of section 1.1 (one stream, one graph replay at a time; listed as A1 in 16.2, not
+the stage-1 ack kernel A1) the device emitted every signal of a request before posting the next,
+so that pass is the last comparison needed. A settle pass bypasses the idle early-out; any other
+pass that takes it compares nothing, and the next settle covers it. Ending the watch only bounds
+the cost of later passes: every comparison matches on the generation, so correctness does not
+depend on when a watch ends, and assumption 1 bears only on how complete the counter is.
 
 ---
 

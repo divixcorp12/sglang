@@ -154,11 +154,14 @@ def test_the_partial_terminal_mask_names_only_unacknowledged_lanes(service):
     Mutant: restore the whole-request mask `(1u << named) - 1u` in exl3_ram_miss.cuh's finalize kernel (the old
     single-stage formula), in place of the per-lane acknowledgement-word loop. Must go red on the mask bit.
 
-    The checklist's second detector, kLeaseDoubleSignal, does NOT independently fire in this minimal setup and is
-    not asserted as a kill signal here: retire_leases()'s early-out on lanes_outstanding_ == 0 means the double
-    signal for this test's own hit lane is never evaluated once that lane's own ack has already retired it and
-    nothing else is outstanding, whether or not the mask is later wrong. Reported to the lead rather than
-    engineered around with a second held lease, which introduced its own unexplained side effects.
+    The checklist's second detector, kLeaseDoubleSignal, is not asserted as a kill signal here. Under the mutant, the
+    hit lane's own ack retires it and the entry closes before the finalize kernel's terminal lands. retire_leases
+    keeps the closed entry watched (LEASE_PROTOCOL.md 7.5), but an idle pass (lanes_outstanding_ == 0) takes the
+    early-out and compares nothing, so that terminal is counted only by the next settle pass: the one after the next
+    demand is posted, or RamThread::pause. This test posts nothing and does not pause after the failing step, so the
+    counter reads 0 under the mutant as well. To use it as a second kill signal, pause the host (or run one more step)
+    after the failing step and assert lease_double_signal == 0. Under the mutant it should then read 1. This is not
+    yet run on the GPU.
     """
     s = service
     s.plan([3])
