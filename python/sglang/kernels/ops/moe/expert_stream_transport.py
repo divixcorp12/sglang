@@ -726,7 +726,9 @@ class ExpertStreamHost:
             raise ValueError("page and slot_map must be contiguous CPU tensors")
         if not bool((slot_map == -1).all()):
             raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
-        self._module = _host_module(layout)
+        # cache_once keys positional and keyword calls apart, so the cached loaders get the layout positionally.
+        self._layout = layout
+        self._module = _host_module(self._layout)
         self.threaded = False
         # The lease block (LEASE_PROTOCOL.md section 4): the service writes its header and slot generations
         # through a raw address, so this object holds it. Allocated here when the caller passes none.
@@ -761,7 +763,7 @@ class ExpertStreamHost:
         )
         if self.handle < 0:
             raise RuntimeError("exl3 RAM miss service failed to open (files, io_uring or bounce)")
-        self.layout_names, self.small_mask = host_layout(layout)
+        self.layout_names, self.small_mask = host_layout(self._layout)
         # expert_stream_close also stops and joins the service thread, if one runs.
         self._close = weakref.finalize(self, self._module.expert_stream_close, self.handle)
         self._close.atexit = False  # _stop_live closes live hosts at exit, logging counters first
@@ -1086,7 +1088,7 @@ class ExpertStreamHost:
     def enable_trace(self, capacity: int = 8192) -> None:
         """Record one stage record per served request, up to ``capacity`` undrained (more are dropped
         and counted). Before ``start_thread``; with it off the service takes no timestamps."""
-        _stage_words()
+        _stage_words(layout=self._layout)
         self._module.expert_stream_trace_enable(self.handle, int(capacity))
 
     def drain_trace(self, limit: int = 4096) -> list[dict]:
