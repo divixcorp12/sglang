@@ -4,7 +4,10 @@
 # long-prompt request (hot-cache-size/long_prompt.py), with a 50 ms nvidia-smi memory.used sampler from
 # before launch to after shutdown. Derived from indexer-cap/smoke.sh.
 #
-# Usage: chunk_smoke.sh <tag> <worktree> <chunk_tokens> <hot_gpu_mb> <long_tokens> [mem_fraction_static]
+# Usage: [CHUNK_NSYS=1] [LONG_MAX_NEW=n] chunk_smoke.sh <tag> <worktree> <chunk_tokens> <hot_gpu_mb> <long_tokens>
+#                                                      [mem_fraction_static]
+#   CHUNK_NSYS=1  captures the long prompt with Nsight Systems (node mode) to <out>/trace.nsys-rep, plus PCIe RX/TX
+#                 from a root metrics session to <out>/trace-pcie.nsys-rep.
 #   mem_fraction_static  replaces the recipe's (default: keep it). The hot cache counts against it, so a smaller hot
 #                        cache at the same fraction grows the KV pool and leaves activation headroom unchanged.
 #
@@ -84,20 +87,51 @@ SMI=$!
 sleep 1
 phase launch
 cd $WT
-taskset -c $CORES env "${ENV[@]}" "${ARGV[@]}" > $LOG 2>&1 &
-SPID=$!
+# CHUNK_NSYS=1: node mode, because graph-mode CUPTI tracing deadlocks the recipe's RAM-miss copy engine
+# (nsys_capture.py); prefill runs eagerly, so node mode costs it nothing. Collection runs over the long prompt only.
+NSYS_PREFIX=()
+NSYS_SESSION=""
+PCIE_SESSION=""
+NSYS_SUDO=(sudo -n /usr/local/sbin/nsys-profile)
+if [ "${CHUNK_NSYS:-0}" = 1 ]; then
+  NSYS_SESSION=chunk-$TAG-$$
+  NSYS_PREFIX=(nsys launch --session-new=$NSYS_SESSION --trace=cuda,nvtx,osrt --cuda-graph-trace=node)
+fi
+taskset -c $CORES "${NSYS_PREFIX[@]}" env "${ENV[@]}" "${ARGV[@]}" > $LOG 2>&1 &
+LAUNCH_PID=$!
+SPID=$LAUNCH_PID
+if [ -n "$NSYS_SESSION" ]; then
+  # nsys launch forks: find the server by its own cmdline.
+  SPID=""
+  for i in $(seq 1 180); do
+    SPID=$(pgrep -f "sglang.launch_server.*--port $PORT" | head -1)
+    [ -n "$SPID" ] && break
+    sleep 1
+  done
+  [ -n "$SPID" ] || { say "no server under nsys"; nsys cancel --session=$NSYS_SESSION; kill $LAUNCH_PID $SMI; exit 1; }
+fi
 healthy=0
 for i in $(seq 1 180); do
   sleep 5
   kill -0 $SPID 2>/dev/null || break
   curl -sf -m 60 localhost:$PORT/health >/dev/null && { healthy=1; break; }
 done
+stop_pcie() {
+  [ -n "$PCIE_SESSION" ] || return 0
+  "${NSYS_SUDO[@]}" $1 --session=$PCIE_SESSION >/dev/null 2>&1 || say "WARNING: nsys $1 failed for $PCIE_SESSION"
+  "${NSYS_SUDO[@]}" shutdown --session=$PCIE_SESSION >/dev/null 2>&1
+  PCIE_SESSION=""
+}
 stop_server() {
   phase stop
+  # Reached with a capture still running only on an abort path: cancel, the data is not worth a report.
+  [ -z "$NSYS_SESSION" ] || nsys cancel --session=$NSYS_SESSION >/dev/null 2>&1
+  stop_pcie cancel
   kill -TERM $SPID 2>/dev/null
   for i in $(seq 1 120); do kill -0 $SPID 2>/dev/null || break; sleep 1; done
   kill -KILL $SPID 2>/dev/null
   pkill -f "sglang.launch_server.*--port $PORT" 2>/dev/null
+  [ $LAUNCH_PID = $SPID ] || kill -TERM $LAUNCH_PID 2>/dev/null
   for i in $(seq 1 60); do [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && break; sleep 2; done
   phase stopped
   kill $SMI 2>/dev/null
@@ -122,12 +156,38 @@ WRC=$?
 phase warm_end
 say "warm rc=$WRC"
 
+REPORT=$OUT/trace
+if [ -n "$NSYS_SESSION" ]; then
+  PCIE_SESSION=pcie-$TAG-$$
+  "${NSYS_SUDO[@]}" launch --session-new=$PCIE_SESSION --trace=none sleep infinity >> $OUT/driver.log 2>&1 &
+  for i in $(seq 1 30); do "${NSYS_SUDO[@]}" sessions list 2>/dev/null | grep -q $PCIE_SESSION && break; sleep 1; done
+  "${NSYS_SUDO[@]}" start --session=$PCIE_SESSION --output=$REPORT-pcie --sample=none --cpuctxsw=none \
+    --gpu-metrics-devices=all --gpu-metrics-set=gb20x --force-overwrite=true \
+    || { say "PCIe metrics session failed to start"; stop_server; exit 1; }
+  nsys start --session=$NSYS_SESSION --output=$REPORT --sample=none --cpuctxsw=none --force-overwrite=true \
+    || { say "nsys start failed"; stop_server; exit 1; }
+  say "capture started -> $REPORT.nsys-rep"
+fi
 phase long_start
 taskset -c 8-15 $PY $LP --port $PORT --model $MODEL --text $WT/DSV41_REFERENCE.md \
-  --tokens $LONG --out $OUT/long.json >> $OUT/driver.log 2>&1
+  --tokens $LONG --max-new ${LONG_MAX_NEW:-64} --out $OUT/long.json >> $OUT/driver.log 2>&1
 LRC=$?
 phase long_end
 say "long rc=$LRC"
+if [ -n "$NSYS_SESSION" ]; then
+  # nsys writes the report on stop; wait for it to stop growing before the server goes.
+  nsys stop --session=$NSYS_SESSION || say "WARNING: nsys stop failed"
+  NSYS_SESSION=""
+  stop_pcie stop
+  last=-1
+  for i in $(seq 1 180); do
+    size=$(stat -c %s $REPORT.nsys-rep 2>/dev/null || echo -1)
+    [ "$size" -gt 0 ] && [ "$size" = "$last" ] && break
+    last=$size
+    sleep 5
+  done
+  say "report: $(ls -l $REPORT.nsys-rep $REPORT-pcie.nsys-rep 2>&1 | tr '\n' ';')"
+fi
 curl -sf -m 60 localhost:$PORT/health >/dev/null && say "healthy after long prompt" || { say "UNHEALTHY after long prompt"; LRC=1; }
 
 stop_server
