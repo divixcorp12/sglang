@@ -696,7 +696,11 @@ struct HostExports {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
+    const auto tier = find(handle);
+    // Exact: RamTier::slot_info writes 4 words per slot through a raw pointer with no bound.
+    expert_stream::verify_named(
+        "out", TensorMatcher({4 * tier->row_capacity(row)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    tier->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
   static void lease_entry(int64_t handle, int64_t idx, TensorView out) {
@@ -823,21 +827,33 @@ struct HostExports {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->mapping(row, static_cast<int64_t*>(out.data_ptr()));
+    const auto tier = find(handle);
+    // Exact: RamTier::mapping writes one word per expert through a raw pointer with no bound.
+    expert_stream::verify_named(
+        "out", TensorMatcher({tier->experts()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    tier->mapping(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
   static void slot_to_expert(int64_t handle, int64_t row, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->slot_to_expert(row, static_cast<int64_t*>(out.data_ptr()));
+    const auto tier = find(handle);
+    // Exact: RamTier::slot_to_expert writes one word per slot through a raw pointer with no bound.
+    expert_stream::verify_named(
+        "out", TensorMatcher({tier->row_capacity(row)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    tier->slot_to_expert(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
   static int64_t lru_order(int64_t handle, int64_t row, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    return find(handle)->lru_order(row, static_cast<int64_t*>(out.data_ptr()));
+    const auto tier = find(handle);
+    // Exact: RamTier::lru_order writes up to one word per slot (its READY slots) with no bound.
+    expert_stream::verify_named(
+        "out", TensorMatcher({tier->row_capacity(row)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    return tier->lru_order(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
   static void set_hot(int64_t handle, int64_t row, TensorView experts) {
@@ -874,7 +890,11 @@ struct HostExports {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
+    const auto tier = find(handle);
+    // Exact: RamTier::layer_rows writes one word per streamed layer through a raw pointer with no bound.
+    expert_stream::verify_named(
+        "out", TensorMatcher({tier->layers()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    tier->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
   }
 
   static int64_t trace_words() {

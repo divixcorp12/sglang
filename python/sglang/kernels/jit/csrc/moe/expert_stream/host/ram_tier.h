@@ -908,6 +908,21 @@ class RamTier {
     lease_changes_.fetch_add(1);
   }
 
+  // The extents the introspection methods below write, for the FFI's exact out-buffer checks: none of those
+  // methods is given a bound. All are fixed at construction, so no lock.
+  int64_t layers() const {
+    return layers_;
+  }
+  int64_t experts() const {
+    return experts_;
+  }
+  int64_t row_capacity(int64_t row) const {
+    if (row < 0 || row >= layers_) {
+      throw std::runtime_error(error_prefix<Layout>() + "streamed row " + std::to_string(row) + " is out of range");
+    }
+    return tiers_[row].capacity;
+  }
+
   // Test hooks and introspection. slot_info: [state, expert, leases, generation] per slot.
   void slot_info(int64_t row, int64_t* out) {
     std::lock_guard<std::mutex> guard(mutex_);
