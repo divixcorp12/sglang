@@ -296,6 +296,9 @@ struct HostExports {
 
   // Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
   static int64_t publish_piece(TensorView word, int64_t generation, int64_t bit) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("word", TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), word);
     return expert_stream::publish_piece(
                static_cast<uint64_t*>(word.data_ptr()), static_cast<uint64_t>(generation), static_cast<uint8_t>(bit))
                ? 1
@@ -542,6 +545,13 @@ struct HostExports {
   // (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
   // (two words per worker). Throws, like the pool, when no core is left.
   static void pack_pool_affinity(TensorView inherited, int64_t workers, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
+    // Exact: two words per requested worker, bound before the pool starts a thread (the pool never builds fewer).
+    // A non-positive count would make the extent a wildcard or a negative size, so it is refused first.
+    if (workers < 1) throw std::runtime_error(error_prefix<Layout>() + "a packing pool needs at least one worker");
+    expert_stream::verify_named("out", TensorMatcher({2 * workers}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -564,6 +574,10 @@ struct HostExports {
   // Test only: the cores a packing worker may use when the creating thread may use those set in `inherited`
   // (two int64 words, cores 0-127), as two words in `out`. Starts no thread.
   static void pack_worker_cpus(TensorView inherited, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
+    expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -670,6 +684,9 @@ struct HostExports {
     expert_stream::verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
     expert_stream::verify_named("protect", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), protect);
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    // Exact: fill_begin writes the evictions word at out[experts.size()] first, then a slot per claimed expert.
+    expert_stream::verify_named(
+        "out", TensorMatcher({experts.size(0) + 1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     auto* result = static_cast<int64_t*>(out.data_ptr());
     const std::vector<int32_t> ids = expert_stream::ids_of(experts);
     return find(handle)->fill_begin(
@@ -828,6 +845,7 @@ struct HostExports {
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto tier = find(handle);
+    tier->row_capacity(row);  // for its range check alone: RamTier::mapping indexes tiers_[row] unchecked
     // Exact: RamTier::mapping writes one word per expert through a raw pointer with no bound.
     expert_stream::verify_named(
         "out", TensorMatcher({tier->experts()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
@@ -1002,6 +1020,11 @@ struct HostExports {
   // order (seq = 0, fence, payload, fence, a new seq) while this thread reads it with
   // read_record. out = {records accepted, accepted records whose payload is not their seq's}.
   static void seqlock_stress(int64_t duration_ns, TensorView out) {
+    {
+      using namespace host;
+      auto cpu = SymbolicDevice{};
+      expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    }
     alignas(64) uint8_t record[kRecordBytes] = {};
     std::atomic<bool> done{false};
     const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
