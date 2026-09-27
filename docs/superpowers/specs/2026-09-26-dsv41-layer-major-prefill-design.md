@@ -27,9 +27,8 @@ experts are then used by many chunks in a row, so they cross NVMe and PCIe once 
 
 1. A 250k-token prompt reaches its first token in under 5 minutes, and never within reach of the scheduler watchdog
    (§5.3).
-2. Output equivalence with today's chunked path, within a measured tolerance, defined in §10.2.
-   - Bitwise identity is not promised: the chunked path's fused mHC carry-over is reproduced (§6.2) but not proven
-     bit-exact under a changed call order.
+2. Output equivalence with today's chunked path: bitwise-identical output is expected, per the carried-state finding
+   in §6.2 and the acceptance criterion in §10.2.
 3. The first decode step after a long prefill costs a normal step plus the hot-cache restore (~1.3 s), not the
    ~200+ ms cold steps seen after prefill today.
 4. No allocator OOM retries, and a device peak no higher than a normal 4096-token chunk.
@@ -43,7 +42,7 @@ experts are then used by many chunks in a row, so they cross NVMe and PCIe once 
 
 ## 2. Scope and trigger
 
-- **Trigger:** `SGLANG_DSV41_LAYER_MAJOR_PREFILL_MIN_TOKENS` (EnvInt, default 0 = off). A request whose uncached
+- **Trigger:** `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS` (EnvInt, default 0 = off). A request whose uncached
   prompt suffix is at least this long takes the layer-major path. The intended production value is 32768, set only
   after phase 3.
 - **Refused at launch** (a clear `ValueError` naming the conflicting option) when set with any of:
@@ -71,10 +70,8 @@ Verified against the code; file:line in the review notes.
   - `engram_layer_ids` [1, 14]; `sliding_window` 128; `index_topk` 512.
 - **The layer loop** (`_forward_layers_hc_pre_from_prev`, `deepseek_v4.py:4427-4607`) carries `hidden` [T, 4, 5120]
   bf16 and `prev_pre` [T, 4] fp32 between layers.
-  - At prefill sizes it also carries the fused post-combine-norm output, `normalized` [T, 5120] bf16, from
-    `mhc_post_combine_norm_prefill` (`:3519-3536`, on by default via `SGLANG_OPT_USE_TILELANG_MHC_POST`).
-  - The next layer consumes it directly (`:3239-3243`). Dropping it changes both the next layer's input and the
-    current layer's post kernel (`:3537-3541`).
+  - Under decoder bounded replay the chunked path never carries the fused post-combine-norm output, `normalized`:
+    see §6.2 for why, and what the layer-major pass carries instead.
 - **Per-forward attention state** lives in the per-forward `DSV4Metadata` object; the backend holds one
   `forward_metadata` slot (`deepseek_v4_backend.py:2429-2448`). Inside it:
   - a per-token page table [T, ceil(seq/256)] int32;
@@ -265,9 +262,9 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
 
 - **Rows:** exactly the chunked path's tail, `min(128, final_chunk_len)` rows of the final chunk, with the window
   floored at the tail start. A final chunk shorter than 128 tokens gives a shorter tail, as today.
-- **Inputs first:** before layer 21 runs, the final chunk's post-layer-20 hidden rows, `prev_pre`, `normalized`,
-  positions, input ids, Engram hash ids, layer 20's c1 top-k rows and the candidate masks are copied into dedicated
-  tensors, because the tail uses `_STAGING` and would clobber anything parked there.
+- **Inputs first:** before layer 21 runs, the final chunk's post-layer-20 hidden rows, `prev_pre`, positions, input
+  ids, Engram hash ids, layer 20's c1 top-k rows and the candidate masks are copied into dedicated tensors, because
+  the tail uses `_STAGING` and would clobber anything parked there.
 - **Expert path:** the tail runs on the normal expert path, after `ExpertBorrow.restore()` (§7.4). It reads hot slots
   in place, so it must never run on borrowed bytes.
 - **Logits:** from the tail rows only, by rewriting `LogitsMetadata.extend_seq_lens` to the tail's (precedent:
@@ -294,13 +291,17 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
 |---|---:|---|
 | `hidden` [4, 5120] bf16 | 40,960 | layer input |
 | `prev_pre` [4] fp32 | 16 | layer input |
-| `normalized` [5120] bf16 | 10,240 | the fused post-combine-norm output the next layer consumes. Carrying it reproduces the chunked path's call graph, and with it `next_combined` is non-None, so the current layer keeps its fused post kernel |
 | top-k bundle | ~8,192 | from each index-source layer to its last consumer |
-| **Total** | **~59.4 KB** | |
+| **Total** | **~49.2 KB** | |
+
+The chunked path under decoder bounded replay always has a late-layer tail (`deepseek_v4.py:4474-4480`), and the
+fused carry-over requires `tail is None` (`:4549`), so it never carries `normalized`. The layer-major pass calls
+every layer with `next_combined=None`, `next_norm=None` and `precomputed_attn=None`, the chunked path's own
+arguments, and carries only `hidden` and `prev_pre`.
 
 ### 6.3 The StateStore
 
-- **Size:** ~59.4 KB per token + ~50 MB of metadata per chunk, ~15.6 GB + ~3 GB at 262,144 tokens.
+- **Size:** ~49.2 KB per token + ~50 MB of metadata per chunk, ~12.9 GB + ~3 GB of metadata at 262,144 tokens.
 - **Placement:** pinned on **NUMA node 1** (explicit `mbind`, then CUDA host registration). Node 1 has ~40 GB free
   after its tier share; node 0 has ~4 GiB (§3).
 - **Allocation:** once at startup, sized from `CONTEXT_LENGTH`.
@@ -308,9 +309,9 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
     accepted suffix to what fits.
   - It refuses to start if node 1 is under a margin. The arm_env note about a reth/nimbus stack keeping node 1 at
     ~9 GB free is from 2026-09-22; phase 1 re-measures node 1 with production-like load.
-- **Device staging:** two ~240 MB carried-state buffers, a metadata slot of ~50 MB and the tail-input tensors. These
+- **Device staging:** two ~168 MB carried-state buffers, a metadata slot of ~50 MB and the tail-input tensors. These
   are dedicated allocations, not `_STAGING`, which the tail pass uses.
-  - Their ~0.55 GB comes out of the activation headroom. §8 budgets it.
+  - Their ~0.39 GB comes out of the activation headroom. §8 budgets it.
 
 ### 6.4 Window KV ring
 
@@ -388,7 +389,7 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
 
 - The layer-major MoE path reads only from `LayerExpertSource` views. It never uses the normal hot-hit or `_STAGING`
   path, never arms native prefetch and never takes `_apply_graph`.
-- A debug assertion (`SGLANG_DSV41_LAYER_MAJOR_VERIFY`) checks at every layer that no hot-hit or graph path was
+- A debug assertion (`SGLANG_LAYER_MAJOR_PREFILL_VERIFY`) checks at every layer that no hot-hit or graph path was
   entered.
 
 ### 7.4 Restore and end
@@ -396,7 +397,7 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
 - **Restore:** after layer 20 and before the tail, `restore()` copies every snapshotted slot's expert back from its
   pinned row, looking up the pinned slot at restore time. That is ~16 GB in ~1.3 s at the link's ceiling, if nothing
   else is on the link.
-- **Check:** in phase 2 validation, and whenever `SGLANG_DSV41_LAYER_MAJOR_VERIFY` is on, every restored slot is
+- **Check:** in phase 2 validation, and whenever `SGLANG_LAYER_MAJOR_PREFILL_VERIFY` is on, every restored slot is
   checksummed against its pinned row. Otherwise a sample is checked.
 - **End:** `end()` releases the pauses after the tail pass.
 
@@ -415,7 +416,7 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
 |---|---:|---|
 | One layer on one 4096 chunk: activations | at or below today's full-chunk peak | as today |
 | Indexer logits, dense fp32 [T, lc] | up to ~4 GB per chunk at 250k (layer 20, ratio 1) | **must be chunked** (phase 0 measures the path taken) |
-| Carried-state staging, 2 x ~240 MB | ~0.48 GB | new, from headroom |
+| Carried-state staging, 2 x ~168 MB | ~0.34 GB | new, from headroom |
 | Metadata slot | ~50 MB | new, from headroom |
 | Tail inputs | ~6 MB | new |
 | Borrowed hot area | 0 extra | the hot cache itself |
@@ -425,11 +426,13 @@ candidate publish (`deepseek_v4_backend.py:3342-3382`) behind a metadata flag th
     peak at 128k.
   - The design requires the row-chunked form: the torch fallback already chunks within 1 GiB, and the dense fp4
     path must adopt the same bound.
-- The ~0.53 GB of new staging exceeds today's ~470 MiB headroom. The recipe gives it room by lowering
-  `--mem-fraction-static` by 0.02 (0.90 to 0.88, ~650 MiB). The KV pool shrinks from ~374k to ~330k tokens, still
-  above 262k.
+- The ~0.39 GB of new staging fits within today's ~470 MiB headroom on its own. The recipe still lowers
+  `--mem-fraction-static` by 0.02 (0.90 to 0.88, ~650 MiB), kept as margin: the indexer-logits bound above is only
+  measured at phase 0, and the staging estimate has not been measured under load either. The KV pool shrinks from
+  ~374k to ~330k tokens, still above 262k.
 
-**Host (node 1):** StateStore ~18.6 GB at 262k (§6.3) + landing buffer ~0.85 GB.
+**Host (node 1):** StateStore ~15.9 GB at 262k (~12.9 GB carried state + ~3 GB metadata, §6.3) + landing buffer
+~0.85 GB.
 
 ## 9. Engram
 
@@ -471,14 +474,8 @@ Under `test/manual/dsv41/`, plus a debug-dump probe modelled on `swa_window_prob
 - **What is compared:** layer 20's output per chunk and the final logits, layer-major against chunked.
 - **Lengths:** 8k, 16k, 32k and 33,000 (final chunk 232 tokens), and one length with a final chunk under 128
   tokens (32,868).
-- **Tolerance, per compared tensor:**
-  - cosine similarity at least 0.9999;
-  - max abs difference within 2x the chunked path's own run-to-run difference, measured on the same prompt;
-  - greedy 64-token output identical at 8k and 16k;
-  - at 32k and above, the first divergence no earlier than the chunked path's own run-to-run divergence.
-- **A second, bitwise reference:** the fused mHC post kernel is disabled on both sides
-  (`SGLANG_OPT_USE_TILELANG_MHC_POST=0`). With it disabled, bitwise identity of layer 20's output is expected; any
-  mismatch there is a bug, not rounding.
+- **Expected:** bitwise identity of layer 20's output per chunk and of the final logits. Any mismatch is a bug to
+  investigate before it is waived. The greedy 64-token outputs must be identical at every length.
 
 ### 10.3 GPU restore and safety
 
@@ -560,7 +557,7 @@ That leaves about 2.5x headroom to the 5-minute target, and 3x to the watchdog e
 | SWA budget and allocator refuse an unchunked extend | §5.1: `LayerMajorBudget` and `alloc_extend_layer_major` |
 | No RequestWindow; ring on the paged allocator | §6.4: ring on `full_to_swa_index_mapping`, mapping lifecycle, tombstones |
 | Watchdog at 300 s | §5.3: `PassHeartbeat`; §12 margin |
-| Fused mHC carry-over | §6.2: `normalized` carried; §10.2: tolerance plus a fusion-off bitwise reference |
+| Fused mHC carry-over | §6.2: `normalized` not carried under bounded replay (the chunked path never carries it either); §10.2: bitwise identity expected |
 | Phase 1 not useful alone at 250k | §11: phase 1 limited to 8-32k; borrow before any long run |
 | Kept metadata and indexer logits exceed headroom | §6.1: metadata on host; §8: indexer chunking required, fraction -0.02 |
 | Tail scatter of ~12.8 GB | §5.5: tail-only logits (dspark precedent) |

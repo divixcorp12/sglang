@@ -1941,6 +1941,14 @@ class Envs:
     # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
 
+    # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
+    # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
+    # stream once per prompt. 0 turns it off. Model- and quant-agnostic; the model must provide an adapter.
+    SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS = EnvInt(0)
+    # NUMA node for the layer-major host state store; node 0 is kept near full by the expert tier (DSV41_REFERENCE
+    # §25.4, 27.17).
+    SGLANG_LAYER_MAJOR_STATE_NUMA_NODE = EnvInt(1)
+
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
