@@ -561,12 +561,6 @@ with a release store, and only then the lease release.
 `ld.acquire.sys.global.u64` and `st.release.sys.global.u64`. No other primitives are
 introduced.
 
-**2026-09-27:** the device helpers now live in `expert_stream/lease_device.cuh` and are `cuda::atomic_ref` at
-`thread_scope_system`: `ld_acquire_sys{,64}` / `st_release_sys{,64}` keep their names, and `ld_relaxed_sys<T>` /
-`st_relaxed_sys<T>` replace every raw `volatile` access (`ld_volatile` is gone). The ordering is unchanged; the
-addressing is generic (`LD`/`ST` in SASS rather than `LDG`/`STG`). The one exception is the hot-page bitmap, whose
-1-byte stores stay `volatile` because `atomic_ref<uint8_t>::store` is a system-scope CAS loop.
-
 ### 6.3 Device-side publication order
 
 *Post kernel* (`exl3_ram_miss_post_kernel`), for a request with `count > 0` **[P]**:
