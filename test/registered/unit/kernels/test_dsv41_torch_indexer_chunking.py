@@ -89,6 +89,9 @@ def _run(case, budget_mb, *, source=False, uses=False, published=None, topk=512)
     raw = torch.zeros(case.n, topk, dtype=torch.int32, device=device)
     backend = object.__new__(backend_mod.DeepseekV4AttnBackend)
     backend.req_to_token = case.req_to_token
+    # No late-layer tail: sources publish every row, as before tail-only publishing.
+    backend.tail_forward_metadata = None
+    backend.candidate_tail_only = True
     backend.token_to_kv_pool = types.SimpleNamespace(
         get_low_ratio_index_k_dequant=lambda layer_id, slots: case.index_k[slots]
     )
@@ -98,6 +101,7 @@ def _run(case, budget_mb, *, source=False, uses=False, published=None, topk=512)
             sparse_raw_indices=lambda ratio: raw,
         ),
         candidate_metadata=published,
+        layer_major_skip_candidates=False,
     )
     indexer = types.SimpleNamespace(
         queries=lambda q_lora, freqs: case.q,
