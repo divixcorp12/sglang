@@ -89,6 +89,18 @@ class TestStateStore(unittest.TestCase):
         store.read_into("hidden", 2, out, stream=stream)
         stream.synchronize()
         self.assertTrue(torch.equal(out.cpu(), rows))
+        store.release()
+        store.release()  # a second call is a no-op
+
+    def test_release_on_an_unpinned_store_drops_buffers_and_is_idempotent(self):
+        store = self._store()
+        store.park(0, {"t": torch.arange(3)})
+        store.release()
+        with self.assertRaises(KeyError):
+            store.write("hidden", 0, torch.zeros(1, 2, 3, dtype=torch.bfloat16))
+        with self.assertRaises(KeyError):
+            store.unpark(0, torch.device("cpu"))
+        store.release()  # a second call is a no-op, not an error
 
 
 if __name__ == "__main__":
