@@ -33,7 +33,6 @@ from sglang.srt.models.deepseek_v4_layer_major import DSV4_WINDOW, DeepseekV4Lay
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
 
 PAGE = 256
 CHUNK = 1024
@@ -51,7 +50,7 @@ class _FakeExtendKernel:
 
 
 @mock.patch("sglang.srt.mem_cache.allocator.paged.alloc_extend_kernel", new=_FakeExtendKernel())
-class TestLayerMajorRadixInsert(CustomTestCase):
+class TestLayerMajorRadixInsert(unittest.TestCase):
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=PAGE))
         self.rtp = ReqToTokenPool(size=4, max_context_len=8192, device="cpu", enable_memory_saver=False)
