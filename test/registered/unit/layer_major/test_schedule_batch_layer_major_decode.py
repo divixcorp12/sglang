@@ -11,12 +11,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
-
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
