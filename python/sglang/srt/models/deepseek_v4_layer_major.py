@@ -186,7 +186,10 @@ class DeepseekV4LayerMajorAdapter:
             prev_pre = torch.empty((rows, self.model.hc_mult), dtype=torch.float32, device=device)
             store.read_into("prev_pre", offset, prev_pre, stream=None)
         meta = store.unpark(span.index, torch.device(device))
-        self.backend.install_forward_metadata(meta)
+        # Only the final chunk has a tail: the layer-20 source can then publish tail-only
+        # masks; earlier chunks have none and rely on layer_major_skip_candidates instead.
+        tail_metadata = handle.final_tail_metadata if span is handle.spans[-1] else None
+        self.backend.install_forward_metadata(meta, tail_metadata=tail_metadata)
         layer = self.model.layers[layer_id]
         if layer.engram is not None:
             before_engram = hidden
