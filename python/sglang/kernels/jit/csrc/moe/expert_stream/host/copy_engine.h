@@ -236,8 +236,10 @@ class CopyEngine {
   using Handler = std::function<bool(const CopyJob&)>;
   using Failure = std::function<void(const CopyJob&, int)>;
 
+  // `thread_name` is the copy thread's pthread name (e.g. Layout::kName + "-copy-eng"), truncated to 15 bytes
+  // (pthread_setname_np's limit).
   CopyEngine(std::unique_ptr<CopyBackend> backend, int64_t rows, int64_t spin_ns, std::atomic<int64_t>* counters,
-             Handler complete, Handler acked, Failure fail, std::string prefix)
+             Handler complete, Handler acked, Failure fail, std::string prefix, std::string thread_name)
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
         spin_ns_(spin_ns),
@@ -245,7 +247,8 @@ class CopyEngine {
         complete_(std::move(complete)),
         acked_(std::move(acked)),
         fail_(std::move(fail)),
-        prefix_(std::move(prefix)) {}
+        prefix_(std::move(prefix)),
+        thread_name_(thread_name.substr(0, 15)) {}
 
   ~CopyEngine() {
     stop(5'000'000'000LL);
@@ -259,7 +262,7 @@ class CopyEngine {
     if (!init_error_.empty()) {
       lock.unlock();
       stop(0);
-      throw std::runtime_error(prefix_ + "copy engine: " + init_error_);
+      throw std::runtime_error(prefix_ + init_error_);
     }
   }
 
@@ -336,7 +339,7 @@ class CopyEngine {
   };
 
   void run() {
-    pthread_setname_np(pthread_self(), "exl3-copy-eng");
+    pthread_setname_np(pthread_self(), thread_name_.c_str());
     const std::string error = backend_->init();
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -494,6 +497,7 @@ class CopyEngine {
   Handler acked_;
   Failure fail_;
   std::string prefix_;
+  std::string thread_name_;
   std::thread thread_;
   std::mutex mutex_;  // guards queue_, outstanding_, stop_, drain_deadline_, started_ and init_error_
   std::condition_variable work_cv_;

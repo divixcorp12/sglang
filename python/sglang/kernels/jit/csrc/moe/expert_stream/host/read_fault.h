@@ -109,8 +109,9 @@ inline ReadFault fault_from(const int64_t* f) {
   return fault;
 }
 
+template <ExpertRowLayout Layout>
 inline void check_fault_words(TensorView fault) {
-  if (fault.size(0) != kFaultWords) throw std::runtime_error("exl3 RAM miss: the fault tensor has the wrong length");
+  if (fault.size(0) != kFaultWords) throw std::runtime_error(error_prefix<Layout>() + "the fault tensor has the wrong length");
 }
 
 // Entry points' abandon callback: stop once `after` batches were admitted (0: never).

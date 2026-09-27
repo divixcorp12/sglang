@@ -135,7 +135,7 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView record,
     int64_t owner_core) {
   using namespace expert_stream;
-  check_fault_words(fault);
+  check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   Exl3Source reader(
       tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
@@ -182,7 +182,7 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView results) {
   using namespace expert_stream;
   auto* out = static_cast<int64_t*>(results.data_ptr());
-  check_fault_words(fault);
+  check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   Exl3Source reader(
       tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
@@ -233,7 +233,7 @@ void exl3_ram_miss_read_rows_sqes(
     TensorView sqes,
     TensorView info) {
   using namespace expert_stream;
-  check_fault_words(fault);
+  check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
   out[0] = out[1] = out[2] = out[3] = out[4] = 0;
@@ -310,7 +310,7 @@ void exl3_ram_miss_read_rows_pieces(
     TensorView ref_slots,
     TensorView info) {
   using namespace expert_stream;
-  check_fault_words(fault);
+  check_fault_words<exl3::Exl3RowLayout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
   std::fill(out, out + 5, 0);
@@ -511,7 +511,9 @@ void exl3_ram_miss_pack_pool_affinity(TensorView inherited, int64_t workers, Ten
   for (int core = 0; core < 128; ++core) {
     if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
   }
-  PackPool pool(static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots));
+  PackPool pool(
+      static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots), error_prefix<exl3::Exl3RowLayout>(),
+      std::string(exl3::Exl3RowLayout::kName) + "-pack");
   auto* words = static_cast<int64_t*>(out.data_ptr());
   for (size_t w = 0; w < pool.workers(); ++w) {
     const cpu_set_t set = pool.worker_affinity(w);
@@ -768,7 +770,7 @@ void exl3_ram_miss_inject(
 
 // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
 void exl3_ram_miss_inject_fault(int64_t handle, TensorView fault) {
-  expert_stream::check_fault_words(fault);
+  expert_stream::check_fault_words<exl3::Exl3RowLayout>(fault);
   find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
 }
 

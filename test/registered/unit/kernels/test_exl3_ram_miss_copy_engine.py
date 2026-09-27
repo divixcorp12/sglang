@@ -277,10 +277,13 @@ def test_a_copy_table_sm_mask_naming_a_trellis_is_refused(tmp_path):
     """set_copy_table refuses an SM mask outside the layout's small tensors: SM-reading a 13 MB trellis in the copy
     wait would stall the chain instead of using the DMA engine."""
     s, _page, host, _sim = _host(tmp_path)
-    host.enable_copy_engine(-1, spin_us=200)
-    table = torch.zeros((6, 3), dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="exl3 RAM miss: .*small"):
-        host.set_copy_table(ROW, table, DST_ROWS, sm_mask=0b000001)
+    try:
+        host.enable_copy_engine(-1, spin_us=200)
+        table = torch.zeros((6, 3), dtype=torch.int64)
+        with pytest.raises(RuntimeError, match="exl3 RAM miss: .*small"):
+            host.set_copy_table(ROW, table, DST_ROWS, sm_mask=0b000001)
+    finally:
+        host.stop()
 
 
 def test_sm_entries_skip_the_dma_and_the_lease_holds_until_the_copy_wait_acknowledges_its_reads(tmp_path):

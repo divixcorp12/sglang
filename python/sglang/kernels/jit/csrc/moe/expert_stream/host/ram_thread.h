@@ -43,8 +43,8 @@ class RamThread {
       thread_.join();
       tier_->set_threaded(false);
       throw std::runtime_error(
-          "exl3 RAM miss: could not pin the service thread to core " + std::to_string(cpu_core_) + ": " +
-          std::strerror(error));
+          error_prefix<typename Tier::Layout>() + "could not pin the service thread to core " +
+          std::to_string(cpu_core_) + ": " + std::strerror(error));
     }
     watchdog_ = std::thread([this] { watch(); });
   }
@@ -95,7 +95,7 @@ class RamThread {
 
  private:
   void run() {
-    pthread_setname_np(pthread_self(), "exl3-ram-miss");
+    pthread_setname_np(pthread_self(), (std::string(Tier::Layout::kName) + "-ram-miss").substr(0, 15).c_str());
     int error = 0;
     if (cpu_core_ >= 0) {
       cpu_set_t cpus;
@@ -155,7 +155,9 @@ class RamThread {
       if (fatal != 0) {
         if (!reported) {
           reported = true;
-          std::fprintf(stderr, "ERROR exl3 RAM miss: request %u timed out or failed; the process must stop\n", fatal);
+          std::fprintf(
+              stderr, "ERROR %srequest %u timed out or failed; the process must stop\n",
+              error_prefix<typename Tier::Layout>().c_str(), fatal);
           std::fflush(stderr);
         }
         if (fatal_since == 0) fatal_since = now;
@@ -167,7 +169,8 @@ class RamThread {
       if (fatal_held || stuck) {
         std::fprintf(
             stderr,
-            "ERROR exl3 RAM miss: %s for %.1f s (fatal %u, busy %u); aborting instead of hanging decode\n",
+            "ERROR %s%s for %.1f s (fatal %u, busy %u); aborting instead of hanging decode\n",
+            error_prefix<typename Tier::Layout>().c_str(),
             stuck ? "a request stayed in service" : "the fatal word stayed raised without the process stopping",
             static_cast<double>(fatal_wait_ns_) / 1e9,
             fatal,

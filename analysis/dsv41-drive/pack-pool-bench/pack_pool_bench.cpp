@@ -158,7 +158,9 @@ int main(int argc, char** argv) {
          memcpy_gbps(src, src_bytes, dst, dst_bytes, chunk, 2000),
          memcpy_gbps(src, src_bytes, dst, dst_bytes, o.piece_bytes, 300));
 
-  PackPool pool(o.workers, inherited, 64);
+  // Out-of-tree: no ExpertRowLayout in scope here, so the prefix/thread-name text is reproduced literally,
+  // matching what the in-tree EXL3 instantiation passes.
+  PackPool pool(o.workers, inherited, 64, "exl3 RAM miss: ", "exl3-pack");
   std::vector<CopyRun> runs(static_cast<size_t>(o.runs));
   std::vector<ChunkStamp> stamps(o.split);
   PackJob job;

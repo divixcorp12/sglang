@@ -460,7 +460,8 @@ class RamTier {
         std::move(backend), layers_, spin_ns, counters_,
         [this](const CopyJob& job) { return copy_completed(job); },
         [this](const CopyJob& job) { return copy_acked(job); },
-        [this](const CopyJob& job, int error) { copy_failed(job, error); }, error_prefix<Layout>());
+        [this](const CopyJob& job, int error) { copy_failed(job, error); },
+        std::string(Layout::kName) + " RAM miss copy engine: ", std::string(Layout::kName) + "-copy-eng");
     engine->start();
     copy_engine_ = std::move(engine);
   }
@@ -1135,8 +1136,9 @@ class RamTier {
 
   // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
   void copy_failed(const CopyJob& job, int error) {
-    std::fprintf(stderr, "ERROR %scopy engine: copy of request %llu failed (%d); leases held\n",
-                 error_prefix<Layout>().c_str(), static_cast<unsigned long long>(job.gen), error);
+    std::fprintf(stderr, "ERROR %s copy of request %llu failed (%d); leases held\n",
+                 (std::string(Layout::kName) + " RAM miss copy engine:").c_str(),
+                 static_cast<unsigned long long>(job.gen), error);
     std::fflush(stderr);
     raise_fatal(static_cast<uint32_t>(job.gen));
   }

@@ -219,7 +219,9 @@ class RowReader {
     if (pack_workers_ > 0) {
       // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
       runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
-      pool_ = std::make_unique<PackPool>(pack_workers_, inherited, static_cast<size_t>(kBounceSlots));
+      pool_ = std::make_unique<PackPool>(
+          pack_workers_, inherited, static_cast<size_t>(kBounceSlots), error_prefix<Layout>(),
+          std::string(Layout::kName) + "-pack");
       if (piece_stream_) size_jobs();
     }
     return true;
