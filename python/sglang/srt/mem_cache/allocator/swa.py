@@ -485,6 +485,42 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # copies a host-resident scalar and blocks until the stream drains.
             self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
+    def ring_slots(self, full_locs_tail: torch.Tensor) -> torch.Tensor:
+        """The window slots alloc_extend_swa_tail gave the last ring positions of an extend, in position order."""
+        return self.full_to_swa_index_mapping[full_locs_tail.to(torch.int64)].clone()
+
+    def map_ring_positions(
+        self, full_locs: torch.Tensor, positions: torch.Tensor, ring: torch.Tensor
+    ) -> None:
+        # Ring page (pos // page) mod pages: a chunk of whole pages plus its predecessor page never share a slot.
+        pages = ring.numel() // self.page_size
+        idx = (positions // self.page_size) % pages * self.page_size + positions % self.page_size
+        self.set_full_to_swa_mapping(full_locs, ring[idx.to(ring.device)])
+
+    def finalize_ring(
+        self,
+        extend_full_locs: torch.Tensor,
+        extend_start: int,
+        keep_from: int,
+        ring: torch.Tensor,
+    ) -> None:
+        """Keep the window from keep_from (an absolute position) to the end of the extend; drop the rest of the ring."""
+        split = keep_from - extend_start
+        assert 0 <= split <= extend_full_locs.numel(), (
+            f"keep_from {keep_from} out of range for extend_start {extend_start} "
+            f"len {extend_full_locs.numel()}"
+        )
+        self.clear_full_to_swa_mapping(extend_full_locs[:split])
+        kept = self.full_to_swa_index_mapping[extend_full_locs[split:].to(torch.int64)]
+        # _release_swa -> the paged allocator frees whole pages (unique(idx //
+        # page_size)), so releasing a bare slot set here would free a kept
+        # position's page out from under it whenever the extend does not end
+        # on a page boundary: page-align on "unused" by keeping any ring page
+        # that still holds a kept slot, not just the individual slots.
+        kept_pages = torch.unique(kept[kept > 0] // self.page_size)
+        unused = ring[~torch.isin(ring // self.page_size, kept_pages)]
+        self._release_swa(unused)
+
     def free_swa(self, free_index: torch.Tensor):
         """Release the SWA peers of an arbitrary slot set and clear their mapping.
         No-op for a per-request ring, which owns no paged SWA peers. Otherwise
