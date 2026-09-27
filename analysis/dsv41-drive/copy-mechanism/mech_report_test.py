@@ -89,3 +89,14 @@ def test_curves_list_each_methods_points_by_bytes_in_flight():
                           _cell("sm_cv16", 32768, 12.1), _cell("ce_each", 0, 13.6)])
     # best GB/s at each in-flight size, ascending; copy-engine methods have no in-flight knob
     assert s["curves"] == {"sm_cv16": [(8192, 11.8), (32768, 12.3)]}
+
+
+def test_a_missing_control_is_blind_and_a_swept_method_without_a_fresh_record_is_unsafe():
+    records = [
+        _meta(), _cell("sm_cv16", 16384, 11.8), _cell("tma", 32768, 12.3), _cell("ce_each", 0, 13.6),
+        _cell("cw_real", 4096, 3.8), _cell("sm_small", 32768, 6.7),
+        {"kind": "fresh", "method": "sm_cv16", "fresh": True},
+    ]
+    s = report.summarize(records)
+    assert s["control_blind"] is True  # no nc_control record: nothing shows the check can see staleness
+    assert s["unsafe"] == ["tma"]  # swept, never fresh-checked; ce*, cw_real and sm_small have no fresh check

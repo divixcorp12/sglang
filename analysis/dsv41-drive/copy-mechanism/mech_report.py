@@ -16,6 +16,9 @@ from collections import defaultdict
 LANE_GBS = {3: 8.0 * 128 / 130 / 8, 4: 16.0 * 128 / 130 / 8, 5: 32.0 * 128 / 130 / 8}
 KNEE_FRACTION = 0.95
 CONTROL = "nc_control"  # the fresh check's negative control: it must come out stale
+# Cells with no fresh check of their own: copy-engine methods, and SM cells that run a fresh-checked kernel shape or
+# production code (cw_real) on other data. Every other method must have a passing fresh record.
+NO_FRESH_CHECK = ("ce", "cw_real", "sm_small")
 
 
 def link_gbs(gen: int, width: int) -> float:
@@ -71,8 +74,11 @@ def summarize(records: list[dict]) -> dict:
         "bdp_bytes": bdp_bytes(rtt_min, measured) if rtt_min else bdp_acquire,
         "bdp_acquire_bytes": bdp_acquire,
         "flag_rtt_min_ns": rtt_min,
-        "unsafe": sorted(m for m, ok in fresh.items() if m != CONTROL and not ok),
-        "control_blind": bool(fresh.get(CONTROL, False)),
+        "unsafe": sorted(
+            {m for m, ok in fresh.items() if m != CONTROL and not ok}
+            | {m for m in by_method if not m.startswith(NO_FRESH_CHECK) and m not in fresh}
+        ),
+        "control_blind": fresh.get(CONTROL) is not False,  # a missing control proves nothing either
         "methods": {
             method: {
                 "best_gbs": max(gbs for _, gbs in points),
