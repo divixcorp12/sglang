@@ -25,7 +25,7 @@ from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layer_major.worker_entry import (
-    layer_major_runtime,
+    layer_major_runtime_for_worker,
     run_layer_major_prefill,
 )
 from sglang.srt.managers.io_struct import (
@@ -359,7 +359,9 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_model_config()
         self._init_model_runner()
-        self._layer_major = layer_major_runtime(self.model_runner)
+        self._layer_major = layer_major_runtime_for_worker(
+            self.model_runner, is_draft_worker=self.is_draft_worker
+        )
 
         if is_multi_layer_eagle:
             self._init_multi_layer_eagle_model_runners()
