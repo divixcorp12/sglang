@@ -561,6 +561,13 @@ with a release store, and only then the lease release.
 `ld.acquire.sys.global.u64` and `st.release.sys.global.u64`. No other primitives are
 introduced.
 
+**2026-09-27:** every concurrent device access in `expert_stream/*.cuh` now goes through a named helper in
+`lease_device.cuh`: `ld_relaxed_sys<T>` / `st_relaxed_sys<T>` (a volatile access, i.e. relaxed at system scope),
+`ld_acquire_sys{,64}` / `st_release_sys{,64}`, and `ld_relaxed_gpu`. `ld_volatile` is gone. The SASS is
+unchanged. `cuda::atomic_ref` was tried and rejected. Under CUDA 13.4's libcu++, every access through a
+`__grid_constant__` parameter gains a run-time local-pointer check with a byte-copy fallback, and adjacent relaxed
+accesses are merged and reordered.
+
 ### 6.3 Device-side publication order
 
 *Post kernel* (`exl3_ram_miss_post_kernel`), for a request with `count > 0` **[P]**:

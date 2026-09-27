@@ -31,7 +31,7 @@ constexpr int kStreamFaultWords = 4;
 
 // state[*word] += value, clamped at INT32_MAX like W2's kPolls, from any number of blocks at once.
 SGL_DEVICE void saturating_add(int32_t* word, int64_t value) {
-  int32_t old = *reinterpret_cast<volatile int32_t*>(word);
+  int32_t old = ld_relaxed_sys(word);
   while (true) {
     const int64_t sum = static_cast<int64_t>(old) + value;
     const int32_t next = static_cast<int32_t>(sum < 0x7fffffffLL ? sum : 0x7fffffffLL);
@@ -295,9 +295,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
     } else if (seq == 0) {
       sh.served = 1;  // no request and no lanes: nothing to wait for or copy
     }
-    capacity = seq != 0
-                   ? *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4)
-                   : 0u;
+    capacity = seq != 0 ? ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4) : 0u;
   }
   __syncthreads();
   if (tid < kLeaseLanes) {
@@ -377,7 +375,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
           // The acquire orders this thread's status and mask loads below after it; the other threads' copies follow
           // through the block barrier at the end of the pass. No fence needed.
           const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
-          const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
+          const uint16_t status = ld_relaxed_sys<uint16_t>(record + kRecStatus);
           if (status != kServed) {
             sh.aborting = 1;
             sh.reason = kLeaseReasonFailed;
@@ -431,13 +429,13 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   if (sh.aborting != 0) {
     if (fault[kStreamFaultAbortBlock] == static_cast<int32_t>(blockIdx.x) + 1) spin_ns(fault[kStreamFaultAbortDelay]);
     // The abort path: this block's own failure record, first writer of the reason wins, then abort, fence, count.
-    *reinterpret_cast<volatile int32_t*>(&state[kReqFailed]) = 1;
+    st_relaxed_sys(&state[kReqFailed], 1);
     if (sh.reason != 0 && atomicCAS(&state[kFailReason], 0, static_cast<int32_t>(sh.reason)) == 0) {
       if (sh.reason == kLeaseReasonTimeout) state[kTimeouts] += 1;
       if (sh.reason == kLeaseReasonFailed) state[kFailures] += 1;
       if (sh.reason == kLeaseReasonIdentity) state[kUnservedMisses] += static_cast<int32_t>(unclaimed);
     }
-    *reinterpret_cast<volatile int32_t*>(stream_abort) = 1;
+    st_relaxed_sys(stream_abort, 1);
     __threadfence();
     increment = 1u;
   } else {
@@ -450,8 +448,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   // The last block. It decides from the value its own atomic returned, never from a second read of the counter.
   const uint32_t now = old + increment;
   __threadfence();
-  int32_t aborted;
-  asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(aborted) : "l"(stream_abort) : "memory");
+  const int32_t aborted = ld_relaxed_gpu(stream_abort);
   if (started != 0) state[kWaits] += 1;
   const bool commit = now / kStreamCompleted == gridDim.x && aborted == 0 && sh.aborting == 0 && sh.served != 0;
   if (!commit) {
@@ -556,8 +553,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
           const uint64_t word = ld_acquire_sys64(result + kLeaseRrReady);
           if ((word >> 56) != kLeaseTagCopying || (word & generation_mask) != generation) continue;
           // After the acquire of the ready word; a COPYING lane's payload is fixed until its lease is released.
-          sm_host[lane] = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrHostSlot);
-          sm_dst[lane] = *reinterpret_cast<const volatile int32_t*>(request + kLeaseLrDst + 4 * lane);
+          sm_host[lane] = ld_relaxed_sys<int32_t>(result + kLeaseRrHostSlot);
+          sm_dst[lane] = ld_relaxed_sys<int32_t>(request + kLeaseLrDst + 4 * lane);
           mask |= 1u << lane;
         }
       }
@@ -628,7 +625,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     word = ld_acquire_sys64(done + kLeaseCdGen);
   }
   // The acquire of the tagged word orders this load after it: the service stores the mask first.
-  if (reason == 0 && *reinterpret_cast<const volatile uint32_t*>(done + kLeaseCdMask) != mask) {
+  if (reason == 0 && ld_relaxed_sys<uint32_t>(done + kLeaseCdMask) != mask) {
     reason = kLeaseReasonIdentity;
   }
   if (reason != 0) {
