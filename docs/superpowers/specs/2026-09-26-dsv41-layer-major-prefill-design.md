@@ -157,6 +157,42 @@ TpModelWorker.forward_batch_generation  -- seam before model_runner.forward (tp_
   -> sampling as today; whole prompt inserted into the radix cache once (§6.5)
 ```
 
+### 4.0 Layering (agreed 2026-09-27)
+
+The scheme is split so other models and quant formats can reuse it. Each layer depends only on the interfaces of
+the layers below it, never on their implementations.
+
+| Layer | Package | Knows about | Must not know about |
+|---|---|---|---|
+| 1. Prefill strategy | `srt/layer_major/` | a `LayerMajorModelAdapter` protocol and an `ExpertResidency` protocol | DeepSeek, EXL3, the dsv4 backend |
+| 2. Model adapter (DSV4.1) | `srt/models/deepseek_v4_layer_major.py` | the strategy's protocols, DSV4's loop, backend, pools and allocator; an expert-compute protocol | EXL3 |
+| 3. Quant adapter (EXL3) | `srt/layers/quantization/exl3_layer_major.py` | row layout; MoE over experts held in GPU row buffers | DeepSeek, the strategy |
+| Beside: expert residency | `srt/layers/moe/expert_residency_borrow.py` (expert-offload layer) | hot cache, pinned tier, NVMe reader, via `ExpertFormat`; the quant adapter's row format | DeepSeek, the strategy's loop |
+
+- **The strategy (layer 1)** owns:
+  - the gate's generic part: threshold, `max_running_requests`, store capacity;
+  - generic chunk bounds;
+  - a StateStore of named per-token tensors, so it does not know what "hidden" is;
+  - the heartbeat and stream joins;
+  - the layer-outer, chunk-inner driver;
+  - the begin, make-resident, restore, end protocol calls.
+- **The model adapter (layer 2)** owns everything DSV4-specific:
+  - which layers run layer-major, and the carried-state spec;
+  - per-chunk metadata and its install;
+  - the window ring, the admission budget and allocator branch;
+  - Engram history, the tail pass and tail-only logits.
+
+  The strategy calls the budget and allocator through adapter hooks.
+- **The quant adapter (layer 3)** owns the weight views and MoE accumulation over resident rows, and the landing
+  buffer's per-name row layout and alignment.
+- **Expert residency** owns the hot-cache borrow and restore, restore-source verification, the writer pauses, the
+  NVMe landing buffer and the reader entry point. It is format-agnostic through `ExpertFormat`.
+
+Interfaces carry only what DSV4 and EXL3 need, with no speculative hooks. NVFP4, a real second expert format in this
+repo, is the check that nothing EXL3-specific leaks into layers 1-2 or into expert residency.
+
+The units below are mapped onto these layers.
+
 ### 4.1 Units
 
 | Unit | File | Does |
