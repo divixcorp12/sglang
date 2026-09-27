@@ -946,7 +946,9 @@ class GpuResidencyUpdater:
 
         Returns the translated remap in ``remap_dtype``, a view of a per-layer buffer.
         """
-        from sglang.kernels.ops.moe.dsv41_layer_fusion import direct_gather_destinations
+        from sglang.kernels.ops.moe.expert_residency_direct_gather import (
+            direct_gather_destinations,
+        )
 
         streamer = self.streamers[row]
         destinations, live = self.fused_destinations[row], self.fused_live[row]
@@ -1033,7 +1035,9 @@ class GpuResidencyUpdater:
         self, row: int, streamer, destinations: torch.Tensor, live: torch.Tensor
     ) -> None:
         """:meth:`commit_gather` as one kernel; ``live`` is narrowed to the delivered lanes inside it."""
-        from sglang.kernels.ops.moe.dsv41_layer_fusion import direct_commit_gather
+        from sglang.kernels.ops.moe.expert_residency_direct_gather import (
+            direct_commit_gather,
+        )
 
         backend = streamer.row_backend
         leased = getattr(backend, "name", None) == "exl3_ram_miss"

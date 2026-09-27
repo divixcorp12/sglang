@@ -140,7 +140,7 @@ class Exl3FusedMoE:
             self.det = torch.zeros((3, slots + 1), dtype=torch.int64, device=device)
 
     def _fused_route_tables(self, x, topk_weights, remap, keep):
-        from sglang.kernels.ops.moe.dsv41_layer_fusion import exl3_moe_route_tables
+        from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
 
         exl3_moe_route_tables(
             remap.contiguous(),

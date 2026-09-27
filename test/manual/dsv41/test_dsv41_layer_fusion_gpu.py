@@ -292,7 +292,7 @@ def test_captured_gather_and_commit_replay_new_inputs():
 def test_route_tables_match_the_torch_chain(
     routes, slots, hidden, remap_dtype, weight_dtype, x_dtype
 ):
-    from sglang.kernels.ops.moe.dsv41_layer_fusion import exl3_moe_route_tables
+    from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
     from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
 
     gen = torch.Generator().manual_seed(routes * 31 + slots + hidden)

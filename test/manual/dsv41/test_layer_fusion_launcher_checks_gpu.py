@@ -73,19 +73,19 @@ def _route_args(routes: int = 6, slots: int = 12, hidden: int = 64) -> dict:
 
 
 def _run_gather(args: dict) -> None:
-    from sglang.kernels.ops.moe.dsv41_layer_fusion import _gather_module
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import _gather_module
 
     _gather_module(torch.int32, torch.int32, torch.int32).run(*args.values())
 
 
 def _run_commit(args: dict) -> None:
-    from sglang.kernels.ops.moe.dsv41_layer_fusion import _commit_module
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import _commit_module
 
     _commit_module().run(*args.values())
 
 
 def _run_route(args: dict) -> None:
-    from sglang.kernels.ops.moe.dsv41_layer_fusion import _route_tables_module
+    from sglang.kernels.ops.moe.exl3_route_tables import _route_tables_module
 
     _route_tables_module(torch.int32, torch.bfloat16, torch.bfloat16).run(
         *args.values()
