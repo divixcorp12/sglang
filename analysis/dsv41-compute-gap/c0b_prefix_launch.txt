@@ -1,0 +1,8 @@
+C0b: prefix hole vs cudaGraphLaunch, trace indexer-payoff-node-20260926-143541 (node mode), 90 selected replays
+gap between nodes: {(8589934606, 8589934608)}
+gap_us                                       median   2041.84 min   1925.26 max   2254.83
+launch_host_ms                               median     99.34 min     58.02 max    146.17
+first_kernel_to_launch_end_us                median   2068.68 min   1952.55 max   2285.17
+after_gap_kernel_start_minus_launch_end_us   median     -8.29 min    -15.29 max     -5.39
+corr(first_kernel->launch_end, gap) = 0.9995
+graph exec nodes (graph 2): 2795

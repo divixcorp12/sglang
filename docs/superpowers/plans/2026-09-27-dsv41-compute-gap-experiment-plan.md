@@ -68,4 +68,18 @@ compute and numerical cost. Record it; do not start it here.
 
 ## Results log
 
-(filled in as experiments complete)
+### E6 / C0b — the 2.047 ms graph-prefix hole is node-mode launch overhead (measured, closed)
+
+Evidence: `analysis/dsv41-compute-gap/c0b_prefix_launch.txt`, from the handoff's own trace and 90 windows.
+
+- In every replay the hole sits between nodes `8589934606` and `8589934608`. Its median is 2041.8 µs.
+- `cudaGraphLaunch` returns a median 2068.7 µs after the graph's first kernel starts. Across replays this
+  interval and the hole correlate at r = 0.9995.
+- The first kernel after the hole starts a median 8.3 µs *before* `cudaGraphLaunch` returns (range −15.3 to −5.4 µs).
+  The GPU runs the first 14 nodes, then waits for the host to finish submitting the rest of the graph.
+- The graph has 2,795 nodes. 2.04 ms / 2,795 is about 0.73 µs per node, the per-node cost that node-mode tracing
+  adds to `cudaGraphLaunch` (CLAUDE.md measured 0.77 µs).
+- Graph-node creation records predate the captured API window, so they cannot give node 15's type. The type does
+  not matter for the conclusion: the hole's end is set by host submission, not by that node.
+- Decision: exclude the hole from every optimization budget. Traced step spans from node-mode reports carry about
+  2 ms of this artifact. Leave the external event record and its write-after-read contract unchanged.
