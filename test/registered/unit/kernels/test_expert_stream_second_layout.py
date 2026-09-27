@@ -30,10 +30,16 @@ def two(monkeypatch):
 
 def test_the_second_layout_has_its_own_host_module(two):
     """Red when HostExports ignores its Layout (say, a body naming Exl3RowLayout again): the two-name module would
-    report EXL3's six names, or share EXL3's module."""
+    report EXL3's six names. Red too when a cached loader is keyed by call form again: _host_module() and
+    _host_module("exl3") would be two loads of one module."""
     assert transport.host_layout("two") == (("a", "b"), 0b10)
-    assert transport.host_layout("exl3") == (tuple(EXL3_STREAMED_NAMES), transport.host_layout("exl3")[1])
-    assert transport._host_module("two") is not transport._host_module("exl3")
+    assert transport.host_layout("exl3") == (tuple(EXL3_STREAMED_NAMES), 0b110110)
+    # Read from each module itself, not through host_layout's cache: two keys naming one .so would agree here.
+    two_module, exl3_module = transport._host_module("two"), transport._host_module("exl3")
+    assert str(two_module.expert_stream_layout_names()) == "a\nb"
+    assert str(exl3_module.expert_stream_layout_names()) == "\n".join(EXL3_STREAMED_NAMES)
+    # One module per layout whatever the call form (cache_once keys f(), f(x) and f(layout=x) apart).
+    assert transport._host_module() is transport._host_module("exl3") is transport._host_module(layout="exl3")
 
 
 def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, monkeypatch):

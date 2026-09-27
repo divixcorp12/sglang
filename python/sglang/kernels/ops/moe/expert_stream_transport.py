@@ -46,8 +46,14 @@ LAYOUTS = {
 }
 
 
-@cache_once
+# cache_once keys f(), f("exl3") and f(layout="exl3") apart; each cached loader below is called only positionally,
+# through a wrapper, so a layout has exactly one module whatever the call form.
 def _host_module(layout: str = "exl3") -> Module:
+    return _host_module_cached(layout)
+
+
+@cache_once
+def _host_module_cached(layout: str) -> Module:
     return load_jit(
         f"expert_stream_host_{layout}",
         cpp_files=[LAYOUTS[layout].host_source],
@@ -56,9 +62,13 @@ def _host_module(layout: str = "exl3") -> Module:
     )
 
 
-@cache_once
 def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
     """The host module's row layout: its tensor names in copy-table order and the SM-readable ones as a bit mask."""
+    return _host_layout_cached(layout)
+
+
+@cache_once
+def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
     module = _host_module(layout)
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(module.expert_stream_layout_small_mask())
 
@@ -726,7 +736,6 @@ class ExpertStreamHost:
             raise ValueError("page and slot_map must be contiguous CPU tensors")
         if not bool((slot_map == -1).all()):
             raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
-        # cache_once keys positional and keyword calls apart, so the cached loaders get the layout positionally.
         self._layout = layout
         self._module = _host_module(self._layout)
         self.threaded = False
@@ -1197,8 +1206,12 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ]
 
 
-@cache_once
 def _device_module(layout: str = "exl3") -> Module:
+    return _device_module_cached(layout)
+
+
+@cache_once
+def _device_module_cached(layout: str) -> Module:
     return load_jit(
         f"expert_stream_{layout}",
         cuda_files=[LAYOUTS[layout].device_source],
