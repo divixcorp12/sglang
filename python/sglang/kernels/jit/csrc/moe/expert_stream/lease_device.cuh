@@ -7,8 +7,7 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <sgl_kernel/distributed/ptx.cuh>
-
+#include <cuda/atomic>
 #include <cuda/ptx>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -16,6 +15,7 @@
 #include "lease_layout.h"
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 namespace device::expert_stream {
@@ -51,30 +51,55 @@ constexpr int kCopyWaits = 18;     // requests whose copy-engine lanes the copy 
 constexpr int kCopySpun = 19;      // ... of which CopyDone was not yet published on the first read
 constexpr int kStateWords = 20;
 
+// Every word the host or another kernel reads or writes concurrently goes through cuda::atomic_ref at system scope.
+// Relaxed is what `volatile` was (the PTX memory model treats ld/st.volatile as relaxed.sys); acquire and release
+// are what the ld.acquire/st.release asm was. The addressing becomes generic (LD/ST, not LDG/STG); the ordering is
+// unchanged. Not for 1-byte fields: atomic_ref<uint8_t>::store is a system-scope CAS loop.
+template <typename T>
+SGL_DEVICE cuda::atomic_ref<T, cuda::thread_scope_system> sys_word(const T* word) {
+  static_assert(sizeof(T) >= 2, "a 1-byte atomic_ref store is a CAS loop; store the byte directly");
+  return cuda::atomic_ref<T, cuda::thread_scope_system>(*const_cast<T*>(word));
+}
+
+template <typename T>
+SGL_DEVICE T ld_relaxed_sys(const T* word) {
+  return sys_word(word).load(cuda::memory_order_relaxed);
+}
+
+template <typename T>
+SGL_DEVICE void st_relaxed_sys(T* word, std::type_identity_t<T> value) {
+  sys_word<T>(word).store(value, cuda::memory_order_relaxed);
+}
+
+// A wire field at a byte address (lease_layout.h offsets); T names the field's type.
+template <typename T>
+SGL_DEVICE T ld_relaxed_sys(const uint8_t* address) {
+  return ld_relaxed_sys(reinterpret_cast<const T*>(address));
+}
+
+template <typename T>
+SGL_DEVICE void st_relaxed_sys(uint8_t* address, std::type_identity_t<T> value) {
+  st_relaxed_sys<T>(reinterpret_cast<T*>(address), value);
+}
+
 SGL_DEVICE uint32_t ld_acquire_sys(const uint8_t* address) {
-  return ::sglang::device::ptx::load_acquire_sys(reinterpret_cast<const uint32_t*>(address));
+  return sys_word(reinterpret_cast<const uint32_t*>(address)).load(cuda::memory_order_acquire);
 }
 
 SGL_DEVICE void st_release_sys(uint8_t* address, uint32_t value) {
-  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
+  sys_word(reinterpret_cast<const uint32_t*>(address)).store(value, cuda::memory_order_release);
 }
 
 SGL_DEVICE uint64_t ld_acquire_sys64(const uint8_t* address) {
-  uint64_t value;
-  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
-  return value;
+  return sys_word(reinterpret_cast<const uint64_t*>(address)).load(cuda::memory_order_acquire);
 }
 
 SGL_DEVICE void st_release_sys64(uint8_t* address, uint64_t value) {
-  asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(address), "l"(value) : "memory");
+  sys_word(reinterpret_cast<const uint64_t*>(address)).store(value, cuda::memory_order_release);
 }
 
 SGL_DEVICE uint64_t tagged_word(uint64_t tag, uint64_t generation) {
   return (tag << 56) | generation;
-}
-
-SGL_DEVICE int32_t ld_volatile(const int32_t* address) {
-  return *reinterpret_cast<const volatile int32_t*>(address);
 }
 
 SGL_DEVICE uint64_t global_ns() {
@@ -113,24 +138,20 @@ SGL_DEVICE void write_record(
     uint32_t after,
     uint32_t armed,
     uint32_t lanes) {
-  volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(record);
-  volatile uint16_t* halves = reinterpret_cast<volatile uint16_t*>(record);
   // Seqlock writer: invalidate seq before touching the payload, so a lapped record that
   // is half rewritten never passes the thread's read_record seq re-check.
-  words[kRecSeq / 4] = 0u;
+  st_relaxed_sys<uint32_t>(record + kRecSeq, 0u);
   __threadfence_system();
-  halves[kRecRow / 2] = static_cast<uint16_t>(row);
-  halves[kRecNeedCount / 2] = static_cast<uint16_t>(need_count);
-  halves[kRecProtectCount / 2] = static_cast<uint16_t>(protect_count);
-  halves[kRecStatus / 2] = 0;
-  words[kRecAfter / 4] = after;
-  words[kRecArmed / 4] = armed;
-  words[kRecLanes / 4] = lanes;
-  volatile int32_t* need_out = reinterpret_cast<volatile int32_t*>(record + kRecNeed);
-  volatile int32_t* protect_out = reinterpret_cast<volatile int32_t*>(record + kRecProtect);
+  st_relaxed_sys<uint16_t>(record + kRecRow, static_cast<uint16_t>(row));
+  st_relaxed_sys<uint16_t>(record + kRecNeedCount, static_cast<uint16_t>(need_count));
+  st_relaxed_sys<uint16_t>(record + kRecProtectCount, static_cast<uint16_t>(protect_count));
+  st_relaxed_sys<uint16_t>(record + kRecStatus, 0);
+  st_relaxed_sys<uint32_t>(record + kRecAfter, after);
+  st_relaxed_sys<uint32_t>(record + kRecArmed, armed);
+  st_relaxed_sys<uint32_t>(record + kRecLanes, lanes);
   for (int i = 0; i < kMaxIds; ++i) {
-    need_out[i] = i < need_count ? need[i] : -1;
-    protect_out[i] = i < protect_count ? protect[i] : -1;
+    st_relaxed_sys<int32_t>(record + kRecNeed + 4 * i, i < need_count ? need[i] : -1);
+    st_relaxed_sys<int32_t>(record + kRecProtect + 4 * i, i < protect_count ? protect[i] : -1);
   }
   // The seqlock order the thread's read_record relies on: seq=0, fence, payload, seq last. The release store is the
   // second fence: it orders every payload store above before the seq.
@@ -166,15 +187,15 @@ struct LaneRead {
 SGL_DEVICE LaneRead lane_result_read(const uint8_t* result) {
   LaneRead r;
   r.ready = ld_acquire_sys64(result + kLeaseRrReady);
-  r.slot_generation = *reinterpret_cast<const volatile uint32_t*>(result + kLeaseRrSlotGeneration);
-  r.host_slot = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrHostSlot);
-  r.expert = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrExpert);
+  r.slot_generation = ld_relaxed_sys<uint32_t>(result + kLeaseRrSlotGeneration);
+  r.host_slot = ld_relaxed_sys<int32_t>(result + kLeaseRrHostSlot);
+  r.expert = ld_relaxed_sys<int32_t>(result + kLeaseRrExpert);
   return r;
 }
 
 // Relaxed: the caller's fence already orders it after the payload loads, and nothing after it depends on it.
 SGL_DEVICE uint64_t lane_result_reread(const uint8_t* result) {
-  return *reinterpret_cast<const volatile uint64_t*>(result + kLeaseRrReady);
+  return ld_relaxed_sys<uint64_t>(result + kLeaseRrReady);
 }
 
 SGL_DEVICE bool lane_result_judge(
@@ -244,8 +265,8 @@ SGL_DEVICE void publish_terminal(
     uint8_t* lease, int64_t lease_d, uint32_t seq, uint64_t generation, uint32_t skipped_mask, uint32_t reason) {
   uint8_t* terminal =
       lease + lease_d + kLeaseTerminal + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseTerminalBytes;
-  *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermSkippedMask) = skipped_mask;
-  *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermReason) = reason;
+  st_relaxed_sys<uint32_t>(terminal + kLeaseTermSkippedMask, skipped_mask);
+  st_relaxed_sys<uint32_t>(terminal + kLeaseTermReason, reason);
   st_release_sys64(terminal + kLeaseTermGen, tagged_word(kLeaseTagTerminal, generation));
 }
 
@@ -296,8 +317,7 @@ SGL_DEVICE void lease_hit_wait_body(
 
   const uint8_t* results =
       lease + kLeaseRowResult + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
-  const uint32_t capacity =
-      *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
+  const uint32_t capacity = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
   const uint64_t deadline = load_deadline(state);
   int32_t slots[kMaxIds];
   uint32_t slot_generations[kMaxIds];
