@@ -142,7 +142,7 @@ class TestWorkerEntry(unittest.TestCase):
         before = pass_progress()
         runtime = SimpleNamespace(adapter="a", store="s", residency="r")
         runner = _runner()
-        schedule_batch = SimpleNamespace(layer_major_ring_tokens=4096)
+        schedule_batch = SimpleNamespace(layer_major_ring_tokens=4096, extend_num_tokens=100)
 
         def fake_run_pass(adapter, residency, forward_batch, schedule_batch, store):
             from sglang.srt.layer_major.heartbeat import current_heartbeat
@@ -158,7 +158,7 @@ class TestWorkerEntry(unittest.TestCase):
     def test_forward_pass_id_advances_once_per_pass(self):
         runtime = SimpleNamespace(adapter="a", store="s", residency="r")
         runner = _runner(forward_pass_id=5)
-        schedule_batch = SimpleNamespace(layer_major_ring_tokens=100)
+        schedule_batch = SimpleNamespace(layer_major_ring_tokens=100, extend_num_tokens=100)
         with mock.patch.object(worker_entry, "run_pass", return_value="logits"):
             worker_entry.run_layer_major_prefill(runtime, runner, schedule_batch, SimpleNamespace())
         self.assertEqual(runner.forward_pass_id, 6)
@@ -167,10 +167,22 @@ class TestWorkerEntry(unittest.TestCase):
         eplb_manager = mock.Mock()
         runtime = SimpleNamespace(adapter="a", store="s", residency="r")
         runner = _runner(eplb_manager=eplb_manager)
-        schedule_batch = SimpleNamespace(layer_major_ring_tokens=100)
+        schedule_batch = SimpleNamespace(layer_major_ring_tokens=100, extend_num_tokens=100)
         with mock.patch.object(worker_entry, "run_pass", return_value="logits"):
             worker_entry.run_layer_major_prefill(runtime, runner, schedule_batch, SimpleNamespace())
         eplb_manager.on_forward_pass_end.assert_called_once_with()
+
+    def test_logs_extend_num_tokens_not_ring_tokens(self):
+        # layer_major_ring_tokens is the fixed ring size (chunk + page) shared by every admitted
+        # request, not the prompt's extend length. The log line, and the chunk count derived from it,
+        # must use extend_num_tokens (the tokens this pass actually prefills).
+        runtime = SimpleNamespace(adapter="a", store="s", residency="r")
+        runner = _runner(server_args=SimpleNamespace(chunked_prefill_size=4096))
+        schedule_batch = SimpleNamespace(layer_major_ring_tokens=99999, extend_num_tokens=8192)
+        with mock.patch.object(worker_entry, "run_pass", return_value="logits"):
+            with self.assertLogs(worker_entry.logger, level="INFO") as cm:
+                worker_entry.run_layer_major_prefill(runtime, runner, schedule_batch, SimpleNamespace())
+        self.assertEqual(cm.output, ["INFO:sglang.srt.layer_major.worker_entry:layer-major prefill: 8192 tokens in 2 chunks"])
 
 
 if __name__ == "__main__":
