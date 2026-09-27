@@ -3515,6 +3515,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        # At max_running_requests=1, update_running_batch reuses the same
+        # object across the extend-to-decode transition (running_batch =
+        # last_batch when running_batch was empty), so a layer-major extend's
+        # ring size would otherwise survive into its own decode batch and the
+        # tp_worker seam would run the layer-major pass on a decode step.
+        self.layer_major_ring_tokens = None
+
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None

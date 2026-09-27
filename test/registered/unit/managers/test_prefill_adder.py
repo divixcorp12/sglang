@@ -126,6 +126,14 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        # Read unconditionally by _select_prefill_admission's layer_major_admission
+        # call, even when the adder has no layer_major_gate (short-circuited to
+        # None inside that function, but the kwargs are still evaluated here).
+        req.return_logprob = False
+        req.logprob_start_len = 0
+        req.origin_input_ids = []
+        req.return_hidden_states = False
+        req.layer_major = False
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -1371,6 +1379,64 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             ).memory_budget.swa_never_fits(**req)
         )
+
+    # --- layer-major admission: req.layer_major is set only on commit ---
+
+    def test_layer_major_rejected_by_delayer_leaves_flag_false(self):
+        """A candidate the layer-major admission would select, but that the
+        prefill delayer then rejects, must not leave a stale req.layer_major."""
+        from sglang.srt.layer_major.gate import LayerMajorGate
+
+        delayer = _RecordingDelayer(allow=False)
+        adder = self.create_shared_adder()
+        adder.layer_major_gate = LayerMajorGate(min_tokens=1, max_tokens=1_000_000)
+        adder.layer_major_ring_tokens = 4
+        adder.prefill_delayer_single_pass = delayer
+        req = self.create_shared_req("rejected")
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertFalse(req.layer_major)
+
+    def test_layer_major_gate_present_but_extend_too_short_is_not_ring(self):
+        """The gate refuses (extend below min_tokens), so the request commits
+        through the normal path; req.layer_major must be False, not stale."""
+        from sglang.srt.layer_major.gate import LayerMajorGate
+
+        adder = self.create_shared_adder()
+        adder.layer_major_gate = LayerMajorGate(min_tokens=999_999, max_tokens=2_000_000)
+        adder.layer_major_ring_tokens = 4
+        req = self.create_shared_req("too-short")
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertFalse(req.layer_major)
+
+    def test_layer_major_admits_and_commits_flag_true(self):
+        """The positive case: gate admits, ring fits, and the flag is set only
+        once _commit_prefill_admission actually runs."""
+        from sglang.srt.layer_major.gate import LayerMajorGate
+
+        adder = self.create_shared_adder()
+        adder.layer_major_gate = LayerMajorGate(min_tokens=1, max_tokens=1_000_000)
+        adder.layer_major_ring_tokens = 4
+        req = self.create_shared_req("ring")
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertTrue(req.layer_major)
 
 
 if __name__ == "__main__":
