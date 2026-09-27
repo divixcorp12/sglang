@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layer_major.heartbeat import pass_progress
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
@@ -506,7 +507,8 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        # A layer-major prefill is one forward that can outlast the timeout; it ticks per layer and chunk.
+        get_counter=lambda: scheduler.forward_ct + pass_progress(),
         is_active=lambda: (
             scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
         ),
