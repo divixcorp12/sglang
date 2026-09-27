@@ -296,11 +296,38 @@ def test_a_file_cut_short_after_open_fails_the_read(tier):
 
 
 def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
-    """tables_from indexes slabs[row][name] for every layout name; a 5-wide table would read past each row."""
+    """tables_from indexes slabs[row][name] for every layout name; a 5-wide table would read past each row.
+
+    check_table_tensors now runs before tables_from and refuses a 5-wide slabs table on shape alone, naming the
+    tensor (Ruling 3's verify_named prefix), so tables_from's own "6 names" message is never reached."""
     s = ram_miss_setup(tmp_path)
     narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:5])
-    with pytest.raises(RuntimeError, match="exl3 RAM miss: .*6 names"):
+    with pytest.raises(RuntimeError, match="^slabs: "):
         exl3_ram_miss.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=False)
+
+
+def test_open_refuses_an_extent_table_of_the_wrong_dtype(tmp_path):
+    """open() (via read_rows_once's C++ entry) reads extents as int64 [L, E, parts, 4] through a raw pointer; int32
+    would be read as packed pairs and name files and offsets that were never written. check_table_tensors catches
+    this at the FFI boundary before tables_from ever dereferences the tensor."""
+    s = ram_miss_setup(tmp_path)
+    bad = dataclasses.replace(s.tables, extents=s.tables.extents.to(torch.int32))
+    with pytest.raises(Exception, match="^extents: "):
+        exl3_ram_miss.read_rows_once(bad, row=0, experts=[0], slots=[0], direct=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to show experts is refused off it")
+def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
+    """experts is read on the host through ids_of's raw int64 cast; a CUDA tensor would have this host-only FFI
+    entry read GPU memory as host memory. read_rows_once always rebuilds experts as a fresh CPU tensor
+    (``_ids``), so this device refusal is only observable by calling the raw C++ export directly."""
+    s = ram_miss_setup(tmp_path)
+    module = exl3_ram_miss._host_module()
+    args = exl3_ram_miss._table_args(s.tables, False)
+    experts = torch.tensor([0], dtype=torch.int64, device="cuda")
+    slots = torch.tensor([0], dtype=torch.int64)
+    with pytest.raises(Exception, match="^experts: "):
+        module.exl3_ram_miss_read_rows(*args, 0, experts, slots, exl3_ram_miss.BOUNCE_ROWS)
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
