@@ -1019,11 +1019,10 @@ def candidate_tail_only_of(config) -> bool:
     """Whether the torch prefill indexer's candidate source may publish tail-only masks:
     true unless a candidate consumer could run before the late-layer tail begins, in
     which case it would read a mask with fewer rows than it addresses. Derived from
-    config alone (never a model instance): a draft model's config (NextN, DSpark) never
-    builds a `late_layer_start` attribute to read, but always has
-    candidate_source_layer_id < 0 (drafts do not run candidate indexing), so
-    late_layer_start_of is never reached for one."""
-    candidate_source_layer_id = getattr(config, "candidate_source_layer_id", -1)
+    config alone (never a model instance): NextN and DSpark reuse the target's hf
+    config with only architectures[0] renamed (model_config.py _config_draft_model),
+    so they resolve exactly like the target here."""
+    candidate_source_layer_id = config.candidate_source_layer_id
     if candidate_source_layer_id < 0:
         return True
     late_layer_start = late_layer_start_of(config)
@@ -1806,14 +1805,17 @@ class DeepseekV4AttnBackend(
         )
         tail = tail_metadata.late_layer_tail
         tail_lens_cpu = candidate_publish_rows(tail_metadata)
-        # The torch source publishes only these rows (the slice is then whole); the dense
-        # source still publishes every row.
+        # Only when candidate_tail_only is set does the torch source publish just
+        # these rows (the slice is then whole); otherwise, and on the dense path,
+        # every row is published and the slice cuts it.
         full_masks = self.forward_metadata.candidate_metadata
         if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
             tail_metadata.candidate_metadata = CandidateMasks(
                 request_masks=[
                     mask[mask.shape[0] - t :]
-                    for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
+                    for mask, t in zip(
+                        full_masks.request_masks, tail_lens_cpu, strict=True
+                    )
                 ]
             )
         # The layers before the switch published top-k into the full metadata's
