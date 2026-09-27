@@ -24,6 +24,10 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layer_major.worker_entry import (
+    layer_major_runtime,
+    run_layer_major_prefill,
+)
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -355,6 +359,7 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_model_config()
         self._init_model_runner()
+        self._layer_major = layer_major_runtime(self.model_runner)
 
         if is_multi_layer_eagle:
             self._init_multi_layer_eagle_model_runners()
@@ -671,10 +676,15 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            if batch is not None and batch.layer_major_ring_tokens is not None:
+                out = run_layer_major_prefill(
+                    self._layer_major, self.model_runner, batch, forward_batch
+                )
+            else:
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
