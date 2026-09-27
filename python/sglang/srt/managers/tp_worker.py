@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layer_major.worker_entry import (
     layer_major_runtime_for_worker,
     run_layer_major_prefill,
+    takes_layer_major_path,
 )
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -678,7 +679,7 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
-            if batch is not None and batch.layer_major_ring_tokens is not None:
+            if takes_layer_major_path(batch, forward_batch):
                 out = run_layer_major_prefill(
                     self._layer_major, self.model_runner, batch, forward_batch
                 )
