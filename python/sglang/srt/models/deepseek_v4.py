@@ -5235,6 +5235,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         output.hidden_states_token_indices = tail.token_indices
         return output
 
+    def make_layer_major_adapter(self, model_runner):
+        from sglang.srt.models.deepseek_v4_layer_major import DeepseekV4LayerMajorAdapter
+
+        return DeepseekV4LayerMajorAdapter(model_runner)
+
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         if _FP8_WO_A_UE8M0:
             from deep_gemm import transform_sf_into_required_layout
