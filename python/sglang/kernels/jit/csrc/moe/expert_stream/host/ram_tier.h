@@ -852,7 +852,9 @@ class RamTier {
   // entry is watched until a `settle` pass: one that runs after the caller observed a later demand posted (or
   // synchronized the stream). Under A1 the device emitted every signal of a request before posting the next one,
   // so that pass compares each closed entry's words for the last time and ends its watch. The idle early-out
-  // skips unsettled watches, which the next posted demand's settle pass then covers.
+  // skips unsettled watches, which the next posted demand's settle pass then covers (or pause, or stop_thread's
+  // final settle). Clearing `watched` at a settle only bounds the cost of later passes: correctness does not depend
+  // on it, since every comparison matches on the generation and a ring index's reuse resets the entry anyway.
   void retire_leases(bool settle = false) {
     if (lease_ == nullptr || (!settle && lanes_outstanding_.load(std::memory_order_relaxed) == 0)) return;
     std::lock_guard<std::mutex> guard(mutex_);

@@ -1104,14 +1104,22 @@ struct HostExports {
 
   static void stop_thread(int64_t handle) {
     std::shared_ptr<Thread> thread;
+    std::shared_ptr<Tier> tier;
     {
       std::lock_guard<std::mutex> guard(registry_mutex());
       const auto found = thread_registry().find(handle);
       if (found == thread_registry().end()) return;
       thread = std::move(found->second);
       thread_registry().erase(found);
+      const auto owner = registry().find(handle);
+      if (owner != registry().end()) tier = owner->second;
     }
     thread->stop();
+    // The final settle (LEASE_PROTOCOL.md 7.5): no demand follows the last one to settle it, so a late second signal
+    // on it is compared here, before ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop,
+    // which ~RamThread also runs and which could then read a lease page the Python side already freed; at this point
+    // the thread has joined and the page is still alive, because close() runs after this call.
+    if (tier) tier->retire_leases(true);
   }
 
   static int64_t pause(int64_t handle, int64_t timeout_ns) {
