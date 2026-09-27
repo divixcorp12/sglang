@@ -15,9 +15,13 @@ import torch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+# alloc_extend_swa_tail's full-side allocator dispatches a Triton kernel that
+# needs an active GPU driver even for these tiny tensors, so TestWindowRing
+# cannot run CPU-only; TestRingBudget (pure Python, no allocator) rides along.
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 PAGE = 4
 CHUNK = 16
@@ -25,6 +29,7 @@ RING = CHUNK + PAGE  # 5 pages
 
 
 def _allocator(size=256, size_swa=64):
+    device = get_device()
     kv = SWAKVPool(
         size=size,
         size_swa=size_swa,
@@ -34,23 +39,25 @@ def _allocator(size=256, size_swa=64):
         head_dim=8,
         swa_attention_layer_ids=[1],
         full_attention_layer_ids=[0],
-        device="cpu",
+        device=device,
     )
     return SWATokenToKVPoolAllocator(
         size=size,
         size_swa=size_swa,
         page_size=PAGE,
         dtype=torch.bfloat16,
-        device="cpu",
+        device=device,
         kvcache=kv,
         need_sort=False,
     )
 
 
 def _alloc_whole(a, n):
-    t = torch.tensor
+    device = get_device()
+    cpu = torch.tensor
+    dev = lambda v: torch.tensor(v, device=device)
     full = a.alloc_extend_swa_tail(
-        t([0]), t([0]), t([n]), t([n]), t([-1]), n, swa_tail_len=RING
+        dev([0]), cpu([0]), dev([n]), cpu([n]), dev([-1]), n, swa_tail_len=RING
     )
     assert full is not None
     return full
@@ -70,24 +77,28 @@ class TestWindowRing(unittest.TestCase):
 
     def test_every_chunk_sees_its_predecessor_page_in_distinct_slots(self):
         a = _allocator()
+        device = get_device()
         n = 64
         full = _alloc_whole(a, n)
         ring = a.ring_slots(full[-RING:])
         for start in range(0, n, CHUNK):
-            pos = torch.arange(start, min(n, start + CHUNK))
+            pos = torch.arange(start, min(n, start + CHUNK), device=device)
             a.map_ring_positions(full[pos], pos, ring)
-            window = torch.arange(max(0, start - PAGE), min(n, start + CHUNK))
+            window = torch.arange(
+                max(0, start - PAGE), min(n, start + CHUNK), device=device
+            )
             slots = a.full_to_swa_index_mapping[full[window]]
             self.assertEqual(slots.unique().numel(), window.numel())
 
     def test_release_after_finalize_returns_every_slot(self):
         a = _allocator()
+        device = get_device()
         swa_before, full_before = a.swa_available_size(), a.full_available_size()
         n = 50  # final chunk of 2 tokens
         full = _alloc_whole(a, n)
         ring = a.ring_slots(full[-RING:])
         for start in range(0, n, CHUNK):
-            pos = torch.arange(start, min(n, start + CHUNK))
+            pos = torch.arange(start, min(n, start + CHUNK), device=device)
             a.map_ring_positions(full[pos], pos, ring)
         keep_from = (n - 8) // PAGE * PAGE
         a.finalize_ring(full, extend_start=0, keep_from=keep_from, ring=ring)
