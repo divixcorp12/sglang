@@ -1617,3 +1617,127 @@ or `row_copy_kernels.cuh`; service → `expert_stream/host/ram_tier.h`; Python �
   - `LayoutType`: Task 7, read by `RamTier`.
   - `LeaseProtocolKernel` / `RowCopyKernel<L>`: Task 8, renamed exports in 11.
   - `_no_hot_slots`: Task 8, used by the Task 8 test.
+
+---
+
+### Task 13: One shared host FFI surface; the EXL3 host file is only bindings (added 2026-09-27 at the user's request)
+
+The final review found that `exl3_ram_miss_host.cpp` is a 1,208-line FFI surface with 65 exports, almost all
+format-free, so a second format would have to copy it wholesale. After this task, adding a format means writing a
+layout trait, a ~30-line host `.cpp`, a ~15-line device `.cuh`, and a `LAYOUTS` row. A test proves it with a second,
+two-name layout.
+
+**Files:**
+- Create: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h`
+- Modify (shrink to bindings): `python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp`
+- Create (test-only): `test/registered/unit/kernels/expert_stream_two_name/{two_name_layout.h,two_name_host.cpp,two_name_device.cuh}`
+- Test: `test/registered/unit/kernels/test_expert_stream_second_layout.py`, and a source test in
+  `test_exl3_ram_miss_device_args.py`
+
+**Interfaces:**
+- Consumes: `RowReader<Layout, Reader>`, `RamTier<Source>`, `RamThread<Tier>`, `tables_from<Layout>`,
+  `check_fault_words<Layout>`, `error_prefix<Layout>()`, `kNumNames<Layout>`, `verify_named`, `TransportBuild`
+  (with `host_source`, `device_layout`, `device_source` after the final-review fix round), `LAYOUTS`.
+- Produces:
+  - `template <ExpertRowLayout Layout, AsyncFileReader Reader> struct sglang::expert_stream::HostExports`, with member
+    types `Source = RowReader<Layout, Reader>`, `Tier = RamTier<Source>`, `Thread = RamThread<Tier>`; every former
+    free export as a `static` member function with the **same name minus the `expert_stream_` prefix** (e.g.
+    `HostExports<...>::read_rows`), the same parameter list and body; `registry_mutex`/`registry`/`find`/
+    `thread_registry`/`find_thread`/`check_table_tensors` as static members.
+  - Macro `EXPERT_STREAM_HOST_EXPORTS(Exports)`, defined at the end of `ffi_exports.h`, expanding to exactly the 65
+    `TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_<x>, Exports::<x>);` lines (same export names as today, so no Python
+    change).
+
+- [ ] **Step 1 (prepare, in place, `non_mechanical_provable`):** In `exl3_ram_miss_host.cpp` only, make every export
+  body format-free without moving it:
+  - Add at the top of the anonymous namespace: `using Layout = exl3::Exl3RowLayout;` and rename the aliases
+    `Exl3Source`/`Exl3Tier`/`Exl3Thread` to `Source`/`Tier`/`Thread`.
+  - Replace every `exl3::Exl3RowLayout` in bodies with `Layout`.
+  - Replace every `"exl3 RAM miss: ..."` literal with `error_prefix<Layout>() + "..."`, and every other EXL3-worded
+    literal (e.g. the `"WARNING exl3 RAM miss: ..."` fprintf, `std::string(exl3::Exl3RowLayout::kName) + "-pack"`)
+    with its `Layout::kName`-built form, **keeping the EXL3 runtime text byte-identical**. List each message with its
+    old text and its new expression in the commit body.
+  - After this step, `grep -n 'exl3\|Exl3' exl3_ram_miss_host.cpp` must show only the include of
+    `exl3/exl3_row_layout.h`, the `using Layout = exl3::Exl3RowLayout;` line, and comments.
+  - Verify: `c++ -fsyntax-only` of the .cpp on divix01, then the targeted host tests
+    (`test_exl3_ram_miss_{tier,split,row_images,copy_engine,thread,pack_workers}.py`, `test_exl3_ram_miss_service.py`).
+
+- [ ] **Step 2 (move, `non_mechanical_provable` — the bodies move into a class template, so indentation and a `static`
+  keyword change; review it with `git show --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`):**
+  - Create `ffi_exports.h`:
+    ```cpp
+    // The expert-stream host FFI surface, written once for every row layout and file reader. An instantiation file
+    // names a layout and a reader and expands EXPERT_STREAM_HOST_EXPORTS; see exl3_ram_miss_host.cpp.
+    #pragma once
+
+    #include "ram_thread.h"
+    // (plus every include the moved bodies need, taken from exl3_ram_miss_host.cpp)
+
+    namespace sglang::expert_stream {
+
+    template <ExpertRowLayout Layout, AsyncFileReader Reader>
+    struct HostExports {
+      using Source = RowReader<Layout, Reader>;
+      using Tier = RamTier<Source>;
+      using Thread = RamThread<Tier>;
+
+      // (the anonymous-namespace helpers and every export body from Step 1, each as `static`, names without the
+      //  expert_stream_ prefix, bodies unchanged apart from indentation)
+    };
+
+    }  // namespace sglang::expert_stream
+
+    // One line per export; the list is the module's whole Python-visible surface.
+    #define EXPERT_STREAM_HOST_EXPORTS(Exports)                                           \
+      TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);         \
+      /* ... every export, in today's order ... */
+    ```
+    Static function-local registries inside a class template are per instantiation, and each layout is its own
+    `.so`, so a second layout can never resolve another's handles (the reason Task 6 used an anonymous namespace).
+  - `exl3_ram_miss_host.cpp` becomes:
+    ```cpp
+    // The EXL3 instantiation of the expert-stream host transport: its row layout and file reader, and the FFI exports.
+    #include "exl3/exl3_row_layout.h"
+    #include "expert_stream/host/faulty_reader.h"
+    #include "expert_stream/host/ffi_exports.h"
+    #include "expert_stream/host/uring_reader.h"
+
+    namespace sglang {
+    using Exl3HostExports = expert_stream::HostExports<exl3::Exl3RowLayout, expert_stream::FaultyReader<expert_stream::UringReader>>;
+    static_assert(expert_stream::AsyncFileReader<expert_stream::FaultyReader<expert_stream::UringReader>>);
+    }  // namespace sglang
+
+    EXPERT_STREAM_HOST_EXPORTS(::sglang::Exl3HostExports)
+    ```
+    (Adjust namespaces/qualification to what compiles; `TVM_FFI_DLL_EXPORT_TYPED_FUNC` must be used where it is
+    legal today — check whether today's exports sit inside `namespace sglang` and keep that.)
+  - Check the export list is complete and unchanged: `nm -D --defined-only` (or the tvm-ffi registry listing) of the
+    built `.so` before (d783fc22a5-era build or the Step 1 build) and after must list the same `expert_stream_*`
+    symbols. Put both lists' diff (expected empty) in the report.
+
+- [ ] **Step 3: The second-layout test (the goal, proven).**
+  - `expert_stream_two_name/two_name_layout.h`: `struct TwoNameLayout { static constexpr std::string_view kName =
+    "two"; static constexpr std::array<std::string_view, 2> kNames = {"a", "b"}; static constexpr uint32_t
+    kSmallMask = 0b10; };` in `namespace sglang::expert_stream::testing`.
+  - `two_name_host.cpp`: the same ~15 lines as the EXL3 file with `TwoNameLayout`.
+  - `two_name_device.cuh`: include `expert_stream/lease_kernels.cuh`, `expert_stream/row_copy_kernels.cuh` and
+    `two_name_layout.h` (mirror what `exl3_ram_miss.cuh` includes).
+  - `test_expert_stream_second_layout.py` (GPU-free host part runs in SUITE_UNIT; the device build is skipped when no
+    CUDA): monkeypatch `LAYOUTS["two"] = TransportBuild(host_source=<abs path of two_name_host.cpp>,
+    device_layout="sglang::expert_stream::testing::TwoNameLayout", device_source=<abs path of two_name_device.cuh>)`,
+    then assert `host_layout("two") == (("a", "b"), 0b10)`, that `_host_module("two")` and `_host_module("exl3")`
+    are distinct modules, and (when CUDA is available) that `_device_module("two")` builds. Check first that
+    `load_jit` accepts absolute source paths (`resolve_sources` in `python/sglang/kernels/jit/utils/compile/`); if it
+    does not, place the three files under `python/sglang/kernels/jit/csrc/moe/expert_stream/testing/` instead and say
+    so.
+  - Source test in `test_exl3_ram_miss_device_args.py`: `test_the_exl3_host_file_is_only_bindings` — the file has no
+    function definitions (no line matching `^\w.*\)\s*\{$` outside the namespace/alias lines) and fewer than 40
+    lines; a regression that re-grows a body there fails with the file name.
+
+- [ ] **Step 4: Verify.** On divix01: compile checks; full `SUITE_UNIT` (expected: previous gate plus the new tests) and
+  `SUITE_GPU` (104). The `nm` export-list diff is empty.
+
+- [ ] **Step 5: Commits** — Step 1: `refactor(expert-stream): the EXL3 host exports name only their layout`;
+  Step 2: `refactor(expert-stream): one host FFI surface for every layout (HostExports)`; Step 3:
+  `test(expert-stream): a second row layout builds from a trait and a bindings file`. Each with
+  `non_mechanical_provable`.
