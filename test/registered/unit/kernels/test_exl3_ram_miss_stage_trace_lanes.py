@@ -89,7 +89,7 @@ def test_without_an_explicit_count_the_simulated_device_posts_one_lane_per_need_
 def test_the_device_writes_the_lane_count_into_the_record_it_posts():
     """The post kernel cannot run here; check its source stores the count the host reads at kRecLanes."""
     source = joined_text(device_sources())
-    assert "words[kRecLanes / 4] = lanes;" in source
+    assert "st_relaxed_sys<uint32_t>(record + kRecLanes, lanes);" in source
     assert re.search(r"lanes = static_cast<uint32_t>\(max\(count\[0\], 0\)\)", source)
     assert source.count("write_record(") == 3  # the definition and the demand and advisory posts
     assert "seq, 1u, ahead_count);" in source and "armed ? 1u : 0u, lanes);" in source
