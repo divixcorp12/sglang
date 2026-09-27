@@ -4,7 +4,7 @@
 #include "ram_tier.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 
 // Pumps one RamTier on its own thread (plan D19): demands first, then advisories; spins
@@ -208,5 +208,5 @@ inline std::shared_ptr<RamThread> find_thread(int64_t handle) {
 }
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

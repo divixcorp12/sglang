@@ -41,7 +41,7 @@
 #include <vector>
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 using tvm::ffi::TensorView;
 
@@ -274,5 +274,5 @@ constexpr int64_t kStageAdvisory = 1;
 constexpr int64_t kStageTouch = 2;
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

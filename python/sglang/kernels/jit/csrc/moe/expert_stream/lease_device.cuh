@@ -8,6 +8,8 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/distributed/ptx.cuh>
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -15,7 +17,7 @@
 #include <cstdint>
 
 namespace sglang {
-namespace exl3_ram_miss_device {
+namespace device::expert_stream {
 
 using namespace ::sglang::expert_stream::wire;
 
@@ -48,62 +50,60 @@ constexpr int kCopyWaits = 18;     // requests whose copy-engine lanes the copy 
 constexpr int kCopySpun = 19;      // ... of which CopyDone was not yet published on the first read
 constexpr int kStateWords = 20;
 
-__device__ __forceinline__ uint32_t ld_acquire_sys(const uint8_t* address) {
-  uint32_t value;
-  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
-  return value;
+SGL_DEVICE uint32_t ld_acquire_sys(const uint8_t* address) {
+  return ::sglang::device::ptx::load_acquire_sys(reinterpret_cast<const uint32_t*>(address));
 }
 
-__device__ __forceinline__ void st_release_sys(uint8_t* address, uint32_t value) {
+SGL_DEVICE void st_release_sys(uint8_t* address, uint32_t value) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
 }
 
-__device__ __forceinline__ uint64_t ld_acquire_sys64(const uint8_t* address) {
+SGL_DEVICE uint64_t ld_acquire_sys64(const uint8_t* address) {
   uint64_t value;
   asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
   return value;
 }
 
-__device__ __forceinline__ void st_release_sys64(uint8_t* address, uint64_t value) {
+SGL_DEVICE void st_release_sys64(uint8_t* address, uint64_t value) {
   asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(address), "l"(value) : "memory");
 }
 
-__device__ __forceinline__ uint64_t tagged_word(uint64_t tag, uint64_t generation) {
+SGL_DEVICE uint64_t tagged_word(uint64_t tag, uint64_t generation) {
   return (tag << 56) | generation;
 }
 
-__device__ __forceinline__ int32_t ld_volatile(const int32_t* address) {
+SGL_DEVICE int32_t ld_volatile(const int32_t* address) {
   return *reinterpret_cast<const volatile int32_t*>(address);
 }
 
-__device__ __forceinline__ uint64_t global_ns() {
+SGL_DEVICE uint64_t global_ns() {
   uint64_t value;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
   return value;
 }
 
-__device__ __forceinline__ void store_deadline(int32_t* state, uint64_t deadline) {
+SGL_DEVICE void store_deadline(int32_t* state, uint64_t deadline) {
   state[kDeadlineLo] = static_cast<int32_t>(static_cast<uint32_t>(deadline & 0xFFFFFFFFull));
   state[kDeadlineHi] = static_cast<int32_t>(static_cast<uint32_t>(deadline >> 32));
 }
 
-__device__ __forceinline__ uint64_t load_deadline(const int32_t* state) {
+SGL_DEVICE uint64_t load_deadline(const int32_t* state) {
   return (static_cast<uint64_t>(static_cast<uint32_t>(state[kDeadlineHi])) << 32) |
          static_cast<uint64_t>(static_cast<uint32_t>(state[kDeadlineLo]));
 }
 
-__device__ __forceinline__ bool reached(uint32_t observed, uint32_t seq) {
+SGL_DEVICE bool reached(uint32_t observed, uint32_t seq) {
   return static_cast<int32_t>(observed - seq) >= 0;
 }
 
-__device__ __forceinline__ bool listed(const int32_t* ids, int count, int32_t id) {
+SGL_DEVICE bool listed(const int32_t* ids, int count, int32_t id) {
   for (int i = 0; i < count; ++i) {
     if (ids[i] == id) return true;
   }
   return false;
 }
 
-__device__ __forceinline__ void write_record(
+SGL_DEVICE void write_record(
     uint8_t* record, uint32_t seq, int64_t row, const int32_t* need, int need_count, const int32_t* protect,
     int protect_count, uint32_t after, uint32_t armed, uint32_t lanes) {
   volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(record);
@@ -130,7 +130,7 @@ __device__ __forceinline__ void write_record(
   st_release_sys(record + kRecSeq, seq);
 }
 
-__device__ __forceinline__ void raise_fatal(uint8_t* page, uint32_t seq) {
+SGL_DEVICE void raise_fatal(uint8_t* page, uint32_t seq) {
   if (ld_acquire_sys(page + kFatal) == 0) st_release_sys(page + kFatal, seq);
 }
 
@@ -156,7 +156,7 @@ struct LaneRead {
   int32_t expert;
 };
 
-__device__ __forceinline__ LaneRead lane_result_read(const uint8_t* result) {
+SGL_DEVICE LaneRead lane_result_read(const uint8_t* result) {
   LaneRead r;
   r.ready = ld_acquire_sys64(result + kLeaseRrReady);
   r.slot_generation = *reinterpret_cast<const volatile uint32_t*>(result + kLeaseRrSlotGeneration);
@@ -166,11 +166,11 @@ __device__ __forceinline__ LaneRead lane_result_read(const uint8_t* result) {
 }
 
 // Relaxed: the caller's fence already orders it after the payload loads, and nothing after it depends on it.
-__device__ __forceinline__ uint64_t lane_result_reread(const uint8_t* result) {
+SGL_DEVICE uint64_t lane_result_reread(const uint8_t* result) {
   return *reinterpret_cast<const volatile uint64_t*>(result + kLeaseRrReady);
 }
 
-__device__ __forceinline__ bool lane_result_judge(
+SGL_DEVICE bool lane_result_judge(
     const LaneRead& r,
     uint64_t again,
     uint64_t generation,
@@ -200,7 +200,7 @@ __device__ __forceinline__ bool lane_result_judge(
   return valid;
 }
 
-__device__ __forceinline__ bool lane_result_valid(
+SGL_DEVICE bool lane_result_valid(
     const uint8_t* result,
     uint64_t generation,
     int64_t expected_expert,
@@ -224,7 +224,7 @@ __device__ __forceinline__ bool lane_result_valid(
 // A Terminal record (LEASE_PROTOCOL.md 13): the mask and the reason first, the tagged generation word last with a
 // release store, so a reader that acquires the word sees the mask. Named lanes never start a copy afterwards: the
 // caller has already left go_count at zero.
-__device__ __forceinline__ void publish_terminal(
+SGL_DEVICE void publish_terminal(
     uint8_t* lease, int64_t lease_d, uint32_t seq, uint64_t generation, uint32_t skipped_mask, uint32_t reason) {
   uint8_t* terminal = lease + lease_d + kLeaseTerminal + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseTerminalBytes;
   *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermSkippedMask) = skipped_mask;
@@ -235,7 +235,7 @@ __device__ __forceinline__ void publish_terminal(
 
 
 // Stage 1's body, shared by the two-phase W1 and piece streaming's W1 (which also resets the stream kernel's words).
-__device__ __forceinline__ void lease_hit_wait_body(
+SGL_DEVICE void lease_hit_wait_body(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int64_t* __restrict__ planned,
@@ -364,5 +364,5 @@ __device__ __forceinline__ void lease_hit_wait_body(
 }
 
 
-}  // namespace exl3_ram_miss_device
+}  // namespace device::expert_stream
 }  // namespace sglang

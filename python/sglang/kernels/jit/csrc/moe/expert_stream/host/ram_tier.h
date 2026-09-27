@@ -4,7 +4,7 @@
 #include "copy_engine.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 struct Tier {
   int64_t capacity = 0;
@@ -1850,5 +1850,5 @@ inline std::shared_ptr<RamTier> find(int64_t handle) {
 }
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

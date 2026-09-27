@@ -5,7 +5,7 @@
 #include "pack_pool.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 // io_uring superset reads of whole expert rows into page-aligned bounce banks, then the
 // per-name split into the pinned slabs (Exl3ShardRowSource.read's copies).
@@ -1477,5 +1477,5 @@ class RowReader {
 };
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

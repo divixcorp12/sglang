@@ -4,7 +4,7 @@
 #include "tier_protocol.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 struct CopyLane {
   int32_t lane = 0;
@@ -505,5 +505,5 @@ class CopyEngine {
 };
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

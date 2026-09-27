@@ -51,7 +51,7 @@ void exl3_ram_miss_post(
     tvm::ffi::TensorView dst_slots,
     int64_t copy_engine) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_post_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -89,7 +89,7 @@ void exl3_ram_miss_wait(
     tvm::ffi::TensorView ram_miss,
     int64_t timeout_ns) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -120,7 +120,7 @@ void exl3_ram_miss_lease_wait(
     tvm::ffi::TensorView go_count,
     tvm::ffi::TensorView lane_ctx) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_lease_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -147,7 +147,7 @@ void exl3_ram_miss_lease_ack(
     tvm::ffi::TensorView lane_ctx,
     tvm::ffi::TensorView keep) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, static_cast<int>(exl3_ram_miss_device::kLeaseLanes), stream)(
+  host::LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(
       exl3_ram_miss_lease_ack_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       reinterpret_cast<uint8_t*>(lease_address),
@@ -175,7 +175,7 @@ void exl3_ram_miss_lease_hit_wait(
     tvm::ffi::TensorView violated,
     int64_t budget_ns) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_lease_hit_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -218,7 +218,7 @@ void exl3_ram_miss_lease_rest_wait(
     tvm::ffi::TensorView lane_ctx_2,
     tvm::ffi::TensorView origin_2) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_lease_rest_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -253,7 +253,7 @@ void exl3_ram_miss_lease_stage_ack(
     tvm::ffi::TensorView origin,
     tvm::ffi::TensorView violated) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, static_cast<int>(exl3_ram_miss_device::kLeaseLanes), stream)(
+  host::LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(
       exl3_ram_miss_lease_stage_ack_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       reinterpret_cast<uint8_t*>(lease_address),
@@ -276,7 +276,7 @@ void exl3_ram_miss_lease_finalize(
     int64_t lease_address,
     int64_t lease_d) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_lease_finalize_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -301,7 +301,7 @@ void exl3_ram_miss_lease_copy_wait(
     int64_t sm_count,
     tvm::ffi::TensorView go_ce) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  const int threads = sm_count > 0 ? exl3_ram_miss_device::kCopyWaitThreads : exl3_ram_miss_device::kBlock;
+  const int threads = sm_count > 0 ? device::expert_stream::kCopyWaitThreads : device::expert_stream::kBlock;
   host::LaunchKernel(1, threads, stream)(
       exl3_ram_miss_lease_copy_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
@@ -336,7 +336,7 @@ void exl3_ram_miss_lease_stream_hit_wait(
     tvm::ffi::TensorView stream_count,
     tvm::ffi::TensorView stream_abort) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(1, exl3_ram_miss_device::kBlock, stream)(
+  host::LaunchKernel(1, device::expert_stream::kBlock, stream)(
       exl3_ram_miss_lease_stream_hit_wait_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),
@@ -386,7 +386,7 @@ void exl3_ram_miss_lease_stream(
     tvm::ffi::TensorView piece_runs,
     tvm::ffi::TensorView fault) {
   const auto stream = host::LaunchKernel::resolve_device(state.device());
-  host::LaunchKernel(exl3_ram_miss_device::kStreamBlocks, exl3_ram_miss_device::kStreamThreads, stream)(
+  host::LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream)(
       exl3_ram_miss_lease_stream_kernel,
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(state.data_ptr()),

@@ -6,7 +6,7 @@
 
 namespace sglang {
 
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_post_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int32_t* __restrict__ slot_map,
@@ -29,7 +29,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     const int32_t* __restrict__ dst_slots,
     int64_t dst_count,
     int64_t copy_engine) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   if (state[kSticky] != 0 || ld_acquire_sys(page + kFatal) != 0) {
     state[kSticky] = 1;
@@ -131,7 +131,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   st_release_sys(page + kAdviseHead, advice);
 }
 
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int32_t* __restrict__ slot_map,
@@ -144,7 +144,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     float* __restrict__ keep,
     int64_t* __restrict__ ram_miss,
     int64_t timeout_ns) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   // D15: the page's fatal word too, not only this device's sticky flag.
   bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0;
@@ -209,7 +209,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
 // from the lanes' RowResults, never from the slot map. `go_count[0]` is zero on entry and is written exactly once,
 // as the last store of a commit; every other exit leaves it zero, so the copy kernel that reads it as its active
 // count copies nothing and the ack kernel that reads it acknowledges nothing.
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_lease_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int64_t* __restrict__ planned,
@@ -224,7 +224,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     int64_t lease_d,
     int32_t* __restrict__ go_count,
     int64_t* __restrict__ lane_ctx) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   go_count[0] = 0;  // fail closed
   bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 && ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
@@ -358,7 +358,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
 // owned by stage 2, the stage that knows the true miss count once the request has been served.
 
 
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_lease_hit_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_hit_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int64_t* __restrict__ planned,
@@ -377,7 +377,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     int32_t* __restrict__ violated,
     int64_t budget_ns) {
   if (threadIdx.x != 0) return;
-  exl3_ram_miss_device::lease_hit_wait_body(
+  device::expert_stream::lease_hit_wait_body(
       page, state, planned, count, dst_slots, row, lanes, host_rows_1, dst_slots_1, lease, lease_d, go_1, lane_ctx_1,
       origin_1, claimed, violated, budget_ns);
 }
@@ -385,7 +385,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
 // Piece streaming's W1: stage 1 exactly, after resetting every word the stream kernel and the finalize kernel read
 // from it (plan 5, C1). go_2 and the counter are written by S only on a commit and by its blocks' counts, so without
 // this a replay could read an earlier replay's values; this is the first kernel of the chain that owns them.
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_lease_stream_hit_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_stream_hit_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int64_t* __restrict__ planned,
@@ -410,7 +410,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
   go_2[0] = 0;
   stream_count[0] = 0u;
   stream_abort[0] = 0;
-  exl3_ram_miss_device::lease_hit_wait_body(
+  device::expert_stream::lease_hit_wait_body(
       page, state, planned, count, dst_slots, row, lanes, host_rows_1, dst_slots_1, lease, lease_d, go_1, lane_ctx_1,
       origin_1, claimed, violated, budget_ns);
 }
@@ -428,7 +428,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
 //
 // `state[kPending]` is not cleared here even though this is the later of the two waits: the finalize kernel still
 // needs the request's generation, so the clear moves there and both stages read it.
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_lease_rest_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_rest_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int64_t* __restrict__ planned,
@@ -445,7 +445,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     int32_t* __restrict__ go_2,
     int64_t* __restrict__ lane_ctx_2,
     int32_t* __restrict__ origin_2) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   go_2[0] = 0;  // fail closed
   for (int64_t i = 0; i < lanes; ++i) host_rows_2[i] = 0;
@@ -559,7 +559,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
 // stage emits nothing: not an acknowledgement, not a violation, not a fatal word.
 //
 // It records a violation in `violated` rather than writing `keep`, which only the finalize kernel writes.
-__global__ __launch_bounds__(exl3_ram_miss_device::kLeaseLanes, 1) void exl3_ram_miss_lease_stage_ack_kernel(
+__global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ram_miss_lease_stage_ack_kernel(
     uint8_t* __restrict__ page,
     uint8_t* __restrict__ lease,
     int64_t lease_d,
@@ -567,7 +567,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kLeaseLanes, 1) void exl3_ram
     const int64_t* __restrict__ lane_ctx,
     const int32_t* __restrict__ origin,
     int32_t* __restrict__ violated) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   __shared__ int any_violated;
   if (threadIdx.x == 0) any_violated = 0;
   __syncthreads();
@@ -604,7 +604,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kLeaseLanes, 1) void exl3_ram
 // whole-request mask would void the hit lanes stage 1 has already acknowledged; retire_leases's per-lane state
 // machine keeps that from corrupting anything, but it records it only as kLeaseDoubleSignal, so the wrong mask
 // would otherwise be invisible.
-__global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss_lease_finalize_kernel(
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_finalize_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int32_t* __restrict__ count,
@@ -618,7 +618,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
     float* __restrict__ keep,
     uint8_t* __restrict__ lease,
     int64_t lease_d) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
@@ -668,14 +668,14 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kBlock, 1) void exl3_ram_miss
 // Every effect below is guarded by `lane < n` with n = go_count[0], so n == 0 emits nothing: not an
 // acknowledgement, not a keep write, not a fatal word. The kernel does not test "was the copy skipped"; the
 // one word that gated the copy gates this too.
-__global__ __launch_bounds__(exl3_ram_miss_device::kLeaseLanes, 1) void exl3_ram_miss_lease_ack_kernel(
+__global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ram_miss_lease_ack_kernel(
     uint8_t* __restrict__ page,
     uint8_t* __restrict__ lease,
     int64_t lease_d,
     const int32_t* __restrict__ go_count,
     const int64_t* __restrict__ lane_ctx,
     float* __restrict__ keep) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   __shared__ int violated;
   if (threadIdx.x == 0) violated = 0;
   __syncthreads();

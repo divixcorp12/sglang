@@ -5,7 +5,7 @@
 #include "row_reader.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 using namespace ::sglang::expert_stream::wire;
 
@@ -229,5 +229,5 @@ class StageRing {
 // ---- Copy engine (LEASE_PROTOCOL.md 7.6) ----
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

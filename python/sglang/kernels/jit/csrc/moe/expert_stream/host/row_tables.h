@@ -4,7 +4,7 @@
 #include "reader_base.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 struct Segment {
   int64_t name;
@@ -193,5 +193,5 @@ inline Tables tables_from(
 }
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

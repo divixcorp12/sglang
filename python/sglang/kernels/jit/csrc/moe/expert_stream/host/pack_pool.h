@@ -33,7 +33,7 @@
 #include <vector>
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 // One contiguous copy of a row: `bytes` from the bounce slot to a slab.
 struct CopyRun {
@@ -305,5 +305,5 @@ class PackPool {
   std::vector<std::thread> threads_;
 };
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

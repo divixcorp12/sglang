@@ -33,10 +33,10 @@
 
 #include "expert_stream/host/pack_pool.h"
 
-using sglang::exl3_ram_miss::ChunkStamp;
-using sglang::exl3_ram_miss::CopyRun;
-using sglang::exl3_ram_miss::PackJob;
-using sglang::exl3_ram_miss::PackPool;
+using sglang::expert_stream::ChunkStamp;
+using sglang::expert_stream::CopyRun;
+using sglang::expert_stream::PackJob;
+using sglang::expert_stream::PackPool;
 
 namespace {
 

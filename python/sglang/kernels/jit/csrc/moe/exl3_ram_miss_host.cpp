@@ -10,13 +10,13 @@
 #include "expert_stream/host/ram_thread.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 using tvm::ffi::TensorView;
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 
-using exl3_ram_miss::TensorView;
+using expert_stream::TensorView;
 
 namespace {
 
@@ -45,7 +45,7 @@ int64_t exl3_ram_miss_read_rows(
     TensorView experts,
     TensorView slots,
     int64_t step) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   RowReader reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
@@ -79,7 +79,7 @@ int64_t exl3_ram_miss_read_rows_traced(
     TensorView fault,
     TensorView record,
     int64_t owner_core) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   RowReader reader(
@@ -125,7 +125,7 @@ void exl3_ram_miss_read_rows_faulted(
     TensorView then_slots,
     TensorView fault,
     TensorView results) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   auto* out = static_cast<int64_t*>(results.data_ptr());
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
@@ -177,7 +177,7 @@ void exl3_ram_miss_read_rows_sqes(
     TensorView record,
     TensorView sqes,
     TensorView info) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
@@ -215,7 +215,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_read_rows_sqes, exl3_ram_miss_read_r
 
 // Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
 int64_t exl3_ram_miss_publish_piece(TensorView word, int64_t generation, int64_t bit) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   return publish_piece(
              static_cast<uint64_t*>(word.data_ptr()), static_cast<uint64_t>(generation), static_cast<uint8_t>(bit))
              ? 1
@@ -254,7 +254,7 @@ void exl3_ram_miss_read_rows_pieces(
     TensorView reference,
     TensorView ref_slots,
     TensorView info) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
@@ -369,7 +369,7 @@ int64_t exl3_ram_miss_piece_geometry(
     int64_t expert,
     TensorView subs,
     TensorView pieces) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   RowGeometry g;
@@ -412,7 +412,7 @@ int64_t exl3_ram_miss_piece_runs(
     int64_t slot_bytes,
     int64_t row_images,
     TensorView runs) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   const size_t rows = static_cast<size_t>(t.layers * t.experts);
@@ -449,7 +449,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_piece_runs, exl3_ram_miss_piece_runs
 // (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
 // (two words per worker). Throws, like the pool, when no core is left.
 void exl3_ram_miss_pack_pool_affinity(TensorView inherited, int64_t workers, TensorView out) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
   cpu_set_t mask;
   CPU_ZERO(&mask);
@@ -473,7 +473,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pack_pool_affinity, exl3_ram_miss_pa
 // Test only: the cores a packing worker may use when the creating thread may use those set in `inherited`
 // (two int64 words, cores 0-127), as two words in `out`. Starts no thread.
 void exl3_ram_miss_pack_worker_cpus(TensorView inherited, TensorView out) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
   cpu_set_t mask;
   CPU_ZERO(&mask);
@@ -490,8 +490,8 @@ void exl3_ram_miss_pack_worker_cpus(TensorView inherited, TensorView out) {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_pack_worker_cpus, exl3_ram_miss_pack_worker_cpus);
 
-namespace exl3_ram_miss {
-}  // namespace exl3_ram_miss
+namespace expert_stream {
+}  // namespace expert_stream
 
 int64_t exl3_ram_miss_open(
     TensorView page,
@@ -511,7 +511,7 @@ int64_t exl3_ram_miss_open(
     TensorView lease,
     int64_t pack_workers,
     TensorView hot_page) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
   auto tier = std::make_shared<RamTier>(
       static_cast<uint8_t*>(page.data_ptr()),
@@ -538,7 +538,7 @@ void exl3_ram_miss_close(int64_t handle);
 // 1 served a demand record, 3 a native-prefetch request, 2 an advisory record, 0 nothing posted. Refused while a
 // thread pumps. The order is the service thread's: demand, prefetch, advisory.
 int64_t exl3_ram_miss_pump(int64_t handle) {
-  const auto tier = exl3_ram_miss::find(handle);
+  const auto tier = expert_stream::find(handle);
   if (tier->threaded()) throw std::runtime_error("exl3 RAM miss: pump() while the service thread runs");
   if (tier->pump_demand()) return 1;
   if (tier->pump_prefetch()) return 3;
@@ -546,18 +546,18 @@ int64_t exl3_ram_miss_pump(int64_t handle) {
 }
 
 int64_t exl3_ram_miss_contains(int64_t handle, int64_t row, int64_t expert) {
-  return exl3_ram_miss::find(handle)->has(row, expert) ? 1 : 0;
+  return expert_stream::find(handle)->has(row, expert) ? 1 : 0;
 }
 
 void exl3_ram_miss_touch(int64_t handle, int64_t row, int64_t expert) {
-  exl3_ram_miss::find(handle)->touch(row, expert);
+  expert_stream::find(handle)->touch(row, expert);
 }
 
 void exl3_ram_miss_assign(
     int64_t handle, int64_t row, int64_t expert, TensorView protect, int64_t fallback, TensorView out) {
   auto* result = static_cast<int64_t*>(out.data_ptr());
   int64_t evicted = -1;
-  result[0] = exl3_ram_miss::find(handle)->assign(row, expert, exl3_ram_miss::ids_of(protect), fallback != 0, &evicted);
+  result[0] = expert_stream::find(handle)->assign(row, expert, expert_stream::ids_of(protect), fallback != 0, &evicted);
   result[1] = evicted;
 }
 
@@ -565,43 +565,43 @@ void exl3_ram_miss_assign(
 int64_t exl3_ram_miss_fill_begin(
     int64_t handle, int64_t row, TensorView experts, TensorView protect, int64_t fallback, TensorView out) {
   auto* result = static_cast<int64_t*>(out.data_ptr());
-  const std::vector<int32_t> ids = exl3_ram_miss::ids_of(experts);
-  return exl3_ram_miss::find(handle)->fill_begin(
-      row, ids, exl3_ram_miss::ids_of(protect), fallback != 0, result, result + ids.size());
+  const std::vector<int32_t> ids = expert_stream::ids_of(experts);
+  return expert_stream::find(handle)->fill_begin(
+      row, ids, expert_stream::ids_of(protect), fallback != 0, result, result + ids.size());
 }
 
 int64_t exl3_ram_miss_fill_wait(int64_t handle, int64_t rows, int64_t timeout_ns) {
-  return exl3_ram_miss::find(handle)->fill_wait(rows, timeout_ns);
+  return expert_stream::find(handle)->fill_wait(rows, timeout_ns);
 }
 
 int64_t exl3_ram_miss_fill_landed(int64_t handle) {
-  return exl3_ram_miss::find(handle)->fill_landed();
+  return expert_stream::find(handle)->fill_landed();
 }
 
 int64_t exl3_ram_miss_fill_end(int64_t handle) {
-  return exl3_ram_miss::find(handle)->fill_end();
+  return expert_stream::find(handle)->fill_end();
 }
 
 void exl3_ram_miss_release(int64_t handle, int64_t row, int64_t slot) {
-  exl3_ram_miss::find(handle)->release(row, slot);
+  expert_stream::find(handle)->release(row, slot);
 }
 
 void exl3_ram_miss_slot_info(int64_t handle, int64_t row, TensorView out) {
-  exl3_ram_miss::find(handle)->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
+  expert_stream::find(handle)->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_lease_entry(int64_t handle, int64_t idx, TensorView out) {
-  if (idx < 0 || idx >= exl3_ram_miss::kDemandRecords) throw std::runtime_error("exl3 RAM miss: request slot out of range");
-  exl3_ram_miss::find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
+  if (idx < 0 || idx >= expert_stream::kDemandRecords) throw std::runtime_error("exl3 RAM miss: request slot out of range");
+  expert_stream::find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_inject_lease(int64_t handle, int64_t row, int64_t slot, int64_t delta) {
-  exl3_ram_miss::find(handle)->inject_lease(row, slot, delta);
+  expert_stream::find(handle)->inject_lease(row, slot, delta);
 }
 
 // out: free, evictable, leased.
 void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted, TensorView out) {
-  const auto census = exl3_ram_miss::find(handle)->victim_census(row, exl3_ram_miss::ids_of(wanted));
+  const auto census = expert_stream::find(handle)->victim_census(row, expert_stream::ids_of(wanted));
   auto* result = static_cast<int64_t*>(out.data_ptr());
   result[0] = census.free;
   result[1] = census.evictable;
@@ -609,143 +609,143 @@ void exl3_ram_miss_victim_census(int64_t handle, int64_t row, TensorView wanted,
 }
 
 int64_t exl3_ram_miss_busy_since(int64_t handle) {
-  return exl3_ram_miss::find(handle)->busy_since();
+  return expert_stream::find(handle)->busy_since();
 }
 
 void exl3_ram_miss_close_admission(int64_t handle) {
-  exl3_ram_miss::find(handle)->close_admission();
+  expert_stream::find(handle)->close_admission();
 }
 
 void exl3_ram_miss_set_lease_mode(int64_t handle, int64_t on) {
-  exl3_ram_miss::find(handle)->set_lease_mode(on != 0);
+  expert_stream::find(handle)->set_lease_mode(on != 0);
 }
 
 void exl3_ram_miss_set_prefill_share(int64_t handle, int64_t share) {
-  exl3_ram_miss::find(handle)->set_prefill_share(share);
+  expert_stream::find(handle)->set_prefill_share(share);
 }
 
 void exl3_ram_miss_set_gpu_hot(int64_t handle, int64_t on) {
-  exl3_ram_miss::find(handle)->set_gpu_hot(on != 0);
+  expert_stream::find(handle)->set_gpu_hot(on != 0);
 }
 
 void exl3_ram_miss_set_two_phase(int64_t handle, int64_t on) {
-  exl3_ram_miss::find(handle)->set_two_phase(on != 0);
+  expert_stream::find(handle)->set_two_phase(on != 0);
 }
 
 void exl3_ram_miss_set_piece_stream(int64_t handle, int64_t on) {
-  exl3_ram_miss::find(handle)->set_piece_stream(on != 0);
+  expert_stream::find(handle)->set_piece_stream(on != 0);
 }
 
 void exl3_ram_miss_enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns) {
-  exl3_ram_miss::find(handle)->enable_copy_engine(device, spin_ns);
+  expert_stream::find(handle)->enable_copy_engine(device, spin_ns);
 }
 
 // entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;
 // sm_mask: the entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES), 0 for none.
 void exl3_ram_miss_set_copy_table(int64_t handle, int64_t row, TensorView entries, int64_t dst_rows, int64_t sm_mask) {
   if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error("exl3 RAM miss: copy table must be [n, 3]");
-  exl3_ram_miss::find(handle)->set_copy_table(
+  expert_stream::find(handle)->set_copy_table(
       row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows, sm_mask);
 }
 
 void exl3_ram_miss_arm_copy_engine(int64_t handle, int64_t on) {
-  exl3_ram_miss::find(handle)->arm_copy_engine(on != 0);
+  expert_stream::find(handle)->arm_copy_engine(on != 0);
 }
 
 // page: pinned uint8 [kPrefetchPageBytes], the native-prefetch request and done lines.
 void exl3_ram_miss_enable_native_prefetch(int64_t handle, TensorView page) {
-  if (page.dim() != 1 || page.size(0) != exl3_ram_miss::kPrefetchPageBytes)
+  if (page.dim() != 1 || page.size(0) != expert_stream::kPrefetchPageBytes)
     throw std::runtime_error("exl3 RAM miss: the native prefetch page must be uint8 [256]");
-  exl3_ram_miss::find(handle)->enable_native_prefetch(static_cast<uint8_t*>(page.data_ptr()));
+  expert_stream::find(handle)->enable_native_prefetch(static_cast<uint8_t*>(page.data_ptr()));
 }
 
 // Test only: out int64 [3] = {active, row, slot} of the service's prefetch lease.
 void exl3_ram_miss_prefetch_lease(int64_t handle, TensorView out) {
-  exl3_ram_miss::find(handle)->prefetch_lease(static_cast<int64_t*>(out.data_ptr()));
+  expert_stream::find(handle)->prefetch_lease(static_cast<int64_t*>(out.data_ptr()));
 }
 
 int64_t exl3_ram_miss_copy_engine_idle(int64_t handle, int64_t timeout_ns) {
-  return exl3_ram_miss::find(handle)->wait_copy_idle(exl3_ram_miss::now_ns() + timeout_ns) ? 1 : 0;
+  return expert_stream::find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
 }
 
 // Test only (HostCopyBackend): let `marks` more copy marks complete (negative: all), fail the calls, count marks.
 void exl3_ram_miss_copy_engine_release(int64_t handle, int64_t marks) {
-  exl3_ram_miss::find(handle)->host_copy_backend().release(marks);
+  expert_stream::find(handle)->host_copy_backend().release(marks);
 }
 
 void exl3_ram_miss_copy_engine_fail(int64_t handle, int64_t issue, int64_t query) {
-  exl3_ram_miss::find(handle)->host_copy_backend().fail(issue != 0, query != 0);
+  expert_stream::find(handle)->host_copy_backend().fail(issue != 0, query != 0);
 }
 
 // Test only: delay every copy job's completion by one extra copy of `bytes` from `src` to `dst` (0 bytes: off).
 void exl3_ram_miss_copy_engine_ballast(int64_t handle, int64_t dst, int64_t src, int64_t bytes) {
-  exl3_ram_miss::find(handle)->copy_engine_ballast(static_cast<uint64_t>(dst), static_cast<uint64_t>(src), bytes);
+  expert_stream::find(handle)->copy_engine_ballast(static_cast<uint64_t>(dst), static_cast<uint64_t>(src), bytes);
 }
 
 int64_t exl3_ram_miss_copy_engine_marked(int64_t handle) {
-  return exl3_ram_miss::find(handle)->host_copy_backend().marked();
+  return expert_stream::find(handle)->host_copy_backend().marked();
 }
 
 void exl3_ram_miss_inject_done_stall(int64_t handle, int64_t ns) {
-  exl3_ram_miss::find(handle)->inject_done_stall(ns);
+  expert_stream::find(handle)->inject_done_stall(ns);
 }
 
 void exl3_ram_miss_mapping(int64_t handle, int64_t row, TensorView out) {
-  exl3_ram_miss::find(handle)->mapping(row, static_cast<int64_t*>(out.data_ptr()));
+  expert_stream::find(handle)->mapping(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_slot_to_expert(int64_t handle, int64_t row, TensorView out) {
-  exl3_ram_miss::find(handle)->slot_to_expert(row, static_cast<int64_t*>(out.data_ptr()));
+  expert_stream::find(handle)->slot_to_expert(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 int64_t exl3_ram_miss_lru_order(int64_t handle, int64_t row, TensorView out) {
-  return exl3_ram_miss::find(handle)->lru_order(row, static_cast<int64_t*>(out.data_ptr()));
+  return expert_stream::find(handle)->lru_order(row, static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_set_hot(int64_t handle, int64_t row, TensorView experts) {
-  exl3_ram_miss::find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
+  expert_stream::find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
 }
 
 void exl3_ram_miss_inject(
     int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
-  exl3_ram_miss::find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
+  expert_stream::find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
 }
 
 // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
 void exl3_ram_miss_inject_fault(int64_t handle, TensorView fault) {
-  exl3_ram_miss::check_fault_words(fault);
-  exl3_ram_miss::find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
+  expert_stream::check_fault_words(fault);
+  expert_stream::find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
 }
 
 void exl3_ram_miss_counters(int64_t handle, TensorView out) {
-  exl3_ram_miss::find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
+  expert_stream::find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
 }
 
 void exl3_ram_miss_layer_rows(int64_t handle, int64_t advisory, TensorView out) {
-  exl3_ram_miss::find(handle)->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
+  expert_stream::find(handle)->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
 }
 
 int64_t exl3_ram_miss_trace_words() {
-  return exl3_ram_miss::stage_words();
+  return expert_stream::stage_words();
 }
 
 void exl3_ram_miss_trace_enable(int64_t handle, int64_t capacity) {
   if (capacity <= 0) throw std::runtime_error("exl3 RAM miss: the stage trace needs a positive capacity");
-  exl3_ram_miss::find(handle)->enable_trace(static_cast<size_t>(capacity));
+  expert_stream::find(handle)->enable_trace(static_cast<size_t>(capacity));
 }
 
 // Fills up to out.size(0) records, stage_words() int64 each; returns the count.
 int64_t exl3_ram_miss_trace_drain(int64_t handle, TensorView out) {
-  return exl3_ram_miss::find(handle)->drain_trace(
-      static_cast<exl3_ram_miss::StageRecord*>(out.data_ptr()), out.size(0));
+  return expert_stream::find(handle)->drain_trace(
+      static_cast<expert_stream::StageRecord*>(out.data_ptr()), out.size(0));
 }
 
 int64_t exl3_ram_miss_trace_clock_reads() {
-  return exl3_ram_miss::traced_clock_reads().load(std::memory_order_relaxed);
+  return expert_stream::traced_clock_reads().load(std::memory_order_relaxed);
 }
 
 int64_t exl3_ram_miss_trace_dropped(int64_t handle) {
-  return exl3_ram_miss::find(handle)->trace_dropped();
+  return expert_stream::find(handle)->trace_dropped();
 }
 
 // ---- Host-side simulated device: the post and wait kernels' protocol, for CPU tests ----
@@ -759,7 +759,7 @@ int64_t exl3_ram_miss_sim_post(
     int64_t after,
     int64_t armed,
     int64_t lanes) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   auto* base = static_cast<uint8_t*>(page.data_ptr());
   const int64_t head_word = advisory ? kAdviseHead : kDemandHead;
   uint32_t seq = load_acquire(base + head_word) + 1u;
@@ -798,7 +798,7 @@ int64_t exl3_ram_miss_sim_post(
 // The wait kernel's decision rule: 1 served, 2 failed, 0 timed out (both raise fatal),
 // 3 fatal already raised (the sticky fast path).
 int64_t exl3_ram_miss_sim_wait(TensorView page, int64_t seq, int64_t timeout_ns) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   auto* base = static_cast<uint8_t*>(page.data_ptr());
   const uint32_t want = static_cast<uint32_t>(seq);
   if (load_acquire(base + kFatal) != 0) return 3;
@@ -826,7 +826,7 @@ int64_t exl3_ram_miss_sim_wait(TensorView page, int64_t seq, int64_t timeout_ns)
 // order (seq = 0, fence, payload, fence, a new seq) while this thread reads it with
 // read_record. out = {records accepted, accepted records whose payload is not their seq's}.
 void exl3_ram_miss_seqlock_stress(int64_t duration_ns, TensorView out) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   alignas(64) uint8_t record[kRecordBytes] = {};
   std::atomic<bool> done{false};
   const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
@@ -922,11 +922,11 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_post, exl3_ram_miss_sim_post);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_sim_wait, exl3_ram_miss_sim_wait);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_seqlock_stress, exl3_ram_miss_seqlock_stress);
 
-namespace exl3_ram_miss {
-}  // namespace exl3_ram_miss
+namespace expert_stream {
+}  // namespace expert_stream
 
 void exl3_ram_miss_start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   if (cpu_core >= CPU_SETSIZE) throw std::runtime_error("exl3 RAM miss: cpu_core out of range");
   if (cpu_core >= 64 && cpu_core <= 71) {
     throw std::runtime_error("exl3 RAM miss: cores 64-71 are reserved (71 is production's doorbell core)");
@@ -958,7 +958,7 @@ void exl3_ram_miss_start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_
 }
 
 void exl3_ram_miss_stop_thread(int64_t handle) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   std::shared_ptr<RamThread> thread;
   {
     std::lock_guard<std::mutex> guard(registry_mutex());
@@ -971,11 +971,11 @@ void exl3_ram_miss_stop_thread(int64_t handle) {
 }
 
 int64_t exl3_ram_miss_pause(int64_t handle, int64_t timeout_ns) {
-  return exl3_ram_miss::find_thread(handle)->pause(timeout_ns);
+  return expert_stream::find_thread(handle)->pause(timeout_ns);
 }
 
 void exl3_ram_miss_resume(int64_t handle) {
-  exl3_ram_miss::find_thread(handle)->resume();
+  expert_stream::find_thread(handle)->resume();
 }
 
 // Takes the tier and its service thread out of the registries under one lock (so no
@@ -983,7 +983,7 @@ void exl3_ram_miss_resume(int64_t handle) {
 // tier, which writes through raw addresses of Python-owned tensors that the caller
 // releases after this returns.
 void exl3_ram_miss_close(int64_t handle) {
-  using namespace exl3_ram_miss;
+  using namespace expert_stream;
   std::shared_ptr<RamThread> thread;
   std::shared_ptr<RamTier> tier;
   {

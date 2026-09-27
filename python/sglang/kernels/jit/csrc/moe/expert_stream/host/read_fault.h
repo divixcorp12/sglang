@@ -4,7 +4,7 @@
 #include "row_tables.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 // Test-only fault injection for RowReader (exl3_ram_miss_read_rows_faulted).
 struct ReadFault {
@@ -119,5 +119,5 @@ inline std::function<bool(size_t)> abandon_after(int64_t after) {
 }
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang

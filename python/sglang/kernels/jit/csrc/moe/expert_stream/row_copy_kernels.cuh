@@ -5,7 +5,7 @@
 
 namespace sglang {
 
-namespace exl3_ram_miss_device {
+namespace device::expert_stream {
 
 // Piece streaming's stream kernel S (piece-streaming plan section 5): kStreamBlocks blocks of kStreamThreads.
 constexpr int kStreamBlocks = 8;
@@ -24,7 +24,7 @@ constexpr int kStreamFaultCountDelay = 3;  // ns a completing block spins before
 constexpr int kStreamFaultWords = 4;
 
 // state[*word] += value, clamped at INT32_MAX like W2's kPolls, from any number of blocks at once.
-__device__ __forceinline__ void saturating_add(int32_t* word, int64_t value) {
+SGL_DEVICE void saturating_add(int32_t* word, int64_t value) {
   int32_t old = *reinterpret_cast<volatile int32_t*>(word);
   while (true) {
     const int64_t sum = static_cast<int64_t>(old) + value;
@@ -35,7 +35,7 @@ __device__ __forceinline__ void saturating_add(int32_t* word, int64_t value) {
   }
 }
 
-__device__ __forceinline__ void spin_ns(int64_t ns) {
+SGL_DEVICE void spin_ns(int64_t ns) {
   if (ns <= 0) return;
   const uint64_t until = global_ns() + static_cast<uint64_t>(ns);
   while (static_cast<int64_t>(global_ns() - until) < 0) __nanosleep(256);
@@ -43,13 +43,13 @@ __device__ __forceinline__ void spin_ns(int64_t ns) {
 
 // ld.global.cv, never .nc: a tag-2 lane's host bytes are written while the kernel runs, and .nc may serve a line
 // cached before its piece was published (LEASE_PROTOCOL.md E1 amendment).
-__device__ __forceinline__ void stream_copy16(const uint8_t* src, uint8_t* dst) {
+SGL_DEVICE void stream_copy16(const uint8_t* src, uint8_t* dst) {
   uint64_t lo, hi;
   asm volatile("ld.global.cv.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(src) : "memory");
   asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dst), "l"(lo), "l"(hi) : "memory");
 }
 
-__device__ __forceinline__ void stream_copy1(const uint8_t* src, uint8_t* dst) {
+SGL_DEVICE void stream_copy1(const uint8_t* src, uint8_t* dst) {
   uint16_t value;
   asm volatile("ld.global.cv.u8 %0, [%1];" : "=h"(value) : "l"(src) : "memory");
   *dst = static_cast<uint8_t>(value);
@@ -57,7 +57,7 @@ __device__ __forceinline__ void stream_copy1(const uint8_t* src, uint8_t* dst) {
 
 // This block's share of `bytes` bytes: units (16 B when both ends allow it) in chunks of kStreamThreads, the chunks
 // dealt round-robin over the grid, so every block copies about 1/gridDim of a range and no two blocks write one byte.
-__device__ __forceinline__ void stream_copy_slice(const uint8_t* src, uint8_t* dst, int64_t bytes) {
+SGL_DEVICE void stream_copy_slice(const uint8_t* src, uint8_t* dst, int64_t bytes) {
   const int64_t tid = threadIdx.x;
   const bool aligned = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0;
   const int64_t units = aligned ? bytes / 16 : bytes;
@@ -78,7 +78,7 @@ __device__ __forceinline__ void stream_copy_slice(const uint8_t* src, uint8_t* d
 // This block's slice of piece `piece` of one lane. `runs` is the lane's [kRowPieces][row_segments][2] table of
 // name-row byte ranges; `segment_map` gives each row segment's copy-table entry (-1: none), then a flag per entry
 // that no row segment names, which is copied whole with piece 0 (C2 copied every entry for a lane).
-__device__ __forceinline__ void stream_copy_piece(
+SGL_DEVICE void stream_copy_piece(
     const int64_t* segments,
     int64_t segment_count,
     const int32_t* segment_map,
@@ -130,7 +130,7 @@ struct StreamLanes {
 
 // One lane's admission (plan 5): the whole lane_result_valid contract, tag LOADING accepted as well as READY.
 // Returns false for a published lane that fails it; an unpublished lane is simply not admitted yet.
-__device__ __forceinline__ bool stream_admit(
+SGL_DEVICE bool stream_admit(
     StreamLanes& sh,
     int lane,
     const uint8_t* results,
@@ -161,11 +161,11 @@ __device__ __forceinline__ bool stream_admit(
   return !ready_seen;
 }
 
-__device__ __forceinline__ uint32_t piece_bits(uint64_t word, uint64_t generation) {
+SGL_DEVICE uint32_t piece_bits(uint64_t word, uint64_t generation) {
   return (word >> 8) == (generation & ((1ull << 56) - 1)) ? static_cast<uint32_t>(word & 0xFFu) : 0u;
 }
 
-}  // namespace exl3_ram_miss_device
+}  // namespace device::expert_stream
 
 // Piece streaming's stage 2 (piece-streaming plan section 5): replaces W2 and C2. It covers every planned lane W1 did
 // not claim, admits each once its RowResult validates (tag READY or LOADING), and copies each piece as its bit appears
@@ -176,7 +176,7 @@ __device__ __forceinline__ uint32_t piece_bits(uint64_t word, uint64_t generatio
 // finished commits `go_2` only if every block completed, none aborted, and (by completing) it saw kDemandDone >= seq
 // with status kServed and every mask full on a re-read made after acquiring kDemandDone. Otherwise go_2 stays at W1's
 // reset of 0. Like W2 it never writes `keep` (the finalize kernel's alone), a terminal or the fatal word.
-__global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_ram_miss_lease_stream_kernel(
+__global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3_ram_miss_lease_stream_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int64_t* __restrict__ planned,
@@ -203,7 +203,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
     int64_t row_segments,
     const int32_t* __restrict__ piece_runs,
     const int32_t* __restrict__ fault) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   __shared__ StreamLanes sh;
   __shared__ int64_t planned_count;
   __shared__ uint32_t seq;
@@ -430,7 +430,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kStreamThreads, 1) void exl3_
 
 // The copy wait's SM reads: `bytes` of the pinned slot into the destination, four 16-byte units in flight per thread
 // (ld.global.cv, as S: never .nc on host bytes). Every load has returned once its store is issued.
-__device__ __forceinline__ void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) {
+SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) {
   const bool aligned = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0;
   const int64_t units = aligned ? bytes / 16 : 0;
   const int64_t step = blockDim.x;
@@ -450,8 +450,8 @@ __device__ __forceinline__ void copy_wait_read(const uint8_t* src, uint8_t* dst,
                    : "memory");
     }
   }
-  for (; u < units; u += step) exl3_ram_miss_device::stream_copy16(src + 16 * u, dst + 16 * u);
-  for (int64_t b = units * 16 + threadIdx.x; b < bytes; b += step) exl3_ram_miss_device::stream_copy1(src + b, dst + b);
+  for (; u < units; u += step) device::expert_stream::stream_copy16(src + 16 * u, dst + 16 * u);
+  for (int64_t b = units * 16 + threadIdx.x; b < bytes; b += step) device::expert_stream::stream_copy1(src + b, dst + b);
 }
 
 // Copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and A2 and before F. The COPYING lanes are read back from the row
@@ -465,7 +465,7 @@ __device__ __forceinline__ void copy_wait_read(const uint8_t* src, uint8_t* dst,
 // and publishes SmAck. The service releases those leases only after SmAck, so no slot is rewritten under these
 // reads. SmAck is published for every armed request, also one that failed and read nothing, since a lease it holds
 // is released only by it; nothing of this request is read after it.
-__global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
+__global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
     uint8_t* __restrict__ page,
     int32_t* __restrict__ state,
     const int32_t* __restrict__ count,
@@ -475,7 +475,7 @@ __global__ __launch_bounds__(exl3_ram_miss_device::kCopyWaitThreads, 1) void exl
     const int64_t* __restrict__ sm_table,
     int64_t sm_count,
     int32_t* __restrict__ go_ce) {
-  using namespace exl3_ram_miss_device;
+  using namespace device::expert_stream;
   __shared__ uint32_t sm_mask;  // the lanes whose SM entries this kernel read; the commit must name exactly them
   if (sm_count > 0) {
     __shared__ int32_t sm_host[kLeaseLanes];

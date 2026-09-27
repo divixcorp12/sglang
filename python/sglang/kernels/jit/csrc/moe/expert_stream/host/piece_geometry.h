@@ -4,7 +4,7 @@
 #include "read_fault.h"
 
 namespace sglang {
-namespace exl3_ram_miss {
+namespace expert_stream {
 
 // Piece streaming, sub-reads (plan §4.1): part `e` as its sub-reads, in file order, into `out` (kSubReads entries);
 // returns how many. Each is len_k = round_up(ceil(length / kSubReads), kPage) bytes and the last takes what is left,
@@ -124,5 +124,5 @@ struct PiecePublish {
 };
 
 
-}  // namespace exl3_ram_miss
+}  // namespace expert_stream
 }  // namespace sglang
