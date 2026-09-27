@@ -5123,9 +5123,29 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 **In the recipe:** `CHUNKED_PREFILL_SIZE = 4096`, `MEM_FRACTION_STATIC = 0.90`, `SGLANG_MOE_HOT_GPU_MB = 16100` and
 `CONTEXT_LENGTH = 262144`.
 
+**Traced 4096-token chunk** (`trace-c4096-12k`, today's recipe at context 262144; a 12,288-token prompt, node mode;
+`prefill_trace.py`).
+- The server started at context 262144 with a 374,016-token KV pool and 2.43 GB free, as at 32768.
+- TTFT was 81.6 s traced, ~27 s per chunk, against ~17 s untraced; node mode's per-launch cost on ~170k eager kernels
+  per chunk accounts for the difference. Proportions below are per chunk and traced.
+
+| Per 4096-token chunk | Value |
+|---|---:|
+| Rows crossing PCIe (VRAM misses): layers 0-20 / 21-39 | ~6,400 / ~2,200 |
+| Gather kernels, at 115 GB / 9.3 s = 12.3 GB/s (the link) | 9.3 s |
+| NVMe rows read (all in layers 0-20) | ~6,000 (82 GB) |
+| Host blocked on NVMe reads, 82 GB / 11.8 s = 7 GB/s | 11.8 s |
+| GPU idle, ~125 gaps of ~100 ms after a routing index kernel | 12.4 s |
+| EXL3 GEMMs / other kernels / attention | 0.8 / 0.6 / 0.06 s |
+
+- **Both transfers run at their ceilings, one after the other.**
+  - 7 GB/s is the two expert mirrors' line rate: nvme0 and nvme4 are Gen3 x4 links, ~3.5 GB/s each.
+  - Of every chunk, 94% of layers 0-20's VRAM misses are also RAM misses. The pinned tier's ~200 rows per layer cannot
+    hold the ~340 experts per layer that each chunk routes to, so every chunk re-reads them from NVMe.
+- **Late layers:** ~26% of the link traffic and none of the NVMe reads, so skipping them on non-final chunks is worth
+  at most ~2.4 s of link time per chunk.
+
 **Not run at this recipe:**
-- A server at context 262144: every arm above ran at 32768, and decode graph or indexer buffers may be sized from
-  the context length.
 - Any prompt past 16k. The 250k estimate is ~61 chunks at 17-27 s, ~20-30 min, if chunk time stays flat with
   context as it did to 30k.
 - Steady decode ms/token at the smaller hot cache.
