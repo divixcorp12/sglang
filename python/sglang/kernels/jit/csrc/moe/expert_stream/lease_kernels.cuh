@@ -96,7 +96,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   if (hot_page != nullptr) {
     uint8_t* hot = hot_page + static_cast<int64_t>((seq - 1u) % kHotRecords) * hot_stride;
     st_relaxed_sys<uint32_t>(hot, 0u);
-    __threadfence_system();
+    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
     st_relaxed_sys<uint32_t>(hot + 4, static_cast<uint32_t>(experts));
     uint8_t* bits = hot + kHotHeaderBytes;
     for (int64_t byte = 0; byte < (experts + 7) / 8; ++byte) {
@@ -122,7 +122,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     uint8_t* request = lease + lease_d + kLeaseLaneRequest +
                        static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLaneRequestBytes;
     st_relaxed_sys<uint64_t>(request + kLeaseLrGen, 0ull);
-    __threadfence_system();
+    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
     st_relaxed_sys<uint32_t>(request + kLeaseLrCount, static_cast<uint32_t>(planned_count));
     st_relaxed_sys<uint32_t>(request + kLeaseLrRow, static_cast<uint32_t>(row));
     for (int i = 0; i < kMaxIds; ++i)

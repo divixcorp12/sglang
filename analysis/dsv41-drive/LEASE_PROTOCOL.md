@@ -586,6 +586,12 @@ was removed on 2026-09-24. The post now pays three `membar.sys` (record, hot pag
 `LaneRequest` invalidates) where it paid seven; four with advisories on (the advisory
 record's invalidate). Cost per fence still unmeasured **[OPEN 5]**.
 
+**2026-09-27:** the three invalidating fences are now `atomic_thread_fence(release, system)` and the device
+readers' fences in `lane_result_valid` and stage 1 are `atomic_thread_fence(acquire, system)`: Boehm's seqlock
+halves, each paired with a host side of the other half (`read_record`, `read_gpu_hot`, `read_lane_request`;
+`grant_lane_group_locked`). On sm_120 this is `MEMBAR.SC.SYS` -> `MEMBAR.ALL.SYS`. The SmAck publish keeps
+`__threadfence_system()`. The saving is still unmeasured **[OPEN 5]**.
+
 *Wait kernel*, described in section 7.3. *Acknowledgement kernel*, section 7.4.
 
 ### 6.4 Why the acknowledgement is a separate kernel, and why that is enough (E3)

@@ -9,6 +9,7 @@
 
 #include <sgl_kernel/distributed/ptx.cuh>
 
+#include <cuda/atomic>
 #include <cuda/ptx>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -146,7 +147,7 @@ SGL_DEVICE void write_record(
   // Seqlock writer: invalidate seq before touching the payload, so a lapped record that
   // is half rewritten never passes the thread's read_record seq re-check.
   st_relaxed_sys<uint32_t>(record + kRecSeq, 0u);
-  __threadfence_system();
+  cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
   st_relaxed_sys<uint16_t>(record + kRecRow, static_cast<uint16_t>(row));
   st_relaxed_sys<uint16_t>(record + kRecNeedCount, static_cast<uint16_t>(need_count));
   st_relaxed_sys<uint16_t>(record + kRecProtectCount, static_cast<uint16_t>(protect_count));
@@ -179,9 +180,9 @@ SGL_DEVICE void raise_fatal(uint8_t* page, uint32_t seq) {
 //
 // The belt of 11.4 is a seqlock re-read of the ready word, and it has two halves. The host clears a lane's ready
 // word before rewriting its payload (grant_lane_group_locked). The reader must order its payload loads before the
-// re-read with a system fence: an acquire orders only what follows it, so without the fence the re-read may be
-// served before the payload and a rewrite caught half-way passes. Hence read, fence, re-read, judge; a caller that
-// polls several lanes reads them all and pays one fence (stage 1).
+// re-read with an acquire fence (Boehm's seqlock reader): an acquire *load* orders only what follows it, so without
+// the fence the re-read may be served before the payload and a rewrite caught half-way passes. Hence read, fence,
+// re-read, judge; a caller that polls several lanes reads them all and pays one fence (stage 1).
 struct LaneRead {
   uint64_t ready;
   uint32_t slot_generation;
@@ -247,7 +248,7 @@ SGL_DEVICE bool lane_result_valid(
     bool accept_copying = false,
     bool* copying = nullptr) {
   const LaneRead r = lane_result_read(result);
-  __threadfence_system();
+  cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
   return lane_result_judge(
       r,
       lane_result_reread(result),
@@ -339,7 +340,8 @@ SGL_DEVICE void lease_hit_wait_body(
     for (int64_t i = 0; i < planned_count; ++i) {
       if (claimed[i] == 0) reads[i] = lane_result_read(results + i * kLeaseRowResultBytes);
     }
-    __threadfence_system();  // one per pass: every lane's payload loads before any lane's re-read
+    // One per pass: every lane's payload loads before any lane's re-read.
+    cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
     int64_t streaming = 0;
     for (int64_t i = 0; i < planned_count && !hard_fail; ++i) {
       if (claimed[i] != 0) continue;
