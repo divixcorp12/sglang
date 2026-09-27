@@ -2,6 +2,7 @@
 #pragma once
 
 #include "copy_engine.h"
+#include "row_layout.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -37,6 +38,8 @@ struct VictimCensus {
 template <class Source>
 class RamTier {
  public:
+  using Layout = typename Source::LayoutType;
+
   RamTier(
       uint8_t* page, int32_t* slot_map, uint8_t* lease, int64_t lease_bytes, Tables tables, std::vector<int64_t> capacity,
       bool direct, int64_t pack_workers, uint8_t* hot_page, int64_t hot_bytes)
@@ -50,7 +53,7 @@ class RamTier {
         tiers_(static_cast<size_t>(layers_)) {
     hot_stride_ = ((kHotHeaderBytes + (experts_ + 7) / 8 + kHotAlignment - 1) / kHotAlignment) * kHotAlignment;
     if (hot_page_ != nullptr && hot_bytes != kHotRecords * hot_stride_)
-      throw std::runtime_error("exl3 RAM miss: hot bitmap sidecar size disagrees with expert count");
+      throw std::runtime_error(error_prefix<Layout>() + "hot bitmap sidecar size disagrees with expert count");
     for (auto& counter : counters_)
       counter.store(0);
     for (int64_t row = 0; row < layers_; ++row) {
@@ -219,7 +222,7 @@ class RamTier {
   // Allocates the ring, then turns the trace on. Before the service thread starts, so the flag
   // never flips under a request being served.
   void enable_trace(size_t capacity) {
-    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: enable the stage trace before the service thread starts");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "enable the stage trace before the service thread starts");
     std::lock_guard<std::mutex> guard(trace_mutex_);
     ring_ = std::make_unique<StageRing>(capacity);
     trace_on_.store(true, std::memory_order_release);
@@ -279,13 +282,13 @@ class RamTier {
     std::lock_guard<std::mutex> guard(mutex_);
     if (tiers_[row].state[slot] == kLoading) {
       // The service is filling it and will publish it; freeing it would hand it out twice.
-      throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while it is loading");
+      throw std::runtime_error(error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is loading");
     }
     if (leased_locked(tiers_[row], slot)) {
-      throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while it is leased");
+      throw std::runtime_error(error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is leased");
     }
     if (tiers_[row].filling[slot]) {
-      throw std::runtime_error("exl3 RAM miss: release of pinned slot " + std::to_string(slot) + " while a fill writes it");
+      throw std::runtime_error(error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while a fill writes it");
     }
     release_locked(row, slot);
     counters_[kVersion].fetch_add(1);
@@ -305,9 +308,9 @@ class RamTier {
       int64_t row, const std::vector<int32_t>& experts, const std::vector<int32_t>& protect, bool fallback,
       int64_t* slots, int64_t* evictions) {
     if (threaded_.load() && !pause_requested_.load()) {
-      throw std::runtime_error("exl3 RAM miss: a prefill fill needs the service thread paused");
+      throw std::runtime_error(error_prefix<Layout>() + "a prefill fill needs the service thread paused");
     }
-    if (fill_thread_.joinable()) throw std::runtime_error("exl3 RAM miss: a prefill fill is already running");
+    if (fill_thread_.joinable()) throw std::runtime_error(error_prefix<Layout>() + "a prefill fill is already running");
     std::vector<int32_t> claimed;
     std::vector<int64_t> taken;
     *evictions = 0;
@@ -316,7 +319,7 @@ class RamTier {
       Tier& tier = tiers_[row];
       for (const int32_t expert : experts) {
         if (tier.expert_slot[expert] >= 0) {
-          throw std::runtime_error("exl3 RAM miss: fill of expert " + std::to_string(expert) + " that holds a slot");
+          throw std::runtime_error(error_prefix<Layout>() + "fill of expert " + std::to_string(expert) + " that holds a slot");
         }
         int64_t evicted = -1;
         // A prefetch (no fallback) stops at the prefill share, leaving the rest to gather_rows' chunked admission,
@@ -378,22 +381,22 @@ class RamTier {
   // Lease mode: the service reads each armed request's lane request, leases every lane's source slot and publishes
   // a row result per lane before it answers (LEASE_PROTOCOL.md 7). Off leaves every request as it always was.
   void set_lease_mode(bool on) {
-    if (lease_ == nullptr) throw std::runtime_error("exl3 RAM miss: lease mode needs a lease block");
-    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set lease mode before the service thread starts");
+    if (lease_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "lease mode needs a lease block");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "set lease mode before the service thread starts");
     lease_mode_ = on;
   }
 
   // Rows a prefill may own per layer; 0 (the default, and always with SGLANG_DSV41_ENABLE_PREFILL_SHARE off) admits as
   // take_slot_locked always has. The service sets it before each forward: the share for a prefill, 0 for decode.
   void set_prefill_share(int64_t share) {
-    if (share < 0) throw std::runtime_error("exl3 RAM miss: a prefill share cannot be negative");
+    if (share < 0) throw std::runtime_error(error_prefix<Layout>() + "a prefill share cannot be negative");
     std::lock_guard<std::mutex> guard(mutex_);
     prefill_share_ = share;
   }
 
   void set_gpu_hot(bool on) {
-    if (hot_page_ == nullptr) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs a sidecar");
-    if (!lease_mode_) throw std::runtime_error("exl3 RAM miss: GPU hot mode needs leases");
+    if (hot_page_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "GPU hot mode needs a sidecar");
+    if (!lease_mode_) throw std::runtime_error(error_prefix<Layout>() + "GPU hot mode needs leases");
     gpu_hot_mode_.store(on);
   }
 
@@ -425,7 +428,7 @@ class RamTier {
   // device can copy them while the missing rows are still being read. Off leaves lease mode exactly as Task 5
   // shipped it, which is the A1 arm every Task 6 measurement is reported against.
   void set_two_phase(bool on) {
-    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set two-phase mode before the service thread starts");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "set two-phase mode before the service thread starts");
     two_phase_ = on;
   }
 
@@ -433,7 +436,7 @@ class RamTier {
   // rows piece by piece. Before the thread starts. The reader refuses it without packing workers; the service
   // refuses it without two-phase and lease mode.
   void set_piece_stream(bool on) {
-    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: set piece streaming before the service thread starts");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "set piece streaming before the service thread starts");
     reader_.set_piece_stream(on);
     piece_stream_ = on;
   }
@@ -441,11 +444,11 @@ class RamTier {
   // Copy engine (LEASE_PROTOCOL.md 7.6): a thread that copies the reservation hold's hit lanes with the DMA engine.
   // `device` < 0 is the CPU test backend (HostCopyBackend). Before the service thread starts; unarmed until arm().
   void enable_copy_engine(int64_t device, int64_t spin_ns) {
-    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: enable the copy engine before the service thread starts");
-    if (copy_engine_ != nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is already enabled");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
+    if (copy_engine_ != nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is already enabled");
     // Only the piece-streaming chain grants every lane in the reservation hold and runs the copy wait.
     if (!(lease_mode_ && two_phase_ && piece_stream_)) {
-      throw std::runtime_error("exl3 RAM miss: the copy engine needs lease mode, two-phase and piece streaming");
+      throw std::runtime_error(error_prefix<Layout>() + "the copy engine needs lease mode, two-phase and piece streaming");
     }
     std::unique_ptr<CopyBackend> backend;
     if (device < 0) {
@@ -457,7 +460,7 @@ class RamTier {
         std::move(backend), layers_, spin_ns, counters_,
         [this](const CopyJob& job) { return copy_completed(job); },
         [this](const CopyJob& job) { return copy_acked(job); },
-        [this](const CopyJob& job, int error) { copy_failed(job, error); });
+        [this](const CopyJob& job, int error) { copy_failed(job, error); }, error_prefix<Layout>());
     engine->start();
     copy_engine_ = std::move(engine);
   }
@@ -465,13 +468,16 @@ class RamTier {
   // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}. Bit i
   // of `sm_mask` leaves entry i to the copy wait's SM reads (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
   void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows, int64_t sm_mask) {
-    if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    if ((static_cast<uint64_t>(sm_mask) & ~static_cast<uint64_t>(Layout::kSmallMask)) != 0) {
+      throw std::runtime_error(error_prefix<Layout>() + "sm_mask names a tensor that is not one of the layout's small ones");
+    }
+    if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     if (sm_mask < 0 || (count < 63 && (sm_mask >> count) != 0)) {
-      throw std::runtime_error("exl3 RAM miss: the SM mask names a copy-table entry that does not exist");
+      throw std::runtime_error(error_prefix<Layout>() + "the SM mask names a copy-table entry that does not exist");
     }
     std::vector<CopyEntry> table;
     for (int64_t i = 0; i < count; ++i) {
-      if (entries[3 * i + 2] <= 0) throw std::runtime_error("exl3 RAM miss: a copy-table entry of no bytes");
+      if (entries[3 * i + 2] <= 0) throw std::runtime_error(error_prefix<Layout>() + "a copy-table entry of no bytes");
       table.push_back(CopyEntry{
           static_cast<uint64_t>(entries[3 * i]), static_cast<uint64_t>(entries[3 * i + 1]), entries[3 * i + 2],
           (sm_mask >> i & 1) != 0});
@@ -480,16 +486,16 @@ class RamTier {
   }
 
   void arm_copy_engine(bool on) {
-    if (on && copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    if (on && copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_armed_.store(on, std::memory_order_release);
   }
 
   // Native prefetch (plan 2026-09-25-dsv41-native-prefetch): serve the device's advisory next-layer copy requests
   // from `page` (kPrefetchPageBytes, pinned). Needs the copy engine; before the service thread starts.
   void enable_native_prefetch(uint8_t* page) {
-    if (threaded_.load()) throw std::runtime_error("exl3 RAM miss: enable native prefetch before the service thread starts");
-    if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: native prefetch needs the copy engine");
-    if (page == nullptr) throw std::runtime_error("exl3 RAM miss: native prefetch needs its page");
+    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "enable native prefetch before the service thread starts");
+    if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "native prefetch needs the copy engine");
+    if (page == nullptr) throw std::runtime_error(error_prefix<Layout>() + "native prefetch needs its page");
     prefetch_page_ = page;
     last_prefetch_gen_ = generation_of(load_acquire64(page + kPfReqGen));
     judge_.assign(static_cast<size_t>(layers_), PrefetchJudge{});
@@ -569,13 +575,13 @@ class RamTier {
   }
 
   void copy_engine_ballast(uint64_t dst, uint64_t src, int64_t bytes) {
-    if (copy_engine_ == nullptr) throw std::runtime_error("exl3 RAM miss: the copy engine is not enabled");
+    if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_engine_->set_ballast(dst, src, bytes);
   }
 
   HostCopyBackend& host_copy_backend() {
     HostCopyBackend* backend = copy_engine_ != nullptr ? copy_engine_->host_backend() : nullptr;
-    if (backend == nullptr) throw std::runtime_error("exl3 RAM miss: no test copy backend");
+    if (backend == nullptr) throw std::runtime_error(error_prefix<Layout>() + "no test copy backend");
     return *backend;
   }
 
@@ -889,7 +895,7 @@ class RamTier {
   // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless.
   void release_lease_locked(Tier& tier, LaneLease& held, int counter) {
     if (tier.leases[held.slot] == 0) {
-      throw std::runtime_error("exl3 RAM miss: lease underflow on slot " + std::to_string(held.slot));
+      throw std::runtime_error(error_prefix<Layout>() + "lease underflow on slot " + std::to_string(held.slot));
     }
     tier.leases[held.slot] -= 1;
     held.state = counter == kLeasesVoided ? 3 : 2;
@@ -931,7 +937,7 @@ class RamTier {
     std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[row];
     if (delta < 0 && tier.leases[slot] < static_cast<uint32_t>(-delta)) {
-      throw std::runtime_error("exl3 RAM miss: lease underflow on slot " + std::to_string(slot));
+      throw std::runtime_error(error_prefix<Layout>() + "lease underflow on slot " + std::to_string(slot));
     }
     tier.leases[slot] = static_cast<uint32_t>(static_cast<int64_t>(tier.leases[slot]) + delta);
     if (delta < 0) lease_changes_.fetch_add(1);
@@ -1129,8 +1135,8 @@ class RamTier {
 
   // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
   void copy_failed(const CopyJob& job, int error) {
-    std::fprintf(stderr, "ERROR exl3 RAM miss copy engine: copy of request %llu failed (%d); leases held\n",
-                 static_cast<unsigned long long>(job.gen), error);
+    std::fprintf(stderr, "ERROR %scopy engine: copy of request %llu failed (%d); leases held\n",
+                 error_prefix<Layout>().c_str(), static_cast<unsigned long long>(job.gen), error);
     std::fflush(stderr);
     raise_fatal(static_cast<uint32_t>(job.gen));
   }
@@ -1190,10 +1196,10 @@ class RamTier {
   // service thread or any device exists, so plain stores and one fence suffice.
   void init_lease_block(const std::vector<int64_t>& capacity, int64_t lease_bytes) {
     if (reinterpret_cast<uintptr_t>(lease_) % 4096 != 0) {
-      throw std::runtime_error("exl3 RAM miss: the lease block must be 4096-byte aligned");
+      throw std::runtime_error(error_prefix<Layout>() + "the lease block must be 4096-byte aligned");
     }
     if (layers_ > (kLeaseRowResult - kLeaseRowTable) / 8) {
-      throw std::runtime_error("exl3 RAM miss: too many rows for the lease block's row table");
+      throw std::runtime_error(error_prefix<Layout>() + "too many rows for the lease block's row table");
     }
     slot_gen_base_.assign(static_cast<size_t>(layers_), 0);
     int64_t total_slots = 0;
@@ -1210,7 +1216,7 @@ class RamTier {
     const int64_t needed = round_up_page(copy_offset + kLeaseAreaCopyDoneBytes);
     if (lease_bytes < needed) {
       throw std::runtime_error(
-          "exl3 RAM miss: the lease block has " + std::to_string(lease_bytes) + " bytes, its layout needs " +
+          error_prefix<Layout>() + "the lease block has " + std::to_string(lease_bytes) + " bytes, its layout needs " +
           std::to_string(needed));
     }
     auto put_u32 = [&](int64_t offset, uint32_t value) { std::memcpy(lease_ + offset, &value, 4); };
@@ -1285,7 +1291,7 @@ class RamTier {
           fill_row_, fill_experts_, fill_slots_, kBounceRows, [](size_t) { return false; }, nullptr, &packed, SIZE_MAX,
           advance, nullptr);
     } catch (const std::exception& error) {
-      std::fprintf(stderr, "ERROR exl3 RAM miss: prefill fill: %s\n", error.what());
+      std::fprintf(stderr, "ERROR %sprefill fill: %s\n", error_prefix<Layout>().c_str(), error.what());
       result = 0;
     }
     _mm_sfence();  // the rows' bytes land before the caller is told (fill_landed_)

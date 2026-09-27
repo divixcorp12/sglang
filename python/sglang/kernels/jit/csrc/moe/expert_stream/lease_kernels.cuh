@@ -1,5 +1,5 @@
 // Lease-protocol kernels: post, the batched and lease waits, the two-phase hit/rest waits, and the
-// acknowledgement and finalize kernels (exl3_ram_miss.cuh split). Format-free.
+// acknowledgement and finalize kernels (a split of the EXL3 instantiation's former exl3_ram_miss.cuh). Format-free.
 #pragma once
 
 #include "lease_device.cuh"

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "reader_base.h"
+#include "row_layout.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -52,16 +53,18 @@ inline std::vector<int32_t> ids_of(TensorView tensor) {
 // when every byte a read returns has exactly one destination and the row's reads return exactly its image. So: the
 // row starts at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and
 // each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is RowReader::open's.
+template <ExpertRowLayout Layout>
 inline void check_image_tables(const Tables& t) {
+  const std::string prefix = error_prefix<Layout>();
   for (int64_t start : t.starts) {
-    if (start != 0) throw std::runtime_error("exl3 RAM miss: row images start every row at 0 of its reads");
+    if (start != 0) throw std::runtime_error(prefix + "row images start every row at 0 of its reads");
   }
   int64_t cursor = 0;
   for (const Segment& s : t.segments) {
     if (s.name < 0 || s.name >= static_cast<int64_t>(t.row_bytes.size()) || s.src != cursor || s.bytes <= 0 ||
         s.dst < 0 || s.dst + s.bytes > t.row_bytes[s.name]) {
       throw std::runtime_error(
-          "exl3 RAM miss: row-image segments must tile the image in source order, each inside its slab row");
+          prefix + "row-image segments must tile the image in source order, each inside its slab row");
     }
     cursor += s.bytes;
   }
@@ -75,10 +78,10 @@ inline void check_image_tables(const Tables& t) {
     std::sort(spans.begin(), spans.end());
     int64_t at = 0;
     for (const auto& span : spans) {
-      if (span.first != at) throw std::runtime_error("exl3 RAM miss: row-image segments must tile each slab row once");
+      if (span.first != at) throw std::runtime_error(prefix + "row-image segments must tile each slab row once");
       at = span.second;
     }
-    if (at != t.row_bytes[name]) throw std::runtime_error("exl3 RAM miss: row-image segments must tile each slab row once");
+    if (at != t.row_bytes[name]) throw std::runtime_error(prefix + "row-image segments must tile each slab row once");
   }
   const size_t parts = static_cast<size_t>(t.parts);
   for (size_t base = 0; base < t.extents.size(); base += parts) {
@@ -86,15 +89,16 @@ inline void check_image_tables(const Tables& t) {
     for (size_t p = 0; p < parts; ++p) {
       const Read& e = t.extents[base + p];
       if (e.length <= 0) continue;
-      if (e.dest != at) throw std::runtime_error("exl3 RAM miss: a row image's parts must tile it in part order");
+      if (e.dest != at) throw std::runtime_error(prefix + "a row image's parts must tile it in part order");
       at += e.length;
     }
     if (at != t.need_end) {
-      throw std::runtime_error("exl3 RAM miss: a row image's parts must read exactly its image, never its padding");
+      throw std::runtime_error(prefix + "a row image's parts must read exactly its image, never its padding");
     }
   }
 }
 
+template <ExpertRowLayout Layout>
 inline Tables tables_from(
     TensorView extents,
     TensorView starts,
@@ -106,6 +110,12 @@ inline Tables tables_from(
     const std::string& source_paths,
     int64_t slot_bytes,
     int64_t row_images) {
+  const std::string prefix = error_prefix<Layout>();
+  if (slabs.size(1) != kNumNames<Layout> || row_bytes.size(0) != kNumNames<Layout>) {
+    throw std::runtime_error(prefix + "slabs and row_bytes must have " + std::to_string(kNumNames<Layout>) +
+                             " names (the layout's), got " + std::to_string(slabs.size(1)) + " and " +
+                             std::to_string(row_bytes.size(0)));
+  }
   Tables t;
   t.images = row_images != 0;
   t.layers = extents.size(0);
@@ -126,7 +136,7 @@ inline Tables tables_from(
   t.paths = split_lines(paths);
   t.source_paths = split_lines(source_paths);
   if (t.source_paths.size() != t.paths.size() || static_cast<size_t>(file_sizes.size(0)) != t.paths.size()) {
-    throw std::runtime_error("exl3 RAM miss: every file needs a size and the path of the source shard it copies");
+    throw std::runtime_error(prefix + "every file needs a size and the path of the source shard it copies");
   }
   const auto* sizes = static_cast<const int64_t*>(file_sizes.data_ptr());
   t.file_sizes.assign(sizes, sizes + file_sizes.size(0));
@@ -140,7 +150,7 @@ inline Tables tables_from(
     if (e.file < 0 || e.file >= static_cast<int64_t>(t.paths.size()) ||
         e.file >= static_cast<int64_t>(t.file_sizes.size()) || e.offset < 0 || e.length < 0 || e.dest < 0 ||
         e.dest + e.length > slot_bytes) {
-      throw std::runtime_error("exl3 RAM miss: an extent names no file or falls outside its bounce slot");
+      throw std::runtime_error(prefix + "an extent names no file or falls outside its bounce slot");
     }
   }
   // The EOF guard (RowReader::admit_batch) decides a whole row from ONE of its parts: it reads that
@@ -165,7 +175,7 @@ inline Tables tables_from(
       if (t.file_sizes[e.file] != t.file_sizes[head->file] ||
           e.offset - e.dest != head->offset - head->dest) {
         throw std::runtime_error(
-            "exl3 RAM miss: a row's parts disagree on their aligned base or their file size, so the "
+            prefix + "a row's parts disagree on their aligned base or their file size, so the "
             "EOF guard cannot decide the row from part 0");
       }
     }
@@ -176,6 +186,10 @@ inline Tables tables_from(
   t.segments.resize(static_cast<size_t>(segments.size(0)));
   for (size_t i = 0; i < t.segments.size(); ++i) {
     t.segments[i] = Segment{segment_data[4 * i], segment_data[4 * i + 1], segment_data[4 * i + 2], segment_data[4 * i + 3]};
+    if (t.segments[i].name < 0 || t.segments[i].name >= kNumNames<Layout>) {
+      throw std::runtime_error(prefix + "a segment names a tensor outside the layout's " +
+                               std::to_string(kNumNames<Layout>) + " names");
+    }
     t.need_end = std::max(t.need_end, t.segments[i].src + t.segments[i].bytes);
   }
   const auto* slab_data = static_cast<const int64_t*>(slabs.data_ptr());
@@ -188,7 +202,7 @@ inline Tables tables_from(
   }
   const auto* rows = static_cast<const int64_t*>(row_bytes.data_ptr());
   t.row_bytes.assign(rows, rows + row_bytes.size(0));
-  if (t.images) check_image_tables(t);
+  if (t.images) check_image_tables<Layout>(t);
   return t;
 }
 

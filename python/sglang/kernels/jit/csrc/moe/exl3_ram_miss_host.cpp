@@ -1,15 +1,9 @@
-// Option C RAM-miss service for EXL3 streamed experts (DSV41 Phase 3b plan, D8-D19).
-//
-// This file grows in three plan tasks: the row reader (Task 10: io_uring superset
-// reads into a page-aligned bounce, then Exl3ShardRowSource's per-name split into the
-// pinned slabs), the C++-owned slot bookkeeping and request service (Task 11), and
-// the service thread with its watchdog (Task 12). Nothing here makes a CUDA call:
-// every write is a CPU store into (pinned) host memory (plan D9).
-
+// The EXL3 instantiation of the expert-stream host transport: type aliases, handle registries and the FFI exports.
 
 #include "expert_stream/host/ram_thread.h"
 #include "expert_stream/host/faulty_reader.h"
 #include "expert_stream/host/uring_reader.h"
+#include "exl3/exl3_row_layout.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -35,7 +29,7 @@ std::vector<int64_t> slots_of(TensorView slots) {
 namespace {
 
 using namespace expert_stream;
-using Exl3Source = RowReader<FaultyReader<UringReader>>;
+using Exl3Source = RowReader<exl3::Exl3RowLayout, FaultyReader<UringReader>>;
 using Exl3Tier = RamTier<Exl3Source>;
 using Exl3Thread = RamThread<Exl3Tier>;
 
@@ -75,6 +69,19 @@ inline std::shared_ptr<Exl3Thread> find_thread(int64_t handle) {
 
 }  // namespace
 
+/// \brief The layout this module was built for: its tensor names in copy-table order, newline-joined.
+std::string exl3_ram_miss_layout_names() {
+  std::string out;
+  for (const auto name : exl3::Exl3RowLayout::kNames) out += std::string(name) + "\n";
+  out.pop_back();
+  return out;
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_layout_names, exl3_ram_miss_layout_names);
+
+/// \brief Bit i: name i may be read by the copy wait's SMs (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
+int64_t exl3_ram_miss_layout_small_mask() { return exl3::Exl3RowLayout::kSmallMask; }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exl3_ram_miss_layout_small_mask, exl3_ram_miss_layout_small_mask);
+
 // Read `experts` of streamed row `row` into `slots` once, synchronously (tests, tools).
 // Arguments are validated by the Python wrapper (read_rows_once).
 int64_t exl3_ram_miss_read_rows(
@@ -94,7 +101,7 @@ int64_t exl3_ram_miss_read_rows(
     TensorView slots,
     int64_t step) {
   using namespace expert_stream;
-  Exl3Source reader(tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
+  Exl3Source reader(tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
 }
@@ -131,7 +138,7 @@ int64_t exl3_ram_miss_read_rows_traced(
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   Exl3Source reader(
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   reader.set_owner_core(owner_core);
   if (f[22] != 0) reader.set_piece_stream(true);
@@ -178,7 +185,7 @@ void exl3_ram_miss_read_rows_faulted(
   check_fault_words(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   Exl3Source reader(
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) {
@@ -231,7 +238,7 @@ void exl3_ram_miss_read_rows_sqes(
   auto* out = static_cast<int64_t*>(info.data_ptr());
   out[0] = out[1] = out[2] = out[3] = out[4] = 0;
   Exl3Source reader(
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) return;
@@ -307,7 +314,7 @@ void exl3_ram_miss_read_rows_pieces(
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
   std::fill(out, out + 5, 0);
-  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+  const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const std::vector<int32_t> ids = ids_of(experts);
   const std::vector<int64_t> dest = slots_of(slots);
   const size_t lanes = static_cast<size_t>(masks.size(1));
@@ -418,7 +425,7 @@ int64_t exl3_ram_miss_piece_geometry(
     TensorView subs,
     TensorView pieces) {
   using namespace expert_stream;
-  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+  const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   RowGeometry g;
   std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
@@ -461,7 +468,7 @@ int64_t exl3_ram_miss_piece_runs(
     int64_t row_images,
     TensorView runs) {
   using namespace expert_stream;
-  const Tables t = tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+  const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   const size_t rows = static_cast<size_t>(t.layers * t.experts);
   if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
@@ -566,7 +573,7 @@ int64_t exl3_ram_miss_open(
       static_cast<int32_t*>(slot_map.data_ptr()),
       static_cast<uint8_t*>(lease.data_ptr()),
       lease.size(0),
-      tables_from(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0,
       pack_workers,

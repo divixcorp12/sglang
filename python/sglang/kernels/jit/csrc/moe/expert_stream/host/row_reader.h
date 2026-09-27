@@ -4,6 +4,7 @@
 #include "file_reader.h"
 #include "piece_geometry.h"
 #include "pack_pool.h"
+#include "row_layout.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -46,9 +47,11 @@ namespace expert_stream {
 // published whole pieces (never a torn one) and otherwise bytes of unpublished slots the caller releases.
 // Trace: with no packing, row_pack_start/end are the clocks of a row's first and last publish (piece streaming)
 // or both the clock it was finished (without), pack_workers is 0, and useful_bytes still counts its segments.
-template <AsyncFileReader Reader>
+template <ExpertRowLayout Layout, AsyncFileReader Reader>
 class RowReader {
  public:
+  using LayoutType = Layout;  // named so it cannot shadow the template parameter
+
   RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
       : t_(std::move(tables)), direct_(direct) {
     set_pack(pack_workers, pack_split);
@@ -88,22 +91,22 @@ class RowReader {
   void set_piece_stream(bool on) {
     if (on) {
       if (pack_workers_ == 0 && !t_.images) {
-        throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+        throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
       }
       if (t_.parts * kSubReads > kPieces) {
-        throw std::runtime_error("exl3 RAM miss: piece streaming reads at most kPieces / kSubReads mirror parts");
+        throw std::runtime_error(error_prefix<Layout>() + "piece streaming reads at most kPieces / kSubReads mirror parts");
       }
       for (size_t row = 0; row < t_.slabs.size(); ++row) {
         for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
           if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kPieceAlign != 0 || t_.row_bytes[name] % kPieceAlign != 0) {
-            throw std::runtime_error("exl3 RAM miss: piece streaming needs every slab row base 128 B aligned");
+            throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs every slab row base 128 B aligned");
           }
         }
       }
     }
     piece_stream_ = on;
     subs_ = on ? kSubReads : 1;
-    if (io_.ready() && !size_extents()) throw std::runtime_error("exl3 RAM miss: too many descriptors for piece streaming");
+    if (io_.ready() && !size_extents()) throw std::runtime_error(error_prefix<Layout>() + "too many descriptors for piece streaming");
     if (pool_) size_jobs();
   }
   bool piece_stream() const { return piece_stream_; }
@@ -161,7 +164,7 @@ class RowReader {
     for (const auto& path : t_.paths) {
       const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (direct_ ? O_DIRECT : 0));
       if (fd < 0) {
-        std::fprintf(stderr, "ERROR exl3 RAM miss: open %s: %s\n", path.c_str(), std::strerror(errno));
+        std::fprintf(stderr, "ERROR %sopen %s: %s\n", error_prefix<Layout>().c_str(), path.c_str(), std::strerror(errno));
         return false;
       }
       fds_.push_back(fd);
@@ -174,7 +177,7 @@ class RowReader {
       // "size mismatch" does not say which copy is bad.
       if (statted && static_cast<int64_t>(st.st_size) != t_.file_sizes[file]) {
         throw std::runtime_error(
-            "exl3 RAM miss: " + path + " has size " + std::to_string(st.st_size) + " bytes but its source " +
+            error_prefix<Layout>() + path + " has size " + std::to_string(st.st_size) + " bytes but its source " +
             t_.source_paths[file] + " has size " + std::to_string(t_.file_sizes[file]) +
             " bytes; the copy is incomplete or stale");
       }
@@ -206,12 +209,12 @@ class RowReader {
       CPU_ZERO(&owner_only);
       CPU_SET(static_cast<int>(owner_core_), &owner_only);
       if (pthread_setaffinity_np(pthread_self(), sizeof(owner_only), &owner_only) != 0) {
-        throw std::runtime_error("exl3 RAM miss: could not pin the owner thread to its core");
+        throw std::runtime_error(error_prefix<Layout>() + "could not pin the owner thread to its core");
       }
       owner_pinned_ = true;
     }
     if (piece_stream_ && pack_workers_ == 0 && !t_.images) {
-      throw std::runtime_error("exl3 RAM miss: piece streaming needs packing workers");
+      throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
     }
     if (pack_workers_ > 0) {
       // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
@@ -513,7 +516,7 @@ class RowReader {
     // silently drop an extent's read while its row still packed and published - the old native-bypass
     // bug's signature. Cheap enough to check on every push, and there is no safe way to continue.
     if (c.queue_count >= queue_.size()) {
-      throw std::runtime_error("exl3 RAM miss: the extent queue overflowed its descriptor count");
+      throw std::runtime_error(error_prefix<Layout>() + "the extent queue overflowed its descriptor count");
     }
     queue_[(c.queue_head + c.queue_count) % queue_.size()] = index;
     ++c.queue_count;
@@ -1129,7 +1132,7 @@ class RowReader {
       if (stx.stx_dio_offset_align == 0 || kImageAlign % stx.stx_dio_offset_align != 0 ||
           stx.stx_dio_mem_align == 0 || kImageAlign % stx.stx_dio_mem_align != 0) {
         throw std::runtime_error(
-            "exl3 RAM miss: " + t_.paths[f] + " needs O_DIRECT alignment of " +
+            error_prefix<Layout>() + t_.paths[f] + " needs O_DIRECT alignment of " +
             std::to_string(stx.stx_dio_offset_align) + " B (offsets) and " + std::to_string(stx.stx_dio_mem_align) +
             " B (memory); row images are built for 512 B");
       }
@@ -1138,18 +1141,18 @@ class RowReader {
     for (size_t row = 0; row < t_.slabs.size(); ++row) {
       for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
         if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kImageAlign != 0 || off(t_.row_bytes[name])) {
-          throw std::runtime_error("exl3 RAM miss: row images need every slab row 512 B aligned");
+          throw std::runtime_error(error_prefix<Layout>() + "row images need every slab row 512 B aligned");
         }
       }
     }
     for (const Segment& s : t_.segments) {
       if (off(s.src) || off(s.dst) || off(s.bytes)) {
-        throw std::runtime_error("exl3 RAM miss: row images need every segment 512 B aligned");
+        throw std::runtime_error(error_prefix<Layout>() + "row images need every segment 512 B aligned");
       }
     }
     for (const Read& e : t_.extents) {
       if (e.length > 0 && (off(e.offset) || off(e.length) || off(e.dest))) {
-        throw std::runtime_error("exl3 RAM miss: row images need every extent's offset and length 512 B aligned");
+        throw std::runtime_error(error_prefix<Layout>() + "row images need every extent's offset and length 512 B aligned");
       }
     }
   }
@@ -1168,7 +1171,7 @@ class RowReader {
       const int64_t slot = (*c.slots)[ordinal];
       // A slot's job is free only once its previous copy is done; arming it earlier would hand a worker a
       // half-armed job. Like queue_push's overflow, this cannot happen unless the accounting above is wrong.
-      if (!jobs_[best].done()) throw std::runtime_error("exl3 RAM miss: a packing job was re-armed while a worker still holds it");
+      if (!jobs_[best].done()) throw std::runtime_error(error_prefix<Layout>() + "a packing job was re-armed while a worker still holds it");
       CopyRun* runs = &runs_[best * t_.segments.size()];
       for (size_t i = 0; i < t_.segments.size(); ++i) {
         const Segment& segment = t_.segments[i];
@@ -1219,7 +1222,7 @@ class RowReader {
           continue;
         }
         PackJob& job = jobs_[job_index];
-        if (!job.done()) throw std::runtime_error("exl3 RAM miss: a packing job was re-armed while a worker still holds it");
+        if (!job.done()) throw std::runtime_error(error_prefix<Layout>() + "a packing job was re-armed while a worker still holds it");
         job.arm(runs, segments, pack_split_, fault_.pack_delay_ns, c.trace ? &worker_stamp : nullptr, c.trace);
         pool_->post(&job);  // throws before queueing
         ++c.packing;

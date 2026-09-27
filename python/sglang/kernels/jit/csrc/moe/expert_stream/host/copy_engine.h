@@ -237,14 +237,15 @@ class CopyEngine {
   using Failure = std::function<void(const CopyJob&, int)>;
 
   CopyEngine(std::unique_ptr<CopyBackend> backend, int64_t rows, int64_t spin_ns, std::atomic<int64_t>* counters,
-             Handler complete, Handler acked, Failure fail)
+             Handler complete, Handler acked, Failure fail, std::string prefix)
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
         spin_ns_(spin_ns),
         counters_(counters),
         complete_(std::move(complete)),
         acked_(std::move(acked)),
-        fail_(std::move(fail)) {}
+        fail_(std::move(fail)),
+        prefix_(std::move(prefix)) {}
 
   ~CopyEngine() {
     stop(5'000'000'000LL);
@@ -258,7 +259,7 @@ class CopyEngine {
     if (!init_error_.empty()) {
       lock.unlock();
       stop(0);
-      throw std::runtime_error("exl3 RAM miss copy engine: " + init_error_);
+      throw std::runtime_error(prefix_ + "copy engine: " + init_error_);
     }
   }
 
@@ -492,6 +493,7 @@ class CopyEngine {
   Handler complete_;
   Handler acked_;
   Failure fail_;
+  std::string prefix_;
   std::thread thread_;
   std::mutex mutex_;  // guards queue_, outstanding_, stop_, drain_deadline_, started_ and init_error_
   std::condition_variable work_cv_;

@@ -41,8 +41,8 @@ constexpr uint16_t kServed = 1;
 constexpr uint16_t kFailed = 2;
 
 // ---- Lease block (LEASE_PROTOCOL.md section 4) ----
-// The lease block beside the request page. Its layout is written here, in exl3_ram_miss_host.cpp,
-// lease_device.cuh and ops/moe/exl3_lease_block.py; test_exl3_ram_miss_device_args checks they agree. The
+// The lease block beside the request page. Its layout is written here, in exl3_ram_miss_host.cpp (the EXL3
+// instantiation), lease_device.cuh and ops/moe/exl3_lease_block.py; test_exl3_ram_miss_device_args checks they agree. The
 // publication word (tag << 56 | generation) is built in code: the layout test parses these lines with + - * only.
 constexpr int64_t kLeaseRing = 16;   // == kDemandRecords
 constexpr int64_t kLeaseLanes = 8;   // == kMaxIds

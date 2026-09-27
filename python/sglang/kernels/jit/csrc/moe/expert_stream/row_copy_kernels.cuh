@@ -1,4 +1,5 @@
-// Row-copy kernels: piece-streaming helpers and the stream kernel, and the copy wait (exl3_ram_miss.cuh split).
+// Row-copy kernels: piece-streaming helpers and the stream kernel, and the copy wait (a split of the EXL3
+// instantiation's former exl3_ram_miss.cuh).
 #pragma once
 
 #include "lease_device.cuh"

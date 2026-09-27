@@ -24,6 +24,7 @@ from sglang.kernels.ops.moe.exl3_ram_miss import (
     MAX_IDS,
     Exl3RamMissDevice,
     Exl3RamMissHost,
+    host_layout,
     new_hot_page,
     new_page,
     stream_segment_map,
@@ -273,10 +274,11 @@ def _row_image_tables(
 
 
 def sm_copy_mask(names: Sequence[str]) -> int:
-    """The copy-table entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): every tensor
-    but the trellises. The four small ones are 44.5 KB of a 13.3 MB DSV4.1 row, and as DMA copies each paid a fixed
-    per-copy cost that dwarfed its bytes."""
-    return sum(1 << i for i, name in enumerate(names) if not name.endswith("_trellis"))
+    """The copy-table entries the copy wait reads itself (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): the host
+    layout's small tensors, wherever they sit in ``names``."""
+    layout_names, small = host_layout()
+    small_names = {name for i, name in enumerate(layout_names) if small >> i & 1}
+    return sum(1 << i for i, name in enumerate(names) if name in small_names)
 
 
 def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
@@ -765,6 +767,11 @@ class Exl3RamMissService:
             **mirrors,
             row_images=open_service_row_images(cfg, fmt.layout, fmt.segment_map(), mirrors, direct, streamers),
         )
+        layout_names, _ = host_layout()
+        if layout_names != EXL3_STREAMED_NAMES:
+            raise RuntimeError(
+                f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
+            )
         pin = torch.cuda.is_available()
         page = new_page(pin=pin)
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)

@@ -93,7 +93,7 @@ inline void UringReader::drain(unsigned pending) {
   if (unsubmitted > 0) {
     io_uring_queue_exit(&ring_);
     ready_ = io_uring_queue_init(depth_, &ring_, 0) == 0;
-    if (!ready_) std::fprintf(stderr, "ERROR exl3 RAM miss: io_uring ring reset failed\n");
+    if (!ready_) std::fprintf(stderr, "ERROR expert stream: io_uring ring reset failed\n");
   }
 }
 

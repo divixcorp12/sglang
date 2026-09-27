@@ -35,6 +35,13 @@ def _host_module() -> Module:
     )
 
 
+@cache_once
+def host_layout() -> tuple[tuple[str, ...], int]:
+    """The host module's row layout: its tensor names in copy-table order and the SM-readable ones as a bit mask."""
+    module = _host_module()
+    return tuple(str(module.exl3_ram_miss_layout_names()).split("\n")), int(module.exl3_ram_miss_layout_small_mask())
+
+
 def _ids(values: Iterable[int]) -> torch.Tensor:
     return torch.tensor(list(values), dtype=torch.int64)
 
@@ -711,6 +718,7 @@ class Exl3RamMissHost:
         )
         if self.handle < 0:
             raise RuntimeError("exl3 RAM miss service failed to open (files, io_uring or bounce)")
+        self.layout_names, self.small_mask = host_layout()
         # exl3_ram_miss_close also stops and joins the service thread, if one runs.
         self._close = weakref.finalize(self, self._module.exl3_ram_miss_close, self.handle)
         self._close.atexit = False  # _stop_live closes live hosts at exit, logging counters first

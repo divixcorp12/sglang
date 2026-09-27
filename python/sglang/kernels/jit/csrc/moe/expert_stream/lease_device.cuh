@@ -1,4 +1,5 @@
-// Device-side constants and helpers shared by the lease-protocol and row-copy kernels (exl3_ram_miss.cuh split).
+// Device-side constants and helpers shared by the lease-protocol and row-copy kernels (a split of the EXL3
+// instantiation's former exl3_ram_miss.cuh).
 #pragma once
 
 #include "lease_layout.h"
