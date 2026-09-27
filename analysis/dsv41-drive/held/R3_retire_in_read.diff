@@ -60,7 +60,7 @@ index 0179c07..1ff1c07 100644
 +    Mutation: retirement only at the top of pump_demand (the counter moves only after request 2 is done)."""
 +    s = ram_miss_setup(tmp_path, capacity=3)
 +    page = new_page(pin=False)
-+    host = Exl3RamMissHost(
++    host = ExpertStreamHost(
 +        s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=pack_workers
 +    )
 +    host.enable_lease_mode()

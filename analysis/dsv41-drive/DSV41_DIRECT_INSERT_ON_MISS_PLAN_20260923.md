@@ -102,7 +102,7 @@ inserted miss. DIRECT is the first port target.
   sidecar through native-service shutdown/quarantine. Add an ABI parity test
   for Python, device, and host layout constants.
 - [ ] Pass the GPU updater's per-layer `slot_to_expert` row and its true
-  capacity through `Exl3RamMissRowBackend` to `Exl3RamMissDevice.post`. In
+  capacity through `Exl3RamMissRowBackend` to `ExpertStreamDevice.post`. In
   `exl3_ram_miss_post_kernel`, build the bitmap from valid resident slots and
   write its sidecar slot as `seq=0 → fence → payload → fence → release(seq)`.
   Then publish the ordinary demand record and finally `demand_head`, using

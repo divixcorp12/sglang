@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -38,7 +38,7 @@ def hang_guard():
 def running(request, tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables,
         page=page,
         slot_map=torch.full((2, 6), -1, dtype=torch.int32),
@@ -135,7 +135,7 @@ def world(tmp_path):
     """The service driven by hand (no thread): every retirement pass is a ``pump``."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     yield s, page, host, LeaseSim(host, page, s.slabs)
     host.stop()

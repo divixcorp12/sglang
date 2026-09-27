@@ -1,7 +1,7 @@
 """Task 6 V1 two-phase, device chain: timing and degenerate shapes (task6-v1-checklist.md S5 T6, T7, T10, T11).
 
 Real GPU kernels against the real C++ service thread in lease mode with two-phase enabled
-(``Exl3RamMissHost.enable_two_phase()``), following the same shape as
+(``ExpertStreamHost.enable_two_phase()``), following the same shape as
 ``test_exl3_lease_kernels_cuda.py``'s ``TestServiceEndToEnd``. ``TwoPhaseService`` mirrors
 ``Exl3RamMissRowBackend.post``'s two-phase branch (post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F,
 ``expert_stream_transport.py:345-360``) one call at a time, so a test can intervene between stages -- T6
@@ -20,7 +20,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissDevice, Exl3RamMissHost, WORDS, new_page  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamDevice, ExpertStreamHost, WORDS, new_page  # noqa: E402
 
 LAYERS, EXPERTS, CAPACITY = 1, 16, 8
 TOP_K = 6
@@ -103,11 +103,11 @@ class TwoPhaseService:
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = Exl3RamMissHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
             self.host.enable_lease_mode()  # two-phase is refused without lease mode
             self.host.enable_two_phase()
             self.host.start_thread(fatal_wait_s=60.0)
-            self.dev = Exl3RamMissDevice(
+            self.dev = ExpertStreamDevice(
                 self.page, slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=advise,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
             )

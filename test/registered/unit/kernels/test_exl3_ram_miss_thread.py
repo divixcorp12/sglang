@@ -12,7 +12,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post, sim_wait
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -33,7 +33,7 @@ def _host(tmp_path, capacity=3, fatal_wait_s=5.0):
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
     host.start_thread(fatal_wait_s=fatal_wait_s)
     return s, page, slot_map, host
 
@@ -158,12 +158,12 @@ def test_concurrent_eager_use_and_advisories_never_share_a_slot(tmp_path):
 
 _SCRIPT_HEAD = """
 import pathlib, sys, time
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
 page = new_page(pin=False)
-host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
 """
 
 
@@ -268,7 +268,7 @@ def test_a_process_that_stops_after_fatal_is_not_aborted(tmp_path):
 
 def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
     s = ram_miss_setup(tmp_path)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
     )
     try:
@@ -283,7 +283,7 @@ def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
 @pytest.mark.parametrize("core, error, match", [(71, ValueError, "64-71"), (1000, RuntimeError, "pin")])
 def test_a_reserved_or_unusable_core_is_refused(tmp_path, core, error, match):
     s = ram_miss_setup(tmp_path)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
     )
     try:
@@ -336,7 +336,7 @@ def _tier(tmp_path, capacity=6):
     """A host with no service thread: the tests pump it, so nothing races."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     return s, page, host
 
 

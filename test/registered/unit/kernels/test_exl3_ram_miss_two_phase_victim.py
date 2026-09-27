@@ -2,7 +2,7 @@
 request must void its hit leases without releasing the slot (T3, T4 of
 docs/superpowers/plans/task6-v1-checklist.md section 5).
 
-Host-only, same LeaseSim/Exl3RamMissHost harness as test_exl3_ram_miss_two_phase.py (T1/T1b/T4b/T4c). Each test
+Host-only, same LeaseSim/ExpertStreamHost harness as test_exl3_ram_miss_two_phase.py (T1/T1b/T4b/T4c). Each test
 names the mutation of the service it must fail under; a mutant that leaves a test green is reported rather than
 escalated.
 """
@@ -13,7 +13,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -34,7 +34,7 @@ def hang_guard():
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     host.enable_two_phase()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)

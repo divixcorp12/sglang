@@ -12,7 +12,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, ExpertStreamHost, new_page, page_word
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -34,7 +34,7 @@ def world(tmp_path, request):
     capacity = getattr(request, "param", 2)
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     host.enable_trace()
     yield s, page, host, LeaseSim(host, page, s.slabs)
@@ -190,7 +190,7 @@ def test_a_demand_blocked_only_by_an_injected_lease_defers_with_lease_mode_off(t
     interim assertion that such a demand fails: it now waits, evicts nothing, and is served once the lease drops."""
     s = ram_miss_setup(tmp_path, capacity=2)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     try:
         from sglang.kernels.ops.moe.expert_stream_transport import sim_post, sim_wait
 

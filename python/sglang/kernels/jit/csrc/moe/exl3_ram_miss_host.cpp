@@ -651,7 +651,7 @@ int64_t exl3_ram_miss_open(
   using namespace expert_stream;
   using namespace host;
   check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
-  // page, slot_map, lease and hot_page are pinned (or not) together (Exl3RamMissHost.__init__), so one
+  // page, slot_map, lease and hot_page are pinned (or not) together (ExpertStreamHost.__init__), so one
   // SymbolicDevice ties them to the same actual device; capacity is always a plain CPU tensor.
   auto host_mem = SymbolicDevice{};
   verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);

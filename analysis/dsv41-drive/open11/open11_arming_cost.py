@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "test" / "manual" / "dsv41"))
 
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissDevice, Exl3RamMissHost, new_page  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamDevice, ExpertStreamHost, new_page  # noqa: E402
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, expert_row_segments  # noqa: E402
 
 LAYERS, EXPERTS, CAPACITY, TOP_K = 2, 16, 8, 6
@@ -57,13 +57,13 @@ class Rig:
         tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
         self.page = new_page(pin=True)
         slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
-        self.host = Exl3RamMissHost(tables, page=self.page, slot_map=slot_map, direct=False)
+        self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
         kw = {}
         if lease:
             self.host.enable_lease_mode()
             kw = {"lease_block": self.host.lease_block, "lease_layout": self.host.lease_layout}
         self.host.start_thread(fatal_wait_s=60.0)
-        self.dev = Exl3RamMissDevice(self.page, slot_map, device="cuda", layers=LAYERS,
+        self.dev = ExpertStreamDevice(self.page, slot_map, device="cuda", layers=LAYERS,
                                      timeout_ms=timeout_ms, advise=False, **kw)
         self.planned = torch.zeros(TOP_K, dtype=torch.int64, device="cuda")
         self.count = torch.zeros(1, dtype=torch.int32, device="cuda")

@@ -116,7 +116,7 @@ on_expert_distribution
         _load_reserved_in_chunks                           chunk = evictable_rows() tickets
           pinned_cache.host_use()                          -> NativePinnedSlotTable.before_host_use
             current_stream().synchronize()                 BLOCKING host sync
-            Exl3RamMissHost.pause(2*timeout+1 s)           BLOCKING, all layers, waits for the
+            ExpertStreamHost.pause(2*timeout+1 s)           BLOCKING, all layers, waits for the
                                                            thread to finish its current request
           _prepare_promotion
             ensure_rows  -> streamer.read_host_rows        BLOCKING NVMe reads, scheduler thread
@@ -151,7 +151,7 @@ Every site the promotion path can block. "Normal path" means a boundary with no 
 |---|---|---|---|---|
 | B1 | `decide_residency_policies`: `.cpu()` on the stacked scores | D2H on the current stream | scheduler thread (inside the forward) | 9.6 ms CPU incl. decision, section 18.6 py-spy |
 | B2 | `Exl3RamMissService.before_host_use`: `current_stream().synchronize()` | drains the forward stream | scheduler thread | not isolated |
-| B3 | same: `Exl3RamMissHost.pause` (`RamThread::pause` in `host.cpp`) | sleep-polls at 20 us until the single service thread is between two requests; pauses every layer at once; waits behind any demand read in flight | scheduler thread; and every demand for the length of the pause | not isolated |
+| B3 | same: `ExpertStreamHost.pause` (`RamThread::pause` in `host.cpp`) | sleep-polls at 20 us until the single service thread is between two requests; pauses every layer at once; waits behind any demand read in flight | scheduler thread; and every demand for the length of the pause | not isolated |
 | B4 | `ExpertPinnedHostCache.ensure_rows` -> `read_host_rows` | synchronous io_uring NVMe reads | scheduler thread | 19.5 ms `_prepare_promotion`, of which io_uring 15.9 ms, section 18.6 |
 | B5 | `_load_reserved_in_chunks`: `current_stream.synchronize()` per chunk | waits for the copies | scheduler thread | 13.8 ms, section 18.6 |
 | B6 | `FixedRowTransferPlan.set_rows`: `_upload_event.synchronize()` | previous plan upload not yet run | scheduler thread | not isolated |
@@ -818,7 +818,7 @@ depend on a scheduler mode the arm harnesses do not record.
 **The rule, stated in its strong form so nobody later "simplifies" it back: the lease release must not
 depend on the scheduler thread at all.** Not on the poll step, and not on "some other point on the
 scheduler thread" either. The scheduler thread is the one that runs `before_host_use`, which blocks in
-`torch.cuda.current_stream().synchronize()` and then `Exl3RamMissHost.pause`
+`torch.cuda.current_stream().synchronize()` and then `ExpertStreamHost.pause`
 (`Exl3RamMissService.before_host_use`), so any release placed anywhere on that thread only moves the
 stall. **This was confirmed independently from a second direction**
 (`analysis/dsv41-drive/LEASE_MODEL_REVIEW.md`, finding F1): the lease model treated the promoter and the
@@ -1348,7 +1348,7 @@ fail.
 **Static spies.** A test that monkeypatches, with a call-counting spy, each of:
 `torch.cuda.synchronize`, `torch.cuda.Stream.synchronize`, `torch.cuda.Event.synchronize`,
 `ExpertHotCache.wait_for_slot_publication`, `ExpertHotCache._drain_device`,
-`Exl3RamMissHost.pause`, `Exl3RamMissService.before_host_use`,
+`ExpertStreamHost.pause`, `Exl3RamMissService.before_host_use`,
 `ExpertPinnedHostCache.host_use`. Drive one full ticket life (STAGED to DONE) and assert **zero**
 calls. The spy for `_drain_device` must not fire on the normal path; it is the failure path only.
 **Where it runs** (second review B2): the pure-ledger drive with a fake executor runs on CPU
@@ -1887,6 +1887,6 @@ while the eager-gather `host_use` pause (9.3) remains. State what remains.
   `_publish_completed_promotions`, `on_expert_distribution`; `ExpertPinnedHostCache.ensure_rows`,
   `host_use`, `evictable_rows`; `AsyncExpertTransferExecutor._submit_operations`,
   `_acquire_slot`, `has_completed`; `FixedRowTransferPlan.set_rows`;
-  `Exl3RamMissService.before_host_use`, `Exl3RamMissHost.pause`;
+  `Exl3RamMissService.before_host_use`, `ExpertStreamHost.pause`;
   `RamTier::serve`, `take_slot_locked`, `set_hot`, `RamThread::pause` (`host.cpp`);
   `exl3_ram_miss_wait_kernel` (`device.cuh`); `exl3_reqs._check`.

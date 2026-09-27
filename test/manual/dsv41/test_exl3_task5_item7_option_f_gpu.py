@@ -25,7 +25,7 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS, Exl3RamMissDevice, new_page, page_word  # noqa: E402
+from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS, ExpertStreamDevice, new_page, page_word  # noqa: E402
 
 LAYERS, EXPERTS = 2, 16
 TOP_K = 6
@@ -51,7 +51,7 @@ class Device:
                 self.raw[entry : entry + 4].view(torch.int32)[0] = self.layout.slot_gen_base[row]
                 self.raw[entry + 4 : entry + 8].view(torch.int32)[0] = self.layout.capacities[row]
             kwargs = dict(lease_block=self.raw, lease_layout=self.layout)
-        self.dev = Exl3RamMissDevice(
+        self.dev = ExpertStreamDevice(
             self.page, self.slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=advise, **kwargs
         )
         self.planned = torch.full((TOP_K,), -1, dtype=torch.int64, device="cuda")

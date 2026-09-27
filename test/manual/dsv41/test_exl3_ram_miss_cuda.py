@@ -21,7 +21,7 @@ TOP_K = 6
 
 
 def _service(tmp_path, *, expert_dir=None, layer=0, capacity=8, timeout_ms=2000, advise=False, layers=2):
-    from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissDevice, Exl3RamMissHost, new_page
+    from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamDevice, ExpertStreamHost, new_page
     from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
@@ -44,9 +44,9 @@ def _service(tmp_path, *, expert_dir=None, layer=0, capacity=8, timeout_ms=2000,
         tables = exl3_ram_miss_tables(layout, fmt.segment_map(), slabs)
         page = new_page(pin=True)
         slot_map = torch.full((len(layer_ids), layout.num_experts), -1, dtype=torch.int32).pin_memory()
-        host = Exl3RamMissHost(tables, page=page, slot_map=slot_map, direct=fmt.direct)
+        host = ExpertStreamHost(tables, page=page, slot_map=slot_map, direct=fmt.direct)
         host.start_thread(fatal_wait_s=30.0)
-        dev = Exl3RamMissDevice(page, slot_map, device="cuda", layers=len(layer_ids), timeout_ms=timeout_ms, advise=advise)
+        dev = ExpertStreamDevice(page, slot_map, device="cuda", layers=len(layer_ids), timeout_ms=timeout_ms, advise=advise)
     except BaseException:
         _close(host, slabs)
         raise
@@ -262,12 +262,12 @@ def test_many_rewritten_slots_are_read_fresh_without_a_host_sync(tmp_path, graph
 
 def test_the_wait_honours_a_fatal_raised_on_the_page():
     """D15: the wait itself reads the page's fatal word, not only the post's sticky flag."""
-    from sglang.kernels.ops.moe.expert_stream_transport import WORDS, Exl3RamMissDevice, new_page
+    from sglang.kernels.ops.moe.expert_stream_transport import WORDS, ExpertStreamDevice, new_page
 
     # No host thread: nothing to serve and no watchdog to trip on the raised fatal.
     page = new_page(pin=True)
     slot_map = torch.full((1, EXPERTS), -1, dtype=torch.int32).pin_memory()
-    dev = Exl3RamMissDevice(page, slot_map, device="cuda", layers=1, timeout_ms=50, advise=False)
+    dev = ExpertStreamDevice(page, slot_map, device="cuda", layers=1, timeout_ms=50, advise=False)
     b = _buffers()
     dev.wait(0, b["planned"], b["count"], b["host_rows"], b["keep"], b["ram_miss"])
     torch.cuda.synchronize()

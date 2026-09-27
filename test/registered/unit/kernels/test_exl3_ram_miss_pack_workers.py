@@ -21,7 +21,7 @@ import torch
 import test_exl3_ram_miss_split as split
 import test_exl3_ram_miss_thread as thread
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, read_rows_traced
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -63,7 +63,7 @@ def packing_without_pieces(request, monkeypatch):
 
 def _packing(mode, monkeypatch):
     workers, chunks, piece_stream = mode
-    fault_tensor, host_init = ops._fault_tensor, Exl3RamMissHost.__init__
+    fault_tensor, host_init = ops._fault_tensor, ExpertStreamHost.__init__
     monkeypatch.setattr(split, "PIECE_STREAM", piece_stream)
 
     def with_workers(**faults):
@@ -79,7 +79,7 @@ def _packing(mode, monkeypatch):
             self.enable_piece_stream()
 
     monkeypatch.setattr(ops, "_fault_tensor", with_workers)
-    monkeypatch.setattr(Exl3RamMissHost, "__init__", init)
+    monkeypatch.setattr(ExpertStreamHost, "__init__", init)
     yield mode
     gc.collect()  # a host the test dropped closes its files and joins its workers now, not at exit
 
@@ -159,7 +159,7 @@ def test_no_worker_thread_exists_unless_asked_for_and_close_joins_them(tmp_path)
     def host(workers):
         (tmp_path / f"w{workers}").mkdir()
         s = ram_miss_setup(tmp_path / f"w{workers}", capacity=3)
-        return Exl3RamMissHost(
+        return ExpertStreamHost(
             s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
             direct=False, pack_workers=workers,
         )
@@ -267,7 +267,7 @@ def test_the_unpinned_service_thread_keeps_off_the_packing_workers_cpus(tmp_path
     if len(os.sched_getaffinity(0) - set(range(64, 72))) < 3:
         pytest.skip("needs three allowed cores")
     s = ram_miss_setup(tmp_path)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False,
         pack_workers=2,
     )
@@ -466,7 +466,7 @@ def _served_records(tmp_path, workers, rows=(2,)):
     host built with ``workers``: the three shapes of record a request can end in."""
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=workers
     )
     host.enable_trace()

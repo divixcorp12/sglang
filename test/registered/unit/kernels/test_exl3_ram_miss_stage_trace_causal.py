@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, read_rows_traced, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced, sim_post, sim_wait
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 from sglang.test.expert_stream_sources import host_sources, joined_text
@@ -32,7 +32,7 @@ def _host(tmp_path, *, trace_capacity=None, capacity=6):
     """A tier and its host; ``trace_capacity`` None leaves the trace off."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32), direct=False)
     if trace_capacity is not None:
         host.enable_trace(capacity=trace_capacity)
     return s, page, host

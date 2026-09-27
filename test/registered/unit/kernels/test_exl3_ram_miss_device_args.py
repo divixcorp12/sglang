@@ -10,7 +10,7 @@ import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe import expert_lease_block
-from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, Exl3RamMissDevice
+from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, ExpertStreamDevice
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.expert_stream_sources import (
     device_sources,
@@ -31,23 +31,23 @@ def test_state_words_are_distinct_and_dense():
 
 def test_a_page_of_the_wrong_size_is_refused():
     with pytest.raises(ValueError, match="page"):
-        Exl3RamMissDevice(torch.zeros(10, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=10, advise=False)
+        ExpertStreamDevice(torch.zeros(10, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=10, advise=False)
 
 
 def test_a_slot_map_of_the_wrong_shape_is_refused():
     with pytest.raises(ValueError, match="slot_map"):
-        Exl3RamMissDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((3, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=10, advise=False)
+        ExpertStreamDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((3, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=10, advise=False)
 
 
 def test_the_timeout_must_be_positive():
     with pytest.raises(ValueError, match="timeout"):
-        Exl3RamMissDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=0, advise=False)
+        ExpertStreamDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=0, advise=False)
 
 
 def _device(layers=2, experts=4, page=None):
     page = torch.zeros(PAGE_BYTES, dtype=torch.uint8) if page is None else page
     slot_map = torch.full((layers, experts), -1, dtype=torch.int32)
-    return Exl3RamMissDevice(page, slot_map, device="cpu", layers=layers, timeout_ms=10, advise=False)
+    return ExpertStreamDevice(page, slot_map, device="cpu", layers=layers, timeout_ms=10, advise=False)
 
 
 def _args(lanes=6):
@@ -72,7 +72,7 @@ def _wait(dev, a, row=0):
 def test_an_unpinned_page_or_slot_map_is_refused_for_a_cuda_device():
     # Checked before any CUDA call: the kernels read both through UVA.
     with pytest.raises(ValueError, match="pinned"):
-        Exl3RamMissDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cuda", layers=2, timeout_ms=10, advise=False)
+        ExpertStreamDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cuda", layers=2, timeout_ms=10, advise=False)
 
 
 def test_a_row_outside_the_streamed_layers_is_refused():
@@ -275,7 +275,7 @@ def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
     page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
     slot_map = torch.full((1, 384), -1, dtype=torch.int32)
     with pytest.raises(ValueError, match="hot_page"):
-        Exl3RamMissDevice(page, slot_map, device="cpu", layers=1, timeout_ms=10,
+        ExpertStreamDevice(page, slot_map, device="cpu", layers=1, timeout_ms=10,
                           advise=False, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
 
 

@@ -16,7 +16,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word, sim_post
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -37,7 +37,7 @@ def hang_guard():
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_lease_mode()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     yield s, page, host, LeaseSim(host, page, s.slabs)
@@ -173,14 +173,14 @@ def test_an_advisory_for_the_deferred_demands_own_row_takes_no_leased_slot(runni
 _DEFERRAL_SCRIPT = """
 import pathlib, sys, time
 import torch
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 FATAL_WAIT = 0.3
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=2)
 page = new_page(pin=False)
-host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
 host.enable_lease_mode()
 sim = LeaseSim(host, page, s.slabs)
 host.start_thread(fatal_wait_s=FATAL_WAIT, spin_us=200)

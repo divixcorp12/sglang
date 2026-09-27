@@ -282,9 +282,9 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
         assert wait_s >= 30.0
         assert wait_s > 2 * timeout_ms / 1000 + 1.0  # the eager pause bound
     started = []
-    start = module.Exl3RamMissHost.start_thread
+    start = module.ExpertStreamHost.start_thread
     monkeypatch.setattr(
-        module.Exl3RamMissHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
+        module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
     )
     with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
         service.ensure_started()
@@ -295,7 +295,7 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
 @pytest.mark.parametrize("prefetch, advise", [(True, 1), (None, 0)], ids=["env_on", "env_unset"])
 def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, prefetch, advise):
     """The production hop: SGLANG_DSV41_ENABLE_EXPERT_PREFETCH -> prefetch_enabled() -> attach ->
-    Exl3RamMissDevice(advise=...) -> the row backend's posts. Nothing else sets ``advise``."""
+    ExpertStreamDevice(advise=...) -> the row backend's posts. Nothing else sets ``advise``."""
     service, streamers, caches = tiers
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
     for streamer in streamers.values():
@@ -473,7 +473,7 @@ def tier_sim_load_forwards(path):
 def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):
     service, streamers, caches = tiers
     enabled = []
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: enabled.append(self))
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: enabled.append(self))
     assert envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get() is False
     _attach_all(service, streamers)
     assert enabled == [] and service.lease_mode is False
@@ -484,9 +484,9 @@ def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_w
     """One env read (ensure_started) feeds both sides, so the device's arming and the service's leasing cannot disagree."""
     service, streamers, caches = tiers
     order = []
-    enable, start = module.Exl3RamMissHost.enable_lease_mode, module.Exl3RamMissHost.start_thread
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
-    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    enable, start = module.ExpertStreamHost.enable_lease_mode, module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
+    monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
     with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
         _attach_all(service, streamers)
     assert order == ["lease", "thread"] and service.lease_mode is True
@@ -536,9 +536,9 @@ def test_piece_stream_is_accepted_by_the_config_refusal_once_all_three_hold(tier
 def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on(tiers, monkeypatch, piece_stream):
     service, streamers, caches = tiers
     order = []
-    enable, start = module.Exl3RamMissHost.enable_piece_stream, module.Exl3RamMissHost.start_thread
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_piece_stream", lambda self: (order.append("piece"), enable(self))[1])
-    monkeypatch.setattr(module.Exl3RamMissHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
+    enable, start = module.ExpertStreamHost.enable_piece_stream, module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_piece_stream", lambda self: (order.append("piece"), enable(self))[1])
+    monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
     with (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(piece_stream),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
@@ -645,9 +645,9 @@ def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch)
     from sglang.kernels.ops.moe import expert_lease_block as lease
 
     service, streamers, caches = tiers
-    header = module.Exl3RamMissHost.lease_header
+    header = module.ExpertStreamHost.lease_header
     monkeypatch.setattr(
-        module.Exl3RamMissHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
+        module.ExpertStreamHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
     )
     with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True), pytest.raises(RuntimeError, match="ABI version"):
         _attach_with_copy_tables(service, streamers)
@@ -1107,7 +1107,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     def reached(self, device):
         raise _CopyEngineReached
 
-    monkeypatch.setattr(module.Exl3RamMissHost, "enable_copy_engine", reached)
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
     # reaches enable_copy_engine here would leak the copy-engine config into every later test.

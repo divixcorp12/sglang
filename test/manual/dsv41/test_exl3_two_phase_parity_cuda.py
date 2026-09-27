@@ -47,8 +47,8 @@ except ImportError:  # pragma: no cover - exercised only when cuda-python is mis
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
-    Exl3RamMissDevice,
-    Exl3RamMissHost,
+    ExpertStreamDevice,
+    ExpertStreamHost,
     new_page,
 )
 from sglang.kernels.ops.moe.expert_cache_transfer import (  # noqa: E402
@@ -105,11 +105,11 @@ class Service:
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = Exl3RamMissHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
             self.host.enable_lease_mode()
             self.host.enable_two_phase()
             self.host.start_thread(fatal_wait_s=60.0)
-            self.dev = Exl3RamMissDevice(
+            self.dev = ExpertStreamDevice(
                 self.page, slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=False,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
             )
@@ -187,7 +187,7 @@ def service(tmp_path):
 def _kernel_func(fn):
     """Capture exactly one call of ``fn`` in its own graph and return its sole kernel node's ``func`` handle.
 
-    ``fn`` must issue exactly one kernel launch when called (true of every ``Exl3RamMissDevice`` stage method
+    ``fn`` must issue exactly one kernel launch when called (true of every ``ExpertStreamDevice`` stage method
     and of ``copy_expert_row_segments_gpu``); more than one is a harness bug, caught by the assertion below
     rather than silently mis-tagging a stage.
     """

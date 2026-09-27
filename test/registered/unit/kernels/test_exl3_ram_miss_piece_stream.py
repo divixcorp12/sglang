@@ -26,7 +26,7 @@ import test_exl3_ram_miss_two_phase_victim as two_phase_victim
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    Exl3RamMissHost,
+    ExpertStreamHost,
     new_page,
     page_word,
     piece_geometry,
@@ -552,7 +552,7 @@ def _host(tmp_path, workers, *, lease_mode=True, two_phase=True, piece_stream=Tr
     """A tier as the service builds it for piece streaming: lease mode, two-phase, packing workers, the flag."""
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=workers
     )
     if lease_mode:
@@ -1024,13 +1024,13 @@ def test_flag_off_the_tier_grants_miss_lanes_after_the_read_and_releases_a_faile
 
 @pytest.fixture
 def piece_streaming_hosts(monkeypatch):
-    init = Exl3RamMissHost.__init__
+    init = ExpertStreamHost.__init__
 
     def with_pieces(self, *args, pack_workers=None, **kwargs):
         init(self, *args, pack_workers=2 if pack_workers is None else pack_workers, **kwargs)
         self.enable_piece_stream()
 
-    monkeypatch.setattr(Exl3RamMissHost, "__init__", with_pieces)
+    monkeypatch.setattr(ExpertStreamHost, "__init__", with_pieces)
 
 
 # Replaced above by their adaptations to the loading grant: T1 asserts the miss lane is unpublished (tag 0) during

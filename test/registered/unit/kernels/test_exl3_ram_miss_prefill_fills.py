@@ -7,7 +7,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -26,7 +26,7 @@ def hang_guard():
 
 
 def _host(s, **kwargs):
-    return Exl3RamMissHost(
+    return ExpertStreamHost(
         s.tables,
         page=new_page(pin=False),
         slot_map=torch.full(tuple(s.tables.starts.shape), -1, dtype=torch.int32),

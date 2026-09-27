@@ -22,8 +22,8 @@ import torch
 from sglang.kernels.ops.moe import expert_lease_block
 from sglang.kernels.ops.moe.expert_stream_transport import (
     MAX_IDS,
-    Exl3RamMissDevice,
-    Exl3RamMissHost,
+    ExpertStreamDevice,
+    ExpertStreamHost,
     host_layout,
     new_hot_page,
     new_page,
@@ -476,7 +476,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self,
         segments,
         host_row_map: torch.Tensor,
-        device_side: Exl3RamMissDevice,
+        device_side: ExpertStreamDevice,
         row: int,
         next_row: int,
         capacity: int,
@@ -677,8 +677,8 @@ class Exl3RamMissService:
 
     def __init__(self) -> None:
         self.tables: dict[int, NativePinnedSlotTable] = {}
-        self.host: Optional[Exl3RamMissHost] = None
-        self.device_side: Optional[Exl3RamMissDevice] = None
+        self.host: Optional[ExpertStreamHost] = None
+        self.device_side: Optional[ExpertStreamDevice] = None
         self.page = None
         self.slot_map = None
         self._rows: dict[int, int] = {}
@@ -777,7 +777,7 @@ class Exl3RamMissService:
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
-        host = Exl3RamMissHost(
+        host = ExpertStreamHost(
             tables,
             page=page,
             slot_map=slot_map,
@@ -944,14 +944,14 @@ class Exl3RamMissService:
                     f"exl3 RAM miss: the lease block's ABI version is {self.host.lease_header()['abi_version']}, "
                     f"the device kernels speak {expert_lease_block.ABI_VERSION}"
                 )
-            self.device_side = Exl3RamMissDevice(
+            self.device_side = ExpertStreamDevice(
                 self.page,
                 self.slot_map,
                 device=cache.device,
                 layers=len(self._rows),
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 advise=prefetch_enabled(),
-                # The host owns the block (Exl3RamMissHost allocates it); the device reads the same one.
+                # The host owns the block (ExpertStreamHost allocates it); the device reads the same one.
                 lease_block=self.host.lease_block if self.lease_mode else None,
                 lease_layout=self.host.lease_layout if self.lease_mode else None,
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,

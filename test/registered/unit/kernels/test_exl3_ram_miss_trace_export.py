@@ -6,7 +6,7 @@ import json
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
 from sglang.srt.layers.moe.exl3_stream_trace import RAM_MISS_TRACE_SCHEMA, Exl3StreamTrace
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -34,7 +34,7 @@ def _lines(path):
 def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
     host.enable_trace(capacity=2)
     trace_path = tmp_path / "trace.jsonl"
     trace = Exl3StreamTrace(str(trace_path))

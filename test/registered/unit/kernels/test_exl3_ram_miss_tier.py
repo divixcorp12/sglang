@@ -16,7 +16,7 @@ from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
     PAGE_BYTES,
-    Exl3RamMissHost,
+    ExpertStreamHost,
     new_page,
     new_hot_page,
     hot_record_bytes,
@@ -46,7 +46,7 @@ def tier(tmp_path, request):
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
     yield s, page, slot_map, host
     host.stop()
 
@@ -96,7 +96,7 @@ def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path, two_
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
     try:
         host.enable_lease_mode()
         if two_phase:
@@ -131,7 +131,7 @@ def test_gpu_hot_sidecar_fails_closed_on_stale_bitmap_and_wraps(tmp_path, fault)
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
     try:
         host.enable_lease_mode()
         host.enable_gpu_hot()
@@ -241,7 +241,7 @@ def mirrored_tier(tmp_path):
             s.slabs[1][name][slot].view(torch.uint8).fill_(0xAB)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = Exl3RamMissHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
     yield s, page, slot_map, host
     host.stop()
 
@@ -454,7 +454,7 @@ def test_a_repeated_protect_id_takes_one_slot(tier):
 def test_the_host_refuses_a_page_or_slot_map_it_cannot_index(tmp_path, page_fn, map_fn):
     s = ram_miss_setup(tmp_path)
     with pytest.raises(ValueError):
-        Exl3RamMissHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=False)
+        ExpertStreamHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=False)
 
 
 def test_release_refuses_a_slot_that_is_still_loading(tier):
@@ -476,12 +476,12 @@ def test_release_refuses_a_slot_that_is_still_loading(tier):
 
 _CLOSE_DURING_PUMP = """
 import pathlib, sys, threading, time
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
 page = new_page(pin=False)
-host = Exl3RamMissHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
 host.inject(delay_s=0.5)
 seq = sim_post(page, 0, need=[1], protect=[1])
 results = []
@@ -511,7 +511,7 @@ def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, 
         (tmp_path / str(i)).mkdir()
         s = ram_miss_setup(tmp_path / str(i))
         hosts.append(
-            Exl3RamMissHost(
+            ExpertStreamHost(
                 s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
             )
         )

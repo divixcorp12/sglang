@@ -24,7 +24,7 @@ import test_exl3_ram_miss_thread as thread
 import test_exl3_ram_miss_two_phase as two_phase
 import test_exl3_ram_miss_two_phase_victim as two_phase_victim
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, read_rows_pieces, read_rows_sqes, read_rows_traced
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, read_rows_pieces, read_rows_sqes, read_rows_traced
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
@@ -89,7 +89,7 @@ def _row_images(pieces, monkeypatch):
     for module in SETUP_USERS:
         monkeypatch.setattr(module, "ram_miss_setup", _images_setup)
     monkeypatch.setattr(split, "PIECE_STREAM", pieces)
-    fault_tensor, table_args, host_init = ops._fault_tensor, ops._table_args, Exl3RamMissHost.__init__
+    fault_tensor, table_args, host_init = ops._fault_tensor, ops._table_args, ExpertStreamHost.__init__
 
     def faults_with_pieces(**faults):
         if pieces:
@@ -104,7 +104,7 @@ def _row_images(pieces, monkeypatch):
 
     monkeypatch.setattr(ops, "_fault_tensor", faults_with_pieces)
     monkeypatch.setattr(ops, "_table_args", direct_table_args)
-    monkeypatch.setattr(Exl3RamMissHost, "__init__", direct_host)
+    monkeypatch.setattr(ExpertStreamHost, "__init__", direct_host)
     yield pieces
 
 

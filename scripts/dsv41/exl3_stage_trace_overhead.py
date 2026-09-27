@@ -24,7 +24,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
 from sglang.kernels.ops.moe.expert_stream_transport import STAGE_FIELDS
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
@@ -95,7 +95,7 @@ class Arm:
         self.name, self.trace = name, trace
         self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS)
         self.page = new_page(pin=False)
-        self.host = Exl3RamMissHost(
+        self.host = ExpertStreamHost(
             self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), direct=False
         )
         if trace:

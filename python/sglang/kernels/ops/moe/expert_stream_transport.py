@@ -534,7 +534,7 @@ WORDS = {
 STATUS = {"pending": 0, "served": 1, "failed": 2}
 # Order of the C++ counters. ``rows_read`` counts every row read, demand AND advisory
 # (``advisory_rows`` is the advisory part); it is not the RAM-miss count behind ``f``. Demand
-# rows come only from ``Exl3RamMissHost.layer_rows()``: per streamed layer, demand-only, and
+# rows come only from ``ExpertStreamHost.layer_rows()``: per streamed layer, demand-only, and
 # read under the host's lock. Do not derive them as ``rows_read - advisory_rows``: the two
 # counters are separate atomics bumped after the rows are published, so a read can tear.
 COUNTERS = (
@@ -642,7 +642,7 @@ def seqlock_stress(seconds: float) -> tuple[int, int]:
     return int(out[0]), int(out[1])
 
 
-_LIVE: weakref.WeakSet[Exl3RamMissHost] = weakref.WeakSet()
+_LIVE: weakref.WeakSet[ExpertStreamHost] = weakref.WeakSet()
 
 
 @atexit.register
@@ -654,7 +654,7 @@ def _stop_live() -> None:
             sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
 
 
-class Exl3RamMissHost:
+class ExpertStreamHost:
     """The C++-owned pinned-slot bookkeeping of every streamed layer and its request service.
 
     ``tables``: ``Exl3RamMissTables``; ``page``: a ``new_page`` tensor; ``slot_map``:
@@ -1205,7 +1205,7 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
     return torch.tensor([entry_of[name] for name in names] + whole, dtype=torch.int32, device=segments.table.device)
 
 
-class Exl3RamMissDevice:
+class ExpertStreamDevice:
     """The post and wait kernels of option C, capturable in a CUDA graph.
 
     ``page`` and ``slot_map`` are the host's pinned tensors (device-readable

@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import Exl3RamMissHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
@@ -25,7 +25,7 @@ DST_ROWS = 6
 def _host(tmp_path, *, piece_stream=True, arm=True):
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False)
-    host = Exl3RamMissHost(
+    host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=2
     )
     host.enable_lease_mode()

@@ -306,7 +306,7 @@ def test_open_refuses_a_mirror_copy_of_the_wrong_size_naming_both_files(tmp_path
         f.truncate(source_bytes + delta)
     for attempt in (
         lambda: read_rows_once(s.tables, 0, [0], [0], direct=False),
-        lambda: ops.Exl3RamMissHost(
+        lambda: ops.ExpertStreamHost(
             s.tables, page=ops.new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
         ),
     ):

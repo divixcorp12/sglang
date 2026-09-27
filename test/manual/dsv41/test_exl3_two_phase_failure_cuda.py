@@ -4,7 +4,7 @@ section 5).
 
 GPU. Copies the real-service end-to-end recipe of test_exl3_lease_kernels_cuda.py's Service/TestServiceEndToEnd,
 with two-phase enabled and the chain driven stage by stage (post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F) instead
-of through Exl3RamMissDevice.wait/ack.
+of through ExpertStreamDevice.wait/ack.
 
 Run on divix01 under gpu-run.sh (it holds cc-gpu.lock) with PYTHONPATH pointing at the tree under test.
 """
@@ -19,8 +19,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
-    Exl3RamMissDevice,
-    Exl3RamMissHost,
+    ExpertStreamDevice,
+    ExpertStreamHost,
     new_page,
 )
 
@@ -55,7 +55,7 @@ def _terminal(host, seq):
 class TwoPhaseService:
     """The real service thread, two-phase enabled, driven stage by stage. Copied from
     test_exl3_lease_kernels_cuda.py's Service, extended with the D1-D4 stage API
-    (Exl3RamMissDevice.hit_wait/rest_wait/stage_ack/finalize)."""
+    (ExpertStreamDevice.hit_wait/rest_wait/stage_ack/finalize)."""
 
     def __init__(self, tmp_path, *, timeout_ms=2000):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
@@ -79,11 +79,11 @@ class TwoPhaseService:
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = Exl3RamMissHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
             self.host.enable_lease_mode()
             self.host.enable_two_phase()
             self.host.start_thread(fatal_wait_s=60.0)
-            self.dev = Exl3RamMissDevice(
+            self.dev = ExpertStreamDevice(
                 self.page, slot_map, device="cuda", layers=LAYERS, timeout_ms=timeout_ms, advise=False,
                 lease_block=self.host.lease_block, lease_layout=self.host.lease_layout,
             )
