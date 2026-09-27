@@ -41,7 +41,11 @@ def layer_major_runtime(model_runner) -> LayerMajorRuntime | None:
     # see every token in the right place. Refuse rather than silently produce wrong shadow scores or
     # captured top-k.
     if model_runner.expert_prediction_runtime is not None:
-        raise ValueError("layer-major prefill cannot be combined with MoE expert-prediction shadow mode yet")
+        raise ValueError(
+            "layer-major prefill cannot be combined with MoE expert-prediction shadow mode yet "
+            "(SGLANG_MOE_EXPERT_PREDICTOR, SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR or "
+            "SGLANG_MOE_EXPERT_PREDICTOR_CAPTURE_DIR is set)"
+        )
     if _capture_enabled():
         raise ValueError("layer-major prefill cannot be combined with routed-experts/indexer top-k capture yet")
     adapter = make(model_runner.model, model_runner)
@@ -66,10 +70,15 @@ def layer_major_runtime_for_worker(model_runner, *, is_draft_worker: bool) -> La
 
 
 def _capture_enabled() -> bool:
-    from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-    from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+    """The launch flags the capturer factories consult (RoutedExpertsCapturer.create,
+    routed_experts.py; create_indexer_capturer, indexer_topk.py), not the capturers themselves:
+    those are only installed later in startup (ModelRunner._init_post_memory_pool_components, after
+    TpModelWorker.__init__ -- and this check -- already ran), so reading them here would never see
+    a launch that enables the feature."""
+    from sglang.srt.runtime_context import get_exec
 
-    return get_global_experts_capturer() is not None or get_global_indexer_capturer() is not None
+    features = get_exec().features
+    return features.enable_return_routed_experts or features.enable_return_indexer_topk
 
 
 def run_layer_major_prefill(runtime: LayerMajorRuntime, model_runner, schedule_batch, forward_batch):
