@@ -330,6 +330,37 @@ def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
         module.expert_stream_read_rows(*args, 0, experts, slots, expert_stream_transport.BOUNCE_ROWS)
 
 
+def _out_extent(host, entry):
+    """The int64 words each introspection entry writes for row 0: its handle's real extent, not the caller's."""
+    capacity = int(host.tables.capacity[0])
+    return {
+        "slot_info": 4 * capacity,
+        "mapping": host.experts,
+        "slot_to_expert": capacity,
+        "lru_order": capacity,
+        "layer_rows": host.layers,
+    }[entry]
+
+
+@pytest.mark.parametrize("delta", [-1, 1], ids=["undersized", "oversized"])
+@pytest.mark.parametrize("entry", ["slot_info", "mapping", "slot_to_expert", "lru_order", "layer_rows"])
+def test_an_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, entry, delta):
+    """Each entry writes a handle-dependent count of int64s through a raw pointer with no bound of its own, so a
+    buffer one word short is written past its end. The out tensor is a view into a larger sentinel-filled backing:
+    a missing refusal shows as the call succeeding, and any write, in bounds or past the view's end, as a changed
+    sentinel. The exact size is required, so one word too many is refused as well."""
+    s, page, slot_map, host = tier
+    assert _serve(page, host, 0, need=[0, 1], protect=[0, 1]) == 1  # every entry has something to write
+    expected = _out_extent(host, entry)
+    sentinel = -7
+    backing = torch.full((expected + 2,), sentinel, dtype=torch.int64)
+    out = backing[: expected + delta]
+    call = getattr(host._module, f"expert_stream_{entry}")
+    with pytest.raises(RuntimeError, match=rf"^out: (?s:.*)expected {expected} but got {expected + delta}"):
+        call(host.handle, 0, out)  # (handle, row, out); layer_rows takes (handle, advisory, out)
+    assert backing.eq(sentinel).all(), "the refusal came after a write"
+
+
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
     s, page, slot_map, host = tier
     seq = sim_post(page, 0, need=[1], protect=[1])
