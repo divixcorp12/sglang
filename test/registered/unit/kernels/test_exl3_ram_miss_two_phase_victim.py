@@ -103,8 +103,10 @@ def test_a_hit_lanes_slot_is_never_its_own_requests_victim(running):
     # is up to the scheduler, and this test's double-signal assertion came out 1 under CPU contention.
     host._module.expert_stream_stop_thread(host.handle)  # the thread only: the tier stays inspectable
     host.threaded = False
+    # The acknowledgement only. The request was served, so the device publishes no terminal: the finalize kernel
+    # returns before its publish when served, and its failure mask never names an acknowledged lane. A terminal
+    # naming lane 0 here would be a double signal, which the service rightly counts.
     sim.ack(req, waited)
-    sim.terminal(req, mask=1 << 0)
     sim.deliver()
     host.pump()
     assert _leases(host, 0)[hit_slot] == 0
