@@ -1,8 +1,8 @@
 // Tier/RamTier: slot state and admission.
 #pragma once
 
-#include "copy_engine.h"
 #include "../row_layout.h"
+#include "copy_engine.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -14,7 +14,8 @@ struct Tier {
   std::vector<uint64_t> stamp;
   std::vector<int32_t> expert_slot;  // assigned slot (LOADING or READY) or -1
   std::vector<uint8_t> hot;
-  std::vector<uint32_t> leases;      // GPU-reader leases per slot (LEASE_PROTOCOL.md section 8); 0 frees a slot for eviction
+  std::vector<uint32_t>
+      leases;  // GPU-reader leases per slot (LEASE_PROTOCOL.md section 8); 0 frees a slot for eviction
   std::vector<uint32_t> generation;  // bumped before a slot's bytes change; mirrored into the lease block's SlotGen
   std::vector<uint8_t> filling;      // a prefill fill is still writing this kReady slot: never a victim, never released
   // Prefill share (plan 2026-09-25-dsv41-prefill-eviction): 1 while a row a prefill admitted has not been used by
@@ -41,8 +42,16 @@ class RamTier {
   using Layout = typename Source::LayoutType;
 
   RamTier(
-      uint8_t* page, int32_t* slot_map, uint8_t* lease, int64_t lease_bytes, Tables tables, std::vector<int64_t> capacity,
-      bool direct, int64_t pack_workers, uint8_t* hot_page, int64_t hot_bytes)
+      uint8_t* page,
+      int32_t* slot_map,
+      uint8_t* lease,
+      int64_t lease_bytes,
+      Tables tables,
+      std::vector<int64_t> capacity,
+      bool direct,
+      int64_t pack_workers,
+      uint8_t* hot_page,
+      int64_t hot_bytes)
       : page_(page),
         map_(slot_map),
         lease_(lease),
@@ -87,7 +96,9 @@ class RamTier {
     return true;
   }
 
-  std::vector<int> packing_cpus() const { return reader_.packing_cpus(); }
+  std::vector<int> packing_cpus() const {
+    return reader_.packing_cpus();
+  }
 
   uint8_t* page() const {
     return page_;
@@ -137,9 +148,9 @@ class RamTier {
     if (read_record(record, next_demand_, &request)) {
       judge_prefetch(request);
       const bool gpu_hot = gpu_hot_mode_.load() && request.armed;
-      const bool hot_ok = !gpu_hot ||
-          (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
-           load_acquire(record + kRecSeq) == next_demand_);
+      const bool hot_ok =
+          !gpu_hot || (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
+                       load_acquire(record + kRecSeq) == next_demand_);
       if (!hot_ok) {
         counters_[kOverruns].fetch_add(1);
         set_status(record, kFailed);
@@ -153,7 +164,8 @@ class RamTier {
         if (reason != Defer::kNone) {
           // Held back, not failed and not served: return before handle_demand (so busy_since_ and kBusySeq stay
           // untouched, or the watchdog would count the wait as a hung read) and before the tail (no demand_done, no
-          // advance). No stage record is pushed; the first observation time is kept for the one written when it is served.
+          // advance). No stage record is pushed; the first observation time is kept for the one written when it is
+          // served.
           if (deferred_seq_ != next_demand_) {
             deferred_seq_ = next_demand_;
             deferred_observed_ns_ = cur_ != nullptr ? cur_->observed : 0;
@@ -226,7 +238,8 @@ class RamTier {
   // Allocates the ring, then turns the trace on. Before the service thread starts, so the flag
   // never flips under a request being served.
   void enable_trace(size_t capacity) {
-    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "enable the stage trace before the service thread starts");
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "enable the stage trace before the service thread starts");
     std::lock_guard<std::mutex> guard(trace_mutex_);
     ring_ = std::make_unique<StageRing>(capacity);
     trace_on_.store(true, std::memory_order_release);
@@ -286,13 +299,16 @@ class RamTier {
     std::lock_guard<std::mutex> guard(mutex_);
     if (tiers_[row].state[slot] == kLoading) {
       // The service is filling it and will publish it; freeing it would hand it out twice.
-      throw std::runtime_error(error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is loading");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is loading");
     }
     if (leased_locked(tiers_[row], slot)) {
-      throw std::runtime_error(error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is leased");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is leased");
     }
     if (tiers_[row].filling[slot]) {
-      throw std::runtime_error(error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while a fill writes it");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while a fill writes it");
     }
     release_locked(row, slot);
     counters_[kVersion].fetch_add(1);
@@ -309,8 +325,12 @@ class RamTier {
   // aborts a hung demand. fill_end() joins it; the service thread's resume() joins it first too, so the service
   // thread and a fill never use the reader at once. Returns the count claimed; slots[i] is expert i's slot.
   int64_t fill_begin(
-      int64_t row, const std::vector<int32_t>& experts, const std::vector<int32_t>& protect, bool fallback,
-      int64_t* slots, int64_t* evictions) {
+      int64_t row,
+      const std::vector<int32_t>& experts,
+      const std::vector<int32_t>& protect,
+      bool fallback,
+      int64_t* slots,
+      int64_t* evictions) {
     if (threaded_.load() && !pause_requested_.load()) {
       throw std::runtime_error(error_prefix<Layout>() + "a prefill fill needs the service thread paused");
     }
@@ -323,7 +343,8 @@ class RamTier {
       Tier& tier = tiers_[row];
       for (const int32_t expert : experts) {
         if (tier.expert_slot[expert] >= 0) {
-          throw std::runtime_error(error_prefix<Layout>() + "fill of expert " + std::to_string(expert) + " that holds a slot");
+          throw std::runtime_error(
+              error_prefix<Layout>() + "fill of expert " + std::to_string(expert) + " that holds a slot");
         }
         int64_t evicted = -1;
         // A prefetch (no fallback) stops at the prefill share, leaving the rest to gather_rows' chunked admission,
@@ -343,7 +364,8 @@ class RamTier {
       }
       if (!taken.empty()) counters_[kVersion].fetch_add(1);
     }
-    for (size_t i = 0; i < taken.size(); ++i) slots[i] = taken[i];
+    for (size_t i = 0; i < taken.size(); ++i)
+      slots[i] = taken[i];
     fill_landed_.store(0, std::memory_order_release);
     fill_state_.store(taken.empty() ? kFillOk : kFillRunning, std::memory_order_release);
     if (taken.empty()) return 0;
@@ -386,7 +408,8 @@ class RamTier {
   // a row result per lane before it answers (LEASE_PROTOCOL.md 7). Off leaves every request as it always was.
   void set_lease_mode(bool on) {
     if (lease_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "lease mode needs a lease block");
-    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "set lease mode before the service thread starts");
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "set lease mode before the service thread starts");
     lease_mode_ = on;
   }
 
@@ -415,8 +438,7 @@ class RamTier {
     request->hot_bitmap.assign(record + kHotHeaderBytes, record + kHotHeaderBytes + bytes);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (load_acquire(record) != expected) return false;
-    if (experts_ % 8 != 0 &&
-        (request->hot_bitmap.back() & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
+    if (experts_ % 8 != 0 && (request->hot_bitmap.back() & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
       return false;
     return true;
   }
@@ -432,7 +454,8 @@ class RamTier {
   // device can copy them while the missing rows are still being read. Off leaves lease mode exactly as Task 5
   // shipped it, which is the A1 arm every Task 6 measurement is reported against.
   void set_two_phase(bool on) {
-    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "set two-phase mode before the service thread starts");
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "set two-phase mode before the service thread starts");
     two_phase_ = on;
   }
 
@@ -440,7 +463,8 @@ class RamTier {
   // rows piece by piece. Before the thread starts. The reader refuses it without packing workers; the service
   // refuses it without two-phase and lease mode.
   void set_piece_stream(bool on) {
-    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "set piece streaming before the service thread starts");
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "set piece streaming before the service thread starts");
     reader_.set_piece_stream(on);
     piece_stream_ = on;
   }
@@ -448,11 +472,14 @@ class RamTier {
   // Copy engine (LEASE_PROTOCOL.md 7.6): a thread that copies the reservation hold's hit lanes with the DMA engine.
   // `device` < 0 is the CPU test backend (HostCopyBackend). Before the service thread starts; unarmed until arm().
   void enable_copy_engine(int64_t device, int64_t spin_ns) {
-    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
-    if (copy_engine_ != nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is already enabled");
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
+    if (copy_engine_ != nullptr)
+      throw std::runtime_error(error_prefix<Layout>() + "the copy engine is already enabled");
     // Only the piece-streaming chain grants every lane in the reservation hold and runs the copy wait.
     if (!(lease_mode_ && two_phase_ && piece_stream_)) {
-      throw std::runtime_error(error_prefix<Layout>() + "the copy engine needs lease mode, two-phase and piece streaming");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "the copy engine needs lease mode, two-phase and piece streaming");
     }
     std::unique_ptr<CopyBackend> backend;
     if (device < 0) {
@@ -461,11 +488,15 @@ class RamTier {
       backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device));
     }
     auto engine = std::make_unique<CopyEngine>(
-        std::move(backend), layers_, spin_ns, counters_,
+        std::move(backend),
+        layers_,
+        spin_ns,
+        counters_,
         [this](const CopyJob& job) { return copy_completed(job); },
         [this](const CopyJob& job) { return copy_acked(job); },
         [this](const CopyJob& job, int error) { copy_failed(job, error); },
-        std::string(Layout::kName) + " RAM miss copy engine: ", std::string(Layout::kName) + "-copy-eng");
+        std::string(Layout::kName) + " RAM miss copy engine: ",
+        std::string(Layout::kName) + "-copy-eng");
     engine->start();
     copy_engine_ = std::move(engine);
   }
@@ -477,7 +508,8 @@ class RamTier {
   // index bitmask) below is comparing the same index space.
   void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows, int64_t sm_mask) {
     if ((static_cast<uint64_t>(sm_mask) & ~static_cast<uint64_t>(Layout::kSmallMask)) != 0) {
-      throw std::runtime_error(error_prefix<Layout>() + "sm_mask names a tensor that is not one of the layout's small ones");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "sm_mask names a tensor that is not one of the layout's small ones");
     }
     if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     if (sm_mask < 0 || (count < 63 && (sm_mask >> count) != 0)) {
@@ -486,23 +518,29 @@ class RamTier {
     std::vector<CopyEntry> table;
     for (int64_t i = 0; i < count; ++i) {
       if (entries[3 * i + 2] <= 0) throw std::runtime_error(error_prefix<Layout>() + "a copy-table entry of no bytes");
-      table.push_back(CopyEntry{
-          static_cast<uint64_t>(entries[3 * i]), static_cast<uint64_t>(entries[3 * i + 1]), entries[3 * i + 2],
-          (sm_mask >> i & 1) != 0});
+      table.push_back(
+          CopyEntry{
+              static_cast<uint64_t>(entries[3 * i]),
+              static_cast<uint64_t>(entries[3 * i + 1]),
+              entries[3 * i + 2],
+              (sm_mask >> i & 1) != 0});
     }
     copy_engine_->set_table(row, std::move(table), dst_rows);
   }
 
   void arm_copy_engine(bool on) {
-    if (on && copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
+    if (on && copy_engine_ == nullptr)
+      throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_armed_.store(on, std::memory_order_release);
   }
 
   // Native prefetch (plan 2026-09-25-dsv41-native-prefetch): serve the device's advisory next-layer copy requests
   // from `page` (kPrefetchPageBytes, pinned). Needs the copy engine; before the service thread starts.
   void enable_native_prefetch(uint8_t* page) {
-    if (threaded_.load()) throw std::runtime_error(error_prefix<Layout>() + "enable native prefetch before the service thread starts");
-    if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "native prefetch needs the copy engine");
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "enable native prefetch before the service thread starts");
+    if (copy_engine_ == nullptr)
+      throw std::runtime_error(error_prefix<Layout>() + "native prefetch needs the copy engine");
     if (page == nullptr) throw std::runtime_error(error_prefix<Layout>() + "native prefetch needs its page");
     prefetch_page_ = page;
     last_prefetch_gen_ = generation_of(load_acquire64(page + kPfReqGen));
@@ -557,10 +595,11 @@ class RamTier {
       }
     }
     if (skip != 0) {
-      counters_[skip == kPfSkipUnarmed    ? kPrefetchSkippedUnarmed
-                : skip == kPfSkipNotReady ? kPrefetchSkippedNotReady
-                                          : kPrefetchSkippedInvalid]
-          .fetch_add(1);
+      counters_
+          [skip == kPfSkipUnarmed    ? kPrefetchSkippedUnarmed
+           : skip == kPfSkipNotReady ? kPrefetchSkippedNotReady
+                                     : kPrefetchSkippedInvalid]
+              .fetch_add(1);
       publish_prefetch_done(kPfTagSkipped, gen, skip);
       return true;
     }
@@ -721,7 +760,8 @@ class RamTier {
     if (!entry.active || entry.gen != request.gen) return;
     entry.grants_pending = false;
     bool held = false;
-    for (uint32_t lane = 0; lane < entry.count; ++lane) held = held || entry.lane[lane].state == 1;
+    for (uint32_t lane = 0; lane < entry.count; ++lane)
+      held = held || entry.lane[lane].state == 1;
     if (!held) entry.active = false;
   }
 
@@ -870,7 +910,8 @@ class RamTier {
       if (terminated) std::memcpy(&mask, terminal + kLeaseTermSkippedMask, 4);
       for (uint32_t lane = 0; lane < entry.count; ++lane) {
         LaneLease& held = entry.lane[lane];
-        // No kernel reads a COPYING lane's slot, so no LaneAck or Terminal bit can release it; its copy's completion does.
+        // No kernel reads a COPYING lane's slot, so no LaneAck or Terminal bit can release it; its copy's completion
+        // does.
         if (held.copy_engine) continue;
         const uint64_t word = load_acquire64(acks + lane * kLeaseLaneAckBytes);
         const bool acknowledged = tag_of(word) != 0 && generation_of(word) == entry.gen;
@@ -902,14 +943,16 @@ class RamTier {
       // two grants, so counting only state == 1 would clear `active` while a grant is still pending -- after
       // which grant_lane_group_locked's `entry.active` guard no longer protects this ring slot.
       bool open = entry.grants_pending;
-      for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
+      for (uint32_t lane = 0; lane < entry.count; ++lane)
+        open = open || entry.lane[lane].state == 1;
       if (!open) entry.active = false;
       if (settle && !entry.active) entry.watched = false;
     }
   }
 
   // Lanes leased by the device and not yet retired. An eager pause is refused while this is non-zero; a lease held by
-  // anything else (a promotion, in Task 8) is not counted, because it protects its own slot (LEASE_PROTOCOL.md 17.1 R2).
+  // anything else (a promotion, in Task 8) is not counted, because it protects its own slot (LEASE_PROTOCOL.md 17.1
+  // R2).
   int64_t graph_leases_outstanding() const {
     return lanes_outstanding_.load();
   }
@@ -1050,8 +1093,9 @@ class RamTier {
   // service thread applies it just before its next read (the reader is that thread's alone), and it then
   // stays until replaced; an all-default tensor clears it. Words 17-20 (abandon_after, step, pack_workers,
   // pack_split) and 22 (piece_stream) are not faults and are ignored: use inject() for the abandon point, the
-  // tier's own constructor for the packing pool and set_piece_stream() for the mode. The reader's counters (submit and completion calls) run over the
-  // reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to a fresh tier.
+  // tier's own constructor for the packing pool and set_piece_stream() for the mode. The reader's counters (submit and
+  // completion calls) run over the reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to
+  // a fresh tier.
   void inject_fault(const int64_t* words) {
     std::lock_guard<std::mutex> guard(fault_mutex_);
     pending_fault_ = fault_from(words);
@@ -1116,7 +1160,8 @@ class RamTier {
       if (held.state == 1 && held.copy_engine) release_lease_locked(tier, held, kLeasesCopied);
     }
     bool open = entry.grants_pending;
-    for (uint32_t lane = 0; lane < entry.count; ++lane) open = open || entry.lane[lane].state == 1;
+    for (uint32_t lane = 0; lane < entry.count; ++lane)
+      open = open || entry.lane[lane].state == 1;
     if (!open) entry.active = false;
   }
 
@@ -1172,9 +1217,12 @@ class RamTier {
 
   // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
   void copy_failed(const CopyJob& job, int error) {
-    std::fprintf(stderr, "ERROR %s copy of request %llu failed (%d); leases held\n",
-                 (std::string(Layout::kName) + " RAM miss copy engine:").c_str(),
-                 static_cast<unsigned long long>(job.gen), error);
+    std::fprintf(
+        stderr,
+        "ERROR %s copy of request %llu failed (%d); leases held\n",
+        (std::string(Layout::kName) + " RAM miss copy engine:").c_str(),
+        static_cast<unsigned long long>(job.gen),
+        error);
     std::fflush(stderr);
     raise_fatal(static_cast<uint32_t>(job.gen));
   }
@@ -1182,7 +1230,11 @@ class RamTier {
   void raise_fatal(uint32_t seq) {
     uint32_t zero = 0;
     __atomic_compare_exchange_n(
-        reinterpret_cast<uint32_t*>(page_ + kFatal), &zero, seq == 0 ? 0xFFFFFFFFu : seq, false, __ATOMIC_RELEASE,
+        reinterpret_cast<uint32_t*>(page_ + kFatal),
+        &zero,
+        seq == 0 ? 0xFFFFFFFFu : seq,
+        false,
+        __ATOMIC_RELEASE,
         __ATOMIC_RELAXED);
   }
 
@@ -1319,15 +1371,24 @@ class RamTier {
     std::vector<uint8_t> packed;
     size_t landed = 0;
     auto advance = [&] {
-      while (landed < packed.size() && packed[landed] != 0) ++landed;
+      while (landed < packed.size() && packed[landed] != 0)
+        ++landed;
       fill_landed_.store(static_cast<int64_t>(landed), std::memory_order_release);
     };
     int result = 0;
     try {
       // A demand's batch size and no publish target: a fill has no device readiness words.
       result = reader_.read(
-          fill_row_, fill_experts_, fill_slots_, kBounceRows, [](size_t) { return false; }, nullptr, &packed, SIZE_MAX,
-          advance, nullptr);
+          fill_row_,
+          fill_experts_,
+          fill_slots_,
+          kBounceRows,
+          [](size_t) { return false; },
+          nullptr,
+          &packed,
+          SIZE_MAX,
+          advance,
+          nullptr);
     } catch (const std::exception& error) {
       std::fprintf(stderr, "ERROR %sprefill fill: %s\n", error_prefix<Layout>().c_str(), error.what());
       result = 0;
@@ -1413,7 +1474,7 @@ class RamTier {
     int64_t spare = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
       if (tier.state[slot] != kReady) continue;
-      if (tier.filling[slot]) continue;  // a prefill fill is still writing it
+      if (tier.filling[slot]) continue;         // a prefill fill is still writing it
       if (leased_locked(tier, slot)) continue;  // a GPU reader may still be reading it
       const int32_t expert = tier.slot_to_expert[slot];
       if (tier.hot[expert]) continue;
@@ -1589,11 +1650,11 @@ class RamTier {
           // fenced before any ready word of the request. Only after the entry opened: an active entry means an
           // older request may still be reading this ring index's words, and opening refuses it.
           if (piece_stream) publishing = init_piece_words_locked(request, missing);
-          if (!(piece_stream ? grant_lane_group_locked(request, [](size_t) { return true; }, true, &slots)
-                             : grant_lane_group_locked(
-                                   request,
-                                   [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); },
-                                   true))) {
+          if (!(piece_stream
+                    ? grant_lane_group_locked(
+                          request, [](size_t) { return true; }, true, &slots)
+                    : grant_lane_group_locked(
+                          request, [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); }, true))) {
             close_pending_grants_locked(request);  // granted nothing: retire the entry rather than leak the ring slot
             ok = false;
           }
@@ -1714,7 +1775,8 @@ class RamTier {
       std::lock_guard<std::mutex> guard(mutex_);
       if (two_phase_) {
         if (ok && !piece_stream) {
-          if (!grant_lane_group_locked(request, [&](size_t lane) { return listed(missing, request.lane_experts[lane]); }))
+          if (!grant_lane_group_locked(
+                  request, [&](size_t lane) { return listed(missing, request.lane_experts[lane]); }))
             ok = false;
         }
         close_pending_grants_locked(request);  // the second grant is owed no longer, however this request answered
@@ -1755,7 +1817,8 @@ class RamTier {
     }
     _mm_sfence();
     piece_publish_ = PiecePublish{
-        request.gen, piece_targets_.data(),
+        request.gen,
+        piece_targets_.data(),
         reinterpret_cast<const uint64_t*>(lease_ + lease_d_ + kLeaseStreamProbe + idx * kLeaseStreamProbeBytes)};
     return any;
   }
@@ -1783,11 +1846,11 @@ class RamTier {
 
   uint8_t* page_;
   int32_t* map_;
-  uint8_t* lease_;             // the lease block, or null when the service runs without one
+  uint8_t* lease_;  // the lease block, or null when the service runs without one
   uint8_t* hot_page_ = nullptr;
   int64_t hot_stride_ = 0;
   std::atomic<bool> gpu_hot_mode_{false};
-  uint32_t* slot_gen_ = nullptr;  // SlotGen[] inside it
+  uint32_t* slot_gen_ = nullptr;        // SlotGen[] inside it
   std::vector<int64_t> slot_gen_base_;  // first SlotGen word of each row
   int64_t lease_d_ = 0;                 // byte offset of area D (the device-written words)
   int64_t lease_p_ = 0;                 // byte offset of area P (the piece readiness words)
@@ -1818,9 +1881,9 @@ class RamTier {
   // Piece streaming: serve()'s readiness words per row it reads, reused every request (like packed_).
   std::vector<PieceTarget> piece_targets_;
   PiecePublish piece_publish_;
-  bool lease_mode_ = false;             // set before the service thread starts; off is today's protocol
-  bool two_phase_ = false;              // Task 6 V1: hit lanes granted before read(); off is the Task 5 batched grant
-  Outstanding outstanding_[kDemandRecords];  // by request slot; guarded by mutex_
+  bool lease_mode_ = false;  // set before the service thread starts; off is today's protocol
+  bool two_phase_ = false;   // Task 6 V1: hit lanes granted before read(); off is the Task 5 batched grant
+  Outstanding outstanding_[kDemandRecords];    // by request slot; guarded by mutex_
   std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
   std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
   std::atomic<int64_t> done_stall_ns_{0};      // test only: sleep between serving a demand and storing demand_done
@@ -1875,7 +1938,6 @@ class RamTier {
   StageRecord* cur_ = nullptr;
   int64_t last_done_ = 0;
 };
-
 
 }  // namespace expert_stream
 }  // namespace sglang

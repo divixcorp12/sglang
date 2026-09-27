@@ -2,8 +2,6 @@
 // instantiation's former exl3_ram_miss.cuh).
 #pragma once
 
-#include "lease_layout.h"
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -14,6 +12,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "lease_layout.h"
 #include <algorithm>
 #include <cstdint>
 
@@ -34,7 +33,7 @@ constexpr int kPolls = 5;
 constexpr int kSticky = 6;
 constexpr int kAdvised = 7;
 constexpr int kUnservedMisses = 8;
-constexpr int kEpoch = 9;         // times seq32 wrapped; the device owns it (LEASE_PROTOCOL.md 11.3)
+constexpr int kEpoch = 9;          // times seq32 wrapped; the device owns it (LEASE_PROTOCOL.md 11.3)
 constexpr int kPendingEpoch = 10;  // the epoch of the request kPending names
 // D5. One absolute deadline per request, written once by the post kernel and compared against by both stages, so a
 // two-stage request cannot run to 2 x SGLANG_DSV41_RAM_MISS_TIMEOUT_MS. `state` is int32[], so it takes two words.
@@ -43,7 +42,7 @@ constexpr int kDeadlineHi = 12;
 // D6. An earlier stage of THIS request failed. kSticky cannot serve here: it is a process-lifetime fail-stop latch
 // with no clear site, so using it would refuse every later request in the process.
 constexpr int kReqFailed = 13;
-constexpr int kFailReason = 14;  // the kLeaseReason* the failing stage recorded, for the terminal F publishes
+constexpr int kFailReason = 14;    // the kLeaseReason* the failing stage recorded, for the terminal F publishes
 constexpr int kStreamPieces = 15;  // piece slices the stream kernel's block 0 copied, cumulative
 constexpr int kStreamPolls = 16;   // stream-kernel leader passes, summed over its blocks, cumulative
 constexpr int kW1Passes = 17;      // stage 1's polling passes over its unclaimed lanes, cumulative
@@ -105,8 +104,16 @@ SGL_DEVICE bool listed(const int32_t* ids, int count, int32_t id) {
 }
 
 SGL_DEVICE void write_record(
-    uint8_t* record, uint32_t seq, int64_t row, const int32_t* need, int need_count, const int32_t* protect,
-    int protect_count, uint32_t after, uint32_t armed, uint32_t lanes) {
+    uint8_t* record,
+    uint32_t seq,
+    int64_t row,
+    const int32_t* need,
+    int need_count,
+    const int32_t* protect,
+    int protect_count,
+    uint32_t after,
+    uint32_t armed,
+    uint32_t lanes) {
   volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(record);
   volatile uint16_t* halves = reinterpret_cast<volatile uint16_t*>(record);
   // Seqlock writer: invalidate seq before touching the payload, so a lapped record that
@@ -193,7 +200,8 @@ SGL_DEVICE bool lane_result_judge(
                  (accept_copying && tag == kLeaseTagCopying)) &&
                 current;
   const bool valid = *ready_seen && again == r.ready && static_cast<int64_t>(r.expert) == expected_expert &&
-                     r.host_slot >= 0 && static_cast<uint32_t>(r.host_slot) < capacity;  // also bounds the ack SlotGen read
+                     r.host_slot >= 0 &&
+                     static_cast<uint32_t>(r.host_slot) < capacity;  // also bounds the ack SlotGen read
   if (valid) {
     *out_slot = r.host_slot;
     *out_slot_generation = r.slot_generation;
@@ -216,24 +224,31 @@ SGL_DEVICE bool lane_result_valid(
   const LaneRead r = lane_result_read(result);
   __threadfence_system();
   return lane_result_judge(
-      r, lane_result_reread(result), generation, expected_expert, capacity, out_slot, out_slot_generation, ready_seen,
-      accept_loading, loading, accept_copying, copying);
+      r,
+      lane_result_reread(result),
+      generation,
+      expected_expert,
+      capacity,
+      out_slot,
+      out_slot_generation,
+      ready_seen,
+      accept_loading,
+      loading,
+      accept_copying,
+      copying);
 }
-
-
 
 // A Terminal record (LEASE_PROTOCOL.md 13): the mask and the reason first, the tagged generation word last with a
 // release store, so a reader that acquires the word sees the mask. Named lanes never start a copy afterwards: the
 // caller has already left go_count at zero.
 SGL_DEVICE void publish_terminal(
     uint8_t* lease, int64_t lease_d, uint32_t seq, uint64_t generation, uint32_t skipped_mask, uint32_t reason) {
-  uint8_t* terminal = lease + lease_d + kLeaseTerminal + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseTerminalBytes;
+  uint8_t* terminal =
+      lease + lease_d + kLeaseTerminal + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseTerminalBytes;
   *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermSkippedMask) = skipped_mask;
   *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermReason) = reason;
   st_release_sys64(terminal + kLeaseTermGen, tagged_word(kLeaseTagTerminal, generation));
 }
-
-
 
 // Stage 1's body, shared by the two-phase W1 and piece streaming's W1 (which also resets the stream kernel's words).
 SGL_DEVICE void lease_hit_wait_body(
@@ -263,8 +278,8 @@ SGL_DEVICE void lease_hit_wait_body(
   }
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
 
-  bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 &&
-            ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
+  bool ok =
+      state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 && ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
   if (ok && (planned_count > kLeaseLanes || planned_count > lanes)) {
     ok = false;
     state[kFailReason] = static_cast<int32_t>(kLeaseReasonCount);
@@ -280,8 +295,8 @@ SGL_DEVICE void lease_hit_wait_body(
   // stage 2 is where it is diagnosed, so this stage simply claims nothing.
   if (seq == 0 || planned_count == 0) return;
 
-  const uint8_t* results = lease + kLeaseRowResult +
-                           static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
+  const uint8_t* results =
+      lease + kLeaseRowResult + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
   const uint32_t capacity =
       *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
   const uint64_t deadline = load_deadline(state);
@@ -308,9 +323,18 @@ SGL_DEVICE void lease_hit_wait_body(
       bool loading = false;
       bool copying = false;
       if (lane_result_judge(
-              reads[i], lane_result_reread(results + i * kLeaseRowResultBytes), generation, planned[i], capacity,
-              &slots[i], &slot_generations[i], &ready_seen, /*accept_loading=*/false, &loading,
-              /*accept_copying=*/true, &copying)) {
+              reads[i],
+              lane_result_reread(results + i * kLeaseRowResultBytes),
+              generation,
+              planned[i],
+              capacity,
+              &slots[i],
+              &slot_generations[i],
+              &ready_seen,
+              /*accept_loading=*/false,
+              &loading,
+              /*accept_copying=*/true,
+              &copying)) {
         // 2: the service's copy engine owns this lane; S skips it, C1 and A1 never see it, the copy wait awaits it.
         claimed[i] = copying ? 2 : 1;
         ++taken;
@@ -344,7 +368,8 @@ SGL_DEVICE void lease_hit_wait_body(
     // rather than patching the arithmetic downstream: stage 2's `unclaimed` then counts the whole request,
     // which is what actually went unserved. The request still fails on its own account (copied != planned),
     // so this is the counters telling the truth, not a change of outcome.
-    for (int64_t i = 0; i < planned_count; ++i) claimed[i] = 0;
+    for (int64_t i = 0; i < planned_count; ++i)
+      claimed[i] = 0;
     state[kUnservedMisses] += static_cast<int32_t>(planned_count);
     return;  // go_1 stays 0: no copy, no acknowledgement; the finalize kernel publishes the terminal
   }
@@ -363,7 +388,6 @@ SGL_DEVICE void lease_hit_wait_body(
   }
   go_1[0] = static_cast<int32_t>(n);  // the single commit point
 }
-
 
 }  // namespace device::expert_stream
 }  // namespace sglang

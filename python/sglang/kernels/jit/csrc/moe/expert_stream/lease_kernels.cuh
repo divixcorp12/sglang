@@ -2,10 +2,10 @@
 // acknowledgement and finalize kernels (a split of the EXL3 instantiation's former exl3_ram_miss.cuh). Format-free.
 #pragma once
 
+#include <sgl_kernel/tensor.h>
+
 #include "lease_device.cuh"
 #include "tensor_checks.h"
-
-#include <sgl_kernel/tensor.h>
 
 namespace sglang {
 
@@ -70,7 +70,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   int32_t protect[kMaxIds];
   int need_count = 0;
   int protect_count = 0;
-  const int64_t planned_count = min(max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0)), static_cast<int64_t>(kMaxIds));
+  const int64_t planned_count =
+      min(max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0)), static_cast<int64_t>(kMaxIds));
   for (int64_t i = 0; i < planned_count; ++i) {
     const int32_t expert = static_cast<int32_t>(planned[i]);
     if (expert >= 0 && expert < experts && ld_volatile(map_row + expert) < 0 && !listed(need, need_count, expert)) {
@@ -87,7 +88,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   uint32_t seq = static_cast<uint32_t>(state[kPosted]) + 1u;
   if (seq == 0) {
     seq = 1;
-    state[kEpoch] += 1;  // seq32 wrapped (LEASE_PROTOCOL.md 11.3); the wait and ack kernels read it back as kPendingEpoch
+    state[kEpoch] +=
+        1;  // seq32 wrapped (LEASE_PROTOCOL.md 11.3); the wait and ack kernels read it back as kPendingEpoch
   }
   state[kPosted] = static_cast<int32_t>(seq);
   uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
@@ -110,19 +112,22 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   // Lease mode arms every request that has planned lanes, not only those with a miss (LEASE_PROTOCOL.md section 15:
   // the all-hit handshake is where the lease is granted, so an unarmed record is reachable only for count == 0). The
   // service leases RAM hits too (7.2) and reads a request's lanes only when the record is armed; an unarmed request
-  // with lanes would be copied from slots nobody leased. The extra service round trip per layer is unmeasured (OPEN 11).
+  // with lanes would be copied from slots nobody leased. The extra service round trip per layer is unmeasured (OPEN
+  // 11).
   const bool armed = need_count > 0 || advise != 0 || (lease != nullptr && planned_count > 0);
   const uint32_t lanes = static_cast<uint32_t>(max(count[0], 0));  // the plan's lanes, unclamped
   if (lease != nullptr) {
     // LaneRequest (6.3): the seqlock shape of write_record, before the demand record and demand_head are published.
     const uint64_t generation = (static_cast<uint64_t>(static_cast<uint32_t>(state[kEpoch])) << 32) | seq;
-    uint8_t* request = lease + lease_d + kLeaseLaneRequest + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLaneRequestBytes;
+    uint8_t* request = lease + lease_d + kLeaseLaneRequest +
+                       static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLaneRequestBytes;
     *reinterpret_cast<volatile uint64_t*>(request + kLeaseLrGen) = 0ull;
     __threadfence_system();
     *reinterpret_cast<volatile uint32_t*>(request + kLeaseLrCount) = static_cast<uint32_t>(planned_count);
     *reinterpret_cast<volatile uint32_t*>(request + kLeaseLrRow) = static_cast<uint32_t>(row);
     volatile int32_t* lane_experts = reinterpret_cast<volatile int32_t*>(request + kLeaseLrExpert);
-    for (int i = 0; i < kMaxIds; ++i) lane_experts[i] = i < planned_count ? static_cast<int32_t>(planned[i]) : -1;
+    for (int i = 0; i < kMaxIds; ++i)
+      lane_experts[i] = i < planned_count ? static_cast<int32_t>(planned[i]) : -1;
     volatile int32_t* lane_dst = reinterpret_cast<volatile int32_t*>(request + kLeaseLrDst);
     for (int i = 0; i < kMaxIds; ++i) {
       lane_dst[i] = dst_slots != nullptr && i < planned_count && i < dst_count ? dst_slots[i] : -1;
@@ -142,7 +147,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   state[kReqFailed] = 0;  // D6, per request: kSticky is a process-lifetime latch and cannot be reused for this
   state[kFailReason] = 0;
   if (advise == 0) return;
-  for (int i = 0; i < kMaxIds; ++i) last_routes[row * kMaxIds + i] = i < protect_count ? protect[i] : -1;
+  for (int i = 0; i < kMaxIds; ++i)
+    last_routes[row * kMaxIds + i] = i < protect_count ? protect[i] : -1;
   if (next_row < 0) return;
   const int32_t* next_map = slot_map + next_row * experts;
   int32_t ahead[kMaxIds];
@@ -248,8 +254,6 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   keep[0] = ok ? 1.0f : 0.0f;
 }
 
-
-
 // LEASE_PROTOCOL.md 7.3. Replaces the translate half of exl3_ram_miss_wait_kernel for lease mode: host_rows comes
 // from the lanes' RowResults, never from the slot map. `go_count[0]` is zero on entry and is written exactly once,
 // as the last store of a commit; every other exit leaves it zero, so the copy kernel that reads it as its active
@@ -290,11 +294,13 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   go_count[0] = 0;  // fail closed
-  bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 && ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
+  bool ok =
+      state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 && ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
   uint32_t reason = ok ? 0u : kLeaseReasonAborted;
   uint32_t fatal_word = 0;  // what to raise, when this wait is the one that fails the page
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
-  const uint64_t generation = seq != 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq : 0ull;
+  const uint64_t generation =
+      seq != 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq : 0ull;
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
   // The post kernel clamps a request at kMaxIds lanes, so a plan of more would silently lose the rest. The host_rows
   // buffer is the other bound: never write past it.
@@ -356,11 +362,17 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   if (ok && planned_count > 0) {
     const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
     const uint8_t* results = lease + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
-    const uint32_t capacity = *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
+    const uint32_t capacity =
+        *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
     for (int64_t i = 0; i < planned_count; ++i) {
       bool ready_seen = false;
       if (!lane_result_valid(
-              results + i * kLeaseRowResultBytes, generation, planned[i], capacity, &slots[i], &slot_generations[i],
+              results + i * kLeaseRowResultBytes,
+              generation,
+              planned[i],
+              capacity,
+              &slots[i],
+              &slot_generations[i],
               &ready_seen)) {
         ++misses;
       }
@@ -376,7 +388,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
 
   if (ok) {
-    for (int64_t i = 0; i < lanes; ++i) host_rows[i] = i < planned_count ? static_cast<int64_t>(slots[i]) : 0;
+    for (int64_t i = 0; i < lanes; ++i)
+      host_rows[i] = i < planned_count ? static_cast<int64_t>(slots[i]) : 0;
     for (int64_t i = 0; i < planned_count; ++i) {
       lane_ctx[4 * i + 0] = static_cast<int64_t>(generation);
       lane_ctx[4 * i + 1] = static_cast<int64_t>(slot_generations[i]);
@@ -388,7 +401,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     go_count[0] = static_cast<int32_t>(planned_count);  // the single commit point
     return;
   }
-  for (int64_t i = 0; i < lanes; ++i) host_rows[i] = 0;
+  for (int64_t i = 0; i < lanes; ++i)
+    host_rows[i] = 0;
   // Terminal first, then the fatal word (F2): the service must be able to tell a give-up from a slow serve.
   if (seq != 0 && planned_count > 0) {
     const int64_t named = planned_count < kLeaseLanes ? planned_count : kLeaseLanes;
@@ -461,8 +475,23 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const int64_t budget_ns = p.budget_ns;
   if (threadIdx.x != 0) return;
   device::expert_stream::lease_hit_wait_body(
-      page, state, planned, count, dst_slots, row, lanes, host_rows_1, dst_slots_1, lease, lease_d, go_1, lane_ctx_1,
-      origin_1, claimed, violated, budget_ns);
+      page,
+      state,
+      planned,
+      count,
+      dst_slots,
+      row,
+      lanes,
+      host_rows_1,
+      dst_slots_1,
+      lease,
+      lease_d,
+      go_1,
+      lane_ctx_1,
+      origin_1,
+      claimed,
+      violated,
+      budget_ns);
 }
 
 // Piece streaming's W1: stage 1 exactly, after resetting every word the stream kernel and the finalize kernel read
@@ -518,8 +547,23 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   stream_count[0] = 0u;
   stream_abort[0] = 0;
   device::expert_stream::lease_hit_wait_body(
-      page, state, planned, count, dst_slots, row, lanes, host_rows_1, dst_slots_1, lease, lease_d, go_1, lane_ctx_1,
-      origin_1, claimed, violated, budget_ns);
+      page,
+      state,
+      planned,
+      count,
+      dst_slots,
+      row,
+      lanes,
+      host_rows_1,
+      dst_slots_1,
+      lease,
+      lease_d,
+      go_1,
+      lane_ctx_1,
+      origin_1,
+      claimed,
+      violated,
+      budget_ns);
 }
 
 // V1 two-phase, stage 2 (D2). The rest of the request: it waits on kDemandDone as the batched wait does, because
@@ -575,7 +619,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   go_2[0] = 0;  // fail closed
-  for (int64_t i = 0; i < lanes; ++i) host_rows_2[i] = 0;
+  for (int64_t i = 0; i < lanes; ++i)
+    host_rows_2[i] = 0;
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
   int64_t unclaimed = 0;
   for (int64_t i = 0; i < planned_count; ++i)
@@ -642,8 +687,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   if (planned_count == 0) return;
 
-  const uint8_t* results = lease + kLeaseRowResult +
-                           static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
+  const uint8_t* results =
+      lease + kLeaseRowResult + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
   const uint32_t capacity =
       *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
   int64_t n = 0;
@@ -654,7 +699,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     uint32_t slot_generation = 0;
     bool ready_seen = false;
     if (!lane_result_valid(
-            results + i * kLeaseRowResultBytes, generation, planned[i], capacity, &host_slot, &slot_generation,
+            results + i * kLeaseRowResultBytes,
+            generation,
+            planned[i],
+            capacity,
+            &host_slot,
+            &slot_generation,
             &ready_seen)) {
       ++misses;
       continue;
@@ -678,7 +728,6 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   go_2[0] = static_cast<int32_t>(n);  // the single commit point
 }
-
 
 // V1 two-phase acknowledgement (D3), launched after each stage's copy kernel in the same stream. One thread per
 // COMPACTED entry; `origin` maps it back to the lane whose acknowledgement word it must write, because
@@ -777,10 +826,9 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
   const uint64_t generation =
       seq != 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq : 0ull;
-  const int64_t copied =
-      static_cast<int64_t>(go_1[0]) + static_cast<int64_t>(go_2[0]) + static_cast<int64_t>(go_ce[0]);
-  const bool served = state[kReqFailed] == 0 && violated[0] == 0 && copied == planned_count &&
-                      ld_acquire_sys(page + kFatal) == 0;
+  const int64_t copied = static_cast<int64_t>(go_1[0]) + static_cast<int64_t>(go_2[0]) + static_cast<int64_t>(go_ce[0]);
+  const bool served =
+      state[kReqFailed] == 0 && violated[0] == 0 && copied == planned_count && ld_acquire_sys(page + kFatal) == 0;
   state[kPending] = 0;  // the last kernel of the chain, so the clear lands here rather than in either wait
   if (served) {
     keep[0] = 1.0f;
@@ -800,8 +848,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       const bool acknowledged = (word >> 56) != 0 && (word & ((1ull << 56) - 1)) == generation;
       if (!acknowledged) mask |= 1u << lane;
     }
-    const uint32_t reason =
-        state[kFailReason] != 0 ? static_cast<uint32_t>(state[kFailReason]) : kLeaseReasonFailed;
+    const uint32_t reason = state[kFailReason] != 0 ? static_cast<uint32_t>(state[kFailReason]) : kLeaseReasonFailed;
     publish_terminal(lease, lease_d, seq, generation, mask, reason);
   }
   // Terminal first, then the fatal word (F2): the service must be able to tell a give-up from a slow serve.
@@ -815,7 +862,6 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   state[kSticky] = 1;
   keep[0] = 0.0f;
 }
-
 
 // LEASE_PROTOCOL.md 7.4, launched after the copy kernel in the same stream (6.4). One block, one thread per lane.
 // Every effect below is guarded by `lane < n` with n = go_count[0], so n == 0 emits nothing: not an
@@ -849,7 +895,8 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     const uint32_t slot_generation = static_cast<uint32_t>(lane_ctx[4 * lane + 1]);
     const int64_t row = lane_ctx[4 * lane + 2];
     const int64_t slot = lane_ctx[4 * lane + 3];
-    const uint32_t base = *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes);
+    const uint32_t base =
+        *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes);
     const uint32_t current = ld_acquire_sys(lease + kLeaseSlotGen + 4 * (static_cast<int64_t>(base) + slot));
     const bool consumed = current == slot_generation;
     const int64_t idx = static_cast<int64_t>((static_cast<uint32_t>(generation) - 1u) % kDemandRecords);
@@ -903,13 +950,19 @@ struct LeaseProtocolKernel {
     auto P_ = SymbolicSize{"planned"};
     auto R_ = SymbolicSize{"routes"};
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("slot_map", TensorMatcher({L_, E_}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), slot_map);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "slot_map", TensorMatcher({L_, E_}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), slot_map);
+    expert_stream::verify_named(
+        "planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
-    expert_stream::verify_named("routes", TensorMatcher({R_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), routes);
+    expert_stream::verify_named(
+        "routes", TensorMatcher({R_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), routes);
     expert_stream::verify_named(
         "last_routes", TensorMatcher({L_, kMaxIds}).with_dtype<int32_t>().with_device<kDLCUDA>(device), last_routes);
     expert_stream::verify_named(
@@ -917,7 +970,8 @@ struct LeaseProtocolKernel {
     if (hot_address != 0) {
       RuntimeCheck(hot_slots.size(0) >= hot_capacity, "hot_slots: size must be at least hot_capacity");
     }
-    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -947,7 +1001,8 @@ struct LeaseProtocolKernel {
         .hot_stride = hot_stride,
         .hot_slots = static_cast<const int64_t*>(hot_slots.data_ptr()),
         .hot_capacity = hot_capacity,
-        .dst_slots = dst_slots.size(0) > 0 ? static_cast<const int32_t*>(dst_slots.data_ptr()) : nullptr,  // empty: no plan slots
+        .dst_slots = dst_slots.size(0) > 0 ? static_cast<const int32_t*>(dst_slots.data_ptr())
+                                           : nullptr,  // empty: no plan slots
         .dst_count = dst_slots.size(0),
         .copy_engine = copy_engine,
     };
@@ -976,16 +1031,23 @@ struct LeaseProtocolKernel {
     auto P_ = SymbolicSize{"planned"};
     const int64_t lanes = host_rows.size(0);
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("slot_map", TensorMatcher({L_, E_}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), slot_map);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "slot_map", TensorMatcher({L_, E_}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), slot_map);
+    expert_stream::verify_named(
+        "planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
-    expert_stream::verify_named("host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
+    expert_stream::verify_named(
+        "host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
     expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
-    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+    expert_stream::verify_named(
+        "ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
 
     const auto stream = LaunchKernel::resolve_device(state.device());
     const auto params = WaitParams{
@@ -1028,16 +1090,23 @@ struct LeaseProtocolKernel {
     auto P_ = SymbolicSize{"planned"};
     const int64_t lanes = host_rows.size(0);
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
-    expert_stream::verify_named("host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
+    expert_stream::verify_named(
+        "host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
     expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
-    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
-    expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
+    expert_stream::verify_named(
+        "ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+    expert_stream::verify_named(
+        "go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
     expert_stream::verify_named(
         "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
 
@@ -1083,10 +1152,14 @@ struct LeaseProtocolKernel {
     auto on_host = SymbolicDevice{};
     on_host.set_options<kDLCPU, kDLCUDAHost>();
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
     expert_stream::verify_named(
         "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
     expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
@@ -1107,7 +1180,8 @@ struct LeaseProtocolKernel {
         .lane_ctx = static_cast<const int64_t*>(lane_ctx.data_ptr()),
         .keep = static_cast<float*>(keep.data_ptr()),
     };
-    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(exl3_ram_miss_lease_ack_kernel, params);
+    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(
+        exl3_ram_miss_lease_ack_kernel, params);
   }
 
   static void lease_hit_wait(
@@ -1139,13 +1213,18 @@ struct LeaseProtocolKernel {
     // lets a device-side count above capacity, up to LANES, read dst_slots out of bounds.
     const int64_t lanes = std::min<int64_t>(host_rows_1.size(0), dst_slots.size(0));
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_1/dst_slots");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
-    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
         "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     expert_stream::verify_named(
@@ -1153,9 +1232,12 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
         "lane_ctx_1", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
-    expert_stream::verify_named("origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
-    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
-    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+    expert_stream::verify_named(
+        "origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
+    expert_stream::verify_named(
+        "claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named(
+        "violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1216,13 +1298,18 @@ struct LeaseProtocolKernel {
     auto P_ = SymbolicSize{"planned"};
     const int64_t lanes = std::min<int64_t>(host_rows_1.size(0), dst_slots.size(0));
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_1/dst_slots");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
-    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
         "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     expert_stream::verify_named(
@@ -1230,9 +1317,12 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
         "lane_ctx_1", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
-    expert_stream::verify_named("origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
-    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
-    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+    expert_stream::verify_named(
+        "origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
+    expert_stream::verify_named(
+        "claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named(
+        "violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named(
         "stream_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_count);
@@ -1297,23 +1387,31 @@ struct LeaseProtocolKernel {
     auto P_ = SymbolicSize{"planned"};
     const int64_t lanes = std::min<int64_t>(host_rows_2.size(0), dst_slots.size(0));
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "planned", TensorMatcher({P_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), planned);
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows_2/dst_slots");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
-    expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    expert_stream::verify_named(
+        "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
         "host_rows_2", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
     expert_stream::verify_named(
         "dst_slots_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
-    expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
-    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named(
+        "ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
+    expert_stream::verify_named(
+        "claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named(
         "lane_ctx_2", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
-    expert_stream::verify_named("origin_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
+    expert_stream::verify_named(
+        "origin_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1360,14 +1458,20 @@ struct LeaseProtocolKernel {
     auto on_host = SymbolicDevice{};
     on_host.set_options<kDLCPU, kDLCUDAHost>();
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
-    expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
+    expert_stream::verify_named(
+        "go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
     expert_stream::verify_named(
         "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
-    expert_stream::verify_named("origin", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin);
-    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+    expert_stream::verify_named(
+        "origin", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin);
+    expert_stream::verify_named(
+        "violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1408,14 +1512,18 @@ struct LeaseProtocolKernel {
     auto on_host = SymbolicDevice{};
     on_host.set_options<kDLCPU, kDLCUDAHost>();
 
-    expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
-        "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+    expert_stream::verify_named(
+        "state",
+        TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        state);
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named("go_ce", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_ce);
-    expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
+    expert_stream::verify_named(
+        "violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
     expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
 
     RuntimeCheck(

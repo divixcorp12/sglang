@@ -2,10 +2,10 @@
 // names a layout and a reader and expands EXPERT_STREAM_HOST_EXPORTS; see exl3_ram_miss_host.cpp.
 #pragma once
 
-#include "ram_thread.h"
-#include "../tensor_checks.h"
-
 #include <sgl_kernel/tensor.h>
+
+#include "../tensor_checks.h"
+#include "ram_thread.h"
 
 namespace sglang::expert_stream {
 
@@ -28,7 +28,11 @@ struct HostExports {
   // dereferences all six through raw pointers with no dtype or device check of its own. Run before
   // tables_from so a wrong-dtype or too-narrow table raises here, naming the tensor, not there.
   static void check_table_tensors(
-      TensorView extents, TensorView starts, TensorView file_sizes, TensorView segments, TensorView slabs,
+      TensorView extents,
+      TensorView starts,
+      TensorView file_sizes,
+      TensorView segments,
+      TensorView slabs,
       TensorView row_bytes) {
     using namespace host;
     auto L_ = SymbolicSize{"layers"};
@@ -39,12 +43,9 @@ struct HostExports {
     verify_named("starts", TensorMatcher({L_, E_}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), starts);
     verify_named("file_sizes", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), file_sizes);
     verify_named("segments", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), segments);
+    verify_named("slabs", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
     verify_named(
-        "slabs", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
-        slabs);
-    verify_named(
-        "row_bytes", TensorMatcher({kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
-        row_bytes);
+        "row_bytes", TensorMatcher({kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), row_bytes);
   }
 
   static std::mutex& registry_mutex() {
@@ -82,13 +83,16 @@ struct HostExports {
   /// \brief The layout this module was built for: its tensor names in copy-table order, newline-joined.
   static std::string layout_names() {
     std::string out;
-    for (const auto name : Layout::kNames) out += std::string(name) + "\n";
+    for (const auto name : Layout::kNames)
+      out += std::string(name) + "\n";
     out.pop_back();
     return out;
   }
 
   /// \brief Bit i: name i may be read by the copy wait's SMs (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
-  static int64_t layout_small_mask() { return Layout::kSmallMask; }
+  static int64_t layout_small_mask() {
+    return Layout::kSmallMask;
+  }
 
   // Read `experts` of streamed row `row` into `slots` once, synchronously (tests, tools).
   // Arguments are validated by the Python wrapper (read_rows_once).
@@ -113,7 +117,10 @@ struct HostExports {
     auto cpu = SymbolicDevice{};
     verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
     verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
-    Source reader(tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
+    Source reader(
+        tables_from<Layout>(
+            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+        direct != 0);
     if (!reader.open()) return 0;
     return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
   }
@@ -154,15 +161,18 @@ struct HostExports {
     check_fault_words<Layout>(fault);
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     Source reader(
-        tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
-        direct != 0, f[19], f[20]);
+        tables_from<Layout>(
+            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+        direct != 0,
+        f[19],
+        f[20]);
     reader.set_owner_core(owner_core);
     if (f[22] != 0) reader.set_piece_stream(true);
     if (!reader.open()) return 0;
     reader.set_fault(fault_from(f));
     StageRecord stage;
-    const int result = reader.read(
-        row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
+    const int result =
+        reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
     stage.ok = result == 1 ? 1 : 0;
     stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
     std::memcpy(record.data_ptr(), &stage, sizeof(stage));
@@ -207,8 +217,11 @@ struct HostExports {
     check_fault_words<Layout>(fault);
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     Source reader(
-        tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
-        direct != 0, f[19], f[20]);
+        tables_from<Layout>(
+            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+        direct != 0,
+        f[19],
+        f[20]);
     if (f[22] != 0) reader.set_piece_stream(true);
     if (!reader.open()) {
       out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = 0;
@@ -229,9 +242,9 @@ struct HostExports {
   }
 
   // Test only (U10): expert_stream_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
-  // up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 5 int64:
-  // the result, the SQE count, the descriptor count, the ring credit and the completions reaped. `fault` as the faulted
-  // call's (word 22 turns piece streaming on).
+  // up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 5
+  // int64: the result, the SQE count, the descriptor count, the ring credit and the completions reaped. `fault` as the
+  // faulted call's (word 22 turns piece streaming on).
   static void read_rows_sqes(
       TensorView extents,
       TensorView starts,
@@ -266,16 +279,19 @@ struct HostExports {
     auto* out = static_cast<int64_t*>(info.data_ptr());
     out[0] = out[1] = out[2] = out[3] = out[4] = 0;
     Source reader(
-        tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
-        direct != 0, f[19], f[20]);
+        tables_from<Layout>(
+            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+        direct != 0,
+        f[19],
+        f[20]);
     if (f[22] != 0) reader.set_piece_stream(true);
     if (!reader.open()) return;
     reader.set_fault(fault_from(f));
     std::vector<typename Source::SqeRecord> log;
     reader.set_sqe_log(&log);
     StageRecord stage;
-    const int result = reader.read(
-        row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
+    const int result =
+        reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
     stage.ok = result == 1 ? 1 : 0;
     stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
     std::memcpy(record.data_ptr(), &stage, sizeof(stage));
@@ -348,7 +364,8 @@ struct HostExports {
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     auto* out = static_cast<int64_t*>(info.data_ptr());
     std::fill(out, out + 5, 0);
-    const Tables t = tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+    const Tables t = tables_from<Layout>(
+        extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
     const std::vector<int32_t> ids = ids_of(experts);
     const std::vector<int64_t> dest = slots_of(slots);
     const size_t lanes = static_cast<size_t>(masks.size(1));
@@ -358,7 +375,8 @@ struct HostExports {
     auto* words = static_cast<uint64_t*>(masks.data_ptr());
     std::vector<PieceTarget> targets(ids.size());
     for (size_t o = 0; o < ids.size(); ++o) {
-      for (size_t l = 0; l < lanes; ++l) targets[o].words[targets[o].count++] = words + o * lanes + l;
+      for (size_t l = 0; l < lanes; ++l)
+        targets[o].words[targets[o].count++] = words + o * lanes + l;
     }
     const PiecePublish publish{static_cast<uint64_t>(generation), targets.data()};
     Source reader(Tables(t), direct != 0, f[19], f[20]);
@@ -399,8 +417,8 @@ struct HostExports {
             const PieceRun& run = runs[(o * kPieces + static_cast<size_t>(j)) * count + i];
             if (run.lo >= run.hi) continue;
             const uint8_t* got = t.slabs[row][s.name] + dest[o] * t.row_bytes[s.name] + s.dst + run.lo;
-            const auto* ref_base = reinterpret_cast<const uint8_t*>(static_cast<intptr_t>(
-                ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
+            const auto* ref_base = reinterpret_cast<const uint8_t*>(
+                static_cast<intptr_t>(ref_table[row * static_cast<int64_t>(t.slabs[row].size()) + s.name]));
             const uint8_t* want = ref_base + ref_slot[o] * t.row_bytes[s.name] + s.dst + run.lo;
             same = same && std::memcmp(got, want, static_cast<size_t>(run.hi - run.lo)) == 0;
           }
@@ -415,14 +433,24 @@ struct HostExports {
     std::thread checker;
     if (checking) {
       checker = std::thread([&] {
-        while (reading.load(std::memory_order_acquire)) check_pass(true);
+        while (reading.load(std::memory_order_acquire))
+          check_pass(true);
       });
     }
     StageRecord stage;
     int result = 0;
     try {
       result = reader.read(
-          row, ids, dest, static_cast<size_t>(step), abandon_after(f[17]), &stage, nullptr, SIZE_MAX, nullptr, &publish);
+          row,
+          ids,
+          dest,
+          static_cast<size_t>(step),
+          abandon_after(f[17]),
+          &stage,
+          nullptr,
+          SIZE_MAX,
+          nullptr,
+          &publish);
     } catch (...) {
       reading.store(false, std::memory_order_release);
       if (checker.joinable()) checker.join();
@@ -464,10 +492,12 @@ struct HostExports {
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
     verify_named("subs", TensorMatcher({kPieces, 6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), subs);
-    const Tables t = tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+    const Tables t = tables_from<Layout>(
+        extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
     const size_t count = t.segments.size();
     verify_named(
-        "pieces", TensorMatcher({kPieces, 1 + 2 * static_cast<int64_t>(count)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+        "pieces",
+        TensorMatcher({kPieces, 1 + 2 * static_cast<int64_t>(count)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
         pieces);
     RowGeometry g;
     std::vector<PieceRun> runs(static_cast<size_t>(kPieces) * count);
@@ -491,8 +521,8 @@ struct HostExports {
     return g.subs;
   }
 
-  // The stream kernel's piece table (piece-streaming plan 4.2, open question 6: one entry per (row, expert), computed by
-  // the reader's own row_geometry so the device cannot disagree with it). `runs`: int32 [layers, experts, kPieces,
+  // The stream kernel's piece table (piece-streaming plan 4.2, open question 6: one entry per (row, expert), computed
+  // by the reader's own row_geometry so the device cannot disagree with it). `runs`: int32 [layers, experts, kPieces,
   // segments, 2], each run as (dst_lo, dst_hi) byte offsets into the segment's name row. A row the reader refuses to
   // cut gets empty runs; its read fails, so no device copy ever uses them. Returns how many rows were refused.
   static int64_t piece_runs(
@@ -511,7 +541,8 @@ struct HostExports {
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
     verify_named("runs", TensorMatcher({-1, -1, -1, -1, -1}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), runs);
-    const Tables t = tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+    const Tables t = tables_from<Layout>(
+        extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
     const size_t count = t.segments.size();
     const size_t rows = static_cast<size_t>(t.layers * t.experts);
     if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
@@ -532,7 +563,8 @@ struct HostExports {
       for (size_t k = 0; k < static_cast<size_t>(kPieces) * count; ++k) {
         const Segment& segment = t.segments[k % count];
         if (segment.dst + piece[k].hi > INT32_MAX) {
-          throw std::runtime_error(error_prefix<Layout>() + "a piece run ends past the int32 range of the stream kernel's table");
+          throw std::runtime_error(
+              error_prefix<Layout>() + "a piece run ends past the int32 range of the stream kernel's table");
         }
         line[2 * k] = static_cast<int32_t>(segment.dst + piece[k].lo);
         line[2 * k + 1] = static_cast<int32_t>(segment.dst + piece[k].hi);
@@ -547,11 +579,13 @@ struct HostExports {
   static void pack_pool_affinity(TensorView inherited, int64_t workers, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
+    expert_stream::verify_named(
+        "inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
     // Exact: two words per requested worker, bound before the pool starts a thread (the pool never builds fewer).
     // A non-positive count would make the extent a wildcard or a negative size, so it is refused first.
     if (workers < 1) throw std::runtime_error(error_prefix<Layout>() + "a packing pool needs at least one worker");
-    expert_stream::verify_named("out", TensorMatcher({2 * workers}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named(
+        "out", TensorMatcher({2 * workers}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -559,7 +593,10 @@ struct HostExports {
       if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
     }
     PackPool pool(
-        static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots), error_prefix<Layout>(),
+        static_cast<unsigned>(workers),
+        mask,
+        static_cast<size_t>(kBounceSlots),
+        error_prefix<Layout>(),
         std::string(Layout::kName) + "-pack");
     auto* words = static_cast<int64_t*>(out.data_ptr());
     for (size_t w = 0; w < pool.workers(); ++w) {
@@ -576,7 +613,8 @@ struct HostExports {
   static void pack_worker_cpus(TensorView inherited, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
+    expert_stream::verify_named(
+        "inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
     expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
     cpu_set_t mask;
@@ -617,13 +655,18 @@ struct HostExports {
     // absent one is an unpinned torch.empty(0)) and gets its own SymbolicDevice so it is not forced to equal
     // page's device when it is not given.
     auto host_mem = SymbolicDevice{};
-    verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
     verify_named(
-        "slot_map", TensorMatcher({extents.size(0), extents.size(1)}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
+        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
+    verify_named(
+        "slot_map",
+        TensorMatcher({extents.size(0), extents.size(1)})
+            .with_dtype<int32_t>()
+            .with_device<kDLCPU, kDLCUDAHost>(host_mem),
         slot_map);
     verify_named("lease", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), lease);
     auto hot_page_mem = SymbolicDevice{};
-    verify_named("hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(hot_page_mem), hot_page);
+    verify_named(
+        "hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(hot_page_mem), hot_page);
     auto cpu = SymbolicDevice{};
     verify_named("capacity", TensorMatcher({extents.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), capacity);
     const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
@@ -632,7 +675,8 @@ struct HostExports {
         static_cast<int32_t*>(slot_map.data_ptr()),
         static_cast<uint8_t*>(lease.data_ptr()),
         lease.size(0),
-        tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+        tables_from<Layout>(
+            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
         std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
         direct != 0,
         pack_workers,
@@ -664,8 +708,8 @@ struct HostExports {
     find(handle)->touch(row, expert);
   }
 
-  static void assign(
-      int64_t handle, int64_t row, int64_t expert, TensorView protect, int64_t fallback, TensorView out) {
+  static void
+  assign(int64_t handle, int64_t row, int64_t expert, TensorView protect, int64_t fallback, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("protect", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), protect);
@@ -677,8 +721,8 @@ struct HostExports {
   }
 
   // Prefill fills: `out` holds experts.size() + 1 int64, the claimed slots in order and then the evictions.
-  static int64_t fill_begin(
-      int64_t handle, int64_t row, TensorView experts, TensorView protect, int64_t fallback, TensorView out) {
+  static int64_t
+  fill_begin(int64_t handle, int64_t row, TensorView experts, TensorView protect, int64_t fallback, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
@@ -725,7 +769,8 @@ struct HostExports {
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named(
         "out", TensorMatcher({4 + 3 * expert_stream::kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    if (idx < 0 || idx >= expert_stream::kDemandRecords) throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
+    if (idx < 0 || idx >= expert_stream::kDemandRecords)
+      throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
     find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
   }
 
@@ -783,8 +828,10 @@ struct HostExports {
   static void set_copy_table(int64_t handle, int64_t row, TensorView entries, int64_t dst_rows, int64_t sm_mask) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("entries", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), entries);
-    if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error(error_prefix<Layout>() + "copy table must be [n, 3]");
+    expert_stream::verify_named(
+        "entries", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), entries);
+    if (entries.dim() != 2 || entries.size(1) != 3)
+      throw std::runtime_error(error_prefix<Layout>() + "copy table must be [n, 3]");
     find(handle)->set_copy_table(
         row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows, sm_mask);
   }
@@ -799,7 +846,9 @@ struct HostExports {
     auto host_mem = SymbolicDevice{};
     expert_stream::verify_named(
         "page",
-        TensorMatcher({expert_stream::kPrefetchPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
+        TensorMatcher({expert_stream::kPrefetchPageBytes})
+            .with_dtype<uint8_t>()
+            .with_device<kDLCPU, kDLCUDAHost>(host_mem),
         page);
     if (page.dim() != 1 || page.size(0) != expert_stream::kPrefetchPageBytes)
       throw std::runtime_error(error_prefix<Layout>() + "the native prefetch page must be uint8 [256]");
@@ -881,8 +930,8 @@ struct HostExports {
     find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
   }
 
-  static void inject(
-      int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
+  static void
+  inject(int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
     find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
   }
 
@@ -932,8 +981,7 @@ struct HostExports {
     // out.size(1)), so the row width must equal stage_words() int64 words or the stride is wrong.
     expert_stream::verify_named(
         "out", TensorMatcher({-1, expert_stream::stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    return find(handle)->drain_trace(
-        static_cast<expert_stream::StageRecord*>(out.data_ptr()), out.size(0));
+    return find(handle)->drain_trace(static_cast<expert_stream::StageRecord*>(out.data_ptr()), out.size(0));
   }
 
   static int64_t trace_clock_reads() {
@@ -1096,7 +1144,8 @@ struct HostExports {
     // (and joins it) or runs before it and leaves no handle to start it on.
     std::lock_guard<std::mutex> guard(registry_mutex());
     if (registry().count(handle) == 0) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
-    if (thread_registry().count(handle)) throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
+    if (thread_registry().count(handle))
+      throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
     auto thread = std::make_shared<Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns);
     thread->start();
     thread_registry()[handle] = std::move(thread);

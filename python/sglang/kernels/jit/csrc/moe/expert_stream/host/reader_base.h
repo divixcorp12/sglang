@@ -1,20 +1,11 @@
 // The bounce-bank pool geometry and per-row stage-trace constants shared by every host reader.
 #pragma once
 
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/function.h>
-
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <immintrin.h>
-#include <liburing.h>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
-#include <time.h>
-#include <unistd.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/function.h>
 
 #include <algorithm>
 #include <array>
@@ -28,14 +19,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <dlfcn.h>
 #include <exception>
+#include <fcntl.h>
 #include <functional>
+#include <immintrin.h>
+#include <liburing.h>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <time.h>
 #include <type_traits>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -209,9 +208,9 @@ struct StageRecord {
   int64_t kind = 0;  // kStageDemand, kStageAdvisory, kStageTouch
   int64_t row = 0;   // streamed row (index into the layer ids), not the layer id
   int64_t ok = 0;
-  int64_t rows = 0;     // rows read
-  int64_t batches = 0;  // io_uring batches the read used
-  int64_t backlog = 0;  // records already posted behind this one when the service saw it
+  int64_t rows = 0;       // rows read
+  int64_t batches = 0;    // io_uring batches the read used
+  int64_t backlog = 0;    // records already posted behind this one when the service saw it
   int64_t prev_done = 0;  // `done` of the request served just before this one (0: the first)
   int64_t observed = 0;   // the service saw the record posted (first poll that found it)
   int64_t reserved = 0;   // slots reserved under the tier mutex
@@ -222,13 +221,14 @@ struct StageRecord {
   // its first chunk, after the worker woke: do not read overlap or "waited for the packer" out of these stamps.
   int64_t pack_start = 0;  // the earliest row's packing started
   int64_t pack_end = 0;    // the last row's packing ended
-  int64_t mapped = 0;  // slots marked READY and slot-map entries published
-  int64_t done = 0;    // completion word stored: the device's wait can release
+  int64_t mapped = 0;      // slots marked READY and slot-map entries published
+  int64_t done = 0;        // completion word stored: the device's wait can release
   int64_t submit_to_first_cqe_ns = 0;
   int64_t first_to_last_cqe_ns = 0;
-  int64_t pack_ns = 0;  // the sum of the rows' packing spans; with workers the spans overlap, so it can exceed pack_end - pack_start
-  int64_t bytes = 0;    // completed bytes, summed over drives (see the byte split)
-  int64_t extents = 0;  // reads issued: one per row and root with a non-empty part
+  int64_t pack_ns =
+      0;  // the sum of the rows' packing spans; with workers the spans overlap, so it can exceed pack_end - pack_start
+  int64_t bytes = 0;                   // completed bytes, summed over drives (see the byte split)
+  int64_t extents = 0;                 // reads issued: one per row and root with a non-empty part
   int64_t drive_dev[kMaxDrives] = {};  // st_dev of the drive's filesystem; -1 folds several drives
   int64_t drive_bytes[kMaxDrives] = {};
   int64_t drive_extents[kMaxDrives] = {};
@@ -272,7 +272,6 @@ inline int64_t stage_words() {
 constexpr int64_t kStageDemand = 0;
 constexpr int64_t kStageAdvisory = 1;
 constexpr int64_t kStageTouch = 2;
-
 
 }  // namespace expert_stream
 }  // namespace sglang
