@@ -1,0 +1,142 @@
+{
+ "per_session": [
+  {
+   "session": "cfq-train-Double_BKR/2017/page_47.pdf",
+   "turn": 0,
+   "tokens": [
+    38,
+    38
+   ],
+   "ms_tok_A": 111.03206215980086,
+   "ms_tok_B": 109.53280624203585,
+   "delta_ms": -1.4992559177650122,
+   "ttft_A": 7.899550750153139,
+   "ttft_B": 7.922332928981632,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-train-Single_CDW/2015/page_35.pdf-2",
+   "turn": 0,
+   "tokens": [
+    7,
+    7
+   ],
+   "ms_tok_A": 133.23408617482832,
+   "ms_tok_B": 132.44272698648274,
+   "delta_ms": -0.7913591883455808,
+   "ttft_A": 8.708879051031545,
+   "ttft_B": 8.712396068032831,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-train-Single_DISCA/2016/page_11.pdf-1",
+   "turn": 0,
+   "tokens": [
+    34,
+    34
+   ],
+   "ms_tok_A": 107.56016090850939,
+   "ms_tok_B": 106.48068542253566,
+   "delta_ms": -1.079475485973731,
+   "ttft_A": 8.24956655409187,
+   "ttft_B": 8.258275788044557,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-train-Single_ETR/2004/page_261.pdf-1",
+   "turn": 0,
+   "tokens": [
+    85,
+    85
+   ],
+   "ms_tok_A": 102.81790761897962,
+   "ms_tok_B": 101.70405358353275,
+   "delta_ms": -1.1138540354468631,
+   "ttft_A": 8.14648448699154,
+   "ttft_B": 8.14794149599038,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-train-Single_TSCO/2018/page_31.pdf-1",
+   "turn": 0,
+   "tokens": [
+    128,
+    128
+   ],
+   "ms_tok_A": 106.7603846689261,
+   "ms_tok_B": 105.4139262831616,
+   "delta_ms": -1.3464583857644925,
+   "ttft_A": 7.714171926956624,
+   "ttft_B": 7.686303847003728,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-train-Single_VLO/2012/page_27.pdf-2",
+   "turn": 0,
+   "tokens": [
+    93,
+    93
+   ],
+   "ms_tok_A": 109.34349121627115,
+   "ms_tok_B": 108.31473667539008,
+   "delta_ms": -1.0287545408810672,
+   "ttft_A": 8.37774583301507,
+   "ttft_B": 8.311132779810578,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-train-Single_WRK/2019/page_49.pdf-1",
+   "turn": 0,
+   "tokens": [
+    76,
+    76
+   ],
+   "ms_tok_A": 106.20055341472228,
+   "ms_tok_B": 104.99326643844445,
+   "delta_ms": -1.2072869762778282,
+   "ttft_A": 7.998438545037061,
+   "ttft_B": 7.987581703113392,
+   "identical_output": true
+  },
+  {
+   "session": "cfq-val-Single_K/2013/page_62.pdf-1",
+   "turn": 0,
+   "tokens": [
+    33,
+    33
+   ],
+   "ms_tok_A": 109.95856038061902,
+   "ms_tok_B": 108.75090740591986,
+   "delta_ms": -1.2076529746991582,
+   "ttft_A": 8.39207020192407,
+   "ttft_B": 8.26812974596396,
+   "identical_output": true
+  }
+ ],
+ "arms": {
+  "A": {
+   "decode_tokens": 486,
+   "decode_ms_per_token_pooled": 107.39848940343876,
+   "nvme_bytes_ready_to_end": 300426871808,
+   "log_marker_counts": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  "B": {
+   "decode_tokens": 486,
+   "decode_ms_per_token_pooled": 106.19634103869306,
+   "nvme_bytes_ready_to_end": 300267236352,
+   "log_marker_counts": [
+    1,
+    1,
+    1,
+    1
+   ]
+  }
+ },
+ "median_delta_ms_per_token_B_minus_A": -1.1605705058623457,
+ "all_outputs_identical": true
+}

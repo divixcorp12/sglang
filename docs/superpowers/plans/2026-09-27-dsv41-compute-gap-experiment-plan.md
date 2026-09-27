@@ -74,6 +74,34 @@ compute and numerical cost. Record it; do not start it here.
 - Run in divix01 `wt-compute-gap` at `8d599afe9c`, under `cc-gpu.lock`.
 - Result: **1748 passed, 1 skipped, EXIT=0**. The exit status was read directly, not through a pipe.
 
+### E4 — C1 shared-expert side stream with CE (measured: passes the promotion bar)
+
+Setup:
+- `analysis/dsv41-compute-gap/drive_ab.sh c1-sidestream 8d599afe9c "SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=0" "...=1"`.
+- The production recipe unchanged, with `DSV41_RUN_ROOT=/mnt/nvme1/compute-transfer-gap`.
+- Arm order A B B A A B B A, with session pairs 0,1 / 2,3 / 4,5 / 6,7.
+- Run 2026-09-27 04:36–05:19. Every arm exited 0.
+- Outputs are in `ab/c1-sidestream/` (`paired.txt`, `compare.json`).
+
+| | A (off) | B (on) |
+|---|---:|---:|
+| decode ms/token, pooled over 486 tokens | 107.40 | 106.20 |
+| median per-session tok/s | 9.221 | 9.312 |
+| NVMe bytes, ready→end | 300.43 GB | 300.27 GB |
+| RAM-miss rows read (4 runs) | 17,631 | 17,702 |
+
+- **B wins 8/8 sessions, sign test p = 0.0039.**
+- The median per-session change is **−1.16 ms/token (−1.1%)**, ranging from −0.79 to −1.50.
+- TTFT is unchanged (7.7–8.7 s in both arms).
+- Every completion (content and reasoning, temperature 0) is **byte-identical** between arms.
+- Every B server logged `MoE side stream enabled` and a first fork of `DeepseekV2MoE._forward_shared_experts`. No A server logged either, so the path really forks.
+- The copy engine was armed in all 8 arms. The combination of side stream and CE wait kernel is therefore exercised in serving.
+- Read errors, overruns and fatal counters were 0 everywhere, and there were no compile events.
+- `test/manual/dsv41/test_moe_side_stream_gpu.py` passed 4/4 (EXIT=0).
+- paired.py's clock, tenancy and compile gates all passed.
+- Attribution (F→nextPost, Post→first copy, CE union) comes from a queued node-mode traced pair (`traced/c1t`), which cannot change the wall-clock result above.
+- Recommendation: promote `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1` into `arm_env.base_env()`. This is a production recipe change, left for the owner to apply.
+
 ### E1 — C2a wo_a (measured, no-go)
 
 `results/micro-1/wo_a.log`. The run uses 40 distinct 64 MiB layers, timed by graph replay over two interleaved rounds that agree to 0.01 µs.
