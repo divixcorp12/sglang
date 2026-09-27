@@ -181,6 +181,7 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
+    swa_ring_tokens: Optional[int] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page
     # (one page per CLASS per request under sharding — the min-class
@@ -190,7 +191,19 @@ def alloc_paged_token_slots_extend(
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
         allocator.page_size * page_interleave_shard_size(allocator)
     )
-    evict_from_tree_cache(tree_cache, num_tokens)
+    if swa_ring_tokens is not None:
+        # The full side still needs room for the whole extend, but the SWA
+        # side only ever holds one ring: sizing its evict target by the full
+        # extend length (as evict_to_free_tokens does for a normal prefill)
+        # would evict ~every cached window to free a few thousand ring slots.
+        _evict_for_ring(
+            tree_cache,
+            allocator,
+            full_target=num_tokens,
+            swa_target=swa_ring_tokens + allocator.page_size,
+        )
+    else:
+        evict_from_tree_cache(tree_cache, num_tokens)
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
@@ -201,6 +214,17 @@ def alloc_paged_token_slots_extend(
         )
         extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
     if is_dsv4:
+        if swa_ring_tokens is not None:
+            # DSV4 compressed KV (c4/c128) needs req_pool_indices/req_to_token_pool
+            # to build the C128 sidecar; the ring path has never been run through
+            # this allocator, so fail loud instead of allocating with a bundle
+            # that silently lacks its compressed-KV state.
+            raise NotImplementedError(
+                "layer-major ring allocation is not implemented for "
+                f"{type(allocator).__name__} (DSV4 compressed KV / c128 "
+                "sidecar); only the generic SWATokenToKVPoolAllocator path "
+                "(used by DSV4.1 on CUDA) is supported"
+            )
         c128_num_pages = allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
         allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
@@ -208,15 +232,28 @@ def alloc_paged_token_slots_extend(
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
+    if swa_ring_tokens is not None:
+        # Layer-major prefill: full KV for the whole extend, window KV for one ring only.
+        out = allocator.alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len=swa_ring_tokens,
+            **extra_alloc_kwargs,
+        )
+    else:
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
 
     if is_dsv4:
         bundle = out
@@ -245,6 +282,27 @@ def alloc_paged_token_slots_extend(
             req.kv_rotation_base = base
 
     return out_cache_loc
+
+
+def _evict_for_ring(
+    tree_cache: BasePrefixCache, allocator, *, full_target: int, swa_target: int
+) -> None:
+    """evict_to_free_tokens, but full and SWA are sized independently.
+
+    SWATokenToKVPoolAllocator.evict_to_free_tokens (and its hisparse/unified
+    siblings) charge both pools the same token count, which is right for a
+    normal extend but not for a layer-major ring: the SWA side only ever
+    holds one ring, so charging it the full extend length would evict nearly
+    every cached window to free a few thousand ring slots.
+    """
+    if tree_cache is None or tree_cache.is_chunk_cache():
+        return
+    full_shortfall = max(0, full_target - allocator.full_available_size())
+    swa_shortfall = max(0, swa_target - allocator.swa_available_size())
+    if full_shortfall or swa_shortfall:
+        tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+        )
 
 
 def _kv_shard_rotation_bases(
@@ -410,6 +468,8 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
+            # TODO(layer-major Task 7): batch.layer_major_ring_tokens.
+            swa_ring_tokens=None,
         )
 
     # Write to req_to_token_pool
