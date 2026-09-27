@@ -1,0 +1,46 @@
+finalize names: ['_ZN6sglang35exl3_ram_miss_lease_finalize_kernelENS_14FinalizeParamsE', 'exl3_ram_miss_lease_finalize_kernel', 'sglang::exl3_ram_miss_lease_finalize_kernel(sglang::FinalizeParams)']
+post names: ['_ZN6sglang25exl3_ram_miss_post_kernelENS_10PostParamsE', 'exl3_ram_miss_post_kernel', 'sglang::exl3_ram_miss_post_kernel(sglang::PostParams)']
+2 replays after skip 5
+{
+ "span_ms": {
+  "mean": 151.2748955,
+  "median": 151.2748955
+ },
+ "F_to_nextPost_ms": {
+  "mean": 12.1212305,
+  "median": 12.1212305
+ },
+ "post_to_first_copy_us_mean": {
+  "mean": 54.69133088235294,
+  "median": 54.69133088235294
+ },
+ "ce_copies": {
+  "mean": 211,
+  "median": 211.0
+ },
+ "ce_MB": {
+  "mean": 1400.09472,
+  "median": 1400.09472
+ },
+ "ce_union_ms": {
+  "mean": 114.940613,
+  "median": 114.940613
+ },
+ "n_F": {
+  "mean": 40,
+  "median": 40.0
+ },
+ "n_Post": {
+  "mean": 40,
+  "median": 40.0
+ },
+ "n_chain": {
+  "mean": 39,
+  "median": 39.0
+ },
+ "streams_first_replay": {
+  "142": 1268,
+  "143": 1170
+ },
+ "replays": 2
+}

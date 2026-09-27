@@ -99,7 +99,27 @@ Setup:
 - Read errors, overruns and fatal counters were 0 everywhere, and there were no compile events.
 - `test/manual/dsv41/test_moe_side_stream_gpu.py` passed 4/4 (EXIT=0).
 - paired.py's clock, tenancy and compile gates all passed.
-- Attribution (F→nextPost, Post→first copy, CE union) comes from a queued node-mode traced pair (`traced/c1t`), which cannot change the wall-clock result above.
+- Attribution comes from a node-mode traced pair.
+  - Setup: `drive_traced.sh c1t4`, one session (index 4) per arm, analysed with `trace_chain.py --skip 5`, 28 replays
+    per arm. The results are in `results/c1-traced/`.
+  - Validation: on the handoff's own trace the script reproduces F→nextPost 13.39 ms/step, against the handoff's 13.46.
+  - Node-mode times are inflated, so only the A-vs-B differences below mean anything.
+
+  | per step (mean) | A (off) | B (on) | Δ |
+  |---|---:|---:|---:|
+  | F-end → next Post-start, summed over 39 transitions | 13.45 ms | 12.21 ms | **−1.24 ms** |
+  | graph span | 120.7 ms | 118.8 ms | −1.9 ms |
+  | CE bytes / copies | 1032.8 MB / 155.6 | 1030.9 MB / 155.4 | same |
+  | CE interval union | 83.1 ms | 81.9 ms | −1.2 ms |
+  | Post-start → first CE copy (per layer) | 45.5 µs | 49.7 µs | +4.2 µs |
+
+  - The mechanism is the one the handoff hypothesised. Moving the shared expert off the main stream shortens the
+    dependent chain from one layer's transfer boundary to the next layer's request by about 1.2 ms/step, at
+    unchanged transfer bytes. That matches the untraced −1.16 ms/token.
+  - The cost is a small Post→first-copy slowdown, about 0.17 ms over 40 layers, probably contention with the
+    side-stream GEMVs. The net win survives it.
+  - A first traced attempt (`c1t`, session 0, 7 tokens) gave only 2 replays and pointed the same way
+    (16.28 → 12.12 ms).
 - Recommendation: promote `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1` into `arm_env.base_env()`. This is a production recipe change, left for the owner to apply.
 
 ### E1 — C2a wo_a (measured, no-go)
