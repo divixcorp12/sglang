@@ -109,6 +109,11 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layer_major.gate import (
+    gate_from_env,
+    launch_refusal,
+    scheduler_layer_major_refusal,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -287,6 +292,13 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.swa import (
+    SWATokenToKVPoolAllocator,
+    is_swa_req_ring,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -1446,6 +1458,46 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+        self.init_layer_major_gate()
+
+    def init_layer_major_gate(self) -> None:
+        """Build the layer-major admission gate once, and refuse a launch that
+        set the env threshold but cannot actually run layer-major prefill."""
+        raw_chunked_prefill_size = get_schedule().chunked_prefill_size
+        self.layer_major_ring_tokens = (raw_chunked_prefill_size or 0) + self.page_size
+        self.layer_major_gate = gate_from_env(max_tokens=self.model_config.context_len)
+        if self.layer_major_gate is None:
+            return
+
+        reason = launch_refusal(
+            max_running_requests=self.max_running_requests,
+            speculative_algorithm=(
+                None if self.spec_algorithm.is_none() else str(self.spec_algorithm)
+            ),
+            enable_dp_attention=self.enable_dp_attention,
+            attn_cp_size=get_parallel().attn_cp_size,
+            enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+            pp_size=get_parallel().pp_size,
+        )
+        if reason is None:
+            model_cls = type(self.tp_worker.model_runner.model)
+            reason = scheduler_layer_major_refusal(
+                raw_chunked_prefill_size=raw_chunked_prefill_size,
+                effective_chunked_prefill_size=self.chunked_prefill_size,
+                is_hybrid_swa_allocator=isinstance(
+                    self.token_to_kv_pool_allocator,
+                    (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+                ),
+                is_swa_req_ring=is_swa_req_ring(self.token_to_kv_pool_allocator),
+                adapter_missing_model_name=(
+                    None
+                    if getattr(model_cls, "make_layer_major_adapter", None) is not None
+                    else model_cls.__name__
+                ),
+            )
+        if reason is not None:
+            raise ValueError(reason)
 
     def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
@@ -3935,6 +3987,8 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            layer_major_gate=self.layer_major_gate,
+            layer_major_ring_tokens=self.layer_major_ring_tokens,
         )
 
         if self.chunked_req is not None:
@@ -4097,6 +4151,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            layer_major_ring_size=self.layer_major_ring_tokens,
         )
 
         new_batch.contains_last_prefill_chunk = (
@@ -4337,6 +4392,54 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch, containing a layer-major pass's forward exception to its one request.
+
+        Guarded only when batch.layer_major_ring_tokens is not None; a normal batch's
+        exception still reaches run_scheduler_process's handler. By the time the
+        exception surfaces, the adapter's release_pass(failed=True) (Task 10/11's
+        seam) has already finalized the window ring. The request is then released
+        through the same no-further-forward path retraction uses: release_kv_cache
+        -> cache_finished_req frees [req.kv.cache_protected_len, owned_kv_len).
+        alloc_for_extend sets kv_committed_len (owned_kv_len reads it) to the whole
+        new sequence length at allocation time, before this pass ever runs, so that
+        range already covers the entire failed extend; is_insert=False is what keeps
+        a possibly-partial pass's KV out of the shared tree, not the freed range."""
+        if batch.layer_major_ring_tokens is not None:
+            try:
+                return self._run_batch_impl(batch, pp_proxy_tensors)
+            except Exception as exc:
+                self._finish_layer_major_batch_after_exception(batch, exc)
+                return GenerationBatchResult()
+        return self._run_batch_impl(batch, pp_proxy_tensors)
+
+    def _finish_layer_major_batch_after_exception(
+        self, batch: ScheduleBatch, exc: Exception
+    ) -> None:
+        tb = get_exception_traceback()
+        for req in batch.reqs:
+            if req.finished():
+                continue
+            logger.error(f"layer-major prefill failed for rid={req.rid}: {exc}\n{tb}")
+            reason = FINISH_ABORT(
+                f"layer-major prefill failed: {exc}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
+            req.finished_reason = reason
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                _make_abort_req(req, finished_reason=reason.to_json()), req
+            )
+        # Matches filter_batch's "filter out all requests" convention: is_empty()
+        # keys off reqs, so process_batch_result's early-out below (and every
+        # other caller) drops this batch without touching its stale tensors.
+        batch.reqs = []
+
+    def _run_batch_impl(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -4761,6 +4864,15 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # A layer-major batch whose forward raised was already fully finished
+        # and released by _finish_layer_major_batch_after_exception (run_batch),
+        # which empties reqs exactly like filter_batch's "filter out all
+        # requests" case; result may be a placeholder here (event_loop_overlap
+        # defers this call, so result_queue can hold it across an iteration).
+        # No legitimate extend batch otherwise reaches this method empty.
+        if not batch.reqs and batch.forward_mode.is_extend():
+            return
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)

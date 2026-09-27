@@ -1203,6 +1203,10 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        # Set by _select_prefill_admission when the whole uncached suffix is
+        # admitted as one layer-major extend; cleared once its forward returns.
+        self.layer_major = False
+
         self.weight_version_events: List[WeightVersionEvent] = []
 
         # Incremental streamining
@@ -2465,6 +2469,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
+    # Window-ring size (in tokens) when this batch's single request is a
+    # layer-major extend, read by alloc_for_extend and the tp_worker seam; None
+    # for every other batch, including every non-layer-major extend.
+    layer_major_ring_tokens: Optional[int] = None
+
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
 
@@ -2512,6 +2521,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        layer_major_ring_size: Optional[int] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -2537,6 +2547,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            layer_major_ring_tokens=(
+                layer_major_ring_size if any(r.layer_major for r in reqs) else None
+            ),
         )
         return batch
 
@@ -3501,6 +3514,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+
+        # At max_running_requests=1, update_running_batch reuses the same
+        # object across the extend-to-decode transition (running_batch =
+        # last_batch when running_batch was empty), so a layer-major extend's
+        # ring size would otherwise survive into its own decode batch and the
+        # tp_worker seam would run the layer-major pass on a decode step.
+        self.layer_major_ring_tokens = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None

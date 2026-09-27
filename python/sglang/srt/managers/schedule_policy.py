@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
+    from sglang.srt.layer_major.gate import LayerMajorGate
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
@@ -615,6 +616,35 @@ class _PrefillAdmission:
     extend_len: int
     max_new_tokens: int
     is_chunked: bool
+    # Carries the layer-major decision through to _commit_prefill_admission,
+    # which is the only place req.layer_major is set: a candidate that gets
+    # rejected after this admission was selected (prefill delayer, host
+    # load-back) must never leave a stale True on the request.
+    is_layer_major: bool = False
+
+
+def layer_major_admission(
+    *,
+    gate: Optional["LayerMajorGate"],
+    budget,
+    req_wants_prompt_logprobs: bool,
+    req_wants_hidden: bool,
+    prefix_len: int,
+    extend_len: int,
+    total_tokens: int,
+    max_new_tokens: int,
+    ring_tokens: int,
+) -> Optional[_PrefillAdmission]:
+    """The whole uncached suffix as one extend, or None to fall back to chunked prefill."""
+    if gate is None or not gate.admits(
+        extend_len=extend_len, wants_prompt_logprobs=req_wants_prompt_logprobs, wants_hidden_states=req_wants_hidden
+    ):
+        return None
+    if not budget.check_prefill_ring(
+        total_tokens=total_tokens, max_new_tokens=max_new_tokens, ring_tokens=ring_tokens
+    ):
+        return None
+    return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, False, True)
 
 
 class PrefillAdder:
@@ -636,12 +666,16 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        layer_major_gate: Optional["LayerMajorGate"] = None,
+        layer_major_ring_tokens: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
+        self.layer_major_gate = layer_major_gate
+        self.layer_major_ring_tokens = layer_major_ring_tokens
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -1356,6 +1390,28 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices) + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
+
+        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        layer_major = layer_major_admission(
+            gate=self.layer_major_gate,
+            budget=self.memory_budget,
+            req_wants_prompt_logprobs=req.return_logprob
+            and req.logprob_start_len < len(req.origin_input_ids) - 1,
+            req_wants_hidden=req.return_hidden_states,
+            prefix_len=prefix_len,
+            extend_len=extend_len,
+            total_tokens=total_tokens,
+            max_new_tokens=max_new_tokens,
+            ring_tokens=self.layer_major_ring_tokens,
+        )
+        # A HiCache host hit is admitted through its own path, so a request with
+        # one falls back to chunked prefill rather than taking the layer-major shape.
+        # req.layer_major is NOT set here: this admission can still be rejected
+        # by the prefill delayer or a host load-back retry before it commits, so
+        # only _commit_prefill_admission may set the flag.
+        if layer_major is not None and host_hit_length == 0 and swa_host_hit_length == 0:
+            return layer_major
+
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
         # not needlessly split into a second chunk.
@@ -1378,7 +1434,6 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         is_chunked = False
-        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         tile_tokens = input_tokens
         if self.dllm_config is not None:
             assert truncation_align_size is None, (
@@ -1436,6 +1491,9 @@ class PrefillAdder:
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
+        # The only place req.layer_major is set: an admission selected but
+        # later rejected (prefill delayer, host load-back) never reaches here.
+        req.layer_major = admission.is_layer_major
         self._req_inc_lock_ref(req)
         self.can_run_list.append(req)
         if admission.is_chunked:
