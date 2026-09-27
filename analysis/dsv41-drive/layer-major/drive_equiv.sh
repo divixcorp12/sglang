@@ -36,7 +36,7 @@ phase() { echo "$(date '+%Y/%m/%d %H:%M:%S.%3N') $1" >> $OUT/phases.txt; }
 # T12-I4: the corpus is a snapshot, not the worktree head's DSV41_REFERENCE.md, so a rerun always tokenizes
 # the same prompts equiv.py:chunked.jsonl etc. were recorded against.
 CORPUS=/mnt/nvme1/layer-major/equiv-corpus/corpus.txt
-CORPUS_SHA256=798f47bbaaa9bff3aa97fdf37bb8e2f2ee9f88c4b7a44db0b6ef2f80cbf9b915
+CORPUS_SHA256=59abe27a89c6915935e6ce1cc79acf3d2acf393067b5609d753b8ff0c9fc70c3
 [ -f "$CORPUS" ] || { say "corpus snapshot missing: $CORPUS"; exit 2; }
 ACTUAL_SHA256=$(sha256sum "$CORPUS" | cut -d' ' -f1)
 [ "$ACTUAL_SHA256" = "$CORPUS_SHA256" ] || { say "corpus hash mismatch: got $ACTUAL_SHA256, want $CORPUS_SHA256"; exit 2; }
