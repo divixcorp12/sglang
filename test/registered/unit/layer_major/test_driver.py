@@ -39,8 +39,11 @@ class _Adapter:
 
 
 class _Residency:
-    def __init__(self, calls):
+    def __init__(self, calls, *, fail_restore=False, fail_end=False):
         self.calls = calls
+        self._fail_restore = fail_restore
+        self._fail_end = fail_end
+        self.restore_calls = 0
 
     def begin(self, layer_ids):
         self.calls.append(("res.begin", tuple(layer_ids)))
@@ -49,10 +52,15 @@ class _Residency:
         self.calls.append(("res.make", layer_id))
 
     def restore(self):
+        self.restore_calls += 1
         self.calls.append("res.restore")
+        if self._fail_restore:
+            raise RuntimeError("restore boom")
 
     def end(self):
         self.calls.append("res.end")
+        if self._fail_end:
+            raise RuntimeError("end boom")
 
 
 class TestDriver(unittest.TestCase):
@@ -81,6 +89,22 @@ class TestDriver(unittest.TestCase):
             run_pass(a, _Residency(a.calls), "fb", "sb", store=None)
         self.assertEqual(a.calls[-3:], ["res.restore", "res.end", ("release", True)])
         self.assertNotIn("finish_pass", a.calls)
+
+    def test_restore_failure_still_ends_and_releases_and_is_not_retried(self):
+        a = _Adapter()
+        residency = _Residency(a.calls, fail_restore=True)
+        with self.assertRaisesRegex(RuntimeError, "restore boom"):
+            run_pass(a, residency, "fb", "sb", store=None)
+        self.assertEqual(residency.restore_calls, 1)
+        self.assertEqual(a.calls[-3:], ["res.restore", "res.end", ("release", True)])
+        self.assertNotIn("finish_pass", a.calls)
+
+    def test_end_failure_still_releases(self):
+        a = _Adapter()
+        residency = _Residency(a.calls, fail_end=True)
+        with self.assertRaisesRegex(RuntimeError, "end boom"):
+            run_pass(a, residency, "fb", "sb", store=None)
+        self.assertEqual(a.calls[-3:], ["finish_pass", "res.end", ("release", False)])
 
 
 if __name__ == "__main__":
