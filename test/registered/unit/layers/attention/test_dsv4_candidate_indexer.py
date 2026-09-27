@@ -259,5 +259,60 @@ def test_dense_fp4_prefill_indexer_needs_topk_v2(monkeypatch, topk_v2, expected)
             assert use(batch) is expected
 
 
+def _tail_masks_by_chunks(logits, lens, keep_from, rows_per_chunk, topk_blocks, block_size):
+    kept = []
+    for start in range(0, logits.shape[0], rows_per_chunk):
+        s = logits[start : start + rows_per_chunk]
+        sl = ci.keep_row_slice(start, s.shape[0], keep_from)
+        if sl is not None:
+            kept.append(
+                ci.select_candidate_blocks(
+                    s[sl], lens[start : start + rows_per_chunk][sl][:, None],
+                    topk_blocks=topk_blocks, block_size=block_size,
+                )
+            )
+    return torch.cat(kept) if kept else torch.zeros(0, logits.shape[1], dtype=torch.bool)
+
+
+@pytest.mark.parametrize("keep_from", [0, 1, 33, 34, 35, 250, 299, 300])
+def test_tail_rows_built_by_chunks_equal_the_full_mask_tail(keep_from):
+    g = torch.Generator().manual_seed(keep_from)
+    rows, width = 300, 97
+    logits = torch.randn(rows, width, generator=g)
+    lens = torch.randint(1, width + 1, (rows,), generator=g)
+    logits = logits.masked_fill(torch.arange(width)[None, :] >= lens[:, None], -INF)
+    full = ci.select_candidate_blocks(logits, lens[:, None], topk_blocks=4, block_size=8)
+    got = _tail_masks_by_chunks(logits, lens, keep_from, 34, 4, 8)
+    assert torch.equal(got, full[keep_from:])
+
+
+def test_keep_row_slice_bounds():
+    assert ci.keep_row_slice(0, 34, 0) == slice(0, 34)
+    assert ci.keep_row_slice(0, 34, 34) is None
+    assert ci.keep_row_slice(34, 34, 40) == slice(6, 34)
+    assert ci.keep_row_slice(68, 10, 40) == slice(0, 10)
+
+
+def _tail_meta(extend_lens_cpu, local_lens_cpu=None):
+    tail = types.SimpleNamespace(
+        extend_seq_lens_cpu=extend_lens_cpu,
+        local_lens_cpu=local_lens_cpu,
+        cp_metadata=object() if local_lens_cpu is not None else None,
+    )
+    return types.SimpleNamespace(late_layer_tail=tail)
+
+
+def test_candidate_publish_rows_without_tail_keeps_every_row():
+    assert backend_mod.candidate_publish_rows(None) is None
+
+
+def test_candidate_publish_rows_per_request_and_short_extends():
+    assert backend_mod.candidate_publish_rows(_tail_meta([128, 57, 128])) == [128, 57, 128]
+
+
+def test_candidate_publish_rows_uses_local_lens_under_cp():
+    assert backend_mod.candidate_publish_rows(_tail_meta([128], local_lens_cpu=[64])) == [64]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
