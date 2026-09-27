@@ -262,6 +262,27 @@ def test_the_sm_mask_leaves_exactly_the_trellis_tensors_on_the_copy_engine():
     assert sm_copy_mask(EXL3_STREAMED_NAMES) == 0b110110
 
 
+def test_the_python_names_are_the_host_modules_layout():
+    """EXL3_STREAMED_NAMES orders the slab table and the copy table; the C++ trait orders the SM mask. A reorder on
+    one side would SM-copy a trellis and DMA a scale vector."""
+    from sglang.kernels.ops.moe.exl3_ram_miss import host_layout
+    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+
+    names, small_mask = host_layout()
+    assert names == EXL3_STREAMED_NAMES
+    assert small_mask == 0b110110
+
+
+def test_a_copy_table_sm_mask_naming_a_trellis_is_refused(tmp_path):
+    """set_copy_table refuses an SM mask outside the layout's small tensors: SM-reading a 13 MB trellis in the copy
+    wait would stall the chain instead of using the DMA engine."""
+    s, _page, host, _sim = _host(tmp_path)
+    host.enable_copy_engine(-1, spin_us=200)
+    table = torch.zeros((6, 3), dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="exl3 RAM miss: .*small"):
+        host.set_copy_table(ROW, table, DST_ROWS, sm_mask=0b000001)
+
+
 def test_sm_entries_skip_the_dma_and_the_lease_holds_until_the_copy_wait_acknowledges_its_reads(tmp_path):
     """The DMA copies only the trellis tensors; CopyDone is published on its completion, but the lease is released only
     once the copy wait has acknowledged its SM reads of the slot. Mutant: release the lease on the DMA's completion

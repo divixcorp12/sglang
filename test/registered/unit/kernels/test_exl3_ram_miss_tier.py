@@ -1,5 +1,6 @@
 """The C++ slot LRU and request service, pumped by hand against a host-simulated device (CPU)."""
 
+import dataclasses
 import errno
 import faulthandler
 import subprocess
@@ -292,6 +293,14 @@ def test_a_file_cut_short_after_open_fails_the_read(tier):
         f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)
     assert _serve(page, host, 0, need=[0], protect=[0]) == 2
     assert not host.contains(0, 0) and host.counters()["read_errors"] == 1
+
+
+def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
+    """tables_from indexes slabs[row][name] for every layout name; a 5-wide table would read past each row."""
+    s = ram_miss_setup(tmp_path)
+    narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:5])
+    with pytest.raises(RuntimeError, match="exl3 RAM miss: .*6 names"):
+        exl3_ram_miss.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=False)
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
