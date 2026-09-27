@@ -764,9 +764,9 @@ class RowReader {
   // Prepare as many queued extents as credit and SQ room allow. `pending` counts SQEs prepared and not
   // yet reaped (in the SQ ring or in the kernel) and never exceeds `capacity`. Credits are counted by
   // nonempty extents, not by rows, because rows do not all issue the same number of reads: a root
-  // serving none of a row issues nothing. A null SQE means the SQ filled before credit ran out: the
-  // next submit sends what is prepared and refill runs again after the reap. Retries re-enter through
-  // the queue, so they take credit like any other read.
+  // serving none of a row issues nothing. `prep_read`/`prep_readv` refused (the SQ filled before credit
+  // ran out) means the next submit sends what is prepared and refill runs again after the reap. Retries
+  // re-enter through the queue, so they take credit like any other read.
   void refill() {
     Call& c = c_;
     int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
@@ -1403,7 +1403,12 @@ class RowReader {
   bool owner_pinned_ = false;
   cpu_set_t unpinned_affinity_{};
   std::unique_ptr<PackPool> pool_;
-  Reader io_;  // declared after pool_: the ring is torn down after the packing workers are joined
+  // Declared after pool_ (and so torn down after close(fds_)/std::free(bounce_) in member-destruction
+  // order): the workers are joined by the destructor body's own pool_.reset(), before any member
+  // destructor runs, so io_'s position here changes nothing about that join. It is safe only because
+  // read() always drains the ring (quiesce()) before returning, so nothing is ever in flight when this
+  // reader is destroyed.
+  Reader io_;
   // Indexed by bounce slot with the flag off, by (slot, piece) with piece streaming (size_jobs).
   PackJob jobs_[kBounceSlots * kPieces];
   std::vector<CopyRun> runs_;

@@ -46,9 +46,11 @@ class UringReader {
   }
 
   // A submit that consumes nothing while nothing is in flight would make the wait below block in
-  // GETEVENTS for a completion no in-kernel SQE can produce. Guarding it costs a second syscall on every
-  // batch of the decode path, and the service watchdog already aborts a read that stays in service, so
-  // this is left to the watchdog deliberately.
+  // GETEVENTS for a completion no in-kernel SQE can produce (the state submit_short_call imitates).
+  // Guarding it costs a second syscall on every batch of the decode path, and the service watchdog
+  // already aborts a read that stays in service, so this is left to the watchdog deliberately.
+  // If it ever does surface, the signature is busy_since_ non-zero with pending > 0 and an empty
+  // completion queue; the guard would be to pass wait_nr = 0 whenever io_uring_sq_ready() > 0.
   int submit(unsigned wait_nr) { return wait_nr != 0 ? io_uring_submit_and_wait(&ring_, wait_nr) : io_uring_submit(&ring_); }
 
   unsigned reap(std::vector<ReadCompletion>& out) {

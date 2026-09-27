@@ -39,7 +39,6 @@ using Exl3Source = RowReader<FaultyReader<UringReader>>;
 using Exl3Tier = RamTier<Exl3Source>;
 using Exl3Thread = RamThread<Exl3Tier>;
 
-static_assert(AsyncFileReader<UringReader>);
 static_assert(AsyncFileReader<FaultyReader<UringReader>>);
 
 inline std::mutex& registry_mutex() {

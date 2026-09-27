@@ -24,6 +24,8 @@ class FaultyReader {
       if (fault_.submit_first) inner_.submit(0);
       return -fault_.error;
     }
+    // Fault: the kernel consumed none of the prepared SQEs and reported success. They stay prepared and
+    // are counted in `pending`, so the next submit must send them; nothing may wait on them meanwhile.
     if (fault_.short_call != 0 && submits_ == fault_.short_call) return 0;
     return inner_.submit(wait_nr);
   }
