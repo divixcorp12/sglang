@@ -32,6 +32,7 @@ def launch_refusal(
     enable_dp_attention: bool,
     attn_cp_size: int,
     enable_two_batch_overlap: bool,
+    pp_size: int = 1,
 ) -> str | None:
     # One blocking pass per request; nothing may run between its chunks.
     if max_running_requests != 1:
@@ -41,6 +42,9 @@ def launch_refusal(
         ("DP attention", enable_dp_attention),
         ("context parallelism", attn_cp_size > 1),
         ("two-batch overlap", enable_two_batch_overlap),
+        # The PP event loop (scheduler_pp_mixin.py) has no exception containment
+        # and cannot consume run_batch's placeholder failure result.
+        ("pipeline parallelism", pp_size > 1),
     ):
         if enabled:
             return f"SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS cannot be combined with {feature} yet"

@@ -43,6 +43,7 @@ class TestGate(unittest.TestCase):
         self.assertIn("DP attention", launch_refusal(**{**ok, "enable_dp_attention": True}))
         self.assertIn("context parallelism", launch_refusal(**{**ok, "attn_cp_size": 2}))
         self.assertIn("two-batch overlap", launch_refusal(**{**ok, "enable_two_batch_overlap": True}))
+        self.assertIn("pipeline parallelism", launch_refusal(**{**ok, "pp_size": 2}))
 
     def test_scheduler_refusals(self):
         ok = dict(
