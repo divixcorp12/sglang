@@ -9,27 +9,42 @@ the ring size.
 """
 
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.allocation import _evict_for_ring
+from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 PAGE = 4
 CHUNK = 16
 RING = CHUNK + PAGE  # 5 pages
 
-# PagedTokenToKVPoolAllocator.alloc_extend dispatches a Triton kernel
-# unconditionally, which needs an active GPU driver even for CPU tensors
-# (page_size > 1 has no eager fallback here). Ring construction and
-# allocation therefore cannot run without CUDA; TestRingBudget is pure
-# Python and needs neither the allocator nor a GPU.
-_HAS_CUDA = torch.cuda.is_available()
+
+class _FakeExtendKernel:
+    """Drop-in for the Triton alloc_extend_kernel[grid](...) call.
+
+    PagedTokenToKVPoolAllocator.alloc_extend dispatches a Triton kernel
+    unconditionally (no CPU/eager fallback), which needs an active GPU
+    driver even for CPU tensors. These tests verify slot/page bookkeeping,
+    not the kernel, so route the same call through the pure-torch
+    alloc_extend_naive instead of spending the shared GPU on a unit test.
+    """
+
+    def __getitem__(self, grid):
+        def _launch(prefix_lens, seq_lens, last_loc, free_pages, out_indices, bs_pow2, page_size):
+            alloc_extend_naive(
+                prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, out_indices.device
+            )
+
+        return _launch
 
 
 def _allocator(size=256, size_swa=64):
@@ -64,11 +79,7 @@ def _alloc_whole(a, n):
     return full
 
 
-@unittest.skipUnless(
-    _HAS_CUDA,
-    "alloc_extend_swa_tail's full-side alloc_extend dispatches a Triton "
-    "kernel that needs an active GPU driver, even on CPU tensors",
-)
+@mock.patch("sglang.srt.mem_cache.allocator.paged.alloc_extend_kernel", new=_FakeExtendKernel())
 class TestWindowRing(unittest.TestCase):
     def test_ring_admission_restores_available_size(self):
         a = _allocator()
@@ -96,7 +107,7 @@ class TestWindowRing(unittest.TestCase):
     def test_release_after_finalize_returns_every_slot(self):
         a = _allocator()
         swa_before, full_before = a.swa_available_size(), a.full_available_size()
-        n = 50  # final chunk of 2 tokens
+        n = 50  # final chunk of 2 tokens; PAGE=4 does not divide n
         full = _alloc_whole(a, n)
         ring = a.ring_slots(full[-RING:])
         for start in range(0, n, CHUNK):
@@ -112,6 +123,42 @@ class TestWindowRing(unittest.TestCase):
             (a.swa_available_size(), a.full_available_size()),
             (swa_before, full_before),
         )
+
+    def test_finalize_keeps_the_partially_kept_page_off_the_free_list(self):
+        """Pins Critical-1: releasing "unused" ring slots page-at-a-time must
+        not free a page that still backs a kept position. With n=50 and
+        PAGE=4, the final kept page (positions 48-49) holds only 2 of its 4
+        slots live; the other 2 must stay reserved with the request, not
+        return to the pool, and the whole ring must come back exactly once
+        when the request frees.
+        """
+        a = _allocator()
+        swa_before, full_before = a.swa_available_size(), a.full_available_size()
+        n = 50
+        full = _alloc_whole(a, n)
+        ring = a.ring_slots(full[-RING:])
+        for start in range(0, n, CHUNK):
+            pos = torch.arange(start, min(n, start + CHUNK))
+            a.map_ring_positions(full[pos], pos, ring)
+        keep_from = (n - 8) // PAGE * PAGE
+        a.finalize_ring(full, extend_start=0, keep_from=keep_from, ring=ring)
+
+        kept = a.full_to_swa_index_mapping[full[keep_from:]]
+        kept_pages = (kept[kept > 0] // PAGE).unique().tolist()
+        free_pages = a.swa_attn_allocator.get_all_free_pages().tolist()
+        for p in kept_pages:
+            self.assertNotIn(
+                p, free_pages, f"page {p} still backs a kept position but was freed"
+            )
+
+        a.free(full)
+        self.assertEqual(a.swa_available_size(), swa_before)
+        self.assertEqual(a.full_available_size(), full_before)
+        # Every physical SWA page came back exactly once: no duplicates, none
+        # missing (available_size above already pins the count; this pins
+        # that it is not e.g. one page short and one page double-counted).
+        all_free = a.swa_attn_allocator.get_all_free_pages()
+        self.assertEqual(all_free.numel(), all_free.unique().numel())
 
 
 class TestRingBudget(unittest.TestCase):
@@ -145,6 +192,47 @@ class TestRingBudget(unittest.TestCase):
                 total_tokens=500, max_new_tokens=8, ring_tokens=RING
             )
         )
+
+
+class TestRingEvictionSizing(unittest.TestCase):
+    """Pins Important-2: the ring branch must size its SWA evict target by
+    the ring, not by the whole (potentially huge) layer-major extend."""
+
+    class _FakeAllocator:
+        def full_available_size(self):
+            return 0
+
+        def swa_available_size(self):
+            return 0
+
+    class _FakeTreeCache:
+        def __init__(self):
+            self.calls = []
+
+        def is_chunk_cache(self):
+            return False
+
+        def evict_for_alloc(self, params):
+            self.calls.append(params)
+
+    def test_ring_branch_sizes_swa_by_ring_not_by_full_extend(self):
+        tree_cache = self._FakeTreeCache()
+        full_target = 250_000  # a long layer-major extend
+        swa_target = RING + PAGE  # what the ring branch should ask for
+
+        _evict_for_ring(
+            tree_cache,
+            self._FakeAllocator(),
+            full_target=full_target,
+            swa_target=swa_target,
+        )
+
+        self.assertEqual(len(tree_cache.calls), 1)
+        params = tree_cache.calls[0]
+        self.assertIsInstance(params, EvictParams)
+        self.assertEqual(params.num_tokens, full_target)
+        self.assertEqual(params.swa_num_tokens, swa_target)
+        self.assertLess(params.swa_num_tokens, full_target)
 
 
 if __name__ == "__main__":
