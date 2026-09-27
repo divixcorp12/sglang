@@ -53,6 +53,22 @@ def test_head_shape_slices():
     assert _rel(exl3_linear(x, t, torch.float32), ref) < 5e-3
 
 
+def test_dense_path_never_holds_the_whole_weight():
+    """A prefill-sized linear must not materialise the fp16 weight: the Engram wkv's is 300 MiB, and holding it
+    (twice, with its reconstruct buffer) is what runs a 2048-token prefill chunk out of memory."""
+    t = random_exl3_tensors(6144, 25600, 5, device="cuda", seed=11)
+    x = torch.randn(512, 6144, device="cuda", dtype=torch.bfloat16)
+    ref = exl3_linear_reference(x, t)
+    dense_bytes = t.in_features * t.out_features * 2
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    y = exl3_linear(x, t, torch.float32)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - before < dense_bytes // 2
+    assert _rel(y, ref) < 5e-3
+
+
 def test_bf16_output_and_leading_dims():
     t = random_exl3_tensors(5120, 1280, 5, device="cuda", seed=1)
     x = torch.randn(2, 3, 5120, device="cuda", dtype=torch.bfloat16)
