@@ -1353,6 +1353,11 @@ its late `ready` is harmless because `go_count` is 0.
 
 ## 14. Shutdown and quarantine
 
+> **Removed on 2026-09-27** (`8ac64c9c99`, branch `doorbell-removal`): the doorbell side-thread copier, its
+> `SGLANG_MOE_EXPERT_DOORBELL*` variables and `--moe-offload-preset doorbell` no longer exist. A set variable only
+> warns at startup, and `Scheduler.release_host_resources` no longer calls a doorbell stop. The per-batch fail-stop
+> hook is now `ExpertHotCacheManager.run_fail_stop_checks`. The text below is kept as history.
+
 Requirement from the plan: "stop admission, drain storage/packing, then establish
 completion of all GPU readers before freeing their memory. If a CUDA error prevents
 establishing completion, retain/quarantine allocations until process teardown; never
@@ -2548,6 +2553,11 @@ read (established by reading, not demonstrated).
 pipe cannot block the child, and the timeout bounds a hang. Neither was tested by making the child chatty.
 
 ### 20.2i PROPOSAL (not implemented): placement of the orderly shutdown call in `Scheduler.release_host_resources()`
+
+> **Removed on 2026-09-27** (`8ac64c9c99`, branch `doorbell-removal`): the doorbell side-thread copier, its
+> `SGLANG_MOE_EXPERT_DOORBELL*` variables and `--moe-offload-preset doorbell` no longer exist. A set variable only
+> warns at startup, and `Scheduler.release_host_resources` no longer calls a doorbell stop. The per-batch fail-stop
+> hook is now `ExpertHotCacheManager.run_fail_stop_checks`. The text below is kept as history.
 
 Read first: `.claude/skills/large-class-style/SKILL.md`. Its frozen list is `model_runner.py` only; `scheduler.py` is
 covered for `__init__` (section 2), and this change is not in `__init__`. Section 1.3's test is still the right one
