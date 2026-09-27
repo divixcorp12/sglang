@@ -10,7 +10,7 @@ first-turn text of each of these 8 sessions, truncated to 256 tokens — but re-
 it as a one-turn chat session so it can be driven over `/v1/chat/completions` like the
 Qwen campaign, instead of fed as raw token ids to an offline Engine.
 
-The serving context length comes from `arm_env.CONTEXT_LENGTH`, currently 32,768 to
+The serving context length comes from `arm_env.CONTEXT_LENGTH`, currently 262,144 to
 match production. The corpus still uses short first-turn prompts and 128 generated
 tokens. Historical 4,096-token results are not directly comparable: the longer
 context changes memory allocation, and the current launch also enables prefix caching.

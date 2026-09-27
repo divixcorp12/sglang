@@ -4116,7 +4116,8 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
 3. **NVMe waits in decode:** ~13 ms per step of S outlasts the layer's RAM-hit copies, with the link partly idle.
    Fewer NVMe misses (the RAM tier, and item 2) or faster streaming are the levers. The earlier "copy-thread" reading
    of this time was wrong (§27.3).
-4. **Long prompts:** larger prefill chunks, which trades against Track A's VRAM headroom (§25.4).
+4. **Long prompts: done (§27.17).** 4096-token prefill chunks, with the hot cache cut by 1 GiB and the static fraction
+   lowered to 0.90: a 16k prompt's TTFT fell 444 -> 107 s.
 5. **Per-layer RAM split: tried, no gain; not merged.** Branch `cc/pinned-layer-weights`: `SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS`
    plus `scripts/dsv41/ram_split.py`.
    - **Replay:** an LRU stack-distance replay of the varied24 route log reproduces the measured per-layer ranking, but
@@ -5074,6 +5075,60 @@ bounded replay is on, with or without a host SWA pool.
     prefill that is up to ~9-13 s of TTFT on such a hit, against ~2 s before.
   - Hits with a suffix of 128 tokens or more pay nothing.
   - Recovering the safe cases would need the tree to record which page boundaries have late-layer coverage.
+
+### 27.17 Prefill chunk size: 4096-token chunks for 250k contexts (result, in the recipe, 2026-09-26)
+
+**Why prefill was slow.** A chunk's cost is streaming the experts it routes to, not its tokens or its context.
+- In the 30k-prompt smoke (`/mnt/nvme1/indexer-cap/b128-30k`, §27.7's older recipe), every 512-token chunk took
+  ~31 s, flat from 0 to 30k of context.
+- Per chunk, layers 0-20 touch ~250 of 384 experts: ~230 miss VRAM and ~190 are read from NVMe (`stages.jsonl`).
+- Layers 21-39 see only the chunk's last 128 tokens (decoder bounded replay), so a larger chunk adds tokens to the
+  first 21 layers only.
+- The payoff trace's short prefill agrees: 14.7 s held ~0.3 s of expert GEMMs, 6.3 s of pinned-RAM gathers and
+  ~6 s of GPU idle between gathers.
+- At 512 tokens a 250k prompt was ~490 chunks, about 4 h on that recipe and ~2 h on today's.
+
+**The Engram dense transient.** Above 144 rows `exl3_linear` rebuilt the whole fp16 weight and, for a weight
+narrower than 32768 columns, a second full-size reconstruct buffer. That is 600 MiB for the Engram wkv
+(6144 x 25600).
+- 2048- and 4096-token chunks ran out of memory on it.
+- Fixed in `d7f6ded58d`: `_exl3_dense_matmul` reconstructs and multiplies one 4096-column slice at a time.
+- `test_dense_path_never_holds_the_whole_weight` (`test/manual/dsv41/test_exl3_ops_gpu.py`) measured a 606 MiB peak
+  before the fix against a 150 MiB bound. After it, the file passes 27/27 on the GPU.
+
+**The hot cache counts against `--mem-fraction-static`.** Cutting it at 0.925 only grows the KV pool: at 16100 MB
+the pool went from ~256k to 934k tokens, and 2048- and 4096-token chunks still ran out of memory. The cut needs
+the fraction lowered with it.
+
+**Sweep** (`analysis/dsv41-drive/prefill-chunk/`, `divix01:/mnt/nvme1/prefill-chunk/`). One cold server per arm,
+a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
+
+| Chunk | Hot MB | Fraction | TTFT | Prefill | Median chunk | KV pool | Long prompt adds | OOM retries |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 17120 | 0.925 | 444 s | 36 tok/s | 14 s | 304k | ~0 | 0 |
+| 2048 | 17120 | 0.925 | 204 s | 78.5 tok/s | 23 s | 256k | 764 MiB | 1 |
+| 2048 | 16100 | 0.90 | 186 s | 85.9 tok/s | 23 s | 431k | 948 MiB | 0 |
+| **4096** | **16100** | **0.90** | **107 s** | **150 tok/s** | 17 s | 387k | 1,416 MiB | 0 |
+| 4096 | 16100 | 0.925 | OOM | | | 877k | | 3 |
+| 2048 | 16100 | 0.925 | OOM | | | 934k | | 3 |
+
+- Headroom at the 4096 arm's peak is ~470 MiB.
+- Decode after the long prompt read 109-121 ms/token across arms. These are 64 tokens right after a prefill that
+  evicts decode's RAM set (§27.2), and the 512 -> 2048 change at the same hot size moved it as much as the hot-cache
+  cut did, so this is not a measure of the cut. §27.7's slope suggests the 1 GiB cut costs ~2-3 ms/token of steady
+  decode. Not measured.
+- The earlier 2048 arm's warm-up read 20.1 s TTFT and 307 ms/token against ~12.3 s / ~168 ms in every other arm.
+  Not investigated; its 16k prompt was in line.
+
+**In the recipe:** `CHUNKED_PREFILL_SIZE = 4096`, `MEM_FRACTION_STATIC = 0.90`, `SGLANG_MOE_HOT_GPU_MB = 16100` and
+`CONTEXT_LENGTH = 262144`.
+
+**Not run at this recipe:**
+- A server at context 262144: every arm above ran at 32768, and decode graph or indexer buffers may be sized from
+  the context length.
+- Any prompt past 16k. The 250k estimate is ~61 chunks at 17-27 s, ~20-30 min, if chunk time stays flat with
+  context as it did to 30k.
+- Steady decode ms/token at the smaller hot cache.
 
 ## Sources
 

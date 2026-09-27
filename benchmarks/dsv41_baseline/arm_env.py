@@ -50,15 +50,21 @@ CUDA_HOME = "/usr/local/cuda-13.2"
 PYTHON = "/data/models/slang/.venv/bin/python"
 GPU_LOCK = f"{NVFP4_WORK}/cc-gpu.lock"
 
-# Match the current production launcher; older benchmark arms used 4096.
-CONTEXT_LENGTH = 32768
+# 262144 since 2026-09-26, for 250k-token prompts; the KV pool at the settings below holds ~387k tokens. No prompt
+# past 32k has been run at this recipe. Older benchmark arms used 4096, then 32768.
+CONTEXT_LENGTH = 262144
 # 0.83 since 2026-09-25, with CUDA_MODULE_LOADING=EAGER (base_env): eager loading keeps every kernel resident, ~1 GiB,
 # and at 0.80 the KV cache no longer fit. At 0.83 it holds 204,288 tokens (0.80 under LAZY: 209,408), with the same
 # ~4.7 GB left over. An arm run at 0.80 is not comparable on memory, only on speed.
 # 0.925 since 2026-09-26: the hot cache counts against this fraction, so its +3072 MiB (of 32607) raised it by the
 # same amount and the KV pool is unchanged. The indexer score budget is what keeps long prefills inside the rest.
-MEM_FRACTION_STATIC = 0.925
-CHUNKED_PREFILL_SIZE = 512
+# 0.90 since 2026-09-26, with the hot cache 1 GiB smaller: ~815 MiB goes back to the 4096-token prefill chunk's
+# activations, and the KV pool still grows (~387k tokens). At 0.925 a smaller hot cache only grows the KV pool, and
+# 2048- and 4096-token chunks run out of memory (27.17).
+MEM_FRACTION_STATIC = 0.90
+# 4096 since 2026-09-26: a chunk's cost is streaming the experts it routes to, nearly the same at 512 and 4096 tokens,
+# so a 16k prompt's TTFT fell 444 -> 107 s (27.17).
+CHUNKED_PREFILL_SIZE = 4096
 MAX_PREFILL_TOKENS = 16384
 # Decode CUDA graphs exist only at batch size 1; anything above it runs eagerly and
 # skips the path under test. Sequential driver, one turn at a time (team ruling).
@@ -133,8 +139,9 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_PINNED_HOST_MB": PINNED_HOST_MB,
         "SGLANG_MOE_PINNED_HOST_NUMA_MB": PINNED_HOST_NUMA_MB,
         # 14336 + 3072 on the indexer cap's freed VRAM: 110.1 -> 103.0 ms/token, byte-identical (27.7). Counts against
-        # MEM_FRACTION_STATIC, which rose with it.
-        "SGLANG_MOE_HOT_GPU_MB": "17408",
+        # MEM_FRACTION_STATIC. Cut to 16100 for 4096-token prefill chunks and a 262144 context (27.17); the decode cost
+        # of the cut is not measured (27.7's slope suggests ~2-3 ms/token).
+        "SGLANG_MOE_HOT_GPU_MB": "16100",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
         "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
