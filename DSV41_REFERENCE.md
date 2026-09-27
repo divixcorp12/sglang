@@ -4147,8 +4147,9 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
     ~1 us of it the resident launch and the rest a same-stream copy residual.
 11. **Multi-turn prefix reuse: done, HiCache in the recipe (§27.16).** The 3584-slot SWA pool lost a 4k conversation's
     tail to the next prefill, so revisits reused nothing (TTFT 130 s). HiCache reloads the tail from host (2.3 s), and
-    cache hits matched cold output within noise. Open: why a mid-chunk hit shows no damage from late-layer slots that
-    bounded replay never wrote.
+    cache hits matched cold output within noise. Two defects found and fixed: HiCache staging buffers ate the runtime
+    slack (CUDA OOM; capped and reserved), and decoder bounded replay let a mid-chunk hit read unwritten late-layer
+    SWA slots (upstream bug; a hit now re-prefills the window, `c515312414`).
 
 ### 27.5 Copy-thread scheduling, untraced
 
@@ -4982,7 +4983,8 @@ cold after `/flush_cache`, with a second cold run as the noise floor. All runs a
   `min(128, extend)` tokens of each extend (`late_layer_tail_layout`). A match boundary inside a chunk therefore
   leaves late-layer slots, which a short suffix's first decode windows read, that no forward wrote.
   - The outputs show no damage: warm and cold diverge at the same depth as cold and cold.
-  - Why is not established. It would take a direct probe of those slots.
+  - This check was blind. After startup and a flush, those slots held zeros or same-document KV, and one greedy
+    sample cannot see a sub-noise bias. The defect is real: see "Decoder bounded replay: stale late-layer SWA" below.
 - **One sample per case.** This rules out gross corruption, not a subtle bias.
 - **Headroom: HiCache's staging buffers caused an OOM (fixed).**
   - Every page_first host mirror allocates a device write-back staging buffer after the KV pool is sized, out of
@@ -5002,6 +5004,76 @@ cold after `/flush_cache`, with a second cold run as the noise floor. All runs a
     this drop is not yet explained.
 - **Operational note.** Under HiCache, `/flush_cache` returns 400 ("pending requests", with none queued or running)
   straight after a request, until write-back drains. Retry it.
+
+#### Decoder bounded replay: stale late-layer SWA on a mid-chunk prefix hit (bug, fixed in `c515312414`)
+
+**The defect, which is also in upstream sglang.** `--enable-decoder-swa-bounded-replay` comes from upstream PR #38798
+and is still on `upstream/main` (`fc9e1c8d29`, 2026-09-26).
+- Layers past the last `kv_source` layer (21-39 of 40; `kv_source_layer_ids` [2, 8, 14, 20]) run a prefill only over
+  each extend's last `min(128, extend)` tokens. So they write SWA KV only for those positions
+  (`late_layer_tail_layout`, `deepseek_v4_backend.py` "window KV before it is never written here").
+- Decode reads the full 128-token window with no floor (`make_forward_metadata_from_raw_decode` passes no
+  `swa_replay_start`).
+- The radix match checks only that the window's SWA slots are allocated, not that each layer wrote them
+  (`SWAComponent.create_match_validator`).
+- **Trigger.** A request reuses a cached prefix whose page-aligned boundary lies inside an earlier extend, then adds
+  fewer than ~128 tokens. Its first decode steps then read late-layer slots no forward wrote: stale KV of whatever last
+  used them.
+  - Examples: the same long document with different short questions, regenerating or editing a long last message, or
+    a shared system prompt followed by a short query.
+- **Safe case.** Append-only multi-turn chat is safe: the revisit boundary is a prior extend end or past it, where the
+  prior tail and decode wrote the window.
+- **HiCache is not involved.** The host copy mirrors the same unwritten bytes, and a no-HiCache arm showed the defect.
+
+**Output evidence (`prefix_poison.py`, arms `poison`, `poison-nohicache`).**
+- Setup: 20 random-token requests of 255 tokens write late-layer KV into every SWA page, then `/flush_cache` frees the
+  pages but keeps the bytes. A 900-token seed prefills [0, 512) and [512, 900), so the late layers write only
+  [384, 512) and [772, 900).
+- A warm request of its first 768 tokens plus 4 hits 768. Its first decode window reads 123 unwritten slots in
+  [645, 768).
+- A 136-token-suffix control reads none.
+- Result:
+  - Short trials: first-decode logprob off by 0.11-0.50 (one token flipped).
+  - Controls: 0.008-0.088 (one flipped).
+  - Cold vs cold: 0.002-0.12.
+- Suggestive, not decisive: one control also flipped.
+
+**Direct evidence (`swa_window_probe.py`, arms `swaprobe-a`/`-b`, probe hook on branch `cc/swa-window-probe` only).**
+- Mechanism: `SGLANG_DEBUG_SWA_WINDOW_DUMP_DIR` makes the TP worker dump, after each bs=1 extend, the 576 data bytes
+  (fp8 nope + bf16 rope) of every layer's SWA window rows.
+- Sequence: same poisoned pool and seed, then warm, cold and cold2 of the 772-token prompt. The rows are compared by
+  cosine similarity, over two trials each.
+
+| Rows | master: warm vs cold | Fix: warm vs cold | cold vs cold |
+|---|---|---|---|
+| Late layers, 645..767 | **0.05, 0.08** | 1.0000 | 1.0000 |
+| Late layers, 768..771 (the suffix) | 0.85 | 1.0000 | 1.0000 |
+| Early layers, 645..767 | 0.99 | 1.0000 | 1.0000 |
+| Early layers, 768..771 | 0.98 | 1.0000 | 1.0000 |
+
+- On master the rows the first decode reads are uncorrelated with the right ones, a cosine of 0.05.
+- The early layers are the extraction check: the same positions match at 0.99.
+- Two cold runs are byte-identical, so the gap is not noise.
+- **The suffix's own late rows (0.85).** A 4-token extend's late layers attend only those 4 tokens, floored at the
+  tail start. That is bounded replay's approximation on a short extend, not the stale slots.
+
+**The fix (`c515312414`).** `UnifiedRadixCache.swa_reprefill_tail_tokens` returns the sliding window whenever decoder
+bounded replay is on, with or without a host SWA pool.
+- The scheduler already caps a match at `input_len - swa_reprefill_tail_tokens()`; unified_kv uses the same hook for
+  its per-request ring. So a hit now leaves at least one window to prefill, and the request's own late-layer tail
+  covers every slot its decode reads.
+- The tree still returns the deepest valid boundary under the cap: 512 here, extend 260, the same extend a cold run's
+  second chunk has.
+- Test: `test/registered/unit/mem_cache/test_decoder_replay_reprefill.py`, red before and green after.
+- Suite: `pytest test/registered/unit/kernels` plus the two new files gives 1339 passed / 412 skipped. That is
+  master's 1329/412 plus the 10 new cases (divix01, `CUDA_VISIBLE_DEVICES=` so the GPU tests skip, `-p no:randomly`).
+- **Cost.**
+  - A hit whose suffix is under 128 tokens now prefills up to ~383 tokens: a 128-token window plus up to 255 of page
+    alignment.
+  - That includes hits that were safe, such as a revisit whose boundary is a prior chunk end. At this box's ~30 tok/s
+    prefill that is up to ~9-13 s of TTFT on such a hit, against ~2 s before.
+  - Hits with a suffix of 128 tokens or more pay nothing.
+  - Recovering the safe cases would need the tree to record which page boundaries have late-layer coverage.
 
 ## Sources
 

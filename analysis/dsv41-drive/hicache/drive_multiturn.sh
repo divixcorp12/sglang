@@ -13,6 +13,8 @@
 #   big-hicache    big plus the hierarchical cache: a host-backed SWA tail is a valid match boundary;
 #   equiv-hicache  big-hicache running prefix_equiv.py: does a prefix hit change greedy output?
 #   poison         the recipe (HiCache included) running prefix_poison.py: a mid-chunk hit over a poisoned SWA pool.
+#   swaprobe-a/-b  the recipe with SGLANG_DEBUG_SWA_WINDOW_DUMP_DIR, running swa_window_probe.py (needs the probe
+#                  hook, branch cc/swa-window-probe); two names so a bug run and a fix run keep separate output.
 # Output under /mnt/nvme1/hicache/mt-<arm>/. Production must be stopped.
 # Usage: drive_multiturn.sh <worktree> [arm ...]
 set -u
@@ -53,7 +55,7 @@ CORES=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.SERVER_CORES)")
 MODEL=$(PYTHONPATH=$H $PY -c "import arm_env; print(arm_env.MODEL_PATH)")
 
 for arm in $ARMS; do
-  doc=4096; turns=3; drop=""; client=multiturn; poison_args=""
+  doc=4096; turns=3; drop=""; client=multiturn; poison_args=""; probe=0
   case $arm in
     big) extra="" ;;
     small) extra="$SMALL" ;;
@@ -66,11 +68,14 @@ for arm in $ARMS; do
     poison) extra=""; client=poison ;;
     poison-nohicache) extra=""; client=poison; poison_args="--short 1 --control 2"
       drop="--enable-hierarchical-cache --hicache-ratio --hicache-size --hicache-write-policy" ;;
+    swaprobe-a|swaprobe-b) extra=""; client=swaprobe; probe=1 ;;
     *) say "unknown arm $arm"; exit 2 ;;
   esac
   OUT=$T/mt-$arm
   rm -rf $OUT; mkdir -p $OUT
-  printf '%s\n' "${ENV[@]}" > $OUT/env.txt
+  ARM_ENV=("${ENV[@]}")
+  [ $probe = 1 ] && ARM_ENV+=("SGLANG_DEBUG_SWA_WINDOW_DUMP_DIR=$OUT/dump")
+  printf '%s\n' "${ARM_ENV[@]}" > $OUT/env.txt
   ARGV=()
   # drop lists flags to remove; a dropped flag's value (the next non-flag element) goes with it.
   skip_value=0
@@ -84,7 +89,7 @@ for arm in $ARMS; do
   printf '%s\n' "${ARGV[@]}" > $OUT/argv.txt
   say "arm $arm: extra='$extra' drop='$drop' doc=$doc turns=$turns"
   cd $WT
-  taskset -c $CORES env "${ENV[@]}" "${ARGV[@]}" > $OUT/server.log 2>&1 &
+  taskset -c $CORES env "${ARM_ENV[@]}" "${ARGV[@]}" > $OUT/server.log 2>&1 &
   SPID=$!
   healthy=0
   for i in $(seq 1 180); do
@@ -94,7 +99,12 @@ for arm in $ARMS; do
   done
   if [ $healthy = 1 ]; then
     say "arm $arm healthy"
-    if [ $client = poison ]; then
+    if [ $client = swaprobe ]; then
+      taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/swa_window_probe.py run --port $PORT --model $MODEL \
+        --text $WT/DSV41_REFERENCE.md 2>&1 | tee -a $OUT/client.log
+      taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/swa_window_probe.py compare --dump $OUT/dump \
+        2>&1 | tee -a $OUT/client.log
+    elif [ $client = poison ]; then
       taskset -c 8-15 $PY $WT/analysis/dsv41-drive/hicache/prefix_poison.py --port $PORT --model $MODEL \
         --text $WT/DSV41_REFERENCE.md --out $OUT/poison.jsonl $poison_args 2>&1 | tee -a $OUT/client.log
     elif [ $client = equiv ]; then
