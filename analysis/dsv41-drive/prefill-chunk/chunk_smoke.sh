@@ -84,6 +84,10 @@ grep -q "sglang from $WT/python/sglang/__init__.py" $OUT/driver.log || { say "sg
 # The GPU is ours alone under cc-gpu.lock, so memory.used is this server plus the ~63 MiB idle floor.
 taskset -c 16-17 nvidia-smi --query-gpu=timestamp,memory.used --format=csv,noheader,nounits -lms 50 > $OUT/vram.csv 2>&1 &
 SMI=$!
+# Node free memory every 5 s: phase 0 of the layer-major plan sizes the host state store on node 1.
+( while true; do echo "$(date +%s) $(numactl --hardware | awk '/free:/ {printf "%s=%s ", $2, $4}')"; sleep 5; done ) \
+  > $OUT/numa.log 2>&1 &
+NUMA=$!
 sleep 1
 phase launch
 cd $WT
@@ -135,6 +139,7 @@ stop_server() {
   for i in $(seq 1 60); do [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && break; sleep 2; done
   phase stopped
   kill $SMI 2>/dev/null
+  kill $NUMA 2>/dev/null
   grep -c "memory allocation failed with OOM" $LOG > $OUT/retries.txt
   say "allocator OOM retries: $(cat $OUT/retries.txt)"
   say "stopped; gpu apps: '$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)'"
