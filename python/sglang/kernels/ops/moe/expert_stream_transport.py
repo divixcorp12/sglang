@@ -54,9 +54,12 @@ def _host_module(layout: str = "exl3") -> Module:
 
 @cache_once
 def _host_module_cached(layout: str) -> Module:
+    # Hidden by default: HostExports' registries and members stay private to each module's .so; only the
+    # TVM_FFI_DLL_EXPORT entry points (visibility "default") are exported.
     return load_jit(
         f"expert_stream_host_{layout}",
         cpp_files=[LAYOUTS[layout].host_source],
+        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
     )
