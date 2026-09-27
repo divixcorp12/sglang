@@ -68,6 +68,33 @@ class TestWorkerEntry(unittest.TestCase):
         finally:
             rc.reset_context()
 
+    def test_takes_layer_major_path_only_on_extend(self):
+        # A decode step of an already-admitted request still carries layer_major_ring_tokens (it lives
+        # on the ScheduleBatch, not cleared between steps); it must still take the normal decode path.
+        extend_batch = SimpleNamespace(layer_major_ring_tokens=4096)
+        decode_batch = SimpleNamespace(layer_major_ring_tokens=4096)
+        extend_fb = SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: True))
+        decode_fb = SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: False))
+
+        self.assertTrue(worker_entry.takes_layer_major_path(extend_batch, extend_fb))
+        self.assertFalse(worker_entry.takes_layer_major_path(decode_batch, decode_fb))
+        self.assertFalse(worker_entry.takes_layer_major_path(None, extend_fb))
+        self.assertFalse(
+            worker_entry.takes_layer_major_path(SimpleNamespace(layer_major_ring_tokens=None), extend_fb)
+        )
+
+    def test_decode_batch_with_the_field_set_takes_the_normal_path_not_run_pass(self):
+        # End-to-end through the same predicate tp_worker.py's seam calls: a decode-mode forward_batch
+        # must never reach run_layer_major_prefill / run_pass, even though the field is still set.
+        batch = SimpleNamespace(layer_major_ring_tokens=4096)
+        forward_batch = SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: False))
+        with mock.patch.object(worker_entry, "run_pass") as mock_run_pass:
+            if worker_entry.takes_layer_major_path(batch, forward_batch):
+                worker_entry.run_layer_major_prefill(
+                    SimpleNamespace(adapter="a", store="s", residency="r"), _runner(), batch, forward_batch
+                )
+            mock_run_pass.assert_not_called()
+
     def test_draft_worker_gets_no_layer_major_runtime(self):
         # A draft worker must short-circuit before layer_major_runtime ever inspects the model: this
         # model has no adapter, so reaching layer_major_runtime would raise instead of returning None.

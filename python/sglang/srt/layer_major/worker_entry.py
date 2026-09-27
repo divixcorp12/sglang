@@ -69,6 +69,19 @@ def layer_major_runtime_for_worker(model_runner, *, is_draft_worker: bool) -> La
     return layer_major_runtime(model_runner)
 
 
+def takes_layer_major_path(batch, forward_batch) -> bool:
+    """Whether TpModelWorker's last-rank branch should route through run_layer_major_prefill instead
+    of model_runner.forward. `batch.layer_major_ring_tokens` marks admission for the *request*; a
+    decode step on that same request still carries the field (it lives on the ScheduleBatch, not
+    cleared between steps) but must take the normal per-token decode path, so forward_mode must be
+    extend too."""
+    return (
+        batch is not None
+        and batch.layer_major_ring_tokens is not None
+        and forward_batch.forward_mode.is_extend()
+    )
+
+
 def _capture_enabled() -> bool:
     """The launch flags the capturer factories consult (RoutedExpertsCapturer.create,
     routed_experts.py; create_indexer_capturer, indexer_topk.py), not the capturers themselves:
