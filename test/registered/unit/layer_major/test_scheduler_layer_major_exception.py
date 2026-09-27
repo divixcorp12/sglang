@@ -14,6 +14,7 @@ from sglang.srt.managers import scheduler as scheduler_mod
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -56,6 +57,10 @@ def _make_scheduler():
 
 
 class TestRunBatchLayerMajorExceptionHandling(unittest.TestCase):
+    def setUp(self):
+        # _make_abort_req reads get_serving().weight_version.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
     def test_catches_exception_finishes_request_and_releases_kv(self):
         sched = _make_scheduler()
         req = _FakeReq("r0")
