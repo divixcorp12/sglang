@@ -9,6 +9,7 @@
 
 #include <sgl_kernel/distributed/ptx.cuh>
 
+#include <cuda/ptx>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -77,9 +78,7 @@ SGL_DEVICE int32_t ld_volatile(const int32_t* address) {
 }
 
 SGL_DEVICE uint64_t global_ns() {
-  uint64_t value;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
-  return value;
+  return cuda::ptx::get_sreg_globaltimer();
 }
 
 SGL_DEVICE void store_deadline(int32_t* state, uint64_t deadline) {

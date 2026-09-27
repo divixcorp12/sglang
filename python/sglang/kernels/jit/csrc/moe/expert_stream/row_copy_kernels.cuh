@@ -49,17 +49,14 @@ SGL_DEVICE void spin_ns(int64_t ns) {
 }
 
 // ld.global.cv, never .nc: a tag-2 lane's host bytes are written while the kernel runs, and .nc may serve a line
-// cached before its piece was published (LEASE_PROTOCOL.md E1 amendment).
+// cached before its piece was published (LEASE_PROTOCOL.md E1 amendment). __ldcv/__stcg emit ld.global.cv/st.global.cg
+// with a "memory" clobber, so they stay ordered after the acquire that admitted the lane.
 SGL_DEVICE void stream_copy16(const uint8_t* src, uint8_t* dst) {
-  uint64_t lo, hi;
-  asm volatile("ld.global.cv.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(src) : "memory");
-  asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dst), "l"(lo), "l"(hi) : "memory");
+  __stcg(reinterpret_cast<longlong2*>(dst), __ldcv(reinterpret_cast<const longlong2*>(src)));
 }
 
 SGL_DEVICE void stream_copy1(const uint8_t* src, uint8_t* dst) {
-  uint16_t value;
-  asm volatile("ld.global.cv.u8 %0, [%1];" : "=h"(value) : "l"(src) : "memory");
-  *dst = static_cast<uint8_t>(value);
+  *dst = __ldcv(src);
 }
 
 // This block's share of `bytes` bytes: units (16 B when both ends allow it) in chunks of kStreamThreads, the chunks
@@ -486,20 +483,13 @@ SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) 
   const int64_t step = blockDim.x;
   int64_t u = threadIdx.x;
   for (; u + 3 * step < units; u += 4 * step) {
-    uint64_t v[8];
+    longlong2 v[4];
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      asm volatile("ld.global.cv.v2.b64 {%0,%1},[%2];"
-                   : "=l"(v[2 * k]), "=l"(v[2 * k + 1])
-                   : "l"(src + 16 * (u + k * step))
-                   : "memory");
-    }
+    for (int k = 0; k < 4; ++k)
+      v[k] = __ldcv(reinterpret_cast<const longlong2*>(src + 16 * (u + k * step)));
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      asm volatile(
-          "st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dst + 16 * (u + k * step)), "l"(v[2 * k]), "l"(v[2 * k + 1])
-          : "memory");
-    }
+    for (int k = 0; k < 4; ++k)
+      __stcg(reinterpret_cast<longlong2*>(dst + 16 * (u + k * step)), v[k]);
   }
   for (; u < units; u += step)
     device::expert_stream::stream_copy16(src + 16 * u, dst + 16 * u);
