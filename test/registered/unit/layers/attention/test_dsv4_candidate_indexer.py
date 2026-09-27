@@ -433,6 +433,42 @@ def test_torch_indexer_publishes_tail_rows_matching_the_full_mask_tail(monkeypat
     assert torch.equal(full_pages, tail_pages)
 
 
+def test_torch_indexer_tail_equal_to_request_rows_publishes_the_whole_mask(
+    monkeypatch,
+):
+    # A tail as long as its request (extend_seq_lens_cpu == the request row counts,
+    # 5 and 4) must publish the full no-tail mask for that request, not a truncation.
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
+    source = _fake_indexer(source=True, uses=False)
+    full_meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
+    )
+    full_length_tail = types.SimpleNamespace(
+        late_layer_tail=types.SimpleNamespace(
+            extend_seq_lens_cpu=[5, 4], local_lens_cpu=None, cp_metadata=None
+        )
+    )
+    tail_meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=full_length_tail,
+        candidate_tail_only=True,
+    )
+    assert torch.equal(tail_meta.request_masks[0], full_meta.request_masks[0])
+    assert torch.equal(tail_meta.request_masks[1], full_meta.request_masks[1])
+
+
 def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail(
     monkeypatch,
 ):
@@ -550,17 +586,16 @@ def test_candidate_tail_only_true_when_bounded_replay_is_off(monkeypatch):
     assert backend_mod.candidate_tail_only_of(config) is True
 
 
-def test_candidate_tail_only_of_never_needs_a_model_for_a_draft_shaped_config(
+def test_candidate_tail_only_of_with_no_candidate_source_never_needs_late_layer_start_of(
     monkeypatch,
 ):
-    # NextN/DSpark draft configs default candidate_source_layer_id to -1 (drafts run
-    # no candidate indexing) and never populate kv_source_layer_ids. late_layer_start_of
-    # would raise on an empty list, so the short-circuit on candidate_source_layer_id
-    # < 0 must skip it even when bounded replay happens to be on globally. The backend
-    # used to read model_runner.model.model.late_layer_start instead: NextN never sets
-    # that attribute and DSpark's model has no `.model` at all, so every MTP/DSpark
-    # launch crashed at backend construction. candidate_tail_only_of takes only a
-    # config, never a model.
+    # A config with candidate_source_layer_id < 0 runs no candidate indexing, so
+    # late_layer_start_of (which would raise on an empty kv_source_layer_ids) must
+    # never be reached, even when bounded replay is on globally. The backend used to
+    # read model_runner.model.model.late_layer_start instead: NextN never sets that
+    # attribute and DSpark's model has no `.model` at all, so every MTP/DSpark launch
+    # crashed at backend construction. candidate_tail_only_of takes only a config,
+    # never a model.
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_exec",
         lambda: _exec_with_bounded_replay(True),
@@ -569,6 +604,56 @@ def test_candidate_tail_only_of_never_needs_a_model_for_a_draft_shaped_config(
         candidate_source_layer_id=-1, kv_source_layer_ids=[]
     )
     assert backend_mod.candidate_tail_only_of(draft_config) is True
+
+
+def test_candidate_tail_only_of_true_for_a_reused_target_config_with_many_kv_sources(
+    monkeypatch,
+):
+    # NextN reuses the target's hf config verbatim (model_config.py
+    # _config_draft_model only renames architectures[0]), so it can carry a real
+    # target's candidate_source_layer_id and a multi-entry kv_source_layer_ids; this
+    # must resolve like the target, not like a no-candidate-source draft.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=20, kv_source_layer_ids=[4, 12, 20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is True
+
+
+# --- enter_late_layer_tail: strict zip on mask/tail-row counts ---------------------
+
+
+def test_enter_late_layer_tail_raises_on_a_mask_and_tail_row_count_mismatch(
+    monkeypatch,
+):
+    # The mask and tail-lens lists are equal by construction; strict=True turns a
+    # future mismatch into a loud error instead of silently mispairing masks.
+    monkeypatch.setattr(
+        backend_mod, "candidate_publish_rows", lambda tail_metadata: [3, 2, 1]
+    )
+    full_masks = backend_mod.CandidateMasks(
+        request_masks=[torch.zeros(5), torch.zeros(4)]
+    )
+    tail_core = types.SimpleNamespace(low_ratios=())
+    tail_metadata = types.SimpleNamespace(
+        late_layer_tail=types.SimpleNamespace(cp_metadata=None),
+        core_attn_metadata=tail_core,
+        candidate_metadata=None,
+    )
+    forward_metadata = types.SimpleNamespace(
+        candidate_metadata=full_masks, core_attn_metadata=tail_core
+    )
+    backend = types.SimpleNamespace(
+        tail_forward_metadata=tail_metadata,
+        forward_metadata=forward_metadata,
+        token_to_kv_pool=types.SimpleNamespace(request_window=None),
+    )
+    forward_batch = types.SimpleNamespace(attn_cp_metadata=None)
+    with pytest.raises(ValueError):
+        backend_mod.DeepseekV4AttnBackend.enter_late_layer_tail(backend, forward_batch)
 
 
 if __name__ == "__main__":
