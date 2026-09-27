@@ -458,6 +458,7 @@ def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail
         tail_metadata=_TAIL_METADATA,
         candidate_tail_only=False,
     )
+    assert len(full_meta.request_masks) == len(unsafe_meta.request_masks)
     for full_b, unsafe_b in zip(full_meta.request_masks, unsafe_meta.request_masks):
         assert torch.equal(full_b, unsafe_b)
 
@@ -501,6 +502,73 @@ def test_torch_indexer_raises_when_a_tail_length_exceeds_its_request_rows(monkey
             tail_metadata=oversized_tail,
             candidate_tail_only=True,
         )
+
+
+# --- candidate_tail_only_of: config-only, no model_runner.model (fix round 2) -----
+
+
+def _exec_with_bounded_replay(enabled):
+    return types.SimpleNamespace(
+        features=types.SimpleNamespace(enable_decoder_swa_bounded_replay=enabled)
+    )
+
+
+def test_candidate_tail_only_true_for_a_target_shaped_config(monkeypatch):
+    # source layer 20, kv sources ending at 20 -> late_layer_start 21, 20 >= 21-1: tail
+    # only.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=20, kv_source_layer_ids=[20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is True
+
+
+def test_candidate_tail_only_false_when_a_consumer_precedes_the_tail(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=10, kv_source_layer_ids=[20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is False
+
+
+def test_candidate_tail_only_true_when_bounded_replay_is_off(monkeypatch):
+    # No tail ever forms, so nothing is unsafe to publish in full: same as before this
+    # fix.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(False),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=20, kv_source_layer_ids=[20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is True
+
+
+def test_candidate_tail_only_of_never_needs_a_model_for_a_draft_shaped_config(
+    monkeypatch,
+):
+    # NextN/DSpark draft configs default candidate_source_layer_id to -1 (drafts run
+    # no candidate indexing) and never populate kv_source_layer_ids. late_layer_start_of
+    # would raise on an empty list, so the short-circuit on candidate_source_layer_id
+    # < 0 must skip it even when bounded replay happens to be on globally. The backend
+    # used to read model_runner.model.model.late_layer_start instead: NextN never sets
+    # that attribute and DSpark's model has no `.model` at all, so every MTP/DSpark
+    # launch crashed at backend construction. candidate_tail_only_of takes only a
+    # config, never a model.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    draft_config = types.SimpleNamespace(
+        candidate_source_layer_id=-1, kv_source_layer_ids=[]
+    )
+    assert backend_mod.candidate_tail_only_of(draft_config) is True
 
 
 if __name__ == "__main__":
