@@ -56,7 +56,6 @@ class DeepseekV4LayerMajorAdapter:
         self.runner = model_runner
         self.causal_lm = model_runner.model
         self.model = model_runner.model.model
-        self.allocator = model_runner.token_to_kv_pool_allocator
         self.page = model_runner.page_size
         self.chunk = model_runner.server_args.chunked_prefill_size
 
@@ -67,6 +66,14 @@ class DeepseekV4LayerMajorAdapter:
         # exist yet at construction time (AttributeError). Read it lazily instead; ModelRunner sets it
         # once, in init_attention_backends(), before any pass through this adapter can run.
         return self.runner.attn_backend
+
+    @property
+    def allocator(self):
+        # Same construction-order problem as `backend`: TpModelWorker builds this adapter before
+        # Scheduler.init_memory_pools() allocates the real pools, so model_runner.token_to_kv_pool_allocator
+        # is still None (or the constructor's placeholder) when __init__ runs; caching it here read that
+        # stale value and every later `self.allocator.swa_req_ring` etc. hit AttributeError on None.
+        return self.runner.token_to_kv_pool_allocator
 
     def field_specs(self) -> list[FieldSpec]:
         return [
