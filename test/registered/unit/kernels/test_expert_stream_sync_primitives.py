@@ -53,3 +53,21 @@ def test_volatile_lives_only_in_the_relaxed_helpers():
         ("lease_device.cuh", "return *reinterpret_cast<const volatile T*>(word);"),
         ("lease_device.cuh", "*reinterpret_cast<volatile T*>(word) = value;"),
     ]
+
+
+def test_only_the_smack_publish_keeps_a_seq_cst_system_fence():
+    # The five seqlock fences are acquire/release (Boehm's shape, paired with the host's); SmAck orders other
+    # threads' loads through __syncthreads before thread 0's release, a different argument, so it stays seq_cst.
+    assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
+        ("row_copy_kernels.cuh", "__threadfence_system();"),
+    ]
+
+
+def test_the_seqlock_fences_are_two_acquires_and_three_releases():
+    assert [(name, code) for name, _, code in matches(r"atomic_thread_fence")] == [
+        ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+        ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);"),
+        ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);"),
+        ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+        ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+    ]
