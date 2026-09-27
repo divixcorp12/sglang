@@ -45,7 +45,10 @@ best GB/s by bytes in flight (K = the method's knee)
 
 The fresh check passed as required. The `.nc` control read stale bytes (`fresh: false`). Every swept method read the
 bytes the host rewrote mid-kernel: `sm_cv16`, `sm_cv32`, `sm_weak16`, `sm_weak32`, `ldgsts` and `tma`. The SASS
-assertion also held: the control kernel has no `CCTL`, and all 24 swept copy kernels have one. Read latency: a serial
+assertion also held: the control kernel has no `CCTL`, and all 24 swept copy kernels have one. **What the fresh check can and cannot see.** The only negative control is `.nc`, so the check is
+shown to detect a stale L1 line and nothing else. `cp.async.cg` (ldgsts) and TMA bypass L1, so their `fresh: true`
+would come out the same without the acquire or without `fence.proxy.async.global`. A missing proxy fence has no
+control here. Their safety rests on code review of the fence and acquire placement, not on this check. Read latency: a serial
 acquire of a pinned host word takes 780.1 ns; a device word takes 108.9 ns. Flag round trip: p50 1440 ns, min 1408 ns
 (240 rounds).
 
@@ -103,7 +106,11 @@ is gated on the expert-stream-native-sync merge and has not run.
   -> **no (on Gen3)**. Both passed the fresh check. No bulk path beat 12.5 GB/s: TMA's best cell is 12.302. Every SM
   path stops at about 12.31 GB/s, 0.90 of the copy engine's 13.69.
 - **Wider copy-wait SM reads.** `cw_pattern` is contiguous and 4-deep, which is **not CW's real shape**. It ran at
-  11.599 GB/s, below 0.90 x the measured ceiling (12.317), so the A half of the condition is met. What that shows is
+  11.599 GB/s, below 0.90 x the measured ceiling (12.317), so the A half of the condition is met, but that decides
+  nothing on Gen3. Every SM cell, including G32 U16 with 2 MiB in flight, is below 0.90 x the measured ceiling,
+  because the measured ceiling is the copy engine's 13.686 while every SM path plateaus at 12.31 (0.899). Against the
+  SM plateau, `cw_pattern` is 11.599 / 12.309 = 0.942, which does not meet the condition. The threshold should compare
+  against the SM plateau (a note for the plan owner). What the cell does show is
   that a single block with 16 KiB in flight is bound by latency, not by the link. 16384 B / 1408 ns (the minimum
   round trip) = 11.64 GB/s, the same as the measured 11.6. Every 16 KiB cell lands in 10.3-11.8 GB/s whatever its
   grid or width. The streaming kernel (S, 32 KiB in flight) is bound by the link on Gen3 instead: 32 KiB cells run at
@@ -120,7 +127,10 @@ is gated on the expert-stream-native-sync merge and has not run.
   conditions (C pending). No CW change is recommended.**
 - **`cudaMemcpyBatchAsync` in the copy thread.** Condition: `ce_batch_small` >= 1.5 x `ce_each_small` GB/s, or host ns
   per call <= 0.7 x, at 4 lanes. Measured 2.354 vs 3.218 GB/s (0.73x) and host 57,083 vs 40,660 ns (1.40x) -> **no
-  (on Gen3)**, whatever Part C finds. The batch call is slower on both measures at every lane count: 1 lane 1.33 vs
+  (on Gen3)**, whatever Part C finds. Caveat: the small-segment copy-engine GB/s mostly measures host enqueue
+  time, because `e0` is recorded before the API loop (4 lanes: host 40.7 us vs event 55 us for `ce_each_small`, 57.1
+  vs 76 us for `ce_batch_small`). The two measures are therefore not independent, and the verdict rests on the
+  host-time arm (1.40x). The batch call is slower at every lane count: 1 lane 1.33 vs
   1.45 GB/s; 8 lanes 2.68 vs 3.98 GB/s, host 101.7 vs 74.8 us. On the large segments batch matches per-segment
   copies on the device (13.69 vs 13.62 GB/s at 4 rows) but costs 1.70x the host time (85.6 vs 50.3 us).
 - **Fewer, larger pieces / more, smaller pieces.** Condition: Part C only -> **pending (Part C gated)**.
@@ -150,6 +160,8 @@ Weak does not beat `.cv`. Best 12.310 vs 12.309 GB/s; the same knees (16 KiB at 
 lower at small in-flight sizes (4 KiB: 4.50 vs 4.96 GB/s).
 
 ### Small segments (the four small tensors, 44,544 B per lane)
+
+The copy-engine columns below are bound by host enqueue time (see the batch row above).
 
 | lanes | `ce_each_small` GB/s (host us) | `ce_batch_small` GB/s (host us) | `sm_small` GB/s (G8 U1) | `cw_real` GB/s (us per lane) |
 |---:|---:|---:|---:|---:|

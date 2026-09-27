@@ -31,8 +31,13 @@ Mode 1 and mode 2 are faster than mode 0 at both work levels, as expected. The s
 PDL overlaps launch latency, not the stage bodies. It comes to about 0.1 us per edge with the implicit trigger and
 about 0.18 us with the early one, over the 8 PDL edges of a layer.
 
-This is an upper bound for the real chain. The real stages also wait on host flags, and PDL cannot shorten those
-waits.
+This is a **launch-latency-only saving**, not a strict upper bound. Every skeleton stage runs `griddepcontrol.wait`
+as its first instruction, so there is no prologue for PDL to overlap. Real stages do prologue work before their
+dependent read (parameter loads, address setup, CW's mbarrier init), and a production PDL placement could overlap
+that. The margin to the gate is 0.52 us per layer, about 65 ns per edge over 8 edges. If the real prologues average
+more than about 65 ns before the wait, the real saving could clear 2 us/layer. Against that, the real stages also
+wait on host flags, which PDL cannot shorten. A skeleton mode with 200-500 ns of pre-wait work would measure that
+sensitivity; it was not run.
 
 ## Task 8 gate
 
@@ -41,7 +46,7 @@ Rule: run Task 8 if the saving is >= 2 us per layer in mode 1 or mode 2 at `work
 Measured: mode 1 saves 0.772 us per layer and mode 2 saves 1.482 us per layer. Both are below 2 us, so **do not run
 Task 8**. Part B stops here on divix01.
 
-Decision-table row "PDL on the chain": **no (bound below threshold)**. The best case, mode 2, saves 59 us per step,
+Decision-table row "PDL on the chain": **no (bound below threshold)**, subject to the prologue caveat above. The best case, mode 2, saves 59 us per step,
 0.09% of 66.8 ms/token, against the 1% (0.67 ms/step) needed to put a ship decision to the user. This verdict is for
 Gen3 divix01. Launch latency is a property of the GPU and driver, not the link, so a Gen5 host with the same GPU is not
 expected to differ much. That expectation is untested.
