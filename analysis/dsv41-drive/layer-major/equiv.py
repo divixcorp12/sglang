@@ -1,6 +1,7 @@
 """Layer-major vs chunked prefill: greedy token-0 identity is the gate (plan 2026-09-27, Task 12 fix round).
 
 Usage: equiv.py run --port P --model M --text FILE --out OUT.jsonl --commit SHA --dirty 0/1 --min-tokens N
+                    [--cases all|quick]
        equiv.py compare A.jsonl B.jsonl [--allow-head-mismatch]
 
 Pass criterion: token-0 id equality, not full 64-token completion identity. DSV4.1's decode kernels are not
@@ -44,13 +45,7 @@ def _top0_logprobs(meta):
     return top[0] if top else None
 
 
-def run(a):
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(a.model)
-    ids = tok(open(a.text).read(), add_special_tokens=False)["input_ids"]
-    while len(ids) < 70000:
-        ids = ids + ids
+def _all_cases(ids):
     # (name, prompt, flush first): prefix-warm -> prefix is the intended radix hit, and after follows it unflushed.
     cases = [(f"len{n}", ids[:n], True) for n in LENGTHS]
     cases.append(("prefix-warm", ids[5000:6024], True))
@@ -61,6 +56,25 @@ def run(a):
     cases.append(("chain-32768", ids[:32768], True))
     cases.append(("chain-32868", ids[:32868], False))
     cases.append(("chain-32868-again", ids[:32868], False))
+    return cases
+
+
+# A fast subset for iteration: one plain case, the longest and its unaligned-tail sibling, the prefix-hit
+# pair, and the unflushed chain -- everything that has caught a real bug, none of the redundant lengths.
+QUICK_CASES = {"len8192", "len32768", "len33000", "prefix-warm", "prefix",
+              "chain-32768", "chain-32868", "chain-32868-again"}
+
+
+def run(a):
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(a.model)
+    ids = tok(open(a.text).read(), add_special_tokens=False)["input_ids"]
+    while len(ids) < 70000:
+        ids = ids + ids
+    cases = _all_cases(ids)
+    if a.cases == "quick":
+        cases = [c for c in cases if c[0] in QUICK_CASES]
     top0_logprobs_error = None
     with open(a.out, "w") as f:
         f.write(json.dumps({"case": "__header__", "commit": a.commit, "dirty": a.dirty,
@@ -157,6 +171,7 @@ if __name__ == "__main__":
     r.add_argument("--commit", required=True)
     r.add_argument("--dirty", required=True)
     r.add_argument("--min-tokens", dest="min_tokens", required=True)
+    r.add_argument("--cases", choices=["all", "quick"], default="all")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")

@@ -3,11 +3,15 @@
 # (arm_env as is) with SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS overridden, then equiv.py's full case
 # list run against it. Derived from analysis/dsv41-drive/prefill-chunk/chunk_smoke.sh.
 #
-# Usage: drive_equiv.sh <arm> <worktree> <min_tokens> [out_root]
+# Usage: drive_equiv.sh <arm> <worktree> <min_tokens> [out_root] [baseline_jsonl]
 #   arm         a label, used only for output paths (e.g. chunked, layer-major, layer-major-8k).
 #   min_tokens  SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS for this arm (0 disables layer-major prefill
 #               entirely, i.e. the chunked-prefill baseline).
 #   out_root    output root, default /mnt/nvme1/layer-major/equiv; compare only arms from one root and head.
+#   baseline_jsonl  when given, skip the server run entirely and copy this existing jsonl (e.g. an older
+#                   chunked.jsonl) to <out_root>/<arm>.jsonl instead. Its header commit will not match this
+#                   run's, so pair the compare with --allow-head-mismatch; the prompt-hash check still
+#                   refuses a mismatched corpus.
 #
 # Writes env.txt, argv.txt, driver.log, server.log, vram.csv, numa.log, phases.txt and retries.txt to
 # <out_root>/<arm>/, and the case results to <out_root>/<arm>.jsonl.
@@ -20,9 +24,18 @@ MIN_TOKENS=${3:?min_tokens}
 H=$WT/benchmarks/dsv41_baseline
 PY=/data/models/slang/.venv/bin/python
 ROOT=${4:-/mnt/nvme1/layer-major/equiv}
+BASELINE_JSONL=${5:-}
 OUT=$ROOT/$ARM
 PORT=30014
 export NSYS_TMPDIR=/mnt/nvme1/nsys-tmp
+
+if [ -n "$BASELINE_JSONL" ]; then
+  mkdir -p $OUT
+  [ -f "$BASELINE_JSONL" ] || { echo "baseline jsonl missing: $BASELINE_JSONL"; exit 2; }
+  cp "$BASELINE_JSONL" $ROOT/$ARM.jsonl
+  echo "reused baseline $BASELINE_JSONL as $ROOT/$ARM.jsonl, no server run" | tee -a $OUT/driver.log
+  exit 0
+fi
 mkdir -p $OUT $NSYS_TMPDIR
 LOG=$OUT/server.log
 : > $OUT/driver.log
