@@ -355,6 +355,17 @@ def _lease_device_only_constants():
     }
 
 
+
+def test_the_exl3_host_file_is_only_bindings():
+    """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); the EXL3 file only names its
+    layout and reader. Red when a body grows back into exl3_ram_miss_host.cpp."""
+    path = CSRC / "exl3_ram_miss_host.cpp"
+    lines = path.read_text().splitlines()
+    bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
+    assert not bodies, f"{path.name} defines functions: {bodies}"
+    assert len(lines) < 40, f"{path.name} has {len(lines)} lines; it should hold only bindings"
+
+
 if __name__ == "__main__":
     import sys
 
