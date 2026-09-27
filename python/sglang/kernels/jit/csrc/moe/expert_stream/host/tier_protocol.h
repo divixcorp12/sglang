@@ -226,8 +226,6 @@ class StageRing {
   int64_t unreported_ = 0;  // producer only: drops since the last record that got in
 };
 
-// ---- Copy engine (LEASE_PROTOCOL.md 7.6) ----
-
 
 }  // namespace expert_stream
 }  // namespace sglang

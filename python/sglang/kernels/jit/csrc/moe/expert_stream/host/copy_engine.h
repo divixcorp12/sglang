@@ -1,10 +1,15 @@
 // The copy engine: CopyLane through CopyEngine (LEASE_PROTOCOL.md 7.6).
 #pragma once
 
+#include "../lease_layout.h"
 #include "tier_protocol.h"
 
 namespace sglang {
 namespace expert_stream {
+
+using namespace ::sglang::expert_stream::wire;
+
+// ---- Copy engine (LEASE_PROTOCOL.md 7.6) ----
 
 struct CopyLane {
   int32_t lane = 0;
