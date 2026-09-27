@@ -34,7 +34,7 @@ ROWS = 160  # 2.1 GB of pinned source rows: no launch reuses a row within 40 lau
 SLOTS = 16  # 213 MB of destination slots, rotated: past the 96 MiB L2
 N_ROWS = 4
 FRESH_BYTES = 64 << 10  # small enough that one block's share fits its L1, so a stale .nc read shows
-KIND_CV, KIND_NC, KIND_LDGSTS, KIND_TMA, KIND_WEAK = 0, 1, 2, 3, 4
+KIND_CV, KIND_NC, KIND_LDGSTS, KIND_TMA, KIND_WEAK, KIND_CW_REAL = 0, 1, 2, 3, 4, 5
 LOAD_NC = 1  # sm_kernel's load template argument for the .nc control (mech_bench.cuh kLoadNc)
 WRAPPERS = ["mech_copy", "mech_fresh", "mech_latency", "mech_pingpong"]
 BUILD_FLAGS = [("v8_weak", "MECH_V8_WEAK")]  # (probe name, define) pairs; Task 4 and 5 append theirs
@@ -53,7 +53,7 @@ def load(repo: Path, probe: dict):
     variant = "-".join(sorted(f[2:] for f in flags)) or "base"
     return load_jit("copy_mech_bench", variant, cuda_files=[str(HERE / "mech_bench.cuh")],
                     cuda_wrappers=[(n, n) for n in WRAPPERS + (["mech_ce_batch"] if probe_ok(probe, "batch") else [])],
-                    extra_cuda_cflags=flags)
+                    extra_cuda_cflags=flags, extra_include_paths=[str(repo / "python/sglang/kernels/jit/csrc")])
 
 
 def loaded_module_path(tag: str) -> str:
@@ -196,6 +196,19 @@ def ce_cells(mod, probe):
 
 
 CELL_GENERATORS += [ce_cells]
+# CW's small tensors in the order its sm_table reads them per lane: w13_suh 20,480, then 9,216, 10,240, 4,608 B.
+CW_ORDER = (1, 2, 5, 4)
+
+
+def cw_real_cells(mod, probe):
+    # The copy wait's real shape (cw_pattern is contiguous 4-deep, which CW is not). in_flight is nominal: ~4 KiB
+    # (one 16 B unit per thread) outside w13_suh's single 16 KiB 4-deep pass. Read us_per_row, i.e. per lane.
+    for lanes in (1, 2, 4, 8):
+        yield Cell("cw_real", 1, lanes, 0, 4096, None, lanes, CW_ORDER,
+                   lambda cpu, dev: mod.mech_copy(dev, KIND_CW_REAL, 1, 0, 0))
+
+
+CELL_GENERATORS += [cw_real_cells]
 
 
 def measure(cell: Cell, rows: Rows, reps: int) -> dict:
@@ -219,7 +232,7 @@ def measure(cell: Cell, rows: Rows, reps: int) -> dict:
     nbytes = cell.rows * sum(SEGMENTS[k] for k in cell.which)
     return {"kind": "cell", "method": cell.method, "name": cell.name, "grid": cell.grid, "a": cell.a, "b": cell.b,
             "in_flight": cell.in_flight, "rows": cell.rows, "bytes": nbytes, "ms_p50": round(ms, 4),
-            "gbs": round(nbytes / (ms * 1e-3) / 1e9, 3),
+            "gbs": round(nbytes / (ms * 1e-3) / 1e9, 3), "us_per_row": round(ms * 1e3 / cell.rows, 2),
             "host_ns_p50": statistics.median(host_ns) if host_ns[0] is not None else None}
 
 

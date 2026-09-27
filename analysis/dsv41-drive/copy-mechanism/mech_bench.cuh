@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+#include "moe/expert_stream/row_copy_kernels.cuh"  // copy_wait_read: the copy wait's own SM small-copy loop
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -27,6 +29,7 @@ constexpr int kKindNc = 1;
 constexpr int kKindLdgsts = 2;
 constexpr int kKindTma = 3;
 constexpr int kKindWeak = 4;
+constexpr int kKindCwReal = 5;
 // sm_kernel's load flavour: .cv (swept), .nc (the fresh check's control, never swept), weak (plain ld.global after
 // the acquire; swept: the PTX memory model orders it after an acquire that observed the host's release).
 constexpr int kLoadCv = 0;
@@ -374,6 +377,16 @@ inline bool launch_sm(int g, int64_t a, int64_t b, const Job* jobs, int64_t njob
   return false;
 }
 
+// The copy wait's SM small copies as production runs them (exl3_ram_miss_lease_copy_wait_kernel with sm_count > 0):
+// one block of kCopyWaitThreads, every job in order through the production copy_wait_read, no barrier between jobs.
+// Its 4-deep loop runs only on the part of a tensor that fills 4 x 256 x 16 B = 16 KiB; the rest goes one 16-byte
+// unit per thread per round trip (stream_copy16).
+__global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void cw_real_kernel(const Job* jobs,
+                                                                                            int64_t njobs) {
+  for (int64_t j = 0; j < njobs; ++j)
+    copy_wait_read(reinterpret_cast<const uint8_t*>(jobs[j].src), reinterpret_cast<uint8_t*>(jobs[j].dst), jobs[j].bytes);
+}
+
 // Every copy kernel of this file behind one switch; Tasks 4 (kinds 2, 3) extend it.
 inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, int64_t a, int64_t b, uint32_t* fresh,
                    cudaStream_t stream) {
@@ -381,6 +394,11 @@ inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, i
   if (kind == kKindNc) {
     host::RuntimeCheck(a == 1 && b == 16, "the .nc control is U=1, W=16 only");
     host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, kLoadNc>, jobs, njobs, fresh);
+    return;
+  }
+  if (kind == kKindCwReal) {
+    host::RuntimeCheck(grid == 1 && fresh == nullptr, "cw_real: one block, no fresh check (it has no midpoint)");
+    host::LaunchKernel(1, device::expert_stream::kCopyWaitThreads, stream)(cw_real_kernel, jobs, njobs);
     return;
   }
   if (kind == kKindLdgsts) {
