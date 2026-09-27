@@ -159,6 +159,144 @@ __global__ void pingpong_kernel(uint32_t* ping, const uint32_t* pong, int64_t ro
   }
 }
 
+#if defined(MECH_LDGSTS) || defined(MECH_BULK)
+__device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem(bar)), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n .reg .pred done;\n WAIT:\n mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n @!done bra WAIT;\n}\n" ::"r"(
+          smem(bar)),
+      "r"(parity)
+      : "memory");
+}
+#endif
+
+#ifdef MECH_LDGSTS
+constexpr int kLdgstsPer = 8;                       // 16-byte units per producer lane per stage
+constexpr int kLdgstsUnits = 32 * kLdgstsPer;       // units per stage
+constexpr int kLdgstsStage = 16 * kLdgstsUnits;     // 4 KiB
+constexpr int kConsumers = kThreads - 32;
+
+// Warp 0 produces: each lane issues its cp.async.cg reads of a stage (L2 only, never L1, so no stale L1 line), then
+// arrives on full[slot] when they land (cp.async.mbarrier.arrive.noinc). Warps 1-7 consume: wait full, store the
+// stage to the destination, arrive on empty[slot]. In flight per block: at most STAGES * 4 KiB.
+template <int STAGES>
+__global__ __launch_bounds__(kThreads, 1) void ldgsts_kernel(const Job* jobs, int64_t njobs, uint32_t* fresh) {
+  __shared__ alignas(128) uint8_t ring[STAGES][kLdgstsStage];
+  __shared__ alignas(8) uint64_t full[STAGES];
+  __shared__ alignas(8) uint64_t empty[STAGES];
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < STAGES; ++s) {
+      mbar_init(&full[s], 32);
+      mbar_init(&empty[s], kConsumers);
+    }
+  }
+  __syncthreads();
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  int64_t local = 0;  // stages this block has used, across passes and jobs: ring position and parity
+  for (int pass = 0; pass < (fresh != nullptr ? 2 : 1); ++pass) {
+    if (pass == 1) fresh_barrier(fresh);
+    for (int64_t j = 0; j < njobs; ++j) {
+      const auto src = reinterpret_cast<const uint8_t*>(jobs[j].src);
+      const auto dst = reinterpret_cast<uint8_t*>(jobs[j].dst);
+      const int64_t units = jobs[j].bytes / 16;
+      const int64_t stages = (units + kLdgstsUnits - 1) / kLdgstsUnits;
+      for (int64_t g = blockIdx.x; g < stages; g += gridDim.x, ++local) {
+        const int slot = static_cast<int>(local % STAGES);
+        const uint32_t phase = static_cast<uint32_t>((local / STAGES) & 1);
+        const int64_t base = g * kLdgstsUnits;
+        if (warp == 0) {
+          if (local >= STAGES) mbar_wait(&empty[slot], phase ^ 1u);
+          for (int k = 0; k < kLdgstsPer; ++k) {
+            const int64_t u = base + k * 32 + lane;
+            if (u < units) {
+              asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem(ring[slot] + 16 * (k * 32 + lane))),
+                           "l"(src + 16 * u)
+                           : "memory");
+            }
+          }
+          asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(smem(&full[slot])) : "memory");
+        } else {
+          mbar_wait(&full[slot], phase);
+          for (int i = threadIdx.x - 32; i < kLdgstsUnits; i += kConsumers) {
+            const int64_t u = base + i;
+            if (u < units) {
+              const uint4 v = *reinterpret_cast<const uint4*>(ring[slot] + 16 * i);
+              asm volatile("st.global.cg.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(dst + 16 * u), "r"(v.x), "r"(v.y),
+                           "r"(v.z), "r"(v.w)
+                           : "memory");
+            }
+          }
+          asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem(&empty[slot])) : "memory");
+        }
+      }
+    }
+  }
+}
+#endif
+
+#ifdef MECH_BULK
+// One thread per block. For each of its chunks: bulk-read host -> shared (async proxy, completion on full[slot]),
+// then bulk-write shared -> VRAM. The producer runs STAGES - 1 chunks ahead of the consumer; before reusing a slot it
+// waits (wait_group.read 0) for every bulk write to have read its shared source. In flight per block: <= STAGES *
+// chunk. The fence.proxy.async.global after the fresh acquire is the contract for async-proxy reads of host bytes.
+template <int STAGES>
+__global__ __launch_bounds__(1, 1) void tma_kernel(const Job* jobs, int64_t njobs, int64_t chunk, uint32_t* fresh) {
+  extern __shared__ __align__(128) uint8_t tma_ring[];
+  __shared__ alignas(8) uint64_t full[STAGES];
+  for (int s = 0; s < STAGES; ++s)
+    mbar_init(&full[s], 1);
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  int64_t local = 0;
+  for (int pass = 0; pass < (fresh != nullptr ? 2 : 1); ++pass) {
+    if (pass == 1) {
+      fresh_barrier(fresh);
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+    }
+    for (int64_t j = 0; j < njobs; ++j) {
+      const auto src = reinterpret_cast<const uint8_t*>(jobs[j].src);
+      const auto dst = reinterpret_cast<uint8_t*>(jobs[j].dst);
+      const int64_t bytes = jobs[j].bytes;
+      const int64_t chunks = (bytes + chunk - 1) / chunk;
+      const int64_t mine = chunks > blockIdx.x ? (chunks - blockIdx.x + gridDim.x - 1) / gridDim.x : 0;
+      for (int64_t k = 0; k < mine + STAGES - 1; ++k) {
+        if (k < mine) {
+          const int64_t pos = local + k;
+          const int slot = static_cast<int>(pos % STAGES);
+          const int64_t off = (blockIdx.x + k * gridDim.x) * chunk;
+          const uint32_t n = static_cast<uint32_t>(min(chunk, bytes - off));
+          if (pos >= STAGES) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+          asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem(&full[slot])), "r"(n)
+                       : "memory");
+          asm volatile(
+              "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                  smem(tma_ring + slot * chunk)),
+              "l"(src + off), "r"(n), "r"(smem(&full[slot]))
+              : "memory");
+        }
+        const int64_t c = k - (STAGES - 1);
+        if (c >= 0) {
+          const int64_t pos = local + c;
+          const int slot = static_cast<int>(pos % STAGES);
+          const int64_t off = (blockIdx.x + c * gridDim.x) * chunk;
+          const uint32_t n = static_cast<uint32_t>(min(chunk, bytes - off));
+          mbar_wait(&full[slot], static_cast<uint32_t>((pos / STAGES) & 1));
+          asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(dst + off),
+                       "r"(smem(tma_ring + slot * chunk)), "r"(n)
+                       : "memory");
+          asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+        }
+      }
+      local += mine;
+    }
+  }
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+}
+#endif
+
 inline void cpu_relax() {
 #if defined(__x86_64__)
   _mm_pause();
@@ -174,7 +312,38 @@ inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, i
     host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, true>, jobs, njobs, fresh);
     return;
   }
-  host::RuntimeCheck(kind == kKindCv, "kind: 0 (.cv) or 1 (.nc control); 2 and 3 arrive in Task 4");
+  if (kind == kKindLdgsts) {
+#ifdef MECH_LDGSTS
+    switch (a) {
+      case 2: host::LaunchKernel(g, kThreads, stream)(ldgsts_kernel<2>, jobs, njobs, fresh); return;
+      case 4: host::LaunchKernel(g, kThreads, stream)(ldgsts_kernel<4>, jobs, njobs, fresh); return;
+      case 8: host::LaunchKernel(g, kThreads, stream)(ldgsts_kernel<8>, jobs, njobs, fresh); return;
+    }
+#endif
+    host::RuntimeCheck(false, "ldgsts: stages 2, 4 or 8, in the MECH_LDGSTS build");
+  }
+  if (kind == kKindTma) {
+#ifdef MECH_BULK
+    host::RuntimeCheck(b % 16 == 0 && a * b <= 64 * 1024, "tma: chunk a multiple of 16, stages * chunk <= 64 KiB");
+    const size_t shared = static_cast<size_t>(a * b);
+    switch (a) {
+      case 2:
+        CHECK_CUDA(cudaFuncSetAttribute(tma_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
+        host::LaunchKernel(g, 1, stream, shared)(tma_kernel<2>, jobs, njobs, b, fresh);
+        return;
+      case 4:
+        CHECK_CUDA(cudaFuncSetAttribute(tma_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
+        host::LaunchKernel(g, 1, stream, shared)(tma_kernel<4>, jobs, njobs, b, fresh);
+        return;
+      case 8:
+        CHECK_CUDA(cudaFuncSetAttribute(tma_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
+        host::LaunchKernel(g, 1, stream, shared)(tma_kernel<8>, jobs, njobs, b, fresh);
+        return;
+    }
+#endif
+    host::RuntimeCheck(false, "tma: stages 2, 4 or 8, in the MECH_BULK build");
+  }
+  host::RuntimeCheck(kind == kKindCv, "kind: 0 (.cv), 1 (.nc control), 2 (ldgsts) or 3 (tma)");
   if (b == 16) {
     switch (a) {
       case 1: host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, false>, jobs, njobs, fresh); return;

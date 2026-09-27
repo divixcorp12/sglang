@@ -97,6 +97,30 @@ CELL_GENERATORS = [sm_cells]
 FRESH_CHECKS = [("sm_cv16", KIND_CV, 8, 1, 16, ""), ("sm_cv32", KIND_CV, 8, 1, 32, "v8_cv"),
                 ("nc_control", KIND_NC, 8, 1, 16, "")]
 
+BUILD_FLAGS += [("ldgsts", "MECH_LDGSTS"), ("bulk", "MECH_BULK")]
+
+
+def ldgsts_cells(mod, probe):
+    if not probe_ok(probe, "ldgsts"):
+        return
+    for grid in (1, 2, 4, 8, 16):
+        for stages in (2, 4, 8):
+            yield Cell("ldgsts", grid, stages, 0, grid * stages * 4096, None, N_ROWS, ALL_SEGMENTS,
+                       lambda cpu, dev, g=grid, s=stages: mod.mech_copy(dev, KIND_LDGSTS, g, s, 0))
+
+
+def tma_cells(mod, probe):
+    if not probe_ok(probe, "bulk"):
+        return
+    for grid in (1, 2, 4, 8, 16):
+        for chunk, stages in ((4096, 2), (4096, 4), (4096, 8), (16384, 2), (16384, 4)):
+            yield Cell("tma", grid, stages, chunk, grid * stages * chunk, None, N_ROWS, ALL_SEGMENTS,
+                       lambda cpu, dev, g=grid, s=stages, c=chunk: mod.mech_copy(dev, KIND_TMA, g, s, c))
+
+
+CELL_GENERATORS += [ldgsts_cells, tma_cells]
+FRESH_CHECKS += [("ldgsts", KIND_LDGSTS, 8, 4, 0, "ldgsts"), ("tma", KIND_TMA, 8, 4, 4096, "bulk")]
+
 
 def measure(cell: Cell, rows: Rows, reps: int) -> dict:
     times, host_ns = [], []
