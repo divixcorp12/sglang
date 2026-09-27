@@ -43,7 +43,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config, late_layer_start_of
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -4349,12 +4349,8 @@ class DeepseekV4Model(nn.Module):
 
         # Decoder SWA bounded replay: layers past the last kv_source layer run over
         # each request's last SWA_WINDOW extend tokens only.
-        self.late_layer_start: Optional[int] = None
-        if get_exec().features.enable_decoder_swa_bounded_replay:
-            assert config.kv_source_layer_ids, (
-                "decoder SWA bounded replay needs kv_source_layer_ids"
-            )
-            self.late_layer_start = max(config.kv_source_layer_ids) + 1
+        self.late_layer_start: Optional[int] = late_layer_start_of(config)
+        if self.late_layer_start is not None:
             late_ratios = set(
                 config.compress_ratios[self.late_layer_start : config.num_hidden_layers]
             )

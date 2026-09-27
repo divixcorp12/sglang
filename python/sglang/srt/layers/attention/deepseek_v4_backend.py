@@ -50,6 +50,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt.configs.deepseek_v4 import late_layer_start_of
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -1014,6 +1015,21 @@ def candidate_publish_rows(
     return tail.extend_seq_lens_cpu
 
 
+def candidate_tail_only_of(config) -> bool:
+    """Whether the torch prefill indexer's candidate source may publish tail-only masks:
+    true unless a candidate consumer could run before the late-layer tail begins, in
+    which case it would read a mask with fewer rows than it addresses. Derived from
+    config alone (never a model instance): a draft model's config (NextN, DSpark) never
+    builds a `late_layer_start` attribute to read, but always has
+    candidate_source_layer_id < 0 (drafts do not run candidate indexing), so
+    late_layer_start_of is never reached for one."""
+    candidate_source_layer_id = getattr(config, "candidate_source_layer_id", -1)
+    if candidate_source_layer_id < 0:
+        return True
+    late_layer_start = late_layer_start_of(config)
+    return late_layer_start is None or candidate_source_layer_id >= late_layer_start - 1
+
+
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -1233,22 +1249,15 @@ class DeepseekV4AttnBackend(
         # Two-level low-ratio indexer (dsv4/candidate_indexer.py).
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
-        candidate_source_layer_id = getattr(cfg, "candidate_source_layer_id", -1)
         self.candidate_indexer = make_candidate_indexer(
             getattr(cfg, "candidate_topk_blocks", 0),
             getattr(cfg, "candidate_block_size", 0),
-            candidate_source_layer_id,
+            getattr(cfg, "candidate_source_layer_id", -1),
         )
-        late_layer_start = model_runner.model.model.late_layer_start
-        # The torch source may publish tail-only masks only when every consumer runs
-        # in the tail (layer_id >= late_layer_start); otherwise a pre-tail consumer
-        # would read a mask with fewer rows than it addresses. Layer-major refuses the
-        # violating config; plain chunked prefill does not, so fall back to full rows.
-        self.candidate_tail_only: bool = (
-            candidate_source_layer_id < 0
-            or late_layer_start is None
-            or candidate_source_layer_id >= late_layer_start - 1
-        )
+        # Layer-major refuses a config where a candidate consumer runs before the tail;
+        # plain chunked prefill does not, so the torch indexer falls back to full-row
+        # publish there instead (candidate_tail_only_of, config-only: see docstring).
+        self.candidate_tail_only: bool = candidate_tail_only_of(cfg)
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
