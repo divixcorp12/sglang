@@ -27,6 +27,8 @@ def main() -> int:
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--replays", type=int, default=200)
+    ap.add_argument("--work-ns", default="0,2000", help="comma-separated per-stage body spins")
+    ap.add_argument("--pre-ns", default="0", help="comma-separated per-stage spins before the PDL wait (prologue)")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
     import sglang
@@ -41,19 +43,19 @@ def main() -> int:
     for _ in range(LAYERS):
         stages += [(name, g, b, True) for name, g, b in CHAIN] + [(*MOE, False)]
     out = open(a.out, "a")
-    for work_ns in (0, 2000):
+    for work_ns, pre_ns in [(w, p) for w in map(int, a.work_ns.split(",")) for p in map(int, a.pre_ns.split(","))]:
         for mode in (0, 1, 2):
             words = torch.zeros(len(stages), dtype=torch.int64, device="cuda")
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
                 for i, (_, g, b, pdl) in enumerate(stages):  # warm: loads the module's kernels before capture
-                    mod.skel_stage(words, i, g, b, work_ns, mode if pdl else 0)
+                    mod.skel_stage(words, i, g, b, work_ns, mode if pdl else 0, pre_ns if pdl else 0)
             torch.cuda.synchronize()
             words.zero_()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 for i, (_, g, b, pdl) in enumerate(stages):
-                    mod.skel_stage(words, i, g, b, work_ns, mode if pdl else 0)
+                    mod.skel_stage(words, i, g, b, work_ns, mode if pdl else 0, pre_ns if pdl else 0)
             torch.cuda.synchronize()
             words.zero_()
             times = []
@@ -70,7 +72,7 @@ def main() -> int:
                 raise SystemExit(f"mode {mode}: stage words {sorted(got)[:5]}, not all {a.replays + 20}: an edge lost "
                                  "its ordering")
             us = statistics.median(times)
-            rec = {"kind": "skeleton", "mode": mode, "work_ns": work_ns, "layers": LAYERS,
+            rec = {"kind": "skeleton", "mode": mode, "work_ns": work_ns, "pre_ns": pre_ns, "layers": LAYERS,
                    "replay_us_p50": round(us, 2), "per_layer_us_p50": round(us / LAYERS, 3)}
             print(json.dumps(rec), flush=True)
             out.write(json.dumps(rec) + "\n")
