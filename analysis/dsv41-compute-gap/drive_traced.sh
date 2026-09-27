@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Short node-mode traced A and B (one timed session each) for attribution only; never read ms/token from these.
+# Short node-mode traced A and B (one timed session each, TRACE_SESSION, default index 4: 128 tokens) for attribution only; never read ms/token from these.
 # Usage: drive_traced.sh TAG SHA "A_OVERRIDES" "B_OVERRIDES"
 set -u
 TAG=$1; SHA=$2; A_OV=$3; B_OV=$4
@@ -14,7 +14,7 @@ arm() {  # arm NAME OVERRIDES
     local name=$1 ov=$2 rc
     while true; do
         wait_gpu; say "traced arm $name overrides=[$ov]"
-        DSV41_MAX_SESSIONS=1 NSYS_TMPDIR=/mnt/nvme1/nsys-tmp NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node NSYS_GPU_METRICS=0 \
+        DSV41_SESSION_INDICES=${TRACE_SESSION:-4} NSYS_TMPDIR=/mnt/nvme1/nsys-tmp NSYS_TRACE=1 NSYS_CUDA_GRAPH_TRACE=node NSYS_GPU_METRICS=0 \
             EXPECT_SHA=$SHA bash benchmarks/dsv41_baseline/run_arm.sh $name 30032 $ov \
             SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:45056 > $OUT/arm-$name.log 2>&1
         rc=$?
