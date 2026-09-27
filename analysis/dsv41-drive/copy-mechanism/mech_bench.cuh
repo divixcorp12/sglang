@@ -26,6 +26,12 @@ constexpr int kKindCv = 0;
 constexpr int kKindNc = 1;
 constexpr int kKindLdgsts = 2;
 constexpr int kKindTma = 3;
+constexpr int kKindWeak = 4;
+// sm_kernel's load flavour: .cv (swept), .nc (the fresh check's control, never swept), weak (plain ld.global after
+// the acquire; swept: the PTX memory model orders it after an acquire that observed the host's release).
+constexpr int kLoadCv = 0;
+constexpr int kLoadNc = 1;
+constexpr int kLoadWeak = 2;
 
 struct Job {
   int64_t src, dst, bytes;
@@ -84,12 +90,17 @@ struct Vec {
   uint32_t v[W / 4];
 };
 
-template <int W, bool kNc>
+template <int W, int kLoad>
 __device__ __forceinline__ Vec<W> load(const uint8_t* p) {
   Vec<W> r;
   if constexpr (W == 16) {
-    if constexpr (kNc) {
+    if constexpr (kLoad == kLoadNc) {
       asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3])
+                   : "l"(p)
+                   : "memory");
+    } else if constexpr (kLoad == kLoadWeak) {
+      asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
                    : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3])
                    : "l"(p)
                    : "memory");
@@ -99,6 +110,14 @@ __device__ __forceinline__ Vec<W> load(const uint8_t* p) {
                    : "l"(p)
                    : "memory");
     }
+  } else if constexpr (kLoad == kLoadWeak) {
+#ifdef MECH_V8_WEAK
+    asm volatile("ld.global.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+                 : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]),
+                   "=r"(r.v[7])
+                 : "l"(p)
+                 : "memory");
+#endif
   } else {
 #ifdef MECH_V8
     asm volatile("ld.global.cv.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
@@ -124,10 +143,10 @@ __device__ __forceinline__ void store(uint8_t* p, const Vec<W>& r) {
 
 // S's access pattern generalised: chunks of kThreads * U units dealt round-robin over the grid, U loads issued
 // before any store. U = 1, W = 16, grid 8 is exactly stream_copy_slice (row_copy_kernels.cuh).
-template <int U, int W, bool kNc>
+template <int U, int W, int kLoad>
 __global__ __launch_bounds__(kThreads, 1) void sm_kernel(const Job* jobs, int64_t njobs, uint32_t* fresh) {
   for (int pass = 0; pass < (fresh != nullptr ? 2 : 1); ++pass) {
-    if (pass == 1) fresh_barrier<kNc>(fresh);
+    if (pass == 1) fresh_barrier<kLoad == kLoadNc>(fresh);
     for (int64_t j = 0; j < njobs; ++j) {
       const auto src = reinterpret_cast<const uint8_t*>(jobs[j].src);
       const auto dst = reinterpret_cast<uint8_t*>(jobs[j].dst);
@@ -137,7 +156,7 @@ __global__ __launch_bounds__(kThreads, 1) void sm_kernel(const Job* jobs, int64_
 #pragma unroll
         for (int k = 0; k < U; ++k) {
           const int64_t u = (chunk * U + k) * kThreads + threadIdx.x;
-          if (u < units) v[k] = load<W, kNc>(src + W * u);
+          if (u < units) v[k] = load<W, kLoad>(src + W * u);
         }
 #pragma unroll
         for (int k = 0; k < U; ++k) {
@@ -319,13 +338,49 @@ inline void cpu_relax() {
 #endif
 }
 
+#ifdef MECH_V8
+constexpr bool kBuiltV8Cv = true;
+#else
+constexpr bool kBuiltV8Cv = false;
+#endif
+#ifdef MECH_V8_WEAK
+constexpr bool kBuiltV8Weak = true;
+#else
+constexpr bool kBuiltV8Weak = false;
+#endif
+
+// The swept SM kernels of one load flavour: U in {1,2,4,8,16} at 16 B, {1,2,4,8} at 32 B (when that width is built).
+template <int kLoad>
+inline bool launch_sm(int g, int64_t a, int64_t b, const Job* jobs, int64_t njobs, uint32_t* fresh, cudaStream_t stream) {
+  if (b == 16) {
+    switch (a) {
+      case 1: host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, kLoad>, jobs, njobs, fresh); return true;
+      case 2: host::LaunchKernel(g, kThreads, stream)(sm_kernel<2, 16, kLoad>, jobs, njobs, fresh); return true;
+      case 4: host::LaunchKernel(g, kThreads, stream)(sm_kernel<4, 16, kLoad>, jobs, njobs, fresh); return true;
+      case 8: host::LaunchKernel(g, kThreads, stream)(sm_kernel<8, 16, kLoad>, jobs, njobs, fresh); return true;
+      case 16: host::LaunchKernel(g, kThreads, stream)(sm_kernel<16, 16, kLoad>, jobs, njobs, fresh); return true;
+    }
+  }
+  if constexpr ((kLoad == kLoadCv && kBuiltV8Cv) || (kLoad == kLoadWeak && kBuiltV8Weak)) {
+    if (b == 32) {
+      switch (a) {
+        case 1: host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 32, kLoad>, jobs, njobs, fresh); return true;
+        case 2: host::LaunchKernel(g, kThreads, stream)(sm_kernel<2, 32, kLoad>, jobs, njobs, fresh); return true;
+        case 4: host::LaunchKernel(g, kThreads, stream)(sm_kernel<4, 32, kLoad>, jobs, njobs, fresh); return true;
+        case 8: host::LaunchKernel(g, kThreads, stream)(sm_kernel<8, 32, kLoad>, jobs, njobs, fresh); return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Every copy kernel of this file behind one switch; Tasks 4 (kinds 2, 3) extend it.
 inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, int64_t a, int64_t b, uint32_t* fresh,
                    cudaStream_t stream) {
   const int g = static_cast<int>(grid);
   if (kind == kKindNc) {
     host::RuntimeCheck(a == 1 && b == 16, "the .nc control is U=1, W=16 only");
-    host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, true>, jobs, njobs, fresh);
+    host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, kLoadNc>, jobs, njobs, fresh);
     return;
   }
   if (kind == kKindLdgsts) {
@@ -359,27 +414,12 @@ inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, i
 #endif
     host::RuntimeCheck(false, "tma: stages 2, 4 or 8, in the MECH_BULK build");
   }
-  host::RuntimeCheck(kind == kKindCv, "kind: 0 (.cv), 1 (.nc control), 2 (ldgsts) or 3 (tma)");
-  if (b == 16) {
-    switch (a) {
-      case 1: host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 16, false>, jobs, njobs, fresh); return;
-      case 2: host::LaunchKernel(g, kThreads, stream)(sm_kernel<2, 16, false>, jobs, njobs, fresh); return;
-      case 4: host::LaunchKernel(g, kThreads, stream)(sm_kernel<4, 16, false>, jobs, njobs, fresh); return;
-      case 8: host::LaunchKernel(g, kThreads, stream)(sm_kernel<8, 16, false>, jobs, njobs, fresh); return;
-      case 16: host::LaunchKernel(g, kThreads, stream)(sm_kernel<16, 16, false>, jobs, njobs, fresh); return;
-    }
-  }
-#ifdef MECH_V8
-  if (b == 32) {
-    switch (a) {
-      case 1: host::LaunchKernel(g, kThreads, stream)(sm_kernel<1, 32, false>, jobs, njobs, fresh); return;
-      case 2: host::LaunchKernel(g, kThreads, stream)(sm_kernel<2, 32, false>, jobs, njobs, fresh); return;
-      case 4: host::LaunchKernel(g, kThreads, stream)(sm_kernel<4, 32, false>, jobs, njobs, fresh); return;
-      case 8: host::LaunchKernel(g, kThreads, stream)(sm_kernel<8, 32, false>, jobs, njobs, fresh); return;
-    }
-  }
-#endif
-  host::RuntimeCheck(false, "no .cv kernel for this (unroll, width); width 32 needs the MECH_V8 build");
+  host::RuntimeCheck(kind == kKindCv || kind == kKindWeak,
+                     "kind: 0 (.cv), 1 (.nc control), 2 (ldgsts), 3 (tma) or 4 (weak)");
+  if (kind == kKindCv ? launch_sm<kLoadCv>(g, a, b, jobs, njobs, fresh, stream)
+                      : launch_sm<kLoadWeak>(g, a, b, jobs, njobs, fresh, stream))
+    return;
+  host::RuntimeCheck(false, "no kernel for this (unroll, width); width 32 needs the MECH_V8 / MECH_V8_WEAK build");
 }
 
 }  // namespace mech

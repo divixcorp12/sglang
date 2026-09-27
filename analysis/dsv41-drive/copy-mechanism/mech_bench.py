@@ -9,6 +9,7 @@ compare directly:
 
 Methods (probe.json decides which exist here):
   sm_cv16 / sm_cv32   ld.global.cv, 16- or 32-byte accesses, U in flight per thread, G blocks of 256
+  sm_weak16 / sm_weak32  the same with plain (weak) ld.global, valid after an acquire (not .nc: non-coherent)
                       (s_pattern = S: G8 U1 W16; cw_pattern = the copy wait: G1 U4 W16)
   ldgsts, tma         Task 4;  ce_each, ce_batch and the *_small workloads: Task 5
 Every method first passes a byte check; the fresh check (kind "fresh" records) runs with the .nc control.
@@ -33,10 +34,10 @@ ROWS = 160  # 2.1 GB of pinned source rows: no launch reuses a row within 40 lau
 SLOTS = 16  # 213 MB of destination slots, rotated: past the 96 MiB L2
 N_ROWS = 4
 FRESH_BYTES = 64 << 10  # small enough that one block's share fits its L1, so a stale .nc read shows
-KIND_CV, KIND_NC, KIND_LDGSTS, KIND_TMA = 0, 1, 2, 3
-LOAD_NC = 1  # sm_kernel's load template argument for the .nc control (bool true today)
+KIND_CV, KIND_NC, KIND_LDGSTS, KIND_TMA, KIND_WEAK = 0, 1, 2, 3, 4
+LOAD_NC = 1  # sm_kernel's load template argument for the .nc control (mech_bench.cuh kLoadNc)
 WRAPPERS = ["mech_copy", "mech_fresh", "mech_latency", "mech_pingpong"]
-BUILD_FLAGS = []  # (probe name, define) pairs; Task 4 and 5 append theirs
+BUILD_FLAGS = [("v8_weak", "MECH_V8_WEAK")]  # (probe name, define) pairs; Task 4 and 5 append theirs
 Cell = collections.namedtuple("Cell", "method grid a b in_flight name rows which run")
 
 
@@ -129,20 +130,25 @@ class Rows:
 
 
 def sm_cells(mod, probe):
-    widths = [16] + ([32] if probe_ok(probe, "v8_cv") else [])
-    for w in widths:
-        for grid in (1, 2, 4, 8, 16, 32):
-            for unroll in (1, 2, 4, 8, 16):
-                if w == 32 and unroll == 16:
-                    continue
-                name = {(16, 8, 1): "s_pattern", (16, 1, 4): "cw_pattern"}.get((w, grid, unroll))
-                yield Cell(f"sm_cv{w}", grid, unroll, w, grid * 256 * unroll * w, name, N_ROWS, ALL_SEGMENTS,
-                           lambda cpu, dev, g=grid, u=unroll, w=w: mod.mech_copy(dev, KIND_CV, g, u, w))
+    # sm_cv*: ld.global.cv. sm_weak*: plain (weak) ld.global after the fresh acquire; contract-valid by the PTX memory
+    # model, unlike .nc, which is non-coherent and is only the fresh check's control.
+    flavours = [("cv", KIND_CV, [16] + ([32] if probe_ok(probe, "v8_cv") else [])),
+                ("weak", KIND_WEAK, [16] + ([32] if probe_ok(probe, "v8_weak") else []))]
+    for flavour, kind, widths in flavours:
+        for w in widths:
+            for grid in (1, 2, 4, 8, 16, 32):
+                for unroll in (1, 2, 4, 8, 16):
+                    if w == 32 and unroll == 16:
+                        continue
+                    name = {(16, 8, 1): "s_pattern", (16, 1, 4): "cw_pattern"}.get((w, grid, unroll)) if kind == KIND_CV else None
+                    yield Cell(f"sm_{flavour}{w}", grid, unroll, w, grid * 256 * unroll * w, name, N_ROWS, ALL_SEGMENTS,
+                               lambda cpu, dev, k=kind, g=grid, u=unroll, w=w: mod.mech_copy(dev, k, g, u, w))
 
 
 CELL_GENERATORS = [sm_cells]
 # (method, kind, grid, a, b, probe that must be ok, or "")
 FRESH_CHECKS = [("sm_cv16", KIND_CV, 8, 1, 16, ""), ("sm_cv32", KIND_CV, 8, 1, 32, "v8_cv"),
+                ("sm_weak16", KIND_WEAK, 8, 1, 16, ""), ("sm_weak32", KIND_WEAK, 8, 1, 32, "v8_weak"),
                 ("nc_control", KIND_NC, 8, 1, 16, "")]
 
 BUILD_FLAGS += [("ldgsts", "MECH_LDGSTS"), ("bulk", "MECH_BULK")]
