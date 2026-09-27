@@ -45,7 +45,9 @@ def child(repo: pathlib.Path, name: str) -> dict:
     n = BYTES[name]
     src = (torch.arange(n, dtype=torch.int64) % 251).to(torch.uint8).pin_memory()
     dst = torch.zeros(n, dtype=torch.uint8, device="cuda")
-    mod.probe_run(src, dst)
+    # A side stream: cudaMemcpyBatchAsync rejects the legacy NULL stream (torch's default) with invalid argument.
+    with torch.cuda.stream(torch.cuda.Stream()):
+        mod.probe_run(src, dst)
     torch.cuda.synchronize()
     return {"build": True, "ok": bool(torch.equal(dst.cpu(), src)), "load_opcodes": opcodes(), "error": None}
 

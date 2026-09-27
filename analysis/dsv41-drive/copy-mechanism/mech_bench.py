@@ -202,6 +202,8 @@ def main() -> int:
     if not str(Path(sglang.__file__).resolve()).startswith(str(repo)):
         raise SystemExit(f"INTERPRETER TRAP: sglang from {sglang.__file__}, not {repo}")
     probe = json.loads(Path(a.probe).read_text())
+    # Everything on a side stream: cudaMemcpyBatchAsync rejects the legacy NULL stream (torch's default).
+    torch.cuda.set_stream(torch.cuda.Stream())
     mod = load(repo, probe)
     rows = Rows(a.node)
     gen, width, gen_now, width_now = pcie(a.gpu_index)
