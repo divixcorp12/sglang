@@ -468,6 +468,9 @@ class RamTier {
 
   // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}. Bit i
   // of `sm_mask` leaves entry i to the copy wait's SM reads (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
+  // Precondition (row_layout.h's ExpertRowLayout): `entries` holds one row per Layout::kNames entry, in
+  // kNames order, so comparing sm_mask (a copy-table entry index) against Layout::kSmallMask (a layout-name
+  // index bitmask) below is comparing the same index space.
   void set_copy_table(int64_t row, const int64_t* entries, int64_t count, int64_t dst_rows, int64_t sm_mask) {
     if ((static_cast<uint64_t>(sm_mask) & ~static_cast<uint64_t>(Layout::kSmallMask)) != 0) {
       throw std::runtime_error(error_prefix<Layout>() + "sm_mask names a tensor that is not one of the layout's small ones");

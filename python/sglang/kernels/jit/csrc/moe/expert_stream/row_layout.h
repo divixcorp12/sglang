@@ -8,6 +8,11 @@
 
 namespace sglang::expert_stream {
 
+// Precondition on every instantiation, not checked by the concept itself: bit i of kSmallMask names layout
+// name i (kNames[i]), and the transport's copy table (RamTier::set_copy_table) is required to list exactly
+// one entry per layout name, in kNames order -- so a copy-table entry index and a layout-name index are the
+// same number. EXL3's copy table satisfies this (Ruling 15); a layout that builds its copy table in a
+// different order, or with a different entry count than kNames.size(), breaks the sm_mask check below.
 template <typename L>
 concept ExpertRowLayout = requires {
   { L::kName } -> std::convertible_to<std::string_view>;
