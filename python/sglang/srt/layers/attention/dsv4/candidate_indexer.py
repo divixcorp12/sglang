@@ -126,3 +126,10 @@ def select_candidate_blocks(
         -1, top.indices, top.values > -torch.inf
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def keep_row_slice(chunk_start: int, chunk_rows: int, keep_from: int) -> Optional[slice]:
+    """Rows of the query-row chunk [chunk_start, chunk_start + chunk_rows) at or after
+    keep_from, as a slice local to the chunk; None when the chunk ends before it."""
+    lo = max(keep_from - chunk_start, 0)
+    return slice(lo, chunk_rows) if lo < chunk_rows else None
