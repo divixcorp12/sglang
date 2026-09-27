@@ -260,6 +260,16 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def dsv41_layer_major_refusal(*, decoder_replay: bool, encoder_replay: bool) -> str | None:
+    """The two DSV4.1-only layer-major refusals, isolated for CPU unit testing."""
+    # The DSV4.1 adapter runs the late layers on the tail and maps a window ring on the paged SWA allocator.
+    if not decoder_replay:
+        return "layer-major prefill on DeepSeek-V4.1 requires --enable-decoder-swa-bounded-replay"
+    if encoder_replay:
+        return "layer-major prefill cannot be combined with --enable-encoder-swa-bounded-replay"
+    return None
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
@@ -381,3 +391,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+
+    if envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS.get() > 0:
+        from sglang.srt.layer_major.gate import launch_refusal
+
+        reason = launch_refusal(
+            max_running_requests=cfg.max_running_requests,
+            speculative_algorithm=cfg.speculative_algorithm,
+            enable_dp_attention=cfg.enable_dp_attention,
+            attn_cp_size=cfg.attn_cp_size,
+            enable_two_batch_overlap=cfg.enable_two_batch_overlap,
+        )
+        if reason is None:
+            reason = dsv41_layer_major_refusal(
+                decoder_replay=cfg.enable_decoder_swa_bounded_replay,
+                encoder_replay=cfg.enable_encoder_swa_bounded_replay,
+            )
+        if reason is not None:
+            raise ValueError(reason)
