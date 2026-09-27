@@ -271,7 +271,9 @@ def _tail_masks_by_chunks(logits, lens, keep_from, rows_per_chunk, topk_blocks, 
                     topk_blocks=topk_blocks, block_size=block_size,
                 )
             )
-    return torch.cat(kept) if kept else torch.zeros(0, logits.shape[1], dtype=torch.bool)
+    if kept:
+        return torch.cat(kept)
+    return torch.zeros(0, logits.shape[1], dtype=torch.bool)
 
 
 @pytest.mark.parametrize("keep_from", [0, 1, 33, 34, 35, 250, 299, 300])
@@ -312,6 +314,162 @@ def test_candidate_publish_rows_per_request_and_short_extends():
 
 def test_candidate_publish_rows_uses_local_lens_under_cp():
     assert backend_mod.candidate_publish_rows(_tail_meta([128], local_lens_cpu=[64])) == [64]
+
+
+# --- driving _low_ratio_index_topk_torch on a fake backend ------------------------
+
+
+def _fake_two_request_setup(monkeypatch, *, rows_per_chunk):
+    """Two requests (5 and 4 compressed positions, ratio 1) sharing one fake backend's
+    dependencies for `_low_ratio_index_topk_torch`."""
+    monkeypatch.setattr(
+        backend_mod, "_torch_indexer_rows_per_chunk", lambda num_heads, lc: rows_per_chunk
+    )
+    req = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1])
+    pos = torch.tensor([0, 1, 2, 3, 4, 0, 1, 2, 3])
+    req_to_token = torch.arange(20, dtype=torch.int64).view(2, 10)
+    q_lora = torch.arange(9, dtype=torch.float32).unsqueeze(-1)
+    layer = types.SimpleNamespace(
+        compress_ratio=1, indexer=None, layer_id=0, freqs_cis=torch.zeros(10, 1)
+    )
+    return req, pos, req_to_token, q_lora, layer
+
+
+def _fake_scores(q_sub, index_k, weights_sub):
+    # Each row's score depends only on its own query value: real-scores rows are
+    # independent, so a fake reproducing that lets chunk-vs-whole runs agree exactly.
+    lc = index_k.shape[0]
+    qv = q_sub.squeeze(-1)
+    cols = torch.arange(lc, dtype=torch.float32)
+    return torch.sin(qv[:, None] * 0.37 + cols[None, :] * 0.11) * 5
+
+
+def _fake_indexer(*, source, uses):
+    return types.SimpleNamespace(
+        is_candidate_source=source,
+        uses_candidates=uses,
+        candidate_topk_blocks=1,
+        candidate_block_size=2,
+        index_topk=3,
+        queries=lambda q_lora, freqs: q_lora,
+        head_weights=lambda x: x,
+        scores=_fake_scores,
+    )
+
+
+def _run_torch_indexer(
+    layer, indexer, req, pos, req_to_token, *, tail_metadata, candidate_tail_only, skip=False
+):
+    layer.indexer = indexer
+    page_indices = torch.zeros(req.numel(), 3, dtype=torch.int32)
+    core = types.SimpleNamespace(
+        sparse_page_indices=lambda ratio: page_indices,
+        sparse_raw_indices=lambda ratio: None,
+    )
+    forward_metadata = types.SimpleNamespace(
+        core_metadata=core, candidate_metadata=None, layer_major_skip_candidates=skip
+    )
+    backend = types.SimpleNamespace(
+        token_to_kv_pool=types.SimpleNamespace(
+            get_low_ratio_index_k_dequant=(
+                lambda layer_id, slots_j: torch.zeros(slots_j.shape[0], 1)
+            )
+        ),
+        forward_metadata=forward_metadata,
+        tail_forward_metadata=tail_metadata,
+        candidate_tail_only=candidate_tail_only,
+        req_to_token=req_to_token,
+    )
+    # Identity queries()/head_weights() make x and q_lora interchangeable here.
+    q_lora = torch.arange(req.numel(), dtype=torch.float32).unsqueeze(-1)
+    backend_mod.DeepseekV4AttnBackend._low_ratio_index_topk_torch(
+        backend, layer, q_lora, q_lora, req, pos
+    )
+    return forward_metadata.candidate_metadata, page_indices
+
+
+_TAIL_METADATA = types.SimpleNamespace(
+    late_layer_tail=types.SimpleNamespace(
+        extend_seq_lens_cpu=[3, 2], local_lens_cpu=None, cp_metadata=None
+    )
+)
+
+
+def test_torch_indexer_publishes_tail_rows_matching_the_full_mask_tail(monkeypatch):
+    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    source = _fake_indexer(source=True, uses=False)
+    full_meta, full_pages = _run_torch_indexer(
+        layer, source, req, pos, req_to_token, tail_metadata=None, candidate_tail_only=True
+    )
+    tail_meta, tail_pages = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=_TAIL_METADATA,
+        candidate_tail_only=True,
+    )
+    assert torch.equal(tail_meta.request_masks[0], full_meta.request_masks[0][-3:])
+    assert torch.equal(tail_meta.request_masks[1], full_meta.request_masks[1][-2:])
+    # The source's own top-k (page_indices) does not depend on tail-only publishing.
+    assert torch.equal(full_pages, tail_pages)
+
+
+def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail(monkeypatch):
+    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    source = _fake_indexer(source=True, uses=False)
+    full_meta, _ = _run_torch_indexer(
+        layer, source, req, pos, req_to_token, tail_metadata=None, candidate_tail_only=True
+    )
+    unsafe_meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=_TAIL_METADATA,
+        candidate_tail_only=False,
+    )
+    for full_b, unsafe_b in zip(full_meta.request_masks, unsafe_meta.request_masks):
+        assert torch.equal(full_b, unsafe_b)
+
+
+def test_torch_indexer_skip_flag_publishes_no_masks(monkeypatch):
+    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    source = _fake_indexer(source=True, uses=False)
+    meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
+        skip=True,
+    )
+    assert isinstance(meta, backend_mod.CandidateMasks)
+    assert meta.request_masks == []
+
+
+def test_torch_indexer_raises_when_a_tail_length_exceeds_its_request_rows(monkeypatch):
+    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    source = _fake_indexer(source=True, uses=False)
+    oversized_tail = types.SimpleNamespace(
+        late_layer_tail=types.SimpleNamespace(
+            extend_seq_lens_cpu=[9, 2], local_lens_cpu=None, cp_metadata=None
+        )
+    )
+    with pytest.raises(ValueError, match="exceeds request"):
+        _run_torch_indexer(
+            layer,
+            source,
+            req,
+            pos,
+            req_to_token,
+            tail_metadata=oversized_tail,
+            candidate_tail_only=True,
+        )
 
 
 if __name__ == "__main__":
