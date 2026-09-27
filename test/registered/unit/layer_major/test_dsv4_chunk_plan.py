@@ -1,6 +1,9 @@
 import unittest
 
 from sglang.srt.models.deepseek_v4_layer_major import ChunkSpan, chunk_spans, engram_history, keep_window_start
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDsv4ChunkPlan(unittest.TestCase):
