@@ -364,7 +364,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
           sh.aborting = 1;
           sh.reason = kLeaseReasonAborted;
         } else if (reached(ld_acquire_sys(page + kDemandDone), seq)) {
-          // The acquire orders this thread's status and mask loads below after it: the other threads' copies follow
+          // The acquire orders this thread's status and mask loads below after it; the other threads' copies follow
           // through the block barrier at the end of the pass. No fence needed.
           const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
           const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
@@ -633,9 +633,10 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   go_ce[0] = __popc(mask);  // the single commit point
 }
 
-// Checked host launchers for the row-copy kernels above (mechanical-refactor-verify Task 8), templated on the
-// streamed row's compile-time layout facts (name count, small-tensor mask). FFI signatures are unchanged from the
-// free launchers they replace.
+/// \brief Checked host launchers for the row-copy kernels above (lease_stream, lease_copy_wait), templated on the
+/// streamed row's compile-time layout facts (name count, small-tensor mask). FFI signatures are unchanged from the
+/// free launchers they replace.
+/// \tparam L The streamed row's compile-time layout (`expert_stream::ExpertRowLayout`).
 template <expert_stream::ExpertRowLayout L>
 struct RowCopyKernel {
   static void lease_stream(
@@ -684,15 +685,15 @@ struct RowCopyKernel {
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "host_rows_2", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
+        "host_rows_2", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
     expert_stream::verify_named(
-        "dst_slots_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
+        "dst_slots_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
     expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
-    expert_stream::verify_named("claimed", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named(
-        "lane_ctx_2", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
-    expert_stream::verify_named("origin_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
+        "lane_ctx_2", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
+    expert_stream::verify_named("origin_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
     expert_stream::verify_named(
         "stream_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_count);
     expert_stream::verify_named(

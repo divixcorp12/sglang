@@ -742,13 +742,14 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
 // whole-request mask would void the hit lanes stage 1 has already acknowledged; retire_leases's per-lane state
 // machine keeps that from corrupting anything, but it records it only as kLeaseDoubleSignal, so the wrong mask
 // would otherwise be invisible.
+//
+// No `lanes` field on purpose. The only bound this kernel needs is kLeaseLanes, because the array it walks is
+// the per-record LaneAck table, which is kLeaseLanes wide by construction -- not a staging buffer. Passing the
+// staging width here would read as the bound and be wrong.
 struct FinalizeParams {
   uint8_t* page;
   int32_t* state;
   const int32_t* count;
-  // No `lanes` field on purpose. The only bound this kernel needs is kLeaseLanes, because the array it walks is
-  // the per-record LaneAck table, which is kLeaseLanes wide by construction -- not a staging buffer. Passing the
-  // staging width here would read as the bound and be wrong.
   const int32_t* go_1;
   const int32_t* go_2;
   const int32_t* go_ce;
@@ -864,10 +865,12 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
   }
 }
 
-// Checked host launchers for the kernels above (mechanical-refactor-verify Task 8): every tensor argument is
-// verified with `TensorMatcher` (named via `verify_named`, Ruling 3) and every address/offset with `RuntimeCheck`
-// before the params struct is built and the kernel launched. FFI signatures are unchanged from the free launchers
-// they replace, so Python call sites do not change.
+/// \brief Checked host launchers for the lease-protocol kernels above: format-free post, wait, lease_wait,
+/// lease_ack, lease_hit_wait, lease_rest_wait, lease_stage_ack, lease_finalize and lease_stream_hit_wait.
+///
+/// Every tensor argument is verified with `TensorMatcher` (named via `verify_named`) and every address/offset with
+/// `RuntimeCheck` before the params struct is built and the kernel launched. FFI signatures are unchanged from the
+/// free launchers they replace, so Python call sites do not change.
 struct LeaseProtocolKernel {
   static void post(
       tvm::ffi::TensorView page,
@@ -981,7 +984,7 @@ struct LeaseProtocolKernel {
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
-    expert_stream::verify_named("keep", TensorMatcher({-1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
     expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
 
     const auto stream = LaunchKernel::resolve_device(state.device());
@@ -1032,11 +1035,11 @@ struct LeaseProtocolKernel {
     RuntimeCheck(P_.unwrap() >= lanes, "planned: must have at least as many lanes as host_rows");
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("host_rows", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows);
-    expert_stream::verify_named("keep", TensorMatcher({-1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
     expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
     expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
     expert_stream::verify_named(
-        "lane_ctx", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
+        "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1085,8 +1088,8 @@ struct LeaseProtocolKernel {
         "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
     expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
     expert_stream::verify_named(
-        "lane_ctx", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
-    expert_stream::verify_named("keep", TensorMatcher({-1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+        "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1144,14 +1147,14 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "host_rows_1", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
+        "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     expert_stream::verify_named(
-        "dst_slots_1", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_1);
+        "dst_slots_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_1);
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
-        "lane_ctx_1", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
-    expert_stream::verify_named("origin_1", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
-    expert_stream::verify_named("claimed", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+        "lane_ctx_1", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
+    expert_stream::verify_named("origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
     expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
 
     RuntimeCheck(
@@ -1221,14 +1224,14 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "host_rows_1", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
+        "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     expert_stream::verify_named(
-        "dst_slots_1", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_1);
+        "dst_slots_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_1);
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
-        "lane_ctx_1", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
-    expert_stream::verify_named("origin_1", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
-    expert_stream::verify_named("claimed", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+        "lane_ctx_1", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_1);
+    expert_stream::verify_named("origin_1", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_1);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
     expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named(
@@ -1302,15 +1305,15 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "host_rows_2", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
+        "host_rows_2", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_2);
     expert_stream::verify_named(
-        "dst_slots_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
+        "dst_slots_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots_2);
     expert_stream::verify_named("ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
-    expert_stream::verify_named("claimed", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+    expert_stream::verify_named("claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named(
-        "lane_ctx_2", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
-    expert_stream::verify_named("origin_2", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
+        "lane_ctx_2", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx_2);
+    expert_stream::verify_named("origin_2", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin_2);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1362,8 +1365,8 @@ struct LeaseProtocolKernel {
         "state", TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), state);
     expert_stream::verify_named("go_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_count);
     expert_stream::verify_named(
-        "lane_ctx", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
-    expert_stream::verify_named("origin", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin);
+        "lane_ctx", TensorMatcher({kLeaseLanes, 4}).with_dtype<int64_t>().with_device<kDLCUDA>(device), lane_ctx);
+    expert_stream::verify_named("origin", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), origin);
     expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
 
     RuntimeCheck(
@@ -1413,7 +1416,7 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named("go_2", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_2);
     expert_stream::verify_named("go_ce", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_ce);
     expert_stream::verify_named("violated", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), violated);
-    expert_stream::verify_named("keep", TensorMatcher({-1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+    expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,

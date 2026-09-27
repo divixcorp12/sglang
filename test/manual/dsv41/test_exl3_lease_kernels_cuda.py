@@ -821,7 +821,10 @@ class TestDelayedConsumption:
 def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrapper_sends():
     """The launchers check what they cast: a state tensor of int64 would have its words read as halves of int32.
     The sentinels the wrapper sends for 'absent' (empty dst_slots, the no-hot-slots tensor, a zero lease address)
-    and the pinned host page must still pass."""
+    and the pinned host page must still pass. Removing either `verify_named` call (`state`'s or `page`'s) from
+    ``LeaseProtocolKernel::post`` turns this red: dropping `state`'s lets the bad-dtype call through to the kernel
+    (an undefined read, not a raised exception), and dropping `page`'s lets the wrong-device call through and the
+    next real bug it should have caught goes undetected."""
     import sglang.kernels.ops.moe.exl3_ram_miss as ram_miss
 
     page = ram_miss.new_page(pin=True)
@@ -833,12 +836,12 @@ def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrappe
     dev.post(0, planned, count, routes, next_row=-1)  # hot_slots, dst_slots absent; no lease block
     torch.cuda.synchronize()
     bad_state = torch.zeros(len(ram_miss.STATE_WORDS), dtype=torch.int64, device="cuda")
-    with pytest.raises(Exception, match="state"):
+    with pytest.raises(Exception, match="^state: "):
         dev._kernels().exl3_ram_miss_post(
             page, bad_state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
             dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
         )
-    with pytest.raises(Exception, match="page"):
+    with pytest.raises(Exception, match="^page: "):
         dev._kernels().exl3_ram_miss_post(
             page.cuda(), dev.state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
             dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,

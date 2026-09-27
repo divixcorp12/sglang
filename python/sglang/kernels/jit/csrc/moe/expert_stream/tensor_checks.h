@@ -1,6 +1,4 @@
-// TensorMatcher::verify never names the tensor it failed on (its message reads "Tensor match failed for
-// Tensor<..> at file:line"). verify_named prefixes the tensor's name so a caught exception can be matched by it.
-// Host-compilable: no CUDA needed, so the host .cpp instantiation (Task 9) can include this too.
+// Host-compilable (no CUDA needed): both device launchers and a host .cpp instantiation can include this.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -14,6 +12,13 @@
 
 namespace sglang::expert_stream {
 
+/// \brief Verifies `view` against `matcher`, prefixing `name` onto the exception if it fails.
+///
+/// `TensorMatcher::verify` never names the tensor it failed on (its message reads "Tensor match failed for
+/// Tensor<..> at file:line"); this rethrows with `"<name>: "` prepended, so a caller can match on it.
+/// \param name The tensor's name, prefixed onto any raised `host::PanicError`.
+/// \param matcher The (moved-from) matcher to run.
+/// \param view The tensor to verify.
 inline void verify_named(std::string_view name, host::TensorMatcher&& matcher, tvm::ffi::TensorView view) {
   try {
     std::move(matcher).verify(view);
