@@ -2,7 +2,7 @@
 #pragma once
 
 #include "reader_base.h"
-#include "row_layout.h"
+#include "../row_layout.h"
 
 namespace sglang {
 namespace expert_stream {

@@ -4,7 +4,7 @@
 #include "file_reader.h"
 #include "piece_geometry.h"
 #include "pack_pool.h"
-#include "row_layout.h"
+#include "../row_layout.h"
 
 namespace sglang {
 namespace expert_stream {
