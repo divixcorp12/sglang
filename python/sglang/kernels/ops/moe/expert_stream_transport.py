@@ -27,15 +27,23 @@ if TYPE_CHECKING:
 
 
 class TransportBuild(msgspec.Struct, frozen=True):
-    """One instantiation of the transport: the host translation unit that binds its C++ layout and file reader, and
-    the device layout type RowCopyKernel is instantiated with."""
+    """One instantiation of the transport: the host translation unit that binds its C++ layout and file reader, the
+    device translation unit RowCopyKernel is compiled in, and the device layout type it is instantiated with."""
 
     host_source: str
+    device_source: str
     device_layout: str
 
 
-# One row per format the transport is built for; adding a format adds a row and its instantiation files.
-LAYOUTS = {"exl3": TransportBuild(host_source="moe/exl3_ram_miss_host.cpp", device_layout="sglang::exl3::Exl3RowLayout")}
+# One row per format the transport is built for; adding a format adds a row, its instantiation files
+# (host_source, device_source) and the layout type they define.
+LAYOUTS = {
+    "exl3": TransportBuild(
+        host_source="moe/exl3_ram_miss_host.cpp",
+        device_source="moe/exl3_ram_miss.cuh",
+        device_layout="sglang::exl3::Exl3RowLayout",
+    )
+}
 
 
 @cache_once
@@ -1170,7 +1178,7 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
 def _device_module(layout: str = "exl3") -> Module:
     return load_jit(
         f"expert_stream_{layout}",
-        cuda_files=["moe/exl3_ram_miss.cuh"],
+        cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
     )
 
@@ -1183,7 +1191,7 @@ def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Mo
     return load_jit(
         f"expert_stream_{layout}",
         "test",
-        cuda_files=["moe/exl3_ram_miss.cuh"],
+        cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
         extra_cuda_cflags=[f"-D{d}" for d in defines],
     )
