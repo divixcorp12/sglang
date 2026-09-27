@@ -208,6 +208,7 @@ def measure(cell: Cell, rows: Rows, reps: int) -> dict:
         e0.record()
         h = cell.run(table, dev)
         e1.record()
+        e1.synchronize()  # the side stream's end event, before any timing or byte check reads it
         torch.cuda.synchronize()
         if i == 0 and not rows.check(pairs, cell.which):
             raise SystemExit(f"{cell.method} g{cell.grid} a{cell.a} b{cell.b} copied the wrong bytes")
@@ -229,6 +230,7 @@ def fresh(mod, kind, grid, a, b) -> bool:
     words = torch.zeros(2, dtype=torch.int32).pin_memory()
     jobs = torch.tensor([[src.data_ptr(), dst.data_ptr(), FRESH_BYTES]], dtype=torch.int64, device="cuda")
     mod.mech_fresh(jobs, words, src, pattern, kind, grid, a, b)
+    torch.cuda.current_stream().synchronize()
     torch.cuda.synchronize()
     return bool((dst.cpu() == 0x22).all())
 
