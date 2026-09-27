@@ -2,19 +2,16 @@
 
 import faulthandler
 import re
-from pathlib import Path
 
 import pytest
 import torch
 
-import sglang.kernels.ops.moe.exl3_ram_miss as ops
 from sglang.kernels.ops.moe.exl3_ram_miss import Exl3RamMissHost, new_page, sim_post, sim_wait
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.expert_stream_sources import device_sources, joined_text
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-
-CUH = Path(ops.__file__).resolve().parents[2] / "jit" / "csrc" / "moe" / "exl3_ram_miss.cuh"
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +88,7 @@ def test_without_an_explicit_count_the_simulated_device_posts_one_lane_per_need_
 
 def test_the_device_writes_the_lane_count_into_the_record_it_posts():
     """The post kernel cannot run here; check its source stores the count the host reads at kRecLanes."""
-    source = CUH.read_text()
+    source = joined_text(device_sources())
     assert "words[kRecLanes / 4] = lanes;" in source
     assert re.search(r"lanes = static_cast<uint32_t>\(max\(count\[0\], 0\)\)", source)
     assert source.count("write_record(") == 3  # the definition and the demand and advisory posts
