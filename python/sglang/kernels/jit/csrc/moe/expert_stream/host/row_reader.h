@@ -1,10 +1,11 @@
-// RowReader: io_uring superset reads of whole expert rows into page-aligned bounce banks, then per-name splits into pinned slabs.
+// RowReader: io_uring superset reads of whole expert rows into page-aligned bounce banks, then per-name splits into
+// pinned slabs.
 #pragma once
 
-#include "file_reader.h"
-#include "piece_geometry.h"
-#include "pack_pool.h"
 #include "../row_layout.h"
+#include "file_reader.h"
+#include "pack_pool.h"
+#include "piece_geometry.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -61,7 +62,8 @@ class RowReader {
 
   ~RowReader() {
     pool_.reset();  // joins the workers before the bounce they read from is freed
-    for (int fd : fds_) ::close(fd);
+    for (int fd : fds_)
+      ::close(fd);
     std::free(bounce_);
     // Undo the owner-pin scaffold's affinity change: the pin targets the calling thread, which a caller
     // (e.g. the benchmark) may reuse across many readers, so a later open() must see the original mask,
@@ -69,7 +71,9 @@ class RowReader {
     if (owner_pinned_) pthread_setaffinity_np(pthread_self(), sizeof(unpinned_affinity_), &unpinned_affinity_);
   }
 
-  const Tables& tables() const { return t_; }
+  const Tables& tables() const {
+    return t_;
+  }
 
   // Pack on `workers` copy threads instead of the owner (0: on the owner, the default), each row in
   // `split` byte-range chunks (0: one per worker); with piece streaming each piece, about an eighth of a
@@ -79,9 +83,15 @@ class RowReader {
     pack_workers_ = t_.images ? 0u : static_cast<unsigned>(std::max<int64_t>(0, workers));
     pack_split_ = split > 0 ? static_cast<unsigned>(split) : pack_workers_;
   }
-  unsigned pack_workers() const { return pack_workers_; }
-  unsigned pack_split() const { return pack_split_; }
-  std::vector<int> packing_cpus() const { return pool_ ? pool_->cpus() : std::vector<int>{}; }
+  unsigned pack_workers() const {
+    return pack_workers_;
+  }
+  unsigned pack_split() const {
+    return pack_split_;
+  }
+  std::vector<int> packing_cpus() const {
+    return pool_ ? pool_->cpus() : std::vector<int>{};
+  }
 
   // Piece streaming (kSubReads sub-reads per part, per-piece vetting, packing and publishing); off by default. Before
   // open(), or on an idle reader after it (the tier sets it before its service thread starts), since it resizes the
@@ -94,38 +104,54 @@ class RowReader {
         throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
       }
       if (t_.parts * kSubReads > kPieces) {
-        throw std::runtime_error(error_prefix<Layout>() + "piece streaming reads at most kPieces / kSubReads mirror parts");
+        throw std::runtime_error(
+            error_prefix<Layout>() + "piece streaming reads at most kPieces / kSubReads mirror parts");
       }
       for (size_t row = 0; row < t_.slabs.size(); ++row) {
         for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
-          if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kPieceAlign != 0 || t_.row_bytes[name] % kPieceAlign != 0) {
-            throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs every slab row base 128 B aligned");
+          if (reinterpret_cast<uintptr_t>(t_.slabs[row][name]) % kPieceAlign != 0 ||
+              t_.row_bytes[name] % kPieceAlign != 0) {
+            throw std::runtime_error(
+                error_prefix<Layout>() + "piece streaming needs every slab row base 128 B aligned");
           }
         }
       }
     }
     piece_stream_ = on;
     subs_ = on ? kSubReads : 1;
-    if (io_.ready() && !size_extents()) throw std::runtime_error(error_prefix<Layout>() + "too many descriptors for piece streaming");
+    if (io_.ready() && !size_extents())
+      throw std::runtime_error(error_prefix<Layout>() + "too many descriptors for piece streaming");
     if (pool_) size_jobs();
   }
-  bool piece_stream() const { return piece_stream_; }
+  bool piece_stream() const {
+    return piece_stream_;
+  }
   // Pieces a readiness word refused to publish, over the reader's life (each also failed its read).
-  int64_t publish_refused() const { return publish_refused_; }
+  int64_t publish_refused() const {
+    return publish_refused_;
+  }
   // Test only (U10): the descriptor count and the ring credit this reader runs with.
-  size_t descriptors() const { return descs_.size(); }
-  unsigned credit() const { return queue_depth(); }
+  size_t descriptors() const {
+    return descs_.size();
+  }
+  unsigned credit() const {
+    return queue_depth();
+  }
   // Test only (U10): every SQE prepared is appended here, while set (null: nothing recorded, one branch per SQE).
   struct SqeRecord {
     int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
   };
-  void set_sqe_log(std::vector<SqeRecord>* log) { sqe_log_ = log; }
+  void set_sqe_log(std::vector<SqeRecord>* log) {
+    sqe_log_ = log;
+  }
 
   // Test-only scaffold (PACK_WORKERS.md owner-pinning measurement): pin the owner thread to `core`
   // at open() and build the packing pool's mask as the inherited set minus that core, so the owner and
   // the workers never share a core. -1 (the default) leaves open() byte-for-byte what it is today: no
   // pin, and the pool's mask is exactly the creating thread's inherited affinity.
-  void set_owner_core(int64_t core) { owner_core_ = core; }
+  void set_owner_core(int64_t core) {
+    owner_core_ = core;
+  }
   // Copies a worker still holds. read() leaves none: this is what a test checks after it returns.
   int64_t unfinished_jobs() const {
     int64_t open_jobs = 0;
@@ -150,8 +176,10 @@ class RowReader {
     stale_waiting_ = false;
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
     if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
-      io_.set_submit_fault(SubmitFault{fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call});
-    } else if (fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0) {
+      io_.set_submit_fault(
+          SubmitFault{fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call});
+    } else if (
+        fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0) {
       // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs RowReader
       // with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above always
       // fires there. This is the fallback for a Reader that cannot inject submit faults at all.
@@ -160,16 +188,23 @@ class RowReader {
   }
 
   // Completions reaped over the reader's life (tests: a zero-length extent must add none).
-  int64_t cqes() const { return cqes_; }
+  int64_t cqes() const {
+    return cqes_;
+  }
   // Completions that named no live descriptor, and generation counter wraps (tests).
-  int64_t stale_cqes() const { return stale_cqes_; }
-  int64_t generation_wraps() const { return generation_wraps_; }
+  int64_t stale_cqes() const {
+    return stale_cqes_;
+  }
+  int64_t generation_wraps() const {
+    return generation_wraps_;
+  }
 
   bool open() {
     for (const auto& path : t_.paths) {
       const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (direct_ ? O_DIRECT : 0));
       if (fd < 0) {
-        std::fprintf(stderr, "ERROR %sopen %s: %s\n", error_prefix<Layout>().c_str(), path.c_str(), std::strerror(errno));
+        std::fprintf(
+            stderr, "ERROR %sopen %s: %s\n", error_prefix<Layout>().c_str(), path.c_str(), std::strerror(errno));
         return false;
       }
       fds_.push_back(fd);
@@ -188,7 +223,8 @@ class RowReader {
       }
       const int64_t dev = statted ? static_cast<int64_t>(st.st_dev) : -1;
       size_t drive = 0;
-      while (drive < devs_.size() && devs_[drive] != dev) ++drive;
+      while (drive < devs_.size() && devs_[drive] != dev)
+        ++drive;
       if (drive == devs_.size()) devs_.push_back(dev);
       file_drive_.push_back(static_cast<uint8_t>(std::min<size_t>(drive, kMaxDrives - 1)));
     }
@@ -198,7 +234,9 @@ class RowReader {
     }
     if (t_.images) {
       check_image_alignment();
-    } else if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) != 0) {
+    } else if (
+        posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) !=
+        0) {
       bounce_ = nullptr;
       return false;
     }
@@ -225,7 +263,10 @@ class RowReader {
       // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
       runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
       pool_ = std::make_unique<PackPool>(
-          pack_workers_, inherited, static_cast<size_t>(kBounceSlots), error_prefix<Layout>(),
+          pack_workers_,
+          inherited,
+          static_cast<size_t>(kBounceSlots),
+          error_prefix<Layout>(),
           std::string(Layout::kName) + "-pack");
       if (piece_stream_) size_jobs();
     }
@@ -346,7 +387,8 @@ class RowReader {
     // row that was never read.
     if (!c.failed) {
       bool clean = c.reading_rows == 0 && c.queue_count == 0;
-      for (int b = 0; b < kBanks; ++b) clean = clean && rows_busy_[b] == 0 && bank_live_[b] == 0;
+      for (int b = 0; b < kBanks; ++b)
+        clean = clean && rows_busy_[b] == 0 && bank_live_[b] == 0;
       if (!clean || (!c.abandoned && c.next_batch < c.batches)) c.failed = true;
     }
     if (trace && c.first_seen != 0) {
@@ -395,7 +437,7 @@ class RowReader {
 
   struct BounceRow {
     RowState state = RowState::Free;
-    size_t ordinal = 0;      // the row's index in the request
+    size_t ordinal = 0;  // the row's index in the request
     unsigned extents_left = 0;
     // Coverage, checked before the row is packed. `needed` is the last byte of the slot the segments
     // can read; `filled` is what the drives actually delivered into it. See pack_one().
@@ -446,16 +488,18 @@ class RowReader {
     const PiecePublish* publish = nullptr;  // piece streaming: where the owner publishes (null: nowhere)
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
-    int64_t events = 0;  // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
-    size_t published = 0;     // piece streaming: pieces published so far (the last_publish_delay_ns fault)
-    int64_t hold_until = 0;   // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
+    int64_t events = 0;      // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
+    size_t published = 0;    // piece streaming: pieces published so far (the last_publish_delay_ns fault)
+    int64_t hold_until = 0;  // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
   };
 
   // How many reads may be outstanding at once. Credit-based preparation in refill() means
   // this bounds concurrency, not batch size: a batch larger than the ring waits for credit
   // rather than overrunning it. Scaled by parts so splitting a row across roots does not
   // halve the number of rows in flight.
-  unsigned queue_depth() const { return kQueueDepth * static_cast<unsigned>(t_.parts); }
+  unsigned queue_depth() const {
+    return kQueueDepth * static_cast<unsigned>(t_.parts);
+  }
 
   uint32_t next_generation() {
     if (++generation_ == 0) {  // 0 means retired: skip it when the counter wraps
@@ -465,7 +509,9 @@ class RowReader {
     return generation_;
   }
 
-  uint8_t* bounce_slot(size_t slot) const { return bounce_ + slot * static_cast<size_t>(t_.slot_bytes); }
+  uint8_t* bounce_slot(size_t slot) const {
+    return bounce_ + slot * static_cast<size_t>(t_.slot_bytes);
+  }
 
   // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part, sub-read), a queue
   // that can hold each descriptor once (an extent waits in it at most once at a time), and completion
@@ -487,22 +533,27 @@ class RowReader {
     // Direct mode: each descriptor's iovecs, rebuilt from its `done` whenever it is prepared (image_iovecs). A read
     // lies inside the image and the segments tile it, so it touches at most one run per segment.
     iovecs_.assign(t_.images ? extents * t_.segments.size() : 0, iovec{});
-    piece_runs_.assign(piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
+    piece_runs_.assign(
+        piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
     return true;
   }
 
   // A new read() starts with every descriptor retired and every bank free. This is also what makes a
   // failed call safe to follow: drain() has already retired the kernel's side of everything.
   void reset_pipeline() {
-    for (auto& d : descs_) d = ExtentDesc{};
-    for (auto& r : rows_) r = BounceRow{};
-    for (int b = 0; b < kBanks; ++b) rows_busy_[b] = bank_live_[b] = 0;
+    for (auto& d : descs_)
+      d = ExtentDesc{};
+    for (auto& r : rows_)
+      r = BounceRow{};
+    for (int b = 0; b < kBanks; ++b)
+      rows_busy_[b] = bank_live_[b] = 0;
   }
 
   // A row to pack; with piece streaming, a vetted piece not yet handed to a job, whatever its row's state.
   bool has_ready() const {
     for (const auto& r : rows_) {
-      if (piece_stream_ ? (r.vetted & static_cast<uint8_t>(~r.dispatched)) != 0 : r.state == RowState::Ready) return true;
+      if (piece_stream_ ? (r.vetted & static_cast<uint8_t>(~r.dispatched)) != 0 : r.state == RowState::Ready)
+        return true;
     }
     return false;
   }
@@ -654,7 +705,8 @@ class RowReader {
         }
       }
     }
-    if (c.trace) c.trace->rows_reading_max = std::max<int64_t>(c.trace->rows_reading_max, static_cast<int64_t>(c.reading_rows));
+    if (c.trace)
+      c.trace->rows_reading_max = std::max<int64_t>(c.trace->rows_reading_max, static_cast<int64_t>(c.reading_rows));
     return true;
   }
 
@@ -682,7 +734,8 @@ class RowReader {
     r.subs = static_cast<uint8_t>(g.subs);
     std::copy(g.deps, g.deps + kPieces, r.deps);
     for (int s = 0; s < g.subs; ++s) {
-      const uint32_t index = static_cast<uint32_t>((slot * parts + static_cast<size_t>(g.part[s])) * kSubReads + g.k[s]);
+      const uint32_t index =
+          static_cast<uint32_t>((slot * parts + static_cast<size_t>(g.part[s])) * kSubReads + g.k[s]);
       sub_reads_[index] = g.sub[s];
       const Read* extent = &sub_reads_[index];
       ExtentDesc& d = descs_[index];
@@ -704,8 +757,8 @@ class RowReader {
         c.trace->drive_extents[drive] += 1;
         const int64_t trace_slot = c.trace->extents++;
         if (trace_slot < kTraceExtents) {
-          c.trace->extent_id[trace_slot] =
-              (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) | static_cast<int64_t>(g.part[s]);
+          c.trace->extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
+                                           static_cast<int64_t>(g.part[s]);
           d.trace_slot = static_cast<int32_t>(trace_slot);
         } else {
           ++c.trace->extents_untraced;
@@ -797,17 +850,23 @@ class RowReader {
         prepared_one = io_.prep_readv(fds_[d.read->file], iov, count, offset, tag);
       } else {
         prepared_one = io_.prep_read(
-            fds_[d.read->file], bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
-            static_cast<unsigned>(remaining), offset, tag);
+            fds_[d.read->file],
+            bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
+            static_cast<unsigned>(remaining),
+            offset,
+            tag);
       }
       if (!prepared_one) break;
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
       ++c.pending;
       if (sqe_log_) {
-        sqe_log_->push_back(SqeRecord{
-            d.read->file, d.read->offset + d.done, remaining,
-            static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + d.done});
+        sqe_log_->push_back(
+            SqeRecord{
+                d.read->file,
+                d.read->offset + d.done,
+                remaining,
+                static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + d.done});
       }
       if (c.trace) {
         c.trace->submitted_bytes += remaining;
@@ -835,13 +894,15 @@ class RowReader {
       held_.clear();
       again_.clear();
       const int64_t released = stamp(c.trace);
-      for (size_t k = 0; k < completions_.size(); ++k) process(completions_[k], released);
+      for (size_t k = 0; k < completions_.size(); ++k)
+        process(completions_[k], released);
       if (c.trace) {
         if (c.first_seen == 0) c.first_seen = released;
         c.last_seen = released;
       }
       if (!c.failed) {
-        for (uint32_t index : again_) queue_push(index);
+        for (uint32_t index : again_)
+          queue_push(index);
       }
       return;
     }
@@ -873,8 +934,9 @@ class RowReader {
         const uint32_t index = static_cast<uint32_t>(completions_[k].data & 0xFFFFFFFFu);
         const bool live = index < descs_.size() && descs_[index].generation != 0 &&
                           descs_[index].generation == static_cast<uint32_t>(completions_[k].data >> 32);
-        if (live && (fault_.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault_.hold_ordinal
-                                       : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) &&
+        if (live &&
+            (fault_.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault_.hold_ordinal
+                              : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) &&
             (fault_.sub < 0 || fault_matches_sub(index))) {
           held_.push_back(completions_[k]);
         } else {
@@ -890,13 +952,15 @@ class RowReader {
       completions_.push_back(stale_);
       stale_armed_ = stale_waiting_ = false;
     }
-    for (size_t k = 0; k < completions_.size(); ++k) process(completions_[k], returned);
+    for (size_t k = 0; k < completions_.size(); ++k)
+      process(completions_[k], returned);
     if (c.trace && seen > 0) {
       if (c.first_seen == 0) c.first_seen = returned;
       c.last_seen = returned;
     }
     if (c.failed) return;
-    for (uint32_t index : again_) queue_push(index);
+    for (uint32_t index : again_)
+      queue_push(index);
   }
 
   void process(const Completion& completion, int64_t returned) {
@@ -1031,7 +1095,8 @@ class RowReader {
     const int64_t slot = (*c.slots)[ordinal];
     for (const Segment& segment : t_.segments) {
       std::memcpy(
-          t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
+          t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst,
+          base + segment.src,
           static_cast<size_t>(segment.bytes));
     }
     finish_row(best, start, stamp(c.trace));
@@ -1078,7 +1143,8 @@ class RowReader {
         if (j >= 1 && holding_for_probe()) continue;
         const PieceRun* runs = &piece_runs_[(s * kPieces + static_cast<size_t>(j)) * segments];
         bool bytes = false;
-        for (size_t i = 0; i < segments && !bytes; ++i) bytes = runs[i].lo < runs[i].hi;
+        for (size_t i = 0; i < segments && !bytes; ++i)
+          bytes = runs[i].lo < runs[i].hi;
         r.dispatched |= bit;
         if (bytes) {
           delay();
@@ -1134,10 +1200,11 @@ class RowReader {
     const auto off = [](int64_t v) { return v % kImageAlign != 0; };
 #ifdef STATX_DIOALIGN
     for (size_t f = 0; f < fds_.size() && direct_; ++f) {
-      struct statx stx {};
-      if (statx(fds_[f], "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) != 0 || (stx.stx_mask & STATX_DIOALIGN) == 0) continue;
-      if (stx.stx_dio_offset_align == 0 || kImageAlign % stx.stx_dio_offset_align != 0 ||
-          stx.stx_dio_mem_align == 0 || kImageAlign % stx.stx_dio_mem_align != 0) {
+      struct statx stx{};
+      if (statx(fds_[f], "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) != 0 || (stx.stx_mask & STATX_DIOALIGN) == 0)
+        continue;
+      if (stx.stx_dio_offset_align == 0 || kImageAlign % stx.stx_dio_offset_align != 0 || stx.stx_dio_mem_align == 0 ||
+          kImageAlign % stx.stx_dio_mem_align != 0) {
         throw std::runtime_error(
             error_prefix<Layout>() + t_.paths[f] + " needs O_DIRECT alignment of " +
             std::to_string(stx.stx_dio_offset_align) + " B (offsets) and " + std::to_string(stx.stx_dio_mem_align) +
@@ -1159,7 +1226,8 @@ class RowReader {
     }
     for (const Read& e : t_.extents) {
       if (e.length > 0 && (off(e.offset) || off(e.length) || off(e.dest))) {
-        throw std::runtime_error(error_prefix<Layout>() + "row images need every extent's offset and length 512 B aligned");
+        throw std::runtime_error(
+            error_prefix<Layout>() + "row images need every extent's offset and length 512 B aligned");
       }
     }
   }
@@ -1178,12 +1246,14 @@ class RowReader {
       const int64_t slot = (*c.slots)[ordinal];
       // A slot's job is free only once its previous copy is done; arming it earlier would hand a worker a
       // half-armed job. Like queue_push's overflow, this cannot happen unless the accounting above is wrong.
-      if (!jobs_[best].done()) throw std::runtime_error(error_prefix<Layout>() + "a packing job was re-armed while a worker still holds it");
+      if (!jobs_[best].done())
+        throw std::runtime_error(error_prefix<Layout>() + "a packing job was re-armed while a worker still holds it");
       CopyRun* runs = &runs_[best * t_.segments.size()];
       for (size_t i = 0; i < t_.segments.size(); ++i) {
         const Segment& segment = t_.segments[i];
         runs[i] = CopyRun{
-            t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst, base + segment.src,
+            t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst,
+            base + segment.src,
             segment.bytes};
       }
       jobs_[best].arm(
@@ -1220,7 +1290,8 @@ class RowReader {
           const Segment& segment = t_.segments[i];
           runs[i] = CopyRun{
               t_.slabs[c.layer][segment.name] + slot * t_.row_bytes[segment.name] + segment.dst + piece[i].lo,
-              base + segment.src + piece[i].lo, piece[i].hi - piece[i].lo};
+              base + segment.src + piece[i].lo,
+              piece[i].hi - piece[i].lo};
           bytes += runs[i].bytes;
         }
         r.dispatched |= bit;
@@ -1229,7 +1300,8 @@ class RowReader {
           continue;
         }
         PackJob& job = jobs_[job_index];
-        if (!job.done()) throw std::runtime_error(error_prefix<Layout>() + "a packing job was re-armed while a worker still holds it");
+        if (!job.done())
+          throw std::runtime_error(error_prefix<Layout>() + "a packing job was re-armed while a worker still holds it");
         job.arm(runs, segments, pack_split_, fault_.pack_delay_ns, c.trace ? &worker_stamp : nullptr, c.trace);
         pool_->post(&job);  // throws before queueing
         ++c.packing;
@@ -1313,7 +1385,8 @@ class RowReader {
     if (c.packing == 0) return;
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
       if (rows_[s].state != RowState::Packing || !jobs_[s].done()) continue;
-      finish_row(s, jobs_[s].first_start.load(std::memory_order_relaxed), jobs_[s].last_end.load(std::memory_order_relaxed));
+      finish_row(
+          s, jobs_[s].first_start.load(std::memory_order_relaxed), jobs_[s].last_end.load(std::memory_order_relaxed));
       --c.packing;
     }
   }
@@ -1329,13 +1402,15 @@ class RowReader {
       const uint8_t held = rows_[s].dispatched & static_cast<uint8_t>(~rows_[s].published);
       for (int j = 0; j < kPieces; ++j) {
         if (held >> j & 1u) {
-          while (!jobs_[s * kPieces + static_cast<size_t>(j)].done()) _mm_pause();
+          while (!jobs_[s * kPieces + static_cast<size_t>(j)].done())
+            _mm_pause();
         }
       }
     }
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
       if (rows_[s].state != RowState::Packing) continue;
-      while (!jobs_[s].done()) _mm_pause();
+      while (!jobs_[s].done())
+        _mm_pause();
     }
     collect_packed();
   }
@@ -1352,7 +1427,8 @@ class RowReader {
       } else {
         ++c.trace->rows_untraced;
       }
-      for (const Segment& segment : t_.segments) c.trace->useful_bytes += segment.bytes;
+      for (const Segment& segment : t_.segments)
+        c.trace->useful_bytes += segment.bytes;
       // Rows pack in completion order and may overlap, so the first to finish is not always the first to start.
       if (c.trace->pack_start == 0 || start < c.trace->pack_start) c.trace->pack_start = start;
       c.trace->pack_end = std::max(c.trace->pack_end, end);
@@ -1380,17 +1456,21 @@ class RowReader {
   }
 
   // Submit the prepared SQEs, waiting for `wait_nr` completions (0: do not block).
-  int submit(unsigned wait_nr) { return io_.submit(wait_nr); }
+  int submit(unsigned wait_nr) {
+    return io_.submit(wait_nr);
+  }
 
   // After a failure, empty the ring before the bounce is reused or freed: settle every read prepared or
   // in flight so nothing can still write the bounce once the caller reuses or frees it.
-  void drain(unsigned pending) { io_.drain(pending); }
+  void drain(unsigned pending) {
+    io_.drain(pending);
+  }
 
   Tables t_;
   bool direct_;
   std::vector<int> fds_;
   uint8_t* bounce_ = nullptr;
-  std::vector<int64_t> devs_;       // st_dev of each distinct filesystem, in first-opened order
+  std::vector<int64_t> devs_;        // st_dev of each distinct filesystem, in first-opened order
   std::vector<uint8_t> file_drive_;  // per file: its drive slot in a StageRecord
   int64_t drive_dev_[kMaxDrives] = {};
   ReadFault fault_{};
@@ -1433,10 +1513,10 @@ class RowReader {
   std::vector<iovec> iovecs_;  // direct mode: segments.size() per descriptor (size_extents)
   RowGeometry geometry_[kBounceRows];
   std::vector<SqeRecord>* sqe_log_ = nullptr;  // test only (set_sqe_log)
-  int64_t publishes_ = 0;        // pieces published over the reader's life (the publish_twice fault counts them)
-  int64_t publish_refused_ = 0;  // publish attempts a readiness word refused
-  size_t rows_busy_[kBanks] = {};   // rows not yet packed, per bank: the packing references
-  size_t bank_live_[kBanks] = {};   // extents not yet retired, per bank: the I/O references
+  int64_t publishes_ = 0;          // pieces published over the reader's life (the publish_twice fault counts them)
+  int64_t publish_refused_ = 0;    // publish attempts a readiness word refused
+  size_t rows_busy_[kBanks] = {};  // rows not yet packed, per bank: the packing references
+  size_t bank_live_[kBanks] = {};  // extents not yet retired, per bank: the I/O references
   uint32_t generation_ = 0;
   int64_t generation_wraps_ = 0;
   int64_t stale_cqes_ = 0;
@@ -1446,7 +1526,6 @@ class RowReader {
   bool stale_waiting_ = false;  // a retired completion is held until its descriptor is recycled
   bool stale_armed_ = false;    // ... and has been: deliver it with the next reap
 };
-
 
 }  // namespace expert_stream
 }  // namespace sglang

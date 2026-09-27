@@ -1,8 +1,8 @@
 // Row tables: the per-expert segment map and the tables_from build of it.
 #pragma once
 
-#include "reader_base.h"
 #include "../row_layout.h"
+#include "reader_base.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -30,9 +30,9 @@ struct Tables {
   int64_t slot_bytes = 0;
   std::vector<std::string> paths;
   std::vector<std::string> source_paths;  // paths[f]'s source shard: a mirror is a copy of it
-  std::vector<int64_t> file_sizes;  // the SOURCE size of every file, mirrors included
-  std::vector<Read> extents;        // [layers][experts][parts]
-  std::vector<int64_t> starts;      // [layers][experts]: where the row starts in its aligned superset
+  std::vector<int64_t> file_sizes;        // the SOURCE size of every file, mirrors included
+  std::vector<Read> extents;              // [layers][experts][parts]
+  std::vector<int64_t> starts;            // [layers][experts]: where the row starts in its aligned superset
   std::vector<Segment> segments;
   int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
   std::vector<std::vector<uint8_t*>> slabs;
@@ -52,7 +52,8 @@ inline std::vector<int32_t> ids_of(TensorView tensor) {
 // Row images: the reader scatters each read straight into slab rows (RowReader::image_iovecs), which is only right
 // when every byte a read returns has exactly one destination and the row's reads return exactly its image. So: the
 // row starts at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and
-// each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is RowReader::open's.
+// each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is
+// RowReader::open's.
 template <ExpertRowLayout Layout>
 inline void check_image_tables(const Tables& t) {
   const std::string prefix = error_prefix<Layout>();
@@ -112,9 +113,9 @@ inline Tables tables_from(
     int64_t row_images) {
   const std::string prefix = error_prefix<Layout>();
   if (slabs.size(1) != kNumNames<Layout> || row_bytes.size(0) != kNumNames<Layout>) {
-    throw std::runtime_error(prefix + "slabs and row_bytes must have " + std::to_string(kNumNames<Layout>) +
-                             " names (the layout's), got " + std::to_string(slabs.size(1)) + " and " +
-                             std::to_string(row_bytes.size(0)));
+    throw std::runtime_error(
+        prefix + "slabs and row_bytes must have " + std::to_string(kNumNames<Layout>) + " names (the layout's), got " +
+        std::to_string(slabs.size(1)) + " and " + std::to_string(row_bytes.size(0)));
   }
   Tables t;
   t.images = row_images != 0;
@@ -160,8 +161,7 @@ inline Tables tables_from(
   // shard - but nothing in this file pinned either, and a builder that ever gave a row parts from
   // genuinely different files would arm the guard to clear a row against the wrong size. Checked here,
   // once per table, rather than per read.
-  for (size_t base = 0; base + static_cast<size_t>(t.parts) <= t.extents.size();
-       base += static_cast<size_t>(t.parts)) {
+  for (size_t base = 0; base + static_cast<size_t>(t.parts) <= t.extents.size(); base += static_cast<size_t>(t.parts)) {
     const Read* head = nullptr;
     for (int64_t p = 0; p < t.parts && head == nullptr; ++p) {
       if (t.extents[base + static_cast<size_t>(p)].length > 0) head = &t.extents[base + static_cast<size_t>(p)];
@@ -172,10 +172,10 @@ inline Tables tables_from(
       // Only the reading parts: a zero-length part is never submitted and its fields are unused, so
       // requiring anything of them would over-constrain the builder for no gain.
       if (e.length <= 0) continue;
-      if (t.file_sizes[e.file] != t.file_sizes[head->file] ||
-          e.offset - e.dest != head->offset - head->dest) {
+      if (t.file_sizes[e.file] != t.file_sizes[head->file] || e.offset - e.dest != head->offset - head->dest) {
         throw std::runtime_error(
-            prefix + "a row's parts disagree on their aligned base or their file size, so the "
+            prefix +
+            "a row's parts disagree on their aligned base or their file size, so the "
             "EOF guard cannot decide the row from part 0");
       }
     }
@@ -185,10 +185,11 @@ inline Tables tables_from(
   const auto* segment_data = static_cast<const int64_t*>(segments.data_ptr());
   t.segments.resize(static_cast<size_t>(segments.size(0)));
   for (size_t i = 0; i < t.segments.size(); ++i) {
-    t.segments[i] = Segment{segment_data[4 * i], segment_data[4 * i + 1], segment_data[4 * i + 2], segment_data[4 * i + 3]};
+    t.segments[i] =
+        Segment{segment_data[4 * i], segment_data[4 * i + 1], segment_data[4 * i + 2], segment_data[4 * i + 3]};
     if (t.segments[i].name < 0 || t.segments[i].name >= kNumNames<Layout>) {
-      throw std::runtime_error(prefix + "a segment names a tensor outside the layout's " +
-                               std::to_string(kNumNames<Layout>) + " names");
+      throw std::runtime_error(
+          prefix + "a segment names a tensor outside the layout's " + std::to_string(kNumNames<Layout>) + " names");
     }
     t.need_end = std::max(t.need_end, t.segments[i].src + t.segments[i].bytes);
   }
@@ -205,7 +206,6 @@ inline Tables tables_from(
   if (t.images) check_image_tables<Layout>(t);
   return t;
 }
-
 
 }  // namespace expert_stream
 }  // namespace sglang

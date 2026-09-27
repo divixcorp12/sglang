@@ -896,10 +896,22 @@ def test_u7_a_lane_voided_while_its_row_is_read_leaves_the_slot_loading_until_th
     """U7. The device gives up on a request (its terminal voids the miss lane) while the row is still being read.
     The lease is retired from inside read(), but the slot stays kLoading -- the workers are still writing it -- and
     only the post-read step decides it: READY and mapped when the read succeeded, FREE (not quarantined: nothing
-    leases it) when it failed."""
+    leases it) when it failed.
+
+    The read is held open by a gate, not a delay: the hold_until_probe_ms fault keeps pieces 1..7 unpublished (so the
+    read cannot end) until the request's StreamProbe word reads tagged(1, gen), which the test stores only after it
+    has seen the void retired. The read's drain loop keeps calling retire_leases() while it holds. A pack delay
+    raced instead: the owner retires only between publish passes, so a pass that found every piece already landed
+    left the void to the read's last turn, microseconds before demand_done."""
     s, page, host, sim = _host(tmp_path, 2)
-    host.inject_fault(pack_delay_ns=40_000_000, publish_twice=3 if fails else 0)
+    host.inject_fault(hold_until_probe_ms=600_000, publish_twice=3 if fails else 0)
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
+    req = None
+
+    def release():  # the stream kernel's probe, tagged(1, gen): the reader may publish the held pieces
+        probe = sim.layout.d_offset + lease.STREAM_PROBE + req.idx * lease.STREAM_PROBE_BYTES
+        sim.write_u64(probe, lease.tagged(lease.STREAM_PROBE_TAG, req.gen))
+
     try:
         req = sim.post(1, [4])
         assert two_phase._until(lambda: sim.row_result(req, 0)["tag"] == lease.LOADING)
@@ -916,6 +928,7 @@ def test_u7_a_lane_voided_while_its_row_is_read_leaves_the_slot_loading_until_th
         assert two_phase._until(voided, timeout_s=10.0)
         assert seen["done"] != req.seq, "the read had ended before the void was retired"
         assert seen["state"] == LOADING_SLOT, "a voided slot left kLoading while its row was still being read"
+        release()
         assert two_phase._until(lambda: page_word(page, "demand_done") == req.seq, timeout_s=20.0)
         counters = host.counters()
         assert counters["leases_voided"] == 1 and counters["slots_quarantined"] == 0
@@ -926,6 +939,8 @@ def test_u7_a_lane_voided_while_its_row_is_read_leaves_the_slot_loading_until_th
             assert _slot(host, 1, slot) == (READY_SLOT, 4, 0) and host.mapping(1)[4] == slot
             _assert_mapped(s, host, [4])
     finally:
+        if req is not None:
+            release()  # a failed assertion must not leave the service thread held until the hold times out
         host.stop()
 
 

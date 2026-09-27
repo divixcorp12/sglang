@@ -3,6 +3,8 @@
 import dataclasses
 import errno
 import faulthandler
+import os
+import re
 import subprocess
 import sys
 import threading
@@ -328,6 +330,131 @@ def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
     slots = torch.tensor([0], dtype=torch.int64)
     with pytest.raises(Exception, match="^experts: "):
         module.expert_stream_read_rows(*args, 0, experts, slots, expert_stream_transport.BOUNCE_ROWS)
+
+
+def _out_extent(host, entry):
+    """The int64 words each introspection entry writes for row 0: its handle's real extent, not the caller's."""
+    capacity = int(host.tables.capacity[0])
+    return {
+        "slot_info": 4 * capacity,
+        "mapping": host.experts,
+        "slot_to_expert": capacity,
+        "lru_order": capacity,
+        "layer_rows": host.layers,
+    }[entry]
+
+
+@pytest.mark.parametrize("delta", [-1, 1], ids=["undersized", "oversized"])
+@pytest.mark.parametrize("entry", ["slot_info", "mapping", "slot_to_expert", "lru_order", "layer_rows"])
+def test_an_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, entry, delta):
+    """Each entry writes a handle-dependent count of int64s through a raw pointer with no bound of its own, so a
+    buffer one word short is written past its end. The out tensor is a view into a larger sentinel-filled backing:
+    a missing refusal shows as the call succeeding, and any write, in bounds or past the view's end, as a changed
+    sentinel. The exact size is required, so one word too many is refused as well."""
+    s, page, slot_map, host = tier
+    assert _serve(page, host, 0, need=[0, 1], protect=[0, 1]) == 1  # every entry has something to write
+    expected = _out_extent(host, entry)
+    sentinel = -7
+    backing = torch.full((expected + 2,), sentinel, dtype=torch.int64)
+    out = backing[: expected + delta]
+    call = getattr(host._module, f"expert_stream_{entry}")
+    with pytest.raises(RuntimeError, match=rf"^out: (?s:.*)expected {expected} but got {expected + delta}"):
+        call(host.handle, 0, out)  # (handle, row, out); layer_rows takes (handle, advisory, out)
+    assert backing.eq(sentinel).all(), "the refusal came after a write"
+
+
+@pytest.mark.parametrize("delta", [-1, 1], ids=["undersized", "oversized"])
+def test_fill_begins_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, delta):
+    """fill_begin writes the evictions word at out[len(experts)] first, then a slot per claimed expert: its extent
+    comes from the input, len(experts) + 1. Mutation: out checked for dtype, rank and device only."""
+    s, page, slot_map, host = tier
+    experts = torch.tensor([0, 1], dtype=torch.int64)
+    expected = experts.numel() + 1
+    sentinel = -7
+    backing = torch.full((expected + 2,), sentinel, dtype=torch.int64)
+    out = backing[: expected + delta]
+    protect = torch.zeros(0, dtype=torch.int64)
+    try:
+        host._module.expert_stream_fill_begin(host.handle, 0, experts, protect, 0, out)
+    except RuntimeError as refused:
+        message = str(refused)
+    else:
+        host._module.expert_stream_fill_end(host.handle)  # a fill started: join it before teardown
+        message = "no refusal"
+    assert re.match(rf"^out: (?s:.*)expected {expected} but got {expected + delta}", message), message
+    assert backing.eq(sentinel).all(), "the refusal came after a write"
+
+
+def _core_words(cores):
+    words = [0, 0]
+    for core in cores:
+        words[core // 64] |= 1 << (core % 64)
+    return torch.tensor([w - (1 << 64) if w >= 1 << 63 else w for w in words], dtype=torch.int64)
+
+
+def _test_only_entry(case):
+    """(tensor name, exact extent, call) of a test-only entry that reads or writes a fixed-extent caller buffer.
+    `call(buffer)` passes `buffer` as the named tensor and correct tensors everywhere else."""
+    module = expert_stream_transport._host_module()
+    mine = _core_words(sorted(os.sched_getaffinity(0) - set(range(64, 72)))[:2])
+    two = lambda: torch.zeros(2, dtype=torch.int64)
+    return {
+        "publish_piece:word": ("word", 1, lambda b: module.expert_stream_publish_piece(b, 0, 1)),
+        "seqlock_stress:out": ("out", 2, lambda b: module.expert_stream_seqlock_stress(1_000_000, b)),
+        "pack_worker_cpus:out": ("out", 2, lambda b: module.expert_stream_pack_worker_cpus(mine, b)),
+        "pack_worker_cpus:inherited": ("inherited", 2, lambda b: module.expert_stream_pack_worker_cpus(b, two())),
+        "pack_pool_affinity:out": ("out", 4, lambda b: module.expert_stream_pack_pool_affinity(mine, 2, b)),
+        "pack_pool_affinity:inherited": (
+            "inherited", 2, lambda b: module.expert_stream_pack_pool_affinity(b, 2, torch.zeros(4, dtype=torch.int64))
+        ),
+    }[case]
+
+
+@pytest.mark.parametrize("delta", [-1, 1], ids=["undersized", "oversized"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "publish_piece:word",
+        "seqlock_stress:out",
+        "pack_worker_cpus:out",
+        "pack_worker_cpus:inherited",
+        "pack_pool_affinity:out",
+        "pack_pool_affinity:inherited",
+    ],
+)
+def test_a_test_only_entrys_fixed_extent_buffer_of_the_wrong_size_is_refused_before_any_write(case, delta):
+    """These entries dereference a caller tensor of a fixed extent through a raw pointer with no check at all.
+    Mutation: the tensor is not checked."""
+    name, expected, call = _test_only_entry(case)
+    sentinel = 0  # for publish_piece a word of generation 0 with bit 1 clear, so an unchecked call would set it
+    backing = torch.full((expected + 2,), sentinel, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match=rf"^{name}: (?s:.*)expected {expected} but got {expected + delta}"):
+        call(backing[: expected + delta])
+    assert backing.eq(sentinel).all(), "the refusal came after a write"
+
+
+_MAPPING_ROW = """
+import pathlib, sys, torch
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+s = ram_miss_setup(pathlib.Path(sys.argv[1]))
+host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+try:
+    host._module.expert_stream_mapping(host.handle, host.layers, torch.empty(host.experts, dtype=torch.int64))
+    print("no refusal")
+except RuntimeError as refused:
+    print(refused)
+host.stop()
+"""
+
+
+def test_mapping_refuses_a_row_out_of_range(tmp_path):
+    """mapping indexes tiers_[row] with no check; its three row-taking siblings refuse through row_capacity.
+    In a subprocess: before the check, the row indexes past tiers_, which may kill the process."""
+    result = subprocess.run(
+        [sys.executable, "-c", _MAPPING_ROW, str(tmp_path)], capture_output=True, text=True, timeout=120
+    )
+    assert "streamed row 2 is out of range" in result.stdout, (result.returncode, result.stdout, result.stderr[-2000:])
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):

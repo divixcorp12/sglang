@@ -1,5 +1,6 @@
-// Test only: a second row layout, two names with only the second SM-readable, to show a format is a trait plus
-// two bindings files (test_expert_stream_second_layout.py).
+// Test only: a second row layout, two names with only the second SM-readable,
+// to show a format is a trait plus two bindings files
+// (test_expert_stream_second_layout.py).
 #pragma once
 
 #include <array>
@@ -14,4 +15,4 @@ struct TwoNameLayout {
   static constexpr uint32_t kSmallMask = 0b10;
 };
 
-}  // namespace sglang::expert_stream::testing
+} // namespace sglang::expert_stream::testing

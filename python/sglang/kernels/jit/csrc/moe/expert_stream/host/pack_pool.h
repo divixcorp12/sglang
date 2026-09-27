@@ -13,19 +13,18 @@
 
 #pragma once
 
-#include <pthread.h>
-#include <sched.h>
-#include <immintrin.h>
-
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cerrno>
-#include <chrono>
+#include <immintrin.h>
 #include <mutex>
+#include <pthread.h>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -66,17 +65,23 @@ struct PackJob {
   ChunkStamp* chunk_stamps = nullptr;  // `chunks` entries, written only when `clock` is set too
   // Worker-shared.
   std::atomic<unsigned> claimed{0};
-  std::atomic<unsigned> finished{1};  // starts done: a job nobody holds reads done()
+  std::atomic<unsigned> finished{1};    // starts done: a job nobody holds reads done()
   std::atomic<int64_t> first_start{0};  // earliest chunk start, only when traced
   std::atomic<int64_t> last_end{0};     // latest chunk end, only when traced
 
-  void arm(
-      const CopyRun* run_list, size_t count, unsigned chunk_count, int64_t delay, int64_t (*clock_fn)(const void*),
-      const void* clock_argument, ChunkStamp* stamps = nullptr) {
+  void
+  arm(const CopyRun* run_list,
+      size_t count,
+      unsigned chunk_count,
+      int64_t delay,
+      int64_t (*clock_fn)(const void*),
+      const void* clock_argument,
+      ChunkStamp* stamps = nullptr) {
     runs = run_list;
     run_count = count;
     total = 0;
-    for (size_t i = 0; i < count; ++i) total += run_list[i].bytes;
+    for (size_t i = 0; i < count; ++i)
+      total += run_list[i].bytes;
     chunks = std::max(1u, chunk_count);
     delay_ns = delay;
     clock = clock_fn;
@@ -89,14 +94,17 @@ struct PackJob {
   }
 
   // Acquire: after true, every byte of every chunk is stored and visible to the caller.
-  bool done() const { return finished.load(std::memory_order_acquire) == chunks; }
+  bool done() const {
+    return finished.load(std::memory_order_acquire) == chunks;
+  }
 };
 
 // The cores a copy worker may run on: what the creating thread may run on, less the production
 // reserve 64-71 (71 is the doorbell's spin core; NVMe completion interrupts land there too).
 inline cpu_set_t pack_worker_cpus(const cpu_set_t& inherited) {
   cpu_set_t allowed = inherited;
-  for (int core = 64; core <= 71; ++core) CPU_CLR(core, &allowed);
+  for (int core = 64; core <= 71; ++core)
+    CPU_CLR(core, &allowed);
   return allowed;
 }
 
@@ -169,7 +177,8 @@ class PackPool {
           std::to_string(cpus_.size()) + " are allowed once cores 64-71 are excluded");
     }
     try {
-      for (unsigned i = 0; i < workers; ++i) threads_.emplace_back([this, i] { run(i); });
+      for (unsigned i = 0; i < workers; ++i)
+        threads_.emplace_back([this, i] { run(i); });
       std::unique_lock<std::mutex> lock(mutex_);
       started_cv_.wait(lock, [&] { return started_ == threads_.size(); });
     } catch (...) {
@@ -182,14 +191,20 @@ class PackPool {
     }
   }
 
-  ~PackPool() { shutdown(); }
+  ~PackPool() {
+    shutdown();
+  }
   PackPool(const PackPool&) = delete;
   PackPool& operator=(const PackPool&) = delete;
 
-  size_t workers() const { return threads_.size(); }
+  size_t workers() const {
+    return threads_.size();
+  }
 
   // Worker i's CPU. The service thread keeps off these, so a piece's copy never waits behind the thread that posts it.
-  const std::vector<int>& cpus() const { return cpus_; }
+  const std::vector<int>& cpus() const {
+    return cpus_;
+  }
 
   // The affinity of worker `index` as the kernel reports it (tests).
   cpu_set_t worker_affinity(size_t index) {
@@ -299,7 +314,7 @@ class PackPool {
   std::string prefix_;
   std::string thread_name_;
   cpu_set_t allowed_;
-  std::vector<int> cpus_;  // worker i's CPU
+  std::vector<int> cpus_;        // worker i's CPU
   std::vector<PackJob*> queue_;  // ring of posted jobs; a job leaves it when its last chunk is claimed
   size_t head_ = 0;
   size_t count_ = 0;

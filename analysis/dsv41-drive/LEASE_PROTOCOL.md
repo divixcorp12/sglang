@@ -861,17 +861,20 @@ Inactive lanes (`i >= count`) are never in the set.
 
 ### 7.5 Service: retirement
 
-`retire_leases()` **[P]**, called from three places and never blocking:
+`retire_leases()` **[P]**, called from four places and never blocking:
 
-1. the top of every `RamThread::run()` iteration (before `pump_demand`);
+1. the top of every `pump_demand` (each `RamThread::run()` iteration, and each `pump()`),
+   after the demand head is read: a settle pass when a new demand is posted (below);
 2. the between-batches callback of `RowReader::read` (the lambda passed in `serve()`
    that currently evaluates `demand_pending() || pause_requested_ || ...`), so leases keep
    retiring while a long read is in flight;
-3. once when a pause is being acknowledged (section 12, F10) and once in the shutdown
-   drain.
+3. once when a pause is being acknowledged (section 12, F10), as a settle pass;
+4. once in `stop_thread`, after the thread joined, as the final settle pass. There is no
+   separate shutdown drain.
 
-Work per call is bounded: at most `R * L = 128` lane entries, and it returns immediately
-when nothing is outstanding. For each `Outstanding` entry (all lanes not yet ACKED/VOID):
+Work per call is bounded: at most `R * L = 128` lane entries. A pass that is not a settle
+pass returns immediately when nothing is outstanding. It visits each `Outstanding` entry
+that is active (a lane not yet ACKED/VOID) or watched (below):
 
 - `a = load_acquire64(LaneAck[idx][i])`; if `gen(a) == G`: CONSUMED or VIOLATED ->
   `leases[slot]--`, lane state ACKED (VIOLATED also increments `lease_violations`).
@@ -885,6 +888,18 @@ when nothing is outstanding. For each `Outstanding` entry (all lanes not yet ACK
 A decrement that would underflow, or a lane retired twice, is an internal error: fatal.
 The per-lane state machine makes a double release impossible even if the device
 misbehaves.
+
+A second signal for a lane already retired (an ack and a terminal bit for the same lane and
+generation) releases nothing and is counted in `lease_double_signal`, whenever it lands: the
+entry stays *watched* after it closes, and every later pass compares its words again. The watch
+ends at a *settle* pass: the first one after the service observed a later demand posted, the
+one in `pause` (whose caller synchronized the stream), or the final one in `stop_thread`. By
+assumption 1 of section 1.1 (one stream, one graph replay at a time; listed as A1 in 16.2, not
+the stage-1 ack kernel A1) the device emitted every signal of a request before posting the next,
+so that pass is the last comparison needed. A settle pass bypasses the idle early-out; any other
+pass that takes it compares nothing, and the next settle covers it. Ending the watch only bounds
+the cost of later passes: every comparison matches on the generation, so correctness does not
+depend on when a watch ends, and assumption 1 bears only on how complete the counter is.
 
 ---
 
@@ -1868,7 +1883,7 @@ evidence is the mutation column, applied to the finished service.
 | 3 | **Duplicate lanes.** Two lanes, one expert. | service | `slot_leases == 2` **before any ack**; after one ack `slot_leases == 1` and the slot is still not a victim (repeat item 1's pressure); after the second, 0 | leases deduplicated per expert (a test that only checks the end state passes); an ack that releases every lease on its slot |
 | 4 | **The rows of section 12.** One test per row *that is observable*, naming its row. **Service-observable:** F1 (a read fault injected *after* reservation, so it is not short-circuited; assert `slot_leases == 0` and no `RowResult`); F2 in *both* orders (terminal delivered before the service serves: `late_after_terminal`, no lease; terminal delivered after grant: retired by the mask); F8 (a lapped request); F10 (item 9); F11 (item 3). **Not observable on the CPU:** F5 (CUDA error), F6 (device hang), F7 (service hang, existing watchdog), and the *device halves* of F1, F2, F12, F13, which are behaviours of the kernels ([kernel], items 12, 5b). F13 exists only if a protocol bug exists; an injected recycle tests the simulator's ack, so it is [sim]. | service / sim / kernel | per row as stated | F1: leases granted at reservation and not voided on failure; F2: a lease granted after a terminal that nothing retires |
 | 5 | **Skipped copy emits no ack.** With `go_count == 0` no `LaneAck` word is written. | **sim only** here; **[kernel] on the GPU** | assert the words are all zero *and* that the simulated wait did run its abort path | On the CPU this checks the simulator against the same author's spec. A kernel that acknowledges `[0, count)` instead of `[0, go_count)` passes every CPU test; only a GPU test that runs `exl3_ram_miss_ack_kernel` catches it. Do not cite the CPU version as evidence for the kernel |
-| 6 | **Terminal mask retires exactly its lanes; a lane signalled by both an ack and a mask is counted, not decremented twice.** | service | inject both signals for one lane and deliver both *before* `retire_leases()` runs (pump once after both are visible), else the first retirement empties the lane and the second is a trivial no-op; a partial mask to exercise the per-lane state machine (the real device publishes only full masks until Task 6) | retirement decrements per signal instead of per lane state. **The old wording, "double-retire is an internal error", disagrees with the model and the design, where the second signal is ignored by the lane state machine; specify the counter `lease_double_signal` and assert exact `leases`** |
+| 6 | **Terminal mask retires exactly its lanes; a lane signalled by both an ack and a mask is counted, not decremented twice.** | service | inject both signals for one lane and deliver both *before* `retire_leases()` runs (pump once after both are visible); a second signal landing after the first retired the lane is counted too, by a later pass (7.5), and has its own tests; a partial mask to exercise the per-lane state machine (the real device publishes only full masks until Task 6) | retirement decrements per signal instead of per lane state. **The old wording, "double-retire is an internal error", disagrees with the model and the design, where the second signal is ignored by the lane state machine; specify the counter `lease_double_signal` and assert exact `leases`** |
 | 7 | **Generation wrap.** (a) the demand/advisory wrap, written (`test_exl3_ram_miss_wrap.py`), fails on the old `pump_demand`/`pump_advice` and passes on the fix; (b) leases retire across the wrap; (c) the stale-acknowledgement case; (d) a lap that crosses the wrap. | (a) service; (b)-(d) service + sim | (c) the stale word must have the **same low 32 bits and a different epoch** as the awaited generation, else it is rejected for the wrong reason and the test passes with a 32-bit compare; assert the lease is *still held* while the stale word is present, and released by the real ack. (d) assert a lap occurred (`overruns`/resume counter) with the service held back by `pump()` stepping, and that the armed request after it is served | (c) a service that compares only the low 32 bits of the generation; (d) a service that counts epochs itself (the model's counterexample) |
 | 8 | **Request-slot reuse.** A request slot is reused only after its lease row retired, and a deferral does not flood the stage ring. | service | acknowledgements withheld so request `G + 16` actually arrives with `G` unretired: `deferred_reuse > 0`; with instant acks it never defers. Assert the stage ring gained **one** record for the deferred request, not one per poll | `defer_reuse=False` (a request slot overwritten with a granted lane unretired: leaked lease); a deferral that re-enters `begin_stage` every poll |
 | 9 | **Pause and shutdown.** (a) a *graph-lane* lease outstanding: the pause is refused; (b) a *host* lease outstanding: the pause is **granted** (R2; the first version tested only the refusal, which passes for an implementation that refuses whenever any lease exists); (c) a fake CUDA error and a fake `synchronize` that outlasts its deadline each select quarantine. | (a),(b) service; (c) python | (c) patch `release_host_slabs` **before** the cache is built (the finalizer binds the function at creation, which the first version of `TestQuarantine` had to work around); assert the fake `synchronize` was actually called; release the blocked helper thread at the end; assert the slab is alive via a weak reference and no unregister was recorded | (a)/(b): a pause that counts host leases; (c): a shutdown that frees when the sync did not complete |

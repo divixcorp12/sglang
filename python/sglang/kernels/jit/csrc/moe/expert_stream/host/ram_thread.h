@@ -6,7 +6,6 @@
 namespace sglang {
 namespace expert_stream {
 
-
 // Pumps one RamTier on its own thread (plan D19): demands first, then advisories; spins
 // with _mm_pause() for spin_ns after the last request, else sleeps 50 us between polls.
 // pause() is a handshake: it asks every advisory in flight to give up at its next row,
@@ -75,9 +74,10 @@ class RamThread {
       }
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
-    // The caller synchronized the stream, so every copy wait has seen its CopyDone; the copy thread releases just after.
+    // The caller synchronized the stream, so every copy wait has seen its CopyDone; the copy thread releases just
+    // after.
     tier_->wait_copy_idle(now_ns() + timeout_ns);
-    tier_->retire_leases();
+    tier_->retire_leases(true);  // a settle pass: the synchronized stream left no signal still to land
     if (tier_->graph_leases_outstanding() > 0) {
       resume();
       return 2;
@@ -110,7 +110,8 @@ class RamThread {
       cpu_set_t cpus;
       CPU_ZERO(&cpus);
       if (pthread_getaffinity_np(pthread_self(), sizeof(cpus), &cpus) == 0) {
-        for (int cpu : tier_->packing_cpus()) CPU_CLR(cpu, &cpus);
+        for (int cpu : tier_->packing_cpus())
+          CPU_CLR(cpu, &cpus);
         // Best effort: a narrowing that fails leaves the thread as it was, which is how it ran before.
         if (CPU_COUNT(&cpus) > 0) pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
       }
@@ -156,8 +157,10 @@ class RamThread {
         if (!reported) {
           reported = true;
           std::fprintf(
-              stderr, "ERROR %srequest %u timed out or failed; the process must stop\n",
-              error_prefix<typename Tier::Layout>().c_str(), fatal);
+              stderr,
+              "ERROR %srequest %u timed out or failed; the process must stop\n",
+              error_prefix<typename Tier::Layout>().c_str(),
+              fatal);
           std::fflush(stderr);
         }
         if (fatal_since == 0) fatal_since = now;
@@ -197,7 +200,6 @@ class RamThread {
   std::atomic<bool> paused_{false};
   std::atomic<int> pin_error_{kPinPending};  // 0 pinned (or not asked), else the errno
 };
-
 
 }  // namespace expert_stream
 }  // namespace sglang

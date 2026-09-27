@@ -133,11 +133,17 @@ _reuse(thread, lambda source: ("_host(" in source or "_tier(" in source) and "_r
 
 
 def _pack_threads():
+    """Live pack workers. A joined thread can stay listed for a few ms in state X (dead, being released): join()
+    returns when the kernel clears the thread's tid, before it unlinks the task. Those are not counted; a worker
+    close() failed to join is still R/S/D and is."""
     count = 0
     for tid in os.listdir("/proc/self/task"):
         try:
             with open(f"/proc/self/task/{tid}/comm") as f:
-                count += f.read().strip() == "exl3-pack"
+                if f.read().strip() != "exl3-pack":
+                    continue
+            with open(f"/proc/self/task/{tid}/stat") as f:
+                count += f.read().rsplit(")", 1)[1].split()[0] not in ("X", "Z")
         except OSError:
             pass  # the thread ended between the listing and the read
     return count
@@ -170,6 +176,11 @@ def test_no_worker_thread_exists_unless_asked_for_and_close_joins_them(tmp_path)
     on = host(3)
     assert _pack_threads() == before + 3
     on._close()
+    # join() can return while a worker is still on its kernel exit path (R, before X): allow it to leave /proc.
+    # A worker close() never joined stays, so this still fails.
+    deadline = time.monotonic() + 1.0
+    while _pack_threads() != before and time.monotonic() < deadline:
+        time.sleep(0.001)
     assert _pack_threads() == before
     off._close()
 

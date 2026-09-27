@@ -9,9 +9,15 @@ namespace expert_stream {
 template <AsyncFileReader Inner>
 class FaultyReader {
  public:
-  void set_submit_fault(const SubmitFault& fault) { fault_ = fault; }
-  bool init(unsigned depth) { return inner_.init(depth); }
-  bool ready() const { return inner_.ready(); }
+  void set_submit_fault(const SubmitFault& fault) {
+    fault_ = fault;
+  }
+  bool init(unsigned depth) {
+    return inner_.init(depth);
+  }
+  bool ready() const {
+    return inner_.ready();
+  }
   bool prep_read(int fd, void* buf, unsigned len, uint64_t off, uint64_t tag) {
     return inner_.prep_read(fd, buf, len, off, tag);
   }
@@ -29,8 +35,12 @@ class FaultyReader {
     if (fault_.short_call != 0 && submits_ == fault_.short_call) return 0;
     return inner_.submit(wait_nr);
   }
-  unsigned reap(std::vector<ReadCompletion>& out) { return inner_.reap(out); }
-  void drain(unsigned pending) { inner_.drain(pending); }
+  unsigned reap(std::vector<ReadCompletion>& out) {
+    return inner_.reap(out);
+  }
+  void drain(unsigned pending) {
+    inner_.drain(pending);
+  }
 
  private:
   Inner inner_;
