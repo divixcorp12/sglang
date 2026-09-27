@@ -639,6 +639,21 @@ def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
     assert host.piece_runs().abs().sum() > 0, "the real tables cut every row"
 
 
+def test_ensure_started_refuses_a_host_module_whose_layout_disagrees_with_exl3_streamed_names(tiers, monkeypatch):
+    """Review Focus 4 (final-review.md Minor 8) was tested only statically: nothing exercised the refusal at
+    exl3_ram_miss.py:770-774 with a reordered host layout. A host module built against a different name order
+    than the Python EXL3_STREAMED_NAMES would stream bytes into the wrong tensor; ensure_started must refuse it
+    rather than start."""
+    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+
+    service, streamers, caches = tiers
+    reordered = tuple(reversed(EXL3_STREAMED_NAMES))
+    assert reordered != EXL3_STREAMED_NAMES, "the fixture's names must actually differ once reversed"
+    monkeypatch.setattr(module, "host_layout", lambda: (reordered, 0))
+    with pytest.raises(RuntimeError, match="the host module's layout"):
+        service.ensure_started()
+
+
 def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch):
     """The device kernels read area D at the offsets of lease ABI 2 (StreamProbe appended); a block the host wrote
     under any other version is refused at attach, not read at the wrong offsets."""
