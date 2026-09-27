@@ -1043,6 +1043,9 @@ class DSV4Metadata:
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
 
+    # Layer-major prefill: only the final chunk's tail reads candidate masks, so earlier chunks skip building them.
+    layer_major_skip_candidates: bool = False
+
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
@@ -2447,6 +2450,14 @@ class DeepseekV4AttnBackend(
                 self.forward_metadata.core_attn_metadata.request_window_layout
             )
 
+    def install_forward_metadata(self, metadata, *, tail_metadata=None) -> None:
+        """Install metadata built earlier by init_forward_metadata, for a layer-major prefill's chunk."""
+        self.encoder_replay = False
+        self.forward_metadata = metadata
+        self.tail_forward_metadata = tail_metadata
+        if self.token_to_kv_pool.request_window is not None:
+            self.token_to_kv_pool.request_window.activate(metadata.core_attn_metadata.request_window_layout)
+
     def prepare_prefill_shared_read_snapshot(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> None:
@@ -3342,6 +3353,9 @@ class DeepseekV4AttnBackend(
     def _publish_or_consume_candidates(
         self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
     ) -> None:
+        if indexer.is_candidate_source and self.forward_metadata.layer_major_skip_candidates:
+            self.forward_metadata.candidate_metadata = CandidateMasks(request_masks=[])
+            return
         publish = [] if indexer.is_candidate_source else None
         consume = (
             None
