@@ -1,0 +1,8 @@
+serving variant: pinned 02aef45 + 0001-experiment-knobs.patch + MOE_SH_STAGES default 4
+02aef45cd681b960a00afcd0749a4ab99e6c1bfe
+aa7f78c620087948efb870a7c3db7c92405dee73ea5c6c134981c122382e4db1  -
+ exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh |  6 ++++++
+ exllamav3/exllamav3_ext/quant/exl3_moe.cu               | 14 ++++++++++++++
+ exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh       |  6 +++++-
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+15:#define MOE_SH_STAGES 4

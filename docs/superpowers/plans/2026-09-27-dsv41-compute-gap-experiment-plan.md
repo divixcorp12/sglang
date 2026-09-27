@@ -66,6 +66,36 @@ compute and numerical cost. Record it; do not start it here.
   clearly above measured arm-to-arm noise, byte-identical completions (greedy), comparable NVMe bytes,
   no compile contamination. Otherwise no-go, recorded.
 
+## Summary (2026-09-27)
+
+Terms used below:
+- Baseline SHA: `8d599afe9c`, which is laptop `master` `91173977c2` plus analysis files and the side stream's first-fork log line.
+- Recipe: `arm_env` 27.17, unchanged.
+- "Gap" means F-end → next Post-start, summed per step.
+- A/B arms run unprofiled in the order A B B A A B B A, 8 paired sessions.
+
+| Exp | Change | Numerics | Unprofiled latency | Transfers | Gap / earlier-transfer evidence | Decision |
+|---|---|---|---|---|---|---|
+| E4 / C1 | `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM=1` | completions byte-identical; GPU tests 4/4 | **−1.16 ms/token median, 8/8 sessions, p=0.0039** (107.40→106.20 pooled) | NVMe 300.4 vs 300.3 GB; rows read +0.4%; CE bytes the same in traces | gap 13.45→12.21 ms/step (−1.24); Post→first copy +4 µs/layer | **Keep**: promote to `arm_env.base_env()` (owner applies) |
+| E3b | exllamav3 `MOE_SH_STAGES` 3→4 (private build), on top of C1 | bitwise in microbench; completions byte-identical | −0.04 ms/token median, 5/8, p=0.36 (106.18→106.13) | comparable | microbench −6.0 µs/layer (−5.9%) | **No-go for now**: not measurable in serving; would need a pin change |
+| E1 / C2a | `wo_a_bf16_gemv` for the einsum | 0.27% of elements differ by 1 BF16 ulp | not run (−1.7 µs/call microbench) | — | both kernels at ~1.6 TB/s, the DRAM floor | **No-go** |
+| E2 / R1 | INT8 SQ GEMV stage depth 2/3/6 and no staging | all bitwise | not run (best 4.0% on wq_b+wo_b) | — | wq_b/wo_b stay at 1.2 TB/s | **No-go** below 10%; remaining headroom needs a numerics-changing decomposition |
+| E3 / C3a | MoE group width 8/16/24, N-tile 128 | not bitwise | not run (all slower) | — | width 28 / N=256 is already best | **No-go** |
+| E6 / C0b | none (diagnostic) | — | — | — | the 2.04 ms prefix hole is node-mode launch submission (r=0.9995) | **Closed**: not an optimisation budget |
+
+What is still unknown:
+- The size of the SH=4 serving effect below about 0.2 ms/token.
+- The exact type of graph node 15. It does not matter for the prefix-hole conclusion.
+- Long-context (30k+) behaviour of the side stream. Only the short decode corpus was run.
+
+Not run:
+- C2c cast fusions (historically about 0.1 ms each).
+- C3b static scheduling. E3 found no sign that control flow dominates, and the default width is already the fastest.
+- R3–R5.
+
+Every microbenchmark budget measured here is small next to C1. Kernels already at the DRAM floor, and INT8 GEMVs
+whose remaining headroom needs a numerical change, are the reason.
+
 ## Results log
 
 ### E0 — baseline suite (measured, green)
@@ -197,7 +227,8 @@ Setup:
 - A serving A/B (`ab/c1moe-sh4`) is queued: A = side stream on, B = side stream on + a private SH=4 exllamav3 tree
   and build dir passed through `SGLANG_EXL3_SRC`/`SGLANG_EXL3_BUILD_DIR`. Its provenance is recorded in
   `exl3-serve-sh4.provenance`. Production's extension and pin are untouched.
-- Integration is blocked on a decision, not on evidence. The constant lives in the pinned upstream exllamav3 (`turboderp-org/exllamav3`, no fork remote), so production would need either a fork commit with a pin bump, or sglang carrying the patch and applying it at build time.
+- Serving A/B result (`results/c1moe-sh4`, both arms with the side stream on): pooled 106.18 → 106.13 ms/token, median −0.04, B wins 5/8, p = 0.36. Completions are identical and transfers comparable. The microbench's ~0.24 ms/token is not visible at this resolution.
+- Integration, were it ever justified, is blocked on a decision. The constant lives in the pinned upstream exllamav3 (`turboderp-org/exllamav3`, no fork remote), so production would need either a fork commit with a pin bump, or sglang carrying the patch and applying it at build time.
 
 ### E6 / C0b — the 2.047 ms graph-prefix hole is node-mode launch overhead (measured, closed)
 
