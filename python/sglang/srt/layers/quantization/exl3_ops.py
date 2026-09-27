@@ -19,6 +19,8 @@ from sglang.srt.layers.quantization.exl3_ext import exl3_ext
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
+# Arbitrary; bounds the dense path's reconstructed weight to 48 MiB of fp16 at the Engram wkv's 6144 rows.
+DENSE_MATMUL_SLICE_N = 4096
 
 
 def assert_not_capturing(module_name: str) -> None:
@@ -97,8 +99,22 @@ def exl3_linear(
         if rows:
             ext.exl3_gemm(x2, t.trellis, y, t.suh, torch.empty_like(x2), t.svh, -1, False, t.mul1, 0)
     else:
-        y = torch.matmul(x2, exl3_dense_weight(t))
+        y = _exl3_dense_matmul(x2, t)
     return y.to(out_dtype).reshape(*lead, t.out_features)
+
+
+def _exl3_dense_matmul(x2: torch.Tensor, t: Exl3Tensors) -> torch.Tensor:
+    """x2 @ W one reconstructed column slice at a time, so the whole fp16 weight is never held."""
+    ext = exl3_ext()
+    y = torch.empty((x2.shape[0], t.out_features), dtype=torch.float16, device=x2.device)
+    piece = None
+    for start in range(0, t.out_features, DENSE_MATMUL_SLICE_N):
+        end = min(start + DENSE_MATMUL_SLICE_N, t.out_features)
+        if piece is None or piece.shape[1] != end - start:
+            piece = torch.empty((t.in_features, end - start), dtype=torch.float16, device=x2.device)
+        ext.reconstruct_had_slice(piece, t.trellis, t.suh, t.svh[start:], t.bits, False, t.mul1, start)
+        y[:, start:end] = torch.matmul(x2, piece)
+    return y
 
 
 class Exl3HalfInput:
