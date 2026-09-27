@@ -30,24 +30,6 @@ struct CopyJob {
   bool sm = false;
 };
 
-// ---- Native prefetch page (plan 2026-09-25-dsv41-native-prefetch) ----
-// A pinned 256-byte page beside the lease block. The device (the plan kernel) writes the request line, the service
-// the done line. The device posts one request and waits for its done word before it posts the next, so one request
-// line is enough; `gen` is the device's 56-bit prefetch counter, tagged kPfTagRequest.
-constexpr int64_t kPfReqGen = 0;      // u64 tagged(kPfTagRequest, gen), stored last with a release
-constexpr int64_t kPfReqRow = 8;      // i32 streamed row of the target layer
-constexpr int64_t kPfReqExpert = 12;  // i32 expert
-constexpr int64_t kPfReqDst = 16;     // i32 destination hot slot of the target layer
-constexpr int64_t kPfDoneGen = 128;   // u64 tagged(kPfTagCopied | kPfTagSkipped, gen), service-written
-constexpr int64_t kPfDoneReason = 136;  // u32, why a request was skipped (kPfSkip*), stored before kPfDoneGen
-constexpr int64_t kPrefetchPageBytes = 256;
-constexpr uint64_t kPfTagRequest = 1;
-constexpr uint64_t kPfTagCopied = 1;
-constexpr uint64_t kPfTagSkipped = 2;
-constexpr uint32_t kPfSkipUnarmed = 1;
-constexpr uint32_t kPfSkipNotReady = 2;
-constexpr uint32_t kPfSkipInvalid = 3;
-
 // One entry of a row's copy table: C1's (source slab, destination tensor, row bytes); lane rows index both.
 struct CopyEntry {
   uint64_t src = 0;

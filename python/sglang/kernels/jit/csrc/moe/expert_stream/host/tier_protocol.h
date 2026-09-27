@@ -1,123 +1,20 @@
 // Page and lease-block constants, and the stage trace ring (StageRing).
 #pragma once
 
+#include "../lease_layout.h"
 #include "row_reader.h"
 
 namespace sglang {
 namespace exl3_ram_miss {
 
-
-// ---- Request page (plan D10) ----
-constexpr int64_t kDemandHead = 0;
-constexpr int64_t kDemandDone = 4;
-constexpr int64_t kFatal = 8;
-constexpr int64_t kAdviseHead = 16;
-constexpr int64_t kAdviseDone = 20;
-constexpr int64_t kBusySeq = 24;
-constexpr int64_t kHeartbeat = 28;
-constexpr int64_t kRecordBytes = 128;
-constexpr int64_t kDemandRing = 64;
-constexpr uint32_t kDemandRecords = 16;
-constexpr int64_t kHotHeaderBytes = 8;
-constexpr int64_t kHotAlignment = 64;
-constexpr uint32_t kHotRecords = kDemandRecords;
-constexpr int64_t kAdviseRing = kDemandRing + kDemandRecords * kRecordBytes;
-constexpr uint32_t kAdviseRecords = 64;
-constexpr int kMaxIds = 8;
-constexpr int64_t kRecSeq = 0;
-constexpr int64_t kRecRow = 4;
-constexpr int64_t kRecNeedCount = 6;
-constexpr int64_t kRecProtectCount = 8;
-constexpr int64_t kRecStatus = 10;
-constexpr int64_t kRecAfter = 12;
-constexpr int64_t kRecNeed = 16;
-constexpr int64_t kRecProtect = 48;
-// uint32: nonzero when the device waits on this demand record (need non-empty or advise on).
-constexpr int64_t kRecArmed = 80;
-// uint32: the layer's planned lane count as the device knew it when it posted (plan.count, RAM hits and
-// misses together, not clamped to kMaxIds); an advisory carries the rows it asks for.
-constexpr int64_t kRecLanes = 84;
-constexpr uint16_t kServed = 1;
-constexpr uint16_t kFailed = 2;
-
-// ---- Lease block (LEASE_PROTOCOL.md section 4) ----
-// The layout is written here, in exl3_ram_miss.cuh and in ops/moe/exl3_lease_block.py; the layout test checks
-// that they agree, so these lines use only + - * over integers and known names. The service writes areas H and
-// S (header, row table, row results, slot generations); the device writes area D; Python writes nothing.
-constexpr int64_t kLeaseRing = 16;  // == kDemandRecords
-constexpr int64_t kLeaseLanes = 8;  // == kMaxIds
-constexpr int64_t kLeaseHeaderRing = 8;
-constexpr int64_t kLeaseHeaderLanes = 12;
-constexpr int64_t kLeaseHeaderShutdown = 20;
-constexpr int64_t kLeaseHeaderSlotGenOffset = 32;
-constexpr int64_t kLeaseHeaderDOffset = 36;
-constexpr int64_t kLeaseHeaderPieceOffset = 40;
-constexpr int64_t kLeaseHeaderCopyOffset = 44;
-constexpr int64_t kLeaseRowTable = 128;
-constexpr int64_t kLeaseRowResult = 4096;
-constexpr int64_t kLeaseRowResultBytes = 32;
-constexpr int64_t kLeaseRrReady = 0;
-constexpr int64_t kLeaseRrSlotGeneration = 8;
-constexpr int64_t kLeaseRrHostSlot = 12;
-constexpr int64_t kLeaseRrExpert = 16;
-constexpr int64_t kLeaseSlotGen = kLeaseRowResult + kLeaseRing * kLeaseLanes * kLeaseRowResultBytes;
-constexpr int64_t kLeaseLaneRequest = 0;
-constexpr int64_t kLeaseLaneRequestBytes = 128;
-constexpr int64_t kLeaseLrGen = 0;
-constexpr int64_t kLeaseLrCount = 8;
-constexpr int64_t kLeaseLrRow = 12;
-constexpr int64_t kLeaseLrExpert = 16;
-constexpr int64_t kLeaseLrDst = 48;
-constexpr int64_t kLeaseLrFlags = 80;
-constexpr uint32_t kLeaseLrFlagCopyEngine = 1;
-static_assert(kLeaseLrExpert + 4 * kLeaseLanes == kLeaseLrDst, "LaneRequest: dst_slot[] follows expert[]");
-static_assert(kLeaseLrDst + 4 * kLeaseLanes == kLeaseLrFlags, "LaneRequest: flags follow dst_slot[]");
-static_assert(kLeaseLrFlags + 4 <= kLeaseLaneRequestBytes, "LaneRequest: the payload fits one record");
-constexpr int64_t kLeaseLaneAck = kLeaseLaneRequest + kLeaseRing * kLeaseLaneRequestBytes;
-constexpr int64_t kLeaseLaneAckBytes = 8;
-constexpr int64_t kLeaseTerminal = kLeaseLaneAck + kLeaseRing * kLeaseLanes * kLeaseLaneAckBytes;
-constexpr int64_t kLeaseTerminalBytes = 16;
-constexpr int64_t kLeaseTermSkippedMask = 0;
-constexpr int64_t kLeaseTermReason = 4;
-constexpr int64_t kLeaseTermGen = 8;
-// StreamProbe[kLeaseRing], device-written: the stream kernel's tagged(1, generation) once it has copied a piece.
-constexpr int64_t kLeaseStreamProbe = kLeaseTerminal + kLeaseRing * kLeaseTerminalBytes;
-constexpr int64_t kLeaseStreamProbeBytes = 8;
-// SmAck[kLeaseRing], device-written: the copy wait finished its SM reads of that request's leased slots.
-constexpr int64_t kLeaseSmAck = kLeaseStreamProbe + kLeaseRing * kLeaseStreamProbeBytes;
-constexpr int64_t kLeaseSmAckBytes = 8;
-constexpr int64_t kLeaseRowTableBytes = 8;
-
-// Area P, service-written, at a new header offset (kLeaseHeaderPieceOffset): PieceMask[kLeaseRing][kLeaseLanes],
-// a per-lane generation-tagged 8-bit readiness bitmask (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment).
-// Each word gets its own 128 B line, so the device's per-lane poll never shares a line with a lane it did not
-// ask for. Under piece streaming the tier stores `gen << 8` into each miss lane's word at reservation, and the
-// reader's owner sets one bit per packed piece (publish_piece); with the flag off nothing writes it.
-constexpr int64_t kLeasePieceMaskLineBytes = 128;
-constexpr int64_t kLeasePieceMaskBytes = 8;  // one uint64 per word
-constexpr int64_t kLeaseAreaPieceMaskBytes = kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
-static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
-// Area C, service-written, at kLeaseHeaderCopyOffset: CopyDone[kLeaseRing], {u32 lane mask; u32 reserved; u64
-// tagged(kLeaseTagCopied, generation)}. Only the copy-engine thread writes it, after it observed the copies complete.
-constexpr int64_t kLeaseCopyDoneBytes = 16;
-constexpr int64_t kLeaseCdMask = 0;
-constexpr int64_t kLeaseCdGen = 8;
-constexpr int64_t kLeaseAreaCopyDoneBytes = kLeaseRing * kLeaseCopyDoneBytes;
-static_assert(kLeaseSmAck + kLeaseRing * kLeaseSmAckBytes <= 4096, "area D fits one page");
+using namespace ::sglang::expert_stream::wire;
 
 // kQuarantine (piece streaming only): a slot whose read failed while a lane still leased it under tag LOADING. Its
 // mapping is cleared on entry, it is never taken, evicted or counted as a victim, and it becomes kFree when its last
 // lease is retired (retire_leases). A leased slot is never released: that is the S6 rule under piece streaming.
 enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2, kQuarantine = 3 };
 
-// RowResult.ready tags (LEASE_PROTOCOL.md 4.3): READY for a lane whose row is resident, LOADING (piece streaming) for
-// a miss lane granted at reservation, whose pieces become readable bit by bit through its PieceMask word.
-constexpr uint64_t kLeaseTagReady = 1;
-constexpr uint64_t kLeaseTagLoading = 2;
-// A hit lane the copy-engine thread copies into its destination slot; the device neither copies nor acknowledges it.
-constexpr uint64_t kLeaseTagCopying = 3;
-constexpr uint64_t kLeaseTagCopied = 1;  // CopyDone
-constexpr uint64_t kLeaseTagSmAck = 1;   // SmAck
+static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
 
 enum Counter : int {
   kServedRequests = 0,

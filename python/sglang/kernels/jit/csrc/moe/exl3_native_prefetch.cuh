@@ -15,6 +15,8 @@
 //
 // The page layout mirrors exl3_ram_miss_host.cpp (kPf*) and ops/moe/exl3_ram_miss.py (PREFETCH_FIELDS).
 
+#include "expert_stream/lease_layout.h"
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -32,20 +34,12 @@ namespace sglang {
 
 namespace exl3_native_prefetch_device {
 
+using namespace ::sglang::expert_stream::wire;
+
 constexpr int kPlanBlock = 128;
 constexpr int kTopK = 6;
 constexpr int kMaxExperts = 512;
 constexpr int kMaxVictims = 16;
-constexpr int64_t kFatal = 8;                // request page: the fatal word
-constexpr int64_t kLeaseHeaderShutdown = 20;  // lease block header: the shutdown word
-constexpr int64_t kPfReqGen = 0;
-constexpr int64_t kPfReqRow = 8;
-constexpr int64_t kPfReqExpert = 12;
-constexpr int64_t kPfReqDst = 16;
-constexpr int64_t kPfDoneGen = 128;
-constexpr uint64_t kPfTagRequest = 1;
-constexpr uint64_t kPfTagCopied = 1;
-constexpr uint64_t kPfTagSkipped = 2;
 constexpr uint64_t kGenerationMask = (1ull << 56) - 1;
 
 // Device counters, int64, cumulative (NATIVE_PREFETCH_COUNTERS in exl3_native_prefetch.py).
