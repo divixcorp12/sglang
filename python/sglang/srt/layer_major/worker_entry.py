@@ -118,10 +118,7 @@ def run_layer_major_prefill(runtime: LayerMajorRuntime, model_runner, schedule_b
     if model_runner.eplb_manager is not None:
         model_runner.eplb_manager.on_forward_pass_end()
 
-    # extend_num_tokens is the request's extend length (the tokens this pass prefills), not
-    # layer_major_ring_tokens, which is the fixed ring size (chunk + page) shared by every admitted
-    # request. The chunk count below matches adapter.num_chunks: chunk_spans steps prefix_len..seq_len
-    # by chunked_prefill_size, giving ceil(extend_num_tokens / chunked_prefill_size) spans.
+    # extend_num_tokens is the request's extend length, not the fixed ring size (chunk + page).
     tokens = schedule_batch.extend_num_tokens
     num_chunks = -(-tokens // model_runner.server_args.chunked_prefill_size)
     logger.info("layer-major prefill: %d tokens in %d chunks", tokens, num_chunks)

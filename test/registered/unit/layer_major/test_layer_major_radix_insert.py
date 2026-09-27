@@ -1,11 +1,7 @@
 """Layer-major ring finalize vs the radix insert that follows it (Task 12 crash, layer-major-8k arm).
 
-cache_unfinished_req inserts a layer-major request up to the SWA branch point when its admission match set one,
-else up to page_floor(seq_len), and then rematches that key: the rematch must reach the insert's prefix, so the
-request has to keep live window KV up to max(window, page) before that end. A ring finalize that kept only the
-last window before seq_len left the key ending on a tombstone and failed
-``new_prefix_len=32512, len(new_indices)=16384`` in unified_radix_cache.cache_unfinished_req.
-"""
+See radix-debug-report.md: a finalize that kept only the last window before seq_len left the insert key
+ending on a tombstone (``new_prefix_len=32512, len(new_indices)=16384``)."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -22,7 +18,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -74,8 +70,8 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.ids = list(range(1000, 9000))
         self.rid = 0
 
-    def _layer_major_prefill(self, n: int) -> Req:
-        """Admission match, ring allocation, ring finalize and the post-prefill insert, as the scheduler runs them."""
+    def _run_pass(self, n: int) -> Req:
+        """Admission match, ring allocation and ring finalize, as the scheduler runs them mid-pass."""
         req = Req(rid=self.rid, origin_input_text="", origin_input_ids=array("q", self.ids[:n]),
                   sampling_params=SamplingParams(temperature=0, max_new_tokens=1))
         self.rid += 1
@@ -97,6 +93,11 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         handle = SimpleNamespace(schedule_batch=SimpleNamespace(reqs=[req], prefix_lens=[prefix]),
                                  spans=[SimpleNamespace(end=n)], extend_full_locs=full, ring=ring, finalized=False)
         self.adapter._finalize_ring(handle)
+        return req
+
+    def _layer_major_prefill(self, n: int) -> Req:
+        """A pass that finishes normally: finalize, then the post-prefill insert."""
+        req = self._run_pass(n)
         req.kv.kv_committed_len = n
         self.cache.cache_unfinished_req(req)
         return req
@@ -104,6 +105,18 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
     def _finish(self, req: Req) -> None:
         self.cache.cache_finished_req(req, owned_kv_len=len(req.origin_input_ids))
         self.rtp.free(req)
+
+    def _abort(self, req: Req, *, owned_kv_len: int) -> None:
+        # release_pass(failed=True): only _finalize_ring ran, so cache_protected_len is still the pre-pass prefix.
+        self.cache.cache_finished_req(req, is_insert=False, owned_kv_len=owned_kv_len)
+        self.rtp.free(req)
+
+    def _pool_sizes(self) -> tuple[int, int]:
+        return self.alloc.full_available_size(), self.alloc.swa_available_size()
+
+    def _assert_pool_restored_after_evict(self, before: tuple[int, int]) -> None:
+        self.cache.evict(EvictParams(num_tokens=KV, swa_num_tokens=KV))
+        self.assertEqual(self._pool_sizes(), before)
 
     def _seed(self, n: int, swa_live_from: int) -> None:
         """Cache ids[:n] with window KV live only from swa_live_from, as a request whose window slid there leaves it."""
@@ -122,30 +135,59 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         # The crash's shape at 1/16 scale: [0, 1792) tombstoned, [1792, 2048) live. A 2148-token prompt's match,
         # capped at 2148 - 128, reaches full KV 1792 but no live window, so admission sets branch point 1792.
         self._seed(2048, swa_live_from=1792)
+        before = self._pool_sizes()
         req = self._layer_major_prefill(2148)
         self.assertEqual(req.kv.cache_protected_len, 1792)
         self._assert_matches(1792)
         self._finish(req)
         self.cache.sanity_check()
+        self._assert_pool_restored_after_evict(before)
 
     def test_branch_point_older_than_the_ring_inserts_to_the_end(self):
         # Branch point 2048 lies more than a ring (5 pages) below seq_len 4000, so its window is gone from the
         # ring: finalize drops the branch and the insert runs to page_floor(seq_len).
         self._seed(2048, swa_live_from=2048)
+        before = self._pool_sizes()
         req = self._layer_major_prefill(4000)
         self.assertEqual(req.kv.cache_protected_len, 3840)
         self._assert_matches(3840)
         self._finish(req)
         self.cache.sanity_check()
+        self._assert_pool_restored_after_evict(before)
 
     def test_unaligned_tail_at_least_a_window_long(self):
         # seq_len % page >= window: the last window starts at page_floor(seq_len), where the insert ends, so a
         # finalize keeping only that window left the whole inserted leaf tombstoned and the tree matched nothing.
+        before = self._pool_sizes()
         req = self._layer_major_prefill(2048 + 200)
         self.assertEqual(req.kv.cache_protected_len, 2048)
         self._assert_matches(2048)
         self._finish(req)
         self.cache.sanity_check()
+        self._assert_pool_restored_after_evict(before)
+
+    def test_live_prefix_hit_clamps_the_no_branch_floor(self):
+        # A real (live, untombstoned) radix hit at 2048: the no-branch floor computed from seq_len alone would
+        # fall to 1536, below the prefix; max(prefix_len, floor) must clamp up to the prefix instead.
+        before = self._pool_sizes()
+        first = self._layer_major_prefill(2048)
+        self._finish(first)
+        req = self._layer_major_prefill(2148)
+        self.assertEqual(req.kv.cache_protected_len, 2048)
+        self._assert_matches(2048)
+        self._finish(req)
+        self.cache.sanity_check()
+        self._assert_pool_restored_after_evict(before)
+
+    def test_abort_after_finalize_restores_the_pool(self):
+        # release_pass(failed=True) runs _finalize_ring only; cache_finished_req(is_insert=False) then frees the
+        # request's KV without inserting it: both the SWA and full pools must return to their starting sizes.
+        self._seed(2048, swa_live_from=1792)
+        before = self._pool_sizes()
+        req = self._run_pass(2148)
+        self._abort(req, owned_kv_len=2148)
+        self.cache.sanity_check()
+        self._assert_pool_restored_after_evict(before)
 
 
 if __name__ == "__main__":

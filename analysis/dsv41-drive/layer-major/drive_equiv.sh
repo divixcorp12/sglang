@@ -33,6 +33,14 @@ phase() { echo "$(date '+%Y/%m/%d %H:%M:%S.%3N') $1" >> $OUT/phases.txt; }
 [ -d "$WT/python/sglang" ] || { say "no sglang tree under $WT"; exit 2; }
 [[ $MIN_TOKENS =~ ^[0-9]+$ ]] || { say "numeric min_tokens only: $MIN_TOKENS"; exit 2; }
 
+# T12-I4: the corpus is a snapshot, not the worktree head's DSV41_REFERENCE.md, so a rerun always tokenizes
+# the same prompts equiv.py:chunked.jsonl etc. were recorded against.
+CORPUS=/mnt/nvme1/layer-major/equiv-corpus/corpus.txt
+CORPUS_SHA256=798f47bbaaa9bff3aa97fdf37bb8e2f2ee9f88c4b7a44db0b6ef2f80cbf9b915
+[ -f "$CORPUS" ] || { say "corpus snapshot missing: $CORPUS"; exit 2; }
+ACTUAL_SHA256=$(sha256sum "$CORPUS" | cut -d' ' -f1)
+[ "$ACTUAL_SHA256" = "$CORPUS_SHA256" ] || { say "corpus hash mismatch: got $ACTUAL_SHA256, want $CORPUS_SHA256"; exit 2; }
+
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock
 say "waiting for rowimg-disk.lock"
 flock 8
@@ -108,9 +116,12 @@ fi
 say "healthy"
 phase healthy
 
+HEAD=$(git -C $WT rev-parse HEAD)
+DIRTY=$(git -C $WT status --porcelain --untracked-files=no | wc -l)
 phase run_start
 taskset -c 8-15 $PY $WT/analysis/dsv41-drive/layer-major/equiv.py run --port $PORT --model $MODEL \
-  --text $WT/DSV41_REFERENCE.md --out $ROOT/$ARM.jsonl >> $OUT/driver.log 2>&1
+  --text $CORPUS --out $ROOT/$ARM.jsonl --commit $HEAD --dirty $DIRTY --min-tokens $MIN_TOKENS \
+  >> $OUT/driver.log 2>&1
 RC=$?
 phase run_end
 say "equiv run rc=$RC"

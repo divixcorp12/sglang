@@ -269,7 +269,10 @@ class TestWindowRingCudaFreePath(unittest.TestCase):
         for p in kept_pages:
             self.assertNotIn(p, free_pages, f"page {p} still backs a kept position but was freed")
 
-        a.free(full)
+        # free_segment (not free()'s finalize_ring path) is what actually reaches _free_swa_pages_cuda: check (a).
+        with mock.patch.object(a, "_free_swa_pages_cuda", wraps=a._free_swa_pages_cuda) as m:
+            a.free_segment(full, start_pos=0)
+            m.assert_called()
         self.assertEqual(a.swa_available_size(), swa_before)
         self.assertEqual(a.full_available_size(), full_before)
         all_free = a.swa_attn_allocator.get_all_free_pages()
