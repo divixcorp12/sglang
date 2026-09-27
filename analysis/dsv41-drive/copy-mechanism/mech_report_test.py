@@ -55,7 +55,10 @@ def test_summarize_names_methods_knees_and_the_named_cells():
     assert s["methods"]["sm_cv16"]["knee_bytes"] == 8192
     assert s["methods"]["ce_each"]["knee_bytes"] is None  # a copy-engine call has no in-flight knob
     assert s["named"] == {"s_pattern": 12.3}
-    assert s["bdp_bytes"] == report.bdp_bytes(711.0, 13.6)
+    # Primary: the round trip (min), which is what bounds a copy with a fixed number of bytes in flight; the serial
+    # acquire understates it (divix01: 16 KiB / 11.59 GB/s = 1.41 us = the 1408 ns ping-pong minimum).
+    assert s["bdp_bytes"] == report.bdp_bytes(3500, 13.6)
+    assert s["bdp_acquire_bytes"] == report.bdp_bytes(711.0, 13.6)
     assert s["unsafe"] == [] and s["control_blind"] is False
 
 
@@ -73,3 +76,16 @@ def test_a_method_that_failed_its_fresh_check_is_unsafe_and_a_passing_control_is
 def test_summarize_needs_exactly_one_meta():
     with pytest.raises(ValueError):
         report.summarize([_cell("sm_cv16", 1, 1.0)])
+
+
+def test_bdp_falls_back_to_the_acquire_without_a_round_trip():
+    s = report.summarize([_meta(), _cell("sm_cv16", 8192, 12.0),
+                          {"kind": "latency", "serial_acquire_ns": 700.0, "device_acquire_ns": 100.0}])
+    assert s["bdp_bytes"] == s["bdp_acquire_bytes"] == report.bdp_bytes(700.0, 12.0)
+
+
+def test_curves_list_each_methods_points_by_bytes_in_flight():
+    s = report.summarize([_meta(), _cell("sm_cv16", 32768, 12.3), _cell("sm_cv16", 8192, 11.8),
+                          _cell("sm_cv16", 32768, 12.1), _cell("ce_each", 0, 13.6)])
+    # best GB/s at each in-flight size, ascending; copy-engine methods have no in-flight knob
+    assert s["curves"] == {"sm_cv16": [(8192, 11.8), (32768, 12.3)]}

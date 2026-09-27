@@ -55,6 +55,8 @@ def summarize(records: list[dict]) -> dict:
     measured = max((gbs for points in by_method.values() for _, gbs in points), default=0.0)
     latency = next((r["serial_acquire_ns"] for r in records if r.get("kind") == "latency"), None)
     rtt = next((r["rtt_ns_p50"] for r in records if r.get("kind") == "pingpong"), None)
+    rtt_min = next((r["rtt_ns_min"] for r in records if r.get("kind") == "pingpong"), None)
+    bdp_acquire = bdp_bytes(latency, measured) if latency else None
     fresh = {r["method"]: r["fresh"] for r in records if r.get("kind") == "fresh"}
     return {
         "host": meta["host"],
@@ -63,7 +65,12 @@ def summarize(records: list[dict]) -> dict:
         "above_ceiling": above_ceiling(cells, ceiling),
         "serial_acquire_ns": latency,
         "flag_rtt_ns": rtt,
-        "bdp_bytes": bdp_bytes(latency, measured) if latency else None,
+        # Primary: the minimum flag round trip. A copy with a fixed number of bytes in flight is bounded by
+        # in_flight / RTT, and the serial acquire understates that latency (divix01 Gen3: 16 KiB cells run at
+        # 11.5-11.8 GB/s whatever their grid or width, = 16 KiB / 1.41 us, the 1408 ns ping-pong minimum).
+        "bdp_bytes": bdp_bytes(rtt_min, measured) if rtt_min else bdp_acquire,
+        "bdp_acquire_bytes": bdp_acquire,
+        "flag_rtt_min_ns": rtt_min,
         "unsafe": sorted(m for m, ok in fresh.items() if m != CONTROL and not ok),
         "control_blind": bool(fresh.get(CONTROL, False)),
         "methods": {
@@ -75,6 +82,11 @@ def summarize(records: list[dict]) -> dict:
             for method, points in sorted(by_method.items())
         },
         "named": {r["name"]: r["gbs"] for r in cells if r.get("name")},
+        "curves": {
+            method: sorted({f: max(g for f2, g in points if f2 == f) for f, _ in points}.items())
+            for method, points in sorted(by_method.items())
+            if not method.startswith("ce")
+        },
     }
 
 
@@ -82,11 +94,21 @@ def main() -> int:
     records = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
     s = summarize(records)
     print(f"# {s['host']}: theoretical {s['theoretical_gbs']} GB/s, measured ceiling {s['measured_ceiling_gbs']} GB/s")
-    print(f"serial acquire {s['serial_acquire_ns']} ns, flag RTT p50 {s['flag_rtt_ns']} ns, BDP {s['bdp_bytes']} B\n")
+    print(f"serial acquire {s['serial_acquire_ns']} ns, flag RTT p50 {s['flag_rtt_ns']} ns, min {s['flag_rtt_min_ns']} ns")
+    print(f"BDP (ceiling x RTT min, primary) {s['bdp_bytes']} B; BDP (ceiling x serial acquire) {s['bdp_acquire_bytes']} B\n")
     print("| method | best GB/s | knee (bytes in flight) | share of measured |\n|---|---:|---:|---:|")
     for method, m in s["methods"].items():
         print(f"| {method} | {m['best_gbs']} | {m['knee_bytes']} | {m['share_of_measured']} |")
     print(f"\nnamed cells: {s['named']}")
+    sizes = sorted({f for points in s["curves"].values() for f, _ in points})
+    print("\nbest GB/s by bytes in flight (K = the method's knee)\n")
+    print("| method | " + " | ".join(f"{f // 1024} KiB" for f in sizes) + " |")
+    print("|---|" + "---:|" * len(sizes))
+    for method, points in s["curves"].items():
+        at = dict(points)
+        knee_at = s["methods"][method]["knee_bytes"]
+        row = [("" if f not in at else f"{at[f]}{' K' if f == knee_at else ''}") for f in sizes]
+        print(f"| {method} | " + " | ".join(row) + " |")
     bad = False
     if s["above_ceiling"]:
         print(f"ABOVE CEILING: {s['above_ceiling']}")
