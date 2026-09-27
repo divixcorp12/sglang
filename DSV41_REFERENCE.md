@@ -5112,8 +5112,8 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 | 4096 | 16100 | 0.925 | OOM | | | 877k | | 3 |
 | 2048 | 16100 | 0.925 | OOM | | | 934k | | 3 |
 
-- Headroom at the 4096 arm's peak was recorded as ~470 MiB, but that is nvidia-smi's 32,607 MiB total minus the peak.
-  CUDA can use only 32,150 MiB, so the real margin was ~40 MiB (§27.18).
+- Headroom at the 4096 arm's peak was recorded as ~470 MiB, but that is nvidia-smi's 32,607 MiB total minus the peak
+  (32,134 MiB, `c4096-16k-h16100-m090/vram.csv`). CUDA can use only 32,150 MiB, so the real margin was ~16 MiB (§27.18).
 - Decode after the long prompt read 109-121 ms/token across arms. These are 64 tokens right after a prefill that
   evicts decode's RAM set (§27.2), and the 512 -> 2048 change at the same hot size moved it as much as the hot-cache
   cut did, so this is not a measure of the cut. §27.7's slope suggests the 1 GiB cut costs ~2-3 ms/token of steady
@@ -5126,32 +5126,43 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 
 ### 27.18 128k prefill: the layer-20 candidate mask OOM (result, 2026-09-27)
 
-- **The failure (phase 0b Task 0, `divix01:/mnt/nvme1/prefill-chunk/phase0-128k/`):** chunk 15 of a 131,072-token
-  prompt, prefix 61,440, OOM'd in `flash_mla_sm120.py:251` needing 256 MiB with 519.5 MiB reserved and free but no
-  contiguous block that size.
+- **The failure (phase 0b Task 0, `divix01:/mnt/nvme1/prefill-chunk/phase0-128k/`):** OOM'd in `flash_mla_sm120.py:251`
+  needing 256 MiB with 519.5 MiB reserved and free but no contiguous block that size, after 57,344 prompt tokens
+  processed plus 256 cached (chunk 15 per the stage trace; `server.log` logs only 14 long-prompt chunk lines before
+  the OOM, so the log alone does not settle 14th vs 15th).
 - **The cause:** layer 20 is the unique layer that runs the full 4096-row chunk, scores with indexer ratio 1 (so
   `lc` equals the whole prefix), and is `candidate_source_layer_id`. It publishes a `[T, P]` bool candidate mask that
   stays alive through `flash_mla` and layers 21-39, though only its last 128 rows are ever read
   (`deepseek_v4_backend.py:1778-1784`). Mask size scales with the prefix: 62.5 MiB at 16k, 240 MiB at the 61k
-  failure, 512 MiB at 131k, and 1 GiB at 262k (build peak is 2x that). The process had ~40 MiB of real headroom from
-  chunk 1 (§27.17's correction above), so the mask's growth alone exceeded the margin, with allocator fragmentation
-  as the proximate trigger.
-- **The fix (Task 1, this branch):** publish only the tail rows' candidate mask when a late-layer tail is set,
-  instead of the full `[T, P]` mask. This is exact, not an approximation: `uses_candidates` is true only for layers
+  failure, 512 MiB at 131k, and 1 GiB at 262k (build peak is 2x that). This is the diagnosis's top-ranked hypothesis
+  (`oom-diagnosis.md` Q3.1): the failing run sat 9-44 MiB below the 32,150 MiB CUDA limit (`phase0-128k/vram.csv`:
+  32,106-32,141 MiB used) from chunk 1, and the mask's growth alone exceeds that margin, with allocator
+  fragmentation as the proximate trigger. The fixed 128k run passing (below) supports the hypothesis but does not
+  prove it: the confirming memory snapshot (Q4) was not run, and an unattributed ~258 MiB request (Q3.3) remains
+  unexplained.
+- **The fix (Task 1, this branch):** publish only the tail rows' candidate mask, instead of the full `[T, P]` mask.
+  Tail-only publishing applies when the config puts every candidate consumer in the late-layer tail
+  (`candidate_tail_only_of`) **and** a tail runs this forward (`candidate_publish_rows`); otherwise the full mask is
+  still published. Where it applies it is exact, not an approximation: `uses_candidates` is true only for layers
   above 20, and with bounded replay every one of them reads `mask[-t:]` — layer 20's own top-k never reads the mask
   it publishes. Row independence means the tail rows' bits are unchanged by not building the rest.
+- **Scope:** every GPU run below had `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0` (layer-major off). Task 1's other
+  change, `run_layer`'s tail install for the layer-major path, is exercised only by CPU unit tests here, not by any
+  GPU run.
 - **Step 2 equality (16k, greedy, `temperature=0`):** base (`290b39fa85`, pre-fix) and fix (`cee8138fc4`) each ran
   `long rc=0`, 0 OOM retries. Base: TTFT 118.3 s, decode 127.0 ms/token. Fix: TTFT 106.3 s, decode 130.4 ms/token.
   The 32-token greedy completions are byte-identical (`DIFF_EXIT=0`).
 - **Step 3, the 128k run with the fix:** `long rc=0`, 0 OOM retries, 0 "memory allocation failed with OOM" lines.
-  TTFT 931.5 s (8-token completion, decode 168.9 ms/token). Chunk times: first 27 s, median 26 s across the 32
-  full 4096-token chunks; the trailing partial chunk (3,840 tokens) took 3 s, consistent with its smaller size, not
-  a discontinuity. Peak VRAM 32,136 MiB (long prompt added 1,426 MiB over the 30,710 MiB pre-long peak). Minimum
-  NUMA node-1 free: 44,568 (MB).
-- **Gate:** `long rc=0`, 0 OOM retries, last (full-size) chunk within 1.5x the first → **Done. Resume layer-major
-  Task 12.**
-- Evidence: `divix01:/mnt/nvme1/prefill-chunk/oom0b-base-16k/`, `oom0b-fix-16k/`, `oom0b-fix-128k/`
-  (`driver.log`, `server.log`, `vram.csv`, `numa.log`, `long.json`); diagnosis at
+  TTFT 931.5 s (8-token completion, decode 168.9 ms/token). 256 cached warm-up tokens, then 31 full 4,096-token
+  chunks plus a 3,840-token remainder. Chunk intervals 25-44 s, median 26 s, last full-size interval 25 s (the final
+  two chunks log at the same second and cannot be timed individually). Peak VRAM 32,136 MiB, ~14 MiB below the
+  32,150 MiB CUDA limit — thin, matching §27.17's corrected margin. Minimum NUMA node-1 free: 44,568 (MB).
+- **Gate:** `long rc=0`, 0 OOM retries, last full-size chunk (25 s) within 1.5x the first (27 s) → **Done. Resume
+  layer-major Task 12.** 128k passes with only ~14 MiB of real headroom; 262k was not run (the fix shrinks its mask
+  from 1 GiB to ~32 MiB, but other T- and P-scaled items are untested there).
+- Tree tested: `cee8138fc4` (`f22e3607f8` after the rebase onto the expert-stream master).
+- Evidence: `divix01:/mnt/nvme1/prefill-chunk/oom0b-base-16k/`, `oom0b-fix-16k/`, `oom0b-fix-128k/`, `phase0-128k/`,
+  `c4096-16k-h16100-m090/` (`driver.log`, `server.log`, `vram.csv`, `numa.log`, `long.json`); diagnosis at
   `.superpowers/sdd/2026-09-27-dsv41-layer-major-prefill-phase1/oom-diagnosis.md`.
 
 **Traced 4096-token chunk** (`trace-c4096-12k`, today's recipe at context 262144; a 12,288-token prompt, node mode;
