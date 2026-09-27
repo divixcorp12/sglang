@@ -100,3 +100,37 @@ def test_a_missing_control_is_blind_and_a_swept_method_without_a_fresh_record_is
     s = report.summarize(records)
     assert s["control_blind"] is True  # no nc_control record: nothing shows the check can see staleness
     assert s["unsafe"] == ["tma"]  # swept, never fresh-checked; ce*, cw_real and sm_small have no fresh check
+
+
+def _line(touch, useful_gbs):
+    return {"kind": "cell", "method": f"sm_line{touch}", "in_flight": 262144, "gbs": useful_gbs, "name": None,
+            "touch": touch, "line_gbs": round(useful_gbs * 128 / touch, 3)}
+
+
+def test_partial_lines_that_cost_a_whole_line_support_the_128_byte_hypothesis():
+    records = [_meta(), _line(16, 1.54), _line(32, 3.08), _line(64, 6.15), _line(128, 12.3)]
+    s = report.summarize(records)
+    assert s["partial_lines"]["useful_gbs"] == {16: 1.54, 32: 3.08, 64: 6.15, 128: 12.3}
+    assert s["partial_lines"]["line_gbs"][32] == pytest.approx(12.32, abs=0.01)
+    assert s["partial_lines"]["verdict"] == "whole-line"  # useful GB/s scales with the fraction touched
+    assert s["unsafe"] == []  # diagnostic cells, no fresh check of their own
+
+
+def test_partial_lines_near_full_rate_at_32_bytes_mean_sector_requests():
+    s = report.summarize([_meta(), _line(32, 11.5), _line(128, 12.3)])
+    assert s["partial_lines"]["verdict"] == "sector"
+    s = report.summarize([_meta(), _line(32, 8.0), _line(128, 12.3)])
+    assert s["partial_lines"]["verdict"] == "mixed"
+    assert report.summarize([_meta(), _line(16, 1.5)])["partial_lines"]["verdict"] is None
+
+
+def test_a_nofence_control_is_informational_whichever_way_it_reads():
+    for fresh in (True, False):
+        s = report.summarize([
+            _meta(), _cell("tma", 32768, 12.3),
+            {"kind": "fresh", "method": "tma", "fresh": True},
+            {"kind": "fresh", "method": "tma_nofence", "fresh": fresh},
+            {"kind": "fresh", "method": "nc_control", "fresh": False},
+        ])
+        assert s["unsafe"] == [] and s["control_blind"] is False
+        assert s["informational"] == {"tma_nofence": fresh}

@@ -18,7 +18,28 @@ KNEE_FRACTION = 0.95
 CONTROL = "nc_control"  # the fresh check's negative control: it must come out stale
 # Cells with no fresh check of their own: copy-engine methods, and SM cells that run a fresh-checked kernel shape or
 # production code (cw_real) on other data. Every other method must have a passing fresh record.
-NO_FRESH_CHECK = ("ce", "cw_real", "sm_small")
+NO_FRESH_CHECK = ("ce", "cw_real", "sm_small", "sm_line")
+# Fresh checks run to learn what the check can see, not to certify a method: never unsafe, whichever way they read.
+INFORMATIONAL = ("tma_nofence",)
+# Partial-line probe: useful GB/s touching 32 B of every 128 B line, as a fraction of touching all 128 B. At or below
+# WHOLE_LINE the SM path fetches (and the host completes) whole 128 B lines; at or above SECTOR it requests 32 B sectors.
+WHOLE_LINE, SECTOR = 0.5, 0.9
+
+
+def partial_lines(cells: list[dict]) -> dict:
+    """Useful and line GB/s of the sm_line<touch> cells (best per touch), and which fetch granularity they show."""
+    useful: dict[int, float] = {}
+    line: dict[int, float] = {}
+    for cell in cells:
+        if cell["method"].startswith("sm_line"):
+            touch = cell["touch"]
+            if cell["gbs"] > useful.get(touch, -1.0):
+                useful[touch], line[touch] = cell["gbs"], cell["line_gbs"]
+    verdict = None
+    if 32 in useful and 128 in useful:
+        ratio = useful[32] / useful[128]
+        verdict = "whole-line" if ratio <= WHOLE_LINE else "sector" if ratio >= SECTOR else "mixed"
+    return {"useful_gbs": dict(sorted(useful.items())), "line_gbs": dict(sorted(line.items())), "verdict": verdict}
 
 
 def link_gbs(gen: int, width: int) -> float:
@@ -75,10 +96,12 @@ def summarize(records: list[dict]) -> dict:
         "bdp_acquire_bytes": bdp_acquire,
         "flag_rtt_min_ns": rtt_min,
         "unsafe": sorted(
-            {m for m, ok in fresh.items() if m != CONTROL and not ok}
+            {m for m, ok in fresh.items() if m != CONTROL and m not in INFORMATIONAL and not ok}
             | {m for m in by_method if not m.startswith(NO_FRESH_CHECK) and m not in fresh}
         ),
         "control_blind": fresh.get(CONTROL) is not False,  # a missing control proves nothing either
+        "informational": {m: ok for m, ok in fresh.items() if m in INFORMATIONAL},
+        "partial_lines": partial_lines(cells),
         "methods": {
             method: {
                 "best_gbs": max(gbs for _, gbs in points),
@@ -106,6 +129,15 @@ def main() -> int:
     for method, m in s["methods"].items():
         print(f"| {method} | {m['best_gbs']} | {m['knee_bytes']} | {m['share_of_measured']} |")
     print(f"\nnamed cells: {s['named']}")
+    if s["informational"]:
+        print(f"informational fresh checks (not certifying): {s['informational']}")
+    pl = s["partial_lines"]
+    if pl["useful_gbs"]:
+        print("\npartial-line probe (sm_line<bytes touched per 128 B line>)\n")
+        print("| bytes touched per line | useful GB/s | line GB/s (lines x 128 B) |\n|---:|---:|---:|")
+        for touch, gbs in pl["useful_gbs"].items():
+            print(f"| {touch} | {gbs} | {pl['line_gbs'][touch]} |")
+        print(f"\nverdict: {pl['verdict']} (useful at 32 B / useful at 128 B: <= {WHOLE_LINE} whole-line, >= {SECTOR} sector)")
     sizes = sorted({f for points in s["curves"].values() for f, _ in points})
     print("\nbest GB/s by bytes in flight (K = the method's knee)\n")
     print("| method | " + " | ".join(f"{f // 1024} KiB" for f in sizes) + " |")
