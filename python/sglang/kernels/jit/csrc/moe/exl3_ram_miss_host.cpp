@@ -708,6 +708,10 @@ void expert_stream_touch(int64_t handle, int64_t row, int64_t expert) {
 
 void expert_stream_assign(
     int64_t handle, int64_t row, int64_t expert, TensorView protect, int64_t fallback, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("protect", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), protect);
+  expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   auto* result = static_cast<int64_t*>(out.data_ptr());
   int64_t evicted = -1;
   result[0] = find(handle)->assign(row, expert, expert_stream::ids_of(protect), fallback != 0, &evicted);
@@ -717,6 +721,11 @@ void expert_stream_assign(
 // Prefill fills: `out` holds experts.size() + 1 int64, the claimed slots in order and then the evictions.
 int64_t expert_stream_fill_begin(
     int64_t handle, int64_t row, TensorView experts, TensorView protect, int64_t fallback, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+  expert_stream::verify_named("protect", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), protect);
+  expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   auto* result = static_cast<int64_t*>(out.data_ptr());
   const std::vector<int32_t> ids = expert_stream::ids_of(experts);
   return find(handle)->fill_begin(
@@ -747,6 +756,10 @@ void expert_stream_slot_info(int64_t handle, int64_t row, TensorView out) {
 }
 
 void expert_stream_lease_entry(int64_t handle, int64_t idx, TensorView out) {
+  using namespace host;
+  auto cpu = SymbolicDevice{};
+  expert_stream::verify_named(
+      "out", TensorMatcher({4 + 3 * expert_stream::kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
   if (idx < 0 || idx >= expert_stream::kDemandRecords) throw std::runtime_error("exl3 RAM miss: request slot out of range");
   find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
 }
