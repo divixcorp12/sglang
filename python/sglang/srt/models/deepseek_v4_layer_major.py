@@ -56,10 +56,17 @@ class DeepseekV4LayerMajorAdapter:
         self.runner = model_runner
         self.causal_lm = model_runner.model
         self.model = model_runner.model.model
-        self.backend = model_runner.attn_backend
         self.allocator = model_runner.token_to_kv_pool_allocator
         self.page = model_runner.page_size
         self.chunk = model_runner.server_args.chunked_prefill_size
+
+    @property
+    def backend(self):
+        # Not cached in __init__: TpModelWorker builds this adapter (via layer_major_runtime_for_worker)
+        # before Scheduler.init_all_attention_backends() runs, so model_runner.attn_backend does not
+        # exist yet at construction time (AttributeError). Read it lazily instead; ModelRunner sets it
+        # once, in init_attention_backends(), before any pass through this adapter can run.
+        return self.runner.attn_backend
 
     def field_specs(self) -> list[FieldSpec]:
         return [
