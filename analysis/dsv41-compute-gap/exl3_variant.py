@@ -38,6 +38,10 @@ VARIANTS: dict[str, list[str]] = {
     "moe_sh2": ["-DMOE_SH_STAGES=2"],
     "moe_sh4": ["-DMOE_SH_STAGES=4"],
     "moe_fs2": ["-DMOE_FRAG_STAGES=2"],
+    "moe_sh5": ["-DMOE_SH_STAGES=5"],
+    "moe_sh6": ["-DMOE_SH_STAGES=6"],
+    "moe_sh4_fs4": ["-DMOE_SH_STAGES=4", "-DMOE_FRAG_STAGES=4"],
+    "moe_sh4_fs2": ["-DMOE_SH_STAGES=4", "-DMOE_FRAG_STAGES=2"],
 }
 
 

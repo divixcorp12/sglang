@@ -44,6 +44,13 @@ for part in $PARTS; do
       r moe-$tag env EXL3_MOE_GROUP_WIDTH=$w EXL3_MOE_TILE_N=$t $PY $D/moe_bench.py --variant $v --out $OUT/moe-$tag.json --save $OUT/moe-$tag.pt
       r moe-cmp-$tag $PY $D/moe_bench.py --compare $OUT/moe-prod.pt $OUT/moe-$tag.pt
     done ;;
+  moe2)
+    [ -e $OUT/moe-prod.pt ] || r moe-prod $PY $D/moe_bench.py --variant prod --out $OUT/moe-prod.json --save $OUT/moe-prod.pt
+    for v in moe_sh4 moe_sh5 moe_sh6 moe_sh4_fs4 moe_sh4_fs2 prod moe_sh4; do
+      tag=$v; [ -e $OUT/moe-$tag.json ] && tag=$v-rep
+      r moe-$tag $PY $D/moe_bench.py --variant $v --out $OUT/moe-$tag.json --save $OUT/moe-$tag.pt
+      r moe-cmp-$tag $PY $D/moe_bench.py --compare $OUT/moe-prod.pt $OUT/moe-$tag.pt
+    done ;;
   esac
 done
 echo "$(date '+%F %T') MICRO DONE" >> $OUT/run.log
