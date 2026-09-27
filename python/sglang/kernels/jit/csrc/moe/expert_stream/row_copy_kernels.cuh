@@ -670,6 +670,10 @@ struct RowCopyKernel {
     auto on_host = SymbolicDevice{};
     on_host.set_options<kDLCPU, kDLCUDAHost>();
     auto P_ = SymbolicSize{"planned"};
+    // The copy table's row count is runtime data (a test may build one with far fewer entries than the layout's
+    // name count), not the layout's kNumNames<L>: bind it from `segments` itself and cross-check segment_map
+    // against that, not against a fixed constant.
+    auto S_ = SymbolicSize{"segments"};
     const int64_t lanes = std::min<int64_t>(host_rows_2.size(0), dst_slots.size(0));
 
     expert_stream::verify_named("page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
@@ -694,14 +698,12 @@ struct RowCopyKernel {
     expert_stream::verify_named(
         "stream_abort", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), stream_abort);
     expert_stream::verify_named(
-        "segments",
-        TensorMatcher({expert_stream::kNumNames<L>, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device),
-        segments);
+        "segments", TensorMatcher({S_, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device), segments);
     expert_stream::verify_named(
         "segment_map", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), segment_map);
     RuntimeCheck(
-        segment_map.size(0) == row_segments + expert_stream::kNumNames<L>,
-        "segment_map: size must equal row_segments + the layout's name count");
+        segment_map.size(0) == row_segments + S_.unwrap(),
+        "segment_map: size must equal row_segments + the copy table's entry count");
     expert_stream::verify_named(
         "piece_runs",
         TensorMatcher({-1, -1, device::expert_stream::kRowPieces, row_segments, 2})
