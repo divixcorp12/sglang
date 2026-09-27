@@ -45,6 +45,7 @@ class _Pass(msgspec.Struct):
     ring: torch.Tensor
     final_tail_metadata: Any
     copy_stream: Any
+    finalized: bool = False
 
 
 class DeepseekV4LayerMajorAdapter:
@@ -69,38 +70,50 @@ class DeepseekV4LayerMajorAdapter:
     # --- pass setup -------------------------------------------------------------------------------------------------
 
     def begin_pass(self, forward_batch, schedule_batch, store: StateStore) -> _Pass:
-        assert len(schedule_batch.reqs) == 1, "layer-major prefill runs one request"
+        if len(schedule_batch.reqs) != 1:
+            raise ValueError("layer-major prefill runs one request")
         req = schedule_batch.reqs[0]
         if req.multimodal_inputs is not None:
             raise ValueError("layer-major prefill does not support multimodal requests")
         if self.runner.server_args.enable_dp_attention:
             raise ValueError("layer-major prefill does not support DP attention")
+        if self.allocator.swa_req_ring:
+            # The per-request SWA ring (unified-KV) allocator gives the extend no window mapping at all
+            # (alloc_extend_swa_tail pages full KV only): ring_slots would read back zeros. DSV4.1 launches
+            # already refuse the unified KV layout (deepseek_v4_hook.validate_deepseek_v41_features), so this
+            # should be unreachable; kept as a hard guard rather than trusting that gate transitively.
+            raise ValueError("layer-major prefill does not support the per-request SWA ring allocator")
         slot = int(schedule_batch.req_pool_indices_cpu[0])
         prefix_len = int(schedule_batch.prefix_lens[0])
         seq_len = int(schedule_batch.seq_lens_cpu[0])
         full = self.runner.req_to_token_pool.req_to_token[slot, prefix_len:seq_len].to(torch.int64)
         ring_len = self.chunk + self.page
         ring = self.allocator.ring_slots(full[-ring_len:])
+        if ring.numel() != ring_len:
+            raise ValueError(f"window ring has {ring.numel()} slots, expected {ring_len}")
         spans = chunk_spans(prefix_len=prefix_len, seq_len=seq_len, chunk=self.chunk)
         # No candidate consumer may run inside the layer-major range: earlier chunks skip building candidate masks.
-        candidate_source_layer_id = getattr(
-            self.runner.model_config.hf_text_config, "candidate_source_layer_id", -1
-        )
-        assert candidate_source_layer_id < 0 or candidate_source_layer_id >= self.model.late_layer_start - 1
+        candidate_source_layer_id = self.runner.model_config.hf_text_config.candidate_source_layer_id
+        if not (candidate_source_layer_id < 0 or candidate_source_layer_id >= self.model.late_layer_start - 1):
+            raise ValueError(
+                f"candidate_source_layer_id={candidate_source_layer_id} has a consumer inside the "
+                f"layer-major range (< {self.model.late_layer_start - 1})"
+            )
         handle = _Pass(schedule_batch=schedule_batch, spans=spans, forward_batches=[], hash_ids=[],
                        extend_full_locs=full, ring=ring, final_tail_metadata=None,
                        copy_stream=torch.cuda.Stream())
         try:
+            # Map the whole suffix once, before the per-chunk loop: mapping per span left a begin_pass failure
+            # mid-loop with the kept window mapped two ways (ring slots for processed spans, allocation-time
+            # slots for the rest), so two kept positions could share one ring slot and double-free later.
+            # Chunk 0's own suffix positions are mapped like every other chunk; only its PREDECESSOR window
+            # (positions before prefix_len, already resident in the prefix's own slots) is never touched here.
+            positions = torch.arange(prefix_len, seq_len, device=full.device)
+            self.allocator.map_ring_positions(full, positions, ring)
             for span in spans:
                 fb = self._chunk_forward_batch(schedule_batch, req, slot, span, last=span is spans[-1])
-                positions = torch.arange(span.start, span.end, device=full.device)
-                if not (prefix_len > 0 and span is spans[0]):
-                    # A cached prefix's predecessor window lives in the prefix's own window slots, not the ring
-                    # (Review Focus #1): chunk 0 with a radix hit must not remap those positions onto the ring.
-                    self.allocator.map_ring_positions(
-                        full[span.start - prefix_len : span.end - prefix_len], positions, ring
-                    )
-                # Builds forward_metadata (and, bounded replay being on, tail metadata) from the mapping just set.
+                # Mapping before init_forward_metadata: the tail's swa_out_cache_loc is translated through the
+                # mapping when metadata is built.
                 self.backend.init_forward_metadata(fb)
                 meta = self.backend.forward_metadata
                 meta.layer_major_skip_candidates = span is not spans[-1]
@@ -135,7 +148,7 @@ class DeepseekV4LayerMajorAdapter:
         sub.seq_lens = torch.tensor([span.end], dtype=torch.int64, device=device)
         sub.seq_lens_cpu = torch.tensor([span.end], dtype=torch.int64)
         sub.seq_lens_sum = span.end
-        sub.orig_seq_lens = sub.seq_lens
+        sub.orig_seq_lens = torch.tensor([len(req.origin_input_ids)], dtype=torch.int32, device=device)
         sub.out_cache_loc = self.runner.req_to_token_pool.req_to_token[slot, span.start : span.end].long()
         sub.extend_logprob_start_lens = [span.end - span.start]
         if not last:
@@ -215,6 +228,9 @@ class DeepseekV4LayerMajorAdapter:
         return output
 
     def _finalize_ring(self, handle: _Pass) -> None:
+        if handle.finalized:
+            # finish_pass already released the ring; release_pass(failed=True) must not double-free it.
+            return
         seq_len = handle.spans[-1].end
         prefix_len = int(handle.schedule_batch.prefix_lens[0])
         keep_from = max(prefix_len, keep_window_start(seq_len=seq_len, window=DSV4_WINDOW, page=self.page))
@@ -222,6 +238,7 @@ class DeepseekV4LayerMajorAdapter:
                                      ring=handle.ring)
         req = handle.schedule_batch.reqs[0]
         req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, keep_from)
+        handle.finalized = True
 
     def release_pass(self, handle: _Pass, store: StateStore, *, failed: bool) -> None:
         store.clear_parked()
