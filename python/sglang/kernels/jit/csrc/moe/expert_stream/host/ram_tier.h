@@ -1,4 +1,4 @@
-// Tier/RamTier: slot state, admission and the tier registry (find).
+// Tier/RamTier: slot state and admission.
 #pragma once
 
 #include "copy_engine.h"
@@ -34,6 +34,7 @@ struct VictimCensus {
 // The pinned-slot bookkeeping of every streamed layer (plan D12) and the service of one
 // request at a time. pump_demand/pump_advice are called by one caller at a time: a test's
 // pump(), or the Task 12 thread. The Python-facing methods take the same mutex.
+template <class Source>
 class RamTier {
  public:
   RamTier(
@@ -1788,7 +1789,7 @@ class RamTier {
   int64_t deferred_observed_ns_ = 0;
   int64_t layers_;
   int64_t experts_;
-  RowReader reader_;
+  Source reader_;
   std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, sized by read(), reused every request
   // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics.
   static constexpr int kFillOk = 0;
@@ -1829,25 +1830,6 @@ class RamTier {
   StageRecord* cur_ = nullptr;
   int64_t last_done_ = 0;
 };
-
-inline std::mutex& registry_mutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
-// Shared ownership: every call holds its own reference, so a close() from another Python
-// thread (or a finalizer) frees the service only after the calls in flight return.
-inline std::unordered_map<int64_t, std::shared_ptr<RamTier>>& registry() {
-  static std::unordered_map<int64_t, std::shared_ptr<RamTier>> tiers;
-  return tiers;
-}
-
-inline std::shared_ptr<RamTier> find(int64_t handle) {
-  std::lock_guard<std::mutex> guard(registry_mutex());
-  const auto found = registry().find(handle);
-  if (found == registry().end()) throw std::runtime_error("exl3 RAM miss: unknown handle");
-  return found->second;
-}
 
 
 }  // namespace expert_stream

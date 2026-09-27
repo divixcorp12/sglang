@@ -1,6 +1,7 @@
 // RowReader: io_uring superset reads of whole expert rows into page-aligned bounce banks, then per-name splits into pinned slabs.
 #pragma once
 
+#include "file_reader.h"
 #include "piece_geometry.h"
 #include "pack_pool.h"
 
@@ -45,6 +46,7 @@ namespace expert_stream {
 // published whole pieces (never a torn one) and otherwise bytes of unpublished slots the caller releases.
 // Trace: with no packing, row_pack_start/end are the clocks of a row's first and last publish (piece streaming)
 // or both the clock it was finished (without), pack_workers is 0, and useful_bytes still counts its segments.
+template <AsyncFileReader Reader>
 class RowReader {
  public:
   RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
@@ -56,7 +58,6 @@ class RowReader {
 
   ~RowReader() {
     pool_.reset();  // joins the workers before the bounce they read from is freed
-    if (ring_ready_) io_uring_queue_exit(&ring_);
     for (int fd : fds_) ::close(fd);
     std::free(bounce_);
     // Undo the owner-pin scaffold's affinity change: the pin targets the calling thread, which a caller
@@ -102,7 +103,7 @@ class RowReader {
     }
     piece_stream_ = on;
     subs_ = on ? kSubReads : 1;
-    if (ring_ready_ && !size_extents()) throw std::runtime_error("exl3 RAM miss: too many descriptors for piece streaming");
+    if (io_.ready() && !size_extents()) throw std::runtime_error("exl3 RAM miss: too many descriptors for piece streaming");
     if (pool_) size_jobs();
   }
   bool piece_stream() const { return piece_stream_; }
@@ -145,6 +146,9 @@ class RowReader {
     stale_armed_ = false;
     stale_waiting_ = false;
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
+    if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
+      io_.set_submit_fault(SubmitFault{fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call});
+    }
   }
 
   // Completions reaped over the reader's life (tests: a zero-length extent must add none).
@@ -191,8 +195,7 @@ class RowReader {
       return false;
     }
     if (!size_extents()) return false;
-    if (io_uring_queue_init(queue_depth(), &ring_, 0) != 0) return false;
-    ring_ready_ = true;
+    if (!io_.init(queue_depth())) return false;
     cpu_set_t inherited;
     CPU_ZERO(&inherited);
     pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited);
@@ -253,7 +256,7 @@ class RowReader {
       size_t max_reading_rows = SIZE_MAX,
       const std::function<void()>& progress = nullptr,
       const PiecePublish* publish = nullptr) {
-    if (!ring_ready_) return 0;
+    if (!io_.ready()) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
     c = Call{};
@@ -406,10 +409,7 @@ class RowReader {
     int64_t pack_last = 0;
   };
 
-  struct Completion {
-    uint64_t data;
-    int res;
-  };
+  using Completion = ReadCompletion;
 
   // One read() call's state. Everything the pipeline mutates lives here or in the members below, all
   // sized at open(); read() allocates nothing.
@@ -771,13 +771,12 @@ class RowReader {
     Call& c = c_;
     int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
     while (c.queue_count > 0 && c.pending < c.capacity) {
-      io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-      if (sqe == nullptr) break;
       const uint32_t index = queue_[c.queue_head];
-      c.queue_head = (c.queue_head + 1) % queue_.size();
-      --c.queue_count;
       ExtentDesc& d = descs_[index];
       const int64_t remaining = d.read->length - d.done;
+      const uint64_t tag = (static_cast<uint64_t>(d.generation) << 32) | index;
+      const uint64_t offset = static_cast<uint64_t>(d.read->offset + d.done);
+      bool prepared_one;
       if (t_.images) {
         // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: the iovecs are rebuilt from
         // `done`, which a mid-file O_DIRECT short read leaves on a block boundary. The kernel is not holding this
@@ -785,13 +784,15 @@ class RowReader {
         iovec* iov = &iovecs_[static_cast<size_t>(index) * t_.segments.size()];
         const unsigned count =
             image_iovecs(static_cast<size_t>(d.slot), d.read->dest + d.done, d.read->dest + d.read->length, iov);
-        io_uring_prep_readv(sqe, fds_[d.read->file], iov, count, static_cast<uint64_t>(d.read->offset + d.done));
+        prepared_one = io_.prep_readv(fds_[d.read->file], iov, count, offset, tag);
       } else {
-        io_uring_prep_read(
-            sqe, fds_[d.read->file], bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
-            static_cast<unsigned>(remaining), static_cast<uint64_t>(d.read->offset + d.done));
+        prepared_one = io_.prep_read(
+            fds_[d.read->file], bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
+            static_cast<unsigned>(remaining), offset, tag);
       }
-      io_uring_sqe_set_data64(sqe, (static_cast<uint64_t>(d.generation) << 32) | index);
+      if (!prepared_one) break;
+      c.queue_head = (c.queue_head + 1) % queue_.size();
+      --c.queue_count;
       ++c.pending;
       if (sqe_log_) {
         sqe_log_->push_back(SqeRecord{
@@ -851,16 +852,9 @@ class RowReader {
       c.soft_errors = 0;
     }
     const int64_t returned = stamp(c.trace);
-    io_uring_cqe* cqe;
-    unsigned head;
-    unsigned seen = 0;
     completions_.clear();
     again_.clear();
-    io_uring_for_each_cqe(&ring_, head, cqe) {
-      ++seen;
-      completions_.push_back(Completion{io_uring_cqe_get_data64(cqe), cqe->res});
-    }
-    io_uring_cq_advance(&ring_, seen);
+    const unsigned seen = io_.reap(completions_);
     c.pending -= seen;
     if (fault_.reverse_cqes) std::reverse(completions_.begin(), completions_.end());
     if (fault_.hold_ordinal >= 0) {
@@ -1376,59 +1370,20 @@ class RowReader {
   }
 
   // Submit the prepared SQEs, waiting for `wait_nr` completions (0: do not block).
-  int submit(unsigned wait_nr) {
-    ++submits_;
-    if (fault_.submit_error != 0 && submits_ == fault_.submit_call) {
-      if (fault_.submit_first) io_uring_submit(&ring_);
-      return -fault_.submit_error;
-    }
-    // Fault: the kernel consumed none of the prepared SQEs and reported success. They stay prepared and
-    // are counted in `pending`, so the next submit must send them; nothing may wait on them meanwhile.
-    if (fault_.submit_short_call != 0 && submits_ == fault_.submit_short_call) return 0;
-    // A submit that consumes nothing while nothing is in flight would make the wait below block in
-    // GETEVENTS for a completion no in-kernel SQE can produce (the state submit_short_call imitates).
-    // Guarding it costs a second syscall on every batch of the decode path, and the service watchdog
-    // already aborts a read that stays in service, so this is left to the watchdog deliberately.
-    // If it ever does surface, the signature is busy_since_ non-zero with pending > 0 and an empty
-    // completion queue; the guard would be to pass wait_nr = 0 whenever io_uring_sq_ready() > 0.
-    return wait_nr != 0 ? io_uring_submit_and_wait(&ring_, wait_nr) : io_uring_submit(&ring_);
-  }
+  int submit(unsigned wait_nr) { return io_.submit(wait_nr); }
 
-  // After a failure, empty the ring before the bounce is reused or freed: reap every
-  // read the kernel holds, then drop SQEs that were prepared but never consumed by
-  // resetting the ring (the kernel has not seen them, so nothing can write the bounce).
-  // `pending` counts both; io_uring_sq_ready counts the unconsumed ones
-  // (uring_file_reader.cpp abandon_after_submit_failure_).
-  void drain(unsigned pending) {
-    const unsigned unsubmitted = std::min(pending, io_uring_sq_ready(&ring_));
-    unsigned in_kernel = pending - unsubmitted;
-    while (in_kernel > 0) {
-      io_uring_cqe* cqe = nullptr;
-      const int rc = io_uring_wait_cqe(&ring_, &cqe);
-      if (rc == -EINTR || rc == -EAGAIN) continue;
-      // A read could still land in the bounce later: no safe way to go on.
-      if (rc < 0) std::terminate();
-      io_uring_cqe_seen(&ring_, cqe);
-      --in_kernel;
-    }
-    if (unsubmitted > 0) {
-      io_uring_queue_exit(&ring_);
-      ring_ready_ = io_uring_queue_init(queue_depth(), &ring_, 0) == 0;
-      if (!ring_ready_) std::fprintf(stderr, "ERROR exl3 RAM miss: io_uring ring reset failed\n");
-    }
-  }
+  // After a failure, empty the ring before the bounce is reused or freed: settle every read prepared or
+  // in flight so nothing can still write the bounce once the caller reuses or frees it.
+  void drain(unsigned pending) { io_.drain(pending); }
 
   Tables t_;
   bool direct_;
   std::vector<int> fds_;
   uint8_t* bounce_ = nullptr;
-  io_uring ring_{};
-  bool ring_ready_ = false;
   std::vector<int64_t> devs_;       // st_dev of each distinct filesystem, in first-opened order
   std::vector<uint8_t> file_drive_;  // per file: its drive slot in a StageRecord
   int64_t drive_dev_[kMaxDrives] = {};
   ReadFault fault_{};
-  int64_t submits_ = 0;
   int64_t cqes_ = 0;
   bool part_fired_ = false;
   // Pipeline state (see the class comment).
@@ -1448,6 +1403,7 @@ class RowReader {
   bool owner_pinned_ = false;
   cpu_set_t unpinned_affinity_{};
   std::unique_ptr<PackPool> pool_;
+  Reader io_;  // declared after pool_: the ring is torn down after the packing workers are joined
   // Indexed by bounce slot with the flag off, by (slot, piece) with piece streaming (size_jobs).
   PackJob jobs_[kBounceSlots * kPieces];
   std::vector<CopyRun> runs_;

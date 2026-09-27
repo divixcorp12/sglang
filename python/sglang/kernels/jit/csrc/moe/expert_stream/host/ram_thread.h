@@ -1,4 +1,4 @@
-// RamThread: the per-tier service thread and its registry (find_thread).
+// RamThread: the per-tier service thread.
 #pragma once
 
 #include "ram_tier.h"
@@ -18,9 +18,10 @@ namespace expert_stream {
 // join in stop(), so a stop during a hung read, demand or advisory, still ends in its abort.
 // pause()/resume() are not reentrant: their one owner is the slot table's depth counter
 // (Task 14), which calls pause at depth 0->1 and resume at 1->0.
+template <class Tier>
 class RamThread {
  public:
-  RamThread(std::shared_ptr<RamTier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns)
+  RamThread(std::shared_ptr<Tier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns)
       : tier_(std::move(tier)),
         page_(tier_->page()),
         cpu_core_(cpu_core),
@@ -179,7 +180,7 @@ class RamThread {
     }
   }
 
-  std::shared_ptr<RamTier> tier_;
+  std::shared_ptr<Tier> tier_;
   uint8_t* page_;
   int cpu_core_;
   int64_t fatal_wait_ns_;
@@ -193,19 +194,6 @@ class RamThread {
   std::atomic<bool> paused_{false};
   std::atomic<int> pin_error_{kPinPending};  // 0 pinned (or not asked), else the errno
 };
-
-// Guarded by registry_mutex(), like the tiers; shared for the same reason as the tiers.
-inline std::unordered_map<int64_t, std::shared_ptr<RamThread>>& thread_registry() {
-  static std::unordered_map<int64_t, std::shared_ptr<RamThread>> threads;
-  return threads;
-}
-
-inline std::shared_ptr<RamThread> find_thread(int64_t handle) {
-  std::lock_guard<std::mutex> guard(registry_mutex());
-  const auto found = thread_registry().find(handle);
-  if (found == thread_registry().end()) throw std::runtime_error("exl3 RAM miss: no service thread");
-  return found->second;
-}
 
 
 }  // namespace expert_stream
