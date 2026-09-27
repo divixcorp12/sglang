@@ -1373,7 +1373,9 @@ Keep `wt-doorbell-removal` until the branch is merged; it is where review re-run
   layer-fusion split. After both branches merge:
   - reword the `check_miss_plans` bullet to "a backend that posts its own plan buffers";
   - change the message to "each graph gather's own miss plan" without the variable;
-  - change `test_expert_residency_gpu.py:1275`'s regex from `DOORBELL_PLAN_CAPACITY` to `own miss plan`.
+  - change `test_expert_residency_gpu.py:1255`'s regex from `DOORBELL_PLAN_CAPACITY` to `own miss plan`;
+  - reword that same test's comment at `test_expert_residency_gpu.py:1248-1249` ("the doorbell backend posts one,
+    and then its thread owns those slots on another stream") to match, alongside the regex.
 - **The divix01 DSV4.1 production launch script** still exports `SGLANG_MOE_EXPERT_DOORBELL=0`. It will warn once
   production runs this code. Remove the line at the next planned restart; this plan does not touch production.
 - **The cores 64-71 reservation** keeps "71 is production's doorbell spin core" as its rationale in code messages

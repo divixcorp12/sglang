@@ -442,6 +442,7 @@ Expert streaming and the RAM-miss path
 - SGLANG_MOE_EXPERT_GRAPH_GATHER=1
 - SGLANG_MOE_EXPERT_FUSED_PLAN=1
 - SGLANG_MOE_EXPERT_DOORBELL=0 (removed on 2026-09-27, 8ac64c9c99: ignored, warns at startup; drop it from the launch script at the next restart)
+  - An operator whose shell still exports any `SGLANG_MOE_EXPERT_DOORBELL*` variable must unset it before running `benchmarks/dsv41_flash`: that harness's dry run refuses any `SGLANG_*` variable that is not in its recipe (`benchmarks/dsv41_flash/bench_arm.py:210-213`).
 - SGLANG_DSV41_ENABLE_RAM_MISS_{LEASES,TWO_PHASE,PIECE_STREAM,ROW_IMAGES,COPY_ENGINE}=1
 - SGLANG_DSV41_RAM_MISS_PACK_WORKERS=8
 - SGLANG_DSV41_RAM_MISS_HIT_WAIT_US=100
