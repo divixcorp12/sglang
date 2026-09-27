@@ -485,6 +485,32 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # copies a host-resident scalar and blocks until the stream drains.
             self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
+    def ring_slots(self, full_locs_tail: torch.Tensor) -> torch.Tensor:
+        """The window slots alloc_extend_swa_tail gave the last ring positions of an extend, in position order."""
+        return self.full_to_swa_index_mapping[full_locs_tail.to(torch.int64)].clone()
+
+    def map_ring_positions(
+        self, full_locs: torch.Tensor, positions: torch.Tensor, ring: torch.Tensor
+    ) -> None:
+        # Ring page (pos // page) mod pages: a chunk of whole pages plus its predecessor page never share a slot.
+        pages = ring.numel() // self.page_size
+        idx = (positions // self.page_size) % pages * self.page_size + positions % self.page_size
+        self.set_full_to_swa_mapping(full_locs, ring[idx.to(ring.device)])
+
+    def finalize_ring(
+        self,
+        extend_full_locs: torch.Tensor,
+        extend_start: int,
+        keep_from: int,
+        ring: torch.Tensor,
+    ) -> None:
+        """Keep the window from keep_from (an absolute position) to the end of the extend; drop the rest of the ring."""
+        split = keep_from - extend_start
+        self.clear_full_to_swa_mapping(extend_full_locs[:split])
+        kept = self.full_to_swa_index_mapping[extend_full_locs[split:].to(torch.int64)]
+        unused = ring[~torch.isin(ring, kept)]
+        self._release_swa(unused)
+
     def free_swa(self, free_index: torch.Tensor):
         """Release the SWA peers of an arbitrary slot set and clear their mapping.
         No-op for a per-request ring, which owns no paged SWA peers. Otherwise

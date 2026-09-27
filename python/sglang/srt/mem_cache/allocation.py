@@ -181,6 +181,7 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
+    swa_ring_tokens: Optional[int] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page
     # (one page per CLASS per request under sharding — the min-class
@@ -208,15 +209,27 @@ def alloc_paged_token_slots_extend(
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
+    if swa_ring_tokens is not None:
+        # Layer-major prefill: full KV for the whole extend, window KV for one ring only.
+        out = allocator.alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len=swa_ring_tokens,
+        )
+    else:
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
 
     if is_dsv4:
         bundle = out
@@ -410,6 +423,8 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
+            # TODO(layer-major Task 7): batch.layer_major_ring_tokens.
+            swa_ring_tokens=None,
         )
 
     # Write to req_to_token_pool
