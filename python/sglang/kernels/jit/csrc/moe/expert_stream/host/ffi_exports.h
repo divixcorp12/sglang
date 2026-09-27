@@ -108,7 +108,6 @@ struct HostExports {
       TensorView experts,
       TensorView slots,
       int64_t step) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -145,7 +144,6 @@ struct HostExports {
       TensorView fault,
       TensorView record,
       int64_t owner_core) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -196,7 +194,6 @@ struct HostExports {
       TensorView then_slots,
       TensorView fault,
       TensorView results) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -255,7 +252,6 @@ struct HostExports {
       TensorView record,
       TensorView sqes,
       TensorView info) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -300,7 +296,6 @@ struct HostExports {
 
   // Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
   static int64_t publish_piece(TensorView word, int64_t generation, int64_t bit) {
-    using namespace expert_stream;
     return expert_stream::publish_piece(
                static_cast<uint64_t*>(word.data_ptr()), static_cast<uint64_t>(generation), static_cast<uint8_t>(bit))
                ? 1
@@ -337,7 +332,6 @@ struct HostExports {
       TensorView reference,
       TensorView ref_slots,
       TensorView info) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -463,7 +457,6 @@ struct HostExports {
       int64_t expert,
       TensorView subs,
       TensorView pieces) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -511,7 +504,6 @@ struct HostExports {
       int64_t slot_bytes,
       int64_t row_images,
       TensorView runs) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     auto cpu = SymbolicDevice{};
@@ -550,7 +542,6 @@ struct HostExports {
   // (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
   // (two words per worker). Throws, like the pool, when no core is left.
   static void pack_pool_affinity(TensorView inherited, int64_t workers, TensorView out) {
-    using namespace expert_stream;
     const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -573,7 +564,6 @@ struct HostExports {
   // Test only: the cores a packing worker may use when the creating thread may use those set in `inherited`
   // (two int64 words, cores 0-127), as two words in `out`. Starts no thread.
   static void pack_worker_cpus(TensorView inherited, TensorView out) {
-    using namespace expert_stream;
     const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -606,7 +596,6 @@ struct HostExports {
       TensorView lease,
       int64_t pack_workers,
       TensorView hot_page) {
-    using namespace expert_stream;
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
     // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
@@ -928,7 +917,6 @@ struct HostExports {
       int64_t after,
       int64_t armed,
       int64_t lanes) {
-    using namespace expert_stream;
     auto* base = static_cast<uint8_t*>(page.data_ptr());
     const int64_t head_word = advisory ? kAdviseHead : kDemandHead;
     uint32_t seq = load_acquire(base + head_word) + 1u;
@@ -967,7 +955,6 @@ struct HostExports {
   // The wait kernel's decision rule: 1 served, 2 failed, 0 timed out (both raise fatal),
   // 3 fatal already raised (the sticky fast path).
   static int64_t sim_wait(TensorView page, int64_t seq, int64_t timeout_ns) {
-    using namespace expert_stream;
     auto* base = static_cast<uint8_t*>(page.data_ptr());
     const uint32_t want = static_cast<uint32_t>(seq);
     if (load_acquire(base + kFatal) != 0) return 3;
@@ -995,7 +982,6 @@ struct HostExports {
   // order (seq = 0, fence, payload, fence, a new seq) while this thread reads it with
   // read_record. out = {records accepted, accepted records whose payload is not their seq's}.
   static void seqlock_stress(int64_t duration_ns, TensorView out) {
-    using namespace expert_stream;
     alignas(64) uint8_t record[kRecordBytes] = {};
     std::atomic<bool> done{false};
     const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
@@ -1042,7 +1028,6 @@ struct HostExports {
   }
 
   static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
-    using namespace expert_stream;
     if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
     if (cpu_core >= 64 && cpu_core <= 71) {
       throw std::runtime_error(error_prefix<Layout>() + "cores 64-71 are reserved (71 is production's doorbell core)");
@@ -1075,7 +1060,6 @@ struct HostExports {
   }
 
   static void stop_thread(int64_t handle) {
-    using namespace expert_stream;
     std::shared_ptr<Thread> thread;
     {
       std::lock_guard<std::mutex> guard(registry_mutex());
@@ -1100,7 +1084,6 @@ struct HostExports {
   // tier, which writes through raw addresses of Python-owned tensors that the caller
   // releases after this returns.
   static void close(int64_t handle) {
-    using namespace expert_stream;
     std::shared_ptr<Thread> thread;
     std::shared_ptr<RamTier<Source>> tier;
     {
