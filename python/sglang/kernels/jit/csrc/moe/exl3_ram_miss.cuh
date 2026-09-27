@@ -25,17 +25,6 @@
 // Copy engine (LEASE_PROTOCOL.md 7.6): the service may publish a hit lane as COPYING and copy it with the DMA engine
 // itself; copy_wait then waits for the service's CopyDone word instead of any kernel copying or acknowledging it.
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
-
-#include <sgl_kernel/utils.cuh>
-
-#include <dlpack/dlpack.h>
-#include <tvm/ffi/container/tensor.h>
-
-#include <algorithm>
-#include <cstdint>
-
 #include "expert_stream/lease_kernels.cuh"
 #include "expert_stream/row_copy_kernels.cuh"
 

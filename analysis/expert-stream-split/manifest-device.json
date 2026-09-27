@@ -1,4 +1,4 @@
-{"base": "33ab172f96",
+{"base": "a35ea855e5",
  "sources": ["python/sglang/kernels/jit/csrc/moe/exl3_ram_miss.cuh"],
  "files": {
   "python/sglang/kernels/jit/csrc/moe/expert_stream/lease_device.cuh": [
