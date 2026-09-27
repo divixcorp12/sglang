@@ -818,6 +818,33 @@ class TestDelayedConsumption:
         assert gone == [3, 4], (gone, _resident(s))
 
 
+def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrapper_sends():
+    """The launchers check what they cast: a state tensor of int64 would have its words read as halves of int32.
+    The sentinels the wrapper sends for 'absent' (empty dst_slots, the no-hot-slots tensor, a zero lease address)
+    and the pinned host page must still pass."""
+    import sglang.kernels.ops.moe.exl3_ram_miss as ram_miss
+
+    page = ram_miss.new_page(pin=True)
+    slot_map = torch.full((1, 16), -1, dtype=torch.int32).pin_memory()
+    dev = ram_miss.Exl3RamMissDevice(page, slot_map, device="cuda", layers=1, timeout_ms=5, advise=False)
+    planned = torch.zeros(8, dtype=torch.int64, device="cuda")
+    count = torch.zeros(1, dtype=torch.int32, device="cuda")
+    routes = torch.zeros(8, dtype=torch.int64, device="cuda")
+    dev.post(0, planned, count, routes, next_row=-1)  # hot_slots, dst_slots absent; no lease block
+    torch.cuda.synchronize()
+    bad_state = torch.zeros(len(ram_miss.STATE_WORDS), dtype=torch.int64, device="cuda")
+    with pytest.raises(Exception, match="state"):
+        dev._kernels().exl3_ram_miss_post(
+            page, bad_state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
+            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
+        )
+    with pytest.raises(Exception, match="page"):
+        dev._kernels().exl3_ram_miss_post(
+            page.cuda(), dev.state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
+            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
+        )
+
+
 if __name__ == "__main__":
     import sys
 
