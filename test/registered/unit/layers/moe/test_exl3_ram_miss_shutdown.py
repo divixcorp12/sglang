@@ -301,12 +301,12 @@ def test_a_device_shared_by_the_service_and_the_tiers_is_synced_once(world, monk
 
 
 # ---- the scheduler's graceful shutdown reaches the service (LEASE_PROTOCOL.md 20.2i) ----
-# These run the REAL, unbound Scheduler.release_host_resources on a stub, as test_expert_doorbell_copier.py does for
-# the doorbell. The barrier is still the fake one above: they show the wiring and its order, not that a real device
-# barrier orders GPU work.
+# These run the REAL, unbound Scheduler.release_host_resources on a stub, as the removed doorbell tests did. The
+# barrier is still the fake one above: they show the wiring and its order, not that a real device barrier orders GPU
+# work.
 
 
-def _release_scheduler_host_resources(order, *, manager=True):
+def _release_scheduler_host_resources(order):
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
 
@@ -314,13 +314,13 @@ def _release_scheduler_host_resources(order, *, manager=True):
 
     def recorder(name):
         mock = MagicMock()
-        getattr(mock, "stop_doorbell" if name == "doorbell" else "release_host_resources" if name != "hisparse" else "destroy").side_effect = (
+        getattr(mock, "destroy" if name == "hisparse" else "release_host_resources").side_effect = (
             lambda: order.append(name)
         )
         return mock
 
+    # A bare namespace: release_host_resources calls nothing on the manager, and any call would raise.
     stub = SimpleNamespace(
-        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(expert_hot_cache_manager=recorder("doorbell") if manager else None)),
         hisparse_coordinator=recorder("hisparse"),
         tree_cache=recorder("tree_cache"),
         decode_offload_manager=recorder("decode_offload"),
@@ -335,11 +335,11 @@ def _release_scheduler_host_resources(order, *, manager=True):
         scheduler_module.Scheduler.release_host_resources(stub)
 
 
-CHEAP = ["doorbell", "hisparse", "tree_cache", "decode_offload", "experts_capturer", "indexer_capturer", "rank_consensus"]
+CHEAP = ["hisparse", "tree_cache", "decode_offload", "experts_capturer", "indexer_capturer", "rank_consensus"]
 
 
 def test_the_graceful_scheduler_shutdown_shuts_the_service_down_after_every_cheaper_release(monkeypatch):
-    """Mutations: the block is omitted; it runs before the doorbell stop, before hisparse, before the tree cache or
+    """Mutations: the block is omitted; it runs before hisparse, before the tree cache or
     before the last cheap release. The whole order is asserted, so the failing line is the `==` below."""
     order = []
     monkeypatch.setattr(module, "shutdown_exl3_ram_miss_service", lambda: order.append("ram_miss"))
@@ -364,15 +364,6 @@ def test_a_failing_service_shutdown_does_not_escape_the_scheduler_release(monkey
         escaped = error
     assert escaped is None, f"the release raised {escaped!r}"
     assert order == CHEAP + ["ram_miss"]
-
-
-def test_the_service_is_shut_down_even_when_the_scheduler_has_no_expert_hot_cache_manager(world, monkeypatch):
-    """Mutation: the block is nested under `if expert_hot_cache_manager is not None` (the natural place to paste it)."""
-    service, caches, order = world
-    _barrier(service, monkeypatch, order, lambda: None)
-    _release_scheduler_host_resources(order, manager=False)
-    assert "close_admission" in order and order[-2:] == ["free0", "free1"]
-    assert "doorbell" not in order
 
 
 def test_scheduler_shutdown_drives_a_live_service_through_the_barrier_last(world, monkeypatch):

@@ -37,7 +37,6 @@ WINDOW_C_ENV = {
     "SGLANG_MOE_HOT_LOG_INTERVAL": 64,
     "SGLANG_MOE_EXPERT_GRAPH_GATHER": False,
     "SGLANG_MOE_GPU_RESIDENCY_UPDATE": False,
-    "SGLANG_MOE_EXPERT_DOORBELL": False,
     "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": 0,
 }
 
@@ -104,6 +103,14 @@ def _gate(args, **env_changes):
 def test_the_exl3_method_selects_the_exl3_requirements(model_dir):
     args = _launch(model_dir)
     assert expert_stream_requirements_for(args, args).label == "EXL3"
+
+
+def test_the_removed_doorbell_variable_does_not_gate_an_exl3_launch(model_dir, monkeypatch):
+    # Assert the resolved format first: a gate that silently fell back to NVFP4 proves nothing (divix01-run-protocol).
+    monkeypatch.setenv("SGLANG_MOE_EXPERT_DOORBELL", "1")
+    args = _launch(model_dir)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    _gate(args)
 
 
 def test_window_c_launches_pass(model_dir):

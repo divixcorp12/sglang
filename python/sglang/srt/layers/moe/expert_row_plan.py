@@ -27,8 +27,7 @@ next-layer (L+1) prediction mode:
   reservation rule below and is not built.
 * **Tags**: one outstanding request per target-layer tag. ``post(tag, plan)``
   and ``resolve(tag, plan)`` are separate in-graph steps; resolve matches that
-  tag's own latest post, so it never reports another layer's delivery. The
-  copier's ring holds at least two outstanding requests.
+  tag's own latest post, so it never reports another layer's delivery.
 * **Delivery** (``ExpertRowDelivery``): ``resolve`` returns a device-side
   result; ``mask()`` is bool ``[C]`` of plan rows valid in their slots.
   Residual rows (planned or actually needed but not delivered) go through the
@@ -41,11 +40,9 @@ next-layer (L+1) prediction mode:
   L+1 writes only layer L+1's rows, never rows layer L reads.
 * **Backends**: ``in_graph`` (the existing ``copy_expert_row_segments_gpu``
   serves the plan at ``post``; resolve reports everything delivered) and
-  ``doorbell`` (the copier thread serves it; resolve reports the thread's
-  delivered flag, and timeouts or a disabled copier leave rows to the
-  residual). ``SGLANG_MOE_EXPERT_DOORBELL`` selects ``doorbell``;
-  ``SGLANG_MOE_EXPERT_DOORBELL_MODE`` is ``current`` (post(L) then resolve(L)
-  inside layer L); ``next_layer`` is reserved and not implemented.
+  ``pinned_tier`` (the same kernel, sourcing rows from a partial pinned host
+  tier; see ``PinnedTierRowBackend``). A doorbell side-thread backend was
+  removed unused on 2026-09-27.
 """
 
 from __future__ import annotations
@@ -62,10 +59,7 @@ from sglang.kernels.ops.moe.expert_cache_transfer import (
 from sglang.srt.layers.moe.expert_route_plan import GraphRoutePlan, plan_graph_routes
 
 BACKEND_IN_GRAPH = "in_graph"
-BACKEND_DOORBELL = "doorbell"
 BACKEND_PINNED_TIER = "pinned_tier"
-MODE_CURRENT = "current"
-MODE_NEXT_LAYER = "next_layer"
 
 
 @dataclass(frozen=True)
@@ -301,32 +295,6 @@ class InGraphRowBackend:
 
     def copy_residual(self, tag: int, delivery: ExpertRowDelivery) -> None:
         """Nothing is ever left undelivered."""
-
-
-class DoorbellRowBackend:
-    """Serves plans through an ``ExpertDoorbellCopier`` thread, one tag per target layer."""
-
-    name = BACKEND_DOORBELL
-
-    def __init__(self, copier, segments: Mapping[int, ExpertRowSegments]) -> None:
-        self.copier = copier
-        self.segments = dict(segments)
-
-    def post(self, tag: int, plan: ExpertRowPlan) -> None:
-        self.copier.post(plan.expert_ids, plan.slots, plan.count, tag=tag)
-
-    def resolve(self, tag: int, plan: ExpertRowPlan) -> ExpertRowDelivery:
-        return ExpertRowDelivery(plan, self.copier.resolve(tag))
-
-    def copy_residual(self, tag: int, delivery: ExpertRowDelivery) -> None:
-        """Copy in-graph the plan rows the thread did not deliver."""
-        plan = delivery.plan
-        copy_expert_row_segments_gpu(
-            self.segments[tag],
-            plan.expert_ids,
-            plan.slots,
-            self.copier.undelivered_count(tag, plan.count),
-        )
 
 
 class PinnedTierRowBackend:

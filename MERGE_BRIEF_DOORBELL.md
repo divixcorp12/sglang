@@ -1,5 +1,10 @@
 # Doorbell copier: what you would be deciding
 
+> **Removed on 2026-09-27** (`8ac64c9c99`, branch `doorbell-removal`): the doorbell side-thread copier, its
+> `SGLANG_MOE_EXPERT_DOORBELL*` variables and `--moe-offload-preset doorbell` no longer exist. A set variable only
+> warns at startup, and `Scheduler.release_host_resources` no longer calls a doorbell stop. The per-batch fail-stop
+> hook is now `ExpertHotCacheManager.run_fail_stop_checks`. The text below is kept as history.
+
 Written while the decision was open, and kept as written: it is the brief the merge was approved
 from. Recorded here for the record rather than edited into hindsight.
 

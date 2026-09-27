@@ -111,7 +111,6 @@ def recipe_env(*, paths: Paths, res: Resources) -> dict[str, str]:
         "SGLANG_MOE_HOT_ASYNC_PROMOTIONS": "0",
         "SGLANG_MOE_HOT_LOG_INTERVAL": "64",
         "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "0",
-        "SGLANG_MOE_EXPERT_DOORBELL": "0",
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
         GRAPH_GATHER_ENV: "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
