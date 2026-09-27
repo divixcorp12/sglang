@@ -7,9 +7,12 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
+#include "expert_stream/tensor_checks.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <type_traits>
+#include <utility>
 
 // Three single-launch replacements for the per-layer torch op chains of the DSV4.1 EXL3 graph decode
 // (SGLANG_DSV41_ENABLE_LAYER_FUSION). Each one reproduces its chain's results bit for bit: the chains are integer
@@ -212,6 +215,17 @@ __global__ void exl3_moe_route_tables_kernel(
   }
 }
 
+/// \brief `verify_named` for a tensor the kernel reads as `bool` (`kDLBool` has no dtype trait).
+inline void verify_bool_named(const char* name, host::TensorMatcher&& matcher, tvm::ffi::TensorView view) {
+  expert_stream::verify_named(name, std::move(matcher), view);
+  host::RuntimeCheck(view.dtype().code == kDLBool && view.dtype().bits == 8, name, ": must be a bool tensor");
+}
+
+/// \brief Checked launcher for `direct_gather_destinations_kernel`: one layer's DIRECT gather destinations.
+///
+/// Precondition, not checked: every `topk_ids` entry indexes `expert_to_slot`. Reading the ids would need a device
+/// sync, which a graph capture refuses, and the route planner indexes `expert_to_slot` with the same ids earlier in
+/// the forward (`expert_route_plan.cuh`); a bad id has already read out of bounds by the time this launch runs.
 template <typename IdT, typename RemapInT, typename RemapOutT>
 void direct_gather_destinations_gpu(
     tvm::ffi::TensorView topk_ids,
@@ -225,6 +239,37 @@ void direct_gather_destinations_gpu(
     tvm::ffi::TensorView destinations_out,
     tvm::ffi::TensorView live_out,
     tvm::ffi::TensorView remap_out) {
+  using namespace host;
+  static_assert(
+      (std::is_same_v<IdT, int32_t> || std::is_same_v<IdT, int64_t>) &&
+          (std::is_same_v<RemapInT, int32_t> || std::is_same_v<RemapInT, int64_t>) &&
+          (std::is_same_v<RemapOutT, int32_t> || std::is_same_v<RemapOutT, int64_t>),
+      "direct_gather_destinations: ids and remaps are int32 or int64");
+  auto K_ = SymbolicSize{"routes"};
+  auto W_ = SymbolicSize{"width"};
+  auto device = SymbolicDevice{};
+  expert_stream::verify_named("topk_ids", TensorMatcher({K_}).with_dtype<IdT>().with_device<kDLCUDA>(device), topk_ids);
+  expert_stream::verify_named(
+      "expert_to_slot", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), expert_to_slot);
+  expert_stream::verify_named(
+      "victims", TensorMatcher({W_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), victims);
+  verify_bool_named("victim_valid", TensorMatcher({W_}).with_device<kDLCUDA>(device), victim_valid);
+  expert_stream::verify_named(
+      "miss_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), miss_count);
+  expert_stream::verify_named(
+      "remap_in", TensorMatcher({K_}).with_dtype<RemapInT>().with_device<kDLCUDA>(device), remap_in);
+  expert_stream::verify_named(
+      "destination_slots_out",
+      TensorMatcher({W_}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+      destination_slots_out);
+  expert_stream::verify_named(
+      "destinations_out", TensorMatcher({W_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), destinations_out);
+  verify_bool_named("live_out", TensorMatcher({W_}).with_device<kDLCUDA>(device), live_out);
+  expert_stream::verify_named(
+      "remap_out", TensorMatcher({K_}).with_dtype<RemapOutT>().with_device<kDLCUDA>(device), remap_out);
+  RuntimeCheck(
+      0 < W_.unwrap() && W_.unwrap() <= kLayerFusionWarp && 0 < K_.unwrap() && K_.unwrap() <= kLayerFusionWarp,
+      "the shortlist and the routes must hold 1-32 entries");
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
   host::LaunchKernel(1, kLayerFusionWarp, stream)(
       direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
@@ -243,6 +288,11 @@ void direct_gather_destinations_gpu(
       static_cast<RemapOutT*>(remap_out.data_ptr()));
 }
 
+/// \brief Checked launcher for `direct_commit_gather_kernel`: one layer's DIRECT residency commit.
+///
+/// The width bound keeps the kernel's 32-entry lane arrays in range. Precondition, not checked (it would need a
+/// device sync): every `destinations` entry indexes `slot_to_expert`, and every live lane's `new_experts` entry
+/// indexes `mapping`; the gather kernel and the planner produce both.
 void direct_commit_gather_gpu(
     tvm::ffi::TensorView destinations,
     tvm::ffi::TensorView live,
@@ -261,6 +311,44 @@ void direct_commit_gather_gpu(
     tvm::ffi::TensorView miss_count,
     int64_t ready,
     int64_t free_state) {
+  using namespace host;
+  auto W_ = SymbolicSize{"width"};
+  auto E_ = SymbolicSize{"mapping_columns"};
+  auto S_ = SymbolicSize{"slot_columns"};
+  auto device = SymbolicDevice{};
+  expert_stream::verify_named(
+      "destinations", TensorMatcher({W_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), destinations);
+  verify_bool_named("live", TensorMatcher({W_}).with_device<kDLCUDA>(device), live);
+  expert_stream::verify_named(
+      "new_experts", TensorMatcher({W_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), new_experts);
+  expert_stream::verify_named(
+      "mapping", TensorMatcher({E_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), mapping);
+  expert_stream::verify_named(
+      "slot_to_expert", TensorMatcher({S_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), slot_to_expert);
+  expert_stream::verify_named(
+      "slot_state", TensorMatcher({S_}).with_dtype<uint8_t>().with_device<kDLCUDA>(device), slot_state);
+  expert_stream::verify_named(
+      "slot_generations", TensorMatcher({S_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), slot_generations);
+  expert_stream::verify_named(
+      "gather_insertions", TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), gather_insertions);
+  expert_stream::verify_named(
+      "gather_evictions", TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), gather_evictions);
+  expert_stream::verify_named(
+      "insertion_truncated",
+      TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCUDA>(device),
+      insertion_truncated);
+  RuntimeCheck(delivered.has_value() == keep.has_value(), "delivered and keep go together");
+  if (delivered.has_value()) {
+    expert_stream::verify_named(
+        "delivered", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), delivered.value());
+    expert_stream::verify_named(
+        "keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep.value());
+  }
+  expert_stream::verify_named(
+      "miss_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), miss_count);
+  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kLayerFusionWarp, "the commit must cover 1-32 lanes");
+  RuntimeCheck(num_experts == E_.unwrap() - 1, "num_experts must be mapping's size minus the dump column");
+  RuntimeCheck(slot_dump == S_.unwrap() - 1, "slot_dump must be slot_to_expert's last column");
   const auto stream = host::LaunchKernel::resolve_device(destinations.device());
   host::LaunchKernel(1, 1, stream)(
       direct_commit_gather_kernel,
@@ -284,6 +372,9 @@ void direct_commit_gather_gpu(
       static_cast<uint8_t>(free_state));
 }
 
+/// \brief Checked launcher for `exl3_moe_route_tables_kernel`: the fused MoE's route tables and input staging.
+///
+/// `x`, `x16_out` and `out_zero` are the one decode token's `[1, hidden]` rows; `det` is the `[3, slots + 1]` stack.
 template <typename RemapT, typename WeightT, typename XT>
 void exl3_moe_route_tables_gpu(
     tvm::ffi::TensorView remap,
@@ -297,6 +388,36 @@ void exl3_moe_route_tables_gpu(
     tvm::ffi::TensorView inv_order,
     tvm::ffi::TensorView weight_sorted,
     tvm::ffi::TensorView det) {
+  using namespace host;
+  static_assert(std::is_same_v<RemapT, int32_t> || std::is_same_v<RemapT, int64_t>, "remap is int32 or int64");
+  static_assert(
+      (std::is_same_v<WeightT, fp32_t> || std::is_same_v<WeightT, fp16_t> || std::is_same_v<WeightT, bf16_t>) &&
+          (std::is_same_v<XT, fp32_t> || std::is_same_v<XT, fp16_t> || std::is_same_v<XT, bf16_t>),
+      "weights and x are fp32, fp16 or bf16");
+  constexpr int64_t kMaxRoutes = 32;
+  auto K_ = SymbolicSize{"routes"};
+  auto H_ = SymbolicSize{"hidden"};
+  auto C_ = SymbolicSize{"columns"};
+  auto device = SymbolicDevice{};
+  expert_stream::verify_named("remap", TensorMatcher({K_}).with_dtype<RemapT>().with_device<kDLCUDA>(device), remap);
+  expert_stream::verify_named(
+      "weights", TensorMatcher({K_}).with_dtype<WeightT>().with_device<kDLCUDA>(device), weights);
+  expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
+  expert_stream::verify_named("x", TensorMatcher({1, H_}).with_dtype<XT>().with_device<kDLCUDA>(device), x);
+  expert_stream::verify_named(
+      "remap64_out", TensorMatcher({K_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), remap64_out);
+  expert_stream::verify_named(
+      "x16_out", TensorMatcher({1, H_}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), x16_out);
+  expert_stream::verify_named(
+      "out_zero", TensorMatcher({1, H_}).with_dtype<float>().with_device<kDLCUDA>(device), out_zero);
+  expert_stream::verify_named(
+      "expert_count", TensorMatcher({C_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), expert_count);
+  expert_stream::verify_named(
+      "inv_order", TensorMatcher({K_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), inv_order);
+  expert_stream::verify_named(
+      "weight_sorted", TensorMatcher({K_}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), weight_sorted);
+  expert_stream::verify_named("det", TensorMatcher({3, C_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), det);
+  RuntimeCheck(0 < K_.unwrap() && K_.unwrap() <= kMaxRoutes, "remap must hold 1-32 routes");
   const auto stream = host::LaunchKernel::resolve_device(remap.device());
   const int64_t hidden = x.numel();
   const int64_t columns = expert_count.numel();
