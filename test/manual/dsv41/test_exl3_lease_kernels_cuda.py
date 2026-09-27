@@ -837,12 +837,12 @@ def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrappe
     torch.cuda.synchronize()
     bad_state = torch.zeros(len(ram_miss.STATE_WORDS), dtype=torch.int64, device="cuda")
     with pytest.raises(Exception, match="^state: "):
-        dev._kernels().exl3_ram_miss_post(
+        dev._kernels().expert_stream_post(
             page, bad_state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
             dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
         )
     with pytest.raises(Exception, match="^page: "):
-        dev._kernels().exl3_ram_miss_post(
+        dev._kernels().expert_stream_post(
             page.cuda(), dev.state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
             dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,
         )

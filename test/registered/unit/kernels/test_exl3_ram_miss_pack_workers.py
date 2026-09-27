@@ -188,9 +188,9 @@ def _cores(words):
 def test_a_worker_may_not_use_cores_64_to_71():
     module = ops._host_module()
     out = torch.zeros(2, dtype=torch.int64)
-    module.exl3_ram_miss_pack_worker_cpus(_words(range(0, 72)), out)
+    module.expert_stream_pack_worker_cpus(_words(range(0, 72)), out)
     assert _cores(out) == set(range(0, 64))
-    module.exl3_ram_miss_pack_worker_cpus(_words([3, 64, 71, 72, 100]), out)
+    module.expert_stream_pack_worker_cpus(_words([3, 64, 71, 72, 100]), out)
     assert _cores(out) == {3, 72, 100}
 
 
@@ -198,17 +198,17 @@ def test_the_pool_pins_each_worker_to_its_own_allowed_core_and_refuses_when_too_
     module = ops._host_module()
     mine = sorted(os.sched_getaffinity(0) - set(range(64, 72)))[:4]
     out = torch.zeros(4, dtype=torch.int64)
-    module.exl3_ram_miss_pack_pool_affinity(_words(mine), 2, out)
+    module.expert_stream_pack_pool_affinity(_words(mine), 2, out)
     pinned = [_cores(out[0:2]), _cores(out[2:4])]
     # One CPU each, distinct, allowed: two workers on one CPU would take turns at the same piece.
     assert [len(p) for p in pinned] == [1, 1] and len(pinned[0] | pinned[1]) == 2, pinned
     assert pinned[0] | pinned[1] <= set(mine)
     # Only reserved cores: refused before a thread starts.
     with pytest.raises(RuntimeError, match="no core is left"):
-        module.exl3_ram_miss_pack_pool_affinity(_words(range(64, 72)), 2, out)
+        module.expert_stream_pack_pool_affinity(_words(range(64, 72)), 2, out)
     # Fewer allowed cores than workers: refused rather than doubled up.
     with pytest.raises(RuntimeError, match="need a core each"):
-        module.exl3_ram_miss_pack_pool_affinity(_words(mine[:1]), 2, out)
+        module.expert_stream_pack_pool_affinity(_words(mine[:1]), 2, out)
 
 
 def _physical_core(cpu):
@@ -232,7 +232,7 @@ def test_workers_take_separate_physical_cores_before_hyperthread_siblings():
     if siblings is None or other is None:
         pytest.skip("needs a core with two allowed hyperthreads, and another core")
     out = torch.zeros(4, dtype=torch.int64)
-    ops._host_module().exl3_ram_miss_pack_pool_affinity(_words(siblings + [other]), 2, out)
+    ops._host_module().expert_stream_pack_pool_affinity(_words(siblings + [other]), 2, out)
     pinned = _cores(out[0:2]) | _cores(out[2:4])
     assert len({_physical_core(cpu) for cpu in pinned}) == 2, (siblings, other, pinned)
 

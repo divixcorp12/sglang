@@ -23,7 +23,7 @@ Files cited (all under `python/sglang/`):
 | `host.cpp` | `kernels/jit/csrc/moe/exl3_ram_miss_host.cpp` |
 | `device.cuh` | `kernels/jit/csrc/moe/exl3_ram_miss.cuh` |
 | `transfer.cuh` | `kernels/jit/csrc/moe/expert_cache_transfer.cuh` |
-| `ops.py` | `kernels/ops/moe/exl3_ram_miss.py` |
+| `ops.py` | `kernels/ops/moe/expert_stream_transport.py` |
 | `srt_ram_miss.py` | `srt/layers/moe/exl3_ram_miss.py` |
 | `row_plan.py` | `srt/layers/moe/expert_row_plan.py` |
 | `host_tier.py` | `srt/layers/moe/expert_host_tier.py` |
@@ -2168,7 +2168,7 @@ side is transcribed faithfully.
 ### Plan correction
 
 The plan's Task 5 file list is Native service/pipeline header, `exl3_ram_miss.cuh`,
-`ops/moe/exl3_ram_miss.py`, `srt/layers/moe/exl3_ram_miss.py` and the thread/GPU-graph tests.
+`ops/moe/expert_stream_transport.py`, `srt/layers/moe/exl3_ram_miss.py` and the thread/GPU-graph tests.
 The shutdown requirement cannot be met inside those files: `ExpertPinnedHostCache.__init__`
 in `srt/layers/moe/expert_stream.py` creates the `weakref.finalize(... release_host_slabs ...)`
 that unregisters the slabs at every process exit, and a quarantine that leaves it attached is
@@ -2244,7 +2244,7 @@ independent review) that lease mode defaults off.
 ### 20.2a Deviations from this order, recorded as they happen
 
 - **Step 1 deviated.** The order above put the block constants and allocator in `ops.py` and
-  `host.cpp`. They were built instead as a **new module** (`ops/moe/exl3_lease_block.py`), the
+  `host.cpp`. They were built instead as a **new module** (`ops/moe/expert_lease_block.py`), the
   constants in `exl3_ram_miss.cuh`, and new tests, because `host.cpp`, `ops.py` and
   `srt/layers/moe/exl3_ram_miss.py` were carrying another change's uncommitted diff (the Task 4
   packing-worker pool) and editing them in step 1 would have collided with it. The host-side

@@ -521,7 +521,7 @@ def test_a_stop_during_an_advisory_returns_promptly_and_leaves_the_tier_consiste
         _post_advisory(page, 1, [1, 2, 3])
         assert _until(lambda: host.counters()["advisories"] == 1)
         started = time.perf_counter()
-        host._module.exl3_ram_miss_stop_thread(host.handle)  # the thread only: the tier stays inspectable
+        host._module.expert_stream_stop_thread(host.handle)  # the thread only: the tier stays inspectable
         host.threaded = False
         assert time.perf_counter() - started < 2.0
         _assert_resident_rows_exact(s, host, 1)

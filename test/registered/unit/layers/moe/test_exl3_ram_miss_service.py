@@ -626,8 +626,8 @@ def test_a_row_the_reader_cannot_cut_into_pieces_refuses_the_piece_table(tiers):
             return getattr(real, name)
 
         @staticmethod
-        def exl3_ram_miss_piece_runs(*args):
-            real.exl3_ram_miss_piece_runs(*args)
+        def expert_stream_piece_runs(*args):
+            real.expert_stream_piece_runs(*args)
             return 1
 
     host._module = OneRowRefused()

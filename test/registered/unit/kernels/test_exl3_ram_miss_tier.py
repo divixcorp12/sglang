@@ -327,7 +327,7 @@ def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
     experts = torch.tensor([0], dtype=torch.int64, device="cuda")
     slots = torch.tensor([0], dtype=torch.int64)
     with pytest.raises(Exception, match="^experts: "):
-        module.exl3_ram_miss_read_rows(*args, 0, experts, slots, expert_stream_transport.BOUNCE_ROWS)
+        module.expert_stream_read_rows(*args, 0, experts, slots, expert_stream_transport.BOUNCE_ROWS)
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
