@@ -40,3 +40,16 @@ def test_the_three_device_headers_are_found():
 
 def test_cache_hinted_copies_and_the_timer_use_intrinsics_not_ptx():
     assert matches(r"ld\.global\.cv|st\.global\.cg|%globaltimer") == []
+
+
+def test_inline_ptx_lives_only_in_the_lease_device_helpers():
+    assert sorted({name for name, _, _ in matches(r"\basm\b")}) == ["lease_device.cuh"]
+
+
+def test_volatile_lives_only_in_the_relaxed_helpers():
+    # Every concurrent access goes through ld/st_relaxed_sys, ld_acquire_sys{,64}, st_release_sys{,64} or
+    # ld_relaxed_gpu; a raw volatile cast at a call site hides which ordering it relies on.
+    assert [(name, code) for name, _, code in matches(r"\bvolatile\b") if not code.startswith("asm")] == [
+        ("lease_device.cuh", "return *reinterpret_cast<const volatile T*>(word);"),
+        ("lease_device.cuh", "*reinterpret_cast<volatile T*>(word) = value;"),
+    ]
