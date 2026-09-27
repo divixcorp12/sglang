@@ -248,7 +248,8 @@ void direct_gather_destinations_gpu(
   auto K_ = SymbolicSize{"routes"};
   auto W_ = SymbolicSize{"width"};
   auto device = SymbolicDevice{};
-  expert_stream::verify_named("topk_ids", TensorMatcher({K_}).with_dtype<IdT>().with_device<kDLCUDA>(device), topk_ids);
+  expert_stream::verify_named(
+      "topk_ids", TensorMatcher({K_}).with_dtype<IdT>().template with_device<kDLCUDA>(device), topk_ids);
   expert_stream::verify_named(
       "expert_to_slot", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), expert_to_slot);
   expert_stream::verify_named(
@@ -257,7 +258,7 @@ void direct_gather_destinations_gpu(
   expert_stream::verify_named(
       "miss_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), miss_count);
   expert_stream::verify_named(
-      "remap_in", TensorMatcher({K_}).with_dtype<RemapInT>().with_device<kDLCUDA>(device), remap_in);
+      "remap_in", TensorMatcher({K_}).with_dtype<RemapInT>().template with_device<kDLCUDA>(device), remap_in);
   expert_stream::verify_named(
       "destination_slots_out",
       TensorMatcher({W_}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
@@ -266,7 +267,7 @@ void direct_gather_destinations_gpu(
       "destinations_out", TensorMatcher({W_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), destinations_out);
   verify_bool_named("live_out", TensorMatcher({W_}).with_device<kDLCUDA>(device), live_out);
   expert_stream::verify_named(
-      "remap_out", TensorMatcher({K_}).with_dtype<RemapOutT>().with_device<kDLCUDA>(device), remap_out);
+      "remap_out", TensorMatcher({K_}).with_dtype<RemapOutT>().template with_device<kDLCUDA>(device), remap_out);
   RuntimeCheck(
       0 < W_.unwrap() && W_.unwrap() <= kLayerFusionWarp && 0 < K_.unwrap() && K_.unwrap() <= kLayerFusionWarp,
       "the shortlist and the routes must hold 1-32 entries");
@@ -399,11 +400,12 @@ void exl3_moe_route_tables_gpu(
   auto H_ = SymbolicSize{"hidden"};
   auto C_ = SymbolicSize{"columns"};
   auto device = SymbolicDevice{};
-  expert_stream::verify_named("remap", TensorMatcher({K_}).with_dtype<RemapT>().with_device<kDLCUDA>(device), remap);
   expert_stream::verify_named(
-      "weights", TensorMatcher({K_}).with_dtype<WeightT>().with_device<kDLCUDA>(device), weights);
+      "remap", TensorMatcher({K_}).with_dtype<RemapT>().template with_device<kDLCUDA>(device), remap);
+  expert_stream::verify_named(
+      "weights", TensorMatcher({K_}).with_dtype<WeightT>().template with_device<kDLCUDA>(device), weights);
   expert_stream::verify_named("keep", TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device), keep);
-  expert_stream::verify_named("x", TensorMatcher({1, H_}).with_dtype<XT>().with_device<kDLCUDA>(device), x);
+  expert_stream::verify_named("x", TensorMatcher({1, H_}).with_dtype<XT>().template with_device<kDLCUDA>(device), x);
   expert_stream::verify_named(
       "remap64_out", TensorMatcher({K_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), remap64_out);
   expert_stream::verify_named(
