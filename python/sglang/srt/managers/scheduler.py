@@ -109,6 +109,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layer_major.gate import gate_from_env, launch_refusal
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -287,6 +288,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -1446,6 +1448,44 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+        self.init_layer_major_gate()
+
+    def init_layer_major_gate(self) -> None:
+        """Build the layer-major admission gate once, and refuse a launch that
+        set the env threshold but cannot actually run layer-major prefill."""
+        self.layer_major_ring_tokens = (self.chunked_prefill_size or 0) + self.page_size
+        self.layer_major_gate = gate_from_env(max_tokens=self.model_config.context_len)
+        if self.layer_major_gate is None:
+            return
+
+        reason = launch_refusal(
+            max_running_requests=self.max_running_requests,
+            speculative_algorithm=(
+                None if self.spec_algorithm.is_none() else str(self.spec_algorithm)
+            ),
+            enable_dp_attention=self.enable_dp_attention,
+            attn_cp_size=get_parallel().attn_cp_size,
+            enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+        )
+        # The request-window SWA ring (unified-KV DeepSeekV4TokenToKVPool mode)
+        # hands every window slot to its owning request up front, so the
+        # layer-major extend has no shared window slots left to claim.
+        if reason is None and is_swa_req_ring(self.token_to_kv_pool_allocator):
+            reason = (
+                "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS cannot be combined with "
+                "the per-request SWA ring allocator (unified-KV mode); it leaves "
+                "no shared window slots for the layer-major ring"
+            )
+        if reason is None:
+            model_cls = type(self.tp_worker.model_runner.model)
+            if getattr(model_cls, "make_layer_major_adapter", None) is None:
+                reason = (
+                    f"{model_cls.__name__} has no layer-major adapter; unset "
+                    "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS or use a supported model"
+                )
+        if reason is not None:
+            raise ValueError(reason)
 
     def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
@@ -3935,6 +3975,8 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            layer_major_gate=self.layer_major_gate,
+            layer_major_ring_tokens=self.layer_major_ring_tokens,
         )
 
         if self.chunked_req is not None:
@@ -4097,6 +4139,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            layer_major_ring_size=self.layer_major_ring_tokens,
         )
 
         new_batch.contains_last_prefill_chunk = (

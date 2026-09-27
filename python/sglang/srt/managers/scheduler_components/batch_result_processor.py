@@ -262,6 +262,11 @@ class SchedulerBatchResultProcessor:
         skip_stream_req = None
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # A retracted request that comes back is re-gated from scratch by
+        # _select_prefill_admission rather than replaying this pass's shape.
+        for req in batch.reqs:
+            req.layer_major = False
+
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
