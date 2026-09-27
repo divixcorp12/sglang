@@ -675,6 +675,17 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if (
+                envs.SGLANG_DEBUG_SWA_WINDOW_DUMP_DIR.get() is not None
+                and forward_batch.forward_mode.is_extend()
+            ):
+                from sglang.srt.debug_utils.swa_window_probe import dump_swa_window
+
+                dump_swa_window(
+                    model_runner=self.model_runner,
+                    forward_batch=forward_batch,
+                    out_dir=envs.SGLANG_DEBUG_SWA_WINDOW_DUMP_DIR.get(),
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
