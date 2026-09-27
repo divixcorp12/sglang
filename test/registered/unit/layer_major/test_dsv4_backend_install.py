@@ -83,8 +83,9 @@ class _FakeStore:
 
 
 class TestRunLayerTailMetadata(unittest.TestCase):
-    """run_layer must hand the backend a tail only on the pass's final chunk (fix round 1,
-    item 6): earlier chunks have no tail and rely on layer_major_skip_candidates instead."""
+    """run_layer must hand the backend a tail only on the pass's final chunk (fix
+    round 1, item 6): earlier chunks have no tail and rely on
+    layer_major_skip_candidates instead."""
 
     def _run(self):
         spans = [ChunkSpan(index=0, start=0, end=4), ChunkSpan(index=1, start=4, end=7)]
