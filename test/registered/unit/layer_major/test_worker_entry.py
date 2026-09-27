@@ -6,8 +6,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt import runtime_context as rc
 from sglang.srt.layer_major import worker_entry
 from sglang.srt.layer_major.heartbeat import pass_progress
+from sglang.srt.server_args import ServerArgs
 
 
 def _runner(**overrides):
@@ -43,16 +45,28 @@ class TestWorkerEntry(unittest.TestCase):
                 worker_entry.layer_major_runtime(runner)
 
     def test_runtime_refuses_when_topk_capture_enabled(self):
+        # Toggle the real launch flag the capturer factories consult
+        # (RoutedExpertsCapturer.create / create_indexer_capturer), not the helper: the capturers
+        # themselves (get_resources().experts_capturer/.indexer_capturer) are only installed later in
+        # startup (ModelRunner._init_post_memory_pool_components, after TpModelWorker.__init__ already
+        # ran), so reading them here would never catch a launch that enables the feature.
         class _Model:
             @staticmethod
             def make_layer_major_adapter(model, model_runner):
                 raise AssertionError("must not build the adapter once a refusal applies")
 
         runner = SimpleNamespace(model=_Model(), expert_prediction_runtime=None)
-        with mock.patch.object(worker_entry.envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS, "get", return_value=64), \
-                mock.patch.object(worker_entry, "_capture_enabled", return_value=True):
-            with self.assertRaisesRegex(ValueError, "top-k capture"):
-                worker_entry.layer_major_runtime(runner)
+        rc.reset_context()
+        try:
+            rc.publish(ServerArgs(model_path="dummy"), role="test")
+            with rc.get_exec().features.override(enable_return_routed_experts=True):
+                with mock.patch.object(
+                    worker_entry.envs.SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS, "get", return_value=64
+                ):
+                    with self.assertRaisesRegex(ValueError, "top-k capture"):
+                        worker_entry.layer_major_runtime(runner)
+        finally:
+            rc.reset_context()
 
     def test_draft_worker_gets_no_layer_major_runtime(self):
         # A draft worker must short-circuit before layer_major_runtime ever inspects the model: this
