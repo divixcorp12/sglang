@@ -245,7 +245,7 @@ NON_TRACE_CLOCK_READS = {
     "drain_deadline_ = now_ns() + drain_ns;": 1,
     "if (now_ns() > deadline_ns) return false;": 1,
     "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
-    "return expert_stream::find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
+    "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "job.submit_ns = now_ns();": 1,
     "const int64_t start = now_ns();": 1,
     "counters_[kCopyIssueNs].fetch_add(now_ns() - start);": 1,
