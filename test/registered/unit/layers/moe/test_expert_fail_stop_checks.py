@@ -21,36 +21,16 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _manager():
-    manager = ExpertHotCacheManager.__new__(ExpertHotCacheManager)
-    manager.doorbell = None
-    return manager
+    return ExpertHotCacheManager.__new__(ExpertHotCacheManager)
 
 
-def test_registered_checks_run_before_the_doorbell_check():
+def test_registered_checks_run_in_registration_order():
     manager = _manager()
     calls = []
     manager.register_fail_stop_check(lambda: calls.append("a"))
     manager.register_fail_stop_check(lambda: calls.append("b"))
-    assert manager.doorbell_fail_stop_check(synchronize=True) == 0.0
+    manager.run_fail_stop_checks()
     assert calls == ["a", "b"]
-    manager.doorbell = SimpleNamespace(
-        fail_stop_check=lambda synchronize: (
-            calls.append(("doorbell", synchronize)) or 1.5
-        )
-    )
-    calls.clear()
-    assert manager.doorbell_fail_stop_check(synchronize=True) == 1.5
-    assert calls == ["a", "b", ("doorbell", True)]
-
-
-def test_the_doorbell_check_still_runs_without_registered_checks():
-    manager = _manager()
-    calls = []
-    manager.doorbell = SimpleNamespace(
-        fail_stop_check=lambda synchronize: calls.append(synchronize) or 0.25
-    )
-    assert manager.doorbell_fail_stop_check(synchronize=False) == 0.25
-    assert calls == [False]
 
 
 def test_a_failing_check_raises_through_the_scheduler_hook():
@@ -61,11 +41,49 @@ def test_a_failing_check_raises_through_the_scheduler_hook():
 
     manager.register_fail_stop_check(fail)
     with pytest.raises(RuntimeError, match="fail-stop"):
-        manager.doorbell_fail_stop_check(synchronize=True)
+        manager.run_fail_stop_checks()
 
 
 def test_a_manager_without_checks_still_returns():
-    assert _manager().doorbell_fail_stop_check() == 0.0
+    assert _manager().run_fail_stop_checks() is None
+
+
+def _scheduler_stub(manager):
+    return SimpleNamespace(
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(expert_hot_cache_manager=manager)
+        )
+    )
+
+
+def test_the_scheduler_hook_runs_the_managers_checks():
+    """The real, unbound Scheduler method on a stub. EXL3's RAM-miss service registers
+    its per-batch fail-stop here (exl3_ram_miss.py), and this hook is its only caller."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    manager = _manager()
+    calls = []
+    manager.register_fail_stop_check(lambda: calls.append("exl3"))
+    Scheduler._run_expert_fail_stop_checks(_scheduler_stub(manager))
+    assert calls == ["exl3"]
+
+
+def test_the_scheduler_hook_does_nothing_without_a_manager():
+    from sglang.srt.managers.scheduler import Scheduler
+
+    Scheduler._run_expert_fail_stop_checks(_scheduler_stub(None))
+    Scheduler._run_expert_fail_stop_checks(SimpleNamespace())
+
+
+def test_every_batch_result_reaches_the_fail_stop_hook():
+    """Wiring: process_batch_result must call the hook for every forward mode (Review Focus 1)."""
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    assert "self._run_expert_fail_stop_checks()" in inspect.getsource(
+        Scheduler.process_batch_result
+    )
 
 
 def test_formats_are_offered_the_manager_then_residency_is_pushed():
@@ -162,10 +180,8 @@ class _AttachingFormat(SpecOnlyFormat):
         self.events = events
 
     def attach_hot_cache_manager(self, manager, streamer):
-        # The manager is finished: every cache exists and the doorbell was decided.
-        self.events.append(
-            ("attach", streamer.layer_id, sorted(manager.caches), manager.doorbell)
-        )
+        # The manager is finished: every cache exists.
+        self.events.append(("attach", streamer.layer_id, sorted(manager.caches)))
         if not getattr(manager, "residency_listeners", None):
             manager.add_residency_listener(
                 lambda layer_id, experts: self.events.append(
@@ -205,7 +221,7 @@ def test_from_model_attaches_formats_then_pushes_residency():
             min_residence_forwards=0,
             benefit_ratio=1.0,
         )
-    assert events[:2] == [("attach", 0, [0, 1], None), ("attach", 1, [0, 1], None)]
+    assert events[:2] == [("attach", 0, [0, 1]), ("attach", 1, [0, 1])]
     assert events[2:] == [
         ("hot", layer_id, list(manager.caches[layer_id].slot_to_expert))
         for layer_id in manager.caches
