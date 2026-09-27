@@ -616,6 +616,11 @@ class _PrefillAdmission:
     extend_len: int
     max_new_tokens: int
     is_chunked: bool
+    # Carries the layer-major decision through to _commit_prefill_admission,
+    # which is the only place req.layer_major is set: a candidate that gets
+    # rejected after this admission was selected (prefill delayer, host
+    # load-back) must never leave a stale True on the request.
+    is_layer_major: bool = False
 
 
 def layer_major_admission(
@@ -639,7 +644,7 @@ def layer_major_admission(
         total_tokens=total_tokens, max_new_tokens=max_new_tokens, ring_tokens=ring_tokens
     ):
         return None
-    return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, False)
+    return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, False, True)
 
 
 class PrefillAdder:
@@ -1401,8 +1406,10 @@ class PrefillAdder:
         )
         # A HiCache host hit is admitted through its own path, so a request with
         # one falls back to chunked prefill rather than taking the layer-major shape.
+        # req.layer_major is NOT set here: this admission can still be rejected
+        # by the prefill delayer or a host load-back retry before it commits, so
+        # only _commit_prefill_admission may set the flag.
         if layer_major is not None and host_hit_length == 0 and swa_host_hit_length == 0:
-            req.layer_major = True
             return layer_major
 
         # Whether the request fits whole. Against the raw length under
@@ -1484,6 +1491,9 @@ class PrefillAdder:
         req.set_extend_range(
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
+        # The only place req.layer_major is set: an admission selected but
+        # later rejected (prefill delayer, host load-back) never reaches here.
+        req.layer_major = admission.is_layer_major
         self._req_inc_lock_ref(req)
         self.can_run_list.append(req)
         if admission.is_chunked:

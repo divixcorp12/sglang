@@ -8,7 +8,12 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.layer_major.gate import LayerMajorGate, gate_from_env, launch_refusal
+from sglang.srt.layer_major.gate import (
+    LayerMajorGate,
+    gate_from_env,
+    launch_refusal,
+    scheduler_layer_major_refusal,
+)
 
 
 class TestGate(unittest.TestCase):
@@ -38,6 +43,36 @@ class TestGate(unittest.TestCase):
         self.assertIn("DP attention", launch_refusal(**{**ok, "enable_dp_attention": True}))
         self.assertIn("context parallelism", launch_refusal(**{**ok, "attn_cp_size": 2}))
         self.assertIn("two-batch overlap", launch_refusal(**{**ok, "enable_two_batch_overlap": True}))
+
+    def test_scheduler_refusals(self):
+        ok = dict(
+            raw_chunked_prefill_size=4096,
+            effective_chunked_prefill_size=4096,
+            is_hybrid_swa_allocator=True,
+            is_swa_req_ring=False,
+            adapter_missing_model_name=None,
+        )
+        self.assertIsNone(scheduler_layer_major_refusal(**ok))
+        self.assertIn(
+            "chunked prefill to be enabled",
+            scheduler_layer_major_refusal(**{**ok, "effective_chunked_prefill_size": None}),
+        )
+        self.assertIn(
+            "differs from the launch value",
+            scheduler_layer_major_refusal(**{**ok, "effective_chunked_prefill_size": 2048}),
+        )
+        self.assertIn(
+            "hybrid-SWA",
+            scheduler_layer_major_refusal(**{**ok, "is_hybrid_swa_allocator": False}),
+        )
+        self.assertIn(
+            "per-request SWA ring",
+            scheduler_layer_major_refusal(**{**ok, "is_swa_req_ring": True}),
+        )
+        self.assertIn(
+            "MyModel has no layer-major adapter",
+            scheduler_layer_major_refusal(**{**ok, "adapter_missing_model_name": "MyModel"}),
+        )
 
 
 if __name__ == "__main__":
