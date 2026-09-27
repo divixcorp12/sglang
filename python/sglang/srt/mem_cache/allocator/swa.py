@@ -506,9 +506,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ) -> None:
         """Keep the window from keep_from (an absolute position) to the end of the extend; drop the rest of the ring."""
         split = keep_from - extend_start
+        assert 0 <= split <= extend_full_locs.numel(), (
+            f"keep_from {keep_from} out of range for extend_start {extend_start} "
+            f"len {extend_full_locs.numel()}"
+        )
         self.clear_full_to_swa_mapping(extend_full_locs[:split])
         kept = self.full_to_swa_index_mapping[extend_full_locs[split:].to(torch.int64)]
-        unused = ring[~torch.isin(ring, kept)]
+        # _release_swa -> the paged allocator frees whole pages (unique(idx //
+        # page_size)), so releasing a bare slot set here would free a kept
+        # position's page out from under it whenever the extend does not end
+        # on a page boundary: page-align on "unused" by keeping any ring page
+        # that still holds a kept slot, not just the individual slots.
+        kept_pages = torch.unique(kept[kept > 0] // self.page_size)
+        unused = ring[~torch.isin(ring // self.page_size, kept_pages)]
         self._release_swa(unused)
 
     def free_swa(self, free_index: torch.Tensor):
