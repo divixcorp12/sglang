@@ -129,7 +129,7 @@ def test_a_rebound_pinned_slab_is_caught():
         ExpertStreamer._check_graph_sources(streamer)
 
 
-def test_the_hot_cache_manager_refuses_a_pinned_tier_under_residency_update_or_doorbell():
+def test_the_hot_cache_manager_refuses_a_pinned_tier_under_residency_update():
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
     from sglang.test.moe_expert_fakes import SpecOnlyFormat
@@ -151,9 +151,10 @@ def test_the_hot_cache_manager_refuses_a_pinned_tier_under_residency_update_or_d
         min_residence_forwards=0,
         benefit_ratio=1.0,
     )
-    for flags in (dict(gpu_residency_update=True), dict(expert_doorbell=True)):
-        with pytest.raises(ValueError, match="does not support graph gather"):
-            ExpertHotCacheManager.from_model(torch.nn.Sequential(layer), **common, **flags)
+    with pytest.raises(ValueError, match="does not support graph gather"):
+        ExpertHotCacheManager.from_model(
+            torch.nn.Sequential(layer), **common, gpu_residency_update=True
+        )
 
 
 if __name__ == "__main__":

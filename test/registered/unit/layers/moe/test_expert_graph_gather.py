@@ -1,9 +1,5 @@
 """Sync-free expert gather: CUDA-graph replays match source rows for any routes."""
 
-import os
-import subprocess
-import sys
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,67 +47,6 @@ def _layer(seed=21, pinned=True, experts=EXPERTS):
 def _source_bytes(layer, name, ids):
     source = getattr(layer, name).data
     return source[ids.long().to(source.device)].view(torch.uint8).cpu()
-
-
-DOORBELL_SPIN_CORE = int(os.environ.get("DOORBELL_SPIN_CORE", "71"))
-
-
-def _streamed_model(seeds):
-    model = torch.nn.Module()
-    for layer_id, seed in enumerate(seeds):
-        layer = _layer(seed=seed)
-        layer.layer_id = layer_id
-        layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
-        model.add_module(str(layer_id), layer)
-    return model
-
-
-def _manager(model, doorbell, **doorbell_budgets):
-    from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
-
-    layers = list(model.children())
-    return ExpertHotCacheManager.from_model(
-        model,
-        budget_bytes=len(layers)
-        * layers[0]._nvfp4_expert_streamer.bytes_per_expert
-        * (TOP_K + 2),
-        seed_path=None,
-        dynamic=False,
-        update_prefill_tokens=16,
-        min_residence_forwards=0,
-        benefit_ratio=1.0,
-        graph_gather_batch_size=1,
-        expert_doorbell=doorbell,
-        doorbell_cpu_core=DOORBELL_SPIN_CORE,
-        **doorbell_budgets,
-    )
-
-
-def _cache_rows(manager):
-    return {
-        (layer_id, name): tensor.view(torch.uint8).cpu()
-        for layer_id, cache in manager.caches.items()
-        for name, tensor in cache.tensors.items()
-    }
-
-
-_FRESH_PROCESS_ENV = "EXPERT_GRAPH_GATHER_FRESH_PROCESS"
-
-
-def _run_in_fresh_process(case, test_id):
-    """Run one test of this module by itself in a new interpreter and require it to pass."""
-    _, class_name, method = test_id.rsplit(".", 2)
-    child = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         f"{__file__}::{class_name}::{method}"],
-        env={**os.environ, _FRESH_PROCESS_ENV: "1"},
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    output = child.stdout[-6000:] + child.stderr[-2000:]
-    case.assertEqual(child.returncode, 0, output)
-    case.assertRegex(child.stdout, r"\b1 passed\b", output)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -537,243 +472,6 @@ class TestExpertGraphGather(unittest.TestCase):
         self.assertEqual(decode["requested_unique_experts"], 3)
         self.assertEqual(decode["h2d_bytes"], streamer.host_bytes_per_expert)
 
-    def test_doorbell_gather_writes_the_same_cache_rows_as_the_in_graph_copy(self):
-        """Flag on, the thread (not the fallback) writes every layer's hot and scratch rows
-        byte-for-byte as the in-graph kernel does, for 0 misses, all-miss plans and random plans.
-
-        Two layers with different rows post under different tags, so a request copied through
-        the wrong layer's segments differs from the in-graph copy.
-        """
-        plain_model, doorbell_model = _streamed_model((21, 33)), _streamed_model((21, 33))
-        plain, doorbell = _manager(plain_model, False), _manager(doorbell_model, True)
-        for manager in (plain, doorbell):
-            for cache in manager.caches.values():
-                for tensor in cache.tensors.values():
-                    tensor[cache.capacity :].view(torch.uint8).zero_()
-        try:
-            self.assertIsNone(plain.doorbell)
-            for layer in plain_model.children():
-                self.assertEqual(layer._nvfp4_expert_streamer.row_backend.name, "in_graph")
-            for layer in doorbell_model.children():
-                self.assertEqual(layer._nvfp4_expert_streamer.row_backend.name, "doorbell")
-            generator = torch.Generator().manual_seed(5)
-            no_miss_steps = 0
-            steps = 0
-            for step in range(12):
-                for layer_id in sorted(plain.caches):
-                    resident = sorted(plain.caches[layer_id].resident_experts())
-                    missing = [e for e in range(EXPERTS) if e not in resident]
-                    if step == 0 and resident:
-                        routes = [resident[0]] * TOP_K
-                        no_miss_steps += 1
-                    elif step == 1:
-                        routes = missing[:TOP_K]
-                    else:
-                        routes = torch.randint(0, EXPERTS, (TOP_K,), generator=generator).tolist()
-                    ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
-                    for model in (plain_model, doorbell_model):
-                        layer = model.get_submodule(str(layer_id))
-                        compact, tensors = layer._nvfp4_expert_streamer.gather(ids)
-                        self._assert_rows(layer, ids, compact, tensors)
-                    steps += 1
-                    torch.cuda.synchronize()
-                    plain_rows, doorbell_rows = _cache_rows(plain), _cache_rows(doorbell)
-                    for key, rows in plain_rows.items():
-                        self.assertTrue(torch.equal(rows, doorbell_rows[key]), f"{key} step={step}")
-            stats = doorbell.doorbell.stats()
-            self.assertGreater(no_miss_steps, 0)
-            self.assertEqual(stats["timeouts"], 0)
-            self.assertEqual(stats["serviced"], steps)
-            self.assertEqual(stats["copy_errors"], 0)
-            self.assertEqual(stats["invalid_records"], 0)
-            self.assertEqual(stats["late_completions"], 0)
-        finally:
-            doorbell.doorbell.stop()
-
-    def test_doorbell_gather_replays_after_a_quiesced_capture(self):
-        """A capture taken with the thread quiesced replays thread-served copies for changing
-        routes. Capture only records the doorbell launches, so a gather run while the thread is
-        still quiesced stands in for any wait that timed out around a capture: it leaves the
-        copier degraded, and resuming must clear that before serving."""
-        model = _streamed_model((21,))
-        manager = _manager(model, True)
-        layer = model.get_submodule("0")
-        streamer = layer._nvfp4_expert_streamer
-        cache = manager.caches[0]
-        ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device="cuda")
-        outputs = {
-            name: torch.empty(
-                (TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda"
-            )
-            for name, tensor in cache.tensors.items()
-        }
-
-        def gather_into_outputs():
-            compact, tensors = streamer.gather(ids)
-            for name, output in outputs.items():
-                output.copy_(tensors[name][compact.reshape(-1).long()])
-
-        try:
-            side_stream = torch.cuda.Stream()
-            with torch.cuda.stream(side_stream):
-                gather_into_outputs()
-            torch.cuda.current_stream().wait_stream(side_stream)
-            graph = torch.cuda.CUDAGraph()
-            manager.quiesce_doorbell()
-            try:
-                with torch.cuda.graph(graph):
-                    gather_into_outputs()
-                torch.cuda.synchronize()
-                streamer.gather(torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device="cuda"))
-                torch.cuda.synchronize()
-                paused = manager.doorbell.stats()
-                self.assertEqual(paused["timeouts"], 1)
-                self.assertEqual(paused["degraded"], 1)
-            finally:
-                manager.resume_doorbell()
-            manager.discard_graph_capture_routes()
-            self.assertEqual(manager.doorbell.stats()["timeouts"], 0)
-            self.assertEqual(manager.doorbell.stats()["degraded"], 0)
-            before = manager.doorbell.stats()["serviced"]
-            replays = ([5, 6, 7, 5], [0, 7, 3, 2], [4, 4, 4, 4], [1, 2, 3, 4], [7, 6, 5, 4])
-            for routes in replays:
-                ids.copy_(torch.tensor([routes], dtype=torch.int32, device="cuda"))
-                graph.replay()
-                torch.cuda.synchronize()
-                for name, output in outputs.items():
-                    self.assertTrue(
-                        torch.equal(
-                            output.view(torch.uint8).cpu(),
-                            _source_bytes(layer, name, ids.reshape(-1)),
-                        ),
-                        f"{name} routes={routes}",
-                    )
-            stats = manager.doorbell.stats()
-            self.assertEqual(stats["timeouts"], 0)
-            self.assertEqual(stats["serviced"] - before, len(replays))
-        finally:
-            manager.doorbell.stop()
-
-    def test_doorbell_drain_on_this_path_ends_at_its_budget_and_never_recovers_the_copy(self):
-        """A drain on the gather path runs its whole budget and resolves undelivered, whatever
-        the copy delay: the copy the thread queued does not land until the drain retires.
-
-        This is a property of the path, not of the budget. Measured on divix01 (E35g/E35h/E35i/
-        E35j/E35k): the thread returns from cudaMemcpyBatchAsync during the drain (enqueued_ns is
-        set, so this is not the E34 deadlock), the host call costs ~89 us, the copy sits at the
-        head of its own non-blocking stream with nothing queued ahead of it, and nsys shows the
-        copy is absent from the device timeline for the whole drain, first executing 16.8 us AFTER
-        the drain retires. Nothing else is dispatched during the drain either: exactly one GPU row
-        starts inside a 1.024 s window, the drain kernel itself. The hold therefore tracks the
-        drain's RETIREMENT, not the copy delay -- 0.05 s and 1.0 s delays both stall the full
-        budget -- so a larger budget only stalls longer and can never recover the copy.
-
-        The same copier, with the same batch API, the same pinned host-to-device copy, the same
-        kind of private stream and a copy enqueued after the drain is already resident, DOES land
-        mid-drain on the copier path in 6 us: see
-        test_timed_out_wait_drains_a_claimed_request_until_its_copies_land, which is where the
-        positive recovery property lives. Five mechanisms were excluded by measurement (cold
-        launch, copy-engine starvation, CUDA-graph replay, pinnedness/memory kind, and channel
-        multiplexing at CUDA_DEVICE_MAX_CONNECTIONS=32); the cause is unnamed, the behaviour is
-        not.
-
-        The consequence for serving is that a timeout on this path always exhausts the drain and
-        always ends in fail-stop disable. That is what the design already does, and it is why this
-        test asserts the bounded ending rather than a recovery the path cannot deliver.
-
-        Red: asserting drain_timeouts == 0 and delivered == 1 here -- the properties this test
-        carried before -- fails on every budget, which is what re-aimed it.
-
-        The stall holds only for the first gather-path drain in a process; later drains recover
-        the copy, so the body runs alone in a fresh interpreter whatever ran before it.
-        """
-        if os.environ.get(_FRESH_PROCESS_ENV) != "1":
-            _run_in_fresh_process(self, self.id())
-            return
-        model = _streamed_model((21,))
-        budget_polls = 4_000_000
-        manager = _manager(
-            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=budget_polls
-        )
-        layer = model.get_submodule("0")
-        streamer = layer._nvfp4_expert_streamer
-        copier = manager.doorbell
-        resident = sorted(manager.caches[0].resident_experts())
-        missing = [e for e in range(EXPERTS) if e not in resident]
-        try:
-            copier.inject_fault(service_delay_s=0.2)
-            ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            compact, tensors = streamer.gather(ids)
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - started
-            stats = copier.stats()
-            self.assertEqual(stats["timeouts"], 1)
-            self.assertEqual(stats["drains"], 1)
-            self.assertEqual(stats["drain_timeouts"], 1)
-            self.assertEqual(stats["disabled"], 1)
-            self.assertEqual(int(copier.delivered[0].item()), 0)
-            self.assertEqual(stats["copy_errors"], 0)
-            self._assert_rows(layer, ids, compact, tensors)
-            self.assertGreaterEqual(stats["last_polls"], budget_polls)
-            self.assertGreater(elapsed, 0.2)
-            manager.doorbell_fail_stop_check()
-            self.assertEqual(copier.stats()["late_completions"], 1)
-        finally:
-            copier.stop()
-
-    def test_doorbell_disables_after_a_drain_runs_out_and_no_late_copy_lands(self):
-        """A drain that runs out disables the copier for good and the gather returns at once,
-        served in-graph with exact rows. The fail-stop check the scheduler runs before the next
-        forward holds until the committed late copy has landed. Later forwards post nothing,
-        serve their different plans into the same scratch rows in-graph, and those rows stay
-        exact."""
-        model = _streamed_model((21,))
-        manager = _manager(
-            model, True, doorbell_timeout_polls=20_000, doorbell_drain_polls=70_000
-        )
-        layer = model.get_submodule("0")
-        streamer = layer._nvfp4_expert_streamer
-        copier = manager.doorbell
-        resident = sorted(manager.caches[0].resident_experts())
-        missing = [e for e in range(EXPERTS) if e not in resident]
-        try:
-            copier.inject_fault(service_delay_s=1.0)
-            ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            compact, tensors = streamer.gather(ids)
-            torch.cuda.synchronize()
-            first_s = time.perf_counter() - started
-            self._assert_rows(layer, ids, compact, tensors)
-            waited_s = manager.doorbell_fail_stop_check()
-            checked_s = time.perf_counter() - started
-            disabled = copier.stats()
-            copier.inject_fault()
-            later_routes = (
-                missing[::-1][:TOP_K],
-                [missing[1], missing[0], missing[3], missing[2]],
-            )
-            for routes in later_routes:
-                ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
-                compact, tensors = streamer.gather(ids)
-                torch.cuda.synchronize()
-                self._assert_rows(layer, ids, compact, tensors)
-            time.sleep(1.5)
-            torch.cuda.synchronize()
-            self._assert_rows(layer, ids, compact, tensors)
-            after = copier.stats()
-            self.assertEqual(disabled["disabled"], 1)
-            self.assertEqual(disabled["drain_timeouts"], 1)
-            self.assertEqual(after["posted"], disabled["posted"])
-            self.assertEqual(after["disabled_posts"], len(later_routes))
-            self.assertLess(first_s, 0.8)
-            self.assertGreater(waited_s, 0.0)
-            self.assertGreaterEqual(checked_s, 0.8)
-        finally:
-            copier.stop()
-
     def test_flag_off_gather_matches_the_pre_doorbell_path(self):
         """Flag off, ``_gather_graph`` issues the same torch ops and the same copy-kernel call
         (same plan tensors, rows, slots and count) and writes the same routes and cache bytes as
@@ -900,12 +598,6 @@ class TestExpertGraphGather(unittest.TestCase):
         self.assertEqual(current_calls, [(True, True, True, True)] * len(routes))
         self.assertEqual(current.graph_counters.tolist(), reference.graph_counters.tolist())
 
-    def _host_scratch_rows(self, cache):
-        return {
-            name: cache.tensors[name][cache.capacity :].view(torch.uint8).cpu()
-            for name in NVFP4_STREAM_TENSORS[:4]
-        }
-
     def _assert_host_rows(self, layer, ids, compact, tensors):
         for name in NVFP4_STREAM_TENSORS[:4]:
             self.assertTrue(
@@ -986,137 +678,86 @@ class TestExpertGraphGather(unittest.TestCase):
             cache.expert_to_slot = original
         self.assertEqual(cache_planner.route_plan(flat).miss_plan_rows.item(), 4)
 
-    def test_same_plan_through_both_backends_writes_identical_rows_and_masks(self):
-        from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
+    def test_in_graph_backend_delivers_every_planned_row_byte_exact(self):
         from sglang.srt.layers.moe.expert_row_plan import (
-            DoorbellRowBackend,
             ExpertRowPlan,
             ExpertRowPlanner,
             InGraphRowBackend,
         )
 
-        layers = (_layer(seed=41), _layer(seed=41))
-        built = [self._graph_streamer(layer) for layer in layers]
-        for _, cache in built:
-            for tensor in cache.tensors.values():
-                tensor[cache.capacity :].view(torch.uint8).zero_()
-        copier = ExpertDoorbellCopier(
-            built[1][0]._graph_row_segments,
-            TOP_K,
-            cpu_core=DOORBELL_SPIN_CORE,
-            stream=torch.cuda.Stream(),
-        )
-        backends = (
-            InGraphRowBackend({0: built[0][0]._graph_row_segments}),
-            DoorbellRowBackend(copier, {0: built[1][0]._graph_row_segments}),
-        )
-        planners = [
-            ExpertRowPlanner(cache, cache.capacity, TOP_K)
-            for _, cache in built
-        ]
-        plans = [
-            ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
-            for _, cache in built
-        ]
-        try:
-            for candidates in ([0, 2, 3, 5], [7, 5], [], [2, 0, 7, 3]):
-                masks = []
-                for backend, planner, plan in zip(backends, planners, plans):
-                    planner.plan_candidates(
-                        torch.tensor(candidates, dtype=torch.int64, device="cuda"), plan
-                    )
-                    backend.post(0, plan)
-                    delivery = backend.resolve(0, plan)
-                    backend.copy_residual(0, delivery)
-                    masks.append(delivery.mask())
-                torch.cuda.synchronize()
-                self.assertEqual(masks[0].tolist(), masks[1].tolist(), candidates)
-                self.assertEqual(sum(masks[0].tolist()), len(candidates))
-                for name, rows in self._host_scratch_rows(built[0][1]).items():
+        layer = _layer(seed=41)
+        streamer, cache = self._graph_streamer(layer)
+        for tensor in cache.tensors.values():
+            tensor[cache.capacity :].view(torch.uint8).zero_()
+        backend = InGraphRowBackend({0: streamer._graph_row_segments})
+        planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
+        plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+        for candidates in ([0, 2, 3, 5], [7, 5], [], [2, 0, 7, 3]):
+            planner.plan_candidates(
+                torch.tensor(candidates, dtype=torch.int64, device="cuda"), plan
+            )
+            backend.post(0, plan)
+            delivery = backend.resolve(0, plan)
+            backend.copy_residual(0, delivery)
+            mask = delivery.mask()
+            torch.cuda.synchronize()
+            self.assertEqual(sum(mask.tolist()), len(candidates), candidates)
+            for row, expert in enumerate(candidates):
+                for name in NVFP4_STREAM_TENSORS[:4]:
                     self.assertTrue(
-                        torch.equal(rows, self._host_scratch_rows(built[1][1])[name]),
+                        torch.equal(
+                            cache.tensors[name][cache.capacity + row].view(torch.uint8).cpu(),
+                            _source_bytes(layer, name, torch.tensor([expert]))[0],
+                        ),
                         f"{name} candidates={candidates}",
                     )
-                for row, expert in enumerate(candidates):
-                    for name in NVFP4_STREAM_TENSORS[:4]:
-                        self.assertTrue(
-                            torch.equal(
-                                built[0][1].tensors[name][built[0][1].capacity + row]
-                                .view(torch.uint8)
-                                .cpu(),
-                                _source_bytes(layers[0], name, torch.tensor([expert]))[0],
-                            )
-                        )
-            self.assertEqual(copier.stats()["timeouts"], 0)
-        finally:
-            copier.stop()
 
     def test_residual_after_a_partly_wrong_plan_serves_actual_routes_byte_exact(self):
         """A plan that predicted some routed experts and some unrouted ones: routes to delivered
         experts read their scratch rows, the other misses are the residual copied in-graph into
-        rows no needed delivered expert occupies, through either backend."""
+        rows no needed delivered expert occupies."""
         from sglang.kernels.ops.moe.expert_cache_transfer import (
             copy_expert_row_segments_gpu,
         )
-        from sglang.kernels.ops.moe.expert_doorbell import ExpertDoorbellCopier
         from sglang.srt.layers.moe.expert_row_plan import (
-            DoorbellRowBackend,
             ExpertRowPlan,
             ExpertRowPlanner,
             InGraphRowBackend,
             plan_residual_routes,
         )
 
-        for kind in ("in_graph", "doorbell"):
-            layer = _layer(seed=33)
-            streamer, cache = self._graph_streamer(layer)
-            segments = streamer._graph_row_segments
-            copier = None
-            if kind == "doorbell":
-                copier = ExpertDoorbellCopier(
-                    segments, TOP_K, cpu_core=DOORBELL_SPIN_CORE, stream=torch.cuda.Stream()
-                )
-                backend = DoorbellRowBackend(copier, {0: segments})
-            else:
-                backend = InGraphRowBackend({0: segments})
-            planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
-            plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
-            residual = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
-            try:
-                for predicted, routes in (
-                    ([0, 2, 5], [2, 3, 6, 7]),
-                    ([7, 3], [3, 7, 0, 2]),
-                    ([5, 0, 2, 3], [1, 4, 6, 1]),
-                    ([], [0, 2, 3, 5]),
-                ):
-                    planner.plan_candidates(
-                        torch.tensor(predicted, dtype=torch.int64, device="cuda"), plan
-                    )
-                    backend.post(0, plan)
-                    delivery = backend.resolve(0, plan)
-                    backend.copy_residual(0, delivery)
-                    ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
-                    remap = plan_residual_routes(
-                        ids.reshape(-1).long(),
-                        cache,
-                        cache.capacity,
-                        delivery,
-                        residual,
-                    )
-                    copy_expert_row_segments_gpu(
-                        segments, residual.expert_ids, residual.slots, residual.count
-                    )
-                    torch.cuda.synchronize()
-                    expected_residual = len(
-                        {e for e in routes if e not in (1, 4, 6) and e not in predicted}
-                    )
-                    self.assertEqual(int(residual.count.item()), expected_residual)
-                    self._assert_host_rows(
-                        layer, ids, remap.reshape(ids.shape), cache.tensors
-                    )
-            finally:
-                if copier is not None:
-                    copier.stop()
+        layer = _layer(seed=33)
+        streamer, cache = self._graph_streamer(layer)
+        segments = streamer._graph_row_segments
+        backend = InGraphRowBackend({0: segments})
+        planner = ExpertRowPlanner(cache, cache.capacity, TOP_K)
+        plan = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+        residual = ExpertRowPlan.for_scratch(TOP_K, cache.capacity, TOP_K, cache.device)
+        for predicted, routes in (
+            ([0, 2, 5], [2, 3, 6, 7]),
+            ([7, 3], [3, 7, 0, 2]),
+            ([5, 0, 2, 3], [1, 4, 6, 1]),
+            ([], [0, 2, 3, 5]),
+        ):
+            planner.plan_candidates(
+                torch.tensor(predicted, dtype=torch.int64, device="cuda"), plan
+            )
+            backend.post(0, plan)
+            delivery = backend.resolve(0, plan)
+            backend.copy_residual(0, delivery)
+            ids = torch.tensor([routes], dtype=torch.int32, device="cuda")
+            remap = plan_residual_routes(
+                ids.reshape(-1).long(), cache, cache.capacity, delivery, residual
+            )
+            copy_expert_row_segments_gpu(
+                segments, residual.expert_ids, residual.slots, residual.count
+            )
+            torch.cuda.synchronize()
+            expected_residual = len(
+                {e for e in routes if e not in (1, 4, 6) and e not in predicted}
+            )
+            self.assertEqual(int(residual.count.item()), expected_residual)
+            self._assert_host_rows(layer, ids, remap.reshape(ids.shape), cache.tensors)
 
     def test_planner_and_in_graph_backend_replay_in_a_cuda_graph(self):
         from sglang.srt.layers.moe.expert_row_plan import (
@@ -1165,37 +806,6 @@ class TestExpertGraphGather(unittest.TestCase):
                         ),
                         f"{name} ids={ids}",
                     )
-
-    def test_doorbell_gather_falls_back_to_correct_rows_when_the_thread_stalls(self):
-        model = _streamed_model((21,))
-        manager = _manager(model, True)
-        layer = model.get_submodule("0")
-        streamer = layer._nvfp4_expert_streamer
-        copier = manager.doorbell
-        resident = sorted(manager.caches[0].resident_experts())
-        missing = [e for e in range(EXPERTS) if e not in resident]
-        try:
-            # The manager primes the copier with one request consumed as skipped_abandoned.
-            primed = copier.stats()
-            copier.pause()
-            ids = torch.tensor([missing[:TOP_K]], dtype=torch.int32, device="cuda")
-            compact, tensors = streamer.gather(ids)
-            torch.cuda.synchronize()
-            self._assert_rows(layer, ids, compact, tensors)
-            stalled = copier.stats()
-            self.assertEqual(stalled["timeouts"], 1)
-            self.assertEqual(stalled["serviced"], 0)
-
-            copier.resume()
-            ids = torch.tensor([missing[::-1][:TOP_K]], dtype=torch.int32, device="cuda")
-            compact, tensors = streamer.gather(ids)
-            torch.cuda.synchronize()
-            self._assert_rows(layer, ids, compact, tensors)
-            recovered = copier.stats()
-            self.assertEqual(recovered["skipped_abandoned"] - primed["skipped_abandoned"], 1)
-            self.assertEqual(recovered["late_completions"], 0)
-        finally:
-            copier.stop()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

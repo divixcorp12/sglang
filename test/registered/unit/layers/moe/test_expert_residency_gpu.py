@@ -168,9 +168,6 @@ def _decode_promotions(manager):
     return [counters[str(layer)]["promotions"] for layer in range(LAYERS)]
 
 
-DOORBELL_SPIN_CORE = int(os.environ.get("DOORBELL_SPIN_CORE", "71"))
-
-
 def _reference_gather_graph(self, topk_ids):
     """``ExpertStreamer._gather_graph`` as of 7de955329a, verbatim: the pre-doorbell path."""
     from sglang.srt.layers.moe.expert_route_plan import plan_graph_routes
@@ -245,115 +242,98 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
                 forward()
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        manager.quiesce_doorbell()
-        try:
-            with torch.cuda.graph(graph):
-                forward()
-        finally:
-            manager.resume_doorbell()
+        with torch.cuda.graph(graph):
+            forward()
         manager.discard_graph_capture_routes()
         return graph
 
     def test_gathers_match_the_pre_doorbell_path_across_residency_updates(self):
         """Gathers, then residency updates, then more gathers, with the host (Python) update and
-        with SGLANG_MOE_GPU_RESIDENCY_UPDATE, the doorbell off and on. Each step's gathered rows,
+        and with SGLANG_MOE_GPU_RESIDENCY_UPDATE. Each step's gathered rows,
         per-layer hit and miss counters and residency state must equal a twin manager whose
         streamers run 7de955329a's ``_gather_graph``, and the rows must equal the source rows.
         The GPU update rebinds each cache's ``expert_to_slot`` to its own table, so a gather
         planner holding the startup mapping diverges at the first update."""
         for gpu in (False, True):
-            for doorbell in (False, True):
-                with self.subTest(gpu_residency_update=gpu, doorbell=doorbell):
-                    self._run_mode(gpu, doorbell)
+            with self.subTest(gpu_residency_update=gpu):
+                self._run_mode(gpu)
 
     def test_gathers_match_the_pre_doorbell_path_across_insert_on_miss_updates(self):
         """The same cross-residency check with SGLANG_MOE_HOT_INSERT_ON_MISS: every forward's
         misses are copied from scratch rows into slots before the next forward's gathers, so a
-        planner, doorbell plan or remap that read a stale mapping or stale scratch row would
+        planner or remap that read a stale mapping or stale scratch row would
         return rows that differ from the reference path or from the source rows."""
-        for doorbell in (False, True):
-            with self.subTest(doorbell=doorbell):
-                self._run_mode(True, doorbell, insert_on_miss=True)
+        self._run_mode(True, insert_on_miss=True)
 
-    def _run_mode(self, gpu, doorbell, insert_on_miss=False):
+    def _run_mode(self, gpu, insert_on_miss=False):
         current_model, reference_model = _model(), _model()
         mode = (
             dict(update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=0.98)
             if insert_on_miss
             else {}
         )
-        current = _manager(
-            current_model,
-            gpu,
-            expert_doorbell=doorbell,
-            doorbell_cpu_core=DOORBELL_SPIN_CORE,
-            **mode,
-        )
+        current = _manager(current_model, gpu, **mode)
         reference = _manager(reference_model, gpu, **mode)
         for streamer in reference.streamers.values():
             streamer._gather_graph = MethodType(_reference_gather_graph, streamer)
-        try:
-            harnesses = []
-            for manager in (current, reference):
-                static, outputs, forward = _gather_harness(manager)
-                graph = self._captured(manager, forward) if gpu else None
-                harnesses.append((manager, static, outputs, forward, graph))
-            generator = random.Random(11)
-            promotions = 0
-            for step in range(17):
-                routes = _decode_routes(generator, step)
-                route_tensor = torch.tensor(routes, dtype=torch.int32, device="cuda")
-                for manager, static, outputs, forward, graph in harnesses:
-                    static.copy_(route_tensor)
-                    if graph is not None:
-                        graph.replay()
-                    else:
-                        forward()
-                torch.cuda.synchronize()
-                context = f"gpu={gpu} doorbell={doorbell} step {step}"
-                current_outputs, reference_outputs = harnesses[0][2], harnesses[1][2]
-                for layer in range(LAYERS):
-                    source_layer = current_model.get_submodule(str(layer))
-                    experts = torch.tensor(routes[layer][0])
-                    for name in NVFP4_STREAM_TENSORS:
-                        actual = current_outputs[layer][name].view(torch.uint8).cpu()
-                        self.assertTrue(
-                            torch.equal(actual, reference_outputs[layer][name].view(torch.uint8).cpu()),
-                            f"{context} layer {layer} {name} differs from the reference path",
-                        )
-                        expected = getattr(source_layer, name)[experts.to(getattr(source_layer, name).device)]
-                        self.assertTrue(
-                            torch.equal(actual.reshape(-1), expected.reshape(-1).view(torch.uint8).cpu()),
-                            f"{context} layer {layer} {name} differs from the source rows",
-                        )
-                current_counters = current.snapshot_counters()["decode"]
-                reference_counters = reference.snapshot_counters()["decode"]
-                fields = ("hot_hits", "miss_rows", "promotions", "evictions")
-                if insert_on_miss:
-                    fields += ("insertions", "insertion_evictions")
-                for layer in range(LAYERS):
-                    for field in fields:
-                        self.assertEqual(
-                            current_counters[str(layer)][field],
-                            reference_counters[str(layer)][field],
-                            f"{context} layer {layer} {field}",
-                        )
-                assert_states_equal(self, device_state(current), device_state(reference), context)
-                changed = "insertions" if insert_on_miss else "promotions"
-                promotions = sum(current_counters[str(layer)][changed] for layer in range(LAYERS))
-                if insert_on_miss:
-                    self.assertEqual(
-                        sum(current_counters[str(layer)]["promotions"] for layer in range(LAYERS)),
-                        0,
-                        f"{context}: insert-on-miss decode boundaries must not promote host rows",
+        harnesses = []
+        for manager in (current, reference):
+            static, outputs, forward = _gather_harness(manager)
+            graph = self._captured(manager, forward) if gpu else None
+            harnesses.append((manager, static, outputs, forward, graph))
+        generator = random.Random(11)
+        promotions = 0
+        for step in range(17):
+            routes = _decode_routes(generator, step)
+            route_tensor = torch.tensor(routes, dtype=torch.int32, device="cuda")
+            for manager, static, outputs, forward, graph in harnesses:
+                static.copy_(route_tensor)
+                if graph is not None:
+                    graph.replay()
+                else:
+                    forward()
+            torch.cuda.synchronize()
+            context = f"gpu={gpu} step {step}"
+            current_outputs, reference_outputs = harnesses[0][2], harnesses[1][2]
+            for layer in range(LAYERS):
+                source_layer = current_model.get_submodule(str(layer))
+                experts = torch.tensor(routes[layer][0])
+                for name in NVFP4_STREAM_TENSORS:
+                    actual = current_outputs[layer][name].view(torch.uint8).cpu()
+                    self.assertTrue(
+                        torch.equal(actual, reference_outputs[layer][name].view(torch.uint8).cpu()),
+                        f"{context} layer {layer} {name} differs from the reference path",
                     )
-                counts = {"global_physical_count": _counts(routes)}
-                current.on_expert_distribution(_decode_batch(), counts)
-                reference.on_expert_distribution(_decode_batch(), counts)
-            self.assertGreater(promotions, 0, f"gpu={gpu} doorbell={doorbell}: no residency update happened")
-        finally:
-            if current.doorbell is not None:
-                current.doorbell.stop()
+                    expected = getattr(source_layer, name)[experts.to(getattr(source_layer, name).device)]
+                    self.assertTrue(
+                        torch.equal(actual.reshape(-1), expected.reshape(-1).view(torch.uint8).cpu()),
+                        f"{context} layer {layer} {name} differs from the source rows",
+                    )
+            current_counters = current.snapshot_counters()["decode"]
+            reference_counters = reference.snapshot_counters()["decode"]
+            fields = ("hot_hits", "miss_rows", "promotions", "evictions")
+            if insert_on_miss:
+                fields += ("insertions", "insertion_evictions")
+            for layer in range(LAYERS):
+                for field in fields:
+                    self.assertEqual(
+                        current_counters[str(layer)][field],
+                        reference_counters[str(layer)][field],
+                        f"{context} layer {layer} {field}",
+                    )
+            assert_states_equal(self, device_state(current), device_state(reference), context)
+            changed = "insertions" if insert_on_miss else "promotions"
+            promotions = sum(current_counters[str(layer)][changed] for layer in range(LAYERS))
+            if insert_on_miss:
+                self.assertEqual(
+                    sum(current_counters[str(layer)]["promotions"] for layer in range(LAYERS)),
+                    0,
+                    f"{context}: insert-on-miss decode boundaries must not promote host rows",
+                )
+            counts = {"global_physical_count": _counts(routes)}
+            current.on_expert_distribution(_decode_batch(), counts)
+            reference.on_expert_distribution(_decode_batch(), counts)
+        self.assertGreater(promotions, 0, f"gpu={gpu}: no residency update happened")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

@@ -1054,7 +1054,7 @@ class Exl3RamMissService:
             self.host.set_hot(self.row_of(layer_id), slot_to_expert)
 
     def fail_stop_check(self) -> None:
-        """Per batch (the scheduler's doorbell hook): raise when a wait timed out or failed.
+        """Per batch (the scheduler's fail-stop hook, ``run_fail_stop_checks``): raise when a wait timed out or failed.
 
         This is also where a warmup or capture timeout surfaces: no check runs between
         capture and the first batch, so a fatal raised during warmup stops the process

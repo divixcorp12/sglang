@@ -55,7 +55,6 @@ KNOWN_NO_MAIN = frozenset(
 KNOWN_NO_REGISTRY = frozenset(
     {
     "unit/kernels/test_expert_cache_transfer_warp_geometry.py",
-    "unit/kernels/test_expert_doorbell_copier.py",
     "unit/kernels/test_sgl_kernel_load_utils.py",
     "unit/layers/moe/test_async_telemetry.py",
     "unit/layers/moe/test_expert_prediction_adapters.py",

@@ -378,7 +378,6 @@ class TestSpecOnlyFormat(unittest.TestCase):
         for flags in (
             dict(graph_gather_batch_size=1),
             dict(gpu_residency_update=True),
-            dict(expert_doorbell=True),
         ):
             with self.subTest(**flags):
                 with self.assertRaisesRegex(ValueError, "does not support graph gather"):

@@ -277,7 +277,7 @@ def require_graph_gather_support(
     Dense formats need dense, GPU-readable host sources frozen at startup, which
     spec-only tensors lack. A ``pinned_tier`` format serves graph gathers from its
     pinned host tier instead; only the plain graph gather supports that
-    (``pinned_tier_ok``), not the GPU residency update or the doorbell, whose
+    (``pinned_tier_ok``), not the GPU residency update, whose
     copies index host rows by expert id.
     """
     for streamer in streamers:
@@ -296,8 +296,8 @@ def require_graph_gather_support(
         if unsupported:
             raise ValueError(
                 f"expert format {key!r} of layer {streamer.layer_id} does not support "
-                "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER, "
-                "SGLANG_MOE_GPU_RESIDENCY_UPDATE and SGLANG_MOE_EXPERT_DOORBELL"
+                "graph gather; unset SGLANG_MOE_EXPERT_GRAPH_GATHER and "
+                "SGLANG_MOE_GPU_RESIDENCY_UPDATE"
             )
 
 
