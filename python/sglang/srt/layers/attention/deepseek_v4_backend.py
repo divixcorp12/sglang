@@ -1001,13 +1001,17 @@ def _tail_rows(
     return t[token_indices]
 
 
-def candidate_publish_rows(tail_metadata: Optional["DSV4Metadata"]) -> Optional[list[int]]:
+def candidate_publish_rows(
+    tail_metadata: Optional["DSV4Metadata"],
+) -> Optional[list[int]]:
     """Rows per request the late layers run on this rank, or None when no tail runs and
     candidate consumers see every row."""
     if tail_metadata is None:
         return None
     tail = tail_metadata.late_layer_tail
-    return tail.local_lens_cpu if tail.cp_metadata is not None else tail.extend_seq_lens_cpu
+    if tail.cp_metadata is not None:
+        return tail.local_lens_cpu
+    return tail.extend_seq_lens_cpu
 
 
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
@@ -1229,10 +1233,21 @@ class DeepseekV4AttnBackend(
         # Two-level low-ratio indexer (dsv4/candidate_indexer.py).
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        candidate_source_layer_id = getattr(cfg, "candidate_source_layer_id", -1)
         self.candidate_indexer = make_candidate_indexer(
             getattr(cfg, "candidate_topk_blocks", 0),
             getattr(cfg, "candidate_block_size", 0),
-            getattr(cfg, "candidate_source_layer_id", -1),
+            candidate_source_layer_id,
+        )
+        late_layer_start = model_runner.model.model.late_layer_start
+        # The torch source may publish tail-only masks only when every consumer runs
+        # in the tail (layer_id >= late_layer_start); otherwise a pre-tail consumer
+        # would read a mask with fewer rows than it addresses. Layer-major refuses the
+        # violating config; plain chunked prefill does not, so fall back to full rows.
+        self.candidate_tail_only: bool = (
+            candidate_source_layer_id < 0
+            or late_layer_start is None
+            or candidate_source_layer_id >= late_layer_start - 1
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
@@ -3657,7 +3672,11 @@ class DeepseekV4AttnBackend(
             # A layer-major non-final chunk has no tail to read the masks.
             self.forward_metadata.candidate_metadata = CandidateMasks(request_masks=[])
             publish = None
-        keep_rows = candidate_publish_rows(self.tail_forward_metadata)
+        keep_rows = (
+            candidate_publish_rows(self.tail_forward_metadata)
+            if self.candidate_tail_only
+            else None
+        )
         consume = (
             published_masks(self.forward_metadata.candidate_metadata).request_masks
             if indexer.uses_candidates
@@ -3684,6 +3703,11 @@ class DeepseekV4AttnBackend(
             rows_per_chunk = _torch_indexer_rows_per_chunk(q.shape[1], lc)
             masks = [] if publish is not None else None
             keep_from = 0 if keep_rows is None else tok.numel() - keep_rows[b]
+            if keep_from < 0:
+                raise ValueError(
+                    f"tail length {keep_rows[b]} exceeds request {r}'s "
+                    f"{tok.numel()} rows"
+                )
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
@@ -3703,7 +3727,9 @@ class DeepseekV4AttnBackend(
                             block_size=indexer.candidate_block_size,
                         )
                     )
-                elif consume is not None and masks is None:
+                elif consume is not None:
+                    # A candidate source never consumes (is_candidate_source implies not
+                    # uses_candidates), so masks is always None here.
                     s = s.masked_fill(~consume[b][rows], -torch.inf)
                 idx = s.topk(k, dim=-1, sorted=False).indices
                 if consume is not None and masks is None:
@@ -3717,13 +3743,14 @@ class DeepseekV4AttnBackend(
                 if raw_indices is not None:
                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
             if masks is not None:
-                publish.append(
-                    torch.cat(masks)
-                    if len(masks) > 1
-                    else masks[0]
-                    if masks
-                    else torch.zeros(0, lc, dtype=torch.bool, device=pos.device)
-                )
+                if not masks:
+                    publish.append(
+                        torch.zeros(0, lc, dtype=torch.bool, device=pos.device)
+                    )
+                elif len(masks) > 1:
+                    publish.append(torch.cat(masks))
+                else:
+                    publish.append(masks[0])
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 request_masks=publish
