@@ -217,12 +217,12 @@ requires `--disable-overlap-schedule`. Since the shipping config removes that
 flag to gain +4%, the doorbell (path 2 below) **cannot be enabled at all** — the
 server will not start. Stage B refuses it independently, for the async-write
 reason in path 2. Treat the doorbell as dead in this configuration unless
+someone is prepared to give up overlap scheduling and re-measure.
 
 > **Removed on 2026-09-27** (`8ac64c9c99`, branch `doorbell-removal`): the doorbell side-thread copier, its
 > `SGLANG_MOE_EXPERT_DOORBELL*` variables and `--moe-offload-preset doorbell` no longer exist. A set variable only
 > warns at startup, and `Scheduler.release_host_resources` no longer calls a doorbell stop. The per-batch fail-stop
 > hook is now `ExpertHotCacheManager.run_fail_stop_checks`. The text below is kept as history.
-someone is prepared to give up overlap scheduling and re-measure.
 
 **Sync audit, 2026-09-17: with overlap scheduling on there are ZERO CUDA
 synchronisations per decode forward in this code.** The one per-forward
