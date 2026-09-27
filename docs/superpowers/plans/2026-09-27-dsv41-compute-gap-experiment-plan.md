@@ -160,7 +160,23 @@ Setup:
 - A fourth shared-memory pipeline stage gives the same bits and saves 6.0 µs per layer, about 0.24 ms/token.
 - Its p10–p90 spread is 0.5 µs.
 - It misses the handoff's 10 µs screening gate, but it is exact and needs no code change beyond one constant.
-- SH=5/6 and SH=4 combined with FS=2/4 are queued (micro-2) to find the best depth.
+- Follow-up sweep (`results/micro-2`):
+
+  | Configuration | µs/layer | bitwise |
+  |---|---:|---|
+  | prod | 101.87 (repeat 101.83) | — |
+  | SH=4 | **95.85 (repeat 95.90)** | yes |
+  | SH=5 | 98.90 | yes |
+  | SH=6 | 98.90 | yes |
+  | SH=4 FS=4 | 100.67 | yes |
+  | SH=4 FS=2 | 99.75 | yes |
+
+  SH=4 is the best depth, reproducibly.
+- `MOE_SH_STAGES` feeds only `exl3_moe_kernel`. That covers the decode tile and the 32/64-row prefill tiles. The dense
+  GEMM/GEMV paths do not use it.
+- A serving A/B (`ab/c1moe-sh4`) is queued: A = side stream on, B = side stream on + a private SH=4 exllamav3 tree
+  and build dir passed through `SGLANG_EXL3_SRC`/`SGLANG_EXL3_BUILD_DIR`. Its provenance is recorded in
+  `exl3-serve-sh4.provenance`. Production's extension and pin are untouched.
 - Integration is blocked on a decision, not on evidence. The constant lives in the pinned upstream exllamav3 (`turboderp-org/exllamav3`, no fork remote), so production would need either a fork commit with a pin bump, or sglang carrying the patch and applying it at build time.
 
 ### E6 / C0b — the 2.047 ms graph-prefix hole is node-mode launch overhead (measured, closed)
