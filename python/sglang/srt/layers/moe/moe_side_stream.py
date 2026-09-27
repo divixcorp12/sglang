@@ -7,16 +7,20 @@ same layer, so the next layer's RAM-miss chain never runs beside a fork that rea
 
 from __future__ import annotations
 
+import logging
 from typing import Callable, Optional, Sequence, TypeVar
 
 import torch
 
 from sglang.srt.environ import envs
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
 
 _stream: Optional[torch.cuda.Stream] = None
 _forked = False
+_fork_logged = False
 
 
 def enable_if_requested() -> None:
@@ -24,6 +28,7 @@ def enable_if_requested() -> None:
     global _stream
     if _stream is None and envs.SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM.get() and torch.cuda.is_available():
         _stream = torch.cuda.Stream()
+        logger.info("MoE side stream enabled")
 
 
 def active() -> bool:
@@ -36,8 +41,11 @@ def fork(fn: Callable[[], T], *, inputs: Sequence[torch.Tensor] = ()) -> T:
     ``inputs`` are tensors ``fn`` reads that the current stream allocated and may free before the join; recording
     them on the side stream keeps the caching allocator from handing their blocks back to the current stream early.
     """
-    global _forked
+    global _forked, _fork_logged
     assert _stream is not None
+    if not _fork_logged:
+        _fork_logged = True
+        logger.info("MoE side stream: first fork (%s)", getattr(fn, "__qualname__", fn))
     _stream.wait_stream(torch.cuda.current_stream())
     for tensor in inputs:
         tensor.record_stream(_stream)
