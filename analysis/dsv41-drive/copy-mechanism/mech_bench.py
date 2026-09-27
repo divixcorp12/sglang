@@ -35,7 +35,7 @@ SLOTS = 16  # 213 MB of destination slots, rotated: past the 96 MiB L2
 N_ROWS = 4
 FRESH_BYTES = 64 << 10  # small enough that one block's share fits its L1, so a stale .nc read shows
 KIND_CV, KIND_NC, KIND_LDGSTS, KIND_TMA, KIND_WEAK, KIND_CW_REAL = 0, 1, 2, 3, 4, 5
-KIND_LINE = 7
+KIND_TMA_NOFENCE, KIND_LINE = 6, 7
 LOAD_NC = 1  # sm_kernel's load template argument for the .nc control (mech_bench.cuh kLoadNc)
 WRAPPERS = ["mech_copy", "mech_fresh", "mech_latency", "mech_pingpong"]
 BUILD_FLAGS = [("v8_weak", "MECH_V8_WEAK")]  # (probe name, define) pairs; Task 4 and 5 append theirs
@@ -178,6 +178,8 @@ def tma_cells(mod, probe):
 
 CELL_GENERATORS += [ldgsts_cells, tma_cells]
 FRESH_CHECKS += [("ldgsts", KIND_LDGSTS, 8, 4, 0, "ldgsts"), ("tma", KIND_TMA, 8, 4, 4096, "bulk")]
+# Informational (mech_report INFORMATIONAL): can the fresh check see a missing proxy fence at all?
+FRESH_CHECKS += [("tma_nofence", KIND_TMA_NOFENCE, 8, 4, 4096, "bulk")]
 
 WRAPPERS += ["mech_ce_each"]
 BUILD_FLAGS += [("batch", "MECH_BATCH")]

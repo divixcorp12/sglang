@@ -30,6 +30,7 @@ constexpr int kKindLdgsts = 2;
 constexpr int kKindTma = 3;
 constexpr int kKindWeak = 4;
 constexpr int kKindCwReal = 5;
+constexpr int kKindTmaNofence = 6;
 constexpr int kKindLine = 7;
 // sm_kernel's load flavour: .cv (swept), .nc (the fresh check's control, never swept), weak (plain ld.global after
 // the acquire; swept: the PTX memory model orders it after an acquire that observed the host's release).
@@ -282,7 +283,8 @@ __global__ __launch_bounds__(kThreads, 1) void ldgsts_kernel(const Job* jobs, in
 // then bulk-write shared -> VRAM. The producer runs STAGES - 1 chunks ahead of the consumer; before reusing a slot it
 // waits (wait_group.read 0) for every bulk write to have read its shared source. In flight per block: <= STAGES *
 // chunk. The fence.proxy.async.global after the fresh acquire is the contract for async-proxy reads of host bytes.
-template <int STAGES>
+// kFence = false is the tma_nofence control: the same kernel without the proxy fence, fresh-checked only.
+template <int STAGES, bool kFence = true>
 __global__ __launch_bounds__(1, 1) void tma_kernel(const Job* jobs, int64_t njobs, int64_t chunk, uint32_t* fresh) {
   extern __shared__ __align__(128) uint8_t tma_ring[];
   __shared__ alignas(8) uint64_t full[STAGES];
@@ -293,7 +295,7 @@ __global__ __launch_bounds__(1, 1) void tma_kernel(const Job* jobs, int64_t njob
   for (int pass = 0; pass < (fresh != nullptr ? 2 : 1); ++pass) {
     if (pass == 1) {
       fresh_barrier(fresh);
-      asm volatile("fence.proxy.async.global;" ::: "memory");
+      if constexpr (kFence) asm volatile("fence.proxy.async.global;" ::: "memory");
     }
     for (int64_t j = 0; j < njobs; ++j) {
       const auto src = reinterpret_cast<const uint8_t*>(jobs[j].src);
@@ -454,6 +456,15 @@ inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, i
     }
 #endif
     host::RuntimeCheck(false, "ldgsts: stages 2, 4 or 8, in the MECH_LDGSTS build");
+  }
+  if (kind == kKindTmaNofence) {
+#ifdef MECH_BULK
+    host::RuntimeCheck(a == 4 && b == 4096, "tma_nofence: stages 4, chunk 4096 (the tma fresh check's shape) only");
+    CHECK_CUDA(cudaFuncSetAttribute(tma_kernel<4, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 4096));
+    host::LaunchKernel(g, 1, stream, 4 * 4096)(tma_kernel<4, false>, jobs, njobs, b, fresh);
+    return;
+#endif
+    host::RuntimeCheck(false, "tma_nofence: the MECH_BULK build");
   }
   if (kind == kKindTma) {
 #ifdef MECH_BULK
