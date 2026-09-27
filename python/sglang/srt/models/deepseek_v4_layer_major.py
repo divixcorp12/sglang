@@ -250,12 +250,29 @@ class DeepseekV4LayerMajorAdapter:
             return
         seq_len = handle.spans[-1].end
         prefix_len = int(handle.schedule_batch.prefix_lens[0])
-        keep_from = max(prefix_len, keep_window_start(seq_len=seq_len, window=DSV4_WINDOW, page=self.page))
+        req = handle.schedule_batch.reqs[0]
+        keep_from = self._insert_keep_from(req, handle, prefix_len=prefix_len, seq_len=seq_len)
         self.allocator.finalize_ring(handle.extend_full_locs, extend_start=prefix_len, keep_from=keep_from,
                                      ring=handle.ring)
-        req = handle.schedule_batch.reqs[0]
         req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, keep_from)
         handle.finalized = True
+
+    def _insert_keep_from(self, req, handle: _Pass, *, prefix_len: int, seq_len: int) -> int:
+        """free_swa_out_of_window_slots' floor for cache_unfinished_req's next insert, which ends at the SWA branch
+        point if admission set one, else page_floor(seq_len); keeping less ends that key on an unmatchable tombstone."""
+        margin = max(DSV4_WINDOW, self.page)
+        # The ring still holds a position iff its page is among the last ring-pages pages of the extend.
+        oldest_intact = ((seq_len - 1) // self.page - handle.ring.numel() // self.page + 1) * self.page
+        branch = req.swa_branching_seqlen
+        if branch is not None and prefix_len < branch <= seq_len:
+            keep_from = max(prefix_len, (branch - 1 - margin) // self.page * self.page)
+            if keep_from >= oldest_intact:
+                return keep_from
+            # The ring has overwritten the window below the branch point, so insert to the end instead.
+            req.swa_branching_seqlen = None
+        keep_from = max(prefix_len, (seq_len // self.page * self.page - 1 - margin) // self.page * self.page)
+        assert keep_from >= oldest_intact, f"ring of {handle.ring.numel()} slots cannot keep from {keep_from}"
+        return keep_from
 
     def release_pass(self, handle: _Pass, store: StateStore, *, failed: bool) -> None:
         store.clear_parked()
