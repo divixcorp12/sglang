@@ -31,10 +31,11 @@ std::vector<int64_t> slots_of(TensorView slots) {
 // resolve to these.
 namespace {
 
+using Layout = exl3::Exl3RowLayout;
 using namespace expert_stream;
-using Exl3Source = RowReader<exl3::Exl3RowLayout, FaultyReader<UringReader>>;
-using Exl3Tier = RamTier<Exl3Source>;
-using Exl3Thread = RamThread<Exl3Tier>;
+using Source = RowReader<Layout, FaultyReader<UringReader>>;
+using Tier = RamTier<Source>;
+using Thread = RamThread<Tier>;
 
 static_assert(AsyncFileReader<FaultyReader<UringReader>>);
 
@@ -54,10 +55,10 @@ void check_table_tensors(
   verify_named("file_sizes", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), file_sizes);
   verify_named("segments", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), segments);
   verify_named(
-      "slabs", TensorMatcher({L_, kNumNames<exl3::Exl3RowLayout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+      "slabs", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
       slabs);
   verify_named(
-      "row_bytes", TensorMatcher({kNumNames<exl3::Exl3RowLayout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+      "row_bytes", TensorMatcher({kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
       row_bytes);
 }
 
@@ -68,28 +69,28 @@ inline std::mutex& registry_mutex() {
 
 // Shared ownership: every call holds its own reference, so a close() from another Python
 // thread (or a finalizer) frees the service only after the calls in flight return.
-inline std::unordered_map<int64_t, std::shared_ptr<Exl3Tier>>& registry() {
-  static std::unordered_map<int64_t, std::shared_ptr<Exl3Tier>> tiers;
+inline std::unordered_map<int64_t, std::shared_ptr<Tier>>& registry() {
+  static std::unordered_map<int64_t, std::shared_ptr<Tier>> tiers;
   return tiers;
 }
 
-inline std::shared_ptr<Exl3Tier> find(int64_t handle) {
+inline std::shared_ptr<Tier> find(int64_t handle) {
   std::lock_guard<std::mutex> guard(registry_mutex());
   const auto found = registry().find(handle);
-  if (found == registry().end()) throw std::runtime_error("exl3 RAM miss: unknown handle");
+  if (found == registry().end()) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
   return found->second;
 }
 
 // Guarded by registry_mutex(), like the tiers; shared for the same reason as the tiers.
-inline std::unordered_map<int64_t, std::shared_ptr<Exl3Thread>>& thread_registry() {
-  static std::unordered_map<int64_t, std::shared_ptr<Exl3Thread>> threads;
+inline std::unordered_map<int64_t, std::shared_ptr<Thread>>& thread_registry() {
+  static std::unordered_map<int64_t, std::shared_ptr<Thread>> threads;
   return threads;
 }
 
-inline std::shared_ptr<Exl3Thread> find_thread(int64_t handle) {
+inline std::shared_ptr<Thread> find_thread(int64_t handle) {
   std::lock_guard<std::mutex> guard(registry_mutex());
   const auto found = thread_registry().find(handle);
-  if (found == thread_registry().end()) throw std::runtime_error("exl3 RAM miss: no service thread");
+  if (found == thread_registry().end()) throw std::runtime_error(error_prefix<Layout>() + "no service thread");
   return found->second;
 }
 
@@ -98,14 +99,14 @@ inline std::shared_ptr<Exl3Thread> find_thread(int64_t handle) {
 /// \brief The layout this module was built for: its tensor names in copy-table order, newline-joined.
 std::string expert_stream_layout_names() {
   std::string out;
-  for (const auto name : exl3::Exl3RowLayout::kNames) out += std::string(name) + "\n";
+  for (const auto name : Layout::kNames) out += std::string(name) + "\n";
   out.pop_back();
   return out;
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, expert_stream_layout_names);
 
 /// \brief Bit i: name i may be read by the copy wait's SMs (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES).
-int64_t expert_stream_layout_small_mask() { return exl3::Exl3RowLayout::kSmallMask; }
+int64_t expert_stream_layout_small_mask() { return Layout::kSmallMask; }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_small_mask, expert_stream_layout_small_mask);
 
 // Read `experts` of streamed row `row` into `slots` once, synchronously (tests, tools).
@@ -132,7 +133,7 @@ int64_t expert_stream_read_rows(
   auto cpu = SymbolicDevice{};
   verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
   verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
-  Exl3Source reader(tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
+  Source reader(tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images), direct != 0);
   if (!reader.open()) return 0;
   return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
 }
@@ -173,10 +174,10 @@ int64_t expert_stream_read_rows_traced(
   verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
   verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
   verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
-  check_fault_words<exl3::Exl3RowLayout>(fault);
+  check_fault_words<Layout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-  Exl3Source reader(
-      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+  Source reader(
+      tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   reader.set_owner_core(owner_core);
   if (f[22] != 0) reader.set_piece_stream(true);
@@ -229,10 +230,10 @@ void expert_stream_read_rows_faulted(
   verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
   verify_named("results", TensorMatcher({8}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), results);
   auto* out = static_cast<int64_t*>(results.data_ptr());
-  check_fault_words<exl3::Exl3RowLayout>(fault);
+  check_fault_words<Layout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-  Exl3Source reader(
-      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+  Source reader(
+      tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) {
@@ -289,17 +290,17 @@ void expert_stream_read_rows_sqes(
   verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
   verify_named("sqes", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sqes);
   verify_named("info", TensorMatcher({5}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
-  check_fault_words<exl3::Exl3RowLayout>(fault);
+  check_fault_words<Layout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
   out[0] = out[1] = out[2] = out[3] = out[4] = 0;
-  Exl3Source reader(
-      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+  Source reader(
+      tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) return;
   reader.set_fault(fault_from(f));
-  std::vector<Exl3Source::SqeRecord> log;
+  std::vector<Source::SqeRecord> log;
   reader.set_sqe_log(&log);
   StageRecord stage;
   const int result = reader.read(
@@ -375,16 +376,16 @@ void expert_stream_read_rows_pieces(
   verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
   verify_named("masks", TensorMatcher({-1, -1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), masks);
   verify_named("info", TensorMatcher({5}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
-  check_fault_words<exl3::Exl3RowLayout>(fault);
+  check_fault_words<Layout>(fault);
   const auto* f = static_cast<const int64_t*>(fault.data_ptr());
   auto* out = static_cast<int64_t*>(info.data_ptr());
   std::fill(out, out + 5, 0);
-  const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+  const Tables t = tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const std::vector<int32_t> ids = ids_of(experts);
   const std::vector<int64_t> dest = slots_of(slots);
   const size_t lanes = static_cast<size_t>(masks.size(1));
   if (static_cast<size_t>(masks.size(0)) != ids.size() || lanes == 0 || lanes > static_cast<size_t>(kPieceTargets)) {
-    throw std::runtime_error("exl3 RAM miss: masks must be [rows, 1..8] readiness words");
+    throw std::runtime_error(error_prefix<Layout>() + "masks must be [rows, 1..8] readiness words");
   }
   auto* words = static_cast<uint64_t*>(masks.data_ptr());
   std::vector<PieceTarget> targets(ids.size());
@@ -392,7 +393,7 @@ void expert_stream_read_rows_pieces(
     for (size_t l = 0; l < lanes; ++l) targets[o].words[targets[o].count++] = words + o * lanes + l;
   }
   const PiecePublish publish{static_cast<uint64_t>(generation), targets.data()};
-  Exl3Source reader(Tables(t), direct != 0, f[19], f[20]);
+  Source reader(Tables(t), direct != 0, f[19], f[20]);
   if (f[22] != 0) reader.set_piece_stream(true);
   if (!reader.open()) return;
   reader.set_fault(fault_from(f));
@@ -411,7 +412,7 @@ void expert_stream_read_rows_pieces(
     for (size_t o = 0; o < ids.size(); ++o) {
       RowGeometry g;
       if (!row_geometry(t, static_cast<size_t>(row * t.experts + ids[o]), g, &runs[o * kPieces * count])) {
-        throw std::runtime_error("exl3 RAM miss: the checker cannot cut a row");
+        throw std::runtime_error(error_prefix<Layout>() + "the checker cannot cut a row");
       }
     }
   }
@@ -498,7 +499,7 @@ int64_t expert_stream_piece_geometry(
   check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
   auto cpu = SymbolicDevice{};
   verify_named("subs", TensorMatcher({kPieces, 6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), subs);
-  const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+  const Tables t = tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   verify_named(
       "pieces", TensorMatcher({kPieces, 1 + 2 * static_cast<int64_t>(count)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
@@ -548,12 +549,12 @@ int64_t expert_stream_piece_runs(
   check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
   auto cpu = SymbolicDevice{};
   verify_named("runs", TensorMatcher({-1, -1, -1, -1, -1}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), runs);
-  const Tables t = tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+  const Tables t = tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
   const size_t count = t.segments.size();
   const size_t rows = static_cast<size_t>(t.layers * t.experts);
   if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
       runs.size(3) != static_cast<int64_t>(count) || runs.size(4) != 2) {
-    throw std::runtime_error("exl3 RAM miss: the piece-run table has the wrong shape");
+    throw std::runtime_error(error_prefix<Layout>() + "the piece-run table has the wrong shape");
   }
   auto* out = static_cast<int32_t*>(runs.data_ptr());
   std::vector<PieceRun> piece(static_cast<size_t>(kPieces) * count);
@@ -569,7 +570,7 @@ int64_t expert_stream_piece_runs(
     for (size_t k = 0; k < static_cast<size_t>(kPieces) * count; ++k) {
       const Segment& segment = t.segments[k % count];
       if (segment.dst + piece[k].hi > INT32_MAX) {
-        throw std::runtime_error("exl3 RAM miss: a piece run ends past the int32 range of the stream kernel's table");
+        throw std::runtime_error(error_prefix<Layout>() + "a piece run ends past the int32 range of the stream kernel's table");
       }
       line[2 * k] = static_cast<int32_t>(segment.dst + piece[k].lo);
       line[2 * k + 1] = static_cast<int32_t>(segment.dst + piece[k].hi);
@@ -592,8 +593,8 @@ void expert_stream_pack_pool_affinity(TensorView inherited, int64_t workers, Ten
     if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
   }
   PackPool pool(
-      static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots), error_prefix<exl3::Exl3RowLayout>(),
-      std::string(exl3::Exl3RowLayout::kName) + "-pack");
+      static_cast<unsigned>(workers), mask, static_cast<size_t>(kBounceSlots), error_prefix<Layout>(),
+      std::string(Layout::kName) + "-pack");
   auto* words = static_cast<int64_t*>(out.data_ptr());
   for (size_t w = 0; w < pool.workers(); ++w) {
     const cpu_set_t set = pool.worker_affinity(w);
@@ -666,12 +667,12 @@ int64_t expert_stream_open(
   auto cpu = SymbolicDevice{};
   verify_named("capacity", TensorMatcher({extents.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), capacity);
   const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
-  auto tier = std::make_shared<Exl3Tier>(
+  auto tier = std::make_shared<RamTier<Source>>(
       static_cast<uint8_t*>(page.data_ptr()),
       static_cast<int32_t*>(slot_map.data_ptr()),
       static_cast<uint8_t*>(lease.data_ptr()),
       lease.size(0),
-      tables_from<exl3::Exl3RowLayout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+      tables_from<Layout>(extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
       std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
       direct != 0,
       pack_workers,
@@ -692,7 +693,7 @@ void expert_stream_close(int64_t handle);
 // thread pumps. The order is the service thread's: demand, prefetch, advisory.
 int64_t expert_stream_pump(int64_t handle) {
   const auto tier = find(handle);
-  if (tier->threaded()) throw std::runtime_error("exl3 RAM miss: pump() while the service thread runs");
+  if (tier->threaded()) throw std::runtime_error(error_prefix<Layout>() + "pump() while the service thread runs");
   if (tier->pump_demand()) return 1;
   if (tier->pump_prefetch()) return 3;
   return tier->pump_advice() ? 2 : 0;
@@ -760,7 +761,7 @@ void expert_stream_lease_entry(int64_t handle, int64_t idx, TensorView out) {
   auto cpu = SymbolicDevice{};
   expert_stream::verify_named(
       "out", TensorMatcher({4 + 3 * expert_stream::kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-  if (idx < 0 || idx >= expert_stream::kDemandRecords) throw std::runtime_error("exl3 RAM miss: request slot out of range");
+  if (idx < 0 || idx >= expert_stream::kDemandRecords) throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
   find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
 }
 
@@ -819,7 +820,7 @@ void expert_stream_set_copy_table(int64_t handle, int64_t row, TensorView entrie
   using namespace host;
   auto cpu = SymbolicDevice{};
   expert_stream::verify_named("entries", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), entries);
-  if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error("exl3 RAM miss: copy table must be [n, 3]");
+  if (entries.dim() != 2 || entries.size(1) != 3) throw std::runtime_error(error_prefix<Layout>() + "copy table must be [n, 3]");
   find(handle)->set_copy_table(
       row, static_cast<const int64_t*>(entries.data_ptr()), entries.size(0), dst_rows, sm_mask);
 }
@@ -837,7 +838,7 @@ void expert_stream_enable_native_prefetch(int64_t handle, TensorView page) {
       TensorMatcher({expert_stream::kPrefetchPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
       page);
   if (page.dim() != 1 || page.size(0) != expert_stream::kPrefetchPageBytes)
-    throw std::runtime_error("exl3 RAM miss: the native prefetch page must be uint8 [256]");
+    throw std::runtime_error(error_prefix<Layout>() + "the native prefetch page must be uint8 [256]");
   find(handle)->enable_native_prefetch(static_cast<uint8_t*>(page.data_ptr()));
 }
 
@@ -914,7 +915,7 @@ void expert_stream_inject_fault(int64_t handle, TensorView fault) {
   auto cpu = SymbolicDevice{};
   expert_stream::verify_named(
       "fault", TensorMatcher({expert_stream::kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
-  expert_stream::check_fault_words<exl3::Exl3RowLayout>(fault);
+  expert_stream::check_fault_words<Layout>(fault);
   find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
 }
 
@@ -938,7 +939,7 @@ int64_t expert_stream_trace_words() {
 }
 
 void expert_stream_trace_enable(int64_t handle, int64_t capacity) {
-  if (capacity <= 0) throw std::runtime_error("exl3 RAM miss: the stage trace needs a positive capacity");
+  if (capacity <= 0) throw std::runtime_error(error_prefix<Layout>() + "the stage trace needs a positive capacity");
   find(handle)->enable_trace(static_cast<size_t>(capacity));
 }
 
@@ -1141,9 +1142,9 @@ namespace expert_stream {
 
 void expert_stream_start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
   using namespace expert_stream;
-  if (cpu_core >= CPU_SETSIZE) throw std::runtime_error("exl3 RAM miss: cpu_core out of range");
+  if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
   if (cpu_core >= 64 && cpu_core <= 71) {
-    throw std::runtime_error("exl3 RAM miss: cores 64-71 are reserved (71 is production's doorbell core)");
+    throw std::runtime_error(error_prefix<Layout>() + "cores 64-71 are reserved (71 is production's doorbell core)");
   }
   if (cpu_core < 0) {
     cpu_set_t inherited;
@@ -1153,27 +1154,28 @@ void expert_stream_start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_
         if (CPU_ISSET(core, &inherited)) {
           std::fprintf(
               stderr,
-              "WARNING exl3 RAM miss: the service thread inherits an affinity that includes reserved cores 64-71; "
-              "run under taskset -c 0-63 or pass cpu_core\n");
+              "WARNING %sthe service thread inherits an affinity that includes reserved cores 64-71; "
+              "run under taskset -c 0-63 or pass cpu_core\n",
+              error_prefix<Layout>().c_str());
           break;
         }
       }
     }
   }
-  std::shared_ptr<Exl3Tier> tier = find(handle);
+  std::shared_ptr<RamTier<Source>> tier = find(handle);
   // Checked and registered under one lock, so a concurrent close() either sees the thread
   // (and joins it) or runs before it and leaves no handle to start it on.
   std::lock_guard<std::mutex> guard(registry_mutex());
-  if (registry().count(handle) == 0) throw std::runtime_error("exl3 RAM miss: unknown handle");
-  if (thread_registry().count(handle)) throw std::runtime_error("exl3 RAM miss: the service thread already runs");
-  auto thread = std::make_shared<Exl3Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns);
+  if (registry().count(handle) == 0) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
+  if (thread_registry().count(handle)) throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
+  auto thread = std::make_shared<Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns);
   thread->start();
   thread_registry()[handle] = std::move(thread);
 }
 
 void expert_stream_stop_thread(int64_t handle) {
   using namespace expert_stream;
-  std::shared_ptr<Exl3Thread> thread;
+  std::shared_ptr<Thread> thread;
   {
     std::lock_guard<std::mutex> guard(registry_mutex());
     const auto found = thread_registry().find(handle);
@@ -1198,8 +1200,8 @@ void expert_stream_resume(int64_t handle) {
 // releases after this returns.
 void expert_stream_close(int64_t handle) {
   using namespace expert_stream;
-  std::shared_ptr<Exl3Thread> thread;
-  std::shared_ptr<Exl3Tier> tier;
+  std::shared_ptr<Thread> thread;
+  std::shared_ptr<RamTier<Source>> tier;
   {
     std::lock_guard<std::mutex> guard(registry_mutex());
     const auto running = thread_registry().find(handle);
