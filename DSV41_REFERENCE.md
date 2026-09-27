@@ -5133,7 +5133,7 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 - **The cause:** layer 20 is the unique layer that runs the full 4096-row chunk, scores with indexer ratio 1 (so
   `lc` equals the whole prefix), and is `candidate_source_layer_id`. It publishes a `[T, P]` bool candidate mask that
   stays alive through `flash_mla` and layers 21-39, though only its last 128 rows are ever read
-  (`deepseek_v4_backend.py:1778-1784`). Mask size scales with the prefix: 62.5 MiB at 16k, 240 MiB at the 61k
+  (`deepseek_v4_backend.py`, `enter_late_layer_tail`). Mask size scales with the prefix: 62.5 MiB at 16k, 240 MiB at the 61k
   failure, 512 MiB at 131k, and 1 GiB at 262k (build peak is 2x that). This is the diagnosis's top-ranked hypothesis
   (`oom-diagnosis.md` Q3.1): the failing run sat 9-44 MiB below the 32,150 MiB CUDA limit (`phase0-128k/vram.csv`:
   32,106-32,141 MiB used) from chunk 1, and the mask's growth alone exceeds that margin, with allocator
