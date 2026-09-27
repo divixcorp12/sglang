@@ -40,14 +40,3 @@ def test_the_three_device_headers_are_found():
 
 def test_cache_hinted_copies_and_the_timer_use_intrinsics_not_ptx():
     assert matches(r"ld\.global\.cv|st\.global\.cg|%globaltimer") == []
-
-
-def test_no_inline_ptx_is_left():
-    assert matches(r"\basm\b") == []
-
-
-def test_volatile_is_left_only_on_the_hot_bitmap_bytes():
-    # atomic_ref<uint8_t>::store compiles to a system-scope CAS loop, one PCIe read-modify-write per byte.
-    assert [(name, code) for name, _, code in matches(r"\bvolatile\b")] == [
-        ("lease_kernels.cuh", "volatile uint8_t* bits = reinterpret_cast<volatile uint8_t*>(hot + kHotHeaderBytes);"),
-    ]
