@@ -151,6 +151,11 @@ class RowReader {
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
     if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
       io_.set_submit_fault(SubmitFault{fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call});
+    } else if (fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0) {
+      // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs RowReader
+      // with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above always
+      // fires there. This is the fallback for a Reader that cannot inject submit faults at all.
+      throw std::runtime_error(error_prefix<Layout>() + "this reader cannot inject submit faults");
     }
   }
 
