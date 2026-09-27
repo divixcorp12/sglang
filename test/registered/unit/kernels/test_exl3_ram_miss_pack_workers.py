@@ -176,6 +176,11 @@ def test_no_worker_thread_exists_unless_asked_for_and_close_joins_them(tmp_path)
     on = host(3)
     assert _pack_threads() == before + 3
     on._close()
+    # join() can return while a worker is still on its kernel exit path (R, before X): allow it to leave /proc.
+    # A worker close() never joined stays, so this still fails.
+    deadline = time.monotonic() + 1.0
+    while _pack_threads() != before and time.monotonic() < deadline:
+        time.sleep(0.001)
     assert _pack_threads() == before
     off._close()
 
