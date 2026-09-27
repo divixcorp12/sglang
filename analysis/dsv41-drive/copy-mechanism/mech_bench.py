@@ -49,7 +49,8 @@ def load(repo: Path, probe: dict):
     flags += [f"-D{define}" for name, define in BUILD_FLAGS if probe_ok(probe, name)]
     variant = "-".join(sorted(f[2:] for f in flags)) or "base"
     return load_jit("copy_mech_bench", variant, cuda_files=[str(HERE / "mech_bench.cuh")],
-                    cuda_wrappers=[(n, n) for n in WRAPPERS], extra_cuda_cflags=flags)
+                    cuda_wrappers=[(n, n) for n in WRAPPERS + (["mech_ce_batch"] if probe_ok(probe, "batch") else [])],
+                    extra_cuda_cflags=flags)
 
 
 class Rows:
@@ -120,6 +121,28 @@ def tma_cells(mod, probe):
 
 CELL_GENERATORS += [ldgsts_cells, tma_cells]
 FRESH_CHECKS += [("ldgsts", KIND_LDGSTS, 8, 4, 0, "ldgsts"), ("tma", KIND_TMA, 8, 4, 4096, "bulk")]
+
+WRAPPERS += ["mech_ce_each"]
+BUILD_FLAGS += [("batch", "MECH_BATCH")]
+SMALL = (1, 2, 4, 5)  # indices of the four small segments (20 KiB, 9 KiB, 4.5 KiB, 10 KiB)
+
+
+def ce_cells(mod, probe):
+    batch = probe_ok(probe, "batch")
+    for n in (1, 2, 4):
+        yield Cell("ce_each", 0, n, 0, 0, None, n, ALL_SEGMENTS, lambda cpu, dev: mod.mech_ce_each(cpu, dev))
+        if batch:
+            yield Cell("ce_batch", 0, n, 0, 0, None, n, ALL_SEGMENTS, lambda cpu, dev: mod.mech_ce_batch(cpu, dev))
+    for lanes in (1, 4, 8):
+        yield Cell("ce_each_small", 0, lanes, 0, 0, None, lanes, SMALL, lambda cpu, dev: mod.mech_ce_each(cpu, dev))
+        if batch:
+            yield Cell("ce_batch_small", 0, lanes, 0, 0, None, lanes, SMALL,
+                       lambda cpu, dev: mod.mech_ce_batch(cpu, dev))
+        yield Cell("sm_small", 8, 1, 16, 8 * 256 * 16, None, lanes, SMALL,
+                   lambda cpu, dev: mod.mech_copy(dev, KIND_CV, 8, 1, 16))
+
+
+CELL_GENERATORS += [ce_cells]
 
 
 def measure(cell: Cell, rows: Rows, reps: int) -> dict:

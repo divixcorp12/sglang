@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -416,5 +417,43 @@ void mech_pingpong(tvm::ffi::TensorView words, tvm::ffi::TensorView out, int64_t
   }
   CHECK_CUDA(cudaStreamSynchronize(stream)) << "ping-pong";
 }
+
+// Copy-engine baselines, timed on the host as well: the API cost per call is what the service's copy thread pays.
+int64_t mech_ce_each(tvm::ffi::TensorView jobs, tvm::ffi::TensorView dev) {
+  const auto stream = host::LaunchKernel::resolve_device(dev.device());
+  const auto* j = static_cast<const mech::Job*>(jobs.data_ptr());
+  const int64_t n = jobs.size(0);
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int64_t i = 0; i < n; ++i) {
+    CHECK_CUDA(cudaMemcpyAsync(reinterpret_cast<void*>(j[i].dst), reinterpret_cast<const void*>(j[i].src),
+                               static_cast<size_t>(j[i].bytes), cudaMemcpyHostToDevice, stream))
+        << "cudaMemcpyAsync";
+  }
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+#ifdef MECH_BATCH
+int64_t mech_ce_batch(tvm::ffi::TensorView jobs, tvm::ffi::TensorView dev) {
+  const auto stream = host::LaunchKernel::resolve_device(dev.device());
+  const auto* j = static_cast<const mech::Job*>(jobs.data_ptr());
+  const int64_t n = jobs.size(0);
+  std::vector<void*> dsts(n);
+  std::vector<const void*> srcs(n);
+  std::vector<size_t> sizes(n);
+  for (int64_t i = 0; i < n; ++i) {
+    dsts[i] = reinterpret_cast<void*>(j[i].dst);
+    srcs[i] = reinterpret_cast<const void*>(j[i].src);
+    sizes[i] = static_cast<size_t>(j[i].bytes);
+  }
+  cudaMemcpyAttributes attr{};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  size_t attr_index = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_CUDA(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), static_cast<size_t>(n), &attr, &attr_index, 1,
+                                  stream))
+      << "cudaMemcpyBatchAsync";
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+#endif
 
 }  // namespace sglang
