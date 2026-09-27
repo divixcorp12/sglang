@@ -1,4 +1,4 @@
-// Packing-pool microbenchmark: the real PackPool (exl3_ram_miss_pack_pool.h) driven the way a piece-streaming read
+// Packing-pool microbenchmark: the real PackPool (expert_stream/host/pack_pool.h) driven the way a piece-streaming read
 // drives it, with per-chunk stamps, so a piece's pack time splits into worker wake-up and copy.
 //
 // Why: in serving, the last piece of a single-row demand (1.66 MB, 8 chunks of ~208 KB on 8 workers) takes a median
@@ -31,7 +31,7 @@
 #include <thread>
 #include <vector>
 
-#include "exl3_ram_miss_pack_pool.h"
+#include "expert_stream/host/pack_pool.h"
 
 using sglang::exl3_ram_miss::ChunkStamp;
 using sglang::exl3_ram_miss::CopyRun;
