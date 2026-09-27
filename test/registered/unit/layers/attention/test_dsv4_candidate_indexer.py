@@ -323,16 +323,17 @@ def _fake_two_request_setup(monkeypatch, *, rows_per_chunk):
     """Two requests (5 and 4 compressed positions, ratio 1) sharing one fake backend's
     dependencies for `_low_ratio_index_topk_torch`."""
     monkeypatch.setattr(
-        backend_mod, "_torch_indexer_rows_per_chunk", lambda num_heads, lc: rows_per_chunk
+        backend_mod,
+        "_torch_indexer_rows_per_chunk",
+        lambda num_heads, lc: rows_per_chunk,
     )
     req = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1])
     pos = torch.tensor([0, 1, 2, 3, 4, 0, 1, 2, 3])
     req_to_token = torch.arange(20, dtype=torch.int64).view(2, 10)
-    q_lora = torch.arange(9, dtype=torch.float32).unsqueeze(-1)
     layer = types.SimpleNamespace(
         compress_ratio=1, indexer=None, layer_id=0, freqs_cis=torch.zeros(10, 1)
     )
-    return req, pos, req_to_token, q_lora, layer
+    return req, pos, req_to_token, layer
 
 
 def _fake_scores(q_sub, index_k, weights_sub):
@@ -358,7 +359,15 @@ def _fake_indexer(*, source, uses):
 
 
 def _run_torch_indexer(
-    layer, indexer, req, pos, req_to_token, *, tail_metadata, candidate_tail_only, skip=False
+    layer,
+    indexer,
+    req,
+    pos,
+    req_to_token,
+    *,
+    tail_metadata,
+    candidate_tail_only,
+    skip=False,
 ):
     layer.indexer = indexer
     page_indices = torch.zeros(req.numel(), 3, dtype=torch.int32)
@@ -396,10 +405,18 @@ _TAIL_METADATA = types.SimpleNamespace(
 
 
 def test_torch_indexer_publishes_tail_rows_matching_the_full_mask_tail(monkeypatch):
-    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
     source = _fake_indexer(source=True, uses=False)
     full_meta, full_pages = _run_torch_indexer(
-        layer, source, req, pos, req_to_token, tail_metadata=None, candidate_tail_only=True
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
     )
     tail_meta, tail_pages = _run_torch_indexer(
         layer,
@@ -416,11 +433,21 @@ def test_torch_indexer_publishes_tail_rows_matching_the_full_mask_tail(monkeypat
     assert torch.equal(full_pages, tail_pages)
 
 
-def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail(monkeypatch):
-    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail(
+    monkeypatch,
+):
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
     source = _fake_indexer(source=True, uses=False)
     full_meta, _ = _run_torch_indexer(
-        layer, source, req, pos, req_to_token, tail_metadata=None, candidate_tail_only=True
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
     )
     unsafe_meta, _ = _run_torch_indexer(
         layer,
@@ -436,7 +463,9 @@ def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail
 
 
 def test_torch_indexer_skip_flag_publishes_no_masks(monkeypatch):
-    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
     source = _fake_indexer(source=True, uses=False)
     meta, _ = _run_torch_indexer(
         layer,
@@ -453,7 +482,9 @@ def test_torch_indexer_skip_flag_publishes_no_masks(monkeypatch):
 
 
 def test_torch_indexer_raises_when_a_tail_length_exceeds_its_request_rows(monkeypatch):
-    req, pos, req_to_token, _, layer = _fake_two_request_setup(monkeypatch, rows_per_chunk=3)
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
     source = _fake_indexer(source=True, uses=False)
     oversized_tail = types.SimpleNamespace(
         late_layer_tail=types.SimpleNamespace(
