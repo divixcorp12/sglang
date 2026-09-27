@@ -136,3 +136,20 @@ class DeepSeekV4Config(PretrainedConfig):
     q_head_norm: bool = True
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+
+
+def late_layer_start_of(config: DeepSeekV4Config) -> Optional[int]:
+    """The first late layer under decoder SWA bounded replay (layers at or after this
+    index run over each request's last SWA_WINDOW extend tokens only), or None when the
+    feature is off. Shared by DeepseekV4Model.__init__, which builds the late layers,
+    and DeepseekV4AttnBackend, which must derive the same value from config alone: a
+    draft model's config (NextN, DSpark) never builds a `late_layer_start` attribute to
+    read."""
+    from sglang.srt.runtime_context import get_exec
+
+    if not get_exec().features.enable_decoder_swa_bounded_replay:
+        return None
+    assert config.kv_source_layer_ids, (
+        "decoder SWA bounded replay needs kv_source_layer_ids"
+    )
+    return max(config.kv_source_layer_ids) + 1

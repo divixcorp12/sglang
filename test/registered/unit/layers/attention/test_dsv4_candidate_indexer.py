@@ -259,5 +259,317 @@ def test_dense_fp4_prefill_indexer_needs_topk_v2(monkeypatch, topk_v2, expected)
             assert use(batch) is expected
 
 
+def _tail_masks_by_chunks(logits, lens, keep_from, rows_per_chunk, topk_blocks, block_size):
+    kept = []
+    for start in range(0, logits.shape[0], rows_per_chunk):
+        s = logits[start : start + rows_per_chunk]
+        sl = ci.keep_row_slice(start, s.shape[0], keep_from)
+        if sl is not None:
+            kept.append(
+                ci.select_candidate_blocks(
+                    s[sl], lens[start : start + rows_per_chunk][sl][:, None],
+                    topk_blocks=topk_blocks, block_size=block_size,
+                )
+            )
+    if kept:
+        return torch.cat(kept)
+    return torch.zeros(0, logits.shape[1], dtype=torch.bool)
+
+
+@pytest.mark.parametrize("keep_from", [0, 1, 33, 34, 35, 250, 299, 300])
+def test_tail_rows_built_by_chunks_equal_the_full_mask_tail(keep_from):
+    g = torch.Generator().manual_seed(keep_from)
+    rows, width = 300, 97
+    logits = torch.randn(rows, width, generator=g)
+    lens = torch.randint(1, width + 1, (rows,), generator=g)
+    logits = logits.masked_fill(torch.arange(width)[None, :] >= lens[:, None], -INF)
+    full = ci.select_candidate_blocks(logits, lens[:, None], topk_blocks=4, block_size=8)
+    got = _tail_masks_by_chunks(logits, lens, keep_from, 34, 4, 8)
+    assert torch.equal(got, full[keep_from:])
+
+
+def test_keep_row_slice_bounds():
+    assert ci.keep_row_slice(0, 34, 0) == slice(0, 34)
+    assert ci.keep_row_slice(0, 34, 34) is None
+    assert ci.keep_row_slice(34, 34, 40) == slice(6, 34)
+    assert ci.keep_row_slice(68, 10, 40) == slice(0, 10)
+
+
+def _tail_meta(extend_lens_cpu, local_lens_cpu=None):
+    tail = types.SimpleNamespace(
+        extend_seq_lens_cpu=extend_lens_cpu,
+        local_lens_cpu=local_lens_cpu,
+        cp_metadata=object() if local_lens_cpu is not None else None,
+    )
+    return types.SimpleNamespace(late_layer_tail=tail)
+
+
+def test_candidate_publish_rows_without_tail_keeps_every_row():
+    assert backend_mod.candidate_publish_rows(None) is None
+
+
+def test_candidate_publish_rows_per_request_and_short_extends():
+    assert backend_mod.candidate_publish_rows(_tail_meta([128, 57, 128])) == [128, 57, 128]
+
+
+def test_candidate_publish_rows_uses_local_lens_under_cp():
+    assert backend_mod.candidate_publish_rows(_tail_meta([128], local_lens_cpu=[64])) == [64]
+
+
+# --- driving _low_ratio_index_topk_torch on a fake backend ------------------------
+
+
+def _fake_two_request_setup(monkeypatch, *, rows_per_chunk):
+    """Two requests (5 and 4 compressed positions, ratio 1) sharing one fake backend's
+    dependencies for `_low_ratio_index_topk_torch`."""
+    monkeypatch.setattr(
+        backend_mod,
+        "_torch_indexer_rows_per_chunk",
+        lambda num_heads, lc: rows_per_chunk,
+    )
+    req = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1])
+    pos = torch.tensor([0, 1, 2, 3, 4, 0, 1, 2, 3])
+    req_to_token = torch.arange(20, dtype=torch.int64).view(2, 10)
+    layer = types.SimpleNamespace(
+        compress_ratio=1, indexer=None, layer_id=0, freqs_cis=torch.zeros(10, 1)
+    )
+    return req, pos, req_to_token, layer
+
+
+def _fake_scores(q_sub, index_k, weights_sub):
+    # Each row's score depends only on its own query value: real-scores rows are
+    # independent, so a fake reproducing that lets chunk-vs-whole runs agree exactly.
+    lc = index_k.shape[0]
+    qv = q_sub.squeeze(-1)
+    cols = torch.arange(lc, dtype=torch.float32)
+    return torch.sin(qv[:, None] * 0.37 + cols[None, :] * 0.11) * 5
+
+
+def _fake_indexer(*, source, uses):
+    return types.SimpleNamespace(
+        is_candidate_source=source,
+        uses_candidates=uses,
+        candidate_topk_blocks=1,
+        candidate_block_size=2,
+        index_topk=3,
+        queries=lambda q_lora, freqs: q_lora,
+        head_weights=lambda x: x,
+        scores=_fake_scores,
+    )
+
+
+def _run_torch_indexer(
+    layer,
+    indexer,
+    req,
+    pos,
+    req_to_token,
+    *,
+    tail_metadata,
+    candidate_tail_only,
+    skip=False,
+):
+    layer.indexer = indexer
+    page_indices = torch.zeros(req.numel(), 3, dtype=torch.int32)
+    core = types.SimpleNamespace(
+        sparse_page_indices=lambda ratio: page_indices,
+        sparse_raw_indices=lambda ratio: None,
+    )
+    forward_metadata = types.SimpleNamespace(
+        core_metadata=core, candidate_metadata=None, layer_major_skip_candidates=skip
+    )
+    backend = types.SimpleNamespace(
+        token_to_kv_pool=types.SimpleNamespace(
+            get_low_ratio_index_k_dequant=(
+                lambda layer_id, slots_j: torch.zeros(slots_j.shape[0], 1)
+            )
+        ),
+        forward_metadata=forward_metadata,
+        tail_forward_metadata=tail_metadata,
+        candidate_tail_only=candidate_tail_only,
+        req_to_token=req_to_token,
+    )
+    # Identity queries()/head_weights() make x and q_lora interchangeable here.
+    q_lora = torch.arange(req.numel(), dtype=torch.float32).unsqueeze(-1)
+    backend_mod.DeepseekV4AttnBackend._low_ratio_index_topk_torch(
+        backend, layer, q_lora, q_lora, req, pos
+    )
+    return forward_metadata.candidate_metadata, page_indices
+
+
+_TAIL_METADATA = types.SimpleNamespace(
+    late_layer_tail=types.SimpleNamespace(
+        extend_seq_lens_cpu=[3, 2], local_lens_cpu=None, cp_metadata=None
+    )
+)
+
+
+def test_torch_indexer_publishes_tail_rows_matching_the_full_mask_tail(monkeypatch):
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
+    source = _fake_indexer(source=True, uses=False)
+    full_meta, full_pages = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
+    )
+    tail_meta, tail_pages = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=_TAIL_METADATA,
+        candidate_tail_only=True,
+    )
+    assert torch.equal(tail_meta.request_masks[0], full_meta.request_masks[0][-3:])
+    assert torch.equal(tail_meta.request_masks[1], full_meta.request_masks[1][-2:])
+    # The source's own top-k (page_indices) does not depend on tail-only publishing.
+    assert torch.equal(full_pages, tail_pages)
+
+
+def test_torch_indexer_falls_back_to_full_rows_when_a_consumer_precedes_the_tail(
+    monkeypatch,
+):
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
+    source = _fake_indexer(source=True, uses=False)
+    full_meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
+    )
+    unsafe_meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=_TAIL_METADATA,
+        candidate_tail_only=False,
+    )
+    assert len(full_meta.request_masks) == len(unsafe_meta.request_masks)
+    for full_b, unsafe_b in zip(full_meta.request_masks, unsafe_meta.request_masks):
+        assert torch.equal(full_b, unsafe_b)
+
+
+def test_torch_indexer_skip_flag_publishes_no_masks(monkeypatch):
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
+    source = _fake_indexer(source=True, uses=False)
+    meta, _ = _run_torch_indexer(
+        layer,
+        source,
+        req,
+        pos,
+        req_to_token,
+        tail_metadata=None,
+        candidate_tail_only=True,
+        skip=True,
+    )
+    assert isinstance(meta, backend_mod.CandidateMasks)
+    assert meta.request_masks == []
+
+
+def test_torch_indexer_raises_when_a_tail_length_exceeds_its_request_rows(monkeypatch):
+    req, pos, req_to_token, layer = _fake_two_request_setup(
+        monkeypatch, rows_per_chunk=3
+    )
+    source = _fake_indexer(source=True, uses=False)
+    oversized_tail = types.SimpleNamespace(
+        late_layer_tail=types.SimpleNamespace(
+            extend_seq_lens_cpu=[9, 2], local_lens_cpu=None, cp_metadata=None
+        )
+    )
+    with pytest.raises(ValueError, match="exceeds request"):
+        _run_torch_indexer(
+            layer,
+            source,
+            req,
+            pos,
+            req_to_token,
+            tail_metadata=oversized_tail,
+            candidate_tail_only=True,
+        )
+
+
+# --- candidate_tail_only_of: config-only, no model_runner.model (fix round 2) -----
+
+
+def _exec_with_bounded_replay(enabled):
+    return types.SimpleNamespace(
+        features=types.SimpleNamespace(enable_decoder_swa_bounded_replay=enabled)
+    )
+
+
+def test_candidate_tail_only_true_for_a_target_shaped_config(monkeypatch):
+    # source layer 20, kv sources ending at 20 -> late_layer_start 21, 20 >= 21-1: tail
+    # only.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=20, kv_source_layer_ids=[20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is True
+
+
+def test_candidate_tail_only_false_when_a_consumer_precedes_the_tail(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=10, kv_source_layer_ids=[20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is False
+
+
+def test_candidate_tail_only_true_when_bounded_replay_is_off(monkeypatch):
+    # No tail ever forms, so nothing is unsafe to publish in full: same as before this
+    # fix.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(False),
+    )
+    config = types.SimpleNamespace(
+        candidate_source_layer_id=20, kv_source_layer_ids=[20]
+    )
+    assert backend_mod.candidate_tail_only_of(config) is True
+
+
+def test_candidate_tail_only_of_never_needs_a_model_for_a_draft_shaped_config(
+    monkeypatch,
+):
+    # NextN/DSpark draft configs default candidate_source_layer_id to -1 (drafts run
+    # no candidate indexing) and never populate kv_source_layer_ids. late_layer_start_of
+    # would raise on an empty list, so the short-circuit on candidate_source_layer_id
+    # < 0 must skip it even when bounded replay happens to be on globally. The backend
+    # used to read model_runner.model.model.late_layer_start instead: NextN never sets
+    # that attribute and DSpark's model has no `.model` at all, so every MTP/DSpark
+    # launch crashed at backend construction. candidate_tail_only_of takes only a
+    # config, never a model.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: _exec_with_bounded_replay(True),
+    )
+    draft_config = types.SimpleNamespace(
+        candidate_source_layer_id=-1, kv_source_layer_ids=[]
+    )
+    assert backend_mod.candidate_tail_only_of(draft_config) is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
