@@ -14,10 +14,6 @@
 #include <type_traits>
 #include <utility>
 
-// Three single-launch replacements for the per-layer torch op chains of the DSV4.1 EXL3 graph decode
-// (SGLANG_DSV41_ENABLE_LAYER_FUSION). Each one reproduces its chain's results bit for bit: the chains are integer
-// bookkeeping plus two exact float conversions, so nothing here reorders a floating-point sum.
-
 namespace sglang {
 
 constexpr int kLayerFusionWarp = 32;
@@ -95,7 +91,7 @@ __global__ __launch_bounds__(kLayerFusionWarp, 1) void direct_gather_destination
 
 // GpuResidencyUpdater.commit_gather + _commit_gather, for one layer. One thread, in the torch chain's order: the
 // chain is a sequence of scatters whose later writes overwrite earlier ones on shared indices (the dump columns), so
-// running it serially is what keeps every final value, dump columns included, identical. width is top_k (6).
+// running it serially is what keeps every final value, dump columns included, identical.
 //
 // delivered is null for a backend without leased delivery; the truncation tripwire then reads miss_count instead.
 __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
