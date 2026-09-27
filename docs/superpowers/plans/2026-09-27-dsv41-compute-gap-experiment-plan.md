@@ -68,6 +68,73 @@ compute and numerical cost. Record it; do not start it here.
 
 ## Results log
 
+### E0 — baseline suite (measured, green)
+
+- Command: `PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 32-63 python -m pytest test/registered/unit/kernels -q -p no:randomly`.
+- Run in divix01 `wt-compute-gap` at `8d599afe9c`, under `cc-gpu.lock`.
+- Result: **1748 passed, 1 skipped, EXIT=0**. The exit status was read directly, not through a pipe.
+
+### E1 — C2a wo_a (measured, no-go)
+
+`results/micro-1/wo_a.log`. The run uses 40 distinct 64 MiB layers, timed by graph replay over two interleaved rounds that agree to 0.01 µs.
+
+| Candidate | µs/call | TB/s |
+|---|---:|---:|
+| einsum (production fallback) | 42.43 | 1.58 |
+| `wo_a_bf16_gemv` (BN=1, 4 warps) | 40.74 | 1.65 |
+| best BN/warp variant | 40.74 | 1.65 |
+
+- The saving is 1.7 µs/call, about 0.07 ms/token over 40 layers. That is below the 5 µs gate.
+- Both kernels already run at the DRAM floor.
+- The GEMV is not bitwise equal to the einsum: 0.27% of elements differ by one BF16 ulp.
+- Decision: do not integrate.
+
+### E2 — C2b/R1 dense INT8 SQ GEMV stage depth (measured, no-go)
+
+`results/micro-1/gemv-*.{json,log}`. Setup:
+
+- Real 5-bpw weights from all 40 layers, one CUDA graph per kind, 400 round-robin replays.
+- `prod` is the production build. `knobs` is the patched source with no defines. Every variant was compared bitwise against `prod` on fixed inputs.
+- The `knobs` build equals `prod` in both bits and time, so the patch alone is inert.
+- Repeat runs of `prod` and `knobs` agree within 0.03 µs.
+
+| µs/call | wq_a | wq_b | wkv | wo_b | sh_w1 | sh_w3 | sh_w2 | bitwise |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| prod (D=4, staged 3/5/7) | 8.56 | 21.05 | 7.84 | 21.99 | 10.46 | 10.45 | 9.52 | — |
+| D=2 | 11.96 | 21.31 | 11.81 | 23.22 | 12.64 | 12.63 | 11.17 | yes |
+| D=3 | 9.15 | 20.63 | 8.61 | 21.82 | 10.58 | 10.57 | 9.53 | yes |
+| D=6 | 8.43 | 21.54 | 7.71 | 22.42 | 11.15 | 11.17 | 10.21 | yes |
+| no staging | 9.57 | 20.17 | 9.12 | 21.16 | 10.63 | 10.65 | 9.59 | yes |
+
+- The best per-shape choice (no staging for wq_b/wo_b, D=6 for wq_a/wkv) saves about 2.0 µs per layer, about 0.08 ms/token.
+- On wq_b + wo_b together that is 4.0%, below the 10% gate.
+- These two kernels run at 1.19–1.25 TB/s against the 1.65 TB/s that E1 shows is reachable. Stage depth does not close that gap.
+- The decomposition changes that might close it alter per-slice activation quantization, which is a numerical change and outside this pass.
+- Decision: stop R1 at stage depth.
+
+### E3 — C3a/R2 routed MoE (measured; one bitwise-identical win)
+
+`results/micro-1/moe-*`. Setup:
+
+- The production `Exl3FusedMoE.run` over 40 layers of real rows, about 80 MB touched per layer.
+- 300 graph replays.
+- Each configuration ran in its own process.
+
+| Configuration | µs/layer | vs prod | bitwise |
+|---|---:|---:|---|
+| prod (6 groups × 28, N=256, SH=3, FS=3) | 101.85 | — | — |
+| width 24 / 16 / 8 | 110.5 / 144.5 / 254.5 | slower | no (rel ≤5.7e-3) |
+| `EXL3_MOE_TILE_N=128` | 133.1 | slower | no |
+| `MOE_SH_STAGES=2` | 148.6 | slower | yes |
+| **`MOE_SH_STAGES=4`** | **95.88** | **−5.97 (−5.9%)** | **yes** |
+| `MOE_FRAG_STAGES=2` | 102.3 | +0.5 | yes |
+
+- A fourth shared-memory pipeline stage gives the same bits and saves 6.0 µs per layer, about 0.24 ms/token.
+- Its p10–p90 spread is 0.5 µs.
+- It misses the handoff's 10 µs screening gate, but it is exact and needs no code change beyond one constant.
+- SH=5/6 and SH=4 combined with FS=2/4 are queued (micro-2) to find the best depth.
+- Integration is blocked on a decision, not on evidence. The constant lives in the pinned upstream exllamav3 (`turboderp-org/exllamav3`, no fork remote), so production would need either a fork commit with a pin bump, or sglang carrying the patch and applying it at build time.
+
 ### E6 / C0b — the 2.047 ms graph-prefix hole is node-mode launch overhead (measured, closed)
 
 Evidence: `analysis/dsv41-compute-gap/c0b_prefix_launch.txt`, from the handoff's own trace and 90 windows.

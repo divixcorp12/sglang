@@ -1,0 +1,17 @@
+{
+ "provenance": {
+  "variant": "moe_sh2",
+  "defines": [
+   "-DMOE_SH_STAGES=2"
+  ],
+  "exllamav3_commit": "02aef45cd681b960a00afcd0749a4ab99e6c1bfe",
+  "patch_sha256": "0c144d9c4e8b9594ec43a590f9ea94db75ccd9153b774d0b6806f586ed3f2a99",
+  "EXL3_MOE_GROUP_WIDTH": "0",
+  "EXL3_MOE_TILE_N": "0"
+ },
+ "ext_module": "exl3_exp_moe_sh2",
+ "median_us_per_layer": 148.60039949417114,
+ "p10": 148.47919940948486,
+ "p90": 148.69920015335083,
+ "implied_TBps": 0.5376399005113969
+}
