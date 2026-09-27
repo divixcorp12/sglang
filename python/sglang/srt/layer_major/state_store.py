@@ -63,6 +63,17 @@ class StateStore:
     def clear_parked(self) -> None:
         self._parked.clear()
 
+    def release(self) -> None:
+        """Undo a pinned store's cudaHostRegister and drop its buffers. A second call is a no-op."""
+        if not self._host:
+            return
+        if self._pin:
+            from sglang.srt.layers.moe.expert_host_tier import release_host_slabs
+
+            release_host_slabs(list(self._host.values()))
+        self._host = {}
+        self._parked.clear()
+
     def _to_host(self, t: torch.Tensor) -> torch.Tensor:
         if t.device.type == "cpu":
             return t.clone()
