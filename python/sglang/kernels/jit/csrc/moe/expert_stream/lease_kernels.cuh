@@ -754,11 +754,9 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
   const int32_t* __restrict__ const origin = p.origin;
   int32_t* __restrict__ const violated = p.violated;
   using namespace device::expert_stream;
-  __shared__ int any_violated;
-  if (threadIdx.x == 0) any_violated = 0;
-  __syncthreads();
   const int64_t entry = threadIdx.x;
   const int64_t n = go_count[0];
+  bool bad = false;  // this thread's lane was acknowledged VIOLATED
   if (entry < n && entry < kLeaseLanes) {
     const uint64_t generation = static_cast<uint64_t>(lane_ctx[4 * entry + 0]);
     const uint32_t slot_generation = static_cast<uint32_t>(lane_ctx[4 * entry + 1]);
@@ -772,11 +770,13 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     st_release_sys64(
         lease + lease_d + kLeaseLaneAck + (idx * kLeaseLanes + lane) * kLeaseLaneAckBytes,
         tagged_word(consumed ? kLeaseTagConsumed : kLeaseTagViolated, generation));
-    if (!consumed) any_violated = 1;
+    bad = !consumed;
   }
-  // Also orders every lane's LaneAck store before thread 0's fatal release; a warp vote would not document that.
-  __syncthreads();
-  if (threadIdx.x == 0 && any_violated != 0) {
+  // Every thread reaches this. __syncthreads_or has full __syncthreads semantics, so besides combining the lanes'
+  // verdicts without a shared flag (several lanes storing to one would race) it still orders every lane's LaneAck
+  // store before thread 0's fatal release; a warp vote would not document that.
+  const int any = __syncthreads_or(bad);
+  if (threadIdx.x == 0 && any) {
     violated[0] = 1;
     raise_fatal(page, static_cast<uint32_t>(lane_ctx[0]));
   }
@@ -883,11 +883,9 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
   const int64_t* __restrict__ const lane_ctx = p.lane_ctx;
   float* __restrict__ const keep = p.keep;
   using namespace device::expert_stream;
-  __shared__ int violated;
-  if (threadIdx.x == 0) violated = 0;
-  __syncthreads();
   const int64_t lane = threadIdx.x;
   const int64_t n = go_count[0];
+  bool bad = false;  // this lane was acknowledged VIOLATED
   if (lane < n && lane < kLeaseLanes) {
     const uint64_t generation = static_cast<uint64_t>(lane_ctx[4 * lane + 0]);
     const uint32_t slot_generation = static_cast<uint32_t>(lane_ctx[4 * lane + 1]);
@@ -900,10 +898,12 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     st_release_sys64(
         lease + lease_d + kLeaseLaneAck + (idx * kLeaseLanes + lane) * kLeaseLaneAckBytes,
         tagged_word(consumed ? kLeaseTagConsumed : kLeaseTagViolated, generation));
-    if (!consumed) violated = 1;
+    bad = !consumed;
   }
-  __syncthreads();  // as in the stage ack: also orders the lanes' LaneAck stores before the fatal release
-  if (threadIdx.x == 0 && violated != 0) {
+  // As in the stage ack: every thread reaches this, and __syncthreads_or has full __syncthreads semantics, so it
+  // also orders the lanes' LaneAck stores before thread 0's fatal release.
+  const int any = __syncthreads_or(bad);
+  if (threadIdx.x == 0 && any) {
     keep[0] = 0.0f;
     raise_fatal(page, static_cast<uint32_t>(lane_ctx[0]));
   }
