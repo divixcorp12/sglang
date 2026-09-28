@@ -260,7 +260,9 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(a0, base)
         self.assertEqual(a0 + n0, a1)
         self.assertEqual((a1 - base) % HUGE_BYTES, 0)
-        self.assertLessEqual(abs((a1 - base) - 6 * row_bytes), HUGE_BYTES // 2)
+        # The 2 MiB multiple just below or just above the ideal row boundary: here below, by almost 2 MiB, because the
+        # tail past the slab (bound to node 1 and counted as its bytes) is compensated at this change.
+        self.assertLessEqual(abs((a1 - base) - 6 * row_bytes), HUGE_BYTES)
         self.assertEqual(a1 + n1, base + -(-nbytes // HUGE_BYTES) * HUGE_BYTES)  # out to the 2 MiB end
         self.assertEqual((a1 + n1 - base) % HUGE_BYTES, 0)
         self.assertEqual(slab._numa_bound_bytes, {0: n0, 1: n1})
