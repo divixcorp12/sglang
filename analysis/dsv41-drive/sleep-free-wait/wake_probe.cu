@@ -15,7 +15,8 @@
 // Replays are interleaved one per variant per round, with the order rotated each round. The main thread waits for
 // the echo of each replay before launching the next, so no stale release write can land in a later replay.
 //
-// Usage: wake_probe <replays per variant> <warmup per variant> <echo cpu> <main cpu> <out dir>
+// Usage: wake_probe <replays per variant> <warmup per variant> <echo cpu> <main cpu> <out dir> <echo delay ns>
+// A nonzero delay makes the echo busy-wait that long after seeing `armed`, so the waiter is parked when release lands.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -205,12 +206,13 @@ static double pct(std::vector<double> v, double q) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 6) {
-    fprintf(stderr, "usage: %s replays warmup echo_cpu main_cpu out_dir\n", argv[0]);
+  if (argc != 7) {
+    fprintf(stderr, "usage: %s replays warmup echo_cpu main_cpu out_dir echo_delay_ns\n", argv[0]);
     return 1;
   }
   const int replays = atoi(argv[1]), warmup = atoi(argv[2]), echo_cpu = atoi(argv[3]), main_cpu = atoi(argv[4]);
   const std::string out_dir = argv[5];
+  const long long delay_ns = atoll(argv[6]);
   const bool explicit_node = getenv("WAKE_PROBE_EXPLICIT_NODE") && atoi(getenv("WAKE_PROBE_EXPLICIT_NODE"));
   pin(main_cpu);
 
@@ -223,6 +225,7 @@ int main(int argc, char** argv) {
   CK(cudaDriverGetVersion(&driver));
   cudaDeviceProp prop;
   CK(cudaGetDeviceProperties(&prop, 0));
+  printf("echo delay %lld ns\n", delay_ns);
   printf("device %s sm_%d%d, driver API %d, CAN_FLUSH_REMOTE_WRITES=%d\n", prop.name, prop.major, prop.minor, driver,
          can_flush);
 
@@ -297,6 +300,11 @@ int main(int argc, char** argv) {
     while (!stop.load(std::memory_order_relaxed)) {
       const uint32_t a = armed.load(std::memory_order_acquire);
       if (a != last) {
+        if (delay_ns > 0) {
+          const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(delay_ns);
+          while (std::chrono::steady_clock::now() < until) {
+          }
+        }
         release.store(1u, std::memory_order_release);
         last = a;
         echoed.store(a, std::memory_order_release);
@@ -380,6 +388,7 @@ int main(int argc, char** argv) {
     }
     int bad = 0;
     double iters_sum = 0, spin_sum = 0;
+    int spun = 0;
     FILE* f = fopen((out_dir + "/" + kNames[k] + ".csv").c_str(), "w");
     fprintf(f, "replay,t2_minus_t0_ns,seen_release,iters,spin_ns\n");
     for (int i = 0; i < total; ++i) {
@@ -388,8 +397,11 @@ int main(int argc, char** argv) {
       if (i < warmup) continue;
       lat[k].push_back(static_cast<double>(t2[i] - t0[i]) / 1000.0);
       if (k != kN && seen[i] != 1u) ++bad;
-      iters_sum += iters[i];
-      spin_sum += spin[i];
+      if (iters[i] > 0) {  // loop-rate stats only from replays that actually polled
+        ++spun;
+        iters_sum += iters[i];
+        spin_sum += spin[i];
+      }
     }
     fclose(f);
     const auto& v = lat[k];
@@ -398,9 +410,10 @@ int main(int argc, char** argv) {
     printf("RESULT %-20s n=%zu us: p50 %.3f p90 %.3f p99 %.3f p99.9 %.3f max %.3f  min %.3f  bad_release=%d",
            kNames[k], v.size(), p50, p90, p99, pct(v, 0.999), mx, *std::min_element(v.begin(), v.end()), bad);
     if (k == kA) {
-      printf("  timeouts=%u  iters/replay %.2f  spin %.3f us/replay  loop %.0f ns/iter  sys loads %.2f M/s while spinning",
-             timeouts, iters_sum / v.size(), spin_sum / v.size() / 1000.0,
-             iters_sum > 0 ? spin_sum / iters_sum : 0.0, spin_sum > 0 ? 3.0 * iters_sum / spin_sum * 1000.0 : 0.0);
+      printf("  timeouts=%u  replays_that_polled=%d  iters/polled-replay %.2f  loop %.0f ns/iter"
+             "  sys loads %.2f M/s while spinning (3 per iter)",
+             timeouts, spun, spun ? iters_sum / spun : 0.0, iters_sum > 0 ? spin_sum / iters_sum : 0.0,
+             spin_sum > 0 ? 3.0 * iters_sum / spin_sum * 1000.0 : 0.0);
     }
     printf("\n");
   }
