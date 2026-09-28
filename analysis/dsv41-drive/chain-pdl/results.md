@@ -377,3 +377,47 @@ wait, not the 200-500 ns that flipped the skeleton's gate. The hoist analysis ad
 that is available without PDL by passing one static word as a kernel parameter.
 
 **Question for the user:** ship PDL on the lease chain, yes or no? (Recommendation: no.)
+
+## Decision and productionization (2026-09-27)
+
+The user decided to ship PDL on the lease chain, with the early trigger, behind `SGLANG_DSV41_ENABLE_LEASE_PDL` (off by
+default, on in the recipe). It is on branch `expert-stream-lease-pdl`: tests 64204c3638, kernels 45949cf721, row
+capacity as a kernel argument 1540bbc243 / 5d91f083d5, and origin/master 48467f2ade merged at a2f0ae97b0. The
+safety argument is LEASE_PROTOCOL.md 7.7. The capacity timing did not resolve: the effect is below between-process
+noise (up to 14 µs). The expected effect is ~0.75 µs per removed host load, at most ~1.5 µs/layer in `all_hit`. The
+change rests on its SASS (one `LDG.E.STRONG.SYS` removed in each of the three kernels) and on the proof that the value
+is constant.
+
+### Copy-engine `[kernel]` stall control
+
+A mutant suite (stage_ack trigger above its wait) failed once in
+`test_exl3_copy_engine_cuda.py::test_work_queued_behind_the_graph_on_other_streams_does_not_hold_the_copy_back[kernel]`.
+Replay 0 of the armed copy-engine graph, with a kernel queued behind it on another stream, took exactly the 2.000 s
+RAM-miss deadline (`keep` still 1.0). DSV41_REFERENCE.md 27.14 records this variant as a known flake (2 of 8 at base).
+
+To test whether PDL makes the flake worse, the control ran that test, all 3 params, 20 rounds, with six trees
+round-robin under the exclusive `cc-gpu.lock`.
+- In the PDL trees, the suite plugin forced `lease_pdl` on every CUDA lease device (3 per run).
+- The implicit-trigger tree is the merged tip with every `PDLTriggerSecondary` call deleted and the waits kept: a scratch
+  mutant, never committed.
+- The mutant and implicit trees have 19 runs because round 1 was cut short to yield the GPU.
+
+| tree | h2d | d2h | kernel | kernel stalls (round) |
+|---|---:|---:|---:|---|
+| base, origin/master 48467f2ade (no PDL code) | 0/20 | 0/20 | **4/20** | 4, 14, 16, 18 |
+| a2f0ae97b0, flag off | 0/20 | 0/20 | **2/20** | 4, 8 |
+| **a2f0ae97b0, flag on** | 0/20 | 0/20 | **3/20** | 1, 3, 11 |
+| a2f0ae97b0 on, implicit trigger | 0/19 | 0/19 | **6/19** | 6, 7, 8, 10, 13, 14 |
+| 45949cf721, flag on | 0/20 | 0/20 | **6/20** | 1, 4, 9, 10, 12, 14 |
+| mutant, trigger above wait, flag on | 0/19 | 0/19 | **2/19** | 6, 13 |
+
+Every failure is `[kernel]` replay 0 at 2.000 s. h2d and d2h never failed in 237 runs.
+
+**Reading: this is a pre-existing copy-engine stall, not made worse by PDL.**
+- The shipped configuration (flag on) stalls 3/20, against base 4/20.
+- Pooled, the four PDL-on trees stall 17/78 (22%) and the two trees without PDL 6/40 (15%). A two-sided Fisher test
+  gives p ≈ 0.5.
+- The rates do not order by feature: flag off is below base, the implicit trigger is no better than the early one, and
+  the mutant is among the lowest.
+- So the mutant shows no scheduling hazard in this test. The source-order test (`test_exl3_ram_miss_device_args.py`)
+  and the SASS gate are what catch a trigger moved above its wait.
