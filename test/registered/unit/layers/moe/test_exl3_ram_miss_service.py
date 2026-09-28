@@ -549,6 +549,41 @@ def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on
     assert order == (["piece", "thread"] if piece_stream else ["thread"])
 
 
+@pytest.mark.parametrize("core", [None, 0])
+def test_the_service_cpu_reaches_start_thread(tiers, monkeypatch, core):
+    """SGLANG_DSV41_RAM_MISS_SERVICE_CPU is the thread's cpu_core; unset it stays -1, the unpinned thread."""
+    service, streamers, caches = tiers
+    seen = []
+    start = module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(
+        module.ExpertStreamHost, "start_thread", lambda self, **kw: (seen.append(kw["cpu_core"]), start(self, **kw))[1]
+    )
+    if core is None:
+        service.ensure_started()
+    else:
+        with envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.override(core):
+            service.ensure_started()
+    assert seen == [-1 if core is None else core]
+
+
+@pytest.mark.parametrize(
+    "core, error, match",
+    [
+        (71, ValueError, "64-71"),
+        (64, ValueError, "64-71"),
+        (-2, ValueError, "SERVICE_CPU"),
+        (os.cpu_count() + 72, ValueError, "SERVICE_CPU"),
+    ],
+    ids=["doorbell_core", "reserved_core", "negative", "past_the_machine"],
+)
+def test_a_reserved_or_out_of_range_service_cpu_is_refused_at_startup(tiers, core, error, match):
+    service, streamers, caches = tiers
+    with envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.override(core):
+        with pytest.raises(error, match=match):
+            service.ensure_started()
+    assert service.host is None
+
+
 def _attach_with_copy_tables(service, streamers, *, drop_name=None):
     """``_attach_all`` with a copy table per layer whose sources are that row's slabs, as a real graph gather's
     are: the stream kernel's segment map is built from them. ``drop_name`` leaves one streamed name out."""

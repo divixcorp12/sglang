@@ -26,6 +26,7 @@ def test_defaults_match_the_env_declarations():
         router_capture_path="",
         ram_miss_timeout_ms=2000,
         ram_miss_pack_workers=0,
+        ram_miss_service_cpu=-1,
         ram_miss_fault="",
         enable_expert_prefetch=False,
         enable_ram_miss_leases=False,
@@ -79,11 +80,20 @@ def test_from_envs_maps_the_renamed_fields():
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(True),
         envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.override("3:0.5"),
         envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(4),
+        envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.override(54),
     ):
         cfg = Dsv41Config.from_envs()
     assert cfg.engram_host_table is True
     assert cfg.ram_miss_fault == "3:0.5"
     assert cfg.ram_miss_pack_workers == 4
+    assert cfg.ram_miss_service_cpu == 54
+
+
+def test_the_service_cpu_defaults_to_unpinned_and_parses_an_int():
+    assert envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.get() == -1
+    with envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.override(40):
+        assert envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.get() == 40
+    assert envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.get() == -1
 
 
 if __name__ == "__main__":

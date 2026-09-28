@@ -291,6 +291,31 @@ def test_the_unpinned_service_thread_keeps_off_the_packing_workers_cpus(tmp_path
         host.stop()
 
 
+def test_a_service_cpu_on_a_packing_workers_cpu_is_refused(tmp_path):
+    """Pinning the service thread onto a worker's CPU would put it behind that worker's copies: refused, naming the
+    workers' CPUs, and no thread is left running. Any other core is taken as given."""
+    allowed = os.sched_getaffinity(0) - set(range(64, 72))
+    if len(allowed) < 3:
+        pytest.skip("needs three allowed cores")
+    s = ram_miss_setup(tmp_path)
+    host = ExpertStreamHost(
+        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False,
+        pack_workers=2,
+    )
+    try:
+        workers = _allowed_cpus_of("exl3-pack")
+        assert len(workers) == 2 and all(len(w) == 1 for w in workers), workers
+        taken = set().union(*workers)
+        with pytest.raises(RuntimeError, match="packing"):
+            host.start_thread(cpu_core=min(taken))
+        assert not host.threaded
+        free = min(allowed - taken)
+        host.start_thread(cpu_core=free)
+        assert host.counters()["spin_cpu"] == free
+    finally:
+        host.stop()
+
+
 # ---- Workers copy concurrently, and they copy what the owner vetted ----
 
 
