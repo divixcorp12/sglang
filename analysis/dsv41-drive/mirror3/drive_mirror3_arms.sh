@@ -6,11 +6,14 @@
 # Usage: drive_mirror3_arms.sh <worktree> <sha> <out_dir under /mnt/nvme1> [port]
 #
 # Guards before anything starts: the NVIDIA driver is 615.71.09, nothing listens on production's 7867 or on the arm
-# port. Before each arm: the same port check, then wait while a pytest, cc1plus or nvcc process exists (matched by
-# process name only -- pgrep -x, never argv: a waiter matching argv text once deadlocked on its own command line) or
-# cc-gpu.lock is held. Note `python -m pytest` is named "python", so only the `pytest` entry point is seen.
-# The driver records every PID it starts (samplers, run_arm.sh) in $OUT/driver-pids.txt and, on exit or interrupt,
-# kills only those. run_arm.sh runs as its own process group, so killing it also stops the server it started.
+# port. Before each arm: the same port check, then wait while a pytest, cc1plus or nvcc process exists or
+# cc-gpu.lock is held. Processes are matched by name (pgrep -x) and, for `python -m pytest` (named "python"), by an
+# interpreter exe/comm plus the exact cmdline tokens "-m" "pytest" -- never by free text over argv: a waiter doing
+# that once deadlocked on its own command line. The driver's own PID and its ancestors are never counted.
+# The driver records every PID it starts (samplers, run_arm.sh) in $OUT/driver-pids.txt and, on exit or on INT/TERM
+# (and HUP, but only when not started under nohup, which ignores HUP before bash could trap it), kills only those.
+# run_arm.sh runs as its own process group, so killing it also stops the server it started.
+# At the end it prints the mirror3_report.py command for the two runs.
 set -u
 WT=${1:?worktree}; SHA=${2:?commit}; OUT=${3:?out dir}; PORT=${4:-30031}
 PY=/data/models/slang/.venv/bin/python
@@ -67,15 +70,47 @@ cleanup() {
     for pid in "${!STARTED[@]}"; do stop_pid "$pid"; done
 }
 trap cleanup EXIT
+# HUP is trappable only when the driver was not started under nohup (bash cannot trap a signal ignored on entry).
 trap 'say "interrupted"; exit 130' INT TERM HUP
 
 exec 8>"$DISK_LOCK"
 say "waiting for rowimg-disk.lock"; flock 8; say "rowimg-disk.lock held"
 
+# This shell and every ancestor, so no process on the driver's own chain is ever counted as foreign.
+MINE=" $$ $BASHPID "
+p=$$
+while p=$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null) && [ -n "$p" ] && [ "$p" != 0 ]; do MINE+="$p "; done
+
+# PIDs of `<python> ... -m pytest ...`: the exe basename (or, when /proc/<pid>/exe is unreadable, comm) is a python
+# interpreter AND /proc/<pid>/cmdline, split on NUL, holds the exact token "-m" followed by the exact token "pytest".
+# One interpreter per scan: a bash loop forking per process took ~9 s a scan on the laptop.
+PYTEST_SCAN='
+import os, re, sys
+mine = set(sys.argv[1:]) | {str(os.getpid())}
+py = re.compile(r"python[0-9.]*")
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    if pid in mine:
+        continue
+    try:
+        try:
+            name = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        except OSError:
+            name = open(f"/proc/{pid}/comm").read().strip()
+        if not py.fullmatch(name):
+            continue
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        continue
+    if any(a == b"-m" and b == b"pytest" for a, b in zip(argv, argv[1:])):
+        print(pid)
+'
+python_pytest() { $PY -c "$PYTEST_SCAN" $MINE; }
+
 wait_for_quiet_box() {
     local busy
     while :; do
-        busy=$(pgrep -x 'pytest|cc1plus|nvcc' | tr '\n' ' ')
+        busy=$( { pgrep -x 'pytest|cc1plus|nvcc'; python_pytest; } | while read -r p; do
+                   [[ $MINE == *" $p "* ]] || echo "$p"; done | tr '\n' ' ')
         if [ -n "$busy" ]; then
             say "foreign pytest/cc1plus/nvcc running (pids $busy); waiting"
         elif ! flock -n "$GPU_LOCK" true; then
@@ -111,6 +146,10 @@ run_one() {  # <arm> [KEY=VAL ...]
     wait "$ARM_PID"; rc=$?
     ARM_PID=""
     echo "DRIVER DONE rc=$rc" >> "$done_log"
+    # The diskstats sampler checks the done log every 50 samples (~5 s) and closes its file on the way out; let it,
+    # so the EXIT trap's TERM never drops buffered samples. nvidia-smi writes each sample as it takes it.
+    for _ in $(seq 1 30); do kill -0 "$pid_s" 2>/dev/null || break; sleep 1; done
+    kill -0 "$pid_s" 2>/dev/null && say "WARNING: diskstats sampler $pid_s still running 30 s after DRIVER DONE"
     stop_pid "$pid_c"
     say "arm $arm rc=$rc run: $(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/$arm-run_arm.log" | head -1)"
     return "$rc"
@@ -119,8 +158,12 @@ run_one() {  # <arm> [KEY=VAL ...]
 run_one mirror2-ref || { say "reference arm failed; not running the 3-root arm (see $OUT/mirror2-ref-run_arm.log)"; exit 1; }
 run_one mirror3 "SGLANG_MOE_EXPERT_MIRROR_DIRS=$ROOTS3"
 rc=$?
-say "ref run: $(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/mirror2-ref-run_arm.log" | head -1)"
-say "new run: $(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/mirror3-run_arm.log" | head -1)"
+ref=$(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/mirror2-ref-run_arm.log" | head -1)
+new=$(sed -n 's/^arm=.* run_dir=\([^ ]*\) .*/\1/p' "$OUT/mirror3-run_arm.log" | head -1)
+say "ref run: $ref"
+say "new run: $new"
 say "devices: $DEVS"
+say "report: $PY $WT/analysis/dsv41-drive/mirror3/mirror3_report.py $ref $OUT/mirror2-ref-diskstats.jsonl" \
+    "$OUT/mirror2-ref-clocks.csv $new $OUT/mirror3-diskstats.jsonl $OUT/mirror3-clocks.csv $DEVS"
 say "DRIVER DONE rc=$rc"
 exit "$rc"
