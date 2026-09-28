@@ -241,12 +241,8 @@ class TestRingEvictionSizing(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestWindowRingCudaFreePath(unittest.TestCase):
-    """TestWindowRing above mocks alloc_extend_kernel with the pure-torch alloc_extend_naive and runs
-    on a CPU allocator, so free_index.is_cuda is always False there and _free_swa_pages always takes
-    _free_swa_pages_none_cuda. This class runs on a real CUDA device with the real Triton
-    alloc_extend_kernel, so free_index.is_cuda is True and _free_swa_pages dispatches to
-    _free_swa_pages_cuda (get_and_clear_swa_pages), the path Task 12's GPU equivalence run actually
-    exercises."""
+    """TestWindowRing above runs on CPU (free_index.is_cuda False), so _free_swa_pages never dispatches to
+    _free_swa_pages_cuda; this class runs on real CUDA to reach it."""
 
     def test_finalize_keeps_the_partially_kept_page_off_the_free_list_on_cuda(self):
         # Same scenario as TestWindowRing.test_finalize_keeps_the_partially_kept_page_off_the_free_list
@@ -269,13 +265,11 @@ class TestWindowRingCudaFreePath(unittest.TestCase):
         for p in kept_pages:
             self.assertNotIn(p, free_pages, f"page {p} still backs a kept position but was freed")
 
-        # free_segment (not free()'s finalize_ring path) is what actually reaches _free_swa_pages_cuda: check (a).
-        # Only the kept tail still has a live SWA mapping; finalize_ring already released [0, keep_from), so
-        # freeing that prefix through free_swa_segment too would double-free its pages.
+        # free_segment (not free()'s finalize_ring path) reaches _free_swa_pages_cuda: check (a).
         with mock.patch.object(a, "_free_swa_pages_cuda", wraps=a._free_swa_pages_cuda) as m:
             a.free_segment(full[keep_from:], start_pos=keep_from)
             m.assert_called()
-        a.full_attn_allocator.free_segment(full[:keep_from], start_pos=0)
+        a.free_full_segment(full[:keep_from], start_pos=0)  # asserts finalize_ring cleared this prefix's SWA
         self.assertEqual(a.swa_available_size(), swa_before)
         self.assertEqual(a.full_available_size(), full_before)
         all_free = a.swa_attn_allocator.get_all_free_pages()

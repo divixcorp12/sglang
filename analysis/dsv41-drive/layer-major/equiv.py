@@ -4,16 +4,15 @@ Usage: equiv.py run --port P --model M --text FILE --out OUT.jsonl --commit SHA 
                     [--cases all|quick]
        equiv.py compare A.jsonl B.jsonl [--allow-head-mismatch]
 
-Pass criterion: token-0 id equality, not full 64-token completion identity. DSV4.1's decode kernels are not
-bitwise-stable across batch composition, so tokens 1..63 legitimately differ between two otherwise-identical
-runs; comparing them would fail a correct layer-major implementation as often as a buggy one. Ratified by
-controller ruling on the Task 12 review (5 of 7 chunked-vs-chunked cases diverged within 64 tokens).
+Pass criterion: token-0 id equality, not full 64-token completion identity -- DSV4.1 decode is not bitwise-stable
+across batch composition (DSV41_REFERENCE.md 27.19), so a full-completion compare would fail a correct pass too.
 """
 
 import argparse
 import hashlib
 import json
 import sys
+import urllib.error
 import urllib.request
 
 LENGTHS = [8192, 16384, 32768, 33000, 32868]
@@ -43,6 +42,18 @@ def _top0_logprobs(meta):
     # Informational only (T12 Minor 1): the server's per-step top-k, for output step 0.
     top = meta.get("output_top_logprobs")
     return top[0] if top else None
+
+
+def _supports_top_logprobs(port):
+    # A one-time probe before any case runs: a per-case try/except would re-send a case's own prompt on
+    # failure, which inside the unflushed chain changes the cache state the chain is testing.
+    try:
+        _generate(port, [0, 1, 2], top_logprobs_num=5)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            return False
+        raise
 
 
 def _all_cases(ids):
@@ -75,29 +86,25 @@ def run(a):
     cases = _all_cases(ids)
     if a.cases == "quick":
         cases = [c for c in cases if c[0] in QUICK_CASES]
-    top0_logprobs_error = None
+    top_logprobs_num = 5 if _supports_top_logprobs(a.port) else None
+    if top_logprobs_num:
+        _flush(a.port)  # clear the probe's own cache footprint before the first real case
+    else:
+        print("server refuses top-5 logprobs (HTTP 400); running without them, gate unaffected", file=sys.stderr)
     with open(a.out, "w") as f:
         f.write(json.dumps({"case": "__header__", "commit": a.commit, "dirty": a.dirty,
-                            "min_tokens": a.min_tokens}) + "\n")
+                            "min_tokens": a.min_tokens, "cases": a.cases}) + "\n")
         for name, prompt, flush in cases:
             if flush:
                 _flush(a.port)
-            try:
-                r = _generate(a.port, prompt, top_logprobs_num=5)
-                top0 = _top0_logprobs(r["meta"])
-            except Exception as e:  # top-5 logprobs is informational; fall back to the plain gate on refusal.
-                if top0_logprobs_error is None:
-                    top0_logprobs_error = repr(e)
-                r = _generate(a.port, prompt)
-                top0 = None
+            r = _generate(a.port, prompt, top_logprobs_num=top_logprobs_num)
+            top0 = _top0_logprobs(r["meta"]) if top_logprobs_num else None
             record = {"case": name, "prompt_len": len(prompt), "prompt_hash": _prompt_hash(prompt), **r}
             if top0 is not None:
                 record["top0_logprobs"] = top0
             f.write(json.dumps(record) + "\n")
             f.flush()
             print(name, len(prompt), repr(r["text"][:60]), flush=True)
-    if top0_logprobs_error:
-        print(f"top-5 logprobs refused, gate unaffected: {top0_logprobs_error}", file=sys.stderr)
 
 
 def _max_abs_logprob_delta(top_a, top_b):
@@ -112,33 +119,48 @@ def _max_abs_logprob_delta(top_a, top_b):
     return max(abs(lp_a[t] - lp_b[t]) for t in shared)
 
 
-def compare(path_a, path_b, *, allow_head_mismatch=False):
+def _is_dirty(v) -> bool:
+    return str(v) not in ("0", "", "None")
+
+
+def compare(path_a, path_b, *, allow_head_mismatch=False, allow_dirty=False):
+    """Gate: token-0 id equality (see module docstring). Prints the full 64-token divergence informationally."""
     a = {json.loads(l)["case"]: json.loads(l) for l in open(path_a)}
     b = {json.loads(l)["case"]: json.loads(l) for l in open(path_b)}
     header_a, header_b = a.pop("__header__", None), b.pop("__header__", None)
-    if not allow_head_mismatch:
-        for name, h in (("a", header_a), ("b", header_b)):
-            if h is None:
-                print(f"NOT COMPARABLE:\n  {path_a if name == 'a' else path_b} has no header record")
-                return 2
-        if header_a["commit"] != header_b["commit"]:
-            print(f"NOT COMPARABLE:\n  arms ran at different heads: {header_a['commit']} vs {header_b['commit']}"
-                  "\n  pass --allow-head-mismatch to compare anyway")
-            return 2
-    # Refuse, rather than raise, when the two runs are not comparable case for case.
-    problems = [f"case {c} missing from {path_b}" for c in a if c not in b]
-    problems += [f"case {c} missing from {path_a}" for c in b if c not in a]
-    for case in sorted(set(a) & set(b)):
-        ha, hb = a[case].get("prompt_hash"), b[case].get("prompt_hash")
+    if header_a is None or header_b is None:
+        missing = path_a if header_a is None else path_b
+        print(f"NOT COMPARABLE:\n  {missing} has no header record")
+        return 2
+    if not allow_head_mismatch and header_a["commit"] != header_b["commit"]:
+        print(f"NOT COMPARABLE:\n  arms ran at different heads: {header_a['commit']} vs {header_b['commit']}"
+              "\n  pass --allow-head-mismatch to compare anyway")
+        return 2
+    if not allow_dirty and (_is_dirty(header_a.get("dirty")) or _is_dirty(header_b.get("dirty"))):
+        print(f"NOT COMPARABLE:\n  a dirty worktree ran one of these arms (a={header_a.get('dirty')} "
+              f"b={header_b.get('dirty')})\n  pass --allow-dirty to compare anyway")
+        return 2
+    if int(header_a.get("min_tokens", -1)) == 0 and int(header_b.get("min_tokens", -1)) == 0:
+        print("NOT COMPARABLE:\n  both arms have min_tokens=0 (chunked); nothing ran layer-major")
+        return 2
+    # A quick-cases arm can compare against a full baseline: use the smaller file's cases, and require every
+    # one of them present in the larger file. The larger file's extra cases are not an error.
+    smaller, larger, smaller_path, larger_path = (a, b, path_a, path_b) if len(a) <= len(b) else (b, a, path_b, path_a)
+    problems = [f"case {c} (in {smaller_path}) missing from {larger_path}" for c in smaller if c not in larger]
+    for case in sorted(smaller):
+        if case not in larger:
+            continue
+        ha, hb = a[case].get("prompt_hash") if case in a else None, b[case].get("prompt_hash") if case in b else None
         if ha is None or hb is None or ha != hb:
             problems.append(f"case {case}: prompt hash differs or is missing (a={ha} b={hb})")
-        if not a[case].get("ids") or not b[case].get("ids"):
-            problems.append(f"case {case}: no output ids (a={a[case].get('ids')!r} b={b[case].get('ids')!r})")
+        if not a.get(case, {}).get("ids") or not b.get(case, {}).get("ids"):
+            problems.append(f"case {case}: no output ids (a={a.get(case, {}).get('ids')!r} "
+                            f"b={b.get(case, {}).get('ids')!r})")
     if problems:
         print("NOT COMPARABLE:\n  " + "\n  ".join(problems))
         return 2
     bad = 0
-    for case in sorted(a):
+    for case in sorted(smaller):
         ids_a, ids_b = a[case]["ids"], b[case]["ids"]
         token0_same = ids_a[0] == ids_b[0]
         ids_same = ids_a == ids_b
@@ -152,8 +174,9 @@ def compare(path_a, path_b, *, allow_head_mismatch=False):
             if ids_same:
                 print("   ids equal, text differs (detokenization only)")
             else:
-                first_tok = next(i for i, (x, y) in enumerate(zip(ids_a, ids_b)) if x != y)
-                print(f"   first differing token index (decode): {first_tok} / {len(ids_a)}")
+                shorter = min(len(ids_a), len(ids_b))
+                first_tok = next((i for i, (x, y) in enumerate(zip(ids_a, ids_b)) if x != y), shorter)
+                print(f"   first differing token index (decode): {first_tok} / {len(ids_a)} vs {len(ids_b)}")
         delta = _max_abs_logprob_delta(a[case].get("top0_logprobs"), b[case].get("top0_logprobs"))
         if delta is not None:
             print(f"   token 0 top-5 logprob max |delta|: {delta:.4g}  [informational, not gating]")
@@ -176,8 +199,9 @@ if __name__ == "__main__":
     c.add_argument("a")
     c.add_argument("b")
     c.add_argument("--allow-head-mismatch", action="store_true")
+    c.add_argument("--allow-dirty", action="store_true")
     args = ap.parse_args()
     if args.cmd == "run":
         sys.exit(run(args) or 0)
     else:
-        sys.exit(compare(args.a, args.b, allow_head_mismatch=args.allow_head_mismatch))
+        sys.exit(compare(args.a, args.b, allow_head_mismatch=args.allow_head_mismatch, allow_dirty=args.allow_dirty))

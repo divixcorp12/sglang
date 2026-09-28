@@ -1,7 +1,5 @@
-"""Layer-major ring finalize vs the radix insert that follows it (Task 12 crash, layer-major-8k arm).
-
-See radix-debug-report.md: a finalize that kept only the last window before seq_len left the insert key
-ending on a tombstone (``new_prefix_len=32512, len(new_indices)=16384``)."""
+"""Layer-major ring finalize vs the radix insert that follows it: keeping only the last window before seq_len
+left the insert key ending on a tombstone (``new_prefix_len=32512, len(new_indices)=16384``)."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -130,18 +128,28 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:n])), value=full,
                                        swa_evicted_seqlen=swa_live_from))
 
+    def _seed_live_prefix_then_tombstone(self, prefix: int, branch: int) -> None:
+        """ids[:prefix] fully live; ids[prefix:branch) full-KV live but SWA-tombstoned, chained onto the same
+        prefix addresses via prev_prefix_len (as cache_finished_req does for a real request)."""
+        self._seed(prefix, swa_live_from=0)
+        m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:prefix]))))
+        last_loc = m.device_indices[-1:].to(torch.int64)
+        ext = self.alloc.alloc_extend(
+            torch.tensor([prefix]), torch.tensor([prefix]), torch.tensor([branch]), torch.tensor([branch]),
+            last_loc, branch - prefix,
+        ).to(torch.int64)
+        self.alloc.free_swa_segment(ext, start_pos=prefix)
+        value = torch.cat([m.device_indices.to(torch.int64), ext])
+        self.cache.insert(InsertParams(key=RadixKey(array("q", self.ids[:branch])), value=value,
+                                       swa_evicted_seqlen=branch, prev_prefix_len=prefix))
+
     def _assert_matches(self, n: int) -> None:
         m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", self.ids[:n]))))
         self.assertEqual(len(m.device_indices), n)
 
     def test_prefix_hit_capped_at_a_tombstone_branch_point(self):
-        # The crash's shape at 1/16 scale: [0, 1792) tombstoned, [1792, 2048) live. A 2148-token prompt's match,
-        # capped at 2148 - 128, reaches full KV 1792 but no live window, so admission sets branch point 1792.
-        # This is also the radix-prefix-hit case for the clamp (Radix M4): prefix_len=1792 here, and the raw
-        # no-branch floor (1536) sits below it, so max(prefix_len, floor) must bind to keep the assertion below
-        # true. A layer-major extend must be at least a ring long (see min_ring_len), and a ring is always many
-        # pages wide, so the floor sits within ~2 pages of seq_len -- always past any prefix short of a
-        # tombstone branch point like this one.
+        # The crash's shape at 1/16 scale: a 2148-token prompt's match, capped at 2148 - 128, reaches full KV
+        # 1792 but no live window (prefix_len=0 here), so admission sets branch point 1792.
         self._seed(2048, swa_live_from=1792)
         req = self._layer_major_prefill(2148)
         self.assertEqual(req.kv.cache_protected_len, 1792)
@@ -167,6 +175,33 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         req = self._layer_major_prefill(2048 + 200)
         self.assertEqual(req.kv.cache_protected_len, 2048)
         self._assert_matches(2048)
+        self._finish(req)
+        self.cache.sanity_check()
+        self._assert_pool_restored_after_evict()
+
+    def test_live_prefix_with_a_branch_clamps_to_the_prefix(self):
+        # Live prefix 1024, tombstoned branch at 1280: the branch-derived floor (768) sits below the prefix, so
+        # max(prefix_len, ...) must clamp up to 1024 instead.
+        self._seed_live_prefix_then_tombstone(prefix=1024, branch=1280)
+        real = DeepseekV4LayerMajorAdapter._insert_keep_from
+        calls = []
+
+        def _spy(self_, *a, **kw):
+            r = real(self_, *a, **kw)
+            calls.append((kw, r))
+            return r
+
+        with mock.patch.object(DeepseekV4LayerMajorAdapter, "_insert_keep_from", autospec=True, side_effect=_spy):
+            req = self._layer_major_prefill(2304)
+        kwargs, (keep_from, drop_branch) = calls[0]
+        prefix_len = kwargs["prefix_len"]
+        self.assertGreater(prefix_len, 0)
+        self.assertEqual((keep_from, drop_branch), (prefix_len, False))
+        self.assertGreater(keep_from, 768)  # the branch-derived floor alone, which the clamp overrides
+        # Without the clamp, finalize_ring(extend_start=1024, keep_from=768, ...) would compute a negative
+        # split and fail its own range assert -- the clamp is load-bearing, not just more conservative.
+        self.assertEqual(req.kv.cache_protected_len, 1280)  # the insert's own cap is the branch point, not keep_from
+        self._assert_matches(1280)
         self._finish(req)
         self.cache.sanity_check()
         self._assert_pool_restored_after_evict()

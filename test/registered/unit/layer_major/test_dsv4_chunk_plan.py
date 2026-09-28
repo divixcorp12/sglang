@@ -2,11 +2,12 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.models.deepseek_v4_layer_major import (
+    DSV4_WINDOW,
     ChunkSpan,
     DeepseekV4LayerMajorAdapter,
     chunk_spans,
     engram_history,
-    min_ring_len,
+    ring_len_ok,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -35,12 +36,20 @@ class TestDsv4ChunkPlan(unittest.TestCase):
         self.assertEqual(engram_history([5, 6, 7, 8], start=2, n=3), [0, 5, 6])
         self.assertEqual(engram_history([5, 6, 7, 8], start=4, n=3), [6, 7, 8])
 
-    def test_min_ring_len_matches_production_geometry(self):
-        # page (256) >= window (128), so margin's page-ceil is exactly one page.
-        self.assertEqual(min_ring_len(chunk=4096, page=256, window=128), 4096 + 256)
+    def test_ring_len_ok_matches_production_geometry(self):
+        self.assertTrue(ring_len_ok(chunk=4096, page=256, window=DSV4_WINDOW))
+        a = _adapter(chunk=4096, page=256)
+        a._check_ring_len(a.chunk + a.page)  # does not raise
 
-    def test_ring_below_minimum_raises(self):
-        # window (128) > page (64): margin's page-ceil is 2 pages, but the ring only holds 1.
+    def test_chunk_equal_to_page_raises(self):
+        # The N1 regression: chunk == page passed the old (weaker) check but leaves no second margin page,
+        # aliasing ring pages at (page, chunk) = (256, 256).
+        self.assertFalse(ring_len_ok(chunk=256, page=256, window=DSV4_WINDOW))
+        a = _adapter(chunk=256, page=256)
+        with self.assertRaises(ValueError):
+            a._check_ring_len(a.chunk + a.page)
+
+    def test_page_below_window_raises(self):
         a = _adapter(chunk=4096, page=64)
         with self.assertRaises(ValueError):
             a._check_ring_len(a.chunk + a.page)

@@ -5192,17 +5192,16 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
   context as it did to 30k.
 - Steady decode ms/token at the smaller hot cache.
 
-### 27.19 Task 12 fix round: layer-major vs chunked GPU equivalence, radix crash closed (2026-09-27)
+### 27.19 Task 12 fix round: layer-major vs chunked GPU equivalence, radix crash closed (2026-09-27, round 2)
 
 Phase 0's numbers (TTFT, chunk times at 128k, peak VRAM, indexer path, node-1 free) are §27.18; not repeated here.
 
 **The radix crash from the first Task 12 run (`new_prefix_len=32512, len(new_indices)=16384` in
-`unified_radix_cache.cache_unfinished_req`) is fixed, in the layer-major adapter only.** Full diagnosis:
-`radix-debug-report.md` (gitignored, not in this repo). In brief: bounded-replay admission can cap a match at a
-device-window boundary that lies inside a *tombstoned* SWA span the tree still holds live full KV for
-(`swa_branching_seqlen`), and the post-prefill radix insert then needs live window KV up to that branch point, not
-just up to `seq_len`'s last window. `DeepseekV4LayerMajorAdapter._finalize_ring` kept only the latter, so the insert
-key ended on an unmatchable tombstone. The fix (`_insert_keep_from`) keeps from
+`unified_radix_cache.cache_unfinished_req`) is fixed, in the layer-major adapter only.** In brief: bounded-replay
+admission can cap a match at a device-window boundary that lies inside a *tombstoned* SWA span the tree still
+holds live full KV for (`swa_branching_seqlen`), and the post-prefill radix insert then needs live window KV up to
+that branch point, not just up to `seq_len`'s last window. `DeepseekV4LayerMajorAdapter._finalize_ring` kept only
+the latter, so the insert key ended on an unmatchable tombstone. The fix (`_insert_keep_from`) keeps from
 `max(prefix_len, page_floor(end - 1 - max(window, page)))`, where `end` is the branch point when the ring still
 covers it, else `page_floor(seq_len)`; it falls back to the seq_len floor when the ring has already overwritten the
 branch point's window. `unified_radix_cache.py` and `components/swa.py` are unchanged.
@@ -5216,40 +5215,49 @@ branch point's window. `unified_radix_cache.py` and `components/swa.py` are unch
 - `equiv.py`'s module docstring and `compare()`'s docstring both state this; `compare()` gates on `ids[0]` equality
   and prints the full-completion divergence informationally only.
 
-**Check (a).** `test_window_ring.py::TestWindowRingCudaFreePath` now reaches `_free_swa_pages_cuda` for real: it
-frees the kept tail through `free_segment`/`free_swa_segment` (wrapped with `mock.patch.object(..., wraps=...)`,
-asserted called), instead of `free()`'s `finalize_ring`-only path, which never dispatches there. GPU run (CPU
-lane, `taskset -c 32-63` under `cc-gpu.lock`, shared with other pytest jobs per today's `flock -s` convention):
-`1 passed`.
+**Check (a).** `test_window_ring.py::TestWindowRingCudaFreePath` reaches `_free_swa_pages_cuda` for real: it frees
+the kept tail through `free_segment`/`free_swa_segment` (wrapped with `mock.patch.object(..., wraps=...)`, asserted
+called), then frees the already-released prefix through `free_full_segment` -- which itself asserts
+`finalize_ring` cleared that prefix's SWA mapping (`_SWA_PEER_RELEASED`), rather than `free()`'s
+`finalize_ring`-only path, which never dispatches to `_free_swa_pages_cuda` at all. GPU run (CPU-affine pytest
+under `flock -s` on `cc-gpu.lock`, per today's shared-lock convention): `1 passed`.
 
-**Radix I1 (unflushed chain).** `equiv.py` now includes `chain-32768` (flush), `chain-32868` (no flush, shares the
-32768-token prefix), `chain-32868-again` (no flush, re-sent). In the `layer-major-8k` arm's `server.log`:
+**Radix I1 (unflushed chain): closed as CPU-covered, not GPU-covered, per controller ruling.** `equiv.py` includes
+`chain-32768` (flush), `chain-32868` (no flush, shares the 32768-token prefix), `chain-32868-again` (no flush,
+re-sent). In the `layer-major-8k` arm's `server.log`:
 
 ```
-[2026-09-27 18:23:17] layer-major prefill: 32868 tokens in 9 chunks
-[2026-09-27 18:23:17] Prefill batch, #new-seq: 1, #new-token: 32868, #cached-token: 0, ...
-[2026-09-27 18:23:42] Prefill batch, #new-seq: 1, #new-token: 1024, #cached-token: 0, ...
-[2026-09-27 18:26:47] layer-major prefill: 32768 tokens in 8 chunks
-[2026-09-27 18:26:47] Prefill batch, #new-seq: 1, #new-token: 32768, #cached-token: 1024, ...
-[2026-09-27 18:27:04] Prefill batch, #new-seq: 1, #new-token: 256, #cached-token: 0, ...
 [2026-09-27 18:30:24] layer-major prefill: 32768 tokens in 8 chunks
 [2026-09-27 18:30:24] Prefill batch, #new-seq: 1, #new-token: 32768, #cached-token: 0, ...
 [2026-09-27 18:30:42] Prefill batch, #new-seq: 1, #new-token: 356, #cached-token: 32512, ...
 [2026-09-27 18:30:59] Prefill batch, #new-seq: 1, #new-token: 356, #cached-token: 32512, ...
 ```
-`chain-32768` (18:30:24) runs layer-major, 8 chunks. `chain-32868` (18:30:42) admits with `#cached-token: 32512` --
-a nonzero branch-point hit against `chain-32768`'s just-finished pass, exactly the crash's shape (its own extend,
-356 tokens, is below `min_tokens` and so runs chunked, but the branch point it hits was set up by the preceding
-*layer-major* pass's `_finalize_ring`). `chain-32868-again` (18:30:59) re-sends the same prompt and hits the same
-`#cached-token: 32512` a second time. No assertion, no traceback; `18:31:09 healthy after run`, `0` OOM retries.
-The chunked arm hits the identical `#cached-token: 32512` branch point for its own `chain-32868`/`chain-32868-again`
-(17:48:36, 17:48:53), also clean -- the fix is consistent across both admission paths.
+`#cached-token: 32512` is `page_floor(32868 - 128)`, the bounded-replay cap -- **an ordinary live-window hit, not a
+branch point.** With the fix, `chain-32768`'s finalize keeps window KV live from `page_floor(32768 - 1 - 256) =
+32256` onward, and 32512 falls inside that live span (`32256 <= 32512 < 32768`). `chain-32868`'s own extend (356
+tokens) is below `min_tokens` (8192) and runs chunked on both arms, so no layer-major pass ever sees this
+admission's branch logic. The chunked arm hits the identical `#cached-token: 32512` at 17:48:36/17:48:53 for its
+own `chain-32868`/`chain-32868-again`, consistent with an ordinary radix hit, not a fix-specific code path.
 
-**GPU equivalence table** (`/mnt/nvme1/layer-major/equiv-t12fix/`, both arms at commit `08da71777d`, `dirty=0`):
+With the fix in place, a real branch point needs the SWA cache to have evicted part of a still-referenced live
+window out from under an in-progress admission -- a race condition, not something any of `equiv.py`'s prompts can
+force deterministically on a lightly-loaded single-request server. **No GPU case in this run exercises the
+branch-kept path.** Coverage of that path is the CPU test
+`test_layer_major_radix_insert.py::test_prefix_hit_capped_at_a_tombstone_branch_point` (a pre-seeded tombstoned
+tree, `prefix_len=0`, branch point 1792) and the new
+`test_live_prefix_with_a_branch_clamps_to_the_prefix` (a pre-seeded live prefix of 1024 with a tombstoned branch at
+1280, spy-verified: `prefix_len=1024 > 0` and the clamp overrides the branch-derived floor of 768). Per controller
+ruling, this is accepted as CPU-only coverage; the chain case stays in `equiv.py` as a real regression case for the
+crash's *admission* shape (pre-fix, `chain-32868`'s match came up short and it was misrouted to layer-major with
+an unrecoverable branch; post-fix it is correctly recognized as a live hit and runs chunked), not as branch-path
+GPU coverage.
+
+**GPU equivalence table** (`/mnt/nvme1/layer-major/equiv-t12fix/`, both arms at commit `08da71777d`, `dirty=0`;
+"chunked" column re-read from `server.log`'s own `Prefill batch` lines per case):
 
 | case | prompt | chunked #new/#cached | layer-major-8k #new/#cached | ran layer-major? | token 0 | e2e chunked / lm-8k (s) |
 |---|---:|---|---|---|---|---|
-| len8192 | 8192 | 8192/0 | 8192/0 | yes, 2 chunks | IDENTICAL | 69.7 / 59.2 |
+| len8192 | 8192 | 4096x2/0 | 8192/0 | yes, 2 chunks | IDENTICAL | 69.7 / 59.2 |
 | len16384 | 16384 | 4096x4/0 | 16384/0 | yes, 4 chunks | IDENTICAL | 112.0 / 102.3 |
 | len32768 | 32768 | 4096x8/0 | 32768/0 | yes, 8 chunks | IDENTICAL | 219.5 / 193.1 |
 | len33000 | 33000 | 4096x8+232/0 | 33000/0 | yes, 9 chunks | IDENTICAL | 221.7 / 192.3 |
@@ -5258,36 +5266,48 @@ The chunked arm hits the identical `#cached-token: 32512` branch point for its o
 | prefix | 33792 | 4096x8/1024 | 32768/1024 | yes, 8 chunks, radix prefix hit | IDENTICAL | 198.1 / 186.8 |
 | after | 256 | 256/0 | 256/0 | no | IDENTICAL | 16.1 / 15.8 |
 | chain-32768 | 32768 | 4096x8/0 | 32768/0 | yes, 8 chunks | IDENTICAL | 196.9 / 201.4 |
-| chain-32868 | 32868 (unflushed) | 4096x8+356/32512 | 356/32512 | branch point on both arms (see above) | IDENTICAL | 17.2 / 17.5 |
-| chain-32868-again | 32868 (unflushed, resend) | 4096x8+356/32512 | 356/32512 | same branch point, resend | IDENTICAL | 17.9 / 17.4 |
+| chain-32868 | 32868 (unflushed) | 356/32512 | 356/32512 | no on either arm (live-window hit, see above) | IDENTICAL | 17.2 / 17.5 |
+| chain-32868-again | 32868 (unflushed, resend) | 356/32512 | 356/32512 | no on either arm, same hit, resend | IDENTICAL | 17.9 / 17.4 |
 
 `compare chunked.jsonl layer-major-8k.jsonl` (`--allow-head-mismatch` not needed, both arms share a head):
 `EXIT=0`, every case `IDENTICAL (token 0)`, top-5 logprob max |delta| `0` on every case (T12 Minor 1: the server
 accepted `return_logprob`/`top_logprobs_num=5` without incident, so this ran; informational only, the gate stays
-token-0 id equality). 6 of 11 cases' full 64-token completions differ from decode step 1-62 onward (documented decode
-drift, not gating). `grep -c "memory allocation failed with OOM"`: chunked 1 (recovered, between `prefix-warm` and
-`prefix`, unrelated to layer-major), layer-major-8k 0.
+token-0 id equality). **8 of 11 cases'** full 64-token completions differ from decode step 1-62 onward
+(`chain-32768`, `chain-32868`, `chain-32868-again`, `len16384`, `len32768`, `len8192`, `prefix`, `prefix-warm`;
+documented decode drift, not gating -- `len33000`, `len32868`, `after` are byte-identical). `grep -c "memory
+allocation failed with OOM"`: chunked 1 (recovered, between `prefix-warm` and `prefix`, unrelated to layer-major),
+layer-major-8k 0.
 
-Layer-major is faster than chunked at every comparable length here (phase 1 was not expected to beat chunked, since
-experts still stream per chunk in both paths; the gap is plausibly the extra chunk-boundary bookkeeping chunked
-prefill pays that a single whole-suffix layer-major pass does not). Not a claim this generalizes past this box/run.
+The e2e figures above include the 64 decode tokens and are single-run wall-clock, not averaged. Layer-major beats
+chunked at every length except `chain-32768` (196.9 s chunked vs 201.4 s layer-major); no causal claim is made
+about why (both paths still stream experts per chunk in phase 1), and this is one run on one box, not a claim that
+generalizes.
 
 **Check (d).** The `262144 x 4 x 5120` bf16 `hidden` StateStore field is `262144 * 4 * 5120 * 2 bytes = 10.0 GiB`.
-Measured NUMA node-1 free minimum: chunked arm 26.2 GiB, layer-major-8k arm 19.5 GiB -- comfortably above the 10.0
-GiB store with the store allocated (layer-major-8k headroom ~9.5 GiB).
+Measured NUMA node-1 free minimum, with that store already resident: chunked arm 26.2 GiB, layer-major-8k arm
+19.5 GiB. That free minimum *is* the headroom past the store (it was sampled while the store was allocated), not a
+quantity to further subtract the store from.
+
+**Radix M5 (held window after finalize).** A layer-major request with a branch can hold up to about one ring
+(~17 pages at production geometry) of window KV briefly after `_finalize_ring`, not "1-2 pages"; it is freed in the
+same scheduler step by `cleanup_after_caching_req` while
+`SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS` is on (the production default). Not a correctness issue.
 
 **Corpus (T12-I4, remaining half).** `drive_equiv.sh` now reads prompts from a pinned snapshot,
 `/mnt/nvme1/layer-major/equiv-corpus/corpus.txt` (`DSV41_REFERENCE.md` at `29c7d4e2b1`, sha256
 `59abe27a89c6915935e6ce1cc79acf3d2acf393067b5609d753b8ff0c9fc70c3`), and refuses if the file's hash differs, instead
 of re-tokenizing the worktree head's own (edited-since) `DSV41_REFERENCE.md`.
 
-**Two small additions per controller ruling, not re-run on GPU (CPU tests only):**
-- `equiv.py run --cases quick` runs a fast subset for iteration: `len8192`, `len32768`, `len33000`,
-  `prefix-warm`/`prefix`, and the unflushed chain.
+**Controller additions, CPU-tested only (no GPU re-run):**
+- `equiv.py run --cases quick` runs a fast subset for iteration (`len8192`, `len32768`, `len33000`,
+  `prefix-warm`/`prefix`, the unflushed chain); the header records `cases` (`all`/`quick`).
 - `drive_equiv.sh <arm> <wt> <min_tokens> <out_root> <baseline_jsonl>` skips that arm's server run and copies
-  `baseline_jsonl` to `<out_root>/<arm>.jsonl` instead, for reusing an existing chunked baseline; pair the compare
-  with `--allow-head-mismatch` since the header commit will differ (the prompt-hash check still refuses a
-  mismatched corpus).
+  `baseline_jsonl` to `<out_root>/<arm>.jsonl` instead, for reusing an existing chunked baseline.
+- `compare()` now supports a `quick`-vs-`all` pairing directly: it compares the smaller file's cases, provided
+  every one is present in the larger file (the larger file's extra cases are not an error); it refuses when either
+  arm's header is `dirty` unless `--allow-dirty` is passed, and refuses when both arms have `min_tokens=0` (nothing
+  ran layer-major on either side). `--allow-head-mismatch` is still required separately for a different-head
+  baseline reuse; the per-case `prompt_hash` check is unconditional either way.
 
 **Open question, not blocking (from `review-radix-fix.md`).** Late-layer SWA in the tree-adopted window below a
 branch point is never written under bounded replay: `swa_reprefill_tail` re-prefills one window from the match end,
