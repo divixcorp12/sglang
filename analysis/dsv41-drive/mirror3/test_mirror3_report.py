@@ -89,3 +89,15 @@ def test_ram_miss_is_none_when_the_server_never_wrote_its_counters(tmp_path):
     (tmp_path / "server.log").write_text("killed\n")
     out = report.ram_miss(tmp_path)
     assert out["thread"] is None and out["stream"] is None
+
+
+def test_node0_gate_rows_are_the_arms_own(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    rows = [dict(arm="mirror2-ref", memfree_mib=1, page_cache_mib=2, ok=False),
+            dict(arm="mirror2-ref", memfree_mib=3, page_cache_mib=4, ok=True),
+            dict(arm="mirror3", memfree_mib=5, page_cache_mib=6, ok=True)]
+    (out / "node0-gate.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    run = tmp_path / "servers" / "mirror2-ref" / "run-1"
+    assert report.node0_gate(out / "mirror2-ref-clocks.csv", run) == rows[:2]
+    assert report.node0_gate(tmp_path / "elsewhere" / "c.csv", run) is None

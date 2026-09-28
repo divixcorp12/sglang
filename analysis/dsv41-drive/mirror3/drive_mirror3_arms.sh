@@ -58,22 +58,30 @@ N0_MIB=57344; N1_MIB=40960; HEADROOM_MIB=4096; NODE0_CUT_MIB=4096; NODE0_CUTS_LE
 # 20028 MiB free + 44045 MiB page cache = 64073 MiB at its check (11:35:58); node 0 idle right after the abort read
 # MemFree 32912 + FilePages 44290 = ~79050 MiB. So the server took ~14977 MiB first; 15360 (15 GiB) covers it.
 PRECHECK_FOOTPRINT_MIB=15360
-node0_avail_mib() {  # host_numa.node_memory's "free" + "reclaimable" for node 0, in MiB
-    awk '$3 == "MemFree:" || $3 == "Active(file):" || $3 == "Inactive(file):" { kb += $4 } END { print int(kb / 1024) }' \
-        /sys/devices/system/node/node0/meminfo
+node0_memory_mib() {  # "<MemFree> <Active(file)+Inactive(file)>" for node 0 in MiB: host_numa.node_memory's free, reclaimable
+    awk '$3 == "MemFree:" { f += $4 } $3 == "Active(file):" || $3 == "Inactive(file):" { c += $4 }
+         END { print int(f / 1024), int(c / 1024) }' /sys/devices/system/node/node0/meminfo
 }
+# At most ONE cut (57344 -> 53248 on node 0, 98304 -> 94208 in total), settled before the reference arm; never a second.
+# Each check is logged and appended to $OUT/node0-gate.jsonl, which mirror3_report.py reports per arm.
 node0_gate() {  # <arm>: settle (reference, may cut once) or re-check (3-root, never cuts) the node-0 share
-    local arm=$1 avail need
+    local arm=$1 free cache avail need ok
     while :; do
-        avail=$(node0_avail_mib); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
-        say "node 0 before $arm: MemFree+file cache ${avail} MiB, need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB})"
-        [ "$avail" -ge "$need" ] && return 0
+        read -r free cache < <(node0_memory_mib)
+        avail=$((free + cache)); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
+        ok=$([ "$avail" -ge "$need" ] && echo true || echo false)
+        say "node 0 before $arm: MemFree ${free} MiB + page cache ${cache} MiB = ${avail} MiB, need ${need} MiB" \
+            "(share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB}): ok=$ok"
+        printf '{"arm": "%s", "utc": "%s", "memfree_mib": %d, "page_cache_mib": %d, "available_mib": %d, "need_mib": %d, "node0_share_mib": %d, "node1_share_mib": %d, "total_mib": %d, "ok": %s}\n' \
+            "$arm" "$(date -u +%FT%TZ)" "$free" "$cache" "$avail" "$need" "$N0_MIB" "$N1_MIB" "$((N0_MIB + N1_MIB))" "$ok" \
+            >> "$OUT/node0-gate.jsonl"
+        [ "$ok" = true ] && return 0
         if [ "$arm" = mirror2-ref ] && [ "$NODE0_CUTS_LEFT" -gt 0 ]; then
             N0_MIB=$((N0_MIB - NODE0_CUT_MIB)); NODE0_CUTS_LEFT=$((NODE0_CUTS_LEFT - 1))
-            say "node 0 short: cutting node 0 (and the total) by ${NODE0_CUT_MIB} MiB for BOTH arms -> 0:${N0_MIB},1:${N1_MIB}"
+            say "node 0 short: cutting node 0 (and the total) by ${NODE0_CUT_MIB} MiB for BOTH arms -> 0:${N0_MIB},1:${N1_MIB} (total $((N0_MIB + N1_MIB)))"
             continue
         fi
-        say "node 0 short before $arm at the settled 0:${N0_MIB},1:${N1_MIB}; stopping rather than run mismatched arms"
+        say "node 0 short before $arm at 0:${N0_MIB},1:${N1_MIB} (${avail} < ${need} MiB); no further cut, stopping before this arm"
         return 1
     done
 }

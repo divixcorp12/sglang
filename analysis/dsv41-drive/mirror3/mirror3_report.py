@@ -155,10 +155,21 @@ def ram_miss(run_dir):
     }
 
 
+def node0_gate(clocks_csv, run_dir):
+    """The driver's node-0 checks for this arm ($OUT/node0-gate.jsonl, beside the clocks CSV): MemFree and page cache
+    (Active(file) + Inactive(file)) as seen before launch, and the pinned-tier shares the arm ran with. The arm is the
+    run dir's parent (servers/<arm>/run-...). None when the file is absent."""
+    path = Path(clocks_csv).parent / "node0-gate.jsonl"
+    if not path.exists():
+        return None
+    return [r for r in load_jsonl(path) if r["arm"] == Path(run_dir).parent.name]
+
+
 def arm(run_dir, diskstats, clocks_csv, devices):
     per_turn, median = ms_per_token(run_dir)
     start, end = timed_window(run_dir)
     return {"run_dir": str(run_dir), "ms_per_token": per_turn, "median_ms_per_token": median,
+            "node0_gate": node0_gate(clocks_csv, run_dir),
             "decode": decode(run_dir),
             "clocks": {"timed_window": clock_summary(clocks_csv, *timed_window_utc(run_dir)),
                        "session_start_end_mhz": session_clocks(run_dir)},
