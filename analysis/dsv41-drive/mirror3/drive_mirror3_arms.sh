@@ -20,8 +20,8 @@
 # and SGLANG_MOE_PINNED_HOST_MB=98304. Reason: the ZFS ARC holds node-0 memory that host_numa.check_capacity does not
 # count as reclaimable, and the recipe's 0:61440 was refused 1463 MiB short. Before the reference arm the driver
 # checks node 0 the way check_capacity does (MemFree + Active(file) + Inactive(file) from node0/meminfo) against the
-# node-0 share + 4096 MiB headroom + arm_env.WEIGHTS_AND_OVERHEAD_MIB (check_capacity runs after the server has loaded,
-# so the idle number must also cover what the server itself takes from node 0 first). If short, it cuts node 0 and the
+# node-0 share + 4096 MiB headroom + the server's observed pre-check node-0 footprint (check_capacity runs after the
+# server has loaded, so the idle number must also cover what the server itself takes from node 0 first). If short, it cuts node 0 and the
 # total by another 4096 MiB once, for both arms. Before the 3-root arm it re-checks the SAME values and stops if short,
 # rather than run mismatched arms.
 set -u
@@ -53,8 +53,11 @@ ports_free() {
 }
 ports_free || exit 1
 N0_MIB=57344; N1_MIB=40960; HEADROOM_MIB=4096; NODE0_CUT_MIB=4096; NODE0_CUTS_LEFT=1
-OVERHEAD_MIB=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.WEIGHTS_AND_OVERHEAD_MIB)") \
-    || { say "cannot read arm_env.WEIGHTS_AND_OVERHEAD_MIB"; exit 1; }
+# The server's node-0 footprint before check_capacity runs, observed, not arm_env.WEIGHTS_AND_OVERHEAD_MIB (12288,
+# which undercounts it). Evidence: the refused reference arm servers/mirror2-ref/run-20260928-113123 saw
+# 20028 MiB free + 44045 MiB page cache = 64073 MiB at its check (11:35:58); node 0 idle right after the abort read
+# MemFree 32912 + FilePages 44290 = ~79050 MiB. So the server took ~14977 MiB first; 15360 (15 GiB) covers it.
+PRECHECK_FOOTPRINT_MIB=15360
 node0_avail_mib() {  # host_numa.node_memory's "free" + "reclaimable" for node 0, in MiB
     awk '$3 == "MemFree:" || $3 == "Active(file):" || $3 == "Inactive(file):" { kb += $4 } END { print int(kb / 1024) }' \
         /sys/devices/system/node/node0/meminfo
@@ -62,8 +65,8 @@ node0_avail_mib() {  # host_numa.node_memory's "free" + "reclaimable" for node 0
 node0_gate() {  # <arm>: settle (reference, may cut once) or re-check (3-root, never cuts) the node-0 share
     local arm=$1 avail need
     while :; do
-        avail=$(node0_avail_mib); need=$((N0_MIB + HEADROOM_MIB + OVERHEAD_MIB))
-        say "node 0 before $arm: MemFree+file cache ${avail} MiB, need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + server ${OVERHEAD_MIB})"
+        avail=$(node0_avail_mib); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
+        say "node 0 before $arm: MemFree+file cache ${avail} MiB, need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB})"
         [ "$avail" -ge "$need" ] && return 0
         if [ "$arm" = mirror2-ref ] && [ "$NODE0_CUTS_LEFT" -gt 0 ]; then
             N0_MIB=$((N0_MIB - NODE0_CUT_MIB)); NODE0_CUTS_LEFT=$((NODE0_CUTS_LEFT - 1))
