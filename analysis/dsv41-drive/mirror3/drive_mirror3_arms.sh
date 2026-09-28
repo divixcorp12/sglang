@@ -40,7 +40,9 @@ ports_free() {
 }
 ports_free || exit 1
 mkdir -p "$OUT"
-DEVS=$(for r in ${ROOTS3//:/ }; do basename "$(findmnt -no SOURCE --target "$r")"; done | sort -u | tr '\n' ' ')
+# The whole namespace (nvme0n1), not the partition findmnt names (nvme0n1p1): the split is per drive.
+disk_of() { local src; src=$(findmnt -no SOURCE --target "$1") || return 1; lsblk -no PKNAME "$src" | grep . || basename "$src"; }
+DEVS=$(for r in ${ROOTS3//:/ }; do disk_of "$r"; done | sort -u | tr '\n' ' ')
 say "mirror drives: $DEVS"
 [ "$(echo $DEVS | wc -w)" = 3 ] || { say "the three roots are not on three devices: $DEVS"; exit 1; }
 
