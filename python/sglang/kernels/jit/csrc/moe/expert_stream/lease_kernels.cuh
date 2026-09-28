@@ -74,7 +74,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       min(max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0)), static_cast<int64_t>(kMaxIds));
   for (int64_t i = 0; i < planned_count; ++i) {
     const int32_t expert = static_cast<int32_t>(planned[i]);
-    if (expert >= 0 && expert < experts && ld_volatile(map_row + expert) < 0 && !listed(need, need_count, expert)) {
+    if (expert >= 0 && expert < experts && ld_relaxed_sys(map_row + expert) < 0 && !listed(need, need_count, expert)) {
       need[need_count++] = expert;
     }
   }
@@ -95,17 +95,17 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
   if (hot_page != nullptr) {
     uint8_t* hot = hot_page + static_cast<int64_t>((seq - 1u) % kHotRecords) * hot_stride;
-    *reinterpret_cast<volatile uint32_t*>(hot) = 0;
-    __threadfence_system();
-    *reinterpret_cast<volatile uint32_t*>(hot + 4) = static_cast<uint32_t>(experts);
-    volatile uint8_t* bits = reinterpret_cast<volatile uint8_t*>(hot + kHotHeaderBytes);
+    st_relaxed_sys<uint32_t>(hot, 0u);
+    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
+    st_relaxed_sys<uint32_t>(hot + 4, static_cast<uint32_t>(experts));
+    uint8_t* bits = hot + kHotHeaderBytes;
     for (int64_t byte = 0; byte < (experts + 7) / 8; ++byte) {
       uint8_t mask = 0;
       for (int64_t slot = 0; slot < hot_capacity; ++slot) {
         const int64_t expert = hot_slots[slot];
         if (expert >= byte * 8 && expert < byte * 8 + 8) mask |= static_cast<uint8_t>(1u << (expert - byte * 8));
       }
-      bits[byte] = mask;
+      st_relaxed_sys(bits + byte, mask);
     }
     st_release_sys(hot, seq);  // orders the bitmap before the seq; no separate fence
   }
@@ -121,18 +121,19 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const uint64_t generation = (static_cast<uint64_t>(static_cast<uint32_t>(state[kEpoch])) << 32) | seq;
     uint8_t* request = lease + lease_d + kLeaseLaneRequest +
                        static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLaneRequestBytes;
-    *reinterpret_cast<volatile uint64_t*>(request + kLeaseLrGen) = 0ull;
-    __threadfence_system();
-    *reinterpret_cast<volatile uint32_t*>(request + kLeaseLrCount) = static_cast<uint32_t>(planned_count);
-    *reinterpret_cast<volatile uint32_t*>(request + kLeaseLrRow) = static_cast<uint32_t>(row);
-    volatile int32_t* lane_experts = reinterpret_cast<volatile int32_t*>(request + kLeaseLrExpert);
+    st_relaxed_sys<uint64_t>(request + kLeaseLrGen, 0ull);
+    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
+    st_relaxed_sys<uint32_t>(request + kLeaseLrCount, static_cast<uint32_t>(planned_count));
+    st_relaxed_sys<uint32_t>(request + kLeaseLrRow, static_cast<uint32_t>(row));
     for (int i = 0; i < kMaxIds; ++i)
-      lane_experts[i] = i < planned_count ? static_cast<int32_t>(planned[i]) : -1;
-    volatile int32_t* lane_dst = reinterpret_cast<volatile int32_t*>(request + kLeaseLrDst);
+      st_relaxed_sys<int32_t>(
+          request + kLeaseLrExpert + 4 * i, i < planned_count ? static_cast<int32_t>(planned[i]) : -1);
     for (int i = 0; i < kMaxIds; ++i) {
-      lane_dst[i] = dst_slots != nullptr && i < planned_count && i < dst_count ? dst_slots[i] : -1;
+      st_relaxed_sys<int32_t>(
+          request + kLeaseLrDst + 4 * i,
+          dst_slots != nullptr && i < planned_count && i < dst_count ? dst_slots[i] : -1);
     }
-    *reinterpret_cast<volatile uint32_t*>(request + kLeaseLrFlags) = copy_engine != 0 ? kLeaseLrFlagCopyEngine : 0u;
+    st_relaxed_sys<uint32_t>(request + kLeaseLrFlags, copy_engine != 0 ? kLeaseLrFlagCopyEngine : 0u);
     st_release_sys64(request + kLeaseLrGen, tagged_word(kLeaseTagDemand, generation));
   }
   write_record(record, seq, row, need, need_count, protect, protect_count, 0, armed ? 1u : 0u, lanes);
@@ -155,7 +156,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   int ahead_count = 0;
   for (int i = 0; i < kMaxIds; ++i) {
     const int32_t expert = last_routes[next_row * kMaxIds + i];
-    if (expert >= 0 && expert < experts && ld_volatile(next_map + expert) < 0) ahead[ahead_count++] = expert;
+    if (expert >= 0 && expert < experts && ld_relaxed_sys(next_map + expert) < 0) ahead[ahead_count++] = expert;
   }
   if (ahead_count == 0) return;
   uint32_t advice = static_cast<uint32_t>(state[kAdvised]) + 1u;
@@ -219,7 +220,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
-      const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
+      const uint16_t status = ld_relaxed_sys<uint16_t>(record + kRecStatus);
       if (status != kServed) {
         state[kFailures] += 1;
         raise_fatal(page, seq);
@@ -235,7 +236,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     int64_t slot = 0;
     if (i < planned_count) {
       const int64_t expert = planned[i];
-      slot = expert >= 0 && expert < experts ? ld_volatile(map_row + expert) : -1;
+      slot = expert >= 0 && expert < experts ? ld_relaxed_sys(map_row + expert) : -1;
       if (slot < 0) {
         ++misses;
         slot = 0;
@@ -339,7 +340,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
-      const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
+      const uint16_t status = ld_relaxed_sys<uint16_t>(record + kRecStatus);
       if (status != kServed) {
         state[kFailures] += 1;
         ok = false;
@@ -362,8 +363,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   if (ok && planned_count > 0) {
     const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
     const uint8_t* results = lease + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
-    const uint32_t capacity =
-        *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
+    const uint32_t capacity = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
     for (int64_t i = 0; i < planned_count; ++i) {
       bool ready_seen = false;
       if (!lane_result_valid(
@@ -665,7 +665,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
-      const uint16_t status = *reinterpret_cast<const volatile uint16_t*>(record + kRecStatus);
+      const uint16_t status = ld_relaxed_sys<uint16_t>(record + kRecStatus);
       if (status != kServed) {
         state[kFailures] += 1;
         ok = false;
@@ -689,8 +689,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 
   const uint8_t* results =
       lease + kLeaseRowResult + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
-  const uint32_t capacity =
-      *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
+  const uint32_t capacity = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
   int64_t n = 0;
   int64_t misses = 0;
   for (int64_t i = 0; i < planned_count; ++i) {
@@ -766,8 +765,7 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     const int64_t row = lane_ctx[4 * entry + 2];
     const int64_t slot = lane_ctx[4 * entry + 3];
     const int64_t lane = static_cast<int64_t>(origin[entry]);
-    const uint32_t base =
-        *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes);
+    const uint32_t base = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes);
     const uint32_t current = ld_acquire_sys(lease + kLeaseSlotGen + 4 * (static_cast<int64_t>(base) + slot));
     const bool consumed = current == slot_generation;
     const int64_t idx = static_cast<int64_t>((static_cast<uint32_t>(generation) - 1u) % kDemandRecords);
@@ -895,8 +893,7 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     const uint32_t slot_generation = static_cast<uint32_t>(lane_ctx[4 * lane + 1]);
     const int64_t row = lane_ctx[4 * lane + 2];
     const int64_t slot = lane_ctx[4 * lane + 3];
-    const uint32_t base =
-        *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes);
+    const uint32_t base = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes);
     const uint32_t current = ld_acquire_sys(lease + kLeaseSlotGen + 4 * (static_cast<int64_t>(base) + slot));
     const bool consumed = current == slot_generation;
     const int64_t idx = static_cast<int64_t>((static_cast<uint32_t>(generation) - 1u) % kDemandRecords);
