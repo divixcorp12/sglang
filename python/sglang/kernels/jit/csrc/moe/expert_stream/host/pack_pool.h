@@ -100,7 +100,7 @@ struct PackJob {
 };
 
 // The cores a copy worker may run on: what the creating thread may run on, less the production
-// reserve 64-71 (71 is the doorbell's spin core; NVMe completion interrupts land there too).
+// reserve 64-71 (NVMe completion interrupts are pinned there).
 inline cpu_set_t pack_worker_cpus(const cpu_set_t& inherited) {
   cpu_set_t allowed = inherited;
   for (int core = 64; core <= 71; ++core)

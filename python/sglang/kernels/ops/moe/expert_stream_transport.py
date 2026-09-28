@@ -797,7 +797,9 @@ class ExpertStreamHost:
         ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19).
         """
         if 64 <= cpu_core <= 71:
-            raise ValueError(f"cpu_core {cpu_core}: cores 64-71 are reserved (71 is production's doorbell core)")
+            raise ValueError(
+                f"cpu_core {cpu_core}: cores 64-71 are reserved (NVMe completion interrupts are pinned there)"
+            )
         self._module.expert_stream_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
         self.threaded = True
 

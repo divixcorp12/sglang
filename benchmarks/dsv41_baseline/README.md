@@ -310,8 +310,9 @@ sessions as context.
 
 ## CPU pinning (hard requirement)
 
-Cores 64-71 stay free for every CPU job on divix01 — core 71 is production's doorbell
-spin core. `run_arm.sh` pins the server to `taskset -c 32-63` and the driver
+Cores 64-71 stay free for every CPU job on divix01 — NVMe completion interrupts are
+pinned there, and the RAM-miss path reads rows from NVMe. `run_arm.sh` pins the
+server to `taskset -c 32-63` and the driver
 (`run_capture_sessions.py`, invoked once per session) to `taskset -c 8-15`, matching
 the Qwen campaign's split, and caps `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 

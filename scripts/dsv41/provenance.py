@@ -343,7 +343,7 @@ def step_latency(log: list) -> dict:
 
 def process_tree_cpu_s(pid: int | None = None) -> float | None:
     """User+system CPU seconds so far of ``pid`` (default: this process) and every live descendant
-    (the scheduler and its workers). Whole-process totals, not per thread: a spinning doorbell
+    (the scheduler and its workers). Whole-process totals, not per thread: a spinning service
     thread counts in full.
 
     ``pid`` lets a caller outside the measured process sample it (e.g. an HTTP driver sampling the
