@@ -93,19 +93,20 @@ class RowReader {
     return pool_ ? pool_->cpus() : std::vector<int>{};
   }
 
-  // Piece streaming (kSubReads sub-reads per part, per-piece vetting, packing and publishing); off by default. Before
-  // open(), or on an idle reader after it (the tier sets it before its service thread starts), since it resizes the
-  // descriptor arrays and the packing queue. Refused without packing workers (the inline path has no piece
-  // publisher), with more mirror parts than the pieces can name, or when a slab row base is not kPieceAlign-aligned
-  // (a piece's cuts are aligned in the row).
+  // Piece streaming (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting, packing and
+  // publishing); off by default. Before open(), or on an idle reader after it (the tier sets it before its service
+  // thread starts), since it resizes the descriptor arrays and the packing queue. Refused without packing workers
+  // (the inline path has no piece publisher), with more mirror parts than pieces (a reading part needs a piece of
+  // its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
       if (pack_workers_ == 0 && !t_.images) {
         throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
       }
-      if (t_.parts * kSubReads > kPieces) {
+      if (t_.parts > kPieces) {
         throw std::runtime_error(
-            error_prefix<Layout>() + "piece streaming reads at most kPieces / kSubReads mirror parts");
+            error_prefix<Layout>() + "piece streaming reads at most " + std::to_string(kPieces) +
+            " mirror parts (a reading part needs a piece of its own), not " + std::to_string(t_.parts));
       }
       for (size_t row = 0; row < t_.slabs.size(); ++row) {
         for (size_t name = 0; name < t_.slabs[row].size(); ++name) {
@@ -723,8 +724,9 @@ class RowReader {
   }
 
   // Piece streaming: queue the row's sub-reads, one descriptor each, (slot, part, k) -> (slot * parts + part) *
-  // kSubReads + k. Credit is untouched: refill() takes it per SQE, so a sub-read costs one like a part did. Pieces
-  // with no bytes are vetted here, at admission.
+  // kSubReads + k: the stride is the most sub-reads a part can have, and k < sub_reads_per_part <= kSubReads, so the
+  // index is unique whatever the row's cut. Credit is untouched: refill() takes it per SQE, so a sub-read costs one
+  // like a part did. Pieces with no bytes (past the row's sub-reads) are vetted here, at admission.
   void queue_sub_reads(size_t slot, size_t ordinal, const RowGeometry& g, int64_t admitted) {
     Call& c = c_;
     const size_t parts = static_cast<size_t>(t_.parts);
@@ -1502,10 +1504,11 @@ class RowReader {
   // Indexed by bounce slot with the flag off, by (slot, piece) with piece streaming (size_jobs).
   PackJob jobs_[kBounceSlots * kPieces];
   std::vector<CopyRun> runs_;
-  // Piece streaming (set_piece_stream; off by default). subs_ is sub-reads per part: 1 with the flag off, which
-  // makes descriptor (slot, part, sub) the old (slot, part). sub_reads_ holds each live sub-read's Read (a
-  // descriptor points into it), piece_runs_ each slot's piece runs, geometry_ a batch's rows between validation
-  // and admission. All sized at open() or set_piece_stream(), and empty with the flag off.
+  // Piece streaming (set_piece_stream; off by default). subs_ is the most sub-reads per part: 1 with the flag off,
+  // which makes descriptor (slot, part, sub) the old (slot, part), and kSubReads with it on whatever a row's cut
+  // (row_geometry cuts each reading part into sub_reads_per_part <= kSubReads). sub_reads_ holds each live sub-read's
+  // Read (a descriptor points into it), piece_runs_ each slot's piece runs, geometry_ a batch's rows between
+  // validation and admission. All sized at open() or set_piece_stream(), and empty with the flag off.
   bool piece_stream_ = false;
   size_t subs_ = 1;
   std::vector<Read> sub_reads_;
