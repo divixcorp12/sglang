@@ -29,19 +29,21 @@ def _gather_module(
 ) -> Module:
     args = make_cpp_args(id_dtype, remap_in, remap_out)
     return load_jit(
-        "dsv41_direct_gather_destinations",
+        "expert_residency_direct_gather_destinations",
         *args,
-        cuda_files=["moe/dsv41_layer_fusion.cuh"],
-        cuda_wrappers=[("run", f"direct_gather_destinations_gpu<{args}>")],
+        cuda_files=["moe/expert_residency/direct_gather.cuh"],
+        cuda_wrappers=[
+            ("run", f"expert_residency::direct_gather_destinations_gpu<{args}>")
+        ],
     )
 
 
 @cache_once
 def _commit_module() -> Module:
     return load_jit(
-        "dsv41_direct_commit_gather",
-        cuda_files=["moe/dsv41_layer_fusion.cuh"],
-        cuda_wrappers=[("run", "direct_commit_gather_gpu")],
+        "expert_residency_direct_commit_gather",
+        cuda_files=["moe/expert_residency/direct_gather.cuh"],
+        cuda_wrappers=[("run", "expert_residency::direct_commit_gather_gpu")],
     )
 
 

@@ -26,10 +26,10 @@ def _route_tables_module(
 ) -> Module:
     args = make_cpp_args(remap, weight, x)
     return load_jit(
-        "dsv41_exl3_moe_route_tables",
+        "exl3_moe_route_tables",
         *args,
-        cuda_files=["moe/dsv41_layer_fusion.cuh"],
-        cuda_wrappers=[("run", f"exl3_moe_route_tables_gpu<{args}>")],
+        cuda_files=["moe/exl3/exl3_route_tables.cuh"],
+        cuda_wrappers=[("run", f"exl3::exl3_moe_route_tables_gpu<{args}>")],
     )
 
 

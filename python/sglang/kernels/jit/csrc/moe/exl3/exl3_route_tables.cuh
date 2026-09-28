@@ -16,15 +16,15 @@
 #include <stdint.h>
 #include <type_traits>
 
-namespace sglang {
+namespace sglang::exl3 {
 
-__device__ __forceinline__ float layer_fusion_to_float(float v) {
+__device__ __forceinline__ float route_tables_to_float(float v) {
   return v;
 }
-__device__ __forceinline__ float layer_fusion_to_float(__half v) {
+__device__ __forceinline__ float route_tables_to_float(__half v) {
   return __half2float(v);
 }
-__device__ __forceinline__ float layer_fusion_to_float(__nv_bfloat16 v) {
+__device__ __forceinline__ float route_tables_to_float(__nv_bfloat16 v) {
   return __bfloat162float(v);
 }
 
@@ -54,7 +54,7 @@ __global__ void exl3_moe_route_tables_kernel(
   const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = tid; i < hidden; i += stride) {
-    x16_out[i] = __float2half_rn(layer_fusion_to_float(x[i]));
+    x16_out[i] = __float2half_rn(route_tables_to_float(x[i]));
     out_zero[i] = 0.0f;
   }
   const bool kept = keep[0] > 0.0f;
@@ -82,7 +82,7 @@ __global__ void exl3_moe_route_tables_kernel(
     }
     remap64_out[tid] = r;
     inv_order[tid] = rank;
-    weight_sorted[rank] = __float2half_rn(__fmul_rn(layer_fusion_to_float(weights[tid]), keep[0]));
+    weight_sorted[rank] = __float2half_rn(__fmul_rn(route_tables_to_float(weights[tid]), keep[0]));
   }
 }
 
@@ -157,4 +157,4 @@ void exl3_moe_route_tables_gpu(
       static_cast<int64_t*>(det.data_ptr()));
 }
 
-}  // namespace sglang
+}  // namespace sglang::exl3

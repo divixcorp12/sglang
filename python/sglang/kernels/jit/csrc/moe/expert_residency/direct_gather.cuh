@@ -17,9 +17,9 @@
 #include <type_traits>
 #include <utility>
 
-namespace sglang {
+namespace sglang::expert_residency {
 
-constexpr int kLayerFusionWarp = 32;
+constexpr int kDirectGatherWarp = 32;
 
 // GpuResidencyUpdater.gather_destinations, for one layer. One warp; lane j owns shortlist entry j (width <= 32).
 //
@@ -28,7 +28,7 @@ constexpr int kLayerFusionWarp = 32;
 // of the reordered list is live when it is usable and k < miss_count; a live lane's destination is its slot, any other
 // lane's is 0. A remap entry at or past scratch_base is a miss lane's rank and becomes that lane's destination.
 template <typename IdT, typename RemapInT, typename RemapOutT>
-__global__ __launch_bounds__(kLayerFusionWarp, 1) void direct_gather_destinations_kernel(
+__global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinations_kernel(
     const IdT* __restrict__ topk_ids,
     int top_k,
     const int64_t* __restrict__ expert_to_slot,
@@ -42,9 +42,9 @@ __global__ __launch_bounds__(kLayerFusionWarp, 1) void direct_gather_destination
     int64_t* __restrict__ destinations_out,
     bool* __restrict__ live_out,
     RemapOutT* __restrict__ remap_out) {
-  __shared__ int64_t usable[kLayerFusionWarp];
-  __shared__ bool usable_valid[kLayerFusionWarp];
-  __shared__ int64_t destinations[kLayerFusionWarp];
+  __shared__ int64_t usable[kDirectGatherWarp];
+  __shared__ bool usable_valid[kDirectGatherWarp];
+  __shared__ int64_t destinations[kDirectGatherWarp];
   const unsigned lane = threadIdx.x;
   const bool entry = static_cast<int>(lane) < width;
   const int64_t victim = entry ? victims[lane] : 0;
@@ -106,9 +106,9 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int32_t* __restrict__ miss_count,
     uint8_t ready,
     uint8_t free_state) {
-  bool live[kLayerFusionWarp];
-  bool evicted[kLayerFusionWarp];
-  int64_t old_expert[kLayerFusionWarp];
+  bool live[kDirectGatherWarp];
+  bool evicted[kDirectGatherWarp];
+  int64_t old_expert[kDirectGatherWarp];
   const bool good = delivered == nullptr || keep[0] > 0.0f;
   int64_t live_sum = 0;
   int64_t evicted_sum = 0;
@@ -200,10 +200,10 @@ void direct_gather_destinations_gpu(
   expert_stream::verify_named(
       "remap_out", TensorMatcher({K_}).with_dtype<RemapOutT>().template with_device<kDLCUDA>(device), remap_out);
   RuntimeCheck(
-      0 < W_.unwrap() && W_.unwrap() <= kLayerFusionWarp && 0 < K_.unwrap() && K_.unwrap() <= kLayerFusionWarp,
+      0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp && 0 < K_.unwrap() && K_.unwrap() <= kDirectGatherWarp,
       "the shortlist and the routes must hold 1-32 entries");
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
-  host::LaunchKernel(1, kLayerFusionWarp, stream)(
+  host::LaunchKernel(1, kDirectGatherWarp, stream)(
       direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
       static_cast<const IdT*>(topk_ids.data_ptr()),
       static_cast<int>(topk_ids.numel()),
@@ -278,7 +278,7 @@ void direct_commit_gather_gpu(
   }
   expert_stream::verify_named(
       "miss_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), miss_count);
-  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kLayerFusionWarp, "the commit must cover 1-32 lanes");
+  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp, "the commit must cover 1-32 lanes");
   RuntimeCheck(num_experts == E_.unwrap() - 1, "num_experts must be mapping's size minus the dump column");
   RuntimeCheck(slot_dump == S_.unwrap() - 1, "slot_dump must be slot_to_expert's last column");
   const auto stream = host::LaunchKernel::resolve_device(destinations.device());
@@ -304,4 +304,4 @@ void direct_commit_gather_gpu(
       static_cast<uint8_t>(free_state));
 }
 
-}  // namespace sglang
+}  // namespace sglang::expert_residency
