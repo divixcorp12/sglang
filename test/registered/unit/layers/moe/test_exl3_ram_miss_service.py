@@ -288,7 +288,7 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     )
     with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
         service.ensure_started()
-    assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000)}]
+    assert started == [{"cpu_core": -1, "fatal_wait_s": module.watchdog_wait_s(40_000)}]  # -1: SERVICE_CPU unset
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
 
 
