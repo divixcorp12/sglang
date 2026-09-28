@@ -676,13 +676,21 @@ def pinned_host_placement(budget_bytes: int) -> "Placement":
 
 
 def _placement_report(placement: "Placement", caches) -> dict | None:
-    """The requested MiB per node and, per node, how many sampled tier pages it holds (-2: not yet resident)."""
+    """The requested MiB per node, the bytes actually bound per node (node changes round to 2 MiB, host_numa) and,
+    per node, how many sampled tier pages it holds (-2: not yet resident)."""
     if not placement:
         return None
     from collections import Counter
 
     from sglang.srt.layers.moe.host_numa import page_nodes
 
+    bound, owners = Counter(), {}
+    for cache in caches:
+        for slab in cache.tensors.values():
+            owner = getattr(slab, "_expert_stream_slab_arena", slab)
+            owners[id(owner)] = owner
+    for owner in owners.values():
+        bound.update(getattr(owner, "_numa_bound_bytes", {}))
     sampled = Counter()
     try:
         for cache in caches:
@@ -691,6 +699,7 @@ def _placement_report(placement: "Placement", caches) -> dict | None:
     except OSError as error:  # a diagnostic; the tier is already bound and registered
         sampled = Counter({f"unavailable: {error.strerror}": 0})
     return {
+        "bound_bytes": {str(node): nbytes for node, nbytes in sorted(bound.items())},
         "mib": {str(node): nbytes >> 20 for node, nbytes in placement},
         "sampled_pages": {str(node): count for node, count in sorted(sampled.items())},
     }

@@ -268,8 +268,11 @@ def allocate_host_slab(
     ``cudaHostRegister`` in row-aligned chunks, as the host arena does.
     Page alignment also lets io_uring fill it with ``O_DIRECT``.
 
-    A non-empty ``placement`` (host_numa) maps the slab on its own and binds
-    its rows to NUMA nodes in proportion before any page is touched.
+    A non-empty ``placement`` (host_numa) maps the slab on its own, 2 MiB
+    aligned, and binds its rows to NUMA nodes in proportion before any page is
+    touched, with every node change on a 2 MiB boundary
+    (``host_numa.plan_bindings``). The slab then carries the bytes bound per
+    node as ``_numa_bound_bytes``.
     """
     shape = (int(rows),) + tuple(int(dimension) for dimension in row_shape)
     nbytes = math.prod(shape) * dtype.itemsize
@@ -283,6 +286,8 @@ def allocate_host_slab(
         storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
         start = (-storage.data_ptr()) % PAGE_BYTES
     slab = storage[start : start + nbytes].view(dtype).view(shape)
+    if placement:
+        slab._numa_bound_bytes = storage._numa_bound_bytes
     if register and nbytes:
         # Imported here: expert_stream imports this module while the model
         # loader package is still importing, and mem_cache.pool_host's package
@@ -305,7 +310,11 @@ def allocate_host_slab_arena(
     Each view retains its uint8 owner as ``_expert_stream_slab_arena``. The
     owner's pointer and byte count describe the whole span, including alignment
     gaps. NUMA placement divides each named slab's rows as in the separate-slab
-    allocator. Registration is deliberately one span, even for large arenas.
+    allocator, then binds the whole arena as one ``allocate_bound`` call, so
+    the node changes at slab joins also sit on 2 MiB boundaries and each node's
+    total is kept within 2 MiB across all of them (the owner's
+    ``_numa_bound_bytes``). Registration is deliberately one span, even for
+    large arenas.
     """
     rows = int(rows)
     if rows < 0:
