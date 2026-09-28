@@ -1,9 +1,23 @@
 import unittest
+from types import SimpleNamespace
 
-from sglang.srt.models.deepseek_v4_layer_major import ChunkSpan, chunk_spans, engram_history, keep_window_start
+from sglang.srt.models.deepseek_v4_layer_major import (
+    DSV4_WINDOW,
+    ChunkSpan,
+    DeepseekV4LayerMajorAdapter,
+    chunk_spans,
+    engram_history,
+    ring_len_ok,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _adapter(*, chunk: int, page: int) -> DeepseekV4LayerMajorAdapter:
+    a = DeepseekV4LayerMajorAdapter.__new__(DeepseekV4LayerMajorAdapter)
+    a.chunk, a.page = chunk, page
+    return a
 
 
 class TestDsv4ChunkPlan(unittest.TestCase):
@@ -18,13 +32,43 @@ class TestDsv4ChunkPlan(unittest.TestCase):
         spans = chunk_spans(prefix_len=512, seq_len=512 + 8192, chunk=4096)
         self.assertEqual([(s.start, s.end) for s in spans], [(512, 4608), (4608, 8704)])
 
-    def test_keep_window_floors_to_a_page(self):
-        self.assertEqual(keep_window_start(seq_len=33000, window=128, page=256), 32768)
-        self.assertEqual(keep_window_start(seq_len=32868, window=128, page=256), 32512)
-
     def test_engram_history_pads_left(self):
         self.assertEqual(engram_history([5, 6, 7, 8], start=2, n=3), [0, 5, 6])
         self.assertEqual(engram_history([5, 6, 7, 8], start=4, n=3), [6, 7, 8])
+
+    def test_ring_len_ok_matches_production_geometry(self):
+        self.assertTrue(ring_len_ok(chunk=4096, page=256, window=DSV4_WINDOW))
+        a = _adapter(chunk=4096, page=256)
+        a._check_ring_len()  # does not raise
+
+    def test_chunk_equal_to_page_raises(self):
+        # The N1 regression: chunk == page passed the old (weaker) check but leaves no second margin page,
+        # aliasing ring pages at (page, chunk) = (256, 256).
+        self.assertFalse(ring_len_ok(chunk=256, page=256, window=DSV4_WINDOW))
+        a = _adapter(chunk=256, page=256)
+        with self.assertRaises(ValueError):
+            a._check_ring_len()
+
+    def test_page_below_window_raises(self):
+        a = _adapter(chunk=4096, page=64)
+        with self.assertRaises(ValueError):
+            a._check_ring_len()
+
+    def test_backend_and_allocator_read_lazily_at_construction(self):
+        # TpModelWorker builds the adapter before ModelRunner sets attn_backend (missing entirely) and
+        # before init_memory_pools() replaces the token_to_kv_pool_allocator placeholder (None). Construction
+        # itself must not touch either field.
+        runner = SimpleNamespace(model=SimpleNamespace(model=object()), page_size=256,
+                                 server_args=SimpleNamespace(chunked_prefill_size=4096),
+                                 token_to_kv_pool_allocator=None)
+        a = DeepseekV4LayerMajorAdapter(runner)
+        self.assertIsNone(a.allocator)
+        with self.assertRaises(AttributeError):
+            _ = a.backend
+        runner.attn_backend = "the-backend"
+        runner.token_to_kv_pool_allocator = "the-allocator"
+        self.assertEqual(a.backend, "the-backend")
+        self.assertEqual(a.allocator, "the-allocator")
 
 
 if __name__ == "__main__":

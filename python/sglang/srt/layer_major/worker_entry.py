@@ -118,7 +118,8 @@ def run_layer_major_prefill(runtime: LayerMajorRuntime, model_runner, schedule_b
     if model_runner.eplb_manager is not None:
         model_runner.eplb_manager.on_forward_pass_end()
 
-    tokens = schedule_batch.layer_major_ring_tokens
+    # extend_num_tokens is the request's extend length, not the fixed ring size (chunk + page).
+    tokens = schedule_batch.extend_num_tokens
     num_chunks = -(-tokens // model_runner.server_args.chunked_prefill_size)
     logger.info("layer-major prefill: %d tokens in %d chunks", tokens, num_chunks)
     return output

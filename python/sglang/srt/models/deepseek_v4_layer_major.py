@@ -4,12 +4,15 @@ per-chunk metadata, one layer on one chunk, and the late-layer tail. Knows nothi
 from __future__ import annotations
 
 from copy import copy
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
 
 from sglang.srt.layer_major.state_store import FieldSpec, StateStore
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 DSV4_WINDOW = 128
 
@@ -27,8 +30,10 @@ def chunk_spans(*, prefix_len: int, seq_len: int, chunk: int) -> list[ChunkSpan]
     ]
 
 
-def keep_window_start(*, seq_len: int, window: int, page: int) -> int:
-    return max(0, seq_len - window) // page * page
+def ring_len_ok(*, chunk: int, page: int, window: int) -> bool:
+    """True iff a chunk+page ring's no-branch keep floor can never sit below the ring's oldest intact page
+    (swept exhaustively against _insert_keep_from's arithmetic)."""
+    return page >= window and chunk >= 2 * page
 
 
 def engram_history(ids: list[int], start: int, n: int) -> list[int]:
@@ -56,10 +61,26 @@ class DeepseekV4LayerMajorAdapter:
         self.runner = model_runner
         self.causal_lm = model_runner.model
         self.model = model_runner.model.model
-        self.backend = model_runner.attn_backend
-        self.allocator = model_runner.token_to_kv_pool_allocator
         self.page = model_runner.page_size
         self.chunk = model_runner.server_args.chunked_prefill_size
+
+    @property
+    def backend(self):
+        # Not cached in __init__: TpModelWorker builds this adapter before attn_backend exists.
+        return self.runner.attn_backend
+
+    @property
+    def allocator(self):
+        # Not cached in __init__: TpModelWorker builds this adapter before init_memory_pools() runs.
+        return self.runner.token_to_kv_pool_allocator
+
+    def _check_ring_len(self) -> None:
+        if not ring_len_ok(chunk=self.chunk, page=self.page, window=DSV4_WINDOW):
+            if self.page < DSV4_WINDOW:
+                raise ValueError(f"page {self.page} is below window {DSV4_WINDOW}: the predecessor window does "
+                                 f"not fit in one page")
+            raise ValueError(f"chunk {self.chunk} holds fewer than 2 pages ({2 * self.page}): the ring cannot "
+                             f"cover the no-branch keep floor")
 
     def field_specs(self) -> list[FieldSpec]:
         return [
@@ -88,6 +109,7 @@ class DeepseekV4LayerMajorAdapter:
         seq_len = int(schedule_batch.seq_lens_cpu[0])
         full = self.runner.req_to_token_pool.req_to_token[slot, prefix_len:seq_len].to(torch.int64)
         ring_len = self.chunk + self.page
+        self._check_ring_len()
         ring = self.allocator.ring_slots(full[-ring_len:])
         if ring.numel() != ring_len:
             raise ValueError(f"window ring has {ring.numel()} slots, expected {ring_len}")
@@ -236,12 +258,34 @@ class DeepseekV4LayerMajorAdapter:
             return
         seq_len = handle.spans[-1].end
         prefix_len = int(handle.schedule_batch.prefix_lens[0])
-        keep_from = max(prefix_len, keep_window_start(seq_len=seq_len, window=DSV4_WINDOW, page=self.page))
+        req = handle.schedule_batch.reqs[0]
+        keep_from, drop_branch = self._insert_keep_from(req, handle, prefix_len=prefix_len, seq_len=seq_len)
+        if drop_branch:
+            # The ring has overwritten the window below the branch point, so the insert runs to the end instead.
+            req.swa_branching_seqlen = None
         self.allocator.finalize_ring(handle.extend_full_locs, extend_start=prefix_len, keep_from=keep_from,
                                      ring=handle.ring)
-        req = handle.schedule_batch.reqs[0]
         req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, keep_from)
         handle.finalized = True
+
+    def _insert_keep_from(self, req: Req, handle: _Pass, *, prefix_len: int, seq_len: int) -> tuple[int, bool]:
+        """Pure: the floor cache_unfinished_req's next insert must keep window KV from, and whether the branch
+        point should be dropped. Ends at the SWA branch point if admission set one and the ring still covers it,
+        else page_floor(seq_len) (one page lower when seq_len is unaligned); keeping less ends that key on an
+        unmatchable tombstone."""
+        margin = max(DSV4_WINDOW, self.page)
+        # The ring still holds a position iff its page is among the last ring-pages pages of the extend.
+        oldest_intact = ((seq_len - 1) // self.page - handle.ring.numel() // self.page + 1) * self.page
+        no_branch_floor = max(prefix_len, (seq_len // self.page * self.page - 1 - margin) // self.page * self.page)
+        # Backstop: begin_pass's _check_ring_len should make this unreachable; keep it as the last line of defense.
+        assert no_branch_floor >= oldest_intact, f"ring of {handle.ring.numel()} slots cannot keep from {no_branch_floor}"
+        branch = req.swa_branching_seqlen
+        if branch is not None and prefix_len < branch <= seq_len:
+            keep_from = max(prefix_len, (branch - 1 - margin) // self.page * self.page)
+            if keep_from >= oldest_intact:
+                return keep_from, False
+            return no_branch_floor, True
+        return no_branch_floor, False
 
     def release_pass(self, handle: _Pass, store: StateStore, *, failed: bool) -> None:
         store.clear_parked()
