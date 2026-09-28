@@ -1053,12 +1053,12 @@ def test_base_env_enables_fused_expert_plan_with_direct_insertion():
     ] == "0"
 
 
-def test_default_mirror_roots_are_two_absolute_paths_on_distinct_drives():
+def test_default_mirror_roots_are_three_absolute_paths_on_distinct_drives():
     roots = arm_env.EXPERT_MIRROR_DIRS.split(os.pathsep)
-    assert len(roots) == 2, roots
+    assert len(roots) == 3, roots
     assert all(r.startswith("/mnt/") for r in roots), roots
-    # Same drive twice would spread nothing; the point of the pair is two spindles.
-    assert len({r.split("/")[2] for r in roots}) == 2, roots
+    # Same drive twice would spread nothing; each root must be its own drive.
+    assert len({r.split("/")[2] for r in roots}) == 3, roots
 
 
 def test_an_arm_turns_mirroring_off_with_an_empty_override():
