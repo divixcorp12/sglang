@@ -96,6 +96,24 @@ def _checked_rows(tables, row: int, experts, slots) -> tuple[torch.Tensor, torch
     return expert_ids, slot_ids
 
 
+def _table_buffer_regions(tables) -> torch.Tensor:
+    """Registration spans come from retained allocations, never gaps between unrelated slabs."""
+    regions: dict[tuple[int, int], None] = {}
+    for slab in getattr(tables, "keepalive", ()):
+        owner = getattr(slab, "_expert_stream_slab_arena", slab)
+        if not isinstance(slab, torch.Tensor) or not isinstance(owner, torch.Tensor):
+            raise ValueError("I/O buffer owners must be tensors")
+        if owner.device.type != "cpu" or slab.device.type != "cpu" or not owner.is_contiguous() or not slab.is_contiguous():
+            raise ValueError("I/O buffer owners and slabs must be contiguous CPU tensors")
+        base, size = owner.data_ptr(), owner.numel() * owner.element_size()
+        start, length = slab.data_ptr(), slab.numel() * slab.element_size()
+        if length and not (base <= start and start + length <= base + size):
+            raise ValueError("I/O buffer owner does not contain its slab")
+        if size:
+            regions[(base, size)] = None
+    return torch.tensor(list(regions), dtype=torch.int64).reshape(-1, 2)
+
+
 def _table_args(tables, direct: bool) -> tuple:
     return (
         tables.extents,
@@ -104,6 +122,7 @@ def _table_args(tables, direct: bool) -> tuple:
         tables.segments,
         tables.slabs,
         tables.row_bytes,
+        _table_buffer_regions(tables),
         "\n".join(tables.paths),
         "\n".join(tables.source_paths),
         tables.slot_bytes,
@@ -767,7 +786,7 @@ class ExpertStreamHost:
         self.handle = int(
             self._module.expert_stream_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
-                tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
+                tables.slabs, tables.row_bytes, _table_buffer_regions(tables), tables.capacity, "\n".join(tables.paths),
                 "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), int(direct), self.lease_block,
                 int(pack_workers),
                 self.hot_page if self.hot_page is not None else torch.empty(0, dtype=torch.uint8),

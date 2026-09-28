@@ -18,6 +18,16 @@ class FaultyReader {
   bool ready() const {
     return inner_.ready();
   }
+  void configure_resources(const std::vector<int>& files, const std::vector<iovec>& buffers, bool direct)
+    requires requires(Inner& reader) { reader.configure_resources(files, buffers, direct); }
+  {
+    inner_.configure_resources(files, buffers, direct);
+  }
+  void close()
+    requires requires(Inner& reader) { reader.close(); }
+  {
+    inner_.close();
+  }
   bool prep_read(int fd, void* buf, unsigned len, uint64_t off, uint64_t tag) {
     return inner_.prep_read(fd, buf, len, off, tag);
   }
