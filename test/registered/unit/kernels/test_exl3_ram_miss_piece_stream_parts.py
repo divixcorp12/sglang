@@ -33,7 +33,41 @@ SHAPES = [
     ("images_zero_second", (1.0, 0.0), True),
 ]
 
-GOLDEN = {}
+GOLDEN = {
+    "one_part": [
+        "e222060697b71979b177d07d4f192f0f61f921818e699bbad6b16ad739b57a1a",
+        "bb2511479b9a392125c6eadd9b571e46d4d929087f4e18398ed2a5817773af77",
+        64,
+        16
+    ],
+    "halves": [
+        "cbe140acf895ec5b27dbb49da5415b39314ff7686a85ee9db3165aad0f0f9855",
+        "ba78686a5c34f75237609f3f8bdee250d3fb57dcc86eb58a831fdc8671c95db6",
+        128,
+        32
+    ],
+    "zero_first_part": [
+        "8c69cd450bc2ccb6c1f9d1f3871334dfbb5a52c494aea2a90ce22588959b5f91",
+        "a7d1a94384f1df05e47a4066b75b33c1c5fcdad3662e6a5f1d87bd8dd8c23fcb",
+        128,
+        32
+    ],
+    "three_to_one": [
+        "176c3c4a23c98c1c779d7d411223950cea45290463a045a2c2191be5391bc059",
+        "742d8088cb2dc9768118a1e2b6b8c2fe38f78cdb957a49b4f9bd1891251530da",
+        128,
+        32
+    ],
+    "images_one_root": [
+        "e7b4c9bd3f235e5dbc4447994bac0dfcfc2a2e2fd0458004c0698f8a49519b7a"
+    ],
+    "images_halves": [
+        "5b16a9887ade9567a76d00ab2eb6f88dcbfed1f229fa51169424571768c787e8"
+    ],
+    "images_zero_second": [
+        "0e7b3ac6f4e3c83ba9c91b89944b59e727053afe452d7e45e4e3f0b33e6520d3"
+    ]
+}
 
 
 def _geometry_digest(tables):
