@@ -197,6 +197,9 @@ def base_env() -> dict[str, str]:
         # outputs identical, ~1 ms/step in a node-mode trace, within noise untraced (DSV41_REFERENCE.md 27.14).
         # Needs the copy engine above.
         "SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES": "1",
+        # The lease chain's kernels launch with PDL: at most ~1 us/layer, outputs identical
+        # (analysis/dsv41-drive/chain-pdl/results.md, on expert-stream-transfer-measurement). Needs the leases above.
+        "SGLANG_DSV41_ENABLE_LEASE_PDL": "1",
     }
 
 

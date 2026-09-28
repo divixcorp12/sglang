@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
 
 # Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
@@ -1284,6 +1284,7 @@ class ExpertStreamDevice:
     def __init__(
         self, page, slot_map, *, device, layers: int, timeout_ms: int, advise: bool, lease_block=None, lease_layout=None,
         hot_page=None, piece_stream: bool = False, piece_runs: Optional[torch.Tensor] = None, layout: str = "exl3",
+        lease_pdl: bool = False,
     ) -> None:
         if piece_stream and (lease_block is None or piece_runs is None):
             raise ValueError("piece streaming needs the lease block and the host's piece table (host.piece_runs())")
@@ -1321,6 +1322,11 @@ class ExpertStreamDevice:
         self._layout = layout
         if (lease_block is None) != (lease_layout is None):
             raise ValueError("lease_block and lease_layout go together")
+        if lease_pdl and torch.device(device).type == "cuda" and not is_arch_support_pdl():
+            raise ValueError("lease-chain PDL needs sm_90 or newer (griddepcontrol)")
+        # SGLANG_DSV41_ENABLE_LEASE_PDL: the six lease-chain launchers (post, W1, stage ack, S, CW, finalize) launch
+        # their kernels with PDL, the wait first and the trigger right after it (LEASE_PROTOCOL.md 7.7).
+        self.lease_pdl = bool(lease_pdl)
         self.lease_block = lease_block
         self.hot_page = hot_page
         self._hot_address = 0
@@ -1446,7 +1452,7 @@ class ExpertStreamDevice:
             self.page, self.state, self.slot_map, planned, count, routes, row, self.advise, self.last_routes, next_row,
             self._lease_address, self._lease_d, self.timeout_ns, self._hot_address, self._hot_stride,
             hot_slots if hot_slots is not None else self._no_hot_slots, hot_capacity,
-            dst_slots if dst_slots is not None else self.state[:0], int(bool(copy_engine)),
+            dst_slots if dst_slots is not None else self.state[:0], int(bool(copy_engine)), int(self.lease_pdl),
         )
 
     def wait(self, row: int, planned, count, host_rows, keep, ram_miss) -> None:
@@ -1500,7 +1506,7 @@ class ExpertStreamDevice:
             self._kernels().expert_stream_lease_stream_hit_wait(
                 self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
                 self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
-                self.violated, budget_ns, self.go_2, self.stream_count, self.stream_abort,
+                self.violated, budget_ns, self.go_2, self.stream_count, self.stream_abort, int(self.lease_pdl),
             )
             return
         self._kernels().expert_stream_lease_hit_wait(
@@ -1554,7 +1560,7 @@ class ExpertStreamDevice:
             self.page, self.state, planned, count, dst_slots, row, int(self.piece_runs.shape[1]), self.host_rows_2,
             self.dst_slots_2, ram_miss, self._lease_address, self._lease_d, self._lease_p, self.claimed, self.go_2,
             self.lane_ctx_2, self.origin_2, self.stream_count, self.stream_abort, segments.table, segment_map,
-            row_segments, self.piece_runs, self.stream_fault,
+            row_segments, self.piece_runs, self.stream_fault, int(self.lease_pdl),
         )
 
     def stage_ack(self, stage: int) -> None:
@@ -1567,7 +1573,8 @@ class ExpertStreamDevice:
         lane_ctx = self.lane_ctx_1 if stage == 1 else self.lane_ctx_2
         origin = self.origin_1 if stage == 1 else self.origin_2
         self._kernels().expert_stream_lease_stage_ack(
-            self.page, self.state, self._lease_address, self._lease_d, go, lane_ctx, origin, self.violated
+            self.page, self.state, self._lease_address, self._lease_d, go, lane_ctx, origin, self.violated,
+            int(self.lease_pdl),
         )
 
     def copy_wait(self, count, sm_table: Optional[torch.Tensor] = None) -> None:
@@ -1589,7 +1596,7 @@ class ExpertStreamDevice:
             sm_address, sm_count = sm_table.data_ptr(), int(sm_table.shape[0])
         self._kernels().expert_stream_lease_copy_wait(
             self.page, self.state, count, self._lease_address, self._lease_c, self._lease_d, sm_address, sm_count,
-            self.go_ce,
+            self.go_ce, int(self.lease_pdl),
         )
 
     def finalize(self, count, keep) -> None:
@@ -1602,7 +1609,7 @@ class ExpertStreamDevice:
         self._check_buffers(count=(count, torch.int32), keep=(keep, torch.float32))
         self._kernels().expert_stream_lease_finalize(
             self.page, self.state, count, self.go_1, self.go_2, self.go_ce, self.violated, keep,
-            self._lease_address, self._lease_d,
+            self._lease_address, self._lease_d, int(self.lease_pdl),
         )
 
     def stats(self) -> dict[str, int]:

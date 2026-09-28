@@ -1893,6 +1893,12 @@ class Envs:
     # the lease is released only once both the DMA completed and CW acknowledged its reads (SmAck). Needs the copy
     # engine (refused without it). Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES = EnvBool(False)
+    # Lease-chain PDL (LEASE_PROTOCOL.md 7.7): the six lease-chain kernels (post, W1, stage ack, S, CW, finalize) launch
+    # with programmatic dependent launch, each waiting on its predecessor as its first statement and letting the next
+    # one launch right after that wait, so a layer's kernels overlap their launch latency. Outputs unchanged; at most
+    # ~1 us per layer (analysis/dsv41-drive/chain-pdl/results.md). Needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES. Read once
+    # at service start. Off by default.
+    SGLANG_DSV41_ENABLE_LEASE_PDL = EnvBool(False)
     # Native next-layer prefetch (plan 2026-09-25-dsv41-native-prefetch): in each captured decode layer T-1, after its
     # gather, layer T's own router gate scores layer T-1's router input; the best top-6 expert of T that is neither in
     # VRAM nor missing from the pinned tier is copied into one of T's hot slots by the copy engine, and layer T waits
