@@ -1034,6 +1034,12 @@ def test_server_args_includes_decode_log_interval_when_set():
 # --- arm_env: expert-row mirroring is on by default, and an arm turns it off by value ---
 
 
+def test_base_env_launches_the_lease_chain_with_pdl():
+    env = arm_env.base_env()
+    assert env["SGLANG_DSV41_ENABLE_LEASE_PDL"] == "1"
+    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"] == "1"  # the flag is refused without lease mode
+
+
 def test_base_env_mirrors_expert_rows_by_default():
     assert arm_env.base_env()["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == arm_env.EXPERT_MIRROR_DIRS
 

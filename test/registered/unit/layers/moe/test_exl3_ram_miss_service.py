@@ -480,6 +480,26 @@ def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_b
     assert service.device_side.lease_block is None and service.device_side.go_count is None
 
 
+@pytest.mark.parametrize("pdl", [False, True], ids=["pdl_off", "pdl_on"])
+def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl):
+    """SGLANG_DSV41_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
+    it to the six chain launchers (test_exl3_ram_miss_device_args.py)."""
+    service, streamers, caches = tiers
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True), envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(pdl):
+        _attach_all(service, streamers)
+    assert service.lease_pdl is pdl and service.device_side.lease_pdl is pdl
+    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(not pdl):
+        service.ensure_started()
+    assert service.device_side.lease_pdl is pdl
+
+
+def test_lease_pdl_without_leases_is_refused(tiers):
+    service, streamers, caches = tiers
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False), envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(True):
+        with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_LEASE_PDL needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"):
+            service.ensure_started()
+
+
 def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_with_the_hosts_block(tiers, monkeypatch):
     """One env read (ensure_started) feeds both sides, so the device's arming and the service's leasing cannot disagree."""
     service, streamers, caches = tiers

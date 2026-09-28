@@ -35,6 +35,7 @@ def test_defaults_match_the_env_declarations():
         enable_ram_miss_row_images=False,
         enable_ram_miss_copy_engine=False,
         enable_ram_miss_sm_small_copies=False,
+        enable_lease_pdl=False,
         enable_native_prefetch=False,
         enable_prefill_fills=False,
         enable_prefill_share=False,
@@ -86,7 +87,16 @@ def test_from_envs_maps_the_renamed_fields():
     assert cfg.ram_miss_pack_workers == 4
 
 
+def test_the_lease_pdl_flag_is_off_by_default_and_observed_when_overridden():
+    assert envs.SGLANG_DSV41_ENABLE_LEASE_PDL.get() is False
+    assert Dsv41Config.from_envs().enable_lease_pdl is False
+    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(True):
+        assert Dsv41Config.from_envs().enable_lease_pdl is True
+    assert Dsv41Config.from_envs().enable_lease_pdl is False
+
+
 if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
