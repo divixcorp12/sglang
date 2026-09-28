@@ -172,8 +172,10 @@ def test_many_slab_arena_binds_on_2mib_boundaries_within_2mib_per_node(monkeypat
         offset = -(-offset // tier.PAGE_BYTES) * tier.PAGE_BYTES
         assert slab.data_ptr() - base == offset and slab.shape == (rows, row_bytes)
         offset += rows * row_bytes
-    # The mbind ranges tile the page-rounded arena, change node only on 2 MiB boundaries, and keep each total.
-    assert calls[0][0] == base and calls[-1][0] + calls[-1][1] == base + span
+    # The mbind ranges tile the arena out to its 2 MiB end, change node only on 2 MiB boundaries, and keep each
+    # total (the untouched tail past the arena counts as bound to the last node).
+    end = -(-nbytes // host_numa.HUGE_BYTES) * host_numa.HUGE_BYTES
+    assert span != end and calls[0][0] == base and calls[-1][0] + calls[-1][1] == base + end
     for (address, length, node), (following_address, _, following) in zip(calls, calls[1:]):
         assert address + length == following_address and node != following
         assert (following_address - base) % host_numa.HUGE_BYTES == 0
@@ -190,7 +192,7 @@ def test_arena_with_a_single_node_binds_its_whole_span_once(monkeypatch: pytest.
         3, {"weights": ((1000,), torch.float32), "scales": ((7,), torch.int16)}, register=False, placement=((1, 1),)
     )
     owner = slabs["weights"]._expert_stream_slab_arena
-    assert calls == [(owner.data_ptr(), 4 * tier.PAGE_BYTES, 1)]
+    assert calls == [(owner.data_ptr(), host_numa.HUGE_BYTES, 1)]  # 3 pages + 42 B, bound out to the 2 MiB end
     assert slabs["scales"].data_ptr() == owner.data_ptr() + 3 * tier.PAGE_BYTES
 
 
@@ -225,3 +227,6 @@ def test_arena_slab_joins_change_node_on_2mib_boundaries_of_the_real_policy() ->
         assert host_numa.address_policy(base + end - tier.PAGE_BYTES) == (2, frozenset({node}))
         assert host_numa.address_policy(base + end) == (2, frozenset({following}))
     assert owner._numa_bound_bytes == _totals(bindings)
+    end = bindings[-1][2]
+    assert end % host_numa.HUGE_BYTES == 0 and end >= nbytes
+    assert host_numa.address_policy(base + end - tier.PAGE_BYTES) == (2, frozenset({bindings[-1][0]}))

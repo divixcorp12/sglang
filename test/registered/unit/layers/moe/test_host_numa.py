@@ -99,12 +99,16 @@ class TestCheckCapacity(unittest.TestCase):
 
 
 class TestPlanBindings(unittest.TestCase):
-    """The mbind ranges: tile the page-rounded span, change node only on 2 MiB boundaries, keep each node's total."""
+    """The mbind ranges: tile the span out to its 2 MiB end, change node only on 2 MiB boundaries, keep each total.
+
+    Totals count the tail past ``nbytes`` (up to the 2 MiB end) as bound to the last range's node, as
+    ``_numa_bound_bytes`` does: each node's bound bytes, tail included, stay within 2 MiB of its ask.
+    """
 
     def _check_tiling(self, nbytes, bindings):
-        span = -(-nbytes // PAGE_BYTES) * PAGE_BYTES
         self.assertEqual(bindings[0][1], 0)
-        self.assertEqual(bindings[-1][2], span)
+        self.assertEqual(bindings[-1][2], -(-nbytes // HUGE_BYTES) * HUGE_BYTES)
+        self.assertEqual(bindings[-1][2] % HUGE_BYTES, 0)  # the last range ends on a 2 MiB boundary of the base
         for (node, _, end), (following, start, _) in zip(bindings, bindings[1:]):
             self.assertEqual(end, start)  # no gap, no overlap
             self.assertNotEqual(node, following)  # same-node neighbours are merged
@@ -118,8 +122,32 @@ class TestPlanBindings(unittest.TestCase):
             totals[node] = totals.get(node, 0) + hi - lo
         return totals
 
-    def test_a_single_node_binds_the_whole_page_rounded_span(self):
-        self.assertEqual(plan_bindings(10 * MIB + 5, [(1, 0, 10 * MIB + 5)]), [(1, 0, 10 * MIB + PAGE_BYTES)])
+    def test_a_single_node_binds_the_whole_span_out_to_its_2mib_end(self):
+        # Replaces the page-rounded end (10 MiB + a page): the tail up to 12 MiB is bound too, to the same node.
+        self.assertEqual(plan_bindings(10 * MIB + 5, [(1, 0, 10 * MIB + 5)]), [(1, 0, 12 * MIB)])
+        self.assertEqual(plan_bindings(4 * MIB, [(0, 0, 4 * MIB)]), [(0, 0, 4 * MIB)])  # already aligned: no tail
+
+    def test_the_last_range_ends_on_a_2mib_boundary_bound_to_the_last_runs_node(self):
+        # A separate production slab (SLAB_ARENA=0): its page-rounded end is not 2 MiB aligned. Ending the last
+        # binding there split the VMA and left the last huge page on 4 KiB folios, so the slab's last registered
+        # chunk could not coalesce (final review, Important 1).
+        row_bytes = 3_501_056
+        for rows, share in ((460, ((0, 5), (1, 4))), (181, ((0, 60), (1, 40))), (182, ((1, 1), (0, 1))), (1, ((0, 1),))):
+            runs = [(node, first * row_bytes, (first + count) * row_bytes) for node, first, count in split_rows(rows, share)]
+            nbytes = rows * row_bytes
+            with self.subTest(rows=rows, share=share):
+                self.assertNotEqual(nbytes % HUGE_BYTES, 0)
+                bindings = plan_bindings(nbytes, runs)
+                self._check_tiling(nbytes, bindings)
+                node, start, end = bindings[-1]
+                self.assertEqual(node, runs[-1][0])
+                self.assertEqual(end, -(-nbytes // HUGE_BYTES) * HUGE_BYTES)
+                self.assertLess(end - nbytes, HUGE_BYTES)
+                self.assertLessEqual(start, end - HUGE_BYTES)  # the last huge page lies wholly in this range
+                bound, asked = self._totals(bindings), self._totals(runs)
+                self.assertEqual(sum(bound.values()), end)  # the tail is counted, to the last node
+                for n in asked:
+                    self.assertLessEqual(abs(bound.get(n, 0) - asked[n]), HUGE_BYTES, (n, bound, asked))
 
     def test_nothing_to_bind_is_no_range(self):
         self.assertEqual(plan_bindings(0, []), [])
@@ -233,14 +261,16 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(a0 + n0, a1)
         self.assertEqual((a1 - base) % HUGE_BYTES, 0)
         self.assertLessEqual(abs((a1 - base) - 6 * row_bytes), HUGE_BYTES // 2)
-        self.assertEqual(a1 + n1, base + -(-nbytes // PAGE_BYTES) * PAGE_BYTES)
+        self.assertEqual(a1 + n1, base + -(-nbytes // HUGE_BYTES) * HUGE_BYTES)  # out to the 2 MiB end
+        self.assertEqual((a1 + n1 - base) % HUGE_BYTES, 0)
         self.assertEqual(slab._numa_bound_bytes, {0: n0, 1: n1})
 
     def test_a_single_node_placement_binds_the_whole_span_once(self):
         calls = []
         with patch.object(host_numa, "_mbind", side_effect=lambda a, n, node: calls.append((a, n, node))):
             slab = allocate_bound(5 * PAGE_BYTES + 3, [(1, 0, 1)], 5 * PAGE_BYTES + 3)
-        self.assertEqual(calls, [(slab.data_ptr(), 6 * PAGE_BYTES, 1)])
+        self.assertEqual(calls, [(slab.data_ptr(), HUGE_BYTES, 1)])
+        self.assertEqual(slab._numa_bound_bytes, {1: HUGE_BYTES})  # the untouched tail is counted as bound
 
     def test_zero_bytes_is_an_empty_tensor_and_binds_nothing(self):
         with patch.object(host_numa, "_mbind") as bind:
@@ -271,6 +301,21 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(slab._numa_bound_bytes, {node: hi - lo for node, lo, hi in bindings})
 
     @unittest.skipUnless(HAS_NODE1, "needs a second NUMA node")
+    def test_the_tail_past_the_slab_is_bound_to_the_last_node_out_to_2mib(self):
+        rows, row_bytes = 40, 3_501_056
+        runs = split_rows(rows, ((0, 60), (1, 40)))
+        nbytes = rows * row_bytes
+        slab = allocate_bound(nbytes, runs, row_bytes)
+        base, end = slab.data_ptr(), -(-nbytes // HUGE_BYTES) * HUGE_BYTES
+        self.assertNotEqual(nbytes % HUGE_BYTES, 0)
+        # The whole last huge page, tail included, is one binding to the last run's node; the slack past it is not.
+        for address in (base + end - HUGE_BYTES, base + nbytes - 1, base + end - PAGE_BYTES):
+            self.assertEqual(address_policy(address), (MPOL_BIND, frozenset({1})))
+        self.assertEqual(address_policy(base + end)[0], MPOL_DEFAULT)
+        self.assertEqual(sum(slab._numa_bound_bytes.values()), end)
+        self.assertFalse(set(page_nodes(slab[nbytes - PAGE_BYTES :], samples=1)) & {0, 1})  # not touched
+
+    @unittest.skipUnless(HAS_NODE1, "needs a second NUMA node")
     def test_row_runs_land_on_their_nodes(self):
         rows, row_bytes = 20, MIB + 5 * PAGE_BYTES
         runs = split_rows(rows, ((0, 3), (1, 1)))
@@ -286,7 +331,7 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(tuple(slab.shape), (6, 5, 7))
         self.assertEqual(slab.data_ptr() % HUGE_BYTES, 0)
         self.assertEqual(address_policy(slab.data_ptr()), (MPOL_BIND, frozenset({0})))
-        self.assertEqual(slab._numa_bound_bytes, {0: PAGE_BYTES})
+        self.assertEqual(slab._numa_bound_bytes, {0: HUGE_BYTES})  # 210 B of rows, bound out to the 2 MiB end
         slab.copy_(torch.arange(6 * 35, dtype=torch.int16).view(6, 5, 7))
         self.assertEqual(int(slab[5, 4, 6]), 6 * 35 - 1)
 
