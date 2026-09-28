@@ -294,7 +294,8 @@ SGL_DEVICE void lease_hit_wait_body(
     int32_t* __restrict__ origin_1,
     int32_t* __restrict__ claimed,
     int32_t* __restrict__ violated,
-    int64_t budget_ns) {
+    int64_t budget_ns,
+    uint32_t row_capacity) {
   const uint64_t start = global_ns();
   go_1[0] = 0;      // fail closed: the single commit point is the last store of this kernel
   violated[0] = 0;  // stage 1 opens the chain, so it is where the shared violation flag is cleared
@@ -323,7 +324,7 @@ SGL_DEVICE void lease_hit_wait_body(
 
   const uint8_t* results =
       lease + kLeaseRowResult + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
-  const uint32_t capacity = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
+  const uint32_t capacity = row_capacity;  // a kernel argument: see the launcher's params (row_capacity)
   const uint64_t deadline = load_deadline(state);
   int32_t slots[kMaxIds];
   uint32_t slot_generations[kMaxIds];

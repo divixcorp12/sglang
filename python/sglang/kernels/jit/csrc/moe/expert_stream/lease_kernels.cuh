@@ -460,6 +460,15 @@ struct HitWaitParams {
   int32_t* claimed;
   int32_t* violated;
   int64_t budget_ns;
+  // The row's pinned-slot capacity, the value of its row-table word in the lease block, passed by the launcher so the
+  // kernel does not read it across PCIe. A kernel argument is frozen into the captured decode graph, which is safe
+  // because the word never changes for the life of the process: its one writer is RamTier::init_lease_block
+  // (host/ram_tier.h:1325), called only from the RamTier constructor (ram_tier.h:81) before the service thread or
+  // any device exists; Tier::capacity is assigned only there (ram_tier.h:70); the service builds its host once
+  // (exl3_ram_miss.py ensure_started returns early once self.host is set, and refuses after shutdown), and each
+  // ExpertStreamHost allocates its own lease block (expert_stream_transport.py, ExpertStreamHost.__init__). The
+  // launcher checks the argument against the word (RuntimeCheck), so a mismatch is refused at launch and capture.
+  uint32_t row_capacity;
 };
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_hit_wait_kernel(
@@ -499,7 +508,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       origin_1,
       claimed,
       violated,
-      budget_ns);
+      budget_ns,
+      p.row_capacity);
 }
 
 // Piece streaming's W1: stage 1 exactly, after resetting every word the stream kernel and the finalize kernel read
@@ -523,6 +533,15 @@ struct StreamHitWaitParams {
   int32_t* claimed;
   int32_t* violated;
   int64_t budget_ns;
+  // The row's pinned-slot capacity, the value of its row-table word in the lease block, passed by the launcher so the
+  // kernel does not read it across PCIe. A kernel argument is frozen into the captured decode graph, which is safe
+  // because the word never changes for the life of the process: its one writer is RamTier::init_lease_block
+  // (host/ram_tier.h:1325), called only from the RamTier constructor (ram_tier.h:81) before the service thread or
+  // any device exists; Tier::capacity is assigned only there (ram_tier.h:70); the service builds its host once
+  // (exl3_ram_miss.py ensure_started returns early once self.host is set, and refuses after shutdown), and each
+  // ExpertStreamHost allocates its own lease block (expert_stream_transport.py, ExpertStreamHost.__init__). The
+  // launcher checks the argument against the word (RuntimeCheck), so a mismatch is refused at launch and capture.
+  uint32_t row_capacity;
   int32_t* go_2;
   uint32_t* stream_count;
   int32_t* stream_abort;
@@ -579,7 +598,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       origin_1,
       claimed,
       violated,
-      budget_ns);
+      budget_ns,
+      p.row_capacity);
 }
 
 // V1 two-phase, stage 2 (D2). The rest of the request: it waits on kDemandDone as the batched wait does, because
@@ -1231,7 +1251,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView origin_1,
       tvm::ffi::TensorView claimed,
       tvm::ffi::TensorView violated,
-      int64_t budget_ns) {
+      int64_t budget_ns,
+      int64_t row_capacity) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1296,6 +1317,7 @@ struct LeaseProtocolKernel {
         .claimed = static_cast<int32_t*>(claimed.data_ptr()),
         .violated = static_cast<int32_t*>(violated.data_ptr()),
         .budget_ns = budget_ns,
+        .row_capacity = expert_stream::checked_row_capacity(lease_address, row, row_capacity),
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_hit_wait_kernel, params);
   }
@@ -1320,6 +1342,7 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView go_2,
       tvm::ffi::TensorView stream_count,
       tvm::ffi::TensorView stream_abort,
+      int64_t row_capacity,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -1387,6 +1410,7 @@ struct LeaseProtocolKernel {
         .claimed = static_cast<int32_t*>(claimed.data_ptr()),
         .violated = static_cast<int32_t*>(violated.data_ptr()),
         .budget_ns = budget_ns,
+        .row_capacity = expert_stream::checked_row_capacity(lease_address, row, row_capacity),
         .go_2 = static_cast<int32_t*>(go_2.data_ptr()),
         .stream_count = static_cast<uint32_t*>(stream_count.data_ptr()),
         .stream_abort = static_cast<int32_t*>(stream_abort.data_ptr()),

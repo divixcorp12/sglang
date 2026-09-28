@@ -1328,6 +1328,9 @@ class ExpertStreamDevice:
         # their kernels with PDL, the wait first and the trigger right after it (LEASE_PROTOCOL.md 7.7).
         self.lease_pdl = bool(lease_pdl)
         self.lease_block = lease_block
+        # Each row's pinned-slot capacity, from the same tables.capacity the service wrote into the lease block's row
+        # table: W1 and S take it as a kernel argument, and their launchers check it against that word.
+        self._lease_capacities = tuple(int(c) for c in lease_layout.capacities) if lease_layout is not None else ()
         self.hot_page = hot_page
         self._hot_address = 0
         self._hot_stride = 0
@@ -1506,13 +1509,14 @@ class ExpertStreamDevice:
             self._kernels().expert_stream_lease_stream_hit_wait(
                 self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
                 self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
-                self.violated, budget_ns, self.go_2, self.stream_count, self.stream_abort, int(self.lease_pdl),
+                self.violated, budget_ns, self.go_2, self.stream_count, self.stream_abort, self._lease_capacities[row],
+                int(self.lease_pdl),
             )
             return
         self._kernels().expert_stream_lease_hit_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_1, self.dst_slots_1,
             self._lease_address, self._lease_d, self.go_1, self.lane_ctx_1, self.origin_1, self.claimed,
-            self.violated, budget_ns,
+            self.violated, budget_ns, self._lease_capacities[row],
         )
 
     def rest_wait(self, row: int, planned, count, dst_slots, ram_miss) -> None:
@@ -1560,7 +1564,7 @@ class ExpertStreamDevice:
             self.page, self.state, planned, count, dst_slots, row, int(self.piece_runs.shape[1]), self.host_rows_2,
             self.dst_slots_2, ram_miss, self._lease_address, self._lease_d, self._lease_p, self.claimed, self.go_2,
             self.lane_ctx_2, self.origin_2, self.stream_count, self.stream_abort, segments.table, segment_map,
-            row_segments, self.piece_runs, self.stream_fault, int(self.lease_pdl),
+            row_segments, self.piece_runs, self.stream_fault, self._lease_capacities[row], int(self.lease_pdl),
         )
 
     def stage_ack(self, stage: int) -> None:

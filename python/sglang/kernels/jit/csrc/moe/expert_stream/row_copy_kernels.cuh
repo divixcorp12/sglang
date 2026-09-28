@@ -217,6 +217,15 @@ struct StreamParams {
   int64_t row_segments;
   const int32_t* piece_runs;
   const int32_t* fault;
+  // The row's pinned-slot capacity, the value of its row-table word in the lease block, passed by the launcher so the
+  // kernel does not read it across PCIe. A kernel argument is frozen into the captured decode graph, which is safe
+  // because the word never changes for the life of the process: its one writer is RamTier::init_lease_block
+  // (host/ram_tier.h:1325), called only from the RamTier constructor (ram_tier.h:81) before the service thread or
+  // any device exists; Tier::capacity is assigned only there (ram_tier.h:70); the service builds its host once
+  // (exl3_ram_miss.py ensure_started returns early once self.host is set, and refuses after shutdown), and each
+  // ExpertStreamHost allocates its own lease block (expert_stream_transport.py, ExpertStreamHost.__init__). The
+  // launcher checks the argument against the word (RuntimeCheck), so a mismatch is refused at launch and capture.
+  uint32_t row_capacity;
 };
 
 template <bool kUsePDL>
@@ -303,7 +312,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
     } else if (seq == 0) {
       sh.served = 1;  // no request and no lanes: nothing to wait for or copy
     }
-    capacity = seq != 0 ? ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4) : 0u;
+    capacity = seq != 0 ? p.row_capacity : 0u;  // a kernel argument (StreamParams::row_capacity)
   }
   __syncthreads();
   if (tid < kLeaseLanes) {
@@ -684,6 +693,7 @@ struct RowCopyKernel {
       int64_t row_segments,
       tvm::ffi::TensorView piece_runs,
       tvm::ffi::TensorView fault,
+      int64_t row_capacity,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -781,6 +791,7 @@ struct RowCopyKernel {
         .row_segments = row_segments,
         .piece_runs = static_cast<const int32_t*>(piece_runs.data_ptr()),
         .fault = static_cast<const int32_t*>(fault.data_ptr()),
+        .row_capacity = expert_stream::checked_row_capacity(lease_address, row, row_capacity),
     };
     LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream).enable_pdl(use_pdl != 0)(
         use_pdl != 0 ? exl3_ram_miss_lease_stream_kernel<true> : exl3_ram_miss_lease_stream_kernel<false>, params);

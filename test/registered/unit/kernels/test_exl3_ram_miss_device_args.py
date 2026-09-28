@@ -452,7 +452,7 @@ def test_w1_and_s_take_the_row_capacity_as_a_kernel_argument_not_from_the_pinned
         assert CAPACITY_WORD not in (CSRC / "expert_stream" / name).read_text(), name
     lease = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
     rows = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
-    for text, params in ((lease, "LeaseHitWaitParams"), (lease, "StreamHitWaitParams"), (rows, "StreamParams")):
+    for text, params in ((lease, "HitWaitParams"), (lease, "StreamHitWaitParams"), (rows, "StreamParams")):
         struct = text[text.index(f"struct {params} {{"):]
         assert "uint32_t row_capacity;" in struct[:struct.index("};")], params
 
