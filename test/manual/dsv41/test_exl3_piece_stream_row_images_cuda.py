@@ -36,16 +36,20 @@ def row_images(monkeypatch):
     tables_of, host_init = ram_miss.exl3_ram_miss_tables, ExpertStreamHost.__init__
 
     def image_tables(layout, segments, slabs, **mirrors):
-        # G1's real service passes row_images=None (the flag is off in its environment); nothing else is passed.
+        # G1's real service passes row_images=None (the flag is off in its environment). A StreamService built with
+        # mirror_weights passes roots, policy and source_root: images then go on one root per mirror, split alike.
         mirrors = {key: value for key, value in mirrors.items() if value is not None}
-        assert not mirrors, "the CUDA suite builds its tables without mirror roots"
         source = os.path.dirname(next(iter(layout.records.values())).path)
-        root = source.rstrip("/") + "_images"
-        write_row_images(layout, segments, source, [root], sorted(slabs))
-        images = open_row_images([root], layout, segments, source, sorted(slabs))
+        if mirrors:
+            assert set(mirrors) == {"roots", "policy", "source_root"}, sorted(mirrors)
+            roots = [source.rstrip("/") + f"_images{i}" for i in range(len(mirrors["roots"]))]
+            policy = mirrors["policy"]
+        else:
+            roots, policy = [source.rstrip("/") + "_images"], StaticSplitPolicy((1.0,))
+        write_row_images(layout, segments, source, roots, sorted(slabs))
+        images = open_row_images(roots, layout, segments, source, sorted(slabs))
         return tables_of(
-            layout, segments, slabs, roots=[root], policy=StaticSplitPolicy((1.0,)), source_root=source,
-            row_images=images,
+            layout, segments, slabs, roots=roots, policy=policy, source_root=source, row_images=images,
         )
 
     def direct_host(self, tables, *args, direct, **kwargs):

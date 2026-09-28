@@ -158,7 +158,9 @@ NOT_REUSED = {
     "test_u10_flag_off_issues_todays_sqes_and_credit_and_packs_the_same_bytes": "compares with the shard SQEs",
     "test_the_reader_refuses_piece_streaming_without_packing_workers": "the direct mode needs none",
     "test_the_tier_refuses_the_flag_without_packing_workers": "the direct mode needs none",
-    "test_the_reader_refuses_more_mirror_parts_than_the_pieces_can_name": "needs three mirror parts of shards",
+    "test_the_reader_refuses_more_mirror_parts_than_the_pieces_can_name": (
+        "nine mirror roots of shards; the refusal is the reader's, not the mode's"
+    ),
     "test_the_reader_refuses_a_slab_row_base_that_is_not_128_byte_aligned": (
         "its row_bytes edit is refused first by the image tables' own check that segments tile each slab row"
     ),
@@ -223,7 +225,9 @@ def _sentinel_all(s):
 
 
 @pytest.mark.parametrize(
-    "weights", [None, (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (3.0, 1.0)], ids=["one", "halves", "first", "second", "3to1"]
+    "weights",
+    [None, (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (3.0, 1.0), (1.0, 1.0, 1.0), (1.0, 0.0, 1.0), (3.0, 1.0, 2.0)],
+    ids=["one", "halves", "first", "second", "3to1", "thirds", "zero_middle", "uneven_thirds"],
 )
 @pytest.mark.parametrize("pieces", [False, True], ids=["rows", "pieces"])
 def test_the_direct_mode_leaves_every_slab_byte_as_the_bounce_path_does(tmp_path, weights, pieces):

@@ -53,11 +53,14 @@ constexpr int kBounceSlots = kBanks * kBounceRows;
 constexpr unsigned kQueueDepth = 16;
 constexpr int64_t kPage = 4096;
 
-// Piece streaming (SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM, plan 2026-09-24-dsv41-piece-streaming §4.1-4.3). With
-// it on, each nonzero part of a row is read as up to kSubReads page-aligned sub-reads, and the row's needed bytes are
-// cut into kPieces pieces: piece j is sub-read j of the row (in file order) mapped into segment destination
-// coordinates, its inner cuts rounded down to kPieceAlign. These are fixed, not knobs: the device's readiness word
-// carries one bit per piece. With the flag off none of this is used and the reader issues one read per part.
+// Piece streaming (SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM, plan 2026-09-24-dsv41-piece-streaming §4.1-4.3; N mirror
+// parts, plan 2026-09-28-mirror3-piece-stream). With it on, each nonzero part of a row is read as up to
+// sub_reads_per_part(reading) page-aligned sub-reads, `reading` being how many of the row's parts are nonzero, and the
+// row's needed bytes are cut into kPieces pieces: piece j is sub-read j of the row (in file order) mapped into segment
+// destination coordinates, its inner cuts rounded down to kPieceAlign. Pieces past the row's sub-reads have no bytes
+// and are published at admission. kPieces is fixed, not a knob: the device's readiness word carries one bit per piece.
+// kSubReads is the most sub-reads a part is cut into; it also sizes the descriptors (one per slot, part and sub-read)
+// and strides their index. With the flag off none of this is used and the reader issues one read per part.
 constexpr int kSubReads = 4;
 constexpr int kPieces = 8;
 constexpr uint8_t kAllPieces = 0xFF;
@@ -66,6 +69,26 @@ constexpr int64_t kPieceAlign = 128;
 // 512 B logical blocks; exl3_row_image.IO_ALIGN). Slab rows are held to it too, which covers dio_mem_align (4).
 constexpr int64_t kImageAlign = 512;
 static_assert(kPieces <= 8, "a row's piece and sub-read masks are one byte each");
+
+// Sub-reads per reading part of a row that reads `reading` nonzero parts: the pieces shared out, at most kSubReads.
+// 1 or 2 reading parts give kSubReads (the cut before N parts), 3 or 4 give 2, 5 to 8 give 1. Past kPieces a part
+// would get none: the reader refuses such tables (set_piece_stream) and row_geometry refuses such a row. 0 (a row with
+// nothing to read, which admission refuses) gives kSubReads.
+constexpr int sub_reads_per_part(int reading) {
+  return reading <= 0 ? kSubReads : std::min(kSubReads, kPieces / reading);
+}
+constexpr bool every_part_count_fits() {
+  for (int reading = 1; reading <= kPieces; ++reading) {
+    const int per_part = sub_reads_per_part(reading);
+    if (per_part < 1 || per_part > kSubReads || reading * per_part > kPieces) return false;
+  }
+  return true;
+}
+static_assert(every_part_count_fits(), "1..kPieces reading parts each get at least one sub-read and fit the pieces");
+static_assert(
+    sub_reads_per_part(1) == kSubReads && sub_reads_per_part(2) == kSubReads,
+    "rows of one or two reading parts keep the cut they had before N parts");
+static_assert(sub_reads_per_part(3) == 2 && sub_reads_per_part(4) == 2 && sub_reads_per_part(8) == 1, "N-part cut");
 
 inline int64_t now_ns() {
   timespec ts;

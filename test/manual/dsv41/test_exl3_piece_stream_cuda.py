@@ -46,6 +46,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     ExpertStreamDevice,
     ExpertStreamHost,
     new_page,
+    piece_geometry,
     piece_word,
     stream_segment_map,
 )
@@ -144,7 +145,7 @@ class StreamService:
 
     def __init__(
         self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2, layers=LAYERS,
-        row=0, copy_engine=False, native_prefetch=False, sm_small=False,
+        row=0, copy_engine=False, native_prefetch=False, sm_small=False, mirror_weights=None,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -168,7 +169,17 @@ class StreamService:
             for lid in range(layers):
                 for n in self.names:
                     self.slabs[lid][n] = allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
-            self.tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
+            mirrors = {}
+            if mirror_weights is not None:
+                import shutil
+
+                from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
+
+                roots = tuple(str(tmp_path.parent / f"{tmp_path.name}_mirror{i}") for i in range(len(mirror_weights)))
+                for root in roots:
+                    shutil.copytree(tmp_path, root)
+                mirrors = dict(roots=roots, policy=StaticSplitPolicy(mirror_weights), source_root=str(tmp_path))
+            self.tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs, **mirrors)
             self.page = new_page(pin=True)
             self.slot_map = torch.full((layers, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.host = ExpertStreamHost(
@@ -415,8 +426,9 @@ def test_the_w1_and_s_launchers_refuse_a_row_capacity_that_is_not_the_row_tables
     torch.cuda.synchronize()
 
 
-def test_g2_s_copies_a_piece_before_the_rest_are_published(tmp_path):
-    s = StreamService(tmp_path, timeout_ms=1000)
+@pytest.mark.parametrize("weights", [None, (1.0, 1.0, 1.0)], ids=["one_root", "three_roots"])
+def test_g2_s_copies_a_piece_before_the_rest_are_published(tmp_path, weights):
+    s = StreamService(tmp_path, timeout_ms=1000, mirror_weights=weights)
     try:
         s.host.inject_fault(hold_until_probe_ms=3000)  # longer than D5: only S's probe can release the pieces early
         s.plan([4])
@@ -435,12 +447,52 @@ def test_g2_s_copies_a_piece_before_the_rest_are_published(tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# G12: three mirror roots (plan 2026-09-28-mirror3-piece-stream). Each reading part is cut into 2 sub-reads (4 when a
+# part is empty), so pieces 6 and 7 of a row reading all three have no runs in S's table and are published at
+# admission. S's exit (done == all eight bits) and its served judgement must hold with no device change.
+# ---------------------------------------------------------------------------------------------------------------
+THREE_ROOTS = [(1.0, 1.0, 1.0), (3.0, 1.0, 2.0), (1.0, 0.0, 1.0)]
+
+
+@pytest.mark.parametrize("weights", THREE_ROOTS, ids=["thirds", "uneven", "zero_middle"])
+def test_g12_three_mirror_roots_stream_every_piece_byte_exact(tmp_path, weights):
+    experts, later = [3, 5, 9, 12], [3, 7, 11]  # later: 3 is resident by then (a READY lane), 7 and 11 are misses
+    s = StreamService(tmp_path, mirror_weights=weights)
+    try:
+        assert s.tables.parts == 3
+        runs = s.host.piece_runs()
+        for expert in experts + later:
+            subs = len(piece_geometry(s.tables, s.row, expert)[0])
+            assert subs == (8 if 0.0 in weights else 6), (expert, subs)
+            empty = runs[s.row, expert, subs:]
+            assert bool((empty[..., 0] == empty[..., 1]).all()), expert  # S copies nothing for pieces past subs
+        s.host.inject_fault(pack_delay_ns=PIECE_DELAY_NS, poison=True)
+        acked = s.counters()["leases_acked"]
+        s.plan(experts)
+        s.step()
+        assert s.keep.item() == 1.0, (s.counters(), s.stats())
+        assert int(s.dev.go_2.item()) == len(experts) and s.stats()["stream_pieces"] > 0
+        assert s.delivered(experts)
+        assert s.until(lambda: s.counters()["leases_acked"] == acked + len(experts)), s.counters()
+        s.plan(later)
+        s.step()
+        assert s.keep.item() == 1.0, (s.counters(), s.stats())
+        assert s.delivered(later)
+    finally:
+        s.quiet()
+        s.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # G3, T4 (device half) and T5: a failed read.
 # ---------------------------------------------------------------------------------------------------------------
-def test_g3_a_failed_read_fails_as_failed_well_under_the_deadline(tmp_path):
+@pytest.mark.parametrize("weights", [None, (1.0, 1.0, 1.0)], ids=["one_root", "three_roots"])
+def test_g3_a_failed_read_fails_as_failed_well_under_the_deadline(tmp_path, weights):
     """keep 0, go_2 0 (so the DIRECT commit, which masks lanes below go_total by keep, commits nothing of S's), the
-    terminal names the S lane, and the reason is Failed at the read's end, not Timeout at the deadline (M14)."""
-    s = StreamService(tmp_path, timeout_ms=2000)
+    terminal names the S lane, and the reason is Failed at the read's end, not Timeout at the deadline (M14). Over three
+    roots, a row the reader admitted before failing has already published its empty pieces 6 and 7. S may see those
+    bits, and it must still end Failed."""
+    s = StreamService(tmp_path, timeout_ms=2000, mirror_weights=weights)
     try:
         s.host.inject(delay_s=0.2, fail_reads=True)
         s.plan([5])
