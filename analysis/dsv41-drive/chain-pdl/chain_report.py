@@ -80,15 +80,19 @@ def prologue(reps: list[list[dict]]) -> dict[str, dict]:
 
 
 def savings(records: list[dict]) -> list[dict]:
-    base = {r["scenario"]: r["replay_us_p50"] for r in records if r.get("kind") == "chain" and r["mode"] == "off"}
-    rows = []
+    """Per scenario and mode, the median replay over its records (one per round) against off's median."""
+    times: dict[tuple, list[float]] = {}
     for r in records:
-        if r.get("kind") != "chain" or r["mode"] == "off" or r["scenario"] not in base:
+        if r.get("kind") == "chain":
+            times.setdefault((r["scenario"], r["mode"]), []).append(r["replay_us_p50"])
+    rows = []
+    for (scenario, mode), ts in times.items():
+        if mode == "off" or (scenario, "off") not in times:
             continue
-        layer = base[r["scenario"]] - r["replay_us_p50"]  # one replay is one layer's chain
+        layer = statistics.median(times[(scenario, "off")]) - statistics.median(ts)  # one replay = one layer
         step = layer * LAYERS
-        rows.append({"scenario": r["scenario"], "mode": r["mode"], "per_layer_us": layer, "per_step_us": step,
-                     "step_share": step / STEP_US, "gate": layer >= GATE_US_PER_LAYER,
+        rows.append({"scenario": scenario, "mode": mode, "rounds": len(ts), "per_layer_us": layer,
+                     "per_step_us": step, "step_share": step / STEP_US, "gate": layer >= GATE_US_PER_LAYER,
                      "ship": step / STEP_US >= SHIP_SHARE})
     return rows
 

@@ -138,7 +138,8 @@ def run(repo: Path, tmp: Path, scenario: str, mode: str, module, edges_mod, repl
                 times.append(e0.elapsed_time(e1) * 1e3)
         rec = {"kind": "chain", "scenario": scenario, "mode": mode, "stamp": stamp,
                "replay_us_p50": round(statistics.median(times), 2), "replay_us_p10": round(sorted(times)[len(times) // 10], 2),
-               "hits_mean": round(statistics.mean(hits), 2), "replays": replays}
+               "hits_mean": round(statistics.mean(hits), 2), "replays": replays,
+               "spin_cpu": s.counters()["spin_cpu"]}  # the unpinned service thread's core: host-bound runs vary with it
         if stamp:
             module.expert_stream_pdl_stamps(ring)
             count = int(ring[-1])
@@ -164,6 +165,7 @@ def main() -> int:
     ap.add_argument("--replays", type=int, default=200)
     ap.add_argument("--stamp", action="store_true")
     ap.add_argument("--scenarios", default=",".join(SCENARIOS))
+    ap.add_argument("--rounds", type=int, default=1, help="repeat every scenario, modes interleaved and rotated")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
     import sglang
@@ -180,13 +182,16 @@ def main() -> int:
     tmp = Path(a.tmp or tempfile.mkdtemp(prefix="chain-pdl-"))
     tmp.mkdir(parents=True, exist_ok=True)
     with open(a.out, "a") as out:
-        for scenario in a.scenarios.split(","):
-            for mode in MODES:
-                for rec in run(repo, tmp, scenario, mode, modules[mode], edges_mod, a.replays, a.stamp):
-                    line = json.dumps(rec)
-                    print(line if rec["kind"] != "graph" else json.dumps({**rec, "edges": len(rec["edges"])}),
-                          flush=True)
-                    out.write(line + "\n")
+        for rnd in range(a.rounds):
+            order = list(MODES)[rnd % len(MODES):] + list(MODES)[:rnd % len(MODES)]  # rotate which mode goes first
+            for scenario in a.scenarios.split(","):
+                for mode in order:
+                    for rec in run(repo, tmp / f"r{rnd}", scenario, mode, modules[mode], edges_mod, a.replays, a.stamp):
+                        rec["round"] = rnd
+                        line = json.dumps(rec)
+                        print(line if rec["kind"] != "graph" else json.dumps({**rec, "edges": len(rec["edges"])}),
+                              flush=True)
+                        out.write(line + "\n")
     return 0
 
 

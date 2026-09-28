@@ -47,6 +47,14 @@ def test_savings_are_per_scenario_against_off_with_the_gate_and_ship_bar():
     assert ("mixed", "pdl") not in by
 
 
+def test_savings_over_rounds_use_the_median_replay_per_scenario_and_mode():
+    recs = [_chain("mixed", "off", t) for t in (900.0, 440.0, 880.0)] + \
+           [_chain("mixed", "pdl_early", t) for t in (870.0, 430.0, 420.0)]
+    (row,) = report.savings(recs)
+    assert row["rounds"] == 3
+    assert row["per_layer_us"] == pytest.approx(880.0 - 430.0)  # medians, not the last record of each
+
+
 def test_prologue_counts_only_launches_that_entered_after_their_predecessor_finished():
     reps = report.replays([_s(1, 100, 104, 110), _s(2, 105, 111, 150), _s(3, 160, 163, 170)])
     p = report.prologue(reps)
