@@ -205,8 +205,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     state[kWaits] += 1;
     const uint64_t start = global_ns();
     int64_t polls = 0;
+    bool aborted = false;
     uint32_t done = ld_acquire_sys(page + kDemandDone);
     while (!reached(done, seq) && static_cast<int64_t>(global_ns() - start) < timeout_ns) {
+      // A fatal word ends the wait early, as in the lease waits: nobody will serve this request. There is no lease
+      // header here, so no shutdown word to check.
+      if (ld_acquire_sys(page + kFatal) != 0) {
+        aborted = true;
+        break;
+      }
       __nanosleep(256);
       ++polls;
       done = ld_acquire_sys(page + kDemandDone);
@@ -214,9 +221,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const int64_t total = static_cast<int64_t>(state[kPolls]) + polls;
     state[kPolls] = static_cast<int32_t>(total < 0x7fffffffLL ? total : 0x7fffffffLL);
     if (!reached(done, seq)) {
-      state[kTimeouts] += 1;
-      raise_fatal(page, seq);
       ok = false;
+      if (!aborted) {  // the page is already failed on an abort: no timeout to count and no fatal word to raise
+        state[kTimeouts] += 1;
+        raise_fatal(page, seq);
+      }
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
