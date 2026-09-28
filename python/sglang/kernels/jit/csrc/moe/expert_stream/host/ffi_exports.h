@@ -5,6 +5,7 @@
 #include <sgl_kernel/tensor.h>
 
 #include "../tensor_checks.h"
+#include "any_reader.h"
 #include "ram_thread.h"
 
 namespace sglang::expert_stream {
@@ -15,7 +16,7 @@ using tvm::ffi::TensorView;
 /// and each layout is its own module, so one layout's handles can never resolve in another's.
 template <ExpertRowLayout Layout, AsyncFileReader Reader>
 struct HostExports {
-  using Source = RowReader<Layout, Reader>;
+  using Source = AnyReader<Layout, Reader>;
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
 
