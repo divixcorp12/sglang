@@ -5,7 +5,7 @@
 # SGLANG_EXPERT_STREAM_URING_* knobs are passed explicitly in both arms as run_arm.sh KEY=VAL overrides.
 # Rule: R3 goes to a confirmation plan only if it beats R0 by >= 1.5 ms/token pooled with byte-identical output.
 # Template: analysis/dsv41-drive/reader-crtp/drive_reader_crtp_pair.sh (changes: one worktree; the arms differ only in
-# their io_uring overrides; a fixed 90 GiB tier with node-0 and node-1 gates; startup memory/vmstat/stack samplers; memory samples
+# their io_uring overrides; tier full-else-90g with node-0 and node-1 gates; a 300 s registration stop rule; startup memory/vmstat/stack samplers; memory samples
 # before R0 and after each arm's "ready"; the server's `expert stream io_uring:` lines are kept per arm; stop on a
 # registration refusal or on diagnostics showing the arm's modes did not take effect).
 # Lock order: rowimg-disk.lock is held across both arms; cc-gpu.lock is polled here and taken by run_arm.sh itself.
@@ -26,10 +26,12 @@
 # arm this driver resolves them with the worktree's python/ tree against arm_env.MODEL_PATH and stops unless the label
 # is EXL3 (benchmarks/dsv41_flash/arm_config.py check_gate is the worked example).
 #
-# Pinned tier: a fixed 90 GiB tier, 0:51200,1:40960 / 92160, passed to BOTH arms as identical KEY=VAL overrides
-# (arm_env's base_env is never edited), with node-0 and node-1 gates before each arm and no cut (see node0_gate). The
-# first run (/mnt/nvme1/uring-reg, full tier 0:61440,1:40960) hung in R3's startup; this tier is the controller's
-# re-run directive.
+# Pinned tier: full (0:61440,1:40960 / 102400) if both nodes clear its gates before R0, else 90g
+# (0:51200,1:40960 / 92160), passed to BOTH arms as identical KEY=VAL overrides (arm_env's base_env is never edited);
+# see node0_gate. History: the first run (/mnt/nvme1/uring-reg, full tier) hung in R3's buffer registration (quadratic
+# kernel pin accounting over uncoalesced THP chunks); the 90 GiB re-run (/mnt/nvme1/uring-reg-90g) was cancelled; Task
+# 10 made the NUMA splits 2 MiB-aligned. Stop rule: an arm still registering 300 s after its pinned-cache line is
+# stopped.
 #
 # Memory: $OUT/memory.jsonl gets node-0/node-1 MemFree and /proc/meminfo VmallocUsed and Slab as a baseline before R0's
 # launch and again after each arm's "ready" line (R3 registers ~100 GB of row slabs; node 0 is tight).
@@ -96,13 +98,15 @@ raise SystemExit(0 if label == 'EXL3' else 'the launch gate resolved ' + repr(la
 " || { say "EXL3 gate failed for $arm ($wt)"; return 1; }
 }
 
-# Fixed 90 GiB tier (controller directive, 2026-09-28, after the full-tier R3 startup hang): the same in both arms,
-# never cut. Gates, before each arm, both logged to the driver log and $OUT/node0-gate.jsonl:
-#   node 0: MemFree + page cache >= 51200 + 4096 headroom + 15360 pre-check footprint = 70656 MiB
-#   node 1: MemFree + page cache >= 40960 + 4096 headroom + 10000 footprint           = 55056 MiB
-# The node-1 footprint is observed: the first run's R0 (/mnt/nvme1/uring-reg/memory.jsonl) went from node-1 MemFree
-# 51231 MiB before launch to 1193 MiB at "ready" with a 40960 MiB node-1 share, i.e. ~9078 MiB beyond the share.
-TIER_NAME=90g; N0_MIB=51200; N1_MIB=40960; HEADROOM_MIB=4096
+# Tier (controller directive for the fresh pair at the Task 10 head): settled once before R0, applied to BOTH arms,
+# never cut afterwards. Gates on MemFree + page cache (Active(file) + Inactive(file)) per node:
+#   full 0:61440,1:40960 / 102400 if node 0 >= 61440+4096+15360 = 80896 and node 1 >= 40960+4096+10000 = 55056 MiB
+#   90g  0:51200,1:40960 /  92160 if node 0 >= 51200+4096+15360 = 70656 and node 1 >= 55056 MiB
+#   otherwise stop. Before R3 the settled tier's gates are re-checked; short means stop.
+# The node-1 footprint (10000) is observed: the first run's R0 (/mnt/nvme1/uring-reg/memory.jsonl) went from node-1
+# MemFree 51231 MiB before launch to 1193 MiB at "ready" with a 40960 MiB node-1 share, i.e. ~9078 MiB beyond it.
+TIER_NAMES=(full 90g); TIER_N0=(61440 51200); TIER_IDX=0
+TIER_NAME=${TIER_NAMES[0]}; N0_MIB=${TIER_N0[0]}; N1_MIB=40960; HEADROOM_MIB=4096
 # The server's node-0 footprint before check_capacity runs, observed (see drive_mirror3_arms.sh).
 PRECHECK_FOOTPRINT_MIB=15360
 NODE1_FOOTPRINT_MIB=10000
@@ -111,24 +115,31 @@ node_memory_mib() {  # <node>: "<MemFree> <Active(file)+Inactive(file)>" in MiB:
          END { print int(f / 1024), int(c / 1024) }' "/sys/devices/system/node/node$1/meminfo"
 }
 FIRST_ARM=R0
-node0_gate() {  # <arm>: node 0 and node 1 must both clear the fixed tier; no cut
+node0_gate() {  # <arm>: R0 settles the tier (full, else 90g); R3 re-checks the settled tier; no other cut
     local arm=$1 free cache avail need ok free1 cache1 avail1 need1 ok1
-    read -r free cache < <(node_memory_mib 0)
-    read -r free1 cache1 < <(node_memory_mib 1)
-    avail=$((free + cache)); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
-    avail1=$((free1 + cache1)); need1=$((N1_MIB + HEADROOM_MIB + NODE1_FOOTPRINT_MIB))
-    ok=$([ "$avail" -ge "$need" ] && echo true || echo false)
-    ok1=$([ "$avail1" -ge "$need1" ] && echo true || echo false)
-    say "node 0 before $arm (tier $TIER_NAME): MemFree ${free} MiB + page cache ${cache} MiB = ${avail} MiB," \
-        "need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB}): ok=$ok"
-    say "node 1 before $arm (tier $TIER_NAME): MemFree ${free1} MiB + page cache ${cache1} MiB = ${avail1} MiB," \
-        "need ${need1} MiB (share ${N1_MIB} + headroom ${HEADROOM_MIB} + footprint ${NODE1_FOOTPRINT_MIB}): ok=$ok1"
-    printf '{"arm": "%s", "utc": "%s", "tier": "%s", "memfree_mib": %d, "page_cache_mib": %d, "available_mib": %d, "need_mib": %d, "node1_memfree_mib": %d, "node1_page_cache_mib": %d, "node1_available_mib": %d, "node1_need_mib": %d, "node0_share_mib": %d, "node1_share_mib": %d, "total_mib": %d, "ok": %s, "node1_ok": %s}\n' \
-        "$arm" "$(date -u +%FT%TZ)" "$TIER_NAME" "$free" "$cache" "$avail" "$need" "$free1" "$cache1" "$avail1" "$need1" \
-        "$N0_MIB" "$N1_MIB" "$((N0_MIB + N1_MIB))" "$ok" "$ok1" >> "$OUT/node0-gate.jsonl"
-    [ "$ok" = true ] && [ "$ok1" = true ] && return 0
-    say "a node is short before $arm at 0:${N0_MIB},1:${N1_MIB}; the tier is fixed, stopping before this arm"
-    return 1
+    while :; do
+        read -r free cache < <(node_memory_mib 0)
+        read -r free1 cache1 < <(node_memory_mib 1)
+        avail=$((free + cache)); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
+        avail1=$((free1 + cache1)); need1=$((N1_MIB + HEADROOM_MIB + NODE1_FOOTPRINT_MIB))
+        ok=$([ "$avail" -ge "$need" ] && echo true || echo false)
+        ok1=$([ "$avail1" -ge "$need1" ] && echo true || echo false)
+        say "node 0 before $arm (tier $TIER_NAME): MemFree ${free} MiB + page cache ${cache} MiB = ${avail} MiB," \
+            "need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB}): ok=$ok"
+        say "node 1 before $arm (tier $TIER_NAME): MemFree ${free1} MiB + page cache ${cache1} MiB = ${avail1} MiB," \
+            "need ${need1} MiB (share ${N1_MIB} + headroom ${HEADROOM_MIB} + footprint ${NODE1_FOOTPRINT_MIB}): ok=$ok1"
+        printf '{"arm": "%s", "utc": "%s", "tier": "%s", "memfree_mib": %d, "page_cache_mib": %d, "available_mib": %d, "need_mib": %d, "node1_memfree_mib": %d, "node1_page_cache_mib": %d, "node1_available_mib": %d, "node1_need_mib": %d, "node0_share_mib": %d, "node1_share_mib": %d, "total_mib": %d, "ok": %s, "node1_ok": %s}\n' \
+            "$arm" "$(date -u +%FT%TZ)" "$TIER_NAME" "$free" "$cache" "$avail" "$need" "$free1" "$cache1" "$avail1" "$need1" \
+            "$N0_MIB" "$N1_MIB" "$((N0_MIB + N1_MIB))" "$ok" "$ok1" >> "$OUT/node0-gate.jsonl"
+        [ "$ok" = true ] && [ "$ok1" = true ] && return 0
+        if [ "$arm" = "$FIRST_ARM" ] && [ $((TIER_IDX + 1)) -lt ${#TIER_N0[@]} ]; then
+            TIER_IDX=$((TIER_IDX + 1)); TIER_NAME=${TIER_NAMES[$TIER_IDX]}; N0_MIB=${TIER_N0[$TIER_IDX]}
+            say "short for the full tier: using the $TIER_NAME tier for BOTH arms -> 0:${N0_MIB},1:${N1_MIB} (total $((N0_MIB + N1_MIB)))"
+            continue
+        fi
+        say "a node is short before $arm at 0:${N0_MIB},1:${N1_MIB}; stopping before this arm"
+        return 1
+    done
 }
 tier_overrides() {
     echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
@@ -301,7 +312,20 @@ run_one() {  # <arm> [KEY=VAL ...]
     pid_s=$!; track "$pid_s" "$arm startup sampler"
     # Watch for run_arm.sh's "<arm> ready:" line to take the post-ready memory sample; run_arm.sh's own timeouts
     # (health 900 s, up to 12 warm-up rounds) are untouched.
+    local pinned_at="" reg_done=0 srv_log="" stopped_reg=0
     while kill -0 "$ARM_PID" 2>/dev/null; do
+        # Stop rule: still registering (no `expert stream io_uring: mode=` line) 300 s after "Pinned host expert cache
+        # startup" -> stop the arm (run_arm.sh's group, and with it the server). No retry.
+        [ -n "$srv_log" ] || { srv_log=$(run_dir_of "$arm"); [ -z "$srv_log" ] || srv_log=$srv_log/server.log; }
+        if [ -n "$srv_log" ] && [ "$reg_done" = 0 ] && [ -f "$srv_log" ]; then
+            [ -n "$pinned_at" ] || ! grep -q "Pinned host expert cache startup" "$srv_log" || { pinned_at=$(date +%s); say "arm $arm: pinned host cache up; watching registration"; }
+            if grep -q "expert stream io_uring: mode=" "$srv_log"; then
+                reg_done=1; [ -z "$pinned_at" ] || say "arm $arm: io_uring setup line after $(( $(date +%s) - pinned_at )) s (poll 5 s)"
+            elif [ -n "$pinned_at" ] && [ $(( $(date +%s) - pinned_at )) -ge 300 ]; then
+                say "arm $arm: still registering 300 s after the pinned-cache line; stopping the arm (stop rule)"
+                stopped_reg=1; stop_pid "$ARM_PID" group
+            fi
+        fi
         if [ "$sampled" = 0 ] && grep -q "^$arm ready:" "$OUT/$arm-run_arm.log" 2>/dev/null; then
             stop_pid "$pid_s"
             memory_sample "$arm-ready"; sampled=1
@@ -323,6 +347,7 @@ run_one() {  # <arm> [KEY=VAL ...]
             return 1
         fi
     fi
+    [ "$stopped_reg" = 0 ] || { say "arm $arm: stopped by the registration stop rule"; return 1; }
     [ "$rc" = 0 ] || return "$rc"
     check_modes "$arm" "$run" || return 1
     errors=$(read_errors_of "$run")
