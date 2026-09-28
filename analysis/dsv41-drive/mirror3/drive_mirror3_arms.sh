@@ -14,6 +14,16 @@
 # (and HUP, but only when not started under nohup, which ignores HUP before bash could trap it), kills only those.
 # run_arm.sh runs as its own process group, so killing it also stops the server it started.
 # At the end it prints the mirror3_report.py command for the two runs.
+#
+# Pinned tier (fix round 2, the user's option c): both arms run a tier 4096 MiB smaller on node 0 than arm_env's
+# recipe (102400 = 0:61440,1:40960), passed as identical KEY=VAL overrides: SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:40960
+# and SGLANG_MOE_PINNED_HOST_MB=98304. Reason: the ZFS ARC holds node-0 memory that host_numa.check_capacity does not
+# count as reclaimable, and the recipe's 0:61440 was refused 1463 MiB short. Before the reference arm the driver
+# checks node 0 the way check_capacity does (MemFree + Active(file) + Inactive(file) from node0/meminfo) against the
+# node-0 share + 4096 MiB headroom + arm_env.WEIGHTS_AND_OVERHEAD_MIB (check_capacity runs after the server has loaded,
+# so the idle number must also cover what the server itself takes from node 0 first). If short, it cuts node 0 and the
+# total by another 4096 MiB once, for both arms. Before the 3-root arm it re-checks the SAME values and stops if short,
+# rather than run mismatched arms.
 set -u
 WT=${1:?worktree}; SHA=${2:?commit}; OUT=${3:?out dir}; PORT=${4:-30031}
 PY=/data/models/slang/.venv/bin/python
@@ -42,6 +52,31 @@ ports_free() {
     done
 }
 ports_free || exit 1
+N0_MIB=57344; N1_MIB=40960; HEADROOM_MIB=4096; NODE0_CUT_MIB=4096; NODE0_CUTS_LEFT=1
+OVERHEAD_MIB=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.WEIGHTS_AND_OVERHEAD_MIB)") \
+    || { say "cannot read arm_env.WEIGHTS_AND_OVERHEAD_MIB"; exit 1; }
+node0_avail_mib() {  # host_numa.node_memory's "free" + "reclaimable" for node 0, in MiB
+    awk '$3 == "MemFree:" || $3 == "Active(file):" || $3 == "Inactive(file):" { kb += $4 } END { print int(kb / 1024) }' \
+        /sys/devices/system/node/node0/meminfo
+}
+node0_gate() {  # <arm>: settle (reference, may cut once) or re-check (3-root, never cuts) the node-0 share
+    local arm=$1 avail need
+    while :; do
+        avail=$(node0_avail_mib); need=$((N0_MIB + HEADROOM_MIB + OVERHEAD_MIB))
+        say "node 0 before $arm: MemFree+file cache ${avail} MiB, need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + server ${OVERHEAD_MIB})"
+        [ "$avail" -ge "$need" ] && return 0
+        if [ "$arm" = mirror2-ref ] && [ "$NODE0_CUTS_LEFT" -gt 0 ]; then
+            N0_MIB=$((N0_MIB - NODE0_CUT_MIB)); NODE0_CUTS_LEFT=$((NODE0_CUTS_LEFT - 1))
+            say "node 0 short: cutting node 0 (and the total) by ${NODE0_CUT_MIB} MiB for BOTH arms -> 0:${N0_MIB},1:${N1_MIB}"
+            continue
+        fi
+        say "node 0 short before $arm at the settled 0:${N0_MIB},1:${N1_MIB}; stopping rather than run mismatched arms"
+        return 1
+    done
+}
+tier_overrides() {
+    echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
+}
 mkdir -p "$OUT"
 # The whole namespace (nvme0n1), not the partition findmnt names (nvme0n1p1): the split is per drive.
 disk_of() { local src; src=$(findmnt -no SOURCE --target "$1") || return 1; lsblk -no PKNAME "$src" | grep . || basename "$src"; }
@@ -128,6 +163,9 @@ run_one() {  # <arm> [KEY=VAL ...]
     : > "$done_log"
     ports_free || return 1
     wait_for_quiet_box
+    node0_gate "$arm" || return 1
+    set -- "$@" $(tier_overrides)
+    say "arm $arm overrides: $*"
     # 8>&- everywhere: no child may inherit (and outlive the driver holding) rowimg-disk.lock.
     setsid nohup taskset -c 20-23 $PY "$WT/analysis/dsv41-drive/nvme-load/nvme_sampler.py" \
         "$OUT/$arm-diskstats.jsonl" "$done_log" $DEVS > "$OUT/$arm-sampler.log" 2>&1 < /dev/null 8>&- &
