@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../row_layout.h"
+#include "file_reader.h"  // RegisteredRegion
 #include "reader_base.h"
 #include <sys/uio.h>
 
@@ -38,7 +39,8 @@ struct Tables {
   int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
   std::vector<std::vector<uint8_t*>> slabs;
   std::vector<int64_t> row_bytes;
-  std::vector<iovec> buffer_regions;  // explicit allocation spans retained by Python tables.keepalive
+  // One per named slab tensor retained by Python tables.keepalive, with its row size: registered as row-aligned chunks.
+  std::vector<RegisteredRegion> buffer_regions;
   // Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, plan 2026-09-24-dsv41-row-images): the files are
   // exl3_row_image layer files, not checkpoint shards. A row's needed bytes are then its image, [0, need_end) of
   // the extents' destination coordinates, and the segments tile it in source order, so every image byte has
@@ -123,10 +125,12 @@ inline Tables tables_from(
   Tables t;
   const auto* regions = static_cast<const int64_t*>(buffer_regions.data_ptr());
   for (int64_t i = 0; i < buffer_regions.size(0); ++i) {
-    const int64_t base = regions[2 * i], bytes = regions[2 * i + 1];
-    if (base <= 0 || bytes <= 0 || static_cast<uint64_t>(base) + static_cast<uint64_t>(bytes) < static_cast<uint64_t>(base))
+    const int64_t base = regions[3 * i], bytes = regions[3 * i + 1], row = regions[3 * i + 2];
+    if (base <= 0 || bytes <= 0 || row <= 0 || bytes % row != 0 ||
+        static_cast<uint64_t>(base) + static_cast<uint64_t>(bytes) < static_cast<uint64_t>(base))
       throw std::runtime_error(prefix + "invalid I/O registration buffer region");
-    t.buffer_regions.push_back({reinterpret_cast<void*>(static_cast<uintptr_t>(base)), static_cast<size_t>(bytes)});
+    t.buffer_regions.push_back(
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(base)), static_cast<size_t>(bytes), static_cast<size_t>(row)});
   }
   t.images = row_images != 0;
   t.layers = extents.size(0);

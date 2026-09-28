@@ -77,6 +77,7 @@ int main() {
 
 _FAKE_LIBURING = r"""
 #pragma once
+#include <linux/types.h>
 #include <sys/uio.h>
 #include <cstdint>
 #include <cerrno>
@@ -150,9 +151,17 @@ inline void io_uring_cqe_seen(io_uring* r,io_uring_cqe*) { r->cq.pop_front(); }
 inline void io_uring_cq_advance(io_uring* r,unsigned n) { while(n--)r->cq.pop_front(); }
 #define io_uring_for_each_cqe(r,head,cqe) for(head=0;head<(r)->cq.size() && ((cqe)=&(r)->cq[head],true);++head)
 inline int io_uring_register_files(io_uring*,const int* f,unsigned n) { ++register_files_calls; mapped_files.assign(f,f+n);return registered_file_error; }
-inline int io_uring_register_buffers(io_uring*,const iovec*,unsigned) { ++register_buffers_calls;return registered_buffer_error; }
+// The sparse registered-buffer table (io::RegisteredBufferTable): one sparse registration, then a slot per chunk.
+inline int registered_chunks=0, unregister_buffers_calls=0;
+inline int io_uring_register_buffers_sparse(io_uring*,unsigned) { ++register_buffers_calls;registered_chunks=0;return 0; }
+inline int io_uring_register_buffers_update_tag(io_uring*,unsigned,const iovec* v,const __u64*,unsigned n) {
+ if(!v->iov_base)return n;
+ if(registered_buffer_error)return registered_buffer_error;
+ ++registered_chunks;return n;
+}
 inline int io_uring_unregister_files(io_uring*) { ++unregister_files_calls;return 0; }
-inline int io_uring_unregister_buffers(io_uring*) { return 0; }
+inline int io_uring_unregister_buffers(io_uring*) { ++unregister_buffers_calls;return 0; }
+inline unsigned io_uring_sq_space_left(const io_uring* r) { return 8 - r->sq.size(); }
 inline io_uring_probe* io_uring_get_probe_ring(io_uring*) { static io_uring_probe p;return &p; }
 inline int io_uring_opcode_supported(io_uring_probe*,int) { return opcode_supported; }
 inline void io_uring_free_probe(io_uring_probe*) {}
@@ -166,8 +175,13 @@ _FAKE_CASES = r"""
 using namespace sglang::expert_stream;
 void env(const char* key,const char* value) { std::string k="SGLANG_EXPERT_STREAM_URING_";setenv((k+key).c_str(),value,1); }
 template<class F> void rejected(F f) { bool bad=false;try {f();}catch(const std::exception&){bad=true;}assert(bad); }
+// Fixed read modes prepare through fixed_legs + prep_readv_fixed (ReaderCore's path): one leg expected.
+bool fixed(UringReader& r,int fd,const iovec* v,unsigned n,uint64_t off,uint64_t tag) {
+ FixedLeg legs[4];const unsigned k=r.fixed_legs(v,n,legs);assert(k==1);
+ return r.prep_readv_fixed(fd,v+legs[0].first,legs[0].count,off,legs[0].buffer,tag);
+}
 int main() {
- char arena[8192]{}; std::vector<iovec> buffers{{arena,sizeof(arena)}}; std::vector<int> files{99,13};
+ char arena[8192]{}; std::vector<RegisteredRegion> buffers{{arena,sizeof(arena),sizeof(arena)}}; std::vector<int> files{99,13};
  {
  UringReader r;assert(r.init(8));r.configure_resources(files,buffers,false);
  assert(last_ring->flags==0 && register_files_calls==0 && register_buffers_calls==0);
@@ -177,29 +191,53 @@ int main() {
  env("FIXED_FILES","1");env("READ_MODE","fixed");
  {
  UringReader r;assert(r.init(8));r.configure_resources(files,buffers,true);
- rejected([&]{r.prep_read(98,arena,16,0,1);});assert(last_ring->sq.empty());
- rejected([&]{r.prep_read(99,arena+8190,16,0,1);});assert(last_ring->sq.empty());
+ assert(registered_chunks==1);
+ const iovec first{arena,16},outside{arena+8190,16};
+ rejected([&]{fixed(r,98,&first,1,0,1);});assert(last_ring->sq.empty());
+ rejected([&]{fixed(r,99,&outside,1,0,1);});assert(last_ring->sq.empty());
+ rejected([&]{r.prep_read(99,arena,16,0,1);});assert(last_ring->sq.empty());
  const iovec v[]{{arena,16},{arena+32,16}};
  rejected([&]{r.prep_readv(99,v,2,0,1);});assert(last_ring->sq.empty());
- assert(r.prep_read(13,arena,16,0,2));assert(last_ring->sq.front().fd==1);
+ rejected([&]{r.prep_readv_fixed(99,v,2,0,0,1);});assert(last_ring->sq.empty());
+ assert(fixed(r,13,&first,1,0,2));assert(last_ring->sq.front().fd==1);assert(last_ring->sq.front().opcode==1);
  assert(last_ring->sq.front().flags & IOSQE_FIXED_FILE);assert(last_ring->sq.front().buf_index==0);
- const int old_setups=setups, old_registration=register_files_calls;
+ const int old_setups=setups, old_registration=register_files_calls, old_buffers=register_buffers_calls;
  r.drain(1);assert(setups==old_setups+1 && register_files_calls==old_registration+1);
- assert(r.prep_read(13,arena,16,0,3));r.submit(0);r.close();assert(!r.ready());
+ assert(register_buffers_calls==old_buffers+1 && registered_chunks==1);
+ assert(fixed(r,13,&first,1,0,3));r.submit(0);r.close();assert(!r.ready());
  }
 #ifndef FAKE_OLD_HEADERS
  env("READ_MODE","readv_fixed");
  {
  UringReader r;assert(r.init(8));r.configure_resources(files,buffers,true);
- assert(r.prep_read(99,arena,17,0,10));assert(r.prep_read(13,arena+64,29,0,11));
- const iovec v[]{{arena+128,13},{arena+256,19}};assert(r.prep_readv(99,v,2,0,12));
+ const iovec a{arena,17},b{arena+64,29};
+ assert(fixed(r,99,&a,1,0,10));assert(fixed(r,13,&b,1,0,11));
+ const iovec v[]{{arena+128,13},{arena+256,19}};assert(fixed(r,99,v,2,0,12));
+ assert(last_ring->sq.back().opcode==3 && last_ring->sq.back().len==2);
  r.submit(0);std::vector<ReadCompletion> out;assert(r.reap(out)==3);
  assert(out[0].res==17 && out[1].res==29 && out[2].res==32);
  }
  {
- UringReader r;assert(r.init(8));r.configure_resources(files,{{arena,64},{arena+64,64}},true);
+ // A scatter across two registered buffers is two legs (one READV_FIXED SQE each), never clipped or refused.
+ UringReader r;assert(r.init(8));r.configure_resources(files,{{arena,64,64},{arena+64,64,64}},true);
+ assert(registered_chunks==2);
  const iovec v[]{{arena,16},{arena+64,16}};
- rejected([&]{r.prep_readv(99,v,2,0,5);});assert(last_ring->sq.empty());
+ FixedLeg legs[4];assert(r.fixed_legs(v,2,legs)==2);
+ assert(legs[0].first==0 && legs[0].count==1 && legs[1].first==1 && legs[1].count==1 && legs[0].buffer!=legs[1].buffer);
+ }
+ {
+ // Rows are cut into chunks on row boundaries: a 64-byte cap over 16-byte rows gives two chunks for 128 bytes.
+ UringReader r;assert(r.init(8));r.set_fixed_chunk_cap(64);r.configure_resources(files,{{arena,128,16}},true);
+ assert(registered_chunks==2);rejected([&]{r.set_fixed_chunk_cap(0);});
+ }
+ {
+ // A row larger than the cap is refused at configuration, with the registration named; files are released.
+ const int old=unregister_files_calls;
+ UringReader r;assert(r.init(8));r.set_fixed_chunk_cap(32);
+ bool named=false;
+ try{r.configure_resources(files,{{arena,128,64}},true);}
+ catch(const std::runtime_error& e){named=std::string(e.what()).find("RLIMIT_MEMLOCK")!=std::string::npos;}
+ assert(named && unregister_files_calls==old+1);
  }
  opcode_supported=false;{ UringReader r;rejected([&]{r.init(8);});assert(!r.ready()); }opcode_supported=true;
 #else
@@ -228,7 +266,9 @@ int main() {
  env("MODE","default");
  registered_file_error=-EMFILE;{UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,true);});}
  registered_file_error=0;env("READ_MODE","fixed");registered_buffer_error=-ENOMEM;
- {int old=unregister_files_calls;{UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,true);});}assert(unregister_files_calls==old+1);}
+ {int old=unregister_files_calls,old_buffers=unregister_buffers_calls;
+  {UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,true);});}
+  assert(unregister_files_calls==old+1 && unregister_buffers_calls==old_buffers+1);}
  registered_buffer_error=0;env("MODE","sqpoll");setup_error=-EINVAL;
  {UringReader r;rejected([&]{r.init(8);});}
  std::cout<<"PASS defaults, registrations, range rejection, reset, SQPOLL partial drain, spin, unsupported capability\n";

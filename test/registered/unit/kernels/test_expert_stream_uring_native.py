@@ -23,6 +23,7 @@ _SOURCE = r'''
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <exception>
 #include <iostream>
@@ -35,7 +36,9 @@ _SOURCE = r'''
 #include <vector>
 #include "moe/expert_stream/host/uring_reader.h"
 
+using sglang::expert_stream::FixedLeg;
 using sglang::expert_stream::ReadCompletion;
+using sglang::expert_stream::RegisteredRegion;
 using sglang::expert_stream::UringReader;
 constexpr size_t kPage = 4096;
 constexpr size_t kArenaBytes = 16 * kPage;
@@ -118,6 +121,22 @@ std::string unsupported_capability(const std::string& mode, const std::string& r
   return unsupported;
 }
 
+// Fixed read modes prepare through fixed_legs + prep_readv_fixed, as ReaderCore does. The arena is one registered
+// region of one row (one chunk), so every read here is one leg. A scalar read's iovec must outlive its completion.
+std::deque<iovec> scalar_iovecs;
+bool scatter(UringReader& reader, int fd, const iovec* iov, unsigned count, uint64_t off, uint64_t tag) {
+  if (!reader.fixed_reads()) return reader.prep_readv(fd, iov, count, off, tag);
+  FixedLeg legs[4];
+  const unsigned n = reader.fixed_legs(iov, count, legs);
+  require(n == 1, "a read inside the one registered arena chunk must be one leg");
+  return reader.prep_readv_fixed(fd, iov + legs[0].first, legs[0].count, off, legs[0].buffer, tag);
+}
+bool scalar(UringReader& reader, int fd, void* buf, unsigned len, uint64_t off, uint64_t tag) {
+  if (!reader.fixed_reads()) return reader.prep_read(fd, buf, len, off, tag);
+  scalar_iovecs.push_back(iovec{buf, len});
+  return scatter(reader, fd, &scalar_iovecs.back(), 1, off, tag);
+}
+
 std::vector<ReadCompletion> finish(UringReader& reader, unsigned count, bool allow_iopoll_unavailable = false) {
   std::vector<ReadCompletion> completions;
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -162,7 +181,7 @@ int main(int argc, char** argv) {
     // values to the registered table's indices. One arena encloses BOTH scatter
     // destinations: READV_FIXED has one buffer index, not an index per iovec.
     const std::vector<int> fds{second.fd, first.fd};
-    const std::vector<iovec> buffers{{arena.data, kArenaBytes}};
+    const std::vector<RegisteredRegion> buffers{{arena.data, kArenaBytes, kArenaBytes}};
     UringReader reader;
     if (!unsupported.empty()) {
       bool rejected = false;
@@ -171,7 +190,7 @@ int main(int argc, char** argv) {
         if (!rejected) {
           reader.configure_resources(fds, buffers, direct);
           const iovec scatter[]{{arena.data + kPage, kPage}, {arena.data + 3 * kPage, kPage}};
-          rejected = !reader.prep_readv(first.fd, scatter, 2, kPage, 1);
+          rejected = !::scatter(reader, first.fd, scatter, 2, kPage, 1);
         }
       } catch (const std::exception& error) {
         rejected = true;
@@ -188,11 +207,16 @@ int main(int argc, char** argv) {
     const unsigned scatter_count = read_mode == "fixed" ? 1 : 2;
     if (read_mode == "fixed") {
       // READ_FIXED has one destination. The explicit mode must reject a
-      // multi-iovec request instead of silently reverting to unregistered READV.
+      // multi-iovec request instead of silently reverting to unregistered READV,
+      // and the unregistered opcodes are refused in a fixed mode.
       bool refused = false;
-      try { reader.prep_readv(first.fd, scatter, 2, kPage, 0xdead); }
+      try { reader.prep_readv_fixed(first.fd, scatter, 2, kPage, 0, 0xdead); }
       catch (const std::invalid_argument&) { refused = true; }
       require(refused, "fixed mode silently accepted multi-iovec READV");
+      refused = false;
+      try { reader.prep_readv(first.fd, scatter, 1, kPage, 0xdead); }
+      catch (const std::logic_error&) { refused = true; }
+      require(refused, "fixed mode silently prepared an unregistered READV");
     }
     // Production opens on the Python thread and submits on its service thread.
     // Do not accidentally add a setup flag that binds the ring to its creator.
@@ -200,10 +224,10 @@ int main(int argc, char** argv) {
     std::exception_ptr service_error;
     std::thread service([&] {
       try {
-        require(reader.prep_readv(first.fd, scatter, scatter_count, kPage, 0x100000011ull), "prepare scatter read failed");
-        require(reader.prep_read(second.fd, arena.data + 5 * kPage, kPage, 2 * kPage, 0x200000012ull),
+        require(::scatter(reader, first.fd, scatter, scatter_count, kPage, 0x100000011ull), "prepare scatter read failed");
+        require(::scalar(reader, second.fd, arena.data + 5 * kPage, kPage, 2 * kPage, 0x200000012ull),
                 "prepare scalar read failed");
-        require(reader.prep_read(first.fd, arena.data + 6 * kPage, kPage, 6 * kPage, 0x300000013ull),
+        require(::scalar(reader, first.fd, arena.data + 6 * kPage, kPage, 6 * kPage, 0x300000013ull),
                 "prepare second scalar read failed");
         completions = finish(reader, 3, iopoll);
       } catch (...) { service_error = std::current_exception(); }
@@ -222,30 +246,30 @@ int main(int argc, char** argv) {
 
     // Discard a prepared, unsubmitted request. Ring recreation must preserve
     // fixed files and the common registered arena before the next read.
-    require(reader.prep_read(second.fd, arena.data + 6 * kPage, kPage, 0, 21), "prepare before reset failed");
+    require(::scalar(reader, second.fd, arena.data + 6 * kPage, kPage, 0, 21), "prepare before reset failed");
     reader.drain(1);
     require(reader.ready(), "drain left the reader unusable");
-    require(reader.prep_readv(first.fd, scatter, scatter_count, 3 * kPage, 22), "prepare after reset failed");
+    require(::scatter(reader, first.fd, scatter, scatter_count, 3 * kPage, 22), "prepare after reset failed");
     completions = finish(reader, 1);
     expect_completion(completions, 22, scatter_count * kPage);
     expect_bytes(arena.data + kPage, first, 3 * kPage, kPage);
     if (scatter_count == 2) expect_bytes(arena.data + 3 * kPage, first, 4 * kPage, kPage);
 
     // Drain submitted work before reusing the registered memory.
-    require(reader.prep_read(second.fd, arena.data + 7 * kPage, kPage, 4 * kPage, 31), "prepare before drain failed");
+    require(::scalar(reader, second.fd, arena.data + 7 * kPage, kPage, 4 * kPage, 31), "prepare before drain failed");
     require(reader.submit(0) >= 0, "submit before drain failed");
     reader.drain(1);
     expect_bytes(arena.data + 7 * kPage, second, 4 * kPage, kPage);
     std::vector<ReadCompletion> empty;
     require(reader.reap(empty) == 0 && empty.empty(), "drain left a stale completion");
 
-    require(reader.prep_read(first.fd, arena.data + 8 * kPage, kPage, 8 * kPage, 41), "prepare EOF read failed");
+    require(::scalar(reader, first.fd, arena.data + 8 * kPage, kPage, 8 * kPage, 41), "prepare EOF read failed");
     completions = finish(reader, 1);
     expect_completion(completions, 41, 123);
     expect_bytes(arena.data + 8 * kPage, first, 8 * kPage, 123);
 
     // close() must settle/cancel writes before its caller reuses/frees buffers.
-    require(reader.prep_read(second.fd, arena.data + 9 * kPage, kPage, 0, 51), "prepare before close failed");
+    require(::scalar(reader, second.fd, arena.data + 9 * kPage, kPage, 0, 51), "prepare before close failed");
     require(reader.submit(0) >= 0, "submit before close failed");
     reader.close();
     require(!reader.ready(), "close did not clear ready");
@@ -257,7 +281,7 @@ int main(int argc, char** argv) {
 
     require(reader.init(depth), "reinitialization failed");
     reader.configure_resources(fds, buffers, direct);
-    require(reader.prep_read(first.fd, arena.data, kPage, 5 * kPage, 61), "prepare after reopen failed");
+    require(::scalar(reader, first.fd, arena.data, kPage, 5 * kPage, 61), "prepare after reopen failed");
     completions = finish(reader, 1);
     expect_completion(completions, 61, kPage);
     expect_bytes(arena.data, first, 5 * kPage, kPage);

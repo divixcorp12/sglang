@@ -64,6 +64,9 @@ struct ReadFault {
   // kDemandDone (G11).
   int64_t hold_until_probe_ms = 0;
   int64_t last_publish_delay_ns = 0;
+  // Fixed reads (Task 7): narrows part_error, part_short (and short_is_eof), cqe_error and hold_ordinal to the
+  // completions of leg `leg` of a fanned-out read (-1: any leg). Default reads are one leg, leg 0.
+  int64_t leg = -1;
 };
 
 // A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
@@ -72,14 +75,16 @@ inline int64_t worker_stamp(const void* trace) {
   return stamp(static_cast<const StageRecord*>(trace));
 }
 
-// The fault tensor of the test entry points: 24 int64 words. Five of them are not reader faults:
+// The fault tensor of the test entry points: kFaultWords int64 words. Five of them are not reader faults:
 // abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and pack_workers / pack_split
 // configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
 // one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
 // streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
-// last_publish_delay_ns. Keep the layout in step with _fault_tensor in ops/moe/expert_stream_transport.py.
-constexpr int64_t kFaultWords = 28;
+// last_publish_delay_ns. Word 28 (fixed_chunk_cap, not a fault) caps the registered-buffer chunk size before the
+// reader opens (0: 1 GiB), and word 29 is leg. Keep the layout in step with _fault_tensor in
+// ops/moe/expert_stream_transport.py.
+constexpr int64_t kFaultWords = 30;
 
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;
@@ -106,6 +111,7 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.short_is_eof = f[25] != 0;
   fault.hold_until_probe_ms = f[26];
   fault.last_publish_delay_ns = f[27];
+  fault.leg = f[29];
   return fault;
 }
 

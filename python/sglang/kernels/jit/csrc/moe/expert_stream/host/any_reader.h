@@ -78,6 +78,15 @@ class AnyReader {
   int64_t generation_wraps() const {
     return visit([](auto& r) { return r.generation_wraps(); });
   }
+  void set_fixed_chunk_cap(int64_t cap) {
+    visit([&](auto& r) { r.set_fixed_chunk_cap(cap); });
+  }
+  int64_t fixed_cuts() const {
+    return visit([](auto& r) { return r.fixed_cuts(); });
+  }
+  int64_t fanout_sqes() const {
+    return visit([](auto& r) { return r.fanout_sqes(); });
+  }
   bool open() {
     return visit([](auto& r) { return r.open(); });
   }

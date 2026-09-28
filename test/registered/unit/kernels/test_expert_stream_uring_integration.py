@@ -19,7 +19,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def _use_shared_slab_arenas(setup):
-    """Retain one complete allocation per layer, containing every readv destination."""
+    """Allocate one arena per layer holding every named slab; the slabs are registered one by one."""
     capacity = int(setup.tables.capacity[0])
     specs = {
         name: (setup.specs[name].row_shape, setup.specs[name].dtype)
@@ -66,25 +66,28 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
         monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU", str(min(os.sched_getaffinity(0))))
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_READ_MODE", read_mode)
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_FIXED_FILES", "1")
-    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH", "2")
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS", "1")
     (tmp_path / "checkpoint").mkdir()
     setup = ram_miss_setup(
         tmp_path / "checkpoint", capacity=3, experts=6, mirror_weights=(1.0, 1.0),
         hidden=256, inter=256, row_images=row_images,
     )
+    # A fixed read reserves all its legs at once, so a fanned-out read needs a ring at least as deep as it is wide:
+    # the row-image reads meet every named slab (one leg per segment), the bounce reads one slot.
+    depth = int(setup.tables.segments.shape[0]) if row_images else 2
+    monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH", str(depth))
     if row_images:
         _use_shared_slab_arenas(setup)
-        # The metadata crossing FFI must describe two complete arenas, rather
-        # than six separately registered named slabs per layer.
+        # The metadata crossing FFI describes each named slab of each layer, with
+        # its row size, never the arena as a whole (an arena can exceed 1 GiB).
         regions = ops._table_buffer_regions(setup.tables)
-        assert regions.shape == (len(setup.tables.layer_ids), 2)
+        assert regions.shape == (len(setup.tables.layer_ids) * len(EXL3_STREAMED_NAMES), 3)
     assert setup.tables.row_images == row_images
 
     experts, slots = [5, 0, 3], [2, 0, 1]
     result, trace = ops.read_rows_traced(setup.tables, 1, experts, slots, direct=True)
     assert result == 1
-    assert 0 < trace["pending_max"] <= 2
+    assert 0 < trace["pending_max"] <= depth
     assert trace["bytes"] > 0
     _assert_rows(setup, 1, experts, slots)
 

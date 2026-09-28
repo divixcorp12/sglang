@@ -4,6 +4,7 @@
 #include <sys/uio.h>
 
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -37,6 +38,23 @@ concept AsyncFileReader = requires(
   { r.submit(n) } -> std::same_as<int>;       // wait for n completions (0: none); <0 is -errno
   { r.reap(out) } -> std::same_as<unsigned>;  // appends, never blocks
   { r.drain(n) } -> std::same_as<void>;       // n prepared-or-in-flight reads: settle all
+};
+
+// Memory a reader registers with its ring: one named slab (or the bounce), `bytes` long, made of `row_bytes` rows. The
+// registration is cut on row boundaries into chunks of at most 1 GiB (io::plan_chunks), so no read's iovec, which lies
+// inside one row, ever straddles two registered buffers. Defined here, not in row_tables.h, so uring_reader.h stays
+// free of the TVM headers the tables need.
+struct RegisteredRegion {
+  void* base;
+  size_t bytes;
+  size_t row_bytes;
+};
+
+// One leg of a fixed read: iovecs [first, first + count) of the read, all in registered buffer `buffer`, `bytes` long.
+struct FixedLeg {
+  unsigned first, count;
+  int buffer;
+  size_t bytes;
 };
 
 // Test-only description of a submit fault, shared by every AsyncFileReader decorator that injects one.

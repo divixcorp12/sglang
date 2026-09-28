@@ -648,7 +648,9 @@ def test_u10_flag_off_issues_todays_sqes_and_credit_and_packs_the_same_bytes(tmp
     assert result == 1 and record["piece_stream"] == 0 and record["pieces"] == []
     baseline = _baseline_sqes(s.tables, 1, experts)
     assert log == baseline
-    assert info == dict(sqes=len(baseline), descriptors=16 * parts, credit=16 * parts, cqes=len(baseline))
+    assert info == dict(
+        sqes=len(baseline), descriptors=16 * parts, credit=16 * parts, cqes=len(baseline), fixed_cuts=0, fanout_sqes=0
+    )
     assert record["extents"] == len(baseline) and record["submitted_bytes"] == sum(e[2] for e in baseline)
     assert all(e["sub"] == 0 for e in record["extent_cqe"]) and record["pieces_vetted"] == 0
     assert record["pieces_published"] == record["pieces_out_of_order"] == record["piece_publish_refused"] == 0

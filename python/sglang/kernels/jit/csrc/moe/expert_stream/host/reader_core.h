@@ -155,6 +155,28 @@ class ReaderCore {
     return generation_wraps_;
   }
 
+  // A fixed read (READ_MODE fixed/readv_fixed) whose iovecs lie in k registered buffers is prepared as k legs, one SQE
+  // each, submitted together (plan 2026-09-28-reader-crtp-uring-registration Task 7). A read has at most kMaxLegs.
+  static constexpr unsigned kMaxLegs = 16;
+
+  // Test only (fault word fixed_chunk_cap): the registration chunk cap, before open() (0: the 1 GiB default).
+  void set_fixed_chunk_cap(int64_t cap) {
+    if constexpr (requires(Reader& reader) { reader.set_fixed_chunk_cap(size_t{0}); }) {
+      io_.set_fixed_chunk_cap(static_cast<size_t>(std::max<int64_t>(0, cap)));
+    } else if (cap != 0) {
+      throw std::runtime_error(error_prefix<Layout>() + "this reader registers no buffers");
+    }
+  }
+
+  // Logical reads prepared as more than one leg, and the SQEs those reads issued (first attempts), over the life.
+  int64_t fixed_cuts() const {
+    return fixed_cuts_;
+  }
+
+  int64_t fanout_sqes() const {
+    return fanout_sqes_;
+  }
+
   bool open() {
     for (const auto& path : t_.paths) {
       const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (direct_ ? O_DIRECT : 0));
@@ -191,7 +213,21 @@ class ReaderCore {
     if (!derived().open_memory()) return false;
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
-    if constexpr (requires(Reader& reader, const std::vector<int>& files, const std::vector<iovec>& buffers) {
+    if (fixed_reads()) {
+      // A fixed read has a leg per registered buffer its iovecs meet, at most one per iovec, all reserved at once.
+      const size_t widest = derived().max_iovecs();
+      if (widest > kMaxLegs) {
+        throw std::runtime_error(
+            error_prefix<Layout>() + "fixed reads fan out to at most " + std::to_string(kMaxLegs) + " legs, not " +
+            std::to_string(widest));
+      }
+      if (queue_depth() < widest) {
+        throw std::runtime_error(
+            error_prefix<Layout>() + "fixed reads need a queue depth of at least " + std::to_string(widest) +
+            " (the widest fanned-out read); SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=" + std::to_string(queue_depth()));
+      }
+    }
+    if constexpr (requires(Reader& reader, const std::vector<int>& files, const std::vector<RegisteredRegion>& buffers) {
                     reader.configure_resources(files, buffers, true);
                   }) {
       io_.configure_resources(fds_, derived().registered_regions(), direct_);
@@ -406,6 +442,22 @@ class ReaderCore {
     int32_t slot = -1;        // bounce slot: bank * kBounceRows + row within the bank
     int32_t trace_slot = -1;  // index into the record's extent arrays, -1 when not stamped
     int32_t sub = 0;          // piece streaming: the sub-read's ordinal in its row's file order
+    uint8_t legs = 0;           // planned legs (legs_[index * kMaxLegs ...]); 0: not yet prepared
+    uint8_t legs_inflight = 0;  // legs prepared and not yet reaped
+    bool queued = false;        // in queue_ (or about to be, through again_): a descriptor is queued at most once
+  };
+
+  // One leg of a descriptor's read: the SQE unit. Default reads are one leg covering the whole read; a fixed read
+  // has a leg per registered buffer its iovecs meet (UringReader::fixed_legs).
+  enum class LegState : uint8_t { Idle, Inflight, Done };
+  struct Leg {
+    int64_t start = 0;     // the leg's first byte, from the read's start (d.read->offset / dest)
+    int64_t bytes = 0;     // what the leg covers
+    int64_t expected = 0;  // bytes, clamped at the read's end-of-file expectation (d.expected)
+    int64_t done = 0;
+    unsigned first_iov = 0, iov_count = 0;
+    int buffer = -1;  // registered buffer; -1 outside fixed modes
+    LegState state = LegState::Idle;
   };
 
   struct BounceRow {
@@ -488,12 +540,13 @@ class ReaderCore {
   // so this is a descriptor per (bounce slot, part) and nothing piece-related is allocated.
   bool size_extents() {
     const size_t extents = static_cast<size_t>(kBounceSlots) * static_cast<size_t>(t_.parts) * subs_;
-    // A completion carries its descriptor index in the low 32 bits of user_data and its generation in
-    // the high 32 (see prepare() and process()). process() rejects an index past descs_.size(), but a
-    // count that does not fit in 32 bits would truncate on the way OUT, so a completion would name a
-    // different live descriptor and pass that check: bytes would be credited to the wrong extent.
-    if (extents > 0xFFFFFFFFull) return false;
+    // A completion carries its descriptor index in the low 24 bits of user_data, its leg in the next 8 and its
+    // generation in the high 32 (make_tag). process() rejects an index past descs_.size(), but a count that does not
+    // fit in 24 bits would truncate on the way OUT, so a completion would name a different live descriptor and pass
+    // that check: bytes would be credited to the wrong extent.
+    if (extents > 0xFFFFFFull) return false;
     descs_.assign(extents, ExtentDesc{});
+    legs_.assign(extents * kMaxLegs, Leg{});
     queue_.assign(extents, 0);
     completions_.reserve(extents + 1);
     held_.reserve(extents);
@@ -540,6 +593,93 @@ class ReaderCore {
     }
     queue_[(c.queue_head + c.queue_count) % queue_.size()] = index;
     ++c.queue_count;
+    descs_[index].queued = true;
+  }
+
+  // Queue descriptor `index` again (through again_) unless it already is: however many of its legs need resubmitting,
+  // it waits in the queue once, and refill() prepares all its Idle legs together.
+  void requeue(uint32_t index) {
+    ExtentDesc& d = descs_[index];
+    if (d.queued) return;
+    d.queued = true;
+    again_.push_back(index);
+  }
+
+  // A completion's tag: generation << 32 | leg << 24 | descriptor index (index < 2^24: size_extents).
+  static uint64_t make_tag(uint32_t generation, uint32_t index, unsigned leg) {
+    return (static_cast<uint64_t>(generation) << 32) | (static_cast<uint64_t>(leg) << 24) | index;
+  }
+  static uint32_t tag_index(uint64_t tag) {
+    return static_cast<uint32_t>(tag & 0xFFFFFFu);
+  }
+  static unsigned tag_leg(uint64_t tag) {
+    return static_cast<unsigned>(tag >> 24 & 0xFFu);
+  }
+  static uint32_t tag_generation(uint64_t tag) {
+    return static_cast<uint32_t>(tag >> 32);
+  }
+
+  bool fixed_reads() const {
+    if constexpr (requires(const Reader& reader) { reader.fixed_reads(); }) {
+      return io_.fixed_reads();
+    } else {
+      return false;
+    }
+  }
+
+  // A descriptor's legs, on its first preparation: its iovecs from `done` 0 (destination), then one leg covering them
+  // all, or (fixed modes) one per run of iovecs in one registered buffer. Each leg's `start` is the prefix sum of the
+  // earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
+  void plan_legs(uint32_t index) {
+    ExtentDesc& d = descs_[index];
+    iovec* iov = &iovecs_[static_cast<size_t>(index) * derived().max_iovecs()];
+    const unsigned count = derived().destination(d, iov);
+    Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+    unsigned n = 1;
+    if constexpr (requires(const Reader& reader, const iovec* v, unsigned k, FixedLeg* out) {
+                    reader.fixed_legs(v, k, out);
+                  }) {
+      if (fixed_reads()) {
+        FixedLeg fixed[kMaxLegs];  // count <= max_iovecs() <= kMaxLegs: open() refuses a wider table
+        n = io_.fixed_legs(iov, count, fixed);
+        int64_t start = 0;
+        for (unsigned l = 0; l < n; ++l) {
+          const int64_t bytes = static_cast<int64_t>(fixed[l].bytes);
+          legs[l] = Leg{start, bytes, std::clamp<int64_t>(d.expected - start, 0, bytes), 0, fixed[l].first,
+                        fixed[l].count, fixed[l].buffer, LegState::Idle};
+          start += bytes;
+        }
+        if (start != d.read->length)
+          throw std::logic_error(error_prefix<Layout>() + "a fixed read's legs do not cover the read");
+        io_.note_fanout(n);
+        if (n > 1) {
+          ++fixed_cuts_;
+          fanout_sqes_ += n;
+        }
+      }
+    }
+    if (!fixed_reads()) legs[0] = Leg{0, d.read->length, d.expected, 0, 0, count, -1, LegState::Idle};
+    for (unsigned l = 0; l < n; ++l)
+      if (legs[l].expected == 0) legs[l].state = LegState::Done;
+    d.legs = static_cast<uint8_t>(n);
+  }
+
+  // Drop from the front of leg `g`'s iovec slice what already landed (g.done), in place: the kernel is not holding
+  // these iovecs now (the leg was reaped). The slice then describes exactly the leg's remaining bytes.
+  void advance_leg(iovec* iov, Leg& g) {
+    size_t have = 0;
+    for (unsigned i = 0; i < g.iov_count; ++i)
+      have += iov[g.first_iov + i].iov_len;
+    size_t skip = have - static_cast<size_t>(g.bytes - g.done);
+    while (skip > 0 && skip >= iov[g.first_iov].iov_len) {
+      skip -= iov[g.first_iov].iov_len;
+      ++g.first_iov;
+      --g.iov_count;
+    }
+    if (skip > 0) {
+      iov[g.first_iov].iov_base = static_cast<uint8_t*>(iov[g.first_iov].iov_base) + skip;
+      iov[g.first_iov].iov_len -= skip;
+    }
   }
 
   // Admit batches while a bank is free. The abandon check comes first: once it says stop, no further
@@ -789,55 +929,93 @@ class ReaderCore {
 
   // Prepare as many queued extents as credit and SQ room allow. `pending` counts SQEs prepared and not
   // yet reaped (in the SQ ring or in the kernel) and never exceeds `capacity`. Credits are counted by
-  // nonempty extents, not by rows, because rows do not all issue the same number of reads: a root
-  // serving none of a row issues nothing. `prep_read`/`prep_readv` refused (the SQ filled before credit
-  // ran out) means the next submit sends what is prepared and refill runs again after the reap. Retries
+  // SQEs, not by rows or logical reads, because rows do not all issue the same number of reads: a root
+  // serving none of a row issues nothing, and a fanned-out fixed read issues one SQE per leg. A descriptor's Idle
+  // legs are reserved all-or-nothing: prepared together only if they fit the credit (or nothing is pending, so a
+  // read wider than a lowered credit still progresses) and the SQ; otherwise it stays at the queue head. Retries
   // re-enter through the queue, so they take credit like any other read.
   void refill() {
     Call& c = c_;
     int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
-    while (c.queue_count > 0 && c.pending < c.capacity) {
+    while (c.queue_count > 0) {
       const uint32_t index = queue_[c.queue_head];
       ExtentDesc& d = descs_[index];
-      const int64_t remaining = d.read->length - d.done;
-      const uint64_t tag = (static_cast<uint64_t>(d.generation) << 32) | index;
-      const uint64_t offset = static_cast<uint64_t>(d.read->offset + d.done);
-      // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: the iovecs are rebuilt from
-      // `done`, which a mid-file O_DIRECT short read leaves on a block boundary. The kernel is not holding this
-      // descriptor's iovecs now: it was either never submitted or its completion was reaped.
-      iovec* iov = &iovecs_[static_cast<size_t>(index) * derived().max_iovecs()];
-      const unsigned count = derived().destination(d, iov);
-      const int fd = fds_[d.read->file];
-      // The bounce path keeps IORING_OP_READ (prep_read), the direct path IORING_OP_READV: the default opcodes.
-      const bool prepared_one =
-          Derived::kScatter ? io_.prep_readv(fd, iov, count, offset, tag)
-                            : io_.prep_read(fd, iov[0].iov_base, static_cast<unsigned>(iov[0].iov_len), offset, tag);
-      if (!prepared_one) break;
+      if (d.legs == 0) plan_legs(index);
+      // First attempt: nothing landed and nothing retried (a descriptor is re-queued only by a short or retried leg).
+      const bool fresh = d.done == 0 && d.retries == 0;
+      Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+      unsigned n = 0;
+      for (unsigned l = 0; l < d.legs; ++l)
+        n += legs[l].state == LegState::Idle ? 1u : 0u;
+      if (!(c.pending + n <= c.capacity || c.pending == 0)) break;
+      if constexpr (requires(const Reader& reader) { reader.sq_space(); }) {
+        if (fixed_reads() && io_.sq_space() < n) break;
+      }
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
-      ++c.pending;
-      if (sqe_log_) {
-        sqe_log_->push_back(
-            SqeRecord{
-                d.read->file,
-                d.read->offset + d.done,
-                remaining,
-                static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + d.done});
-      }
-      if (c.trace) {
-        c.trace->submitted_bytes += remaining;
-        if (d.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
-        c.trace->pending_max = std::max<int64_t>(c.trace->pending_max, static_cast<int64_t>(c.pending));
-        if (d.trace_slot >= 0) {
-          if (c.trace->extent_submit[d.trace_slot] == 0) {
-            if (prepared == 0) prepared = stamp(c.trace);
-            c.trace->extent_submit[d.trace_slot] = prepared;
+      d.queued = false;
+      // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: advance_leg trims the leg's
+      // iovecs, which a mid-file O_DIRECT short read leaves on a block boundary.
+      iovec* iov = &iovecs_[static_cast<size_t>(index) * derived().max_iovecs()];
+      const int fd = fds_[d.read->file];
+      for (unsigned l = 0; l < d.legs; ++l) {
+        Leg& g = legs[l];
+        if (g.state != LegState::Idle) continue;
+        if (g.done > 0) advance_leg(iov, g);
+        const int64_t remaining = g.bytes - g.done;
+        const uint64_t tag = make_tag(d.generation, index, l);
+        const uint64_t offset = static_cast<uint64_t>(d.read->offset + g.start + g.done);
+        const iovec* slice = &iov[g.first_iov];
+        bool prepared_one;
+        if constexpr (requires(Reader& reader, const iovec* v, uint64_t at) {
+                        reader.prep_readv_fixed(0, v, 1u, at, 0, at);
+                      }) {
+          if (fixed_reads()) {
+            prepared_one = io_.prep_readv_fixed(fd, slice, g.iov_count, offset, g.buffer, tag);
           } else {
-            ++c.trace->extent_attempts[d.trace_slot];
+            prepared_one = prep_default(fd, slice, g.iov_count, offset, tag);
+          }
+        } else {
+          prepared_one = prep_default(fd, slice, g.iov_count, offset, tag);
+        }
+        // Credit and SQ room were checked for every Idle leg above.
+        if (!prepared_one) throw std::logic_error(error_prefix<Layout>() + "an SQE was refused after it was reserved");
+        g.state = LegState::Inflight;
+        ++d.legs_inflight;
+        ++c.pending;
+        if (sqe_log_) {
+          sqe_log_->push_back(
+              SqeRecord{
+                  d.read->file,
+                  d.read->offset + g.start + g.done,
+                  remaining,
+                  static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + g.start + g.done});
+        }
+        if (c.trace) {
+          c.trace->submitted_bytes += remaining;
+          if (g.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
+          c.trace->pending_max = std::max<int64_t>(c.trace->pending_max, static_cast<int64_t>(c.pending));
+          if (d.trace_slot >= 0) {
+            if (fresh) {
+              if (c.trace->extent_submit[d.trace_slot] == 0) {
+                if (prepared == 0) prepared = stamp(c.trace);
+                c.trace->extent_submit[d.trace_slot] = prepared;
+              }
+            } else {
+              ++c.trace->extent_attempts[d.trace_slot];
+            }
           }
         }
       }
     }
+  }
+
+  // The default opcodes: the bounce path IORING_OP_READ (prep_read; one leg, one iovec), the direct path
+  // IORING_OP_READV (prep_readv).
+  bool prep_default(int fd, const iovec* iov, unsigned count, uint64_t offset, uint64_t tag) {
+    return Derived::kScatter
+               ? io_.prep_readv(fd, iov, count, offset, tag)
+               : io_.prep_read(fd, iov[0].iov_base, static_cast<unsigned>(iov[0].iov_len), offset, tag);
   }
 
   // Submit, wait for a completion only when `ready` is false, then drain the CQ before processing
@@ -887,13 +1065,14 @@ class ReaderCore {
     if (fault_.hold_ordinal >= 0) {
       size_t kept = 0;
       for (size_t k = 0; k < completions_.size(); ++k) {
-        const uint32_t index = static_cast<uint32_t>(completions_[k].data & 0xFFFFFFFFu);
+        const uint32_t index = tag_index(completions_[k].data);
         const bool live = index < descs_.size() && descs_[index].generation != 0 &&
-                          descs_[index].generation == static_cast<uint32_t>(completions_[k].data >> 32);
+                          descs_[index].generation == tag_generation(completions_[k].data);
         if (live &&
             (fault_.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault_.hold_ordinal
                               : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) &&
-            (fault_.sub < 0 || fault_matches_sub(index))) {
+            (fault_.sub < 0 || fault_matches_sub(index)) &&
+            (fault_.leg < 0 || static_cast<int64_t>(tag_leg(completions_[k].data)) == fault_.leg)) {
           held_.push_back(completions_[k]);
         } else {
           completions_[kept++] = completions_[k];
@@ -921,21 +1100,29 @@ class ReaderCore {
 
   void process(const Completion& completion, int64_t returned) {
     Call& c = c_;
-    const uint32_t index = static_cast<uint32_t>(completion.data & 0xFFFFFFFFu);
-    const uint32_t generation = static_cast<uint32_t>(completion.data >> 32);
-    if (index >= descs_.size() || generation == 0 || descs_[index].generation != generation) {
+    const uint32_t index = tag_index(completion.data);
+    const unsigned l = tag_leg(completion.data);
+    const uint32_t generation = tag_generation(completion.data);
+    // Stale unless it names a live descriptor's leg that is in flight: a dead generation, a leg the read does not
+    // have, or a leg already reaped.
+    if (index >= descs_.size() || generation == 0 || descs_[index].generation != generation ||
+        l >= descs_[index].legs || legs_[static_cast<size_t>(index) * kMaxLegs + l].state != LegState::Inflight) {
       ++stale_cqes_;
       c.failed = true;
       return;
     }
     ExtentDesc& d = descs_[index];
+    Leg& g = legs_[static_cast<size_t>(index) * kMaxLegs + l];
+    g.state = LegState::Idle;
+    --d.legs_inflight;
     // A fault's part is the descriptor's part whatever the sub-read count (subs_ is 1 with the flag off).
     const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
+    const bool leg_matches = fault_.leg < 0 || static_cast<int64_t>(l) == fault_.leg;
     int res = completion.res;
     bool eof = false;  // fault (short_is_eof): this completion ends the sub-read
     ++cqes_;
-    if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call) res = -fault_.cqe_error;
-    if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(part) == fault_.part &&
+    if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call && leg_matches) res = -fault_.cqe_error;
+    if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(part) == fault_.part && leg_matches &&
         (fault_.sub < 0 || static_cast<int64_t>(index % subs_) == fault_.sub) &&
         (fault_.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault_.ordinal)) {
       if (fault_.part_error != 0) {
@@ -947,29 +1134,38 @@ class ReaderCore {
         eof = fault_.short_is_eof;
       }
     }
-    // The extent, not the row: two parts of one row complete independently.
+    // The leg, not the row: two parts of one row, and two legs of one read, complete independently.
     if (res == -EINTR || res == -EAGAIN) {
-      if (++d.retries > kMaxRetries) {
+      if (++d.retries > kMaxRetries) {  // the retry budget is the descriptor's
         c.failed = true;
       } else {
-        again_.push_back(index);  // resubmit the same range (M3)
+        requeue(index);  // resubmit the same range (M3)
       }
       return;
     }
-    if (res < 0 || (res == 0 && d.done < d.expected)) {
+    if (res < 0 || (res == 0 && g.done < g.expected)) {
       c.failed = true;
       return;
     }
+    g.done += res;
     d.done += res;
-    if (eof) d.expected = d.done;
+    if (eof) {
+      d.expected -= g.expected - g.done;
+      g.expected = g.done;
+    }
     // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
     // offset + done, bounce + dest + done and length - done stay block-aligned (an
     // extent's offset, dest and length are whole pages) and the resubmit is a legal
-    // direct read of just this extent. At EOF, done == expected: no resubmit.
-    if (d.done < d.expected) {
-      again_.push_back(index);
+    // direct read of just this leg. At EOF, done == expected: no resubmit.
+    if (g.done < g.expected) {
+      requeue(index);
       return;
     }
+    g.state = LegState::Done;
+    if (d.legs_inflight != 0) return;
+    const Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+    for (unsigned k = 0; k < d.legs; ++k)
+      if (legs[k].state != LegState::Done) return;
     retire(index, completion, returned);
   }
 
@@ -984,6 +1180,15 @@ class ReaderCore {
   void retire(uint32_t index, const Completion& completion, int64_t returned) {
     Call& c = c_;
     ExtentDesc& d = descs_[index];
+    if (d.legs_inflight != 0) throw std::logic_error(error_prefix<Layout>() + "an extent retired with a leg in flight");
+    // What the read delivered contiguously from its start: the legs in order, up to the first that ended short (only
+    // the end of file, or the short_is_eof fault, ends a leg short). With one leg this is d.done.
+    int64_t delivered = 0;
+    const Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+    for (unsigned k = 0; k < d.legs; ++k) {
+      delivered += legs[k].done;
+      if (legs[k].done < legs[k].bytes) break;
+    }
     if (c.trace) {
       const size_t drive = file_drive_[d.read->file];
       c.trace->drive_bytes[drive] += d.done;
@@ -991,8 +1196,8 @@ class ReaderCore {
       if (d.trace_slot >= 0) c.trace->extent_cqe[d.trace_slot] = returned;
     }
     const size_t slot = static_cast<size_t>(d.slot);
-    rows_[slot].filled += d.done;
-    if (piece_stream_) land_sub_read(slot, d.sub, d.done, returned);
+    rows_[slot].filled += delivered;
+    if (piece_stream_) land_sub_read(slot, d.sub, delivered, returned);
     --bank_live_[slot / kBounceRows];
     if (fault_.stale_cqe_call > 0 && ++retired_ == fault_.stale_cqe_call) {
       stale_ = completion;
@@ -1138,6 +1343,9 @@ class ReaderCore {
   std::vector<ExtentDesc> descs_;
   std::vector<uint32_t> queue_;  // ring of descriptors waiting for credit; each appears at most once
   std::vector<Completion> completions_;
+  std::vector<Leg> legs_;  // kMaxLegs per descriptor (size_extents)
+  int64_t fixed_cuts_ = 0;   // reads prepared as more than one leg (first attempts), over the reader's life
+  int64_t fanout_sqes_ = 0;  // the SQEs those reads issued (first attempts)
   std::vector<Completion> held_;  // fault: completions withheld from the reader (hold_ordinal)
   std::vector<uint32_t> again_;
   BounceRow rows_[kBounceSlots];

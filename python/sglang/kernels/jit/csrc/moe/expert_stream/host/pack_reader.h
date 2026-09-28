@@ -126,12 +126,11 @@ class PackReader : public ReaderCore<PackReader<Layout, Reader>, Layout, Reader>
     }
   }
 
-  // The memory reads land in, registered with the ring: one region per bounce slot, or the slab rows.
-  std::vector<iovec> registered_regions() const {
-    std::vector<iovec> regions;
-    for (size_t slot = 0; slot < static_cast<size_t>(kBounceSlots); ++slot)
-      regions.push_back({bounce_slot(slot), static_cast<size_t>(t_.slot_bytes)});
-    return regions;
+  // The memory reads land in, registered with the ring: the bounce, one region whose rows are its slots (a read lies
+  // in one slot, so it never straddles two registered chunks).
+  std::vector<RegisteredRegion> registered_regions() const {
+    const size_t slot = static_cast<size_t>(t_.slot_bytes);
+    return {RegisteredRegion{bounce_, static_cast<size_t>(kBounceSlots) * slot, slot}};
   }
 
   size_t max_iovecs() const {

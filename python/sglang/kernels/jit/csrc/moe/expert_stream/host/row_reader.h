@@ -85,8 +85,8 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
 
   void open_workers(cpu_set_t /*inherited*/) {}
 
-  // The memory reads land in, registered with the ring: one region per bounce slot, or the slab rows.
-  std::vector<iovec> registered_regions() const {
+  // The memory reads land in, registered with the ring: one region per named slab, with its row size.
+  std::vector<RegisteredRegion> registered_regions() const {
     return t_.buffer_regions;
   }
 
