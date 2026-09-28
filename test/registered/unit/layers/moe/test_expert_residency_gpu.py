@@ -1245,14 +1245,14 @@ class TestInsertOnMissDirect(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "PREFETCH_PULL_MODE=off"):
                 _manager(_model(), gpu=True, **DIRECT)
 
-        # A plan whose buffers are not the gather's own: the doorbell backend posts one, and then
-        # its thread owns those slots on another stream.
+        # A plan whose buffers are not the gather's own: a backend that posts its own plan buffers
+        # could then write those slots from another stream.
         manager = _manager(_model(), gpu=True, **DIRECT)
         streamer = next(iter(manager.streamers.values()))
         streamer.row_plan = ExpertRowPlan.for_scratch(
             TOP_K, streamer.hot_cache.capacity, TOP_K, streamer.hot_cache.device
         )
-        with self.assertRaisesRegex(ValueError, "DOORBELL_PLAN_CAPACITY"):
+        with self.assertRaisesRegex(ValueError, "gather's own miss plan"):
             manager.gpu_residency.check_miss_plans()
 
         manager = _manager(_model(), gpu=True, **DIRECT)

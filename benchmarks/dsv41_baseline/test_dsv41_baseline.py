@@ -1109,7 +1109,7 @@ def test_server_cores_touch_no_node_1_core():
 def test_server_cores_do_not_overlap_the_driver_or_the_reserved_cores():
     server = _cores(arm_env.SERVER_CORES)
     assert not (server & _cores(arm_env.DRIVER_CORES)), "server and driver share cores"
-    # Core 71 is production's doorbell spin core; 64-71 stay free for every CPU job.
+    # NVMe completion interrupts are pinned to 64-71; they stay free for every CPU job.
     assert not (server & _cores(arm_env.FREE_CORES)), "server touches the reserved cores"
 
 

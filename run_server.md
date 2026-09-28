@@ -496,7 +496,7 @@ Build and runtime
 Cores (not environment variables):
 - The server runs on 0-7,16-17,36-53, all on NUMA node 0.
 - The benchmark driver runs on 8-15.
-- Cores 64-71 are never used; core 71 is production's spin core.
+- Cores 64-71 are never used; NVMe completion interrupts are pinned there.
 
 The hot-cache launcher from earlier (dsv41-direct-live/launch-hot16282.sh) overrides two settings: SGLANG_MOE_HOT_GPU_MB=16282 and --mem-fraction-static 0.89. The arms don't use it.
 ```

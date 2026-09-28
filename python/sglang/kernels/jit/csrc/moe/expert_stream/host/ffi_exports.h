@@ -1121,7 +1121,8 @@ struct HostExports {
   static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
     if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
     if (cpu_core >= 64 && cpu_core <= 71) {
-      throw std::runtime_error(error_prefix<Layout>() + "cores 64-71 are reserved (71 is production's doorbell core)");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "cores 64-71 are reserved (NVMe completion interrupts are pinned there)");
     }
     if (cpu_core < 0) {
       cpu_set_t inherited;
