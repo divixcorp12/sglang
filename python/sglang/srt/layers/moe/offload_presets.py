@@ -10,7 +10,7 @@ argument resolution, before the weight load. ``#N`` refers to a row of
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import msgspec
@@ -58,15 +58,10 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
     prefetch_max_candidates: int | None = None
     # JIT route planner: about 65 fewer bookkeeping kernels per layer, +6.4%.
     expert_fused_plan: bool | None = None
-    # 2 (DIRECT) copies misses straight into victim slots, +4.4% over 1; stage 2 refuses the doorbell.
+    # 2 (DIRECT) copies misses straight into victim slots, +4.4% over 1.
     insert_on_miss_stage: int | None = None
     # MTP draft experts FP8 to NVFP4 at load: draft 2.46 to 1.45 GB (#30). No effect without such a draft.
     draft_moe_nvfp4_requant: bool | None = None
-    # Side-thread copier that starts a miss copy before the graph reaches it.
-    expert_doorbell: bool | None = None
-    expert_doorbell_mode: str | None = None
-    # The spin thread's core; must be in the process's allowed CPUs or it runs unpinned.
-    expert_doorbell_cpu: int | None = None
 
 
 ENV_NAMES: dict[str, str] = {
@@ -92,9 +87,6 @@ ENV_NAMES: dict[str, str] = {
     "expert_fused_plan": "SGLANG_MOE_EXPERT_FUSED_PLAN",
     "insert_on_miss_stage": "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE",
     "draft_moe_nvfp4_requant": "SGLANG_ENABLE_DRAFT_MOE_NVFP4_REQUANT",
-    "expert_doorbell": "SGLANG_MOE_EXPERT_DOORBELL",
-    "expert_doorbell_mode": "SGLANG_MOE_EXPERT_DOORBELL_MODE",
-    "expert_doorbell_cpu": "SGLANG_MOE_EXPERT_DOORBELL_CPU",
 }
 OFFLOAD_ENV_NAMES: tuple[str, ...] = tuple(ENV_NAMES.values())
 
@@ -131,22 +123,9 @@ GRAPH_GATHER_PRESET = MoeOffloadPreset(
     draft_moe_nvfp4_requant=True,
 )
 
-# Experimental and unmeasured on this stack. The side-thread doorbell copier on the
-# graph-gather base, with insert-on-miss stage 1 because stage 2 refuses it. The doorbell
-# requires overlap scheduling off (set automatically), no speculative decoding, no TP, PP,
-# DP or DP attention, and its spin core (71) in the process's allowed CPUs.
-DOORBELL_PRESET = MoeOffloadPreset(
-    **_SHARED,
-    insert_on_miss_stage=1,
-    expert_doorbell=True,
-    expert_doorbell_mode="current",
-    expert_doorbell_cpu=71,
-)
-
 PRESETS: dict[str, MoeOffloadPreset | None] = {
     "off": None,
     "graph-gather": GRAPH_GATHER_PRESET,
-    "doorbell": DOORBELL_PRESET,
 }
 
 
@@ -233,8 +212,6 @@ def needs_overlap_off(values: Mapping[str, str], *, nvfp4_hot_cache: bool) -> bo
     known yet); other formats declare their own hot-cache rules in
     ``expert_stream_requirements``.
     """
-    if _value(values, "SGLANG_MOE_EXPERT_DOORBELL"):
-        return True
     # The NVFP4 requirements (expert_stream_requirements._check_nvfp4) enforce the same rule.
     return nvfp4_hot_cache and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0 and not (
         _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER") and _residency_update(values)
@@ -251,16 +228,10 @@ def check_offload_config(
     pp_size: int,
     dp_size: int,
     dp_attention: bool,
-    allowed_cpus: Collection[int],
     nvfp4_hot_cache: bool,
 ) -> None:
     """Refuse combinations that would otherwise fail after the weight load, or silently.
 
-    ``allowed_cpus`` is the launcher process's cpuset; the doorbell spin thread
-    actually runs in the spawned scheduler, which can narrow its own cpuset
-    later (numactl wrap, SGLANG_SET_CPU_AFFINITY, numa_bind_to_node). Passing
-    this check is necessary, not sufficient: the scheduler can still end up
-    unpinned even when the launcher's cpuset includes the configured core.
     ``nvfp4_hot_cache`` is as in ``needs_overlap_off``.
     """
     if (
@@ -276,28 +247,3 @@ def check_offload_config(
         )
     if _residency_update(values) and (decode_max_bs or 0) > 1:
         raise ValueError("SGLANG_MOE_GPU_RESIDENCY_UPDATE=1 requires --cuda-graph-max-bs-decode 1")
-    if not _value(values, "SGLANG_MOE_EXPERT_DOORBELL"):
-        return
-    if speculative:
-        raise ValueError(
-            "SGLANG_MOE_EXPERT_DOORBELL cannot run with speculative decoding; drop "
-            "--speculative-algorithm or use --moe-offload-preset graph-gather"
-        )
-    if tp_size > 1 or pp_size > 1 or dp_size > 1 or dp_attention:
-        raise ValueError(
-            "SGLANG_MOE_EXPERT_DOORBELL runs one spin thread on one core and cannot run "
-            "with tensor, pipeline or data parallelism, or DP attention"
-        )
-    if _value(values, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE") == 2:
-        raise ValueError(
-            "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 cannot run with SGLANG_MOE_EXPERT_DOORBELL: "
-            "the doorbell thread can write a slot after stage 2 has committed it"
-        )
-    cpu = _value(values, "SGLANG_MOE_EXPERT_DOORBELL_CPU")
-    if cpu not in allowed_cpus:
-        raise ValueError(
-            f"SGLANG_MOE_EXPERT_DOORBELL_CPU={cpu} is outside the launcher's allowed CPUs "
-            f"({min(allowed_cpus)}-{max(allowed_cpus)}); set it to an allowed core. This "
-            "does not guarantee the scheduler process keeps that core: it can narrow its "
-            "own cpuset further after this check runs."
-        )

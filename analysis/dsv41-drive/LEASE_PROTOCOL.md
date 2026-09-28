@@ -561,6 +561,13 @@ with a release store, and only then the lease release.
 `ld.acquire.sys.global.u64` and `st.release.sys.global.u64`. No other primitives are
 introduced.
 
+**2026-09-27:** every concurrent device access in `expert_stream/*.cuh` now goes through a named helper in
+`lease_device.cuh`: `ld_relaxed_sys<T>` / `st_relaxed_sys<T>` (a volatile access, i.e. relaxed at system scope),
+`ld_acquire_sys{,64}` / `st_release_sys{,64}`, and `ld_relaxed_gpu`. `ld_volatile` is gone. The SASS is
+unchanged. `cuda::atomic_ref` was tried and rejected. Under CUDA 13.4's libcu++, every access through a
+`__grid_constant__` parameter gains a run-time local-pointer check with a byte-copy fallback, and adjacent relaxed
+accesses are merged and reordered.
+
 ### 6.3 Device-side publication order
 
 *Post kernel* (`exl3_ram_miss_post_kernel`), for a request with `count > 0` **[P]**:
@@ -578,6 +585,12 @@ thread, so the second fence before it (and the one before `demand_head`) added n
 was removed on 2026-09-24. The post now pays three `membar.sys` (record, hot page,
 `LaneRequest` invalidates) where it paid seven; four with advisories on (the advisory
 record's invalidate). Cost per fence still unmeasured **[OPEN 5]**.
+
+**2026-09-27:** the three invalidating fences are now `atomic_thread_fence(release, system)` and the device
+readers' fences in `lane_result_valid` and stage 1 are `atomic_thread_fence(acquire, system)`: Boehm's seqlock
+halves, each paired with a host side of the other half (`read_record`, `read_gpu_hot`, `read_lane_request`;
+`grant_lane_group_locked`). On sm_120 this is `MEMBAR.SC.SYS` -> `MEMBAR.ALL.SYS`. The SmAck publish keeps
+`__threadfence_system()`. The saving is still unmeasured **[OPEN 5]**.
 
 *Wait kernel*, described in section 7.3. *Acknowledgement kernel*, section 7.4.
 
@@ -1352,6 +1365,11 @@ its late `ready` is harmless because `go_count` is 0.
 ---
 
 ## 14. Shutdown and quarantine
+
+> **Removed on 2026-09-27** (`8ac64c9c99`, branch `doorbell-removal`): the doorbell side-thread copier, its
+> `SGLANG_MOE_EXPERT_DOORBELL*` variables and `--moe-offload-preset doorbell` no longer exist. A set variable only
+> warns at startup, and `Scheduler.release_host_resources` no longer calls a doorbell stop. The per-batch fail-stop
+> hook is now `ExpertHotCacheManager.run_fail_stop_checks`. The text below is kept as history.
 
 Requirement from the plan: "stop admission, drain storage/packing, then establish
 completion of all GPU readers before freeing their memory. If a CUDA error prevents
@@ -2548,6 +2566,11 @@ read (established by reading, not demonstrated).
 pipe cannot block the child, and the timeout bounds a hang. Neither was tested by making the child chatty.
 
 ### 20.2i PROPOSAL (not implemented): placement of the orderly shutdown call in `Scheduler.release_host_resources()`
+
+> **Removed on 2026-09-27** (`8ac64c9c99`, branch `doorbell-removal`): the doorbell side-thread copier, its
+> `SGLANG_MOE_EXPERT_DOORBELL*` variables and `--moe-offload-preset doorbell` no longer exist. A set variable only
+> warns at startup, and `Scheduler.release_host_resources` no longer calls a doorbell stop. The per-batch fail-stop
+> hook is now `ExpertHotCacheManager.run_fail_stop_checks`. The text below is kept as history.
 
 Read first: `.claude/skills/large-class-style/SKILL.md`. Its frozen list is `model_runner.py` only; `scheduler.py` is
 covered for `__init__` (section 2), and this change is not in `__init__`. Section 1.3's test is still the right one

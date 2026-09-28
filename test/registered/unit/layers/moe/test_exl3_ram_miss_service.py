@@ -206,7 +206,7 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
         has_spec_only_tensors=True, _graph_source_rows=source, _graph_miss_count=count,
         row_plan=SimpleNamespace(expert_ids=source, count=count), row_backend=backend,
     )
-    # OFF/SCRATCH and a doorbell configuration retain the original EXL3 GPU
+    # OFF/SCRATCH retain the original EXL3 GPU
     # update rejection. Only the DIRECT caller opts into pinned-tier support.
     for stage in (0, 1):
         with pytest.raises(ValueError, match="does not support graph gather"):

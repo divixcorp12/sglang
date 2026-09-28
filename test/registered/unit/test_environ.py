@@ -13,6 +13,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
+DOORBELL_ENVS = (
+    "SGLANG_MOE_EXPERT_DOORBELL",
+    "SGLANG_MOE_EXPERT_DOORBELL_CPU",
+    "SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS",
+    "SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS",
+    "SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS",
+    "SGLANG_MOE_EXPERT_DOORBELL_MODE",
+    "SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S",
+    "SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY",
+)
+
 
 class TestEnvField(unittest.TestCase):
     def setUp(self):
@@ -175,6 +186,30 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DEPRECATED_ENVS[old_name])
         self.assertEqual(envs.SGLANG_REQ_WAITING_TIMEOUT.get(), 1.5)
+
+    def test_the_doorbell_envs_warn_that_the_copier_was_removed(self):
+        for old_name in DOORBELL_ENVS:
+            with self.subTest(old_name=old_name):
+                os.environ[old_name] = "1"
+                self.addCleanup(os.environ.pop, old_name, None)
+                caught = self._apply(old_name, _DEPRECATED_ENVS[old_name])
+                self.assertTrue(caught, old_name)
+                message = str(caught[0].message)
+                self.assertIn(f"{old_name} is deprecated", message)
+                self.assertIn("doorbell side-thread expert copier was removed", message)
+                self.assertIsNone(_DEPRECATED_ENVS[old_name].replacement)
+                self.assertFalse(hasattr(envs, old_name))
+
+    def test_a_pinned_off_doorbell_env_warns_when_sglang_starts_and_nothing_fails(self):
+        # Production launches pin it to 0 today: they must start, and learn the variable is gone.
+        env = {**os.environ, "SGLANG_MOE_EXPERT_DOORBELL": "0"}
+        result = subprocess.run(
+            [sys.executable, "-W", "always", "-c", "import sglang.srt.environ"],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertIn(
+            "Environment variable SGLANG_MOE_EXPERT_DOORBELL is deprecated", result.stderr
+        )
 
 
 if __name__ == "__main__":
