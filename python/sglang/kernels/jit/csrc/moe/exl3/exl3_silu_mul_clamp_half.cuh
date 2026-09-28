@@ -1,3 +1,9 @@
+// REQUIRED BUILD FLAG: -use_fast_math. silu_and_mul (deepseek_v4/silu_and_mul_masked_post_quant.cuh) must compile
+// to the same instructions as in silu_and_mul_clamp's module, which builds with it; bit parity depends on that.
+// Part of the EXL3 decode cast fusion (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION): it keeps each rounding of the unfused
+// chain, in the same order, and only drops the round trips through memory.
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -6,24 +12,20 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "../../deepseek_v4/silu_and_mul_masked_post_quant.cuh"
+#include "../expert_stream/tensor_checks.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#include "../deepseek_v4/silu_and_mul_masked_post_quant.cuh"
-
-// Kernels of the DSV4.1 EXL3 decode cast fusion (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION). exl3_gemm reads and writes
-// fp16 while the model runs in bf16, so every EXL3 linear sits between two casts. These kernels keep each rounding
-// of the unfused chain, in the same order, and only drop the round trips through memory.
-
-namespace sglang {
+namespace sglang::exl3 {
 
 // The shared expert's y.to(bf16) -> silu_mul_clamp -> x.to(fp16): gate_up [rows, 2 * inter] fp16 in, the down
 // projection's fp16 input [rows, inter] out. Built with the same -use_fast_math as silu_mul_clamp_kernel, whose
 // silu_and_mul it calls, so the activation is computed by the same instructions.
 template <bool kUsePDL>
-__global__ __launch_bounds__(1024, 2) void exl3_silu_mul_clamp_half_kernel(
-    const SiluAndMulClampParams __grid_constant__ params) {
+__global__
+__launch_bounds__(1024, 2) void exl3_silu_mul_clamp_half_kernel(const SiluAndMulClampParams __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<fp16x2_t, 4>;
   const auto row = blockIdx.x / params.blocks_per_row;
@@ -49,6 +51,11 @@ __global__ __launch_bounds__(1024, 2) void exl3_silu_mul_clamp_half_kernel(
   PDLTriggerSecondary<kUsePDL>();
 }
 
+/// \brief Checked launcher for `exl3_silu_mul_clamp_half_kernel`: the shared expert's fp16 gate_up to the down
+/// projection's fp16 input, through bf16 silu_mul_clamp.
+///
+/// `input` is [rows, 2 * inter] fp16 and `output` [rows, inter] fp16, both CUDA tensors on one device; `inter` must be
+/// a positive multiple of 8.
 template <bool kUsePDL>
 void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView output, double swiglu_limit) {
   using namespace host;
@@ -56,9 +63,9 @@ void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView o
   auto M = SymbolicSize{"rows"};
   auto D = SymbolicSize{"gate_up_dim"};
   auto H = SymbolicSize{"inter"};
-  device.set_options<kDLCUDA>();
-  TensorMatcher({M, D}).with_dtype<fp16_t>().with_device(device).verify(input);
-  TensorMatcher({M, H}).with_dtype<fp16_t>().with_device(device).verify(output);
+  expert_stream::verify_named("input", TensorMatcher({M, D}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), input);
+  expert_stream::verify_named(
+      "output", TensorMatcher({M, H}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), output);
   RuntimeCheck(D.unwrap() == 2 * H.unwrap(), "gate_up must be twice as wide as the output");
   const auto inter = static_cast<uint32_t>(H.unwrap());
   RuntimeCheck(inter > 0 && inter % 8 == 0, "inter must be a positive multiple of 8");
@@ -76,35 +83,4 @@ void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView o
       .enable_pdl(kUsePDL)(exl3_silu_mul_clamp_half_kernel<kUsePDL>, params);
 }
 
-// Exl3MoEMethod's out.to(bf16) * routed_scaling_factor on the fused MoE's fp32 output. The factor is the float
-// torch's mul uses for a Python scalar on a bf16 tensor; this kernel must not be built with fast math, which would
-// flush the subnormal products torch keeps.
-__global__ void exl3_scale_to_bf16_kernel(
-    const float* __restrict__ input, __nv_bfloat16* __restrict__ output, int64_t n, float factor) {
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < n) {
-    output[i] = __float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(input[i])) * factor);
-  }
-}
-
-void exl3_scale_to_bf16(tvm::ffi::TensorView input, tvm::ffi::TensorView output, double factor) {
-  using namespace host;
-  auto device = SymbolicDevice{};
-  auto N = SymbolicSize{"n"};
-  device.set_options<kDLCUDA>();
-  TensorMatcher({N}).with_dtype<fp32_t>().with_device(device).verify(input);
-  TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(output);
-  const int64_t n = N.unwrap();
-  if (n == 0) {
-    return;
-  }
-  constexpr int kThreads = 256;
-  LaunchKernel(static_cast<uint32_t>(div_ceil(n, static_cast<int64_t>(kThreads))), kThreads, device.unwrap())(
-      exl3_scale_to_bf16_kernel,
-      static_cast<const float*>(input.data_ptr()),
-      static_cast<__nv_bfloat16*>(output.data_ptr()),
-      n,
-      static_cast<float>(factor));
-}
-
-}  // namespace sglang
+}  // namespace sglang::exl3

@@ -1,0 +1,23 @@
+{
+ "base": "f176e4d8dfe4b7da510cda2bf34c2abc9515169b",
+ "sources": [
+  "python/sglang/kernels/jit/csrc/moe/dsv41_cast_fusion.cuh"
+ ],
+ "files": {
+  "python/sglang/kernels/jit/csrc/moe/exl3/exl3_silu_mul_clamp_half.cuh": [
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_cast_fusion.cuh",
+    16,
+    73
+   ]
+  ],
+  "python/sglang/kernels/jit/csrc/moe/exl3/exl3_scale_to_bf16.cuh": [
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_cast_fusion.cuh",
+    74,
+    104
+   ]
+  ],
+  "python/sglang/kernels/jit/csrc/moe/dsv41_cast_fusion.cuh": []
+ }
+}
