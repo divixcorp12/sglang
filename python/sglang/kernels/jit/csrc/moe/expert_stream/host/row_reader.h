@@ -88,13 +88,13 @@ class RowReader {
     pack_split_ = split > 0 ? static_cast<unsigned>(split) : pack_workers_;
   }
   unsigned pack_workers() const {
-    return pack_workers_;
+    return t_.images ? row_pack_workers() : pack_pack_workers();
   }
   unsigned pack_split() const {
-    return pack_split_;
+    return t_.images ? row_pack_split() : pack_pack_split();
   }
   std::vector<int> packing_cpus() const {
-    return pool_ ? pool_->cpus() : std::vector<int>{};
+    return t_.images ? row_packing_cpus() : pack_packing_cpus();
   }
 
   // Piece streaming (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting, packing and
@@ -104,9 +104,7 @@ class RowReader {
   // its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
-      if (pack_workers_ == 0 && !t_.images) {
-        throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
-      }
+      check_piece_stream_support();
       if (t_.parts > kPieces) {
         throw std::runtime_error(
             error_prefix<Layout>() + "piece streaming reads at most " + std::to_string(kPieces) +
@@ -126,7 +124,7 @@ class RowReader {
     subs_ = on ? kSubReads : 1;
     if (io_.ready() && !size_extents())
       throw std::runtime_error(error_prefix<Layout>() + "too many descriptors for piece streaming");
-    if (pool_) size_jobs();
+    on_piece_stream_set();
   }
   bool piece_stream() const {
     return piece_stream_;
@@ -159,18 +157,7 @@ class RowReader {
   }
   // Copies a worker still holds. read() leaves none: this is what a test checks after it returns.
   int64_t unfinished_jobs() const {
-    int64_t open_jobs = 0;
-    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
-      if (piece_stream_) {
-        const uint8_t held = rows_[s].dispatched & static_cast<uint8_t>(~rows_[s].published);
-        for (int j = 0; j < kPieces; ++j) {
-          if ((held >> j & 1u) && !jobs_[s * kPieces + static_cast<size_t>(j)].done()) ++open_jobs;
-        }
-        continue;
-      }
-      if (rows_[s].state == RowState::Packing && !jobs_[s].done()) ++open_jobs;
-    }
-    return open_jobs;
+    return t_.images ? row_unfinished_jobs() : pack_unfinished_jobs();
   }
 
   void set_fault(const ReadFault& fault) {
@@ -237,25 +224,13 @@ class RowReader {
       const size_t slot = std::min<size_t>(drive, kMaxDrives - 1);
       drive_dev_[slot] = drive < kMaxDrives ? devs_[drive] : -1;
     }
-    if (t_.images) {
-      check_image_alignment();
-    } else if (
-        posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) !=
-        0) {
-      bounce_ = nullptr;
-      return false;
-    }
+    if (!open_memory()) return false;
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
     if constexpr (requires(Reader& reader, const std::vector<int>& files, const std::vector<iovec>& buffers) {
                     reader.configure_resources(files, buffers, true);
                   }) {
-      std::vector<iovec> regions = t_.images ? t_.buffer_regions : std::vector<iovec>{};
-      if (!t_.images) {
-        for (size_t slot = 0; slot < static_cast<size_t>(kBounceSlots); ++slot)
-          regions.push_back({bounce_slot(slot), static_cast<size_t>(t_.slot_bytes)});
-      }
-      io_.configure_resources(fds_, regions, direct_);
+      io_.configure_resources(fds_, registered_regions(), direct_);
     }
     cpu_set_t inherited;
     CPU_ZERO(&inherited);
@@ -271,20 +246,7 @@ class RowReader {
       }
       owner_pinned_ = true;
     }
-    if (piece_stream_ && pack_workers_ == 0 && !t_.images) {
-      throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
-    }
-    if (pack_workers_ > 0) {
-      // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
-      runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
-      pool_ = std::make_unique<PackPool>(
-          pack_workers_,
-          inherited,
-          static_cast<size_t>(kBounceSlots),
-          error_prefix<Layout>(),
-          std::string(Layout::kName) + "-pack");
-      if (piece_stream_) size_jobs();
-    }
+    open_workers(inherited);
     return true;
   }
 
@@ -346,8 +308,8 @@ class RowReader {
     if (packed) packed->assign(c.total, 0);
     if (trace) {
       trace->rows_asked = static_cast<int64_t>(c.total);
-      trace->pack_workers = pack_workers_;
-      trace->pack_split = pack_split_;
+      trace->pack_workers = pack_workers();
+      trace->pack_split = pack_split();
       trace->piece_stream = piece_stream_ ? 1 : 0;
     }
     reset_pipeline();
@@ -382,7 +344,7 @@ class RowReader {
           next_progress_ns = now + kProgressIntervalNs;
         }
       }
-      collect_packed();  // before admit: a bank whose last copy just finished is free for the next batch
+      collect();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
       if (!c.failed) refill();
       if (c.failed) break;
@@ -395,7 +357,7 @@ class RowReader {
       if (c.pending > 0 || (!ready && c.packing == 0 && !held_.empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
       // (The hold_until_probe_ms fault keeps direct-mode pieces vetted but unpublished with nothing to wait on.)
-      if (!pack_one() && (c.packing > 0 || c.hold_until != 0)) _mm_pause();
+      if (!advance() && (c.packing > 0 || c.hold_until != 0)) _mm_pause();
     }
     // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
     // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
@@ -455,7 +417,7 @@ class RowReader {
     size_t ordinal = 0;  // the row's index in the request
     unsigned extents_left = 0;
     // Coverage, checked before the row is packed. `needed` is the last byte of the slot the segments
-    // can read; `filled` is what the drives actually delivered into it. See pack_one().
+    // can read; `filled` is what the drives actually delivered into it. See take_ready_row().
     int64_t needed = 0;
     int64_t filled = 0;
     // Piece streaming only (zero otherwise): the row's sub-reads by ordinal and its pieces. A piece is vetted once
@@ -528,6 +490,156 @@ class RowReader {
     return bounce_ + slot * static_cast<size_t>(t_.slot_bytes);
   }
 
+  // Path hooks. Every place the bounce path (pack_*) and the direct path (row_*, Tables::images) differ is one of
+  // these; the shared pipeline calls only the dispatchers below.
+  void check_piece_stream_support() const {
+    t_.images ? row_check_piece_stream_support() : pack_check_piece_stream_support();
+  }
+  void on_piece_stream_set() {
+    t_.images ? row_on_piece_stream_set() : pack_on_piece_stream_set();
+  }
+  bool open_memory() {
+    return t_.images ? row_open_memory() : pack_open_memory();
+  }
+  void open_workers(cpu_set_t inherited) {
+    t_.images ? row_open_workers(inherited) : pack_open_workers(inherited);
+  }
+  std::vector<iovec> registered_regions() const {
+    return t_.images ? row_registered_regions() : pack_registered_regions();
+  }
+  size_t max_iovecs() const {
+    return t_.images ? row_max_iovecs() : pack_max_iovecs();
+  }
+  unsigned destination(const ExtentDesc& d, iovec* out) const {
+    return t_.images ? row_destination(d, out) : pack_destination(d, out);
+  }
+  bool advance() {
+    return t_.images ? row_advance() : pack_advance();
+  }
+  void collect() {
+    t_.images ? row_collect() : pack_collect();
+  }
+  void quiesce() {
+    t_.images ? row_quiesce() : pack_quiesce();
+  }
+  void poison_slot(size_t slot, uint8_t fill) {
+    t_.images ? row_poison_slot(slot, fill) : pack_poison_slot(slot, fill);
+  }
+  void after_finish(size_t slot) {
+    t_.images ? row_after_finish(slot) : pack_after_finish(slot);
+  }
+
+  // Piece streaming publishes from the owner once a job is done, so the bounce path needs packing workers.
+  void pack_check_piece_stream_support() const {
+    if (pack_workers_ == 0) {
+      throw std::runtime_error(error_prefix<Layout>() + "piece streaming needs packing workers");
+    }
+  }
+  // Direct mode publishes each piece as it is vetted (publish_landed): no workers needed.
+  void row_check_piece_stream_support() const {}
+
+  void pack_on_piece_stream_set() {
+    if (pool_) size_jobs();
+  }
+  void row_on_piece_stream_set() {}
+
+  // The bounce: kBounceSlots page-aligned row supersets.
+  bool pack_open_memory() {
+    if (posix_memalign(reinterpret_cast<void**>(&bounce_), kPage, static_cast<size_t>(kBounceSlots * t_.slot_bytes)) !=
+        0) {
+      bounce_ = nullptr;
+      return false;
+    }
+    return true;
+  }
+  // Direct mode: no bounce; the drive writes the slab rows, so their alignment is checked instead.
+  bool row_open_memory() {
+    check_image_alignment();
+    return true;
+  }
+
+  void pack_open_workers(cpu_set_t inherited) {
+    if (piece_stream_) check_piece_stream_support();
+    if (pack_workers_ > 0) {
+      // Every buffer the workers use is sized here too: a job and a run list per bounce slot.
+      runs_.assign(static_cast<size_t>(kBounceSlots) * t_.segments.size(), CopyRun{});
+      pool_ = std::make_unique<PackPool>(
+          pack_workers_,
+          inherited,
+          static_cast<size_t>(kBounceSlots),
+          error_prefix<Layout>(),
+          std::string(Layout::kName) + "-pack");
+      if (piece_stream_) size_jobs();
+    }
+  }
+  void row_open_workers(cpu_set_t /*inherited*/) {}
+
+  // The memory reads land in, registered with the ring: one region per bounce slot, or the slab rows.
+  std::vector<iovec> pack_registered_regions() const {
+    std::vector<iovec> regions;
+    for (size_t slot = 0; slot < static_cast<size_t>(kBounceSlots); ++slot)
+      regions.push_back({bounce_slot(slot), static_cast<size_t>(t_.slot_bytes)});
+    return regions;
+  }
+  std::vector<iovec> row_registered_regions() const {
+    return t_.buffer_regions;
+  }
+
+  size_t pack_max_iovecs() const {
+    return 1;
+  }
+  size_t row_max_iovecs() const {
+    return t_.segments.size();
+  }
+
+  // Where descriptor `d`'s remaining bytes land, as iovecs in `out` (max_iovecs of them). Returns how many.
+  unsigned pack_destination(const ExtentDesc& d, iovec* out) const {
+    out[0] = {bounce_slot(d.slot) + d.read->dest + d.done, size_t(d.read->length - d.done)};
+    return 1;
+  }
+  unsigned row_destination(const ExtentDesc& d, iovec* out) const {
+    return image_iovecs(size_t(d.slot), d.read->dest + d.done, d.read->dest + d.read->length, out);
+  }
+
+  int64_t pack_unfinished_jobs() const {
+    int64_t open_jobs = 0;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      if (piece_stream_) {
+        const uint8_t held = rows_[s].dispatched & static_cast<uint8_t>(~rows_[s].published);
+        for (int j = 0; j < kPieces; ++j) {
+          if ((held >> j & 1u) && !jobs_[s * kPieces + static_cast<size_t>(j)].done()) ++open_jobs;
+        }
+        continue;
+      }
+      if (rows_[s].state == RowState::Packing && !jobs_[s].done()) ++open_jobs;
+    }
+    return open_jobs;
+  }
+  int64_t row_unfinished_jobs() const {
+    return 0;
+  }
+
+  unsigned pack_pack_workers() const {
+    return pack_workers_;
+  }
+  unsigned row_pack_workers() const {
+    return 0;
+  }
+  // Direct mode keeps the split set_pack stored (traced as given), though nothing is cut by it.
+  unsigned pack_pack_split() const {
+    return pack_split_;
+  }
+  unsigned row_pack_split() const {
+    return pack_split_;
+  }
+
+  std::vector<int> pack_packing_cpus() const {
+    return pool_ ? pool_->cpus() : std::vector<int>{};
+  }
+  std::vector<int> row_packing_cpus() const {
+    return {};
+  }
+
   // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part, sub-read), a queue
   // that can hold each descriptor once (an extent waits in it at most once at a time), and completion
   // and resubmission lists bounded by the same count. With piece streaming off there is one sub-read per part,
@@ -545,9 +657,10 @@ class RowReader {
     held_.reserve(extents);
     again_.reserve(extents);
     sub_reads_.assign(piece_stream_ ? extents : 0, Read{});
-    // Direct mode: each descriptor's iovecs, rebuilt from its `done` whenever it is prepared (image_iovecs). A read
-    // lies inside the image and the segments tile it, so it touches at most one run per segment.
-    iovecs_.assign(t_.images ? extents * t_.segments.size() : 0, iovec{});
+    // Each descriptor's iovecs (max_iovecs), rebuilt from its `done` whenever it is prepared (destination). Direct
+    // mode: a read lies inside the image and the segments tile it, so it touches at most one run per segment
+    // (image_iovecs). The bounce path: one, the read's span of its bounce slot.
+    iovecs_.assign(extents * max_iovecs(), iovec{});
     piece_runs_.assign(
         piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
     return true;
@@ -855,23 +968,16 @@ class RowReader {
       const int64_t remaining = d.read->length - d.done;
       const uint64_t tag = (static_cast<uint64_t>(d.generation) << 32) | index;
       const uint64_t offset = static_cast<uint64_t>(d.read->offset + d.done);
-      bool prepared_one;
-      if (t_.images) {
-        // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: the iovecs are rebuilt from
-        // `done`, which a mid-file O_DIRECT short read leaves on a block boundary. The kernel is not holding this
-        // descriptor's iovecs now: it was either never submitted or its completion was reaped.
-        iovec* iov = &iovecs_[static_cast<size_t>(index) * t_.segments.size()];
-        const unsigned count =
-            image_iovecs(static_cast<size_t>(d.slot), d.read->dest + d.done, d.read->dest + d.read->length, iov);
-        prepared_one = io_.prep_readv(fds_[d.read->file], iov, count, offset, tag);
-      } else {
-        prepared_one = io_.prep_read(
-            fds_[d.read->file],
-            bounce_slot(static_cast<size_t>(d.slot)) + d.read->dest + d.done,
-            static_cast<unsigned>(remaining),
-            offset,
-            tag);
-      }
+      // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: the iovecs are rebuilt from
+      // `done`, which a mid-file O_DIRECT short read leaves on a block boundary. The kernel is not holding this
+      // descriptor's iovecs now: it was either never submitted or its completion was reaped.
+      iovec* iov = &iovecs_[static_cast<size_t>(index) * max_iovecs()];
+      const unsigned count = destination(d, iov);
+      const int fd = fds_[d.read->file];
+      // The bounce path keeps IORING_OP_READ (prep_read), the direct path IORING_OP_READV: the default opcodes.
+      const bool prepared_one =
+          t_.images ? io_.prep_readv(fd, iov, count, offset, tag)
+                    : io_.prep_read(fd, iov[0].iov_base, static_cast<unsigned>(iov[0].iov_len), offset, tag);
       if (!prepared_one) break;
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
@@ -1096,8 +1202,7 @@ class RowReader {
   // Pack ONE complete row inline, the earliest in request order among those ready. One row per loop turn
   // keeps packing bounded: the loop refills and reaps between rows. With a packing pool, every ready row
   // is handed to the workers instead, and the loop finishes each one when its copy is done.
-  bool pack_one() {
-    if (t_.images) return publish_landed();
+  bool pack_advance() {
     if (pool_) return piece_stream_ ? dispatch_ready_pieces() : dispatch_ready_rows();
     const size_t best = take_ready_row();
     if (best == static_cast<size_t>(kBounceSlots)) return false;
@@ -1117,6 +1222,11 @@ class RowReader {
     }
     finish_row(best, start, stamp(c.trace));
     return true;
+  }
+
+  // Direct mode's turn of work: publish what has landed (publish_landed).
+  bool row_advance() {
+    return publish_landed();
   }
 
   // Direct mode's "packing": nothing to copy, the drive already wrote the slab rows. Without piece streaming, finish
@@ -1194,11 +1304,10 @@ class RowReader {
 
   // The poison fault: fill the memory the row in `slot` is read into, the bounce slot or (direct mode) the
   // destination slab rows, so a byte published without having been read shows.
-  void poison_slot(size_t slot, uint8_t fill) {
-    if (!t_.images) {
-      std::memset(bounce_slot(slot), fill, static_cast<size_t>(t_.slot_bytes));
-      return;
-    }
+  void pack_poison_slot(size_t slot, uint8_t fill) {
+    std::memset(bounce_slot(slot), fill, static_cast<size_t>(t_.slot_bytes));
+  }
+  void row_poison_slot(size_t slot, uint8_t fill) {
     const Call& c = c_;
     const int64_t dest = (*c.slots)[rows_[slot].ordinal];
     for (size_t name = 0; name < t_.slabs[c.layer].size(); ++name) {
@@ -1395,7 +1504,7 @@ class RowReader {
 
   // Finish every row whose copy the workers have completed: the bank's packing reference is released
   // here, on the owner, and only after its job reads done.
-  void collect_packed() {
+  void pack_collect() {
     Call& c = c_;
     if (piece_stream_) return collect_pieces();
     if (c.packing == 0) return;
@@ -1407,11 +1516,23 @@ class RowReader {
     }
   }
 
+  // Direct mode: no piece is ever held by a job (publish_landed publishes on dispatch), so the only collecting left
+  // is, with piece streaming, finishing each row whose pieces are all published once its last sub-read retires.
+  void row_collect() {
+    if (!piece_stream_) return;
+    for (size_t s = 0; s < static_cast<size_t>(kBounceSlots); ++s) {
+      BounceRow& r = rows_[s];
+      if (r.state == RowState::Ready && r.published == kAllPieces) {
+        finish_row(s, r.pack_first == INT64_MAX ? 0 : r.pack_first, r.pack_last);
+      }
+    }
+  }
+
   // Wait for every copy the workers still hold, and finish those rows like any other: they were copied
   // whole, and the accounting says so. On a failure the caller still releases every slot; this
   // guarantees nothing writes into them, or reads the bounce, afterwards.
   // With piece streaming every piece job is waited for, then collected and published like any other.
-  void quiesce() {
+  void pack_quiesce() {
     Call& c = c_;
     if (c.packing == 0) return;
     for (size_t s = 0; s < static_cast<size_t>(kBounceSlots) && piece_stream_; ++s) {
@@ -1428,8 +1549,10 @@ class RowReader {
       while (!jobs_[s].done())
         _mm_pause();
     }
-    collect_packed();
+    collect();
   }
+  // Direct mode holds no copies: with images c.packing is always 0, so the old body returned at once.
+  void row_quiesce() {}
 
   // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank
   // held on this slot: only now may it be reused.
@@ -1451,11 +1574,17 @@ class RowReader {
       c.trace->pack_ns += end - start;
     }
     if (c.packed) (*c.packed)[ordinal] = 1;
-    // Direct mode: the bytes are the slot's own now, and the caller publishes them.
-    if (fault_.poison && !t_.images) poison_slot(best, kPoisonFill ^ 0xFF);
+    after_finish(best);
     rows_[best] = BounceRow{};
     --rows_busy_[best / kBounceRows];
   }
+
+  // The poison fault re-fills a finished row's bounce slot, so a later row that reuses it without reading shows.
+  void pack_after_finish(size_t slot) {
+    if (fault_.poison) poison_slot(slot, kPoisonFill ^ 0xFF);
+  }
+  // Direct mode: the bytes are the slot's own now, and the caller publishes them.
+  void row_after_finish(size_t /*slot*/) {}
 
   // A failed call: what every extent still live was owed but never returned is cancelled. Extents that
   // retired were accounted when they did.
