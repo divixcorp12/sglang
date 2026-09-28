@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1790381142014,
+  "lastScanned": 1790496954713,
   "projectRoot": "/home/dimitri/data/divix/sglang-nvfp4",
   "techStack": {
     "languages": [],
@@ -42,21 +42,21 @@
       "path": "3rdparty",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1790381142002,
+      "lastAccessed": 1790496954705,
       "keyFiles": []
     },
     "analysis": {
       "path": "analysis",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1790381142003,
+      "lastAccessed": 1790496954706,
       "keyFiles": []
     },
     "assets": {
       "path": "assets",
       "purpose": "Static assets",
       "fileCount": 4,
-      "lastAccessed": 1790381142004,
+      "lastAccessed": 1790496954706,
       "keyFiles": [
         "logo.png",
         "logo.svg",
@@ -68,7 +68,7 @@
       "path": "benchmark",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1790381142009,
+      "lastAccessed": 1790496954708,
       "keyFiles": [
         "bench_adaptive_speculative.py",
         "lean_kernel_sweep.py"
@@ -78,14 +78,14 @@
       "path": "benchmarks",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1790381142009,
+      "lastAccessed": 1790496954708,
       "keyFiles": []
     },
     "docker": {
       "path": "docker",
       "purpose": null,
       "fileCount": 18,
-      "lastAccessed": 1790381142009,
+      "lastAccessed": 1790496954708,
       "keyFiles": [
         "Dockerfile",
         "Dockerfile.cu134",
@@ -98,7 +98,7 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 10,
-      "lastAccessed": 1790381142010,
+      "lastAccessed": 1790496954708,
       "keyFiles": [
         "AGENTS.md",
         "CONTRIBUTING.md",
@@ -111,28 +111,28 @@
       "path": "examples",
       "purpose": "Example code",
       "fileCount": 0,
-      "lastAccessed": 1790381142010,
+      "lastAccessed": 1790496954708,
       "keyFiles": []
     },
     "experimental": {
       "path": "experimental",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1790381142010,
+      "lastAccessed": 1790496954709,
       "keyFiles": []
     },
     "proto": {
       "path": "proto",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1790381142010,
+      "lastAccessed": 1790496954710,
       "keyFiles": []
     },
     "python": {
       "path": "python",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1790381142011,
+      "lastAccessed": 1790496954710,
       "keyFiles": [
         "MANIFEST.in",
         "pyproject.toml",
@@ -145,7 +145,7 @@
       "path": "rust",
       "purpose": null,
       "fileCount": 3,
-      "lastAccessed": 1790381142012,
+      "lastAccessed": 1790496954710,
       "keyFiles": [
         "Cargo.lock",
         "Cargo.toml",
@@ -156,7 +156,7 @@
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 10,
-      "lastAccessed": 1790381142012,
+      "lastAccessed": 1790496954710,
       "keyFiles": [
         "build_sgl_deep_gemm.sh",
         "build_sgl_deepep.sh",
@@ -169,7 +169,7 @@
       "path": "sgl-model-gateway",
       "purpose": null,
       "fileCount": 7,
-      "lastAccessed": 1790381142012,
+      "lastAccessed": 1790496954710,
       "keyFiles": [
         "Cargo.toml",
         "Makefile",
@@ -182,7 +182,7 @@
       "path": "test",
       "purpose": "Test files",
       "fileCount": 3,
-      "lastAccessed": 1790381142012,
+      "lastAccessed": 1790496954711,
       "keyFiles": [
         "README.md",
         "pytest.ini",
@@ -193,14 +193,14 @@
       "path": "tools",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1790381142012,
+      "lastAccessed": 1790496954711,
       "keyFiles": []
     },
     "examples/assets": {
       "path": "examples/assets",
       "purpose": "Static assets",
       "fileCount": 2,
-      "lastAccessed": 1790381142013,
+      "lastAccessed": 1790496954712,
       "keyFiles": [
         "example_image.png"
       ]
@@ -209,10 +209,95 @@
       "path": "sgl-model-gateway/examples",
       "purpose": "Example code",
       "fileCount": 0,
-      "lastAccessed": 1790381142014,
+      "lastAccessed": 1790496954713,
       "keyFiles": []
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "docs/superpowers/plans/2026-09-26-expert-stream-transport-split.md",
+      "accessCount": 9,
+      "lastAccessed": 1790458098212,
+      "type": "file"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-09-27-layer-fusion-split.md",
+      "accessCount": 8,
+      "lastAccessed": 1790530124529,
+      "type": "file"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-09-27-expert-stream-native-sync.md",
+      "accessCount": 7,
+      "lastAccessed": 1790544637180,
+      "type": "file"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-09-27-expert-stream-transfer-measurement.md",
+      "accessCount": 4,
+      "lastAccessed": 1790547279498,
+      "type": "file"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-09-27-doorbell-removal.md",
+      "accessCount": 2,
+      "lastAccessed": 1790529926755,
+      "type": "file"
+    },
+    {
+      "path": ".claude/skills/env-var-conventions/SKILL.md",
+      "accessCount": 2,
+      "lastAccessed": 1790542240171,
+      "type": "file"
+    },
+    {
+      "path": ".claude/skills/mechanical-refactor-verify/SKILL.md",
+      "accessCount": 2,
+      "lastAccessed": 1790554609769,
+      "type": "file"
+    },
+    {
+      "path": ".claude/skills/mechanical-refactor-verify/guide-verify-proof.md",
+      "accessCount": 2,
+      "lastAccessed": 1790561337314,
+      "type": "file"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-09-26-dsv41-compute-transfer-gap-experiments-handoff.md",
+      "accessCount": 1,
+      "lastAccessed": 1790463619012,
+      "type": "file"
+    },
+    {
+      "path": "benchmarks/dsv41_baseline/run_arm.sh",
+      "accessCount": 1,
+      "lastAccessed": 1790499605358,
+      "type": "file"
+    },
+    {
+      "path": "analysis/dsv41-drive/NC_VISIBILITY.md",
+      "accessCount": 1,
+      "lastAccessed": 1790545144539,
+      "type": "file"
+    },
+    {
+      "path": "NVME_PINNED_PREFETCH_HANDOFF.md",
+      "accessCount": 1,
+      "lastAccessed": 1790545164180,
+      "type": "file"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-09-25-dsv41-copy-compute-overlap.md",
+      "accessCount": 1,
+      "lastAccessed": 1790545170444,
+      "type": "file"
+    },
+    {
+      "path": ".claude/skills/mechanical-refactor-verify/spec-reproduction-cli.md",
+      "accessCount": 1,
+      "lastAccessed": 1790561337258,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }
