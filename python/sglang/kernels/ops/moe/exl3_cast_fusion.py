@@ -30,10 +30,10 @@ if TYPE_CHECKING:
 def _silu_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        "dsv41_exl3_silu_mul_clamp_half",
+        "exl3_silu_mul_clamp_half",
         *args,
-        cuda_files=["moe/dsv41_cast_fusion.cuh"],
-        cuda_wrappers=[("run", f"exl3_silu_mul_clamp_half<{args}>")],
+        cuda_files=["moe/exl3/exl3_silu_mul_clamp_half.cuh"],
+        cuda_wrappers=[("run", f"exl3::exl3_silu_mul_clamp_half<{args}>")],
         # The same flags as silu_and_mul_clamp's module, so silu_and_mul compiles to the same instructions.
         extra_cuda_cflags=["-use_fast_math"],
     )
@@ -42,9 +42,9 @@ def _silu_module() -> Module:
 @cache_once
 def _scale_module() -> Module:
     return load_jit(
-        "dsv41_exl3_scale_to_bf16",
-        cuda_files=["moe/dsv41_cast_fusion.cuh"],
-        cuda_wrappers=[("run", "exl3_scale_to_bf16")],
+        "exl3_scale_to_bf16",
+        cuda_files=["moe/exl3/exl3_scale_to_bf16.cuh"],
+        cuda_wrappers=[("run", "exl3::exl3_scale_to_bf16")],
     )
 
 

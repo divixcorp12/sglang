@@ -17,7 +17,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-namespace sglang {
+namespace sglang::exl3 {
 
 // The shared expert's y.to(bf16) -> silu_mul_clamp -> x.to(fp16): gate_up [rows, 2 * inter] fp16 in, the down
 // projection's fp16 input [rows, inter] out. Built with the same -use_fast_math as silu_mul_clamp_kernel, whose
@@ -77,4 +77,4 @@ void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView o
       .enable_pdl(kUsePDL)(exl3_silu_mul_clamp_half_kernel<kUsePDL>, params);
 }
 
-}  // namespace sglang
+}  // namespace sglang::exl3

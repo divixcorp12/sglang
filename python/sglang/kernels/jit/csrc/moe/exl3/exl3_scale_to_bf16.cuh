@@ -14,7 +14,7 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-namespace sglang {
+namespace sglang::exl3 {
 
 // Exl3MoEMethod's out.to(bf16) * routed_scaling_factor on the fused MoE's fp32 output. The factor is the float
 // torch's mul uses for a Python scalar on a bf16 tensor; this kernel must not be built with fast math, which would
@@ -47,4 +47,4 @@ void exl3_scale_to_bf16(tvm::ffi::TensorView input, tvm::ffi::TensorView output,
       static_cast<float>(factor));
 }
 
-}  // namespace sglang
+}  // namespace sglang::exl3
