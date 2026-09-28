@@ -206,8 +206,12 @@ def test_u1_geometry_of_every_row_of_a_random_layout(seed, parts):
         for expert in range(tables.extents.shape[1]):
             sub_reads, _ = _assert_geometry(tables, row, expert)
             counts.add(len(sub_reads))
-    # Row 0 is split evenly and long enough for every sub-read: 4, 8, 6, 8, 8 of them.
-    assert max(counts) == _per_part(parts) * parts
+    # Row 0 reads all `parts` parts, split evenly and long enough for every sub-read (per_part(parts) * parts of
+    # them: 4, 8, 6, 8, 8). But every third row (r % 3 == 1) zeroes one part's pages, dropping `reading` below
+    # `parts` for that row, and per_part(reading) can rise faster than reading falls (per_part(2) == 4 vs
+    # per_part(3) == 2, so 2 reading parts give 8 sub-reads -- more than 3 parts' 6): the true ceiling over a
+    # layout with parts >= 2 is max(per_part(reading) * reading for reading in 1..parts), not row 0's own count.
+    assert max(counts) == max(_per_part(reading) * reading for reading in range(1, parts + 1))
 
 
 @pytest.mark.parametrize(
