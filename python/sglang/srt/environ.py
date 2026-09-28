@@ -1833,6 +1833,10 @@ class Envs:
     # copy on the service thread (there is no auto). Workers never run on cores 64-71. Do not enable in a run
     # that produces stage traces until the trace record carries the mode: overlap_timeline.py misreads them.
     SGLANG_DSV41_RAM_MISS_PACK_WORKERS = EnvInt(0)
+    # Option C: pin the RAM-miss service thread to this CPU. -1 leaves it unpinned: it inherits the server's affinity
+    # less the packing workers' CPUs. Refused at startup when it is one of cores 64-71, not a CPU of this machine, or
+    # one of the packing workers' CPUs. An A/B override (NUMA placement against the NVMe drives), not in the recipe.
+    SGLANG_DSV41_RAM_MISS_SERVICE_CPU = EnvInt(-1)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.

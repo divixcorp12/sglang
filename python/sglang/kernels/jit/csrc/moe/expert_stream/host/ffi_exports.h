@@ -1140,6 +1140,18 @@ struct HostExports {
       }
     }
     std::shared_ptr<RamTier<Source>> tier = find(handle);
+    if (cpu_core >= 0) {
+      // Pinned onto a packing worker's CPU, the thread that posts the workers' jobs would wait behind their copies.
+      const std::vector<int> packing = tier->packing_cpus();
+      if (std::find(packing.begin(), packing.end(), static_cast<int>(cpu_core)) != packing.end()) {
+        std::string cpus;
+        for (int cpu : packing)
+          cpus += (cpus.empty() ? "" : ",") + std::to_string(cpu);
+        throw std::runtime_error(
+            error_prefix<Layout>() + "cpu_core " + std::to_string(cpu_core) +
+            " is one of the packing workers' CPUs (" + cpus + ")");
+      }
+    }
     // Checked and registered under one lock, so a concurrent close() either sees the thread
     // (and joins it) or runs before it and leaves no handle to start it on.
     std::lock_guard<std::mutex> guard(registry_mutex());

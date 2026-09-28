@@ -293,6 +293,20 @@ def sm_copy_table(segments, sm_mask: int) -> torch.Tensor:
     return table
 
 
+def check_service_cpu(core: int) -> int:
+    """SGLANG_DSV41_RAM_MISS_SERVICE_CPU, checked: -1 (unpinned) or a CPU of this machine. Cores 64-71 are left to
+    ExpertStreamHost.start_thread, which refuses them, and a packing worker's CPU to the host, which knows them."""
+    if core == -1 or 64 <= core <= 71:
+        return core
+    cpus = os.cpu_count() or 0
+    if not 0 <= core < cpus:
+        raise ValueError(
+            f"exl3 RAM miss: SGLANG_DSV41_RAM_MISS_SERVICE_CPU={core} is not -1 (unpinned) or a CPU of this machine "
+            f"(0-{cpus - 1})"
+        )
+    return core
+
+
 def check_sm_small_copies(cfg: Dsv41Config) -> None:
     """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES without the copy engine: it moves part of the copy engine's
     work into its copy wait, which only the copy-engine chain runs."""
@@ -848,7 +862,10 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
-            host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            host.start_thread(
+                cpu_core=check_service_cpu(cfg.ram_miss_service_cpu),
+                fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
+            )
             fault = parse_fault(cfg.ram_miss_fault)
             if fault is not None:
                 demands, seconds = fault

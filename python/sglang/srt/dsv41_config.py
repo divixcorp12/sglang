@@ -25,6 +25,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     router_capture_path: str
     ram_miss_timeout_ms: int
     ram_miss_pack_workers: int
+    ram_miss_service_cpu: int
     ram_miss_fault: str
     enable_expert_prefetch: bool
     enable_ram_miss_leases: bool
@@ -62,6 +63,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             router_capture_path=envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get(),
             ram_miss_timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
             ram_miss_pack_workers=envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.get(),
+            ram_miss_service_cpu=envs.SGLANG_DSV41_RAM_MISS_SERVICE_CPU.get(),
             ram_miss_fault=envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get(),
             enable_expert_prefetch=envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get(),
             enable_ram_miss_leases=envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get(),
