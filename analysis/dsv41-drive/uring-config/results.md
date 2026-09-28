@@ -1,12 +1,14 @@
 # io_uring option campaign: end-to-end screen, 2026-09-28
 
 **Verdict: keep the defaults.** No option beats S0 by the 1.5 ms/token needed to go to confirmation, so step 2 was
-skipped. The campaign used 7 arms.
+skipped. The campaign used 9 arms: S0–S6, then a fresh S0b next to the S7 the user added.
 - Queue depth 128, the slab arena and SQPOLL (block or spin) are all within ±0.7 ms/token of S0, with byte-identical
   output.
 - IOPOLL is clearly worse: +10.2 ms/token pooled, TTFT +1.4 s. Its reads are punted to io-wq worker threads.
 - SQPOLL costs a full core (98% system time on the SQ thread), and spin waiting adds about 11 points to the service
   thread, for no latency gain.
+- S7 (`sqpoll_iopoll` + spin) matches a fresh S0b at 104.4 vs 104.5 ms/token, and costs a full SQ core plus a
+  spinning service thread.
 - Fixed vectored reads (S3) are **unsupported** at this tier size: each per-layer arena is 2.69 GB, above the
   kernel's 1 GiB per registered buffer, and registration fails with EFAULT.
 
@@ -115,8 +117,49 @@ slots_quarantined.
   - `uring-S4-iopoll/run-20260928-032205`
   - `uring-S5-sqpoll-cpu20/run-20260928-033255`
   - `uring-S6-sqpoll-cpu20-spin/run-20260928-034018`
+  - `uring-S0b-default/run-20260928-034816`
+  - `uring-S7-sqpolliopoll-cpu20-spin/run-20260928-035259`
 - Per-arm logs, thread samples and report JSON are in `divix01:/mnt/nvme1/sf-ab/uring-*`.
+
+## S7: `MODE=sqpoll_iopoll WAIT_MODE=spin` (added by the user), run next to a fresh S0b
+
+S7 used `SQ_THREAD_CPU=20` and `SQ_THREAD_IDLE_MS=1000`, with everything else at the explicit defaults. The arms ran
+back to back, in the order S0b then S7, in a fresh worktree `/data/models/slang/nvfp4-work/wt-uring-s7` at the same
+`f3ba371ad4` (tree `8244785c`). CPU 20 was ~99% idle beforehand.
+
+| Arm | Session 0 ms/token (TTFT) | Session 1 ms/token (TTFT) | **Pooled** | Output | rows_read / served / errors | startup |
+|---|---|---|---|---|---|---|
+| S0b (defaults) | 129.1 (8.64 s) | 102.7 (8.08 s) | **104.5** | byte-identical to S0 | 4221 / 2939 / 0 | 148.7 s |
+| S7 | 128.8 (8.63 s) | 102.7 (8.06 s) | **104.4** | byte-identical to S0 and S0b | 4210 / 2960 / 0 | 145.1 s |
+
+The SM clock was 2970 MHz at both sessions' start in both arms. S7 is −0.1 ms/token vs S0b, which is noise. S0b
+reproduces S0 (104.2) within 0.3 ms/token.
+
+- **Diagnostics.** `mode=sqpoll_iopoll read_mode=normal wait=spin requested_flags=0x7 effective_flags=0x10007
+  depth=32 sq/cq=32/64 sq_thread_idle_ms=1000 sq_thread_cpu=20`. `0x7` is `IOPOLL|SQPOLL|SQ_AFF`, so **both SQPOLL
+  and IOPOLL are in effect**.
+- **CPU over the 28.6 s timed window.**
+  - SQ thread `iou-sqp`: **98.1%** (28.06 s, all system time).
+  - Service thread `exl3-ram-miss`: **36.2%** (10.34 s, all user time: the spinning completion wait), against 25.5%
+    in S0b.
+  - Copy engine: 34.9%, the same as S0b. Scheduler main thread: 82.9%.
+  - Process-tree CPU: 75.4 s, against 43.2 s in S0b. Harness cpu_s: 24.4 s and 54.8 s, against 10.3 s and 31.4 s.
+- **io-wq punting.** Yes, but less than S4. Six `iou-wrk-714815` workers appeared, children of the SQ thread
+  (714815). They used 4.45 s of CPU over the whole run, 1.45 s of it in the timed window. S0b had none.
+
+## Why S4 (IOPOLL alone) lost 10 ms/token (likely cause)
+
+The likely reason is that IOPOLL reads on these files were **punted to io-wq** rather than completed by polling.
+- Over the run, S4 spawned 14 `iou-wrk-600353` workers, children of the service thread 600353, using 12.7 s of CPU.
+  That is on top of ~16 other short-lived workers.
+- In the timed window the service thread's system time rose from ~0.3 s to **4.4 s**, and 12 workers used 4.3 s.
+- The defaults, S1, S2, S5 and S6 had no workers at all.
+
+A punted read takes an extra thread handoff and wakeup on the RAM-miss critical path. That fits both the +10.2
+ms/token and the +1.4 s TTFT. S7 also punts, but from the SQ thread and less, and its busy SQ thread plus spinning
+waiter hide the handoff, so it shows no loss. The workers and system time are measured; the causal link to latency
+is inferred, because no per-read latency is available without the stage trace.
 
 ## Step 2
 
-Skipped: no screen arm beat S0 by at least 1.5 ms/token.
+Skipped: no screen arm, S7 included, beat S0 by at least 1.5 ms/token.
