@@ -25,7 +25,7 @@ struct HostExports {
   }
 
   // The table tensors every reader entry takes, checked once here rather than per read: tables_from
-  // dereferences all six through raw pointers with no dtype or device check of its own. Run before
+  // dereferences these tensors through raw pointers with no dtype or device check of its own. Run before
   // tables_from so a wrong-dtype or too-narrow table raises here, naming the tensor, not there.
   static void check_table_tensors(
       TensorView extents,
@@ -33,7 +33,8 @@ struct HostExports {
       TensorView file_sizes,
       TensorView segments,
       TensorView slabs,
-      TensorView row_bytes) {
+      TensorView row_bytes,
+      TensorView buffer_regions) {
     using namespace host;
     auto L_ = SymbolicSize{"layers"};
     auto E_ = SymbolicSize{"experts"};
@@ -46,6 +47,7 @@ struct HostExports {
     verify_named("slabs", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
     verify_named(
         "row_bytes", TensorMatcher({kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), row_bytes);
+    verify_named("buffer_regions", TensorMatcher({-1, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), buffer_regions);
   }
 
   static std::mutex& registry_mutex() {
@@ -103,6 +105,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
@@ -113,13 +116,13 @@ struct HostExports {
       TensorView slots,
       int64_t step) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
     verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
     Source reader(
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
         direct != 0);
     if (!reader.open()) return 0;
     return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
@@ -139,6 +142,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
@@ -152,7 +156,7 @@ struct HostExports {
       TensorView record,
       int64_t owner_core) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
     verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
@@ -162,7 +166,7 @@ struct HostExports {
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     Source reader(
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
         direct != 0,
         f[19],
         f[20]);
@@ -192,6 +196,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
@@ -205,7 +210,7 @@ struct HostExports {
       TensorView fault,
       TensorView results) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
     verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
@@ -218,7 +223,7 @@ struct HostExports {
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     Source reader(
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
         direct != 0,
         f[19],
         f[20]);
@@ -252,6 +257,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
@@ -266,7 +272,7 @@ struct HostExports {
       TensorView sqes,
       TensorView info) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
     verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
@@ -280,7 +286,7 @@ struct HostExports {
     out[0] = out[1] = out[2] = out[3] = out[4] = 0;
     Source reader(
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
         direct != 0,
         f[19],
         f[20]);
@@ -335,6 +341,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
@@ -352,7 +359,7 @@ struct HostExports {
       TensorView ref_slots,
       TensorView info) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
     verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
@@ -365,7 +372,7 @@ struct HostExports {
     auto* out = static_cast<int64_t*>(info.data_ptr());
     std::fill(out, out + 5, 0);
     const Tables t = tables_from<Layout>(
-        extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+        extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images);
     const std::vector<int32_t> ids = ids_of(experts);
     const std::vector<int64_t> dest = slots_of(slots);
     const size_t lanes = static_cast<size_t>(masks.size(1));
@@ -480,6 +487,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
@@ -489,11 +497,11 @@ struct HostExports {
       TensorView subs,
       TensorView pieces) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("subs", TensorMatcher({kPieces, 6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), subs);
     const Tables t = tables_from<Layout>(
-        extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+        extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images);
     const size_t count = t.segments.size();
     verify_named(
         "pieces",
@@ -532,17 +540,18 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       std::string paths,
       std::string source_paths,
       int64_t slot_bytes,
       int64_t row_images,
       TensorView runs) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     auto cpu = SymbolicDevice{};
     verify_named("runs", TensorMatcher({-1, -1, -1, -1, -1}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), runs);
     const Tables t = tables_from<Layout>(
-        extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images);
+        extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images);
     const size_t count = t.segments.size();
     const size_t rows = static_cast<size_t>(t.layers * t.experts);
     if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
@@ -639,6 +648,7 @@ struct HostExports {
       TensorView segments,
       TensorView slabs,
       TensorView row_bytes,
+      TensorView buffer_regions,
       TensorView capacity,
       std::string paths,
       std::string source_paths,
@@ -649,7 +659,7 @@ struct HostExports {
       int64_t pack_workers,
       TensorView hot_page) {
     using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes);
+    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
     // ties them to the same actual device; capacity is always a plain CPU tensor. hot_page is optional (an
     // absent one is an unpinned torch.empty(0)) and gets its own SymbolicDevice so it is not forced to equal
@@ -676,7 +686,7 @@ struct HostExports {
         static_cast<uint8_t*>(lease.data_ptr()),
         lease.size(0),
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, paths, source_paths, slot_bytes, row_images),
+            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
         std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
         direct != 0,
         pack_workers,

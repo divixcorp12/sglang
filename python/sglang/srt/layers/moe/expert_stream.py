@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.expert_host_tier import (
     PinnedSlotLRU,
     PinnedSlotTable,
     allocate_host_slab,
+    allocate_host_slab_arena,
     quarantine_host_slabs,
     release_host_slabs,
 )
@@ -175,6 +176,10 @@ class ExpertPinnedHostCache:
     ``device`` keeps the tier on the host with unregistered slabs, so it runs
     without a GPU. ``is_pinned(expert_id)`` protects experts from eviction.
 
+    ``SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=1`` places all named slabs in one
+    registered allocation, retaining page-aligned starts and the same tensor
+    layouts for fixed-buffer vectored I/O experiments.
+
     ``slot_table`` replaces the default ``PinnedSlotLRU``. Such a table chooses
     its own victims: ``is_pinned`` is then used only to size requests
     (``evictable_rows``), so the table must protect the same experts itself.
@@ -225,19 +230,35 @@ class ExpertPinnedHostCache:
         register = self.device.type == "cuda"
         self.tensors: dict[str, torch.Tensor] = {}
         registered: list[torch.Tensor] = []
+        arena_option = os.environ.get("SGLANG_EXPERT_STREAM_URING_SLAB_ARENA", "0")
+        if arena_option not in ("0", "1"):
+            raise ValueError("SGLANG_EXPERT_STREAM_URING_SLAB_ARENA must be 0 or 1")
         try:
-            for name in self.cached_names:
-                spec = streamer.spec(name)
-                slab = allocate_host_slab(
+            if arena_option == "1":
+                self.tensors = allocate_host_slab_arena(
                     capacity,
-                    spec.row_shape,
-                    spec.dtype,
+                    {
+                        name: (streamer.spec(name).row_shape, streamer.spec(name).dtype)
+                        for name in self.cached_names
+                    },
                     register=register,
                     placement=placement,
                 )
-                self.tensors[name] = slab
-                if register and slab.numel():
-                    registered.append(slab)
+                if register:
+                    registered.extend(slab for slab in self.tensors.values() if slab.numel())
+            else:
+                for name in self.cached_names:
+                    spec = streamer.spec(name)
+                    slab = allocate_host_slab(
+                        capacity,
+                        spec.row_shape,
+                        spec.dtype,
+                        register=register,
+                        placement=placement,
+                    )
+                    self.tensors[name] = slab
+                    if register and slab.numel():
+                        registered.append(slab)
         except BaseException:
             release_host_slabs(registered)
             raise

@@ -3,6 +3,7 @@
 
 #include "../row_layout.h"
 #include "reader_base.h"
+#include <sys/uio.h>
 
 namespace sglang {
 namespace expert_stream {
@@ -37,6 +38,7 @@ struct Tables {
   int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
   std::vector<std::vector<uint8_t*>> slabs;
   std::vector<int64_t> row_bytes;
+  std::vector<iovec> buffer_regions;  // explicit allocation spans retained by Python tables.keepalive
   // Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, plan 2026-09-24-dsv41-row-images): the files are
   // exl3_row_image layer files, not checkpoint shards. A row's needed bytes are then its image, [0, need_end) of
   // the extents' destination coordinates, and the segments tile it in source order, so every image byte has
@@ -107,6 +109,7 @@ inline Tables tables_from(
     TensorView segments,
     TensorView slabs,
     TensorView row_bytes,
+    TensorView buffer_regions,
     const std::string& paths,
     const std::string& source_paths,
     int64_t slot_bytes,
@@ -118,6 +121,13 @@ inline Tables tables_from(
         std::to_string(slabs.size(1)) + " and " + std::to_string(row_bytes.size(0)));
   }
   Tables t;
+  const auto* regions = static_cast<const int64_t*>(buffer_regions.data_ptr());
+  for (int64_t i = 0; i < buffer_regions.size(0); ++i) {
+    const int64_t base = regions[2 * i], bytes = regions[2 * i + 1];
+    if (base <= 0 || bytes <= 0 || static_cast<uint64_t>(base) + static_cast<uint64_t>(bytes) < static_cast<uint64_t>(base))
+      throw std::runtime_error(prefix + "invalid I/O registration buffer region");
+    t.buffer_regions.push_back({reinterpret_cast<void*>(static_cast<uintptr_t>(base)), static_cast<size_t>(bytes)});
+  }
   t.images = row_images != 0;
   t.layers = extents.size(0);
   t.experts = extents.size(1);

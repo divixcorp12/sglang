@@ -6,6 +6,7 @@
 #include "file_reader.h"
 #include "pack_pool.h"
 #include "piece_geometry.h"
+#include "uring_options.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -55,6 +56,7 @@ class RowReader {
 
   RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
       : t_(std::move(tables)), direct_(direct) {
+    configured_queue_depth_ = UringOptions::from_env().queue_depth;
     set_pack(pack_workers, pack_split);
   }
   RowReader(const RowReader&) = delete;  // owns fds, the ring and the bounce
@@ -62,6 +64,8 @@ class RowReader {
 
   ~RowReader() {
     pool_.reset();  // joins the workers before the bounce they read from is freed
+    // Registered regions must be released while their allocations and files still exist.
+    if constexpr (requires(Reader& reader) { reader.close(); }) io_.close();
     for (int fd : fds_)
       ::close(fd);
     std::free(bounce_);
@@ -243,6 +247,16 @@ class RowReader {
     }
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
+    if constexpr (requires(Reader& reader, const std::vector<int>& files, const std::vector<iovec>& buffers) {
+                    reader.configure_resources(files, buffers, true);
+                  }) {
+      std::vector<iovec> regions = t_.images ? t_.buffer_regions : std::vector<iovec>{};
+      if (!t_.images) {
+        for (size_t slot = 0; slot < static_cast<size_t>(kBounceSlots); ++slot)
+          regions.push_back({bounce_slot(slot), static_cast<size_t>(t_.slot_bytes)});
+      }
+      io_.configure_resources(fds_, regions, direct_);
+    }
     cpu_set_t inherited;
     CPU_ZERO(&inherited);
     pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited);
@@ -499,7 +513,7 @@ class RowReader {
   // rather than overrunning it. Scaled by parts so splitting a row across roots does not
   // halve the number of rows in flight.
   unsigned queue_depth() const {
-    return kQueueDepth * static_cast<unsigned>(t_.parts);
+    return configured_queue_depth_ != 0 ? configured_queue_depth_ : kQueueDepth * static_cast<unsigned>(t_.parts);
   }
 
   uint32_t next_generation() {
@@ -1501,6 +1515,7 @@ class RowReader {
   // read() always drains the ring (quiesce()) before returning, so nothing is ever in flight when this
   // reader is destroyed.
   Reader io_;
+  unsigned configured_queue_depth_ = 0;
   // Indexed by bounce slot with the flag off, by (slot, piece) with piece streaming (size_jobs).
   PackJob jobs_[kBounceSlots * kPieces];
   std::vector<CopyRun> runs_;
