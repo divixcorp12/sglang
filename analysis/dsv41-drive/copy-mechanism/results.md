@@ -256,3 +256,73 @@ Root port cache line size: 64 B.
 safety of TMA or of LDGSTS. Both bypass L1, and the check's only demonstrated sensitivity is to a stale L1 line. Their
 visibility rests on the PTX rules (acquire, then `fence.proxy.async.global` before an async-proxy read), not on this
 measurement. No verdict changes: TMA and LDGSTS were not adopted (Decision-table rows above).
+
+### 5c. Write-combined source slab (2026-09-27, commit 561715b4c9)
+
+**Question.** On divix01's Sky Lake-E root port, does a source slab allocated with
+`cudaHostAlloc(Mapped | WriteCombined)` raise SM or copy-engine H2D above the ordinary pinned slab? The GPU's reads of
+it may skip the CPU snoop.
+
+**Probe** (`wc_bench.py`, `wc_report.py`). Three source slabs with the sweep's rows and segments:
+
+- `pinned`: `allocate_host_slab`, the sweep's.
+- `hostalloc`: `cudaHostAlloc(Mapped)`. This control has the same allocator without WC, so any WC effect is not an
+  allocator effect.
+- `wc`: `cudaHostAlloc(Mapped | WriteCombined)`.
+
+Both `cudaHostAlloc` slabs were allocated and written with the thread on the GPU's NUMA node 0 (cores 36-53). Each
+shape ran once per slab per round, slabs interleaved, 3 rounds x 30 reps; the median over rounds is shown. The fresh
+check ran against a WC source, with the host's rewrite fenced by `sfence` before the flag release (now in
+`mech_fresh` for every method). The protocol words stayed in ordinary pinned memory. `WC_EXIT=0` and `REPORT_EXIT=0`;
+no cell was above the ceiling.
+
+```
+| method | grid | a | pinned GB/s | hostalloc GB/s | WC GB/s | WC / pinned | hostalloc / pinned |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ce_batch | 0 | 4 | 13.692 | 13.688 | 13.701 | 1.001 | 1.000 |
+| ce_each | 0 | 4 | 13.626 | 13.623 | 13.627 | 1.000 | 1.000 |
+| sm_cv16 | 1 | 4 | 11.587 | 11.536 | 11.497 | 0.992 | 0.996 |
+| sm_cv16 | 8 | 4 | 12.297 | 12.294 | 12.297 | 1.000 | 1.000 |
+fresh sm_cv16@wc: True
+fresh nc_control@wc: False
+host pinned: write 4.03 GB/s, read 7.258 GB/s
+host hostalloc: write 4.04 GB/s, read 7.125 GB/s
+host wc: write 10.65 GB/s, read 0.048 GB/s
+```
+
+Per-round GB/s:
+
+| shape | pinned | hostalloc | WC |
+|---|---|---|---|
+| `sm_cv16` G8 U4 (plateau) | 12.295 / 12.299 / 12.297 | 12.294 / 12.293 / 12.295 | 12.296 / 12.297 / 12.301 |
+| `sm_cv16` G1 U4 (16 KiB) | 11.598 / 11.558 / 11.587 | 11.539 / 11.506 / 11.536 | 11.497 / 11.509 / 11.493 |
+| `ce_each` 4 rows | 13.628 / 13.625 / 13.626 | 13.625 / 13.623 / 13.619 | 13.627 / 13.629 / 13.616 |
+| `ce_batch` 4 rows | 13.686 / 13.694 / 13.692 | 13.688 / 13.687 / 13.688 | 13.706 / 13.701 / 13.693 |
+
+**Result: WC does not raise H2D on divix01.**
+
+- **Plateau and copy engine:** WC / pinned is 1.000 (SM plateau), 1.000 (`ce_each`) and 1.001 (`ce_batch`). Every
+  difference is inside the round-to-round spread.
+- **16 KiB, latency-bound:** WC is consistently about 0.8% slower (0.992). Its rounds, 11.49-11.51, do not overlap
+  pinned's, 11.56-11.60. `hostalloc` is about 0.4% slower too, so roughly half of that gap comes from the allocator, not
+  WC.
+- **The snoop is not what limits these reads.** Both ceilings, 12.31 SM and 13.69 copy engine, stay where they were,
+  consistent with 5a putting the limit in the link's request/completion efficiency.
+
+**Fresh check against a WC source:** `sm_cv16@wc` fresh (true); `nc_control@wc` stale (false). So the check can still
+see staleness on WC memory, and the fenced host rewrite is visible to `.cv` reads.
+
+**Host side** (256 MiB memset + sfence; 32 MiB read):
+
+| slab | CPU write GB/s | CPU read GB/s |
+|---|---:|---:|
+| pinned | 4.03 | 7.26 |
+| hostalloc | 4.04 | 7.13 |
+| WC | 10.65 | 0.048 |
+
+CPU writes to WC are 2.6x faster, and CPU reads of it are about 150x slower.
+
+**A speedup here would NOT have cleared WC for production, and the absence of one is not a safety result either.**
+NVMe `O_DIRECT` writes may land in the LLC through DDIO, and a no-snoop GPU read could miss them. That needs its own
+NVMe-write check, which was not requested and was not run. On divix01, WC buys nothing on the GPU side and makes any
+CPU read of the slab very slow.
