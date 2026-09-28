@@ -38,3 +38,13 @@ def test_region_metadata_must_actually_contain_the_slab():
 def test_tables_without_owners_supply_no_inferred_address_span():
     regions = transport._table_buffer_regions(SimpleNamespace())
     assert regions.dtype == torch.int64 and regions.shape == (0, 2)
+
+
+@pytest.mark.parametrize("has_owner", [False, True])
+def test_region_metadata_stays_on_cpu_under_a_non_cpu_default(has_owner):
+    slab = torch.empty(64, dtype=torch.uint8, device="cpu")
+    tables = SimpleNamespace(keepalive=(slab,) if has_owner else ())
+    with torch.device("meta"):
+        regions = transport._table_buffer_regions(tables)
+    assert regions.device.type == "cpu"
+    assert regions.tolist() == ([[slab.data_ptr(), 64]] if has_owner else [])

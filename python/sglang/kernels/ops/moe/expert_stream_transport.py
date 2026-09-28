@@ -111,7 +111,7 @@ def _table_buffer_regions(tables) -> torch.Tensor:
             raise ValueError("I/O buffer owner does not contain its slab")
         if size:
             regions[(base, size)] = None
-    return torch.tensor(list(regions), dtype=torch.int64).reshape(-1, 2)
+    return torch.tensor(list(regions), dtype=torch.int64, device="cpu").reshape(-1, 2)
 
 
 def _table_args(tables, direct: bool) -> tuple:
