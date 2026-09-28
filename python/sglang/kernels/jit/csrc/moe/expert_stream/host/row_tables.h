@@ -57,7 +57,7 @@ inline std::vector<int32_t> ids_of(TensorView tensor) {
 // when every byte a read returns has exactly one destination and the row's reads return exactly its image. So: the
 // row starts at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and
 // each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is
-// RowReader::open's.
+// RowReader::check_image_alignment's, at open.
 template <ExpertRowLayout Layout>
 inline void check_image_tables(const Tables& t) {
   const std::string prefix = error_prefix<Layout>();
@@ -168,7 +168,7 @@ inline Tables tables_from(
       throw std::runtime_error(prefix + "an extent names no file or falls outside its bounce slot");
     }
   }
-  // The EOF guard (RowReader::admit_batch) decides a whole row from ONE of its parts: it reads that
+  // The EOF guard (ReaderCore::admit_batch) decides a whole row from ONE of its parts: it reads that
   // part's `offset - dest` as the row's aligned base and its file size as the row's file size. Both are
   // true by construction of today's builder - exl3_ram_miss.py repeats one source size across all the
   // parts of a shard, and the mirror layout puts two files under a row only as two copies of the SAME

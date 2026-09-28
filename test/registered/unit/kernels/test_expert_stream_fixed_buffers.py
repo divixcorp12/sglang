@@ -158,8 +158,9 @@ def test_one_failing_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path,
     s = _setup(tmp_path, True)
     uring_env(READ_MODE="readv_fixed")
     stats, cqes = {}, []
-    # Leg 1 of row 0 fails with EIO while its other legs succeed. The read fails once; read() drains every SQE still
-    # in flight before returning (unfinished_jobs 0, and the same reader's next read succeeds on a clean ring).
+    # Leg 1 of row 0 fails with EIO while its other legs succeed. The read fails once, and the same reader's next read
+    # is clean. (unfinished_jobs counts packing jobs, not SQEs, so it cannot see the drain; the drain guard is
+    # test_ring_reset_mid_fan_out.)
     first, then = _supported(lambda: read_rows_with_fault(
         s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False, part=0, part_error=errno.EIO,
         ordinal=0, leg=1, fixed_chunk_cap=CAP, stats=stats, cqes=cqes, **_pieces(True, pieces)))

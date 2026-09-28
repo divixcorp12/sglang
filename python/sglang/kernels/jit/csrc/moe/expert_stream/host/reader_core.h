@@ -15,8 +15,10 @@ struct SqeRecord {
   int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
 };
 
-// io_uring superset reads of whole expert rows into page-aligned bounce banks, then the
-// per-name split into the pinned slabs (Exl3ShardRowSource.read's copies).
+// io_uring superset reads of whole expert rows through per-extent descriptors, for both derived readers: PackReader
+// reads into page-aligned bounce banks and then splits each row per name into the pinned slabs
+// (Exl3ShardRowSource.read's copies); RowReader reads the row images straight into the slab rows. "Bank" and "slot"
+// below name pipeline state in both; only PackReader backs them with bounce memory.
 //
 // Pipeline (plan Task 4). A read() call is split into batches of `step` rows; batch b fills bank
 // b % kBanks. Every bounce slot is one row's aligned superset, and every extent has its own
@@ -135,9 +137,9 @@ class ReaderCore {
     } else if (
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
         fault.ring_reset_fail) {
-      // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs RowReader
-      // with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above always
-      // fires there. This is the fallback for a Reader that cannot inject submit faults at all.
+      // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs the readers
+      // (AnyReader) with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above
+      // always fires there. This is the fallback for a Reader that cannot inject submit faults at all.
       throw std::runtime_error(error_prefix<Layout>() + "this reader cannot inject submit faults");
     }
   }
@@ -267,7 +269,7 @@ class ReaderCore {
   //
   // `progress`, when set, is invoked periodically from inside the drain loop -- at most once every
   // kProgressIntervalNs, never once per turn, since a turn can be as short as a single _mm_pause().
-  // RowReader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
+  // The reader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
   // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
   // caller decides when to stop admitting. Null costs one comparison per turn and no clock read.
   //

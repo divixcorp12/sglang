@@ -176,8 +176,8 @@ class PackReader : public ReaderCore<PackReader<Layout, Reader>, Layout, Reader>
     return true;
   }
 
-  // The poison fault: fill the memory the row in `slot` is read into, the bounce slot or (direct mode) the
-  // destination slab rows, so a byte published without having been read shows.
+  // The poison fault: fill the bounce slot the row in `slot` is read into, so a byte published without having been
+  // read shows.
   void poison_slot(size_t slot, uint8_t fill) {
     std::memset(bounce_slot(slot), fill, static_cast<size_t>(t_.slot_bytes));
   }

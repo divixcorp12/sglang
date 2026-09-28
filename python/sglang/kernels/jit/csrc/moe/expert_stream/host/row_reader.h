@@ -217,8 +217,8 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
     return count;
   }
 
-  // The poison fault: fill the memory the row in `slot` is read into, the bounce slot or (direct mode) the
-  // destination slab rows, so a byte published without having been read shows.
+  // The poison fault: fill the destination slab rows the row in `slot` is read into, so a byte published without
+  // having been read shows.
   void poison_slot(size_t slot, uint8_t fill) {
     const Call& c = c_;
     const int64_t dest = (*c.slots)[rows_[slot].ordinal];
@@ -281,7 +281,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
     }
   }
 
-  // Direct mode holds no copies: with images c.packing is always 0, so the old body returned at once.
+  // Direct mode holds no copies (c.packing is always 0), so there is nothing to wait for.
   void quiesce() {}
 
   // Direct mode: the bytes are the slot's own now, and the caller publishes them.

@@ -135,7 +135,7 @@ struct HostExports {
   // except that ordinal 0 selects row 0: the Python wrapper sends -1.
   // `owner_core` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1 (the Python wrapper's default)
   // leaves the reader byte-for-byte what it is without this parameter; >= 0 pins the calling/owner thread
-  // to that core and excludes it from the packing pool's mask (RowReader::set_owner_core).
+  // to that core and excludes it from the packing pool's mask (ReaderCore::set_owner_core).
   static int64_t read_rows_traced(
       TensorView extents,
       TensorView starts,

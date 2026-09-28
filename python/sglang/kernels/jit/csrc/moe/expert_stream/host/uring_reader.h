@@ -267,6 +267,11 @@ class UringReader {
     if (unsubmitted != 0) {
       close_ring();
       outstanding_ = 0;
+      // In a fixed read mode the reset re-registers the whole tier: about 59 s at tier scale (the plan's Task 10,
+      // 90 GiB), past RamThread's 30 s fatal_wait, so one submit failure that leaves SQEs unconsumed likely
+      // fail-stops the server. Keeping the ring and rewriting the unconsumed SQEs as IORING_OP_NOP (clearing
+      // IOSQE_FIXED_FILE; they still belong to userspace) would avoid both the re-registration and most of this
+      // failure path: a follow-up.
       // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
       // to settle) and throws its reason to the caller: "io_uring ring reset failed", create_ring's own error, or
       // register_resources' refusal.

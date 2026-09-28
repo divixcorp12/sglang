@@ -32,7 +32,9 @@
 
 ## Node-0 gate
 
-No cut was needed. Both arms ran the reduced tier (0:57344,1:40960), set as a driver override.
+No cut was needed. Both arms ran the reduced tier (0:57344,1:40960), set as a driver override. Node 0 also cleared
+the full tier (85759 and 87066 MiB available against the 80896 MiB it needs), so the reduced tier was not required; the
+pair stays valid because both arms used it.
 
 | arm | MemFree MiB | page cache MiB | available MiB | need MiB (57344 + 4096 + 15360) | ok |
 |---|---|---|---|---|---|

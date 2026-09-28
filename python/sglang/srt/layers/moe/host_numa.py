@@ -7,8 +7,10 @@ io_uring fixed buffers, the copy kernels) is unaffected by where its pages live.
 
 The rows are divided in proportion to the nodes' bytes, but the binding is not exact to the row: every place where
 the node changes is rounded to a 2 MiB boundary of the mapping (``plan_bindings``), so the rows around it lie partly
-or wholly on the neighbouring node. Each node's bound bytes stay within 2 MiB of what its rows asked for, because
-each boundary is rounded in whichever direction keeps the running per-node error smallest, not independently.
+or wholly on the neighbouring node. With two nodes each node's bound bytes stay within 2 MiB of what its rows asked
+for (with more nodes, within (nodes - 1) x 2 MiB), because each boundary is rounded in whichever direction keeps the
+running per-node error smallest, not independently. The last binding runs past the slab to the next 2 MiB boundary
+(bound to the last node, counted in its bound bytes, never touched), so the slab's last huge page is not split either.
 
 Why 2 MiB: an ``mbind`` range splits the mapping's VMA at its ends, and a split that is not 2 MiB aligned leaves the
 huge page around it backed by 4 KiB pages. An io_uring registered buffer that mixes 4 KiB and 2 MiB folios does not
@@ -19,6 +21,7 @@ Binding replaces first touch, which put the tier wherever the faulting thread ra
 onto a nearly full node, where the allocation stalled in reclaim instead of failing (arm_env's SERVER_CORES note).
 ``check_capacity`` refuses a placement a node cannot hold before anything is allocated.
 """
+
 from __future__ import annotations
 
 import ctypes

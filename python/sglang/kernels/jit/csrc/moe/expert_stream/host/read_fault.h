@@ -1,4 +1,4 @@
-// Test-only fault injection for RowReader (expert_stream_read_rows_faulted).
+// Test-only fault injection for the expert-stream readers (ReaderCore; expert_stream_read_rows_faulted).
 #pragma once
 
 #include "row_tables.h"
@@ -6,7 +6,7 @@
 namespace sglang {
 namespace expert_stream {
 
-// Test-only fault injection for RowReader (expert_stream_read_rows_faulted).
+// Test-only fault injection for the expert-stream readers (ReaderCore; expert_stream_read_rows_faulted).
 struct ReadFault {
   int submit_error = 0;       // errno the `submit_call`-th submit returns (0: no fault)
   int64_t submit_call = 0;    // 1-based count of submit-and-wait calls over the reader's life

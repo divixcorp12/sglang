@@ -283,6 +283,8 @@ def allocate_host_slab(
         storage = allocate_bound(nbytes, split_rows(shape[0], placement), row_bytes)
         start = 0
     else:
+        # Page-aligned only, not 2 MiB: the slab's first and last huge pages can mix folio sizes, so io_uring fixed
+        # buffers over it can meet uncoalesced registration (host_numa's docstring). Every recipe sets a placement.
         storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
         start = (-storage.data_ptr()) % PAGE_BYTES
     slab = storage[start : start + nbytes].view(dtype).view(shape)

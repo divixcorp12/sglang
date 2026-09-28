@@ -52,6 +52,12 @@ including one-vector scalar reads. Every vector in one request must fit within
 ONE registered buffer entry; independent slab allocations cannot be treated as
 one address span. Row-image experiments therefore need `SLAB_ARENA=1`.
 
+**2026-09-28 update** (plan `docs/superpowers/plans/2026-09-28-reader-crtp-uring-registration.md`, Task 7): the
+paragraph above is superseded. `fixed` and `readv_fixed` now fan a read whose iovecs meet several registered buffers
+out into one SQE per buffer, submitted together, so multi-iovec row-image reads work in both modes and row images no
+longer need `SLAB_ARENA=1`. Separate slabs register without the quadratic pin accounting once each mapping's tail is
+bound out to its 2 MiB end (final review Important 1, fixed on the same branch).
+
 `readv_fixed` requires liburing 2.10+ headers and a kernel advertising
 `IORING_OP_READV_FIXED`. The reader probes the running kernel. Enabling NVMe poll
 queues does not add this opcode. Buffer registration can also fail because of

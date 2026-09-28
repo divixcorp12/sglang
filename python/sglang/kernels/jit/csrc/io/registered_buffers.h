@@ -107,6 +107,7 @@ class RegisteredBufferTable {
       __u64 tag = 0;
       int rc = io_uring_register_buffers_update_tag(ring_, slot, &vector, &tag, 1);
       if (rc != 1) {
+        // update_tag returns the entries it updated: 0 with no errno (nothing registered) is reported as EIO.
         int error = rc < 0 ? -rc : EIO;
         last_error_ = error;
         last_error_context_ = "update slot " + std::to_string(slot) + ": " + std::strerror(error);
